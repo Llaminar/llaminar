@@ -1,0 +1,106 @@
+From: ROCm/rocm-systems upstream repair
+Subject: [PATCH] Share valid SDMA engines after exclusive stream assignments fill
+
+The release allocator reserves one SDMA engine per VirtualGPU and returns an
+empty mask once streams outnumber engines. NoCU copies then fail instead of
+performing their required transfer. Completion markers can still advance,
+so a success-only HIP event check does not establish that bytes were moved.
+
+Backport the exact two CLR changes from upstream commit
+8c1053773aed9a2e90585af3ced0b62e288af7a7 (ROCm/rocm-systems#9652).
+Preserve exclusive affinity when engines are available; otherwise balance
+sharing over valid physical engines and let ROCr's SDMA ring order submissions.
+This does not add a host wait, serialize graph builders, change the hardware
+queue limit or substitute a compute blit for NoCU maintenance copies.
+
+Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
+             (therock-10.0, ROCm Core SDK 10.0.0)
+Upstream: https://github.com/ROCm/rocm-systems/commit/8c1053773aed9a2e90585af3ced0b62e288af7a7
+
+diff --git a/rocclr/device/rocm/rocdevice.cpp b/rocclr/device/rocm/rocdevice.cpp
+--- a/rocclr/device/rocm/rocdevice.cpp
++++ b/rocclr/device/rocm/rocdevice.cpp
+@@ -4259,26 +4259,58 @@ uint32_t Device::SdmaEngineAllocator::AllocateEngine(VirtualGPU* vgpu, HwQueueEn
+             "candidate_mask=0x%x",
+             vgpu, candidate_mask);
+   } else {
+-    // Regular read/write/intra: enforce exclusivity (don't share engines)
+-    // Build a mask of engines already allocated to other VirtualGPUs
++    // Regular read/write/intra: prefer exclusive affinity to avoid cross-stream contention.
+     for (const auto& pair : vgpu_to_engine_) {
+       allocated_mask |= pair.second;
+     }
+ 
+     uint32_t available_mask = validEngineMask & ~allocated_mask;
+ 
+-    if (available_mask == 0) {
+-      ClPrint(amd::LOG_WARNING, amd::LOG_COPY,
+-              "No unallocated SDMA engines available for VirtualGPU %p, engine_type=%d "
+-              "(valid_mask=0x%x, allocated_mask=0x%x)",
+-              vgpu, engine_type, validEngineMask, allocated_mask);
+-      return 0;
+-    }
++    if (available_mask != 0) {
++      // Prefer high-bandwidth (recommended) engines if available.
++      candidate_mask = available_mask & preferredMask;
++      if (candidate_mask == 0) {
++        candidate_mask = available_mask;
++      }
++    } else {
++      // If all valid engines are assigned, share one and rely on ROCr to serialize submissions.
++      // Prefer idle engines, then preferred engines, and round-robin within the selected class.
++      uint32_t idle_mask = freeEngineMask & validEngineMask;
++      uint32_t selection_mask = idle_mask & preferredMask;
++      if (selection_mask == 0) {
++        selection_mask = idle_mask;
++      }
++      if (selection_mask == 0) {
++        selection_mask = validEngineMask & preferredMask;
++      }
++      if (selection_mask == 0) {
++        selection_mask = validEngineMask;
++      }
++      if (selection_mask == 0) {
++        ClPrint(amd::LOG_WARNING, amd::LOG_COPY,
++                "No valid SDMA engines available for oversubscribed VirtualGPU %p, "
++                "engine_type=%d",
++                vgpu, engine_type);
++        return 0;
++      }
++
++      uint32_t engine_count = 0;
++      for (uint32_t mask = selection_mask; mask != 0; mask &= mask - 1) {
++        ++engine_count;
++      }
++      uint32_t slot =
++          next_rr_engine_.fetch_add(1, std::memory_order_relaxed) % engine_count;
++      // Select the set bit at the zero-based slot index, starting from the least significant bit.
++      while (slot != 0) {
++        selection_mask &= selection_mask - 1;
++        --slot;
++      }
++      candidate_mask = selection_mask & (~selection_mask + 1);
+ 
+-    // Prefer high-bandwidth (recommended) engines if available
+-    candidate_mask = available_mask & preferredMask;
+-    if (candidate_mask == 0) {
+-      candidate_mask = available_mask;
++      ClPrint(amd::LOG_INFO, amd::LOG_COPY,
++              "All valid SDMA engines are assigned; sharing an engine for VirtualGPU %p, "
++              "engine_type=%d (candidate_mask=0x%x, valid_mask=0x%x, allocated_mask=0x%x)",
++              vgpu, engine_type, candidate_mask, validEngineMask, allocated_mask);
+     }
+   }
+ 
+diff --git a/rocclr/device/rocm/rocdevice.hpp b/rocclr/device/rocm/rocdevice.hpp
+--- a/rocclr/device/rocm/rocdevice.hpp
++++ b/rocclr/device/rocm/rocdevice.hpp
+@@ -832,7 +832,7 @@ class Device : public NullDevice {
+   struct SdmaEngineAllocator {
+     amd::Monitor lock_;  //!< Protects the allocation state
+     std::unordered_map<VirtualGPU*, uint32_t> vgpu_to_engine_;  //!< VirtualGPU -> engine mask
+-    std::atomic<uint32_t> next_rr_engine_{0};  //!< Simple RR counter for future use
++    std::atomic<uint32_t> next_rr_engine_{0};  //!< RR counter for sdma engine selection
+     const Device& device_;  //!< Reference to parent device for accessing masks
+ 
+     SdmaEngineAllocator(const Device& device) : device_(device) {}

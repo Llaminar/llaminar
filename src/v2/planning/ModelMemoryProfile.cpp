@@ -1,5 +1,6 @@
 #include "planning/ModelMemoryProfile.h"
 #include "loaders/ModelLoader.h"
+#include "execution/mtp/MTPLearnedBlockCount.h"
 #include <regex>
 #include <numeric>
 #include <cstring>
@@ -194,15 +195,9 @@ namespace llaminar2
         profile.expert_shared_feed_forward_length = firstPositiveMetadataInt(
             model,
             {model.architecture + ".expert_shared_feed_forward_length"});
-        profile.mtp_layer_count = firstPositiveMetadataInt(
-            model,
-            {
-                model.architecture + ".nextn_predict_layers",
-                model.architecture + ".mtp_num_hidden_layers",
-                model.architecture + ".mtp.num_hidden_layers",
-                "mtp.num_hidden_layers",
-                "mtp_num_hidden_layers",
-            });
+        // Count real directory-inferred predictors exactly as graph discovery
+        // does. Optional exporter metadata must not erase their shifted KV BOM.
+        profile.mtp_layer_count = mtpLearnedBlockCount(model);
         profile.full_attention_interval = firstPositiveMetadataInt(
             model,
             {model.architecture + ".full_attention_interval"});

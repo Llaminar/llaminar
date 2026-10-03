@@ -5507,6 +5507,35 @@ namespace llaminar2::test::parity
                 {
                     const auto &dev_data = tp_snapshot.device_data[dev_idx];
 
+                    if (tp_snapshot.mode == SnapshotShardingMode::TOKEN_ROW_PARTITION)
+                    {
+                        // Row ownership is explicit diagnostic metadata. Compare
+                        // only that producer's values; empty participants still
+                        // must be present in computeCombined's coverage proof.
+                        std::vector<float> local, reference;
+                        validateSnapshotOwnedRows(dev_data.row_ownership, dev_data.rows);
+                        for (const auto &range : dev_data.row_ownership.intervals)
+                        {
+                            const auto begin = range.begin * dev_data.cols;
+                            const auto end = (range.begin + range.count) * dev_data.cols;
+                            if (dev_data.rows != pytorch_rows || dev_data.cols != pytorch_cols ||
+                                end > pytorch_data.size() || end > dev_data.data.size())
+                                throw std::runtime_error("Row-partitioned parity checkpoint has incompatible reference geometry");
+                            local.insert(local.end(), dev_data.data.begin() + begin, dev_data.data.begin() + end);
+                            reference.insert(reference.end(), pytorch_data.begin() + begin, pytorch_data.begin() + end);
+                        }
+                        if (!local.empty())
+                        {
+                            TPDeviceComparisonResult dev_result;
+                            dev_result.device_id = dev_data.device_id.toString();
+                            dev_result.device_index = dev_idx;
+                            dev_result.cosine_similarity = computeCosineSimilarity(local.data(), reference.data(), local.size());
+                            dev_result.slice_size = local.size();
+                            dev_result.passed = dev_result.cosine_similarity >= config_.cosine_threshold;
+                            result.device_results.push_back(std::move(dev_result));
+                        }
+                        continue;
+                    }
                     size_t compare_size = std::min(dev_data.data.size(), pytorch_data.size());
                     EXPECT_EQ(dev_data.data.size(), pytorch_data.size())
                         << "TP checkpoint '" << tp_snapshot.key << "' device "

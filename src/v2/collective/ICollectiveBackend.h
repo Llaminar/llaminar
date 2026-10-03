@@ -27,6 +27,7 @@
 #include "../config/OrchestrationConfig.h" // For CollectiveBackendType (canonical definition)
 #include "DeviceGroup.h"
 #include "IBufferRegistration.h"
+#include "NativeCollectiveRows.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -1003,6 +1004,10 @@ namespace llaminar2
          * This is the required path for MoE rebalance control traffic that is
          * intended to ride an existing LocalTP allreduce, rather than launch
          * separate rebalance-specific collectives.
+         * @param live_rows Empty for a fixed anchor, otherwise one device-owned
+         * prefix per participant. All entries have identical capacity and row
+         * width, while their pointers belong to their respective devices. Only
+         * the anchor is clipped; control sidebands retain their exact extents.
          */
         virtual bool allreduceWithSidebandsMultiOnStreams(
             const std::vector<void *> &buffers,
@@ -1010,7 +1015,8 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op,
             const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
-            const std::vector<void *> &streams)
+            const std::vector<void *> &streams,
+            const std::vector<NativeCollectiveRows> &live_rows = {})
         {
             (void)buffers;
             (void)count;
@@ -1018,6 +1024,7 @@ namespace llaminar2
             (void)op;
             (void)sidebands;
             (void)streams;
+            (void)live_rows;
             return false;
         }
 
@@ -1261,6 +1268,58 @@ namespace llaminar2
          * current backend instance.
          */
         virtual bool supportsAllgatherSingleDeviceOnStream() const { return false; }
+
+        /**
+         * @brief Enqueue native sum/reduce-scatter on one participant's exact stream.
+         *
+         * Calls from all participants must name the same receive count, type
+         * and collective position. The output is a communicator-indexed block
+         * of the reduced rank-major input. There is no host rendezvous, copy,
+         * allocation, precision conversion or completion wait in this API.
+         * @param send_buf Read-only input with nranks*receive_count elements.
+         * @param recv_buf Disjoint device output with receive_count elements.
+         * @param receive_count Number of result elements per participant.
+         * @param dtype Explicit native reduction type.
+         * @param device_idx Index in the native communicator, not GPU ordinal.
+         * @param stream Exact non-null CUDA/HIP producer and consumer stream.
+         * @return False when unsupported or enqueue fails; never emulates the operation.
+         */
+        virtual bool reduceScatterSingleDeviceOnStream(
+            const void *send_buf, void *recv_buf, size_t receive_count,
+            CollectiveDataType dtype, int device_idx, void *stream)
+        {
+            (void)send_buf; (void)recv_buf; (void)receive_count;
+            (void)dtype; (void)device_idx; (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Submit equal-prefix rows without communicating inactive capacity.
+         * @param operation Native gather, allreduce or reduce-scatter semantics.
+         * @param send Read-only source; only allreduce may alias the receive bank.
+         * @param receive Result bank, using the original capacity-sized rank strides.
+         * @param rows Immutable row geometry and borrowed device count authority.
+         * @param dtype Exact scalar/wire type; no implicit precision conversion.
+         * @param reduction SUM/MIN/MAX for reductions; ALLGATHER for a byte gather.
+         * @param participant Communicator coordinate, not physical device ordinal.
+         * @param stream Exact non-null producer/consumer stream.
+         * @param payload_bytes Optional persistent device-only diagnostic counter.
+         * @return Enqueue success; unsupported backends fail, never send capacity instead.
+         *
+         * All participants publish the same live row prefix before this native
+         * batch. Counts are device operands, not host scheduling decisions.
+         * The optional counter observes native useful sends, not PCIe framing.
+         */
+        virtual bool nativeRowsOnStream(
+            NativeRowCollective operation, const void *send, void *receive,
+            const NativeCollectiveRows &rows, CollectiveDataType dtype,
+            CollectiveOp reduction, int participant, void *stream,
+            unsigned long long *payload_bytes = nullptr)
+        {
+            (void)operation; (void)send; (void)receive; (void)rows; (void)dtype;
+            (void)reduction; (void)participant; (void)stream; (void)payload_bytes;
+            return false;
+        }
 
         /**
          * @brief Per-device broadcast on a caller-provided stream (graph-capturable).

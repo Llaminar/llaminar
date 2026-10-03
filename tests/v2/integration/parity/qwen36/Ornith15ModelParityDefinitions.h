@@ -10,7 +10,9 @@
  * fine-tune's larger weights require the two-CUDA overlay instead of one CUDA;
  * ROCm covers both one device and the two-device overlay, alongside CPU NodeTP.
  * The independent Q8 accuracy workload retains the production four-ROCm drift
- * reproducer and its CPU control without granting an HTTP certification tag.
+ * reproducer and its diagnostic CPU control. The four-ROCm overlay additionally
+ * declares matched whole-expert and automatic projection HTTP/benchmark
+ * selectors; CPU diagnostics stay untagged.
  */
 #pragma once
 
@@ -19,6 +21,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace llaminar2::test::parity::qwen36
@@ -142,14 +145,53 @@ What is 2+2?<|im_end|>
     }
 
     /**
+     * @brief Certify the reported Ornith Q8 four-ROCm deployment through HTTP.
+     * @return Existing exact-weight matrix with one Dynamic/Ordinal/adaptive tag.
+     *
+     * The 424-token/89-step HF diagnosis remains unchanged. Its standard HTTP
+     * profile independently exercises long needles, prefix restore, stochastic
+     * MTP, movement and shutdown; the benchmark exporter derives production
+     * defaults from the same model/topology declaration. A tag is eligibility,
+     * never a passing certificate or permission to replace serial controls.
+     */
+    inline ModelParityDefinition ornith15MoEQ8Rocm4CertificationDefinition()
+    {
+        auto definition = ornith15MoEQ8AccuracyParityDefinition(
+            ornith15MoERocm4ExpertOverlayTopology(),
+            "pytorch_ornith15_q8_natural_decode_rocm4_snapshots");
+        definition.e2e_certifiable = {{
+            .mtp = ModelParityMTP::DynamicDepth,
+            .owner_order = RoutedExpertOwnerOrder::Ordinal,
+            .movement = ModelParityExpertMovement::Dynamic,
+        }};
+        return definition;
+    }
+
+    /**
+     * @brief Certify the four-ROCm automatic projection default beside its control.
+     * @return The same model, HF oracle, matrix and HTTP profile with a distinct
+     *         physical projection topology and artifact identity.
+     *
+     * Derive the variant rather than copying weights, prompts or feature axes.
+     * Its public exporters omit a compute override and authenticate the resolved
+     * projection policy, so routine E2E exercises the degree-four rank-fold fork.
+     */
+    inline ModelParityDefinition ornith15MoEQ8Rocm4ProjectionCertificationDefinition()
+    {
+        auto definition = ornith15MoEQ8Rocm4CertificationDefinition();
+        definition.topology = qwen36MoEProjectionTopology(std::move(definition.topology));
+        return definition;
+    }
+
+    /**
      * @brief Add Ornith's single-ROCm and overlay certification definitions.
      * @param definitions Canonical Qwen3.6 topology/feature definitions.
      * @return Original definitions followed by independent Ornith identities.
      *
      * Copying the typed definition preserves budgets, topology, precision and
      * prefix obligations without another topology table. Overlay definitions
-     * select Dynamic/Ordinal/adaptive MTP, including the two-GPU topologies
-     * that the parent model exercises numerically but does not tag for HTTP.
+     * select Dynamic/Ordinal/adaptive MTP, including the two-GPU topologies,
+     * while preserving any certification profile authored by the parent.
      */
     inline std::vector<ModelParityDefinition> withOrnith15CertificationModels(
         std::span<const ModelParityDefinition> definitions)

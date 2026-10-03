@@ -5,12 +5,47 @@
 
 #include "LocalTPCollectiveInventory.h"
 
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 #include <utility>
 
 namespace llaminar2
 {
+    PeerAccessCoverage localTPPeerAccessCoverage(const RankInventory &inventory, const std::vector<DeviceId> &devices)
+    {
+        if (devices.size() < 2 || !devices.front().is_gpu())
+            throw std::invalid_argument("LocalTP P2P coverage needs a homogeneous GPU subset");
+        const auto type = devices.front().type;
+        const auto &matrix = type == DeviceType::CUDA ? inventory.p2p_cuda : inventory.p2p_rocm;
+        const int count = type == DeviceType::CUDA ? inventory.p2p_cuda_count : inventory.p2p_rocm_count;
+        std::vector<int> ordinals, indices;
+        for (const auto &gpu : inventory.gpus) if (gpu.type == type)
+        {
+            if (gpu.local_device_id < 0 || std::find(ordinals.begin(), ordinals.end(), gpu.local_device_id) != ordinals.end())
+                throw std::invalid_argument("LocalTP P2P inventory has repeated or invalid GPU identities");
+            ordinals.push_back(gpu.local_device_id);
+        }
+        if (count < 2 || static_cast<std::size_t>(count) != ordinals.size() ||
+            matrix.size() / static_cast<std::size_t>(count) != static_cast<std::size_t>(count) ||
+            matrix.size() % static_cast<std::size_t>(count))
+            throw std::invalid_argument("LocalTP P2P coverage lacks a complete observed matrix");
+        for (auto device : devices)
+        {
+            const auto found = std::find(ordinals.begin(), ordinals.end(), device.ordinal);
+            if (device.type != type || found == ordinals.end())
+                throw std::invalid_argument("LocalTP P2P subset names a foreign endpoint");
+            const auto index = static_cast<int>(found - ordinals.begin());
+            if (std::find(indices.begin(), indices.end(), index) != indices.end())
+                throw std::invalid_argument("LocalTP P2P subset repeats an endpoint");
+            indices.push_back(index);
+        }
+        bool any = false, all = true;
+        for (int from : indices) for (int to : indices) if (from != to)
+        { const bool enabled = matrix[static_cast<std::size_t>(from) * count + to]; any |= enabled; all &= enabled; }
+        return all ? PeerAccessCoverage::Complete : any ? PeerAccessCoverage::Partial : PeerAccessCoverage::None;
+    }
+
     ClusterInventory buildLocalTPCollectiveInventory(
         const std::vector<GlobalDeviceAddress> &participants,
         int mpi_rank,

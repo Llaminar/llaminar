@@ -31,6 +31,7 @@
 #include "../../execution/compute_stages/stages/QKNormStage.h"
 #include "../../execution/moe/MoERebalanceController.h"
 #include "../../execution/mtp/MTPSpecDecodeMetadata.h"
+#include "../../execution/mtp/MTPTerminalGatherGeometry.h"
 #include "../../kernels/IHybridKVCache.h"
 #include "../../config/PipelineConfig.h"
 #include "../../memory/BufferId.h" // Phase 2: contract BufferIds
@@ -881,6 +882,37 @@ namespace llaminar2
     QwenGraphBase::ForwardExecutionPhaseScope::~ForwardExecutionPhaseScope()
     {
         owner_.forward_execution_phase_ = previous_;
+    }
+
+    QwenGraphBase::PrefillCollectiveRowsScope::PrefillCollectiveRowsScope(
+        QwenGraphBase &owner, const ForwardInput &input)
+        : owner_(owner), previous_(owner.prefill_collective_rows_)
+    {
+        std::optional<DeviceRowRange> rows;
+        if (input.device_prefill_chunk)
+        {
+            if (!devicePrefillChunkOwnsInput(input))
+                throw std::invalid_argument("Native prefill collective has no authenticated chunk materializer");
+            rows = DeviceRowRange::deviceCounted(input.seq_len,
+                input.device_prefill_chunk->chunk_real_rows_device);
+        }
+        owner_.prefill_collective_rows_ = rows;
+    }
+
+    QwenGraphBase::PrefillCollectiveRowsScope::~PrefillCollectiveRowsScope()
+    {
+        owner_.prefill_collective_rows_ = previous_;
+    }
+
+    std::optional<DeviceRowRange> QwenGraphBase::prefillCollectiveRows(DeviceId device, int rows) const
+    {
+        // A shifted sidecar has its own append lengths. Never inherit the
+        // main graph's query geometry merely because construction is nested.
+        if (!device.is_gpu() || !prefill_collective_rows_)
+            return std::nullopt;
+        if (prefill_collective_rows_->capacity() != rows)
+            throw std::logic_error("Native prefill collective changed its materializer-owned row capacity");
+        return prefill_collective_rows_;
     }
 
     QwenGraphBase::MirroredMTPHeadScope::MirroredMTPHeadScope(
@@ -1940,6 +1972,7 @@ namespace llaminar2
         ForwardOutput &output)
     {
         const int total_tokens = input.batch_size * input.seq_len;
+        PrefillCollectiveRowsScope collective_rows_scope(*this, input);
         ForwardExecutionPhaseScope execution_phase_scope(
             *this,
             input.execution_phase);
@@ -3912,35 +3945,19 @@ namespace llaminar2
                                     ? config_.vocab_size
                                     : config.local_vocab);
         /*
-         * An explicitly vocabulary-sharded MTP head needs compact gathered
-         * rows for stochastic sampling. Mirrored ownership writes the complete
-         * vocabulary on every TP participant and therefore reserves only the
-         * schema's 1x1 gathered-logits placeholder, irrespective of TP scope.
+         * Condition and verifier graphs bind the complete distribution for
+         * local as well as cross-rank vocabulary shards. Storage must not be
+         * inferred from whether the sidecar owns a GlobalTP collective: local
+         * TP has a different collective owner, but the same output geometry.
+         * This retained union also survives requests that temporarily disable
+         * MTP. Admission consumes this exact geometry through the shared BOM.
          */
-        const bool spans_multiple_global_ranks =
-            (config_.tp_ctx != nullptr &&
-             !config_.tp_ctx->isLocal() &&
-             config_.tp_ctx->degree() > 1) ||
-            (config_.tp_ctx == nullptr &&
-             mpi_ctx_ != nullptr &&
-             mpi_ctx_->world_size() > 1);
-        const bool reserve_global_mtp_gather =
-            resolveMTPTerminalLogitsCollective({
-                .layout = config_.mtpTerminalLogitsLayout(),
-                .sidecar_produces_logits =
-                    retainsMTPGraphCapacity(config_.mtp),
-                .spans_multiple_global_ranks =
-                    spans_multiple_global_ranks,
-            }) ==
-            MTPTerminalLogitsCollective::GlobalVocabularyAllGather;
-        config.custom_formulas["mtp_global_gather_rows"] =
-            reserve_global_mtp_gather
-                ? static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp))
-                : 1ULL;
-        config.custom_formulas["mtp_global_gather_vocab"] =
-            reserve_global_mtp_gather
-                ? static_cast<size_t>(config_.vocab_size)
-                : 1ULL;
+        const auto mtp_gather = MTPTerminalGatherGeometry::resolve(
+            config_.mtpTerminalLogitsLayout(),
+            static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp)),
+            static_cast<size_t>(config_.vocab_size));
+        config.custom_formulas["mtp_gather_rows"] = mtp_gather.rows();
+        config.custom_formulas["mtp_gather_vocab"] = mtp_gather.columns();
 
         LOG_DEBUG("[QwenGraphBase::getResolverConfig] Created config: "
                   << "seq_len=" << config.seq_len << ", "
@@ -4138,6 +4155,18 @@ namespace llaminar2
             params.tensor_buffer_id = tensor_buffer_id;
             params.sideband_device_index = config_.tp_device_idx;
             params.sideband_workspace_bindings = std::move(sideband_workspace_bindings);
+
+            // Only a homogeneous native domain can consume this device-owned
+            // prefix directly. The matrix stride remains fixed in the arena;
+            // the materializer, not the host, controls its useful wire extent.
+            const auto backend = config_.tp_ctx->backend();
+            if (config_.tp_ctx->isLocal() &&
+                (backend == CollectiveBackendType::NCCL || backend == CollectiveBackendType::RCCL) &&
+                buffer && buffer->cols() > 0 && count % buffer->cols() == 0)
+            {
+                const auto rows = prefillCollectiveRows(device, static_cast<int>(count / buffer->cols()));
+                if (rows) params.live_rows.emplace(*rows, buffer->cols());
+            }
 
             return std::make_unique<TPAllreduceStage>(params);
         }

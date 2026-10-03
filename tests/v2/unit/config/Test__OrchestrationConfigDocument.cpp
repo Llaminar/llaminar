@@ -177,6 +177,33 @@ TEST(OrchestrationConfigDocument, AllBackendsMovementOwnerAndOptionalMtpPolicies
     }
 }
 
+/** @test Saved A/B plans retain the physical projection mode independently of movement and MTP. */
+TEST(OrchestrationConfigDocument, WholeExpertAndMovableGateUpModesHaveDistinctLosslessIdentity)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto whole = example(backend);
+        whole.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        for (auto &domain : whole.moe_routed_expert_plan->domains)
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        const auto control = serializeOrchestrationConfig(whole);
+        // Decode to create a separate plan owner rather than mutating the
+        // shared_ptr-backed source of the whole-expert control.
+        auto projected = deserializeOrchestrationConfig(control);
+        projected.routed_expert_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+        for (auto &domain : projected.moe_routed_expert_plan->domains)
+            domain.routed_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+        const auto candidate = serializeOrchestrationConfig(projected);
+        ASSERT_NE(control, candidate);
+        const auto restored = deserializeOrchestrationConfig(candidate);
+        EXPECT_EQ(restored.routed_expert_compute_policy, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+        for (const auto &domain : restored.moe_routed_expert_plan->domains)
+            EXPECT_EQ(domain.routed_compute_policy, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+        EXPECT_EQ(serializeOrchestrationConfig(restored), candidate);
+        EXPECT_EQ(serializeOrchestrationConfig(whole), control);
+    }
+}
+
 TEST(OrchestrationConfigDocument, PublicConfigRoutePreservesApplyAndAllowsExplicitRequestOverrides)
 {
     auto config = example(DeviceType::ROCm);

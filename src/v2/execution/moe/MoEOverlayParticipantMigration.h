@@ -4,7 +4,7 @@
  *
  * Physical transfer lanes move one gate, up, or down projection and eventually
  * publish a prepared destination engine.  Sparse inference, however, consumes
- * one immutable participant bank containing complete expert triplets.  This
+ * one immutable participant bank containing complete expert payloads.  This
  * file joins those two ownership domains without making inference wait: a
  * topology-owned provider reserves and enqueues the physical work, while the
  * participant factory clones the old RCU banks, applies the complete movement
@@ -36,12 +36,21 @@ namespace llaminar2
      * A physical operation may construct its prepared GEMM before enqueue, from
      * a progress callback, or on a background worker.  It publishes exactly one
      * shared lifetime under the matching projection role.  The bank transaction
-     * reads the triplet only after the composite transfer barrier reports Ready,
+     * reads the payload only after the composite transfer barrier reports Ready,
      * but the mutex also makes publication safe when callbacks run concurrently.
      */
     class MoEOverlayPreparedExpertArrival final
     {
     public:
+        /**
+         * @brief Bind the immutable projection contract before any arrival.
+         * @throws std::invalid_argument For an unknown projection family.
+         */
+        explicit MoEOverlayPreparedExpertArrival(
+            DeviceMoEProjectionSet projections = DeviceMoEProjectionSet::CompleteExpert);
+
+        /** @return The family authenticated by this transfer transaction. */
+        [[nodiscard]] DeviceMoEProjectionSet projections() const noexcept { return projections_; }
         /**
          * @brief Publish one prepared projection lifetime exactly once.
          * @param projection Gate, up, or down role represented by @p engine.
@@ -62,18 +71,19 @@ namespace llaminar2
         bool fail(std::string error);
 
         /**
-         * @brief Snapshot the complete destination triplet after transfer readiness.
-         * @param triplet Receives the three retained prepared-engine lifetimes.
+         * @brief Snapshot the complete destination payload after transfer readiness.
+         * @param payload Receives exactly the declared prepared-engine family.
          * @param error Optional incomplete/failure diagnostic.
          * @return True only when all projections are present and no failure exists.
          */
-        [[nodiscard]] bool completeTriplet(
-            MoEOverlayPreparedExpertTriplet &triplet,
+        [[nodiscard]] bool completePayload(
+            MoEOverlayPreparedExpertPayload &payload,
             std::string *error = nullptr) const;
 
     private:
         mutable std::mutex mutex_;
-        MoEOverlayPreparedExpertTriplet triplet_;
+        const DeviceMoEProjectionSet projections_;
+        std::array<std::shared_ptr<ITensorGemm>, 3> engines_{};
         std::string failure_;
     };
 

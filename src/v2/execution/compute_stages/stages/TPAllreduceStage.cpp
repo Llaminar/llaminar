@@ -1,6 +1,12 @@
 /**
  * @file TPAllreduceStage.cpp
  * @brief Implementation of all-reduce stage for tensor parallelism
+ *
+ * Native fork submission retains this stage's precision and telemetry authority;
+ * the explicit paired graph join, never an auxiliary-stream host shadow, owns
+ * publication. Native sums and canonical rank folds share their ordinary
+ * arithmetic implementation even when forked; control sidebands retain their
+ * existing ordered execution contracts.
  * @author David Sanftenberg
  * @date February 2026
  */
@@ -80,6 +86,23 @@ namespace llaminar2
         constexpr const char *kDefaultAllreducePrecision = "fp32";
         constexpr const char *kCanonicalRankBankWorkspace =
             "tp_allreduce_canonical_rank_banks";
+
+        /**
+         * @brief Reject a malformed row binding before publishing stage parameters.
+         * @param params Immutable row-bank and participant declaration.
+         * @throws std::invalid_argument If device, stride or membership is incomplete.
+         *
+         * Tensor binding may still occur later, but it cannot change the row
+         * geometry already selected for a captured native call. Construction
+         * and rebinding use this same admission check.
+         */
+        void validateAllreduceRows(const TPAllreduceParams &params)
+        {
+            if (params.live_rows && (params.count == 0 ||
+                params.live_rows->bankElements() != params.count ||
+                !params.device_id.is_gpu() || params.sideband_device_index < 0))
+                throw std::invalid_argument("TP allreduce live prefix requires exact GPU bank and participant bindings");
+        }
 
         const char *allreduceRoleForStage(const std::string &stage_name)
         {
@@ -343,6 +366,7 @@ namespace llaminar2
                 {"accounting", "graph_template_or_eager_launch"},
                 {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"}};
             common_tags.emplace("elements", std::to_string(effective_count));
+            common_tags.emplace("extent", params.live_rows ? "device_row_prefix" : "fixed_elements");
             const size_t logical_row_elements = params.tensor->cols();
             common_tags.emplace(
                 "logical_row_elements", std::to_string(logical_row_elements));
@@ -362,7 +386,7 @@ namespace llaminar2
 
             PerfStatsCollector::addCounter(
                 "tp_allreduce_bom",
-                "bytes",
+                params.live_rows ? "capacity_bytes" : "bytes",
                 static_cast<double>(reduced_bytes),
                 {},
                 params.device_id.toString(),
@@ -385,7 +409,9 @@ namespace llaminar2
     TPAllreduceStage::TPAllreduceStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
-        // Validation is done at execute time to allow late binding
+        // Late-bound tensors remain legal, but immutable row-bank declarations
+        // must already agree. Never silently revert to a capacity-sized send.
+        validateAllreduceRows(params_);
     }
 
     // =========================================================================
@@ -553,7 +579,7 @@ namespace llaminar2
         // Use stage_name overload with count parameter.
         // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size).
         bool success;
-        if (!sidebands.empty())
+        if (!sidebands.empty() || params_.live_rows)
         {
             if (!stage_stream)
             {
@@ -583,7 +609,8 @@ namespace llaminar2
                 stage_stream,
                 transport_precision,
                 sidebands,
-                params_.sideband_device_index);
+                params_.sideband_device_index,
+                params_.live_rows ? &*params_.live_rows : nullptr);
             if (!success)
             {
                 LOG_ERROR("TPAllreduceStage: LocalTP grouped allreduce sideband bundle failed"
@@ -637,6 +664,34 @@ namespace llaminar2
         // collective completion before D2H.
 
         return true;
+    }
+
+    bool TPAllreduceStage::enqueueAcquiredInput(const AcquiredDeviceTransferInput &input) const
+    {
+        auto *local = dynamic_cast<ILocalTPContext *>(params_.tp_ctx);
+        if (!local || !input.valid() || input.sourceOwner() != params_.tensor ||
+            input.device() != params_.device_id ||
+            !params_.sidebands.empty() || !params_.sideband_workspace_bindings.empty())
+            throw std::invalid_argument("TP allreduce fork requires its exact tensor without control sidebands");
+        const auto count = params_.count ? params_.count : params_.tensor->numel();
+        if (count == 0 || count > params_.tensor->numel())
+            throw std::invalid_argument("TP allreduce fork exceeds its exact tensor extent");
+        recordAllreduceBillOfMaterials(params_, count, debugEnv().skip_allreduce);
+        if (debugEnv().skip_allreduce) return true;
+        // The fork changes only scheduling. Decode with more than two ranks
+        // must still gather and fold in the same ascending rank order as the
+        // ordinary stage; a native sum here would break grouped-row equivalence.
+        if (params_.arithmetic_policy == TPAllreduceArithmeticPolicy::CanonicalRankOrder)
+        {
+            if (effectiveTransportPrecision(params_, count) != "fp32")
+                throw std::invalid_argument("Canonical TP allreduce fork requires FP32 transport");
+            return executeCanonicalRankOrder(local, count, input.consumerStream(), {});
+        }
+        if (params_.arithmetic_policy != TPAllreduceArithmeticPolicy::NativeCollective)
+            throw std::invalid_argument("TP allreduce fork has an unknown arithmetic policy");
+        return local->allreduceAcquiredInput(input, params_.stage_name, count,
+                                             effectiveTransportPrecision(params_, count),
+                                             params_.live_rows ? &*params_.live_rows : nullptr);
     }
 
     WorkspaceRequirements TPAllreduceStage::getWorkspaceRequirements(
@@ -743,6 +798,7 @@ namespace llaminar2
 
     void TPAllreduceStage::setParams(const Params &params)
     {
+        validateAllreduceRows(params);
         params_ = params;
         // Update base class device
         // Note: IComputeStage doesn't expose setDevice() publicly, so device
@@ -753,7 +809,7 @@ namespace llaminar2
         ILocalTPContext *local_tp,
         size_t effective_count,
         void *stage_stream,
-        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands)
+        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands) const
     {
         if (!local_tp || !stage_stream || !params_.tensor ||
             params_.sideband_device_index < 0 || !bound_workspace_)
@@ -814,14 +870,19 @@ namespace llaminar2
 
         const std::string collective_name =
             params_.stage_name + "_canonical_rank_banks";
-        if (!local_tp->allgatherRawOnStream(
+        const bool gathered = params_.live_rows
+            ? local_tp->nativeRowsOnStream(NativeRowCollective::AllGather, tensor_data,
+                rank_banks, *params_.live_rows, CollectiveDataType::FLOAT32,
+                CollectiveOp::ALLGATHER, params_.sideband_device_index, stage_stream, collective_name)
+            : local_tp->allgatherRawOnStream(
                 tensor_data,
                 rank_banks,
                 effective_count,
                 CollectiveDataType::FLOAT32,
                 params_.sideband_device_index,
                 stage_stream,
-                collective_name))
+                collective_name);
+        if (!gathered)
         {
             LOG_ERROR("TPAllreduceStage: canonical rank-bank allgather failed"
                       << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));

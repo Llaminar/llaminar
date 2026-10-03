@@ -12,6 +12,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
+#include "execution/local_execution/engine/ForwardGraphEntryOrdering.h"
 #include "execution/local_execution/engine/PrefillGraphCache.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
@@ -22,10 +23,57 @@
 #include "utils/TestTensorFactory.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <optional>
+#include <stdexcept>
+#include <string>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
 using namespace llaminar2::testing;
+
+namespace
+{
+    /** @brief Isolate one environment override without changing global DebugEnv. */
+    class ScopedPrefillMinimumEnvironment final
+    {
+    public:
+        /** @brief Save the caller's setting and begin with production defaults. */
+        ScopedPrefillMinimumEnvironment()
+        {
+            if (const char *value = std::getenv(kName)) previous_ = value;
+            clear();
+        }
+
+        /** @brief Restore the caller's environment even after a fatal assertion. */
+        ~ScopedPrefillMinimumEnvironment()
+        {
+            if (previous_) (void)::setenv(kName, previous_->c_str(), 1);
+            else (void)::unsetenv(kName);
+        }
+
+        ScopedPrefillMinimumEnvironment(const ScopedPrefillMinimumEnvironment &) = delete;
+        ScopedPrefillMinimumEnvironment &operator=(const ScopedPrefillMinimumEnvironment &) = delete;
+
+        /** @brief Supply an explicit coalescing floor to a subsequent reload. */
+        void set(int value)
+        {
+            if (::setenv(kName, std::to_string(value).c_str(), 1) != 0)
+                throw std::runtime_error("cannot set test prefill floor");
+        }
+
+        /** @brief Remove the override so a subsequent reload must use defaults. */
+        void clear()
+        {
+            if (::unsetenv(kName) != 0)
+                throw std::runtime_error("cannot clear test prefill floor");
+        }
+
+    private:
+        static constexpr const char *kName = "LLAMINAR_PREFILL_GRAPH_MIN_SEQ";
+        std::optional<std::string> previous_;
+    };
+}
 
 // =============================================================================
 // Helper: Capturable mock stage for graph capture tests
@@ -213,7 +261,8 @@ public:
     }
     void resetAuxiliaryStreams() override {}
 
-    void *createEvent() override { return nullptr; }
+    /** @copydoc IWorkerGPUContext::createEvent */
+    void *createEvent(GPUEventPurpose = GPUEventPurpose::Ordering) override { return nullptr; }
     void destroyEvent(void *) override {}
     void recordEvent(void *, void *) override {}
     void waitEvent(void *, void *) override {}
@@ -338,10 +387,60 @@ TEST(Test__PrefillGraphCache, DefaultConfig_MatchesExpectedDefaults)
 {
     PrefillGraphConfig config;
     EXPECT_TRUE(config.enabled);
-    EXPECT_EQ(config.minimum_padded_bucket_seq_len, 256);
+    EXPECT_EQ(config.minimum_padded_bucket_seq_len, 64);
     EXPECT_FALSE(config.trace);
     EXPECT_TRUE(config.buckets_enabled);
     EXPECT_EQ(config.max_cached_entries, 10u);
+}
+
+/** @brief Default selection and admission agree on economical short GPU tails. */
+TEST(Test__PrefillGraphCache, DefaultServingFloorPreservesSmallestSupportedBucket)
+{
+    ScopedPrefillMinimumEnvironment environment;
+    ExecutionConfig execution;
+    const PrefillGraphConfig defaults;
+    ASSERT_EQ(execution.prefill_graph_min_seq, kSupportedPrefillGraphBucketSizes.front());
+    ASSERT_EQ(defaults.minimum_padded_bucket_seq_len, execution.prefill_graph_min_seq);
+
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        for (const int capacity : {32, 64, 128, 256, 512})
+        {
+            PrefillGraphConfig config;
+            config.minimum_padded_bucket_seq_len =
+                effectivePrefillGraphMinimumPaddedBucketSeqLen(
+                    execution.prefill_graph_min_seq, capacity);
+            PrefillGraphCache cache(config);
+            const auto buckets = rawPrefillGraphBucketsForResidentCapacity(
+                defaultPrefillGraphBuckets(), capacity, execution.prefill_graph_min_seq);
+            for (int live_rows = 2; live_rows <= capacity; ++live_rows)
+            {
+                const auto selected = selectPrefillGraphBucket(live_rows, buckets);
+                ASSERT_TRUE(selected);
+                if (live_rows <= 64)
+                    EXPECT_EQ(selected.bucket_seq_len, std::min(64, capacity));
+                auto key = makeGPUKey(selected.bucket_seq_len);
+                key.device_id = device;
+                const auto graph = buildCapturableGraph(device);
+                EXPECT_NE(cache.preflight(graph, key, nullptr, false, false,
+                              live_rows, selected.bucket_seq_len),
+                          PrefillGraphRejectReason::PaddedBucketBelowMinimum);
+            }
+        }
+    }
+}
+
+/** @brief Debug overrides remain explicit and disappear when removed. */
+TEST(Test__PrefillGraphCache, PrefillFloorReloadRestoresCanonicalDefault)
+{
+    ScopedPrefillMinimumEnvironment environment;
+    ExecutionConfig execution;
+    environment.set(256);
+    execution.reload();
+    EXPECT_EQ(execution.prefill_graph_min_seq, 256);
+    environment.clear();
+    execution.reload();
+    EXPECT_EQ(execution.prefill_graph_min_seq, kDefaultPrefillGraphMinBucketSize);
 }
 
 // =============================================================================
@@ -661,6 +760,69 @@ TEST(Test__PrefillGraphCache, ChunkSchedule_UsesFixedIntervalAndRealTokenRange)
     EXPECT_EQ(schedule.chunks[2].bucket_seq_len, 128)
         << "A fixed real-token interval must retain one physical graph bucket "
            "for its short final tail.";
+}
+
+/** @test Every externally submitted resident bucket joins its preceding graph frontier. */
+TEST(Test__PrefillGraphCache, DeviceResidentBucketEntryRequiresPreviousForwardCompletion)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const auto input_hint : {DeviceId::cpu(), DeviceId::cuda(1), DeviceId::rocm(1)})
+        for (const int rows : {1, 64, 384, 4096})
+            for (const auto role : {ForwardParticipantOutputRole::TerminalOwner,
+                                   ForwardParticipantOutputRole::PipelineFollower})
+                for (const bool resident_chunk : {false, true})
+                    for (const bool setup_only : {false, true})
+                    {
+                        ForwardInput input;
+                        // Exact execution ownership is independent of an
+                        // omitted or differently placed request declaration.
+                        input.device = input_hint;
+                        input.seq_len = rows;
+                        input.execution_phase = ForwardExecutionPhase::Prefill;
+                        if (resident_chunk)
+                            input.device_prefill_chunk.emplace();
+                        if (setup_only)
+                            input.graph_submission_intent =
+                                ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+                        const auto expected = device.is_gpu() && !setup_only &&
+                            (resident_chunk || role == ForwardParticipantOutputRole::PipelineFollower)
+                            ? ForwardGraphEntryDependency::PreviousForwardCompletion
+                            : ForwardGraphEntryDependency::PublishedRequestState;
+                        EXPECT_EQ(forwardGraphEntryDependency(input, device, role), expected)
+                            << "device=" << device.toString() << " rows=" << rows
+                            << " input_hint=" << input_hint.toString()
+                            << " resident_chunk=" << resident_chunk << " setup=" << setup_only;
+                    }
+}
+
+/** @test Production family selection never expands an exact admitted tail. */
+TEST(Test__PrefillGraphCache, RetainedBucketFamilyPreservesEconomicalRemainders)
+{
+    for (const int start : {0, 64, 8192})
+    {
+        const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+            {384, 64, 256, 128, 64}, start, 448);
+        const auto schedule = planPrefillChunkSchedule(policy);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), 2u);
+        EXPECT_EQ(policy.min_rebalance_interval_tokens, 384);
+        EXPECT_EQ(schedule.chunks[0].token_offset, start);
+        EXPECT_EQ(schedule.chunks[0].real_count, 384);
+        EXPECT_EQ(schedule.chunks[0].bucket_seq_len, 384);
+        EXPECT_EQ(schedule.chunks[1].token_offset, start + 384);
+        EXPECT_EQ(schedule.chunks[1].real_count, 64);
+        EXPECT_EQ(schedule.chunks[1].bucket_seq_len, 64);
+    }
+    for (const int cap : {128, 256, 384, 512, 4096})
+    {
+        const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+            {64, cap}, 17, cap + 64);
+        const auto schedule = planPrefillChunkSchedule(policy);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), 2u);
+        EXPECT_EQ(schedule.chunks.back().bucket_seq_len, 64);
+        EXPECT_EQ(schedule.chunks.back().real_count, 64);
+    }
 }
 
 TEST(Test__PrefillGraphCache, ChunkSchedule_RebalanceIntervalsCountRealTokensOnly)

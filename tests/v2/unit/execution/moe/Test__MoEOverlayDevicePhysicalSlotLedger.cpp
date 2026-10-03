@@ -25,12 +25,12 @@ namespace llaminar2::test
         }
 
         /** Create three independently retained prepared projection identities. */
-        MoEOverlayPreparedExpertTriplet triplet()
+        MoEOverlayPreparedExpertPayload payload()
         {
             return {
-                .gate = engineIdentity(),
-                .up = engineIdentity(),
-                .down = engineIdentity(),
+                engineIdentity(),
+                engineIdentity(),
+                engineIdentity(),
             };
         }
 
@@ -131,13 +131,13 @@ namespace llaminar2::test
                 .key = {.participant_id = 0, .layer_idx = 0, .expert_id = 0},
                 .entered_epoch = 1u,
                 .bootstrap_allocation = true,
-                .triplet = triplet(),
+                .payload = payload(),
             });
             initial.push_back({
                 .key = {.participant_id = 1, .layer_idx = 0, .expert_id = 1},
                 .entered_epoch = 1u,
                 .bootstrap_allocation = true,
-                .triplet = triplet(),
+                .payload = payload(),
             });
             return MoEOverlayDevicePhysicalSlotLedger({
                 .initial_epoch = 1u,
@@ -146,6 +146,50 @@ namespace llaminar2::test
             });
         }
     } // namespace
+
+    /** @brief Gate/up movement uses the same publication/retirement state machine as full experts. */
+    TEST(Test__MoEOverlayDevicePhysicalSlotLedger, GateUpLifetimeAndCrossFamilyRejection)
+    {
+        const auto pair = [] { return MoEOverlayPreparedExpertPayload::gateUp(engineIdentity(), engineIdentity()); };
+        MoEOverlayDevicePhysicalSlotLedger slots({
+            .initial_epoch = 1u, .local_participant_ids = {0, 1},
+            .initial_slots = {
+                {.key = {0, 0, 0}, .entered_epoch = 1u, .payload = pair()},
+                {.key = {1, 0, 1}, .entered_epoch = 1u, .payload = pair()}},
+            .movable_projections = DeviceMoEProjectionSet::GateUp});
+        auto movement = batch(51u, 1u, 0, 1);
+        std::string error;
+        ASSERT_TRUE(slots.begin(movement, &error)) << error;
+        auto source = slots.sourcePayload(movement, {0, 0, 0}, &error);
+        ASSERT_TRUE(source);
+        EXPECT_FALSE(source->complete());
+        EXPECT_EQ(source->down(), nullptr);
+        std::weak_ptr<ITensorGemm> old_gate = source->gate();
+        source.reset();
+        // Complete-but-wrong payloads must not slip through a readiness check.
+        EXPECT_FALSE(slots.stage(movement,
+            {{{1, 0, 0}, payload()}, {{0, 0, 1}, pair()}}, &error));
+        EXPECT_EQ(slots.activeSlotCount(), 2u);
+        ASSERT_TRUE(slots.stage(movement,
+            {{{1, 0, 0}, pair()}, {{0, 0, 1}, pair()}}, &error)) << error;
+        ASSERT_TRUE(slots.publish(movement, &error)) << error;
+        EXPECT_EQ(slots.activeSlotCount(), 4u);
+        EXPECT_FALSE(old_gate.expired());
+        std::vector<MoEOverlayDeviceRetiredPhysicalSlot> retired;
+        ASSERT_TRUE(slots.retire(movement, &retired, &error)) << error;
+        EXPECT_FALSE(old_gate.expired()); // Retirement receipt still owns its engines.
+        retired.clear();
+        EXPECT_TRUE(old_gate.expired());
+        const auto inventory = slots.snapshot(movement.candidate_epoch, &error);
+        ASSERT_TRUE(inventory) << error;
+        for (const auto &slot : inventory->slots)
+            EXPECT_TRUE(slot.payload.readyFor(DeviceMoEProjectionSet::GateUp));
+
+        EXPECT_THROW((MoEOverlayDevicePhysicalSlotLedger{
+            {.initial_epoch = 1u, .local_participant_ids = {0},
+             .initial_slots = {{.key = {0, 0, 0}, .entered_epoch = 1u, .payload = pair()}}}}),
+            std::invalid_argument);
+    }
 
     TEST(Test__MoEOverlayDevicePhysicalSlotLedger,
          PublicationRetainsOldAndNewSlotsUntilReaderRetirement)
@@ -159,11 +203,11 @@ namespace llaminar2::test
         EXPECT_EQ(slots.currentEpoch(), 1u);
         EXPECT_EQ(slots.activeSlotCount(), 2u);
 
-        EXPECT_TRUE(slots.sourceTriplet(
+        EXPECT_TRUE(slots.sourcePayload(
             first,
             {.participant_id = 0, .layer_idx = 0, .expert_id = 0},
             &error));
-        EXPECT_TRUE(slots.sourceTriplet(
+        EXPECT_TRUE(slots.sourcePayload(
             first,
             {.participant_id = 1, .layer_idx = 0, .expert_id = 1},
             &error));
@@ -177,7 +221,7 @@ namespace llaminar2::test
                         .layer_idx = 0,
                         .expert_id = 1,
                     },
-                    .triplet = triplet(),
+                    .payload = payload(),
                 },
                 {
                     .key = {
@@ -185,7 +229,7 @@ namespace llaminar2::test
                         .layer_idx = 0,
                         .expert_id = 0,
                     },
-                    .triplet = triplet(),
+                    .payload = payload(),
                 },
             },
             &error))
@@ -194,7 +238,7 @@ namespace llaminar2::test
         EXPECT_EQ(slots.currentEpoch(), 2u);
         EXPECT_EQ(slots.activeSlotCount(), 4u)
             << "old readers and the new device bank must overlap";
-        EXPECT_TRUE(slots.sourceTriplet(
+        EXPECT_TRUE(slots.sourcePayload(
             first,
             {.participant_id = 0, .layer_idx = 0, .expert_id = 0},
             &error));
@@ -212,11 +256,11 @@ namespace llaminar2::test
         auto second = batch(12u, 2u, 1, 0);
         ASSERT_TRUE(second.valid());
         ASSERT_TRUE(slots.begin(second, &error)) << error;
-        EXPECT_TRUE(slots.sourceTriplet(
+        EXPECT_TRUE(slots.sourcePayload(
             second,
             {.participant_id = 0, .layer_idx = 0, .expert_id = 1},
             &error));
-        EXPECT_TRUE(slots.sourceTriplet(
+        EXPECT_TRUE(slots.sourcePayload(
             second,
             {.participant_id = 1, .layer_idx = 0, .expert_id = 0},
             &error));
@@ -239,7 +283,7 @@ namespace llaminar2::test
                     .layer_idx = 0,
                     .expert_id = 0,
                 },
-                .triplet = triplet(),
+                .payload = payload(),
             }},
             &error));
         EXPECT_EQ(slots.currentEpoch(), 1u);
@@ -273,7 +317,7 @@ namespace llaminar2::test
                         .layer_idx = 0,
                         .expert_id = 1,
                     },
-                    .triplet = triplet(),
+                    .payload = payload(),
                 },
                 {
                     .key = {
@@ -281,7 +325,7 @@ namespace llaminar2::test
                         .layer_idx = 0,
                         .expert_id = 0,
                     },
-                    .triplet = triplet(),
+                    .payload = payload(),
                 },
             },
             &error))

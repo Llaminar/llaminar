@@ -10,6 +10,8 @@
 
 #include "planning/ActivationMemoryEstimator.h"
 #include "execution/mtp/GenerationRequestSeeds.h"
+#include "execution/mtp/MTPTerminalGatherGeometry.h"
+#include "execution/moe/MoEProjectionArenaGeometry.h"
 
 #include <algorithm>
 #include <limits>
@@ -417,7 +419,7 @@ size_t ActivationMemoryEstimator::estimate(
             target_rows, mtp_target_columns, "MTP target-row arena"),
         "MTP target-row arena");
 
-    /* Stable selected-row input plus the no-global-gather 1x1 placeholder. */
+    /* Stable selected-row input and the exact retained terminal output bank. */
     bytes = checkedAdd(
         bytes,
         fp32RowBankBytes(1u, d_model, "LM-head selected row"),
@@ -427,7 +429,12 @@ size_t ActivationMemoryEstimator::estimate(
         fp32RowBankBytes(
             target_rows, d_model, "LM-head verifier rows"),
         "LM-head verifier rows");
-    bytes = checkedAdd(bytes, sizeof(float), "MTP gather placeholder");
+    const auto mtp_gather = MTPTerminalGatherGeometry::resolve(
+        geometry.mtp_terminal_logits_layout, target_rows,
+        static_cast<size_t>(profile.vocab_size));
+    bytes = checkedAdd(bytes,
+        fp32RowBankBytes(mtp_gather.rows(), mtp_gather.columns(), "MTP gathered logits"),
+        "MTP gathered logits");
 
     if (profile.expert_count > 0)
     {
@@ -452,17 +459,23 @@ size_t ActivationMemoryEstimator::estimate(
             moe_columns,
             checkedMultiply(2u, d_model, "MoE compact output columns"),
             "MoE compact output columns");
-        const size_t canonical_slots = checkedAdd(
-            top_k,
-            canonical_participants,
-            "MoE canonical publication slots");
-        moe_columns = checkedAdd(
-            moe_columns,
-            checkedMultiply(
-                canonical_slots,
-                d_model,
-                "MoE canonical route-contribution columns"),
-            "MoE canonical route-contribution columns");
+        if (geometry.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+        {
+            if (!device.is_gpu())
+                throw std::invalid_argument("MoE projection arena requires a native GPU domain");
+            // Exactly the schema's replacement owner set, not an extra reserve
+            // beside the complete-expert route tensor that no longer exists.
+            bytes = checkedAdd(bytes,
+                MoEProjectionArenaGeometry::resolve(profile, geometry.total_shards).bytes(mtp_prefill_rows),
+                "MoE projection transaction arena");
+        }
+        else
+        {
+            const size_t canonical_slots = checkedAdd(top_k, canonical_participants, "MoE canonical publication slots");
+            moe_columns = checkedAdd(moe_columns,
+                checkedMultiply(canonical_slots, d_model, "MoE canonical route-contribution columns"),
+                "MoE canonical route-contribution columns");
+        }
         moe_columns = checkedAdd(
             moe_columns,
             checkedMultiply(

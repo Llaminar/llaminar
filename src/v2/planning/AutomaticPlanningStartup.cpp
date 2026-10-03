@@ -11,6 +11,8 @@
 #include "planning/AutomaticPlanningStartup.h"
 #include "planning/PlanningPublication.h"
 #include "planning/PlanningRequestCostModel.h"
+#include "execution/mtp/MTPWeightManifest.h"
+#include "loaders/ModelLoader.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "interfaces/IMPIContext.h"
 #include <exception>
@@ -61,6 +63,14 @@ namespace llaminar2
         std::optional<PlanningModelSource> source;
         const auto metadata = exchangePlanningModelMetadata(mpi, [&] {
             source.emplace(shared.model_path);
+            // Root authenticates learned weights before any hardware samples,
+            // BOM search or rank selection. This fallible work stays inside the
+            // metadata publication transaction so every discovery rank rejects
+            // the same request rather than leaving followers in a collective.
+            if (retainsMTPGraphCapacity(shared.mtp))
+                (void)requireMTPWeightManifest(source->loader(),
+                    source->loader().architecture(),
+                    static_cast<int>(source->loader().blockCount()));
             return source->metadata();
         });
         const AutomaticPlanningPreparation context(shared, inventory, mpi, metadata,

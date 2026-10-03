@@ -3279,5 +3279,147 @@ class TestNativeRetainedParentEvidence(unittest.TestCase):
                 self.assertIsNotNone(validate_graph_capture_policy(rows, kinds).error)
 
 
+class StochasticRequestGraphMatrixTests(unittest.TestCase):
+    """Exercise the executable HTTP matrix, including failures hidden inside SSE."""
+
+    @staticmethod
+    def response(body: dict, text: str = "PASS.") -> str:
+        """Return equivalent OpenAI JSON/SSE payloads from a fake server."""
+        if body.get("dry_multiplier", 0) != 0:
+            from io import BytesIO
+            from urllib.error import HTTPError
+            error = {"error": {"type": "invalid_request_error",
+                "code": "unsupported_mtp_sampling_policy", "param": "dry_multiplier"}}
+            raise HTTPError("http://fixture", 400, "unsupported policy", None,
+                            BytesIO(json.dumps(error).encode()))
+        if body["stream"]:
+            return "data: " + json.dumps({"choices": [{
+                "delta": {"content": text}, "finish_reason": "stop"}]}) + "\n\ndata: [DONE]\n\n"
+        return json.dumps({"choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+                           "runtime_summary": {"mtp": {"enabled": True, "bypassed": False,
+                               "verifier_runs": 1, "stochastic_verify": body["temperature"] > 0}}})
+
+    def test_matrix_covers_unseeded_first_and_policy_return(self) -> None:
+        import stochastic_mtp_scenarios as matrix
+        requests = []
+
+        def send(url, body, timeout):
+            requests.append(body)
+            return self.response(body)
+
+        records = matrix.run("http://fixture", "fixture", 1, send=send)
+        self.assertTrue(all(row["status"] == "passed" for row in records))
+        self.assertNotIn("seed", requests[0])
+        self.assertEqual(requests[1]["seed"], 0)
+        self.assertEqual({row["top_k"] for row in requests}, {1, 2, 20, 40, 256})
+        self.assertEqual({row["stream"] for row in requests}, {False, True})
+        self.assertGreater(len({row["temperature"] for row in requests}), 3)
+        self.assertTrue(any(row.get("presence_penalty", 0) != 0 for row in requests))
+        self.assertTrue(any(row.get("frequency_penalty", 0) != 0 for row in requests))
+        self.assertTrue(any(row.get("dry_multiplier", 0) != 0 for row in requests))
+        self.assertTrue(any(row["max_tokens"] == 1 for row in requests))
+        self.assertEqual(records[2]["status"], records[7]["status"])
+
+    def test_disabled_mtp_cannot_pass_a_successful_http_response(self) -> None:
+        import stochastic_mtp_scenarios as matrix
+
+        def send(url, body, timeout):
+            response = json.loads(self.response(body))
+            response["runtime_summary"]["mtp"]["bypassed"] = True
+            return json.dumps(response)
+
+        records = matrix.run("http://fixture", "fixture", 1,
+                             scenarios=(matrix.SCENARIOS[0],), send=send)
+        self.assertEqual(records[0]["status"], "failed")
+        self.assertIn("did not execute", records[0]["error"])
+
+    def test_sse_error_is_failure_and_remaining_cases_run(self) -> None:
+        import stochastic_mtp_scenarios as matrix
+        calls = []
+
+        def send(url, body, timeout):
+            calls.append(body)
+            if len(calls) == 2:
+                return 'data: {"error":{"message":"graph construction failed"}}\n\n'
+            return self.response(body)
+
+        records = matrix.run("http://fixture", "fixture", 1, send=send)
+        self.assertEqual(len(calls), len(matrix.SCENARIOS))
+        self.assertEqual([i for i, row in enumerate(records) if row["status"] == "failed"], [1])
+
+    def test_sampler_change_cannot_corrupt_seeded_restore(self) -> None:
+        import stochastic_mtp_scenarios as matrix
+        calls = []
+
+        def send(url, body, timeout):
+            calls.append(body)
+            return self.response(body, "STALE" if len(calls) == 8 else "PASS.")
+
+        records = matrix.run("http://fixture", "fixture", 1, send=send)
+        self.assertEqual(records[7]["status"], "failed")
+        self.assertIn("seeded output changed", records[7]["error"])
+
+    def test_role_only_or_unfinished_stream_is_not_success(self) -> None:
+        from stochastic_mtp_scenarios import decode_response
+        for packet in ({"choices": [{"delta": {"role": "assistant"}, "finish_reason": "stop"}]},
+                       {"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}):
+            with self.subTest(packet=packet), self.assertRaises(ValueError):
+                decode_response("data: " + json.dumps(packet), streaming=True)
+
+    def test_dry_rejection_is_explicit_and_not_generation(self) -> None:
+        import stochastic_mtp_scenarios as matrix
+        dry = next(case for case in matrix.SCENARIOS if case.name == "dry_penalty")
+        records = matrix.run("http://fixture", "fixture", 1, scenarios=(dry,),
+                             send=lambda url, body, timeout: self.response(body))
+        self.assertEqual(records[0]["status"], "passed")
+        self.assertEqual(records[0]["outcome"], "unsupported_policy_rejected")
+
+    def test_dry_supported_by_cpu_must_still_prove_generation(self) -> None:
+        import stochastic_mtp_scenarios as matrix
+        dry = next(case for case in matrix.SCENARIOS if case.name == "dry_penalty")
+        records = matrix.run("http://fixture", "fixture", 1, scenarios=(dry,),
+            send=lambda url, body, timeout: self.response({**body, "dry_multiplier": 0}))
+        self.assertEqual(records[0]["status"], "passed")
+        self.assertEqual(records[0]["outcome"], "generation")
+
+    def test_generic_http_failures_cannot_masquerade_as_admission_rejection(self) -> None:
+        import stochastic_mtp_scenarios as matrix
+        from io import BytesIO
+        from urllib.error import HTTPError
+        dry = next(case for case in matrix.SCENARIOS if case.name == "dry_penalty")
+        for status, code, parameter in ((500, "unsupported_mtp_sampling_policy", "dry_multiplier"),
+                                       (400, "server_error", "dry_multiplier"),
+                                       (400, "unsupported_mtp_sampling_policy", "temperature")):
+            with self.subTest(status=status, code=code, parameter=parameter):
+                def send(url, body, timeout):
+                    detail = {"error": {"type": "invalid_request_error", "code": code,
+                                       "param": parameter}}
+                    raise HTTPError(url, status, "bad request", None,
+                                    BytesIO(json.dumps(detail).encode()))
+                records = matrix.run("http://fixture", "fixture", 1, scenarios=(dry,), send=send)
+                self.assertEqual(records[0]["status"], "failed")
+
+    def test_malformed_http_error_body_does_not_hide_later_scenarios(self) -> None:
+        import stochastic_mtp_scenarios as matrix
+        from io import BytesIO
+        from urllib.error import HTTPError
+        for malformed in (b"\xff", b"not JSON", b"{\"error\":null}"):
+            with self.subTest(body=malformed):
+                calls = []
+
+                def send(url, body, timeout):
+                    calls.append(body)
+                    if len(calls) == 1:
+                        raise HTTPError(url, 400, "bad body", None, BytesIO(malformed))
+                    return self.response(body)
+
+                records = matrix.run("http://fixture", "fixture", 1,
+                                     scenarios=matrix.SCENARIOS[:2], send=send)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(records[0]["status"], "failed")
+                self.assertEqual(records[0]["http_status"], 400)
+                self.assertEqual(records[1]["status"], "passed")
+
+
 if __name__ == "__main__":
     unittest.main()

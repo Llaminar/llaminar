@@ -147,9 +147,7 @@ TEST(Test__ActivationMemoryEstimator,
     add_projection("blk.0.ssm_alpha.weight", 64, 3072);
     add_projection("blk.0.ssm_beta.weight", 64, 3072);
 
-    const size_t actual = ActivationMemoryEstimator::estimate(
-        profile,
-        ActivationGraphMemoryGeometry{
+    ActivationGraphMemoryGeometry geometry{
             .batch_size = 1,
             .resident_graph_rows = 4096,
             .local_d_ff = 512,
@@ -161,8 +159,9 @@ TEST(Test__ActivationMemoryEstimator,
             .mtp_target_query_rows = 2,
             .mtp_terminal_logits_layout =
                 MTPTerminalLogitsLayout::FullVocabularyPerParticipant,
-        },
-        DeviceId::cuda(0));
+        };
+    const size_t actual = ActivationMemoryEstimator::estimate(
+        profile, geometry, DeviceId::cuda(0));
 
     /*
      * This constant is the independent sum of all 49 layer/model BufferSpecs
@@ -174,6 +173,24 @@ TEST(Test__ActivationMemoryEstimator,
     // The production arena additionally retains one admitted UINT64 seed.
     constexpr size_t kExpectedDeclarativeArenaBytes = 2253085700ULL + sizeof(uint64_t);
     EXPECT_EQ(actual, kExpectedDeclarativeArenaBytes);
+
+    // A sharded projection replaces the full local bank with its vocabulary
+    // slice AND needs the complete gathered bank. Previously admission only
+    // charged a 1x1 placeholder, even though condition/verifier graphs bind
+    // the full output. Keep this independent sum valid on every backend.
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int degree : {2, 4, 8})
+    for (const int rows : {2, 4, 16, 31})
+    {
+        geometry.total_shards = degree;
+        geometry.local_vocab = profile.vocab_size / degree;
+        geometry.mtp_target_query_rows = rows;
+        geometry.mtp_terminal_logits_layout = MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+        const auto mirrored = ActivationMemoryEstimator::estimate(profile, geometry, device);
+        geometry.mtp_terminal_logits_layout = MTPTerminalLogitsLayout::VocabularyShardPerParticipant;
+        const auto sharded = ActivationMemoryEstimator::estimate(profile, geometry, device);
+        EXPECT_EQ(sharded, mirrored + static_cast<size_t>(rows) * geometry.local_vocab * sizeof(float) - sizeof(float));
+    }
 }
 
 /** @test GPU request seeds use real retained row capacity, not MTP enablement or TP division. */

@@ -208,6 +208,7 @@ namespace llaminar2
             require(capture.begin(), "graph begin failed");
             require(execute(), "captured projection failed");
             capture.finish();
+            require(graph->prepareRuntimeContextStorage(memory), "projection context storage preparation failed");
             require(graph->nodeCount() && graph->instantiate(), "nonempty graph instantiation failed");
             if (graph->residentMemoryBytes() > std::numeric_limits<size_t>::max() - graph_growth)
                 throw std::overflow_error("Planning projection graph-family growth overflow");

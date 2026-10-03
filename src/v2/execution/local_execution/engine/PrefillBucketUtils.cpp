@@ -18,6 +18,22 @@
 namespace llaminar2
 {
 
+    PrefillChunkSchedulerPolicy PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+        const std::vector<int> &buckets, int real_start, int real_count)
+    {
+        const auto retained = normalizePrefillGraphBuckets(buckets);
+        return {
+            .bucket_sizes = retained,
+            // Zero retains the whole ladder: the ordinary planner limits full
+            // chunks to its maximum but chooses the smallest shape for a tail.
+            .fixed_chunk_real_tokens = 0,
+            .min_rebalance_interval_tokens = retained.empty() ? 0 : retained.back(),
+            .max_rebalance_interval_tokens = 0,
+            .real_token_start = real_start,
+            .real_token_count = real_count,
+        };
+    }
+
     std::vector<int> defaultPrefillGraphBuckets()
     {
         return defaultPrefillGraphBucketSizes();

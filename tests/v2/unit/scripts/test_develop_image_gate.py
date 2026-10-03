@@ -289,13 +289,14 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(set(workflow["on"]["pull_request_target"]["types"]),
                          {"opened", "reopened", "synchronize", "ready_for_review"})
         self.assertEqual(workflow["permissions"],
-                         {"contents": "read", "pull-requests": "write"})
+                         {"contents": "write", "pull-requests": "write"})
         self.assertEqual(set(workflow["jobs"]), {"arm"})
         job = workflow["jobs"]["arm"]
         self.assertIn("head.repo.full_name == github.repository", job["if"])
         self.assertIn("!github.event.pull_request.draft", job["if"])
         self.assertEqual(len(job["steps"]), 1)
         step = job["steps"][0]
+        self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.GITHUB_TOKEN }}")
         self.assertEqual(step["env"]["PR_NUMBER"],
                          "${{ github.event.pull_request.number }}")
         self.assertIn('gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" '

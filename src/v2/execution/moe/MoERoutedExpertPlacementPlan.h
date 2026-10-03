@@ -5,7 +5,9 @@
  * Routed-expert placement is independent from both dense tensor parallelism
  * and the compute distribution used inside a routed domain.  A tiered overlay
  * may therefore contain whole-expert-apportioned, replicated, or
- * tensor-sharded domains without changing its topology name.
+ * tensor-sharded domains without changing its topology name. Automatic compute
+ * intent remains unresolved until hardware binding; one homogeneous native GPU
+ * tier then defaults to gate/up ownership with fixed down-column shards.
  */
 
 #pragma once
@@ -153,10 +155,10 @@ namespace llaminar2
              * known.
              */
             result.scope = domain.scope;
-            result.routed_compute_policy =
-                domain.routed_compute_policy == RoutedExpertComputePolicy::Unspecified
-                    ? RoutedExpertComputePolicy::Apportioned
-                    : domain.routed_compute_policy;
+            // Omission inherits the global request during normalization. Do
+            // not erase it here: an explicit whole-expert choice must remain
+            // distinguishable from topology-dependent automatic intent.
+            result.routed_compute_policy = domain.routed_compute_policy;
             result.routed_phase_policy =
                 domain.routed_phase_policy == RoutedExpertPhasePolicy::Unspecified
                     ? RoutedExpertPhasePolicy::Uniform
@@ -1150,6 +1152,8 @@ namespace llaminar2
 
                 if (domain.routed_compute_policy !=
                         RoutedExpertComputePolicy::Apportioned &&
+                    domain.routed_compute_policy != RoutedExpertComputePolicy::Automatic &&
+                    domain.routed_compute_policy != RoutedExpertComputePolicy::Unspecified &&
                     !(phase_allows_replicated_apportionment &&
                       apportioned_prefill_over_replicated_weights))
                 {
@@ -1160,7 +1164,11 @@ namespace llaminar2
                         "use participant-assigned complete experts");
                 }
 
-                if (!domain.supportsLeastLoadedResidentAssignment())
+                // The ownership check above accepts unresolved request intent;
+                // only inventory binding may seal it. Validate its independent
+                // collective geometry here, not a physical mode that does not
+                // exist yet. The bound plan is validated again before admission.
+                if (!domain.toExecutionDomainDefinition().supportsLeastLoadedResidentAssignment())
                 {
                     addError(
                         "routed expert domain '" + domain.name + "' uses " +

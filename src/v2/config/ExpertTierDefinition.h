@@ -35,9 +35,10 @@ namespace llaminar2
          * @return Domain and tier with automatic capacity and explicit overrides.
          * @throws std::invalid_argument for missing, duplicate or malformed fields.
          *
-         * GPU and CPU participants use the same existing apportioned-expert
-         * default. Tensor-sharded and replicated compute remain explicit,
-         * independently selectable policies rather than backend-name guesses.
+         * Omitted compute inherits the global automatic intent. Inventory
+         * binding later selects the topology-compatible physical default;
+         * explicit whole-expert, tensor-sharded and replicated modes remain
+         * independent policies and are never silently reinterpreted.
          */
         static ExpertTierDefinition parse(const std::string &declaration)
         {

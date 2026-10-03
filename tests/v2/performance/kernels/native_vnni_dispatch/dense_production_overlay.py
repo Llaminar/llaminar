@@ -31,6 +31,7 @@ from .production_dense_prefill_sweep import (
     DEFAULT_BENCH_RUNS,
     DEFAULT_WARMUP_RUNS,
     SWEEP_PLAN_FILENAME,
+    ROCM_PRODUCER_IDS,
     DensePrefillCell,
     _cuda_candidate_is_spill_free,
     _read_aggregate_rows,
@@ -204,6 +205,7 @@ def _launch_tuple(
         int(row["observed_min_blocks"]),
         int(row["observed_unroll"]),
         int(row["observed_full_tiles"]),
+        ROCM_PRODUCER_IDS[row["observed_producer"]],
     )
 
 
@@ -484,12 +486,18 @@ def _render_cuda(entries: Sequence[DenseOverlayEntry]) -> str:
 
 
 def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
+    producers = (
+        "NativeCooperative", "NativeStreaming", "Int8BlockwiseV3", "Int8BlockwiseV7",
+    )
+    if any(len(entry.launch) != 6 or entry.launch[5] not in range(len(producers))
+           for entry in entries):
+        raise ValueError("ROCm dense overlay requires an exact producer identity")
     rows = [
         "        {"
         f"{entry.key.execution_codebook}, {entry.key.m}, {entry.key.n}, "
         f"{entry.key.k}, {{{entry.launch[0]}, {entry.launch[1]}, "
         f"{entry.launch[2]}, {entry.launch[3]}, "
-        f"{str(bool(entry.launch[4])).lower()}}}"
+        f"{str(bool(entry.launch[4])).lower()}, VNNIPrefillProducer::{producers[entry.launch[5]]}}}"
         "},"
         for entry in entries
     ]
@@ -499,6 +507,7 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "",
         "#include <cstddef>",
         "#include <cstdint>",
+        '#include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"',
         "",
         "namespace llaminar2::rocm::generated",
         "{",
@@ -509,6 +518,7 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "        int min_blocks;",
         "        int unroll;",
         "        bool full_tiles;",
+        "        VNNIPrefillProducer producer;",
         "    };",
         "",
         "    struct ROCmDensePrefillOverlayEntry",
@@ -613,7 +623,8 @@ def _split_generated_overlay(
         r"-?\d+, (?:true|false), (?:true|false)"
         r"(?:, prefill::PrefillStagingSchedule::"
         r"(?:RegisterDecode|AsyncPayload|AsyncWeightOperands|AsyncAllOperands))?"
-        if backend == "cuda" else r"\d+, \d+, \d+, \d+, (?:true|false)"
+        if backend == "cuda" else r"\d+, \d+, \d+, \d+, (?:true|false), "
+        r"VNNIPrefillProducer::(?:NativeCooperative|NativeStreaming|Int8BlockwiseV3|Int8BlockwiseV7)"
     )
     row_pattern = re.compile(
         r"        \{(\d+), (\d+), (\d+), (\d+), \{" + config + r"\}\},\n"

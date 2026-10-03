@@ -6,6 +6,8 @@
  * standard matrix and that every generated policy reaches the production
  * configuration without parsing its GoogleTest name.  They intentionally load
  * no model and touch no accelerator; real-weight campaigns certify execution.
+ * Domain checks use production normalization and the public CLI round trip so
+ * matching test names cannot hide contradictory dense/routed declarations.
  * Phase-specific numerical allowances must survive expansion without changing
  * the ordinary decode or recursively conditioned MTP logit budgets.
  */
@@ -1856,7 +1858,9 @@ namespace llaminar2::test::parity
 
     TEST(ModelParityDefinition, E2ETagsSelectExistingCellsWithoutChangingMatrix)
     {
-        auto definition = makeDefinition(makeOverlayTopology(), 15);
+        // Export needs a real domain policy; the deliberately skeletal overlay
+        // used by axis-only tests is not an automatically executable topology.
+        auto definition = makeDefinition(qwen36::qwen36MoECuda2ExpertOverlayTopology(), 15);
         definition.features.mtp = ModelParityAxisProfile::Standard;
         const auto before = expandModelParityDefinition(definition);
         definition.e2e_certifiable = {{
@@ -1913,7 +1917,7 @@ namespace llaminar2::test::parity
         for (const auto movement : {ModelParityExpertMovement::Static,
                                     ModelParityExpertMovement::Dynamic})
         {
-            auto overlay = makeDefinition(makeOverlayTopology());
+            auto overlay = makeDefinition(qwen36::qwen36MoECuda2ExpertOverlayTopology());
             overlay.e2e_certifiable = {{
                 .owner_order = RoutedExpertOwnerOrder::Ordinal,
                 .movement = movement,
@@ -2633,6 +2637,159 @@ namespace llaminar2::test::parity
             }
         EXPECT_EQ(cpu_tags, 2u);
         EXPECT_EQ(gpu_tags, 2u);
+    }
+
+    /** Both ownership modes expand the identical matrix without sharing mutable plans. */
+    TEST(ModelParityDefinition, ProjectionOwnershipRetainsCanonicalMatrixAndControl)
+    {
+        for (const auto &control_topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
+                                           qwen36::qwen36MoERocm2ExpertOverlayTopology()})
+        {
+            const auto control = qwen36::qwen36MoEParityDefinition(
+                control_topology, "/reference", qwen36::qwen36MoEExpertOverlayThresholds());
+            auto projection = control;
+            projection.topology = qwen36::qwen36MoEProjectionTopology(control_topology);
+            const auto before = expandModelParityDefinition(control);
+            const auto after = expandModelParityDefinition(projection);
+            ASSERT_EQ(before.size(), 24u);
+            ASSERT_EQ(after.size(), before.size());
+            ASSERT_EQ(control_topology.expert_overlay_plan->domains.size(), 1u);
+            EXPECT_EQ(control_topology.expert_overlay_plan->domains.front().routed_compute_policy,
+                      RoutedExpertComputePolicy::Apportioned);
+            ASSERT_EQ(control_topology.expert_overlay_plan->dense_domains.size(), 1u);
+            EXPECT_EQ(control_topology.expert_overlay_plan->dense_domains.front().routed_compute_policy,
+                      RoutedExpertComputePolicy::Apportioned);
+            for (std::size_t i = 0; i < before.size(); ++i)
+            {
+                SCOPED_TRACE(after[i].testName());
+                EXPECT_NE(before[i].testName(), after[i].testName());
+                EXPECT_EQ(before[i].model.reference_directory, after[i].model.reference_directory);
+                EXPECT_EQ(before[i].mtp, after[i].mtp);
+                EXPECT_EQ(before[i].prefix_restore_geometry, after[i].prefix_restore_geometry);
+                ASSERT_TRUE(before[i].expert_overlay);
+                ASSERT_TRUE(after[i].expert_overlay);
+                EXPECT_EQ(before[i].expert_overlay->owner_order, after[i].expert_overlay->owner_order);
+                EXPECT_EQ(before[i].expert_overlay->movement, after[i].expert_overlay->movement);
+                const auto config = after[i].toTestConfig();
+                ASSERT_TRUE(config.moe_routed_expert_plan);
+                EXPECT_EQ(config.moe_routed_expert_plan->domains.front().routed_compute_policy,
+                          RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+                // The real runner normalizes every declaration of a hardware
+                // domain. A routed-only edit used to pass the matrix checks
+                // here, then conflict with its copied dense-domain policy
+                // before a single model operation could execute.
+                auto production = after[i].makeOrchestrationConfig("/model.gguf", 0);
+                const auto errors = normalizeMoERoutedExpertPlacementDomains(production);
+                ASSERT_TRUE(errors.empty()) << ::testing::PrintToString(errors);
+                auto exported = parseE2EArguments(after[i]);
+                for (auto *runtime : {&production, &exported})
+                {
+                    ASSERT_TRUE(normalizeMoERoutedExpertPlacementDomains(*runtime).empty());
+                    ASSERT_EQ(runtime->domain_definitions.size(), 1u);
+                    EXPECT_EQ(runtime->domain_definitions.front().routed_compute_policy,
+                              RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+                    ASSERT_TRUE(runtime->moe_routed_expert_plan);
+                    const auto &plan = *runtime->moe_routed_expert_plan;
+                    ASSERT_EQ(plan.dense_domains.size(), 1u);
+                    ASSERT_EQ(plan.domains.size(), 1u);
+                    EXPECT_EQ(plan.dense_domains.front().routed_compute_policy,
+                              RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+                    EXPECT_EQ(plan.domains.front().routed_compute_policy,
+                              RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+                }
+                EXPECT_FALSE(after[i].e2e_certification);
+            }
+        }
+        EXPECT_THROW(qwen36::qwen36MoEProjectionTopology(qwen36::qwen36MoECPU2NodeTPTopology()),
+                     std::invalid_argument);
+    }
+
+    /** Public auto/benchmark projections must execute the newly tagged ownership mode. */
+    TEST(ModelParityDefinition, ProjectionCertificationPreservesAutoComputeIntent)
+    {
+        for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
+                                    qwen36::qwen36MoERocm2ExpertOverlayTopology()})
+        {
+            const auto definition = qwen36::qwen36MoEProjectionParityDefinition(topology, "/reference");
+            const auto cells = expandModelParityDefinition(definition);
+            ASSERT_EQ(cells.size(), 24u);
+            int tagged = 0;
+            for (const auto &cell : cells)
+            {
+                if (!cell.e2e_certification) continue;
+                ++tagged;
+                EXPECT_EQ(cell.mtp, ModelParityMTP::DynamicDepth);
+                ASSERT_TRUE(cell.expert_overlay);
+                EXPECT_EQ(cell.expert_overlay->movement, ModelParityExpertMovement::Dynamic);
+                EXPECT_EQ(cell.expert_overlay->owner_order, RoutedExpertOwnerOrder::Ordinal);
+                EXPECT_EQ(cell.movementEvidence(), ModelParityMovementEvidence::MovementRequired);
+                std::ostringstream output;
+                PrintTo(cell, &output);
+                const auto record = nlohmann::json::parse(output.str());
+                EXPECT_EQ(record.at("e2e").at("planning").at("routed_compute"), "gate-up-owned-down-columns");
+                for (auto args : {record.at("e2e").at("server_args").get<std::vector<std::string>>(),
+                                  modelParityBenchmarkArguments(cell)})
+                {
+                    args.insert(args.begin(), "llaminar2");
+                    std::vector<char *> argv;
+                    for (auto &arg : args) argv.push_back(arg.data());
+                    const auto runtime = OrchestrationConfigParser{}.parseArgs(argv.size(), argv.data());
+                    EXPECT_TRUE(std::holds_alternative<AutomaticOrchestrationRequest>(resolveOrchestrationIntent(runtime)));
+                    EXPECT_FALSE(runtime.moe_routed_expert_plan);
+                    EXPECT_TRUE(runtime.tp_devices.empty());
+                    EXPECT_EQ(runtime.routed_expert_compute_policy, RoutedExpertComputePolicy::Automatic);
+                    EXPECT_EQ(std::count(args.begin(), args.end(), "--moe-routed-expert-compute"), 0);
+                    EXPECT_TRUE(runtime.mtp.enabled);
+                    EXPECT_EQ(runtime.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+                    EXPECT_EQ(runtime.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+                }
+            }
+            EXPECT_EQ(tagged, 1);
+            EXPECT_EQ(topology.expert_overlay_plan->domains.front().routed_compute_policy,
+                      RoutedExpertComputePolicy::Apportioned);
+
+            auto broken = cells.front();
+            auto missing = std::make_shared<MoERoutedExpertPlacementPlan>(*broken.topology.expert_overlay_plan);
+            missing->domains.clear();
+            broken.topology.expert_overlay_plan = missing;
+            EXPECT_THROW((void)modelParityAutomaticRoutedComputePolicy(broken), std::invalid_argument);
+
+            auto unresolved = std::make_shared<MoERoutedExpertPlacementPlan>(*topology.expert_overlay_plan);
+            unresolved->domains.front().routed_compute_policy = RoutedExpertComputePolicy::Unspecified;
+            broken.topology.expert_overlay_plan = unresolved;
+            EXPECT_THROW((void)modelParityAutomaticRoutedComputePolicy(broken), std::invalid_argument);
+            unresolved->domains.front().routed_compute_policy = RoutedExpertComputePolicy::Automatic;
+            EXPECT_THROW((void)modelParityAutomaticRoutedComputePolicy(broken), std::invalid_argument);
+
+            auto ineligible = std::make_shared<MoERoutedExpertPlacementPlan>(*cells.front().topology.expert_overlay_plan);
+            ineligible->domains.front().scope = ExecutionDomainScope::NODE_LOCAL;
+            broken.topology.expert_overlay_plan = ineligible;
+            EXPECT_THROW((void)modelParityAutomaticPlacementArguments(broken), std::invalid_argument);
+
+            // Tier count is not domain count. Neither a missing tier nor two
+            // tiers referencing one domain may certify the single-tier default.
+            auto missing_tiers = std::make_shared<MoERoutedExpertPlacementPlan>(*cells.front().topology.expert_overlay_plan);
+            missing_tiers->routed_tiers.clear();
+            broken.topology.expert_overlay_plan = missing_tiers;
+            EXPECT_THROW((void)modelParityAutomaticPlacementArguments(broken), std::invalid_argument);
+
+            auto multiple_tiers = std::make_shared<MoERoutedExpertPlacementPlan>(*cells.front().topology.expert_overlay_plan);
+            ASSERT_EQ(multiple_tiers->routed_tiers.size(), 1u);
+            auto extra_tier = multiple_tiers->routed_tiers.front();
+            extra_tier.name += "_secondary";
+            ++extra_tier.priority;
+            multiple_tiers->routed_tiers.push_back(std::move(extra_tier));
+            broken.topology.expert_overlay_plan = multiple_tiers;
+            EXPECT_THROW((void)modelParityAutomaticPlacementArguments(broken), std::invalid_argument);
+
+            auto mixed = std::make_shared<MoERoutedExpertPlacementPlan>(*topology.expert_overlay_plan);
+            auto secondary = mixed->domains.front();
+            secondary.name = "different_compute_contract";
+            secondary.routed_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+            mixed->domains.push_back(std::move(secondary));
+            broken.topology.expert_overlay_plan = mixed;
+            EXPECT_THROW((void)modelParityAutomaticRoutedComputePolicy(broken), std::invalid_argument);
+        }
     }
 
     TEST(ModelParityDefinition, CPUNodeCertificationRetainsFullMatrixAndOneAuthority)

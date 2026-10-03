@@ -13,6 +13,7 @@
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -88,6 +89,36 @@ namespace llaminar2
         return result;
     }
 
+    WeightShardMatrix PlanningRoutedExpertWeightWork::projectionMatrix(WeightRole role) const
+    {
+        const size_t slot = role == WeightRole::MoEExpertGate ? 0 : role == WeightRole::MoEExpertUp ? 1 :
+            role == WeightRole::MoEExpertDown ? 2 : throw std::invalid_argument("Expert work requires a routed projection role");
+        const auto &operand = gate_up_down[slot];
+        const auto &source = operand.geometry.matrix();
+        if (operand.role != role || !source || source->instances != 1 || !source->rows || !source->columns)
+            throw std::invalid_argument("Expert work requires the exact source projection matrix");
+        if (!projection_ownership) return *source;
+        const auto projection = projection_ownership->projection(role);
+        if (projection_ownership->geometry().experts != expert_count ||
+            source->rows != static_cast<size_t>(projection.source_rows) ||
+            source->columns != static_cast<size_t>(projection.source_columns))
+            throw std::invalid_argument("Expert work source disagrees with admitted projection ownership");
+        // This is the preparation authority's interval, not a new TP quotient.
+        // Down keeps all intermediate columns and only partitions output rows.
+        return {static_cast<size_t>(projection.rows), source->columns, 1};
+    }
+
+    PlanningExpertWorkExpectation PlanningRoutedExpertWeightWork::projectionExpectation(
+        WeightRole role, size_t token_rows) const
+    {
+        (void)projectionMatrix(role); // Authenticate the semantic source before pricing its population.
+        if (projection_ownership && projection_ownership->projection(role).residence ==
+                MoEProjectionResidence::ParticipantOutputSlice)
+            return PlanningExpertExecutionShare(PlanningExpertExecution::ReplicatedExperts, expert_count)
+                .uniformExpectation(expert_count, routes_per_token, token_rows);
+        return uniformExpectation(token_rows);
+    }
+
     namespace
     {
         /**
@@ -109,7 +140,9 @@ namespace llaminar2
                 const auto policy = candidate.rankPlans().at(device.world_rank).runtime.routed_expert_compute_policy;
                 if (policy == RoutedExpertComputePolicy::Replicated)
                     return {{PlanningExpertExecution::ReplicatedExperts, model_experts}};
-                if (policy != RoutedExpertComputePolicy::Apportioned || ordinary_experts > static_cast<size_t>(model_experts))
+                if ((policy != RoutedExpertComputePolicy::Apportioned &&
+                     policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns) ||
+                    ordinary_experts > static_cast<size_t>(model_experts))
                     throw std::logic_error("Whole-expert planning work requires replicated or apportioned execution");
                 return {{PlanningExpertExecution::OwnedExperts, static_cast<int>(ordinary_experts)}};
             }
@@ -130,7 +163,8 @@ namespace llaminar2
                 if (!quota || domain == plan.domains.end())
                     throw std::logic_error("Expert work references an absent admitted tier/domain");
                 const int copies = quota->participant_live_copies.at(participant.domain_participant_index).at(layer_index);
-                if (domain->routed_compute_policy == RoutedExpertComputePolicy::Apportioned)
+                if (domain->routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
+                    domain->routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
                     result.emplace_back(PlanningExpertExecution::OwnedExperts, copies);
                 else if (domain->routed_compute_policy == RoutedExpertComputePolicy::Replicated)
                 {
@@ -314,6 +348,41 @@ namespace llaminar2
                     {std::move(*triplet[0]), std::move(*triplet[1]), std::move(*triplet[2])},
                     executionShares(candidate, device, participants, layer, profile.expert_count,
                         candidate.overlayCapacity() ? 0 : ordinary_expert_counts.at(layer), phase)});
+                auto &routed_work = work.routed.back();
+                const auto *ownership = device.weight_residency.projectionOwnership();
+                if (device.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+                {
+                    // Overlay device inputs describe the fixed, zero-owner
+                    // BOM; resolved expert bytes belong to the separate admitted
+                    // capacity certificate. Do not pretend that fixed BOM is a
+                    // fully selected residency or independently reprice it.
+                    // Bind the same pure preparation geometry to the capacity
+                    // authority's exact routed-domain coordinate instead.
+                    const auto endpoint = std::find_if(participants.begin(), participants.end(), [&](const auto &entry) {
+                        return entry.world_rank == device.world_rank && entry.device == device.device;
+                    });
+                    if (!device.device.is_gpu() || !candidate.overlayCapacity() || endpoint == participants.end() ||
+                        std::count_if(participants.begin(), participants.end(), [&](const auto &entry) {
+                            return entry.world_rank == device.world_rank && entry.device == device.device;
+                        }) != 1 || gate.rows > size_t(std::numeric_limits<int>::max()) ||
+                        gate.columns > size_t(std::numeric_limits<int>::max()))
+                        throw std::logic_error("Projection work requires one exact admitted GPU domain binding");
+                    const auto &plan = *candidate.config().moe_routed_expert_plan;
+                    const auto &tier = plan.routed_tiers.at(endpoint->tier_index);
+                    const auto domain = std::find_if(plan.domains.begin(), plan.domains.end(),
+                        [&](const auto &entry) { return entry.name == tier.domain; });
+                    if (domain == plan.domains.end() || domain->routed_compute_policy != device.routed_compute_policy)
+                        throw std::logic_error("Projection work lost its admitted routed-domain policy");
+                    routed_work.projection_ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
+                        {profile.expert_count, static_cast<int>(gate.columns), static_cast<int>(gate.rows)},
+                        endpoint->domain_participant_index, static_cast<int>(domain->participants.size()));
+                    if (ownership && *ownership != *routed_work.projection_ownership)
+                        throw std::logic_error("Projection work and explicit prepared residency disagree");
+                    for (auto role : {WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown})
+                        (void)routed_work.projectionMatrix(role);
+                }
+                else if (ownership && ownership->movableProjections() != DeviceMoEProjectionSet::CompleteExpert)
+                    throw std::logic_error("Whole-expert work cannot silently consume a projection-only residency");
             }
             result.push_back(std::move(work));
         }

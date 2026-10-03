@@ -55,6 +55,7 @@
 
 // We use the dynamic loader consistent with the rest of the codebase
 #include "collective/backends/RCCLDynamicLoader.h"
+#include "kernels/common/ColumnShardAssemblyKernels.h"
 namespace rccl = llaminar2::rccl_dynamic;
 
 #define HIP_CHECK(call)                                                               \
@@ -1936,6 +1937,240 @@ namespace
                   << " us (p95 " << rooted.p95_us << " us)\n"
                   << "  route-slot allreduce: " << allreduce.median_us
                   << " us (p95 " << allreduce.p95_us << " us)\n";
+    }
+
+    /**
+     * @brief Measure the native captured messages used by projection MoE prefill.
+     *
+     * Each participant retains one graph with forty identical, out-of-place
+     * collectives. Inputs remain immutable, so every replay also has an exact
+     * numerical oracle; repeated sums must not overflow into infinity. Timing
+     * brackets the complete graph on device, with host joins only after every
+     * participant has been submitted. This distinguishes actual transport cost
+     * from the per-call host synchronization in the older latency probes.
+     *
+     * This is a diagnostic performance test, not a production certificate. The
+     * two message families reproduce the existing FP32 reduction and opaque
+     * byte-allgather ABIs without changing precision or selecting a transport.
+     * The 448/512-row pairs quantify the same payload with and without the
+     * inactive suffix of a partial prefill bucket. They are separate fixed-count
+     * graphs: they do not certify a device-counted collective implementation.
+     */
+    TEST_F(Perf__RCCLAllreduceLatency, CapturedProjectionPrefillMessages)
+    {
+        ASSERT_TRUE(initialized_);
+        enum class Operation { Sum, Gather, ScatterSum, PackedColumnScatterSum };
+        struct Message
+        {
+            const char *name;
+            Operation operation;
+            size_t send_bytes;
+        };
+        constexpr int kLayers = 40;
+        constexpr int kWarmup = 8;
+        constexpr int kSamples = 40;
+        const std::vector<Message> messages{
+            {"sum_fp32_64x2048", Operation::Sum, 64u * 2048u * sizeof(float)},
+            {"sum_fp32_512x2048", Operation::Sum, 512u * 2048u * sizeof(float)},
+            {"sum_fp32_448x2048", Operation::Sum, 448u * 2048u * sizeof(float)},
+            // Quantized down consumes 512 Q8 values and sixteen FP32 scales
+            // per route. This copies that existing representation losslessly.
+            {"gather_q8_512x8x512", Operation::Gather, 512u * 8u * (512u + 16u * sizeof(float))},
+            {"gather_columns_512x2048", Operation::Gather,
+             512u * 2048u * sizeof(float) / static_cast<size_t>(num_devices_)},
+            {"gather_columns_448x2048", Operation::Gather,
+             448u * 2048u * sizeof(float) / static_cast<size_t>(num_devices_)},
+            {"scatter_sum_fp32_64x2048", Operation::ScatterSum, 64u * 2048u * sizeof(float)},
+            {"scatter_sum_fp32_512x2048", Operation::ScatterSum, 512u * 2048u * sizeof(float)},
+            {"scatter_sum_fp32_448x2048", Operation::ScatterSum, 448u * 2048u * sizeof(float)},
+            {"pack_scatter_columns_fp32_64x2048", Operation::PackedColumnScatterSum, 64u * 2048u * sizeof(float)},
+            {"pack_scatter_columns_fp32_512x2048", Operation::PackedColumnScatterSum, 512u * 2048u * sizeof(float)},
+            {"pack_scatter_columns_fp32_448x2048", Operation::PackedColumnScatterSum, 448u * 2048u * sizeof(float)},
+        };
+
+        for (const auto &message : messages)
+        {
+            ASSERT_EQ(message.send_bytes % (num_devices_ * sizeof(float)), 0u);
+            const size_t receive_bytes = message.operation == Operation::Gather
+                ? message.send_bytes * num_devices_
+                : (message.operation == Operation::ScatterSum || message.operation == Operation::PackedColumnScatterSum)
+                    ? message.send_bytes / num_devices_ : message.send_bytes;
+            ASSERT_LE(message.send_bytes, MAX_BUFFER_BYTES / 2);
+            ASSERT_LE(receive_bytes, MAX_BUFFER_BYTES / 2);
+            ASSERT_EQ(message.send_bytes % sizeof(float), 0u);
+            // Three disjoint prefixes of the existing fixture allocation hold
+            // immutable source, rank-major pack scratch and the native result.
+            // Production will borrow graph-admitted banks with these lifetimes.
+            ASSERT_LE(message.send_bytes, MAX_BUFFER_BYTES / 4);
+            ASSERT_EQ(2048 % num_devices_, 0);
+
+            /** @brief Retire native graph handles before the fixture's streams/comms. */
+            struct CapturedLane
+            {
+                int device = -1;
+                hipGraph_t graph = nullptr;
+                hipGraphExec_t executable = nullptr;
+
+                /** @brief Restore the owning device even after a test assertion fails. */
+                ~CapturedLane()
+                {
+                    if (device < 0) return;
+                    HIP_CHECK(hipSetDevice(device));
+                    if (executable) HIP_CHECK(hipGraphExecDestroy(executable));
+                    if (graph) HIP_CHECK(hipGraphDestroy(graph));
+                }
+            };
+            std::vector<CapturedLane> lanes(static_cast<size_t>(num_devices_));
+            std::vector<hipError_t> hip_status(lanes.size(), hipSuccess);
+            std::vector<rccl::ncclResult_t> rccl_status(lanes.size(), rccl::ncclSuccess);
+            std::barrier entered(num_devices_), recorded(num_devices_);
+
+            // The ordinary fixture warmup modifies d_buffer in place. Restore
+            // finite, rank-distinct inputs outside all captures and timing.
+            for (int rank = 0; rank < num_devices_; ++rank)
+            {
+                auto &device = devices_[rank];
+                lanes[rank].device = device.ordinal;
+                std::vector<float> input(message.send_bytes / sizeof(float));
+                for (size_t element = 0; element < input.size(); ++element)
+                    input[element] = float((rank + 1) * 2048 + int(element % 1021) - 510);
+                ASSERT_EQ(hipSetDevice(device.ordinal), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(device.d_buffer, input.data(), message.send_bytes,
+                    hipMemcpyHostToDevice, device.stream), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(device.stream), hipSuccess);
+            }
+
+            std::vector<std::thread> builders;
+            for (int rank = 0; rank < num_devices_; ++rank)
+            {
+                builders.emplace_back([&, rank]
+                {
+                    auto &device = devices_[rank];
+                    hip_status[rank] = hipSetDevice(device.ordinal);
+                    if (hip_status[rank] == hipSuccess)
+                        hip_status[rank] = hipStreamBeginCapture(device.stream, hipStreamCaptureModeRelaxed);
+                    entered.arrive_and_wait();
+                    const bool capturing = hip_status[rank] == hipSuccess;
+                    auto *receive = device.d_buffer + MAX_BUFFER_FLOATS / 2;
+                    if (capturing)
+                    {
+                        for (int layer = 0; layer < kLayers; ++layer)
+                        {
+                            switch (message.operation)
+                            {
+                            case Operation::Sum:
+                                rccl_status[rank] = rccl::ncclAllReduce(device.d_buffer, receive,
+                                    message.send_bytes / sizeof(float), rccl::ncclFloat,
+                                    rccl::ncclSum, comms_[rank], device.stream);
+                                break;
+                            case Operation::Gather:
+                                rccl_status[rank] = rccl::ncclAllGather(device.d_buffer, receive,
+                                    message.send_bytes, rccl::ncclInt8, comms_[rank], device.stream);
+                                break;
+                            case Operation::ScatterSum:
+                                rccl_status[rank] = rccl::ncclReduceScatter(device.d_buffer, receive,
+                                    receive_bytes / sizeof(float), rccl::ncclFloat,
+                                    rccl::ncclSum, comms_[rank], device.stream);
+                                break;
+                            case Operation::PackedColumnScatterSum:
+                            {
+                                auto *packed = device.d_buffer + MAX_BUFFER_FLOATS / 4;
+                                const int rows = static_cast<int>(message.send_bytes / (2048u * sizeof(float)));
+                                // This transpose is its own inverse after
+                                // swapping rows/participants: [row,rank,col]
+                                // becomes [rank,row,col] for native scatter.
+                                if (!llaminar2::assembleColumnShardsFP32(
+                                        llaminar2::DeviceId::rocm(device.ordinal),
+                                        device.d_buffer, packed, num_devices_, rows,
+                                        2048 / num_devices_, device.stream))
+                                {
+                                    rccl_status[rank] = rccl::ncclInvalidArgument;
+                                    break;
+                                }
+                                rccl_status[rank] = rccl::ncclReduceScatter(packed, receive,
+                                    receive_bytes / sizeof(float), rccl::ncclFloat,
+                                    rccl::ncclSum, comms_[rank], device.stream);
+                                break;
+                            }
+                            }
+                            if (rccl_status[rank] != rccl::ncclSuccess) break;
+                        }
+                    }
+                    recorded.arrive_and_wait();
+                    if (capturing)
+                        hip_status[rank] = hipStreamEndCapture(device.stream, &lanes[rank].graph);
+                    if (hip_status[rank] == hipSuccess && rccl_status[rank] == rccl::ncclSuccess)
+                        hip_status[rank] = hipGraphInstantiate(&lanes[rank].executable,
+                            lanes[rank].graph, nullptr, nullptr, 0);
+                });
+            }
+            for (auto &builder : builders) builder.join();
+            for (int rank = 0; rank < num_devices_; ++rank)
+            {
+                ASSERT_EQ(hip_status[rank], hipSuccess) << message.name << " rank=" << rank;
+                ASSERT_EQ(rccl_status[rank], rccl::ncclSuccess) << message.name << " rank=" << rank;
+                ASSERT_NE(lanes[rank].executable, nullptr);
+            }
+
+            std::vector<double> samples;
+            for (int iteration = -kWarmup; iteration < kSamples; ++iteration)
+            {
+                for (int rank = 0; rank < num_devices_; ++rank)
+                {
+                    auto &device = devices_[rank];
+                    ASSERT_EQ(hipSetDevice(device.ordinal), hipSuccess);
+                    ASSERT_EQ(hipEventRecord(device.start_event, device.stream), hipSuccess);
+                    ASSERT_EQ(hipGraphLaunch(lanes[rank].executable, device.stream), hipSuccess);
+                    ASSERT_EQ(hipEventRecord(device.stop_event, device.stream), hipSuccess);
+                }
+                double slowest_us = 0;
+                for (int rank = 0; rank < num_devices_; ++rank)
+                {
+                    auto &device = devices_[rank];
+                    ASSERT_EQ(hipSetDevice(device.ordinal), hipSuccess);
+                    ASSERT_EQ(hipEventSynchronize(device.stop_event), hipSuccess);
+                    float elapsed_ms = 0;
+                    ASSERT_EQ(hipEventElapsedTime(&elapsed_ms, device.start_event, device.stop_event), hipSuccess);
+                    slowest_us = std::max(slowest_us, double(elapsed_ms) * 1000 / kLayers);
+                }
+                if (iteration >= 0) samples.push_back(slowest_us);
+            }
+
+            // Every element, including every allgather rank segment, has an
+            // exact finite oracle. Completion on one rank alone is not proof.
+            for (int rank = 0; rank < num_devices_; ++rank)
+            {
+                ASSERT_EQ(hipSetDevice(devices_[rank].ordinal), hipSuccess);
+                std::vector<float> result(receive_bytes / sizeof(float));
+                ASSERT_EQ(hipMemcpy(result.data(), devices_[rank].d_buffer + MAX_BUFFER_FLOATS / 2,
+                    receive_bytes, hipMemcpyDeviceToHost), hipSuccess);
+                for (size_t element = 0; element < result.size(); ++element)
+                {
+                    const size_t send_elements = message.send_bytes / sizeof(float);
+                    const size_t local_columns = 2048u / num_devices_;
+                    const size_t source_element = message.operation == Operation::PackedColumnScatterSum
+                        ? (element / local_columns) * 2048u + rank * local_columns + element % local_columns
+                        : message.operation == Operation::ScatterSum
+                            ? static_cast<size_t>(rank) * result.size() + element
+                            : element % send_elements;
+                    const int source_rank = static_cast<int>(element / send_elements);
+                    const int coordinate_value = int(source_element % 1021) - 510;
+                    // Exact small integers detect shuffled rows and the wrong
+                    // receive partition without making a native reduction-tree
+                    // rounding difference into a transport benchmark failure.
+                    const float expected = message.operation != Operation::Gather
+                        ? float(2048 * num_devices_ * (num_devices_ + 1) / 2 +
+                                num_devices_ * coordinate_value)
+                        : float((source_rank + 1) * 2048 + coordinate_value);
+                    ASSERT_EQ(result[element], expected) << message.name << " rank=" << rank << " element=" << element;
+                }
+            }
+            const auto timing = computeStats(samples, message.send_bytes, message.name);
+            std::printf("CAPTURED_PREFILL_COLLECTIVE,%s,participants=%d,send_bytes=%zu,receive_bytes=%zu,"
+                        "layers=%d,samples=%d,median_us=%.3f,p5_us=%.3f,p95_us=%.3f,exact=1\n",
+                message.name, num_devices_, message.send_bytes, receive_bytes,
+                kLayers, kSamples, timing.median_us, timing.p5_us, timing.p95_us);
+        }
     }
 
     // ============================================================================

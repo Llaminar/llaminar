@@ -150,8 +150,13 @@ namespace llaminar2::moe_overlay_controller_device
         std::int32_t local_slot;
         std::uint32_t flags;
         DeviceMoEWeightFormat weight_format;
-        std::uint32_t reserved;
+        DeviceMoEWeightFormat floating_allocation_format;
+        DeviceMoEProjectionSet projection_set;
     };
+
+    static_assert(offsetof(RuntimeExpertDescriptorView, weight_format) == 232);
+    static_assert(offsetof(RuntimeExpertDescriptorView, floating_allocation_format) == 234);
+    static_assert(offsetof(RuntimeExpertDescriptorView, projection_set) == 236);
 
     /** Device-safe view of one complete double-buffered placement generation. */
     struct RuntimePlacementBankView
@@ -386,14 +391,14 @@ namespace llaminar2::moe_overlay_controller_device
         return matrix.data != nullptr && matrix.n > 0 && matrix.k > 0;
     }
 
-    /** @return Whether one prepared arrival is a complete shape-consistent triple. */
+    /** @return Whether an arrival contains exactly its shape-consistent movable family. */
     __device__ __forceinline__ bool runtimeArrivalReady(
         const RuntimeExpertDescriptorView &descriptor,
         std::uint32_t expert) noexcept
     {
         if (descriptor.logical_expert_id !=
                 static_cast<std::int32_t>(expert) ||
-            descriptor.local_slot < 0)
+            descriptor.local_slot < 0 || !deviceMoEProjectionPayloadValid(descriptor))
         {
             return false;
         }
@@ -401,20 +406,22 @@ namespace llaminar2::moe_overlay_controller_device
         {
             return nativeMatrixReady(descriptor.gate) &&
                    nativeMatrixReady(descriptor.up) &&
-                   nativeMatrixReady(descriptor.down) &&
                    descriptor.gate.n == descriptor.up.n &&
                    descriptor.gate.k == descriptor.up.k &&
-                   descriptor.down.n == descriptor.gate.k &&
-                   descriptor.down.k == descriptor.gate.n;
+                   (descriptor.projection_set == DeviceMoEProjectionSet::GateUp ||
+                    (nativeMatrixReady(descriptor.down) &&
+                     descriptor.down.n == descriptor.gate.k &&
+                     descriptor.down.k == descriptor.gate.n));
         }
         return deviceMoEWeightFormatIsFloating(descriptor.weight_format) &&
                floatingMatrixReady(descriptor.floating_gate) &&
                floatingMatrixReady(descriptor.floating_up) &&
-               floatingMatrixReady(descriptor.floating_down) &&
                descriptor.floating_gate.n == descriptor.floating_up.n &&
                descriptor.floating_gate.k == descriptor.floating_up.k &&
-               descriptor.floating_down.n == descriptor.floating_gate.k &&
-               descriptor.floating_down.k == descriptor.floating_gate.n;
+               (descriptor.projection_set == DeviceMoEProjectionSet::GateUp ||
+                (floatingMatrixReady(descriptor.floating_down) &&
+                 descriptor.floating_down.n == descriptor.floating_gate.k &&
+                 descriptor.floating_down.k == descriptor.floating_gate.n));
     }
 
     /**

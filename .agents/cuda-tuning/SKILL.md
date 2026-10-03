@@ -60,20 +60,22 @@ trade architecture for an isolated microbenchmark win:
 Before touching anything, capture a baseline so every change is measured against it.
 
 ```bash
-# Release build of the engine (always Ninja, never limit parallelism)
-ninja -C build_v2_release llaminar2
+# Use the Ninja executable recorded by the configured build tree.
+cmake --build build_v2_release --target llaminar2 --parallel
 
 # Baseline throughput (1st "Throughput" line = prefill, 2nd = decode)
 ./build_v2_release/llaminar2 benchmark -m <model>.gguf -d cuda:0 2>/dev/null | grep -iE "Throughput"
 ```
 
-Record the prefill/decode tok/s and the noise band (run 2-3×; typical noise is a few
-tok/s on prefill, <0.5 tok/s on decode). A change inside the noise band is **not** a win.
+Record the prefill/decode tok/s and the measured noise band. Use warmed,
+interleaved A/B and B/A runs with identical prompt tokens, seed, sampling and
+MTP work; do not assume a fixed tok/s noise allowance. A change inside the
+observed noise band is **not** a win. For an auto-planned topology, save the
+unprofiled plan first and apply that same document to both candidates.
 
-> **Parity gate (must stay PASS the whole time):**
-> ```bash
-> ctest --test-dir build_v2_integration -R "<Model>ParityTest_(Prefill|Decode)Parity.*CUDA" --output-on-failure
-> ```
+Use `.agents/llaminar-testing/SKILL.md` to select the exact generated HF parity
+cells for the affected model/topology and reuse the unchanged Unit/preflight
+receipt. Do not use a stale regex that can silently select no tests.
 
 ---
 
@@ -109,6 +111,15 @@ explicit target).
 
 ## Profiler attachment and privilege rules
 
+- **Driver safety comes before attachment.** Open a driver-diagnostic window
+  around profiler experiments. If an attachment produces an NVIDIA Xid,
+  assertion, reset, or hang, stop further CUPTI/NCU/NSYS attempts on that
+  environment; a model-free probe failing this way is not permission to try a
+  larger model. Preserve the report and use non-attached structural/resource
+  evidence. Repeat attachment only after the driver/tooling cause is resolved
+  or an explicitly authorized isolated investigation. See
+  `.agents/cuda-tuning/references/native-graph-events.md` for diagnostic commands
+  that do not attach CUPTI and for their interpretation limits.
 - Resolve Nsight Systems with `command -v nsys`; the devcontainer package
   installs it as `/usr/local/bin/nsys`, independently of the CUDA toolkit.
   Nsight Compute remains `/usr/local/cuda/bin/ncu`.
@@ -125,6 +136,86 @@ explicit target).
   they do not auto-bootstrap MPI.
 - Write `.nsys-rep` and `.ncu-rep` artifacts under `/tmp` or another explicit
   result directory, not in the repository.
+
+### Graph audits without profiler attachment
+
+Read `.agents/cuda-tuning/references/native-graph-events.md` before using the
+standalone parent-graph event observer under this skill's `scripts/`. It records
+native DAG edges, geometry and selected event brackets without changing model
+arithmetic or entering conditional bodies. It is **diagnostic instrumentation**,
+not a production dependency or an alternative execution mode. Selected-node
+brackets include scheduler/event overhead; they are not kernel service times,
+hardware counters, or proof of canonical performance.
+
+The same reference documents the host-boundary tracer for prefill time outside
+those parents. Separate pinned prefix allocation, queued GPU completion and
+host computation; their nested/overlapping intervals must not be added as
+independent costs. Authenticate its token stream and overhead against a matched
+unobserved run before assigning the remainder to a kernel.
+
+For a single-thread audit, join executed dispatches or the exact retained graph
+inventory to source. Distinguish literal one-thread launches, many-thread
+kernels doing bulk work on lane zero, cooperative reductions with a scalar
+final store, and fixed-size controller publication. Captured occurrences are
+not replay counts; source matches alone are not evidence that a path ran.
+For communication-free estimates, recompute a dependency critical path rather
+than subtracting summed inclusive communication time. Preserve queue-order
+assumptions, identify unresolved peer joins and opaque conditional bodies, and
+label event-bracket estimates as such.
+The reference also documents local expert-phase timing/resource records and
+how to avoid mistaking a long native-memset bracket for pure memory service.
+For kernel scaling, use its communication-free local-shape ranking procedure:
+complete 1/2/4 curves, separate main/suffix workloads and ownership modes, then
+corroborate absolute lost time against the executed dependency critical path.
+The backend-neutral CSV/JSON/SVG reporter lives under
+`tests/v2/performance/kernels/plot_kernel_shard_scaling.py`.
+
+### Profiling an automatically planned MPI topology
+
+Freeze an **unprofiled** `llaminar2 plan --output <plan.json>` with the same
+model, context, MTP and placement intent as the benchmark. Apply that document
+only for the diagnostic run. Profiling the automatic search itself perturbs its
+measured costs and can select a different continuation backend. Canonical
+performance measurements must still use their original production invocation.
+
+Resolve the target domain's owner through the saved execution membership:
+
+```bash
+# Domain names come from this plan, not a CUDA/ROCm naming convention.
+jq -r --arg domain '<selected-domain-name>' '
+  .configuration as $c |
+  ($c.domain_definitions[] | select(.name == $domain) | .owner_rank) as $owner |
+  if $c.execution_rank_selection == null then $owner
+  else $c.execution_rank_selection[$owner] end
+' <plan.json>
+```
+
+This result is the original/discovery MPI rank. Compare it with
+`OMPI_COMM_WORLD_RANK` in the per-rank profiler wrapper. `owner_rank` and the
+application's log rank belong to the selected **execution** communicator;
+they are not necessarily the launch rank. For example, membership `[1,0]`
+means execution owner 0 runs in discovery process 1. Profiling launch rank 0
+can collect CUDA startup probes yet miss all CUDA inference after selection.
+The same mistake affects ROCm followers. Never infer ownership from socket
+number, vendor name, or a previous run.
+
+Keep the benchmark's MPI count and physical-core binding. Start the profiler
+inside only the selected rank, then exec `llaminar2 benchmark --config
+<plan.json> --no-mpi-bootstrap` with the original prompt, seed and sampling
+settings; other ranks exec the same command without the profiler. Log both
+rank namespaces and the chosen backend. Use `LLAMINAR_PROFILER_NORMAL_EXIT=1`
+for the diagnostic: ordinary successful CLI exit intentionally uses `_exit`,
+which skips profiler trace-buffer finalizers. Preserve the variable through
+MPI/`sudo -E`, and leave it unset in canonical timing/service commands.
+
+Authenticate the result by finding real model kernels during the measured
+request interval, on the intended devices. Graph-construction events, startup
+projection probes, or a successful profiler exit alone are insufficient. The
+tested `nsys --cuda-graph-trace=node` path traces retained mixed-vendor CUDA
+inference when attached to the resolved owner. Separate startup, prefill and
+decode; summed busy time across devices and persistent wait/service kernels is
+not critical-path latency. Keep profiled throughput separate from the warmed,
+unprofiled benchmark.
 
 ### Prove profiler attachment before a model run
 
@@ -150,7 +241,8 @@ launch instances from the focused test. A report containing
 normally say `CUDA profiling might have not been started correctly` or report
 only graph-node creation. Check privilege first.
 
-CUDA 13 conditional/device-loop graphs expose a second tool boundary on Ampere:
+After confirming the correct process and normal-exit flushing, CUDA 13
+conditional/device-loop graphs can expose a second tool boundary on Ampere:
 the tested Nsight Systems 2025.3 and 2026.1 releases can collect ordinary eager
 and simple captured graphs yet omit all activities from Llaminar's complete
 production conditional graph. Confirm this by comparing the smoke test with the
@@ -244,7 +336,8 @@ only. It does not replace warmed unprofiled Release timing, and it does not
 certify occupancy or spills.
 
 If NCU prints `No kernels were profiled`, first run the profiler-attachment
-smoke above, then inspect the report's `Available Kernels`. Do not switch to
+smoke above, verify the selected execution/discovery-rank mapping for MPI,
+then inspect the report's `Available Kernels`. Do not switch to
 eager execution, segmented graphs, late `cudaProfilerStart()`, or a host-side
 surrogate to make the profiler easier to use; those are different execution
 paths.
@@ -321,11 +414,13 @@ For the Qwen 3.6 35B grouped-prefill path, a proven real-graph selector is
 `SpeedOfLight` supply registers, launch geometry, achieved occupancy, and the
 compute/memory throughput balance.
 
-> 🧹 **MANDATORY CLEANUP after every ncu run** (ncu leaves zombie processes that hold
-> the GPU and corrupt the next run):
-> ```bash
-> sudo pkill -9 -f "llaminar2 oneshot"; sudo pkill -9 -f "ncu --kernel"; sleep 1; nvidia-smi
-> ```
+After each profiler invocation, verify that its process tree exited and released
+the GPU before starting another measurement. A profiler interrupted during replay
+can leave a child holding a device; identify that exact PID and terminate only
+the process tree owned by the diagnostic, first gracefully. Never use broad
+`pkill` patterns that could kill a user's server or another agent's work. Check
+`nvidia-smi` afterward. A normal successful profiler exit does not require killing
+anything.
 
 ### What to read first
 
@@ -393,7 +488,7 @@ so it is a valid proxy for those kernels.
 
 ```bash
 # Build the perf test (Release)
-ninja -C build_v2_release tests/v2/v2_perf_cuda_native_vnni_gemm
+cmake --build build_v2_release --target v2_perf_cuda_native_vnni_gemm --parallel
 
 # Correctness gate is cosine >= 0.9990 vs cuBLAS. The full-shape sweep is SLOW
 # (single-threaded CPU reference, several minutes) — ALWAYS scope to the shapes you care about.
@@ -589,10 +684,11 @@ decode reordering without enabling global `LLAMINAR_DETERMINISTIC`. Stage code
 must use that shared RAII interface, never call CUDA `extern "C"` mode toggles
 or set environment variables directly.
 
-> **Build gotcha:** the MoE expert kernel `#include`s the decode header
-> `src/v2/kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh`. After editing that header you
-> MUST `touch src/v2/kernels/cuda/moe/CUDAMoEKernels.cu` before `ninja`, or the change
-> won't be picked up. CUDA compiles are slow (~min, cicc-bound); ccache hits are fast.
+After editing a shared CUDA header, verify that the configured Ninja dependency
+graph rebuilds every consuming translation unit, including MoE. If it does
+not, fix dependency tracking; do not make manual `touch` operations a permanent
+build procedure. Compile the complete shipped architecture set before promotion,
+not only the GPU currently used for timing.
 
 ---
 
@@ -602,19 +698,18 @@ A perf-test win is necessary but **not sufficient**. Confirm on the full model a
 
 ```bash
 # 1. Rebuild engine
-touch src/v2/kernels/cuda/moe/CUDAMoEKernels.cu   # if a .cuh include changed
-ninja -C build_v2_release llaminar2
+cmake --build build_v2_release --target llaminar2 --parallel
 
 # 2. Same-session A/B (build baseline binary, measure; build variant, measure)
 ./build_v2_release/llaminar2 benchmark -m <model>.gguf -d cuda:0 2>/dev/null | grep -iE "Throughput"
 
-# 3. Parity MUST stay PASS
-ninja -C build_v2_integration llaminar2_core llaminar2
-ctest --test-dir build_v2_integration -R "<Model>ParityTest_.*CUDA" --output-on-failure
+# 3. Build the affected integration targets and run exact canonical HF cells
+#    using the llaminar-testing workflow, not an obsolete test-name regex.
 ```
 
 Accept the change only if: full-model throughput improves **beyond the noise band** AND
-parity stays PASS. Reject (and `git stash`/revert) otherwise.
+parity stays PASS. Undo only the scoped experimental edits otherwise; never
+stash or revert unrelated working-tree changes.
 
 ### Hard-won lesson (why isolated wins can regress the model)
 
@@ -631,7 +726,9 @@ GEMM got faster. When the kernel is at the register ceiling, only **register-neu
 
 - Production high-water marks live in `benchmarks/production/high_water.json`.
   Only the official successful production pipeline commits those marks, after
-  both ISA images pass parity, the full E2E suites, and benchmarks. Use
+  both ISA images complete the canonical `llaminar-testing` certification
+  sequence, including generation regression, the full E2E suites and benchmarks.
+  Full mathematical HF parity is an explicit diagnostic, not a routine CI gate. Use
   `scripts/ci/run_model_parity_benchmarks.py --diagnostic` for one-off experiments;
   these reports cannot certify images or advance marks. See `docs/production-ci.md`.
 - Note rejected experiments and *why* (regression cause) so they aren't retried blindly.
@@ -643,13 +740,13 @@ GEMM got faster. When the kernel is at the register ceiling, only **register-neu
 ## Quick reference — one-liners
 
 ```bash
-# Hotspot ranking (relative only; decode runs eager under profiling)
+# Hotspot ranking (captured production execution; diagnostic event overhead)
 LLAMINAR_PERF_STATS_JSON=/tmp/cuda-profile.json \
 LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
 ./build_v2_release/llaminar2 benchmark -m M.gguf -d cuda:0
 
 # Timeline + launch order
-sudo /usr/local/cuda/bin/nsys profile -t cuda --stats=true -o /tmp/t -f true \
+sudo -E "$(command -v nsys)" profile -t cuda --stats=true -o /tmp/t -f true \
   ./build_v2_release/llaminar2 oneshot --no-mpi-bootstrap -d cuda:0 -m M.gguf -p "x" -n 10
 
 # Per-kernel counters (skip warmup, 1 launch)
@@ -658,8 +755,8 @@ sudo -E /usr/local/cuda/bin/ncu --kernel-name "K" --launch-skip 1 --launch-count
   --section MemoryWorkloadAnalysis --section WarpStateStats --target-processes all \
   -o /tmp/k -f ./build_v2_release/llaminar2 oneshot --no-mpi-bootstrap -d cuda:0 -m M.gguf -p "x" -n 1
 
-# Cleanup (ALWAYS after ncu)
-sudo pkill -9 -f "llaminar2 oneshot"; sudo pkill -9 -f "ncu --kernel"; sleep 1; nvidia-smi
+# Confirm the profiler-owned process exited and released its GPU.
+nvidia-smi
 
 # Scoped, correctness-gated GEMM A/B
 LLAMINAR_CUDA_NATIVE_GEMM_SHAPES="ShapeA,ShapeB" \

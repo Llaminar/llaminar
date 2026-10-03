@@ -16,6 +16,7 @@
 #include "planning/ModelMemoryProfile.h"
 #include "planning/GraphSnapshotMemoryCapacity.h"
 #include "planning/PipelineTransferMemory.h"
+#include "backends/PeerAccessCoverage.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "backends/DeviceId.h"
 #include "config/CollectiveBackendType.h"
@@ -240,6 +241,12 @@ struct DevicePlanConfig
     // TP configuration for this device
     int shard_index = 0;
     int total_shards = 1;
+
+    /** Frozen physical expert layout, shared by the activation BOM and graph schema. */
+    RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+
+    /// Canonical observed topology for the optional rank-local compact projection transport.
+    std::optional<PeerAccessCoverage> projection_peer_access;
 
     /**
      * Optional resolved rank-local collective backend for this participant.

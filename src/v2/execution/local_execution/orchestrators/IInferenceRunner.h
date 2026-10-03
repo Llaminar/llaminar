@@ -23,6 +23,7 @@
 
 #include "../../../backends/DeviceId.h"
 #include "../../../snapshots/SnapshotPublication.h"
+#include "../../../snapshots/SnapshotRowPartition.h"
 #include "../../InferenceReadiness.h"
 #include "../../mtp/DeviceGenerationContract.h"
 #include "../../moe/DeviceMoERebalanceABI.h"
@@ -1161,6 +1162,7 @@ namespace llaminar2
 
         /// Producer completeness belongs to these exact bytes, not to the key.
         SnapshotPublication publication = SnapshotPublication::SchemaPartition;
+        SnapshotOwnedRows row_ownership; ///< Immutable observed row ownership; no inference authority.
 
         explicit operator bool() const { return data != nullptr && size > 0; }
     };
@@ -5422,6 +5424,28 @@ namespace llaminar2
         {
             (void)tokens;
             return {};
+        }
+
+        /**
+         * @brief Prepare asynchronous storage pressure before any prefill work.
+         * @param admission Immutable participant lookup identity.
+         * @param tokens Actual complete prompt, excluding capture padding.
+         * @param schedule Exact coordinator-selected harvest frontiers.
+         * @return True after valid nonblocking preparation (including pending
+         *         durable writes), false for unsupported or broken publication.
+         *
+         * Composites forward each child's own admission. This starts IO only;
+         * it neither captures model state nor claims pending bytes as free RAM.
+         */
+        virtual bool preparePrefixHarvest(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            const PrefixHarvestSchedule &schedule)
+        {
+            (void)admission;
+            (void)tokens;
+            (void)schedule;
+            return false;
         }
 
         virtual bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0)

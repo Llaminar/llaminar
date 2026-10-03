@@ -17,6 +17,7 @@
 
 #include "WeightManager.h"
 #include "WeightSlicer.h"
+#include "MoEExpertSourceView.h"
 #include "MmapRegion.h"
 #include "PreparedWeightRepresentationContract.h"
 #include "PreparedWeightStore.h"
@@ -4610,7 +4611,20 @@ namespace llaminar2
 
         auto preparation_plan = MoEExpertOverlayPreparationPlan::build(
             runtime_plan,
+            loader_,
             routed_expert_bytes_per_expert);
+        return prepareMoEExpertOverlayWeightsFromPlan(runtime_plan, std::move(preparation_plan),
+            target_device, frozen_weights, execution_plan, admission);
+    }
+
+    bool WeightManager::prepareMoEExpertOverlayWeightsFromPlan(
+        const MoEExpertOverlayRuntimePlan &runtime_plan,
+        MoEExpertOverlayPreparationPlan preparation_plan,
+        DeviceId target_device,
+        const FrozenModelWeightSet *frozen_weights,
+        const MoEExpertOverlayExecutionPlan *execution_plan,
+        PreparedWeightAdmission admission)
+    {
         if (execution_plan)
             preparation_plan = preparation_plan.filteredForRank(execution_plan->currentRankPlan());
         std::vector<DeviceId> graph_execution_devices{target_device};
@@ -4687,14 +4701,14 @@ namespace llaminar2
                         request.participant_index,
                         request.layer,
                         request.expert_id,
-                        request.role);
+                        request.role, request.projection_ownership);
                 const auto domain_engine =
                     expert_gemm_registry_.getEngineLifetimeForDomain(
                         request.domain_name,
                         request.device,
                         request.layer,
                         request.expert_id,
-                        request.role);
+                        request.role, request.projection_ownership);
                 const bool same_owner =
                     participant_engine && domain_engine &&
                     !participant_engine.owner_before(domain_engine) &&
@@ -5437,6 +5451,8 @@ namespace llaminar2
             std::shared_ptr<TensorBase> parent_owner;
             /** 2D expert view; every tensor implementation retains its root parent. */
             std::shared_ptr<TensorBase> view;
+            /** Complete source/partition identity, never inferred from the smaller physical N. */
+            std::optional<MoEExpertProjectionOwnership> projection_ownership;
         };
         std::vector<MoEExpertJob> moe_jobs;
         size_t moe_jobs_already_satisfied = 0;
@@ -5458,11 +5474,7 @@ namespace llaminar2
                 std::shared_ptr<TensorBase> owner;
                 TensorBase *tensor = nullptr;
                 std::string name;
-                size_t tensor_expert_start = 0;
-                size_t global_expert_start = 0;
-                size_t expert_count = 0;
-                std::vector<int> expert_ids;
-                bool inner_is_presliced = false;
+                std::optional<MoEExpertSourceView> selection;
             };
             struct MoELayerTensors
             {
@@ -5488,81 +5500,16 @@ namespace llaminar2
 
                 const auto &shape = tensor->shape();
                 if (shape.size() != 3 || shape[2] == 0)
-                    return;
+                    throw std::invalid_argument(
+                        "GPU MoE preparation requires a nonempty GGUF [K,N,E] source parent: " + name);
 
                 MoERoleTensor source;
                 source.owner = std::move(owner);
                 source.tensor = tensor;
                 source.name = name;
-                source.inner_is_presliced = slice.inner_is_presliced;
-                source.expert_ids = slice.expert_ids;
-
-                /**
-                 * Expert-ID-apportioned LocalTP freezes a tensor that already contains
-                 * only this participant's expert range. The registry, router, and
-                 * graph still use global expert ids, so keep two coordinates:
-                 *
-                 * - tensor_expert_start: local index inside this tensor for view offsets
-                 * - global_expert_start: model expert id registered in ExpertGemmRegistry
-                 */
-                source.expert_count = shape[2];
-                if (!source.expert_ids.empty())
-                {
-                    if (!std::is_sorted(source.expert_ids.begin(), source.expert_ids.end()) ||
-                        std::adjacent_find(source.expert_ids.begin(), source.expert_ids.end()) !=
-                            source.expert_ids.end())
-                    {
-                        throw std::runtime_error(
-                            "[WeightManager] GPU pipeline received unordered or duplicate explicit expert IDs for " +
-                            name);
-                    }
-                    source.global_expert_start =
-                        static_cast<size_t>(source.expert_ids.front());
-                    source.expert_count = source.expert_ids.size();
-                    if (slice.expert_count != 0 &&
-                        slice.expert_count != source.expert_ids.size())
-                    {
-                        throw std::runtime_error(
-                            "[WeightManager] GPU pipeline explicit expert count disagrees with slice metadata for " +
-                            name);
-                    }
-                    if (slice.inner_is_presliced)
-                    {
-                        if (source.expert_ids.size() != shape[2])
-                        {
-                            throw std::runtime_error(
-                                "[WeightManager] GPU pipeline packed expert IDs do not cover the presliced tensor for " +
-                                name);
-                        }
-                    }
-                    else if (std::any_of(
-                                 source.expert_ids.begin(),
-                                 source.expert_ids.end(),
-                                 [tensor_experts = shape[2]](int expert_id)
-                                 {
-                                     return expert_id < 0 ||
-                                            static_cast<size_t>(expert_id) >= tensor_experts;
-                                 }))
-                    {
-                        throw std::runtime_error(
-                            "[WeightManager] GPU pipeline explicit expert ID is outside the unsliced tensor for " +
-                            name);
-                    }
-                }
-                else if (slice.expert_count != 0)
-                {
-                    source.global_expert_start = slice.expert_start;
-                    source.expert_count = std::min(slice.expert_count, shape[2]);
-                    if (!slice.inner_is_presliced)
-                    {
-                        source.tensor_expert_start = slice.expert_start;
-                        if (source.tensor_expert_start >= shape[2])
-                            source.expert_count = 0;
-                        else
-                            source.expert_count = std::min(source.expert_count,
-                                                           shape[2] - source.tensor_expert_start);
-                    }
-                }
+                // Validate the two coordinate systems once: global router IDs
+                // versus physical slots in this exact frozen source parent.
+                source.selection.emplace(shape, slice);
 
                 if (name.find("ffn_gate_exps.weight") != std::string::npos)
                 {
@@ -5621,100 +5568,69 @@ namespace llaminar2
                 return false;
             }
 
-            // Create 2D expert views for each complete layer
+            // The preparation plan, not the set of available source tensors,
+            // owns completeness. Include absent layers so a partial frozen set
+            // cannot silently certify a model with missing prepared experts.
+            if (overlay_preparation_plan)
+                for (const auto &request : overlay_preparation_plan->requests())
+                    if (request.device == target_device)
+                        moe_layers.try_emplace(request.layer);
+
+            // Compile each projection independently. A fixed down bank covers
+            // every expert; its gate/up parents may cover only a sparse subset.
             for (auto &[layer_idx, tensors] : moe_layers)
             {
-                if (!tensors.gate.tensor || !tensors.up.tensor || !tensors.down.tensor)
+                if (!overlay_preparation_plan &&
+                    (!tensors.gate.tensor || !tensors.up.tensor || !tensors.down.tensor))
                 {
                     LOG_WARN("[WeightManager] GPU pipeline: incomplete MoE expert tensors for layer "
                              << layer_idx << " — skipping");
                     continue;
                 }
 
-                // GGUF 3D: shape[0]=cols (K, fastest), shape[1]=rows_per_expert, shape[2]=num_experts
-                const auto &gate_shape = tensors.gate.tensor->shape();
-                if (gate_shape.size() != 3)
-                {
-                    LOG_WARN("[WeightManager] GPU pipeline: MoE gate tensor for layer "
-                             << layer_idx << " is not 3D — skipping");
-                    continue;
-                }
-
-                const bool has_explicit_expert_ids = !tensors.gate.expert_ids.empty() ||
-                                                     !tensors.up.expert_ids.empty() ||
-                                                     !tensors.down.expert_ids.empty();
-                if (has_explicit_expert_ids &&
-                    (tensors.gate.expert_ids.empty() ||
-                     tensors.gate.expert_ids != tensors.up.expert_ids ||
-                     tensors.gate.expert_ids != tensors.down.expert_ids))
-                {
-                    throw std::runtime_error(
-                        "[WeightManager] GPU pipeline gate/up/down explicit expert IDs disagree for layer " +
-                        std::to_string(layer_idx));
-                }
-
-                const size_t local_expert_count = has_explicit_expert_ids
-                                                      ? tensors.gate.expert_ids.size()
-                                                      : std::min({tensors.gate.expert_count,
-                                                                  tensors.up.expert_count,
-                                                                  tensors.down.expert_count});
-                if (local_expert_count == 0 ||
-                    (!has_explicit_expert_ids &&
-                     (tensors.gate.global_expert_start != tensors.up.global_expert_start ||
-                      tensors.gate.global_expert_start != tensors.down.global_expert_start)))
+                if (!overlay_preparation_plan &&
+                    (tensors.gate.selection->experts() != tensors.up.selection->experts() ||
+                     tensors.gate.selection->experts() != tensors.down.selection->experts()))
                 {
                     throw std::runtime_error(
                         "[WeightManager] GPU pipeline found inconsistent MoE expert slices for layer " +
                         std::to_string(layer_idx));
                 }
 
-                std::vector<int> expected_experts;
-                expected_experts.reserve(local_expert_count);
-                for (size_t local_idx = 0; local_idx < local_expert_count; ++local_idx)
-                {
-                    expected_experts.push_back(
-                        has_explicit_expert_ids
-                            ? tensors.gate.expert_ids[local_idx]
-                            : static_cast<int>(tensors.gate.global_expert_start + local_idx));
-                }
-
-                moe_parent_tensors.push_back({tensors.gate.name, tensors.gate.owner, expected_experts});
-                moe_parent_tensors.push_back({tensors.up.name, tensors.up.owner, expected_experts});
-                moe_parent_tensors.push_back({tensors.down.name, tensors.down.owner, expected_experts});
-
                 struct RoleTensor
                 {
                     ExpertGemmRegistry::WeightRole role;
+                    WeightRole semantic_role;
                     const char *tag;
                     const MoERoleTensor *source;
                 };
                 RoleTensor roles[] = {
-                    {ExpertGemmRegistry::WeightRole::GATE, "gate", &tensors.gate},
-                    {ExpertGemmRegistry::WeightRole::UP, "up", &tensors.up},
-                    {ExpertGemmRegistry::WeightRole::DOWN, "down", &tensors.down},
+                    {ExpertGemmRegistry::WeightRole::GATE, WeightRole::MoEExpertGate, "gate", &tensors.gate},
+                    {ExpertGemmRegistry::WeightRole::UP, WeightRole::MoEExpertUp, "up", &tensors.up},
+                    {ExpertGemmRegistry::WeightRole::DOWN, WeightRole::MoEExpertDown, "down", &tensors.down},
                 };
 
                 for (const auto &rt : roles)
                 {
-                    // Each role tensor may have different dimensions
-                    // (e.g., down is [intermediate, d_model, num_experts] while gate/up are [d_model, intermediate, num_experts])
-                    const auto &role_shape = rt.source->tensor->shape();
-                    const size_t role_cols = role_shape[0];
-                    const size_t role_rows_per_expert = role_shape[1];
-                    const size_t role_elements_per_expert = role_rows_per_expert * role_cols;
+                    const std::vector<int> empty_source;
+                    const auto &source_experts = rt.source->selection
+                        ? rt.source->selection->experts() : empty_source;
+                    const auto expected_experts = overlay_preparation_plan
+                        ? overlay_preparation_plan->expertsForDeviceLayerRole(target_device, layer_idx, rt.role)
+                        : source_experts;
+                    if (rt.source->selection)
+                        moe_parent_tensors.push_back({rt.source->name, rt.source->owner, expected_experts});
 
-                    for (size_t local_idx = 0; local_idx < local_expert_count; ++local_idx)
+                    for (const int global_expert : expected_experts)
                     {
-                        const int global_expert = has_explicit_expert_ids
-                                                      ? rt.source->expert_ids[local_idx]
-                                                      : static_cast<int>(rt.source->global_expert_start + local_idx);
                         const auto *overlay_request = overlay_preparation_plan
                                                           ? overlay_preparation_plan->requestFor(target_device, layer_idx, global_expert, rt.role)
                                                           : nullptr;
                         if (overlay_preparation_plan && !overlay_request)
                         {
-                            continue;
+                            throw std::logic_error("GPU MoE preparation lost a planned projection request");
                         }
+                        const auto projection = overlay_request ? overlay_request->projection_ownership : std::nullopt;
 
                         std::string slot_name = "moe_L" + std::to_string(layer_idx) + "_" + rt.tag + "_e" + std::to_string(global_expert);
                         std::string domain_name;
@@ -5736,12 +5652,12 @@ namespace llaminar2
                             auto *domain_engine =
                                 expert_gemm_registry_.getEngineForDomain(
                                     domain_name, target_device, layer_idx,
-                                    global_expert, rt.role);
+                                    global_expert, rt.role, projection);
                             auto *participant_engine =
                                 expert_gemm_registry_.getEngineForParticipant(
                                     domain_name, target_device,
                                     participant_world_rank, participant_index,
-                                    layer_idx, global_expert, rt.role);
+                                    layer_idx, global_expert, rt.role, projection);
                             if ((domain_engine == nullptr) !=
                                     (participant_engine == nullptr) ||
                                 (domain_engine != nullptr &&
@@ -5759,17 +5675,22 @@ namespace llaminar2
                                 continue;
                             }
 
+                            if (projection && expert_gemm_registry_.getEngine(
+                                    target_device, layer_idx, global_expert, rt.role))
+                                throw std::logic_error(
+                                    "GPU projected expert preparation cannot duplicate a complete device-scoped expert allocation");
+
                             /* A fresh overlay may adopt a legacy device-scoped
                              * engine exactly once. Both scoped aliases must be
                              * published from that same owner; accepting only
                              * one would create a torn bank that later context
                              * sealing cannot certify. */
                             const bool domain_aliased =
-                                expert_gemm_registry_.aliasEngineForDomainFromDevice(
+                                !projection && expert_gemm_registry_.aliasEngineForDomainFromDevice(
                                     domain_name, target_device, layer_idx,
                                     global_expert, rt.role);
                             const bool participant_aliased =
-                                expert_gemm_registry_.aliasEngineForParticipantFromDevice(
+                                !projection && expert_gemm_registry_.aliasEngineForParticipantFromDevice(
                                     domain_name, target_device,
                                     participant_world_rank, participant_index,
                                     layer_idx, global_expert, rt.role);
@@ -5801,13 +5722,17 @@ namespace llaminar2
                             }
                         }
 
-                        const size_t tensor_expert_idx = rt.source->inner_is_presliced
-                                                             ? local_idx
-                                                             : (!rt.source->expert_ids.empty()
-                                                                    ? static_cast<size_t>(global_expert)
-                                                                    : rt.source->tensor_expert_start + local_idx);
-                        const size_t element_offset = tensor_expert_idx * role_elements_per_expert;
-                        std::vector<size_t> view_shape = {role_rows_per_expert, role_cols};
+                        // Slice original contiguous GGUF rows before native packing.
+                        // No complete GPU matrix or conversion round trip is needed.
+                        // A previously prepared expert needs no surviving source;
+                        // otherwise the exact logical resident must be present.
+                        if (!rt.source->selection)
+                            throw std::runtime_error("GPU preparation is missing a requested MoE source projection");
+                        const auto matrix = rt.source->selection->matrix(global_expert, rt.semantic_role,
+                            projection ? &*projection : nullptr);
+                        const auto &role_shape = rt.source->tensor->shape();
+                        const size_t element_offset = matrix.element_offset;
+                        std::vector<size_t> view_shape = {matrix.rows, matrix.columns};
                         std::shared_ptr<TensorBase> view;
                         try
                         {
@@ -5819,11 +5744,7 @@ namespace llaminar2
                             oss << "[WeightManager] GPU pipeline: failed to create expert view for layer "
                                 << layer_idx << " " << rt.tag
                                 << " global_expert=" << global_expert
-                                << " tensor_expert_idx=" << tensor_expert_idx
-                                << " tensor_expert_start=" << rt.source->tensor_expert_start
-                                << " global_expert_start=" << rt.source->global_expert_start
-                                << " local_idx=" << local_idx
-                                << " expert_count=" << rt.source->expert_count
+                                << " expert_count=" << source_experts.size()
                                 << " tensor_shape=[";
                             for (size_t i = 0; i < role_shape.size(); ++i)
                             {
@@ -5831,17 +5752,15 @@ namespace llaminar2
                                     oss << ",";
                                 oss << role_shape[i];
                             }
-                            oss << "] view_shape=[" << role_rows_per_expert << "," << role_cols
+                            oss << "] view_shape=[" << matrix.rows << "," << matrix.columns
                                 << "] offset_elements=" << element_offset
-                                << " slice_inner_is_presliced="
-                                << (rt.source->inner_is_presliced ? "true" : "false")
                                 << ": " << e.what();
                             throw std::runtime_error(oss.str());
                         }
                         if (!view)
                         {
                             throw std::runtime_error(
-                                "[WeightManager] GPU pipeline: failed to create expert view for layer " + std::to_string(layer_idx) + " " + rt.tag + " expert " + std::to_string(global_expert) + " (shape=[" + std::to_string(role_rows_per_expert) + "," + std::to_string(role_cols) + "], offset=" + std::to_string(element_offset) + ")");
+                                "[WeightManager] GPU pipeline: failed to create expert view for layer " + std::to_string(layer_idx) + " " + rt.tag + " expert " + std::to_string(global_expert) + " (shape=[" + std::to_string(matrix.rows) + "," + std::to_string(matrix.columns) + "], offset=" + std::to_string(element_offset) + ")");
                         }
 
                         moe_jobs.push_back({layer_idx, global_expert, rt.role, std::move(slot_name),
@@ -5849,15 +5768,11 @@ namespace llaminar2
                                             participant_world_rank, participant_index,
                                             rt.source->tensor,
                                             rt.source->owner,
-                                            std::move(view)});
+                                            std::move(view), projection});
                     }
                 }
 
-                LOG_DEBUG("[WeightManager] GPU pipeline: collected " << local_expert_count
-                                                                     << " local experts x 3 roles for MoE layer " << layer_idx
-                                                                     << (has_explicit_expert_ids
-                                                                             ? " with explicit global IDs"
-                                                                             : " from a contiguous global span"));
+                LOG_DEBUG("[WeightManager] GPU pipeline: collected exact per-role MoE source views for layer " << layer_idx);
             }
         }
 
@@ -6431,7 +6346,7 @@ namespace llaminar2
                         target_device,
                         moe_job.layer_idx,
                         moe_job.expert_idx,
-                        moe_job.role);
+                        moe_job.role, moe_job.projection_ownership);
                 auto *participant_engine =
                     expert_gemm_registry_.getEngineForParticipant(
                         moe_job.domain_name,
@@ -6440,7 +6355,7 @@ namespace llaminar2
                         moe_job.participant_index,
                         moe_job.layer_idx,
                         moe_job.expert_idx,
-                        moe_job.role);
+                        moe_job.role, moe_job.projection_ownership);
                 if ((domain_engine == nullptr) !=
                         (participant_engine == nullptr) ||
                     (domain_engine != nullptr &&
@@ -6452,7 +6367,7 @@ namespace llaminar2
                         std::to_string(moe_job.layer_idx) + " expert=" +
                         std::to_string(moe_job.expert_idx));
                 }
-                if (domain_engine == nullptr)
+                if (domain_engine == nullptr && !moe_job.projection_ownership)
                 {
                     const bool domain_aliased =
                         expert_gemm_registry_.aliasEngineForDomainFromDevice(
@@ -6844,11 +6759,11 @@ namespace llaminar2
                         mj.domain_name,
                         target_device, mj.participant_world_rank, mj.participant_index,
                         mj.layer_idx, mj.expert_idx, mj.role,
-                        raw_ptr, kernel);
+                        raw_ptr, kernel, mj.projection_ownership);
                     expert_gemm_registry_.registerEngineForDomain(
                         mj.domain_name,
                         target_device, mj.layer_idx, mj.expert_idx, mj.role,
-                        raw_ptr, std::move(kernel));
+                        raw_ptr, std::move(kernel), mj.projection_ownership);
                 }
                 else
                 {
@@ -6896,8 +6811,14 @@ namespace llaminar2
                         domain_name, target_device, layer_idx, role);
                     if (expected_experts.empty())
                         continue;
-                    if (!expert_gemm_registry_.hasCompleteRoleForExpertsInDomain(
-                            domain_name, target_device, layer_idx, expected_experts, role))
+                    const bool complete = std::all_of(expected_experts.begin(), expected_experts.end(), [&](int expert)
+                    {
+                        const auto *request = overlay_preparation_plan->requestFor(target_device, layer_idx, expert, role);
+                        return request && request->domain_name == domain_name &&
+                            expert_gemm_registry_.getEngineForDomain(domain_name, target_device, layer_idx,
+                                expert, role, request->projection_ownership) != nullptr;
+                    });
+                    if (!complete)
                     {
                         overlay_ready = false;
                         missing_domain = domain_name;

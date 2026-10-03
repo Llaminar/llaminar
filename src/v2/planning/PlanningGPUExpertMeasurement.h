@@ -46,6 +46,19 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief Reject unsupported projection arithmetic from metadata alone.
+         * @param request Authenticated gate/up/down source tensor identities.
+         * @param description Their resolved format and geometry, before payload I/O.
+         * @throws std::invalid_argument For uncatalogued or incompatible formats.
+         *
+         * This uses the live GPU expert payload's canonical validation contract,
+         * not a second planning capability table. CPU expert sampling remains a
+         * separate native implementation and does not acquire GPU restrictions.
+         */
+        static void validateSourceArithmetic(const PlanningExpertSampleRequest &request,
+            const PlanningExpertSampleDescription &description);
+
+        /**
          * @brief Contribute source, native weights, staging, workspace and graphs.
          * @param source Retained metadata authority; this operation reads no payload.
          * @param request Full source triplet, shared with CPU sampling.

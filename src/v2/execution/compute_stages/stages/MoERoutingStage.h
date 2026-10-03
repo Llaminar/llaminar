@@ -40,6 +40,16 @@ namespace llaminar2
         FixedCapacityOverlayTicket,
     };
 
+    /** @brief Arena-owned compact output of ordinary, row-distributed GPU prefill.
+     * The explicit following collective retains the fabric/count lifetime.
+     * Complete route tensors are produced by its publication stage, not this one. */
+    struct MoERouterOwnedStageOutput
+    {
+        MoERouterRowPacketLayout layout;
+        TensorBase *packet = nullptr;
+        BufferId packet_id = BufferId::MOE_PROJECTION_LOCAL_PACKET;
+        std::uint64_t *selected_bytes = nullptr;
+    };
 
     /**
      * @brief MoE routing stage: compute expert selection via softmax top-k
@@ -193,9 +203,12 @@ namespace llaminar2
              * but allocates and publishes no demand history.
              *
              * This is valid only for a GPU main verifier with a complete
-             * per-layer runtime ledger.  Ordinary and LocalTP overlay graphs
-             * use @ref MoEGroupedVerifierHistogramRole::NotOwner because their
-             * expert stage owns the per-layer boundary.
+             * per-layer runtime ledger. Projection-distributed graphs also
+             * use this publisher: their gate/up phase retains final participant
+             * assignments in that same ledger before accepted publication.
+             * Whole-expert LocalTP graphs use @ref
+             * MoEGroupedVerifierHistogramRole::NotOwner because their expert
+             * stage owns the per-layer boundary instead.
              */
             MoEGroupedVerifierHistogramRole grouped_verifier_histogram_role =
                 MoEGroupedVerifierHistogramRole::NotOwner;
@@ -212,6 +225,13 @@ namespace llaminar2
              * scalar upload can influence captured topology.
              */
             const int32_t *active_row_count_device = nullptr;
+            /// Present only for the complete-row distributed ordinary-prefill contract.
+            std::optional<MoERouterOwnedStageOutput> owned_rows;
+            /** @brief Diagnostic-only row ownership for small replicated prefill buckets.
+             * Bulk owned_rows defines its own compact layout. Using the same
+             * logical partition on small buckets lets a multi-chunk prompt
+             * assemble its complete probability checkpoint without duplication. */
+            std::optional<DeviceRowPartition> probability_snapshot_partition;
 
             // Outputs (written by this stage)
             TensorBase *output_indices = nullptr; ///< FP32 [seq_len * top_k] expert IDs as float

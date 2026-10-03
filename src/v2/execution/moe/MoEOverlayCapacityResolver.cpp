@@ -12,6 +12,7 @@
 #include "MoEOverlayCapacityResolver.h"
 
 #include "ExpertPreparedMemoryGeometry.h"
+#include "MoEExpertProjectionOwnership.h"
 
 #include <algorithm>
 #include <limits>
@@ -67,10 +68,12 @@ namespace llaminar2
             }
         };
 
+        /** @brief Immutable per-tier byte geometry beside its setup quota candidate. */
         struct TierState
         {
             const MoEOverlayTierCapacityRequest *request = nullptr;
             MoEOverlayResolvedTierCapacity output;
+            std::vector<MoEOverlayPreparedExpertFootprint> movable_footprints;
         };
 
         [[nodiscard]] std::size_t resourceUsed(
@@ -99,6 +102,75 @@ namespace llaminar2
                           : footprint.liveBytes(device);
         }
 
+        /**
+         * @brief Price the immutable down bank independently of movable owner counts.
+         * @param input Complete model manifest and frozen tier copy policies.
+         * @param resource_index Validated participant-to-physical-resource join.
+         * @param resources Canonical base BOMs before expert residency is added.
+         * @return Unconditional routed-weight contributions for each physical resource.
+         * @throws std::invalid_argument for an unsupported topology or source layout.
+         *
+         * The first installed projection pipeline covers a complete homogeneous
+         * GPU domain. A tier containing only some experts cannot claim the same
+         * bank: cross-tier slice arrival needs its own publication protocol. Fail
+         * here instead of admitting a cheap but physically incomplete layout.
+         */
+        [[nodiscard]] std::map<std::string, std::size_t> fixedDownCharges(
+            const MoEOverlayCapacityResolverInput &input,
+            const std::unordered_map<std::string, std::size_t> &resource_index,
+            const std::vector<ResourceState> &resources)
+        {
+            std::map<std::string, std::size_t> charges;
+            for (const auto &tier : input.tiers)
+            {
+                if (tier.copy_policy != MoEOverlayTierCopyPolicy::GateUpOwnedDownColumns)
+                    continue;
+                if (input.tiers.size() != 1u || tier.participants.size() >
+                    static_cast<std::size_t>(std::numeric_limits<int>::max()))
+                    throw std::invalid_argument("Gate/up capacity requires one complete GPU domain");
+                const auto first_device = resources.at(resource_index.at(
+                    tier.participants.front().resource_id)).memory.build().resource().device;
+                std::set<std::string> unique_resources;
+                for (std::size_t index = 0; index < tier.participants.size(); ++index)
+                {
+                    const auto &participant = tier.participants[index];
+                    const auto device = resources.at(resource_index.at(
+                        participant.resource_id)).memory.build().resource().device;
+                    if (!device.is_gpu() || device.type != first_device.type ||
+                        !unique_resources.insert(participant.resource_id).second ||
+                        participant.shadow_slots_per_layer != 0u)
+                        throw std::invalid_argument(
+                            "Gate/up capacity requires distinct homogeneous GPUs and native transfer-directory storage");
+
+                    for (const auto &layer : input.layer_weight_manifest)
+                    {
+                        // valid() has already proved every role occurs once.
+                        // Address projections by role, never by array position.
+                        const auto &gate = *std::find_if(layer.projections.begin(), layer.projections.end(),
+                            [](const auto &p) { return p.projection == ExpertTierWeightProjection::Gate; });
+                        const auto &up = *std::find_if(layer.projections.begin(), layer.projections.end(),
+                            [](const auto &p) { return p.projection == ExpertTierWeightProjection::Up; });
+                        const auto &down = *std::find_if(layer.projections.begin(), layer.projections.end(),
+                            [](const auto &p) { return p.projection == ExpertTierWeightProjection::Down; });
+                        if (gate.N != up.N || gate.K != up.K || down.N != gate.K || down.K != gate.N)
+                            throw std::invalid_argument("Gate/up capacity has incompatible source projection dimensions");
+                        const auto ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
+                            {input.num_experts, gate.K, gate.N}, static_cast<int>(index),
+                            static_cast<int>(tier.participants.size()));
+                        const auto slice = ownership.projection(WeightRole::MoEExpertDown);
+                        const auto geometry = resolveExpertPreparedProjectionMemoryGeometry(
+                            slice.rows, slice.source_columns, down.format);
+                        const auto bytes = checkedMultiply(
+                            ownership.residentExperts(WeightRole::MoEExpertDown, 0),
+                            geometry.gpu_live_bytes, "fixed down projection bank");
+                        charges[participant.resource_id] = checkedAdd(
+                            charges[participant.resource_id], bytes, "fixed down layer inventory");
+                    }
+                }
+            }
+            return charges;
+        }
+
         /** @brief Build the exact shared-arena key from one layer manifest. */
         [[nodiscard]] ExpertPreparedTripletGeometryKey geometryKey(
             const MoEOverlayLayerWeightManifest &layer)
@@ -124,11 +196,11 @@ namespace llaminar2
 
         [[nodiscard]] std::map<std::string, std::size_t> tierShadowCharges(
             const TierState &tier,
-            const std::vector<MoEOverlayPreparedExpertFootprint> &footprints,
             const std::vector<MoEOverlayLayerWeightManifest> &manifest,
             const std::unordered_map<std::string, std::size_t> &resource_index,
             const std::vector<ResourceState> &resources)
         {
+            const auto &footprints = tier.movable_footprints;
             if (manifest.size() != footprints.size())
             {
                 throw std::logic_error(
@@ -178,14 +250,14 @@ namespace llaminar2
         [[nodiscard]] std::map<std::string, std::size_t> nextLiveCharges(
             const TierState &tier,
             int layer_idx,
-            const std::vector<MoEOverlayPreparedExpertFootprint> &footprints,
             const std::unordered_map<std::string, std::size_t> &resource_index,
             const std::vector<ResourceState> &resources)
         {
+            const auto &footprints = tier.movable_footprints;
             std::map<std::string, std::size_t> charges;
             const int quota =
                 tier.output.live_experts_per_layer[static_cast<std::size_t>(layer_idx)];
-            if (tier.request->copy_policy == MoEOverlayTierCopyPolicy::Apportioned)
+            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated)
             {
                 const std::size_t participant_index =
                     static_cast<std::size_t>(quota) %
@@ -245,7 +317,6 @@ namespace llaminar2
         [[nodiscard]] bool addOneLiveExpert(
             TierState &tier,
             int layer_idx,
-            const std::vector<MoEOverlayPreparedExpertFootprint> &footprints,
             const std::unordered_map<std::string, std::size_t> &resource_index,
             std::vector<ResourceState> &resources)
         {
@@ -257,7 +328,7 @@ namespace llaminar2
                 return false;
             }
             const auto live_charges = nextLiveCharges(
-                tier, layer_idx, footprints, resource_index, resources);
+                tier, layer_idx, resource_index, resources);
             if (!chargesFit(live_charges, resource_index, resources))
                 return false;
             commitCharges(
@@ -266,7 +337,7 @@ namespace llaminar2
             const int previous_quota = tier.output.live_experts_per_layer[layer];
             ++tier.output.live_experts_per_layer[layer];
             tier.output.has_live_residency = true;
-            if (tier.request->copy_policy == MoEOverlayTierCopyPolicy::Apportioned)
+            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated)
             {
                 const std::size_t participant =
                     static_cast<std::size_t>(previous_quota) %
@@ -297,7 +368,6 @@ namespace llaminar2
          * @param layer_idx Layer whose next allocation could not be admitted.
          * @param requested_quota Required logical expert count for this demand.
          * @param demand Diagnostic name of the mandatory coverage obligation.
-         * @param footprints Canonical prepared projection footprints by layer.
          * @param resource_index Logical participant to physical resource lookup.
          * @param resources Current setup BOMs, never a separate runtime ledger.
          * @throws std::invalid_argument with category-level admission evidence.
@@ -307,7 +377,6 @@ namespace llaminar2
             int layer_idx,
             int requested_quota,
             const char *demand,
-            const std::vector<MoEOverlayPreparedExpertFootprint> &footprints,
             const std::unordered_map<std::string, std::size_t> &resource_index,
             const std::vector<ResourceState> &resources)
         {
@@ -337,7 +406,6 @@ namespace llaminar2
             const auto charges = nextLiveCharges(
                 tier,
                 layer_idx,
-                footprints,
                 resource_index,
                 resources);
             for (const auto &[resource_id, additional_bytes] : charges)
@@ -430,10 +498,11 @@ namespace llaminar2
 
     std::vector<MoEOverlayPreparedExpertFootprint>
     MoEOverlayCapacityResolver::preparedFootprints(
-        const std::vector<MoEOverlayLayerWeightManifest> &manifest)
+        const std::vector<MoEOverlayLayerWeightManifest> &manifest,
+        DeviceMoEProjectionSet projections)
     {
-        if (manifest.empty())
-            throw std::invalid_argument("ExpertOverlay capacity resolver requires a layer manifest");
+        if (manifest.empty() || !deviceMoEProjectionSetValid(projections))
+            throw std::invalid_argument("ExpertOverlay capacity resolver requires a layer manifest and a valid projection family");
 
         std::vector<MoEOverlayPreparedExpertFootprint> footprints;
         footprints.reserve(manifest.size());
@@ -453,6 +522,12 @@ namespace llaminar2
             footprint.layer_idx = layer.layer_idx;
             for (const auto &projection : layer.projections)
             {
+                // Only ownership-dependent bytes scale with the live quota.
+                // The complete manifest is still authenticated above, and the
+                // fixed down bank is priced before admitting any live owner.
+                if (projections == DeviceMoEProjectionSet::GateUp &&
+                    projection.projection == ExpertTierWeightProjection::Down)
+                    continue;
                 const auto geometry =
                     resolveExpertPreparedProjectionMemoryGeometry(
                         projection.N,
@@ -597,6 +672,8 @@ namespace llaminar2
 
             TierState state;
             state.request = &request;
+            state.movable_footprints = preparedFootprints(
+                input.layer_weight_manifest, moeOverlayMovableProjections(request.copy_policy));
             state.output.tier_index = request.tier_index;
             state.output.tier_name = request.tier_name;
             state.output.priority = request.priority;
@@ -623,6 +700,14 @@ namespace llaminar2
             return lhs.request->priority < rhs.request->priority;
         });
 
+        // Fixed down slices cover every expert, including on a participant
+        // whose movable quota is zero. Add them to the same physical BOM before
+        // quota search; no second ledger or post-admission discount is involved.
+        const auto fixed_down = fixedDownCharges(input, resource_index, resources);
+        if (!chargesFit(fixed_down, resource_index, resources))
+            throw MoEOverlayCapacityExhausted("ExpertOverlay fixed down banks exceed the complete physical BOM");
+        commitCharges(fixed_down, resource_index, resources, /*shadow=*/false);
+
         /*
          * The physical fabric materializes every configured endpoint/layer
          * shadow bank during model setup, even when that tier initially owns no
@@ -635,7 +720,6 @@ namespace llaminar2
         {
             const auto tier_charges = tierShadowCharges(
                 tier,
-                footprints,
                 input.layer_weight_manifest,
                 resource_index,
                 resources);
@@ -721,7 +805,6 @@ namespace llaminar2
                     if (!addOneLiveExpert(
                             tier,
                             static_cast<int>(layer),
-                            footprints,
                             resource_index,
                             resources))
                     {
@@ -730,7 +813,6 @@ namespace llaminar2
                             static_cast<int>(layer),
                             quota,
                             "fixed live quota",
-                            footprints,
                             resource_index,
                             resources);
                     }
@@ -755,8 +837,8 @@ namespace llaminar2
             {
                 const std::size_t participant_count =
                     tier.request->participants.size();
-                if (tier.request->copy_policy ==
-                        MoEOverlayTierCopyPolicy::Apportioned &&
+                if (tier.request->copy_policy !=
+                        MoEOverlayTierCopyPolicy::Replicated &&
                     participant_count >
                         static_cast<std::size_t>(input.num_experts))
                 {
@@ -813,7 +895,6 @@ namespace llaminar2
                         if (!addOneLiveExpert(
                                 tier,
                                 static_cast<int>(layer),
-                                footprints,
                                 resource_index,
                                 resources))
                         {
@@ -822,7 +903,6 @@ namespace llaminar2
                                 static_cast<int>(layer),
                                 source_quota,
                                 "initial migration-source seed",
-                                footprints,
                                 resource_index,
                                 resources);
                         }
@@ -863,7 +943,7 @@ namespace llaminar2
                 for (const int layer : candidates)
                 {
                     if (addOneLiveExpert(
-                            tier, layer, footprints,
+                            tier, layer,
                             resource_index, resources))
                     {
                         --unassigned[static_cast<std::size_t>(layer)];
@@ -892,7 +972,6 @@ namespace llaminar2
                     if (!addOneLiveExpert(
                             *fallback,
                             static_cast<int>(layer),
-                            footprints,
                             resource_index,
                             resources))
                     {
@@ -901,7 +980,6 @@ namespace llaminar2
                             static_cast<int>(layer),
                             remainder,
                             "fallback remainder",
-                            footprints,
                             resource_index,
                             resources);
                     }

@@ -2263,6 +2263,43 @@ namespace
      * `LLAMINAR_ATTN_PROFILE_KV_LEN` to select one listed point for NCU. In
      * profiler mode the graph is replayed once after calibration.
      */
+    /**
+     * @brief Compare actual Q/KV shard geometry without adding interconnect cost.
+     *
+     * The main query bucket and prefix-harvest tail retain their physical KV
+     * spans. TP4 correctly replicates the two KV heads; it must not benchmark
+     * a fictional fractional head. Results are medians of warmed captured
+     * replay batches, not whole-model or four-device measurements.
+     */
+    TEST_F(CUDAFlashAttentionPerf, Prefill_Qwen36MoE_TPShardScaling)
+    {
+        for (const int degree : {1, 2, 4})
+        {
+            const auto geometry = resolveTensorParallelAttentionGeometry(kQwen36MoE35BAttention, degree);
+            ASSERT_TRUE(geometry.valid);
+            CapturedProductionPrefill benchmark(geometry.local, 512, 512);
+            ASSERT_TRUE(benchmark.ready()) << benchmark.error();
+            for (const ProductionPrefillPoint point : {
+                     // Prefix harvesting splits the canonical 512-token prompt
+                     // into 448 live main rows and a 64-row suffix. Keep the
+                     // full-bucket point too, but do not use it as a substitute
+                     // for the actually executed main attention geometry.
+                     ProductionPrefillPoint{448, 448, "live main chunk"},
+                     ProductionPrefillPoint{512, 512, "main"},
+                     ProductionPrefillPoint{64, 512, "prefix-harvest tail"}})
+                for (int sample = 0; sample < 5; ++sample)
+                {
+                    const auto measured = benchmark.measure(point, false);
+                    ASSERT_GT(measured.latency_us, 0) << benchmark.error();
+                    ASSERT_TRUE(benchmark.finalResultIsFinite());
+                    std::cout << std::setprecision(12) << "fa2_tp_sample,"
+                              << degree << ',' << point.query_rows << ',' << point.kv_len << ','
+                              << sample << ',' << measured.latency_us << ','
+                              << measured.grid_blocks << ',' << measured.block_threads << '\n';
+                }
+        }
+    }
+
     TEST_F(CUDAFlashAttentionPerf, Prefill_Qwen36MoE_CapturedFP16KVScaling)
     {
         const std::array<ProductionPrefillPoint, 25> points{{

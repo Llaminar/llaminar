@@ -15,6 +15,8 @@
 #include "../../backends/DeviceId.h"
 #include "DecodeExpertHistogram.h"
 #include "MoEExpertOwnerMap.h"
+#include "MoEOverlayPreparedExpertPayload.h"
+#include "MoEExpertProjectionOwnership.h"
 
 #include <array>
 #include <atomic>
@@ -29,6 +31,7 @@
 
 namespace llaminar2
 {
+    class MoEExpertOverlayPreparationPlan;
     class ExpertGemmRegistry;
     class ITensorGemm;
 
@@ -67,70 +70,50 @@ namespace llaminar2
     };
 
     /**
-     * @brief Complete prepared gate/up/down engines for one resident expert.
-     *
-     * Shared ownership is intentional.  Registry entries and cached graph
-     * stages may come and go independently, while this triplet is the lifetime
-     * authority for the exact residency epoch that names the engines.
-     */
-    struct MoEOverlayPreparedExpertTriplet
-    {
-        std::shared_ptr<ITensorGemm> gate;
-        std::shared_ptr<ITensorGemm> up;
-        std::shared_ptr<ITensorGemm> down;
-
-        /** @return Whether all three projections are present. */
-        [[nodiscard]] bool complete() const noexcept;
-
-        /** @return Whether no projection lifetime is present. */
-        [[nodiscard]] bool empty() const noexcept;
-
-        /** @return Whether two triplets name the same three engine objects. */
-        [[nodiscard]] bool sameIdentity(
-            const MoEOverlayPreparedExpertTriplet &other) const noexcept;
-    };
-
-    /**
      * @brief Resolve exact shared participant-scoped engine lifetimes for one layer.
      *
      * Raw graph-stage pointers are insufficient for RCU residency because the
      * mutable preparation registry may replace them during migration. This
      * helper converts the canonical participant mask into complete shared
-     * triplets suitable for an immutable epoch bank.
+     * payloads suitable for an immutable epoch bank.
      *
      * @param registry Model-owned prepared engine registry.
      * @param participant Canonical logical endpoint descriptor.
      * @param layer_idx Transformer layer index.
      * @param num_experts Exact global expert count.
      * @param resident_mask Canonical residents for this endpoint and layer.
-     * @param output Receives one triplet per global expert id.
+     * @param output Receives one payload per global expert id.
      * @param error Optional failure diagnostic.
-     * @return True only when every resident has an exact owned triplet and
+     * @param ownership Exact prepared layout; absent means ordinary complete experts.
+     * @return True only when every resident has an exact owned payload and
      *         every non-resident output entry is empty.
      */
-    bool resolveMoEOverlayPreparedExpertTriplets(
+    bool resolveMoEOverlayPreparedExpertPayloads(
         const ExpertGemmRegistry &registry,
         const MoEExpertOwnerParticipant &participant,
         int layer_idx,
         int num_experts,
         const std::vector<bool> &resident_mask,
-        std::vector<MoEOverlayPreparedExpertTriplet> &output,
-        std::string *error = nullptr);
+        std::vector<MoEOverlayPreparedExpertPayload> &output,
+        std::string *error = nullptr,
+        const std::optional<MoEExpertProjectionOwnership> &ownership = std::nullopt);
 
     /** @brief Immutable-ready engine table and local mask for one model layer. */
     struct MoEOverlayParticipantLayerBank
     {
         std::vector<bool> resident_mask;
-        std::vector<MoEOverlayPreparedExpertTriplet> experts;
+        std::vector<MoEOverlayPreparedExpertPayload> experts;
+        /** Immutable family inherited from the endpoint, never inferred from pointers. */
+        DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
 
         /**
-         * @brief Install one complete resident expert into this candidate bank.
+         * @brief Install a complete declared payload into this candidate bank.
          * @throws std::out_of_range When @p expert_id is outside the bank.
-         * @throws std::invalid_argument When @p engines is incomplete.
+         * @throws std::invalid_argument When @p engines is empty or has the wrong family.
          */
         void setResidentExpert(
             int expert_id,
-            MoEOverlayPreparedExpertTriplet engines);
+            MoEOverlayPreparedExpertPayload engines);
 
         /**
          * @brief Remove one expert from this candidate without touching old banks.
@@ -162,7 +145,7 @@ namespace llaminar2
         DeviceId device = DeviceId::invalid();
         std::vector<MoEOverlayParticipantLayerBank> layers;
 
-        /** @return Whether identity, geometry, masks, and engine triplets are exact. */
+        /** @return Whether identity, geometry, masks, and engine payloads are exact. */
         [[nodiscard]] bool valid(
             int expected_participant_id,
             DeviceId expected_device,
@@ -353,6 +336,8 @@ namespace llaminar2
              * no-movement path pays no timing-event or accounting cost.
              */
             bool collect_economy_service_measurements = false;
+            /** Movable family fixed for this endpoint before its first epoch. */
+            DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
         };
 
         /**
@@ -388,6 +373,12 @@ namespace llaminar2
         [[nodiscard]] int numExperts() const noexcept
         {
             return config_.num_experts;
+        }
+
+        /** @return The immutable family accepted by every placement epoch. */
+        [[nodiscard]] DeviceMoEProjectionSet movableProjections() const noexcept
+        {
+            return config_.movable_projections;
         }
 
         /** @return Whether this endpoint accepts service timing observations. */
@@ -470,7 +461,7 @@ namespace llaminar2
          * @brief Validate and allocate an immutable bank on maintenance work.
          *
          * This is the deliberately heavy half of publication. It validates all
-         * layers and triplets, moves the supplied value into an independently
+         * layers and payloads, moves the supplied value into an independently
          * owned node, and returns that node without changing inference-visible
          * state. A transaction prepares every local endpoint before installing
          * any endpoint, so allocation can never lengthen a partial publication.
@@ -634,6 +625,13 @@ namespace llaminar2
             std::size_t retained_epoch_capacity = 2;
             /** Enable exact service evidence on every process-local endpoint. */
             bool collect_economy_service_measurements = false;
+            /**
+             * Frozen projected preparation, when fixed down slices are used.
+             * Absence retains complete-expert placement. Every local layer is
+             * authenticated from this plan before an endpoint can be created;
+             * payload arrival cannot change the endpoint's projection family.
+             */
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> projection_preparation;
         };
 
         /**
@@ -655,8 +653,8 @@ namespace llaminar2
          * @brief Register one graph-resolved initial layer for an endpoint.
          *
          * The supplied mask must equal the canonical owner map. Resident
-         * experts require complete shared triplets and non-residents require
-         * empty triplets. Once every layer with resident experts is registered,
+         * experts require complete shared payloads and non-residents require
+         * empty payloads. Once every layer with resident experts is registered,
          * the complete initial bank is installed atomically in that endpoint.
          * Repeated cached-graph registration is accepted only for identical
          * engine identities.
@@ -667,7 +665,7 @@ namespace llaminar2
             int participant_id,
             int layer_idx,
             const std::vector<bool> &resident_mask,
-            const std::vector<MoEOverlayPreparedExpertTriplet> &experts,
+            const std::vector<MoEOverlayPreparedExpertPayload> &experts,
             std::string *error = nullptr);
 
         /**
@@ -701,6 +699,10 @@ namespace llaminar2
 
         /** @return Sorted process-local participant ids. */
         [[nodiscard]] std::vector<int> localParticipantIds() const;
+
+        /** @return Frozen projection preparation, or null for complete-expert ownership. */
+        [[nodiscard]] const std::shared_ptr<const MoEExpertOverlayPreparationPlan> &projectionPreparation() const noexcept
+        { return config_.projection_preparation; }
 
         /**
          * @return Whether every process-local initial bank completed its

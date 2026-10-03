@@ -7,6 +7,7 @@
  */
 #include <gtest/gtest.h>
 #include <limits>
+#include <stdexcept>
 
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
 #include "execution/prefix_cache/PrefixTerminalLogitsSlice.h"
@@ -120,6 +121,24 @@ TEST(Test__PrefixStateSnapshot, ReusableCheckpointRespectsLiveAndStableBoundarie
     admission.block_size = std::numeric_limits<int>::max() - 1;
     EXPECT_FALSE(admission.reusablePrefillCheckpoint(
         std::numeric_limits<int>::max(), 0, std::numeric_limits<int>::max()));
+}
+
+/** @test Scheduling preserves canonical frontiers and rejects malformed admission. */
+TEST(Test__PrefixStateSnapshot, HarvestScheduleSealsCanonicalFrontiers)
+{
+    PrefixLookupResult hit;
+    EXPECT_THROW(PrefixHarvestSchedule::forPrefill(hit, 365, 0), std::invalid_argument);
+    hit.supported = hit.cache_enabled = true;
+    hit.block_size = 64;
+    hit.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    const auto schedule = PrefixHarvestSchedule::forPrefill(hit, 365, 0, 96);
+    EXPECT_EQ(schedule.promptTokens(), 365);
+    EXPECT_EQ(schedule.reusableCheckpoint(), 192);
+    EXPECT_FALSE(PrefixHarvestSchedule::forPrefill(hit, 365, 365).reusableCheckpoint());
+    EXPECT_FALSE(PrefixHarvestSchedule::forPrefill(hit, 365, 320).reusableCheckpoint());
+    EXPECT_THROW(PrefixHarvestSchedule::forPrefill(hit, 365, -1), std::invalid_argument);
+    EXPECT_THROW(PrefixHarvestSchedule::forPrefill(hit, 365, 366), std::invalid_argument);
+    EXPECT_THROW(PrefixHarvestSchedule::forPrefill(hit, 365, 0, -1), std::invalid_argument);
 }
 
 /** @brief Disabled, unsupported, and attention-only caches retain one terminal harvest. */

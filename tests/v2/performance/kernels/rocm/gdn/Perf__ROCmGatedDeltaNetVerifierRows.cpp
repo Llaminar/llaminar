@@ -16,6 +16,10 @@
  * and provides a clean single-kernel attachment point for rocprof.
  * Device-counted cases hold the live prefix fixed while varying the retained
  * capture capacity, separating useful recurrence from inactive-row overhead.
+ * Long-prefill cases also vary participant-local head counts: tensor parallel
+ * sharding must not silently drop an economical fixed-width kernel route.
+ * The exact-candidate profiler can retain a bounded snapshot bank, so both
+ * capture-time publication policies receive independent counter/ISA evidence.
  */
 
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
@@ -28,6 +32,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -415,13 +420,12 @@ namespace
     using GdnBenchmarkFixture = GdnBenchmarkStorage<32>;
 
     /**
-     * @brief Exact Qwen3.6-35B-A3B prefill recurrence fixture.
+     * @brief Persistent long-prefill recurrence storage, including TP head shards.
      *
-     * The production model owns 32 value heads with 128 key and value
-     * dimensions and the dashboard prompt contains 425 real rows.  Keeping
-     * this case separate from the verifier fixture avoids allocating a
-     * 425-row state-snapshot matrix: ordinary prefill commits only the live
-     * terminal state and passes no speculative capture rows.
+     * The default retains the existing 32-head, 425-row production shape.
+     * Explicit dimensions measure the same recurrence after tensor-parallel
+     * sharding. Ordinary prefill commits only terminal state, so this fixture
+     * deliberately does not allocate a row-by-row speculative state matrix.
      */
     class GdnPrefillBenchmarkFixture
     {
@@ -435,17 +439,27 @@ namespace
         static constexpr int kQkRowFloats = kHeads * kKeyWidth;
         static constexpr int kValueRowFloats = kHeads * kValueWidth;
 
-        GdnPrefillBenchmarkFixture()
-            : q(static_cast<size_t>(kRows) * kQkRowFloats, timing.stream),
-              k(static_cast<size_t>(kRows) * kQkRowFloats, timing.stream),
-              v(static_cast<size_t>(kRows) * kValueRowFloats, timing.stream),
-              alpha(static_cast<size_t>(kRows) * kHeads, timing.stream),
-              beta(static_cast<size_t>(kRows) * kHeads, timing.stream),
-              a_log(kHeads, timing.stream),
-              dt_bias(kHeads, timing.stream),
-              output(static_cast<size_t>(kRows) * kValueRowFloats, timing.stream),
-              state(kStateFloats, timing.stream)
-        {}
+        /** @brief Bind one immutable row/head geometry before graph recording. */
+        explicit GdnPrefillBenchmarkFixture(
+            int row_count = kRows, int head_count = kHeads, int capture_rows = 0)
+            : rows(requirePositive(row_count)),
+              heads(requirePositive(head_count)),
+              snapshot_rows(requirePartialSnapshots(capture_rows, rows)),
+              q(static_cast<size_t>(rows) * heads * kKeyWidth, timing.stream),
+              k(static_cast<size_t>(rows) * heads * kKeyWidth, timing.stream),
+              v(static_cast<size_t>(rows) * heads * kValueWidth, timing.stream),
+              alpha(static_cast<size_t>(rows) * heads, timing.stream),
+              beta(static_cast<size_t>(rows) * heads, timing.stream),
+              a_log(heads, timing.stream),
+              dt_bias(heads, timing.stream),
+              output(static_cast<size_t>(rows) * heads * kValueWidth, timing.stream),
+              state(static_cast<size_t>(heads) * kKeyWidth * kValueWidth, timing.stream)
+        {
+            if (snapshot_rows > 0)
+                snapshots = std::make_unique<DeviceFloatBuffer>(
+                    static_cast<size_t>(snapshot_rows) * heads * kKeyWidth * kValueWidth,
+                    timing.stream);
+        }
 
         /** @brief Launch the exact production prefill recurrence once. */
         void launch()
@@ -461,14 +475,14 @@ namespace
                 output.get(),
                 state.get(),
                 state.get(),
-                kRows,
-                kHeads,
+                rows,
+                heads,
                 kKeyWidth,
                 kValueWidth,
                 /*use_qk_l2norm=*/true,
-                /*state_snapshots=*/nullptr,
-                /*snapshot_stride_floats=*/0,
-                /*max_snapshot_rows=*/0,
+                snapshots ? snapshots->get() : nullptr,
+                heads * kKeyWidth * kValueWidth,
+                snapshot_rows,
                 /*device_idx=*/0,
                 timing.stream);
             if (!launched)
@@ -499,6 +513,32 @@ namespace
                    static_cast<double>(iterations);
         }
 
+        /**
+         * @brief Measure retained production replay, excluding capture/setup.
+         *
+         * Zero inputs and zero state remain zero across replays. No reset or
+         * initialization operation is included in the timed graph. The final
+         * event joins every replay before the executable or storage retires.
+         */
+        double timeCapturedAverageUs(int warmups, int iterations)
+        {
+            RetainedHipGraph graph;
+            graph.record(timing.stream, [&]() { launch(); return true; });
+            for (int i = 0; i < warmups; ++i)
+                graph.replay(timing.stream);
+            checkHip(hipEventRecord(timing.start, timing.stream), "start captured prefill timing");
+            for (int i = 0; i < iterations; ++i)
+                graph.replay(timing.stream);
+            checkHip(hipEventRecord(timing.stop, timing.stream), "stop captured prefill timing");
+            checkHip(hipEventSynchronize(timing.stop), "join captured prefill timing");
+            float elapsed_ms = 0.0f;
+            checkHip(hipEventElapsedTime(&elapsed_ms, timing.start, timing.stop), "read captured prefill timing");
+            return static_cast<double>(elapsed_ms) * 1000.0 / iterations;
+        }
+
+        const int rows;
+        const int heads;
+        const int snapshot_rows;
         ROCmDeviceSelection device;
         ROCmTimingContext timing;
         DeviceFloatBuffer q;
@@ -510,8 +550,61 @@ namespace
         DeviceFloatBuffer dt_bias;
         DeviceFloatBuffer output;
         DeviceFloatBuffer state;
+        std::unique_ptr<DeviceFloatBuffer> snapshots;
+
+    private:
+        /** @brief Reject invalid geometry before constructing device allocations. */
+        static int requirePositive(int dimension)
+        {
+            if (dimension <= 0)
+                throw std::invalid_argument("GDN prefill benchmark dimensions must be positive");
+            return dimension;
+        }
+
+        /** @brief Keep this probe on long prefill, not the complete verifier route. */
+        static int requirePartialSnapshots(int capture_rows, int rows)
+        {
+            if (capture_rows < 0 || capture_rows >= rows)
+                throw std::invalid_argument("Prefill snapshots must be absent or shorter than the row capacity");
+            return capture_rows;
+        }
     };
 } // namespace
+
+/** @brief Compare captured long-prefill economy before and after TP head sharding. */
+TEST(Perf__ROCmGatedDeltaNetVerifierRows, PrefillHeadShardCapturedSweep)
+{
+    std::cout << "backend,case,M,heads,d_k,d_v,median_us\n";
+    for (int heads : {32, 16, 8, 4, 48, 3})
+        for (int rows : {64, 256, 448, 512})
+        {
+            GdnPrefillBenchmarkFixture fixture(rows, heads);
+            std::array<double, 3> samples{};
+            for (double &sample : samples)
+                sample = fixture.timeCapturedAverageUs(/*warmups=*/5, /*iterations=*/20);
+            for (size_t index = 0; index < samples.size(); ++index)
+                std::cout << std::setprecision(12) << "gdn_prefill_sample," << rows << ','
+                          << heads << ',' << index << ',' << samples[index] << '\n';
+            std::sort(samples.begin(), samples.end());
+            EXPECT_GT(samples[1], 0.0);
+            std::cout << std::fixed << std::setprecision(3)
+                      << "rocm,gdn_prefill_captured," << rows << ',' << heads
+                      << ",128,128," << samples[1] << '\n';
+        }
+}
+
+/** @brief Profile exactly one captured long-prefill shape, never a mixed sweep. */
+TEST(Perf__ROCmGatedDeltaNetVerifierRows, PrefillHeadShardProfiler)
+{
+    const int rows = static_cast<int>(positiveEnv("LLAMINAR_ROCM_GDN_PREFILL_ROWS", 448));
+    const int heads = static_cast<int>(positiveEnv("LLAMINAR_ROCM_GDN_PREFILL_HEADS", 16));
+    const int snapshots = static_cast<int>(positiveEnv("LLAMINAR_ROCM_GDN_PREFILL_SNAPSHOT_ROWS", 0));
+    GdnPrefillBenchmarkFixture fixture(rows, heads, snapshots);
+    const double elapsed = fixture.timeCapturedAverageUs(/*warmups=*/0, /*iterations=*/1);
+    EXPECT_GT(elapsed, 0.0);
+    std::cout << "rocm,gdn_prefill_profile," << rows << ',' << heads
+              << ",128,128," << elapsed << ",snapshot_rows=" << snapshots << '\n';
+}
 
 /** @brief Isolate Qwen3.8-27B's 48-head recurrence capacity tax without model setup. */
 TEST(Perf__ROCmGatedDeltaNetVerifierRows, Qwen38DeviceCountedCapacity)

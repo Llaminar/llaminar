@@ -4,7 +4,12 @@
  *
  * All CUDA runtime and NCCL API calls are isolated in NCCLBackendCUDA.cu to avoid
  * conflicts with HIP headers when building with both CUDA and ROCm support.
- * This file only uses wrapper functions from the nccl_cuda_wrappers namespace.
+ * This file only uses wrapper functions from the nccl_backend_detail namespace.
+ *
+ * Setup owns only the requested DeviceGroup. The rank-local coordinator is
+ * the sole native communicator owner for both collectives and endpoint-stream
+ * copies. Creating a second family would duplicate buffers/proxy resources and
+ * could initialize devices excluded by the caller's placement contract.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -18,8 +23,6 @@
 
 #ifdef HAVE_NCCL
 #include <mpi.h>
-#include <atomic>
-#include <thread>
 #include <string>
 #include <cstring>
 #include <algorithm>
@@ -427,14 +430,9 @@ namespace llaminar2
                      << num_ranks_ << " GPU(s), local_rank=" << local_rank_);
         }
 
-        // Initialize all-GPU copy communicator (for efficient cross-device copy)
-        // This must happen AFTER the main communicator setup to avoid conflicts
-        if (!initializeCopyComms())
-        {
-            LOG_WARN("NCCLBackend: Failed to initialize copy communicators, cross-device copy may fall back to P2P");
-            // This is not fatal - copy() will fail gracefully if needed
-        }
-
+        // Copies already use the group's coordinator and exact endpoint
+        // streams. Readiness must not acquire any other visible devices or a
+        // duplicate native communicator family for the same participants.
         initialized_ = true;
         LOG_DEBUG("[NCCLReady] status=ready"
                  << " mode=" << (is_multi_gpu_single_process_ ? "multi_gpu_single_process" : (is_multi_process ? "multi_process" : "single_gpu"))
@@ -496,9 +494,6 @@ namespace llaminar2
             strided_allgather_temp_buf_ = nullptr;
             strided_allgather_temp_size_ = 0;
         }
-
-        // Free all-GPU copy communicators
-        shutdownCopyComms();
 
         initialized_ = false;
         LOG_DEBUG("NCCLBackend: Shutdown complete");
@@ -1537,7 +1532,8 @@ namespace llaminar2
         CollectiveDataType dtype,
         CollectiveOp op,
         const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
-        const std::vector<void *> &streams)
+        const std::vector<void *> &streams,
+        const std::vector<NativeCollectiveRows> &live_rows)
     {
 #ifdef HAVE_NCCL
         if (!initialized_)
@@ -1570,7 +1566,7 @@ namespace llaminar2
         }
 
         if (!coordinator_->allreduceWithSidebandsMultiOnStreams(
-                buffers, count, dtype, op, sidebands, streams))
+                buffers, count, dtype, op, sidebands, streams, live_rows))
         {
             last_error_ = "NCCLCoordinator allreduceWithSidebandsMultiOnStreams failed: " +
                           coordinator_->lastError();
@@ -1795,6 +1791,59 @@ namespace llaminar2
 #ifdef HAVE_NCCL
         return initialized_ && coordinator_ && is_multi_gpu_single_process_;
 #else
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::nativeRowsOnStream(
+        NativeRowCollective operation, const void *send, void *receive,
+        const NativeCollectiveRows &rows, CollectiveDataType dtype,
+        CollectiveOp reduction, int participant, void *stream, unsigned long long *payload_bytes)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_ || !coordinator_ || !is_multi_gpu_single_process_)
+        {
+            last_error_ = "NCCL live rows require an initialized rank-local communicator";
+            return false;
+        }
+        if (!coordinator_->nativeRowsOnStream(operation, send, receive, rows, dtype,
+                reduction, participant, stream, payload_bytes))
+        {
+            last_error_ = "NCCL live-row enqueue failed: " + coordinator_->lastError();
+            return false;
+        }
+        return true;
+#else
+        (void)operation; (void)send; (void)receive; (void)rows; (void)dtype;
+        (void)reduction; (void)participant; (void)stream; (void)payload_bytes;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::reduceScatterSingleDeviceOnStream(
+        const void *send_buf, void *recv_buf, size_t receive_count,
+        CollectiveDataType dtype, int device_idx, void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_ || !coordinator_ || !is_multi_gpu_single_process_)
+        {
+            last_error_ = "NCCL native reduce-scatter requires an initialized rank-local communicator";
+            return false;
+        }
+        // The coordinator records directly on this participant's exact stream;
+        // its worker queue and private streams do not participate in capture.
+        if (!coordinator_->reduceScatterSingleDeviceOnStream(
+                send_buf, recv_buf, receive_count, dtype, device_idx, stream))
+        {
+            last_error_ = "NCCL reduce-scatter enqueue failed: " + coordinator_->lastError();
+            return false;
+        }
+        return true;
+#else
+        (void)send_buf; (void)recv_buf; (void)receive_count;
+        (void)dtype; (void)device_idx; (void)stream;
+        last_error_ = "NCCL not available";
         return false;
 #endif
     }
@@ -2452,152 +2501,6 @@ namespace llaminar2
     // Type Conversion Helpers (removed - now using int-based converters above)
     // =========================================================================
     // See toNcclDataTypeInt() and toNcclRedOpInt() for the portable implementations.
-
-    // =========================================================================
-    // All-GPU NCCL Communicator for Copy Operations
-    // =========================================================================
-
-#ifdef HAVE_NCCL
-    bool NCCLBackend::initializeCopyComms()
-    {
-        // Get total number of CUDA devices
-        int device_count = 0;
-        if (!nccl_backend_detail::cudaGetDeviceCountWrapper(&device_count))
-        {
-            last_error_ = "NCCLBackend::initializeCopyComms: cudaGetDeviceCount failed";
-            LOG_ERROR(last_error_);
-            return false;
-        }
-
-        if (device_count < 2)
-        {
-            // No need for inter-GPU copy communicator if only 0 or 1 GPU
-            LOG_DEBUG("[NCCLBackend] Skipping copy communicator init: only " << device_count << " CUDA device(s)");
-            copy_comms_initialized_ = true;
-            copy_num_gpus_ = device_count;
-            return true;
-        }
-
-        LOG_DEBUG("[NCCLBackend] Initializing all-GPU copy communicator for " << device_count << " CUDA devices");
-
-        copy_num_gpus_ = device_count;
-        copy_comms_.resize(device_count, nullptr);
-        copy_streams_.resize(device_count, nullptr);
-
-        // Create streams for each device FIRST (before NCCL init)
-        for (int i = 0; i < device_count; ++i)
-        {
-            nccl_backend_detail::cudaSetDeviceOrdinal(i);
-            void *stream_ptr = nullptr;
-            if (!nccl_backend_detail::cudaCreateStream(&stream_ptr))
-            {
-                last_error_ = "NCCLBackend::initializeCopyComms: cudaStreamCreate failed for device " + std::to_string(i);
-                LOG_ERROR(last_error_);
-                // Cleanup already created streams
-                for (int j = 0; j < i; ++j)
-                {
-                    nccl_backend_detail::cudaSetDeviceOrdinal(j);
-                    nccl_backend_detail::cudaDestroyStream(copy_streams_[j]);
-                }
-                copy_streams_.clear();
-                return false;
-            }
-            copy_streams_[i] = stream_ptr;
-        }
-
-        // Generate unique ID for this communicator group
-        std::vector<char> unique_id_buffer(nccl_backend_detail::ncclUniqueIdSize());
-        if (!nccl_backend_detail::ncclGetUniqueIdWrapper(unique_id_buffer.data()))
-        {
-            last_error_ = "NCCLBackend::initializeCopyComms: ncclGetUniqueId failed";
-            LOG_ERROR(last_error_);
-            shutdownCopyComms();
-            return false;
-        }
-
-        // Initialize communicators using threaded ncclCommInitRank
-        // Each GPU must call ncclCommInitRank in a separate thread
-        std::vector<std::thread> init_threads;
-        std::atomic<int> init_errors{0};
-        std::vector<std::string> thread_errors(device_count);
-
-        for (int i = 0; i < device_count; ++i)
-        {
-            init_threads.emplace_back([this, i, device_count, &unique_id_buffer, &init_errors, &thread_errors]()
-                                      {
-                nccl_backend_detail::cudaSetDeviceOrdinal(i);
-                void* comm_ptr = nullptr;
-                constexpr std::string_view copy_network_module =
-                    ncclNetworkModuleName(NCCLNetworkModule::Socket);
-                if (!nccl_backend_detail::ncclCommInitRankWithNetworkWrapper(
-                        &comm_ptr,
-                        device_count,
-                        unique_id_buffer.data(),
-                        i,
-                        copy_network_module.data(),
-                        thread_errors[i]))
-                {
-                    LOG_ERROR("ncclCommInitRankConfig failed for copy comm GPU "
-                              << i << ": " << thread_errors[i]);
-                    init_errors++;
-                }
-                else
-                {
-                    copy_comms_[i] = comm_ptr;
-                } });
-        }
-
-        // Wait for all threads to complete
-        for (auto &t : init_threads)
-        {
-            t.join();
-        }
-
-        if (init_errors > 0)
-        {
-            last_error_ = "NCCLBackend::initializeCopyComms: ncclCommInitRank failed for " + std::to_string(init_errors.load()) + " GPU(s)";
-            LOG_ERROR(last_error_);
-            shutdownCopyComms();
-            return false;
-        }
-
-        copy_comms_initialized_ = true;
-        LOG_DEBUG("[NCCLBackend] All-GPU copy communicator initialized with " << device_count << " devices");
-        return true;
-    }
-
-    void NCCLBackend::shutdownCopyComms()
-    {
-        if (!copy_comms_initialized_ && copy_comms_.empty() && copy_streams_.empty())
-        {
-            return;
-        }
-
-        for (size_t i = 0; i < copy_comms_.size(); ++i)
-        {
-            if (copy_comms_[i])
-            {
-                nccl_backend_detail::cudaSetDeviceOrdinal(static_cast<int>(i));
-                nccl_backend_detail::ncclCommDestroyWrapper(copy_comms_[i]);
-            }
-        }
-        copy_comms_.clear();
-
-        for (size_t i = 0; i < copy_streams_.size(); ++i)
-        {
-            if (copy_streams_[i])
-            {
-                nccl_backend_detail::cudaSetDeviceOrdinal(static_cast<int>(i));
-                nccl_backend_detail::cudaDestroyStream(copy_streams_[i]);
-            }
-        }
-        copy_streams_.clear();
-
-        copy_num_gpus_ = 0;
-        copy_comms_initialized_ = false;
-        LOG_DEBUG("[NCCLBackend] Copy communicators shutdown complete");
-    }
-#endif
 
     // =========================================================================
     // Data Copy Operations

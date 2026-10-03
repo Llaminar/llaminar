@@ -60,17 +60,17 @@ namespace llaminar2
 
     bool MoEOverlayDeviceInitialPhysicalSlot::valid() const noexcept
     {
-        return key.valid() && entered_epoch != 0u && triplet.complete();
+        return key.valid() && entered_epoch != 0u && payload.ready();
     }
 
     bool MoEOverlayDeviceStagedPhysicalArrival::valid() const noexcept
     {
-        return key.valid() && triplet.complete();
+        return key.valid() && payload.ready();
     }
 
     bool MoEOverlayDeviceActivePhysicalSlot::valid() const noexcept
     {
-        return key.valid() && entered_epoch != 0u && triplet.complete();
+        return key.valid() && entered_epoch != 0u && payload.ready();
     }
 
     bool MoEOverlayDevicePhysicalInventorySnapshot::valid() const noexcept
@@ -90,7 +90,7 @@ namespace llaminar2
         {
             std::uint64_t entered_epoch = 0u;
             bool bootstrap_allocation = false;
-            MoEOverlayPreparedExpertTriplet triplet;
+            MoEOverlayPreparedExpertPayload payload;
         };
 
         /** Immutable identity and mutable transport phase of one Dynamic wave. */
@@ -105,7 +105,7 @@ namespace llaminar2
             std::vector<MoEOverlayTierMigration> migrations;
             std::map<
                 MoEOverlayDevicePhysicalSlotKey,
-                MoEOverlayPreparedExpertTriplet>
+                MoEOverlayPreparedExpertPayload>
                 staged_arrivals;
             bool staged = false;
             bool published = false;
@@ -137,6 +137,7 @@ namespace llaminar2
         mutable std::mutex mutex;
         std::uint64_t current_epoch = 0u;
         std::vector<int> local_participant_ids;
+        DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
         std::map<MoEOverlayDevicePhysicalSlotKey, ActiveSlot> active;
         std::optional<PendingWave> pending;
     };
@@ -145,7 +146,8 @@ namespace llaminar2
         Config config)
         : impl_(std::make_unique<Impl>())
     {
-        if (config.initial_epoch == 0u ||
+        if ((config.movable_projections != DeviceMoEProjectionSet::CompleteExpert &&
+             config.movable_projections != DeviceMoEProjectionSet::GateUp) || config.initial_epoch == 0u ||
             config.local_participant_ids.empty() ||
             !std::is_sorted(
                 config.local_participant_ids.begin(),
@@ -159,11 +161,13 @@ namespace llaminar2
                 "device physical slot ledger requires a positive epoch and sorted unique local participants");
         }
         impl_->current_epoch = config.initial_epoch;
+        impl_->movable_projections = config.movable_projections;
         impl_->local_participant_ids =
             std::move(config.local_participant_ids);
         for (auto &slot : config.initial_slots)
         {
-            if (!slot.valid() || slot.entered_epoch > config.initial_epoch ||
+            if (!slot.valid() || !slot.payload.readyFor(impl_->movable_projections) ||
+                slot.entered_epoch > config.initial_epoch ||
                 !impl_->local(slot.key.participant_id))
             {
                 throw std::invalid_argument(
@@ -174,7 +178,7 @@ namespace llaminar2
                 Impl::ActiveSlot{
                     .entered_epoch = slot.entered_epoch,
                     .bootstrap_allocation = slot.bootstrap_allocation,
-                    .triplet = std::move(slot.triplet),
+                    .payload = std::move(slot.payload),
                 });
             if (!inserted)
                 throw std::invalid_argument(
@@ -221,7 +225,7 @@ namespace llaminar2
             {
                 const auto found = impl_->active.find(source);
                 if (found == impl_->active.end() ||
-                    !found->second.triplet.complete())
+                    !found->second.payload.readyFor(impl_->movable_projections))
                 {
                     return reject(
                         error,
@@ -250,8 +254,8 @@ namespace llaminar2
         return true;
     }
 
-    std::optional<MoEOverlayPreparedExpertTriplet>
-    MoEOverlayDevicePhysicalSlotLedger::sourceTriplet(
+    std::optional<MoEOverlayPreparedExpertPayload>
+    MoEOverlayDevicePhysicalSlotLedger::sourcePayload(
         const MoEOverlayDevicePhysicalMovementBatch &batch,
         const MoEOverlayDevicePhysicalSlotKey &key,
         std::string *error) const noexcept
@@ -268,14 +272,14 @@ namespace llaminar2
             return std::nullopt;
         }
         const auto found = impl_->active.find(key);
-        if (found == impl_->active.end() || !found->second.triplet.complete())
+        if (found == impl_->active.end() || !found->second.payload.readyFor(impl_->movable_projections))
         {
             reject(
                 error,
                 "device physical slot ledger source is not active");
             return std::nullopt;
         }
-        return found->second.triplet;
+        return found->second.payload;
     }
 
     bool MoEOverlayDevicePhysicalSlotLedger::stage(
@@ -304,13 +308,14 @@ namespace llaminar2
 
         std::map<
             MoEOverlayDevicePhysicalSlotKey,
-            MoEOverlayPreparedExpertTriplet>
+            MoEOverlayPreparedExpertPayload>
             staged;
         for (auto &arrival : arrivals)
         {
-            if (!arrival.valid() || !expected.contains(arrival.key) ||
+            if (!arrival.valid() || !arrival.payload.readyFor(impl_->movable_projections) ||
+                !expected.contains(arrival.key) ||
                 !staged.emplace(
-                           arrival.key, std::move(arrival.triplet)).second)
+                           arrival.key, std::move(arrival.payload)).second)
             {
                 return reject(
                     error,
@@ -342,22 +347,22 @@ namespace llaminar2
                 error,
                 "device physical slot ledger publish has invalid lifecycle or epoch");
         }
-        for (const auto &[key, triplet] :
+        for (const auto &[key, payload] :
              impl_->pending->staged_arrivals)
         {
-            if (impl_->active.contains(key) || !triplet.complete())
+            if (impl_->active.contains(key) || !payload.readyFor(impl_->movable_projections))
                 return reject(
                     error,
                     "device physical slot ledger destination changed before publication");
         }
-        for (auto &[key, triplet] : impl_->pending->staged_arrivals)
+        for (auto &[key, payload] : impl_->pending->staged_arrivals)
         {
             impl_->active.emplace(
                 key,
                 Impl::ActiveSlot{
                     .entered_epoch = batch.candidate_epoch,
                     .bootstrap_allocation = false,
-                    .triplet = std::move(triplet),
+                    .payload = std::move(payload),
                 });
         }
         impl_->pending->staged_arrivals.clear();
@@ -403,7 +408,7 @@ namespace llaminar2
                 .entered_epoch = found->second.entered_epoch,
                 .bootstrap_allocation =
                     found->second.bootstrap_allocation,
-                .triplet = std::move(found->second.triplet),
+                .payload = std::move(found->second.payload),
             });
             impl_->active.erase(found);
         }
@@ -461,7 +466,7 @@ namespace llaminar2
                 .key = key,
                 .entered_epoch = slot.entered_epoch,
                 .bootstrap_allocation = slot.bootstrap_allocation,
-                .triplet = slot.triplet,
+                .payload = slot.payload,
             });
         }
         if (!result.valid())

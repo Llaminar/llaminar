@@ -57,6 +57,7 @@
 #include "../../../utils/PrefillGraphBucketDefaults.h"
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
+#include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "kernels/common/NativeVNNIDispatchCache.h"
 #include "kernels/common/DeviceRowWorkGrid.h"
 #include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
@@ -2180,13 +2181,18 @@ struct DeviceMoEExpertDescriptorView
     int32_t owner_participant;
     int32_t local_slot;
     uint32_t flags;
-    uint32_t weight_format;
-    uint32_t reserved;
+    llaminar2::DeviceMoEWeightFormat weight_format;
+    llaminar2::DeviceMoEWeightFormat floating_allocation_format;
+    llaminar2::DeviceMoEProjectionSet projection_set;
 };
 
 static_assert(
     sizeof(DeviceMoEExpertDescriptorView) == 240,
     "ROCm GEMV expert descriptor view must match the shared runtime ABI");
+
+static_assert(offsetof(DeviceMoEExpertDescriptorView, weight_format) == 232);
+static_assert(offsetof(DeviceMoEExpertDescriptorView, floating_allocation_format) == 234);
+static_assert(offsetof(DeviceMoEExpertDescriptorView, projection_set) == 236);
 
 struct DeviceMoEPlacementBankView
 {
@@ -4205,10 +4211,10 @@ __global__ void gemv_native_vnni_reduce_kernel_t(
 /**
  * @brief Publishes one runtime verifier row from ordered split-K partials.
  *
- * Grid Y owns the verifier row.  Consequently the reducer's register state,
- * launch shape, and ascending-KB addition order do not depend on the total
- * speculative depth.  This is the same reduction tree used by serial M=1
- * decode, applied independently to each row's `[KB][M][N]` partial slice.
+ * Grid Y owns a bounded row worker, not an allocation-capacity row. A counted
+ * replay visits only live rows by grid stride. The reducer's register state
+ * and ascending-KB addition order do not depend on speculative capacity; this
+ * is serial M=1's reduction applied to each row's `[KB][M][N]` partial slice.
  */
 template <int TILE_N, int CPT>
 __global__ void gemv_native_vnni_reduce_small_m_kernel_t(
@@ -4216,31 +4222,33 @@ __global__ void gemv_native_vnni_reduce_small_m_kernel_t(
     float* __restrict__ d_C_fp32,                // [M x N] output
     int M, int N, int kblocks, llaminar2::DeviceRowRange rows)
 {
-    const int row = static_cast<int>(blockIdx.y);
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
-    // Never read inactive partials left by an earlier, wider replay.
-    if (row >= rows.activeRows())
-        return;
-
-    #pragma unroll
-    for (int c = 0; c < CPT; ++c)
+    // The count is borrowed once. Physical M remains the split-K plane stride
+    // after a large-to-small replay; no inactive partial is read or published.
+    const int active_m = rows.activeRows();
+    for (int row = static_cast<int>(blockIdx.y); row < active_m;
+         row += static_cast<int>(gridDim.y))
     {
-        const int n = n_base + c;
-        if (n >= N)
-            continue;
-
-        float sum = 0.0f;
-        #pragma unroll 16
-        for (int kb = 0; kb < kblocks; ++kb)
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
         {
-            const size_t idx =
-                (static_cast<size_t>(kb) * static_cast<size_t>(M) +
-                 static_cast<size_t>(row)) * static_cast<size_t>(N) +
-                static_cast<size_t>(n);
-            sum = rocm_native_vnni_accumulate_rn(
-                sum, d_partial_fp32[idx]);
+            const int n = n_base + c;
+            if (n >= N)
+                continue;
+
+            float sum = 0.0f;
+            #pragma unroll 16
+            for (int kb = 0; kb < kblocks; ++kb)
+            {
+                const size_t idx =
+                    (static_cast<size_t>(kb) * static_cast<size_t>(M) +
+                     static_cast<size_t>(row)) * static_cast<size_t>(N) +
+                    static_cast<size_t>(n);
+                sum = rocm_native_vnni_accumulate_rn(
+                    sum, d_partial_fp32[idx]);
+            }
+            d_C_fp32[static_cast<size_t>(row) * N + n] = sum;
         }
-        d_C_fp32[static_cast<size_t>(row) * N + n] = sum;
     }
 }
 
@@ -4931,10 +4939,11 @@ __global__ void gemv_native_vnni_reduce_small_m_batched_kernel_t(
  * @brief Runtime-row NativeVNNI verifier GEMV with fixed four-row work tiles.
  *
  * A workgroup decodes each packed weight block once and applies it to at most
- * four verifier rows.  Larger speculative batches add independent Z-grid tiles;
- * they never enlarge the accumulator array or alter an existing row's block
- * order.  Split-K output is always written to declared workspace so the
- * following reducer can publish partitions in serial-M1 order.
+ * four verifier rows. Counted captures use bounded Z-grid workers that visit
+ * further live tiles by grid stride, rather than scheduling idle capacity.
+ * Workers never enlarge the accumulator array or alter an existing row's
+ * block order. Split-K uses the fixed physical workspace stride so the reducer
+ * can publish partitions in serial-M1 order on every replay.
  */
 template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT>
 __global__ void gemv_native_vnni_small_m_kernel_t(
@@ -4959,82 +4968,84 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
 
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
     const int kb = blockIdx.y;
-    const int row_base = static_cast<int>(blockIdx.z) * ROWS_PER_TILE;
-    // The whole workgroup exits before weight decode when its tile is idle.
-    // M remains the physical partial-buffer stride on every replay.
+    // Geometry supplies enough column/K parallelism before admitting extra
+    // row workers. The whole CTA borrows one count; padding owns no dot product.
     const int active_m = rows.activeRows();
-    if (row_base >= active_m)
-        return;
 
     const int blocks_per_row = K / 32;
     const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
     const int b_start = kb * b_per;
     const int b_end = min(b_start + b_per, blocks_per_row);
 
-    float acc[ROWS_PER_TILE][CPT];
-    #pragma unroll
-    for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
+    for (int row_base = static_cast<int>(blockIdx.z) * ROWS_PER_TILE;
+         row_base < active_m;
+         row_base += static_cast<int>(gridDim.z) * ROWS_PER_TILE)
     {
-        #pragma unroll
-        for (int c = 0; c < CPT; ++c)
-            acc[tile_row][c] = 0.0f;
-    }
-
-    #pragma unroll
-    for (int c = 0; c < CPT; ++c)
-    {
-        const int n = n_base + c;
-        if (n >= N)
-            continue;
-
-        for (int b = b_start; b < b_end; ++b)
+        float acc[ROWS_PER_TILE][CPT];
+#pragma unroll
+        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
         {
-            int32_t packed_groups[8];
-            const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
-            const uint8_t* payload = d_payload + linear * NVNNITraits<FMT>::payload_bytes;
-            moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
+#pragma unroll
+            for (int c = 0; c < CPT; ++c)
+                acc[tile_row][c] = 0.0f;
+        }
 
-            #pragma unroll
+#pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            const int n = n_base + c;
+            if (n >= N)
+                continue;
+
+            for (int b = b_start; b < b_end; ++b)
+            {
+                int32_t packed_groups[8];
+                const size_t linear =
+                    static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                const uint8_t* payload = d_payload + linear * NVNNITraits<FMT>::payload_bytes;
+                moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
+
+#pragma unroll
+                for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
+                {
+                    const int row = row_base + tile_row;
+                    if (row >= active_m)
+                        continue;
+                    native_vnni_small_m_accumulate_row<FMT>(
+                        acc[tile_row][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, row, K,
+                        blocks_per_row, b, packed_groups, payload, d_block_scales, d_block_mins,
+                        d_block_emins, linear);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            const int n = n_base + c;
+            if (n >= N)
+                continue;
+
+#pragma unroll
             for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
             {
                 const int row = row_base + tile_row;
                 if (row >= active_m)
                     continue;
-                native_vnni_small_m_accumulate_row<FMT>(
-                    acc[tile_row][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
-                    row, K, blocks_per_row, b, packed_groups, payload, d_block_scales,
-                    d_block_mins, d_block_emins, linear);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (int c = 0; c < CPT; ++c)
-    {
-        const int n = n_base + c;
-        if (n >= N)
-            continue;
-
-        #pragma unroll
-        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
-        {
-            const int row = row_base + tile_row;
-            if (row >= active_m)
-                continue;
-            const size_t out_idx =
-                static_cast<size_t>(row) * static_cast<size_t>(N) +
-                static_cast<size_t>(n);
-            if (kblocks == 1)
-            {
-                d_C_fp32[out_idx] = acc[tile_row][c];
-            }
-            else
-            {
-                const size_t partial_idx =
-                    (static_cast<size_t>(kb) * static_cast<size_t>(M) +
-                     static_cast<size_t>(row)) * static_cast<size_t>(N) +
-                    static_cast<size_t>(n);
-                d_partial_fp32[partial_idx] = acc[tile_row][c];
+                const size_t out_idx =
+                    static_cast<size_t>(row) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                if (kblocks == 1)
+                {
+                    d_C_fp32[out_idx] = acc[tile_row][c];
+                }
+                else
+                {
+                    const size_t partial_idx = (static_cast<size_t>(kb) * static_cast<size_t>(M) +
+                                                static_cast<size_t>(row)) *
+                                                   static_cast<size_t>(N) +
+                                               static_cast<size_t>(n);
+                    d_partial_fp32[partial_idx] = acc[tile_row][c];
+                }
             }
         }
     }
@@ -6095,8 +6106,11 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         const int tile_m = min(workspace_tile_rows, M - row_base);
         const auto tile_rows = rows.slice(row_base, tile_m);
         const int tile_rows_per_group = native_vnni_verifier_rows_per_tile(tile_m);
-        const int tile_row_groups =
-            (tile_m + tile_rows_per_group - 1) / tile_rows_per_group;
+        const int tile_row_groups = llaminar2::deviceRowWorkerGroups(
+            tile_rows, tile_rows_per_group,
+            static_cast<int64_t>(grid_n) * kb, target_total_waves);
+        const int reducer_row_groups = llaminar2::deviceRowWorkerGroups(
+            tile_rows, 1, grid_n, target_total_waves);
         const int8_t* tile_a =
             d_A_int8 + static_cast<size_t>(row_base) * K;
         const float* tile_scales =
@@ -6146,7 +6160,7 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         {
             hipLaunchKernelGGL(
                 HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_kernel_t<TN, CPT>),
-                dim3(grid_n, tile_m), dim3(THREADS, 1, 1), 0,
+                dim3(grid_n, reducer_row_groups), dim3(THREADS, 1, 1), 0,
                 static_cast<hipStream_t>(stream),
                 d_partial_fp32, tile_c, tile_m, N, kb, tile_rows);
         }

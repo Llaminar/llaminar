@@ -1,3 +1,18 @@
+/**
+ * @file Perf__ROCmMoEVerifierPrefill.cpp
+ * @brief Captured routed/shared MoE economy and arithmetic evidence on ROCm.
+ *
+ * Persistent prepared experts, explicit streams and fixed workspaces mirror
+ * production. Correctness is compared with serial diagnostic rows outside
+ * timing; captured timing never includes weight preparation or host transfers.
+ * The shard probe retains global route capacity while filtering ownership,
+ * separating apportioned-expert compute scaling from transport and route skew.
+ * The adaptive-verifier capacity probe holds live routes and prepared weight
+ * identities constant while varying retained graph capacity; spare storage
+ * must not be mistaken for additional expert computation in that comparison.
+ * Benchmark geometry admission is shared with CUDA and rejects malformed
+ * explicit selectors instead of silently substituting or dropping shapes.
+ */
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
 
@@ -12,6 +27,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include "../../../mocks/MockComputeStage.h"
+#include "../../../utils/BenchmarkGeometrySelection.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/NativeVNNITrainerEvidence.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -88,6 +104,7 @@ namespace
 {
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
     using llaminar2::TransferEngine;
+    using llaminar2::test::benchmarkGeometryIntegers;
 
     struct CloseMetrics
     {
@@ -315,26 +332,6 @@ namespace
             start = comma + 1;
         }
         return false;
-    }
-
-    std::vector<int> envCsvInts(
-        const char *name,
-        std::initializer_list<int> defaults)
-    {
-        const char *value = std::getenv(name);
-        if (!value || !*value)
-            return std::vector<int>(defaults);
-
-        std::vector<int> parsed;
-        std::stringstream stream(value);
-        std::string token;
-        while (std::getline(stream, token, ','))
-        {
-            const int number = std::atoi(token.c_str());
-            if (number > 0)
-                parsed.push_back(number);
-        }
-        return parsed.empty() ? std::vector<int>(defaults) : parsed;
     }
 
     std::shared_ptr<llaminar2::FP32Tensor> makeTensor(
@@ -1198,7 +1195,8 @@ namespace
         const llaminar2::test::QuantizedVerifierFormatCase *down_format = nullptr,
         bool canonical_route_split = false,
         const std::vector<float> *routing_indices_override = nullptr,
-        const std::vector<float> *routing_weights_override = nullptr)
+        const std::vector<float> *routing_weights_override = nullptr,
+        std::vector<double> *captured_samples_ms = nullptr)
     {
         /*
          * Keep this harness aligned with the Qwen3.6 MoE model shape.  The
@@ -1393,7 +1391,7 @@ namespace
         for (int i = 0; i < warmups; ++i)
             requireHipBenchBody(graph.launch(), "graph warmup replay");
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
-        const double graph_ms = timeHipEvents(
+        double graph_ms = timeHipEvents(
             stream,
             iterations,
             [&]()
@@ -1401,6 +1399,20 @@ namespace
                 return graph.launch();
             });
         EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        if (captured_samples_ms)
+        {
+            // A scaling probe needs repeat evidence, not one best observation.
+            // Reuse the same weights/graph so setup cannot contaminate samples.
+            captured_samples_ms->clear();
+            captured_samples_ms->push_back(graph_ms);
+            for (int sample = 1; sample < 7; ++sample)
+                captured_samples_ms->push_back(timeHipEvents(
+                    stream, iterations, [&]() { return graph.launch(); }));
+            auto sorted = *captured_samples_ms;
+            std::sort(sorted.begin(), sorted.end());
+            graph_ms = sorted[sorted.size() / 2];
+        }
 
         TransferEngine::publishDeviceWrite(grouped_output, device, stream);
         std::vector<float> grouped(
@@ -2253,7 +2265,7 @@ namespace
     /**
      * @brief Benchmark captured batch-invariant Q8 routing against serial M=1.
      *
-     * The grouped kernel owns one expert and one fixed four-row tile. Increasing
+     * The grouped kernel owns one expert and one fixed sixteen-row tile. Increasing
      * M adds independent tiles while preserving each row's serial K traversal
      * and reduction tree. The perfstats assertion prevents a batch-shaped GEMM
      * or hidden row-replay substitution from passing on coincidental equality.
@@ -4481,7 +4493,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_ProductionGGUFMixtureCandidatePairTrainer)
         "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_MAX_FINALISTS", 24);
     settings.finalist_margin = envPositiveDouble(
         "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_FINALIST_MARGIN", 0.05);
-    const std::vector<int> m_values = envCsvInts(
+    const std::vector<int> m_values = benchmarkGeometryIntegers(
         "LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_M",
         {64, 256, 1024, 2048, 4096, 8192, 16384});
     const int maximum_cells = envInt(
@@ -5040,8 +5052,15 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M24832256_BatchInvariantRouterEconomy)
     ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
     std::cout << "backend,case,m,graph_ms,router_int8_gops,rowwise_ms,speedup,index_bit_mismatches,"
                  "weight_bit_mismatches\n";
-    for (int rows : {2, 4, 8, 32, 256})
+    int measured_shapes = 0;
+    for (int rows : {2, 4, 8, 32, 256, 448, 512})
     {
+        // Isolate one physical M for profiler attachment, without introducing
+        // a different launch path or including other shapes in its evidence.
+        if (!envCsvContainsOrUnset("LLAMINAR_ROCM_MOE_BATCH_INVARIANT_ROUTER_ROWS",
+                                  std::to_string(rows).c_str()))
+            continue;
+        ++measured_shapes;
         SCOPED_TRACE(rows);
         const RouterBenchResult result = runROCmBatchInvariantRouterCase(rows);
         EXPECT_EQ(result.index_bit_mismatches, 0u);
@@ -5068,6 +5087,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M24832256_BatchInvariantRouterEconomy)
                   << result.index_bit_mismatches << ','
                   << result.weight_bit_mismatches << '\n';
     }
+    ASSERT_GT(measured_shapes, 0) << "Router row selector matched no supported benchmark shape";
 #endif
 }
 
@@ -5260,6 +5280,211 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M4_CanonicalRouteSplitUpperBound)
 #endif
 }
 
+/**
+ * @brief Measure the captured long-prefill canonical-route publication surface.
+ *
+ * The fixture owns real prepared expert descriptors and compares every result
+ * byte with serial decode. One declared geometry per invocation keeps profiler
+ * attribution separate from the timing sweep. No transport or reduced wire
+ * precision is substituted for the participant-local production pipeline.
+ */
+TEST(Perf__MoEVerifierPrefill, ROCm_LongPrefillCanonicalRoutes)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+    const int rows = envInt("LLAMINAR_ROCM_MOE_CANONICAL_PREFILL_ROWS", 512);
+    const auto &gateup = llaminar2::test::quantizedVerifierFormat("IQ2_S");
+    const auto &down = llaminar2::test::quantizedVerifierFormat("IQ4_XS");
+    const auto result = runROCmCase(
+        /*shared=*/false, rows,
+        /*routed_top_k=*/8, /*routed_num_experts=*/256,
+        /*case_name_override=*/"long_prefill_canonical_routes",
+        /*unique_routes=*/false, /*include_terminal_expert=*/true,
+        /*d_model=*/2048, /*intermediate=*/512,
+        &gateup, &down, /*canonical_route_split=*/true);
+    expectClose(result.metrics);
+    printResult(result);
+#endif
+}
+
+/**
+ * @brief Isolate balanced 1/2/4-participant expert compute with fixed routing.
+ *
+ * Experts are whole matrices, not TP-sharded N/K dimensions. Every token
+ * retains eight global slots and the same router weights; non-owned experts
+ * become inactive slots. The 512-capacity main graph contains 448 live rows,
+ * followed by a 64-row tail, matching the prefix-harvest benchmark workload.
+ * This measures a balanced compute bound, not multi-card transport or an
+ * assertion that real-model routing is balanced.
+ */
+TEST(Perf__MoEVerifierPrefill, ROCm_CapturedExpertShardScaling)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice()) GTEST_SKIP() << "No ROCm device available";
+    constexpr int experts = 256, top_k = 8;
+    const auto &gateup = llaminar2::test::quantizedVerifierFormat("IQ2_S");
+    const auto &down = llaminar2::test::quantizedVerifierFormat("IQ4_XS");
+    // An exact subset lets rocprof attach to one physical candidate without
+    // mixing another TP degree or row bucket into its dispatch evidence.
+    const auto degrees = benchmarkGeometryIntegers("LLAMINAR_ROCM_MOE_SCALING_DEGREES", {1, 2, 4});
+    const auto capacities = benchmarkGeometryIntegers("LLAMINAR_ROCM_MOE_SCALING_ROWS", {64, 512});
+    for (const int degree : degrees)
+        ASSERT_TRUE(degree == 1 || degree == 2 || degree == 4);
+    for (const int capacity : capacities)
+        ASSERT_TRUE(capacity == 64 || capacity == 512);
+    std::cout << "case,degree,capacity,live_rows,active_routes,sample_index,latency_us,max_abs_error\n";
+    for (const int degree : degrees)
+        for (const int rows : capacities)
+        {
+            const int live = rows == 512 ? 448 : rows;
+            auto routes = makeUniqueRoutingIndices(rows, top_k, experts);
+            auto weights = makeRoutingWeights(rows, top_k);
+            int active = 0;
+            for (int row = 0; row < rows; ++row)
+                for (int slot = 0; slot < top_k; ++slot)
+                {
+                    const int index = row * top_k + slot;
+                    if (row >= live || static_cast<int>(routes[index]) % degree != 0)
+                    {
+                        routes[index] = -1.0f;
+                        weights[index] = 0.0f;
+                    }
+                    else ++active;
+                }
+            ASSERT_EQ(active, live * top_k / degree);
+            std::vector<double> samples;
+            const auto result = runROCmCase(false, rows, top_k, experts,
+                "captured_expert_shard", false, false, 2048, 512,
+                &gateup, &down, degree > 1, &routes, &weights, &samples);
+            expectClose(result.metrics);
+            for (size_t index = 0; index < samples.size(); ++index)
+                std::cout << "moe_captured_shard," << degree << ',' << rows << ',' << live
+                          << ',' << active << ',' << index << ',' << std::setprecision(12)
+                          << samples[index] * 1000.0 << ',' << result.metrics.max_abs << '\n';
+        }
+#endif
+}
+
+/**
+ * @brief Isolate retained-verifier capacity overhead with identical live work.
+ *
+ * Fixed depth three admits four verifier rows, whereas unconstrained adaptive
+ * MTP retains sixteen. Both may execute the same four rows. Every inactive
+ * tail route is published with the real -1/zero-weight contract before capture;
+ * no host readback, production policy override, or different kernel is used.
+ * The shared registry supplies every quantized source format and strengthens
+ * otherwise degenerate IQ3_S/IQ4_XS witnesses. Reused and uniform expert routes
+ * distinguish dispatch overhead from expert-weight reuse.
+ *
+ * This opt-in speedometer is not a preflight timing gate or an image certificate.
+ * Format/profile/live-row/capacity selectors isolate one exact candidate per
+ * invocation; profiler attribution must exclude preparation and serial-oracle
+ * dispatches. Canonical timings use unprofiled captured HIP events.
+ * An explicit down-format selector admits a GGUF-derived mixed-format pair
+ * without sweeping an unnecessary Cartesian product or changing model weights.
+ */
+TEST(Perf__MoEVerifierPrefill, ROCm_AdaptiveVerifierCapacityTax)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+    if (envInt("LLAMINAR_ROCM_MOE_MTP_CAPACITY_PROBE", 0) == 0)
+        GTEST_SKIP() << "Set LLAMINAR_ROCM_MOE_MTP_CAPACITY_PROBE=1 for the capacity probe";
+
+    constexpr int hidden_size = 2048;
+    constexpr int expert_width = 512;
+    constexpr int expert_count = 256;
+    constexpr int top_k = 8;
+    const auto live_rows = benchmarkGeometryIntegers("LLAMINAR_ROCM_MOE_MTP_LIVE_ROWS", {4});
+    const auto capacities = benchmarkGeometryIntegers("LLAMINAR_ROCM_MOE_MTP_CAPACITIES", {4, 16});
+    const char *down_format = std::getenv("LLAMINAR_ROCM_MOE_MTP_DOWN_FORMAT");
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvOverride rowwise_env("LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    std::size_t observed_cases = 0;
+    std::cout
+        << "gateup_format,down_format,gateup_codebook,down_codebook,route_profile,"
+           "hidden_size,expert_width,expert_count,top_k,live_rows,capacity,"
+           "sample_index,graph_us,prepare_us,pipeline_us,bit_mismatches,"
+           "nonfinite_count\n";
+
+    for (const auto &format : llaminar2::test::quantizedMoEVerifierFormats())
+    {
+        if (!envCsvContainsOrUnset("LLAMINAR_MOE_VERIFIER_PREFILL_FORMATS", format.label))
+            continue;
+        const auto &down = down_format && *down_format
+            ? llaminar2::test::quantizedMoEVerifierFormat(down_format) : format;
+        for (const auto &[profile, unique_routes] : {
+                 std::pair{"reused", false}, std::pair{"uniform", true}})
+        {
+            if (!envCsvContainsOrUnset("LLAMINAR_ROCM_MOE_MTP_ROUTE_PROFILES", profile))
+                continue;
+            for (const int live : live_rows)
+                for (const int capacity : capacities)
+                {
+                    // Admission cannot replay more live rows than the retained
+                    // graph owns. The full standard comparison remains 4/16;
+                    // selectors may choose other supported verifier geometries.
+                    if (live > capacity)
+                        continue;
+                    SCOPED_TRACE(std::string(format.label) + '/' + down.label + '/' + profile +
+                                 "/live=" + std::to_string(live) +
+                                 "/capacity=" + std::to_string(capacity));
+                    auto routes = unique_routes
+                        ? makeUniqueRoutingIndices(capacity, top_k, expert_count)
+                        : makeRoutingIndices(capacity, top_k, expert_count);
+                    auto weights = makeRoutingWeights(capacity, top_k);
+                    // The first live rows, hidden inputs, owner IDs, routing
+                    // weights and expert seeds are identical at both capacities.
+                    // Tail rows remain allocated but consume no expert weights.
+                    for (int row = live; row < capacity; ++row)
+                        for (int slot = 0; slot < top_k; ++slot)
+                        {
+                            const auto index = static_cast<std::size_t>(row * top_k + slot);
+                            routes[index] = -1.0f;
+                            weights[index] = 0.0f;
+                        }
+                    ASSERT_EQ(std::count_if(routes.begin(), routes.end(),
+                        [](float expert) { return expert >= 0.0f; }), live * top_k);
+                    std::vector<double> samples;
+                    const auto result = runROCmCase(
+                        /*shared=*/false, capacity, top_k, expert_count,
+                        "adaptive_verifier_capacity_tax",
+                        /*unique_routes=*/false, /*include_terminal_expert=*/false,
+                        hidden_size, expert_width, &format, &down,
+                        /*canonical_route_split=*/false, &routes, &weights, &samples);
+                    expectClose(result.metrics);
+                    ASSERT_FALSE(samples.empty());
+                    // Compare only captured GPU intervals across capacities.
+                    // The serial oracle visits inactive rows for byte proof;
+                    // its host time is deliberately not a speedup denominator.
+                    for (std::size_t sample = 0; sample < samples.size(); ++sample)
+                        std::cout << format.label << ',' << down.label << ','
+                                  << static_cast<unsigned>(format.device_execution_codebook_id)
+                                  << ',' << static_cast<unsigned>(down.device_execution_codebook_id)
+                                  << ',' << profile << ',' << hidden_size << ','
+                                  << expert_width << ',' << expert_count << ',' << top_k
+                                  << ',' << live << ',' << capacity
+                                  << ',' << sample << ',' << std::setprecision(12)
+                                  << samples[sample] * 1000.0 << ','
+                                  << result.prepare_ms * 1000.0 << ','
+                                  << result.pipeline_ms * 1000.0 << ','
+                                  << result.metrics.bit_mismatch_count << ','
+                                  << result.metrics.nonfinite_count << '\n';
+                    ++observed_cases;
+                }
+        }
+    }
+    ASSERT_GT(observed_cases, 0u) << "capacity-probe selectors admitted no case";
+#endif
+}
+
 TEST(Perf__MoEVerifierPrefill, ROCm_M4M9M31_CombinedTop9AllFormatsDecodeEquivalent)
 {
 #ifndef HAVE_ROCM
@@ -5319,7 +5544,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_AllFormatAspectRatioMGroupedPrefillDispatchT
             << "Set LLAMINAR_ROCM_MOE_PREFILL_SWEEP=1 to run the exhaustive trainer";
     }
 
-    const std::vector<int> m_values = envCsvInts(
+    const std::vector<int> m_values = benchmarkGeometryIntegers(
         "LLAMINAR_ROCM_MOE_PREFILL_SWEEP_M",
         {12, 16, 24, 32, 64, 128, 256});
     const int warmups = envInt(

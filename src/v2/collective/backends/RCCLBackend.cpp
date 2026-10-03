@@ -1617,7 +1617,8 @@ namespace llaminar2
         CollectiveDataType dtype,
         CollectiveOp op,
         const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
-        const std::vector<void *> &streams)
+        const std::vector<void *> &streams,
+        const std::vector<NativeCollectiveRows> &live_rows)
     {
 #ifdef HAVE_RCCL
         if (!initialized_)
@@ -1650,7 +1651,7 @@ namespace llaminar2
         }
 
         if (!coordinator_->allreduceWithSidebandsMultiOnStreams(
-                buffers, count, dtype, op, sidebands, streams))
+                buffers, count, dtype, op, sidebands, streams, live_rows))
         {
             last_error_ = "RCCLCoordinator allreduceWithSidebandsMultiOnStreams failed: " +
                           coordinator_->lastError();
@@ -1875,6 +1876,59 @@ namespace llaminar2
 #ifdef HAVE_RCCL
         return initialized_ && coordinator_ && is_multi_gpu_single_process_;
 #else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::nativeRowsOnStream(
+        NativeRowCollective operation, const void *send, void *receive,
+        const NativeCollectiveRows &rows, CollectiveDataType dtype,
+        CollectiveOp reduction, int participant, void *stream, unsigned long long *payload_bytes)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_ || !coordinator_ || !is_multi_gpu_single_process_)
+        {
+            last_error_ = "RCCL live rows require an initialized rank-local communicator";
+            return false;
+        }
+        if (!coordinator_->nativeRowsOnStream(operation, send, receive, rows, dtype,
+                reduction, participant, stream, payload_bytes))
+        {
+            last_error_ = "RCCL live-row enqueue failed: " + coordinator_->lastError();
+            return false;
+        }
+        return true;
+#else
+        (void)operation; (void)send; (void)receive; (void)rows; (void)dtype;
+        (void)reduction; (void)participant; (void)stream; (void)payload_bytes;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::reduceScatterSingleDeviceOnStream(
+        const void *send_buf, void *recv_buf, size_t receive_count,
+        CollectiveDataType dtype, int device_idx, void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_ || !coordinator_ || !is_multi_gpu_single_process_)
+        {
+            last_error_ = "RCCL native reduce-scatter requires an initialized rank-local communicator";
+            return false;
+        }
+        // The coordinator records directly on this participant's exact stream;
+        // its worker queue and private streams do not participate in capture.
+        if (!coordinator_->reduceScatterSingleDeviceOnStream(
+                send_buf, recv_buf, receive_count, dtype, device_idx, stream))
+        {
+            last_error_ = "RCCL reduce-scatter enqueue failed: " + coordinator_->lastError();
+            return false;
+        }
+        return true;
+#else
+        (void)send_buf; (void)recv_buf; (void)receive_count;
+        (void)dtype; (void)device_idx; (void)stream;
+        last_error_ = "RCCL not available";
         return false;
 #endif
     }

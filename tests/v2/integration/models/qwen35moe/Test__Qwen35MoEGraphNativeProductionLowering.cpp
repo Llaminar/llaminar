@@ -860,19 +860,18 @@ namespace llaminar2::test
             output.gate = arena.fp32({rows, 16u});
             output.up = arena.fp32({rows, 16u});
             output.ffn_output = arena.fp32({rows, kDModel});
-            output.moe_expert_indices = arena.fp32({rows, kTopK});
-            output.moe_expert_weights = arena.fp32({rows, kTopK});
-            output.moe_combined_output = arena.fp32({rows, kDModel});
-            output.moe_canonical_route_contributions = arena.fp32(
-                {rows,
-                 static_cast<size_t>(kTopK + 2) *
-                     static_cast<size_t>(kDModel)});
-            output.moe_shared_expert_output =
-                arena.fp32({rows, kDModel});
-            output.moe_gate_scratch =
-                arena.fp32({rows, kIntermediate});
-            output.moe_up_scratch =
-                arena.fp32({rows, kIntermediate});
+            const std::unordered_map<BufferId, TensorBase *> moe_buffers{
+                {BufferId::MOE_EXPERT_INDICES, arena.fp32({rows, kTopK})},
+                {BufferId::MOE_EXPERT_WEIGHTS, arena.fp32({rows, kTopK})},
+                {BufferId::MOE_COMBINED_OUTPUT, arena.fp32({rows, kDModel})},
+                {BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
+                    arena.fp32({rows, static_cast<size_t>(kTopK + 2) * kDModel})},
+                {BufferId::MOE_SHARED_EXPERT_OUTPUT, arena.fp32({rows, kDModel})},
+                {BufferId::MOE_GATE_SCRATCH, arena.fp32({rows, kIntermediate})},
+                {BufferId::MOE_UP_SCRATCH, arena.fp32({rows, kIntermediate})},
+            };
+            output.moe = MoEActivationBindings::bind(RoutedExpertComputePolicy::Apportioned, rows,
+                [&](BufferId id) { return moe_buffers.at(id); });
             return output;
         }
 

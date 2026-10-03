@@ -136,16 +136,19 @@ namespace llaminar2
         int depth_idx) noexcept
         : graph_(graph),
           previous_active_(graph.mtp_graph_context_active_),
-          previous_depth_idx_(graph.mtp_graph_depth_idx_)
+          previous_depth_idx_(graph.mtp_graph_depth_idx_),
+          previous_prefill_rows_(graph.prefill_collective_rows_)
     {
         graph_.mtp_graph_context_active_ = true;
         graph_.mtp_graph_depth_idx_ = depth_idx;
+        graph_.prefill_collective_rows_.reset();
     }
 
     Qwen35Graph::ScopedMTPGraphContext::~ScopedMTPGraphContext()
     {
         graph_.mtp_graph_context_active_ = previous_active_;
         graph_.mtp_graph_depth_idx_ = previous_depth_idx_;
+        graph_.prefill_collective_rows_ = previous_prefill_rows_;
     }
 
     std::string Qwen35Graph::ffnGraphStagePrefix(int layer_idx) const
@@ -569,18 +572,14 @@ namespace llaminar2
                 (!registry_owned_mtp_experts &&
                  missing("mtp.moe_up_exps", weights.fa_block.moe_up_exps)) ||
                 (!registry_owned_mtp_experts &&
-                 missing("mtp.moe_down_exps", weights.fa_block.moe_down_exps)) ||
-                missing("output.moe_expert_indices", output.moe_expert_indices) ||
-                missing("output.moe_expert_weights", output.moe_expert_weights) ||
-                missing("output.moe_combined_output", output.moe_combined_output) ||
-                missing("output.moe_canonical_route_contributions",
-                        output.moe_canonical_route_contributions) ||
-                missing("output.moe_shared_expert_output", output.moe_shared_expert_output) ||
-                missing("output.moe_gate_scratch", output.moe_gate_scratch) ||
-                missing("output.moe_up_scratch", output.moe_up_scratch))
+                 missing("mtp.moe_down_exps", weights.fa_block.moe_down_exps)))
             {
                 return graph;
             }
+
+            if (!output.moe)
+                throw std::invalid_argument("MoE MTP graph requires its policy-selected activation binding");
+            output.moe->require(config_.moe.routed_compute_policy, total_tokens);
 
             /*
              * ExpertOverlay deliberately removes raw 3-D routed parents from
@@ -741,14 +740,11 @@ namespace llaminar2
         }
         if (mtp_moe && !kv_cache_only)
         {
-            mtp_buffers.extensions[BufferId::MOE_EXPERT_INDICES] = output.moe_expert_indices;
-            mtp_buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = output.moe_expert_weights;
-            mtp_buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = output.moe_combined_output;
-            mtp_buffers.extensions[BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS] =
-                output.moe_canonical_route_contributions;
-            mtp_buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = output.moe_shared_expert_output;
-            mtp_buffers.extensions[BufferId::MOE_GATE_SCRATCH] = output.moe_gate_scratch;
-            mtp_buffers.extensions[BufferId::MOE_UP_SCRATCH] = output.moe_up_scratch;
+            // Main and sidecar work are ordered users of the same admitted
+            // routed arena. Preserve its selected layout, not a second list
+            // of whole-expert-specific MTP fields.
+            for (const auto &[id, tensor] : output.moe->entries())
+                mtp_buffers.extensions.emplace(id, tensor);
         }
 
         if (kv_cache_only)

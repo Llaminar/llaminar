@@ -1,0 +1,63 @@
+From: ROCm/rocm-systems upstream repair
+Subject: [PATCH] Remove CQ_THREAD_STACK_SIZE and use the system default stack
+
+Linux/glibc puts a process's initial ELF TLS in each pthread stack mapping.
+A fixed 256 KiB mapping can be smaller than a valid client's TLS alone;
+pthread_create then returns EINVAL before the worker entry point executes.
+Full CUDA/HIP clients can encounter this during graph instantiation when a
+diagnostic kernel creates a hostcall listener. Command-queue workers also
+consume this stack contract outside direct dispatch. This is not thread
+exhaustion or a device error.
+
+Backport the three CLR changes from upstream commit
+ccc4faf7c7517f3e970ac849cc77f38a41d4f45a (ROCm/rocm-systems#9643).
+Both consumers use amd::Thread's existing native-default stack contract;
+the TLS-incompatible flag is removed rather than kept as a second authority.
+Graph capture, queue counts, packet publication and dispatch concurrency
+are unchanged. The upstream hostcall tests are outside this runtime-only
+build; Llaminar registers its captured timeline/TLS proof in preflight.
+
+Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
+             (therock-10.0, ROCm Core SDK 10.0.0)
+Upstream: https://github.com/ROCm/rocm-systems/commit/ccc4faf7c7517f3e970ac849cc77f38a41d4f45a
+
+diff --git a/rocclr/device/devhostcall.cpp b/rocclr/device/devhostcall.cpp
+--- a/rocclr/device/devhostcall.cpp
++++ b/rocclr/device/devhostcall.cpp
+@@ -334,7 +334,10 @@ class HostcallListener {
+ #endif
+   class Thread : public amd::Thread {
+    public:
+-    Thread() : amd::Thread("Hostcall Listener Thread", CQ_THREAD_STACK_SIZE) {}
++    // Take the system default stack: glibc allocates a thread's static TLS block inside the stack
++    // requested through pthread_attr_setstacksize() and refuses the request when the two do not
++    // fit, which is easy to hit from a process that links libraries with large PT_TLS segments.
++    Thread() : amd::Thread("Hostcall Listener Thread") {}
+ 
+     //! The hostcall listener thread entry point.
+     void run(void* data) {
+diff --git a/rocclr/platform/commandqueue.hpp b/rocclr/platform/commandqueue.hpp
+--- a/rocclr/platform/commandqueue.hpp
++++ b/rocclr/platform/commandqueue.hpp
+@@ -152,7 +152,8 @@ class HostQueue : public CommandQueue {
+ 
+     //! Create a new thread
+     Thread()
+-        : amd::Thread("Command Queue Thread", CQ_THREAD_STACK_SIZE, !AMD_DIRECT_DISPATCH),
++        : amd::Thread("Command Queue Thread", 0 /* use the system default stack size */,
++                      !AMD_DIRECT_DISPATCH),
+           acceptingCommands_(false),
+           virtualDevice_(nullptr) {}
+ 
+diff --git a/rocclr/utils/flags.hpp b/rocclr/utils/flags.hpp
+--- a/rocclr/utils/flags.hpp
++++ b/rocclr/utils/flags.hpp
+@@ -22,8 +22,6 @@ release(bool, AMD_LOG_ASYNC, true,
+         "Async logging with in-memory buffer and background thread (set 0 to disable)")\
+ debug(uint, DEBUG_GPU_FLAGS, 0,                                               \
+         "The debug options for GPU device")                                   \
+-release(size_t, CQ_THREAD_STACK_SIZE, 256*Ki, /* @todo: that much! */         \
+-        "The default command queue thread stack size")                        \
+ release(int, GPU_MAX_WORKGROUP_SIZE, 0,                                       \
+         "Maximum number of workitems in a workgroup for GPU, 0 -use default") \
+ debug(bool, CPU_MEMORY_GUARD_PAGES, false,                                    \

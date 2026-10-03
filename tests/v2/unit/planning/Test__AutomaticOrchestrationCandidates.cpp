@@ -13,6 +13,7 @@
 #include "app/RuntimeInitPhase.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
+#include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "utils/NUMATopology.h"
 #include <gtest/gtest.h>
 #include <array>
@@ -181,6 +182,72 @@ TEST(AutomaticOrchestrationCandidates, GPUChoicesIncludeEverySubsetThroughEightP
     }
 }
 
+/** @test Impossible native output partitions never enter pricing as valid proposals. */
+TEST(AutomaticOrchestrationCandidates, ProjectionCandidatesPreserveIntegralSourceOutputPartitions)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int columns : {512, 1536})
+    {
+        auto inventory = hosts(1);
+        cards(inventory, 0, backend, 8);
+        auto profile = model(true).memoryProfile();
+        profile.d_model = columns;
+        profile.n_heads = columns / profile.head_dim;
+        const PlanningModelMetadata source(std::move(profile), 4);
+        const auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+        std::set<std::size_t> degrees;
+        visitAutomaticOrchestrationCandidates(config, source, inventory, [&](const auto &proposal) {
+            ASSERT_TRUE(proposal.config.moe_routed_expert_plan);
+            const auto &placement = *proposal.config.moe_routed_expert_plan;
+            ASSERT_EQ(placement.domains.size(), 1u);
+            const auto declaration = placement.domains.front().toExecutionDomainDefinition();
+            const auto degree = declaration.participants.size();
+            EXPECT_TRUE(MoEProjectionArenaGeometry::hasIntegralOutputPartition(columns, degree));
+            EXPECT_EQ(declaration.resolveRoutedComputePolicy(placement.routed_tiers.size()),
+                RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+            EXPECT_EQ(proposal.config.routed_expert_compute_policy, RoutedExpertComputePolicy::Automatic);
+            degrees.insert(degree);
+        });
+        const std::set<std::size_t> expected = columns == 512
+            ? std::set<std::size_t>{2, 4, 8} : std::set<std::size_t>{2, 3, 4, 6, 8};
+        EXPECT_EQ(degrees, expected);
+    }
+}
+
+/** @test Geometry rejection does not replace a requested mode or ban that device degree elsewhere. */
+TEST(AutomaticOrchestrationCandidates, ProjectionGeometryRejectionPreservesExplicitAndMultiTierIntent)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto inventory = hosts(2);
+        cards(inventory, 0, backend, 3);
+        auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+        config.automatic_planning.device_counts = {{backend, 3}};
+        EXPECT_TRUE(candidates(config, inventory, true).empty());
+        config.routed_expert_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+        EXPECT_TRUE(candidates(config, inventory, true).empty());
+        config.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        const auto controls = candidates(config, inventory, true);
+        ASSERT_EQ(controls.size(), 2u);
+        for (const auto &control : controls)
+            EXPECT_EQ(control.config.moe_routed_expert_plan->domains.front().routed_compute_policy,
+                RoutedExpertComputePolicy::Apportioned);
+
+        auto tiered = request({backend, DeviceType::CPU}, {OrchestrationStrategy::ExpertOverlay});
+        tiered.automatic_planning.device_counts = {{backend, 3}, {DeviceType::CPU, 1}};
+        const auto overlays = candidates(tiered, inventory, true);
+        ASSERT_FALSE(overlays.empty());
+        for (const auto &overlay : overlays)
+        {
+            const auto &placement = *overlay.config.moe_routed_expert_plan;
+            ASSERT_GE(placement.routed_tiers.size(), 2u);
+            for (const auto &domain : placement.domains)
+                EXPECT_EQ(domain.toExecutionDomainDefinition().resolveRoutedComputePolicy(
+                    placement.routed_tiers.size()), RoutedExpertComputePolicy::Apportioned);
+        }
+    }
+}
+
 TEST(AutomaticOrchestrationCandidates, LocalMoETPCompilesWithOneOverlayAuthority)
 {
     for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
@@ -220,8 +287,55 @@ TEST(AutomaticOrchestrationCandidates, LocalMoETPCompilesWithOneOverlayAuthority
             ASSERT_TRUE(resolved.config().moe_routed_expert_plan);
             EXPECT_EQ(resolved.config().moe_routed_expert_plan->domains.size(), 1u);
             EXPECT_EQ(resolved.config().moe_rebalance.mode, mode);
+            const auto expected_compute = backend == DeviceType::CPU
+                ? RoutedExpertComputePolicy::Apportioned
+                : RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+            EXPECT_EQ(resolved.config().moe_routed_expert_plan->domains.front()
+                .routed_compute_policy, expected_compute);
+            EXPECT_EQ(resolved.rankPlan().runtime.routed_expert_compute_policy, expected_compute);
         }
     }
+}
+
+/**
+ * @brief Auto preserves the requested routed arithmetic/ownership mode through apply.
+ *
+ * The planner remains free to select sparse endpoint ordinals and dense work
+ * policy. Neither normalization, serialization nor compilation may silently
+ * turn projection ownership or replication into whole-expert apportionment.
+ */
+TEST(AutomaticOrchestrationCandidates, LocalMoETPPreservesRoutedComputeConstraint)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto policy : {RoutedExpertComputePolicy::Apportioned,
+                                  RoutedExpertComputePolicy::Replicated,
+                                  RoutedExpertComputePolicy::GateUpOwnedDownColumns})
+        {
+            SCOPED_TRACE(::testing::Message() << deviceTypeToString(backend)
+                << " policy=" << routedExpertComputePolicyToString(policy));
+            auto inventory = hosts(1);
+            cards(inventory, 0, backend, 2);
+            auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+            config.routed_expert_compute_policy = policy;
+            const auto proposals = candidates(config, inventory, true);
+            ASSERT_EQ(proposals.size(), 2u);
+            for (const auto &proposal : proposals)
+            {
+                compile(proposal, true);
+                const auto applied = deserializeOrchestrationConfig(
+                    serializeOrchestrationConfig(proposal.config));
+                ExecutionPlanBuilder builder;
+                const auto resolved = ResolvedRankOrchestration::resolve(
+                    applied, model(true), proposal.membership.inventory(), builder, 0);
+                ASSERT_TRUE(resolved.config().moe_routed_expert_plan);
+                const auto &plan = *resolved.config().moe_routed_expert_plan;
+                ASSERT_EQ(plan.domains.size(), 1u);
+                EXPECT_EQ(plan.domains.front().routed_compute_policy, policy);
+                for (const auto &domain : plan.dense_domains)
+                    EXPECT_EQ(domain.routed_compute_policy, policy);
+                EXPECT_EQ(config.routed_expert_compute_policy, policy);
+            }
+        }
 }
 
 TEST(AutomaticOrchestrationCandidates,

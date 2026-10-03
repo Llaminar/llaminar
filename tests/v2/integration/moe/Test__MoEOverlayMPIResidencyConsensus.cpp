@@ -1190,7 +1190,7 @@ namespace llaminar2::test
         }
 
         /** @brief Fill one real prepared CPU expert with deterministic final bytes. */
-        MoEOverlayPreparedExpertTriplet distributedCpuSourceExpert(
+        MoEOverlayPreparedExpertPayload distributedCpuSourceExpert(
             int participant_id,
             int expert_id,
             std::uint8_t seed)
@@ -1209,7 +1209,7 @@ namespace llaminar2::test
                 throw std::runtime_error(
                     "Distributed CPU physical test could not acquire source expert");
 
-            MoEOverlayPreparedExpertTriplet triplet;
+            std::array<std::shared_ptr<ITensorGemm>, 3> engines{};
             for (const auto &projection : lease->projections)
             {
                 for (std::size_t byte = 0;
@@ -1223,20 +1223,18 @@ namespace llaminar2::test
                 switch (projection.projection)
                 {
                 case ExpertTierWeightProjection::Gate:
-                    triplet.gate = projection.engine;
+                    engines[0] = projection.engine;
                     break;
                 case ExpertTierWeightProjection::Up:
-                    triplet.up = projection.engine;
+                    engines[1] = projection.engine;
                     break;
                 case ExpertTierWeightProjection::Down:
-                    triplet.down = projection.engine;
+                    engines[2] = projection.engine;
                     break;
                 }
             }
-            if (!triplet.complete())
-                throw std::runtime_error(
-                    "Distributed CPU physical source triplet is incomplete");
-            return triplet;
+            return MoEOverlayPreparedExpertPayload::fromProjections(
+                DeviceMoEProjectionSet::CompleteExpert, std::move(engines));
         }
 
         /** @brief Publish the one initial layer owned by this process. */
@@ -1245,7 +1243,7 @@ namespace llaminar2::test
             const std::shared_ptr<const MoEOverlayResidencySnapshot> &snapshot,
             int participant_id,
             int expert_id,
-            const MoEOverlayPreparedExpertTriplet &expert,
+            const MoEOverlayPreparedExpertPayload &expert,
             bool collect_economy_service_measurements = false)
         {
             auto registry = std::make_shared<
@@ -1262,7 +1260,7 @@ namespace llaminar2::test
                 });
             const auto mask = snapshot->owner_map.expertMaskForParticipant(
                 0, participant_id, 2);
-            std::vector<MoEOverlayPreparedExpertTriplet> engines(2);
+            std::vector<MoEOverlayPreparedExpertPayload> engines(2);
             engines[static_cast<std::size_t>(expert_id)] = expert;
             std::string error;
             if (!registry->registerInitialLayer(
@@ -1362,13 +1360,13 @@ namespace llaminar2::test
 
         /** @brief Verify every final byte against the source's fill function. */
         bool distributedCpuBytesMatchSeed(
-            const MoEOverlayPreparedExpertTriplet &triplet,
+            const MoEOverlayPreparedExpertPayload &payload,
             std::uint8_t seed)
         {
             const std::array<std::shared_ptr<ITensorGemm>, 3> engines{
-                triplet.gate,
-                triplet.up,
-                triplet.down,
+                payload.gate(),
+                payload.up(),
+                payload.down(),
             };
             for (const auto &engine : engines)
             {

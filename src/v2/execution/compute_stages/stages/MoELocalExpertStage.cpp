@@ -1685,9 +1685,9 @@ namespace llaminar2
 
         const auto &engines = layer.experts[expert_index];
         ExpertPackedWeights packed;
-        packed.gate = engines.gate->cloneWeights();
-        packed.up = engines.up->cloneWeights();
-        packed.down = engines.down->cloneWeights();
+        packed.gate = engines.gate()->cloneWeights();
+        packed.up = engines.up()->cloneWeights();
+        packed.down = engines.down()->cloneWeights();
         if (!packed.complete())
         {
             throw std::runtime_error(
@@ -3251,11 +3251,11 @@ namespace llaminar2
                     const auto &engines =
                         execution_layer_bank->experts[expert_index];
                     invocation_gate_engines_[expert_index] =
-                        transient ? transient->gate.get() : engines.gate.get();
+                        transient ? transient->gate.get() : engines.gate().get();
                     invocation_up_engines_[expert_index] =
-                        transient ? transient->up.get() : engines.up.get();
+                        transient ? transient->up.get() : engines.up().get();
                     invocation_down_engines_[expert_index] =
-                        transient ? transient->down.get() : engines.down.get();
+                        transient ? transient->down.get() : engines.down().get();
                 }
             }
             else

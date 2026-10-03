@@ -62,6 +62,22 @@ namespace llaminar2
             using ncclGroupStart_t = ncclResult_t (*)();
             using ncclGroupEnd_t = ncclResult_t (*)();
 
+            // The extension retains the native schedule/transport while clipping
+            // only useful payload bytes. Resolve it once, never during capture.
+            using deviceRowsGather_t = ncclResult_t (*)(const void *, void *,
+                const std::int32_t *, size_t, size_t, unsigned long long *, ncclComm_t, void *);
+            using deviceRowsReduction_t = ncclResult_t (*)(const void *, void *,
+                const std::int32_t *, size_t, size_t, ncclDataType_t, ncclRedOp_t,
+                unsigned long long *, ncclComm_t, void *);
+            deviceRowsGather_t fp_device_rows_gather = nullptr;
+            deviceRowsReduction_t fp_device_rows_reduce = nullptr;
+            deviceRowsReduction_t fp_device_rows_scatter = nullptr;
+
+            // Read native descriptor ownership only at a quiescent diagnostic
+            // boundary. This is not a live allocator or an inference decision.
+            using hostTransportStorage_t = ncclResult_t (*)(ncclComm_t, RCCLHostTransportStorage *);
+            hostTransportStorage_t fp_host_transport_storage = nullptr;
+
             // Function pointers
             ncclGetUniqueId_t fp_ncclGetUniqueId = nullptr;
             ncclCommInitRank_t fp_ncclCommInitRank = nullptr;
@@ -82,6 +98,41 @@ namespace llaminar2
             ncclRecv_t fp_ncclRecv = nullptr;
             ncclGroupStart_t fp_ncclGroupStart = nullptr;
             ncclGroupEnd_t fp_ncclGroupEnd = nullptr;
+
+            /**
+             * @brief Withdraw the entire resolved table before retiring its DSO.
+             *
+             * Both failed partial admission and ordinary unload use this one
+             * path. A callback resolved before a later missing symbol must not
+             * outlive dlclose or masquerade as available diagnostic evidence.
+             * The caller already owns g_mutex; this helper never takes a lock.
+             */
+            void clearResolvedSymbols() noexcept
+            {
+                fp_ncclGetUniqueId = nullptr;
+                fp_ncclCommInitRank = nullptr;
+                fp_ncclCommInitAll = nullptr;
+                fp_ncclCommDestroy = nullptr;
+                fp_ncclCommAbort = nullptr;
+                fp_ncclCommFinalize = nullptr;
+                fp_ncclCommCount = nullptr;
+                fp_ncclCommCuDevice = nullptr;
+                fp_ncclCommUserRank = nullptr;
+                fp_ncclGetErrorString = nullptr;
+                fp_ncclAllReduce = nullptr;
+                fp_ncclBroadcast = nullptr;
+                fp_ncclReduce = nullptr;
+                fp_ncclAllGather = nullptr;
+                fp_ncclReduceScatter = nullptr;
+                fp_device_rows_gather = nullptr;
+                fp_device_rows_reduce = nullptr;
+                fp_device_rows_scatter = nullptr;
+                fp_host_transport_storage = nullptr;
+                fp_ncclSend = nullptr;
+                fp_ncclRecv = nullptr;
+                fp_ncclGroupStart = nullptr;
+                fp_ncclGroupEnd = nullptr;
+            }
 
             // Helper to load a symbol
             template <typename T>
@@ -177,6 +228,10 @@ namespace llaminar2
             success = success && loadSymbol(fp_ncclReduce, "ncclReduce");
             success = success && loadSymbol(fp_ncclAllGather, "ncclAllGather");
             success = success && loadSymbol(fp_ncclReduceScatter, "ncclReduceScatter");
+            success = success && loadSymbol(fp_device_rows_gather, "llaminarNcclAllGatherDeviceRows");
+            success = success && loadSymbol(fp_device_rows_reduce, "llaminarNcclAllReduceDeviceRows");
+            success = success && loadSymbol(fp_device_rows_scatter, "llaminarNcclReduceScatterDeviceRows");
+            success = success && loadSymbol(fp_host_transport_storage, "llaminarRcclHostTransportStorage");
             success = success && loadSymbol(fp_ncclSend, "ncclSend");
             success = success && loadSymbol(fp_ncclRecv, "ncclRecv");
             success = success && loadSymbol(fp_ncclGroupStart, "ncclGroupStart");
@@ -185,12 +240,13 @@ namespace llaminar2
             if (!success)
             {
                 LOG_ERROR("RCCL Dynamic Loader: " << g_last_error);
+                clearResolvedSymbols();
                 dlclose(g_library_handle);
                 g_library_handle = nullptr;
                 return false;
             }
 
-            LOG_INFO("RCCL Dynamic Loader: All " << 17 << " symbols loaded successfully");
+            LOG_INFO("RCCL Dynamic Loader: All required symbols loaded successfully");
             return true;
         }
 
@@ -200,30 +256,9 @@ namespace llaminar2
 
             if (g_library_handle)
             {
+                clearResolvedSymbols();
                 dlclose(g_library_handle);
                 g_library_handle = nullptr;
-
-                // Clear function pointers
-                fp_ncclGetUniqueId = nullptr;
-                fp_ncclCommInitRank = nullptr;
-                fp_ncclCommInitAll = nullptr;
-                fp_ncclCommDestroy = nullptr;
-                fp_ncclCommAbort = nullptr;
-                fp_ncclCommFinalize = nullptr;
-                fp_ncclCommCount = nullptr;
-                fp_ncclCommCuDevice = nullptr;
-                fp_ncclCommUserRank = nullptr;
-                fp_ncclGetErrorString = nullptr;
-                fp_ncclAllReduce = nullptr;
-                fp_ncclBroadcast = nullptr;
-                fp_ncclReduce = nullptr;
-                fp_ncclAllGather = nullptr;
-                fp_ncclReduceScatter = nullptr;
-                fp_ncclSend = nullptr;
-                fp_ncclRecv = nullptr;
-                fp_ncclGroupStart = nullptr;
-                fp_ncclGroupEnd = nullptr;
-
                 LOG_DEBUG("RCCL Dynamic Loader: Library unloaded");
             }
         }
@@ -344,6 +379,17 @@ namespace llaminar2
             return fp_ncclCommUserRank(comm, rank);
         }
 
+        /** @copydoc hostTransportStorage(ncclComm_t,RCCLHostTransportStorage&) */
+        ncclResult_t hostTransportStorage(ncclComm_t comm, RCCLHostTransportStorage &receipt)
+        {
+            if (!comm || !receipt.valid())
+                return ncclInvalidArgument;
+            if (!fp_host_transport_storage)
+                return ncclInvalidUsage;
+            const auto result = fp_host_transport_storage(comm, &receipt);
+            return result == ncclSuccess && !receipt.valid() ? ncclInvalidUsage : result;
+        }
+
         const char *ncclGetErrorString(ncclResult_t result)
         {
             if (!fp_ncclGetErrorString)
@@ -398,6 +444,52 @@ namespace llaminar2
                 return ncclInternalError;
             }
             return fp_ncclAllGather(sendbuff, recvbuff, sendcount, datatype, comm, stream);
+        }
+
+        /** @copydoc nativeRows(NativeRowCollective,const void*,void*,const NativeCollectiveRows&,ncclDataType_t,ncclRedOp_t,unsigned long long*,ncclComm_t,void*) */
+        ncclResult_t nativeRows(NativeRowCollective operation, const void *send, void *receive,
+            const NativeCollectiveRows &rows, ncclDataType_t datatype, ncclRedOp_t op,
+            unsigned long long *payload_bytes, ncclComm_t comm, void *stream)
+        {
+            if (!send || !receive || !comm || !stream) return ncclInvalidArgument;
+            // Fully-live rows retain exactly the ordinary native API. A passive
+            // receipt is available only for the device-counted implementation.
+            if (!rows.rows().countOwner())
+            {
+                if (payload_bytes) return ncclInvalidArgument;
+                switch (operation)
+                {
+                case NativeRowCollective::AllGather:
+                    return ncclAllGather(send, receive, rows.bankElements(), datatype, comm, stream);
+                case NativeRowCollective::AllReduce:
+                    return ncclAllReduce(send, receive, rows.bankElements(), datatype, op, comm, stream);
+                case NativeRowCollective::ReduceScatter:
+                    return ncclReduceScatter(send, receive, rows.bankElements(), datatype, op, comm, stream);
+                default: return ncclInvalidArgument;
+                }
+            }
+            const auto *count = rows.rows().countOwner();
+            const auto capacity = static_cast<size_t>(rows.rows().capacity());
+            const auto width = rows.elementsPerRow();
+            if (operation == NativeRowCollective::AllGather)
+            {
+                size_t bytes = 0;
+                switch (datatype)
+                {
+                case ncclInt8: bytes = 1; break;
+                case ncclFloat16: case ncclBfloat16: bytes = 2; break;
+                case ncclInt32: case ncclFloat32: bytes = 4; break;
+                default: return ncclInvalidArgument;
+                }
+                if (!fp_device_rows_gather) return ncclInvalidUsage;
+                if (!rows.byteGeometryValid(bytes, 1)) return ncclInvalidArgument;
+                return fp_device_rows_gather(send, receive, count, capacity, width * bytes,
+                    payload_bytes, comm, stream);
+            }
+            const auto function = operation == NativeRowCollective::AllReduce ? fp_device_rows_reduce :
+                operation == NativeRowCollective::ReduceScatter ? fp_device_rows_scatter : nullptr;
+            if (!function) return ncclInvalidUsage;
+            return function(send, receive, count, capacity, width, datatype, op, payload_bytes, comm, stream);
         }
 
         ncclResult_t ncclReduceScatter(const void *sendbuff, void *recvbuff, size_t recvcount,

@@ -123,7 +123,8 @@ namespace llaminar2
         // IWorkerGPUContext Interface - Event Access (worker-thread-only)
         // =========================================================================
 
-        void *createEvent() override;
+        /** @copydoc IWorkerGPUContext::createEvent */
+        void *createEvent(GPUEventPurpose purpose = GPUEventPurpose::Ordering) override;
         void destroyEvent(void *event) override;
         void recordEvent(void *event, void *stream) override;
         bool recordEventChecked(void *event, void *stream) override;

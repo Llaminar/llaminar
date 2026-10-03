@@ -1,176 +1,69 @@
 #!/usr/bin/env bash
-# install-rocm.sh
+# Install Llaminar's pinned ROCm Core SDK user-space closure.
 #
-# Install AMD ROCm 7.2.4. The user-space stack is installed inside the
-# container; the kernel driver is expected on the host and passed through
-# via /dev/kfd + /dev/dri + the render/video groups.
-#
-# MODE=full     (default) — AMD's full `rocm` usecase.
-# MODE=build              — minimal compiler/dev package set for building
-#                           Llaminar's ROCm backend and optional RCCL source.
-# MODE=runtime            — minimal runtime package set.
-#
-# gfx906 (MI50) was dropped from ROCm 7.x. We restore support by grafting the
-# gfx906 Tensile library files from Arch Linux's rocBLAS package, which
-# still ships them.
+# MODE=build supplies the compiler and headers for HIP/RCCL/BLAS builds;
+# MODE=full additionally supplies the developer debugger/profiler tools;
+# MODE=runtime installs only host libraries. No mode installs a kernel driver.
+# The compiler modes build the repaired HIP runtime and matching gfx906 BLAS
+# kernels. Runtime images copy those exact artifacts from their tested builder;
+# they must never graft kernels from another distribution or release.
 set -euo pipefail
 
+rocm_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${rocm_script_dir}/rocm-release.env"
 MODE="${MODE:-full}"
-ROCM_VERSION="${ROCM_VERSION:-7.2.4}"
-ROCM_DEB_VERSION="${ROCM_DEB_VERSION:-7.2.4.70204-1}"
 export DEBIAN_FRONTEND=noninteractive
+APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
 
-APT_OPTS=(
-    -o Acquire::Retries=5
-    -o Acquire::http::Timeout=30
-    -o Acquire::https::Timeout=30
-)
-
-curl_download() {
-    local url="$1"
-    local output="$2"
-
-    curl -fsSL \
-        --connect-timeout 30 \
-        --max-time 300 \
-        --retry 8 \
-        --retry-all-errors \
-        --retry-delay 5 \
-        --retry-max-time 900 \
-        -o "${output}" \
-        "${url}"
-}
-
-download_arch_rocblas() {
-    local output="$1"
-    local package_url="${ROCBLAS_ARCH_PACKAGE_URL:-}"
-    local package_file=""
-    local urls=()
-
-    if [[ -n "${package_url}" ]]; then
-        urls+=("${package_url}")
-    else
-        if ! package_url="$(
-            curl -fsSLI \
-                --connect-timeout 30 \
-                --max-time 60 \
-                --retry 3 \
-                --retry-all-errors \
-                "https://archlinux.org/packages/extra/x86_64/rocblas/download" \
-            | awk 'tolower($1) == "location:" { loc=$2 } END { gsub(/\r/, "", loc); print loc }'
-        )"; then
-            package_url=""
-        fi
-        package_file="${package_url##*/}"
-
-        if [[ "${package_file}" == rocblas-*.pkg.tar.zst ]]; then
-            urls+=(
-                "https://geo.mirror.pkgbuild.com/extra/os/x86_64/${package_file}"
-                "https://mirror.rackspace.com/archlinux/extra/os/x86_64/${package_file}"
-                "https://arch.mirror.constant.com/extra/os/x86_64/${package_file}"
-                "https://mirrors.edge.kernel.org/archlinux/extra/os/x86_64/${package_file}"
-            )
-        fi
-        urls+=("https://archlinux.org/packages/extra/x86_64/rocblas/download")
-    fi
-
-    for package_url in "${urls[@]}"; do
-        echo "==> [rocm] downloading rocBLAS Arch package from ${package_url}"
-        if curl -fsSL \
-            --connect-timeout 30 \
-            --max-time 300 \
-            --speed-limit 262144 \
-            --speed-time 60 \
-            --retry 2 \
-            --retry-all-errors \
-            --retry-delay 5 \
-            -o "${output}" \
-            "${package_url}"; then
-            return 0
-        fi
-        rm -f "${output}"
-    done
-
-    echo "Failed to download Arch rocBLAS package from all mirrors" >&2
-    return 1
-}
-
-# amdgpu-install is the canonical installer for ROCm on Ubuntu.
-curl_download \
-    "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/noble/amdgpu-install_${ROCM_DEB_VERSION}_all.deb" \
-    /tmp/amdgpu-install.deb
-apt-get "${APT_OPTS[@]}" update
-apt-get "${APT_OPTS[@]}" install -y --allow-change-held-packages /tmp/amdgpu-install.deb
-rm /tmp/amdgpu-install.deb
-
+# The package pin and source pins form one dependency. An environment override
+# may not silently install a different SDK underneath the retained source DSOs.
+if [[ "${ROCM_VERSION:-${LLAMINAR_ROCM_VERSION}}" != "${LLAMINAR_ROCM_VERSION}" ||
+      "${ROCM_DEB_VERSION:-${LLAMINAR_ROCM_DEB_VERSION}}" != "${LLAMINAR_ROCM_DEB_VERSION}" ]]; then
+    echo "ROCm package override does not match rocm-release.env" >&2
+    exit 1
+fi
+# hipBLAS's host DSO directly needs rocSOLVER even when inference only calls
+# GEMM. Core SDK's blas-host package does not declare that solver dependency;
+# include it explicitly in every profile rather than resolving an older SDK's
+# same-SONAME library from the system loader cache.
+rocm_packages=(base sysdeps runtime math-common blas-host solver-host amdsmi profiler-base)
+rocm_system_packages=()
 case "${MODE}" in
-    full)
-        # --no-dkms: the kernel driver comes from the host; don't rebuild it
-        # inside the container.
-        amdgpu-install --usecase=rocm --no-dkms -y
-        # ROCclr includes GL interop in its HIP-only source build. Declare the
-        # GL/GLX headers explicitly instead of relying on full-SDK recommends.
-        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
-            rocm-llvm-dev libglvnd-dev
+    full|build)
+        rocm_packages+=(llvm llvm-dev runtime-dev blas-dev hipblas-common-dev ccl-dev rccl-dev hipify)
+        # HIP ROCclr's headless build still compiles GL interop. Tensile's host
+        # library needs MessagePack C++ headers; none may be accidental extras
+        # inherited only by a full development image.
+        rocm_system_packages+=(libdrm-dev libglvnd-dev libmsgpack-cxx-dev)
+        if [[ "${MODE}" == full ]]; then rocm_packages+=(debugger profiler); fi
         ;;
-    build)
-        # Direct package closure needed by CMake:
-        # - hipcc/amdclang + HIP headers/runtime
-        # - hipBLAS/hipBLASLt headers and shared libraries
-        # - ROCm CMake/device libs for HIP and RCCL source builds
-        # - GL/GLX development closure for the repaired HIP runtime's ROCclr
-        # - RCCL dev package for headers/system fallback when source build is off
-        apt-get "${APT_OPTS[@]}" update
-        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
-            rocm-llvm \
-            rocm-llvm-dev \
-            rocm-cmake \
-            rocm-device-libs \
-            hipcc \
-            hipify-clang \
-            hip-dev \
-            hsa-rocr-dev \
-            libdrm-dev \
-            libglvnd-dev \
-            hipblas-dev \
-            hipblaslt-dev \
-            rocblas-dev \
-            rccl-dev \
-            rocminfo \
-            rocm-smi-lib
-        ;;
-    runtime)
-        apt-get "${APT_OPTS[@]}" update
-        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
-            hipblas \
-            rocminfo \
-            rocm-smi-lib
-        ;;
-    *)
-        echo "Unknown MODE='${MODE}' (expected full, build, or runtime)" >&2
-        exit 2
-        ;;
+    runtime) ;;
+    *) echo "Unknown MODE='${MODE}' (expected full, build, or runtime)" >&2; exit 2 ;;
 esac
+rocm_package_args=()
+for rocm_package in "${rocm_packages[@]}"; do
+    rocm_package_args+=("amdrocm-${rocm_package}${LLAMINAR_ROCM_SERIES}=${LLAMINAR_ROCM_DEB_VERSION}")
+done
 
-# Restore gfx906 (MI50 / Vega 20) Tensile kernels removed in ROCm 7.x.
-apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages zstd
-download_arch_rocblas /tmp/rocblas-arch.pkg.tar.zst
-mkdir -p /tmp/rocblas-arch
-tar -I zstd -xf /tmp/rocblas-arch.pkg.tar.zst -C /tmp/rocblas-arch
-if compgen -G "/tmp/rocblas-arch/opt/rocm/lib/rocblas/library/*gfx906*" >/dev/null; then
-    cp /tmp/rocblas-arch/opt/rocm/lib/rocblas/library/*gfx906* \
-       /opt/rocm/lib/rocblas/library/
-fi
-rm -rf /tmp/rocblas-arch /tmp/rocblas-arch.pkg.tar.zst
+bash "${rocm_script_dir}/configure-rocm-repository.sh"
+apt-get "${APT_OPTS[@]}" update
+apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
+    "${rocm_package_args[@]}" "${rocm_system_packages[@]}"
 
-# Keep parallel graph construction and native packet replay, with the same
-# repaired HIP runtime in development, release builds, and exported images.
+# Core SDK installs below /opt/rocm/core-X.Y rather than replacing /opt/rocm.
+# One stable SDK link lets Docker, CMake and shell commands share the active
+# compiler/library root without independently spelling a release version.
+test "$(<"${LLAMINAR_ROCM_SDK_PREFIX}/.info/version")" = "${LLAMINAR_ROCM_VERSION}"
+ln -sfn "${LLAMINAR_ROCM_SDK_PREFIX}" "${LLAMINAR_ROCM_ACTIVE_PREFIX}"
+export ROCM_PATH="${LLAMINAR_ROCM_ACTIVE_PREFIX}" HIP_PATH="${LLAMINAR_ROCM_ACTIVE_PREFIX}"
+export PATH="${ROCM_PATH}/bin:${ROCM_PATH}/lib/llvm/bin:${PATH}"
+export LD_LIBRARY_PATH="${ROCM_PATH}/lib:${ROCM_PATH}/lib/llvm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
 if [[ "${MODE}" != runtime ]]; then
-    bash "$(dirname -- "${BASH_SOURCE[0]}")/install-hip-graph-runtime.sh"
+    bash "${rocm_script_dir}/install-hip-graph-runtime.sh"
+    bash "${rocm_script_dir}/install-rocblas-gfx906.sh"
 fi
 
-# Do not run autoremove here.  The caller owns the surrounding image and may
-# intentionally have build tools marked as automatically installed; a ROCm
-# installer must not make lifecycle decisions for unrelated packages.
+# The caller owns unrelated packages; never autoremove them during SDK setup.
 apt-get clean
 rm -rf /var/lib/apt/lists/*

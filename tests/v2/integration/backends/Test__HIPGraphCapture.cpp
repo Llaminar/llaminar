@@ -12,6 +12,8 @@
  *
  * All GPU API calls are issued from the device context's worker thread
  * via submitAndWait() to maintain thread safety.
+ * Native dependency reduction receives the same captured fork/join and
+ * retained-parent byte-equivalence proof as CUDA.
  */
 
 #include <gtest/gtest.h>
@@ -19,10 +21,12 @@
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/BackendManager.h"
+#include "backends/rocm/HIPGraphCapture.h"
 #include "MTPTerminalScratchCaptureProof.h"
 #include "MTPMainForwardReadRetirementProof.h"
 #include "GPUGraphMemoryContractProof.h"
 #include "NativeTimelineImportProof.h"
+#include "NativeDependencyReductionProof.h"
 
 #include <hip/hip_runtime.h>
 
@@ -65,6 +69,24 @@ TEST_F(Test__HIPGraphCapture, OrderedTimelineImportsRetainedNativeWork)
     auto *backend = getROCmBackend();
     ASSERT_NE(backend, nullptr);
     ctx().submitAndWait([&] { test::proveNativeTimelineImports(ctx(), *backend); });
+}
+
+/** @test HIP's shared dependency compiler preserves both captured branch writers. */
+TEST_F(Test__HIPGraphCapture, DependencyReductionPreservesCapturedForkJoin)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] {
+        const auto count = [](IGPUGraphCapture &owner) {
+            auto graph = dynamic_cast<HIPGraphCapture &>(owner).graph();
+            std::size_t edges = 0;
+            test::requireNativeDependencyProof(
+                hipGraphGetEdges(graph, nullptr, nullptr, &edges) == hipSuccess,
+                "HIP reduction proof edge count");
+            return edges;
+        };
+        test::proveNativeDependencyReduction(ctx(), *backend, count);
+    });
 }
 
 /** @test Scratch invalidation preserves in-flight readers and accepted bytes. */

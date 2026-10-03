@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <set>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -701,6 +702,18 @@ namespace
                 gpu.memory_bytes = gpu.free_memory_bytes = size_t{16} << 30;
                 gpu.compute_units = 32;
             }
+            // Explicit physical topology, independent of the synthetic service
+            // receipts: projection fixtures begin with proven absent P2P.
+            for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+            {
+                const auto count = std::count_if(rank.gpus.begin(), rank.gpus.end(),
+                    [&](const auto &gpu) { return gpu.type == backend; });
+                auto &matrix = backend == DeviceType::CUDA ? rank.p2p_cuda : rank.p2p_rocm;
+                auto &width = backend == DeviceType::CUDA ? rank.p2p_cuda_count : rank.p2p_rocm_count;
+                width = count;
+                matrix.assign(static_cast<size_t>(count * count), false);
+                for (size_t i = 0; i < static_cast<size_t>(count); ++i) matrix[i * count + i] = true;
+            }
         }
         cluster.buildNodeAggregations();
         return cluster;
@@ -734,7 +747,8 @@ namespace
     /** @return Exact admitted rank-zero candidate; no model payload or accelerator is loaded. */
     AdmittedOrchestrationCandidate requestCandidate(const PlanningModelSource &source, const ClusterInventory &cluster,
         DeviceType backend, OrchestrationStrategy strategy,
-        MoERebalanceRuntimeMode movement = MoERebalanceRuntimeMode::Off)
+        MoERebalanceRuntimeMode movement = MoERebalanceRuntimeMode::Off,
+        RoutedExpertComputePolicy routed = RoutedExpertComputePolicy::Apportioned)
     {
         OrchestrationConfig request;
         request.model_path = source.path();
@@ -743,6 +757,7 @@ namespace
         // Costing predicts initial placement without assuming future movement
         // gains; admission must still retain the exact requested maintenance.
         request.moe_rebalance.mode = movement;
+        request.routed_expert_compute_policy = routed;
         request.automatic_planning.only_backends = std::vector{backend};
         request.automatic_planning.only_strategies = std::vector{strategy};
         std::optional<AdmittedOrchestrationCandidate> found;
@@ -941,6 +956,141 @@ TEST(PlanningWeightServiceModel, ExpertGroupingAndReplicationPreserveAllNativeFo
             for (const size_t rows : {1u, 2u, 7u, 64u, 8192u})
                 EXPECT_GT(ordinary_service.projectionSeconds(1, device, weight, rows), 0);
         }
+    }
+}
+
+/** @brief Zero movable quota never erases the fixed all-expert down population. */
+TEST(PlanningWeightServiceModel, ProjectionWorkChargesDownAtZeroOwnersAllNativeFormats)
+{
+    using T = GGUFTensorType;
+    const std::vector formats{T::F32, T::F16, T::BF16, T::Q4_0, T::Q4_1, T::Q5_0, T::Q5_1, T::Q8_0,
+        T::Q2_K, T::Q3_K, T::Q4_K, T::Q5_K, T::Q6_K, T::Q8_K, T::IQ1_S, T::IQ1_M,
+        T::IQ2_XXS, T::IQ2_XS, T::IQ2_S, T::IQ3_XXS, T::IQ3_S, T::IQ4_NL, T::IQ4_XS};
+    const auto cluster = inventory();
+    for (const auto format : formats)
+    {
+        PlanningGGUFFixture file(true, true, format, 512);
+        PlanningModelSource source(file.path());
+        const auto plan = PlanningExpertSamplePlan::resolve(source, request());
+        const auto encoded = receipts(cluster, plan);
+        const auto catalog = PlanningKernelServiceCatalog::accept(cluster, AutomaticOrchestrationRequest{}, plan, borrow(encoded));
+        // Make the arithmetic witness the limiting basis, so exact operation
+        // fractions are testable independently of format-dependent streaming.
+        const PlanningWeightServiceModel service(memoryCatalog(cluster, 1e-12), {catalog});
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const int degree : {2, 4, 8})
+        {
+            SCOPED_TRACE(::testing::Message() << int(format) << "/" << device.toString() << "/" << degree);
+            PlanningRoutedExpertWeightWork work{0, 8, 2,
+                {sourceOperand(source, plan.request().gate.tensor_name, device, 1),
+                 sourceOperand(source, plan.request().up.tensor_name, device, 1),
+                 sourceOperand(source, plan.request().down.tensor_name, device, 1)},
+                {{PlanningExpertExecution::OwnedExperts, 8}}};
+            for (size_t rows : {1u, 2u, 16u, 33u, 64u, 8192u})
+            {
+                work.projection_ownership.reset();
+                work.execution_shares = {{PlanningExpertExecution::OwnedExperts, 8}};
+                const auto complete = service.expertSeconds(1, device, work, rows);
+                work.projection_ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns({8, 256, 512}, 0, degree);
+                work.execution_shares = {{PlanningExpertExecution::OwnedExperts, 8 / degree}};
+                EXPECT_NEAR(service.expertSeconds(1, device, work, rows), complete / degree, complete * 1e-12);
+                work.execution_shares = {{PlanningExpertExecution::OwnedExperts, 0}};
+                EXPECT_NEAR(service.expertSeconds(1, device, work, rows), complete / (3 * degree), complete * 1e-12);
+                EXPECT_DOUBLE_EQ(service.expertSeconds(1, device, work, 0), 0);
+            }
+            EXPECT_THROW(service.expertSeconds(1, DeviceId::cpu(), work, 1), std::invalid_argument);
+        }
+    }
+}
+
+/** @brief Both declared fabrics require their own evidence; timing cannot pick a transport. */
+TEST(PlanningRequestCostModel, ProjectionPolicyRequiresActualFabricAndColumnPublication)
+{
+    for (const bool p2p : {false, true})
+    {
+        auto cluster = requestInventory(true);
+        if (p2p)
+            for (auto &rank : cluster.ranks)
+            {
+                std::fill(rank.p2p_cuda.begin(), rank.p2p_cuda.end(), true);
+                std::fill(rank.p2p_rocm.begin(), rank.p2p_rocm.end(), true);
+            }
+        cluster.buildNodeAggregations();
+        constexpr std::array precisions{PlanningAllreducePrecision::FP32};
+        for (const auto format : {GGUFTensorType::F32, GGUFTensorType::F16, GGUFTensorType::BF16, GGUFTensorType::Q8_0,
+                                 GGUFTensorType::Q6_K, GGUFTensorType::IQ2_S})
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            SCOPED_TRACE(::testing::Message() << p2p << "/" << int(format) << "/" << int(backend));
+            // Reproduce the public topology's TP-only search. An unrestricted
+            // search also samples PP/overlay host links and hid this defect.
+            const AutomaticOrchestrationRequest constraints({.only_backends = {{backend}},
+                .only_strategies = {{OrchestrationStrategy::TensorParallel}}});
+            const auto sample = PlanningCommunicationSamplePlan::resolve(cluster, constraints, 256, 64, precisions,
+                RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+            const auto encoded = nativeReceipts(sample, cluster.world_size);
+            const auto observations = PlanningCommunicationService::acceptLocal(sample, cluster.world_size, borrow(encoded));
+            PlanningGGUFFixture file(true, true, format, 512);
+            PlanningModelSource source(file.path());
+            const auto candidate = requestCandidate(source, cluster, backend, OrchestrationStrategy::TensorParallel,
+                MoERebalanceRuntimeMode::Dynamic, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+            const PlanningRequestCostModel costs(source.metadata(), cluster, requestWeights(source, cluster),
+                requestArithmetic(cluster), PlanningCommunicationCost(cluster, observations.native, {}, observations.host_device));
+            const auto estimate = costs.evaluate(candidate, {64, 16});
+            EXPECT_GT(estimate.requestSeconds(), 0);
+            EXPECT_NE(estimate.evidence().find("all-expert down slices"), std::string::npos);
+            EXPECT_NE(estimate.evidence().find("projection column gather"), std::string::npos);
+            EXPECT_NE(estimate.evidence().find(p2p ? "projection native intermediate" : "counted owner records"), std::string::npos);
+            EXPECT_EQ(estimate.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
+            const PlanningRequestCostModel missing_native(source.metadata(), cluster, requestWeights(source, cluster),
+                requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}, observations.host_device));
+            EXPECT_THROW(missing_native.evaluate(candidate, {64, 16}), std::invalid_argument);
+            if (!p2p)
+            {
+                const PlanningRequestCostModel missing_mapped(source.metadata(), cluster, requestWeights(source, cluster),
+                    requestArithmetic(cluster), PlanningCommunicationCost(cluster, observations.native, {}));
+                EXPECT_THROW(missing_mapped.evaluate(candidate, {64, 16}), std::invalid_argument);
+            }
+        }
+    }
+}
+
+/** @brief TP-only projection searches retain exact host first-touch scopes, unlike whole-expert TP. */
+TEST(PlanningCommunicationService, ProjectionOnlyTPSamplesItsActualHostScopes)
+{
+    const auto cluster = communicationInventory();
+    constexpr std::array precision{PlanningAllreducePrecision::FP32};
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        SCOPED_TRACE(int(backend));
+        const AutomaticOrchestrationRequest tp({.only_backends = {{backend}},
+            .only_strategies = {{OrchestrationStrategy::TensorParallel}}});
+        EXPECT_TRUE(PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision).hostDevice().empty());
+        const auto projection = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
+            RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+        ASSERT_EQ(projection.hostDevice().size(), 7u);
+        const auto automatic = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
+            RoutedExpertComputePolicy::Automatic);
+        ASSERT_EQ(automatic.hostDevice().size(), projection.hostDevice().size());
+        for (size_t index = 0; index < projection.hostDevice().size(); ++index)
+            EXPECT_EQ(automatic.hostDevice()[index], projection.hostDevice()[index]);
+        std::set<std::pair<int, int>> scopes;
+        for (const auto &sample : projection.hostDevice())
+        {
+            EXPECT_EQ(sample.device().type, backend);
+            EXPECT_EQ(sample, PlanningHostDeviceRequest::fromInventory(cluster.ranks.at(sample.rank()),
+                sample.device(), 257 * 31 * sizeof(float)));
+            EXPECT_TRUE(scopes.emplace(sample.rank(), sample.device().ordinal).second);
+        }
+        const AutomaticOrchestrationRequest single({.only_backends = {{backend}},
+            .only_strategies = {{OrchestrationStrategy::SingleDevice}}});
+        EXPECT_TRUE(PlanningCommunicationSamplePlan::resolve(cluster, single, 257, 31, precision,
+            RoutedExpertComputePolicy::GateUpOwnedDownColumns).hostDevice().empty());
+        EXPECT_NE(PlanningCommunicationSamplePlan::resolve(cluster, single, 257, 31, precision).serialize(),
+            PlanningCommunicationSamplePlan::resolve(cluster, single, 257, 31, precision,
+                RoutedExpertComputePolicy::GateUpOwnedDownColumns).serialize());
+        EXPECT_THROW(PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
+            static_cast<RoutedExpertComputePolicy>(255)), std::invalid_argument);
     }
 }
 

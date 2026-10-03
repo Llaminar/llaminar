@@ -32,6 +32,7 @@
 #include "../graph/DeviceGraphCaptureController.h"
 #include "../graph/DeviceExecutionTimeline.h"
 #include "../engine/PrefillBucketUtils.h"
+#include "../engine/ForwardGraphEntryOrdering.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/MPIContext.h"
@@ -5093,7 +5094,7 @@ namespace llaminar2
                 if (cache)
                     cache->invalidate();
             }
-            mtp_stochastic_serial_outcome_graph_.invalidate();
+            mtp_stochastic_outcome_graph_.invalidate();
             mtp_stochastic_target_distribution_graph_.invalidate();
             moe_overlay_epoch_acquire_graph_.invalidate();
             moe_overlay_epoch_release_graph_.invalidate();
@@ -19941,21 +19942,25 @@ namespace llaminar2
 
         const int captured_bucket_seq_len =
             planned_chunks.chunks.front().bucket_seq_len;
-        const bool one_physical_bucket = std::all_of(
-            planned_chunks.chunks.begin(),
-            planned_chunks.chunks.end(),
-            [captured_bucket_seq_len](const PrefillChunkPlan &chunk)
-            {
-                return chunk.bucket_seq_len == captured_bucket_seq_len;
-            });
-        if (!one_physical_bucket || captured_bucket_seq_len <= 0 ||
-            captured_bucket_seq_len > prefill_chunk_row_capacity_)
+        std::uint64_t physical_rows = 0;
+        std::vector<DevicePrefillChunkGraphBinding> chunk_bindings;
+        chunk_bindings.reserve(planned_chunks.chunks.size());
+        for (const auto &chunk : planned_chunks.chunks)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Device-resident prefill requires one capacity-complete physical graph bucket"
-                      << " bucket=" << captured_bucket_seq_len
-                      << " capacity=" << prefill_chunk_row_capacity_
-                      << " chunks=" << planned_chunks.chunks.size());
-            return false;
+            // Setup and admission use this same binding authority. A smaller
+            // retained tail changes only immutable graph width/identity, never
+            // the token bank, producer stream or canonical device KV cursor.
+            const auto binding = makeDevicePrefillChunkGraphBinding(
+                chunk.bucket_seq_len, pad_token_id);
+            if (!binding)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Device-resident prefill bucket exceeds its admitted family capacity"
+                          << " bucket=" << chunk.bucket_seq_len
+                          << " capacity=" << prefill_chunk_row_capacity_);
+                return false;
+            }
+            chunk_bindings.push_back(*binding);
+            physical_rows += static_cast<std::uint64_t>(binding->bucket_seq_len);
         }
 
         std::vector<int> request_position_ids(static_cast<size_t>(seq_len));
@@ -20029,9 +20034,7 @@ namespace llaminar2
                 "graph lacks an explicit publication stream");
             return false;
         }
-        input.device_prefill_chunk = makeDevicePrefillChunkGraphBinding(
-            captured_bucket_seq_len,
-            pad_token_id);
+        input.device_prefill_chunk = chunk_bindings.front();
         if (!input.device_prefill_chunk)
         {
             LOG_ERROR(
@@ -20062,7 +20065,21 @@ namespace llaminar2
         output.logits = logits_output;
         output.hidden = state_.hidden.get();
 
-        if (!forward_engine_->runPrefillChunkSchedule(input, schedule, output, *this))
+        std::vector<ForwardInput> chunk_inputs;
+        chunk_inputs.reserve(chunk_bindings.size());
+        for (const auto &binding : chunk_bindings)
+        {
+            ForwardInput chunk_input = input;
+            chunk_input.device_prefill_chunk = binding;
+            // Shifted-MTP identity embeds the materializer's physical width.
+            // Seal it through its existing authority too; copying the largest
+            // bucket's predictor identity would miss the retained smaller graph.
+            if (!bindShiftedMTPPrefillTransaction(chunk_input, /*request_count=*/1))
+                return false;
+            chunk_inputs.push_back(std::move(chunk_input));
+        }
+        if (!forward_engine_->runPrefillChunkSchedule(input, schedule, output, *this,
+                                                     chunk_inputs))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Prefill chunk schedule execution failed");
             return false;
@@ -20110,6 +20127,8 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"logical_rows", std::to_string(seq_len)},
              {"bucket_rows", std::to_string(captured_bucket_seq_len)},
+             {"terminal_bucket_rows", std::to_string(chunk_bindings.back().bucket_seq_len)},
+             {"physical_rows", std::to_string(physical_rows)},
              {"request_admissions", "1"},
              {"source_cursor", "canonical_kv_count"},
              {"host_chunk_slices", "0"}});
@@ -23768,7 +23787,7 @@ namespace llaminar2
     std::optional<
         DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
     DeviceGraphOrchestrator::
-        mtpStochasticSerialOutcomeDeviceLoopGraphTemplate(
+        mtpStochasticOutcomeDeviceLoopGraphTemplate(
             int request_count,
             int comparison_rows_per_request,
             std::string *error) const
@@ -23787,17 +23806,17 @@ namespace llaminar2
         if (!state_.device_id.is_gpu())
         {
             return reject(
-                "seeded stochastic outcome loop composition requires a GPU runner");
+                "stochastic outcome loop composition requires a GPU runner");
         }
 
-        const auto &cache = mtp_stochastic_serial_outcome_graph_;
+        const auto &cache = mtp_stochastic_outcome_graph_;
         if (!cache.valid || !cache.graph || !cache.stage)
-            return reject("seeded stochastic outcome graph is not initialized");
+            return reject("stochastic outcome graph is not initialized");
         if (cache.workspace_generation == 0 ||
             cache.workspace_generation != workspaceGeneration(state_.device_id))
         {
             return reject(
-                "seeded stochastic outcome graph belongs to a stale workspace generation");
+                "stochastic outcome graph belongs to a stale workspace generation");
         }
         const auto &params = cache.stage->getParams();
         if (request_count <= 0 || comparison_rows_per_request <= 0 ||
@@ -23806,14 +23825,14 @@ namespace llaminar2
                 comparison_rows_per_request)
         {
             return reject(
-                "seeded stochastic outcome graph geometry does not match the requested parent loop");
+                "stochastic outcome graph geometry does not match the requested parent loop");
         }
         if (!params.generation_control_device ||
             !params.threshold_base_positions_device ||
             !params.verifier_input_tokens_device)
         {
             return reject(
-                "seeded stochastic outcome graph lacks persistent controller or verifier bindings");
+                "stochastic outcome graph lacks persistent controller or verifier bindings");
         }
 
         return cache.segment_cache.deviceLoopGraphTemplate(
@@ -24399,14 +24418,14 @@ namespace llaminar2
                 }
 
                 fragment_error.clear();
-                auto serial_outcome =
-                    mtpStochasticSerialOutcomeDeviceLoopGraphTemplate(
+                auto stochastic_outcome =
+                    mtpStochasticOutcomeDeviceLoopGraphTemplate(
                         request_count,
                         draft_depth,
                         &fragment_error);
                 if (!append(
-                        "stochastic serial-equivalent outcome",
-                        serial_outcome,
+                        "stochastic outcome",
+                        stochastic_outcome,
                         fragment_error))
                 {
                     return false;
@@ -25134,14 +25153,6 @@ namespace llaminar2
         TensorBase *mtp_gate = get_extension(BufferId::MTP_GATE_PROJ);
         TensorBase *mtp_up = get_extension(BufferId::MTP_UP_PROJ);
         TensorBase *mtp_ffn_output = get_extension(BufferId::MTP_FFN_OUTPUT);
-        TensorBase *mtp_moe_expert_indices = get_extension(BufferId::MOE_EXPERT_INDICES);
-        TensorBase *mtp_moe_expert_weights = get_extension(BufferId::MOE_EXPERT_WEIGHTS);
-        TensorBase *mtp_moe_combined_output = get_extension(BufferId::MOE_COMBINED_OUTPUT);
-        TensorBase *mtp_moe_canonical_route_contributions =
-            get_extension(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
-        TensorBase *mtp_moe_shared_expert_output = get_extension(BufferId::MOE_SHARED_EXPERT_OUTPUT);
-        TensorBase *mtp_moe_gate_scratch = get_extension(BufferId::MOE_GATE_SCRATCH);
-        TensorBase *mtp_moe_up_scratch = get_extension(BufferId::MOE_UP_SCRATCH);
 
         const bool missing_common_buffers =
             !terminal_hidden ||
@@ -25162,16 +25173,6 @@ namespace llaminar2
         if (requires_global_mtp_logits_gather && !mtp_logits_gathered)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] GlobalTP MTP sidecar is missing its gathered full-vocabulary logits buffer");
-            return false;
-        }
-        if (!kv_cache_only && mtp_moe_sidecar &&
-            (!mtp_moe_expert_indices || !mtp_moe_expert_weights ||
-             !mtp_moe_combined_output ||
-             !mtp_moe_canonical_route_contributions ||
-             !mtp_moe_shared_expert_output ||
-             !mtp_moe_gate_scratch || !mtp_moe_up_scratch))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] MoE MTP sidecar missing required MoE scratch buffers");
             return false;
         }
         auto require_rows = [&](const char *name, const TensorBase *tensor) -> bool
@@ -25209,17 +25210,7 @@ namespace llaminar2
               !require_rows("mtp_attn_proj", mtp_attn_proj) ||
               !require_rows("mtp_gate", mtp_gate) ||
               !require_rows("mtp_up", mtp_up) ||
-              !require_rows("mtp_ffn_output", mtp_ffn_output))) ||
-            (!kv_cache_only && mtp_moe_sidecar &&
-             (!require_rows("mtp_moe_expert_indices", mtp_moe_expert_indices) ||
-              !require_rows("mtp_moe_expert_weights", mtp_moe_expert_weights) ||
-              !require_rows("mtp_moe_combined_output", mtp_moe_combined_output) ||
-              !require_rows(
-                  "mtp_moe_canonical_route_contributions",
-                  mtp_moe_canonical_route_contributions) ||
-              !require_rows("mtp_moe_shared_expert_output", mtp_moe_shared_expert_output) ||
-              !require_rows("mtp_moe_gate_scratch", mtp_moe_gate_scratch) ||
-              !require_rows("mtp_moe_up_scratch", mtp_moe_up_scratch))))
+              !require_rows("mtp_ffn_output", mtp_ffn_output))))
         {
             return false;
         }
@@ -25247,14 +25238,9 @@ namespace llaminar2
         output.gate = mtp_gate;
         output.up = mtp_up;
         output.ffn_output = mtp_ffn_output;
-        output.moe_expert_indices = mtp_moe_expert_indices;
-        output.moe_expert_weights = mtp_moe_expert_weights;
-        output.moe_combined_output = mtp_moe_combined_output;
-        output.moe_canonical_route_contributions =
-            mtp_moe_canonical_route_contributions;
-        output.moe_shared_expert_output = mtp_moe_shared_expert_output;
-        output.moe_gate_scratch = mtp_moe_gate_scratch;
-        output.moe_up_scratch = mtp_moe_up_scratch;
+        if (!kv_cache_only && mtp_moe_sidecar)
+            output.moe = MoEActivationBindings::bind(
+                graph_builder_->config().moe.routed_compute_policy, total_rows, get_extension);
 
         /*
          * Resolve cache identity and input publication from the same typed role.
@@ -27090,16 +27076,6 @@ namespace llaminar2
             .gate = extension(BufferId::MTP_GATE_PROJ),
             .up = extension(BufferId::MTP_UP_PROJ),
             .ffn_output = extension(BufferId::MTP_FFN_OUTPUT),
-            .moe_expert_indices = extension(BufferId::MOE_EXPERT_INDICES),
-            .moe_expert_weights = extension(BufferId::MOE_EXPERT_WEIGHTS),
-            .moe_combined_output =
-                extension(BufferId::MOE_COMBINED_OUTPUT),
-            .moe_canonical_route_contributions =
-                extension(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS),
-            .moe_shared_expert_output =
-                extension(BufferId::MOE_SHARED_EXPERT_OUTPUT),
-            .moe_gate_scratch = extension(BufferId::MOE_GATE_SCRATCH),
-            .moe_up_scratch = extension(BufferId::MOE_UP_SCRATCH),
         };
         const std::array<std::pair<const char *, TensorBase *>, 9>
             required_kv_only_scratch{{
@@ -34187,7 +34163,7 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::materializeMTPStochasticSerialOutcomeGraph(
+    bool DeviceGraphOrchestrator::materializeMTPStochasticOutcomeGraph(
         const DeviceStochasticBatchOutcomeRequest *requests,
         int request_count,
         std::string *error)
@@ -34211,7 +34187,7 @@ namespace llaminar2
             !supportsDeviceStochasticMTPVerification())
         {
             return fail(
-                "seeded stochastic outcome graph requires finalized GPU bindings and positive request geometry");
+                "stochastic outcome graph requires finalized GPU bindings and positive request geometry");
         }
         if (!device_generation_storage_.validFor(request_count) ||
             device_generation_storage_.active_request_count != request_count ||
@@ -34219,12 +34195,12 @@ namespace llaminar2
             mtp_publication_base_cache_snapshot_request_count_ < request_count)
         {
             return fail(
-                "seeded stochastic outcome graph has no admitted controller or verifier-base snapshot");
+                "stochastic outcome graph has no admitted controller or verifier-base snapshot");
         }
 
         IBackend *backend = getBackendFor(state_.device_id);
         if (!backend)
-            return fail("seeded stochastic outcome graph could not resolve its backend");
+            return fail("stochastic outcome graph could not resolve its backend");
 
         const MTPSpecDecodeMetadataDevicePointers &publication_metadata =
             mtp_spec_decode_metadata_binding_.devicePointers();
@@ -34238,7 +34214,7 @@ namespace llaminar2
             !stochastic_batch_output_meta_dev_)
         {
             return fail(
-                "seeded stochastic outcome graph has incomplete persistent arena bindings");
+                "stochastic outcome graph has incomplete persistent arena bindings");
         }
 
         const int comparison_rows = requests[0].row_count;
@@ -34248,7 +34224,7 @@ namespace llaminar2
             verifier_input_stride < verifier_rows)
         {
             return fail(
-                "seeded stochastic outcome graph received invalid verifier depth or input stride");
+                "stochastic outcome graph received invalid verifier depth or input stride");
         }
         const bool materialized_batch_matches =
             materialized_mtp_verifier_device_token_batch_.valid &&
@@ -34276,17 +34252,20 @@ namespace llaminar2
         if (!materialized_batch_matches && !materialized_scalar_matches)
         {
             return fail(
-                "seeded stochastic outcome graph requires a complete materialized verifier-token matrix");
+                "stochastic outcome graph requires a complete materialized verifier-token matrix");
         }
         if (!mtp_request_stop_tokens_published_session_epoch_ ||
             *mtp_request_stop_tokens_published_session_epoch_ != session_epoch_)
         {
             return fail(
-                "seeded stochastic outcome graph reached capture without request-admitted stop controls");
+                "stochastic outcome graph reached capture without request-admitted stop controls");
         }
 
         std::vector<uint64_t> threshold_seeds;
         threshold_seeds.reserve(static_cast<size_t>(request_count));
+        const auto verification = requests[0].serial_sample_equivalent
+            ? MTPStochasticOutcomeStage::Verification::SerialEquivalent
+            : MTPStochasticOutcomeStage::Verification::OneHotProbabilityRejection;
         int shared_top_k = 0;
         for (int request_index = 0;
              request_index < request_count;
@@ -34298,7 +34277,8 @@ namespace llaminar2
                 request_index * verifier_rows;
             const int expected_token_row_offset =
                 request_index * verifier_input_stride;
-            if (!request.serial_sample_equivalent ||
+            if (request.serial_sample_equivalent == request.use_vllm_probability_rejection ||
+                request.serial_sample_equivalent != requests[0].serial_sample_equivalent ||
                 !request.derive_thresholds_from_seed ||
                 request.inverse_sample_seed == 0 ||
                 request.inverse_sample_first_logical_position >= 0 ||
@@ -34318,7 +34298,7 @@ namespace llaminar2
                     mtp_request_stop_token_count_)
             {
                 return fail(
-                    "seeded stochastic outcome descriptor does not match uniform captured geometry at request " +
+                    "stochastic outcome descriptor does not match uniform captured geometry at request " +
                     std::to_string(request_index));
             }
             for (int stop_index = 0;
@@ -34329,7 +34309,7 @@ namespace llaminar2
                     mtp_request_stop_tokens_[static_cast<size_t>(stop_index)])
                 {
                     return fail(
-                        "seeded stochastic outcome stop controls differ from request admission");
+                        "stochastic outcome stop controls differ from request admission");
                 }
             }
 
@@ -34342,7 +34322,7 @@ namespace llaminar2
                 (shared_top_k != 0 && shared_top_k != request_top_k))
             {
                 return fail(
-                    "seeded stochastic outcome target rows disagree on top-k width");
+                    "stochastic outcome target rows disagree on top-k width");
             }
             shared_top_k = request_top_k;
             for (int row = 0; row < verifier_rows; ++row)
@@ -34355,7 +34335,7 @@ namespace llaminar2
                         StochasticRowFormat::CompactDistribution)
                 {
                     return fail(
-                        "seeded stochastic outcome target matrix is incomplete at slot " +
+                        "stochastic outcome target matrix is incomplete at slot " +
                         std::to_string(slot));
                 }
             }
@@ -34364,7 +34344,7 @@ namespace llaminar2
         if (request_count * verifier_rows > stochastic_target_row_capacity_)
         {
             return fail(
-                "seeded stochastic outcome geometry exceeds target-row capacity");
+                "stochastic outcome geometry exceeds target-row capacity");
         }
 
         /*
@@ -34385,7 +34365,7 @@ namespace llaminar2
         if (requires_rebalance_controller && !rebalance_controller)
         {
             return fail(
-                "seeded stochastic outcome graph cannot bind the required MoE maintenance controller: " +
+                "stochastic outcome graph cannot bind the required MoE maintenance controller: " +
                 rebalance_controller_error);
         }
         auto *rebalance_bytes =
@@ -34397,9 +34377,15 @@ namespace llaminar2
                        : nullptr;
         };
 
-        MTPStochasticSerialOutcomeStage::Params params;
+        MTPStochasticOutcomeStage::Params params;
         params.device_id = state_.device_id;
         params.backend = backend;
+        params.verification = verification;
+        params.vocabulary_size =
+            graph_builder_ ? graph_builder_->config().vocab_size : state_.vocab_size;
+        params.accepted_rows_device =
+            static_cast<int32_t *>(stochastic_verify_accepted_dev_);
+        params.accepted_row_stride = verifier_rows;
         params.target_token_ids_device =
             static_cast<const int32_t *>(stochastic_target_token_ids_dev_);
         params.target_probs_device =
@@ -34451,7 +34437,7 @@ namespace llaminar2
             !mtp_first_transaction_diagnostic_dev_)
         {
             return fail(
-                "seeded stochastic outcome graph has no arena-owned first-transaction diagnostic record");
+                "stochastic outcome graph has no arena-owned first-transaction diagnostic record");
         }
         params.first_transaction_diagnostic_device =
             retain_first_transaction_diagnostic
@@ -34477,7 +34463,7 @@ namespace llaminar2
                 DeviceMoERebalanceGraphControllerState,
                 decode_boundary_advanced));
 
-        auto &cache = mtp_stochastic_serial_outcome_graph_;
+        auto &cache = mtp_stochastic_outcome_graph_;
         if (cache.valid && cache.graph && cache.stage &&
             cache.workspace_generation == generation &&
             cache.stage->hasSameCaptureIdentity(params))
@@ -34486,12 +34472,12 @@ namespace llaminar2
         }
 
         auto stage =
-            std::make_unique<MTPStochasticSerialOutcomeStage>(
+            std::make_unique<MTPStochasticOutcomeStage>(
                 std::move(params));
         auto *outcome_stage = stage.get();
         auto graph = std::make_unique<ComputeGraph>();
         graph->addNode(
-            "mtp_stochastic_serial_outcome",
+            "mtp_stochastic_outcome",
             std::move(stage),
             state_.device_id);
 
@@ -34504,7 +34490,7 @@ namespace llaminar2
 
         PerfStatsCollector::addCounter(
             "mtp",
-            "stochastic_serial_outcome_graph_materializations",
+            "stochastic_outcome_graph_materializations",
             1.0,
             "graph_setup",
             state_.device_id.toString(),
@@ -34515,7 +34501,7 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::executeMTPStochasticSerialOutcomeCaptured(
+    bool DeviceGraphOrchestrator::executeMTPStochasticOutcomeCaptured(
         void *producer_stream,
         int request_count,
         int comparison_rows_per_request,
@@ -34529,7 +34515,7 @@ namespace llaminar2
             return false;
         };
 
-        auto &cache = mtp_stochastic_serial_outcome_graph_;
+        auto &cache = mtp_stochastic_outcome_graph_;
         const uint64_t generation = workspaceGeneration(state_.device_id);
         if (!state_.device_id.is_gpu() || !producer_stream ||
             !cache.valid || !cache.graph || !cache.stage ||
@@ -34540,17 +34526,17 @@ namespace llaminar2
                 comparison_rows_per_request)
         {
             return fail(
-                "captured seeded stochastic outcome requires a current exact-geometry graph and producer stream");
+                "captured stochastic outcome requires a current exact-geometry graph and producer stream");
         }
         if (!debugEnv().execution.gpu_graphs)
         {
             return fail(
-                "seeded stochastic GPU outcome reduction requires graph capture; eager execution is forbidden");
+                "stochastic GPU outcome reduction requires graph capture; eager execution is forbidden");
         }
 
         IDeviceContext *ctx = getDeviceContext(state_.device_id);
         if (!ctx)
-            return fail("captured seeded stochastic outcome has no device context");
+            return fail("captured stochastic outcome has no device context");
         auto &gpu_ctx =
             GPUDeviceContextPool::instance().getContext(state_.device_id);
         if (!cache.segment_cache.ensureCaptureStream(
@@ -34562,11 +34548,11 @@ namespace llaminar2
                 producer_stream))
         {
             return fail(
-                "captured seeded stochastic outcome could not consume target-distribution readiness");
+                "captured stochastic outcome could not consume target-distribution readiness");
         }
 
         cache.segment_cache.perf_context =
-            "mtp_stochastic_serial_outcome";
+            "mtp_stochastic_outcome";
         cache.segment_cache.replay_workload = {
             .seq_len = comparison_rows_per_request + 1,
             .batch_size = request_count,
@@ -34581,7 +34567,7 @@ namespace llaminar2
         if (!capture_policy.allow_cached_graph_replay)
         {
             return fail(
-                "captured seeded stochastic outcome requires mandatory graph replay");
+                "captured stochastic outcome requires mandatory graph replay");
         }
         capture_policy.defer_final_sync = true;
         capture_policy.force_recapture = false;
@@ -34601,14 +34587,14 @@ namespace llaminar2
                 &used_graph_replay))
         {
             return fail(
-                "seeded stochastic outcome failed under the strict monolithic capture policy");
+                "stochastic outcome failed under the strict monolithic capture policy");
         }
         if (!cache.segment_cache.orderStreamAfterCapture(
                 &gpu_ctx,
                 producer_stream))
         {
             return fail(
-                "seeded stochastic outcome could not publish completion to its producer stream");
+                "stochastic outcome could not publish completion to its producer stream");
         }
         return true;
     }
@@ -41653,19 +41639,24 @@ namespace llaminar2
         {
             return false;
         }
-        // A pipeline follower has no sampler or logical-mailbox producer to
-        // join the previous main forward. Condition and verifier executables
-        // may use different capture streams, even when they share the same
-        // native communicator and hidden/KV storage. Acquire the durable local
-        // terminal before either their metadata collective or compute can run.
-        // This orders external submissions only: retained parent iterations
-        // already carry the same dependency inside their captured DAG.
-        if (pp_stage_config_ && !pp_stage_config_->has_lm_head &&
+        // A follower has no sampler/mailbox edge between forwards. A resident
+        // prefill family likewise shares activation and chunk metadata across
+        // independently captured widths. Acquire the actual preceding terminal
+        // on this exact consumer stream before any root can read/write them.
+        // Native parent iterations retain their own internal DAG, not this
+        // external-submission prelude. No host/device synchronization is added.
+        const auto output_role = pp_stage_config_ && !pp_stage_config_->has_lm_head
+            ? ForwardParticipantOutputRole::PipelineFollower
+            : ForwardParticipantOutputRole::TerminalOwner;
+        if (forwardGraphEntryDependency(input, state_.device_id, output_role) ==
+                ForwardGraphEntryDependency::PreviousForwardCompletion &&
             !waitForForwardGraphOutputReady(
                 execution_stream,
                 DeviceTimelineRole::MainForwardGraph,
                 ForwardGraphOutputKind::Any,
-                "pipeline_follower_previous_forward"))
+                output_role == ForwardParticipantOutputRole::PipelineFollower
+                    ? "pipeline_follower_previous_forward"
+                    : "prefill_previous_bucket"))
         {
             return false;
         }
@@ -47768,6 +47759,32 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::preparePrefixHarvest(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        const PrefixHarvestSchedule &schedule)
+    {
+        if (!admission.supported || !admission.cache_enabled ||
+            !prefix_cache_ || admission.fingerprint_key == 0u)
+            return false;
+        // As at harvest, a moved namespace cannot be relabeled. Preparing its
+        // obsolete payloads would merely create avoidable background traffic.
+        if (admission.fingerprint_key != prefix_identity_.key)
+            return true;
+        const auto preparation = prefix_cache_->prepareHarvest(
+            admission, tokens, schedule, prefix_layout_,
+            graph_builder_ ? graph_builder_->prefixCacheRuntimeStateCapacity() : 0u);
+        if (preparation == PrefixRamInsertPreparation::Error)
+            return false;
+        PerfStatsCollector::addCounter(
+            "prefix_cache", "prefill_archive_preparations", 1.0,
+            "admission", state_.device_id.toString(),
+            {{"state", preparation == PrefixRamInsertPreparation::Busy ? "pending" : "prepared"},
+             {"prompt_tokens", std::to_string(schedule.promptTokens())},
+             {"reusable_checkpoint", std::to_string(schedule.reusableCheckpoint().value_or(0))}});
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::harvestPrefix(
         const PrefixLookupResult &admission,
         const std::vector<int32_t> &tokens,
@@ -47822,6 +47839,12 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Prefix harvest could not refresh its live payload layout");
             return false;
         }
+
+        // Completed restore reads no longer need their source aliases. Poll
+        // their exact events before admitting new archives, without waiting on
+        // a stream or mistaking retired cache metadata for released PMA bytes.
+        if (state_.device_id.is_gpu())
+            retirePendingPrefixPayloadUses(false);
 
         const uint64_t request_fingerprint = admission.fingerprint_key;
         if (request_fingerprint != prefix_identity_.key)
@@ -47955,6 +47978,11 @@ namespace llaminar2
                     LOG_ERROR("[DeviceGraphOrchestrator] Prefix harvest failed: model runtime state capture failed");
                     return false;
                 }
+                if (captured->size() > graph_builder_->prefixCacheRuntimeStateCapacity())
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Model prefix serializer exceeded its declared capacity");
+                    return false;
+                }
                 if (!captured->empty())
                     model_runtime_state = std::move(captured);
             }
@@ -47964,34 +47992,12 @@ namespace llaminar2
             const size_t total_block_bytes =
                 block_layout.totalBytes() + model_runtime_state_bytes;
 
-            const PrefixRamInsertPreparation ram_preparation =
-                prefix_cache_->prepareInsert(key, total_block_bytes);
-            if (ram_preparation == PrefixRamInsertPreparation::Busy)
-            {
-                // A bounded optional archive can be full while the request's
-                // DMA/restore handles still own its admitted physical bytes.
-                // Preserve the successful inference result and record the
-                // missed cache admission; never overcommit PMA or block on a
-                // GPU stream merely to force an archive into RAM.
-                PerfStatsCollector::addCounter(
-                    "prefix_cache",
-                    "ram_harvest_busy_skips",
-                    1.0,
-                    "harvest",
-                    state_.device_id.toString(),
-                    {{"block", std::to_string(block)},
-                     {"bytes", std::to_string(total_block_bytes)},
-                     {"policy", "bounded_physical_lease"}});
-                continue;
-            }
-            if (ram_preparation != PrefixRamInsertPreparation::Prepared)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Prefix harvest failed: "
-                          "cache replacement/capacity preparation rejected key="
-                          << key.toHex()
-                          << " block_bytes=" << total_block_bytes);
-                return false;
-            }
+            // Early request preparation overlaps writes with prefill, but a
+            // short tail can finish first. This required storage boundary joins
+            // only the receipt needed to admit its original physical payload;
+            // checksum/write/fsync stay on the background worker. Busy never
+            // means permission to drop the terminal state or overcommit PMA.
+            prefix_cache_->completeInsertPreparation(key, total_block_bytes);
 
             std::string archive_allocation_error;
             PrefixBlockHandle handle = prefix_ram_backend_->allocateWithDiagnostics(
@@ -57812,6 +57818,7 @@ namespace llaminar2
         bool uses_resident_threshold_positions = false;
         bool uses_verifier_base_snapshot_positions = false;
         bool all_requests_serial_sample_equivalent = true;
+        bool all_requests_captured_rejection = true;
         for (int request_idx = 0; request_idx < request_count; ++request_idx)
         {
             const DeviceStochasticDrawPositionSource source =
@@ -57825,6 +57832,11 @@ namespace llaminar2
             all_requests_serial_sample_equivalent =
                 all_requests_serial_sample_equivalent &&
                 requests[request_idx].serial_sample_equivalent;
+            const auto &request = requests[request_idx];
+            all_requests_captured_rejection = all_requests_captured_rejection &&
+                request.use_vllm_probability_rejection && !request.serial_sample_equivalent &&
+                request.derive_thresholds_from_seed && request.inverse_sample_seed != 0 &&
+                source == DeviceStochasticDrawPositionSource::VerifierBaseSnapshot;
         }
 
         DeviceResidentLogicalSequenceStateHandle threshold_position_state;
@@ -57962,7 +57974,9 @@ namespace llaminar2
             }
         }
 
-        if (all_requests_serial_sample_equivalent)
+        const bool captured_outcome =
+            all_requests_serial_sample_equivalent || all_requests_captured_rejection;
+        if (captured_outcome)
         {
             for (int request_idx = 0;
                  request_idx < request_count;
@@ -57972,36 +57986,38 @@ namespace llaminar2
                         requests[request_idx].first_draft_slot,
                         requests[request_idx].row_count,
                         stream,
-                        "captured_stochastic_serial_outcome"))
+                        "captured_stochastic_outcome"))
                 {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Captured seeded stochastic outcome could not consume deferred draft readiness");
+                    LOG_ERROR("[DeviceGraphOrchestrator] Captured stochastic outcome could not consume deferred draft readiness");
                     return false;
                 }
             }
 
             std::string captured_error;
-            if (!materializeMTPStochasticSerialOutcomeGraph(
+            if (!materializeMTPStochasticOutcomeGraph(
                     requests,
                     request_count,
                     &captured_error) ||
-                !executeMTPStochasticSerialOutcomeCaptured(
+                !executeMTPStochasticOutcomeCaptured(
                     stream,
                     request_count,
                     requests[0].row_count,
                     &captured_error))
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Captured seeded stochastic outcome failed: "
+                LOG_ERROR("[DeviceGraphOrchestrator] Captured stochastic outcome failed: "
                           << captured_error);
                 return false;
             }
             PerfStatsCollector::addCounter(
                 "mtp",
-                "stochastic_serial_equivalent_captured_outcomes",
+                all_requests_serial_sample_equivalent
+                    ? "stochastic_serial_equivalent_captured_outcomes"
+                    : "stochastic_probability_rejection_captured_outcomes",
                 static_cast<double>(request_count),
                 "decode",
                 state_.device_id.toString(),
                 {{"comparison_rows", std::to_string(requests[0].row_count)},
-                 {"fused_sample_summary", "true"}});
+                 {"fused_sample_summary", all_requests_serial_sample_equivalent ? "true" : "false"}});
         }
         else
         {
@@ -58149,7 +58165,7 @@ namespace llaminar2
             }
         }
 
-        if (!all_requests_serial_sample_equivalent &&
+        if (!captured_outcome &&
             rebalance_controller &&
             !backend->enqueueAdvanceSpeculativeCommitBoundary(
                 stochastic_batch_output_meta_dev_,
@@ -61529,16 +61545,6 @@ namespace llaminar2
             .gate = extension(BufferId::MTP_GATE_PROJ),
             .up = extension(BufferId::MTP_UP_PROJ),
             .ffn_output = extension(BufferId::MTP_FFN_OUTPUT),
-            .moe_expert_indices = extension(BufferId::MOE_EXPERT_INDICES),
-            .moe_expert_weights = extension(BufferId::MOE_EXPERT_WEIGHTS),
-            .moe_combined_output =
-                extension(BufferId::MOE_COMBINED_OUTPUT),
-            .moe_canonical_route_contributions =
-                extension(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS),
-            .moe_shared_expert_output =
-                extension(BufferId::MOE_SHARED_EXPERT_OUTPUT),
-            .moe_gate_scratch = extension(BufferId::MOE_GATE_SCRATCH),
-            .moe_up_scratch = extension(BufferId::MOE_UP_SCRATCH),
         };
 
         void *const publication_stream = state_.device_id.is_gpu()
@@ -61556,6 +61562,11 @@ namespace llaminar2
 
         const int maximum_rows =
             mtp_sidecar_capture_layout_.maximumRows();
+        const auto &sidecar_weights = bindings.mtp.depths[0].fa_block;
+        if (sidecar_weights.moe_gate || sidecar_weights.moe_gate_exps ||
+            sidecar_weights.moe_up_exps || sidecar_weights.moe_down_exps)
+            output.moe = MoEActivationBindings::bind(
+                graph_builder_->config().moe.routed_compute_policy, maximum_rows, extension);
         std::vector<int32_t> host_tokens(
             static_cast<size_t>(maximum_rows),
             0);

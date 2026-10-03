@@ -812,6 +812,26 @@ namespace llaminar2
     };
 
     /**
+     * @brief Authenticate the prefill materializer's complete input ownership.
+     * @param input Captured forward declaration, not current device values.
+     * @return True only when the materializer owns every physical input/count.
+     *
+     * Both generic graph preparation and model lowering use this same proof.
+     * A similarly named sequence-length pointer is not a query-count authority.
+     */
+    [[nodiscard]] inline bool devicePrefillChunkOwnsInput(const ForwardInput &input) noexcept
+    {
+        if (!input.device_prefill_chunk) return false;
+        const auto &binding = *input.device_prefill_chunk;
+        return binding.valid() && input.device.is_gpu() && input.batch_size == 1 &&
+            input.seq_len == binding.bucket_seq_len && input.token_ids == nullptr &&
+            input.token_ids_device == binding.chunk_token_ids_device && input.position_ids == nullptr &&
+            input.position_ids_device == binding.chunk_position_ids_device &&
+            input.position_policy == ForwardPositionPolicy::ExplicitRows &&
+            input.sequence_lengths_device == binding.chunk_real_rows_device;
+    }
+
+    /**
      * @brief Resolve the exact completion scope declared by one forward input.
      *
      * Presence of the immutable shifted-prefill binding changes graph topology;
@@ -1022,6 +1042,15 @@ namespace llaminar2
         {
             (void)material;
         }
+
+        /**
+         * @brief Geometry-only upper bound of a model's terminal archive extension.
+         * @return Serializer-owned bytes, zero when no model extension is emitted.
+         * The bound uses immutable table geometry, never captured execution
+         * values. Early eviction may overlap inference; PMA still admits the
+         * actual serialized allocation at harvest.
+         */
+        virtual size_t prefixCacheRuntimeStateCapacity() const { return 0u; }
 
         /**
          * @brief Capture model-owned runtime state needed to continue from a prefix block.

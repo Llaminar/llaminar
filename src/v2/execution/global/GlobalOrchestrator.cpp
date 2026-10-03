@@ -824,6 +824,23 @@ namespace llaminar2
         return aggregate;
     }
 
+    bool StageRunnerRegistry::preparePrefixHarvestAll(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        const PrefixHarvestSchedule &schedule)
+    {
+        if (!admission.supported || !admission.cache_enabled ||
+            entries_.empty() || last_prefix_hits_.size() != entries_.size())
+            return false;
+        for (size_t index = 0u; index < entries_.size(); ++index)
+        {
+            if (!entries_[index].runner->preparePrefixHarvest(
+                    last_prefix_hits_[index], tokens, schedule))
+                return false;
+        }
+        return true;
+    }
+
     bool StageRunnerRegistry::populatePrefixAll(
         const PrefixLookupResult &hit,
         int seq_idx)
@@ -2188,6 +2205,14 @@ namespace llaminar2
         const std::vector<int32_t> &tokens)
     {
         return stage_runners_.lookupPrefixAll(tokens);
+    }
+
+    bool GlobalOrchestrator::preparePrefixHarvest(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        const PrefixHarvestSchedule &schedule)
+    {
+        return stage_runners_.preparePrefixHarvestAll(admission, tokens, schedule);
     }
 
     bool GlobalOrchestrator::populatePrefix(

@@ -3,6 +3,10 @@
 /**
  * @file DeviceMoETransferSlotDirectory.h
  * @brief Stable device-side directory for graph-captured MoE expert arrivals.
+ *
+ * One immutable projection set drives both admission and physical storage.
+ * Complete-expert and gate/up-only arrivals cannot reuse each other's slots;
+ * fixed down-column banks never enter the movement directory.
  */
 
 #include "../../backends/DeviceId.h"
@@ -44,6 +48,8 @@ namespace llaminar2
             size_t max_wire_payload_bytes = 0;
             /// Immutable raw alias capacity, independent of a slot's occupant.
             DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeVNNI;
+            /// Exact movable family, shared by sizing, materialization and device copy.
+            DeviceMoEProjectionSet projection_set = DeviceMoEProjectionSet::CompleteExpert;
         };
 
         /**
@@ -70,11 +76,14 @@ namespace llaminar2
          * the waste of transmitting an impossible combination of per-projection
          * maxima.
          *
-         * @throws std::invalid_argument when the profile is empty, lacks a
-         *         gate/up/down projection, or mixes incompatible matrix geometry.
+         * @param layer_formats Exact movable projection specs for each layer.
+         * @param projection_set Complete expert or explicit gate/up-only ownership.
+         * @throws std::invalid_argument when any layer lacks a required projection,
+         *         includes a fixed projection, or mixes incompatible matrix geometry.
          */
         static FormatProfile profileForLayerFormats(
-            const std::vector<std::vector<ProjectionSpec>> &layer_formats);
+            const std::vector<std::vector<ProjectionSpec>> &layer_formats,
+            DeviceMoEProjectionSet projection_set = DeviceMoEProjectionSet::CompleteExpert);
 
         /**
          * @brief Derive the reusable device profile from model-authenticated metadata.
@@ -85,13 +94,15 @@ namespace llaminar2
          * before prepared engines and their device pointers exist.
          *
          * @param layer_weight_manifest Contiguous gate/up/down model manifest.
+         * @param projection_set The frozen domain's movable projections only.
          * @return Cross-layer allocation and wire-capacity union.
          * @throws std::invalid_argument for malformed, mixed projection, or
          *         uncatalogued projection formats.
          */
         static FormatProfile profileForLayerWeightManifest(
             const std::vector<MoEOverlayLayerWeightManifest> &
-                layer_weight_manifest);
+                layer_weight_manifest,
+            DeviceMoEProjectionSet projection_set = DeviceMoEProjectionSet::CompleteExpert);
 
         /**
          * @brief Describe the persistent and transactional capacity of one directory.

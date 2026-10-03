@@ -70,7 +70,9 @@ namespace
         }
         void resetAuxiliaryStreams() override {}
 
-        void *createEvent() override { return reinterpret_cast<void *>(0xCAFEBABE); }
+        /** @copydoc IWorkerGPUContext::createEvent */
+        void *createEvent(GPUEventPurpose = GPUEventPurpose::Ordering) override
+        { return reinterpret_cast<void *>(0xCAFEBABE); }
         void destroyEvent(void * /*event*/) override {}
         void recordEvent(void * /*event*/, void *stream) override
         {

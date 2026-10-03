@@ -77,13 +77,17 @@ namespace llaminar2
         double projectionSeconds(int rank, DeviceId device, const PlanningWeightOperand &weight, size_t rows) const;
 
         /**
-         * @brief Estimate this endpoint's complete routed FFNs under explicit uniform top-k routing.
+         * @brief Estimate actual routed projections under explicit uniform top-k routing.
          * @param work Compiled exact quotas/replication policy; not aggregate physical capacity.
          * @param token_rows Routing rows, not rows per individual expert.
-         * @return Estimated seconds; zero only for explicitly zero routed ownership/work.
+         * @return Estimated seconds; zero only for zero issued work. Fixed down
+         *         slices are charged even when this endpoint owns no gate/up.
          *
          * Charge expected nonempty groups, not K*T separate weight reads. No
          * future promotion benefit, observed hotness or MTP acceptance is invented.
+         * Projection-distributed work borrows the measured complete-FFN family
+         * operation rate, with explicit local N/K and per-role routing; it does
+         * not claim independently measured projection throughput or overlap.
          */
         double expertSeconds(int rank, DeviceId device,
             const PlanningRoutedExpertWeightWork &work, size_t token_rows) const;

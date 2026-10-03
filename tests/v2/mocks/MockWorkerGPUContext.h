@@ -170,8 +170,10 @@ namespace llaminar2::testing
 
         void resetAuxiliaryStreams() override { auxiliary_streams_.clear(); }
 
-        void *createEvent() override
+        /** @copydoc IWorkerGPUContext::createEvent */
+        void *createEvent(GPUEventPurpose purpose = GPUEventPurpose::Ordering) override
         {
+            (void)gpuEventHasTiming(purpose);
             events_.push_back(std::make_unique<int>(++next_event_token_));
             return events_.back().get();
         }

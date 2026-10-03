@@ -7,6 +7,9 @@
  * Every invocation owns one participant's graph and output stream. Pipeline
  * composition belongs to the rank/global orchestrator; there is no uncached
  * multi-device execution branch in this engine.
+ * Prefill schedules preserve one admitted request bank and device KV cursor
+ * across a retained bucket family; shape-specific materializer and shifted-MTP
+ * identities must be complete before the first chunk is submitted.
  *
  * Split into:
  * - execute():          Entry point — signature computation, cache dispatch
@@ -1410,7 +1413,8 @@ namespace llaminar2
         const ForwardInput &base_input,
         const PrefillChunkRuntimeSchedule &schedule,
         ForwardOutput &output,
-        IForwardExecutionHost &host)
+        IForwardExecutionHost &host,
+        std::span<const ForwardInput> chunk_inputs)
     {
         if (!schedule)
         {
@@ -1424,9 +1428,57 @@ namespace llaminar2
             return false;
         }
 
-        for (const auto &chunk_plan : schedule.chunks)
+        if (!chunk_inputs.empty() &&
+            (!base_input.device_prefill_chunk ||
+             chunk_inputs.size() != schedule.chunks.size()))
         {
-            if (!runPrefillChunk(base_input, chunk_plan, output, host))
+            LOG_ERROR("[ForwardExecutionEngine] Prefill bucket family requires one complete binding per chunk and one request owner");
+            return false;
+        }
+
+        // Validate the complete immutable family before submitting any work.
+        // Shape selection is request-admission geometry, not a host cursor:
+        // each captured materializer still reads the very same device KV count.
+        for (size_t index = 0; index < schedule.chunks.size(); ++index)
+        {
+            if (!base_input.device_prefill_chunk)
+                continue;
+            const auto &owner = *base_input.device_prefill_chunk;
+            const auto &declaration = chunk_inputs.empty() ? base_input : chunk_inputs[index];
+            if (!declaration.device_prefill_chunk ||
+                declaration.device != base_input.device ||
+                declaration.batch_size != base_input.batch_size ||
+                declaration.device_state_publication_stream != base_input.device_state_publication_stream ||
+                declaration.shifted_mtp_prefill.has_value() != base_input.shifted_mtp_prefill.has_value())
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill bucket family has incomplete device or MTP graph ownership at chunk " << index);
+                return false;
+            }
+            const auto &binding = *declaration.device_prefill_chunk;
+            if (!binding.valid() ||
+                binding.bucket_seq_len != schedule.chunks[index].chunk.bucket_seq_len ||
+                binding.backend != owner.backend ||
+                binding.request_token_ids_device != owner.request_token_ids_device ||
+                binding.request_position_ids_device != owner.request_position_ids_device ||
+                binding.request_total_rows_device != owner.request_total_rows_device ||
+                binding.cached_tokens_device != owner.cached_tokens_device ||
+                binding.chunk_token_ids_device != owner.chunk_token_ids_device ||
+                binding.chunk_position_ids_device != owner.chunk_position_ids_device ||
+                binding.chunk_real_rows_device != owner.chunk_real_rows_device ||
+                binding.chunk_row_stride_device != owner.chunk_row_stride_device ||
+                binding.request_row_capacity != owner.request_row_capacity ||
+                binding.pad_token_id != owner.pad_token_id)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill bucket family changes request ownership or lacks the exact physical graph identity at chunk " << index);
+                return false;
+            }
+        }
+
+        for (size_t index = 0; index < schedule.chunks.size(); ++index)
+        {
+            const auto &chunk_plan = schedule.chunks[index];
+            const auto &chunk_base = chunk_inputs.empty() ? base_input : chunk_inputs[index];
+            if (!runPrefillChunk(chunk_base, chunk_plan, output, host))
             {
                 host.cancelPrefillChunkSnapshotDiagnostics();
                 LOG_ERROR("[ForwardExecutionEngine] Prefill chunk schedule failed at chunk "
@@ -4326,7 +4378,7 @@ namespace llaminar2
         const bool padded_bucket = isPaddedBucketExecution(input);
         const bool snapshots_active = (executor_.config().snapshot_callback != nullptr);
         DeviceGraphExecutor::GraphSnapshotLogicalRows snapshot_logical_rows;
-        if (padded_bucket && snapshots_active)
+        if (snapshots_active)
         {
             if (input.batch_size <= 0 || bucket_seq_len <= 0 ||
                 real_seq_len <= 0 || real_seq_len > bucket_seq_len)
@@ -4515,8 +4567,8 @@ namespace llaminar2
             bool gpu_event_timing_active = false;
             if (should_time_gpu)
             {
-                gpu_start_event = gpu_ctx->createEvent();
-                gpu_stop_event = gpu_ctx->createEvent();
+                gpu_start_event = gpu_ctx->createEvent(GPUEventPurpose::Timing);
+                gpu_stop_event = gpu_ctx->createEvent(GPUEventPurpose::Timing);
                 if (gpu_start_event && gpu_stop_event)
                 {
                     gpu_ctx->recordEvent(gpu_start_event, stream);
@@ -5610,21 +5662,7 @@ namespace llaminar2
         {
             const DevicePrefillChunkGraphBinding &binding =
                 *effective_input.device_prefill_chunk;
-            const bool binding_matches_forward_input =
-                binding.valid() && effective_input.device.is_gpu() &&
-                effective_input.batch_size == 1 &&
-                effective_input.seq_len == binding.bucket_seq_len &&
-                effective_input.token_ids == nullptr &&
-                effective_input.token_ids_device ==
-                    binding.chunk_token_ids_device &&
-                effective_input.position_ids == nullptr &&
-                effective_input.position_ids_device ==
-                    binding.chunk_position_ids_device &&
-                effective_input.position_policy ==
-                    ForwardPositionPolicy::ExplicitRows &&
-                effective_input.sequence_lengths_device ==
-                    binding.chunk_real_rows_device;
-            if (!binding_matches_forward_input)
+            if (!devicePrefillChunkOwnsInput(effective_input))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Device prefill chunk binding does not exactly own the forward graph inputs");
                 return false;

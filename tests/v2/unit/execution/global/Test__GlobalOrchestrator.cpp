@@ -190,6 +190,42 @@ namespace llaminar2::test
         MTPRequestPenaltyPolicy configured_penalty_policy_{};
     };
 
+    /** @brief Observe local-stage archive admission without a model or device. */
+    class PrefixPreparationMockRunner final : public MockDeviceRunner
+    {
+    public:
+        /** @brief Supply one independently authenticated stage fingerprint. */
+        explicit PrefixPreparationMockRunner(uint64_t fingerprint)
+        {
+            lookup.supported = lookup.cache_enabled = true;
+            lookup.block_size = 2;
+            lookup.fingerprint_key = fingerprint;
+            lookup.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+        }
+        /** @brief Publish only this stage's immutable admission. */
+        PrefixLookupResult lookupPrefix(const std::vector<int32_t> &) override
+        {
+            return lookup;
+        }
+        /** @brief Authenticate the exact child identity and coordinated frontier. */
+        bool preparePrefixHarvest(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            const PrefixHarvestSchedule &schedule) override
+        {
+            EXPECT_EQ(admission.fingerprint_key, lookup.fingerprint_key);
+            prepared_tokens = tokens;
+            prepared_checkpoint = schedule.reusableCheckpoint();
+            ++prepare_calls;
+            return prepare_ok;
+        }
+        PrefixLookupResult lookup;
+        std::vector<int32_t> prepared_tokens;
+        std::optional<int> prepared_checkpoint;
+        int prepare_calls = 0;
+        bool prepare_ok = true;
+    };
+
     class ScriptedBroadcastMPIContext : public MockMPIContext
     {
     public:
@@ -850,6 +886,29 @@ namespace llaminar2::test
     // =========================================================================
     // Forward Pass Tests
     // =========================================================================
+
+    /** @test Both head and tail prepare their own archive before model work. */
+    TEST_F(Test__GlobalOrchestrator, PrefixPreparationPreservesStageAdmission)
+    {
+        for (int rank : {0, 1})
+        {
+            MockMPIContext mpi(rank, 2);
+            auto child = std::make_unique<PrefixPreparationMockRunner>(100u + rank);
+            auto *observed = child.get();
+            GlobalOrchestrator orch(makeConfig(
+                buildTwoStagePPTopo(), rank, 2, &mpi, std::move(child)));
+            const std::vector<int32_t> tokens{1, 2, 3};
+            const auto admission = orch.lookupPrefix(tokens);
+            const auto schedule = PrefixHarvestSchedule::forPrefill(admission, 3, 0);
+            EXPECT_TRUE(orch.preparePrefixHarvest(admission, tokens, schedule));
+            EXPECT_EQ(observed->prepare_calls, 1);
+            EXPECT_EQ(observed->prepared_tokens, tokens);
+            EXPECT_EQ(observed->prepared_checkpoint, 2);
+            EXPECT_EQ(observed->forward_call_count(), 0u);
+            observed->prepare_ok = false;
+            EXPECT_FALSE(orch.preparePrefixHarvest(admission, tokens, schedule));
+        }
+    }
 
     TEST_F(Test__GlobalOrchestrator, ForwardDelegatesToRunner_SingleStage)
     {

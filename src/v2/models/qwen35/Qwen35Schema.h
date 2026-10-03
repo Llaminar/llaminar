@@ -393,7 +393,7 @@ namespace llaminar2
                 {"mtp_up", {"mtp_target_query_rows", "mtp_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
                 {"mtp_ffn_output", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
                 {"mtp_logits", {"mtp_target_query_rows", "mtp_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Participant MTP logits: explicit vocabulary shard or mirrored full vocabulary at any TP scope"},
-                {"mtp_logits_gathered", {"mtp_global_gather_rows", "mtp_global_gather_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Full-vocabulary explicit-sharded GlobalTP MTP rows; conditionally 1x1 when no gather is owned"},
+                {"mtp_logits_gathered", {"mtp_gather_rows", "mtp_gather_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Full-vocabulary sharded MTP condition/verifier rows at any TP scope; 1x1 for mirrored output"},
             };
 
             schema.model_buffers = {

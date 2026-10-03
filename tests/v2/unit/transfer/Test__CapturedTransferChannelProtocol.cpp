@@ -215,3 +215,66 @@ TEST(CapturedTransferChannelProtocol, AbortAndExhaustionAreAbsorbingInEitherDire
                   Status::EpochExhausted);
     }
 }
+
+TEST(CapturedTransferChannelProtocol, CountedReplayUsesOnePublishedExtentIncludingEmptyEpochs)
+{
+    using Source = CapturedTransferExtentSource;
+    for (unsigned seed = 0; seed < 32; ++seed)
+    {
+        Lane lane;
+        std::mt19937 random(seed);
+        const CapturedTransferMessage capacity{41, identity.capacity};
+        std::array<std::uint8_t, identity.capacity> slot{}, received{};
+        for (std::uint64_t epoch = 1; epoch <= 384; ++epoch)
+        {
+            const auto bytes = epoch % 3 == 0 ? 0 : epoch % 3 == 1 ? capacity.bytes : random() % capacity.bytes;
+            const auto acquire_consumer = [&] {
+                return Protocol::acquire(Role::Consumer, identity, identity, lane.consumer, lane.produced,
+                    capacity, Source::ProducerPublication);
+            };
+            EXPECT_EQ(acquire_consumer().status, Status::WaitForPeer);
+            ASSERT_TRUE(Protocol::acquire(Role::Producer, identity, identity, lane.producer, lane.consumed,
+                capacity, Source::ProducerDevice, bytes).ready());
+            ASSERT_EQ(lane.producer.acquired_message.bytes, bytes);
+            for (size_t i = 0; i < bytes; ++i) slot[i] = static_cast<std::uint8_t>(epoch + i);
+            ASSERT_TRUE(lane.publishProducer().ready());
+            ASSERT_TRUE(acquire_consumer().ready());
+            ASSERT_EQ(lane.consumer.acquired_message.bytes, bytes);
+            received.fill(0xa5);
+            for (size_t i = 0; i < lane.consumer.acquired_message.bytes; ++i) received[i] = slot[i];
+            // A next producer, even an empty one, cannot invalidate this lease
+            // before the receiver has finished consuming the current message.
+            EXPECT_EQ(Protocol::acquire(Role::Producer, identity, identity, lane.producer, lane.consumed,
+                capacity, Source::ProducerDevice, 0).status, Status::WaitForPeer);
+            ASSERT_TRUE(lane.publishConsumer().ready());
+            for (size_t i = 0; i < received.size(); ++i)
+                ASSERT_EQ(received[i], i < bytes ? static_cast<std::uint8_t>(epoch + i) : 0xa5);
+            EXPECT_EQ(lane.consumed.message.bytes, bytes);
+            EXPECT_EQ(lane.consumed.epoch, epoch);
+        }
+    }
+}
+
+TEST(CapturedTransferChannelProtocol, CountedExtentRejectsWrongAuthorityAndOverflowBeforePayload)
+{
+    using Source = CapturedTransferExtentSource;
+    for (const auto role : {Role::Producer, Role::Consumer})
+    {
+        CapturedTransferCursor cursor;
+        EXPECT_EQ(Protocol::acquire(role, identity, identity, cursor, {}, message,
+            role == Role::Producer ? Source::ProducerPublication : Source::ProducerDevice).status, Status::InvalidBinding);
+    }
+    for (const auto bytes : {message.bytes + 1, kCapturedTransferAbortEpoch})
+    {
+        CapturedTransferCursor producer, consumer;
+        EXPECT_EQ(Protocol::acquire(Role::Producer, identity, identity, producer, {}, message,
+            Source::ProducerDevice, bytes).status, Status::InvalidBinding);
+        EXPECT_EQ(Protocol::acquire(Role::Consumer, identity, identity, consumer,
+            {.epoch = 1, .message = {message.key, bytes}}, message, Source::ProducerPublication).status, Status::MessageMismatch);
+        EXPECT_EQ(consumer.completed_epoch, 0u);
+        EXPECT_EQ(consumer.phase, CapturedTransferPhase::Failed);
+    }
+    CapturedTransferCursor wrong_key;
+    EXPECT_EQ(Protocol::acquire(Role::Consumer, identity, identity, wrong_key,
+        {.epoch = 1, .message = {message.key + 1, 0}}, message, Source::ProducerPublication).status, Status::MessageMismatch);
+}

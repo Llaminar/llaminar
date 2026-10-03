@@ -192,6 +192,26 @@ class TestServerExecutionContract(unittest.TestCase):
             automatic_evidence(["CUDA:0", "CUDA:0"], strategy="tp", nodes=[0, 1]), selection)
         self.assertEqual(observed["device_counts"], {"cuda": 2})
 
+    def test_projection_cell_requires_actual_compute_mode_not_merely_two_gpus(self):
+        """The old whole-expert path cannot pass a new projection-mode cell."""
+        for backend in ("cuda", "rocm"):
+            label = "CUDA" if backend == "cuda" else "ROCm"
+            selection = {"mode": "auto", "strategy": "tp", "mpi_ranks": 1,
+                         "device_counts": {backend: 2}, "routed_compute": "gate-up-owned-down-columns"}
+            data = automatic_evidence([f"{label}:2,{label}:3"], strategy="tp")
+            policy = next(row["tags"] for row in data["records"] if row["name"] == "execution_policy")
+            for mode in (None, "apportioned", "mixed", "tensor-sharded"):
+                with self.subTest(backend=backend, mode=mode), self.assertRaisesRegex(ValueError, "routed compute mismatch"):
+                    policy["routed_compute"] = mode
+                    validate_automatic_selection(data, selection)
+            policy["routed_compute"] = "gate-up-owned-down-columns"
+            self.assertEqual(validate_automatic_selection(data, selection)["routed_compute"], policy["routed_compute"])
+            for change in ({"strategy": "pp"}, {"mpi_ranks": 2}, {"device_counts": {backend: 1}},
+                           {"device_counts": {"cpu": 2}}, {"device_counts": {"cuda": 1, "rocm": 1}},
+                           {"routed_compute": "future"}, {"routed_compute": None}, {"routed_compute": []}):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    automatic_selection_policy({"planning": {**selection, **change}})
+
     def test_two_rank_cell_rejects_single_rank_with_same_physical_device_count(self):
         selection = {"mode": "auto", "strategy": "tp", "device_counts": {"cuda": 2},
                      "mpi_ranks": 2}

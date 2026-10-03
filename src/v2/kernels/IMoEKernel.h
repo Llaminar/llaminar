@@ -27,6 +27,10 @@
 #include "../execution/moe/DeviceMoERebalanceController.h"
 #include "../tensors/TensorKernels.h"
 #include "common/DeviceRowRange.h"
+#include "common/MoERouterOwnedRows.h"
+#include "common/MoEPrefillProjectionExecution.h"
+#include "../execution/moe/MoEGroupedIntermediateExchangeABI.h"
+#include "../execution/moe/MoEGroupedPlanDemand.h"
 
 #include <cstdint>
 #include <memory>
@@ -378,6 +382,36 @@ namespace llaminar2
             ITensor *output_indices, ITensor *output_weights,
             MoERoutingResult &host_result,
             const int *device_effective_seq_len);
+
+        /**
+         * @brief Route complete participant-owned prefill rows into one compact packet.
+         * @param hidden Full normalized rows, still needed by each local expert owner.
+         * @param gate_weights Canonical router weights; reuse this kernel's prepared owner.
+         * @param layout Frozen row membership, physical bucket and top-k geometry.
+         * @param d_model Hidden width.
+         * @param num_experts Router output width.
+         * @param normalize_weights Original top-k normalization policy.
+         * @param packet Admitted tensor owning at least layout.packetBytes() bytes.
+         * @param selected_bytes Fabric-owned device uint64 extent, written even when empty.
+         * @param live_rows Canonical device INT32 request length, never downloaded here.
+         * @return True after packet/count publication on the exact execution stream.
+         *
+         * This does not publish complete routes or perform a collective. The graph
+         * must acquire every peer packet then explicitly publish complete selections
+         * before grouping, expert work, or history. Scalar/MTP routing is a separate
+         * arithmetic contract. Unsupported backends reject this GPU-only operation.
+         */
+        virtual bool routeOwnedRowsWithTensors(
+            ITensor *hidden, ITensor *gate_weights,
+            const MoERouterRowPacketLayout &layout, int d_model, int num_experts,
+            bool normalize_weights, ITensor *packet, std::uint64_t *selected_bytes,
+            const std::int32_t *live_rows);
+
+        /** @brief Publish complete route arrays after the explicit counted collective.
+         * @param publication Immutable local/peer packet geometry and acquired device counts.
+         * @return Whether publication was enqueued on this kernel's exact bound stream.
+         * The calling stage owns TransferEngine input acquisition and output publication. */
+        virtual bool publishOwnedRouteRows(const MoERouterRowPublication &publication);
 
         /**
          * @brief Route MTP verifier rows with grouped serial-row-equivalent math.
@@ -2751,6 +2785,15 @@ namespace llaminar2
          * compact descriptor materialization, and stable active-expert ids as
          * one stream-ordered transaction. Implementations may mode-shift by
          * geometry, but the method must publish every product before returning.
+         *
+         * @param demand Exact history effect: ordinary prefill, retained final
+         * assignments for accepted MTP rows, or none. Decode routing already
+         * counts its own rows; static and predictor work must not count demand.
+         * @param expected_projections Immutable payload contract authenticated by
+         * the runtime table's fixed-down binding. Both owner filtering and
+         * descriptor publication must require this exact set. A gate/up pair
+         * is never accepted implicitly as an incomplete whole expert; its down
+         * columns remain in the separate model-lifetime descriptor table.
          */
         virtual bool publishCompleteGroupedPrefillPlanFromRouter(
             DeviceMoELayerRuntime *runtime_layer,
@@ -2761,7 +2804,8 @@ namespace llaminar2
             int gateup_desc_table_id,
             int down_desc_table_id,
             bool filter_to_local_runtime_experts,
-            bool retain_routes_for_deferred_commit = false)
+            MoEGroupedPlanDemand demand = MoEGroupedPlanDemand::OrdinaryPrefill,
+            DeviceMoEProjectionSet expected_projections = DeviceMoEProjectionSet::CompleteExpert)
         {
             (void)runtime_layer;
             (void)routing_indices;
@@ -2773,7 +2817,8 @@ namespace llaminar2
             (void)gateup_desc_table_id;
             (void)down_desc_table_id;
             (void)filter_to_local_runtime_experts;
-            (void)retain_routes_for_deferred_commit;
+            (void)demand;
+            (void)expected_projections;
             return false;
         }
 
@@ -2785,6 +2830,11 @@ namespace llaminar2
          * rows, inverse map, compact descriptor tables, active ids, and optional
          * deferred verifier ledger consumed by the following grouped compute.
          * No host observation or separate descriptor side effect is permitted.
+         *
+         * @param demand Serial-visible history boundary, independent of whether
+         * the compute plan itself contains one row or multiple rows.
+         * @param expected_projections Exact movable payload selected by the
+         * fixed graph binding, never inferred from a missing down pointer.
          */
         virtual bool publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
             DeviceMoELayerRuntime *runtime_layer,
@@ -2794,7 +2844,8 @@ namespace llaminar2
             int top_k,
             int gateup_desc_table_id,
             int down_desc_table_id,
-            bool retain_routes_for_deferred_commit = false)
+            MoEGroupedPlanDemand demand = MoEGroupedPlanDemand::OrdinaryPrefill,
+            DeviceMoEProjectionSet expected_projections = DeviceMoEProjectionSet::CompleteExpert)
         {
             (void)runtime_layer;
             (void)current_tokens;
@@ -2803,7 +2854,8 @@ namespace llaminar2
             (void)top_k;
             (void)gateup_desc_table_id;
             (void)down_desc_table_id;
-            (void)retain_routes_for_deferred_commit;
+            (void)demand;
+            (void)expected_projections;
             return false;
         }
 
@@ -3111,6 +3163,97 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish this participant's existing SwiGLU representation for an explicit collective.
+         * @param layout Exact source encoding, intermediate width, route extent and domain width.
+         * @param route_participants Device-owned original-slot assignment in communicator coordinates.
+         * @param packet Arena-owned output covering one packetBytes() prefix.
+         * @param participant This graph's coordinate in that same communicator.
+         * @return True after packing on the bound non-default stream; false for incomplete bindings.
+         *
+         * The preceding gate/up phase and this call use the same kernel/workspace.
+         * Packing must precede any consumer regrouping, which overwrites the
+         * producer inverse map. No tensor format conversion or collective occurs.
+         */
+        virtual bool exportGroupedPrefillIntermediates(
+            const MoEGroupedIntermediateLayout &layout,
+            const std::int32_t *route_participants, ITensor *packet, int participant)
+        {
+            (void)layout; (void)route_participants; (void)packet; (void)participant;
+            return false;
+        }
+
+        /**
+         * @brief Import completed participant packets into the fixed-down consumer's grouping.
+         * @param layout The producer's identical immutable packet geometry.
+         * @param route_participants Original device-owned assignments, unchanged by local regrouping.
+         * @param packets Arena-owned participant-major native-allgather result.
+         * @return True after exact-byte materialization on the bound stream.
+         *
+         * The graph first calls prepareExpertGroupsAsync() with the ORIGINAL
+         * router tensors, not the owner-filtered runtime weights. That complete
+         * grouping reuses this kernel's scratch after export has finished. The
+         * immutable fixed-down phase then consumes it without a second workspace,
+         * quantization boundary, placement authority, or host observation.
+         */
+        virtual bool importGroupedPrefillIntermediates(
+            const MoEGroupedIntermediateLayout &layout,
+            const std::int32_t *route_participants, ITensor *packets)
+        {
+            (void)layout; (void)route_participants; (void)packets;
+            return false;
+        }
+
+        /**
+         * @brief Publish only live producer-grouped rows and their device-owned byte extent.
+         * @param layout Frozen activation encoding, width, route capacity and participant count.
+         * @param runtime Immutable addresses/geometry of the published runtime grouping, not a live host mirror.
+         * @param packet Admitted output with compactCapacityBytes() available; unused tail is untouched.
+         * @param packet_bytes Aligned device uint64 output retained by the captured transfer binding.
+         * @return True after packing on the bound stream, false for an incomplete binding.
+         *
+         * The preceding gate/up phase owns the expert offsets, counts and inverse
+         * map. This method reads those same values; it does not count routes again,
+         * synchronize, clear capacity, change precision or initiate communication.
+         * The graph must retain packet/count storage and order export before any
+         * regrouping. TransferEngine freezes the published count at acquisition.
+         */
+        virtual bool exportCompactGroupedPrefillIntermediates(
+            const MoEGroupedIntermediateLayout &layout,
+            const DeviceMoELayerRuntime &runtime, ITensor *packet,
+            std::uint64_t *packet_bytes)
+        {
+            (void)layout; (void)runtime; (void)packet; (void)packet_bytes;
+            return false;
+        }
+
+        /**
+         * @brief Import one producer's authenticated compact packet without touching capacity holes.
+         * @param layout Identical immutable producer geometry.
+         * @param route_participants Original runtime assignments, unchanged by consumer regrouping.
+         * @param packet Canonical arena storage owner of the producer packet or receive bank.
+         * @param packet_byte_offset Aligned packet start within that owner, checked against its capacity.
+         * @param packet_bytes Device extent acquired by TransferEngine (local producers use their output).
+         * @param participant The producer coordinate authenticated by that channel binding.
+         * @return True after exact-bit import into this kernel's complete grouping.
+         *
+         * Prepare the consumer grouping from the original router inputs once,
+         * then import each producer, including the local packet, before down
+         * projection. The count, route IDs and owners are validated on device.
+         * Empty publications execute the same captured path and read no payload.
+         * Offsets preserve the arena owner's capture/coherence identity; a new
+         * tensor view must not invent a second publication for the same bytes.
+         */
+        virtual bool importCompactGroupedPrefillIntermediates(
+            const MoEGroupedIntermediateLayout &layout,
+            const std::int32_t *route_participants, ITensor *packet,
+            std::size_t packet_byte_offset, const std::uint64_t *packet_bytes, int participant)
+        {
+            (void)layout; (void)route_participants; (void)packet; (void)packet_byte_offset;
+            (void)packet_bytes; (void)participant;
+            return false;
+        }
+
+        /**
          * @brief Execute the full grouped MoE prefill pipeline (graph-capturable).
          *
          * Runs a fixed device-side pipeline with grouped gather/quantization,
@@ -3127,7 +3270,6 @@ namespace llaminar2
          *        @p canonical_route_contributions is null; otherwise it is a
          *        later reducer target that may not yet have device storage.
          * @param gate_desc_table_id  Descriptor table ID for gate weights
-         * @param up_desc_table_id    Descriptor table ID for up weights (same table)
          * @param down_desc_table_id  Descriptor table ID for down weights
          * @param seq_len        Number of tokens in the sequence
          * @param d_model        Model dimension
@@ -3140,12 +3282,60 @@ namespace llaminar2
          *        @p output.
          * @return true on success
          */
-        virtual bool executeGroupedPrefillPipeline(
+        bool executeGroupedPrefillPipeline(
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
             int down_desc_table_id,
             int seq_len, int d_model, int intermediate,
             int num_experts, int top_k,
+            ITensor *canonical_route_contributions = nullptr)
+        {
+            if (d_model <= 0)
+                return false;
+            return executeGroupedPrefillProjection(
+                hidden, output, gateup_desc_table_id, down_desc_table_id,
+                seq_len, d_model, intermediate, num_experts, top_k,
+                MoEPrefillProjectionExecution::complete(d_model),
+                canonical_route_contributions);
+        }
+
+        /**
+         * @brief Enqueue one typed projection phase using the ordinary pipeline.
+         *
+         * Complete execution is the same operation used by the convenience
+         * wrapper above, not a second numerical implementation. Gate/up owns
+         * only intermediate workspace and therefore requires no output tensor.
+         * Down consumes already-published intermediate rows and requires no
+         * hidden tensor. Its descriptor N and output stride use columnCount(),
+         * while every arithmetic-policy key retains modelColumns().
+         *
+         * Grouping and intermediate storage belong to this graph-local kernel's
+         * existing workspace. An explicit graph edge must retain each producer
+         * until its consumer has completed; this call adds neither transport nor
+         * a second placement authority. Descriptor IDs describe the same source
+         * family in every phase, including phases that do not read their weights.
+         *
+         * @param hidden FP32 input [seq_len, d_model], required only for gate/up.
+         * @param output FP32 [seq_len, columnCount()] down result, unless canonical output is supplied.
+         * @param gateup_desc_table_id Prepared gate/up descriptor family and source geometry.
+         * @param down_desc_table_id Prepared down descriptor family and physical column interval.
+         * @param seq_len Captured token-row extent.
+         * @param d_model Original, unsliced model width.
+         * @param intermediate Complete expert intermediate width; never sharded over K.
+         * @param num_experts Logical expert count in both descriptor tables.
+         * @param top_k Router slots per token.
+         * @param execution Immutable phase and original/sliced column geometry.
+         * @param canonical_route_contributions Optional FP32 [seq_len, top_k, columnCount()] output;
+         *        when present, down does not inspect or write output.
+         * @return Whether the declared backend transaction was enqueued.
+         */
+        virtual bool executeGroupedPrefillProjection(
+            ITensor *hidden, ITensor *output,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
+            int seq_len, int d_model, int intermediate,
+            int num_experts, int top_k,
+            const MoEPrefillProjectionExecution &execution,
             ITensor *canonical_route_contributions = nullptr)
         {
             (void)hidden;
@@ -3157,6 +3347,7 @@ namespace llaminar2
             (void)intermediate;
             (void)num_experts;
             (void)top_k;
+            (void)execution;
             (void)canonical_route_contributions;
             return false;
         }
@@ -3175,7 +3366,7 @@ namespace llaminar2
          * @p output belongs to the later canonical reducer and may not yet
          * have device storage.
          */
-        virtual bool executeGroupedPrefillPipelineFromPublishedRuntimePlan(
+        bool executeGroupedPrefillPipelineFromPublishedRuntimePlan(
             DeviceMoELayerRuntime *device_runtime_layer,
             const DeviceMoELayerRuntime &runtime_host_layer,
             ITensor *hidden, ITensor *output,
@@ -3183,6 +3374,54 @@ namespace llaminar2
             int down_desc_table_id,
             int seq_len, int d_model, int intermediate,
             int num_experts, int top_k,
+            ITensor *canonical_route_contributions = nullptr)
+        {
+            if (d_model <= 0)
+                return false;
+            return executeGroupedPrefillProjectionFromPublishedRuntimePlan(
+                device_runtime_layer, runtime_host_layer, hidden, output,
+                gateup_desc_table_id, down_desc_table_id,
+                seq_len, d_model, intermediate, num_experts, top_k,
+                MoEPrefillProjectionExecution::complete(d_model),
+                canonical_route_contributions);
+        }
+
+        /**
+         * @brief Enqueue a projection phase from the existing published route plan.
+         *
+         * Runtime descriptor banks remain the sole movable-weight authority.
+         * The host layer is a borrow of immutable scratch addresses, never a
+         * snapshot of live device counts or ownership. Publication and phase
+         * geometry follow executeGroupedPrefillProjection(); an explicit graph
+         * collective, not this compute operation, exchanges intermediates.
+         * Runtime placement owns complete down matrices, not immutable column
+         * slices. A sliced down consumer must use the static descriptor entry
+         * point and its fixed-down bank; this method rejects sliced down work.
+         *
+         * @param device_runtime_layer Exact captured device runtime address.
+         * @param runtime_host_layer Immutable borrow of its workspace addresses.
+         * @param hidden FP32 gate/up input, absent for down-only execution.
+         * @param output Down output, absent for gate/up or canonical publication.
+         * @param gateup_desc_table_id Immutable family metadata for the runtime gate/up bank.
+         * @param down_desc_table_id Immutable family metadata for the runtime down bank.
+         * @param seq_len Captured token-row extent.
+         * @param d_model Original model width.
+         * @param intermediate Complete intermediate width.
+         * @param num_experts Logical expert count.
+         * @param top_k Router slots per token.
+         * @param execution Immutable phase and original/sliced column geometry.
+         * @param canonical_route_contributions Optional sole down-publication target.
+         * @return Whether the declared backend transaction was enqueued.
+         */
+        virtual bool executeGroupedPrefillProjectionFromPublishedRuntimePlan(
+            DeviceMoELayerRuntime *device_runtime_layer,
+            const DeviceMoELayerRuntime &runtime_host_layer,
+            ITensor *hidden, ITensor *output,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
+            int seq_len, int d_model, int intermediate,
+            int num_experts, int top_k,
+            const MoEPrefillProjectionExecution &execution,
             ITensor *canonical_route_contributions = nullptr)
         {
             (void)device_runtime_layer;
@@ -3196,6 +3435,7 @@ namespace llaminar2
             (void)intermediate;
             (void)num_experts;
             (void)top_k;
+            (void)execution;
             (void)canonical_route_contributions;
             return false;
         }

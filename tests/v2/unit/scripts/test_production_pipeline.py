@@ -57,6 +57,13 @@ from test_server_execution_contract import automatic_evidence
 from test_gpu_driver_diagnostics import clean_evidence as clean_driver_evidence
 
 
+def rocm_release_pins():
+    """Read the installer-owned flat pins without maintaining another version table."""
+    return dict(line.split("=", 1) for line in
+                (ROOT / "scripts/docker/rocm-release.env").read_text().splitlines()
+                if line and not line.startswith("#"))
+
+
 def cell(name="cell"):
     """Minimal tagged configuration with a complete split-model manifest."""
     runtime = GenerationHTTPTests().record()["runtime"]
@@ -3362,7 +3369,7 @@ class ImageIdentityTests(unittest.TestCase):
                 self.assertIn(unused, workspace)
         self.assertIn("ENTRYPOINT []", test_runner)
         self.assertIn(
-            "LD_LIBRARY_PATH=/src/build_v2_integration:/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm/lib",
+            "LD_LIBRARY_PATH=/src/build_v2_integration:/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm-sdk/lib",
             test_runner,
         )
         self.assertNotIn("apt-get install -y --no-install-recommends cuda", test_runner)
@@ -3873,6 +3880,79 @@ class InfrastructureTests(unittest.TestCase):
         self.assertLess(patch_copy, patch_consumer)
         self.assertLess(patch_consumer, patch_cleanup)
 
+    def test_native_live_row_abi_is_in_both_dependency_build_identities(self):
+        """The runtime's required row ABI must ship in both vendor dependencies.
+
+        Device integration proves the actual payload and graph semantics. This
+        packaging regression prevents a cache hit or missing Docker COPY from
+        silently delivering the older capacity-only native library instead.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        installer = (ROOT / "scripts/docker/install-nccl.sh").read_text()
+        rccl_installer = (ROOT / "scripts/docker/apply-rccl-capture-patch.sh").read_text()
+        cmake = (ROOT / "src/v2/CMakeLists.txt").read_text()
+        self.assertIn('sha256sum "${nccl_rows_patch}"', installer)
+        self.assertIn('apply "${nccl_rows_patch}"', installer)
+        self.assertIn("rccl-device-live-rows.patch", rccl_installer)
+        self.assertIn("RCCL_ROWS_PATCH_HASH", cmake)
+        self.assertIn("${rccl_rows_patch_sha}", dockerfile)
+        for backend in ("nccl", "rccl"):
+            patch = f"scripts/docker/patches/{backend}-device-live-rows.patch"
+            self.assertIn(patch, dockerfile)
+            self.assertIn(f"/tmp/install-scripts/patches/{backend}-device-live-rows.patch", dockerfile)
+            contents = (ROOT / patch).read_text()
+            loader = (ROOT / f"src/v2/collective/backends/{backend.upper()}DynamicLoader.cpp").read_text()
+            for operation in ("AllGather", "AllReduce", "ReduceScatter"):
+                symbol = f"llaminarNccl{operation}DeviceRows"
+                self.assertIn(symbol, contents)
+                self.assertIn(f'"{symbol}"', loader)
+
+    def test_rccl_host_storage_contract_is_staged_and_source_bound(self):
+        """Native storage evidence and its implementation must ship together.
+
+        Real captured integration checks descriptor ownership. Packaging cannot
+        select a cached library missing that required ABI or its allocation fix.
+        Each ordered patch owns only its change: repeating the preceding live
+        row header additions makes a fresh image fail before compilation.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        installer = (ROOT / "scripts/docker/apply-rccl-capture-patch.sh").read_text()
+        cmake = (ROOT / "src/v2/CMakeLists.txt").read_text()
+        loader = (ROOT / "src/v2/collective/backends/RCCLDynamicLoader.cpp").read_text()
+        native = (ROOT / "scripts/docker/patches/rccl-native-host-storage.patch").read_text()
+        patch_name = "rccl-native-host-storage.patch"
+        self.assertIn(patch_name, installer)
+        self.assertIn(f"COPY scripts/docker/patches/{patch_name}", dockerfile)
+        self.assertIn("${rccl_storage_patch_sha}", dockerfile)
+        self.assertIn("RCCL_HOST_STORAGE_PATCH_HASH", cmake)
+        self.assertIn("llaminarRcclHostTransportStorage", native)
+        self.assertIn('"llaminarRcclHostTransportStorage"', loader)
+        receipt = (ROOT / "src/v2/collective/backends/RCCLHostTransportStorage.h").read_text()
+        cpp_fields = re.findall(r"std::uint64_t (\w+) =", receipt)
+        c_fields = re.findall(r"^\+  uint64_t (\w+);$", native, flags=re.MULTILINE)
+        self.assertEqual(c_fields, cpp_fields)
+        self.assertEqual(len(c_fields), 8)
+        cmake_patch = native.split("diff --git a/CMakeLists.txt b/CMakeLists.txt\n", 1)[1]
+        cmake_patch = cmake_patch.split("diff --git ", 1)[0]
+        added_headers = re.findall(r"^\+  (src/include/\S+|src/device/\S+)$",
+                                   cmake_patch, flags=re.MULTILINE)
+        self.assertEqual(added_headers, ["src/include/llaminar_host_transport.h"])
+
+    def test_rccl_changed_receipt_requires_successful_incremental_rebuild(self):
+        """A new patch cannot reuse the DSO or erase every unchanged kernel object."""
+        cmake = (ROOT / "src/v2/CMakeLists.txt").read_text()
+        start = cmake.index("set(RCCL_REBUILD_REQUIRED OFF)")
+        end = cmake.index("endif() # LLAMINAR_BUILD_RCCL_FROM_SOURCE", start)
+        owner = cmake[start:end]
+        self.assertNotIn('file(REMOVE_RECURSE "${RCCL_BUILD_DIR}")', owner)
+        self.assertIn('NOT RCCL_BUILD_COMMIT STREQUAL RCCL_BUILD_ID', owner)
+        self.assertIn('OR RCCL_REBUILD_REQUIRED', owner)
+        self.assertIn('-G Ninja', owner)
+        self.assertIn('-DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}', owner)
+        successful_build = owner.index('if(NOT RCCL_BUILD_RESULT EQUAL 0)')
+        authenticated_receipt = owner.index('file(WRITE "${RCCL_VERSION_FILE}"')
+        self.assertLess(successful_build, authenticated_receipt)
+
     def test_hip_runtime_repair_is_shared_by_builder_and_shipping_image(self):
         """A green builder cannot ship the uncorrected distribution HIP DSO.
 
@@ -3881,25 +3961,158 @@ class InfrastructureTests(unittest.TestCase):
         Runtime images do not need the compiler or a second source build.
         """
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        development = (ROOT / ".devcontainer/Dockerfile").read_text(encoding="utf-8")
         toolchain = dockerfile.split("FROM toolchain AS builder", 1)[0]
         installer = (ROOT / "scripts/docker/install-rocm.sh").read_text(encoding="utf-8")
         self.assertIn("scripts/docker/install-hip-graph-runtime.sh", toolchain)
-        self.assertIn("patches/rocm-hip-graph-node-identity.patch", toolchain)
+        self.assertIn("scripts/docker/rocm-release.env", toolchain)
+        self.assertIn("patches/rocm-hip-graph-empty-segment-publication.patch", toolchain)
+        self.assertIn("patches/rocm-hip-host-queue-native-stack.patch", toolchain)
+        self.assertIn("patches/rocm-hip-sdma-stream-sharing.patch", toolchain)
+        self.assertIn("patches/rocm-hip-sdma-event-publication.patch", toolchain)
+        self.assertIn("patches/rocm-hip-graph-progress-safe-collapse.patch", toolchain)
+        # Those four backports are part of the pinned upstream monorepo now.
+        # Applying them again would make the upgrade a second orphaned repair.
+        for old_patch in ("node-identity", "queue-placement", "packet-publication", "entry-ordering"):
+            self.assertNotIn(f"rocm-hip-graph-{old_patch}.patch", toolchain)
         self.assertIn('if [[ "${MODE}" != runtime ]]; then', installer)
-        self.assertIn('bash "$(dirname -- "${BASH_SOURCE[0]}")/install-hip-graph-runtime.sh"', installer)
-        self.assertIn("cp -L /opt/rocm/lib/libamdhip64.so.7 /src/runtime-libs/libamdhip64.so.7", dockerfile)
-        self.assertIn("/opt/rocm/share/licenses/llaminar-hip", dockerfile)
+        self.assertIn('bash "${rocm_script_dir}/install-hip-graph-runtime.sh"', installer)
+        # Creating a development container must execute the same source repair,
+        # not merely advertise a newer SDK path above an older runtime DSO.
+        self.assertIn("COPY scripts/docker /tmp/install-scripts", development)
+        self.assertIn("MODE=full /tmp/install-scripts/install-rocm.sh", development)
+        active_prefix = rocm_release_pins()["LLAMINAR_ROCM_ACTIVE_PREFIX"]
+        for variable in ("ROCM_PATH", "ROCM_HOME", "HIP_PATH"):
+            self.assertIn(f"{variable}={active_prefix}", development)
+        self.assertIn(f":{active_prefix}/bin:{active_prefix}/lib/llvm/bin:", development)
+        self.assertIn(f"LD_LIBRARY_PATH=/usr/local/cuda/lib64:{active_prefix}/lib", development)
+        self.assertIn('cp -L "${ROCM_PATH}/lib/libamdhip64.so.7" /src/runtime-libs/libamdhip64.so.7', dockerfile)
+        self.assertIn('${ROCM_PATH}/share/licenses/llaminar-hip', dockerfile)
         runtime = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1].split(
             "FROM runtime AS test-runner", 1)[0]
         self.assertIn("COPY --from=builder /src/runtime-libs/ /usr/local/lib/", runtime)
-        self.assertIn("LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm/lib", runtime)
+        self.assertIn("LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm-sdk/lib", runtime)
+
+    def test_hip_runtime_reuse_authenticates_every_graph_repair(self):
+        """An older repair receipt cannot certify complete native graph ordering.
+
+        Use a tiny fake SDK/DSO and the real installer's early reuse boundary.
+        No compiler, package installation, source download or GPU is required.
+        All patch digests and the exact loaded DSO must participate. A repaired
+        file alongside a stock SONAME target does not certify callers, and the
+        package-stamped candidate may not resurrect stock code after ldconfig.
+        Tool discovery is private to this fixture: a slim installed runner need
+        not carry ccache or a compiler merely to reach the fake SDK boundary.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            commands = Path(directory) / "commands"
+            commands.mkdir()
+            # Receipt authentication uses real coreutils. Build-tool names are
+            # discoverable but must never execute: the deliberately incomplete
+            # SDK rejects stale receipts before any native work or network I/O.
+            for name in ("dirname", "sha256sum", "cut"):
+                (commands / name).symlink_to(Path("/usr/bin") / name)
+            for name in ("cmake", "ninja", "ccache", "curl", "git", "python3"):
+                tool = commands / name
+                tool.write_text(
+                    '#!/bin/sh\necho "unexpected build tool execution" >&2\nexit 97\n',
+                    encoding="utf-8")
+                tool.chmod(0o755)
+            sdk = Path(directory) / "sdk"
+            (sdk / ".info").mkdir(parents=True)
+            pins = rocm_release_pins()
+            (sdk / ".info/version").write_text(pins["LLAMINAR_ROCM_VERSION"] + "\n")
+            output = Path(directory) / "output"
+            environment = {**os.environ, "PATH": str(commands), "ROCM_PATH": str(sdk),
+                           "HIP_RUNTIME_INSTALL_PREFIX": str(output)}
+            (output / "lib").mkdir(parents=True)
+            (output / "share/llaminar").mkdir(parents=True)
+            library = output / f'lib/libamdhip64.so.{pins["LLAMINAR_HIP_LIBRARY_VERSION"]}'
+            library.write_bytes(b"isolated installer receipt fixture")
+            aliases = {
+                library.with_name(library.name + "-0000000"): library.name,
+                library.with_name("libamdhip64.so.7"): library.name,
+                library.with_name("libamdhip64.so"): "libamdhip64.so.7",
+            }
+            for alias, target in aliases.items():
+                alias.symlink_to(target)
+            patches = (
+                ROOT / "scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-host-queue-native-stack.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-sdma-stream-sharing.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-sdma-event-publication.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch",
+            )
+            parts = [pins[key] for key in ("LLAMINAR_ROCM_VERSION", "LLAMINAR_ROCM_DEB_VERSION",
+                     "LLAMINAR_ROCM_SYSTEMS_REVISION", "LLAMINAR_HIP_LIBRARY_VERSION")]
+            base_count = len(parts)
+            parts.extend(hashlib.sha256(path.read_bytes()).hexdigest() for path in patches)
+            library_digest = hashlib.sha256(library.read_bytes()).hexdigest()
+            marker = output / "share/llaminar/hip-graph-runtime.txt"
+            receipts = [(f"patch-count-{count}",
+                         [*parts[:base_count + count], library_digest], count == len(patches))
+                        for count in range(len(patches) + 1)]
+            # Authenticate every pin and repair body, as well as a DSO replaced
+            # without updating its installation receipt.
+            complete_receipt = [*parts, library_digest]
+            receipt_names = ["sdk", "package", "source", "hip-version",
+                             *[path.name for path in patches], "installed-DSO"]
+            for index, name in enumerate(receipt_names):
+                stale_receipt = complete_receipt.copy()
+                stale_receipt[index] = "0" * 64
+                receipts.append((f"stale-{name}", stale_receipt, False))
+            for name, receipt, current in receipts:
+                with self.subTest(receipt=name):
+                    marker.write_text(":".join(receipt) + "\n")
+                    result = subprocess.run(
+                        ["/bin/bash", str(ROOT / "scripts/docker/install-hip-graph-runtime.sh")],
+                        env=environment,
+                        text=True, capture_output=True, timeout=10)
+                    if current:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn("already installed", result.stdout)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertNotIn("already installed", result.stdout)
+                        # The fake SDK deliberately lacks LLVM development
+                        # metadata, so an invalid receipt stops before network
+                        # access or native compilation rather than being reused.
+                        self.assertIn(f'matching amdrocm-llvm-dev{pins["LLAMINAR_ROCM_SERIES"]} package',
+                                      result.stderr)
+
+            # The repaired artifact receipt stays valid while each loader
+            # entry is removed or redirected to an unauthenticated package.
+            # Admission must still fail before compilation or network access.
+            marker.write_text(":".join(complete_receipt) + "\n")
+            stock = output / "lib/stock-runtime-fixture"
+            stock.write_bytes(b"unpatched distribution DSO fixture")
+            for alias, target in aliases.items():
+                for operation in ("missing", "stock"):
+                    with self.subTest(alias=alias.name, operation=operation):
+                        alias.unlink()
+                        if operation == "stock":
+                            alias.symlink_to(stock.name)
+                        try:
+                            result = subprocess.run(
+                                ["/bin/bash", str(ROOT / "scripts/docker/install-hip-graph-runtime.sh")],
+                                env=environment,
+                                text=True, capture_output=True, timeout=10)
+                        finally:
+                            # Restore each loader entry even when its negative
+                            # control fails, so later controls remain independent.
+                            if alias.is_symlink():
+                                alias.unlink()
+                            alias.symlink_to(target)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertNotIn("already installed", result.stdout)
+                        self.assertIn("matching amdrocm-llvm-dev", result.stderr)
 
     def test_hip_runtime_installer_rejects_an_unreviewed_sdk_before_building(self):
         """An SDK override must not silently mix a pinned HIP runtime ABI."""
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory) / "sdk"
             (sdk / ".info").mkdir(parents=True)
-            for version in (None, "7.2.3", "7.3.0"):
+            for version in (None, "7.2.4", "10.0.1", "10.1.0"):
                 with self.subTest(version=version):
                     if version is not None:
                         (sdk / ".info/version").write_text(version + "\n")
@@ -3909,7 +4122,8 @@ class InfrastructureTests(unittest.TestCase):
                              "HIP_RUNTIME_INSTALL_PREFIX": str(Path(directory) / "output")},
                         text=True, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, 1, result.stderr)
-                    self.assertIn("requires the pinned ROCm 7.2.4 SDK", result.stderr)
+                    self.assertIn(f'requires the pinned ROCm {rocm_release_pins()["LLAMINAR_ROCM_VERSION"]} SDK',
+                                  result.stderr)
                     self.assertFalse((Path(directory) / "output").exists())
 
     def test_rocm_installer_declares_hip_source_build_dependencies(self):
@@ -3922,36 +4136,52 @@ class InfrastructureTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as directory:
             commands = Path(directory)
-            # Stop before the first mode-specific package transaction. Earlier
-            # installer/network/removal commands are inert, including the fixed
-            # /tmp installer pathname, so this test cannot mutate the machine.
-            for name in ("curl", "rm", "amdgpu-install"):
-                command = commands / name
-                command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                command.chmod(0o755)
+            scripts = commands / "scripts"
+            scripts.mkdir()
+            for name in ("install-rocm.sh", "rocm-release.env"):
+                (scripts / name).write_bytes((ROOT / "scripts/docker" / name).read_bytes())
+            # Replace only repository registration in the private script tree.
+            # The real profile/pin logic reaches a fake apt boundary and exits
+            # before installation, symlink publication or a source build.
+            (scripts / "configure-rocm-repository.sh").write_text("#!/bin/sh\nexit 0\n")
+            for name in ("bash", "dirname"):
+                (commands / name).symlink_to(Path("/usr/bin") / name)
             apt = commands / "apt-get"
             apt.write_text(
                 '#!/bin/sh\ncase " $* " in\n'
-                '  *" rocm-llvm-dev "*|*" hip-dev "*|*" hipblas "*)\n'
+                '  *" install "*)\n'
                 '    printf "%s\\n" "$@"\n    exit 77;;\n'
                 '  *) exit 0;;\nesac\n', encoding="utf-8")
             apt.chmod(0o755)
             for mode in ("full", "build", "runtime"):
                 with self.subTest(mode=mode):
                     result = subprocess.run(
-                        ["/bin/bash", str(ROOT / "scripts/docker/install-rocm.sh")],
+                        ["/bin/bash", str(scripts / "install-rocm.sh")],
                         # No real commands are reachable if the installer
                         # unexpectedly advances beyond our package boundary.
                         env={**os.environ, "MODE": mode, "PATH": directory},
                         text=True, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, 77, result.stderr)
                     packages = result.stdout.splitlines()
+                    pins = rocm_release_pins()
+                    # hipBLAS has a direct rocSOLVER DSO dependency which the
+                    # upstream host package currently omits. Builder and
+                    # serving closures must never rely on another installed SDK.
+                    self.assertIn(
+                        f'amdrocm-solver-host{pins["LLAMINAR_ROCM_SERIES"]}={pins["LLAMINAR_ROCM_DEB_VERSION"]}',
+                        packages)
+                    llvm_package = f'amdrocm-llvm-dev{pins["LLAMINAR_ROCM_SERIES"]}={pins["LLAMINAR_ROCM_DEB_VERSION"]}'
                     if mode == "runtime":
-                        self.assertNotIn("rocm-llvm-dev", packages)
+                        self.assertNotIn(llvm_package, packages)
                         self.assertNotIn("libglvnd-dev", packages)
+                        self.assertNotIn("libmsgpack-cxx-dev", packages)
                     else:
-                        self.assertIn("rocm-llvm-dev", packages)
+                        self.assertIn(llvm_package, packages)
                         self.assertIn("libglvnd-dev", packages)
+                        self.assertIn("libmsgpack-cxx-dev", packages)
+                    for package in packages:
+                        if package.startswith("amdrocm-"):
+                            self.assertTrue(package.endswith("=" + pins["LLAMINAR_ROCM_DEB_VERSION"]))
 
     def test_rocm_test_dependency_installer_declares_only_annotation_package(self):
         """The test closure needs ROCTX, not the complete profiling toolchain.
@@ -3961,6 +4191,7 @@ class InfrastructureTests(unittest.TestCase):
         than duplicating its package selection in the image workflow.
         """
         with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "dirname").symlink_to("/usr/bin/dirname")
             apt = Path(directory) / "apt-get"
             apt.write_text(
                 '#!/bin/sh\ncase " $* " in\n'
@@ -3972,8 +4203,123 @@ class InfrastructureTests(unittest.TestCase):
                 env={**os.environ, "PATH": directory},
                 text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 77, result.stderr)
+            pins = rocm_release_pins()
             self.assertEqual(result.stdout.splitlines(), [
-                "install", "-y", "--no-install-recommends", "rocprofiler-sdk-roctx"])
+                "install", "-y", "--no-install-recommends",
+                f'amdrocm-profiler-base{pins["LLAMINAR_ROCM_SERIES"]}={pins["LLAMINAR_ROCM_DEB_VERSION"]}'])
+
+    def test_rocm_blas_kernels_are_built_and_shipped_with_the_matching_dso(self):
+        """Both ISA lanes inherit one source-built gfx906 BLAS artifact closure.
+
+        A host-only package or a kernel tree copied without its DSO is not a
+        supported MI50 BLAS implementation. The runtime must not download a
+        different distribution's kernels or compile again after certification.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        toolchain = dockerfile.split("FROM toolchain AS builder", 1)[0]
+        runtime = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1].split(
+            "FROM runtime AS test-runner", 1)[0]
+        installer = (ROOT / "scripts/docker/install-rocm.sh").read_text()
+        blas = (ROOT / "scripts/docker/install-rocblas-gfx906.sh").read_text()
+        self.assertIn("scripts/docker/install-rocblas-gfx906.sh", toolchain)
+        self.assertIn('bash "${rocm_script_dir}/install-rocblas-gfx906.sh"', installer)
+        self.assertIn('blas_targets="${ROCBLAS_GPU_TARGETS:-gfx906:xnack-}"', blas)
+        self.assertIn("ROCm/rocm-libraries/tar.gz/${LLAMINAR_ROCM_LIBRARIES_REVISION}", blas)
+        self.assertIn('Tensile_TEST_LOCAL_PATH="${blas_work}/libraries/shared/tensile"', blas)
+        self.assertIn('cmake --build "${blas_work}/build" --parallel', blas)
+        self.assertIn('cmake --install "${blas_work}/build"', blas)
+        self.assertIn('-DROCTX_LIBRARY="${blas_sdk_root}/lib/librocprofiler-sdk-roctx.so"', blas)
+        self.assertIn('cp -L "${ROCM_PATH}/lib/librocblas.so" /src/runtime-rocblas/lib/librocblas.so.5', dockerfile)
+        self.assertIn('cp -r "${ROCM_PATH}/lib/rocblas/library" /src/runtime-rocblas/lib/rocblas/', dockerfile)
+        self.assertIn("COPY --from=builder /src/runtime-rocblas/ /opt/rocm-sdk/", runtime)
+        self.assertNotIn("install-rocblas-gfx906.sh", runtime)
+        for script in ("install-rocm.sh", "install-rocm-runtime.sh", "install-rocblas-gfx906.sh"):
+            self.assertNotIn("archlinux.org", (ROOT / "scripts/docker" / script).read_text())
+        pins = rocm_release_pins()
+        self.assertIn(f'ROCM_PATH={pins["LLAMINAR_ROCM_ACTIVE_PREFIX"]}', runtime)
+        self.assertIn(f'ROCM_PATH={pins["LLAMINAR_ROCM_ACTIVE_PREFIX"]}',
+                      (ROOT / ".devcontainer/Dockerfile").read_text())
+
+    def test_rocm_blas_reuse_requires_every_installed_kernel_and_dispatch_table(self):
+        """Execute the real receipt boundary with no package, compiler or GPU.
+
+        Losing or modifying either side of a generated BLAS dispatch is a
+        missing implementation, not permission to reuse a host-only receipt.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            pins = rocm_release_pins()
+            sdk = Path(directory) / "sdk"
+            (sdk / ".info").mkdir(parents=True)
+            (sdk / ".info/version").write_text(pins["LLAMINAR_ROCM_VERSION"] + "\n")
+            output = Path(directory) / "output"
+            tree = output / "lib/rocblas/library/gfx906-xnack-"
+            tree.mkdir(parents=True)
+            (output / "share/llaminar").mkdir(parents=True)
+            payloads = {"lib/librocblas.so": b"matching source DSO"}
+            for precision in ("SS", "HH", "BB"):
+                for suffix in ("co", "dat"):
+                    payloads[f"lib/rocblas/library/gfx906-xnack-/Tensile_{precision}_gfx906.{suffix}"] = (
+                        f"isolated {precision} {suffix} fixture".encode())
+            for name, data in payloads.items():
+                (output / name).write_bytes(data)
+            receipt_bytes = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n"
+                                    for name, data in sorted(payloads.items())).encode()
+            identity = ":".join(pins[key] for key in ("LLAMINAR_ROCM_VERSION",
+                                 "LLAMINAR_ROCM_DEB_VERSION", "LLAMINAR_ROCM_LIBRARIES_REVISION"))
+            identity += ":gfx906:xnack-"
+            marker = output / "share/llaminar/rocblas-source.txt"
+            marker.write_text(identity + ":" + hashlib.sha256(receipt_bytes).hexdigest() + "\n")
+
+            def run_installer():
+                """Run the actual isolated receipt verifier, not a Python copy."""
+                return subprocess.run(
+                    ["bash", str(ROOT / "scripts/docker/install-rocblas-gfx906.sh")],
+                    env={**os.environ, "ROCM_PATH": str(sdk),
+                         "ROCBLAS_INSTALL_PREFIX": str(output), "ROCBLAS_GPU_TARGETS": "gfx906:xnack-"},
+                    capture_output=True, text=True, timeout=10)
+
+            result = run_installer()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("already installed", result.stdout)
+            for name, data in payloads.items():
+                for operation in ("changed", "missing"):
+                    with self.subTest(artifact=name, operation=operation):
+                        if operation == "changed":
+                            (output / name).write_bytes(data + b" changed")
+                        else:
+                            (output / name).unlink()
+                        result = run_installer()
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertNotIn("already installed", result.stdout)
+                        self.assertIn("matching amdrocm-llvm-dev", result.stderr)
+                        (output / name).write_bytes(data)
+            for targets in ("gfx908", "gfx906:xnack-;gfx908"):
+                with self.subTest(targets=targets):
+                    result = subprocess.run(
+                        ["bash", str(ROOT / "scripts/docker/install-rocblas-gfx906.sh")],
+                        env={**os.environ, "ROCM_PATH": str(sdk),
+                             "ROCBLAS_INSTALL_PREFIX": str(output), "ROCBLAS_GPU_TARGETS": targets},
+                        capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("already installed", result.stdout)
+
+    def test_rocm_blas_installer_rejects_unreviewed_sdk_without_building(self):
+        """A complete old kernel receipt cannot authorize another SDK ABI."""
+        with tempfile.TemporaryDirectory() as directory:
+            sdk = Path(directory) / "sdk"
+            (sdk / ".info").mkdir(parents=True)
+            for version in (None, "7.2.4", "10.0.1"):
+                with self.subTest(version=version):
+                    if version is not None:
+                        (sdk / ".info/version").write_text(version + "\n")
+                    output = Path(directory) / "output"
+                    result = subprocess.run(
+                        ["bash", str(ROOT / "scripts/docker/install-rocblas-gfx906.sh")],
+                        env={**os.environ, "ROCM_PATH": str(sdk), "ROCBLAS_INSTALL_PREFIX": str(output)},
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("requires the pinned ROCm", result.stderr)
+                    self.assertFalse(output.exists())
 
     def test_rocm_annotation_dependency_is_test_only_and_shared_with_builder(self):
         """Both test image stages use one installer; serving has no profiler.
@@ -4389,9 +4735,9 @@ class InfrastructureTests(unittest.TestCase):
             "--mount=type=cache,id=llaminar-ccache,"
             "target=/root/.ccache,sharing=locked"
         )
-        # RCCL, Integration, and Release compilation must share the one
+        # HIP/BLAS, RCCL, Integration, and Release compilation share the one
         # bounded compiler cache instead of allocating anonymous mounts.
-        self.assertEqual(dockerfile.count(mount), 3)
+        self.assertEqual(dockerfile.count(mount), 4)
 
     def test_develop_workflow_uses_one_persistent_buildkit_worker_for_host_cache(self):
         """The ARC cache needs a retained BuildKit worker, never the unsupported Docker driver."""

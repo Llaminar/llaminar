@@ -14,8 +14,11 @@ LLAMINAR_NINJA_BIN="$(command -v ninja)"
 echo '[pre-commit] Configuring the Integration build...'
 # Resolve the active devcontainer Ninja once; never switch executables on an
 # existing tree implicitly. Preserve unrelated cached ISA/toolchain options.
+# Regenerate compiler metadata even after CMake resets a changed toolchain's
+# cache. SDK/flag audits must inspect this build, never a surviving old JSON.
 cmake -B "$BUILD_DIR" -S "$REPO_ROOT/src/v2" -G Ninja \
     -DCMAKE_BUILD_TYPE=Integration \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DCMAKE_MAKE_PROGRAM:FILEPATH="$LLAMINAR_NINJA_BIN" \
     -DLLAMINAR_BUILD_TESTS=ON -DHAVE_CUDA=ON -DHAVE_ROCM=ON
 

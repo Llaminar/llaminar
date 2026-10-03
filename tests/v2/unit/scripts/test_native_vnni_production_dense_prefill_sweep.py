@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Regressions for the resumable all-format dense GPU prefill sweep."""
+"""Device-free regressions for the resumable all-format dense GPU prefill sweep.
+
+Synthetic trainer records exercise exact family/geometry identity, resource and
+byte-certificate rejection, and durable publication without launching devices.
+Auto may select a different physical family than a forced tournament tile;
+that distinction must survive validation without weakening either contract.
+"""
 
 from __future__ import annotations
 
@@ -244,6 +250,8 @@ def _write_cell(
                     (sample - mean) ** 2 for sample in samples
                 ))
                 components = candidate.split("/")
+                int8 = cell.source_format.runtime_codebook("rocm") == 19
+                int8_v3 = candidate.startswith("INT8V3/")
                 explicit_unroll = (
                     int(components[3].removeprefix("U"))
                     if len(components) >= 4 and components[3].startswith("U")
@@ -270,7 +278,8 @@ def _write_cell(
                     "first_byte_mismatch_vs_auto": _UINT64_MAX,
                     "is_best": int(candidate_index == 0),
                     "observed_n_tile": (
-                        128 if candidate == "Auto"
+                        (64 if int8_v3 else 128) if int8
+                        else 128 if candidate == "Auto"
                         else int(candidate.split("/")[0].removeprefix("N"))
                     ),
                     "observed_m_tile": (
@@ -278,11 +287,12 @@ def _write_cell(
                         else int(candidate.split("/")[1].removeprefix("MT"))
                     ),
                     "observed_min_blocks": (
-                        1 if candidate == "Auto"
+                        1 if int8 or candidate == "Auto"
                         else int(candidate.split("/")[2].removeprefix("MB"))
                     ),
                     "observed_unroll": (
                         2 if candidate == "Auto"
+                        else int(components[2].removeprefix("U")) if int8
                         else explicit_unroll
                     ),
                     "observed_full_tiles": int(
@@ -293,6 +303,11 @@ def _write_cell(
                     "static_shared_memory_bytes": 16384,
                     "max_threads_per_block": 256,
                     "max_active_blocks_per_sm": 2,
+                    "observed_producer": (
+                        ("int8_blockwise_v3" if int8_v3 else "int8_blockwise_v7")
+                        if int8 else "native_cooperative"
+                    ),
+                    "dynamic_shared_memory_bytes": 0,
                 })
 
     with paths.timing.open("w", newline="", encoding="utf-8") as handle:
@@ -472,6 +487,143 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                 )
                 self.assertEqual(result.sample_count, result.candidate_count * 3)
                 self.assertEqual(result.winner_min_us, 10.0)
+
+    def test_rocm_auto_streaming_observation_is_distinct_from_forced_tiles(self) -> None:
+        """Auto can select its existing barrier-free family outside the tournament tiles."""
+        cells = production_dense_prefill_cells("rocm")
+        for source_format, m_tile in (("IQ1_M", 8), ("IQ1_S", 16)):
+            with self.subTest(m_tile=m_tile), tempfile.TemporaryDirectory() as tmp:
+                cell = next(cell for cell in cells
+                            if cell.source_format.label == source_format
+                            and cell.shape.name == "Qwen36MoE_GDN_QKVProjection"
+                            and cell.m == 64)
+                cell, paths = _write_cell(Path(tmp), "rocm", cell=cell, bench_runs=3)
+                with paths.aggregate.open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                auto = next(row for row in rows if row["variant"] == "Auto")
+                auto.update(observed_n_tile="256", observed_m_tile=str(m_tile),
+                            observed_min_blocks="3", observed_unroll="0",
+                            observed_full_tiles="0", observed_producer="native_streaming")
+                with paths.aggregate.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=ROCM_AGGREGATE_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                result = validate_production_dense_prefill_cell(
+                    paths.aggregate, paths.timing, cell, bench_runs=3)
+                self.assertEqual(result.sample_count, result.candidate_count * 3)
+
+    def test_rocm_streaming_observation_rejects_invented_or_forced_launch(self) -> None:
+        """A valid Auto family is not permission to loosen any candidate's identity."""
+        fields = ("observed_n_tile", "observed_m_tile", "observed_min_blocks",
+                  "observed_unroll", "observed_full_tiles")
+        invalid = ((128, 8, 3, 0, 0), (256, 32, 3, 0, 0), (256, 8, 2, 0, 0),
+                   (256, 8, 3, 4, 0), (256, 8, 3, 0, 1))
+        cases = [("Auto", launch) for launch in invalid]
+        cases.append(("N64/MT16/MB1", (256, 8, 3, 0, 0)))
+        for candidate, launch in cases:
+            with self.subTest(candidate=candidate, launch=launch), tempfile.TemporaryDirectory() as tmp:
+                cell, paths = _write_cell(Path(tmp), "rocm", bench_runs=3)
+                with paths.aggregate.open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                target = next(row for row in rows if row["variant"] == candidate)
+                target.update(zip(fields, map(str, launch)))
+                target["observed_producer"] = "native_streaming"
+                with paths.aggregate.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=ROCM_AGGREGATE_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with self.assertRaisesRegex(ValueError, "invalid observed ROCm launch"):
+                    validate_production_dense_prefill_cell(
+                        paths.aggregate, paths.timing, cell, bench_runs=3)
+
+    def test_rocm_q8_aliases_authenticate_their_int8_producers(self) -> None:
+        """Each Q8 source measures actual V3/V7 controls, never ignored low-bit knobs."""
+        cells = production_dense_prefill_cells("rocm")
+        for source in ("Q8_0", "Q8_1", "Q8_K"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                cell = next(cell for cell in cells if cell.source_format.label == source)
+                cell, paths = _write_cell(Path(tmp), "rocm", cell=cell)
+                candidates = dense_prefill_candidate_ids("rocm", cell.source_format)
+                self.assertEqual(len(candidates), 25)
+                self.assertTrue(all(c == "Auto" or c.startswith(("INT8V3/", "INT8V7/"))
+                                    for c in candidates))
+                result = validate_production_dense_prefill_cell(
+                    paths.aggregate, paths.timing, cell, bench_runs=3)
+                self.assertEqual(result.sample_count, 75)
+
+    def test_rocm_winner_uses_raw_ticks_and_native_tie_order(self) -> None:
+        """Rounded display values and lexical names never override native timing."""
+        first, later = "N64/MT16/MB1", "N128/MT16/MB1"
+        for exact_tie in (True, False):
+            with self.subTest(exact_tie=exact_tie), tempfile.TemporaryDirectory() as tmp:
+                cell, paths = _write_cell(Path(tmp), "rocm")
+                samples = {
+                    first: (10.0002, 10.5002, 10.8002),
+                    later: (10.0002 if exact_tie else 10.0001, 10.5002, 10.8002),
+                }
+                winner = first if exact_tie else later
+                with paths.aggregate.open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                for row in rows:
+                    row["is_best"] = str(int(row["variant"] == winner))
+                    if row["variant"] in samples:
+                        values = samples[row["variant"]]
+                        mean = statistics.fmean(values)
+                        row.update(min_us=f"{min(values):.3f}", mean_us=f"{mean:.3f}",
+                                   stddev_us=f"{math.sqrt(statistics.fmean((v-mean)**2 for v in values)):.3f}")
+                with paths.aggregate.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=ROCM_AGGREGATE_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with paths.timing.open(newline="", encoding="utf-8") as handle:
+                    timing_rows = list(csv.DictReader(handle))
+                for row in timing_rows:
+                    if row["variant"] in samples:
+                        value = samples[row["variant"]][int(row["sample_index"])]
+                        row.update(latency_us=f"{value:.9f}", latency_us_hex=value.hex())
+                with paths.timing.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=ROCM_TIMING_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(timing_rows)
+                result = validate_production_dense_prefill_cell(
+                    paths.aggregate, paths.timing, cell, bench_runs=3)
+                self.assertEqual(result.winner_id, winner)
+                self.assertEqual(result.winner_min_us, min(samples[winner]))
+                for row in rows:
+                    row["is_best"] = str(int(row["variant"] == (later if exact_tie else first)))
+                with paths.aggregate.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=ROCM_AGGREGATE_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with self.assertRaisesRegex(ValueError, "winner marker disagrees"):
+                    validate_production_dense_prefill_cell(
+                        paths.aggregate, paths.timing, cell, bench_runs=3)
+
+    def test_rocm_producer_identity_rejects_cross_family_and_stale_evidence(self) -> None:
+        """A plausible tile/resource tuple cannot authenticate another producer."""
+        cells = production_dense_prefill_cells("rocm")
+        cases = (
+            ("Q8_0", "Auto", {"observed_producer": "native_cooperative"}),
+            ("Q8_1", "INT8V3/MT16/U0", {"observed_producer": "int8_blockwise_v7"}),
+            ("Q8_K", "INT8V7/MT32/U1", {"observed_unroll": "2"}),
+            ("Q8_0", "Auto", {"dynamic_shared_memory_bytes": "-1"}),
+            ("Q6_K", "Auto", {"observed_producer": "int8_blockwise_v7"}),
+            ("Q4_0", "Auto", {"observed_producer": ""}),
+        )
+        for source, candidate, changed in cases:
+            with self.subTest(source=source, candidate=candidate), tempfile.TemporaryDirectory() as tmp:
+                cell = next(cell for cell in cells if cell.source_format.label == source)
+                cell, paths = _write_cell(Path(tmp), "rocm", cell=cell)
+                with paths.aggregate.open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                next(row for row in rows if row["variant"] == candidate).update(changed)
+                with paths.aggregate.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=ROCM_AGGREGATE_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with self.assertRaises(ValueError):
+                    validate_production_dense_prefill_cell(
+                        paths.aggregate, paths.timing, cell, bench_runs=3)
 
     def test_cuda_staging_is_distinct_in_aggregate_and_every_timing_sample(self) -> None:
         """A faster copy schedule cannot inherit the register schedule's receipt."""
@@ -1002,7 +1154,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                     backend, DenseOverlayKey(4, 512, 5120, 17408),
                     ("IQ4_NL", "IQ4_XS"), ("Qwen36_FFN_DownProjection",),
                     "STD:t5:full" if backend == "cuda" else "N64/MT16/MB1",
-                    (5, 1, 0, 0, 0) if backend == "cuda" else (64, 16, 1, 0, 0),
+                    (5, 1, 0, 0, 0) if backend == "cuda" else (64, 16, 1, 0, 0, 0),
                     0.0, 0.0, 1.0,
                 )
                 last = replace(first, key=replace(first.key, m=1024))
@@ -1012,7 +1164,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                     # explicitly defaulted staging field; do not normalize it.
                     base = base.replace(", prefill::PrefillStagingSchedule::RegisterDecode", "")
                 updated = replace(first, launch=(4, 1, 0, 0, 3) if backend == "cuda"
-                                  else (128, 32, 1, 2, 1))
+                                  else (128, 32, 1, 2, 1, 0))
                 added = replace(updated, key=replace(first.key, m=4096))
                 output, receipt = retain_dense_overlay_base(base, (updated, added))
                 base_rows = [row for row in base.splitlines() if row.startswith("        {4,")]
@@ -1156,7 +1308,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             source_formats=("Q6_K",),
             shape_names=("35BMoE_Expert_GateUp",),
             candidate_id="N128/MT32/MB2/U4/FULL",
-            launch=(128, 32, 2, 4, 1),
+            launch=(128, 32, 2, 4, 1, 0),
             geometric_mean_regret=0.0,
             maximum_alias_regret=0.0,
             geometric_mean_speedup_vs_auto=1.1,
@@ -1165,7 +1317,23 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
         rendered = render_dense_overlay((entry,))
 
         self.assertIn("selectROCmDensePrefillOverlay", rendered)
-        self.assertIn("{128, 32, 2, 4, true}", rendered)
+        self.assertIn("{128, 32, 2, 4, true, VNNIPrefillProducer::NativeCooperative}", rendered)
+
+    def test_rocm_overlay_retains_distinct_int8_and_streaming_producers(self) -> None:
+        """Installation cannot reinterpret identical tile fields as another kernel."""
+        for codebook, producer, family, launch in (
+            (19, 2, "Int8BlockwiseV3", (64, 32, 1, 2, 0)),
+            (19, 3, "Int8BlockwiseV7", (128, 64, 1, 2, 0)),
+            (17, 1, "NativeStreaming", (256, 8, 3, 0, 0)),
+        ):
+            with self.subTest(family=family):
+                entry = DenseOverlayEntry("rocm", DenseOverlayKey(codebook, 512, 4096, 2048),
+                    (), (), "Auto", (*launch, producer), 0.0, 0.0, 1.0)
+                rendered = render_dense_overlay((entry,))
+                self.assertIn(f"VNNIPrefillProducer::{family}", rendered)
+                self.assertEqual(retain_dense_overlay_base(rendered, (entry,))[0], rendered)
+                with self.assertRaisesRegex(ValueError, "producer identity"):
+                    render_dense_overlay((replace(entry, launch=launch),))
 
     def test_overlay_rejects_aliases_with_conflicting_physical_auto_launches(self) -> None:
         cells = production_dense_prefill_cells("cuda")

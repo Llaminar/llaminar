@@ -8,6 +8,7 @@
  * These are functional lifecycle tests, not throughput or model-math certificates.
  */
 #include "planning/PlanningGPUExpertMeasurement.h"
+#include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "../../utils/PlanningGGUFFixture.h"
@@ -45,11 +46,14 @@ namespace
     std::shared_ptr<PhysicalMemoryAuthority> memoryFor(const PlanningModelSource &source, DeviceId device)
     {
         PhysicalMemoryPlanBuilder builder;
+        auto *backend = getBackendFor(device);
+        if (!backend) throw std::runtime_error("Expert sample proof lost its physical GPU backend");
         PlanningGPUExpertMeasurement::contributeMemory(source, request(),
             {.world_rank = 0, .device = DeviceId::cpu(), .total_bytes = 256u << 20,
              .admission_available_bytes = 256u << 20},
-            {.world_rank = 0, .device = device, .total_bytes = 256u << 20,
-             .admission_available_bytes = 256u << 20}, builder);
+            {.world_rank = 0, .device = device,
+             .total_bytes = backend->deviceMemoryTotal(device.ordinal),
+             .admission_available_bytes = backend->deviceMemoryFree(device.ordinal)}, builder);
         return std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
     }

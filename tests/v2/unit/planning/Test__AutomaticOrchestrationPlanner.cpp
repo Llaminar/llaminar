@@ -98,6 +98,50 @@ TEST(AutomaticOrchestrationPlanner, RejectsMissingAndNonfiniteCostEvidence)
     EXPECT_EQ(cost.workload(), work);
 }
 
+/** @brief Plan/default-auto serve reject missing predictors before hardware measurement. */
+TEST(AutomaticOrchestrationPlanner, MissingMTPWeightsFailBeforeEvidencePreparation)
+{
+    for (const bool moe : {false, true})
+    {
+        test::PlanningGGUFFixture file(moe, false);
+        PlanningModelSource source(file.path());
+        for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        for (const bool active : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << "moe=" << moe << " backend="
+                << deviceTypeToString(backend) << " active=" << active);
+            auto config = request(source, backend);
+            config.mtp.enabled = active;
+            config.mtp.graph_capacity_draft_tokens = 15;
+            const auto original = serializeOrchestrationConfig(config);
+            // This test has no MPI context. Keep discovery process-local so a
+            // communicator mismatch cannot mask learned-weight admission.
+            auto observed = inventory(backend);
+            observed.world_size = 1;
+            observed.ranks.resize(1);
+            observed.buildNodeAggregations();
+            size_t preparations = 0;
+            try
+            {
+                (void)AutomaticPlanningStartup::run(config, observed, {},
+                    [&](const AutomaticPlanningPreparation &)
+                        -> std::optional<AutomaticOrchestrationPlanner::Evaluate> {
+                        ++preparations;
+                        throw std::logic_error("Missing MTP reached hardware preparation");
+                    });
+                FAIL() << "A plain GGUF reached automatic selection with retained MTP";
+            }
+            catch (const std::runtime_error &error)
+            {
+                EXPECT_NE(std::string(error.what()).find("no MTP/nextn metadata or tensors"), std::string::npos)
+                    << error.what();
+            }
+            EXPECT_EQ(preparations, 0u);
+            EXPECT_EQ(serializeOrchestrationConfig(config), original);
+        }
+    }
+}
+
 TEST(AutomaticOrchestrationPlanner, StartupSearchSharesPolicyAndPreservesDiscoveryWithoutMutatingRequest)
 {
     test::PlanningGGUFFixture file;

@@ -14,6 +14,8 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <limits>
+#include <set>
+#include <string>
 #include "memory/BufferArena.h"
 #include "memory/BufferId.h"
 #include "memory/BufferAccess.h"
@@ -978,11 +980,26 @@ TEST(Test__BufferId, NameRoundTrips)
         "MTP_LOGITS_GATHERED");
 }
 
-TEST(Test__BufferId, CountIsReasonable)
+/** Every declared ID must fit the arena's enum-sized registry without a magic ceiling. */
+TEST(Test__BufferId, EveryDeclaredIdHasUniqueNameAndArenaSlot)
 {
-    auto count = static_cast<size_t>(BufferId::_COUNT);
-    EXPECT_GT(count, 10u);
-    EXPECT_LT(count, 128u);
+    const auto count = static_cast<size_t>(BufferId::_COUNT);
+    ASSERT_GT(count, 0u);
+    BufferArena arena;
+    std::set<std::string> names;
+    for (size_t index = 0; index < count; ++index)
+    {
+        const auto id = static_cast<BufferId>(index);
+        SCOPED_TRACE(index);
+        EXPECT_STRNE(bufferIdName(id), "UNKNOWN");
+        EXPECT_TRUE(names.insert(bufferIdName(id)).second);
+        // Registration is metadata-only, so even device scratch roles can be
+        // checked on CPU without making this Unit test allocate GPU storage.
+        ASSERT_TRUE(arena.registerBuffer(id, 1, index + 1, "FP32", DeviceId::cpu()));
+        EXPECT_TRUE(arena.isRegistered(id));
+        EXPECT_EQ(arena.getCols(id), index + 1);
+    }
+    EXPECT_EQ(arena.registeredCount(), count);
 }
 
 // ============================================================================

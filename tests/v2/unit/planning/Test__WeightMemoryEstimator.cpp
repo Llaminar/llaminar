@@ -8,6 +8,7 @@
 #include "kernels/common/EmbedQ8Block.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
+#include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
 #include <stdexcept>
 #include <limits>
@@ -407,6 +408,165 @@ TEST(Test__WeightMemoryEstimator, ExpertGeometryRetainsIndependentAxisAndExplici
         std::invalid_argument);
     EXPECT_THROW(WeightShardGeometryResolver(profile, DeviceId::cpu(), 0, 1, {}).resolve(profile.tensors[0], 1),
         std::invalid_argument);
+}
+
+/** @brief Source, ownership and per-projection matrix identity cannot diverge silently. */
+TEST(MoEExpertProjectionOwnership, ValidatesGeometryAndPreservesOnlyOwnerMovableProjections)
+{
+    using Ownership = llaminar2::MoEExpertProjectionOwnership;
+    const Ownership::Geometry source{24, 1680, 256};
+    for (int degree = 1; degree <= 8; ++degree)
+    {
+        int covered_rows = 0;
+        for (int participant = 0; participant < degree; ++participant)
+        {
+            const auto whole = Ownership::completeExperts(source, participant, degree);
+            const auto partitioned = Ownership::gateUpOwnedDownColumns(source, participant, degree);
+            const auto down = partitioned.projection(WeightRole::MoEExpertDown);
+            EXPECT_EQ(down.source_rows, source.model_columns);
+            EXPECT_EQ(down.source_columns, source.intermediate_columns);
+            EXPECT_EQ(down.first_row, covered_rows);
+            EXPECT_EQ(down.rows, source.model_columns / degree);
+            covered_rows += down.rows;
+            for (auto role : {WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown})
+            {
+                for (int owner = 0; owner < degree; ++owner)
+                {
+                    EXPECT_EQ(whole.prepares(role, owner), owner == participant);
+                    EXPECT_EQ(partitioned.prepares(role, owner),
+                        role == WeightRole::MoEExpertDown || owner == participant);
+                }
+                for (size_t owned : {0u, 1u, 11u, 24u})
+                {
+                    EXPECT_EQ(whole.residentExperts(role, owned), owned);
+                    EXPECT_EQ(partitioned.residentExperts(role, owned),
+                        role == WeightRole::MoEExpertDown ? 24u : owned);
+                }
+            }
+        }
+        EXPECT_EQ(covered_rows, source.model_columns);
+    }
+    EXPECT_THROW(Ownership::completeExperts({0, 512, 256}), std::invalid_argument);
+    EXPECT_THROW(Ownership::gateUpOwnedDownColumns(source, -1, 2), std::invalid_argument);
+    EXPECT_THROW(Ownership::gateUpOwnedDownColumns(source, 2, 2), std::invalid_argument);
+    EXPECT_THROW(Ownership::gateUpOwnedDownColumns(source, 0, 0), std::invalid_argument);
+    EXPECT_THROW(Ownership::gateUpOwnedDownColumns({24, 65, 256}, 0, 2), std::invalid_argument);
+    EXPECT_THROW(Ownership::gateUpOwnedDownColumns({24, 2, 256}, 0, 4), std::invalid_argument);
+    const auto layout = Ownership::gateUpOwnedDownColumns(source, 1, 2);
+    EXPECT_THROW(layout.projection(WeightRole::SharedExpertDown), std::invalid_argument);
+    EXPECT_THROW(layout.prepares(WeightRole::MoEExpertDown, 2), std::invalid_argument);
+    EXPECT_THROW(layout.residentExperts(WeightRole::MoEExpertGate, 25), std::invalid_argument);
+    EXPECT_THROW((void)DeviceWeightResidency{}.withProjectionOwnership(layout), std::invalid_argument);
+    EXPECT_THROW((void)DeviceWeightResidency::selectedRoutedExpertsOnly(23, {3}).withProjectionOwnership(layout),
+        std::invalid_argument);
+    const auto maximum = std::numeric_limits<int>::max();
+    EXPECT_THROW(Ownership::completeExperts({maximum, maximum, maximum}), std::overflow_error);
+}
+
+/**
+ * @brief PMA's existing weight BOM retains fixed down slices at every owner count.
+ *
+ * This sweeps all quantized codebooks and floating types without opening any
+ * device. Both GPU backends consume the same physical format contract. The
+ * expected bytes use the canonical packer geometry, not a flat expert discount.
+ */
+TEST(MoEExpertProjectionOwnership, AllFormatsRetainExactIndependentProjectionGeometryAndBytes)
+{
+    using Ownership = llaminar2::MoEExpertProjectionOwnership;
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35moe";
+    profile.n_layers = 1;
+    profile.d_model = 2048;
+    profile.expert_feed_forward_length = 512;
+    profile.expert_count = 24;
+    const Ownership::Geometry source{profile.expert_count, profile.d_model, profile.expert_feed_forward_length};
+    const auto align = [](size_t bytes) { return (bytes + 255u) & ~size_t(255u); };
+    for (const auto &format : nativeFormats())
+    {
+        SCOPED_TRACE(format.quant_type);
+        for (const auto role : {WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown})
+        {
+            const bool down = role == WeightRole::MoEExpertDown;
+            const std::string name = down ? "blk.0.ffn_down_exps.weight" :
+                role == WeightRole::MoEExpertGate ? "blk.0.ffn_gate_exps.weight" : "blk.0.ffn_up_exps.weight";
+            const size_t elements = 24u * 2048u * 512u;
+            const TensorSizeInfo tensor{name, static_cast<size_t>(elements * format.bytes_per_weight),
+                format.quant_type, elements, down ? 512u : 2048u, 0};
+            profile.tensors = {tensor};
+            for (const int degree : {1, 2, 4, 8})
+            {
+                SCOPED_TRACE(degree);
+                for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+                {
+                    const auto ownership = Ownership::gateUpOwnedDownColumns(source, degree - 1, degree);
+                    const auto whole = Ownership::completeExperts(source, degree - 1, degree);
+                    const WeightShardGeometryResolver resolver(profile, device, degree - 1, degree);
+                    for (const int owned : {0, 1, 11, 24})
+                    {
+                        SCOPED_TRACE(owned);
+                        const auto local = resolver.resolve(tensor, ownership, owned);
+                        ASSERT_TRUE(local.matrix());
+                        const size_t rows = down ? 2048u / degree : 512u;
+                        const size_t k = down ? 512u : 2048u;
+                        const size_t instances = down ? 24u : static_cast<size_t>(owned);
+                        EXPECT_EQ(*local.matrix(), (WeightShardMatrix{rows, k, instances}));
+                        EXPECT_EQ(local.elements(), rows * k * instances);
+                        const auto residency = DeviceWeightResidency::selectedRoutedExpertsOnly(24, {owned});
+                        const auto actual = WeightMemoryEstimator::estimate(profile, device, degree - 1, degree,
+                            0, 0, residency.withProjectionOwnership(ownership));
+                        size_t expected_bytes = 0;
+                        if (instances > 0)
+                        {
+                            if (const auto *native = native_vnni_formats::forQuantType(format.quant_type))
+                            {
+                                const auto packed = nativeVnniPackedRegionSizes(rows * instances, k, *native);
+                                expected_bytes = align(packed.payload_bytes) + align(packed.scales_bytes) +
+                                    align(packed.mins_bytes) + align(packed.emins_bytes);
+                            }
+                            else
+                                expected_bytes = static_cast<size_t>(rows * k * instances * format.bytes_per_weight);
+                        }
+                        EXPECT_EQ(actual.device_bytes, expected_bytes);
+                        EXPECT_EQ(actual.native_bytes,
+                            tensor.native_bytes / elements * local.elements() +
+                            (tensor.native_bytes % elements) * local.elements() / elements);
+                        // Attaching the ordinary complete layout must not alter
+                        // any existing residency/packing result.
+                        const auto old = WeightMemoryEstimator::estimate(profile, device, degree - 1, degree, 0, 0, residency);
+                        const auto unchanged = WeightMemoryEstimator::estimate(profile, device, degree - 1, degree,
+                            0, 0, residency.withProjectionOwnership(whole));
+                        EXPECT_EQ(old.device_bytes, unchanged.device_bytes);
+                        EXPECT_EQ(old.native_bytes, unchanged.native_bytes);
+                    }
+                    const auto balanced = DeviceWeightResidency::selectedRoutedExpertsOnly(24, {24 / degree});
+                    const auto old = WeightMemoryEstimator::estimate(profile, device, degree - 1, degree, 0, 0, balanced);
+                    const auto partitioned = WeightMemoryEstimator::estimate(profile, device, degree - 1, degree,
+                        0, 0, balanced.withProjectionOwnership(ownership));
+                    EXPECT_EQ(old.device_bytes, partitioned.device_bytes);
+                    EXPECT_EQ(old.native_bytes, partitioned.native_bytes);
+                }
+            }
+        }
+    }
+}
+
+/** @brief A view of another source matrix must not obtain an undersized weight grant. */
+TEST(MoEExpertProjectionOwnership, RejectsMismatchedSourceEvenWhenOwnerCountIsZero)
+{
+    using Ownership = llaminar2::MoEExpertProjectionOwnership;
+    const auto profile = createMoEResidencyProfile();
+    const auto &gate = profile.tensors[4];
+    const auto correct = Ownership::gateUpOwnedDownColumns({8, 32, 64}, 0, 2);
+    const WeightShardGeometryResolver resolver(profile, DeviceId::rocm(0));
+    EXPECT_NO_THROW(resolver.resolve(gate, correct, 0));
+    EXPECT_THROW(resolver.resolve(gate, Ownership::gateUpOwnedDownColumns({7, 32, 64}, 0, 2), 0),
+        std::invalid_argument);
+    EXPECT_THROW(resolver.resolve(gate, Ownership::gateUpOwnedDownColumns({8, 64, 32}, 0, 2), 0),
+        std::invalid_argument);
+    auto incomplete = gate;
+    incomplete.K = 0;
+    EXPECT_THROW(resolver.resolve(incomplete, correct, 0), std::invalid_argument);
+    EXPECT_THROW(resolver.resolve(profile.tensors[0], correct, 0), std::invalid_argument);
 }
 
 /** @brief Vector inventory never masquerades as GEMM work; malformed shapes fail before pricing. */

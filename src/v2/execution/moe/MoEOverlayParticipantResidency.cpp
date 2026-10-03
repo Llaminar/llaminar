@@ -1,11 +1,20 @@
 /**
  * @file MoEOverlayParticipantResidency.cpp
  * @brief Implementation of participant-local epoch-indexed expert banks.
+ *
+ * One RCU publication protocol retains immutable movable payloads for both
+ * complete experts and gate/up owners. Projection-distributed down weights
+ * instead use a model-lifetime bank: they never enter a movement epoch or
+ * disappear when this participant no longer owns an expert's gate/up pair.
  */
 
 #include "MoEOverlayParticipantResidency.h"
+#include "MoEOverlayFixedDownProjectionBank.h"
+#include "MoEExpertOverlayPreparationPlan.h"
+#include "DeviceMoEExpertDescriptorBuilder.h"
 
 #include "../../loaders/ExpertGemmRegistry.h"
+#include "../../tensors/NativeVnniFormatInfo.h"
 
 #include <algorithm>
 #include <iterator>
@@ -166,32 +175,15 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEOverlayPreparedExpertTriplet::complete() const noexcept
-    {
-        return gate != nullptr && up != nullptr && down != nullptr;
-    }
-
-    bool MoEOverlayPreparedExpertTriplet::empty() const noexcept
-    {
-        return gate == nullptr && up == nullptr && down == nullptr;
-    }
-
-    bool MoEOverlayPreparedExpertTriplet::sameIdentity(
-        const MoEOverlayPreparedExpertTriplet &other) const noexcept
-    {
-        return gate.get() == other.gate.get() &&
-               up.get() == other.up.get() &&
-               down.get() == other.down.get();
-    }
-
-    bool resolveMoEOverlayPreparedExpertTriplets(
+    bool resolveMoEOverlayPreparedExpertPayloads(
         const ExpertGemmRegistry &registry,
         const MoEExpertOwnerParticipant &participant,
         int layer_idx,
         int num_experts,
         const std::vector<bool> &resident_mask,
-        std::vector<MoEOverlayPreparedExpertTriplet> &output,
-        std::string *error)
+        std::vector<MoEOverlayPreparedExpertPayload> &output,
+        std::string *error,
+        const std::optional<MoEExpertProjectionOwnership> &ownership)
     {
         if (error)
             error->clear();
@@ -205,12 +197,20 @@ namespace llaminar2
             if (error)
             {
                 *error =
-                    "ExpertOverlay prepared-triplet resolution has invalid "
+                    "ExpertOverlay prepared-payload resolution has invalid "
                     "geometry or participant identity";
             }
             return false;
         }
 
+        if (ownership && (ownership->geometry().experts != num_experts ||
+                          ownership->participant() != participant.domain_participant_index ||
+                          !participant.device.is_gpu()))
+        {
+            if (error) *error = "ExpertOverlay prepared payload does not match its frozen projection geometry";
+            return false;
+        }
+        const auto projections = ownership ? ownership->movableProjections() : DeviceMoEProjectionSet::CompleteExpert;
         output.resize(static_cast<std::size_t>(num_experts));
         const int world_rank = participant.world_rank_known
                                    ? participant.world_rank
@@ -220,52 +220,165 @@ namespace llaminar2
             if (!resident_mask[static_cast<std::size_t>(expert)])
                 continue;
 
-            auto &triplet = output[static_cast<std::size_t>(expert)];
-            triplet.gate = registry.getEngineLifetimeForParticipant(
+            auto gate = registry.getEngineLifetimeForParticipant(
                 participant.domain_name,
                 participant.device,
                 world_rank,
                 participant.domain_participant_index,
                 layer_idx,
                 expert,
-                ExpertGemmRegistry::WeightRole::GATE);
-            triplet.up = registry.getEngineLifetimeForParticipant(
+                ExpertGemmRegistry::WeightRole::GATE, ownership);
+            auto up = registry.getEngineLifetimeForParticipant(
                 participant.domain_name,
                 participant.device,
                 world_rank,
                 participant.domain_participant_index,
                 layer_idx,
                 expert,
-                ExpertGemmRegistry::WeightRole::UP);
-            triplet.down = registry.getEngineLifetimeForParticipant(
+                ExpertGemmRegistry::WeightRole::UP, ownership);
+            // Never borrow a fixed slice into the movable lifetime, even when
+            // the registry contains it under this same logical expert ID.
+            auto down = projections == DeviceMoEProjectionSet::GateUp ? std::shared_ptr<ITensorGemm>{}
+                : registry.getEngineLifetimeForParticipant(
                 participant.domain_name,
                 participant.device,
                 world_rank,
                 participant.domain_participant_index,
                 layer_idx,
                 expert,
-                ExpertGemmRegistry::WeightRole::DOWN);
-            if (!triplet.complete())
+                ExpertGemmRegistry::WeightRole::DOWN, ownership);
+            if (!gate || !up || (projections == DeviceMoEProjectionSet::CompleteExpert && !down))
             {
                 if (error)
                 {
                     *error =
                         "ExpertOverlay participant p" +
                         std::to_string(participant.participant_id) +
-                        " has no complete owned gate/up/down lifetime for layer " +
+                        " has no complete declared movable lifetime for layer " +
                         std::to_string(layer_idx) + " expert " +
                         std::to_string(expert);
                 }
                 output.clear();
                 return false;
             }
+            output[static_cast<std::size_t>(expert)] = MoEOverlayPreparedExpertPayload::fromProjections(
+                projections, {std::move(gate), std::move(up), std::move(down)});
         }
         return true;
     }
 
+    MoEOverlayFixedDownProjectionBank::MoEOverlayFixedDownProjectionBank(
+        MoEExpertOwnerParticipant participant, int layer, MoEExpertProjectionOwnership ownership,
+        std::vector<std::shared_ptr<ITensorGemm>> engines)
+        : participant_(std::move(participant)), layer_(layer), ownership_(std::move(ownership)), engines_(std::move(engines))
+    {
+    }
+
+    std::shared_ptr<const MoEOverlayFixedDownProjectionBank> MoEOverlayFixedDownProjectionBank::resolve(
+        const ExpertGemmRegistry &registry, const MoEExpertOwnerParticipant &participant,
+        int layer, const MoEExpertProjectionOwnership &ownership)
+    {
+        if (layer < 0 || participant.participant_id < 0 || !participant.device.is_gpu() ||
+            participant.domain_name.empty() || participant.domain_participant_index != ownership.participant() ||
+            ownership.movableProjections() != DeviceMoEProjectionSet::GateUp)
+            throw std::invalid_argument("Fixed down bank requires an exact GPU participant and output-column contract");
+        std::vector<std::shared_ptr<ITensorGemm>> engines;
+        engines.reserve(static_cast<std::size_t>(ownership.geometry().experts));
+        const int world_rank = participant.world_rank_known ? participant.world_rank : -1;
+        for (int expert = 0; expert < ownership.geometry().experts; ++expert)
+        {
+            // The exact preparation identity authenticates the original N/K
+            // and slice interval, not just the smaller matrix dimensions.
+            auto engine = registry.getEngineLifetimeForParticipant(participant.domain_name, participant.device,
+                world_rank, participant.domain_participant_index, layer, expert,
+                ExpertGemmRegistry::WeightRole::DOWN, ownership);
+            if (!engine)
+                throw std::runtime_error("Fixed down bank is missing prepared slice for layer " +
+                    std::to_string(layer) + " expert " + std::to_string(expert));
+            engines.push_back(std::move(engine));
+        }
+        return std::shared_ptr<const MoEOverlayFixedDownProjectionBank>(
+            new MoEOverlayFixedDownProjectionBank(participant, layer, ownership, std::move(engines)));
+    }
+
+    bool MoEOverlayFixedDownProjectionBank::sameIdentity(const MoEOverlayFixedDownProjectionBank &other) const noexcept
+    {
+        return layer_ == other.layer_ && ownership_ == other.ownership_ && engines_ == other.engines_ &&
+               participant_.participant_id == other.participant_.participant_id &&
+               participant_.address == other.participant_.address &&
+               participant_.domain_name == other.participant_.domain_name && participant_.device == other.participant_.device &&
+               participant_.world_rank_known == other.participant_.world_rank_known &&
+               (!participant_.world_rank_known || participant_.world_rank == other.participant_.world_rank);
+    }
+
+    MoEOverlayFixedDownProjectionBank::DescriptorTable
+    MoEOverlayFixedDownProjectionBank::exportDescriptorTable() const
+    {
+        const auto projection = ownership_.projection(WeightRole::MoEExpertDown);
+        // Build a local candidate, then return it only after every expert has
+        // validated. A late failure must never expose a partially usable table.
+        DescriptorTable table = NativeDescriptorTable{};
+        for (std::size_t expert = 0; expert < engines_.size(); ++expert)
+        {
+            const auto fail = [&](const char *reason) -> void
+            {
+                throw std::runtime_error("Fixed down descriptor for layer " +
+                    std::to_string(layer_) + " expert " + std::to_string(expert) +
+                    " on " + device().to_string() + ": " + reason);
+            };
+            auto &engine = *engines_[expert];
+            DeviceNativeVNNIMatrixDesc native{};
+            if (engine.exportNativeVNNIMatrixDesc(native))
+            {
+                if (!native.valid() || native.n != projection.rows || native.k != projection.source_columns ||
+                    native.k % 32 != 0 || native.blocks_per_row != static_cast<uint32_t>(native.k / 32))
+                    fail("prepared geometry differs from the fixed full-K slice");
+                NativeVnniSourceIdentity source{};
+                NativeVnniExecutionFormatEnvelope envelope;
+                if (!engine.exportNativeVNNISourceIdentity(source) || !source.present ||
+                    !addNativeVnniExecutionFormat(envelope, native.codebook_id, source, false) ||
+                    (native.source_identity_present &&
+                     (native.source_codebook_id != source.codebook_id ||
+                      static_cast<bool>(native.source_is_superblock) != source.is_superblock)))
+                    fail("native source arithmetic identity is missing or contradictory");
+                // Some prepared engines export provenance separately. Carry
+                // that same identity into the immutable kernel table rather
+                // than letting a normalized execution codebook replace it.
+                // The graph also retains ownership()'s original N in its
+                // phase contract; the descriptor's N is the physical slice.
+                native.source_codebook_id = source.codebook_id;
+                native.source_is_superblock = static_cast<uint8_t>(source.is_superblock);
+                native.source_identity_present = 1;
+                auto *entries = std::get_if<NativeDescriptorTable>(&table);
+                if (!entries) fail("mixed native and floating down descriptors");
+                if (expert == 0) entries->experts.reserve(engines_.size());
+                entries->experts.push_back(native);
+                continue;
+            }
+
+            ContiguousFloatingPointWeightDescriptor source{};
+            DeviceMoEFloatingMatrixDesc floating{};
+            DeviceMoEWeightFormat format{};
+            if (!engine.exportContiguousFloatingPointWeights(source) ||
+                !exportDeviceMoEFloatingMatrixDescriptor(source, floating, format) ||
+                floating.n != projection.rows || floating.k != projection.source_columns)
+                fail("floating descriptor is invalid or differs from the fixed full-K slice");
+            if (expert == 0)
+            {
+                table = FloatingDescriptorTable{format, {}};
+                std::get<FloatingDescriptorTable>(table).experts.reserve(engines_.size());
+            }
+            auto *entries = std::get_if<FloatingDescriptorTable>(&table);
+            if (!entries || entries->format != format)
+                fail("mixed down descriptor arithmetic families or floating precisions");
+            entries->experts.push_back(floating);
+        }
+        return table;
+    }
+
     void MoEOverlayParticipantLayerBank::setResidentExpert(
         int expert_id,
-        MoEOverlayPreparedExpertTriplet engines)
+        MoEOverlayPreparedExpertPayload engines)
     {
         if (expert_id < 0 ||
             static_cast<std::size_t>(expert_id) >= experts.size() ||
@@ -274,10 +387,10 @@ namespace llaminar2
             throw std::out_of_range(
                 "ExpertOverlay participant bank expert id is outside geometry");
         }
-        if (!engines.complete())
+        if (!engines.readyFor(movable_projections))
         {
             throw std::invalid_argument(
-                "ExpertOverlay resident expert requires gate, up, and down engines");
+                "ExpertOverlay resident expert requires the endpoint's exact movable projection family");
         }
 
         const auto index = static_cast<std::size_t>(expert_id);
@@ -307,7 +420,8 @@ namespace llaminar2
 
     bool MoEOverlayParticipantLayerBank::valid(int num_experts) const noexcept
     {
-        if (num_experts <= 0 ||
+        if ((movable_projections != DeviceMoEProjectionSet::CompleteExpert &&
+             movable_projections != DeviceMoEProjectionSet::GateUp) || num_experts <= 0 ||
             resident_mask.size() != static_cast<std::size_t>(num_experts) ||
             experts.size() != static_cast<std::size_t>(num_experts))
         {
@@ -316,7 +430,7 @@ namespace llaminar2
 
         for (std::size_t expert = 0; expert < experts.size(); ++expert)
         {
-            if (resident_mask[expert] != experts[expert].complete())
+            if (resident_mask[expert] != experts[expert].readyFor(movable_projections))
                 return false;
             if (!resident_mask[expert] && !experts[expert].empty())
                 return false;
@@ -327,7 +441,7 @@ namespace llaminar2
     bool MoEOverlayParticipantLayerBank::sameIdentity(
         const MoEOverlayParticipantLayerBank &other) const noexcept
     {
-        if (resident_mask != other.resident_mask ||
+        if (movable_projections != other.movable_projections || resident_mask != other.resident_mask ||
             experts.size() != other.experts.size())
         {
             return false;
@@ -505,7 +619,10 @@ namespace llaminar2
     {
         if (config_.participant_id < 0 || !config_.device.is_valid() ||
             config_.num_layers <= 0 || config_.num_experts <= 0 ||
-            config_.retained_epoch_capacity < 2)
+            config_.retained_epoch_capacity < 2 ||
+            (config_.movable_projections != DeviceMoEProjectionSet::CompleteExpert &&
+             config_.movable_projections != DeviceMoEProjectionSet::GateUp) ||
+            (config_.movable_projections == DeviceMoEProjectionSet::GateUp && !config_.device.is_gpu()))
         {
             throw std::invalid_argument(
                 "ExpertOverlay participant residency requires valid identity, "
@@ -780,7 +897,10 @@ namespace llaminar2
                 config_.participant_id,
                 config_.device,
                 config_.num_layers,
-                config_.num_experts))
+                config_.num_experts) ||
+            std::any_of(bank.layers.begin(), bank.layers.end(), [this](const auto &layer) {
+                return layer.movable_projections != config_.movable_projections;
+            }))
         {
             if (error)
             {
@@ -1012,6 +1132,18 @@ namespace llaminar2
             }
 
             EndpointAssembly assembly;
+            const auto projections = config_.projection_preparation
+                ? DeviceMoEProjectionSet::GateUp : DeviceMoEProjectionSet::CompleteExpert;
+            if (config_.projection_preparation)
+            {
+                for (int layer = 0; layer < config_.num_layers; ++layer)
+                {
+                    const auto layout = config_.projection_preparation->requireProjectionOwnershipForParticipant(
+                        *participant, layer);
+                    if (layout.geometry().experts != config_.num_experts)
+                        throw std::invalid_argument("ExpertOverlay registry and projection preparation disagree on expert geometry");
+                }
+            }
             assembly.endpoint =
                 std::make_shared<MoEOverlayParticipantResidency>(
                     MoEOverlayParticipantResidency::Config{
@@ -1023,6 +1155,7 @@ namespace llaminar2
                             config_.retained_epoch_capacity,
                         .collect_economy_service_measurements =
                             config_.collect_economy_service_measurements,
+                        .movable_projections = projections,
                     });
             assembly.initial_bank.epoch = config_.initial_epoch;
             assembly.initial_bank.participant_id = participant_id;
@@ -1037,6 +1170,7 @@ namespace llaminar2
                 auto &layer_bank =
                     assembly.initial_bank.layers[
                         static_cast<std::size_t>(layer)];
+                layer_bank.movable_projections = projections;
                 layer_bank.resident_mask =
                     config_.owner_map.expertMaskForParticipant(
                         layer,
@@ -1098,7 +1232,7 @@ namespace llaminar2
         int participant_id,
         int layer_idx,
         const std::vector<bool> &resident_mask,
-        const std::vector<MoEOverlayPreparedExpertTriplet> &experts,
+        const std::vector<MoEOverlayPreparedExpertPayload> &experts,
         std::string *error)
     {
         if (error)
@@ -1134,6 +1268,7 @@ namespace llaminar2
         MoEOverlayParticipantLayerBank supplied_layer{
             .resident_mask = resident_mask,
             .experts = experts,
+            .movable_projections = assembly.endpoint->movableProjections(),
         };
         if (!supplied_layer.valid(config_.num_experts))
         {
@@ -1240,16 +1375,20 @@ namespace llaminar2
                         layer_idx,
                         participant_id,
                         config_.num_experts);
-                std::vector<MoEOverlayPreparedExpertTriplet> experts;
+                std::vector<MoEOverlayPreparedExpertPayload> experts;
                 std::string detail;
-                if (!resolveMoEOverlayPreparedExpertTriplets(
+                const auto ownership = config_.projection_preparation
+                    ? std::optional(config_.projection_preparation->requireProjectionOwnershipForParticipant(
+                        *participant, layer_idx)) : std::nullopt;
+                if (!resolveMoEOverlayPreparedExpertPayloads(
                         registry,
                         *participant,
                         layer_idx,
                         config_.num_experts,
                         resident_mask,
                         experts,
-                        &detail))
+                        &detail,
+                        ownership))
                 {
                     if (error)
                     {

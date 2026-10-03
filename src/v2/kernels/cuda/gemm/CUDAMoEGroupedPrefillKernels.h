@@ -12,6 +12,7 @@
 #pragma once
 
 #include "../../common/DeviceNativeVNNIMatrixDesc.h"
+#include "../../common/MoEGroupedSourceRows.h"
 
 #include <algorithm>
 #include <array>
@@ -327,9 +328,12 @@ extern "C"
      * arithmetic, and emits the blockwise-INT8 down-projection input directly.
      * The operation therefore removes FP32 gate/up intermediates from the
      * production grouped-IMMA path without changing a serial-row result byte.
+     * Original hidden rows are borrowed through the route map rather than
+     * gathered into duplicate rows for every routed expert.
      *
-     * @param d_A_int8 Grouped blockwise-INT8 activation rows `[slots,K]`.
+     * @param d_A_int8 Original blockwise-INT8 token rows `[tokens,K]`.
      * @param d_scales_A Per-row/per-32-value activation scales.
+     * @param source_rows Checked grouped-route to original-token address view.
      * @param d_gate_desc_table Device gate descriptor table by expert id.
      * @param d_up_desc_table Device up descriptor table by expert id.
      * @param d_group_counts Device-resident row count per expert.
@@ -353,6 +357,7 @@ extern "C"
     bool cudaMoEGroupedImma_projectGateUpSwiGlu(
         const int8_t *d_A_int8,
         const float *d_scales_A,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
         const int *d_group_counts,

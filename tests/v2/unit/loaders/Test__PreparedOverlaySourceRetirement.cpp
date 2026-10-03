@@ -180,7 +180,19 @@ TEST(PreparedOverlaySourceRetirement, WeightManagerPreparationRetiresSourcesOuts
         }
         FrozenModelWeightSet weights({}, bindings);
 
-        // The complete prepared bank makes this a device-free setup replay.
+        // Sources cover 0 and 2, but the plan also requires expert 1. Missing
+        // both its source and prepared engine must fail before GPU admission,
+        // and must not retire the other sources as if the bank were complete.
+        EXPECT_THROW(manager.prepareMoEExpertOverlayWeights(*runtime_plan, device, &weights),
+            std::invalid_argument);
+        for (const auto &binding : bindings)
+        {
+            EXPECT_FALSE(binding.tensor->is_raw_data_released());
+            publish(manager.expertGemmRegistry(), binding, {1});
+        }
+
+        // The now complete prepared bank makes this a device-free setup replay.
+        // Expert 1 intentionally has no source: its certified engine owns it.
         // Crucially, none of its frozen source tensors were inserted in cache_.
         ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime_plan, device, &weights));
         for (const auto &binding : bindings)

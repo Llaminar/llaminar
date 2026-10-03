@@ -1,9 +1,22 @@
+/**
+ * @file MTPWeightManifest.cpp
+ * @brief Canonical learned-predictor discovery and fail-fast MTP admission.
+ *
+ * Discovery reads only metadata and tensor names. Auto planning and concrete
+ * graph construction use the same mandatory-weight contract before estimating
+ * or allocating predictor state; no synthetic predictor or hidden downgrade is
+ * permitted when a plain GGUF has no learned NextN/MTP weights.
+ */
 #include "MTPWeightManifest.h"
+#include "MTPLearnedBlockCount.h"
 
 #include "../../loaders/IModelLoader.h"
+#include "../../loaders/ModelLoader.h"
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -12,6 +25,7 @@ namespace llaminar2
     {
         constexpr int kSupportedMTPDepth = 1;
 
+        /** @return Whether every required source role is present in this exact directory. */
         bool hasAll(const IModelLoader &loader, const std::vector<std::string> &names)
         {
             return std::all_of(names.begin(), names.end(),
@@ -21,6 +35,7 @@ namespace llaminar2
                                });
         }
 
+        /** @return Missing source names, preserving role order for useful diagnostics. */
         std::vector<std::string> missingFrom(const IModelLoader &loader, const std::vector<std::string> &names)
         {
             std::vector<std::string> missing;
@@ -32,26 +47,7 @@ namespace llaminar2
             return missing;
         }
 
-        int metadataDepth(const IModelLoader &loader, const std::string &architecture)
-        {
-            const std::vector<std::string> keys = {
-                architecture + ".nextn_predict_layers",
-                architecture + ".mtp_num_hidden_layers",
-                architecture + ".mtp.num_hidden_layers",
-                "mtp.num_hidden_layers",
-                "mtp_num_hidden_layers",
-            };
-
-            for (const auto &key : keys)
-            {
-                const int value = loader.getInt(key, 0);
-                if (value > 0)
-                    return value;
-            }
-
-            return 0;
-        }
-
+        /** @return Dense NextN roles for one source block without consulting payloads. */
         MTPDepthWeightNames makeNextNDepth(int depth_index, int source_layer_index)
         {
             const std::string prefix = "blk." + std::to_string(source_layer_index) + ".";
@@ -79,6 +75,7 @@ namespace llaminar2
             return names;
         }
 
+        /** @return MoE NextN roles, with routed and shared parents replacing the dense FFN. */
         MTPDepthWeightNames makeNextNMoEDepth(int depth_index, int source_layer_index)
         {
             auto names = makeNextNDepth(depth_index, source_layer_index);
@@ -99,6 +96,7 @@ namespace llaminar2
             return names;
         }
 
+        /** @return Dedicated `mtp.layers` roles for one learned predictor block. */
         MTPDepthWeightNames makeGenericMTPDepth(int depth_index)
         {
             const std::string prefix = "mtp.layers." + std::to_string(depth_index) + ".";
@@ -124,6 +122,7 @@ namespace llaminar2
             return names;
         }
 
+        /** @return Unvalidated roles for exactly the declared learned-block interval. */
         MTPWeightManifest makeNextNManifest(int depth, int source_layer_start, bool moe_ffn_layout)
         {
             MTPWeightManifest manifest;
@@ -138,6 +137,7 @@ namespace llaminar2
             return manifest;
         }
 
+        /** @return Distinct starts for encodings whose raw block count includes or excludes NextN. */
         std::vector<int> nextNSourceLayerStartCandidates(int block_count_or_base_layer_count, int depth)
         {
             std::vector<int> candidates;
@@ -155,6 +155,50 @@ namespace llaminar2
             return candidates;
         }
 
+        /**
+         * @brief Apply one count algorithm to borrowed loader and GGUF views.
+         * @param architecture Source metadata namespace.
+         * @param block_count Raw inventory count or a known main-layer boundary.
+         * @param integer_lookup Lookup of one unsigned source metadata scalar.
+         * @param tensor_lookup Presence query over the same source directory.
+         * @return Declared count, or the existing single-block directory inference.
+         * @throws std::invalid_argument For unrepresentable declared geometry.
+         *
+         * The complete manifest validates availability afterward. In particular,
+         * an FC name alone establishes accounting geometry, not permission to
+         * synthesize missing attention/FFN weights or execute that predictor.
+         */
+        template <typename IntegerLookup, typename TensorLookup>
+        int resolveLearnedBlockCount(
+            const std::string &architecture, int block_count,
+            const IntegerLookup &integer_lookup, const TensorLookup &tensor_lookup)
+        {
+            const std::vector<std::string> keys = {
+                architecture + ".nextn_predict_layers",
+                architecture + ".mtp_num_hidden_layers",
+                architecture + ".mtp.num_hidden_layers",
+                "mtp.num_hidden_layers",
+                "mtp_num_hidden_layers",
+            };
+            for (const auto &key : keys)
+            {
+                const uint64_t value = integer_lookup(key);
+                if (value > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+                    throw std::invalid_argument("MTP learned-block count exceeds runtime geometry: " + key);
+                if (value > 0)
+                    return static_cast<int>(value);
+            }
+
+            // Some exporters omit the optional count key. Use the exact FC
+            // roles already owned by discovery, at both supported raw-count
+            // conventions, instead of asking planners to infer another count.
+            for (const int source_layer : nextNSourceLayerStartCandidates(block_count, 1))
+                if (tensor_lookup(makeNextNDepth(0, source_layer).fc))
+                    return 1;
+            return tensor_lookup(makeGenericMTPDepth(0).fc) ? 1 : 0;
+        }
+
+        /** @return Empty, unavailable discovery with the precise admission diagnostic. */
         MTPWeightManifest unavailable(std::string diagnostic)
         {
             MTPWeightManifest manifest;
@@ -162,6 +206,45 @@ namespace llaminar2
             return manifest;
         }
     } // namespace
+
+    int mtpLearnedBlockCount(
+        const IModelLoader &loader, const std::string &architecture, int block_count)
+    {
+        return resolveLearnedBlockCount(architecture, block_count,
+            [&](const std::string &key) { return loader.getUInt64(key, 0); },
+            [&](const std::string &name) { return loader.hasTensor(name); });
+    }
+
+    int mtpLearnedBlockCount(const GGUFModel &model)
+    {
+        if (model.block_count > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("MTP source block count exceeds runtime geometry");
+        return resolveLearnedBlockCount(model.architecture, static_cast<int>(model.block_count),
+            [&](const std::string &key) {
+                const auto entry = model.metadata.find(key);
+                return entry == model.metadata.end() ? uint64_t{0} : entry->second.asUInt64();
+            },
+            [&](const std::string &name) { return model.findTensor(name) != nullptr; });
+    }
+
+    MTPWeightManifest requireMTPWeightManifest(
+        const IModelLoader &loader,
+        const std::string &architecture,
+        int base_layer_count)
+    {
+        auto manifest = discoverMTPWeightManifest(
+            loader, architecture, base_layer_count, /*explicit_mtp=*/true);
+        if (!manifest.available)
+        {
+            std::string diagnostic = manifest.diagnostic;
+            if (!manifest.missing_required.empty())
+                diagnostic += "; missing required tensor: " + manifest.missing_required.front();
+            throw std::invalid_argument(
+                diagnostic + "; supply a GGUF with complete learned MTP/NextN weights "
+                             "or explicitly disable retained MTP capacity");
+        }
+        return manifest;
+    }
 
     std::vector<std::string> MTPDepthWeightNames::requiredNames() const
     {
@@ -265,7 +348,7 @@ namespace llaminar2
         if (raw_layer_count <= 0)
             return raw_layer_count;
 
-        const int depth = metadataDepth(loader, architecture);
+        const int depth = mtpLearnedBlockCount(loader, architecture, raw_layer_count);
         if (depth <= 0 || raw_layer_count < depth)
             return raw_layer_count;
 
@@ -284,28 +367,7 @@ namespace llaminar2
         int base_layer_count,
         bool explicit_mtp)
     {
-        int depth = metadataDepth(loader, architecture);
-        if (depth <= 0)
-        {
-            bool found_nextn_depth = false;
-            for (int source_layer_start : nextNSourceLayerStartCandidates(base_layer_count, 1))
-            {
-                if (loader.hasTensor(makeNextNDepth(0, source_layer_start).fc))
-                {
-                    found_nextn_depth = true;
-                    break;
-                }
-            }
-
-            if (found_nextn_depth)
-            {
-                depth = 1;
-            }
-            else if (loader.hasTensor(makeGenericMTPDepth(0).fc))
-            {
-                depth = 1;
-            }
-        }
+        const int depth = mtpLearnedBlockCount(loader, architecture, base_layer_count);
 
         if (depth <= 0)
         {

@@ -11,6 +11,7 @@
 
 #include "MoEOverlayLocalCapacityPlanner.h"
 #include "MoEOverlayCPUServiceMeasurement.h"
+#include "collective/LocalTPCollectiveInventory.h"
 
 #include "planning/ActivationBufferSizing.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
@@ -634,6 +635,22 @@ namespace llaminar2
             config.execution_role = role;
             if (role == DeviceExecutionMemoryRole::ContinuationGraph)
             {
+                // The continuation spec owns dense layout, while the named
+                // routed domain owns expert projection layout. A dense-only
+                // continuation has no routed projection bank to replace.
+                for (const auto &domain : overlay_plan.domains)
+                    if (domain.name == overlay_plan.continuation_domain)
+                    {
+                        config.routed_compute_policy = domain.routed_compute_policy;
+                        if (domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+                        {
+                            if (domain.scope != ExecutionDomainScope::RANK_LOCAL || domain.owner_rank != inventory.rank)
+                                throw std::invalid_argument("Projection staging requires exact rank-local membership");
+                            std::vector<DeviceId> devices;
+                            for (const auto &address : domain.participants) devices.push_back(address.toLocalDeviceId());
+                            config.projection_peer_access = localTPPeerAccessCoverage(inventory, devices);
+                        }
+                    }
                 config.additional_weight_sets =
                     resolveAdditionalPersistentWeightSets(
                         overlay_plan.continuation_domain_spec

@@ -10,6 +10,10 @@
  * 1. ring_append_kernel - Append tokens with wrap-around
  * 2. ring_linearize_kernel - Copy wrapped data to contiguous buffer
  * 3. device-state batched gather kernels - Gather multiple request rings
+ *
+ * Each permanent entry owns only native K/V. Contiguous observation and
+ * conversion use the graph workspace's ordered K/V pair; direct floating
+ * attention reads ring metadata without making a context-sized copy.
  */
 
 #include "CUDARingKVCache.h"
@@ -1819,17 +1823,13 @@ namespace llaminar2
         // partially completed entries before propagating the fatal error.
         allocate_buffer(&entry.d_K, "K entry");
         allocate_buffer(&entry.d_V, "V entry");
-        allocate_buffer(&entry.d_K_scratch, "K linearization scratch");
-        allocate_buffer(&entry.d_V_scratch, "V linearization scratch");
     }
 
     template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::free_entry(EntryT &entry)
     {
         auto *const backend = getCUDABackend();
-        if ((entry.d_K || entry.d_V ||
-             entry.d_K_scratch || entry.d_V_scratch) &&
-            !backend)
+        if ((entry.d_K || entry.d_V) && !backend)
         {
             LOG_ERROR("[CUDARingKVCache] CUDA backend unavailable while releasing permanent entry storage");
             std::terminate();
@@ -1839,15 +1839,9 @@ namespace llaminar2
             backend->free(entry.d_K, device_id_);
         if (entry.d_V)
             backend->free(entry.d_V, device_id_);
-        if (entry.d_K_scratch)
-            backend->free(entry.d_K_scratch, device_id_);
-        if (entry.d_V_scratch)
-            backend->free(entry.d_V_scratch, device_id_);
 
         entry.d_K = nullptr;
         entry.d_V = nullptr;
-        entry.d_K_scratch = nullptr;
-        entry.d_V_scratch = nullptr;
     }
 
     /**
@@ -1907,9 +1901,10 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[CUDARingKVCache] Allocated "
-                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) /
+                  << (static_cast<size_t>(n_layers_) * batch_size_ * 2u *
+                      max_seq_len_ * kv_storage_dim_ * sizeof(DataT)) /
                          (1024 * 1024)
-                  << " MB total (including scratch)");
+                  << " MB native K/V (conversion workspace owned separately)");
     }
 
     /**
@@ -2467,8 +2462,8 @@ namespace llaminar2
         const void **d_k_out, const void **d_v_out,
         int *kv_len, cudaStream_t stream)
     {
-        const DataT *k_typed;
-        const DataT *v_typed;
+        const DataT *k_typed = nullptr;
+        const DataT *v_typed = nullptr;
         bool result = get_kv_typed(layer, seq_idx, &k_typed, &v_typed, kv_len, stream);
         *d_k_out = k_typed;
         *d_v_out = v_typed;
@@ -2514,25 +2509,40 @@ namespace llaminar2
             return true;
         }
 
-        // Buffer is wrapped - need to linearize
-        linearize_entry(entry, head, count, stream);
+        // Scalar observation requires contiguous bytes. Reuse the pre-bound
+        // workspace; production native-ring attention never enters this path.
+        if (!linearize_entry(entry, head, count, stream))
+            return false;
         ++linearization_count_;
 
-        *d_k_out = entry.d_K_scratch;
-        *d_v_out = entry.d_V_scratch;
+        *d_k_out = static_cast<DataT *>(conv_scratch_k_);
+        *d_v_out = static_cast<DataT *>(conv_scratch_v_);
         return true;
     }
 
     template <ActivationPrecision Precision>
-    void CUDARingKVCache<Precision>::linearize_entry(
+    bool CUDARingKVCache<Precision>::linearize_entry(
         EntryT &entry,
         int head,
         int count,
         cudaStream_t stream)
     {
+        // This path launches a copy, unlike an unwrapped pointer-only view.
+        // Reject the legacy default stream rather than silently publishing on
+        // an event edge that the caller cannot own or order.
+        if (!stream)
+        {
+            LOG_ERROR("[CUDARingKVCache] Wrapped scalar observation requires an explicit CUDA stream");
+            return false;
+        }
+        const size_t required_bytes = static_cast<size_t>(count) *
+                                      kv_storage_dim_ * sizeof(DataT);
+        if (!ensureConvScratch(required_bytes))
+            return false;
         launch_linearize_kernel(
-            entry, head, count,
-            entry.d_K_scratch, entry.d_V_scratch, stream);
+            entry, head, count, static_cast<DataT *>(conv_scratch_k_),
+            static_cast<DataT *>(conv_scratch_v_), stream);
+        return cudaGetLastError() == cudaSuccess;
     }
 
     template <ActivationPrecision Precision>

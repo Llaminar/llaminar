@@ -7,6 +7,19 @@
 # llaminar2_core. Existing targets still use CMake's ordinary validation.
 include_guard(DIRECTORY)
 
+# Keep startup device ownership at the same boundary as target selection.
+# Release excludes non-performance executables. Other missing targets and
+# unknown scopes remain errors, never permission to lose device ownership.
+function(v2_test_device_scope target scope)
+    if(NOT scope STREQUAL "FullInventory" AND NOT scope STREQUAL "DeclaredBackends")
+        message(FATAL_ERROR "Unknown V2 test device scope '${scope}' for ${target}")
+    endif()
+    if(V2_PERF_TESTS_ONLY AND NOT "${target}" MATCHES "^v2_perf_")
+        return()
+    endif()
+    set_property(TARGET ${target} PROPERTY V2_TEST_DEVICE_SCOPE "${scope}")
+endfunction()
+
 if(V2_PERF_TESTS_ONLY)
     message(STATUS "V2 Tests: Release mode — building performance tests only")
 

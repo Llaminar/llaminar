@@ -2,7 +2,7 @@
  * @file PlanningGPUExpertMeasurement.cpp
  * @brief Canonical GPU weight preparation and captured full-expert sampling.
  *
- * A single source triplet is prepared in the production GPU pool. The ordinary
+ * A single source payload is prepared in the production GPU pool. The ordinary
  * MoE stage supplies the graph and exact runtime workspace; metadata admission
  * uses the same routed-participant workspace authority. Phase graphs execute
  * serially and release their private tensors/workspace before the next phase.
@@ -22,6 +22,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "execution/moe/GPUExpertProjectionContract.h"
 #include "kernels/KernelFactory.h"
 #ifdef HAVE_CUDA
 #include "kernels/cuda/gemm/CUDAQuantisedGemmWorkspaceContract.h"
@@ -184,7 +185,7 @@ namespace llaminar2
          */
         PlanningGPUExpertPhaseObservation measurePhase(DeviceId device, IWorkerGPUContext &worker,
             const PlanningExpertSampleDescription &description, ExpertHistogramSource phase,
-            const MoEOverlayPreparedExpertTriplet &triplet, const std::shared_ptr<PhysicalMemoryAuthority> &memory,
+            const MoEOverlayPreparedExpertPayload &payload, const std::shared_ptr<PhysicalMemoryAuthority> &memory,
             const std::string &identity, size_t &pool_growth)
         {
             const int rows = rowsFor(phase);
@@ -234,9 +235,9 @@ namespace llaminar2
             params.force_decode_equivalent_verifier_prefill = phase == ExpertHistogramSource::GroupedVerifier;
             params.require_device_routing_tensor_decode = true;
             params.expert_mask = {true};
-            params.prepared_gate_gemm = {triplet.gate.get()};
-            params.prepared_up_gemm = {triplet.up.get()};
-            params.prepared_down_gemm = {triplet.down.get()};
+            params.prepared_gate_gemm = {payload.gate().get()};
+            params.prepared_up_gemm = {payload.up().get()};
+            params.prepared_down_gemm = {payload.down().get()};
             params.expert_weight_resolution_policy = MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
             MoEExpertComputeStage stage(std::move(params));
             StageBinding binding(stage);
@@ -254,6 +255,7 @@ namespace llaminar2
             require(capture.begin(), "capture begin failed");
             require(stage.execute(context.get()), "captured FFN failed");
             capture.finish();
+            require(graph->prepareRuntimeContextStorage(memory), "expert context storage preparation failed");
             require(graph->nodeCount() > 0 && graph->instantiate(), "nonempty graph instantiation failed");
             if (graph->residentMemoryBytes() > std::numeric_limits<size_t>::max() - pool_growth)
                 throw std::overflow_error("GPU expert graph pool growth overflow");
@@ -275,6 +277,41 @@ namespace llaminar2
             host, gpu, builder);
     }
 
+    void PlanningGPUExpertMeasurement::validateSourceArithmetic(
+        const PlanningExpertSampleRequest &request, const PlanningExpertSampleDescription &description)
+    {
+        const std::array labels{"gate", "up", "down"};
+        const auto sources = request.projections();
+        std::vector<GpuExpertSlotPool::ProjectionSpec> projections;
+        projections.reserve(labels.size());
+        for (std::size_t index = 0; index < labels.size(); ++index)
+        {
+            const auto &matrix = description.matrices[index];
+            if (matrix.n > std::numeric_limits<int>::max() || matrix.k > std::numeric_limits<int>::max())
+                throw std::invalid_argument("GPU expert sample source geometry exceeds native indexing: " +
+                    sources[index]->tensor_name);
+            GpuExpertSlotPool::ProjectionSpec projection{
+                .label = labels[index], .N = static_cast<int>(matrix.n), .K = static_cast<int>(matrix.k)};
+            const auto &format = description.formats[index];
+            if (const auto *native = native_vnni_formats::forQuantType(format))
+            {
+                projection.format = ExpertWeightFormat::nativeVnni({native->codebook_id, native->is_superblock, true});
+                projection.payload_bytes_per_block = native->payload_bytes;
+                projection.codebook_id = canonicalDeviceVnniCodebookId(native->codebook_id);
+                projection.is_asymmetric = native->is_asymmetric;
+                projection.has_emins = native->has_emins;
+            }
+            else if (format == "F32") projection.format = ExpertWeightFormat::floating(TensorType::FP32);
+            else if (format == "F16") projection.format = ExpertWeightFormat::floating(TensorType::FP16);
+            else if (format == "BF16") projection.format = ExpertWeightFormat::floating(TensorType::BF16);
+            else throw std::invalid_argument("GPU expert sample has an uncatalogued source format: " +
+                sources[index]->tensor_name + '=' + format);
+            projections.push_back(std::move(projection));
+        }
+        validateGPUExpertProjectionContract(
+            projections, DeviceMoEProjectionSet::CompleteExpert, description.layer);
+    }
+
     void PlanningGPUExpertMeasurement::contributeMemory(const PlanningExpertSamplePlan &sample_plan,
         PlanningSampleOrigin origin, PhysicalMemoryResource host, PhysicalMemoryResource gpu, PhysicalMemoryPlanBuilder &builder)
     {
@@ -286,6 +323,7 @@ namespace llaminar2
             throw std::invalid_argument("GPU expert sample BOM must query launch policy on its owning device worker");
         const auto &description = sample_plan.description();
         const auto &request = sample_plan.request();
+        validateSourceArithmetic(request, description);
         LoadOrchestrator plan;
         planWeights(plan, gpu.device, request, description);
         const auto staging = resolveGPUWeightLoadMemoryGeometry(description.largest_source_bytes,
@@ -315,7 +353,9 @@ namespace llaminar2
             throw std::invalid_argument("GPU expert sampling requires an admitted GPU device");
         if (!GPUDeviceContextPool::instance().getContext(device).ownsCurrentThread())
             throw std::invalid_argument("GPU expert sampling must run on the exact device's owning worker");
-        const auto sample = PlanningExpertSamplePlan::resolve(source, request).load(source, memory, DeviceId::cpu());
+        const auto plan = PlanningExpertSamplePlan::resolve(source, request);
+        validateSourceArithmetic(plan.request(), plan.description());
+        const auto sample = plan.load(source, memory, DeviceId::cpu());
         return measure(sample, device, memory);
     }
 
@@ -326,6 +366,7 @@ namespace llaminar2
             throw std::invalid_argument("GPU expert sampling requires an admitted GPU device");
         const auto &description = sample.plan().description();
         const auto &request = sample.plan().request();
+        validateSourceArithmetic(request, description);
         auto &worker = GPUDeviceContextPool::instance().getContext(device);
         if (!worker.ownsCurrentThread())
             throw std::invalid_argument("GPU expert sampling must run on the exact device's owning worker");
@@ -352,7 +393,7 @@ namespace llaminar2
         for (size_t i = 0; i < engines.size(); ++i)
             engines[i] = llaminar::v2::kernels::KernelFactory::createGemmFromGPUWeightPool(
                 sample.tensor(i), device, pool, inputs[i]->tensor_name);
-        const MoEOverlayPreparedExpertTriplet triplet{engines[0], engines[1], engines[2]};
+        const MoEOverlayPreparedExpertPayload payload{engines[0], engines[1], engines[2]};
         const size_t family_bytes = kPhases.size() * GPUGraphMemoryContract::reservationBytesPerExecutable(device);
         auto graph_reservation = memory->reserveNewAllocations(device,
             PhysicalMemoryOwner::NativeGraphExecutable, family_bytes);
@@ -367,7 +408,7 @@ namespace llaminar2
             "; cache-regime=repeated-same-prepared-expert";
         size_t pool_growth = 0;
         for (auto phase : kPhases)
-            result.phases.push_back(measurePhase(device, worker, description, phase, triplet, memory, identity, pool_growth));
+            result.phases.push_back(measurePhase(device, worker, description, phase, payload, memory, identity, pool_growth));
         if (!GPUGraphMemoryContract::acceptsFamilyObservation(device, pool_growth, family_bytes))
             throw std::runtime_error("GPU expert sample native graph family exceeded certified physical admission: observed=" +
                 std::to_string(pool_growth) + " admitted=" + std::to_string(family_bytes));

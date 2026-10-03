@@ -22,7 +22,9 @@ namespace llaminar2::moe_rebalance_abi
      * Any field-layout change to a cross-backend record must increment this
      * value and update the corresponding byte-size assertion below.
      */
-    inline constexpr uint32_t kVersion = 15u;
+    // v16 uses compact format tags plus an explicit movable-projection tag.
+    // Descriptor byte size is unchanged, but v15's field interpretation is not.
+    inline constexpr uint32_t kVersion = 16u;
 
     /**
      * @brief Exact byte size of one device-owned rebalance command.

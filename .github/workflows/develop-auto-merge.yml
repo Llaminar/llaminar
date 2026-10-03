@@ -9,7 +9,9 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
-  contents: read
+  # Enabling a merge needs repository write authority, not only PR metadata
+  # writes. This trusted workflow never checks out or executes proposed code.
+  contents: write
   pull-requests: write
 
 jobs:

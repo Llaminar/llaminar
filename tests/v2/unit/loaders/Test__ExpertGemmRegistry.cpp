@@ -1,3 +1,11 @@
+/**
+ * @file Test__ExpertGemmRegistry.cpp
+ * @brief Device-free prepared engine identity, scope and lifetime proofs.
+ *
+ * Mock engines exercise registration and model-context publication without
+ * initializing drivers. Projection tests prevent full-expert callers from
+ * borrowing or retiring fixed output slices under an ambiguous logical key.
+ */
 #include <gtest/gtest.h>
 #include "loaders/ExpertGemmRegistry.h"
 #include "tensors/TensorKernels.h"
@@ -754,4 +762,46 @@ TEST(Test__ExpertGemmRegistry, ThreadSafety_ConcurrentReads)
         th.join();
 
     EXPECT_EQ(errors.load(), 0);
+}
+
+TEST(ExpertProjectionPreparedIdentity, RejectsWholeExpertAndNeighbourSliceAdoption)
+{
+    for (const auto device : {DeviceId::cuda(3), DeviceId::rocm(3)})
+    {
+        ExpertGemmRegistry registry;
+        const auto identity = MoEExpertProjectionOwnership::gateUpOwnedDownColumns({4, 512, 256}, 1, 2);
+        const auto neighbour = MoEExpertProjectionOwnership::gateUpOwnedDownColumns({4, 512, 256}, 0, 2);
+        for (const auto role : {Role::GATE, Role::UP, Role::DOWN})
+        {
+            auto engine = std::make_shared<MockGemm>(1);
+            registry.registerEngineForParticipant("compute", device, 2, 1, 0, 0, role, engine.get(), engine, identity);
+            registry.registerEngineForDomain("compute", device, 0, 0, role, engine.get(), engine, identity);
+            EXPECT_EQ(registry.getEngineForParticipant("compute", device, 2, 1, 0, 0, role, identity), engine.get());
+            EXPECT_EQ(registry.getEngineLifetimeForDomain("compute", device, 0, 0, role, identity), engine);
+            EXPECT_THROW(registry.getEngineForParticipant("compute", device, 2, 1, 0, 0, role), std::logic_error);
+            EXPECT_THROW(registry.getEngineForDomain("compute", device, 0, 0, role, neighbour), std::logic_error);
+            EXPECT_THROW((void)registry.getEngineLifetimeForParticipant("compute", device, 2, 1, 0, 0, role), std::logic_error);
+            EXPECT_THROW(registry.registerEngineForDomain("compute", device, 0, 0, role, engine.get(), engine), std::logic_error);
+            EXPECT_FALSE(registry.hasCompleteRoleForExpertsInDomain("compute", device, 0, {0}, role));
+            EXPECT_THROW(registry.replaceEngineForDomain("compute", device, 0, 0, role, engine.get(), engine), std::logic_error);
+            EXPECT_THROW(registry.removeEngineForDomain("compute", device, 0, 0, role), std::logic_error);
+
+            auto legacy = std::make_shared<MockGemm>(2);
+            registry.registerEngine(device, 0, 0, role, legacy.get(), legacy);
+            EXPECT_THROW(registry.aliasEngineForDomainFromDevice("compute", device, 0, 0, role), std::logic_error);
+            EXPECT_EQ(registry.getEngineForDomain("compute", device, 0, 0, role, identity), engine.get());
+        }
+        EXPECT_FALSE(registry.hasCompleteLayerInDomain("compute", device, 0, 1));
+        EXPECT_TRUE(registry.completeExpertsForLayerInDomain("compute", device, 0, 1).empty());
+        std::vector<ITensorGemm *> gates, ups, downs;
+        EXPECT_THROW(registry.populateExpertEnginesForParticipant("compute", device, 2, 1, 0, 1, gates, ups, downs), std::logic_error);
+        const ExpertGemmRegistry::ParticipantLayerScope scope{"compute", device, 2, 1, 0};
+        std::string error;
+        EXPECT_FALSE(registry.replaceParticipantResidency(std::array{scope}, {}, &error));
+        EXPECT_NE(error.find("fixed projection"), std::string::npos);
+        EXPECT_NE(registry.getEngineForParticipant("compute", device, 2, 1, 0, 0, Role::DOWN, identity), nullptr);
+        auto other = std::make_shared<MockGemm>(3);
+        EXPECT_THROW(registry.registerEngineForParticipant("compute", device, 2, 0, 0, 0,
+            Role::DOWN, other.get(), other, identity), std::invalid_argument);
+    }
 }

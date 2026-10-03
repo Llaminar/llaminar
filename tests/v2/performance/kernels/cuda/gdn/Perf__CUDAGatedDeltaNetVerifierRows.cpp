@@ -15,6 +15,8 @@
 
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "kernels/cuda/gdn/CUDAGatedDeltaNet.h"
+#include "backends/cuda/CUDAGraphCapture.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -26,6 +28,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <set>
+#include <tuple>
+#include <vector>
 
 namespace
 {
@@ -312,18 +317,28 @@ namespace
         static constexpr int kQkRowFloats = kHeads * kKeyWidth;
         static constexpr int kValueRowFloats = kHeads * kValueWidth;
 
-        GdnPrefillBenchmarkFixture()
-            : q(static_cast<size_t>(kRows) * kQkRowFloats, timing.stream),
-              k(static_cast<size_t>(kRows) * kQkRowFloats, timing.stream),
-              v(static_cast<size_t>(kRows) * kValueRowFloats, timing.stream),
-              alpha(static_cast<size_t>(kRows) * kHeads, timing.stream),
-              beta(static_cast<size_t>(kRows) * kHeads, timing.stream),
-              a_log(kHeads, timing.stream),
-              dt_bias(kHeads, timing.stream),
+        /**
+         * @brief Bind immutable recurrence geometry before graph construction.
+         * @param row_count Physical rows in the captured transaction.
+         * @param head_count Participant-local heads, including odd head counts.
+         * @param key_count Supported key width; each has a distinct specialization.
+         * @param value_count Independent state columns, including partial CTAs.
+         */
+        explicit GdnPrefillBenchmarkFixture(int row_count = kRows, int head_count = kHeads,
+                                           int key_count = kKeyWidth, int value_count = kValueWidth)
+            : rows(requirePositive(row_count)), heads(requirePositive(head_count)),
+              keys(requireKeyWidth(key_count)), values(requirePositive(value_count)),
+              q(static_cast<size_t>(rows) * heads * keys, timing.stream),
+              k(static_cast<size_t>(rows) * heads * keys, timing.stream),
+              v(static_cast<size_t>(rows) * heads * values, timing.stream),
+              alpha(static_cast<size_t>(rows) * heads, timing.stream),
+              beta(static_cast<size_t>(rows) * heads, timing.stream),
+              a_log(heads, timing.stream),
+              dt_bias(heads, timing.stream),
               output(
-                  static_cast<size_t>(kRows) * kValueRowFloats,
+                  static_cast<size_t>(rows) * heads * values,
                   timing.stream),
-              state(kStateFloats, timing.stream)
+              state(static_cast<size_t>(heads) * keys * values, timing.stream)
         {}
 
         /** @brief Launch one exact production-shape long-prefill recurrence. */
@@ -340,10 +355,10 @@ namespace
                 output.get(),
                 state.get(),
                 state.get(),
-                kRows,
-                kHeads,
-                kKeyWidth,
-                kValueWidth,
+                rows,
+                heads,
+                keys,
+                values,
                 /*use_qk_l2norm=*/true,
                 /*state_snapshots=*/nullptr,
                 /*snapshot_stride_floats=*/0,
@@ -381,6 +396,80 @@ namespace
                    static_cast<double>(iterations);
         }
 
+        /**
+         * @brief Measure recurrence without host submission or capture cost.
+         * Sixteen retained operations amortize event/graph launch overhead.
+         * Zero is a fixed point of this fixture; integration tests separately
+         * authenticate nonzero recurrent state and serial arithmetic identity.
+         */
+        std::array<double, 9> capturedSamples()
+        {
+            llaminar2::CUDAGraphCapture graph(timing.stream, 0);
+            {
+                llaminar2::ScopedBackendGraphCapture recording(graph, "CUDA GDN head scaling");
+                if (!recording.begin()) throw std::runtime_error("cannot capture GDN scaling");
+                for (int operation = 0; operation < 16; ++operation) launch();
+                recording.finish();
+            }
+            if (!graph.instantiate()) throw std::runtime_error("cannot instantiate GDN scaling");
+            // Inspect the actual retained symbols, not a compiler estimate for
+            // another specialization. This has no profiler replay overhead and
+            // makes underfilled head shards visible beside their timing rows.
+            std::vector<llaminar2::GPUGraphKernelNodeInfo> nodes;
+            std::string inspection_error;
+            if (!graph.inspectKernelNodes(nodes, &inspection_error))
+                throw std::runtime_error("cannot inspect GDN scaling graph: " + inspection_error);
+            std::set<uintptr_t> reported;
+            cudaDeviceProp properties{};
+            checkCuda(cudaGetDeviceProperties(&properties, 0), "query GDN device geometry");
+            for (const auto &node : nodes)
+                if (reported.insert(node.function_identity).second)
+                    std::cout << "gdn_resource," << rows << ',' << heads << ','
+                              << node.name << ',' << node.grid_x * node.grid_y * node.grid_z << ','
+                              << node.block_x * node.block_y * node.block_z << ','
+                              << node.registers_per_thread << ',' << node.local_memory_bytes_per_thread << ','
+                              << node.max_active_blocks_per_sm << ',' << properties.multiProcessorCount << '\n';
+            std::array<double, 9> samples{};
+            for (int sample = -5; sample < 9; ++sample)
+            {
+                checkCuda(cudaEventRecord(timing.start, timing.stream), "start GDN scaling");
+                if (!graph.launch()) throw std::runtime_error("cannot replay GDN scaling");
+                checkCuda(cudaEventRecord(timing.stop, timing.stream), "stop GDN scaling");
+                checkCuda(cudaEventSynchronize(timing.stop), "join GDN scaling");
+                float elapsed = 0;
+                checkCuda(cudaEventElapsedTime(&elapsed, timing.start, timing.stop), "read GDN scaling");
+                if (sample >= 0) samples[sample] = elapsed * 1000.0 / 16;
+            }
+            return samples;
+        }
+
+        /**
+         * @brief Expose one retained production transaction to a node profiler.
+         *
+         * There are no warmup or timing-cohort launches in this transaction.
+         * A profiler's kernel selector therefore identifies one exact head/
+         * row geometry without contaminating another candidate's counters.
+         * The final event join belongs only to diagnostic observation.
+         */
+        void profileCapturedLaunch()
+        {
+            llaminar2::CUDAGraphCapture graph(timing.stream, 0);
+            {
+                llaminar2::ScopedBackendGraphCapture recording(graph, "CUDA GDN isolated profile");
+                if (!recording.begin()) throw std::runtime_error("cannot capture GDN profile");
+                launch();
+                recording.finish();
+            }
+            if (!graph.instantiate() || !graph.launch())
+                throw std::runtime_error("cannot replay GDN profile");
+            checkCuda(cudaEventRecord(timing.stop, timing.stream), "record GDN profile completion");
+            checkCuda(cudaEventSynchronize(timing.stop), "observe GDN profile completion");
+        }
+
+        const int rows;
+        const int heads;
+        const int keys;
+        const int values;
         CudaDeviceSelection device;
         CudaTimingContext timing;
         DeviceFloatBuffer q;
@@ -392,8 +481,109 @@ namespace
         DeviceFloatBuffer dt_bias;
         DeviceFloatBuffer output;
         DeviceFloatBuffer state;
+
+    private:
+        /** @brief Reject unsupported specializations before any device allocation. */
+        static int requireKeyWidth(int value)
+        {
+            if (value != 64 && value != 128)
+                throw std::invalid_argument("GDN key width must be 64 or 128");
+            return value;
+        }
+
+        /** @brief Reject invalid geometry before its physical allocations. */
+        static int requirePositive(int value)
+        {
+            if (value <= 0) throw std::invalid_argument("GDN dimensions must be positive");
+            return value;
+        }
     };
+
+    /** @brief Independently selectable retained row/head geometry for Nsight. */
+    class CUDAGdnShardProfile : public ::testing::TestWithParam<std::tuple<int, int>> {};
+
+    /** @brief Run one captured production transaction, never a shape sweep. */
+    TEST_P(CUDAGdnShardProfile, CapturedPrefill)
+    {
+        const auto [rows, heads] = GetParam();
+        GdnPrefillBenchmarkFixture fixture(rows, heads);
+        fixture.profileCapturedLaunch();
+    }
+
+    INSTANTIATE_TEST_SUITE_P(ProductionShape, CUDAGdnShardProfile,
+        ::testing::Combine(::testing::Values(64, 448, 512), ::testing::Values(32, 16, 8)),
+        [](const auto &info) {
+            return "Rows" + std::to_string(std::get<0>(info.param)) +
+                "Heads" + std::to_string(std::get<1>(info.param));
+        });
 } // namespace
+
+/** @brief Rank local 1/2/4-way TP recurrence shapes on the same physical GPU. */
+TEST(Perf__CUDAGatedDeltaNetVerifierRows, PrefillHeadShardCapturedSweep)
+{
+    for (const int rows : {64, 448, 512})
+        for (const int heads : {32, 16, 8})
+        {
+            GdnPrefillBenchmarkFixture fixture(rows, heads);
+            const auto samples = fixture.capturedSamples();
+            for (size_t sample = 0; sample < samples.size(); ++sample)
+            {
+                ASSERT_GT(samples[sample], 0);
+                std::cout << std::setprecision(12) << "gdn_prefill_sample,"
+                          << rows << ',' << heads << ',' << sample << ',' << samples[sample] << '\n';
+            }
+        }
+}
+
+/**
+ * @brief Check launch economy beyond the three model-specific TP shapes.
+ *
+ * Wider head populations expose resident-block cliffs hidden by an underfilled
+ * shard, while narrow and odd populations cover partially occupied devices.
+ * Run against the baseline and candidate shared libraries, separately from the
+ * matched main-model sweep. Functional totality belongs to Integration.
+ */
+TEST(Perf__CUDAGatedDeltaNetVerifierRows, PrefillAdditionalHeadCapturedSweep)
+{
+    for (const int heads : {1, 3, 4, 48, 64, 96})
+    {
+        GdnPrefillBenchmarkFixture fixture(448, heads);
+        const auto samples = fixture.capturedSamples();
+        for (size_t sample = 0; sample < samples.size(); ++sample)
+        {
+            ASSERT_GT(samples[sample], 0);
+            std::cout << std::setprecision(12) << "gdn_prefill_sample,448,"
+                      << heads << ',' << sample << ',' << samples[sample] << '\n';
+        }
+    }
+}
+
+/**
+ * @brief Compare input-layout economy across key widths and partial column CTAs.
+ *
+ * Use the same executable against frozen control/current shared cores. The
+ * complete geometry is printed with every timing row; a Qwen-only key-width
+ * win must not hide a regression in the other supported specialization.
+ * Correctness remains the nonzero, byte-exact Integration test's obligation.
+ */
+TEST(Perf__CUDAGatedDeltaNetVerifierRows, PrefillInputLayoutCapturedSweep)
+{
+    for (const int keys : {64, 128})
+        for (const int values : {17, 128})
+            for (const int rows : {64, 448})
+                for (const int heads : {3, 16, 32})
+                {
+                    GdnPrefillBenchmarkFixture fixture(rows, heads, keys, values);
+                    const auto samples = fixture.capturedSamples();
+                    for (size_t sample = 0; sample < samples.size(); ++sample)
+                    {
+                        ASSERT_GT(samples[sample], 0);
+                        std::cout << std::setprecision(12) << "gdn_geometry_sample,"
+                                  << rows << ',' << heads << ',' << keys << ',' << values
+                                  << ',' << sample << ',' << samples[sample] << '\n';
+                    }
+                }
+}
 
 /** @brief Gate the exact Qwen 3.6 M=425 CUDA long-prefill recurrence. */
 TEST(Perf__CUDAGatedDeltaNetVerifierRows, Qwen36ProductionPrefillM425)

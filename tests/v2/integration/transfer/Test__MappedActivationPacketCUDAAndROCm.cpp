@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -238,8 +239,13 @@ namespace
         return context;
     }
 
-    /** @return Fixed wire workspace required by transport construction. */
-    template <std::int32_t Rows>
+    /**
+     * @brief Bind the same immutable geometry in wire and captured storage.
+     * @tparam Rows Captured physical row capacity.
+     * @tparam Width Hidden width, including unaligned row tails.
+     * @return Fixed wire workspace required by transport construction.
+     */
+    template <std::int32_t Rows, std::int32_t Width = kDModel>
     std::shared_ptr<MoEOverlayRankBatchWireWorkspace> makeWireWorkspace()
     {
         constexpr std::size_t entries =
@@ -249,13 +255,21 @@ namespace
                 .participant_ids = {kTargetParticipant},
                 .max_total_rows = static_cast<std::size_t>(Rows),
                 .max_total_entries = entries,
-                .d_model = kDModel,
+                .d_model = Width,
                 .top_k = kTopK,
             });
     }
 
-    /** @return Exact rank-pair transport config for one process-local endpoint. */
-    template <std::int32_t Rows>
+    /**
+     * @brief Describe one endpoint without assuming which vendor continues.
+     * @tparam Rows Captured physical row capacity.
+     * @tparam Width Hidden width shared by the two endpoint graphs.
+     * @param local_rank Synthetic rank owning this endpoint.
+     * @param local_device Real device executing the endpoint graph.
+     * @param identity Unique transport binding for this fixture.
+     * @return Exact rank-pair transport config for one process-local endpoint.
+     */
+    template <std::int32_t Rows, std::int32_t Width = kDModel>
     MoEOverlayRankBatchTransportConfig makeTransportConfig(
         int local_rank,
         DeviceId local_device,
@@ -267,10 +281,10 @@ namespace
             .mpi_ctx = makeContext(local_rank),
             .source_world_rank = 0,
             .target_world_rank = 1,
-            .workspace = makeWireWorkspace<Rows>(),
+            .workspace = makeWireWorkspace<Rows, Width>(),
             .max_rows_per_participant = static_cast<std::size_t>(Rows),
             .max_entries_per_participant = entries,
-            .d_model = kDModel,
+            .d_model = Width,
             .top_k = kTopK,
             .tier_index = 3,
             .domain_ordinal = 9,
@@ -301,7 +315,7 @@ namespace
                 .participant_count = 1u,
                 .max_rows_per_participant = static_cast<std::size_t>(Rows),
                 .max_entries_per_participant = entries,
-                .d_model = kDModel,
+                .d_model = Width,
                 .activation_graph_family_count = 1u,
             }),
             .local_lanes = {{
@@ -341,16 +355,21 @@ namespace
 
     /**
      * @brief Own one role-neutral real-device sparse activation round trip.
+     * @tparam Rows Captured physical row capacity.
+     * @tparam Width Hidden width shared by tensors, wire storage and kernels.
      *
      * Teardown first publishes abort sentinels, then drains exact streams and
      * only afterward releases device pointers and mapped transport pages. This
      * keeps failed assertions from leaving a GPU wait referencing unmapped RAM.
      */
-    template <std::int32_t Rows>
+    template <std::int32_t Rows, std::int32_t Width = kDModel>
     class PacketRoundTrip final
     {
     public:
         static_assert(Rows > 0);
+        static_assert(Width > 0);
+        // Class-local geometry deliberately shadows the small fixture default.
+        static constexpr std::int32_t kDModel = Width;
         static constexpr std::int32_t kRows = Rows;
         static constexpr std::size_t kEntries =
             static_cast<std::size_t>(Rows * kTopK);
@@ -450,7 +469,7 @@ namespace
                                                {
                                                    source_transport_ = std::make_unique<
                                                        MoEOverlayNodeLocalRankBatchTransport>(
-                                                       makeTransportConfig<Rows>(
+                                                       makeTransportConfig<Rows, Width>(
                                                            /*local_rank=*/0,
                                                            source_device_,
                                                            identity));
@@ -467,7 +486,7 @@ namespace
                                                {
                                                    target_transport_ = std::make_unique<
                                                        MoEOverlayNodeLocalRankBatchTransport>(
-                                                       makeTransportConfig<Rows>(
+                                                       makeTransportConfig<Rows, Width>(
                                                            /*local_rank=*/1,
                                                            target_device_,
                                                            identity));
@@ -2607,12 +2626,20 @@ namespace
         std::string error_;
     };
 
-    /** @brief Replay one retained pair across two authenticated generations. */
-    template <std::int32_t Rows>
-    void runRoleAssignment(DeviceId source, DeviceId target)
+    /**
+     * @brief Replay a retained pair across independently authenticated leases.
+     * @param source Continuation device that acquires the peer descriptor.
+     * @param target Follower device publishing canonical route contributions.
+     * @param generations Number of independently authenticated descriptor generations.
+     * @tparam Rows Captured physical row capacity.
+     * @tparam Width Captured hidden width, including unaligned row tails.
+     */
+    template <std::int32_t Rows, std::int32_t Width = kDModel>
+    void runRoleAssignment(DeviceId source, DeviceId target,
+                           std::uint64_t generations = 2u)
     {
         ScopedActivationEpochPerfStats perf_stats;
-        PacketRoundTrip<Rows> transaction(source, target);
+        PacketRoundTrip<Rows, Width> transaction(source, target);
         ASSERT_TRUE(transaction.initialize()) << transaction.error();
 
         double waits_enqueued = 0.0;
@@ -2740,7 +2767,7 @@ namespace
                 ? 0.0
                 : static_cast<double>(
                       kLayers.size() *
-                      static_cast<std::size_t>(Rows * kDModel) *
+                      static_cast<std::size_t>(Rows * Width) *
                       sizeof(float));
         EXPECT_EQ(
             waits_enqueued,
@@ -2769,7 +2796,7 @@ namespace
             asynchronous_lane_joins,
             single_row_direct ? 0.0 : static_cast<double>(kLayers.size()));
 
-        for (std::uint64_t generation = 1u; generation <= 2u; ++generation)
+        for (std::uint64_t generation = 1u; generation <= generations; ++generation)
         {
             const auto submit_begin = std::chrono::steady_clock::now();
             ASSERT_TRUE(transaction.submit(generation)) << transaction.error();
@@ -3025,6 +3052,9 @@ namespace
         std::array<void *, kLanes> events_{};
     };
 
+    /** Live extents varied independently of the captured route-bank capacity. */
+    enum class TicketRoutePattern { Full, Varying };
+
     /**
      * @brief Reuse one CPU-published canonical ticket for twenty GPU replays.
      *
@@ -3037,11 +3067,14 @@ namespace
      * @param continuation_device Native captured consumer backend and ordinal.
      * @param route_capacity Original route slots, covering decode and prefill.
      * @param d_model Hidden width, including partial-warp tails.
+     * @param pattern Alternate empty, sparse and full publications
+     *        without rebinding the captured capacity or clearing old device rows.
      */
     void runCanonicalRouteTicketReuseProof(
         DeviceId continuation_device,
         std::size_t route_capacity,
-        std::int32_t d_model = 3072)
+        std::int32_t d_model = 3072,
+        TicketRoutePattern pattern = TicketRoutePattern::Full)
     {
         /* Exercise both decode and prefill-sized grids at the real hidden
          * width. A publication-first eager launch cannot prove that a retained
@@ -3201,7 +3234,13 @@ namespace
             EXPECT_FALSE(storage.arm(residency_epoch + 1u))
                 << "a producer cannot arm one ticket twice";
 
-            std::fill(expected.begin(), expected.end(), 0.0f);
+            const std::array live_extents{
+                std::size_t{0}, std::size_t{1}, std::min(std::size_t{3}, route_capacity),
+                route_capacity, route_capacity / 2u, route_capacity - 1u};
+            const std::size_t live_routes = pattern == TicketRoutePattern::Varying
+                ? live_extents[replay % live_extents.size()] : route_capacity;
+            // Unpublished slots must retain their prior bytes. Keeping the old
+            // bank catches capacity-sized reads/writes on empty or sparse replay.
             auto *const original_slots = storage.originalRouteSlotsHost();
             auto *const compact_slots = storage.compactRouteSlotsHost();
             float *const contribution_rows = storage.contributionRowsHost();
@@ -3222,14 +3261,20 @@ namespace
                      column < static_cast<std::size_t>(d_model);
                      ++column)
                 {
-                    const float value = static_cast<float>(
-                        10000u * (replay + 1u) + 100u * entry + column);
+                    // Copy semantics must preserve arbitrary bits, including
+                    // signed zero, subnormals and NaN payloads; no FP fold is
+                    // permitted in this materialization kernel. Every replay
+                    // changes even unpublished source rows to expose overreads.
+                    const auto bits = static_cast<std::uint32_t>(
+                        0x9e3779b9u * (replay + 1u) + 0x85ebca6bu * entry + column);
+                    const float value = std::bit_cast<float>(bits);
                     contribution_rows[
                         compact_slot * static_cast<std::size_t>(d_model) +
                         column] = value;
-                    expected[
-                        original_slot * static_cast<std::size_t>(d_model) +
-                        column] = value;
+                    if (entry < live_routes)
+                        expected[
+                            original_slot * static_cast<std::size_t>(d_model) +
+                            column] = value;
                 }
             }
 
@@ -3265,12 +3310,12 @@ namespace
             EXPECT_FALSE(storage.arm(residency_epoch + 1u))
                 << "unpublished payload is still owned by its CPU producer";
 
-            ASSERT_TRUE(publication.publish(route_capacity))
+            ASSERT_TRUE(publication.publish(live_routes))
                 << "replay=" << replay;
             // A live captured consumer may acknowledge before publish returns.
             // The durable success receipt, not transient readiness, is proof.
             ASSERT_TRUE(storage.publicationSucceededFor(residency_epoch));
-            EXPECT_FALSE(publication.publish(route_capacity))
+            EXPECT_FALSE(publication.publish(live_routes))
                 << "publication requires one fresh arm transition";
 
             ASSERT_TRUE(awaitEvent(
@@ -3316,6 +3361,10 @@ namespace
      * @param rows Live physical-row count for the retained route envelope.
      * @param d_model Hidden width of every canonical route contribution.
      * @param epochs Number of monotonic publications to retain and fold.
+     * @param replay_through_retained_graphs Capture both endpoint transactions.
+     * @param sparse_owner_stride Zero selects the dense ownership pattern;
+     *        otherwise select one peer slot per stride and start with an empty
+     *        peer epoch to exercise blocks which must do no payload work.
      */
     void runSparseCanonicalRouteExchange(
         DeviceId root_device,
@@ -3323,7 +3372,8 @@ namespace
         std::uint32_t rows = 64u,
         std::uint32_t d_model = 512u,
         std::uint32_t epochs = 5u,
-        bool replay_through_retained_graphs = false)
+        bool replay_through_retained_graphs = false,
+        std::uint32_t sparse_owner_stride = 0u)
     {
         constexpr std::uint32_t top_k = 8u;
         constexpr std::int32_t root_participant = 11;
@@ -3401,8 +3451,9 @@ namespace
             expected_epochs[epoch].assign(expected.size(), 0.0f);
             for (std::uint32_t slot = 0u; slot < route_slots; ++slot)
             {
-                const bool producer_owns =
-                    ((slot + epoch) % 3u) != 0u;
+                const bool producer_owns = sparse_owner_stride == 0u
+                    ? ((slot + epoch) % 3u) != 0u
+                    : epoch != 0u && ((slot + epoch) % sparse_owner_stride) == 0u;
                 route_participant_epochs[epoch][slot] =
                     producer_owns
                         ? producer_participant
@@ -3762,6 +3813,12 @@ namespace
             expected.size() * static_cast<std::size_t>(epochs));
         for (std::uint32_t epoch = 0u; epoch < epochs; ++epoch)
         {
+            EXPECT_EQ(
+                std::memcmp(
+                    actual.data() + static_cast<std::size_t>(epoch) * expected.size(),
+                    expected_epochs[epoch].data(), output_bytes),
+                0)
+                << "epoch=" << epoch << " canonical route bytes changed";
             for (std::size_t index = 0u; index < expected.size(); ++index)
             {
                 EXPECT_FLOAT_EQ(
@@ -3986,6 +4043,73 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CooperativeReturnDescriptorCUDAReplaysTwentyGenerations)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    // Each lease changes descriptor identity while reusing exactly
+    // the same captured graph and mapped addresses. The cooperative read must
+    // never mix generations or expose payload before complete validation.
+    runRoleAssignment<17>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CooperativeReturnDescriptorROCmReplaysTwentyGenerations)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    runRoleAssignment<17>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CUDAContinuationReturnRowsCoverGridStrideAndUnalignedWidth)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    // Sparse original/compact slot maps cross the bounded row grid. Width 67
+    // must not drop tail columns or leak a preceding row's shared identities.
+    runRoleAssignment<257, 67>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     ROCmContinuationReturnRowsCoverGridStrideAndUnalignedWidth)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    runRoleAssignment<257, 67>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CUDAFollowerDispatchRowsPreserveWidePayloadsAcrossTwentyGenerations)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    // Multiple iterations within each row exercise the cooperative metadata
+    // lifetime; width 3073 also leaves a scalar tail after vectorized copies.
+    runRoleAssignment<33, 3073>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     ROCmFollowerDispatchRowsPreserveWidePayloadsAcrossTwentyGenerations)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    runRoleAssignment<33, 3073>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
      SingleRowCUDAContinuationROCmFollowerFusesTimelineAndIsExact)
 {
     IBackend *const cuda = getCUDABackend();
@@ -3995,6 +4119,21 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
     if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
         GTEST_SKIP() << "Requires at least one CUDA and one ROCm device";
     runRoleAssignment<1>(DeviceId::cuda(0), DeviceId::rocm(0));
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     SingleRowWideReturnRetainsBytesAcrossTwentyGenerations)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    // Both vectorized rows and scalar tails must preserve the original route
+    // permutation through the fused acquire/copy/publication replay lifetime.
+    runRoleAssignment<1, 3072>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
+    runRoleAssignment<1, 3073>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
+    runRoleAssignment<1, 3072>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
+    runRoleAssignment<1, 3073>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
@@ -4114,6 +4253,8 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
         runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), slots);
     }
     runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 67);
+    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 128u, 3072, TicketRoutePattern::Varying);
+    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 67, TicketRoutePattern::Varying);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
@@ -4129,6 +4270,8 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
         runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), slots);
     }
     runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 67);
+    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 128u, 3072, TicketRoutePattern::Varying);
+    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 67, TicketRoutePattern::Varying);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
@@ -4217,6 +4360,39 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
     runSparseCanonicalRouteExchange(DeviceId::rocm(0), DeviceId::rocm(1));
 }
 
+/**
+ * @brief Prove root-local staging/cache reuse at the 122B verifier envelope.
+ *
+ * The same retained graphs consume twenty different payloads and owner maps.
+ * An aligned model width exercises vector reads; an extra column exercises
+ * unaligned rows/tails. Cancellation-heavy final epochs lock the FP32 fold
+ * order independently of which participant owns each original router slot.
+ */
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CUDASparseCanonicalRoutesRetainVerifierBytesAcrossTwentyEpochs)
+{
+    auto *const backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two CUDA devices";
+    for (const auto width : {3072u, 3073u})
+        runSparseCanonicalRouteExchange(
+            DeviceId::cuda(0), DeviceId::cuda(1), 16u, width, 20u, true, 17u);
+}
+
+/** @brief Symmetric HIP proof of staged route lifetime, tails and fold order. */
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     ROCmSparseCanonicalRoutesRetainVerifierBytesAcrossTwentyEpochs)
+{
+    auto *const backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two ROCm devices";
+    for (const auto width : {3072u, 3073u})
+        runSparseCanonicalRouteExchange(
+            DeviceId::rocm(0), DeviceId::rocm(1), 16u, width, 20u, true, 17u);
+}
+
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      SparseCanonicalRoutesAcrossCUDAAndROCmAreExactAndAsync)
 {
@@ -4227,6 +4403,38 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
     if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
         GTEST_SKIP() << "Requires CUDA and ROCm devices";
     runSparseCanonicalRouteExchange(DeviceId::cuda(0), DeviceId::rocm(0));
+}
+
+/**
+ * @brief Preserve full-prefill route bytes through independently captured endpoints.
+ *
+ * Adjacent bucket/tail geometries exercise uneven rows, empty peer payloads,
+ * changed ownership, and cancellation-sensitive canonical route order.
+ * Each retained graph is reused for twenty device-owned publication epochs.
+ */
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CUDASparseCanonicalRoutesRetainPrefillBytesAcrossTwentyEpochs)
+{
+    auto *const backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two CUDA devices";
+    for (const auto rows : {63u, 64u, 65u, 512u})
+        runSparseCanonicalRouteExchange(
+            DeviceId::cuda(0), DeviceId::cuda(1), rows, 2049u, 20u, true, 17u);
+}
+
+/** @brief Symmetric retained-HIP proof of full-prefill publication and reuse. */
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     ROCmSparseCanonicalRoutesRetainPrefillBytesAcrossTwentyEpochs)
+{
+    auto *const backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two ROCm devices";
+    for (const auto rows : {63u, 64u, 65u, 512u})
+        runSparseCanonicalRouteExchange(
+            DeviceId::rocm(0), DeviceId::rocm(1), rows, 2049u, 20u, true, 17u);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,

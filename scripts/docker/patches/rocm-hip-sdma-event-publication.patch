@@ -1,0 +1,69 @@
+From: Llaminar native progress regression
+Subject: [PATCH] Publish ordering events from the completed native SDMA frontier
+
+A timing-disabled hipEventRecord after a required NoCU copy currently queues
+a compute barrier. Physical queues are shared after the native queue bound is
+reached, so that barrier can sit behind an unrelated peer-held captured graph.
+The DMA completion is already zero, but hipEventQuery remains not ready. If
+the graph awaits expert movement certified by that event, this forms a cycle.
+
+For an uncaptured ordering-only event with no pending compute/cache fence,
+external dependency or raw queue wait, retain the exact native SDMA signal.
+ROCr's copy completion already certifies system-coherent bytes. Preserve the
+signal reference and normal coalescing lifecycle rather than generating an
+unrelated compute fence. Timing, IPC, callback, captured and compute frontiers
+retain their existing implementations and scopes. No queue limit, allocation
+policy, host synchronization, packet batching or stream priority is changed.
+
+Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
+             (therock-10.0, ROCm Core SDK 10.0.0)
+
+diff --git a/rocclr/device/rocm/rocvirtual.hpp b/rocclr/device/rocm/rocvirtual.hpp
+--- a/rocclr/device/rocm/rocvirtual.hpp
++++ b/rocclr/device/rocm/rocvirtual.hpp
+@@ -299,6 +299,15 @@ class VirtualGPU : public device::VirtualDevice {
+     //! Empty check for external signals
+     bool IsExternalSignalListEmpty() const { return external_signals_.empty(); }
+ 
++    /**
++     * @brief Whether the exact last SDMA signal covers this logical FIFO.
++     * Pending cross-queue dependencies must still be submitted, so their
++     * existence prohibits substituting an earlier copy's completion signal.
++     */
++    bool HasOrderedSdmaCompletion() const {
++      return IsSdmaEngine(engine_) && external_signals_.empty() && dynamic_queue_waits_.empty();
++    }
++
+     //! Adds a raw signal for dependency tracking
+     void AddDynamicQueueWait(hsa_signal_t signal) { dynamic_queue_waits_.push_back(signal); }
+ 
+diff --git a/rocclr/device/rocm/rocvirtual.cpp b/rocclr/device/rocm/rocvirtual.cpp
+--- a/rocclr/device/rocm/rocvirtual.cpp
++++ b/rocclr/device/rocm/rocvirtual.cpp
+@@ -5072,6 +5072,26 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
+           reinterpret_cast<uintptr_t>(vcmd.ipcCompletionSignal()->getHandle()));
+     }
+ 
++    // A required SDMA copy already publishes system-coherent completion. An
++    // ordering-only event names that exact frontier; routing its receipt
++    // through a shared compute queue can place it behind an unrelated graph
++    // waiting for this very receipt. Retain the native signal instead. The
++    // reference prevents signal-pool reuse until every event consumer retires.
++    // Real timing, IPC, capture, callbacks and outstanding compute/cache work
++    // still require their ordinary marker implementation and fence scopes.
++    if (vcmd.coalesceEvent() != 0 && !vcmd.profilingInfo().enabled_ &&
++        !vcmd.getPktCapturingState() && vcmd.Callback() == nullptr &&
++        ipc_s.handle == 0 && vcmd.ipcDepSignal() == nullptr &&
++        !hasPendingDispatch_ && !isFenceDirty() &&
++        Barriers().HasOrderedSdmaCompletion()) {
++      auto* completion = Barriers().GetLastSignal();
++      AttachHwEvent(command_, completion);
++      SetCoalesceWindow(vcmd.coalesceEvent(), completion);
++      profilingEnd();
++      force_irq_ = false;
++      return;
++    }
++
+     if (vcmd.ipcDepSignal() != nullptr) {
+       hsa_signal_t s;
+       s.handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(

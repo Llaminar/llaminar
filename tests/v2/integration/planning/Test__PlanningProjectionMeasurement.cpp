@@ -49,6 +49,14 @@ namespace
     /** @return Test resource ceiling; all demand comes from the production contributor. */
     PhysicalMemoryResource resource(DeviceId device)
     {
+        if (device.is_gpu())
+        {
+            auto *backend = getBackendFor(device);
+            if (!backend) throw std::runtime_error("Projection proof lost its physical GPU backend");
+            return {.world_rank = 0, .device = device,
+                .total_bytes = backend->deviceMemoryTotal(device.ordinal),
+                .admission_available_bytes = backend->deviceMemoryFree(device.ordinal)};
+        }
         return {.world_rank = 0, .device = device, .total_bytes = 256u << 20,
             .admission_available_bytes = 256u << 20};
     }

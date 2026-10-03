@@ -10,12 +10,16 @@
  * - Proper rcclGroupStart/End semantics for multi-GPU collectives
  * - Thread-safe work queue for operation submission
  *
- * All RCCL operations are serialized on the coordinator thread to ensure
- * proper threading semantics - RCCL requires that all operations on a
- * communicator happen from the same thread.
+ * Setup and grouped host transactions use the coordinator worker. Captured
+ * participant-local operations enqueue directly on their caller's explicit
+ * stream; each participant retains a consistent communicator operation order.
+ * No coordinator queue, default stream or host wait is inserted into those
+ * captured operations, including output-partitioned sum/reduce-scatter.
  */
 
 #include "RCCLCoordinator.h"
+#include "../NativeReduceScatterContract.h"
+#include "../NativeCollectiveRowsContract.h"
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
 
@@ -1143,7 +1147,8 @@ namespace llaminar2
         CollectiveDataType dtype,
         CollectiveOp op,
         const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
-        const std::vector<void *> &streams)
+        const std::vector<void *> &streams,
+        const std::vector<NativeCollectiveRows> &live_rows)
     {
 #ifdef HAVE_RCCL
         if (!initialized_.load())
@@ -1153,7 +1158,8 @@ namespace llaminar2
         }
 
         if (buffers.size() != static_cast<size_t>(num_devices_) ||
-            streams.size() != static_cast<size_t>(num_devices_))
+            streams.size() != static_cast<size_t>(num_devices_) ||
+            (!live_rows.empty() && live_rows.size() != static_cast<size_t>(num_devices_)))
         {
             last_error_ = "Buffer/stream count does not match device count";
             return false;
@@ -1161,6 +1167,19 @@ namespace llaminar2
 
         for (int i = 0; i < num_devices_; ++i)
         {
+            // Validate the complete bundle before opening a native group. Each
+            // GPU owns a distinct count pointer, never a host-read row value.
+            if (!live_rows.empty() &&
+                (live_rows[i].bankElements() != count ||
+                 live_rows[i].elementsPerRow() != live_rows.front().elementsPerRow() ||
+                 (live_rows[i].rows().countOwner() != nullptr) !=
+                     (live_rows.front().rows().countOwner() != nullptr) ||
+                 !nativeCollectiveRowsValid(NativeRowCollective::AllReduce,
+                     buffers[i], buffers[i], live_rows[i], dtype, op, num_devices_, i, streams[i])))
+            {
+                last_error_ = "Grouped allreduce live-row binding mismatch at participant " + std::to_string(i);
+                return false;
+            }
             if (!buffers[i])
             {
                 last_error_ = "Null anchor allreduce buffer for device " + std::to_string(i);
@@ -1261,10 +1280,13 @@ namespace llaminar2
 
             rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
             hipStream_t stream = static_cast<hipStream_t>(streams[i]);
-            r = rccl::ncclAllReduce(
-                buffers[i], buffers[i], count,
-                toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
-                comm, stream);
+            r = live_rows.empty()
+                ? rccl::ncclAllReduce(buffers[i], buffers[i], count,
+                    toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)), comm, stream)
+                : rccl::nativeRows(NativeRowCollective::AllReduce,
+                    buffers[i], buffers[i], live_rows[i],
+                    toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
+                    nullptr, comm, stream);
             if (r != rccl::ncclSuccess)
             {
                 last_error_ = std::string("rcclAllReduce(grouped bundle anchor) failed for device ") +
@@ -1823,6 +1845,110 @@ namespace llaminar2
         (void)root;
         (void)device_idx;
         (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::nativeRowsOnStream(
+        NativeRowCollective operation, const void *send, void *receive,
+        const NativeCollectiveRows &rows, CollectiveDataType dtype,
+        CollectiveOp reduction, int participant, void *stream, unsigned long long *payload_bytes)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load() || !nativeCollectiveRowsValid(operation, send, receive, rows,
+                dtype, reduction, num_devices_, participant, stream))
+        {
+            last_error_ = "RCCL live-row collective has invalid native row/buffer/stream geometry";
+            return false;
+        }
+        // Another operation may change this host thread's current GPU between
+        // graph recordings. Select the actual owner; never cache that assumption.
+        const auto selected = trackedHipSetDevice(device_ordinals_[participant]);
+        if (selected != hipSuccess)
+        {
+            last_error_ = std::string("RCCL live-row device selection failed: ") + hipGetErrorString(selected);
+            return false;
+        }
+        const auto producer_error = hipGetLastError();
+        if (producer_error != hipSuccess)
+        {
+            last_error_ = std::string("RCCL live-row producer failed: ") + hipGetErrorString(producer_error);
+            return false;
+        }
+        const auto native_op = operation == NativeRowCollective::AllGather ? rccl::ncclSum :
+            toRcclRedOpInt(toOpInt(reduction));
+        const auto result = rccl::nativeRows(operation, send, receive, rows,
+            toRcclDataTypeInt(toDataTypeInt(dtype)), native_op, payload_bytes,
+            static_cast<rccl::ncclComm_t>(comms_[participant]), stream);
+        if (result != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("RCCL live-row enqueue failed: ") + rccl::ncclGetErrorString(result);
+            return false;
+        }
+        const auto enqueue_error = hipGetLastError();
+        if (enqueue_error != hipSuccess)
+        {
+            last_error_ = std::string("RCCL live-row runtime enqueue failed: ") + hipGetErrorString(enqueue_error);
+            return false;
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)operation; (void)send; (void)receive; (void)rows; (void)dtype;
+        (void)reduction; (void)participant; (void)stream; (void)payload_bytes;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::reduceScatterSingleDeviceOnStream(
+        const void *send_buf, void *recv_buf, size_t receive_count,
+        CollectiveDataType dtype, int device_idx, void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load() || !nativeReduceScatterBuffersValid(
+                send_buf, recv_buf, receive_count, dtype, num_devices_, device_idx, stream))
+        {
+            last_error_ = "RCCL reduce-scatter has an invalid communicator, stream or disjoint buffer geometry";
+            return false;
+        }
+        // Never cache an assumed current device here: another operation on
+        // this host thread may have selected a different participant since the
+        // last capture. Replay has no host-side device-selection work.
+        const auto selected = trackedHipSetDevice(device_ordinals_[device_idx]);
+        if (selected != hipSuccess)
+        {
+            last_error_ = std::string("hipSetDevice before reduce-scatter failed: ") + hipGetErrorString(selected);
+            return false;
+        }
+        const auto producer_error = hipGetLastError();
+        if (producer_error != hipSuccess)
+        {
+            last_error_ = std::string("RCCL reduce-scatter producer launch failed: ") + hipGetErrorString(producer_error);
+            return false;
+        }
+        const auto result = rccl::ncclReduceScatter(send_buf, recv_buf, receive_count,
+            toRcclDataTypeInt(toDataTypeInt(dtype)), rccl::ncclSum,
+            static_cast<rccl::ncclComm_t>(comms_[device_idx]), static_cast<hipStream_t>(stream));
+        if (result != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("RCCL native reduce-scatter failed: ") + rccl::ncclGetErrorString(result);
+            return false;
+        }
+        // Attribute sticky enqueue failures here, not to the next model kernel.
+        // Later asynchronous execution errors remain owned by graph completion.
+        const auto enqueue_error = hipGetLastError();
+        if (enqueue_error != hipSuccess)
+        {
+            last_error_ = std::string("RCCL reduce-scatter runtime enqueue failed: ") + hipGetErrorString(enqueue_error);
+            return false;
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buf; (void)recv_buf; (void)receive_count;
+        (void)dtype; (void)device_idx; (void)stream;
         last_error_ = "RCCL not available";
         return false;
 #endif

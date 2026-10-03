@@ -912,6 +912,31 @@ namespace llaminar2
         return limit - direct - reserved;
     }
 
+    std::size_t PhysicalMemoryMaterializationLedger::unmaterializedNewBytes(
+        PhysicalMemoryAllocatorIdentity identity) const
+    {
+        const auto &resources = state_->certificate->plan().resources();
+        const auto found = std::find_if(resources.begin(), resources.end(),
+            [&](const auto &bom) { return matches(bom.resource(), identity); });
+        if (found == resources.end())
+            throw std::out_of_range("Physical memory pending-demand query names an unadmitted resource " +
+                identity.toString());
+        const auto resource_index = static_cast<std::size_t>(found - resources.begin());
+        std::lock_guard lock(state_->mutex);
+        const auto &claims = state_->claims[resource_index];
+        std::size_t pending = 0u;
+        for (std::size_t index = 0; index < PhysicalMemoryBOM::ownerCount(); ++index)
+        {
+            const auto planned = found->charge(PhysicalMemoryBOM::ownerAt(index)).incrementalBytes();
+            const auto live = checkedAdd(claims.new_allocations[index],
+                claims.new_reservation_materialized[index], "materialized owner bytes");
+            if (live > planned)
+                throw std::logic_error("Physical memory materialization exceeds its admitted owner line");
+            pending = checkedAdd(pending, planned - live, "pending allocator demand");
+        }
+        return pending;
+    }
+
     bool PhysicalMemoryMaterializationLedger::complete() const
     {
         const auto &resources = state_->certificate->plan().resources();
@@ -1197,6 +1222,32 @@ namespace llaminar2
     {
         return ledger_.reserveNewAllocations(
             identity(device), owner, bytes);
+    }
+
+    PhysicalMemoryAllocationLease PhysicalMemoryAuthority::claimMeasuredRuntimeContextStorage(
+        PhysicalMemoryResource observed, std::size_t bytes) const
+    {
+        if (!observed.valid() || !observed.device.is_gpu() ||
+            observed.world_rank != world_rank_ || !bytes)
+            throw std::invalid_argument("Native execution-context storage requires positive same-rank GPU residency");
+        const auto allocator = identity(observed.device);
+        const auto *source = admission()->plan().find(allocator);
+        if (!source || source->resource().total_bytes != observed.total_bytes)
+            throw std::invalid_argument("Native execution-context observation changed its physical allocator");
+        const auto pending = ledger_.unmaterializedNewBytes(allocator);
+        if (pending > observed.admission_available_bytes)
+            throw PhysicalMemoryCapacityExhausted("Native execution-context preparation would displace outstanding physical owners for " +
+                observed.id() + " pending_bytes=" + std::to_string(pending));
+        // Fresh driver capacity already excludes live backing. Protect only
+        // the original plan's future allocations; lazy pool capacity must not
+        // disappear just because its reservation was claimed before capture.
+        observed.admission_available_bytes -= pending;
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(observed, PhysicalMemoryOwner::NativeExecutionContext, bytes);
+        PhysicalMemoryAuthority context(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), world_rank_);
+        return context.claimNewAllocation(observed.device,
+            PhysicalMemoryOwner::NativeExecutionContext, bytes);
     }
 
     std::size_t PhysicalMemoryAuthority::claimedBytes(

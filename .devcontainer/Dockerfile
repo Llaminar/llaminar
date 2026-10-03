@@ -94,7 +94,8 @@ RUN if [ "$INSTALL_CUDA" = "true" ]; then \
         echo "Skipping CUDA installation"; \
     fi
 
-# Conditional ROCm 7.2.4 (gfx906 Tensile overlay handled inside script).
+# The shared ROCm installer builds matching gfx906 BLAS and the repaired HIP
+# runtime from the pinned release sources, exactly like the shipping builder.
 RUN if [ "$INSTALL_ROCM" = "true" ]; then \
         MODE=full /tmp/install-scripts/install-rocm.sh; \
     else \
@@ -135,10 +136,11 @@ RUN mkdir -p /home/vscode/.codex && chmod 700 /home/vscode/.codex
 ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
     OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     CUDA_HOME=/usr/local/cuda \
-    ROCM_HOME=/opt/rocm \
-    HIP_PATH=/opt/rocm \
-    PATH=/home/vscode/.local/bin:/usr/local/cuda/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/rocm/lib
+    ROCM_PATH=/opt/rocm-sdk \
+    ROCM_HOME=/opt/rocm-sdk \
+    HIP_PATH=/opt/rocm-sdk \
+    PATH=/home/vscode/.local/bin:/usr/local/cuda/bin:/opt/rocm-sdk/bin:/opt/rocm-sdk/lib/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/rocm-sdk/lib
 
 # vcpkg + uv for convenience in shells.
 RUN git clone https://github.com/Microsoft/vcpkg.git ~/vcpkg && \

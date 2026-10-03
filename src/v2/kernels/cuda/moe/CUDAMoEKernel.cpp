@@ -3,13 +3,19 @@
  * @brief CUDA MoE kernel bridge implementation.
  *
  * The C++ bridge owns tensor coherence, persistent scratch allocation, and
- * error reporting while delegating actual CUDA launches to extern "C" wrappers
- * in `CUDAMoEKernels.cu`. This keeps MPI-heavy project headers out of nvcc
+ * error reporting while delegating CUDA launches to typed backend wrappers.
+ * This keeps MPI-heavy project headers out of nvcc
  * compilation and preserves the established CUDA backend split used by other
- * kernels.
+ * kernels. Compact projection export borrows the runtime grouping's exact
+ * device count; private regrouping scratch is not an alternate count authority.
+ * Import restores the existing activation bits, without host inspection or an
+ * extra quantization boundary, before the unchanged down projection.
  */
 
 #include "CUDAMoEKernel.h"
+#include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
+#include "kernels/common/MoEGroupedIntermediateExchangeKernels.h"
+#include "kernels/common/MoEGroupingInitialization.h"
 #include "CUDAMoEBatchInvariantPolicy.h"
 #include "CUDAMoEOverlayActivationPacketKernels.h"
 #include "CUDAMoEOverlayDeviceControllerKernels.h"
@@ -1637,7 +1643,8 @@ extern "C"
         int filter_to_local_runtime_experts,
         int retain_routes_for_deferred_commit,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
     bool cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
         const float *routing_indices,
@@ -1657,7 +1664,8 @@ extern "C"
         int retain_routes_for_deferred_commit,
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
     bool cudaMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
@@ -1685,7 +1693,8 @@ extern "C"
         int retain_routes_for_deferred_commit,
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
     bool cudaMoE_commit_grouped_verifier_histograms(
         void *runtime,
@@ -1967,29 +1976,9 @@ extern "C"
         llaminar2::cuda::moe::GroupedImmaGateUpSchedule
             imma_gateup_schedule,
         int device_idx,
-        void *stream);
+        void *stream,
+        const llaminar2::MoEPrefillProjectionExecution &execution);
 
-    bool cudaMoE_grouped_floating_prefill_pipeline(
-        const float *d_hidden,
-        const llaminar2::DeviceMoEFloatingMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceMoEFloatingMatrixDesc *d_up_desc_table,
-        const llaminar2::DeviceMoEFloatingMatrixDesc *d_down_desc_table,
-        const int *d_original_to_grouped,
-        const int *d_original_expert_ids,
-        const float *d_grouped_weights,
-        float *d_grouped_gate,
-        float *d_grouped_up,
-        float *d_output,
-        float *d_canonical_route_contributions,
-        int seq_len,
-        int total_slots,
-        int top_k,
-        int d_model,
-        int intermediate,
-        int num_experts,
-        llaminar2::DeviceMoEWeightFormat format,
-        int device_idx,
-        void *stream);
 
     bool cudaMoE_reduce_canonical_route_contributions(
         const float *d_route_contributions,
@@ -4630,9 +4619,10 @@ namespace llaminar2
                                   int seq_len, int d_model, int num_experts, int top_k,
                                   bool normalize_weights,
                                   float *output_indices, float *output_weights,
-                                  const int *device_effective_seq_len)
+                                  const int *device_effective_seq_len,
+                                  const MoERouterOwnedRowOutputs *owned)
     {
-        if (!output_indices || !output_weights ||
+        if ((!owned && (!output_indices || !output_weights)) ||
             seq_len <= 0 || d_model <= 0 || num_experts <= 0 ||
             top_k <= 0 || top_k > num_experts)
             return false;
@@ -4658,16 +4648,16 @@ namespace llaminar2
         void *stream = getStream();
         if (!requireAlignedPointer(hidden, 16, "hidden", "routeCore") ||
             !requireAlignedPointer(d_route_logits_, 16, "route logits", "routeCore") ||
-            !requireAlignedPointer(output_indices, 16, "output indices", "routeCore") ||
-            !requireAlignedPointer(output_weights, 16, "output weights", "routeCore"))
+            (!owned && (!requireAlignedPointer(output_indices, 16, "output indices", "routeCore") ||
+                        !requireAlignedPointer(output_weights, 16, "output weights", "routeCore"))))
             return false;
         if (gate_is_fp32 && !requireAlignedPointer(gate_weights, 16, "FP32 gate", "routeCore"))
             return false;
         if (!requireCudaDevicePointer(hidden, device_ordinal_, "hidden", "routeCore", stream) ||
             !requireCudaDevicePointer(gate_weights, device_ordinal_, "gate weights", "routeCore", stream) ||
             !requireCudaDevicePointer(d_route_logits_, device_ordinal_, "route logits", "routeCore", stream) ||
-            !requireCudaDevicePointer(output_indices, device_ordinal_, "output indices", "routeCore", stream) ||
-            !requireCudaDevicePointer(output_weights, device_ordinal_, "output weights", "routeCore", stream))
+            (!owned && (!requireCudaDevicePointer(output_indices, device_ordinal_, "output indices", "routeCore", stream) ||
+                        !requireCudaDevicePointer(output_weights, device_ordinal_, "output weights", "routeCore", stream))))
             return false;
         if (device_effective_seq_len &&
             !requireCudaDevicePointer(device_effective_seq_len, device_ordinal_,
@@ -4677,6 +4667,20 @@ namespace llaminar2
             return false;
         }
 
+        // Row distribution changes ownership, not the prepared representation or
+        // arithmetic. This same workspace/gate owner serves both destinations.
+        if (owned)
+        {
+            const MoERouterOwnedRowsLaunch launch{
+                .partition = owned->partition,
+                .capacity = seq_len, .width = d_model, .experts = num_experts,
+                .top_k = top_k, .normalize = normalize_weights,
+                .live_rows = device_effective_seq_len, .hidden = hidden,
+                .format = gate_is_fp32 ? MoERouterPreparedFormat::FP32 : MoERouterPreparedFormat::BF16,
+                .gate = gate_weights, .logits = d_route_logits_,
+                .selected = owned->selected, .selected_bytes = owned->selected_bytes};
+            return cuda::routeOwnedRows(launch, stream);
+        }
         const bool route_ok = gate_is_fp32
                                   ? cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
                                                          seq_len, d_model, num_experts,
@@ -4856,6 +4860,41 @@ namespace llaminar2
                                     host_result,
                                     device_effective_seq_len,
                                     "CUDAMoEKernel::routeWithTensorsEffectiveSeqLen");
+    }
+
+    bool CUDAMoEKernel::publishOwnedRouteRows(const MoERouterRowPublication &publication)
+    {
+        return cuda::publishRouterOwnedRows(publication, getStream());
+    }
+
+    bool CUDAMoEKernel::routeOwnedRowsWithTensors(
+        ITensor *hidden, ITensor *gate_weights,
+        const MoERouterRowPacketLayout &layout, int d_model, int num_experts,
+        bool normalize_weights, ITensor *packet, std::uint64_t *selected_bytes,
+        const std::int32_t *live_rows)
+    {
+        constexpr const char *context = "CUDAMoEKernel::routeOwnedRowsWithTensors";
+        void *stream = requireStream(context);
+        const auto device = deviceId();
+        if (!layout.valid() || d_model <= 0 || num_experts < layout.top_k ||
+            !live_rows || !selected_bytes || !hidden || !gate_weights || !packet ||
+            hidden->native_type() != TensorType::FP32 ||
+            !requireTensorOnDevice(hidden, device, stream, "hidden") ||
+            !requireTensorOnDevice(gate_weights, device, stream, "gate_weights") ||
+            !requireOutputOnDevice(packet, device, stream, "router packet") ||
+            !requireMatrixCapacity(hidden, layout.capacity, d_model, "hidden", context) ||
+            !requireMatrixCapacity(gate_weights, num_experts, d_model, "gate", context) ||
+            packet->size_bytes() < layout.packetBytes() ||
+            !requireCudaDevicePointer(selected_bytes, device_ordinal_, "packet extent", context, stream))
+            return false;
+        const MoERouterOwnedRowOutputs owned{layout.partition,
+            static_cast<MoERouterSelectedRoute *>(packet->gpu_data_ptr()), selected_bytes};
+        if (!routeCore(static_cast<const float *>(hidden->gpu_data_ptr()), gate_weights->gpu_data_ptr(),
+                       gate_weights->native_type(), layout.capacity, d_model, num_experts, layout.top_k,
+                       normalize_weights, nullptr, nullptr, live_rows, &owned))
+            return false;
+        markDeviceWritten(packet, device, stream);
+        return true;
     }
 
     bool CUDAMoEKernel::prepareRouteLaunch(
@@ -6549,6 +6588,19 @@ namespace llaminar2
         markDeviceWritten(output, device, stream);
     }
 
+    /**
+     * @brief Reset and publish stable expert grouping on one retained stream.
+     * @param d_routing_indices Original expert IDs, including -1 inactive slots.
+     * @param d_routing_weights Unmodified per-route probability bits.
+     * @param seq_len Admitted token extent, including a padded bucket tail.
+     * @param num_experts Number of experts represented by counts and offsets.
+     * @param top_k Route slots per token.
+     * @param d_expert_offsets Output exclusive count prefix.
+     * @param d_expert_counts Output integer expert counts.
+     * @param d_grouped_token_indices Output stable compact route IDs.
+     * @param d_grouped_weights Output compact probabilities; unused slots are zero.
+     * @return False if initialization or any grouping launch fails.
+     */
     bool CUDAMoEKernel::groupTokensByExpertDevice(const int *d_routing_indices,
                                                   const float *d_routing_weights,
                                                   int seq_len, int num_experts, int top_k,
@@ -6557,46 +6609,17 @@ namespace llaminar2
     {
         const int total_slots = seq_len * top_k;
         void *stream = requireStream("CUDAMoEKernel::groupTokensByExpertDevice");
-        cudaError_t err = cudaMemsetAsync(d_expert_counts, 0, static_cast<size_t>(num_experts) * sizeof(int),
-                                          static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-            return false;
-        err = cudaMemsetAsync(d_group_write_heads_, 0, static_cast<size_t>(num_experts) * sizeof(int),
-                              static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-            return false;
-        /*
-         * Padded prefill replay deliberately marks bucket-tail routes invalid
-         * with expert_id=-1.  The deterministic scatter kernel only writes a
-        * mapping for valid routes, so the ordered down-scatter must start from
-         * an all-invalid map every request.  Otherwise graph replay can reuse
-         * stale slot mappings from the previous real sequence length and write
-         * arbitrary expert output into padded rows.
-         */
-        err = cudaMemsetAsync(d_group_original_to_grouped_, 0xff,
-                              static_cast<size_t>(total_slots) * sizeof(int),
-                              static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-            return false;
-        err = cudaMemsetAsync(d_group_original_expert_ids_, 0xff,
-                              static_cast<size_t>(total_slots) * sizeof(int),
-                              static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-            return false;
-        /*
-         * Masked/padded routing can compact fewer rows than total_slots.  The
-         * grouped prefill gather still launches over total_slots, so stale token
-         * ids from a previous larger request must not survive in unused rows.
-         */
-        err = cudaMemsetAsync(d_grouped_token_indices, 0,
-                              static_cast<size_t>(total_slots) * sizeof(int),
-                              static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-            return false;
-        err = cudaMemsetAsync(d_grouped_weights, 0,
-                              static_cast<size_t>(total_slots) * sizeof(float),
-                              static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
+        // One graph node resets every publication, including padded/remote
+        // slots. Preserve -1 maps and exact-zero compact tails across replay.
+        if (!cudaMoE_initialize_grouping({
+                .expert_counts = d_expert_counts,
+                .write_heads = d_group_write_heads_,
+                .original_to_grouped = d_group_original_to_grouped_,
+                .original_expert_ids = d_group_original_expert_ids_,
+                .grouped_token_indices = d_grouped_token_indices,
+                .grouped_weights = d_grouped_weights,
+                .num_experts = num_experts,
+                .total_slots = total_slots}, device_ordinal_, stream))
             return false;
         return cudaMoE_count_per_expert(d_routing_indices, d_expert_counts, total_slots,
                                         num_experts, device_ordinal_, stream) &&
@@ -6686,7 +6709,8 @@ namespace llaminar2
             filter_to_local_runtime_experts ? 1 : 0,
             retain_routes_for_deferred_commit ? 1 : 0,
             device_ordinal_,
-            stream);
+            stream,
+            DeviceMoEProjectionSet::CompleteExpert);
     }
 
     bool CUDAMoEKernel::regroupPrefillRoutesForDiagnostics(
@@ -6735,11 +6759,14 @@ namespace llaminar2
         int gateup_desc_table_id,
         int down_desc_table_id,
         bool filter_to_local_runtime_experts,
-        bool retain_routes_for_deferred_commit)
+        MoEGroupedPlanDemand demand,
+        DeviceMoEProjectionSet expected_projections)
     {
-        if (!runtime_layer || !routing_indices || !routing_weights ||
+        if (!validMoEGroupedPlanDemand(demand) || !runtime_layer || !routing_indices || !routing_weights ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
+            max_tokens > std::numeric_limits<int>::max() / top_k ||
+            !deviceMoEProjectionSetValid(expected_projections) ||
             gateup_desc_table_id < 0 ||
             gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
             down_desc_table_id < 0 ||
@@ -6820,10 +6847,10 @@ namespace llaminar2
                    top_k,
                    max_active_experts,
                    filter_to_local_runtime_experts ? 1 : 0,
-                   retain_routes_for_deferred_commit ? 1 : 0,
+                   static_cast<int>(demand),
                    gateup_table.weight_format,
                    device_ordinal_,
-                   stream);
+                   stream, expected_projections);
     }
 
     bool CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
@@ -6834,11 +6861,14 @@ namespace llaminar2
         int top_k,
         int gateup_desc_table_id,
         int down_desc_table_id,
-        bool retain_routes_for_deferred_commit)
+        MoEGroupedPlanDemand demand,
+        DeviceMoEProjectionSet expected_projections)
     {
-        if (!runtime_layer ||
+        if (!validMoEGroupedPlanDemand(demand) || !runtime_layer ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
+            max_tokens > std::numeric_limits<int>::max() / top_k ||
+            !deviceMoEProjectionSetValid(expected_projections) ||
             gateup_desc_table_id < 0 ||
             gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
             down_desc_table_id < 0 ||
@@ -6905,10 +6935,10 @@ namespace llaminar2
             num_experts,
             top_k,
             std::min(max_slots, num_experts),
-            retain_routes_for_deferred_commit ? 1 : 0,
+            static_cast<int>(demand),
             gateup_table.weight_format,
             device_ordinal_,
-            stream);
+            stream, expected_projections);
     }
 
     bool CUDAMoEKernel::commitGroupedVerifierHistograms(
@@ -8550,22 +8580,167 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::executeGroupedPrefillPipeline(
+    bool CUDAMoEKernel::exportGroupedPrefillIntermediates(
+        const MoEGroupedIntermediateLayout &layout,
+        const std::int32_t *route_participants, ITensor *packet, int participant)
+    {
+        // These pointers are owned by the already-admitted grouped workspace.
+        // Do not expose names or pointer arithmetic to model graph callers.
+        if (!layout.valid() || !route_participants || !packet ||
+            packet->size_bytes() < layout.packetBytes() ||
+            participant < 0 || static_cast<std::uint32_t>(participant) >= layout.participants ||
+            layout.route_capacity > static_cast<std::uint32_t>(group_slots_cap_) ||
+            layout.route_capacity > static_cast<std::uint32_t>(prefill_slots_cap_) ||
+            layout.columns > static_cast<std::uint32_t>(prefill_intermediate_cap_) ||
+            !d_group_original_to_grouped_ || !setMoEDevice(device_ordinal_, "exportGroupedPrefillIntermediates"))
+            return false;
+        const auto device = DeviceId::cuda(device_ordinal_);
+        auto *stream = getStream();
+        if (!stream || !requireOutputOnDevice(packet, device, stream, "exportGroupedPrefillIntermediates(packet)"))
+            return false;
+        const bool floating = layout.encoding == MoEGroupedIntermediateEncoding::FP32;
+        const MoEGroupedIntermediatePackLaunch launch{
+            .layout = layout,
+            .route_owners = route_participants,
+            .original_to_grouped = d_group_original_to_grouped_,
+            .grouped_values = floating ? static_cast<const void *>(d_prefill_gate_)
+                                      : static_cast<const void *>(d_prefill_swiglu_int8_),
+            .grouped_scales = floating ? nullptr : d_prefill_swiglu_scales_,
+            .packet = static_cast<std::uint32_t *>(packet->gpu_data_ptr()),
+            .participant = participant};
+        if (!cuda::packGroupedIntermediate(launch, stream)) return false;
+        markDeviceWritten(packet, device, stream);
+        return true;
+    }
+
+    bool CUDAMoEKernel::importGroupedPrefillIntermediates(
+        const MoEGroupedIntermediateLayout &layout,
+        const std::int32_t *route_participants, ITensor *packets)
+    {
+        if (!layout.valid() || !route_participants || !packets ||
+            packets->size_bytes() < layout.packetBytes() * layout.participants ||
+            layout.route_capacity > static_cast<std::uint32_t>(group_slots_cap_) ||
+            layout.route_capacity > static_cast<std::uint32_t>(prefill_slots_cap_) ||
+            layout.columns > static_cast<std::uint32_t>(prefill_intermediate_cap_) ||
+            !d_group_original_to_grouped_ || !setMoEDevice(device_ordinal_, "importGroupedPrefillIntermediates"))
+            return false;
+        const auto device = DeviceId::cuda(device_ordinal_);
+        auto *stream = getStream();
+        if (!stream || !requireTensorOnDevice(packets, device, stream, "importGroupedPrefillIntermediates(packets)"))
+            return false;
+        const bool floating = layout.encoding == MoEGroupedIntermediateEncoding::FP32;
+        const MoEGroupedIntermediateConsumeLaunch launch{
+            .layout = layout,
+            .route_owners = route_participants,
+            .original_to_grouped = d_group_original_to_grouped_,
+            .participant_packets = static_cast<const std::uint32_t *>(packets->gpu_data_ptr()),
+            .grouped_values = floating ? static_cast<void *>(d_prefill_gate_)
+                                      : static_cast<void *>(d_prefill_swiglu_int8_),
+            .grouped_scales = floating ? nullptr : d_prefill_swiglu_scales_};
+        return cuda::consumeGroupedIntermediate(launch, stream);
+    }
+
+    bool CUDAMoEKernel::exportCompactGroupedPrefillIntermediates(
+        const MoEGroupedIntermediateLayout &layout,
+        const DeviceMoELayerRuntime &runtime, ITensor *packet,
+        std::uint64_t *packet_bytes)
+    {
+        if (!layout.compactValid() || !packet || !packet_bytes ||
+            reinterpret_cast<std::uintptr_t>(packet_bytes) % alignof(std::uint64_t) ||
+            packet->size_bytes() < layout.compactCapacityBytes() ||
+            runtime.participant_count != layout.participants || runtime.participant_id >= layout.participants ||
+            !runtime.expert_count || runtime.expert_count > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+            runtime.prefill_route_capacity < layout.route_capacity ||
+            layout.route_capacity > static_cast<std::uint32_t>(group_slots_cap_) ||
+            layout.route_capacity > static_cast<std::uint32_t>(prefill_slots_cap_) ||
+            layout.columns > static_cast<std::uint32_t>(prefill_intermediate_cap_) ||
+            !runtime.expert_offsets || !runtime.expert_counts || !runtime.route_participant_ids ||
+            !d_group_original_to_grouped_ ||
+            !setMoEDevice(device_ordinal_, "exportCompactGroupedPrefillIntermediates"))
+            return false;
+        const auto device = DeviceId::cuda(device_ordinal_);
+        auto *stream = getStream();
+        if (!stream || !requireOutputOnDevice(packet, device, stream, "exportCompactGroupedPrefillIntermediates(packet)")) return false;
+        const bool floating = layout.encoding == MoEGroupedIntermediateEncoding::FP32;
+        // Runtime-plan execution reads runtime-owned counts, not the kernel's
+        // private grouping scratch. That scratch may still describe a prior
+        // layer. Bind the same authoritative addresses used by gate/up, with
+        // the actual expert geometry rather than the allocation's capacity.
+        const MoECompactIntermediatePackLaunch launch{
+            .payload = {
+                .layout = layout,
+                .route_owners = runtime.route_participant_ids,
+                .original_to_grouped = d_group_original_to_grouped_,
+                .grouped_values = floating ? static_cast<const void *>(d_prefill_gate_)
+                                          : static_cast<const void *>(d_prefill_swiglu_int8_),
+                .grouped_scales = floating ? nullptr : d_prefill_swiglu_scales_,
+                .packet = static_cast<std::uint32_t *>(packet->gpu_data_ptr()),
+                .participant = static_cast<std::int32_t>(runtime.participant_id)},
+            .last_group_offset = runtime.expert_offsets + runtime.expert_count - 1,
+            .last_group_count = runtime.expert_counts + runtime.expert_count - 1,
+            .packet_bytes = packet_bytes};
+        if (!cuda::packCompactIntermediate(launch, stream)) return false;
+        markDeviceWritten(packet, device, stream);
+        return true;
+    }
+
+    bool CUDAMoEKernel::importCompactGroupedPrefillIntermediates(
+        const MoEGroupedIntermediateLayout &layout,
+        const std::int32_t *route_participants, ITensor *packet,
+        std::size_t packet_byte_offset, const std::uint64_t *packet_bytes, int participant)
+    {
+        if (!layout.compactValid() || !route_participants || !packet || !packet_bytes ||
+            reinterpret_cast<std::uintptr_t>(packet_bytes) % alignof(std::uint64_t) ||
+            packet_byte_offset % alignof(std::uint32_t) || packet_byte_offset > packet->size_bytes() ||
+            layout.compactCapacityBytes() > packet->size_bytes() - packet_byte_offset ||
+            participant < 0 || static_cast<std::uint32_t>(participant) >= layout.participants ||
+            layout.route_capacity > static_cast<std::uint32_t>(group_slots_cap_) ||
+            layout.route_capacity > static_cast<std::uint32_t>(prefill_slots_cap_) ||
+            layout.columns > static_cast<std::uint32_t>(prefill_intermediate_cap_) ||
+            !d_group_original_to_grouped_ ||
+            !setMoEDevice(device_ordinal_, "importCompactGroupedPrefillIntermediates"))
+            return false;
+        const auto device = DeviceId::cuda(device_ordinal_);
+        auto *stream = getStream();
+        if (!stream || !requireTensorOnDevice(packet, device, stream, "importCompactGroupedPrefillIntermediates(packet)")) return false;
+        const bool floating = layout.encoding == MoEGroupedIntermediateEncoding::FP32;
+        // Regrouping has already rebound the original router slots. Import
+        // changes only this producer's live rows, so peers and empty packets
+        // cannot overwrite each other's contributions or any unused capacity.
+        // The offset selects bytes, not a new tensor/coherence authority. The
+        // capture ledger above authenticates the published arena owner itself.
+        const MoECompactIntermediateConsumeLaunch launch{
+            .layout = layout,
+            .route_owners = route_participants,
+            .original_to_grouped = d_group_original_to_grouped_,
+            .packet = static_cast<const std::uint32_t *>(packet->gpu_data_ptr()) + packet_byte_offset / sizeof(std::uint32_t),
+            .packet_bytes = packet_bytes,
+            .participant = participant,
+            .grouped_values = floating ? static_cast<void *>(d_prefill_gate_)
+                                      : static_cast<void *>(d_prefill_swiglu_int8_),
+            .grouped_scales = floating ? nullptr : d_prefill_swiglu_scales_};
+        return cuda::consumeCompactIntermediate(launch, stream);
+    }
+
+    bool CUDAMoEKernel::executeGroupedPrefillProjection(
         ITensor *hidden, ITensor *output,
         int gateup_desc_table_id,
         int down_desc_table_id,
         int seq_len, int d_model, int intermediate,
         int num_experts, int top_k,
+        const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
-        if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top_k <= 0)
+if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top_k <= 0 ||
+            seq_len > std::numeric_limits<int>::max() / top_k ||
+            execution.modelColumns() != d_model)
             return false;
         if (gateup_desc_table_id < 0 ||
             gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
             down_desc_table_id < 0 ||
             down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] invalid descriptor table id");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] invalid descriptor table id");
             return false;
         }
 
@@ -8579,15 +8754,15 @@ namespace llaminar2
             gateup_table.num_experts != num_experts ||
             down_table.num_experts != num_experts ||
             gateup_table.d_model != d_model ||
-            down_table.d_model != d_model ||
+            (execution.executesDown() && down_table.d_model != execution.columnCount()) ||
             gateup_table.intermediate != intermediate ||
             down_table.intermediate != intermediate)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] descriptor table shape mismatch");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] descriptor table shape mismatch");
             return false;
         }
 
-        void *stream = requireStream("CUDAMoEKernel::executeGroupedPrefillPipeline");
+        void *stream = requireStream("CUDAMoEKernel::executeGroupedPrefillProjection");
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
@@ -8617,20 +8792,20 @@ namespace llaminar2
                 !d_group_original_expert_ids_ || !d_group_weights_ ||
                 !ensureGroupedPrefillScratchCapacity(
                     total_slots, d_model, intermediate) ||
-                !requireTensorOnDevice(hidden, device, stream, "hidden") ||
-                !requireOutputOnDevice(
+                (execution.executesGateUp() && !requireTensorOnDevice(hidden, device, stream, "hidden")) ||
+                (execution.executesDown() && !requireOutputOnDevice(
                     publication_output,
                     device,
                     stream,
-                    publication_output_name))
+                    publication_output_name)))
             {
-                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] "
                           "floating grouped-prefill publication is incomplete");
                 return false;
             }
 
             const bool ok = cudaMoE_grouped_floating_prefill_pipeline(
-                static_cast<const float *>(hidden->gpu_data_ptr()),
+                execution.executesGateUp() ? static_cast<const float *>(hidden->gpu_data_ptr()) : nullptr,
                 gateup_table.device_floating_gate_descs,
                 gateup_table.device_floating_up_descs,
                 down_table.device_floating_descs,
@@ -8638,11 +8813,10 @@ namespace llaminar2
                 d_group_original_expert_ids_,
                 d_group_weights_,
                 d_prefill_gate_,
-                d_prefill_up_,
-                canonical_route_contributions
+                !execution.executesDown() || canonical_route_contributions
                     ? nullptr
                     : static_cast<float *>(output->gpu_data_ptr()),
-                canonical_route_contributions
+                execution.executesDown() && canonical_route_contributions
                     ? static_cast<float *>(
                           canonical_route_contributions->gpu_data_ptr())
                     : nullptr,
@@ -8654,14 +8828,15 @@ namespace llaminar2
                 num_experts,
                 gateup_table.weight_format,
                 device_ordinal_,
-                stream);
+                stream, execution);
             if (!ok)
             {
-                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] "
                           "floating grouped CUDA pipeline failed");
                 return false;
             }
-            markDeviceWritten(publication_output, device, stream);
+            if (execution.executesDown())
+                markDeviceWritten(publication_output, device, stream);
             PerfStatsCollector::addCounter(
                 "kernel",
                 "cuda_moe_grouped_prefill_floating_calls",
@@ -8698,7 +8873,7 @@ namespace llaminar2
         if (use_gateup_kpart &&
             !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] "
                       "capture-time prefill policy is invalid"
                       << " seq_len=" << seq_len
                       << " d_model=" << d_model
@@ -8715,7 +8890,7 @@ namespace llaminar2
              !cuda::moe::validGroupedImmaGateUpSchedule(
                  prefill_policy.imma_gateup_schedule)))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] "
                       "capture-time IMMA geometry is invalid");
             return false;
         }
@@ -8725,14 +8900,14 @@ namespace llaminar2
                 CUDAMoEBatchInvariantPolicy::gate_up_k_partitions,
                 intermediate))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] "
                       "verifier grouped gate/up split-K scratch allocation failed");
             return false;
         }
         if (active_expert_slots > 0 &&
             (!d_group_original_to_grouped_ || !d_group_original_expert_ids_))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] "
                       "decode-equivalent grouped prefill requires ordered route maps");
             return false;
         }
@@ -8746,7 +8921,7 @@ namespace llaminar2
                 d_model,
                 splitk_route_slots))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] "
                       "verifier grouped down split-K scratch allocation failed");
             return false;
         }
@@ -8759,43 +8934,44 @@ namespace llaminar2
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
             (use_grouped_imma &&
              !ensureGroupedImmaDirectoryCapacity(total_slots, num_experts)) ||
-            !requireTensorOnDevice(hidden, device, stream, "hidden") ||
-            !requireOutputOnDevice(
+            (execution.executesGateUp() && !requireTensorOnDevice(hidden, device, stream, "hidden")) ||
+            (execution.executesDown() && !requireOutputOnDevice(
                 publication_output,
                 device,
                 stream,
-                publication_output_name))
+                publication_output_name)))
             return false;
 
-        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        float *d_output = canonical_route_contributions
+        const float *d_hidden = execution.executesGateUp()
+            ? static_cast<const float *>(hidden->gpu_data_ptr()) : nullptr;
+        float *d_output = !execution.executesDown() || canonical_route_contributions
                               ? nullptr
                               : static_cast<float *>(output->gpu_data_ptr());
         float *d_canonical_route_contributions =
-            canonical_route_contributions
+            execution.executesDown() && canonical_route_contributions
                 ? static_cast<float *>(
                       canonical_route_contributions->gpu_data_ptr())
                 : nullptr;
-        if (!d_hidden ||
-            (!d_output && !d_canonical_route_contributions))
+        if ((execution.executesGateUp() && !d_hidden) ||
+            (execution.executesDown() && !d_output && !d_canonical_route_contributions))
             return false;
         const char *router_q8_reuse_block_reason =
             routerQ8HiddenReuseBlockReason(d_hidden, seq_len, d_model);
         const bool reuse_router_q8_hidden =
-            active_expert_slots > 0 &&
+            execution.executesGateUp() && active_expert_slots > 0 &&
             router_q8_reuse_block_reason == nullptr;
-        if (router_q8_publication_access_ ==
+        if (execution.executesGateUp() && router_q8_publication_access_ ==
                 MoERouterQ8PublicationAccess::RequiredConsumer &&
             !reuse_router_q8_hidden)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] required "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] required "
                       "router Q8 publication is unavailable: "
                       << (router_q8_reuse_block_reason
                               ? router_q8_reuse_block_reason
                               : "no_active_experts"));
             return false;
         }
-        if (!reuse_router_q8_hidden)
+        if (execution.executesGateUp() && !reuse_router_q8_hidden)
         {
             PerfStatsCollector::addCounter(
                 "kernel",
@@ -8824,11 +9000,11 @@ namespace llaminar2
             active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
         if (active_expert_slots > 0 && !ordered_scatter_overwrites_output)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] "
                       "active grouped prefill routes require ordered scatter ownership");
             return false;
         }
-        if (active_expert_slots == 0)
+        if (execution.executesDown() && active_expert_slots == 0)
         {
             cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
             float *clear_target = d_canonical_route_contributions
@@ -8836,7 +9012,7 @@ namespace llaminar2
                                       : d_output;
             const size_t clear_count =
                 static_cast<size_t>(seq_len) *
-                static_cast<size_t>(d_model) *
+                static_cast<size_t>(execution.columnCount()) *
                 (d_canonical_route_contributions
                      ? static_cast<size_t>(top_k)
                      : size_t{1});
@@ -8847,7 +9023,7 @@ namespace llaminar2
                 cuda_stream);
             if (err != cudaSuccess)
             {
-                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] output memset failed: "
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] output memset failed: "
                           << cudaGetErrorString(err));
                 return false;
             }
@@ -8912,10 +9088,10 @@ namespace llaminar2
             prefill_policy.imma_down_columns,
             prefill_policy.imma_gateup_schedule,
             device_ordinal_,
-            stream);
+            stream, execution);
         if (!ok)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] grouped CUDA pipeline failed");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] grouped CUDA pipeline failed");
             return false;
         }
 
@@ -8932,7 +9108,7 @@ namespace llaminar2
                  {"descriptor_source", "static_table"}});
         }
 
-        markDeviceWritten(
+        if (execution.executesDown()) markDeviceWritten(
             canonical_route_contributions
                 ? canonical_route_contributions
                 : output,
@@ -8971,7 +9147,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(
+    bool CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan(
         DeviceMoELayerRuntime *device_runtime_layer,
         const DeviceMoELayerRuntime &runtime_host_layer,
         ITensor *hidden, ITensor *output,
@@ -8979,11 +9155,21 @@ namespace llaminar2
         int down_desc_table_id,
         int seq_len, int d_model, int intermediate,
         int num_experts, int top_k,
+        const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
         if (!device_runtime_layer)
             return false;
-        if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top_k <= 0)
+        // Mutable placement never owns immutable column slices. Binding a
+        // local-N hint to its full-N packed matrix would change indexing.
+        if (execution.executesDown() && execution.columnCount() != d_model)
+        {
+            LOG_ERROR("Sliced MoE down execution requires the immutable fixed-down descriptor table");
+            return false;
+        }
+if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top_k <= 0 ||
+            seq_len > std::numeric_limits<int>::max() / top_k ||
+            execution.modelColumns() != d_model)
             return false;
         if (runtime_host_layer.expert_count != static_cast<uint32_t>(num_experts) ||
             runtime_host_layer.top_k != static_cast<uint32_t>(top_k) ||
@@ -8994,7 +9180,7 @@ namespace llaminar2
             !runtime_host_layer.grouped_token_ids ||
             !runtime_host_layer.grouped_route_weights)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] invalid runtime scratch contract"
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] invalid runtime scratch contract"
                       << " expert_count=" << runtime_host_layer.expert_count
                       << " expected_experts=" << num_experts
                       << " top_k=" << runtime_host_layer.top_k
@@ -9010,7 +9196,7 @@ namespace llaminar2
             down_desc_table_id < 0 ||
             down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] invalid descriptor table id");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] invalid descriptor table id");
             return false;
         }
 
@@ -9024,16 +9210,16 @@ namespace llaminar2
             gateup_table.num_experts != num_experts ||
             down_table.num_experts != num_experts ||
             gateup_table.d_model != d_model ||
-            down_table.d_model != d_model ||
+            (execution.executesDown() && down_table.d_model != execution.columnCount()) ||
             gateup_table.intermediate != intermediate ||
             down_table.intermediate != intermediate)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] descriptor table shape mismatch");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] descriptor table shape mismatch");
             return false;
         }
 
         void *stream = requireStream(
-            "CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan");
+            "CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan");
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
@@ -9049,7 +9235,7 @@ namespace llaminar2
                 !ensureGroupedPrefillScratchCapacity(
                     total_slots, d_model, intermediate))
             {
-                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                           "floating runtime grouping workspace is incomplete");
                 return false;
             }
@@ -9061,12 +9247,12 @@ namespace llaminar2
                 canonical_route_contributions
                     ? "canonical_route_contributions"
                     : "output";
-            if (!requireTensorOnDevice(hidden, device, stream, "hidden") ||
-                !requireOutputOnDevice(
+            if ((execution.executesGateUp() && !requireTensorOnDevice(hidden, device, stream, "hidden")) ||
+                (execution.executesDown() && !requireOutputOnDevice(
                     publication_output,
                     device,
                     stream,
-                    publication_output_name))
+                    publication_output_name)))
             {
                 return false;
             }
@@ -9098,7 +9284,7 @@ namespace llaminar2
 
             group_active_expert_slots_ = active_expert_slots;
             const bool ok = cudaMoE_grouped_floating_prefill_pipeline(
-                static_cast<const float *>(hidden->gpu_data_ptr()),
+                execution.executesGateUp() ? static_cast<const float *>(hidden->gpu_data_ptr()) : nullptr,
                 reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
                     runtime_gate_descs),
                 reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
@@ -9109,11 +9295,10 @@ namespace llaminar2
                 runtime_host_layer.route_expert_ids,
                 runtime_host_layer.grouped_route_weights,
                 d_prefill_gate_,
-                d_prefill_up_,
-                canonical_route_contributions
+                !execution.executesDown() || canonical_route_contributions
                     ? nullptr
                     : static_cast<float *>(output->gpu_data_ptr()),
-                canonical_route_contributions
+                execution.executesDown() && canonical_route_contributions
                     ? static_cast<float *>(
                           canonical_route_contributions->gpu_data_ptr())
                     : nullptr,
@@ -9125,14 +9310,15 @@ namespace llaminar2
                 num_experts,
                 gateup_table.weight_format,
                 device_ordinal_,
-                stream);
+                stream, execution);
             if (!ok)
             {
-                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                           "floating grouped CUDA pipeline failed");
                 return false;
             }
-            markDeviceWritten(publication_output, device, stream);
+            if (execution.executesDown())
+                markDeviceWritten(publication_output, device, stream);
             PerfStatsCollector::addCounter(
                 "kernel",
                 "cuda_moe_grouped_prefill_floating_calls",
@@ -9169,7 +9355,7 @@ namespace llaminar2
         if (use_gateup_kpart &&
             !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                       "capture-time prefill policy is invalid"
                       << " seq_len=" << seq_len
                       << " d_model=" << d_model
@@ -9186,7 +9372,7 @@ namespace llaminar2
              !cuda::moe::validGroupedImmaGateUpSchedule(
                  prefill_policy.imma_gateup_schedule)))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                       "capture-time IMMA geometry is invalid");
             return false;
         }
@@ -9205,7 +9391,7 @@ namespace llaminar2
                 CUDAMoEBatchInvariantPolicy::gate_up_k_partitions,
                 intermediate))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                       "verifier grouped gate/up split-K scratch allocation failed");
             return false;
         }
@@ -9216,7 +9402,7 @@ namespace llaminar2
         if ((use_gateup_kpart || use_down_ordered_kpart) &&
             !runtime_host_layer.route_expert_ids)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                       "verifier grouped down split-K requires runtime route expert ids");
             return false;
         }
@@ -9226,7 +9412,7 @@ namespace llaminar2
                 d_model,
                 splitk_route_slots))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                       "verifier grouped down split-K scratch allocation failed");
             return false;
         }
@@ -9240,12 +9426,12 @@ namespace llaminar2
             !ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
             (use_grouped_imma &&
              !ensureGroupedImmaDirectoryCapacity(total_slots, num_experts)) ||
-            !requireTensorOnDevice(hidden, device, stream, "hidden") ||
-            !requireOutputOnDevice(
+            (execution.executesGateUp() && !requireTensorOnDevice(hidden, device, stream, "hidden")) ||
+            (execution.executesDown() && !requireOutputOnDevice(
                 publication_output,
                 device,
                 stream,
-                publication_output_name))
+                publication_output_name)))
         {
             return false;
         }
@@ -9277,29 +9463,30 @@ namespace llaminar2
                 &runtime_down_descs,
                 "CUDA runtime prefill down descriptors"))
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                       "failed to bind graph-owned runtime descriptor slots");
             return false;
         }
 
-        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        float *d_output = canonical_route_contributions
+        const float *d_hidden = execution.executesGateUp()
+            ? static_cast<const float *>(hidden->gpu_data_ptr()) : nullptr;
+        float *d_output = !execution.executesDown() || canonical_route_contributions
                               ? nullptr
                               : static_cast<float *>(output->gpu_data_ptr());
         float *d_canonical_route_contributions =
-            canonical_route_contributions
+            execution.executesDown() && canonical_route_contributions
                 ? static_cast<float *>(
                       canonical_route_contributions->gpu_data_ptr())
                 : nullptr;
-        if (!d_hidden ||
-            (!d_output && !d_canonical_route_contributions))
+        if ((execution.executesGateUp() && !d_hidden) ||
+            (execution.executesDown() && !d_output && !d_canonical_route_contributions))
             return false;
         const char *router_q8_reuse_block_reason =
             routerQ8HiddenReuseBlockReason(d_hidden, seq_len, d_model);
         const bool reuse_router_q8_hidden =
-            active_expert_slots > 0 &&
+            execution.executesGateUp() && active_expert_slots > 0 &&
             router_q8_reuse_block_reason == nullptr;
-        if (!reuse_router_q8_hidden)
+        if (execution.executesGateUp() && !reuse_router_q8_hidden)
         {
             PerfStatsCollector::addCounter(
                 "kernel",
@@ -9382,10 +9569,10 @@ namespace llaminar2
             prefill_policy.imma_down_columns,
             prefill_policy.imma_gateup_schedule,
             device_ordinal_,
-            stream);
+            stream, execution);
         if (!ok)
         {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] grouped CUDA pipeline failed");
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] grouped CUDA pipeline failed");
             return false;
         }
 
@@ -9402,7 +9589,7 @@ namespace llaminar2
                  {"descriptor_source", "runtime_table"}});
         }
 
-        markDeviceWritten(
+        if (execution.executesDown()) markDeviceWritten(
             canonical_route_contributions
                 ? canonical_route_contributions
                 : output,
@@ -9742,7 +9929,9 @@ namespace llaminar2
                       "mandatory K-part gate/up scratch allocation failed");
             return false;
         }
-        if (!ensureGroupedGateUpDecodeCapacity(num_active, d_model))
+        // Floating descriptors never consume Q8 publications. Requiring their
+        // scratch would incorrectly impose quantized block-width constraints.
+        if (!floating && !ensureGroupedGateUpDecodeCapacity(num_active, d_model))
             return false;
 
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
@@ -9943,7 +10132,7 @@ namespace llaminar2
         void *stream = requireStream("CUDAMoEKernel::groupedExpertDownDecodeFromTable");
         const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
         const DeviceId device = deviceId();
-        if (!ensureGroupedDownDecodeCapacity(num_active, intermediate) ||
+        if ((!floating && !ensureGroupedDownDecodeCapacity(num_active, intermediate)) ||
             !setMoEDevice(device_ordinal_, "groupedExpertDownDecodeFromTable"))
             return false;
 
@@ -10746,9 +10935,9 @@ namespace llaminar2
              (!ensureGroupedGateUpKPartScratchCapacity(
                   num_active, gateup_k_partitions, intermediate) ||
               !ensureGroupedDownKPartScratchCapacity(
-                  down_k_partitions, d_model, num_active))) ||
-            !ensureGroupedGateUpDecodeCapacity(num_active, d_model) ||
-            !ensureGroupedDownDecodeCapacity(num_active, intermediate) ||
+                  down_k_partitions, d_model, num_active) ||
+              !ensureGroupedGateUpDecodeCapacity(num_active, d_model) ||
+              !ensureGroupedDownDecodeCapacity(num_active, intermediate))) ||
             !resolveFixedTableGateUpMetadata(
                 gateup_table.workspace_slot,
                 RuntimePointerArrayScope::TableDecode,
@@ -10766,7 +10955,8 @@ namespace llaminar2
         {
             return false;
         }
-        // Preparation publishes metadata addresses; execution consumes them.
+        // Both families publish immutable metadata and pointer arrays. Only
+        // quantized arithmetic above binds Q8/K-part intermediate workspaces.
         (void)fixed_gateup_expert_ids;
         (void)fixed_down_expert_ids;
         (void)fixed_down_expert_weights;

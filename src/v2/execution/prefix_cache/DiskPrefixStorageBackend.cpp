@@ -11,12 +11,22 @@
  * Metadata is parsed with nlohmann::json rather than ad-hoc string searching.
  * A record is visible only when its footer is present and its metadata
  * checksum matches. Payload sections are verified lazily during hydration.
+ * Compaction copies a committed snapshot and subsequent append history on one
+ * background worker. Foreground operations keep using the source inode until
+ * a short, atomic publication; verified hydration owns its original descriptor.
+ * Bulk maintenance uses bounded O_DSYNC writes on that worker. A bounded
+ * scratch allocation alone cannot prevent a whole-archive dirty-page backlog
+ * from starving the small fsync that a live RAM-capacity receipt depends on.
+ * Range writeback is insufficient on container OverlayFS mappings, so there
+ * is no separate submit/join lifecycle or filesystem-dependent alternate path.
  */
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
 
 #include "execution/prefix_cache/BlockHash.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixArchiveMaintenanceWriter.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <nlohmann/json.hpp>
 
@@ -28,8 +38,10 @@
 #include <fcntl.h>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <utility>
 #include <unistd.h>
 
 namespace llaminar2
@@ -60,10 +72,13 @@ namespace llaminar2
             "model_runtime_state",
         };
 
+        /** @brief Move-only native descriptor; an open inode survives rename. */
         class FileDescriptor
         {
         public:
+            /** @brief Adopt one descriptor returned by a native open operation. */
             explicit FileDescriptor(int value = -1) : value_(value) {}
+            /** @brief Close exactly the owned descriptor; no pathname mutation. */
             ~FileDescriptor()
             {
                 if (value_ >= 0)
@@ -71,38 +86,71 @@ namespace llaminar2
             }
             FileDescriptor(const FileDescriptor &) = delete;
             FileDescriptor &operator=(const FileDescriptor &) = delete;
+            /** @brief Transfer ownership, leaving the old handle empty. */
             FileDescriptor(FileDescriptor &&other) noexcept : value_(other.value_)
             {
                 other.value_ = -1;
             }
+            /** @brief Retire the previous descriptor before taking ownership. */
+            FileDescriptor &operator=(FileDescriptor &&other) noexcept
+            {
+                if (this != &other)
+                {
+                    if (value_ >= 0)
+                        ::close(value_);
+                    value_ = std::exchange(other.value_, -1);
+                }
+                return *this;
+            }
+            /** @return Borrowed descriptor; ownership stays with this handle. */
             int get() const { return value_; }
+            /** @return Transfer inode ownership to a verified hydration ticket. */
+            int release() noexcept { return std::exchange(value_, -1); }
+            /** @return Whether a native descriptor was successfully acquired. */
             explicit operator bool() const { return value_ >= 0; }
 
         private:
             int value_ = -1;
         };
 
+        /** @brief Cross-process serialization for index publication or copying. */
         class AdvisoryLock
         {
         public:
-            explicit AdvisoryLock(const std::filesystem::path &path)
+            /** @brief A try-lock is used only for the sole compaction writer. */
+            enum class Acquisition { Exclusive, TryExclusive };
+            /** @brief Acquire without borrowing the foreground index mutex. */
+            explicit AdvisoryLock(
+                const std::filesystem::path &path,
+                Acquisition acquisition = Acquisition::Exclusive)
                 : fd_(::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600))
             {
-                if (fd_ && ::flock(fd_.get(), LOCK_EX) != 0)
-                    locked_ = false;
-                else
-                    locked_ = static_cast<bool>(fd_);
+                if (!fd_)
+                {
+                    error_ = errno;
+                    return;
+                }
+                const int operation = LOCK_EX |
+                    (acquisition == Acquisition::TryExclusive ? LOCK_NB : 0);
+                locked_ = ::flock(fd_.get(), operation) == 0;
+                if (!locked_)
+                    error_ = errno;
             }
+            /** @brief Release only this descriptor's native advisory lock. */
             ~AdvisoryLock()
             {
                 if (locked_)
                     (void)::flock(fd_.get(), LOCK_UN);
             }
+            /** @return Whether this scope owns the requested process lease. */
             bool locked() const { return locked_; }
+            /** @return Native acquisition error, distinct from peer ownership. */
+            int error() const noexcept { return error_; }
 
         private:
             FileDescriptor fd_;
             bool locked_ = false;
+            int error_ = 0;
         };
 
         void storeU32(uint8_t *destination, uint32_t value)
@@ -413,6 +461,70 @@ namespace llaminar2
         {
             return operation + ": " + std::strerror(errno);
         }
+
+        /**
+         * @brief Serialize a payload-free touch without mutating any live index.
+         * @param sequence Authoritative recency already assigned by the archive.
+         * @param record_bytes Receives the exact appended native write extent.
+         *
+         * Compaction preserves recency with these records rather than calling a
+         * live-index mutator on an unpublished destination. This also makes a
+         * cancelled or failed rewrite incapable of corrupting live offsets.
+         */
+        bool appendTouchRecord(
+            int fd,
+            const PrefixCacheKey &key,
+            uint64_t sequence,
+            uint64_t *record_bytes,
+            std::string *error)
+        {
+            const json metadata_json = {
+                {"type", "touch"}, {"key", keyToJson(key)},
+                {"sections", json::array()},
+            };
+            const std::string metadata = metadata_json.dump();
+            const uint64_t checksum = checksumBytes(metadata.data(), metadata.size());
+            *record_bytes = kRecordPreambleBytes + metadata.size() + kRecordFooterBytes;
+            std::array<uint8_t, kRecordPreambleBytes> preamble{};
+            std::memcpy(preamble.data(), kRecordMagic.data(), kRecordMagic.size());
+            storeU32(preamble.data() + 8, kRecordVersion);
+            storeU32(preamble.data() + 12, kTouchRecord);
+            storeU64(preamble.data() + 16, *record_bytes);
+            storeU64(preamble.data() + 24, metadata.size());
+            storeU64(preamble.data() + 40, sequence);
+            storeU64(preamble.data() + 48, checksum);
+            std::array<uint8_t, kRecordFooterBytes> footer{};
+            std::memcpy(footer.data(), kCommitMagic.data(), kCommitMagic.size());
+            storeU64(footer.data() + 8, recordCommitChecksum(
+                kTouchRecord, sequence, checksum, metadata_json["sections"]));
+            if (::lseek(fd, 0, SEEK_END) < 0 ||
+                !writeAll(fd, preamble.data(), preamble.size()) ||
+                !writeAll(fd, metadata.data(), metadata.size()) ||
+                !writeAll(fd, footer.data(), footer.size()))
+            {
+                if (error)
+                    *error = errnoMessage("failed to append archive LRU touch");
+                return false;
+            }
+            return true;
+        }
+
+        /** @brief Unpublished replacement is unlinked on cancellation or error. */
+        class TemporaryArchive final
+        {
+        public:
+            /** @brief Own one exact worker pathname, never an archive directory. */
+            explicit TemporaryArchive(std::filesystem::path path)
+                : path_(std::move(path)) {}
+            TemporaryArchive(const TemporaryArchive &) = delete;
+            TemporaryArchive &operator=(const TemporaryArchive &) = delete;
+            /** @brief Rename consumes this name; unlink then harmlessly sees ENOENT. */
+            ~TemporaryArchive() { (void)::unlink(path_.c_str()); }
+            /** @return The one unpublished output pathname. */
+            const std::filesystem::path &path() const noexcept { return path_; }
+        private:
+            std::filesystem::path path_;
+        };
     } // namespace
 
     DiskPrefixStorageBackend::HydrationTicket::~HydrationTicket()
@@ -424,6 +536,7 @@ namespace llaminar2
         HydrationTicket &&other) noexcept
         : backend_(std::move(other.backend_)),
           handle_(std::move(other.handle_)),
+          archive_fd_(std::exchange(other.archive_fd_, -1)),
           archive_device_(other.archive_device_),
           archive_inode_(other.archive_inode_),
           sections_(other.sections_),
@@ -443,6 +556,7 @@ namespace llaminar2
         release();
         backend_ = std::move(other.backend_);
         handle_ = std::move(other.handle_);
+        archive_fd_ = std::exchange(other.archive_fd_, -1);
         archive_device_ = other.archive_device_;
         archive_inode_ = other.archive_inode_;
         sections_ = other.sections_;
@@ -456,11 +570,13 @@ namespace llaminar2
     DiskPrefixStorageBackend::HydrationTicket::HydrationTicket(
         std::shared_ptr<DiskPrefixStorageBackend> backend,
         PrefixBlockHandle handle,
+        int archive_fd,
         uint64_t archive_device,
         uint64_t archive_inode,
         std::array<SectionSnapshot, 6> sections)
         : backend_(std::move(backend)),
           handle_(std::move(handle)),
+          archive_fd_(archive_fd),
           archive_device_(archive_device),
           archive_inode_(archive_inode),
           sections_(std::move(sections))
@@ -469,7 +585,7 @@ namespace llaminar2
 
     bool DiskPrefixStorageBackend::HydrationTicket::valid() const noexcept
     {
-        return backend_ && handle_.valid() && !consumed_;
+        return backend_ && archive_fd_ >= 0 && handle_.valid() && !consumed_;
     }
 
     size_t DiskPrefixStorageBackend::HydrationTicket::totalBytes() const noexcept
@@ -485,9 +601,8 @@ namespace llaminar2
 
     void DiskPrefixStorageBackend::HydrationTicket::release() noexcept
     {
-        if (!backend_)
-            return;
-        backend_->releaseHydrationTicket();
+        if (archive_fd_ >= 0)
+            (void)::close(std::exchange(archive_fd_, -1));
         backend_.reset();
         consumed_ = true;
     }
@@ -533,6 +648,48 @@ namespace llaminar2
         std::string error;
         ready_ = initialize(&error);
         initialization_error_ = std::move(error);
+        if (ready_)
+        {
+            compaction_worker_ = std::jthread(
+                [this](std::stop_token stop) { maintainArchive(stop); });
+            persistence_ = std::make_unique<PrefixArchivePersistence>(*this);
+        }
+    }
+
+    DiskPrefixStorageBackend::~DiskPrefixStorageBackend()
+    {
+        // Durable puts may request compaction. Finish their FIFO before closing
+        // the maintenance worker or releasing its singly admitted I/O scratch.
+        persistence_.reset();
+        compaction_worker_.request_stop();
+        compaction_changed_.notify_all();
+        if (compaction_worker_.joinable())
+            compaction_worker_.join();
+    }
+
+    PrefixArchivePersistenceTicket DiskPrefixStorageBackend::scheduleWrite(PrefixBlockHandle handle)
+    {
+        if (!persistence_)
+            throw std::runtime_error(initialization_error_);
+        return persistence_->write(std::move(handle));
+    }
+
+    PrefixArchivePersistenceTicket DiskPrefixStorageBackend::scheduleRetirement(const PrefixCacheKey &key)
+    {
+        if (!persistence_)
+            throw std::runtime_error(initialization_error_);
+        return persistence_->retire(key);
+    }
+
+    bool DiskPrefixStorageBackend::waitForPersistence(std::string *error)
+    {
+        if (!persistence_)
+        {
+            if (error)
+                *error = initialization_error_;
+            return false;
+        }
+        return persistence_->waitUntilIdle(error);
     }
 
     std::shared_ptr<DiskPrefixStorageBackend> DiskPrefixStorageBackend::openShared(
@@ -623,8 +780,9 @@ namespace llaminar2
         return ready_;
     }
 
-    const std::string &DiskPrefixStorageBackend::initializationError() const
+    std::string DiskPrefixStorageBackend::initializationError() const
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         return initialization_error_;
     }
 
@@ -1042,46 +1200,9 @@ namespace llaminar2
         }
 
         const uint64_t sequence = next_sequence_++;
-        const json metadata_json = {
-            {"type", "touch"},
-            {"key", keyToJson(key)},
-            {"sections", json::array()},
-        };
-        const std::string metadata = metadata_json.dump();
-        const uint64_t metadata_checksum =
-            checksumBytes(metadata.data(), metadata.size());
-        const uint64_t record_bytes =
-            kRecordPreambleBytes + metadata.size() + kRecordFooterBytes;
-
-        std::array<uint8_t, kRecordPreambleBytes> preamble{};
-        std::memcpy(preamble.data(), kRecordMagic.data(), kRecordMagic.size());
-        storeU32(preamble.data() + 8, kRecordVersion);
-        storeU32(preamble.data() + 12, kTouchRecord);
-        storeU64(preamble.data() + 16, record_bytes);
-        storeU64(preamble.data() + 24, metadata.size());
-        storeU64(preamble.data() + 32, 0);
-        storeU64(preamble.data() + 40, sequence);
-        storeU64(preamble.data() + 48, metadata_checksum);
-
-        std::array<uint8_t, kRecordFooterBytes> footer{};
-        std::memcpy(footer.data(), kCommitMagic.data(), kCommitMagic.size());
-        storeU64(
-            footer.data() + 8,
-            recordCommitChecksum(
-                kTouchRecord,
-                sequence,
-                metadata_checksum,
-                metadata_json["sections"]));
-
-        if (::lseek(archive_fd, 0, SEEK_END) < 0 ||
-            !writeAll(archive_fd, preamble.data(), preamble.size()) ||
-            !writeAll(archive_fd, metadata.data(), metadata.size()) ||
-            !writeAll(archive_fd, footer.data(), footer.size()))
-        {
-            if (error)
-                *error = errnoMessage("failed to append archive LRU touch");
+        uint64_t record_bytes = 0;
+        if (!appendTouchRecord(archive_fd, key, sequence, &record_bytes, error))
             return false;
-        }
         if (!applyTouchRecord(key, sequence))
         {
             if (error)
@@ -1308,9 +1429,9 @@ namespace llaminar2
             *evicted_keys = std::move(evicted);
 
         /*
-         * Compaction runs only after the new record is durable and while the
-         * cross-process lock is still held. It rewrites active records when
-         * stale append history materially exceeds the configured capacity.
+         * The record is already durable. Request background reclamation here;
+         * never make a live inference command copy the whole archive or wait
+         * for the maintenance worker to publish its replacement.
          */
         return compactIfNeededLocked(archive.get(), error);
     }
@@ -1420,10 +1541,10 @@ namespace llaminar2
                 .checksum = touched_record.sections[index].checksum,
             };
         }
-        ++active_hydration_tickets_;
         return HydrationTicket(
             std::move(self),
             touched_record.handle,
+            archive.release(),
             archive_device_,
             archive_inode_,
             std::move(sections));
@@ -1458,16 +1579,15 @@ namespace llaminar2
                 *error = errnoMessage("failed to lock prefix archive");
             return false;
         }
-        FileDescriptor archive(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
         struct stat archive_state
         {
         };
-        if (!archive || ::fstat(archive.get(), &archive_state) != 0 ||
+        if (::fstat(ticket.archive_fd_, &archive_state) != 0 ||
             static_cast<uint64_t>(archive_state.st_dev) != ticket.archive_device_ ||
             static_cast<uint64_t>(archive_state.st_ino) != ticket.archive_inode_)
         {
             if (error)
-                *error = "prefix archive changed after hydration verification";
+                *error = "verified prefix archive descriptor lost its inode identity";
             return false;
         }
 
@@ -1527,7 +1647,7 @@ namespace llaminar2
                 (destination_bytes > 0 &&
                  (!destination ||
                   !preadAll(
-                      archive.get(),
+                      ticket.archive_fd_,
                       destination,
                       destination_bytes,
                       section.offset) ||
@@ -1547,13 +1667,16 @@ namespace llaminar2
          * when the verified record remains resident on disk; an evicted record
          * now has RAM as its sole payload authority.
          */
-        if (!refreshIndexLocked(archive.get(), error))
+        // The payload was read from its retained inode; logical recency belongs
+        // to the current archive, which may have been compacted meanwhile.
+        FileDescriptor current(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
+        if (!current || !refreshIndexLocked(current.get(), error))
         {
             ram_backend.release(out);
             return false;
         }
         if (records_.find(verified.key) != records_.end() &&
-            !appendTouchLocked(archive.get(), verified.key, error))
+            !appendTouchLocked(current.get(), verified.key, error))
         {
             ram_backend.release(out);
             return false;
@@ -1710,7 +1833,8 @@ namespace llaminar2
             while (remaining > 0)
             {
                 const size_t chunk = static_cast<size_t>(
-                    std::min<uint64_t>(remaining, archive_scratch_.size()));
+                    std::min<uint64_t>(remaining,
+                        PrefixArchiveIOGeometry::verificationBytes()));
                 if (!preadAll(
                         archive_fd,
                         archive_scratch_.data(),
@@ -1788,15 +1912,6 @@ namespace llaminar2
         int archive_fd,
         std::string *error)
     {
-        /*
-         * A verified ticket may refer to a put record that was logically
-         * evicted during a RAM/disk swap.  Append-only mutation preserves its
-         * bytes; compaction is the sole operation that could invalidate those
-         * immutable offsets, so defer it until every in-process ticket retires.
-         */
-        if (active_hydration_tickets_ != 0u)
-            return true;
-
         const uint64_t physical_bytes = fileSize(archive_fd);
         const uint64_t threshold = std::max<uint64_t>(
             64ull * 1024ull * 1024ull,
@@ -1809,118 +1924,302 @@ namespace llaminar2
         {
             return true;
         }
-        return rewriteArchiveLocked(archive_fd, error);
+        return scheduleCompactionLocked(error);
     }
 
-    void DiskPrefixStorageBackend::releaseHydrationTicket() noexcept
+    bool DiskPrefixStorageBackend::scheduleCompactionLocked(std::string *error)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (active_hydration_tickets_ == 0u)
-            std::terminate();
-        --active_hydration_tickets_;
+        if (!ready_ || compaction_status_.state == CompactionState::Stopping)
+        {
+            if (error)
+                *error = initialization_error_;
+            return false;
+        }
+        if (compaction_status_.state == CompactionState::Idle)
+        {
+            compaction_status_.state = CompactionState::Scheduled;
+            compaction_changed_.notify_all();
+        }
+        return true;
     }
 
-    bool DiskPrefixStorageBackend::rewriteArchiveLocked(
-        int source_fd,
-        std::string *error)
+    bool DiskPrefixStorageBackend::requestCompaction(std::string *error)
     {
-        const std::filesystem::path temporary =
-            archive_path_.string() + ".compact." + std::to_string(::getpid());
+        std::lock_guard lock(mutex_);
+        return scheduleCompactionLocked(error);
+    }
+
+    DiskPrefixStorageBackend::CompactionStatus
+    DiskPrefixStorageBackend::compactionStatus() const
+    {
+        std::lock_guard lock(mutex_);
+        return compaction_status_;
+    }
+
+    bool DiskPrefixStorageBackend::waitForCompaction(std::string *error)
+    {
+        std::unique_lock lock(mutex_);
+        compaction_changed_.wait(lock, [this]
+        {
+            return compaction_status_.state == CompactionState::Idle ||
+                   compaction_status_.state == CompactionState::Failed ||
+                   compaction_status_.state == CompactionState::Stopping;
+        });
+        if (!ready_ && error)
+            *error = initialization_error_;
+        return ready_ && compaction_status_.state == CompactionState::Idle;
+    }
+
+    void DiskPrefixStorageBackend::maintainArchive(std::stop_token stop) noexcept
+    {
+        std::unique_lock lock(mutex_);
+        while (compaction_changed_.wait(lock, stop, [this]
+                   { return compaction_status_.state == CompactionState::Scheduled; }))
+        {
+            compaction_status_.state = CompactionState::Copying;
+            lock.unlock();
+            std::string error;
+            CompactionOutcome outcome = CompactionOutcome::Failed;
+            try
+            {
+                outcome = rewriteArchive(stop, &error);
+            }
+            catch (const std::exception &exception)
+            {
+                error = exception.what();
+            }
+            catch (...)
+            {
+                error = "unknown exception in prefix archive maintenance";
+            }
+            lock.lock();
+            if (outcome == CompactionOutcome::Failed)
+            {
+                // A failed native operation is retained by the archive itself,
+                // not disguised as a successful append or a second cache path.
+                ready_ = false;
+                initialization_error_ = "prefix archive compaction failed: " + error;
+                compaction_status_.state = CompactionState::Failed;
+                compaction_changed_.notify_all();
+                return;
+            }
+            if (stop.stop_requested())
+                break;
+            compaction_status_.state = CompactionState::Idle;
+            compaction_changed_.notify_all();
+        }
+        compaction_status_.state = CompactionState::Stopping;
+        compaction_changed_.notify_all();
+    }
+
+    DiskPrefixStorageBackend::CompactionOutcome
+    DiskPrefixStorageBackend::rewriteArchive(std::stop_token stop, std::string *error)
+    {
+        // Only copying needs this lease. Appends and reads use the separate,
+        // short-held archive lock and cannot queue behind a full-file rewrite.
+        AdvisoryLock copier_lock(
+            archive_path_.string() + ".compact.lock",
+            AdvisoryLock::Acquisition::TryExclusive);
+        if (!copier_lock.locked())
+        {
+            if (copier_lock.error() == EWOULDBLOCK)
+                return CompactionOutcome::PeerOwned;
+            if (error)
+                *error = "failed to acquire prefix compaction lease: " +
+                         std::string(std::strerror(copier_lock.error()));
+            return CompactionOutcome::Failed;
+        }
+
+        FileDescriptor source;
+        std::vector<RecordIndex> snapshot;
+        uint64_t copied_end = 0;
+        uint64_t source_device = 0;
+        uint64_t source_inode = 0;
+        {
+            std::lock_guard lock(mutex_);
+            AdvisoryLock archive_lock(lock_path_);
+            source = FileDescriptor(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
+            if (!archive_lock.locked() || !source ||
+                !refreshIndexLocked(source.get(), error))
+            {
+                if (error && error->empty())
+                    *error = errnoMessage("failed to snapshot prefix archive");
+                return CompactionOutcome::Failed;
+            }
+            snapshot.reserve(records_.size());
+            for (const auto &[key, record] : records_)
+            {
+                (void)key;
+                snapshot.push_back(record);
+            }
+            copied_end = scan_offset_;
+            source_device = archive_device_;
+            source_inode = archive_inode_;
+        }
+
+        TemporaryArchive temporary(
+            archive_path_.string() + ".compact." + std::to_string(::getpid()));
         FileDescriptor destination(::open(
-            temporary.c_str(),
-            O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC,
+            temporary.path().c_str(),
+            O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC | O_DSYNC,
             0600));
         if (!destination)
         {
             if (error)
                 *error = errnoMessage("failed to create compact prefix archive");
-            return false;
+            return CompactionOutcome::Failed;
         }
 
+        // Validate the actual kernel write contract before producing any bulk
+        // output. This follows the filesystem's backing write path, including
+        // OverlayFS, instead of flushing its potentially empty logical mapping.
+        PrefixArchiveMaintenanceWriter maintenance_writer(destination.get());
         std::array<uint8_t, kArchiveHeaderBytes> header{};
-        if (!preadAll(source_fd, header.data(), header.size(), 0) ||
-            !writeAll(destination.get(), header.data(), header.size()))
+        if (!preadAll(source.get(), header.data(), header.size(), 0))
         {
             if (error)
                 *error = "failed to copy prefix archive header during compaction";
-            (void)::unlink(temporary.c_str());
-            return false;
+            return CompactionOutcome::Failed;
         }
 
-        std::vector<const RecordIndex *> ordered;
-        ordered.reserve(records_.size());
-        for (const auto &[key, record] : records_)
-        {
-            (void)key;
-            ordered.push_back(&record);
-        }
+        if (!maintenance_writer.write(std::as_bytes(std::span(header)), error))
+            return CompactionOutcome::Failed;
+
+        // Source offsets make the disk walk sequential. Each descriptor refers
+        // to immutable committed bytes, even when another writer evicts the key.
         std::sort(
-            ordered.begin(),
-            ordered.end(),
-            [](const RecordIndex *lhs, const RecordIndex *rhs)
+            snapshot.begin(), snapshot.end(),
+            [](const RecordIndex &lhs, const RecordIndex &rhs)
             {
-                return lhs->sequence < rhs->sequence;
+                return lhs.record_offset < rhs.record_offset;
             });
 
-        for (const RecordIndex *record : ordered)
+        // A completed range is not a published archive. Keep these outcomes
+        // separate so cancellation cannot claim the final inode transition.
+        enum class CopyOutcome { Complete, Cancelled, Failed };
+        const auto copy_range = [&](uint64_t source_offset, uint64_t remaining)
         {
-            uint64_t remaining = record->record_bytes;
-            uint64_t source_offset = record->record_offset;
+            uint8_t *const scratch = archive_scratch_.data() +
+                PrefixArchiveIOGeometry::verificationBytes();
             while (remaining > 0)
             {
+                if (stop.stop_requested())
+                    return CopyOutcome::Cancelled;
                 const size_t chunk = static_cast<size_t>(
-                    std::min<uint64_t>(remaining, archive_scratch_.size()));
-                if (!preadAll(
-                        source_fd,
-                        archive_scratch_.data(),
-                        chunk,
-                        source_offset) ||
-                    !writeAll(destination.get(), archive_scratch_.data(), chunk))
+                    std::min<uint64_t>(remaining,
+                        PrefixArchiveIOGeometry::compactionBytes()));
+                if (!preadAll(source.get(), scratch, chunk, source_offset))
                 {
                     if (error)
                         *error = "failed to copy active prefix record during compaction";
-                    (void)::unlink(temporary.c_str());
-                    return false;
+                    return CopyOutcome::Failed;
                 }
+                if (!maintenance_writer.write(std::as_bytes(std::span(scratch, chunk)), error))
+                    return CopyOutcome::Failed;
+                // Native O_DSYNC completion bounds this worker to one dirty
+                // chunk. Only maintenance waits; inference keeps the source
+                // inode and small capacity appends cannot inherit a bulk tail.
                 source_offset += chunk;
                 remaining -= chunk;
             }
-        }
+            return CopyOutcome::Complete;
+        };
 
-        /*
-         * The copied put records retain their original sequence fields. Append
-         * compact touch records in current LRU order so a restart reconstructs
-         * the same recency ordering instead of reverting to historical put
-         * order after compaction.
-         */
-        for (const RecordIndex *record : ordered)
+        for (const RecordIndex &record : snapshot)
         {
-            if (!appendTouchLocked(
-                    destination.get(),
-                    record->handle.key,
-                    error))
-            {
-                (void)::unlink(temporary.c_str());
-                return false;
-            }
+            const auto outcome = copy_range(record.record_offset, record.record_bytes);
+            if (outcome != CopyOutcome::Complete)
+                return outcome == CopyOutcome::Cancelled
+                    ? CompactionOutcome::Cancelled : CompactionOutcome::Failed;
         }
 
-        if (::fsync(destination.get()) != 0 ||
-            ::rename(temporary.c_str(), archive_path_.c_str()) != 0)
+        // Touches use snapshotted authoritative sequences. In particular they
+        // never advance scan_offset_/next_sequence_ in the live source index.
+        for (const RecordIndex &record : snapshot)
+        {
+            uint64_t touch_bytes = 0;
+            if (!appendTouchRecord(destination.get(), record.handle.key,
+                    record.sequence, &touch_bytes, error))
+                return CompactionOutcome::Failed;
+        }
+
+        // Catch up only complete committed records. A writer may append while
+        // this worker copies/fsyncs; the next short inspection captures that
+        // tail. Publication is allowed only at an identical committed frontier.
+        for (;;)
+        {
+            if (stop.stop_requested())
+                return CompactionOutcome::Cancelled;
+            // Every bulk write already completed on the background worker.
+            // The final file fsync still owns the complete archive's durability
+            // before the short committed-frontier inspection and publication.
+            if (::fsync(destination.get()) != 0)
+            {
+                if (error)
+                    *error = errnoMessage("failed to commit compact prefix archive");
+                return CompactionOutcome::Failed;
+            }
+            uint64_t next_end = 0;
+            {
+                std::lock_guard lock(mutex_);
+                AdvisoryLock archive_lock(lock_path_);
+                FileDescriptor current(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
+                if (!archive_lock.locked() || !current ||
+                    !refreshIndexLocked(current.get(), error))
+                    return CompactionOutcome::Failed;
+                if (archive_device_ != source_device || archive_inode_ != source_inode ||
+                    scan_offset_ < copied_end)
+                {
+                    if (error)
+                        *error = "prefix compaction source changed outside its writer lease";
+                    return CompactionOutcome::Failed;
+                }
+                next_end = scan_offset_;
+                if (next_end == copied_end)
+                {
+                    compaction_status_.state = CompactionState::Publishing;
+                    if (::rename(temporary.path().c_str(), archive_path_.c_str()) != 0)
+                    {
+                        if (error)
+                            *error = errnoMessage("failed to publish compact prefix archive");
+                        return CompactionOutcome::Failed;
+                    }
+                    // Index refresh is metadata-only. Retained hydration tickets
+                    // still own source, so no reader loses its verified payload.
+                    if (!refreshIndexLocked(destination.get(), error))
+                        return CompactionOutcome::Failed;
+                    ++compaction_status_.publications;
+                    compaction_status_.last_executor = std::this_thread::get_id();
+                    compaction_status_.last_writeback = maintenance_writer.evidence();
+                    break;
+                }
+            }
+            const auto outcome = copy_range(copied_end, next_end - copied_end);
+            if (outcome != CopyOutcome::Complete)
+                return outcome == CopyOutcome::Cancelled
+                    ? CompactionOutcome::Cancelled : CompactionOutcome::Failed;
+            copied_end = next_end;
+        }
+
+        // Durability belongs to the published directory entry as well as the
+        // already-fsynced file. Neither writeback is done under cache locks.
+        FileDescriptor directory(::open(
+            archive_path_.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        if (!directory || ::fsync(directory.get()) != 0)
         {
             if (error)
-                *error = errnoMessage("failed to publish compact prefix archive");
-            (void)::unlink(temporary.c_str());
-            return false;
+                *error = errnoMessage("failed to persist prefix archive publication");
+            return CompactionOutcome::Failed;
         }
 
-        /*
-         * The active index points into the old inode. Mark it invalid so the
-         * next operation rescans the newly renamed archive before reading.
-         */
-        archive_device_ = 0;
-        archive_inode_ = 0;
-        scan_offset_ = 0;
-        return true;
+        // Observability is emitted after unlocking; it cannot make publication
+        // wait for profiling or turn counters into the storage authority.
+        PerfStatsCollector::addCounter(
+            "prefix_archive", "background_compactions", 1.0,
+            "maintenance", "disk",
+            {{"source_bytes", std::to_string(copied_end)},
+             {"published_bytes", std::to_string(fileSize(destination.get()))},
+             {"authority", "archive_worker"}});
+        return CompactionOutcome::Published;
     }
 } // namespace llaminar2

@@ -8,6 +8,10 @@
  * Provides:
  * - ICUDARingKVCache::append(ITensor*) implementation
  * - CUDARingKVCache<>::get_k() and get_v() implementations using GpuTensorView
+ *
+ * Contiguous observations borrow explicitly bound workspace. Scalar RoPE
+ * conversion uses the same native-ring reader as captured grouped attention;
+ * it neither allocates per-layer temporary payloads nor grows storage on read.
  */
 
 #include "CUDARingKVCache.h"
@@ -723,18 +727,6 @@ namespace llaminar2
     // get_kv_converted(): FP16 shadow buffers with optional RoPE
     // =========================================================================
 
-    extern "C" bool cuda_rope_apply_fp16(
-        __half *d_K, int count,
-        int n_kv_heads, int head_dim,
-        float rope_theta, int position_start,
-        cudaStream_t stream, int rope_dim = 0);
-
-    extern "C" bool cuda_rope_apply_fp32(
-        float *d_K, int count,
-        int n_kv_heads, int head_dim,
-        float rope_theta, int position_start,
-        cudaStream_t stream, int rope_dim = 0);
-
     template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::ensureRoPEShadow(int layer, int seq_idx)
     {
@@ -796,7 +788,6 @@ namespace llaminar2
             return false;
         }
 
-        const auto &entry = entries_[layer][seq_idx];
         KVCacheSequenceState state;
         if (!observeDeviceSequenceState(layer, seq_idx, &state))
             return false;
@@ -829,93 +820,30 @@ namespace llaminar2
         const cudaStream_t stream = getEffectiveStream(
             rope ? static_cast<cudaStream_t>(rope->gpu_stream) : nullptr);
 
+        /*
+         * Read the native ring directly through the production conversion ABI.
+         * This removes the second native-format temporary for FP32/BF16/Q8_1
+         * and keeps scalar diagnostic arithmetic aligned with captured reads.
+         * The output pair remains graph-workspace-owned, so subsequent readers
+         * must be ordered after consumption or have an exclusive workspace.
+         */
+        KVReadParams grouped_read = *rope;
+        grouped_read.gpu_stream = stream;
+        grouped_read.n_kv_heads = local_n_kv_heads_;
+        grouped_read.head_dim = head_dim_;
+        ITensor *grouped_k = nullptr;
+        ITensor *grouped_v = nullptr;
+        if (!get_kv_batched_converted_device_view(
+                layer, seq_idx, 1, ActivationPrecision::FP16,
+                &grouped_k, &grouped_v, grouped_read))
+            return false;
+
         ensureRoPEShadow(layer, seq_idx);
         auto &shadow = rope_shadows_[layer][seq_idx];
         if (!shadow.d_K || !shadow.d_V || read_count > max_seq_len_)
         {
             LOG_ERROR("[CUDARingKVCache::get_kv_converted] Scalar conversion storage is unavailable");
             return false;
-        }
-
-        /*
-         * This API is deliberately a complete observation-boundary rebuild.
-         * Incremental validity cannot be inferred from host counters once graph
-         * replay owns append/publication. The production grouped API performs
-         * its fixed-shape conversion directly from canonical device metadata.
-         */
-        if constexpr (Precision == ActivationPrecision::FP16)
-        {
-            launch_linearize_kernel(
-                entry, state.implementation_head, read_count,
-                shadow.d_K, shadow.d_V, stream);
-            if (!cuda_rope_apply_fp16(
-                    shadow.d_K, read_count, local_n_kv_heads_, head_dim_,
-                    rope->rope_theta, rope->position_start, stream,
-                    rope->rope_dim))
-                return false;
-        }
-        else if constexpr (Precision == ActivationPrecision::FP32)
-        {
-            auto *d_temp_k = entry.d_K_scratch;
-            auto *d_temp_v = entry.d_V_scratch;
-            launch_linearize_kernel(
-                entry, state.implementation_head, read_count,
-                d_temp_k, d_temp_v, stream);
-            if (!cuda_rope_apply_fp32(
-                    d_temp_k, read_count, local_n_kv_heads_, head_dim_,
-                    rope->rope_theta, rope->position_start, stream,
-                    rope->rope_dim) ||
-                !cuda_convert_tensor_to_fp16(
-                    d_temp_k, TensorType::FP32,
-                    reinterpret_cast<uint16_t *>(shadow.d_K),
-                    read_count * kv_dim_, stream) ||
-                !cuda_convert_tensor_to_fp16(
-                    d_temp_v, TensorType::FP32,
-                    reinterpret_cast<uint16_t *>(shadow.d_V),
-                    read_count * kv_dim_, stream))
-                return false;
-        }
-        else if constexpr (Precision == ActivationPrecision::Q8_1)
-        {
-            auto *d_temp_k = entry.d_K_scratch;
-            auto *d_temp_v = entry.d_V_scratch;
-            launch_linearize_kernel(
-                entry, state.implementation_head, read_count,
-                d_temp_k, d_temp_v, stream);
-            if (!cuda_convert_tensor_to_fp16(
-                    d_temp_k, TensorType::Q8_1,
-                    reinterpret_cast<uint16_t *>(shadow.d_K),
-                    read_count * kv_dim_, stream) ||
-                !cuda_convert_tensor_to_fp16(
-                    d_temp_v, TensorType::Q8_1,
-                    reinterpret_cast<uint16_t *>(shadow.d_V),
-                    read_count * kv_dim_, stream) ||
-                !cuda_rope_apply_fp16(
-                    shadow.d_K, read_count, local_n_kv_heads_, head_dim_,
-                    rope->rope_theta, rope->position_start, stream,
-                    rope->rope_dim))
-                return false;
-        }
-        else if constexpr (Precision == ActivationPrecision::BF16)
-        {
-            auto *d_temp_k = entry.d_K_scratch;
-            auto *d_temp_v = entry.d_V_scratch;
-            launch_linearize_kernel(
-                entry, state.implementation_head, read_count,
-                d_temp_k, d_temp_v, stream);
-            if (!cuda_convert_tensor_to_fp16(
-                    d_temp_k, TensorType::BF16,
-                    reinterpret_cast<uint16_t *>(shadow.d_K),
-                    read_count * kv_dim_, stream) ||
-                !cuda_convert_tensor_to_fp16(
-                    d_temp_v, TensorType::BF16,
-                    reinterpret_cast<uint16_t *>(shadow.d_V),
-                    read_count * kv_dim_, stream) ||
-                !cuda_rope_apply_fp16(
-                    shadow.d_K, read_count, local_n_kv_heads_, head_dim_,
-                    rope->rope_theta, rope->position_start, stream,
-                    rope->rope_dim))
-                return false;
         }
 
         if (cudaGetLastError() != cudaSuccess)

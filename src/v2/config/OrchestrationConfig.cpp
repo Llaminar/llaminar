@@ -291,13 +291,20 @@ namespace llaminar2
 
         bool sameDomainIntentAfterHardwareBinding(
             const ExecutionDomainDefinition &requested,
-            const ExecutionDomainDefinition &resolved)
+            const ExecutionDomainDefinition &resolved,
+            std::size_t routed_tier_count)
         {
+            // Only automatic intent may become a different physical spelling.
+            // Recompute its exact authorized result from the resolved topology;
+            // accepting any concrete mode here would erase explicit intent.
+            auto expected_compute = resolved;
+            expected_compute.routed_compute_policy = requested.routed_compute_policy;
             if (requested.name != resolved.name ||
                 requested.participants.size() != resolved.participants.size() ||
                 !sameWeights(requested.weights, resolved.weights) ||
                 requested.backend != resolved.backend ||
-                requested.routed_compute_policy != resolved.routed_compute_policy ||
+                expected_compute.resolveRoutedComputePolicy(routed_tier_count) !=
+                    resolved.routed_compute_policy ||
                 requested.routed_phase_policy != resolved.routed_phase_policy ||
                 requested.routed_decode_assignment_policy !=
                     resolved.routed_decode_assignment_policy ||
@@ -680,8 +687,13 @@ namespace llaminar2
         std::vector<ExecutionDomainDefinition> inventory;
         std::unordered_map<std::string, size_t> index_by_name;
 
-        auto addDomain = [&](const ExecutionDomainDefinition &domain, const std::string &source)
+        auto addDomain = [&](ExecutionDomainDefinition domain, const std::string &source)
         {
+            // An omitted domain policy inherits the global request, including
+            // an explicit apportioned override. Keep Automatic unresolved until
+            // physical inventory establishes scope and participant ownership.
+            if (domain.routed_compute_policy == RoutedExpertComputePolicy::Unspecified)
+                domain.routed_compute_policy = config.routed_expert_compute_policy;
             if (domain.name.empty())
             {
                 errors.push_back(source + " defines an execution domain with an empty name");
@@ -858,7 +870,8 @@ namespace llaminar2
             }
             if (!sameDomainIntentAfterHardwareBinding(
                     requested.toExecutionDomainDefinition(),
-                    found->second->toExecutionDomainDefinition()))
+                    found->second->toExecutionDomainDefinition(),
+                    config.moe_routed_expert_plan->routed_tiers.size()))
             {
                 errors.push_back(
                     "Hardware binding changed non-location intent for MoE overlay domain '" +
@@ -889,7 +902,8 @@ namespace llaminar2
 
             if (!sameDomainIntentAfterHardwareBinding(
                     existing->toExecutionDomainDefinition(),
-                    resolved_definition))
+                    resolved_definition,
+                    config.moe_routed_expert_plan->routed_tiers.size()))
             {
                 errors.push_back(
                     "Resolved MoE overlay domain '" + resolved.name +
@@ -905,6 +919,16 @@ namespace llaminar2
 
         config.moe_routed_expert_plan = std::move(resolved_plan);
         config.domain_definitions = std::move(installed_domains);
+        if (config.routed_expert_compute_policy == RoutedExpertComputePolicy::Automatic)
+        {
+            // The installed domains own overlay physical policy. The ordinary
+            // runtime field must also be concrete: a single domain shares its
+            // exact choice; a multi-tier plan retains whole-expert semantics.
+            config.routed_expert_compute_policy =
+                config.moe_routed_expert_plan->domains.size() == 1
+                    ? config.moe_routed_expert_plan->domains.front().routed_compute_policy
+                    : RoutedExpertComputePolicy::Apportioned;
+        }
 
         if (origin ==
             MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP)

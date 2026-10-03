@@ -20,6 +20,13 @@
  * Backend-specific GEMM implementations live in separate files:
  *   - ROCmQuantisedGemmKernel_INT8_VNNI.hip : INT8 VNNI prefill kernels (gfx906)
  *
+ * Prefill's canonical 32-value activation blocks use a register-only producer:
+ * eight lanes retain four values each through reduction and byte publication.
+ * No shared-memory atomic loop, input reread, or extra workspace is required.
+ * Scale words and INT8 rounding remain the serial decode contract. Tiny rows
+ * retain their independently measured decode geometry; this is not a change
+ * to a weight format, activation precision, or consuming GEMM arithmetic.
+ *
  * @author David Sanftenberg
  * @date February 2026
  */
@@ -999,6 +1006,120 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
     }
 }
 
+/**
+ * @brief Publish Q8 blocks in one pass, without atomic maxima or shared memory.
+ *
+ * Eight neighbouring lanes own one complete 32-value block. Keeping each
+ * lane's four inputs live avoids the former prefill producer's second load.
+ * All reductions stay inside that eight-lane group, including a partial final
+ * workgroup. Every nonempty group remains converged for its shuffles. Integer
+ * sums are exact; maximum reduction does not reassociate FP32 accumulation.
+ *
+ * @tparam Aligned Rows and base addresses permit vector loads/packed stores.
+ * @tparam WithSums Also publish the existing row-major INT32 block-sum ABI.
+ * @param input Row-major finite FP32 activations, rows by width.
+ * @param output Row-major INT8 payload with no padded row bytes.
+ * @param scales One serial-equivalent FP32 scale per row/32-value block.
+ * @param sums Optional row-major INT32 sums; unused when WithSums is false.
+ * @param rows Positive physical row count, fixed by the captured launch.
+ * @param width Positive physical row pitch, including a partial final block.
+ * @param blocks_per_row Ceiling of width divided by 32.
+ */
+template<bool Aligned, bool WithSums>
+__global__ __launch_bounds__(128, 4)
+void quantizeActivationsQ8_register_blocks_kernel(
+    const float *__restrict__ input, int8_t *__restrict__ output,
+    float *__restrict__ scales, int32_t *__restrict__ sums,
+    int rows, int width, int blocks_per_row)
+{
+    constexpr int lanes_per_block = 8;
+    const int group = (static_cast<int>(blockIdx.x) * 128 + threadIdx.x) / lanes_per_block;
+    if (group >= rows * blocks_per_row) return;
+    const int lane = threadIdx.x % lanes_per_block;
+    const int row = group / blocks_per_row;
+    const int column = (group % blocks_per_row) * 32 + lane * 4;
+    const size_t index = static_cast<size_t>(row) * width + column;
+    float4 values{};
+    if constexpr (Aligned)
+    {
+        if (column < width) values = *reinterpret_cast<const float4 *>(input + index);
+    }
+    else
+    {
+        values.x = column < width ? input[index] : 0.f;
+        values.y = column + 1 < width ? input[index + 1] : 0.f;
+        values.z = column + 2 < width ? input[index + 2] : 0.f;
+        values.w = column + 3 < width ? input[index + 3] : 0.f;
+    }
+    float maximum = fmaxf(fmaxf(fabsf(values.x), fabsf(values.y)),
+                          fmaxf(fabsf(values.z), fabsf(values.w)));
+#pragma unroll
+    for (int offset = 4; offset > 0; offset /= 2)
+        maximum = fmaxf(maximum, __shfl_xor(maximum, offset, lanes_per_block));
+    const float scale = llaminar2::rocm::decode_equivalent::q8Scale(maximum);
+    const float inverse = 1.f / scale;
+    if (lane == 0) scales[group] = scale;
+    const int q0 = llaminar2::rocm::decode_equivalent::quantizeQ8(values.x, inverse);
+    const int q1 = llaminar2::rocm::decode_equivalent::quantizeQ8(values.y, inverse);
+    const int q2 = llaminar2::rocm::decode_equivalent::quantizeQ8(values.z, inverse);
+    const int q3 = llaminar2::rocm::decode_equivalent::quantizeQ8(values.w, inverse);
+    if constexpr (Aligned)
+    {
+        if (column < width)
+            *reinterpret_cast<uint32_t *>(output + index) = uint32_t(uint8_t(q0)) |
+                (uint32_t(uint8_t(q1)) << 8) | (uint32_t(uint8_t(q2)) << 16) |
+                (uint32_t(uint8_t(q3)) << 24);
+    }
+    else
+    {
+        if (column < width) output[index] = static_cast<int8_t>(q0);
+        if (column + 1 < width) output[index + 1] = static_cast<int8_t>(q1);
+        if (column + 2 < width) output[index + 2] = static_cast<int8_t>(q2);
+        if (column + 3 < width) output[index + 3] = static_cast<int8_t>(q3);
+    }
+    if constexpr (WithSums)
+    {
+        // Tail values are zero and contribute no bytes or integer sum. This
+        // preserves the original row-major sum pitch for asymmetric codebooks.
+        int sum = q0 + q1 + q2 + q3;
+#pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2)
+            sum += __shfl_xor(sum, offset, lanes_per_block);
+        if (lane == 0) sums[group] = sum;
+    }
+}
+
+/**
+ * @brief Select vector versus scalar tail geometry before capture, never in it.
+ * @tparam WithSums Whether the consuming codebook requires integer block sums.
+ * @param input Borrowed row-major FP32 source, including unaligned views.
+ * @param output Borrowed INT8 destination with the same row extent.
+ * @param scales Borrowed per-row block-scale destination.
+ * @param sums Borrowed block-sum destination when WithSums is true.
+ * @param rows Positive physical rows; no host live-count readback is involved.
+ * @param width Physical row stride, which may be unaligned or partially blocked.
+ * @param stream Exact non-null producer stream inherited from the caller.
+ */
+template<bool WithSums>
+static void launchRegisterBlockQuantization(
+    const float *input, int8_t *output, float *scales, int32_t *sums,
+    int rows, int width, hipStream_t stream)
+{
+    const int blocks_per_row = (width + 31) / 32;
+    const dim3 grid((rows * blocks_per_row + 15) / 16);
+    // A legal unaligned tensor view must not become an unaligned float4 read.
+    // Pointer identity and width already belong to the enclosing captured graph.
+    const bool aligned = width % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(input) % alignof(float4) == 0 &&
+        reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) == 0;
+    if (aligned)
+        hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<true, WithSums>),
+            grid, dim3(128), 0, stream, input, output, scales, sums, rows, width, blocks_per_row);
+    else
+        hipLaunchKernelGGL((quantizeActivationsQ8_register_blocks_kernel<false, WithSums>),
+            grid, dim3(128), 0, stream, input, output, scales, sums, rows, width, blocks_per_row);
+}
+
 // ============================================================================
 // DISPATCH FUNCTIONS
 // ============================================================================
@@ -1064,6 +1185,13 @@ extern "C"
         if (M <= 0 || K <= 0)
             return true;
 
+        if (!stream || !d_A_fp32 || !d_A_int8 || !d_scales_blockwise)
+        {
+            fprintf(stderr, "[rocmQuantGemm_quantizeActivationsBlockwise] "
+                    "Nonempty quantization requires buffers and an explicit stream\n");
+            return false;
+        }
+
         hipStream_t s = static_cast<hipStream_t>(stream);
 
         // For non-standard block sizes, use the generic kernel
@@ -1104,17 +1232,25 @@ extern "C"
         const int blocks_per_row = (K + QUANT_BLOCK - 1) / QUANT_BLOCK;
         const int total_blocks = M * blocks_per_row;
 
-        // variant=0 (auto): M=1 → V4 (best latency), M≤64 → V2 (multi-block), M≥128 → V5 (vec4)
+        // Keep the independently measured small-row decoder unchanged. Larger
+        // batches use one-pass register blocks. Manual variants remain explicit
+        // diagnostic comparisons; auto never tries one kernel after another.
         int variant = llaminar2::debugEnv().rocm.blockwise_quant_variant;
         if (variant == 0)
         {
             if (M <= 1)      variant = 4;  // V4: Minimal WG, best single-row latency
-            else if (M <= 64) variant = 2;  // V2: Multi-block, amortized launch overhead
-            else              variant = 5;  // V5: Two-pass vec4, bandwidth-dominated
+            else if (M <= 16) variant = 2;  // V2: Retained grouped decode geometry
+            else              variant = 6;  // Register-owned, one-pass prefill
         }
 
         switch (variant)
         {
+        case 6:
+        {
+            launchRegisterBlockQuantization<false>(
+                d_A_fp32, d_A_int8, d_scales_blockwise, nullptr, M, K, s);
+            break;
+        }
         case 2:
         {
             // V2: Multi-block per workgroup (8 blocks × 32 threads = 256)
@@ -1208,6 +1344,13 @@ extern "C"
         if (M <= 0 || K <= 0)
             return true;
 
+        if (!stream || !d_A_fp32 || !d_A_int8 || !d_scales_blockwise)
+        {
+            fprintf(stderr, "[rocmQuantGemm_quantizeActivationsBlockwiseWithSums] "
+                    "Nonempty quantization requires buffers and an explicit stream\n");
+            return false;
+        }
+
         if (block_size != 32)
         {
             fprintf(stderr,
@@ -1219,11 +1362,16 @@ extern "C"
         constexpr int QUANT_BLOCK = 32;
         const int blocks_per_row = (K + QUANT_BLOCK - 1) / QUANT_BLOCK;
         const int total_blocks = M * blocks_per_row;
-        hipLaunchKernelGGL(
-            quantizeActivationsQ8_blockwise_v4_with_sums_kernel,
-            dim3(total_blocks, 1, 1), dim3(32, 1, 1), 0, static_cast<hipStream_t>(stream),
-            d_A_fp32, d_A_int8, d_scales_blockwise, d_sums_blockwise,
-            M, K, blocks_per_row);
+        if (M > 16)
+            launchRegisterBlockQuantization<true>(
+                d_A_fp32, d_A_int8, d_scales_blockwise, d_sums_blockwise,
+                M, K, static_cast<hipStream_t>(stream));
+        else
+            hipLaunchKernelGGL(
+                quantizeActivationsQ8_blockwise_v4_with_sums_kernel,
+                dim3(total_blocks, 1, 1), dim3(32, 1, 1), 0, static_cast<hipStream_t>(stream),
+                d_A_fp32, d_A_int8, d_scales_blockwise, d_sums_blockwise,
+                M, K, blocks_per_row);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)

@@ -14,6 +14,7 @@
 
 #include "../backends/GlobalDeviceAddress.h"
 #include "../execution/mpi_orchestration/DeviceInventory.h"
+#include "../backends/PeerAccessCoverage.h"
 
 #include <vector>
 
@@ -46,5 +47,17 @@ namespace llaminar2
         const std::vector<GlobalDeviceAddress> &participants,
         int mpi_rank,
         int mpi_world_size);
+
+    /** @brief Project canonical observed directed P2P facts onto an exact local GPU subset.
+     * @param inventory This rank's authenticated discovery observation.
+     * @param devices Ordered, distinct homogeneous physical endpoints on that rank.
+     * @return None only when every directed off-diagonal edge is observed disabled.
+     * @throws std::invalid_argument For missing/malformed facts, foreign or repeated devices.
+     *
+     * Matrix indices follow backend-filtered inventory order, not device ordinal.
+     * This pure projection never re-probes hardware or infers connectivity from timings.
+     */
+    [[nodiscard]] PeerAccessCoverage localTPPeerAccessCoverage(
+        const RankInventory &inventory, const std::vector<DeviceId> &devices);
 
 } // namespace llaminar2

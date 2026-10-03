@@ -1160,6 +1160,13 @@ namespace llaminar2
             }
         }
 
+        // Scope and exact rank ownership now come from observed inventory.
+        // Seal automatic physical compute before capacity/BOM or graph users
+        // can see the plan. Explicit modes pass through unchanged.
+        for (auto &domain : bound->domains)
+            domain.routed_compute_policy = domain.toExecutionDomainDefinition()
+                .resolveRoutedComputePolicy(bound->routed_tiers.size());
+
         /* Automatic policy is deliberately finalized only after hardware
          * binding. Before this point AUTO scope cannot distinguish a LocalTP
          * group, which benefits from complete decode replicas, from NodeTP or

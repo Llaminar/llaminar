@@ -91,6 +91,7 @@ class PreCommitHookTests(unittest.TestCase):
                 self.assertEqual(calls[1]["args"], [
                     "-B", build, "-S", str(root / "src/v2"), "-G", "Ninja",
                     "-DCMAKE_BUILD_TYPE=Integration",
+                    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                     f"-DCMAKE_MAKE_PROGRAM:FILEPATH={tools / 'ninja'}",
                     "-DLLAMINAR_BUILD_TESTS=ON", "-DHAVE_CUDA=ON", "-DHAVE_ROCM=ON",
                 ])
@@ -104,6 +105,13 @@ class PreCommitHookTests(unittest.TestCase):
                 self.assertEqual(calls[4]["args"], common + ["-L", "^ProductionTestPreflight$"])
                 for call in calls[1:]:
                     self.assertEqual(call["cwd"], str(root))
+
+    def test_compiler_metadata_is_explicitly_regenerated(self):
+        """A stale cache cannot disable the compile database used by SDK audits."""
+        result, calls, _, _ = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        configure = calls[1]["args"]
+        self.assertEqual(configure.count("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"), 1)
 
     def test_each_failure_blocks_later_phases(self):
         """Configure/build/Unit/preflight failures all propagate to Git."""

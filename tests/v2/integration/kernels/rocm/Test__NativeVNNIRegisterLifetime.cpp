@@ -103,8 +103,33 @@ uint32_t mixed(uint32_t v)
     return v ^ (v >> 16);
 }
 
-/** @brief Prove grouped bytes and guard tails across twenty captured replays. */
-void verify(int codebook, int payload_bytes, int m, int n, int k)
+/** @brief Production activation-scaling contracts, including the null block plane. */
+enum class ActivationScaleMode
+{
+    Blockwise, ///< One independent scale per row and 32-element K block.
+    WholeRow   ///< One row scale; the optional block-scale pointer is absent.
+};
+
+/** @brief Distinguish ordinary row scales from IEEE-754 zero-edge witnesses. */
+enum class RowScaleProfile
+{
+    Nonzero,   ///< Independent positive scales exercise partition rounding.
+    SignedZero ///< Alternate negative and positive zero without changing inputs.
+};
+
+/**
+ * @brief Prove grouped bytes and guard tails across twenty captured replays.
+ * @param codebook Concrete execution format, including stable migration aliases.
+ * @param payload_bytes Physical bytes in one codebook's 32-element block.
+ * @param m Live activation rows.
+ * @param n Live output columns, including non-tile-aligned tails.
+ * @param k Admitted activation width, divisible by the quantization block width.
+ * @param scale_mode Production whole-row or blockwise activation scale contract.
+ * @param row_scale_profile Nontrivial rounding inputs or IEEE-754 zero witnesses.
+ */
+void verify(int codebook, int payload_bytes, int m, int n, int k,
+            ActivationScaleMode scale_mode,
+            RowScaleProfile row_scale_profile = RowScaleProfile::Nonzero)
 {
     const int blocks = k / 32;
     const size_t weight_blocks = static_cast<size_t>(blocks) * n;
@@ -130,6 +155,10 @@ void verify(int codebook, int payload_bytes, int m, int n, int k)
         activation[i] = static_cast<int>(mixed(i + 389) % 255) - 127;
     for (size_t i = 0; i < a_scales.size(); ++i)
         a_scales[i] = static_cast<float>(1 + mixed(i + 7) % 31) / 256;
+    for (size_t i = 0; i < row_scales.size(); ++i)
+        row_scales[i] = row_scale_profile == RowScaleProfile::SignedZero
+            ? (i % 2 == 0 ? -0.0f : 0.0f)
+            : static_cast<float>(1 + mixed(i + 19) % 31) / 256;
 
     Storage<uint8_t> p(payload.size());
     Storage<uint16_t> s(weight_blocks), secondary_s(weight_blocks);
@@ -156,11 +185,15 @@ void verify(int codebook, int payload_bytes, int m, int n, int k)
                 launched &= rocmGemv_native_vnni_fp32(
                     a.data + row * k, p.data, s.data, secondary_s.data, em.data,
                     destination + row * n, sr.data + row, partials.data,
-                    n, k, static_cast<uint8_t>(codebook), 0, stream, sa.data + row * blocks);
+                    n, k, static_cast<uint8_t>(codebook), 0, stream,
+                    scale_mode == ActivationScaleMode::Blockwise
+                        ? sa.data + row * blocks : nullptr);
         else
             launched = rocmGemm_native_vnni_fp32(
                 a.data, p.data, s.data, secondary_s.data, em.data, destination,
-                sr.data, sa.data, m, n, k, static_cast<uint8_t>(codebook), 0, stream);
+                sr.data,
+                scale_mode == ActivationScaleMode::Blockwise ? sa.data : nullptr,
+                m, n, k, static_cast<uint8_t>(codebook), 0, stream);
         hipGraph_t graph = nullptr;
         checked(hipStreamEndCapture(stream, &graph));
         const auto status = hipGraphInstantiate(&execution.graphs[path], graph, nullptr, nullptr, 0);
@@ -183,6 +216,38 @@ void verify(int codebook, int payload_bytes, int m, int n, int k)
     }
     for (size_t i = output_size - 8; i < output_size; ++i)
         ASSERT_EQ(std::bit_cast<uint32_t>(candidate[i]), 0x5a5a5a5aU);
+}
+
+/** @brief The serial reducer's initial positive zero is part of its byte contract. */
+TEST(ROCmNativeVNNIRegisterLifetime, WholeRowSignedZeroKeepsSerialReducerOrigin)
+{
+    llaminar2::requireROCmRuntimeStartup();
+    int devices = 0;
+    checked(hipGetDeviceCount(&devices));
+    ASSERT_GT(devices, 0);
+    checked(hipSetDevice(0));
+    using namespace llaminar2;
+    for (auto initialize : {rocmInitIQGridTables, rocmInitIQGridTables_gemm})
+        ASSERT_TRUE(initialize(0, iq3s_grid, iq3xxs_grid, iq2s_grid,
+                               iq2xs_grid, iq2xxs_grid, iq1s_grid));
+    std::map<int, int> formats;
+    for (const auto& source : native_vnni_formats::kAllSourceFormats)
+    {
+        const auto& format = *source.metadata;
+        formats.emplace(canonicalDeviceVnniCodebookId(format.codebook_id), format.payload_bytes);
+        const auto promoted = migrationStableDeviceVnniFormat(format);
+        formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
+    }
+    for (const auto& [codebook, payload_bytes] : formats)
+        for (int n : {1024, 16385})
+            for (int m : {1, 2, 16, 17})
+            {
+                SCOPED_TRACE(::testing::Message() << "codebook=" << codebook
+                    << " M=" << m << " N=" << n << " signed-zero row scales");
+                verify(codebook, payload_bytes, m, n, 256,
+                       ActivationScaleMode::WholeRow, RowScaleProfile::SignedZero);
+                if (::testing::Test::HasFatalFailure()) return;
+            }
 }
 } // namespace
 
@@ -214,10 +279,13 @@ TEST(ROCmNativeVNNIRegisterLifetime, CapturedAllFormatsMatchSerialRows)
                  std::pair{1024, 256}, std::pair{1025, 160},
                  std::pair{16384, 256}, std::pair{16385, 256}})
             for (int m : {1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65})
+                for (auto scale_mode : {ActivationScaleMode::Blockwise,
+                                        ActivationScaleMode::WholeRow})
             {
                 SCOPED_TRACE(::testing::Message() << "codebook=" << codebook
-                    << " M=" << m << " N=" << n << " K=" << k);
-                verify(codebook, payload_bytes, m, n, k);
+                    << " M=" << m << " N=" << n << " K=" << k
+                    << " scale_mode=" << static_cast<int>(scale_mode));
+                verify(codebook, payload_bytes, m, n, k, scale_mode);
                 if (::testing::Test::HasFatalFailure()) return;
             }
 }

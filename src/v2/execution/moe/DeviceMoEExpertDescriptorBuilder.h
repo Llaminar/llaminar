@@ -2,15 +2,18 @@
  * @file DeviceMoEExpertDescriptorBuilder.h
  * @brief Typed export of prepared expert engines into the runtime-table ABI.
  *
- * Prepared weights may be NativeVNNI or contiguous FP16/BF16/FP32.  Graph
- * builders and compute stages must classify the complete gate/up/down triple
- * identically, so this header owns the one conversion and geometry check used
- * by both call sites.
+ * Prepared weights may be NativeVNNI or contiguous FP16/BF16/FP32. Graph
+ * builders, compute stages and migration share one family/geometry validator.
+ * Whole experts require all three projections. Projection-partitioned domains
+ * publish an explicitly typed movable gate/up pair and keep fixed down slices
+ * outside that placement lifecycle. Rejection never partially mutates a bank.
  */
 
 #pragma once
 
 #include "MoERuntimeTable.h"
+#include "MoEExpertProjectionOwnership.h"
+#include "MoEOverlayPreparedExpertPayload.h"
 
 #include <array>
 
@@ -55,88 +58,78 @@ namespace llaminar2
         return output.valid();
     }
 
+    namespace moe_descriptor_detail
+    {
     /**
-     * @brief Export one complete, uniform routed-expert projection family.
-     *
-     * The three prepared engines must all export NativeVNNI descriptors or all
-     * export the same floating precision.  Mixed families are rejected because
-     * one captured grouped kernel and one migration byte contract own the
-     * expert.  Existing placement metadata in @p output is preserved; only the
-     * six pointer-bearing descriptors and @ref DeviceMoEExpertDescriptor::weight_format
-     * are replaced after the complete triple validates.
-     *
-     * @param gate Prepared gate projection engine.
-     * @param up Prepared up projection engine.
-     * @param down Prepared down projection engine.
-     * @param d_model Hidden width expected by gate/up and produced by down.
-     * @param intermediate Expert intermediate width produced by gate/up.
-     * @param output Runtime descriptor to populate.
-     * @return True when a complete supported family with exact geometry exists.
+     * @brief Validate an entire movable payload before replacing any descriptor.
+     * @param gate Prepared complete gate projection.
+     * @param up Prepared complete up projection.
+     * @param down Complete down engine, absent only for an explicit GateUp contract.
+     * @param projections Immutable projection set selected by the ownership plan.
+     * @param d_model Full original model width, never a local down-slice width.
+     * @param intermediate Full expert intermediate width.
+     * @param output Publication target; placement and allocation capacity survive.
+     * @return False without mutation for mixed families, missing engines or bad geometry.
      */
-    inline bool exportDeviceMoEExpertWeightDescriptors(
+    inline bool exportMovableWeights(
         ITensorGemm *gate,
         ITensorGemm *up,
         ITensorGemm *down,
+        DeviceMoEProjectionSet projections,
         int d_model,
         int intermediate,
         DeviceMoEExpertDescriptor &output) noexcept
     {
-        if (!gate || !up || !down || d_model <= 0 || intermediate <= 0)
+        const bool complete = projections == DeviceMoEProjectionSet::CompleteExpert;
+        if (!deviceMoEProjectionSetValid(projections) || !gate || !up ||
+            (complete ? down == nullptr : down != nullptr) ||
+            d_model <= 0 || intermediate <= 0)
             return false;
 
-        DeviceNativeVNNIMatrixDesc native_gate{};
-        DeviceNativeVNNIMatrixDesc native_up{};
-        DeviceNativeVNNIMatrixDesc native_down{};
-        const bool gate_native = gate->exportNativeVNNIMatrixDesc(native_gate);
-        const bool up_native = up->exportNativeVNNIMatrixDesc(native_up);
-        const bool down_native = down->exportNativeVNNIMatrixDesc(native_down);
-        if (gate_native || up_native || down_native)
+        const std::array<ITensorGemm *, 3> engines{gate, up, down};
+        const std::size_t count = complete ? 3u : 2u;
+        std::array<DeviceNativeVNNIMatrixDesc, 3> native{};
+        std::size_t native_count = 0u;
+        for (std::size_t i = 0; i < count; ++i)
+            native_count += engines[i]->exportNativeVNNIMatrixDesc(native[i]) ? 1u : 0u;
+        if (native_count != 0u)
         {
-            if (!gate_native || !up_native || !down_native ||
-                !native_gate.valid() || !native_up.valid() || !native_down.valid() ||
-                native_gate.n != intermediate || native_gate.k != d_model ||
-                native_up.n != intermediate || native_up.k != d_model ||
-                native_down.n != d_model || native_down.k != intermediate)
-            {
+            if (native_count != count)
                 return false;
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                const int n = i == 2 ? d_model : intermediate;
+                const int k = i == 2 ? intermediate : d_model;
+                if (!native[i].valid() || native[i].n != n || native[i].k != k)
+                    return false;
             }
 
-            output.gate = native_gate;
-            output.up = native_up;
-            output.down = native_down;
+            output.gate = native[0];
+            output.up = native[1];
+            output.down = native[2];
             output.floating_gate = {};
             output.floating_up = {};
             output.floating_down = {};
             output.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+            output.projection_set = projections;
             return true;
         }
 
         std::array<ContiguousFloatingPointWeightDescriptor, 3> source{};
-        if (!gate->exportContiguousFloatingPointWeights(source[0]) ||
-            !up->exportContiguousFloatingPointWeights(source[1]) ||
-            !down->exportContiguousFloatingPointWeights(source[2]))
-        {
-            return false;
-        }
-
         std::array<DeviceMoEFloatingMatrixDesc, 3> floating{};
         std::array<DeviceMoEWeightFormat, 3> formats{};
-        for (std::size_t projection = 0; projection < source.size(); ++projection)
+        for (std::size_t i = 0; i < count; ++i)
         {
-            if (!exportDeviceMoEFloatingMatrixDescriptor(
-                    source[projection], floating[projection], formats[projection]))
-            {
+            const int n = i == 2 ? d_model : intermediate;
+            const int k = i == 2 ? intermediate : d_model;
+            if (!engines[i]->exportContiguousFloatingPointWeights(source[i]) ||
+                !exportDeviceMoEFloatingMatrixDescriptor(source[i], floating[i], formats[i]) ||
+                formats[i] != formats[0] || floating[i].n != n || floating[i].k != k)
                 return false;
-            }
-        }
-        if (formats[0] != formats[1] || formats[0] != formats[2] ||
-            floating[0].n != intermediate || floating[0].k != d_model ||
-            floating[1].n != intermediate || floating[1].k != d_model ||
-            floating[2].n != d_model || floating[2].k != intermediate)
-        {
-            return false;
         }
 
+        // Publish only after all required matrices validate. A rejected family
+        // leaves the previous usable descriptor and its allocation tags intact.
         output.gate = {};
         output.up = {};
         output.down = {};
@@ -144,7 +137,78 @@ namespace llaminar2
         output.floating_up = floating[1];
         output.floating_down = floating[2];
         output.weight_format = formats[0];
-        return output.weightsReady();
+        output.projection_set = projections;
+        return true;
+    }
+    } // namespace moe_descriptor_detail
+
+    /**
+     * @brief Export a complete expert without weakening whole-FFN readiness.
+     * @param gate Prepared gate engine with shape [intermediate, d_model].
+     * @param up Prepared up engine with the same shape and arithmetic family.
+     * @param down Prepared complete down engine with shape [d_model, intermediate].
+     * @param d_model Full model width.
+     * @param intermediate Full expert intermediate width.
+     * @param output Runtime publication target; unchanged on rejection.
+     * @return Whether every required projection validates as one supported family.
+     */
+    inline bool exportDeviceMoEExpertWeightDescriptors(
+        ITensorGemm *gate, ITensorGemm *up, ITensorGemm *down,
+        int d_model, int intermediate, DeviceMoEExpertDescriptor &output) noexcept
+    {
+        return moe_descriptor_detail::exportMovableWeights(gate, up, down,
+            DeviceMoEProjectionSet::CompleteExpert, d_model, intermediate, output);
+    }
+
+    /**
+     * @brief Export the movable pair of a projection-partitioned expert.
+     * @param gate Prepared complete gate engine, authenticated by the prepared registry.
+     * @param up Prepared complete up engine, authenticated by the same registry.
+     * @param ownership Frozen domain layout; a whole-expert layout is rejected.
+     * @param output Runtime publication target; no fixed down pointer is accepted.
+     * @return Whether the pair validates against the original source geometry.
+     */
+    inline bool exportDeviceMoEGateUpWeightDescriptors(
+        ITensorGemm *gate, ITensorGemm *up,
+        const MoEExpertProjectionOwnership &ownership,
+        DeviceMoEExpertDescriptor &output) noexcept
+    {
+        if (ownership.movableProjections() != DeviceMoEProjectionSet::GateUp)
+            return false;
+        const auto geometry = ownership.geometry();
+        return moe_descriptor_detail::exportMovableWeights(gate, up, nullptr,
+            ownership.movableProjections(), geometry.model_columns,
+            geometry.intermediate_columns, output);
+    }
+
+    /**
+     * @brief Export an authenticated arrival without inventing a host geometry shadow.
+     * @param payload Complete declared family retained by the physical lifetime authority.
+     * @param output Publication target; unchanged on rejection.
+     * @return Whether all movable projections validate against the prepared gate geometry.
+     *
+     * Fixed down slices never occur in a gate/up payload. The same validator
+     * handles quantized and floating families and checks every declared engine;
+     * inspecting the gate here supplies dimensions, not a weaker readiness test.
+     */
+    inline bool exportDeviceMoEPreparedPayload(
+        const MoEOverlayPreparedExpertPayload &payload,
+        DeviceMoEExpertDescriptor &output) noexcept
+    {
+        if (!payload.ready())
+            return false;
+        DeviceNativeVNNIMatrixDesc native_gate{};
+        if (payload.gate()->exportNativeVNNIMatrixDesc(native_gate))
+        {
+            return native_gate.valid() && moe_descriptor_detail::exportMovableWeights(
+                payload.gate().get(), payload.up().get(), payload.down().get(), payload.projections(),
+                native_gate.k, native_gate.n, output);
+        }
+        ContiguousFloatingPointWeightDescriptor floating_gate{};
+        return payload.gate()->exportContiguousFloatingPointWeights(floating_gate) &&
+               floating_gate.valid() && moe_descriptor_detail::exportMovableWeights(
+                   payload.gate().get(), payload.up().get(), payload.down().get(), payload.projections(),
+                   floating_gate.k, floating_gate.n, output);
     }
 
     /**

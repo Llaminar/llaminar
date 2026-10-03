@@ -9,6 +9,7 @@
  * Timings are diagnostic only; production preflight has no performance threshold.
  */
 #include "transfer/CapturedTransferChannel.h"
+#include "CapturedChannelGraphProof.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IGPUGraphCapture.h"
@@ -229,7 +230,8 @@ namespace
                                 transfer.enqueueCapturedTransfer(collect, first_stream);
                                 capture.finish();
                             }
-                            require(graph->instantiate() && graph->nodeCount() >= 6, "Source graph incomplete");
+                            counted_channel_test::verifyCapturedChannelGraph(*graph, bytes, 2);
+                            require(graph->instantiate(), "Source graph incomplete");
                         });
                         second_worker.submitAndWait([&] {
                             auto &graph = second_graphs[pattern];
@@ -242,7 +244,8 @@ namespace
                                 transfer.enqueueCapturedTransfer(reply, second_stream);
                                 capture.finish();
                             }
-                            require(graph->instantiate() && graph->nodeCount() >= 6, "Peer graph incomplete");
+                            counted_channel_test::verifyCapturedChannelGraph(*graph, bytes, 2);
+                            require(graph->instantiate(), "Peer graph incomplete");
                         });
                     }
                     // Native graph pools grow in slabs. Attest the complete

@@ -126,13 +126,12 @@ extern "C" bool hipMoEOverlayActivationPackReturn(
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::packReturnMetadataKernel,
         dim3(1u), dim3(kThreads), 0u, hip_stream, *launch);
-    const std::size_t output_elements =
-        static_cast<std::size_t>(launch->physical_rows) *
-        static_cast<std::size_t>(launch->dispatch.top_k) *
-        static_cast<std::size_t>(launch->returned.d_model);
+    // Each block owns a route, amortizing mapped metadata across its width.
+    const auto payload_blocks = static_cast<unsigned int>(std::min<std::size_t>(
+        kSparseRoutePayloadBlocks, launch->returned.route_slot_capacity));
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::packMappedReturnPayloadKernel,
-        dim3(blocksFor(output_elements)), dim3(kThreads), 0u, hip_stream,
+        dim3(payload_blocks), dim3(kThreads), 0u, hip_stream,
         *launch);
     return launchAccepted();
 }
@@ -151,13 +150,12 @@ extern "C" bool hipMoEOverlayActivationConsumeReturn(
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::validateReturnKernel,
         dim3(1u), dim3(kThreads), 0u, hip_stream, *launch);
-    const std::size_t output_elements =
-        static_cast<std::size_t>(launch->physical_rows) *
-        static_cast<std::size_t>(launch->dispatch.top_k) *
-        static_cast<std::size_t>(launch->returned.d_model);
+    // One block owns a row; payload width no longer multiplies the grid.
+    const unsigned int payload_blocks = static_cast<unsigned int>(std::min<std::size_t>(
+        kSparseRoutePayloadBlocks, launch->returned.route_slot_capacity));
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::materializeMappedCanonicalReturnKernel,
-        dim3(blocksFor(output_elements)), dim3(kThreads), 0u, hip_stream,
+        dim3(payload_blocks), dim3(kThreads), 0u, hip_stream,
         *launch);
     return launchAccepted();
 }
@@ -295,14 +293,11 @@ extern "C" bool hipMoEOverlayActivationConsumeSingleRowReturnBatch(
             validateSingleRowReturnBatchKernel,
         dim3(launch->lane_count), dim3(kSingleRowThreads), 0u, hip_stream,
         *launch);
-    const std::size_t route_elements =
-        static_cast<std::size_t>(launch->top_k) *
-        static_cast<std::size_t>(launch->d_model);
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
             materializeSingleRowCanonicalReturnBatchKernel,
-        dim3(blocksFor(route_elements), launch->lane_count, 1u),
-        dim3(kThreads), 0u, hip_stream, *launch);
+        dim3(static_cast<unsigned int>(launch->top_k), launch->lane_count, 1u),
+        dim3(kSingleRowThreads), 0u, hip_stream, *launch);
     return launchAccepted();
 }
 
@@ -321,15 +316,14 @@ extern "C" bool hipMoEOverlayActivationConsumeMultiRowReturnBatch(
         llaminar2::moe_activation_packet_device::
             validateMultiRowReturnBatchKernel,
         dim3(launch->lane_count), dim3(kThreads), 0u, hip_stream, *launch);
-    const std::size_t output_elements =
+    const std::size_t route_capacity =
         static_cast<std::size_t>(launch->physical_rows) *
-        static_cast<std::size_t>(launch->top_k) *
-        static_cast<std::size_t>(launch->d_model);
+        static_cast<std::size_t>(launch->top_k);
     // Each lane copies its compact live entries with unique writers. Bound
     // the grid independently of capacity so sparse lanes do not schedule
     // thousands of idle workgroups; the shared loop covers every grid stride.
-    const unsigned int payload_blocks = std::min(
-        kSparseRoutePayloadBlocks, blocksFor(output_elements));
+    const unsigned int payload_blocks = static_cast<unsigned int>(std::min<std::size_t>(
+        kSparseRoutePayloadBlocks, route_capacity));
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
             materializeMultiRowCanonicalReturnBatchKernel,

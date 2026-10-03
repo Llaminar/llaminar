@@ -9,6 +9,8 @@
  * This file contains the production INT8×INT8→INT32 GEMM kernels used for the
  * **prefill** (prompt-processing) phase on AMD gfx906 GPUs.  All kernels use
  * the `v_dot4_i32_i8` instruction to compute 4 multiply-accumulates per cycle.
+ * Blockwise launchers publish their exact producer/template for diagnostics;
+ * observations never query resources or participate in device graph replay.
  *
  * Scaling from INT32 to FP32 is handled *outside* this file, in
  * ROCmQuantisedGemmKernel.hip (the common utilities file).
@@ -121,6 +123,7 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include "ROCmVNNIPrefillLaunch.h"
 
 // ============================================================================
 // WIDE-TILE V3: LDS Double-Buffered Pipeline
@@ -3515,9 +3518,18 @@ extern "C"
         const dim3 grid(n_tiles, m_tiles, 1);
         const dim3 block(BLOCK_SIZE, 1, 1);
 
-#define LAUNCH_V3B(MT, UK) \
+#define LAUNCH_V3B(MT, UK) do { \
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v3_blockwise_kernel<N_TILE, MT, UK>), \
-                           grid, block, 0, s, d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, M, N, K)
+                           grid, block, 0, s, d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, M, N, K); \
+        llaminar2::rocm::publishVNNIPrefillLaunch({ \
+            .producer = llaminar2::rocm::VNNIPrefillProducer::Int8BlockwiseV3, \
+            .execution_codebook = 19, .n_tile = N_TILE, .m_tile = MT, \
+            .min_blocks = 1, .unroll = UK, .full_tiles = false, \
+            .function = reinterpret_cast<const void*>(HIP_KERNEL_NAME( \
+                qgemm_int8_vnni_wide_tile_v3_blockwise_kernel<N_TILE, MT, UK>)), \
+            .block_threads = BLOCK_SIZE, .dynamic_shared_memory_bytes = 0, \
+        }); \
+    } while (false)
 
 #define LAUNCH_V3B_UNROLL(MT) \
         switch (unroll_kk) { \
@@ -3615,9 +3627,18 @@ extern "C"
         const dim3 grid(n_tiles, m_tiles, 1);
         const dim3 block(BLOCK_SIZE, 1, 1);
 
-#define LAUNCH_V7B(MT, UK) \
+#define LAUNCH_V7B(MT, UK) do { \
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v7_blockwise_kernel<N_TILE, MT, 8, UK>), \
-                           grid, block, 0, s, d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, M, N, K)
+                           grid, block, 0, s, d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, M, N, K); \
+        llaminar2::rocm::publishVNNIPrefillLaunch({ \
+            .producer = llaminar2::rocm::VNNIPrefillProducer::Int8BlockwiseV7, \
+            .execution_codebook = 19, .n_tile = N_TILE, .m_tile = MT, \
+            .min_blocks = 1, .unroll = UK, .full_tiles = false, \
+            .function = reinterpret_cast<const void*>(HIP_KERNEL_NAME( \
+                qgemm_int8_vnni_wide_tile_v7_blockwise_kernel<N_TILE, MT, 8, UK>)), \
+            .block_threads = BLOCK_SIZE, .dynamic_shared_memory_bytes = 0, \
+        }); \
+    } while (false)
 
 #define LAUNCH_V7B_UNROLL(MT) \
         switch (unroll_kk) { \

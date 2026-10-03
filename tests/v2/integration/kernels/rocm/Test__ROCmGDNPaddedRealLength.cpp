@@ -7,6 +7,8 @@
  * prefill with an effective real length against an unpadded reference prefill
  * followed by a decode step, proving that padding rows do not corrupt the GPU
  * recurrence or convolution state carried into decode.
+ * Long-prefill head-shard coverage additionally proves captured recurrence is
+ * byte-identical to serial decode across TP widths, resets and live lengths.
  */
 
 #include <gtest/gtest.h>
@@ -23,6 +25,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1988,7 +1991,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
  *
  * Widths through eight intentionally use the grouped recurrent kernel, whereas
  * an ordinary prefill longer than eight rows selects the specialized
- * `rocm_gdn_chunk_forward_kernel<32, 128, 128, 256>` production route. That
+ * `rocm_gdn_chunk_forward_kernel<128, 128, 256>` production route. That
  * specialization retains recurrent state in VGPR/LDS storage and evaluates all
  * token-independent gate expressions cooperatively before entering the causal
  * recurrence. The sweep starts immediately above the dispatch boundary, probes
@@ -2113,6 +2116,323 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceLongPrefillQwen36MoEStaticChunkMTo
             /*offset=*/0,
             chunk_state.size());
     }
+}
+
+/**
+ * @brief Prove long-prefill head shards retain exact arithmetic under capture.
+ *
+ * Head counts cover Qwen TP degrees through eight, uneven shard widths and
+ * independent model geometries. The same executable is replayed with full,
+ * short and empty live prefixes after data-only state resets. Comparing every
+ * output and terminal state with scalar decode catches both changed reduction
+ * order and accidental recurrence over padded rows. Economy remains in the
+ * separate Release performance fixture, never in the production preflight.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, CapturedLongPrefillHeadShardsMatchSerialDecodeByteExact)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+
+    for (int heads : {1, 3, 4, 5, 6, 7, 8, 11, 16, 32, 48})
+        for (bool normalize : {false, true})
+            for (int capacity : {64, 256, 512, 1024, 2048, 2049, 4096})
+            {
+                // The odd and TP2 head shards also straddle the bounded LDS
+                // normalization-cache limit. Wider prompts retain the same
+                // arithmetic without exceeding per-workgroup shared memory.
+                if (capacity > 512 && heads != 3 && heads != 16)
+                    continue;
+                SCOPED_TRACE("heads=" + std::to_string(heads) +
+                             " norm=" + std::to_string(normalize) +
+                             " capacity=" + std::to_string(capacity));
+                const int qk_stride = heads * d_k;
+                const int v_stride = heads * d_v;
+                const int state_floats = heads * d_k * d_v;
+                const size_t output_elems = static_cast<size_t>(capacity) * v_stride;
+                // Every physical row is nonzero. Inactive rows would therefore
+                // change state if a retained graph ignored its live-length input.
+                HipFloatBuffer q(makeSequenceRows(capacity, qk_stride, capacity, capacity, 0.0037f, 0.0f, 0.0f));
+                HipFloatBuffer k(makeSequenceRows(capacity, qk_stride, capacity, capacity, -0.0029f, 0.0f, 0.0f));
+                HipFloatBuffer v(makeSequenceRows(capacity, v_stride, capacity, capacity, 0.0043f, 0.0f, 0.0f));
+                HipFloatBuffer alpha(makeSequenceRows(capacity, heads, capacity, capacity, 0.037f, 0.0f, 0.0f));
+                HipFloatBuffer beta(makeSequenceRows(capacity, heads, capacity, capacity, -0.031f, 0.0f, 0.0f));
+                HipFloatBuffer a_log(static_cast<size_t>(heads), -0.5f);
+                HipFloatBuffer dt_bias(static_cast<size_t>(heads), 0.1f);
+                HipFloatBuffer chunk_output(output_elems, 123.0f);
+                HipFloatBuffer serial_output(output_elems, 0.0f);
+                HipIntBuffer effective_length(capacity);
+                HipStreamHandle stream;
+                const auto initial = makeInitialState(state_floats, 0.0017f);
+
+                ROCmGatedDeltaNet chunk(0);
+                HipGDNStateOwner chunk_owner(chunk, state_floats);
+                chunk.setGPUStream(stream.stream);
+                ASSERT_TRUE(chunk.importState(initial.data(), nullptr, stream.stream));
+                ROCmGatedDeltaNet serial(0);
+                HipGDNStateOwner serial_owner(serial, state_floats);
+                serial.setGPUStream(stream.stream);
+                HipCapturedGraph graph(stream.stream, [&]() {
+                    return chunk.chunkForwardWithEffectiveSeqLen(
+                        q.ptr, k.ptr, v.ptr, alpha.ptr, beta.ptr, a_log.ptr, dt_bias.ptr,
+                        chunk_output.ptr, nullptr, capacity, heads, d_k, d_v,
+                        /*chunk_size=*/64, normalize, effective_length.ptr);
+                });
+
+                for (const int live : {capacity, capacity > 64 ? capacity - 64 : 57, 9, 0})
+                {
+                    SCOPED_TRACE("live=" + std::to_string(live));
+                    ASSERT_TRUE(chunk.importState(initial.data(), nullptr, stream.stream));
+                    ASSERT_TRUE(serial.importState(initial.data(), nullptr, stream.stream));
+                    checkHip(hipMemsetAsync(serial_output.ptr, 0, output_elems * sizeof(float), stream.stream),
+                             "reset serial reference output");
+                    checkHip(hipMemcpyAsync(effective_length.ptr, &live, sizeof(live),
+                                           hipMemcpyHostToDevice, stream.stream), "publish live prefill length");
+                    graph.launch(stream.stream);
+                    // Scalar row replay is a diagnostic oracle only. The
+                    // candidate executes one retained production chunk graph.
+                    for (int row = 0; row < live; ++row)
+                        ASSERT_TRUE(serial.recurrent_step(
+                            q.ptr + static_cast<size_t>(row) * qk_stride,
+                            k.ptr + static_cast<size_t>(row) * qk_stride,
+                            v.ptr + static_cast<size_t>(row) * v_stride,
+                            alpha.ptr + static_cast<size_t>(row) * heads,
+                            beta.ptr + static_cast<size_t>(row) * heads,
+                            a_log.ptr, dt_bias.ptr,
+                            serial_output.ptr + static_cast<size_t>(row) * v_stride,
+                            nullptr, heads, d_k, d_v, normalize));
+                    checkHip(hipStreamSynchronize(stream.stream), "join head-shard equivalence proof");
+                    std::vector<float> chunk_state(state_floats), serial_state(state_floats);
+                    ASSERT_TRUE(chunk.exportState(chunk_state.data(), nullptr, nullptr));
+                    ASSERT_TRUE(serial.exportState(serial_state.data(), nullptr, nullptr));
+                    expectByteExactEquivalent("captured head-shard output", chunk_output.toHost(),
+                                              serial_output.toHost(), 0, output_elems);
+                    expectByteExactEquivalent("captured head-shard state", chunk_state,
+                                              serial_state, 0, state_floats);
+                }
+            }
+}
+
+/**
+ * @brief Keep long-prefill snapshot addressing exact without register bloat.
+ *
+ * A partial snapshot bank deliberately selects the ordinary long-prefill
+ * kernel, not the complete MTP verifier route. Non-power-of-two value widths
+ * and padded snapshot strides exercise affine column addressing. One retained
+ * graph advances full, shortened and empty live prefixes from reset state;
+ * every output, terminal state, snapshot and guard byte must match scalar
+ * decode. Both aliased and separate terminal-state banks remain supported.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, CapturedLongPrefillPartialSnapshotAddressingByteExact)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+    constexpr int capacity = 64;
+    constexpr int snapshot_rows = 9;
+    constexpr int guard_floats = 13;
+    constexpr float sentinel = -99.0f;
+
+    for (int d_k : {64, 128})
+        for (int d_v : {17, 64, 128})
+            for (int heads : {3, 8})
+                for (bool normalize : {false, true})
+                    for (bool in_place : {false, true})
+                    {
+                        SCOPED_TRACE("keys=" + std::to_string(d_k) +
+                                     " values=" + std::to_string(d_v) +
+                                     " heads=" + std::to_string(heads) +
+                                     " norm=" + std::to_string(normalize) +
+                                     " alias=" + std::to_string(in_place));
+                        const int qk_stride = heads * d_k;
+                        const int v_stride = heads * d_v;
+                        const int state_floats = heads * d_k * d_v;
+                        const int snapshot_stride = state_floats + guard_floats;
+                        const size_t output_floats = static_cast<size_t>(capacity) * v_stride;
+                        const size_t snapshot_floats =
+                            static_cast<size_t>(snapshot_rows) * snapshot_stride + guard_floats;
+                        const auto initial = makeInitialState(state_floats, 0.0017f);
+                        HipStreamHandle stream;
+                        HipFloatBuffer q(makeSequenceRows(capacity, qk_stride, capacity, capacity, 0.0037f, 0.0f, 0.0f));
+                        HipFloatBuffer k(makeSequenceRows(capacity, qk_stride, capacity, capacity, -0.0029f, 0.0f, 0.0f));
+                        HipFloatBuffer v(makeSequenceRows(capacity, v_stride, capacity, capacity, 0.0043f, 0.0f, 0.0f));
+                        HipFloatBuffer alpha(makeSequenceRows(capacity, heads, capacity, capacity, 0.037f, 0.0f, 0.0f));
+                        HipFloatBuffer beta(makeSequenceRows(capacity, heads, capacity, capacity, -0.031f, 0.0f, 0.0f));
+                        HipFloatBuffer a_log(heads, -0.5f);
+                        HipFloatBuffer dt_bias(heads, 0.1f);
+                        HipFloatBuffer state(initial);
+                        HipFloatBuffer separate_state(state_floats, sentinel);
+                        HipFloatBuffer serial_state(initial);
+                        HipFloatBuffer output(output_floats, sentinel);
+                        HipFloatBuffer serial_output(output_floats, 0.0f);
+                        HipFloatBuffer snapshots(snapshot_floats, sentinel);
+                        HipFloatBuffer serial_snapshots(snapshot_floats, sentinel);
+                        HipIntBuffer effective_length(capacity);
+                        float *terminal = in_place ? state.ptr : separate_state.ptr;
+                        HipCapturedGraph graph(stream.stream, [&]() {
+                            return rocmGDN_chunk_forward_effective(
+                                q.ptr, k.ptr, v.ptr, alpha.ptr, beta.ptr,
+                                a_log.ptr, dt_bias.ptr, output.ptr, state.ptr,
+                                terminal, capacity, heads, d_k, d_v, normalize,
+                                effective_length.ptr, snapshots.ptr,
+                                snapshot_stride, snapshot_rows, 0, stream.stream);
+                        });
+
+                        for (const int live : {capacity, 13, 0})
+                        {
+                            SCOPED_TRACE("live=" + std::to_string(live));
+                            state.copyFrom(initial);
+                            serial_state.copyFrom(initial);
+                            snapshots.fill(sentinel);
+                            serial_snapshots.fill(sentinel);
+                            checkHip(hipMemsetAsync(serial_output.ptr, 0,
+                                output_floats * sizeof(float), stream.stream), "reset serial output");
+                            checkHip(hipMemcpyAsync(effective_length.ptr, &live, sizeof(live),
+                                hipMemcpyHostToDevice, stream.stream), "publish snapshot-test live rows");
+                            graph.launch(stream.stream);
+                            // Only this diagnostic oracle replays rows. The
+                            // candidate is one captured production transaction.
+                            for (int row = 0; row < live; ++row)
+                            {
+                                ASSERT_TRUE(rocmGDN_recurrent_step(
+                                    q.ptr + static_cast<size_t>(row) * qk_stride,
+                                    k.ptr + static_cast<size_t>(row) * qk_stride,
+                                    v.ptr + static_cast<size_t>(row) * v_stride,
+                                    alpha.ptr + static_cast<size_t>(row) * heads,
+                                    beta.ptr + static_cast<size_t>(row) * heads,
+                                    a_log.ptr, dt_bias.ptr,
+                                    serial_output.ptr + static_cast<size_t>(row) * v_stride,
+                                    serial_state.ptr, serial_state.ptr,
+                                    heads, d_k, d_v, normalize, 0, stream.stream));
+                                if (row < snapshot_rows)
+                                    checkHip(hipMemcpyAsync(
+                                        serial_snapshots.ptr + static_cast<size_t>(row) * snapshot_stride,
+                                        serial_state.ptr, static_cast<size_t>(state_floats) * sizeof(float),
+                                        hipMemcpyDeviceToDevice, stream.stream), "retain serial snapshot oracle");
+                            }
+                            checkHip(hipStreamSynchronize(stream.stream), "join partial-snapshot proof");
+                            expectByteExactEquivalent("long-prefill partial snapshot output",
+                                output.toHost(), serial_output.toHost(), 0, output_floats);
+                            expectByteExactEquivalent("long-prefill partial snapshot state",
+                                in_place ? state.toHost() : separate_state.toHost(),
+                                serial_state.toHost(), 0, state_floats);
+                            expectByteExactEquivalent("long-prefill snapshot payload and guards",
+                                snapshots.toHost(), serial_snapshots.toHost(), 0, snapshot_floats);
+                        }
+                    }
+}
+
+/**
+ * @brief Prove independent recurrence waves retain exact rows and request state.
+ *
+ * Unequal device-owned request lengths straddle the sixteen-row input-tile
+ * boundary. Replaying one captured graph after resets exercises both directions
+ * of tile reuse, fully inactive requests, and separate terminal-state banks.
+ * The optional partial bank snapshots every row except the last physical row;
+ * this selects long prefill rather than the complete verifier implementation.
+ * Every live snapshot and untouched guard is compared byte-for-byte with the
+ * scalar oracle. The test uses FP32 operator inputs and is independent of the
+ * weight codebook that produced them.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, CapturedParallelRecurrenceRequestAndTileBoundariesByteExact)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+    constexpr int requests = 2;
+    constexpr int capacity = 65;
+    constexpr int rows = requests * capacity;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int snapshot_rows = rows - 1;
+    constexpr int guard_floats = 13;
+    constexpr float sentinel = -99.0f;
+    constexpr std::array<std::array<int, requests>, 6> lengths{{
+        {65, 17}, {16, 32}, {1, 0}, {0, 65}, {33, 64}, {65, 65}}};
+
+    for (int heads : {3, 16})
+        for (bool normalize : {false, true})
+            for (bool capture_rows : {false, true})
+            {
+                SCOPED_TRACE("heads=" + std::to_string(heads) +
+                             " norm=" + std::to_string(normalize) +
+                             " snapshots=" + std::to_string(capture_rows));
+                const int qk_stride = heads * d_k;
+                const int v_stride = heads * d_v;
+                const int state_floats = heads * d_k * d_v;
+                const int snapshot_stride = state_floats + guard_floats;
+                const size_t output_floats = static_cast<size_t>(rows) * v_stride;
+                const size_t snapshot_floats =
+                    static_cast<size_t>(snapshot_rows) * snapshot_stride + guard_floats;
+                HipStreamHandle stream;
+                HipFloatBuffer q(makeSequenceRows(rows, qk_stride, rows, rows, 0.0037f, 0.0f, 0.0f));
+                HipFloatBuffer k(makeSequenceRows(rows, qk_stride, rows, rows, -0.0029f, 0.0f, 0.0f));
+                HipFloatBuffer v(makeSequenceRows(rows, v_stride, rows, rows, 0.0043f, 0.0f, 0.0f));
+                HipFloatBuffer alpha(makeSequenceRows(rows, heads, rows, rows, 0.037f, 0.0f, 0.0f));
+                HipFloatBuffer beta(makeSequenceRows(rows, heads, rows, rows, -0.031f, 0.0f, 0.0f));
+                HipFloatBuffer a_log(heads, -0.5f);
+                HipFloatBuffer dt_bias(heads, 0.1f);
+                const auto initial = makeInitialState(requests * state_floats, 0.0017f);
+                HipFloatBuffer state(initial), terminal(requests * state_floats, sentinel);
+                HipFloatBuffer serial_state(initial);
+                HipFloatBuffer output(output_floats, sentinel), serial_output(output_floats, 0.0f);
+                HipFloatBuffer snapshots(capture_rows ? snapshot_floats : 0, sentinel);
+                HipFloatBuffer serial_snapshots(capture_rows ? snapshot_floats : 0, sentinel);
+                HipIntBuffer effective_lengths({capacity, capacity});
+                HipCapturedGraph graph(stream.stream, [&]() {
+                    return rocmGDN_chunk_forward_batched_effective(
+                        q.ptr, k.ptr, v.ptr, alpha.ptr, beta.ptr, a_log.ptr, dt_bias.ptr,
+                        output.ptr, state.ptr, terminal.ptr, rows, requests, capacity,
+                        heads, d_k, d_v, normalize, effective_lengths.ptr,
+                        snapshots.ptr, snapshot_stride, capture_rows ? snapshot_rows : 0,
+                        0, stream.stream);
+                });
+                for (const auto &live : lengths)
+                {
+                    SCOPED_TRACE("live=" + std::to_string(live[0]) + "," + std::to_string(live[1]));
+                    state.copyFrom(initial);
+                    serial_state.copyFrom(initial);
+                    terminal.fill(sentinel);
+                    output.fill(sentinel);
+                    serial_output.fill(0.0f);
+                    snapshots.fill(sentinel);
+                    serial_snapshots.fill(sentinel);
+                    checkHip(hipMemcpyAsync(effective_lengths.ptr, live.data(), sizeof(live),
+                        hipMemcpyHostToDevice, stream.stream), "publish independent request lengths");
+                    graph.launch(stream.stream);
+                    for (int request = 0; request < requests; ++request)
+                        for (int local_row = 0; local_row < live[request]; ++local_row)
+                        {
+                            const int row = request * capacity + local_row;
+                            float *reference_state = serial_state.ptr + request * state_floats;
+                            ASSERT_TRUE(rocmGDN_recurrent_step(
+                                q.ptr + static_cast<size_t>(row) * qk_stride,
+                                k.ptr + static_cast<size_t>(row) * qk_stride,
+                                v.ptr + static_cast<size_t>(row) * v_stride,
+                                alpha.ptr + static_cast<size_t>(row) * heads,
+                                beta.ptr + static_cast<size_t>(row) * heads,
+                                a_log.ptr, dt_bias.ptr,
+                                serial_output.ptr + static_cast<size_t>(row) * v_stride,
+                                reference_state, reference_state, heads, d_k, d_v,
+                                normalize, 0, stream.stream));
+                            if (capture_rows && row < snapshot_rows)
+                                checkHip(hipMemcpyAsync(
+                                    serial_snapshots.ptr + static_cast<size_t>(row) * snapshot_stride,
+                                    reference_state, static_cast<size_t>(state_floats) * sizeof(float),
+                                    hipMemcpyDeviceToDevice, stream.stream), "retain request snapshot oracle");
+                        }
+                    checkHip(hipStreamSynchronize(stream.stream), "join parallel recurrence proof");
+                    expectByteExactEquivalent("parallel recurrence output", output.toHost(),
+                        serial_output.toHost(), 0, output_floats);
+                    expectByteExactEquivalent("parallel recurrence request state", terminal.toHost(),
+                        serial_state.toHost(), 0, initial.size());
+                    if (capture_rows)
+                        expectByteExactEquivalent("parallel recurrence snapshots and guards",
+                            snapshots.toHost(), serial_snapshots.toHost(), 0, snapshot_floats);
+                }
+            }
 }
 
 /**
@@ -2418,7 +2738,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
         m4_q,
         m4_k,
         m4_v,
-        verifier_len,
+        DeviceRequestRowRanges::fullyActive(verifier_len),
         n_k_heads,
         n_v_heads,
         d_k,
@@ -2448,7 +2768,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
             step_q,
             step_k,
             step_v,
-            1,
+            DeviceRequestRowRanges::fullyActive(1),
             n_k_heads,
             n_v_heads,
             d_k,
@@ -2556,7 +2876,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeVerifierCaptureIs
         m4_q,
         m4_k,
         m4_v,
-        verifier_len,
+        DeviceRequestRowRanges::fullyActive(verifier_len),
         n_k_heads,
         n_v_heads,
         d_k,
@@ -2586,7 +2906,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeVerifierCaptureIs
             step_q,
             step_k,
             step_v,
-            1,
+            DeviceRequestRowRanges::fullyActive(1),
             n_k_heads,
             n_v_heads,
             d_k,
@@ -2710,7 +3030,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMa
         grouped_q,
         grouped_k,
         grouped_v,
-        verifier_len,
+        DeviceRequestRowRanges::fullyActive(verifier_len),
         n_k_heads,
         n_v_heads,
         d_k,
@@ -2743,7 +3063,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMa
             step_q,
             step_k,
             step_v,
-            1,
+            DeviceRequestRowRanges::fullyActive(1),
             n_k_heads,
             n_v_heads,
             d_k,
@@ -2878,7 +3198,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMa
         grouped_q,
         grouped_k,
         grouped_v,
-        verifier_len,
+        DeviceRequestRowRanges::fullyActive(verifier_len),
         n_k_heads,
         n_v_heads,
         d_k,
@@ -2911,7 +3231,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMa
             step_q,
             step_k,
             step_v,
-            1,
+            DeviceRequestRowRanges::fullyActive(1),
             n_k_heads,
             n_v_heads,
             d_k,

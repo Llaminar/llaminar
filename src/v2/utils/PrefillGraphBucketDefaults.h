@@ -39,6 +39,18 @@ namespace llaminar2
     };
 
     /**
+     * @brief Smallest ordinary-prefill bucket used by default serving.
+     *
+     * Short prompts and prefix-cache tails must use the supported lower ladder,
+     * not pad to an unrelated historical capture threshold. A 64-token tail
+     * padded to 256 wastes dense projections and collective bandwidth even
+     * when recurrent state correctly observes the live row count. Admission
+     * still clips this floor to a smaller explicitly planned row capacity.
+     */
+    inline constexpr int kDefaultPrefillGraphMinBucketSize =
+        kSupportedPrefillGraphBucketSizes.front();
+
+    /**
      * @brief Default maximum prefill rows, independent of the KV context limit.
      *
      * Long prompts reuse these smaller captured chunks. Larger shapes remain

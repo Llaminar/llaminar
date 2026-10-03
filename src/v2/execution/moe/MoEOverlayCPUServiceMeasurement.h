@@ -63,7 +63,7 @@ namespace llaminar2
          * arithmetic and explicit workspace as resident expert service.
          */
         [[nodiscard]] static uint64_t measurePrepared(
-            const MoEOverlayPreparedExpertTriplet &source, DeviceId device, int layer,
+            const MoEOverlayPreparedExpertPayload &source, DeviceId device, int layer,
             ExpertHistogramSource phase, Geometry geometry,
             const std::shared_ptr<PhysicalMemoryAuthority> &memory);
 

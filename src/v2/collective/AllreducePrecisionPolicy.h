@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string_view>
 
 namespace llaminar2
 {
@@ -45,5 +46,25 @@ namespace llaminar2
             return effective_count;
         }
         return logical_row_elements;
+    }
+
+    /**
+     * @brief Select FP16 transport for an FP32 sum without changing row arithmetic.
+     * @param precision Resolved native collective policy, not activation precision.
+     * @param effective_count Complete message extent before any rank partition.
+     * @param logical_row_elements Width of the original model row.
+     * @param minimum_elements Canonical configured FP16 threshold.
+     * @return Whether the original FP32 inputs must be rounded before summing.
+     *
+     * Allreduce and column reduce-scatter consume the same decision. Partitioning
+     * a row between receivers must not lower its policy width or select another
+     * arithmetic merely because fewer result bytes are returned locally.
+     */
+    [[nodiscard]] constexpr bool fp32SumUsesFP16Transport(
+        std::string_view precision, std::size_t effective_count,
+        std::size_t logical_row_elements, std::size_t minimum_elements) noexcept
+    {
+        return precision == "fp16" &&
+            batchInvariantAllreduceDecisionElements(effective_count, logical_row_elements) >= minimum_elements;
     }
 } // namespace llaminar2

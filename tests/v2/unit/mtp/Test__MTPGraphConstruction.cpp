@@ -551,14 +551,17 @@ namespace
             out.gate = gate.get();
             out.up = up.get();
             out.ffn_output = ffn_output.get();
-            out.moe_expert_indices = moe_expert_indices.get();
-            out.moe_expert_weights = moe_expert_weights.get();
-            out.moe_combined_output = moe_combined_output.get();
-            out.moe_canonical_route_contributions =
-                moe_canonical_route_contributions.get();
-            out.moe_shared_expert_output = moe_shared_expert_output.get();
-            out.moe_gate_scratch = moe_gate_scratch.get();
-            out.moe_up_scratch = moe_up_scratch.get();
+            const std::unordered_map<BufferId, TensorBase *> moe_buffers{
+                {BufferId::MOE_EXPERT_INDICES, moe_expert_indices.get()},
+                {BufferId::MOE_EXPERT_WEIGHTS, moe_expert_weights.get()},
+                {BufferId::MOE_COMBINED_OUTPUT, moe_combined_output.get()},
+                {BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS, moe_canonical_route_contributions.get()},
+                {BufferId::MOE_SHARED_EXPERT_OUTPUT, moe_shared_expert_output.get()},
+                {BufferId::MOE_GATE_SCRATCH, moe_gate_scratch.get()},
+                {BufferId::MOE_UP_SCRATCH, moe_up_scratch.get()},
+            };
+            out.moe = MoEActivationBindings::bind(config.moe.routed_compute_policy, row_capacity,
+                [&](BufferId id) { return moe_buffers.at(id); });
             return out;
         }
 
@@ -1475,7 +1478,100 @@ namespace
         EXPECT_GT(fp32_abs_sum(k_payload), 0.0f);
         EXPECT_GT(fp32_abs_sum(v_payload), 0.0f);
     }
+    /** @brief Observe the real MTP-to-FFN arena handoff without executing device work. */
+    class MTPExtensionBindingProbe final : public Qwen35Graph
+    {
+    public:
+        using Qwen35Graph::Qwen35Graph;
+        ActivationBuffers observed;
+        int ffn_calls = 0;
+
+    protected:
+        /** @brief Retain the borrowed view, then use ordinary declaration-only FFN wiring. */
+        ComputeGraph buildFFNGraph(const LayerWeights &layer, ActivationBuffers &buffers,
+            int layer_idx, int seq_len, int batch_size, DeviceId device, void *publication_stream,
+            const int32_t *sequence_lengths, const int32_t *absolute_positions) override
+        {
+            observed = buffers;
+            ++ffn_calls;
+            return Qwen35Graph::buildFFNGraph(layer, buffers, layer_idx, seq_len, batch_size,
+                device, publication_stream, sequence_lengths, absolute_positions);
+        }
+    };
 } // namespace
+
+/** @test Each MTP physical mode carries exactly its admitted buffer inventory into the real FFN builder. */
+TEST(Test__MTPGraphConstruction, MoEPolicySelectedArenaSurvivesSidecarHandoff)
+{
+    for (const auto policy : {RoutedExpertComputePolicy::Apportioned,
+                             RoutedExpertComputePolicy::GateUpOwnedDownColumns})
+    {
+        DenseMTPGraphFixture fixture(16);
+        auto output = fixture.output();
+        fixture.config.moe.routed_compute_policy = policy;
+        std::unordered_map<BufferId, TensorBase *> arena;
+        for (const auto &[id, tensor] : output.moe->entries()) arena.emplace(id, tensor);
+        std::vector<std::unique_ptr<FP32Tensor>> projection_storage;
+        if (policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+        {
+            arena.erase(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
+            for (const auto id : {BufferId::MOE_PROJECTION_LOCAL_PACKET,
+                    BufferId::MOE_PROJECTION_GATHERED_PACKETS, BufferId::MOE_PROJECTION_ROUTE_COLUMNS,
+                    BufferId::MOE_PROJECTION_LOCAL_COLUMNS, BufferId::MOE_PROJECTION_GATHERED_COLUMNS})
+            {
+                projection_storage.push_back(TestTensorFactory::createFP32({16, 64}));
+                arena.emplace(id, projection_storage.back().get());
+            }
+        }
+        const auto lookup = [&](BufferId id) -> TensorBase * {
+            const auto it = arena.find(id);
+            return it == arena.end() ? nullptr : it->second;
+        };
+        output.moe = MoEActivationBindings::bind(policy, 16, lookup);
+        EXPECT_EQ(output.moe->entries().size(), projection_storage.empty() ? 7 : 11);
+        EXPECT_THROW(output.moe->require(policy, 17), std::invalid_argument);
+        EXPECT_THROW(output.moe->require(policy, 0), std::invalid_argument);
+        const auto other_policy = policy == RoutedExpertComputePolicy::Apportioned
+            ? RoutedExpertComputePolicy::GateUpOwnedDownColumns : RoutedExpertComputePolicy::Apportioned;
+        EXPECT_THROW(output.moe->require(other_policy, 1), std::invalid_argument);
+        EXPECT_THROW(MoEActivationBindings::bind(other_policy, 1, lookup), std::invalid_argument);
+        // Request intent must be resolved before arena/graph materialization.
+        // Neither Automatic nor an omitted declaration owns physical storage.
+        for (const auto unresolved : {RoutedExpertComputePolicy::Automatic,
+                                     RoutedExpertComputePolicy::Unspecified})
+            EXPECT_THROW(MoEActivationBindings::bind(unresolved, 1, lookup), std::invalid_argument);
+
+        auto weights = fixture.mtpWeights();
+        weights.fa_block.moe_gate = fixture.moe_gate.get();
+        weights.fa_block.moe_gate_exps = fixture.moe_gate_exps.get();
+        weights.fa_block.moe_up_exps = fixture.moe_up_exps.get();
+        weights.fa_block.moe_down_exps = fixture.moe_down_exps.get();
+        MTPExtensionBindingProbe builder(fixture.config, fixture.mpi);
+        builder.setWeights(fixture.modelWeights());
+        auto input = fixture.input();
+        ASSERT_GT(builder.buildMTPGraph(0, weights, input, output).size(), 0);
+        ASSERT_EQ(builder.ffn_calls, 1);
+        EXPECT_EQ(builder.observed.normalized, output.norm_hidden);
+        EXPECT_EQ(builder.observed.idFor(BufferId::NORMALIZED), BufferId::MTP_NORM_HIDDEN);
+        for (const auto &[id, tensor] : output.moe->entries())
+            EXPECT_EQ(builder.observed.get(id), tensor);
+        EXPECT_EQ(builder.observed.get(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS),
+            lookup(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
+
+        // Every required role fails at the shared binding boundary. An absent
+        // inactive-mode bank, conversely, never needs to be materialized.
+        for (const auto &[required_id, tensor] : output.moe->entries())
+        {
+            (void)tensor;
+            EXPECT_THROW(MoEActivationBindings::bind(policy, 1,
+                [&](BufferId id) -> TensorBase * { return id == required_id ? nullptr : lookup(id); }),
+                std::invalid_argument);
+        }
+        output.moe.reset();
+        EXPECT_THROW(builder.buildMTPGraph(0, weights, input, output), std::invalid_argument);
+        EXPECT_EQ(builder.ffn_calls, 1);
+    }
+}
 
 TEST(Test__MTPGraphConstruction,
      HostedGenerationCursorRejectsInvalidAndNonContiguousTransitions)
@@ -7717,8 +7813,10 @@ TEST(Test__MTPGraphConstruction,
     const std::string source(
         (std::istreambuf_iterator<char>(input)),
         std::istreambuf_iterator<char>());
+    // Bind the source guard to the operation, not to a diagnostic that used
+    // to reject all retained bucket families with more than one width.
     const size_t chunked_prefill = source.find(
-        "Device-resident prefill requires one capacity-complete physical graph bucket");
+        "bool DeviceGraphOrchestrator::forwardPrefillChunkSchedule(");
     const size_t publication = source.find(
         "state_.mtp_terminal_hidden_publication.publishMainForward()",
         chunked_prefill);

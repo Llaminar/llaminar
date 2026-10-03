@@ -8,6 +8,12 @@
  * - Gated RMSNorm
  * - Attention output gate (sigmoid)
  *
+ * Long bounded prefill owns recurrent columns per wave and caches independent
+ * inputs cooperatively. Every token still uses scalar decode's rounded state
+ * updates and ordered four-part key reduction. No prefix-scan reassociation,
+ * host replay, global scratch or dynamic allocation is required. Capture-time
+ * snapshot policy separates terminal-only publication from bounded row output.
+ *
  * Key HIP differences from CUDA:
  * - 64-thread wavefronts (vs 32 warps), shuffle width adjusted
  * - hip_runtime.h / hip_fp16.h headers
@@ -22,6 +28,7 @@
 #include <limits>
 #include <stdexcept>
 #include "../../../utils/DebugEnv.h"
+#include "kernels/gdn/GDNDeinterleaveRows.h"
 
 namespace {
 
@@ -61,6 +68,16 @@ constexpr int kGdnRecurrentThreads = 256;
 constexpr int kGdnRecurrentRowSplit = 4;
 constexpr int kGdnRecurrentColumnsPerBlock =
     kGdnRecurrentThreads / kGdnRecurrentRowSplit;
+
+/// @brief Bounded independent-input tile for wave-owned recurrence columns.
+constexpr int kGdnPrefillInputTileRows = 16;
+
+/** @brief Capture-time state publication contract, independent of live row count. */
+enum class GdnPrefillSnapshots
+{
+    TerminalOnly, ///< Publish only the final recurrent state, as ordinary prefill requires.
+    BoundedRows,  ///< Also publish each live row admitted by the caller's snapshot bank.
+};
 
 /**
  * @brief Advance grouped recurrence rows while retaining state in VGPRs.
@@ -535,17 +552,38 @@ bool launch_rocm_gdn_recurrent_step(
 //   2. Single-pass per timestep: kv dot product → delta → state update →
 //      output accumulation in ONE loop over the 32 cached rows.
 //   3. The four-way row split is identical to grouped/scalar decode.
-//   4. The Qwen D_K=128 specialization places its final five rows in explicit
-//      LDS, avoiding compiler-owned private scratch at the two-wave VGPR limit.
+//   4. The in-loop-normalization D_K=128 specialization places its final five
+//      rows in explicit LDS, avoiding private scratch at the two-wave VGPR
+//      limit. Precomputed normalization shortens live ranges enough to retain
+//      all 32 state values in VGPRs without that LDS tail.
+//   5. Bounded prompt buckets evaluate Q/K normalization cooperatively before
+//      loading state. Recurrence retains the serial decode sum tree but no
+//      longer waits on three extra normalization barriers for each token.
 //
 // Release ISA metadata is a gate: every specialization must report zero
 // private segment and zero VGPR/SGPR spills before it may remain dispatchable.
 // =========================================================================
 
-template <int STATIC_N_HEADS = 0,
-          int STATIC_D_K = 0,
+/**
+ * @brief Keep one head's fixed-order recurrence resident across a prompt chunk.
+ *
+ * Independent workgroups partition value columns without changing the four-way
+ * key reduction used by decode. Width/block specialization removes dynamic
+ * indexing; head count remains a runtime stride so TP shards share this route.
+ * The optional normalization cache retains per-row scale factors in LDS; its
+ * capture-time size limit keeps larger buckets within the same hardware limit.
+ * With cached inputs, each wave owns all four key partitions of its independent
+ * value columns. Those waves advance concurrently through the input tile, with
+ * no per-token workgroup barrier. Lane exchange preserves the ordered four-part
+ * sum; it does not compose or reassociate recurrent transitions across tokens.
+ * Caller-owned state, output, snapshots and shared-memory capacity must remain
+ * valid until the explicit launch stream completes.
+ */
+template <int STATIC_D_K,
           int STATIC_D_V = 0,
-          int STATIC_BLOCK_SIZE = 0>
+          int STATIC_BLOCK_SIZE = 0,
+          bool CACHE_QK_NORMALIZATION = false,
+          GdnPrefillSnapshots SNAPSHOTS = GdnPrefillSnapshots::BoundedRows>
 __global__ __launch_bounds__(256, 2)
 void rocm_gdn_chunk_forward_kernel(
     const float *__restrict__ Q,
@@ -569,8 +607,11 @@ void rocm_gdn_chunk_forward_kernel(
     static_assert(
         STATIC_D_K == 64 || STATIC_D_K == 128,
         "ROCm long-prefill GDN requires a capture-time D_K specialization");
-    const int kernel_n_heads =
-        STATIC_N_HEADS > 0 ? STATIC_N_HEADS : n_heads;
+    static_assert(
+        !CACHE_QK_NORMALIZATION ||
+            (STATIC_D_K == 128 && STATIC_BLOCK_SIZE == 256),
+        "Wave-owned prefill retains the 128-key, four-part serial decode tree");
+    const int kernel_n_heads = n_heads;
     constexpr int kernel_d_k = STATIC_D_K;
     const int kernel_d_v = STATIC_D_V > 0 ? STATIC_D_V : d_v;
     const int kernel_block_size =
@@ -583,9 +624,15 @@ void rocm_gdn_chunk_forward_kernel(
     const int tid = threadIdx.x;
 
     constexpr int ROW_SPLIT = 4;
+    constexpr int columns_per_wave = 64 / ROW_SPLIT;
     const int cols_per_block = kernel_block_size / ROW_SPLIT;
+    const int column_in_block = CACHE_QK_NORMALIZATION
+        ? (tid / 64) * columns_per_wave + tid % columns_per_wave
+        : tid % cols_per_block;
+    const int key_partition = CACHE_QK_NORMALIZATION
+        ? (tid % 64) / columns_per_wave : tid / cols_per_block;
     const int vi =
-        blockIdx.y * cols_per_block + tid % cols_per_block;
+        blockIdx.y * cols_per_block + column_in_block;
 
     const int qk_stride = kernel_n_heads * kernel_d_k;
     const int v_stride = kernel_n_heads * kernel_d_v;
@@ -603,17 +650,23 @@ void rocm_gdn_chunk_forward_kernel(
         static_cast<size_t>(h) * kernel_d_k * kernel_d_v;
 
     extern __shared__ float smem[];
-    float *q_local = smem;
-    float *k_local = smem + kernel_d_k;
-    float *warp_sums = smem + 2 * kernel_d_k; // [16] for warp reduction
-    float *reduce_kv = smem + 2 * kernel_d_k + 16; // [kernel_block_size]
-    float *reduce_out =
-        smem + 2 * kernel_d_k + 16 + kernel_block_size; // [kernel_block_size]
+    constexpr int input_tile_rows =
+        CACHE_QK_NORMALIZATION ? kGdnPrefillInputTileRows : 1;
+    float *q_tile = smem;
+    float *k_tile = q_tile + input_tile_rows * kernel_d_k;
+    float *v_tile = k_tile + input_tile_rows * kernel_d_k;
+    float *warp_sums = v_tile +
+        (CACHE_QK_NORMALIZATION ? input_tile_rows * cols_per_block : 0);
+    const int shared_reduction_size = CACHE_QK_NORMALIZATION ? 0 : kernel_block_size;
+    float *reduce_kv = warp_sums + 16;
+    float *reduce_out = reduce_kv + shared_reduction_size;
     constexpr int kExplicitLdsStateTailRows =
-        STATIC_D_K == 128 && STATIC_BLOCK_SIZE == 256 ? 5 : 0;
+        STATIC_D_K == 128 && STATIC_BLOCK_SIZE == 256 &&
+                !CACHE_QK_NORMALIZATION
+            ? 5 : 0;
     constexpr bool kUsesExplicitLdsStateTail =
         kExplicitLdsStateTailRows > 0;
-    float *state_tail = reduce_out + kernel_block_size;
+    float *state_tail = reduce_out + shared_reduction_size;
     float *gate_decay = state_tail +
         kExplicitLdsStateTailRows * kernel_block_size;
     float *gate_beta = gate_decay + request_seq_len;
@@ -661,6 +714,64 @@ void rocm_gdn_chunk_forward_kernel(
             1.0f /
             (1.0f + expf(-beta_raw[row * kernel_n_heads + h]));
     }
+    if constexpr (CACHE_QK_NORMALIZATION)
+    {
+        if (use_qk_l2norm)
+        {
+#pragma clang fp contract(off)
+            /* Normalization has no dependency on recurrent state. One wave
+             * prepares each row before that state occupies the register file.
+             * Keep the two 64-key reductions separate: adding keys 0 and 64
+             * in each lane first would change the serial-decode sum tree.
+             * The final two zero waves are retained explicitly as well. */
+            const int lane = tid % 64;
+            const int wave = tid / 64;
+            for (int t = wave; t < effective_seq_len; t += kernel_block_size / 64)
+            {
+                const int row = request_row_base + t;
+                const int base = row * qk_stride + h * kernel_d_k;
+                const float q0 = Q[base + lane];
+                const float q1 = Q[base + lane + 64];
+                const float k0 = K[base + lane];
+                const float k1 = K[base + lane + 64];
+                float q_sum0 = q0 * q0;
+                float q_sum1 = q1 * q1;
+                float k_sum0 = k0 * k0;
+                float k_sum1 = k1 * k1;
+                for (int offset = 32; offset > 0; offset >>= 1)
+                {
+                    // The square is rounded before the first shuffle add.
+                    // HIP's round-to-nearest helpers alone do not prevent LLVM
+                    // contracting that first add into an FMA: the exchanged
+                    // lane is rounded but the local lane would not be. The
+                    // lexical contract(off) applies to these direct expressions,
+                    // not helper bodies compiled outside this scope. It keeps
+                    // both boundaries without changing recurrence contraction.
+                    q_sum0 += __shfl_xor(q_sum0, offset);
+                    q_sum1 += __shfl_xor(q_sum1, offset);
+                    k_sum0 += __shfl_xor(k_sum0, offset);
+                    k_sum1 += __shfl_xor(k_sum1, offset);
+                }
+                if (lane == 0)
+                {
+                    float q_total = 0.0f;
+                    float k_total = 0.0f;
+                    q_total += q_sum0;
+                    q_total += q_sum1;
+                    q_total += 0.0f;
+                    q_total += 0.0f;
+                    k_total += k_sum0;
+                    k_total += k_sum1;
+                    k_total += 0.0f;
+                    k_total += 0.0f;
+                    gate_beta[request_seq_len + t] =
+                        scale / fmaxf(sqrtf(q_total), 1e-6f);
+                    gate_beta[2 * request_seq_len + t] =
+                        1.0f / fmaxf(sqrtf(k_total), 1e-6f);
+                }
+            }
+        }
+    }
     __syncthreads();
 
     // =====================================================================
@@ -669,7 +780,20 @@ void rocm_gdn_chunk_forward_kernel(
     // its column vi. With d_k=128, ROW_SPLIT=4: 32 floats per thread.
     // =====================================================================
     constexpr int rows_per_split = kernel_d_k / ROW_SPLIT;
-    const int j_start = (tid / cols_per_block) * rows_per_split;
+    // State addressing is an affine, nonnegative element offset, not signed
+    // 32-bit arithmetic. In the signed form LLVM must preserve a separate
+    // sign-extended offset for every snapshot row and keeps those 32 pointer
+    // offsets live through the entire recurrence, even with no snapshots.
+    // Widen the common base once so each row can use a constant displacement.
+    // This changes address calculation only; the four key partitions and all
+    // floating-point operations below retain their serial-decode order.
+    const size_t j_start =
+        static_cast<size_t>(key_partition) * rows_per_split;
+    // Put the four key partitions in neighbouring LDS banks. A wave now owns
+    // all four partitions; retaining key-major order would issue four distinct
+    // addresses to the same bank for every input load.
+    constexpr int input_key_step = CACHE_QK_NORMALIZATION ? ROW_SPLIT : 1;
+    const size_t input_key_begin = CACHE_QK_NORMALIZATION ? key_partition : j_start;
 
     // Use individual variables in groups of 8 to help the compiler
     // keep them in VGPRs (AMD compiler more likely to register-allocate
@@ -761,76 +885,134 @@ void rocm_gdn_chunk_forward_kernel(
         float *o_dst = output + row * v_stride + h * kernel_d_v;
 
         if (t >= effective_seq_len) {
-            if (vi < kernel_d_v && tid < cols_per_block)
+            if (vi < kernel_d_v && key_partition == 0)
                 o_dst[vi] = 0.0f;
             continue;
         }
 
-        // Load Q and K into shared memory (all threads cooperate).
-        for (int i = tid; i < kernel_d_k; i += kernel_block_size) {
-            q_local[i] = q_src[i];
-            k_local[i] = k_src[i];
-        }
-        __syncthreads();
-
-        if (use_qk_l2norm) {
-            /*
-             * Q and K normalization are independent, but both reductions use
-             * the same fixed wavefront and warp ordering.  Keep separate
-             * accumulators and shared-memory lanes so each result remains
-             * byte-identical to the former serial Q-then-K implementation,
-             * while publishing both reductions through one barrier sequence.
-             */
-            float q_sum = 0.0f;
-            float k_sum = 0.0f;
-            for (int i = tid; i < kernel_d_k; i += kernel_block_size)
+        float *q_local = q_tile + (t % input_tile_rows) * kernel_d_k;
+        float *k_local = k_tile + (t % input_tile_rows) * kernel_d_k;
+        if constexpr (CACHE_QK_NORMALIZATION)
+        {
+            // Q/K/V are independent input rows, unlike the recurrent state.
+            // Prepare a bounded tile once so global input latency and its
+            // publication barrier are paid once per tile, not once per row.
+            // Waves advance independently inside the tile. Join before reuse
+            // so no fast wave overwrites inputs still consumed by a slow wave.
+            if (t % input_tile_rows == 0)
             {
-                q_sum += q_local[i] * q_local[i];
-                k_sum += k_local[i] * k_local[i];
-            }
-            for (int offset = 32; offset > 0; offset >>= 1)
-            {
-                q_sum += __shfl_xor(q_sum, offset);
-                k_sum += __shfl_xor(k_sum, offset);
-            }
-            if (tid % 64 == 0)
-            {
-                warp_sums[tid / 64] = q_sum;
-                warp_sums[8 + tid / 64] = k_sum;
-            }
-            __syncthreads();
-            if (tid == 0)
-            {
-                float q_total = 0.0f;
-                float k_total = 0.0f;
-                for (int w = 0; w < num_warps; ++w)
+                __syncthreads();
+                for (int cell = tid; cell < input_tile_rows * kernel_d_k;
+                     cell += kernel_block_size)
                 {
-                    q_total += warp_sums[w];
-                    k_total += warp_sums[8 + w];
+                    const int tile_row = t + cell / kernel_d_k;
+                    if (tile_row < effective_seq_len)
+                    {
+                        const int key = cell % kernel_d_k;
+                        const int prepared_index =
+                            (cell / kernel_d_k) * kernel_d_k +
+                            (key % rows_per_split) * ROW_SPLIT + key / rows_per_split;
+                        const int base = (request_row_base + tile_row) * qk_stride +
+                            h * kernel_d_k + key;
+                        q_tile[prepared_index] = Q[base] * (use_qk_l2norm
+                            ? gate_beta[request_seq_len + tile_row] : scale);
+                        k_tile[prepared_index] = use_qk_l2norm
+                            ? K[base] * gate_beta[2 * request_seq_len + tile_row]
+                            : K[base];
+                    }
                 }
-                warp_sums[0] = q_total;
-                warp_sums[8] = k_total;
+                for (int cell = tid; cell < input_tile_rows * cols_per_block;
+                     cell += kernel_block_size)
+                {
+                    const int tile_row = t + cell / cols_per_block;
+                    const int col = blockIdx.y * cols_per_block + cell % cols_per_block;
+                    if (tile_row < effective_seq_len && col < kernel_d_v)
+                        v_tile[cell] = V[(request_row_base + tile_row) * v_stride +
+                            h * kernel_d_v + col];
+                }
+                __syncthreads();
             }
-            __syncthreads();
-
-            const float q_inv =
-                scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-            const float k_inv =
-                1.0f / fmaxf(sqrtf(warp_sums[8]), 1e-6f);
+        }
+        else
+        {
             for (int i = tid; i < kernel_d_k; i += kernel_block_size)
             {
-                q_local[i] *= q_inv;
-                k_local[i] *= k_inv;
+                q_local[i] = q_src[i];
+                k_local[i] = k_src[i];
             }
             __syncthreads();
-        } else {
-            for (int i = tid; i < kernel_d_k; i += kernel_block_size)
-                q_local[i] *= scale;
-            __syncthreads();
+        }
+
+        if constexpr (!CACHE_QK_NORMALIZATION)
+        {
+            if (use_qk_l2norm) {
+                /*
+                 * Q and K normalization are independent, but both reductions use
+                 * the same fixed wavefront and warp ordering.  Keep separate
+                 * accumulators and shared-memory lanes so each result remains
+                 * byte-identical to the former serial Q-then-K implementation,
+                 * while publishing both reductions through one barrier sequence.
+                 */
+                float q_sum = 0.0f;
+                float k_sum = 0.0f;
+                for (int i = tid; i < kernel_d_k; i += kernel_block_size)
+                {
+                    q_sum += q_local[i] * q_local[i];
+                    k_sum += k_local[i] * k_local[i];
+                }
+                for (int offset = 32; offset > 0; offset >>= 1)
+                {
+                    q_sum += __shfl_xor(q_sum, offset);
+                    k_sum += __shfl_xor(k_sum, offset);
+                }
+                if (tid % 64 == 0)
+                {
+                    warp_sums[tid / 64] = q_sum;
+                    warp_sums[8 + tid / 64] = k_sum;
+                }
+                __syncthreads();
+                if (tid == 0)
+                {
+                    float q_total = 0.0f;
+                    float k_total = 0.0f;
+                    for (int w = 0; w < num_warps; ++w)
+                    {
+                        q_total += warp_sums[w];
+                        k_total += warp_sums[8 + w];
+                    }
+                    warp_sums[0] = q_total;
+                    warp_sums[8] = k_total;
+                }
+                __syncthreads();
+
+                const float q_inv =
+                    scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+                const float k_inv =
+                    1.0f / fmaxf(sqrtf(warp_sums[8]), 1e-6f);
+                for (int i = tid; i < kernel_d_k; i += kernel_block_size)
+                {
+                    q_local[i] *= q_inv;
+                    k_local[i] *= k_inv;
+                }
+                __syncthreads();
+            } else {
+                for (int i = tid; i < kernel_d_k; i += kernel_block_size)
+                    q_local[i] *= scale;
+                __syncthreads();
+            }
         }
 
         const float decay = gate_decay[t];
         const float beta_h = gate_beta[t];
+
+        // K is immutable for both recurrence passes. Retain this lane's key
+        // partition across the delta-publication barrier instead of issuing a
+        // second LDS read for every state update. The affine state addresses
+        // above leave room for these values without private-memory spills.
+        float k_registers[rows_per_split];
+#pragma unroll
+        for (int key = 0; key < rows_per_split; ++key)
+            k_registers[key] = k_local[input_key_begin + input_key_step * key];
 
         // =================================================================
         // DECODE-EQUIVALENT register-cached state processing
@@ -845,7 +1027,7 @@ void rocm_gdn_chunk_forward_kernel(
         if (vi < kernel_d_v) {
 #define LLAMINAR_ROCM_GDN_DECAY_OBSERVE(OFFSET, MEMBER)                       \
             MEMBER *= decay;                                                  \
-            partial_kv += MEMBER * k_local[j_start + OFFSET]
+            partial_kv += MEMBER * k_registers[OFFSET]
             LLAMINAR_ROCM_GDN_DECAY_OBSERVE(0, sc0);
             LLAMINAR_ROCM_GDN_DECAY_OBSERVE(1, sc1);
             LLAMINAR_ROCM_GDN_DECAY_OBSERVE(2, sc2);
@@ -880,47 +1062,54 @@ void rocm_gdn_chunk_forward_kernel(
                     float tail_state =
                         state_tail[0 * kernel_block_size + tid] * decay;
                     state_tail[0 * kernel_block_size + tid] = tail_state;
-                    partial_kv += tail_state * k_local[j_start + 27];
+                    partial_kv += tail_state * k_registers[27];
 
                     tail_state =
                         state_tail[1 * kernel_block_size + tid] * decay;
                     state_tail[1 * kernel_block_size + tid] = tail_state;
-                    partial_kv += tail_state * k_local[j_start + 28];
+                    partial_kv += tail_state * k_registers[28];
 
                     tail_state =
                         state_tail[2 * kernel_block_size + tid] * decay;
                     state_tail[2 * kernel_block_size + tid] = tail_state;
-                    partial_kv += tail_state * k_local[j_start + 29];
+                    partial_kv += tail_state * k_registers[29];
 
                     tail_state =
                         state_tail[3 * kernel_block_size + tid] * decay;
                     state_tail[3 * kernel_block_size + tid] = tail_state;
-                    partial_kv += tail_state * k_local[j_start + 30];
+                    partial_kv += tail_state * k_registers[30];
 
                     tail_state =
                         state_tail[4 * kernel_block_size + tid] * decay;
                     state_tail[4 * kernel_block_size + tid] = tail_state;
-                    partial_kv += tail_state * k_local[j_start + 31];
+                    partial_kv += tail_state * k_registers[31];
                 }
                 else
                 {
-                    sc27 *= decay; partial_kv += sc27 * k_local[j_start + 27];
-                    sc28 *= decay; partial_kv += sc28 * k_local[j_start + 28];
-                    sc29 *= decay; partial_kv += sc29 * k_local[j_start + 29];
-                    sc30 *= decay; partial_kv += sc30 * k_local[j_start + 30];
-                    sc31 *= decay; partial_kv += sc31 * k_local[j_start + 31];
+                    sc27 *= decay; partial_kv += sc27 * k_registers[27];
+                    sc28 *= decay; partial_kv += sc28 * k_registers[28];
+                    sc29 *= decay; partial_kv += sc29 * k_registers[29];
+                    sc30 *= decay; partial_kv += sc30 * k_registers[30];
+                    sc31 *= decay; partial_kv += sc31 * k_registers[31];
                 }
             }
 #undef LLAMINAR_ROCM_GDN_DECAY_OBSERVE
         }
-        reduce_kv[tid] = partial_kv;
-        __syncthreads();
+        if constexpr (!CACHE_QK_NORMALIZATION)
+        {
+            reduce_kv[tid] = partial_kv;
+            __syncthreads();
+        }
 
         // Reduce kv across splits and compute delta
         float delta = 0.0f;
         if (vi < kernel_d_v) {
             int reduction_col = 0;
-            if constexpr (STATIC_BLOCK_SIZE == 256)
+            if constexpr (CACHE_QK_NORMALIZATION)
+            {
+                reduction_col = column_in_block;
+            }
+            else if constexpr (STATIC_BLOCK_SIZE == 256)
             {
                 /*
                  * Keep this invariant address out of the 425-row live range.
@@ -940,19 +1129,38 @@ void rocm_gdn_chunk_forward_kernel(
             }
             float kv = 0.0f;
             for (int s = 0; s < ROW_SPLIT; s++)
-                kv += reduce_kv[
-                    reduction_col + s * cols_per_block];
-            delta = (v_src[vi] - kv) * beta_h;
+            {
+                if constexpr (CACHE_QK_NORMALIZATION)
+                    kv += __shfl(partial_kv,
+                        tid % columns_per_wave + s * columns_per_wave, 64);
+                else
+                    kv += reduce_kv[reduction_col + s * cols_per_block];
+            }
+            const float value = CACHE_QK_NORMALIZATION
+                ? v_tile[(t % input_tile_rows) * cols_per_block + reduction_col]
+                : v_src[vi];
+            delta = (value - kv) * beta_h;
         }
 
         // =================================================================
         // Pass 2: Update state + accumulate output (all in registers)
         // =================================================================
+        // Stage Q independently of the dependent output FMA chain. K and Q
+        // lifetimes overlap here deliberately; compiler spill certification
+        // proves this remains a register-only operation for the selected ISA.
+        float q_registers[rows_per_split];
+        if constexpr (CACHE_QK_NORMALIZATION)
+        {
+#pragma unroll
+            for (int key = 0; key < rows_per_split; ++key)
+                q_registers[key] = q_local[input_key_begin + input_key_step * key];
+        }
         float partial_out = 0.0f;
         if (vi < kernel_d_v) {
 #define LLAMINAR_ROCM_GDN_UPDATE_PROJECT(OFFSET, MEMBER)                      \
-            MEMBER += k_local[j_start + OFFSET] * delta;                      \
-            partial_out += MEMBER * q_local[j_start + OFFSET]
+            MEMBER += k_registers[OFFSET] * delta;                            \
+            partial_out += MEMBER * (CACHE_QK_NORMALIZATION ? q_registers[OFFSET] \
+                : q_local[input_key_begin + input_key_step * OFFSET])
             LLAMINAR_ROCM_GDN_UPDATE_PROJECT(0, sc0);
             LLAMINAR_ROCM_GDN_UPDATE_PROJECT(1, sc1);
             LLAMINAR_ROCM_GDN_UPDATE_PROJECT(2, sc2);
@@ -986,69 +1194,47 @@ void rocm_gdn_chunk_forward_kernel(
                 {
                     float tail_state =
                         state_tail[0 * kernel_block_size + tid] +
-                        k_local[j_start + 27] * delta;
+                        k_registers[27] * delta;
                     state_tail[0 * kernel_block_size + tid] = tail_state;
                     partial_out += tail_state * q_local[j_start + 27];
 
                     tail_state =
                         state_tail[1 * kernel_block_size + tid] +
-                        k_local[j_start + 28] * delta;
+                        k_registers[28] * delta;
                     state_tail[1 * kernel_block_size + tid] = tail_state;
                     partial_out += tail_state * q_local[j_start + 28];
 
                     tail_state =
                         state_tail[2 * kernel_block_size + tid] +
-                        k_local[j_start + 29] * delta;
+                        k_registers[29] * delta;
                     state_tail[2 * kernel_block_size + tid] = tail_state;
                     partial_out += tail_state * q_local[j_start + 29];
 
                     tail_state =
                         state_tail[3 * kernel_block_size + tid] +
-                        k_local[j_start + 30] * delta;
+                        k_registers[30] * delta;
                     state_tail[3 * kernel_block_size + tid] = tail_state;
                     partial_out += tail_state * q_local[j_start + 30];
 
                     tail_state =
                         state_tail[4 * kernel_block_size + tid] +
-                        k_local[j_start + 31] * delta;
+                        k_registers[31] * delta;
                     state_tail[4 * kernel_block_size + tid] = tail_state;
                     partial_out += tail_state * q_local[j_start + 31];
                 }
                 else
                 {
-                    sc27 += k_local[j_start + 27] * delta; partial_out += sc27 * q_local[j_start + 27];
-                    sc28 += k_local[j_start + 28] * delta; partial_out += sc28 * q_local[j_start + 28];
-                    sc29 += k_local[j_start + 29] * delta; partial_out += sc29 * q_local[j_start + 29];
-                    sc30 += k_local[j_start + 30] * delta; partial_out += sc30 * q_local[j_start + 30];
-                    sc31 += k_local[j_start + 31] * delta; partial_out += sc31 * q_local[j_start + 31];
+                    LLAMINAR_ROCM_GDN_UPDATE_PROJECT(27, sc27);
+                    LLAMINAR_ROCM_GDN_UPDATE_PROJECT(28, sc28);
+                    LLAMINAR_ROCM_GDN_UPDATE_PROJECT(29, sc29);
+                    LLAMINAR_ROCM_GDN_UPDATE_PROJECT(30, sc30);
+                    LLAMINAR_ROCM_GDN_UPDATE_PROJECT(31, sc31);
                 }
             }
 #undef LLAMINAR_ROCM_GDN_UPDATE_PROJECT
         }
-        reduce_out[tid] = partial_out;
-        __syncthreads();
-
-        // Reduce output and write (only split_id=0 writes)
-        if (vi < kernel_d_v && tid < cols_per_block) {
-            int reduction_col = 0;
-            if constexpr (STATIC_BLOCK_SIZE == 256)
-            {
-                asm volatile(
-                    "v_and_b32_e32 %0, 63, %1"
-                    : "=v"(reduction_col)
-                    : "v"(tid));
-            }
-            else
-            {
-                reduction_col = tid % cols_per_block;
-            }
-            float out_vi = 0.0f;
-            for (int s = 0; s < ROW_SPLIT; s++)
-                out_vi += reduce_out[
-                    reduction_col + s * cols_per_block];
-            o_dst[vi] = out_vi;
-        }
-        if (state_snapshots && row < max_snapshot_rows && vi < kernel_d_v) {
+        if (SNAPSHOTS == GdnPrefillSnapshots::BoundedRows &&
+            state_snapshots && row < max_snapshot_rows && vi < kernel_d_v) {
             float *snapshot =
                 state_snapshots +
                 (size_t)row * snapshot_stride_floats +
@@ -1104,6 +1290,43 @@ void rocm_gdn_chunk_forward_kernel(
                     snapshot[(j_start + 31) * kernel_d_v + vi] = sc31;
                 }
             }
+        }
+        if constexpr (!CACHE_QK_NORMALIZATION)
+        {
+            reduce_out[tid] = partial_out;
+            __syncthreads();
+        }
+
+        // Every source lane must participate in a wave shuffle. Exchanging
+        // values inside the writer-only branch would read inactive partitions.
+        float wave_output = 0.0f;
+        if constexpr (CACHE_QK_NORMALIZATION)
+        {
+            for (int s = 0; s < ROW_SPLIT; ++s)
+                wave_output += __shfl(partial_out,
+                    tid % columns_per_wave + s * columns_per_wave, 64);
+        }
+        // Reduce output and write (only split_id=0 writes).
+        if (vi < kernel_d_v && key_partition == 0) {
+            int reduction_col = 0;
+            if constexpr (!CACHE_QK_NORMALIZATION && STATIC_BLOCK_SIZE == 256)
+            {
+                asm volatile(
+                    "v_and_b32_e32 %0, 63, %1"
+                    : "=v"(reduction_col)
+                    : "v"(tid));
+            }
+            else
+            {
+                reduction_col = tid % cols_per_block;
+            }
+            float out_vi = wave_output;
+            if constexpr (!CACHE_QK_NORMALIZATION)
+            {
+                for (int s = 0; s < ROW_SPLIT; s++)
+                    out_vi += reduce_out[reduction_col + s * cols_per_block];
+            }
+            o_dst[vi] = out_vi;
         }
     }
 
@@ -1763,65 +1986,17 @@ __global__ void rocm_attention_output_gate_kernel(
 
 namespace {
 
+/** @brief Captured request-local copy; the shared mapping never touches padding. */
 __global__ void rocm_gdn_deinterleave_qkv_kernel(
     const float *__restrict__ merged,
     float *__restrict__ out_q,
     float *__restrict__ out_k,
     float *__restrict__ out_v,
-    int seq_len, int n_k_heads, int n_v_heads,
+    llaminar2::DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
     int d_k, int d_v, int global_v_offset)
 {
-    if (n_k_heads <= 0 || n_v_heads <= 0 || d_k <= 0 || d_v <= 0)
-        return;
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    int q_src_dim = n_k_heads * d_k;
-    int k_src_dim = n_k_heads * d_k;
-    int v_dim = n_v_heads * d_v;
-    int stride = q_src_dim + k_src_dim + v_dim;
-
-    int q_dst_dim = n_v_heads * d_k;
-    int k_dst_dim = n_v_heads * d_k;
-
-    int q_total = seq_len * q_dst_dim;
-    int k_total = seq_len * k_dst_dim;
-    int v_total = seq_len * v_dim;
-    int total = q_total + k_total + v_total;
-
-    if (idx >= total)
-        return;
-
-    if (idx < q_total)
-    {
-        int t = idx / q_dst_dim;
-        int rem = idx % q_dst_dim;
-        int j = rem / d_k;
-        int d = rem % d_k;
-        int k_idx = (j + global_v_offset) % n_k_heads;
-        if (k_idx < 0)
-            k_idx += n_k_heads;
-        out_q[idx] = merged[t * stride + k_idx * d_k + d];
-    }
-    else if (idx < q_total + k_total)
-    {
-        int local = idx - q_total;
-        int t = local / k_dst_dim;
-        int rem = local % k_dst_dim;
-        int j = rem / d_k;
-        int d = rem % d_k;
-        int k_idx = (j + global_v_offset) % n_k_heads;
-        if (k_idx < 0)
-            k_idx += n_k_heads;
-        out_k[local] = merged[t * stride + q_src_dim + k_idx * d_k + d];
-    }
-    else
-    {
-        int local = idx - q_total - k_total;
-        int t = local / v_dim;
-        int d = local % v_dim;
-        out_v[local] = merged[t * stride + q_src_dim + k_src_dim + d];
-    }
+    llaminar2::gdnDeinterleaveLiveRows(merged, out_q, out_k, out_v,
+        rows, n_k_heads, n_v_heads, d_k, d_v, global_v_offset);
 }
 
 /**
@@ -2312,9 +2487,10 @@ bool rocmGDN_reassemble_modulo_linked_state(
 
 extern "C" {
 
+/** @brief Validate immutable extent and enqueue live-row copying on a non-null stream. */
 bool rocmGDN_deinterleave_qkv(
     const float *merged, float *out_q, float *out_k, float *out_v,
-    int seq_len, int n_k_heads, int n_v_heads,
+    llaminar2::DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
     int d_k, int d_v, int global_v_offset,
     int device_idx, void *stream)
 {
@@ -2328,12 +2504,10 @@ bool rocmGDN_deinterleave_qkv(
         print_pointer_attrs("out_v", out_v);
     }
 
-    int q_dst_dim = n_v_heads * d_k;
-    int k_dst_dim = n_v_heads * d_k;
-    int v_dim = n_v_heads * d_v;
-    int total = seq_len * (q_dst_dim + k_dst_dim + v_dim);
-    if (seq_len <= 0 || n_k_heads <= 0 || n_v_heads <= 0 ||
-        d_k <= 0 || d_v <= 0 || total <= 0)
+    const int seq_len = rows.physicalRows();
+    const int total = llaminar2::gdnDeinterleaveElementsPerRequest(
+        rows, n_k_heads, n_v_heads, d_k, d_v);
+    if (!stream || !merged || !out_q || !out_k || !out_v || total <= 0)
     {
         fprintf(stderr,
                 "[rocmGDN_deinterleave_qkv] invalid launch geometry: "
@@ -2345,12 +2519,12 @@ bool rocmGDN_deinterleave_qkv(
     }
 
     int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    const int blocks = 1 + (total - 1) / threads;
 
     hipLaunchKernelGGL(rocm_gdn_deinterleave_qkv_kernel,
-        dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+        dim3(blocks, rows.requests()), dim3(threads), 0, (hipStream_t)stream,
         merged, out_q, out_k, out_v,
-        seq_len, n_k_heads, n_v_heads, d_k, d_v, global_v_offset);
+        rows, n_k_heads, n_v_heads, d_k, d_v, global_v_offset);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -2482,6 +2656,16 @@ bool rocmGDN_recurrent_step_effective_row(
     return true;
 }
 
+/**
+ * @brief Enqueue the shape-appropriate, serial-row-exact GDN recurrence.
+ *
+ * All pointers and the explicit stream remain caller-owned for the captured
+ * graph lifetime. Complete speculative snapshots select the verifier route;
+ * ordinary long prefill specializes key/value widths and block geometry,
+ * independently of participant-local head count. TP sharding changes strides
+ * and grid width, not the arithmetic or storage contract of each head.
+ * @return False for invalid bindings/geometry or a failed HIP launch.
+ */
 bool rocmGDN_chunk_forward_batched_kernel_route(
     const float *Q, const float *K, const float *V,
     const float *alpha, const float *beta_raw,
@@ -2579,9 +2763,9 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
         return true;
     }
 
-    // Row-split: 256 threads per block, 4 threads per column = 64 cols/block.
-    // 4 wavefronts/block matches CUDA's ROW_SPLIT=4 and preserves the fixed
-    // reduction order that compounds through the recurrent state.
+    // Four threads per column retain scalar decode's four fixed key partitions.
+    // Bounded prefill places those threads in the same wave; other geometries
+    // exchange them through LDS. Neither changes the partition or sum order.
     int col_threads = 256;
     int cols_per_block = col_threads / 4; // 64 columns per block
     if (d_v <= 64)
@@ -2590,22 +2774,67 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
         cols_per_block = col_threads / 4; // 32 columns per block
     }
     int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
-    const bool uses_qwen36_moe_static_kernel =
-        n_heads == 32 && d_k == 128 && d_v == 128 && col_threads == 256;
+    // Specialize the recurrence geometry, not a model's unsharded head count.
+    // The head count only controls independent workgroups and row strides;
+    // restricting this route to 32 made TP shards use slower dynamic indexing.
+    const bool uses_fixed_width_kernel =
+        d_k == 128 && d_v == 128 && col_threads == 256;
+    // Two additional per-row scales fit in LDS through the 2048-row bucket.
+    // Larger buckets retain the same on-row normalization arithmetic without
+    // exceeding gfx906's shared-memory limit. This is capture-time geometry,
+    // not a runtime capability switch or a new physical allocation.
+    const bool cache_qk_normalization =
+        uses_fixed_width_kernel && request_seq_len <= 2048;
     const int lds_state_tail_rows =
-        uses_qwen36_moe_static_kernel ? 5 : 0;
-    // q[d_k] + k[d_k] + warp sums[16] + two reduction arrays + state tail
-    // + one decay and beta scalar for every row in this captured bucket.
+        uses_fixed_width_kernel && !cache_qk_normalization ? 5 : 0;
+    // Bounded Q/K/V input tile + warp sums[16] + reduction arrays + state tail
+    // + per-row decay/beta and, when selected, the two normalization scales.
+    const int input_tile_floats = cache_qk_normalization
+        ? kGdnPrefillInputTileRows * (2 * d_k + cols_per_block)
+        : 2 * d_k;
     int smem_size =
-        (2 * d_k + 16 +
-         (2 + lds_state_tail_rows) * col_threads +
-         2 * request_seq_len) * sizeof(float);
+        (input_tile_floats + 16 +
+         ((cache_qk_normalization ? 0 : 2) + lds_state_tail_rows) * col_threads +
+         (cache_qk_normalization ? 4 : 2) * request_seq_len) * sizeof(float);
 
-    if (uses_qwen36_moe_static_kernel)
+    if (cache_qk_normalization && !state_snapshots)
+    {
+        // Snapshot presence is frozen into this captured launch. Ordinary
+        // prefill must not carry a never-taken intermediate-publication branch
+        // around every token back edge. Both policies share exact arithmetic.
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_gdn_chunk_forward_kernel<
+                128, 128, 256, true, GdnPrefillSnapshots::TerminalOnly>),
+            dim3(n_heads, num_col_blocks, request_count), dim3(col_threads),
+            smem_size, static_cast<hipStream_t>(stream),
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, initial_state, updated_state, device_effective_seq_len,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+            request_count, request_seq_len, n_heads, d_v, use_qk_l2norm);
+    }
+    else if (cache_qk_normalization)
     {
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(
-                rocm_gdn_chunk_forward_kernel<32, 128, 128, 256>),
+                rocm_gdn_chunk_forward_kernel<128, 128, 256, true>),
+            dim3(n_heads, num_col_blocks, request_count),
+            dim3(col_threads),
+            smem_size,
+            (hipStream_t)stream,
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, initial_state, updated_state,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            request_count, request_seq_len,
+            n_heads, d_v, use_qk_l2norm);
+    }
+    else if (uses_fixed_width_kernel)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                rocm_gdn_chunk_forward_kernel<128, 128, 256>),
             dim3(n_heads, num_col_blocks, request_count),
             dim3(col_threads),
             smem_size,
@@ -2622,7 +2851,7 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
     else if (d_k == 64)
     {
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(rocm_gdn_chunk_forward_kernel<0, 64>),
+            HIP_KERNEL_NAME(rocm_gdn_chunk_forward_kernel<64>),
             dim3(n_heads, num_col_blocks, request_count),
             dim3(col_threads),
             smem_size,
@@ -2639,7 +2868,7 @@ bool rocmGDN_chunk_forward_batched_kernel_route(
     else
     {
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(rocm_gdn_chunk_forward_kernel<0, 128>),
+            HIP_KERNEL_NAME(rocm_gdn_chunk_forward_kernel<128>),
             dim3(n_heads, num_col_blocks, request_count),
             dim3(col_threads),
             smem_size,

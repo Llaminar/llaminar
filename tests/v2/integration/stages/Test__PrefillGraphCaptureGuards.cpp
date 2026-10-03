@@ -307,13 +307,13 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_RequiresBoundWorkspa
     float *d_q = nullptr, *d_k_out = nullptr, *d_v_out = nullptr;
     EXPECT_FALSE(gdn.deinterleave_qkv_device(
         d_merged, d_q, d_k_out, d_v_out,
-        small_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
+        DeviceRequestRowRanges::fullyActive(small_seq), n_k_heads, n_v_heads, d_k, d_v, 0));
 
     auto small_workspace = bind_deinterleave_workspace(small_total);
     ASSERT_NE(small_workspace, nullptr);
     ASSERT_TRUE(gdn.deinterleave_qkv_device(
         d_merged, d_q, d_k_out, d_v_out,
-        small_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
+        DeviceRequestRowRanges::fullyActive(small_seq), n_k_heads, n_v_heads, d_k, d_v, 0));
 
     // A larger request must fail with the too-small bound workspace both
     // during and outside graph capture. The kernel no longer allocates a
@@ -330,14 +330,14 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_RequiresBoundWorkspa
         float *dq2 = nullptr, *dk2 = nullptr, *dv2 = nullptr;
         EXPECT_FALSE(gdn.deinterleave_qkv_device(
             d_merged_big, dq2, dk2, dv2,
-            big_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
+            DeviceRequestRowRanges::fullyActive(big_seq), n_k_heads, n_v_heads, d_k, d_v, 0));
     }
 
     {
         float *dq3 = nullptr, *dk3 = nullptr, *dv3 = nullptr;
         EXPECT_FALSE(gdn.deinterleave_qkv_device(
             d_merged_big, dq3, dk3, dv3,
-            big_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
+            DeviceRequestRowRanges::fullyActive(big_seq), n_k_heads, n_v_heads, d_k, d_v, 0));
     }
 
     auto big_workspace = bind_deinterleave_workspace(big_total);
@@ -346,7 +346,7 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_RequiresBoundWorkspa
         float *dq4 = nullptr, *dk4 = nullptr, *dv4 = nullptr;
         EXPECT_TRUE(gdn.deinterleave_qkv_device(
             d_merged_big, dq4, dk4, dv4,
-            big_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
+            DeviceRequestRowRanges::fullyActive(big_seq), n_k_heads, n_v_heads, d_k, d_v, 0));
     }
 
     (void)hipFree(d_merged);

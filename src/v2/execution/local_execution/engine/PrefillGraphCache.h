@@ -1,12 +1,13 @@
 /**
  * @file PrefillGraphCache.h
- * @brief Persistent graph capture/replay cache for monolithic single-device prefill
+ * @brief Participant-local ownership of retained prefill graph executables.
  *
- * Provides the state machine, preflight checks, and GPU graph lifecycle
- * (warmup → capture → replay) for prefill graph caching.
- *
- * Tier 1 Phase 4: Self-contained cache implementation.
- * Phase 5 will integrate this into ForwardExecutionEngine.
+ * ForwardExecutionEngine uses the typed entry lifecycle to prepare, capture
+ * and replay an exact graph identity. Request reset changes live inputs while
+ * preserving reusable topology; retirement must respect outstanding graph
+ * submissions. Bucket admission shares the canonical serving floor with
+ * runtime selection, so a short supported tail neither becomes eager work nor
+ * silently pads to a larger historical capture threshold.
  */
 
 #pragma once
@@ -124,7 +125,7 @@ namespace llaminar2
     struct PrefillGraphConfig
     {
         bool enabled = true;                 ///< LLAMINAR_GPU_GRAPHS master flag
-        int minimum_padded_bucket_seq_len = 256; ///< Minimum padded raw-prompt bucket; exact smaller graphs remain capturable
+        int minimum_padded_bucket_seq_len = kDefaultPrefillGraphMinBucketSize; ///< Canonical serving floor; exact smaller graphs remain capturable.
         bool trace = false;                  ///< LLAMINAR_PREFILL_GRAPH_TRACE
         bool buckets_enabled = true;         ///< Bucketed capture is on by default; LLAMINAR_PREFILL_GRAPH_BUCKETS=0 opts out.
         std::vector<int> bucket_sizes;       ///< LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES

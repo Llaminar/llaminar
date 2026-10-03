@@ -49,7 +49,7 @@ namespace
     ENUM(CollectiveBackendType, VALUE(AUTO), VALUE(NCCL), VALUE(RCCL), VALUE(HETEROGENEOUS), VALUE(UPI), VALUE(MPI), VALUE(HOST))
     ENUM(ExecutionDomainScope, VALUE(AUTO), VALUE(SINGLE), VALUE(RANK_LOCAL), VALUE(NODE_LOCAL), VALUE(GLOBAL))
     ENUM(FusedAttentionBackend, VALUE(JIT), VALUE(REFERENCE), VALUE(TILED), VALUE(Q16_INTEGER))
-    ENUM(RoutedExpertComputePolicy, VALUE(Unspecified), VALUE(Replicated), VALUE(Apportioned), VALUE(TensorSharded))
+    ENUM(RoutedExpertComputePolicy, VALUE(Unspecified), VALUE(Replicated), VALUE(Apportioned), VALUE(TensorSharded), VALUE(GateUpOwnedDownColumns), VALUE(Automatic))
     ENUM(RoutedExpertPhasePolicy, VALUE(Unspecified), VALUE(Uniform), VALUE(PrefillApportionedDecodeReplicated))
     ENUM(RoutedExpertAssignmentPolicy, VALUE(Unspecified), VALUE(StaticOwner), VALUE(LeastLoadedResident))
     ENUM(RoutedExpertOwnerOrder, VALUE(Ordinal), VALUE(Random))

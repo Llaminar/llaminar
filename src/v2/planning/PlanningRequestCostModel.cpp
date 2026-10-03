@@ -13,6 +13,9 @@
 #include "PlanningForwardStateWork.h"
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
+#include "execution/moe/MoEGroupedIntermediateExchangeABI.h"
+#include "transfer/CapturedTransferChannelProtocol.h"
+#include "tensors/NativeVnniFormatInfo.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -70,7 +73,8 @@ namespace llaminar2
         // for inference. The final evidence labels volume proxies explicitly.
         constexpr std::array precisions{PlanningAllreducePrecision::FP32};
         auto communication = PlanningCommunicationService::collect(context.mpi(), context.inventory(), *request,
-            context.metadata().memoryProfile().d_model, 64, precisions);
+            context.metadata().memoryProfile().d_model, 64, precisions,
+            context.request().routed_expert_compute_policy);
         if (!context.isRoot()) return std::nullopt;
         auto service = std::make_shared<const PlanningRequestCostModel>(context.metadata(), context.inventory(),
             std::move(*weights), std::move(*arithmetic), PlanningCommunicationCost(context.inventory(),
@@ -329,6 +333,95 @@ namespace llaminar2
             return seconds;
         };
 
+        /**
+         * @brief Price the declared projection exchange, not a complete-FFN output sum.
+         *
+         * Counted channels send each owner's live records to its down consumers.
+         * P2P domains retain the native packet layout; neither transport is
+         * selected from timings. Column publication is a lossless gather, not
+         * another floating reduction. The bounded native allreduce witness is
+         * explicitly a byte-volume proxy for those unmeasured gather protocols.
+         */
+        const auto projectionCommunication = [&](const std::vector<size_t> &group, int layer) {
+            if (group.size() < 2) throw std::logic_error("Projection cost has no complete GPU domain");
+            const auto &root = work[group.front()];
+            const auto *first = local[group.front()].routed[layer];
+            if (!first || !first->projection_ownership)
+                throw std::logic_error("Projection cost has no admitted source ownership");
+            const auto coverage = devices[group.front()].projection_peer_access;
+            if (!coverage) throw std::logic_error("Projection cost is missing observed P2P topology");
+            std::vector<DeviceId> endpoints;
+            std::vector<double> records;
+            const auto geometry = first->projection_ownership->geometry();
+            if (rows > std::numeric_limits<int>::max() / first->routes_per_token)
+                throw std::overflow_error("Projection live route geometry exceeds its packet ABI");
+            const bool floating = !native_vnni_formats::forQuantType(first->gate_up_down[2].executionFormat());
+            const MoEGroupedIntermediateLayout layout{
+                floating ? MoEGroupedIntermediateEncoding::FP32 : MoEGroupedIntermediateEncoding::BlockQ8FP32Scales,
+                static_cast<uint32_t>(geometry.intermediate_columns),
+                static_cast<uint32_t>(rows * first->routes_per_token), static_cast<uint32_t>(group.size())};
+            if (!layout.compactValid()) throw std::logic_error("Projection cost has invalid packet geometry");
+            for (size_t index : group)
+            {
+                const auto *expert = local[index].routed[layer];
+                if (!expert || !expert->projection_ownership || work[index].discovery_rank != root.discovery_rank ||
+                    work[index].device.type != root.device.type || devices[index].projection_peer_access != coverage ||
+                    expert->projection_ownership->geometry() != geometry ||
+                    expert->projection_ownership->participants() != static_cast<int>(group.size()))
+                    throw std::logic_error("Projection cost cannot substitute foreign domain/ownership evidence");
+                endpoints.push_back(work[index].device);
+                records.push_back(expert->uniformExpectation(rows).routed_rows);
+            }
+            const auto nativeVolume = [&](double bytes) {
+                const auto byte_count = payload(bytes);
+                const size_t row_bytes = size_t(profile.d_model) * sizeof(float);
+                const auto equivalent = byte_count / row_bytes + (byte_count % row_bytes != 0);
+                if (equivalent > size_t(std::numeric_limits<int>::max()))
+                    throw std::overflow_error("Projection native volume exceeds its measured row basis");
+                const auto prediction = communication_.nativeAllreduce(root.discovery_rank, endpoints,
+                    profile.d_model, static_cast<int>(equivalent), PlanningAllreducePrecision::FP32);
+                result.qualifications.insert(prediction.evidence);
+                return prediction.seconds;
+            };
+            double intermediate = 0;
+            if (*coverage == PeerAccessCoverage::None)
+            {
+                result.qualifications.insert("projection intermediate uses counted owner records and mapped byte primitives; ordered local sends/receives; protocol polling not separately fitted");
+                std::vector<double> participants;
+                for (size_t producer = 0; producer < group.size(); ++producer)
+                {
+                    double seconds = 0;
+                    for (size_t peer = 0; peer < group.size(); ++peer)
+                    {
+                        if (producer == peer) continue;
+                        // The cache-line-sized publication has three uint64
+                        // fields. Price those live fields, not its alignment
+                        // padding or the channel's reserved physical capacity.
+                        constexpr auto metadata = sizeof(CapturedTransferPublication::epoch) + sizeof(CapturedTransferMessage);
+                        const auto outgoing = payload(records[producer] * layout.compactRecordWords() * sizeof(uint32_t) + metadata);
+                        const auto incoming = payload(records[peer] * layout.compactRecordWords() * sizeof(uint32_t) + metadata);
+                        seconds += communication_.hostTransfer(root.discovery_rank, endpoints[producer], root.discovery_rank,
+                            PlanningHostTransferMechanism::MappedKernel, MappedTransferDirection::DeviceToHost, outgoing).seconds;
+                        seconds += communication_.hostTransfer(root.discovery_rank, endpoints[producer], root.discovery_rank,
+                            PlanningHostTransferMechanism::MappedKernel, MappedTransferDirection::HostToDevice, incoming).seconds;
+                    }
+                    participants.push_back(seconds);
+                }
+                // Domain participants execute concurrently, but each captured
+                // stream issues its own sends/receives in order. No invented
+                // overlap between those local channel operations is credited.
+                intermediate = planningIndependentSeconds(participants);
+            }
+            else
+            {
+                result.qualifications.insert("projection native intermediate packet gather uses a measured FP32 allreduce byte-volume proxy, not measured gather throughput");
+                intermediate = nativeVolume(layout.packetBytes());
+            }
+            result.qualifications.insert("projection per-role work extrapolates complete-FFN measured rate; gate/up quota and all-expert down slices remain distinct");
+            result.qualifications.insert("projection column gather uses a measured FP32 allreduce byte-volume proxy, not measured gather throughput");
+            return intermediate + nativeVolume(double(rows) * geometry.model_columns * sizeof(float) / group.size());
+        };
+
         std::vector<double> entries, terminals;
         for (const auto &cost : local) { entries.push_back(cost.entry); terminals.push_back(cost.terminal); }
         result.compute = planningIndependentSeconds(entries) + planningIndependentSeconds(terminals);
@@ -378,6 +471,13 @@ namespace llaminar2
             }
             result.compute += planningIndependentSeconds(ordinary) + planningIndependentSeconds(experts);
             result.communication += 2 * reduction(tp); // Attention and FFN row-parallel joins.
+            // The shared FFN retains a native sum/reduce-scatter volume proxy
+            // above. Projection mode additionally exchanges intermediates and
+            // assembles independent down columns; whole-expert mode does not.
+            const bool projection = std::any_of(continuation.begin(), continuation.end(), [&](size_t index) {
+                return local[index].routed[layer] && local[index].routed[layer]->projection_ownership.has_value();
+            });
+            if (projection) result.communication += projectionCommunication(continuation, layer);
             // Ordinary TP replicas do not become a sparse overlay: their
             // row-parallel joins were already charged above. Overlay routing
             // uses its bound logical root, never vector order or discovery rank.

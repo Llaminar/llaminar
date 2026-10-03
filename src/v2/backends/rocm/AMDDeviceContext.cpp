@@ -603,19 +603,24 @@ namespace llaminar2
     // Event Access (Worker-Thread-Only)
     // ============================================================================
 
-    void *AMDDeviceContext::createEvent()
+    /** @copydoc IWorkerGPUContext::createEvent */
+    void *AMDDeviceContext::createEvent(GPUEventPurpose purpose)
     {
+        // Validate before touching HIP; ordinary lifecycle receipts do not
+        // request the compute/timestamp work needed only by real profiling.
+        const unsigned flags = gpuEventHasTiming(purpose) ? hipEventDefault : hipEventDisableTiming;
         if (!setAMDDeviceForResource(device_ordinal_, "createEvent"))
         {
-            return nullptr;
+            throw std::runtime_error("AMDDeviceContext::createEvent could not select device " +
+                                     std::to_string(device_ordinal_));
         }
 
-        hipEvent_t event;
-        hipError_t err = hipEventCreate(&event);
+        hipEvent_t event{};
+        hipError_t err = hipEventCreateWithFlags(&event, flags);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[AMDDeviceContext] hipEventCreate failed: " << hipGetErrorString(err));
-            return nullptr;
+            throw std::runtime_error("AMDDeviceContext::createEvent on device " +
+                std::to_string(device_ordinal_) + ": " + hipGetErrorString(err));
         }
         return static_cast<void *>(event);
     }

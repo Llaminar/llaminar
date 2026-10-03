@@ -42,10 +42,21 @@ namespace
             record.cpu_execution = test::kSyntheticCPUExecutionGeometry;
             record.numa_nodes = 1;
             if (rank == 1 && backend != DeviceType::CPU)
+            {
                 for (int index = 0; index < gpu_count; ++index)
                     record.gpus.push_back({.type = backend, .local_device_id = index + 2,
                         .memory_bytes = 32ull << 30, .free_memory_bytes = 24ull << 30,
                         .compute_units = 64, .uuid = "card-" + std::to_string(index), .numa_node = 3});
+                // A typed projection candidate needs a complete topology
+                // observation. This fixture declares no off-diagonal P2P;
+                // it does not infer a link from its synthetic timing/capacity.
+                auto &matrix = backend == DeviceType::CUDA ? record.p2p_cuda : record.p2p_rocm;
+                auto &count = backend == DeviceType::CUDA ? record.p2p_cuda_count : record.p2p_rocm_count;
+                count = gpu_count;
+                matrix.assign(static_cast<size_t>(gpu_count) * gpu_count, false);
+                for (int index = 0; index < gpu_count; ++index)
+                    matrix[static_cast<size_t>(index) * gpu_count + index] = true;
+            }
             result.ranks.push_back(std::move(record));
         }
         result.buildNodeAggregations();
@@ -54,7 +65,8 @@ namespace
 
     /** @return Last complete proposal of one family, preserving sparse discovery identity. */
     AutomaticOrchestrationCandidate proposal(const PlanningModelSource &source, DeviceType backend,
-        OrchestrationStrategy strategy, int gpu_count = 1)
+        OrchestrationStrategy strategy, int gpu_count = 1,
+        RoutedExpertComputePolicy routed_policy = RoutedExpertComputePolicy::Apportioned)
     {
         OrchestrationConfig request;
         request.model_path = source.path();
@@ -62,6 +74,9 @@ namespace
         request.mtp.enabled = false;
         request.mtp.graph_capacity_draft_tokens = source.metadata().memoryProfile().mtp_layer_count > 0 ? 15 : 0;
         request.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        request.routed_expert_compute_policy = routed_policy;
+        if (routed_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+            request.automatic_planning.device_counts = {{backend, gpu_count}};
         request.automatic_planning.only_backends = strategy == OrchestrationStrategy::ExpertOverlay
             ? std::vector{backend, DeviceType::CPU} : std::vector{backend};
         request.automatic_planning.only_strategies = {strategy};
@@ -483,6 +498,74 @@ TEST(PlanningForwardWeightWork, AdmittedReplicaDecodeDoesNotClaimPrefillAssignme
                 EXPECT_EQ(expert.execution_shares.front().assignmentParticipants(), assigned ? 2 : 1);
                 EXPECT_DOUBLE_EQ(expected.routed_rows, assigned ? 24 : 48);
             }
+        }
+    }
+}
+
+/**
+ * @brief The installed projection layout must have a real automatic work description.
+ *
+ * Metadata-only admission already supports this homogeneous GPU mode. Its
+ * costing compiler must preserve that mode rather than reject it as an unknown
+ * whole-expert policy. Every source format uses the same ownership authority;
+ * neither payload conversion nor a device is needed to prove this contract.
+ */
+TEST(PlanningForwardWeightWork, ProjectionOwnershipCompilesBothPhasesAllFormats)
+{
+    using T = GGUFTensorType;
+    const std::vector formats{T::F32, T::F16, T::BF16, T::Q4_0, T::Q4_1, T::Q5_0, T::Q5_1, T::Q8_0,
+        T::Q2_K, T::Q3_K, T::Q4_K, T::Q5_K, T::Q6_K, T::Q8_K, T::IQ1_S, T::IQ1_M,
+        T::IQ2_XXS, T::IQ2_XS, T::IQ2_S, T::IQ3_XXS, T::IQ3_S, T::IQ4_NL, T::IQ4_XS};
+    for (const auto format : formats)
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int degree : {2, 4, 8})
+    {
+        SCOPED_TRACE(::testing::Message() << int(format) << "/" << int(backend) << "/" << degree);
+        // Eight-way GQA needs at least two Q heads per participant when the
+        // two KV heads are replicated. Keep source matrices/normalizers
+        // consistent with sixteen heads rather than weakening shard validation.
+        test::PlanningGGUFFixture file(true, false, format, 512, std::nullopt, 16);
+        PlanningModelSource source(file.path());
+        const auto candidate = admit(proposal(source, backend,
+            OrchestrationStrategy::TensorParallel, degree,
+            RoutedExpertComputePolicy::GateUpOwnedDownColumns), source);
+        ASSERT_EQ(candidate.devicePlans().size(), static_cast<size_t>(degree));
+        for (const auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
+        {
+            std::vector<PlanningParticipantWeightWork> work;
+            ASSERT_NO_THROW(work = compilePlanningForwardWeightWork(source.metadata(), candidate, phase));
+            ASSERT_EQ(work.size(), static_cast<size_t>(degree));
+            double owned_routes = 0;
+            for (size_t index = 0; index < work.size(); ++index)
+            {
+                EXPECT_EQ(candidate.devicePlans()[index].routed_compute_policy,
+                    RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+                EXPECT_EQ(work[index].routed.size(), 2u);
+                for (const auto &expert : work[index].routed)
+                {
+                    ASSERT_TRUE(expert.projection_ownership);
+                    EXPECT_EQ(*expert.projection_ownership,
+                        MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
+                            {8, 256, 512}, static_cast<int>(index), degree));
+                    EXPECT_EQ(expert.projectionMatrix(WeightRole::MoEExpertGate), (WeightShardMatrix{512, 256, 1}));
+                    EXPECT_EQ(expert.projectionMatrix(WeightRole::MoEExpertUp), (WeightShardMatrix{512, 256, 1}));
+                    EXPECT_EQ(expert.projectionMatrix(WeightRole::MoEExpertDown),
+                        (WeightShardMatrix{static_cast<size_t>(256 / degree), 512, 1}));
+                    const auto gate = expert.projectionExpectation(WeightRole::MoEExpertGate, 33);
+                    const auto down = expert.projectionExpectation(WeightRole::MoEExpertDown, 33);
+                    EXPECT_DOUBLE_EQ(gate.routed_rows, expert.uniformExpectation(33).routed_rows);
+                    EXPECT_DOUBLE_EQ(down.routed_rows, 66);
+                    EXPECT_DOUBLE_EQ(expert.projectionExpectation(WeightRole::MoEExpertDown, 0).routed_rows, 0);
+                    if (expert.layer == 0) owned_routes += gate.routed_rows;
+                    // Ownership has one authority. A forged source shape or
+                    // semantic role must not become a cheaper candidate.
+                    auto corrupt = expert;
+                    corrupt.gate_up_down[2] = expert.gate_up_down[0];
+                    EXPECT_THROW(corrupt.projectionMatrix(WeightRole::MoEExpertDown), std::invalid_argument);
+                    EXPECT_THROW(expert.projectionMatrix(WeightRole::FFNDown), std::invalid_argument);
+                }
+            }
+            EXPECT_DOUBLE_EQ(owned_routes, 66);
         }
     }
 }

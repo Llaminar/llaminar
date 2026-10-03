@@ -52,7 +52,8 @@ namespace
         int filter_to_local_runtime_experts,
         int retain_routes_for_deferred_commit,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
     extern "C" bool cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
         const float *routing_indices,
@@ -72,7 +73,8 @@ namespace
         int retain_routes_for_deferred_commit,
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
     extern "C" bool cudaMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
@@ -100,7 +102,8 @@ namespace
         int retain_routes_for_deferred_commit,
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
     bool hasCudaDevice()
     {
@@ -629,7 +632,8 @@ TEST(Perf__MoELLEPDeterminism, CUDA_CompleteRuntimePrefillPlanFusion)
                    /*filter_to_local_runtime_experts=*/0,
                    /*retain_routes_for_deferred_commit=*/0,
                    /*device_idx=*/0,
-                   harness.stream_) &&
+                   harness.stream_,
+                   llaminar2::DeviceMoEProjectionSet::CompleteExpert) &&
                cudaMoE_materialize_runtime_prefill_plan(
                    harness.runtime_table_->deviceLayerState(0),
                    baseline_gate,
@@ -661,7 +665,8 @@ TEST(Perf__MoELLEPDeterminism, CUDA_CompleteRuntimePrefillPlanFusion)
             /*retain_routes_for_deferred_commit=*/0,
             llaminar2::DeviceMoEWeightFormat::NativeVNNI,
             /*device_idx=*/0,
-            harness.stream_);
+            harness.stream_,
+            llaminar2::DeviceMoEProjectionSet::CompleteExpert);
     };
 
     ASSERT_TRUE(launch_baseline());
@@ -860,7 +865,8 @@ TEST(Perf__MoELLEPDeterminism, CUDA_CompleteRuntimePrefillPlanFusion)
             /*retain_routes_for_deferred_commit=*/0,
             llaminar2::DeviceMoEWeightFormat::NativeVNNI,
             /*device_idx=*/0,
-            harness.stream_);
+            harness.stream_,
+            llaminar2::DeviceMoEProjectionSet::CompleteExpert);
     };
 
     ASSERT_TRUE(launch_assigned_baseline());

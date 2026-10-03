@@ -13,17 +13,25 @@
  * Cloned conditional-body compositions authenticate source graphs recursively.
  * Ordering must be expressed by the graph's native dependency edges at the
  * producer; graph composition never rewrites a captured lifecycle after the
- * fact.
+ * fact. Before instantiation, an owner-only transitive reduction removes
+ * redundant full-completion edges without changing that lifecycle's ordering.
  * Mapped peer waits occupy a single sleeping warp rather than a batch-memory
  * scheduling channel: outstanding waits from distinct graph executables must
  * not prevent an independent controller or DMA producer from making progress.
+ * Planning callers prepare captured-kernel context requirements before native
+ * executable construction. Context-private storage receives a measured PMA
+ * lease with context lifetime, so executable-pool observations cannot consume
+ * that allocation or pretend graph destruction returned it.
  */
 
 #ifdef HAVE_CUDA
 
 #include "CUDAGraphCapture.h"
 #include "CUDADriverApi.h"
+#include "CUDABackend.h"
+#include "../BackendManager.h"
 #include "../NativeParallelGraphBranch.h"
+#include "../NativeGraphDependencyReduction.h"
 #include "../../utils/Logger.h"
 
 #include <cuda.h>
@@ -71,6 +79,60 @@ namespace llaminar2
 
     namespace
     {
+        /** @brief Lossless CUDA edge operations for the common setup compiler. */
+        struct CUDADependencyReductionAPI
+        {
+            using Graph = cudaGraph_t;
+            using Node = cudaGraphNode_t;
+#if CUDART_VERSION >= 12030
+            using EdgeData = cudaGraphEdgeData;
+#else
+            /** @brief Older CUDA graphs expose full-completion edges only. */
+            struct EdgeData {};
+#endif
+            static constexpr auto success = cudaSuccess;
+            static constexpr auto nodes = cudaGraphGetNodes;
+            static constexpr auto errorString = cudaGetErrorString;
+
+            /** @brief Read all native edge annotations, never a lossy projection. */
+            static cudaError_t edges(Graph graph, Node *from, Node *to,
+                                     EdgeData *data, std::size_t *count)
+            {
+#if CUDART_VERSION >= 13000
+                return cudaGraphGetEdges(graph, from, to, data, count);
+#elif CUDART_VERSION >= 12030
+                return cudaGraphGetEdges_v2(graph, from, to, data, count);
+#else
+                return cudaGraphGetEdges(graph, from, to, count);
+#endif
+            }
+
+            /** @brief Preserve programmatic/launch ports and unknown annotations. */
+            static detail::NativeDependencyKind kind(const EdgeData &data)
+            {
+#if CUDART_VERSION >= 12030
+                if (data.from_port != 0 || data.to_port != 0 || data.type != 0 ||
+                    std::any_of(std::begin(data.reserved), std::end(data.reserved),
+                                [](auto byte) { return byte != 0; }))
+                    return detail::NativeDependencyKind::PreserveNative;
+#endif
+                return detail::NativeDependencyKind::FullCompletion;
+            }
+
+            /** @brief Remove exactly the proved edges with their original metadata. */
+            static cudaError_t remove(Graph graph, const Node *from, const Node *to,
+                                      const EdgeData *data, std::size_t count)
+            {
+#if CUDART_VERSION >= 13000
+                return cudaGraphRemoveDependencies(graph, from, to, data, count);
+#elif CUDART_VERSION >= 12030
+                return cudaGraphRemoveDependencies_v2(graph, from, to, data, count);
+#else
+                return cudaGraphRemoveDependencies(graph, from, to, count);
+#endif
+            }
+        };
+
         /**
          * @brief Acquire a peer timeline without blocking a CUDA work channel.
          *
@@ -2004,6 +2066,31 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAGraphCapture::prepareRuntimeContextStorage(
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+    {
+        if (recording_role_ != RecordingRole::Owner || !graph_ || exec_ ||
+            !activateOwner("prepareRuntimeContextStorage")) return false;
+        std::vector<GPUGraphKernelNodeInfo> kernels;
+        std::string error;
+        if (!inspectKernelNodes(kernels, &error))
+            throw std::runtime_error("CUDA context requirement inspection failed: " + error);
+        std::size_t required = 0u;
+        for (const auto &kernel : kernels)
+            required = std::max(required, kernel.local_memory_bytes_per_thread);
+        auto *backend = dynamic_cast<CUDABackend *>(getBackendFor(DeviceId::cuda(device_ordinal_)));
+        if (!backend) throw std::runtime_error("CUDA captured-context preparation lost its owning backend");
+        backend->prepareNativeExecutionContextStorage(required, device_ordinal_, stream_, memory);
+        return true;
+    }
+
+    /**
+     * @brief Compile one sealed owner's exact DAG, preserving all ordering.
+     * @return False on invalid ownership or any native compilation failure.
+     *
+     * Dependency simplification is cold, owner-only work. Fragments cannot
+     * mutate shared timeline storage; replay and request reset never run it.
+     */
     bool CUDAGraphCapture::instantiate()
     {
         if (recording_role_ == RecordingRole::Fragment)
@@ -2033,6 +2120,18 @@ namespace llaminar2
             }
             exec_ = nullptr;
             resident_memory_bytes_ = 0u;
+        }
+
+        try
+        {
+            const auto reduced = detail::reduceNativeGraphDependencies<CUDADependencyReductionAPI>(graph_);
+            LOG_DEBUG("[CUDAGraphCapture] Dependency reduction nodes=" << reduced.nodes
+                      << " edges=" << reduced.edges << " removed=" << reduced.removed);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Cannot compile native dependency DAG: " << error.what());
+            return false;
         }
 
         /*

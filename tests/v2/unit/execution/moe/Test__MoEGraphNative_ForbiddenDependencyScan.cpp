@@ -10,6 +10,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "execution/moe/DeviceMoERebalanceABI.h"
 
 #include <algorithm>
 #include <array>
@@ -1825,11 +1826,11 @@ namespace llaminar2::test
         const std::array<std::tuple<const char *, const char *, const char *>, 2>
             methods = {{
                 {"src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp",
-                 "bool CUDAMoEKernel::executeGroupedPrefillPipeline(",
-                 "bool CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan("},
+                 "bool CUDAMoEKernel::executeGroupedPrefillProjection(",
+                 "bool CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan("},
                 {"src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp",
-                 "bool ROCmMoEKernel::executeGroupedPrefillPipeline(",
-                 "bool ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan("},
+                 "bool ROCmMoEKernel::executeGroupedPrefillProjection(",
+                 "bool ROCmMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan("},
             }};
 
         for (const auto &[relative_path, method, next_method] : methods)
@@ -1911,12 +1912,12 @@ namespace llaminar2::test
         const std::array<BackendMethod, 2> backends = {{
             {
                 "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp",
-                "bool CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(",
+                "bool CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan(",
                 "bool CUDAMoEKernel::reduceCanonicalRouteContributions(",
             },
             {
                 "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp",
-                "bool ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(",
+                "bool ROCmMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan(",
                 "bool ROCmMoEKernel::reduceCanonicalRouteContributions(",
             },
         }};
@@ -2057,8 +2058,8 @@ namespace llaminar2::test
             {"bool ROCmMoEKernel::prepareExpertGroupsAsync",
              "bool ROCmMoEKernel::ensureGroupedPrefillScratchCapacity"},
             {"bool ROCmMoEKernel::ensureGroupedPrefillScratchCapacity",
-             "bool ROCmMoEKernel::executeGroupedPrefillPipeline"},
-            {"bool ROCmMoEKernel::executeGroupedPrefillPipeline", "} // namespace llaminar2"},
+             "bool ROCmMoEKernel::executeGroupedPrefillProjection"},
+            {"bool ROCmMoEKernel::executeGroupedPrefillProjection", "} // namespace llaminar2"},
         };
 
         std::vector<std::string> failures;
@@ -2099,11 +2100,11 @@ namespace llaminar2::test
 
         const std::string rocm_body = functionBody(
             readFile(rocm_path),
-            "bool ROCmMoEKernel::executeGroupedPrefillPipeline(",
+            "bool ROCmMoEKernel::executeGroupedPrefillProjection(",
             "} // namespace llaminar2");
         const std::string cuda_body = functionBody(
             readFile(cuda_path),
-            "bool CUDAMoEKernel::executeGroupedPrefillPipeline(",
+            "bool CUDAMoEKernel::executeGroupedPrefillProjection(",
             "bool CUDAMoEKernel::groupedExpertGateUpDecodeFromTable(");
         ASSERT_FALSE(rocm_body.empty()) << rocm_path;
         ASSERT_FALSE(cuda_body.empty()) << cuda_path;
@@ -2127,9 +2128,9 @@ namespace llaminar2::test
         EXPECT_NE(cuda_body.find("active_expert_slots > 0 && !ordered_scatter_overwrites_output"),
                   std::string::npos)
             << "CUDA must fail hard when active routes lack ordered publication metadata";
-        EXPECT_NE(cuda_body.find("if (active_expert_slots == 0)"),
+        EXPECT_NE(cuda_body.find("if (execution.executesDown() && active_expert_slots == 0)"),
                   std::string::npos)
-            << "A CUDA participant with no local routes must publish a zero collective contribution";
+            << "An empty CUDA down phase must publish zero; gate/up must not touch an unowned output";
 
         const fs::path cuda_kernels_path = root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu";
         ASSERT_TRUE(fs::exists(cuda_kernels_path)) << cuda_kernels_path;
@@ -6772,7 +6773,10 @@ namespace llaminar2::test
      * from the softmax producer itself. An intermediate INT32 route table would
      * require a conversion launch, while an intermediate weight table would
      * require a captured D2D copy; either silently restores two tiny nodes per
-     * MoE layer to every verifier replay.
+     * MoE layer to every verifier replay. Bulk row-owned routing writes those
+     * same FP32 fields directly into its interleaved exchange packet; it must
+     * not reintroduce a separate packing or precision-conversion producer.
+     * Captured backend tests, not these source checks, prove byte equivalence.
      */
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
          GPURouterSoftmaxPublishesFinalFP32TensorsDirectly)
@@ -6814,9 +6818,19 @@ namespace llaminar2::test
             << "CUDA softmax/top-k must publish final FP32 expert IDs";
         EXPECT_NE(
             rocm_kernel.find(
-                "out_idx[slot] = static_cast<float>(selected_ids[slot])"),
+                "expert_indices[out] = static_cast<float>(selected_ids[slot])"),
             std::string::npos)
             << "ROCm softmax/top-k must publish final FP32 expert IDs";
+        EXPECT_NE(
+            cuda_kernel.find(
+                "selected_packet[out] = {static_cast<float>(selected[k]), probability}"),
+            std::string::npos)
+            << "CUDA owned top-k must publish the unchanged pair without another packing launch";
+        EXPECT_NE(
+            rocm_kernel.find(
+                "selected_packet[out] = {static_cast<float>(selected_ids[slot]), selected_weights[slot]}"),
+            std::string::npos)
+            << "ROCm owned top-k must publish the unchanged pair without another packing launch";
 
         auto method_region = [](
                                  const std::string &contents,
@@ -8523,9 +8537,8 @@ namespace llaminar2::test
             4u)
             << "The typed capacity must cross the helper, production create, prefill, and decode boundaries intact";
 
-        EXPECT_NE(
-            abi.find("kVersion = 15u"),
-            std::string::npos);
+        EXPECT_GE(moe_rebalance_abi::kVersion, 16u)
+            << "Projection-aware descriptors require the revised host/device ABI";
         EXPECT_NE(
             abi.find("kPlanEntryBytes = 64u"),
             std::string::npos)
@@ -9654,7 +9667,7 @@ namespace llaminar2::test
             << "Least-loaded assignment must cross one complete plan boundary.";
         EXPECT_NE(
             stage_source.find(
-                "retain_routes_for_deferred_commit);",
+                "grouped_plan_demand);",
                 complete_assignment_publication),
             std::string::npos)
             << "Least-loaded assignment must retain routes only while its final "
@@ -10910,16 +10923,16 @@ namespace llaminar2::test
         const fs::path orchestrator_path =
             root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
         const fs::path stage_path =
-            root / "src/v2/execution/compute_stages/stages/MTPStochasticSerialOutcomeStage.cpp";
+            root / "src/v2/execution/compute_stages/stages/MTPStochasticOutcomeStage.cpp";
         ASSERT_TRUE(fs::exists(orchestrator_path));
         ASSERT_TRUE(fs::exists(stage_path));
 
         const std::string orchestrator = readFile(orchestrator_path);
         const std::string stage = readFile(stage_path);
         const size_t materialize = orchestrator.find(
-            "bool DeviceGraphOrchestrator::materializeMTPStochasticSerialOutcomeGraph(");
+            "bool DeviceGraphOrchestrator::materializeMTPStochasticOutcomeGraph(");
         const size_t execute = orchestrator.find(
-            "bool DeviceGraphOrchestrator::executeMTPStochasticSerialOutcomeCaptured(",
+            "bool DeviceGraphOrchestrator::executeMTPStochasticOutcomeCaptured(",
             materialize);
         ASSERT_NE(materialize, std::string::npos);
         ASSERT_NE(execute, std::string::npos);

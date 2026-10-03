@@ -3,7 +3,7 @@
 
 Release excludes Unit executables, including standalone host/device arithmetic
 contracts that declare their own language level. Their property declarations
-must be excluded with them, while admitted performance targets must retain
+must be excluded with them, including startup device ownership, while admitted targets retain
 every requirement and CMake must still reject invalid features. These probes
 configure tiny CPU-only projects; they never build or run an executable.
 """
@@ -26,7 +26,8 @@ class TestTargetSelection(unittest.TestCase):
     cmake = "cmake"
     ninja = "ninja"
 
-    def configure(self, performance_only: bool, feature: str = "cxx_std_20"):
+    def configure(self, performance_only: bool, feature: str = "cxx_std_20", *,
+                  scope: str = "FullInventory", extra: str = ""):
         """Configure an isolated fixture with the selected production module."""
         with tempfile.TemporaryDirectory(prefix="llaminar-test-targets-") as tmp:
             root = Path(tmp)
@@ -47,6 +48,7 @@ foreach(target v2_test_contract v2_integration_contract v2_perf_contract)
     target_compile_definitions(${{target}} PRIVATE CONTRACT_CHECK=1)
     target_compile_options(${{target}} PRIVATE -Wall)
     target_compile_features(${{target}} PRIVATE {feature})
+    v2_test_device_scope(${{target}} {scope})
     if(V2_PERF_TESTS_ONLY AND NOT target MATCHES "^v2_perf_")
         if(TARGET ${{target}})
             message(FATAL_ERROR "Excluded target was materialized: ${{target}}")
@@ -56,18 +58,23 @@ foreach(target v2_test_contract v2_integration_contract v2_perf_contract)
             message(FATAL_ERROR "Admitted target is missing: ${{target}}")
         endif()
         foreach(property LINK_LIBRARIES INCLUDE_DIRECTORIES COMPILE_DEFINITIONS
-                         COMPILE_OPTIONS COMPILE_FEATURES)
+                         COMPILE_OPTIONS COMPILE_FEATURES V2_TEST_DEVICE_SCOPE)
             get_target_property(value ${{target}} ${{property}})
             if(NOT value)
                 message(FATAL_ERROR "Lost ${{property}} for ${{target}}")
             endif()
         endforeach()
         get_target_property(features ${{target}} COMPILE_FEATURES)
+        get_target_property(device_scope ${{target}} V2_TEST_DEVICE_SCOPE)
+        if(NOT device_scope STREQUAL "{scope}")
+            message(FATAL_ERROR "Lost startup device ownership for ${{target}}")
+        endif()
         if(NOT "{feature}" IN_LIST features)
             message(FATAL_ERROR "Lost language contract for ${{target}}")
         endif()
     endif()
 endforeach()
+{extra}
 ''', encoding="utf-8")
             return subprocess.run(
                 [self.cmake, "-S", str(root), "-B", str(root / "build"),
@@ -88,6 +95,22 @@ endforeach()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cxx_not_a_real_compile_feature", result.stderr)
         self.assertIn("v2_perf_contract", result.stderr)
+
+    def test_unknown_scope_is_not_hidden_by_release_exclusion(self):
+        """Invalid startup ownership fails even on a skipped declaration."""
+        result = self.configure(True, scope="InventedScope")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unknown V2 test device scope", result.stderr)
+
+    def test_missing_live_target_is_not_silently_ignored(self):
+        """Only intentional Release exclusions may have no target owner."""
+        for performance_only, target in ((False, "v2_integration_missing"),
+                                         (True, "v2_perf_missing")):
+            with self.subTest(performance_only=performance_only):
+                result = self.configure(performance_only,
+                    extra=f"v2_test_device_scope({target} FullInventory)")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(target, result.stderr)
 
 
 if __name__ == "__main__":

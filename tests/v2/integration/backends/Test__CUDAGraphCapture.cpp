@@ -14,6 +14,8 @@
  * Graph ownership lives on the device context worker. Concurrency regressions
  * additionally use explicit device-bound host submitters to exercise the same
  * HTTP/archive versus maintenance-worker ordering as production.
+ * Native dependency reduction is proved through actual fork/join capture,
+ * instantiation, parent composition and changing-input replay.
  */
 
 #include <gtest/gtest.h>
@@ -26,6 +28,7 @@
 #include "MTPMainForwardReadRetirementProof.h"
 #include "GPUGraphMemoryContractProof.h"
 #include "NativeTimelineImportProof.h"
+#include "NativeDependencyReductionProof.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 
 #include <cuda_runtime.h>
@@ -70,6 +73,24 @@ TEST_F(Test__CUDAGraphCapture, OrderedTimelineImportsRetainedNativeWork)
     auto *backend = getCUDABackend();
     ASSERT_NE(backend, nullptr);
     ctx().submitAndWait([&] { test::proveNativeTimelineImports(ctx(), *backend); });
+}
+
+/** @test Shared dependency simplification retains concurrent producer publication. */
+TEST_F(Test__CUDAGraphCapture, DependencyReductionPreservesCapturedForkJoin)
+{
+    auto *backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] {
+        const auto count = [](IGPUGraphCapture &owner) {
+            auto graph = dynamic_cast<CUDAGraphCapture &>(owner).graph();
+            std::size_t edges = 0;
+            test::requireNativeDependencyProof(
+                cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &edges) == cudaSuccess,
+                "CUDA reduction proof edge count");
+            return edges;
+        };
+        test::proveNativeDependencyReduction(ctx(), *backend, count);
+    });
 }
 
 /** @test Scratch invalidation preserves in-flight readers and accepted bytes. */

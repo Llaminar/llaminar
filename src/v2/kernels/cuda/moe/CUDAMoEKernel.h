@@ -291,6 +291,16 @@ namespace llaminar2
             MoERoutingResult &host_result,
             const int *device_effective_seq_len) override;
 
+        /** @copydoc IMoEKernel::publishOwnedRouteRows */
+        bool publishOwnedRouteRows(const MoERouterRowPublication &publication) override;
+
+        /** @copydoc IMoEKernel::routeOwnedRowsWithTensors */
+        bool routeOwnedRowsWithTensors(
+            ITensor *hidden, ITensor *gate_weights,
+            const MoERouterRowPacketLayout &layout, int d_model, int num_experts,
+            bool normalize_weights, ITensor *packet, std::uint64_t *selected_bytes,
+            const std::int32_t *live_rows) override;
+
         bool routeVerifierRowsDecodeEquivalent(
             ITensor *hidden, ITensor *gate_weights,
             int seq_len, int d_model, int num_experts, int top_k,
@@ -421,6 +431,7 @@ namespace llaminar2
             int top_k,
             bool retain_routes_for_deferred_commit = false);
 
+        /** @copydoc IMoEKernel::publishCompleteGroupedPrefillPlanFromRouter */
         bool publishCompleteGroupedPrefillPlanFromRouter(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *routing_indices,
@@ -432,8 +443,10 @@ namespace llaminar2
             int gateup_desc_table_id,
             int down_desc_table_id,
             bool filter_to_local_runtime_experts,
-            bool retain_routes_for_deferred_commit = false) override;
+            MoEGroupedPlanDemand demand = MoEGroupedPlanDemand::OrdinaryPrefill,
+            DeviceMoEProjectionSet expected_projections = DeviceMoEProjectionSet::CompleteExpert) override;
 
+        /** @copydoc IMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments */
         bool publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens,
@@ -442,7 +455,8 @@ namespace llaminar2
             int top_k,
             int gateup_desc_table_id,
             int down_desc_table_id,
-            bool retain_routes_for_deferred_commit = false) override;
+            MoEGroupedPlanDemand demand = MoEGroupedPlanDemand::OrdinaryPrefill,
+            DeviceMoEProjectionSet expected_projections = DeviceMoEProjectionSet::CompleteExpert) override;
 
         bool commitGroupedVerifierHistograms(
             const MoEKernelLaunchContext &launch,
@@ -586,16 +600,41 @@ namespace llaminar2
             std::shared_ptr<MoERouterQ8HiddenPublication> publication,
             MoERouterQ8PublicationAccess access) override;
 
-        /// @brief Execute fixed-topology grouped MoE prefill without host synchronization.
-        bool executeGroupedPrefillPipeline(
+        // The common interface owns the phase, operand and publication contract.
+        /** @copydoc IMoEKernel::exportGroupedPrefillIntermediates */
+        bool exportGroupedPrefillIntermediates(
+            const MoEGroupedIntermediateLayout &layout,
+            const std::int32_t *route_participants, ITensor *packet, int participant) override;
+
+        /** @copydoc IMoEKernel::importGroupedPrefillIntermediates */
+        bool importGroupedPrefillIntermediates(
+            const MoEGroupedIntermediateLayout &layout,
+            const std::int32_t *route_participants, ITensor *packets) override;
+
+        /** @copydoc IMoEKernel::exportCompactGroupedPrefillIntermediates */
+        bool exportCompactGroupedPrefillIntermediates(
+            const MoEGroupedIntermediateLayout &layout,
+            const DeviceMoELayerRuntime &runtime, ITensor *packet,
+            std::uint64_t *packet_bytes) override;
+
+        /** @copydoc IMoEKernel::importCompactGroupedPrefillIntermediates */
+        bool importCompactGroupedPrefillIntermediates(
+            const MoEGroupedIntermediateLayout &layout,
+            const std::int32_t *route_participants, ITensor *packet,
+            std::size_t packet_byte_offset, const std::uint64_t *packet_bytes, int participant) override;
+
+        /** @copydoc IMoEKernel::executeGroupedPrefillProjection */
+        bool executeGroupedPrefillProjection(
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
             int down_desc_table_id,
             int seq_len, int d_model, int intermediate,
             int num_experts, int top_k,
+            const MoEPrefillProjectionExecution &execution,
             ITensor *canonical_route_contributions = nullptr) override;
 
-        bool executeGroupedPrefillPipelineFromPublishedRuntimePlan(
+        /** @copydoc IMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan */
+        bool executeGroupedPrefillProjectionFromPublishedRuntimePlan(
             DeviceMoELayerRuntime *device_runtime_layer,
             const DeviceMoELayerRuntime &runtime_host_layer,
             ITensor *hidden, ITensor *output,
@@ -603,6 +642,7 @@ namespace llaminar2
             int down_desc_table_id,
             int seq_len, int d_model, int intermediate,
             int num_experts, int top_k,
+            const MoEPrefillProjectionExecution &execution,
             ITensor *canonical_route_contributions = nullptr) override;
 
         /// @brief Execute grouped gate/up decode from a persistent descriptor table and static host ids.
@@ -1059,13 +1099,15 @@ namespace llaminar2
          * @param output_indices Caller-owned FP32 expert IDs.
          * @param output_weights Caller-owned FP32 selected weights.
          * @param device_effective_seq_len Optional device scalar masking padded rows.
+         * @param owned Optional compact row destination; complete outputs are then unused.
          * @return True when both router kernels were enqueued successfully.
          */
         bool routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                        int seq_len, int d_model, int num_experts, int top_k,
                        bool normalize_weights,
                        float *output_indices, float *output_weights,
-                       const int *device_effective_seq_len = nullptr);
+                       const int *device_effective_seq_len = nullptr,
+                       const MoERouterOwnedRowOutputs *owned = nullptr);
         bool routeWithTensorsImpl(
             ITensor *hidden, ITensor *gate_weights,
             int seq_len, int d_model, int num_experts, int top_k,

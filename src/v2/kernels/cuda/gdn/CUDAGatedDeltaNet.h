@@ -7,17 +7,18 @@
  *
  * Device-pointer design: All input/output pointers passed to chunk_forward()
  * and recurrent_step() are expected to be DEVICE pointers (already on GPU).
- * The stage (GDNRecurrenceStage) handles coherence via ensureOnDevice() /
- * allocateOnDevice() before calling these methods. No H2D/D2H copies are
- * performed here — the CUDA kernels operate directly on device-resident data.
+ * DeviceGraphExecutor and TransferEngine establish storage and producer-event
+ * ordering on the exact stage stream. No H2D/D2H copies are performed here.
  */
 
 #pragma once
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
+#include "kernels/gdn/GDNDeinterleaveRows.h"
 
 #include <algorithm>
 #include <cmath>
@@ -116,7 +117,7 @@ extern "C"
     // QKV deinterleave on device
     bool cudaGDN_deinterleave_qkv(
         const float *merged, float *out_q, float *out_k, float *out_v,
-        int seq_len, int n_k_heads, int n_v_heads,
+        llaminar2::DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
         int d_k, int d_v, int global_v_offset,
         int device_idx, void *stream);
 }
@@ -443,7 +444,7 @@ namespace llaminar2
             float *v = nullptr;
             if (!deinterleave_qkv_device(
                     merged_qkv, q, k, v,
-                    seq_len, n_k_heads, n_heads,
+                    DeviceRequestRowRanges::fullyActive(seq_len), n_k_heads, n_heads,
                     d_k, d_v, global_v_head_offset))
             {
                 return false;
@@ -875,13 +876,35 @@ namespace llaminar2
             bound_deinterleave_scratch_size_ = scratch_size;
         }
 
+        /**
+         * @brief Split live request rows into stable caller-owned Q/K/V planes.
+         * @param d_merged_qkv Ordered device input on the bound stream.
+         * @param d_q Output borrow of the physical Q plane.
+         * @param d_k Output borrow of the physical K plane.
+         * @param d_v Output borrow of the physical V plane.
+         * @param rows Frozen request strides and borrowed device length authority.
+         * @param n_k_heads Merged key/query head count.
+         * @param n_v_heads Local value/output head count.
+         * @param head_dim_k Key/query head dimension.
+         * @param head_dim_v Value head dimension.
+         * @param global_v_head_offset Global modular repeat coordinate.
+         * @return True after enqueue; invalid geometry or absent stream/workspace fails.
+         *
+         * Capacity owns the plane addresses, while device lengths own copy
+         * admission. Large-to-small and empty replays never rebind buffers,
+         * read back lengths, synchronize a stream, or overwrite inactive rows.
+         */
         bool deinterleave_qkv_device(
             const float *d_merged_qkv,
             float *&d_q, float *&d_k, float *&d_v,
-            int seq_len, int n_k_heads, int n_v_heads,
+            DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
             int head_dim_k, int head_dim_v, int global_v_head_offset) override
         {
+            if (!stream_ || !d_merged_qkv || gdnDeinterleaveElementsPerRequest(
+                    rows, n_k_heads, n_v_heads, head_dim_k, head_dim_v) <= 0)
+                return false;
             cudaGDN_gpu_set_device(device_ordinal_);
+            const int seq_len = rows.physicalRows();
 
             size_t q_elems = static_cast<size_t>(seq_len) * n_v_heads * head_dim_k;
             size_t k_elems = q_elems;
@@ -922,7 +945,7 @@ namespace llaminar2
 
             return cudaGDN_deinterleave_qkv(
                 d_merged_qkv, d_q, d_k, d_v,
-                seq_len, n_k_heads, n_v_heads,
+                rows, n_k_heads, n_v_heads,
                 head_dim_k, head_dim_v, global_v_head_offset,
                 device_ordinal_, stream_);
         }

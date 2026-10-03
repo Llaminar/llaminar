@@ -3,9 +3,9 @@
 # Llaminar — CUDA + ROCm runtime image
 #
 # Two-stage build:
-#   1. builder — Ubuntu 24.04 + full CUDA 13 toolkit + ROCm 7.2.4 + C++23
+#   1. builder — Ubuntu 24.04 + full CUDA 13 toolkit + pinned ROCm Core SDK + C++23
 #      toolchain, compiles `llaminar2` (Release).
-#   2. runtime — Ubuntu 24.04 + CUDA 13 shared libs + ROCm 7.2.4 user-space +
+#   2. runtime — Ubuntu 24.04 + CUDA 13 shared libs + matching ROCm user-space +
 #      compiled binary only (no compilers, no -dev packages).
 #
 # All dependency-install logic lives in scripts/docker/install-*.sh, which are
@@ -16,15 +16,18 @@
 # skipped; CI rejects skipped tests and still authenticates/executes the real
 # installed test inventory. Metadata never substitutes for a successful gate.
 #
-# Runtime usage (both CUDA + ROCm available; pick per invocation with -d):
+# Runtime usage: let the auto planner choose within the requested backend.
+# CUDA device access must be configured on the Docker host first.
 #   docker run --gpus all --rm -it \
 #       --security-opt seccomp=unconfined \
 #       --cap-add SYS_NICE --cap-add SYS_PTRACE \
 #       --shm-size=16G \
 #       -v /path/to/models:/models:ro \
 #       -p 8080:8080 \
-#       ghcr.io/llaminar/llaminar:latest \
-#       --serve --port 8080 -d cuda:0 -m /models/Qwen2.5-1.5B-Instruct-Q8_0.gguf
+#       ghcr.io/llaminar/llaminar:master serve \
+#       -m /models/Qwen3.8-27B-IQ4_XS.gguf --context-length 8192 \
+#       --only-backends cuda --auto-device-counts cuda=1 \
+#       --host 0.0.0.0 --port 8080
 #
 # ROCm-only host:
 #   docker run --device=/dev/kfd --device=/dev/dri \
@@ -34,7 +37,11 @@
 #       --cap-add SYS_NICE --cap-add SYS_PTRACE \
 #       --shm-size=16G \
 #       -v /path/to/models:/models:ro \
-#       ghcr.io/llaminar/llaminar:latest -d rocm:0 -m /models/<gguf>
+#       -p 8080:8080 \
+#       ghcr.io/llaminar/llaminar:master serve \
+#       -m /models/Qwen3.8-27B-IQ4_XS.gguf --context-length 32768 \
+#       --only-backends rocm --auto-device-counts rocm=1 \
+#       --host 0.0.0.0 --port 8080
 
 ARG CUTLASS_VERSION=v4.2.1
 ARG NINJA_VERSION=1.13.0
@@ -71,10 +78,11 @@ ARG RCCL_GPU_TARGETS
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDAARCHS=${LLAMINAR_CUDA_ARCHS} \
     CUDA_HOME=/usr/local/cuda \
-    PATH=/usr/local/cuda/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/rocm/lib \
-    ROCM_HOME=/opt/rocm \
-    HIP_PATH=/opt/rocm \
+    PATH=/usr/local/cuda/bin:/opt/rocm-sdk/bin:/opt/rocm-sdk/lib/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/rocm-sdk/lib \
+    ROCM_PATH=/opt/rocm-sdk \
+    ROCM_HOME=/opt/rocm-sdk \
+    HIP_PATH=/opt/rocm-sdk \
     CUTLASS_DIR=/opt/cutlass \
     CCACHE_DIR=/root/.ccache \
     CCACHE_MAXSIZE=50G \
@@ -89,14 +97,23 @@ COPY scripts/docker/install-system-deps.sh \
      scripts/docker/install-cuda.sh \
      scripts/docker/install-nccl.sh \
      scripts/docker/install-rocm.sh \
+     scripts/docker/rocm-release.env \
+     scripts/docker/configure-rocm-repository.sh \
      scripts/docker/install-hip-graph-runtime.sh \
+     scripts/docker/install-rocblas-gfx906.sh \
      scripts/docker/install-cutlass.sh \
      /tmp/install-scripts/
 # CUDA's NCCL installer consumes this patch during early toolchain setup.
 COPY scripts/docker/patches/nccl-capture-reentry.patch \
      /tmp/install-scripts/patches/nccl-capture-reentry.patch
-COPY scripts/docker/patches/rocm-hip-graph-node-identity.patch \
-     /tmp/install-scripts/patches/rocm-hip-graph-node-identity.patch
+COPY scripts/docker/patches/nccl-device-live-rows.patch \
+     /tmp/install-scripts/patches/nccl-device-live-rows.patch
+COPY scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch \
+     scripts/docker/patches/rocm-hip-host-queue-native-stack.patch \
+     scripts/docker/patches/rocm-hip-sdma-stream-sharing.patch \
+     scripts/docker/patches/rocm-hip-sdma-event-publication.patch \
+     scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch \
+     /tmp/install-scripts/patches/
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
 RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
@@ -104,7 +121,8 @@ RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
     else \
         echo "==> [cuda] disabled for this build"; \
     fi
-RUN if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
+RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
+    if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
         MODE=build /tmp/install-scripts/install-rocm.sh; \
     else \
         echo "==> [rocm] disabled for this build"; \
@@ -120,8 +138,9 @@ WORKDIR /src
 
 # RCCL — build in a dedicated layer so the ROCm collective library is visible,
 # cacheable, and not hidden inside Llaminar's CMake configure step. The source
-# build is enabled by default for release images because packaged ROCm 7.2.4
-# RCCL has no usable gfx906 binaries on MI50/MI60 systems.
+# build is enabled by default for release images because packaged RCCL has no
+# usable gfx906 binaries on MI50/MI60 systems. RCCL_GIT_REF pins our collective
+# source ABI independently of the SDK; rebuild it with the active HIP compiler.
 # MSCCL generated kernels are optional for standard collectives and make source
 # builds dramatically slower, so release images default them off.
 ARG RCCL_ENABLE_MSCCL_KERNEL=OFF
@@ -136,6 +155,10 @@ COPY scripts/docker/rccl-functions.txt /src/rccl-functions.txt
 COPY scripts/docker/apply-rccl-capture-patch.sh /tmp/install-scripts/
 COPY scripts/docker/patches/rccl-hip-capture-event-wait.patch \
      /tmp/install-scripts/patches/rccl-hip-capture-event-wait.patch
+COPY scripts/docker/patches/rccl-device-live-rows.patch \
+     /tmp/install-scripts/patches/rccl-device-live-rows.patch
+COPY scripts/docker/patches/rccl-native-host-storage.patch \
+     /tmp/install-scripts/patches/rccl-native-host-storage.patch
 # ccache hashes the compiler and full command line, so one 50 GB shared cache
 # is correct across both ISA lanes. It lives in the persistent named BuildKit
 # worker hosted by the one host Docker daemon; locked sharing keeps independent
@@ -171,10 +194,10 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
             echo "==> [rccl] ONLY_FUNCS=${rccl_build_funcs}"; \
             cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang \
-                -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
-                -DCMAKE_PREFIX_PATH=/opt/rocm \
-                -DROCM_PATH=/opt/rocm \
+                -DCMAKE_C_COMPILER="${ROCM_PATH}/bin/amdclang" \
+                -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
+                -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
+                -DROCM_PATH="${ROCM_PATH}" \
                 -DGPU_TARGETS="${RCCL_GPU_TARGETS}" \
                 -DENABLE_MSCCL_KERNEL="${RCCL_ENABLE_MSCCL_KERNEL}" \
                 -DONLY_FUNCS="${rccl_build_funcs}" \
@@ -182,10 +205,10 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         else \
             cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang \
-                -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
-                -DCMAKE_PREFIX_PATH=/opt/rocm \
-                -DROCM_PATH=/opt/rocm \
+                -DCMAKE_C_COMPILER="${ROCM_PATH}/bin/amdclang" \
+                -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
+                -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
+                -DROCM_PATH="${ROCM_PATH}" \
                 -DGPU_TARGETS="${RCCL_GPU_TARGETS}" \
                 -DENABLE_MSCCL_KERNEL="${RCCL_ENABLE_MSCCL_KERNEL}" \
                 -DBUILD_TESTS=OFF; \
@@ -200,7 +223,9 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         ln -sf librccl.so.1.0 /src/external/rccl/build/librccl.so.1; \
         ln -sf librccl.so.1 /src/external/rccl/build/librccl.so; \
         rccl_capture_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-hip-capture-event-wait.patch | cut -d ' ' -f 1)"; \
-        printf '%s\n' "${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}" \
+        rccl_rows_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-device-live-rows.patch | cut -d ' ' -f 1)"; \
+        rccl_storage_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-native-host-storage.patch | cut -d ' ' -f 1)"; \
+        printf '%s\n' "${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}" \
             > /src/external/rccl/build/.llaminar-rccl-commit; \
         echo "==> [rccl] done; elapsed_seconds=$(( $(date +%s) - rccl_started_epoch )); library: $(readlink -f /src/external/rccl/build/librccl.so.1.0)"; \
     elif [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
@@ -316,10 +341,11 @@ RUN case "${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}:${LLAMINAR_TEST_RUNNER_INVENTO
 # Install it after the expensive toolchain cache boundary and use this same
 # small package closure in the installed test runner below.
 COPY scripts/docker/install-rocm-test-deps.sh /tmp/install-rocm-test-deps.sh
+COPY scripts/docker/rocm-release.env /tmp/rocm-release.env
 RUN if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
         bash /tmp/install-rocm-test-deps.sh; \
     fi \
- && rm /tmp/install-rocm-test-deps.sh
+ && rm /tmp/install-rocm-test-deps.sh /tmp/rocm-release.env
 
 COPY src ./src
 COPY tests ./tests
@@ -433,7 +459,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ ! -e external/rccl/build/librccl.so.1.0 ]; then \
         echo "==> [release] source-built RCCL not present; staging system RCCL"; \
         mkdir -p external/rccl/build; \
-        cp -P /opt/rocm/lib/librccl.so* external/rccl/build/; \
+        cp -P "${ROCM_PATH}"/lib/librccl.so* external/rccl/build/; \
     fi \
  && echo "==> [release] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
  && { find build_v2_release \
@@ -446,14 +472,20 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
         -delete \
  && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} + \
- && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses \
+ && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses /src/runtime-rocblas \
  && cp build_v2_release/llaminar2 /src/runtime-bin/llaminar2 \
  && cp build_v2_release/libllaminar2_core.so /src/runtime-libs/ \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -P /usr/local/lib/libllaminar_nccl.so* /src/runtime-libs/; fi \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -r /usr/local/share/licenses/llaminar-nccl /src/runtime-licenses/; fi \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
-        cp -L /opt/rocm/lib/libamdhip64.so.7 /src/runtime-libs/libamdhip64.so.7; \
-        cp -r /opt/rocm/share/licenses/llaminar-hip /src/runtime-licenses/; \
+        cp -L "${ROCM_PATH}/lib/libamdhip64.so.7" /src/runtime-libs/libamdhip64.so.7; \
+        cp -r "${ROCM_PATH}/share/licenses/llaminar-hip" /src/runtime-licenses/; \
+        mkdir -p /src/runtime-rocblas/lib/rocblas /src/runtime-rocblas/share/llaminar; \
+        cp -L "${ROCM_PATH}/lib/librocblas.so" /src/runtime-rocblas/lib/librocblas.so.5; \
+        ln -s librocblas.so.5 /src/runtime-rocblas/lib/librocblas.so; \
+        cp -r "${ROCM_PATH}/lib/rocblas/library" /src/runtime-rocblas/lib/rocblas/; \
+        cp "${ROCM_PATH}/share/llaminar/rocblas-source.txt" /src/runtime-rocblas/share/llaminar/; \
+        cp -r "${ROCM_PATH}/share/licenses/llaminar-rocblas" /src/runtime-licenses/; \
     fi \
  && cp "external/onednn/build-$(printf '%s' "${LLAMINAR_CPU_ISA}" | tr '[:upper:]' '[:lower:]')/lib/libdnnl.so.3.11" /src/runtime-libs/ \
  && if [ -e external/rccl/build/librccl.so.1.0 ]; then cp external/rccl/build/librccl.so.1.0 /src/runtime-libs/; fi \
@@ -512,14 +544,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LLAMINAR_ENABLE_CUDA=${LLAMINAR_ENABLE_CUDA} \
     LLAMINAR_ENABLE_ROCM=${LLAMINAR_ENABLE_ROCM} \
     CUDA_HOME=/usr/local/cuda \
-    ROCM_HOME=/opt/rocm \
-    HIP_PATH=/opt/rocm \
+    ROCM_PATH=/opt/rocm-sdk \
+    ROCM_HOME=/opt/rocm-sdk \
+    HIP_PATH=/opt/rocm-sdk \
     ROCM_RUNTIME_GPU_TARGETS=${ROCM_RUNTIME_GPU_TARGETS} \
-    PATH=/usr/local/cuda/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm/lib
+    PATH=/usr/local/cuda/bin:/opt/rocm-sdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm-sdk/lib
 
 COPY scripts/docker/install-system-deps.sh \
      scripts/docker/install-cuda.sh \
+     scripts/docker/rocm-release.env \
+     scripts/docker/configure-rocm-repository.sh \
+     scripts/docker/install-rocm.sh \
      scripts/docker/install-rocm-runtime.sh \
      scripts/docker/prune-runtime-image.sh \
      /tmp/install-scripts/
@@ -549,6 +585,10 @@ ENV LLAMINAR_CPU_ISA=${LLAMINAR_CPU_ISA}
 COPY --from=builder /src/runtime-bin/ /usr/local/bin/
 COPY --from=builder /src/runtime-libs/ /usr/local/lib/
 COPY --from=builder /src/runtime-licenses/ /usr/local/share/licenses/
+# Keep the rocBLAS DSO and its gfx906 Tensile tree at their SDK-relative paths.
+# The DSO resolves code objects relative to itself, not from a foreign package.
+# This directory is empty for a CPU/CUDA-only image and has no compiler closure.
+COPY --from=builder /src/runtime-rocblas/ /opt/rocm-sdk/
 RUN ln -sf libdnnl.so.3.11 /usr/local/lib/libdnnl.so.3 \
  && ln -sf libdnnl.so.3 /usr/local/lib/libdnnl.so \
  && if [ -e /usr/local/lib/librccl.so.1.0 ]; then \
@@ -640,10 +680,11 @@ RUN apt-get update \
 # The compiler-stage annotations must also resolve when sealed test binaries
 # execute here. This layer does not enter the production runtime image.
 COPY scripts/docker/install-rocm-test-deps.sh /tmp/install-rocm-test-deps.sh
+COPY scripts/docker/rocm-release.env /tmp/rocm-release.env
 RUN if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
         bash /tmp/install-rocm-test-deps.sh; \
     fi \
- && rm /tmp/install-rocm-test-deps.sh
+ && rm /tmp/install-rocm-test-deps.sh /tmp/rocm-release.env
 
 # CTest's sealed registration names the workspace-pinned Ninja by its absolute
 # /usr/local path. Copy that tiny exact executable rather than substituting the
@@ -666,7 +707,7 @@ COPY --from=builder /usr/local/lib/python3.12/dist-packages/ \
 # Integration executable with that Release library can silently change tensor
 # behavior or fail at a newer symbol.  This ordering is test-runner-only and
 # cannot affect a published runtime image.
-ENV LD_LIBRARY_PATH=/src/build_v2_integration:/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm/lib
+ENV LD_LIBRARY_PATH=/src/build_v2_integration:/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm-sdk/lib
 
 # Docker resolves group names inside the test-runner image.  Establish the host
 # render/video groups and a matching ephemeral CI identity before CTest creates

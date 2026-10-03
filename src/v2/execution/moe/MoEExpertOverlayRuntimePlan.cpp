@@ -106,10 +106,12 @@ namespace llaminar2
                                });
         }
 
-        bool isLocalTPExpertIdApportionedDomain(const MoEOverlayRuntimeDomain &domain)
+        /** @brief Dense continuation topology is independent of which projections follow owners. */
+        bool isLocalTPOwnerAssignedDomain(const MoEOverlayRuntimeDomain &domain)
         {
             if (domain.scope != ExecutionDomainScope::RANK_LOCAL ||
-                domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned ||
+                (domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
+                 domain.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns) ||
                 domain.participants.size() < 2)
             {
                 return false;
@@ -194,7 +196,7 @@ namespace llaminar2
         {
             return isCpuNodeLocalFallbackDomain(domain) ||
                    isAcceleratorLocalTPTensorShardedDomain(domain) ||
-                   isLocalTPExpertIdApportionedDomain(domain) ||
+                   isLocalTPOwnerAssignedDomain(domain) ||
                    isLocalTPReplicatedDomain(domain) ||
                    isRemoteRankBatchApportionedDomain(domain);
         }

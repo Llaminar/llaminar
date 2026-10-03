@@ -954,7 +954,7 @@ public:
     MOCK_METHOD(bool, deinterleave_qkv_device,
                 (const float *d_merged_qkv,
                  float *&d_q, float *&d_k, float *&d_v,
-                 int seq_len, int n_k_heads, int n_v_heads,
+                 DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
                  int head_dim_k, int head_dim_v, int global_v_head_offset),
                 (override));
 };
@@ -4655,7 +4655,7 @@ TEST(Test__GDNKernels, ROCmMergedQKVDeinterleaveUsesModularQKTiling)
     float *d_v_out = nullptr;
     ASSERT_TRUE(kernel.deinterleave_qkv_device(
         d_merged, d_q, d_k_out, d_v_out,
-        seq_len, n_k_heads, n_v_heads, d_k, d_v,
+        DeviceRequestRowRanges::fullyActive(seq_len), n_k_heads, n_v_heads, d_k, d_v,
         /*global_v_head_offset=*/0));
     ASSERT_EQ(d_q, d_scratch);
     ASSERT_EQ(d_k_out, d_scratch + q_dst_dim);

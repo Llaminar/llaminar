@@ -34,6 +34,20 @@ namespace
     /** Bounded route-slot blocks; each block walks additional slots grid-stride. */
     constexpr unsigned int kSparseRoutePayloadBlocks = 256u;
 
+    /**
+     * @brief Expose more PCIe reads once the row-owned grid reaches its bound.
+     * @param routes Captured route capacity, independent of current live routing.
+     * @return Threads per mapped return-copy block.
+     *
+     * Small verifier packets retain the lower-latency 256-thread block. Bulk
+     * packets cannot add blocks beyond the bounded row grid, so doubling its
+     * warps hides dependent mapped-read latency without changing storage.
+     */
+    constexpr unsigned int returnPayloadThreads(std::size_t routes) noexcept
+    {
+        return routes >= kSparseRoutePayloadBlocks ? kSingleRowThreads : kThreads;
+    }
+
     /** @return Number of blocks needed for one positive element count. */
     unsigned int blocksFor(std::size_t elements) noexcept
     {
@@ -122,12 +136,11 @@ extern "C" bool cudaMoEOverlayActivationPackReturn(
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_activation_packet_device::packReturnMetadataKernel
         <<<1u, kThreads, 0u, cuda_stream>>>(*launch);
-    const std::size_t output_elements =
-        static_cast<std::size_t>(launch->physical_rows) *
-        static_cast<std::size_t>(launch->dispatch.top_k) *
-        static_cast<std::size_t>(launch->returned.d_model);
+    // Each block owns a route, amortizing mapped metadata across its width.
+    const auto payload_blocks = static_cast<unsigned int>(std::min<std::size_t>(
+        kSparseRoutePayloadBlocks, launch->returned.route_slot_capacity));
     llaminar2::moe_activation_packet_device::packMappedReturnPayloadKernel
-        <<<blocksFor(output_elements), kThreads, 0u, cuda_stream>>>(*launch);
+        <<<payload_blocks, kThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -144,12 +157,11 @@ extern "C" bool cudaMoEOverlayActivationConsumeReturn(
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_activation_packet_device::validateReturnKernel
         <<<1u, kThreads, 0u, cuda_stream>>>(*launch);
-    const std::size_t output_elements =
-        static_cast<std::size_t>(launch->physical_rows) *
-        static_cast<std::size_t>(launch->dispatch.top_k) *
-        static_cast<std::size_t>(launch->returned.d_model);
+    // One block owns a row; payload width no longer multiplies the grid.
+    const unsigned int payload_blocks = static_cast<unsigned int>(std::min<std::size_t>(
+        kSparseRoutePayloadBlocks, launch->returned.route_slot_capacity));
     llaminar2::moe_activation_packet_device::materializeMappedCanonicalReturnKernel
-        <<<blocksFor(output_elements), kThreads, 0u, cuda_stream>>>(*launch);
+        <<<payload_blocks, returnPayloadThreads(launch->returned.route_slot_capacity), 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -273,11 +285,8 @@ extern "C" bool cudaMoEOverlayActivationConsumeSingleRowReturnBatch(
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_activation_packet_device::validateSingleRowReturnBatchKernel
         <<<launch->lane_count, kSingleRowThreads, 0u, cuda_stream>>>(*launch);
-    const std::size_t route_elements =
-        static_cast<std::size_t>(launch->top_k) *
-        static_cast<std::size_t>(launch->d_model);
     llaminar2::moe_activation_packet_device::materializeSingleRowCanonicalReturnBatchKernel
-        <<<dim3(blocksFor(route_elements), launch->lane_count, 1u),
+        <<<dim3(static_cast<unsigned int>(launch->top_k), launch->lane_count, 1u),
            kThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
@@ -296,19 +305,18 @@ extern "C" bool cudaMoEOverlayActivationConsumeMultiRowReturnBatch(
     llaminar2::moe_activation_packet_device::
         validateMultiRowReturnBatchKernel
         <<<launch->lane_count, kThreads, 0u, cuda_stream>>>(*launch);
-    const std::size_t output_elements =
+    const std::size_t route_capacity =
         static_cast<std::size_t>(launch->physical_rows) *
-        static_cast<std::size_t>(launch->top_k) *
-        static_cast<std::size_t>(launch->d_model);
+        static_cast<std::size_t>(launch->top_k);
     // A lane owns only its compact live entries, not every possible route.
     // Launching a capacity-sized grid per lane multiplies idle blocks and
     // system-memory latency. The existing grid-stride loop retains unique
     // writers and full coverage while reusing the bounded payload geometry.
-    const unsigned int payload_blocks = std::min(
-        kSparseRoutePayloadBlocks, blocksFor(output_elements));
+    const unsigned int payload_blocks = static_cast<unsigned int>(std::min<std::size_t>(
+        kSparseRoutePayloadBlocks, route_capacity));
     llaminar2::moe_activation_packet_device::materializeMultiRowCanonicalReturnBatchKernel
         <<<dim3(payload_blocks, launch->lane_count, 1u),
-           kThreads, 0u, cuda_stream>>>(*launch);
+           returnPayloadThreads(route_capacity), 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 

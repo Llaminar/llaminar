@@ -23,6 +23,7 @@
 
 #include "IOrchestrationRunner.h"
 #include "RankInitializationLifecycle.h"
+#include "ContinuationRequestGroup.h"
 #include "../mpi_orchestration/IExecutionPlanBuilder.h"
 #include "../local_execution/orchestrators/IInferenceRunner.h"
 #include "../mpi_orchestration/DeviceInventory.h"
@@ -531,25 +532,18 @@ namespace llaminar2
         bool freezeMoEExpertOverlayPlanForLoadedModel();
 
         /**
-         * @brief Freeze the MPI scope that owns continuation prefix/KV state.
+         * @brief Freeze the one recipient group for prompt and prefix/KV state.
          *
          * Heterogeneous overlays may contain expert-only ranks that follow
          * retained sparse transactions but own no prefix cache.  This setup
-         * phase creates a persistent communicator containing only dense
-         * continuation ranks, before any request enters the hot path.
+         * phase retains the execution plan's continuation ranks before any
+         * request enters the hot path. Prompt distribution and prefix consensus
+         * share this membership; expert-only followers receive neither payload.
          *
          * @return False when the frozen execution plan cannot produce one
          *         valid continuation-state authority set.
          */
-        bool initializeMoEContinuationPrefixCoordination();
-
-        /**
-         * @brief Release an owned continuation-prefix communicator.
-         *
-         * This runs after inference and worker-loop admission have closed.
-         * World and process-local scopes own no communicator and are inert.
-         */
-        void releaseMoEContinuationPrefixCoordination() noexcept;
+        bool initializeContinuationRequestGroup();
 
         /**
          * @brief Create the one process-local RCU authority for a tiered overlay.
@@ -1346,26 +1340,8 @@ namespace llaminar2
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
         std::shared_ptr<IMPIContext> mpi_ctx_;
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx_;
-        /**
-         * @brief Typed scope for prefix/KV consensus during request admission.
-         *
-         * `OrchestrationWorld` is the ordinary TP/PP policy.
-         * `ProcessLocalContinuation` means one rank already aggregates every
-         * continuation device. `ContinuationRankGroup` owns an MPI
-         * communicator excluding expert-only followers.
-         */
-        enum class PrefixCoordinationScope : std::uint8_t
-        {
-            OrchestrationWorld,
-            ProcessLocalContinuation,
-            ContinuationRankGroup,
-        };
-        PrefixCoordinationScope prefix_coordination_scope_{
-            PrefixCoordinationScope::OrchestrationWorld};
-        /** Persistent subgroup communicator, owned only in group scope. */
-        MPI_Comm continuation_prefix_comm_{MPI_COMM_NULL};
-        /** Whether this rank owns continuation state in the frozen scope. */
-        bool continuation_prefix_participant_{true};
+        /** Sole request-data membership; owns any retained continuation subgroup. */
+        std::unique_ptr<ContinuationRequestGroup> continuation_request_group_;
         /** Shared route evidence retained by authority and every child graph. */
         std::shared_ptr<DecodeExpertHistogram>
             moe_expert_overlay_decode_histogram_;
@@ -1618,8 +1594,8 @@ namespace llaminar2
         std::vector<int32_t> stop_tokens_;
         Sampler sampler_;
         SamplingParams active_sampling_params_;                         // Current sampling params for decodeStep()
-        /** Immutable ordinary request seeds, retained across budget continuations. */
-        std::optional<GenerationRequestSeeds> ordinary_generation_seeds_;
+        /** Immutable request entropy for ordinary/MTP draws, retained across budget continuations. */
+        std::optional<GenerationRequestSeeds> generation_request_seeds_;
         SamplingParams recommended_sampling_params_;                    // Model-specific defaults
         std::string stop_thinking_prompt_;                              // Model-specific stop-thinking prompt
         ToolCallFormat tool_call_format_{ToolCallFormat::HERMES_2_PRO}; // Model-specific tool call format

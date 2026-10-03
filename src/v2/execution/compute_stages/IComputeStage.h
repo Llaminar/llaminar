@@ -35,6 +35,7 @@
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/MPITopology.h"
 #include "../../memory/StageBufferContract.h"
+#include "../../snapshots/SnapshotRowPartition.h"
 
 namespace llaminar2
 {
@@ -167,6 +168,7 @@ namespace llaminar2
             size_t element_size = sizeof(float);
             size_t byte_size = 0;      ///< Total byte size for native format (0 = use rows*cols*element_size)
             ITensor *tensor = nullptr; ///< Optional tensor pointer for coherence management
+            SnapshotRowLayout row_layout; ///< Explicit compact/observed row ownership, diagnostics only.
         };
 
         // Weight/parameter buffers (read-only during execute)
@@ -434,7 +436,7 @@ namespace llaminar2
          * Captured seeded stochastic transaction: sample compact target rows
          * and reduce them against the materialized verifier input sequence.
          */
-        MTP_STOCHASTIC_SERIAL_OUTCOME,
+        MTP_STOCHASTIC_OUTCOME,
 
         /**
          * Captured accepted-state transaction: response/controller commit,
@@ -442,6 +444,15 @@ namespace llaminar2
          * recurrent verifier-row restoration.
          */
         MTP_SPEC_STATE_PUBLICATION,
+
+        /** Lossless equal-byte native GPU gather; never strided host/MPI gathering. */
+        NATIVE_ALLGATHER,
+        /** Native sum returning only each participant's owned output columns. */
+        NATIVE_REDUCE_SCATTER,
+        /** Participant-local phase separated by explicit native collective nodes. */
+        MOE_PROJECTION_PHASE,
+        /** Explicit same-rank byte exchange with GPU-authored live extents. */
+        DEVICE_COUNTED_ALLGATHER,
     };
 
     /**
@@ -464,6 +475,9 @@ namespace llaminar2
         case ComputeStageType::ROOTED_COLLECTIVE:
         case ComputeStageType::PIPELINE_ACTIVATION_EXCHANGE:
         case ComputeStageType::ALLGATHER:
+        case ComputeStageType::NATIVE_ALLGATHER:
+        case ComputeStageType::DEVICE_COUNTED_ALLGATHER:
+        case ComputeStageType::NATIVE_REDUCE_SCATTER:
         case ComputeStageType::ALLGATHER_V:
         case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:
         case ComputeStageType::GDN_LIVE_STATE_ALLGATHER:

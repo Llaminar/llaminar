@@ -31,6 +31,7 @@
 #include "../../../utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -2163,7 +2164,7 @@ TEST_F(
                 d_q_ptr,
                 d_k_ptr,
                 d_v_ptr,
-                bucket_len,
+                DeviceRequestRowRanges::fullyActive(bucket_len),
                 n_heads,
                 n_heads,
                 d_k,
@@ -3037,6 +3038,131 @@ TEST_F(
     }
 }
 
+/**
+ * @brief Prove retained prefill input tiles preserve exact causal state.
+ *
+ * Both key widths, TP-local head counts, odd value widths, uneven independent
+ * requests, aliased/separate state and partial snapshots exercise the public
+ * long-prefill launch. Every replay resets data without rebuilding the graph.
+ * CUDA preprocessing mutates Q/K and gate scratch, so the serial oracle owns
+ * pristine copies and the captured scratch is restored before each replay.
+ * All output/state/snapshot bytes, including inactive guards, must agree.
+ */
+TEST_F(Test__CUDAGDNPaddedRealLength, CapturedInputTilesRequestsAndSnapshotsByteExact)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+    constexpr int requests = 2;
+    constexpr int capacity = 33;
+    constexpr int rows = requests * capacity;
+    constexpr int snapshot_rows = rows - 1;
+    constexpr int guard_floats = 13;
+    constexpr float sentinel = -99.0f;
+    constexpr std::array<std::array<int, requests>, 9> lengths{{
+        {33, 9}, {8, 16}, {1, 0}, {0, 33}, {17, 32}, {33, 33},
+        {4, 5}, {5, 4}, {-1, 34}}};
+    /** @brief Independent model/key and TP-local head/column geometry. */
+    struct Geometry
+    {
+        int keys;
+        int values;
+        int heads;
+    };
+    for (const auto geometry : {Geometry{128, 128, 32}, Geometry{128, 128, 16},
+                               Geometry{128, 128, 8}, Geometry{64, 17, 3},
+                               Geometry{128, 7, 1}, Geometry{64, 64, 4}})
+        for (bool normalize : {false, true})
+            for (bool in_place : {false, true})
+            {
+                const auto [d_k, d_v, heads] = geometry;
+                SCOPED_TRACE("keys=" + std::to_string(d_k) +
+                             " values=" + std::to_string(d_v) +
+                             " heads=" + std::to_string(heads) +
+                             " norm=" + std::to_string(normalize) +
+                             " alias=" + std::to_string(in_place));
+                const int qk_stride = heads * d_k;
+                const int v_stride = heads * d_v;
+                const int state_floats = heads * d_k * d_v;
+                const int snapshot_stride = state_floats + guard_floats;
+                const size_t output_floats = static_cast<size_t>(rows) * v_stride;
+                const size_t snapshot_floats =
+                    static_cast<size_t>(snapshot_rows) * snapshot_stride + guard_floats;
+                const auto host_q = makeSequenceRows(rows, qk_stride, rows, rows, 0.0037f, 0.0f, 0.0f);
+                const auto host_k = makeSequenceRows(rows, qk_stride, rows, rows, -0.0029f, 0.0f, 0.0f);
+                const auto host_alpha = makeSequenceRows(rows, heads, rows, rows, 0.037f, 0.0f, 0.0f);
+                const auto host_beta = makeSequenceRows(rows, heads, rows, rows, -0.031f, 0.0f, 0.0f);
+                const auto initial = makeInitialState(requests * state_floats, 0.0017f);
+                CudaStreamHandle stream;
+                CudaFloatBuffer q(host_q), k(host_k), alpha(host_alpha), beta(host_beta);
+                CudaFloatBuffer serial_q(host_q), serial_k(host_k);
+                CudaFloatBuffer serial_alpha(host_alpha), serial_beta(host_beta);
+                CudaFloatBuffer v(makeSequenceRows(rows, v_stride, rows, rows, 0.0043f, 0.0f, 0.0f));
+                CudaFloatBuffer a_log(heads, -0.5f), dt_bias(heads, 0.1f);
+                CudaFloatBuffer state(initial), separate_state(initial), serial_state(initial);
+                CudaFloatBuffer output(output_floats, sentinel), serial_output(output_floats, 0.0f);
+                CudaFloatBuffer snapshots(snapshot_floats, sentinel);
+                CudaFloatBuffer serial_snapshots(snapshot_floats, sentinel);
+                CudaIntBuffer effective_lengths({capacity, capacity});
+                float *terminal = in_place ? state.ptr : separate_state.ptr;
+                CudaCapturedGraph graph(stream.stream, [&]() {
+                    return cudaGDN_chunk_forward_batched_effective(
+                        q.ptr, k.ptr, v.ptr, alpha.ptr, beta.ptr, a_log.ptr, dt_bias.ptr,
+                        output.ptr, state.ptr, terminal, rows, requests, capacity,
+                        heads, d_k, d_v, normalize, effective_lengths.ptr,
+                        snapshots.ptr, snapshot_stride, snapshot_rows,
+                        cuda_ordinal_, stream.stream);
+                });
+                for (const auto &live : lengths)
+                {
+                    SCOPED_TRACE("live=" + std::to_string(live[0]) + "," + std::to_string(live[1]));
+                    q.copyFrom(host_q);
+                    k.copyFrom(host_k);
+                    alpha.copyFrom(host_alpha);
+                    beta.copyFrom(host_beta);
+                    state.copyFrom(initial);
+                    serial_state.copyFrom(initial);
+                    output.fill(sentinel);
+                    serial_output.fill(0.0f);
+                    snapshots.fill(sentinel);
+                    serial_snapshots.fill(sentinel);
+                    checkCuda(cudaMemcpyAsync(effective_lengths.ptr, live.data(), sizeof(live),
+                        cudaMemcpyHostToDevice, stream.stream), "publish input-tile request lengths");
+                    graph.launch(stream.stream);
+                    // Only the diagnostic oracle replays serial rows. The
+                    // candidate always submits its retained production graph.
+                    for (int request = 0; request < requests; ++request)
+                        for (int local_row = 0; local_row < std::clamp(live[request], 0, capacity); ++local_row)
+                        {
+                            const int row = request * capacity + local_row;
+                            float *reference_state = serial_state.ptr + request * state_floats;
+                            ASSERT_TRUE(cudaGDN_recurrent_step(
+                                serial_q.ptr + static_cast<size_t>(row) * qk_stride,
+                                serial_k.ptr + static_cast<size_t>(row) * qk_stride,
+                                v.ptr + static_cast<size_t>(row) * v_stride,
+                                serial_alpha.ptr + static_cast<size_t>(row) * heads,
+                                serial_beta.ptr + static_cast<size_t>(row) * heads,
+                                a_log.ptr, dt_bias.ptr,
+                                serial_output.ptr + static_cast<size_t>(row) * v_stride,
+                                reference_state, reference_state, heads, d_k, d_v,
+                                normalize, cuda_ordinal_, stream.stream));
+                            if (row < snapshot_rows)
+                                checkCuda(cudaMemcpyAsync(
+                                    serial_snapshots.ptr + static_cast<size_t>(row) * snapshot_stride,
+                                    reference_state, static_cast<size_t>(state_floats) * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, stream.stream), "retain input-tile snapshot oracle");
+                        }
+                    checkCuda(cudaStreamSynchronize(stream.stream), "join input-tile byte proof");
+                    expectByteExactEquivalent("input-tile outputs", output.toHost(),
+                        serial_output.toHost(), 0, output_floats);
+                    expectByteExactEquivalent("input-tile request state",
+                        in_place ? state.toHost() : separate_state.toHost(),
+                        serial_state.toHost(), 0, initial.size());
+                    expectByteExactEquivalent("input-tile snapshots and guards",
+                        snapshots.toHost(), serial_snapshots.toHost(), 0, snapshot_floats);
+                }
+            }
+}
+
 TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
 {
     SKIP_IF_NO_CUDA();
@@ -3106,7 +3232,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay
         m4_q,
         m4_k,
         m4_v,
-        verifier_len,
+        DeviceRequestRowRanges::fullyActive(verifier_len),
         n_k_heads,
         n_v_heads,
         d_k,
@@ -3136,7 +3262,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay
             step_q,
             step_k,
             step_v,
-            1,
+            DeviceRequestRowRanges::fullyActive(1),
             n_k_heads,
             n_v_heads,
             d_k,
@@ -3250,7 +3376,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCapture
         grouped_q,
         grouped_k,
         grouped_v,
-        verifier_len,
+        DeviceRequestRowRanges::fullyActive(verifier_len),
         n_k_heads,
         n_v_heads,
         d_k,
@@ -3284,7 +3410,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCapture
             step_q,
             step_k,
             step_v,
-            1,
+            DeviceRequestRowRanges::fullyActive(1),
             n_k_heads,
             n_v_heads,
             d_k,

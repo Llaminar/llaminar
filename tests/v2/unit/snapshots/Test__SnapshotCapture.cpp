@@ -4,6 +4,8 @@
  *
  * Tests the snapshot capture routing logic, dequantization,
  * and stage name → key conversion extracted in Phase 2 of DGO refactor.
+ * Producer publication tests retain complete/column-partition semantics across
+ * MTP namespaces and padded prefill chunks without executing a model or GPU.
  */
 
 #include <gtest/gtest.h>
@@ -432,6 +434,79 @@ TEST(Test__SnapshotCapture_KeyConversion,
     EXPECT_EQ(bank1_snapshot->data, (std::vector<float>{7.0f, 8.0f, 9.0f}));
     EXPECT_EQ(bank1_epoch_snapshot->data, (std::vector<float>{13.0f}));
     EXPECT_EQ(selected_bank_snapshot->data, (std::vector<float>{1.0f}));
+}
+
+/**
+ * @brief A column-assembled routed row is complete on every TP participant.
+ *
+ * The schema's historical row-parallel default must not make diagnostic
+ * aggregation sum replicated complete rows. The placement ledger stays an
+ * exact runtime observation under the same keys as whole-expert ownership.
+ */
+TEST(Test__SnapshotCapture_KeyConversion,
+     ProjectionAssemblyPublishesCompleteRowsAndPinnedRouteEvidence)
+{
+    const std::vector<float> routed{1.f, -2.f, 3.f, -4.f};
+    const std::vector<int32_t> participants{1, 0};
+    const std::vector<float> weights{.75f, 0.f};
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("output", routed.data(), 2, 2));
+    dump.outputs.push_back(makeINT32Output("domain_route_participant_ids", participants.data(), 2, 1));
+    dump.outputs.push_back(makeFP32Output("runtime_route_weights", weights.data(), 2, 1));
+    // Sidecar contexts must retain their namespace through the same generic
+    // mapper as the main graph. Neither case introduces a new parity fixture.
+    for (const std::string context : {"", "mtp_draft_depth2::"})
+    {
+        const std::string stage = context + "layer7_projection_assemble";
+        SCOPED_TRACE(stage);
+        const std::string key_prefix = context.empty() ? "layer7_" : "MTP_DRAFT_DEPTH2_layer7_";
+        const auto keys = SnapshotCapture::possibleKeysForStage(stage, dump);
+        EXPECT_NE(std::find(keys.begin(), keys.end(), key_prefix + "MOE_EXPERT_OUTPUT"), keys.end());
+        SnapshotCapture capture;
+        capture.captureStage(stage, dump);
+        const auto *output = capture.get(key_prefix + "MOE_EXPERT_OUTPUT");
+        ASSERT_NE(output, nullptr);
+        EXPECT_EQ(output->data, routed);
+        EXPECT_EQ(output->publication, SnapshotPublication::CompleteValue);
+        const auto *routes = capture.get(key_prefix + "MOE_DOMAIN_ROUTE_PARTICIPANT_IDS");
+        ASSERT_NE(routes, nullptr);
+        EXPECT_EQ(routes->data, (std::vector<float>{1.f, 0.f}));
+        const auto *runtime_weights = capture.get(key_prefix + "MOE_RUNTIME_ROUTE_WEIGHTS");
+        ASSERT_NE(runtime_weights, nullptr);
+        EXPECT_EQ(runtime_weights->data, weights);
+    }
+}
+
+/**
+ * @brief Down-column route evidence retains both packed geometry and ownership.
+ *
+ * The schema normally adds expert-owned contributions. This producer instead
+ * owns every route for a contiguous output-column interval, so the exact
+ * publication must instruct the collector to concatenate those intervals.
+ */
+TEST(Test__SnapshotCapture_KeyConversion,
+     ProjectionDownPublishesColumnPartitionedRouteContributions)
+{
+    const std::vector<float> values{1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f};
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("canonical_route_contributions", values.data(), 4, 2));
+    for (const std::string context : {"", "mtp_draft_depth15::", "prefill_chunk_2::"})
+    {
+        const std::string stage = context + "layer7_projection_import_down";
+        SCOPED_TRACE(stage);
+        const auto keys = SnapshotCapture::possibleKeysForStage(stage, dump);
+        ASSERT_EQ(keys.size(), 1u);
+        EXPECT_EQ(keys, SnapshotCapture::possibleKeysForStageName(stage));
+        EXPECT_TRUE(keys.front().ends_with("layer7_MOE_ROUTE_CONTRIBUTIONS"));
+        SnapshotCapture capture;
+        capture.captureStage(stage, dump);
+        const auto output = capture.getShared(keys.front());
+        ASSERT_TRUE(output);
+        EXPECT_EQ(output->rows, 4u);
+        EXPECT_EQ(output->cols, 2u);
+        EXPECT_EQ(output->data, values);
+        EXPECT_EQ(output->publication, SnapshotPublication::ColumnPartition);
+    }
 }
 
 /**
@@ -1340,78 +1415,72 @@ TEST(Test__SnapshotCapture_Capture,
  * final segmented chunk still occupies the fixed physical bucket, so its
  * inactive route rows must not survive in the prompt-wide diagnostic tensor.
  */
-TEST(Test__SnapshotCapture_Capture,
-     SegmentedPrefillAggregationJoinsPackedRouteRowsWithoutPadding)
+TEST(Test__SnapshotCapture_Capture, SegmentedPrefillAggregationJoinsPackedRouteRowsWithoutPadding)
 {
-    const std::vector<float> first_indices = {0.0f, 1.0f, 2.0f, 3.0f};
-    const std::vector<float> final_indices = {4.0f, 5.0f};
-    const std::vector<float> first_contributions = {
-        1.0f, 2.0f,
-        3.0f, 4.0f,
-        5.0f, 6.0f,
-        7.0f, 8.0f,
-    };
-    const std::vector<float> final_bucket_contributions = {
-        9.0f, 10.0f,
-        11.0f, 12.0f,
-        99.0f, 99.0f,
-        99.0f, 99.0f,
-    };
+    // Both physical ownership modes retain top-k rows per live token. Joining
+    // time chunks must not erase the producer's later TP assembly contract.
+    for (const std::string producer :
+         {"layer0_moe_expert_ffn_overlay_fast", "layer0_projection_import_down"})
+    {
+        SCOPED_TRACE(producer);
+        const std::vector<float> first_indices = {0.0f, 1.0f, 2.0f, 3.0f};
+        const std::vector<float> final_indices = {4.0f, 5.0f};
+        const std::vector<float> first_contributions = {
+            1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f,
+        };
+        const std::vector<float> final_bucket_contributions = {
+            9.0f, 10.0f, 11.0f, 12.0f, 99.0f, 99.0f, 99.0f, 99.0f,
+        };
 
-    SnapshotCapture capture;
-    StageDumpInfo first_routing;
-    first_routing.outputs.push_back(makeFP32Output(
-        "output_indices_tensor", first_indices.data(), 2, 2));
-    capture.captureStage(
-        "prefill_chunk_0::layer0_moe_routing", first_routing);
-    StageDumpInfo final_routing;
-    final_routing.outputs.push_back(makeFP32Output(
-        "output_indices_tensor", final_indices.data(), 1, 2));
-    capture.captureStage(
-        "prefill_chunk_1::layer0_moe_routing", final_routing);
+        SnapshotCapture capture;
+        StageDumpInfo first_routing;
+        first_routing.outputs.push_back(
+            makeFP32Output("output_indices_tensor", first_indices.data(), 2, 2));
+        capture.captureStage("prefill_chunk_0::layer0_moe_routing", first_routing);
+        StageDumpInfo final_routing;
+        final_routing.outputs.push_back(
+            makeFP32Output("output_indices_tensor", final_indices.data(), 1, 2));
+        capture.captureStage("prefill_chunk_1::layer0_moe_routing", final_routing);
 
-    StageDumpInfo first_experts;
-    first_experts.outputs.push_back(makeFP32Output(
-        "canonical_route_contributions",
-        first_contributions.data(),
-        4,
-        2));
-    capture.captureStage(
-        "prefill_chunk_0::layer0_moe_expert_ffn_overlay_fast",
-        first_experts);
-    StageDumpInfo final_experts;
-    final_experts.outputs.push_back(makeFP32Output(
-        "canonical_route_contributions",
-        final_bucket_contributions.data(),
-        4,
-        2));
-    capture.captureStage(
-        "prefill_chunk_1::layer0_moe_expert_ffn_overlay_fast",
-        final_experts);
+        StageDumpInfo first_experts;
+        first_experts.outputs.push_back(
+            makeFP32Output("canonical_route_contributions", first_contributions.data(), 4, 2));
+        capture.captureStage("prefill_chunk_0::" + producer, first_experts);
+        StageDumpInfo final_experts;
+        final_experts.outputs.push_back(makeFP32Output("canonical_route_contributions",
+                                                       final_bucket_contributions.data(), 4, 2));
+        capture.captureStage("prefill_chunk_1::" + producer, final_experts);
 
-    const auto aggregation = capture.aggregateSequentialChunkSnapshots({
-        {.context = "prefill_chunk_0", .logical_rows = 2},
-        {.context = "prefill_chunk_1", .logical_rows = 1},
-    });
-    ASSERT_TRUE(aggregation) << aggregation.error;
-    EXPECT_EQ(aggregation.aggregated_sequence_keys, 2u);
-    EXPECT_EQ(aggregation.terminal_or_nonsequence_keys, 0u);
+        const auto aggregation = capture.aggregateSequentialChunkSnapshots({
+            {.context = "prefill_chunk_0", .logical_rows = 2},
+            {.context = "prefill_chunk_1", .logical_rows = 1},
+        });
+        ASSERT_TRUE(aggregation) << aggregation.error;
+        EXPECT_EQ(aggregation.aggregated_sequence_keys, 2u);
+        EXPECT_EQ(aggregation.terminal_or_nonsequence_keys, 0u);
 
-    const auto *canonical =
-        capture.get("layer0_MOE_ROUTE_CONTRIBUTIONS");
-    ASSERT_NE(canonical, nullptr);
-    EXPECT_EQ(canonical->rows, 6u);
-    EXPECT_EQ(canonical->cols, 2u);
-    EXPECT_EQ(
-        canonical->data,
-        (std::vector<float>{
-            1.0f, 2.0f,
-            3.0f, 4.0f,
-            5.0f, 6.0f,
-            7.0f, 8.0f,
-            9.0f, 10.0f,
-            11.0f, 12.0f,
-        }));
+        const auto *canonical = capture.get("layer0_MOE_ROUTE_CONTRIBUTIONS");
+        ASSERT_NE(canonical, nullptr);
+        EXPECT_EQ(canonical->rows, 6u);
+        EXPECT_EQ(canonical->cols, 2u);
+        EXPECT_EQ(canonical->publication, producer.ends_with("_projection_import_down")
+                                              ? SnapshotPublication::ColumnPartition
+                                              : SnapshotPublication::SchemaPartition);
+        EXPECT_EQ(canonical->data, (std::vector<float>{
+                                       1.0f,
+                                       2.0f,
+                                       3.0f,
+                                       4.0f,
+                                       5.0f,
+                                       6.0f,
+                                       7.0f,
+                                       8.0f,
+                                       9.0f,
+                                       10.0f,
+                                       11.0f,
+                                       12.0f,
+                                   }));
+    }
 }
 
 /**
@@ -1687,6 +1756,32 @@ TEST_F(Test__SnapshotCapture_Routing, ShapeMetadataPreserved)
     EXPECT_EQ(snap->rows, 4u);
     EXPECT_EQ(snap->cols, 8u);
     EXPECT_EQ(snap->data.size(), 32u);
+}
+
+/** @brief Shared-column completion preserves each semantic checkpoint without a diagnostic collective. */
+TEST_F(Test__SnapshotCapture_Routing, ProjectionCombinedAssemblyPreservesColumnOwnedIntermediates)
+{
+    std::vector<float> routed{1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> shared{0.5f, 1.0f, 1.5f, 2.0f};
+    std::vector<float> combined{1.5f, 3.0f, 7.0f, 8.0f, 4.5f, 6.0f, 9.0f, 10.0f};
+    auto dump = makeSingleOutputDump("routed_output", routed.data(), 2, 2);
+    const auto shared_dump = makeSingleOutputDump("shared_output", shared.data(), 2, 2);
+    dump.outputs.push_back(shared_dump.outputs.front());
+    capture.captureStage("layer3_projection_shared_columns", dump);
+    capture.captureStage("layer3_projection_assemble",
+        makeSingleOutputDump("combined_output", combined.data(), 2, 4));
+    const auto *route = capture.get("layer3_MOE_EXPERT_OUTPUT");
+    const auto *gate = capture.get("layer3_MOE_SHARED_GATE_OUTPUT");
+    const auto *result = capture.get("layer3_MOE_COMBINED_OUTPUT");
+    ASSERT_NE(route, nullptr);
+    ASSERT_NE(gate, nullptr);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(route->publication, SnapshotPublication::ColumnPartition);
+    EXPECT_EQ(gate->publication, SnapshotPublication::ColumnPartition);
+    EXPECT_EQ(result->publication, SnapshotPublication::CompleteValue);
+    EXPECT_EQ(route->data, routed);
+    EXPECT_EQ(gate->data, shared);
+    EXPECT_EQ(result->data, combined);
 }
 
 // =========================================================================

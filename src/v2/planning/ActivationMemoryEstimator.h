@@ -40,6 +40,8 @@ struct ActivationGraphMemoryGeometry
     int first_layer = 0;            ///< First main-model layer assigned here.
     int last_layer = -1;            ///< Last main-model layer assigned here.
     int total_shards = 1;           ///< Dense tensor-parallel participant count.
+    RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        ///< Frozen physical expert layout; determines which publication banks exist.
     int mtp_target_query_rows = 2;  ///< Flattened maximum verifier-row capacity.
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;

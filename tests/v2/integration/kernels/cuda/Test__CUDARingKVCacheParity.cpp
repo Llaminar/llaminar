@@ -13,6 +13,8 @@
  * 6. Multi-precision (FP32, FP16, BF16)
  * 7. Captured unequal-length continuation and seed-authenticated diagnostic
  *    partitions, with external producer events joined before capture.
+ * 8. Exact permanent allocation bytes and ordered workspace reuse across
+ *    layers, requests and twenty wrapped captured replays in all native formats.
  */
 
 #include <gtest/gtest.h>
@@ -28,6 +30,8 @@
 #include "execution/prefix_cache/PrefixCacheStateProbe.h"
 #include "transfer/TransferEngine.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
+#include "backends/BackendManager.h"
+#include "backends/IBackend.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
@@ -286,7 +290,162 @@ namespace
         cache.unbindWorkspace();
     }
 
+    /**
+     * @brief Prove permanent payload size and reuse wrapped contiguous workspace.
+     * @tparam Precision Native cache scalar or block representation.
+     *
+     * Byte accounting is observed at the canonical backend, not inferred from
+     * driver free memory. Every entry wraps; two layers and three requests reuse
+     * the same ordered workspace. A retained append/gather graph then crosses
+     * twenty ring frontiers without growing allocations or changing pointers.
+     */
+    template <ActivationPrecision Precision>
+    void runWrappedWorkspaceStorageProof()
+    {
+        using DataT = typename detail::CUDAKVCacheType<Precision>::Type;
+        constexpr int layers = 2, requests = 3, capacity = 32;
+        constexpr int heads = 2, head_dim = 32, columns = heads * head_dim;
+        constexpr int storage_columns = Precision == ActivationPrecision::Q8_1
+            ? columns / Q8_1Block::BLOCK_SIZE : columns;
+        constexpr int appended = 5, source_rows = capacity + appended;
+        constexpr size_t row_bytes = storage_columns * sizeof(DataT);
+        const auto device = DeviceId::cuda(0);
+        auto *backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+        ScopedCudaStream stream;
+        const auto before = backend->deviceAllocationAccounting(0);
+        ASSERT_TRUE(before.supported) << before.diagnostic;
+        {
+            CUDARingKVCache<Precision> cache(layers, requests, capacity,
+                                             heads, head_dim, 0);
+            const auto allocated = backend->deviceAllocationAccounting(0);
+            constexpr size_t entries = layers * requests;
+            constexpr size_t native_bytes = entries * 2 * capacity * row_bytes;
+            constexpr size_t metadata = entries * (2 * sizeof(int) + 2 * sizeof(void *));
+            EXPECT_EQ(allocated.active_bytes - before.active_bytes,
+                      native_bytes + metadata);
+
+            std::vector<DataT> source_k(source_rows * storage_columns);
+            std::vector<DataT> source_v(source_k.size());
+            for (size_t i = 0; i < source_k.size() * sizeof(DataT); ++i)
+            {
+                reinterpret_cast<unsigned char *>(source_k.data())[i] =
+                    static_cast<unsigned char>(1 + (i * 29 + 17) % 251);
+                reinterpret_cast<unsigned char *>(source_v.data())[i] =
+                    static_cast<unsigned char>(1 + (i * 31 + 113) % 251);
+            }
+            DataT *input_k = nullptr, *input_v = nullptr;
+            ASSERT_EQ(cudaMalloc(&input_k, source_k.size() * sizeof(DataT)), cudaSuccess);
+            ASSERT_EQ(cudaMalloc(&input_v, source_v.size() * sizeof(DataT)), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(input_k, source_k.data(), source_k.size() * sizeof(DataT),
+                                      cudaMemcpyHostToDevice, stream.stream()), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(input_v, source_v.data(), source_v.size() * sizeof(DataT),
+                                      cudaMemcpyHostToDevice, stream.stream()), cudaSuccess);
+            for (int layer = 0; layer < layers; ++layer)
+                for (int request = 0; request < requests; ++request)
+                    ASSERT_TRUE(cache.append(layer, request, input_k, input_v,
+                                             source_rows, stream.stream()));
+            stream.synchronize();
+
+            // An unbound wrapped observation must fail rather than allocate a
+            // hidden per-entry payload. Outputs must not expose stale pointers.
+            const void *observed_k = nullptr, *observed_v = nullptr;
+            int count = 0;
+            EXPECT_FALSE(cache.get_kv_for_attention(0, 0, &observed_k, &observed_v,
+                                                   &count, stream.stream()));
+            EXPECT_EQ(observed_k, nullptr);
+            EXPECT_EQ(observed_v, nullptr);
+
+            auto workspace = bindRequiredWorkspace(&cache, appended, requests, head_dim);
+            const auto bound = backend->deviceAllocationAccounting(0);
+            // Bound capacity is not permission to launch on CUDA's default
+            // stream. Rejection must precede both writes and publication.
+            EXPECT_FALSE(cache.get_kv_for_attention(0, 0, &observed_k, &observed_v,
+                                                   &count, nullptr));
+            EXPECT_EQ(observed_k, nullptr);
+            EXPECT_EQ(observed_v, nullptr);
+            EXPECT_EQ(backend->deviceAllocationAccounting(0).active_bytes, bound.active_bytes);
+            const void *shared_k = nullptr, *shared_v = nullptr;
+            std::vector<DataT> actual_k(capacity * storage_columns);
+            std::vector<DataT> actual_v(actual_k.size());
+            for (int layer = 0; layer < layers; ++layer)
+                for (int request = 0; request < requests; ++request)
+                {
+                    ASSERT_TRUE(cache.get_kv_for_attention(layer, request,
+                        &observed_k, &observed_v, &count, stream.stream()));
+                    EXPECT_EQ(count, capacity);
+                    if (!shared_k) { shared_k = observed_k; shared_v = observed_v; }
+                    EXPECT_EQ(observed_k, shared_k);
+                    EXPECT_EQ(observed_v, shared_v);
+                    ASSERT_EQ(cudaMemcpyAsync(actual_k.data(), observed_k, actual_k.size() * sizeof(DataT),
+                                              cudaMemcpyDeviceToHost, stream.stream()), cudaSuccess);
+                    ASSERT_EQ(cudaMemcpyAsync(actual_v.data(), observed_v, actual_v.size() * sizeof(DataT),
+                                              cudaMemcpyDeviceToHost, stream.stream()), cudaSuccess);
+                    stream.synchronize();
+                    EXPECT_EQ(std::memcmp(actual_k.data(), source_k.data() + appended * storage_columns,
+                                          actual_k.size() * sizeof(DataT)), 0);
+                    EXPECT_EQ(std::memcmp(actual_v.data(), source_v.data() + appended * storage_columns,
+                                          actual_v.size() * sizeof(DataT)), 0);
+                }
+
+            ITensor *gathered_k = nullptr, *gathered_v = nullptr;
+            ASSERT_TRUE(cache.get_kv_batched_device_view(0, 0, requests,
+                &gathered_k, &gathered_v, stream.opaque()));
+            stream.synchronize();
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t executable = nullptr;
+            ASSERT_EQ(cudaStreamBeginCapture(stream.stream(), cudaStreamCaptureModeGlobal), cudaSuccess);
+            {
+                GraphCaptureGuard guard;
+                for (int request = 0; request < requests; ++request)
+                    ASSERT_TRUE(cache.append(0, request, input_k, input_v, appended, stream.stream()));
+                ASSERT_TRUE(cache.get_kv_batched_device_view(0, 0, requests,
+                    &gathered_k, &gathered_v, stream.opaque()));
+            }
+            ASSERT_EQ(cudaStreamEndCapture(stream.stream(), &graph), cudaSuccess);
+            ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+            auto expected_k = source_k, expected_v = source_v;
+            std::vector<DataT> batch_k(requests * capacity * storage_columns);
+            std::vector<DataT> batch_v(batch_k.size());
+            for (int replay = 0; replay < 20; ++replay)
+            {
+                expected_k.insert(expected_k.end(), source_k.begin(), source_k.begin() + appended * storage_columns);
+                expected_v.insert(expected_v.end(), source_v.begin(), source_v.begin() + appended * storage_columns);
+                ASSERT_EQ(cudaGraphLaunch(executable, stream.stream()), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(batch_k.data(), gathered_k->gpu_data_ptr(), batch_k.size() * sizeof(DataT),
+                                          cudaMemcpyDeviceToHost, stream.stream()), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(batch_v.data(), gathered_v->gpu_data_ptr(), batch_v.size() * sizeof(DataT),
+                                          cudaMemcpyDeviceToHost, stream.stream()), cudaSuccess);
+                stream.synchronize();
+                for (int request = 0; request < requests; ++request)
+                {
+                    EXPECT_EQ(std::memcmp(batch_k.data() + request * capacity * storage_columns,
+                        expected_k.data() + expected_k.size() - actual_k.size(), actual_k.size() * sizeof(DataT)), 0);
+                    EXPECT_EQ(std::memcmp(batch_v.data() + request * capacity * storage_columns,
+                        expected_v.data() + expected_v.size() - actual_v.size(), actual_v.size() * sizeof(DataT)), 0);
+                }
+                EXPECT_EQ(backend->deviceAllocationAccounting(0).active_bytes, bound.active_bytes);
+            }
+            ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
+            ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+            cache.unbindWorkspace();
+            ASSERT_EQ(cudaFree(input_k), cudaSuccess);
+            ASSERT_EQ(cudaFree(input_v), cudaSuccess);
+        }
+        EXPECT_EQ(backend->deviceAllocationAccounting(0).active_bytes, before.active_bytes);
+    }
+
 } // namespace
+
+/** @brief No per-entry linearization payload survives in any native CUDA format. */
+TEST(Test__CUDARingKVCache, WrappedWorkspaceReuseAllFormatsIsByteExact)
+{
+    ASSERT_TRUE(hasCUDA());
+    runWrappedWorkspaceStorageProof<ActivationPrecision::FP32>();
+    runWrappedWorkspaceStorageProof<ActivationPrecision::FP16>();
+    runWrappedWorkspaceStorageProof<ActivationPrecision::BF16>();
+    runWrappedWorkspaceStorageProof<ActivationPrecision::Q8_1>();
+}
 
 /**
  * @brief Every standard CUDA cache format grows beyond capture byte-exactly.
@@ -684,6 +843,8 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
     ScopedCudaStream stream;
+    auto workspace = bindRequiredWorkspace(dynamic_cast<IWorkspaceConsumer *>(cache.get()),
+                                             max_seq_len, batch_size, head_dim);
 
     // Phase 1: Fill buffer with 6 tokens [T0..T5]
     const int phase1_tokens = 6;
@@ -734,7 +895,8 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
     // Retrieve and verify linearization happens
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, stream.stream()));
+    stream.synchronize();
     EXPECT_EQ(kv_len, 8);
     EXPECT_EQ(cache->get_linearization_count(), 1); // Should have linearized
 
@@ -1664,6 +1826,8 @@ TEST(Test__CUDARingKVCache, AppendWithStream_RejectsNullAndAcceptsExplicitStream
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 
     ScopedCudaStream stream;
+    ASSERT_TRUE(K_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
     ASSERT_TRUE(cache->appendWithStream(0, 0,
                                         static_cast<const ITensor *>(K_tensor.get()),
                                         static_cast<const ITensor *>(V_tensor.get()),
@@ -1716,6 +1880,10 @@ TEST(Test__CUDARingKVCache, GraphCapturedFP32ToFP16AppendUsesFusedConversionWith
     ScopedCudaStream stream;
     ASSERT_TRUE(K_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
     ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    // Capture consumes a proven publication on this exact stream. A host wait
+    // alone does not authenticate the tensor's producer/consumer event edge.
+    TransferEngine::requireDeviceInput(K_tensor.get(), DeviceId::cuda(0), stream.opaque());
+    TransferEngine::requireDeviceInput(V_tensor.get(), DeviceId::cuda(0), stream.opaque());
     stream.synchronize();
 
     ASSERT_TRUE(cache->bindGraphAppendCountSource(
@@ -1783,6 +1951,8 @@ TEST(Test__CUDARingKVCache, GraphCapturedFP32ToFP16FusedAppendReplaysAfterClear)
     ScopedCudaStream stream;
     ASSERT_TRUE(K_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
     ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    TransferEngine::requireDeviceInput(K_tensor.get(), DeviceId::cuda(0), stream.opaque());
+    TransferEngine::requireDeviceInput(V_tensor.get(), DeviceId::cuda(0), stream.opaque());
     stream.synchronize();
 
     ASSERT_TRUE(cache->bindGraphAppendCountSource(
@@ -1918,6 +2088,8 @@ TEST(Test__CUDARingKVCache, CapturedPaddedFP32ToQ8AppendAndGatherPreservesLiveRo
     ScopedCudaStream stream;
     ASSERT_TRUE(K->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
     ASSERT_TRUE(V->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    TransferEngine::requireDeviceInput(K.get(), DeviceId::cuda(0), stream.opaque());
+    TransferEngine::requireDeviceInput(V.get(), DeviceId::cuda(0), stream.opaque());
 
     int32_t *device_live_rows = nullptr;
     ASSERT_EQ(cudaMalloc(&device_live_rows, sizeof(int32_t)), cudaSuccess);

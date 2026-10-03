@@ -73,6 +73,8 @@ namespace llaminar2
             {
             case RoutedExpertComputePolicy::Apportioned:
                 return MoEOverlayTierCopyPolicy::Apportioned;
+            case RoutedExpertComputePolicy::GateUpOwnedDownColumns:
+                return MoEOverlayTierCopyPolicy::GateUpOwnedDownColumns;
             case RoutedExpertComputePolicy::Replicated:
                 return MoEOverlayTierCopyPolicy::Replicated;
             case RoutedExpertComputePolicy::TensorSharded:
@@ -80,9 +82,10 @@ namespace llaminar2
                     "ExpertOverlay exact whole-expert capacity does not yet "
                     "admit tensor-sharded routed domain '" + domain.name + "'");
             case RoutedExpertComputePolicy::Unspecified:
+            case RoutedExpertComputePolicy::Automatic:
                 throw std::invalid_argument(
                     "ExpertOverlay capacity domain '" + domain.name +
-                    "' has an unspecified routed compute policy");
+                    "' has an unresolved routed compute policy");
             }
             throw std::logic_error(
                 "Unknown routed-expert compute policy during capacity admission");
@@ -141,7 +144,7 @@ namespace llaminar2
             for (; admitted < num_experts; ++admitted)
             {
                 std::size_t next = 0;
-                if (policy == MoEOverlayTierCopyPolicy::Apportioned)
+                if (policy != MoEOverlayTierCopyPolicy::Replicated)
                 {
                     const auto participant =
                         static_cast<std::size_t>(admitted) %
@@ -584,7 +587,9 @@ namespace llaminar2
             const auto profile =
                 DeviceMoETransferSlotDirectory::
                     profileForLayerWeightManifest(
-                        layer_weight_manifest);
+                        layer_weight_manifest,
+                        moeOverlayMovableProjections(copyPolicy(
+                            requireDomain(plan, plan.routed_tiers.front()))));
             const auto directory_bom =
                 DeviceMoETransferSlotDirectory::allocationBOM(
                     policy.device_transfer_directory_capacity,
@@ -739,6 +744,10 @@ namespace llaminar2
             request.priority = tier.priority;
             request.fallback = tier.fallback;
             request.copy_policy = copyPolicy(domain);
+            if (request.copy_policy == MoEOverlayTierCopyPolicy::GateUpOwnedDownColumns &&
+                (plan.routed_tiers.size() != 1u || policy.usesPhysicalResidencyFabric()))
+                throw std::invalid_argument(
+                    "Gate/up-owned down columns require a single native GPU domain; cross-tier slice publication is not implemented");
             request.quota_mode =
                 tier.resolved_live_experts_per_layer.empty()
                     ? MoEOverlayLiveQuotaMode::Automatic
@@ -797,6 +806,9 @@ namespace llaminar2
 
             request.max_live_experts_per_layer.assign(
                 layer_count, num_experts);
+            const auto tier_footprints =
+                MoEOverlayCapacityResolver::preparedFootprints(
+                    layer_weight_manifest, moeOverlayMovableProjections(request.copy_policy));
             for (std::size_t layer = 0; layer < layer_count; ++layer)
             {
                 int maximum = num_experts;
@@ -813,7 +825,7 @@ namespace llaminar2
                         layer,
                         request.copy_policy,
                         participant_devices,
-                        footprints));
+                        tier_footprints));
                 request.max_live_experts_per_layer[layer] = maximum;
             }
             input.tiers.push_back(std::move(request));

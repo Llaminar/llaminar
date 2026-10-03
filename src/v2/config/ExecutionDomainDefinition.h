@@ -13,6 +13,7 @@
 #include "config/CollectiveBackendType.h"
 #include "execution/config/RoutedExpertPolicy.h"
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -156,6 +157,20 @@ namespace llaminar2
 
         /** @brief Return true when every expert may be tensor-sharded here. */
         bool supportsRoutedExpertTensorSharding() const;
+
+        /**
+         * @brief Seal routed compute intent using the bound topology, not a name.
+         * @param routed_tier_count Number of declared routed-expert tiers.
+         * @return Explicit compute unchanged; otherwise the concrete default.
+         * @throws std::invalid_argument if automatic intent still has AUTO scope.
+         *
+         * One rank-local homogeneous multi-GPU tier uses movable gate/up and
+         * fixed down columns. CPU, cross-rank, heterogeneous and multi-tier
+         * topologies use whole-expert ownership. A least-loaded row assignment
+         * explicitly requires complete expert residents and selects that mode.
+         */
+        [[nodiscard]] RoutedExpertComputePolicy resolveRoutedComputePolicy(
+            std::size_t routed_tier_count) const;
 
         /** @brief Return the stable logical identity used by placement references. */
         std::string logicalIdentity() const { return name; }

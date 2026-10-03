@@ -232,7 +232,8 @@ extern "C" bool cudaMoE_group_prefill_routes_runtime(
     int filter_to_local_runtime_experts,
     int retain_routes_for_deferred_commit,
     int device_idx,
-    void *stream);
+    void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
 extern "C" bool cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
     const float *routing_indices,
@@ -252,7 +253,8 @@ extern "C" bool cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
     int retain_routes_for_deferred_commit,
     llaminar2::DeviceMoEWeightFormat expected_format,
     int device_idx,
-    void *stream);
+    void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
 #endif
 
@@ -2879,7 +2881,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillScalableGroupingPublishesCompleteStabl
         /*filter_to_local_runtime_experts=*/0,
         /*retain_routes_for_deferred_commit=*/0,
         /*device_idx=*/0,
-        stream_));
+        stream_,
+        llaminar2::DeviceMoEProjectionSet::CompleteExpert));
     verify_transaction(
         std::vector<int32_t>(static_cast<size_t>(total_slots), 0),
         "initial scalable grouping");
@@ -8267,7 +8270,8 @@ TEST_F(Test__CUDAMoEKernel,
         /*retain_routes_for_deferred_commit=*/0,
         llaminar2::DeviceMoEWeightFormat::NativeVNNI,
         /*device_idx=*/0,
-        stream_));
+        stream_,
+        llaminar2::DeviceMoEProjectionSet::CompleteExpert));
     ASSERT_TRUE(prefill_graph.finishAndInstantiate());
 
     const auto drain_one_generation = [&]()
@@ -27174,6 +27178,19 @@ TEST_F(Test__CUDAMoEKernel, TransferredCurrentBatchAllNativeFormatsPublishExactB
 }
 
 /** @brief Captured slot reuse preserves all floating and quantized wire formats. */
+TEST_F(Test__CUDAMoEKernel, CapturedGateUpTransfersExcludeFixedDownStorage)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice()) GTEST_SKIP() << "No CUDA device available";
+    llaminar2::test::runMixedFormatExpertTransferPublication(
+        llaminar2::DeviceId::cuda(0), stream_,
+        llaminar2::DeviceMoEProjectionSet::GateUp);
+#endif
+}
+
+/** @brief Complete experts retain their existing all-format transfer contract. */
 TEST_F(Test__CUDAMoEKernel, CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases)
 {
 #ifndef HAVE_CUDA

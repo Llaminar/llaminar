@@ -165,25 +165,6 @@ namespace llaminar2
     };
 
     /**
-     * @brief Build an expert-only immutable weight plan for one participant.
-     *
-     * Each requirement is an explicit expert-axis selection.  Materialization
-     * therefore faults only the GGUF pages assigned to @p participant and
-     * preserves the logical-to-physical expert-slot map in WeightSliceSpec.
-     *
-     * @param model_context Metadata and loader authority for the real model.
-     * @param execution_plan Rank/domain ownership resolved from the topology.
-     * @param owner_map Whole-expert ownership for every model layer.
-     * @param participant Local participant whose weights are requested.
-     * @return A typed plan containing only gate/up/down routed-expert parents.
-     */
-    WeightPlan buildMoEOverlayParticipantWeightPlan(
-        const ModelContext &model_context,
-        const MoEExpertOverlayExecutionPlan &execution_plan,
-        const MoEExpertOwnerMap &owner_map,
-        const MoEExpertOwnerParticipant &participant);
-
-    /**
      * @brief Execute all rank-local sparse expert endpoints without a dense model.
      *
      * One fixed-capacity graph serves decode, full prefill buckets, and short

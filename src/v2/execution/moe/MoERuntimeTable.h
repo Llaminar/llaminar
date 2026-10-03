@@ -1,6 +1,10 @@
 /**
  * @file MoERuntimeTable.h
  * @brief Stable graph-facing MoE placement runtime tables.
+ *
+ * Placement epochs own movable projection descriptors. A gate/up-only epoch
+ * never owns the fixed down-column bank; its typed payload contract is distinct
+ * from the complete-expert contract used by ordinary grouped execution.
  */
 
 #pragma once
@@ -34,6 +38,7 @@ namespace llaminar2
     class DecodeExpertHistogram;
     class DeviceMoEOverlayEpochArena;
     class MoEOverlayEconomyCalibrationLayerCatalog;
+    class MoEOverlayFixedDownProjectionBank;
     using DeviceMoERuntimeHistogramBank =
         moe_runtime_abi::DeviceMoERuntimeHistogramBank;
     using RuntimeExpertHistogramSourceMask =
@@ -154,6 +159,7 @@ namespace llaminar2
         PreferredReplica = 3,
     };
 
+    /** @brief Pointer-bearing movable payload and its exact arithmetic identity. */
     struct DeviceMoEExpertDescriptor
     {
         /** Prepared NativeVNNI views used when weight_format is NativeVNNI. */
@@ -172,18 +178,30 @@ namespace llaminar2
         // Immutable capacity tag for reusable raw storage. NativeVNNI means
         // no raw view was allocated, not a conversion or alternate arithmetic.
         DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeVNNI;
+        DeviceMoEProjectionSet projection_set = DeviceMoEProjectionSet::CompleteExpert;
+
+        /** @return Whether the declared movable family, rather than a full FFN, exists. */
+        [[nodiscard]] constexpr bool movableWeightsReady() const noexcept
+        {
+            if (weight_format != DeviceMoEWeightFormat::NativeVNNI)
+                return deviceMoEFloatingExpertCopyReady(*this);
+            if (!deviceMoEProjectionPayloadValid(*this) || !gate.valid() || !up.valid())
+                return false;
+            return projection_set == DeviceMoEProjectionSet::GateUp || down.valid();
+        }
 
         /** @return Whether the selected arithmetic family has a complete triple. */
         [[nodiscard]] constexpr bool weightsReady() const noexcept
         {
-            if (weight_format == DeviceMoEWeightFormat::NativeVNNI)
-                return gate.valid() && up.valid() && down.valid();
-            return deviceMoEWeightFormatIsFloating(weight_format) &&
-                   floating_gate.valid() &&
-                   floating_up.valid() &&
-                   floating_down.valid();
+            return projection_set == DeviceMoEProjectionSet::CompleteExpert &&
+                   movableWeightsReady();
         }
     };
+
+    static_assert(sizeof(DeviceMoEExpertDescriptor) == 240);
+    static_assert(offsetof(DeviceMoEExpertDescriptor, weight_format) == 232);
+    static_assert(offsetof(DeviceMoEExpertDescriptor, floating_allocation_format) == 234);
+    static_assert(offsetof(DeviceMoEExpertDescriptor, projection_set) == 236);
 
     struct DeviceMoEPlacementBank
     {
@@ -1176,6 +1194,16 @@ namespace llaminar2
              * The graph builder owns both tables for their captured lifetime.
              */
             DeviceMoERuntimeTable *overlay_placement_source = nullptr;
+            /**
+             * @brief Immutable fixed down slices for projection-distributed execution.
+             *
+             * Empty means complete-expert execution. Otherwise exactly one
+             * authenticated bank per layer is required. Their geometry defines
+             * the movable family; there is no independent policy flag that can
+             * admit gate/up payloads without the fixed down lifetimes. Reset,
+             * prefix restore and placement epochs cannot replace these banks.
+             */
+            std::vector<std::shared_ptr<const MoEOverlayFixedDownProjectionBank>> fixed_down_banks;
         };
 
         explicit DeviceMoERuntimeTable(Config config);
@@ -1190,6 +1218,22 @@ namespace llaminar2
         DeviceMoERuntimeTable &operator=(const DeviceMoERuntimeTable &) = delete;
         DeviceMoERuntimeTable(DeviceMoERuntimeTable &&) = delete;
         DeviceMoERuntimeTable &operator=(DeviceMoERuntimeTable &&) = delete;
+
+        /** @return Captured model-lifetime down binding, or null for complete experts.
+         *  @throws std::out_of_range If the layer is outside this table.
+         */
+        [[nodiscard]] const MoEOverlayFixedDownProjectionBank *fixedDownProjectionBank(int layer_idx) const;
+        /** @return Shared immutable bank lifetime retained by this table and its captured consumers. */
+        [[nodiscard]] std::shared_ptr<const MoEOverlayFixedDownProjectionBank> retainFixedDownProjectionBank(int layer_idx) const
+        {
+            (void)fixedDownProjectionBank(layer_idx); // Validate the same layer boundary before indexing.
+            return fixed_down_banks_.empty() ? nullptr : fixed_down_banks_[static_cast<std::size_t>(layer_idx)];
+        }
+        /** @return The exact movable family authenticated by the fixed graph binding. */
+        [[nodiscard]] DeviceMoEProjectionSet movableProjections() const noexcept
+        {
+            return fixed_down_banks_.empty() ? DeviceMoEProjectionSet::CompleteExpert : DeviceMoEProjectionSet::GateUp;
+        }
 
         DeviceMoELayerRuntime *deviceLayerState(int layer_idx) override;
         bool prepareInactiveBank(int layer_idx, const MoEPlacementUpdate &update) override;
@@ -1243,6 +1287,17 @@ namespace llaminar2
          */
         void resetDecodeRuntimeState(void *stream = nullptr) override;
         bool hasInitialRuntimeState() const noexcept;
+        /**
+         * @brief Whether this layer has a usable immutable setup baseline.
+         * @param layer_idx Retained main or sidecar layer in this runtime family.
+         * @return False before first publication or after an empty-state reset;
+         *         true after publication, including after device-owned movement.
+         *
+         * This is a setup lifecycle query, not a download or comparison of the
+         * live device epoch. Graph preparation must not reset moved placement
+         * simply because its original host recipe no longer describes it.
+         */
+        [[nodiscard]] bool hasInitialLayerRuntimeState(int layer_idx) const;
         /**
          * @brief Return whether every retained layer owns a published baseline.
          *
@@ -1573,6 +1628,8 @@ namespace llaminar2
         uint32_t overlay_epoch_ticket_slot_ = 0u;
         /** Non-owning model-lifetime source retained by the owning graph builder. */
         DeviceMoERuntimeTable *overlay_placement_source_ = nullptr;
+        /** Model lifetime, independent of both placement banks and request snapshots. */
+        const std::vector<std::shared_ptr<const MoEOverlayFixedDownProjectionBank>> fixed_down_banks_;
         std::vector<DeviceMoEPrefillRouteScratchBindings>
             prefill_route_scratch_;
         int32_t *deferred_verifier_route_expert_ids_ = nullptr;

@@ -6,11 +6,14 @@
  * owns its payload. The production reservation therefore follows the backing
  * allocation through the final shared handle, independently of logical LRU
  * occupancy. Failed materialization reports which boundary rejected it.
+ * Complete GPU recurrent sections deliberately avoid a redundant CPU clear;
+ * attention padding and optional terminal sections retain initialization.
  */
 
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 
 #include "backends/BackendManager.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cstring>
@@ -89,6 +92,7 @@ namespace llaminar2
 
     bool RamPrefixStorageBackend::allocateSection(
         size_t bytes,
+        SectionWriteCoverage coverage,
         std::shared_ptr<std::vector<uint8_t>> *pageable_owner,
         std::shared_ptr<void> *pinned_owner,
         void **payload,
@@ -117,7 +121,13 @@ namespace llaminar2
         void *raw = backend->allocatePinned(bytes, ordinal);
         if (!raw)
             return false;
-        std::memset(raw, 0, bytes);
+        // Recurrent checkpoints overwrite their entire serialized section.
+        // A host memset of large pinned images can dominate prefill (especially
+        // with uncached mappings), yet contributes no observable archive data.
+        // Keep initialization where short KV blocks or optional terminal rows
+        // can leave allocated bytes outside the published payload.
+        if (coverage == SectionWriteCoverage::Partial)
+            std::memset(raw, 0, bytes);
         *pinned_owner = std::shared_ptr<void>(
             raw,
             [backend, ordinal, readiness](void *pointer)
@@ -135,14 +145,28 @@ namespace llaminar2
                 }
             });
         *payload = raw;
+        PerfStatsCollector::addCounter(
+            "prefix_cache",
+            coverage == SectionWriteCoverage::Partial
+                ? "ram_payload_cpu_zeroed_bytes"
+                : "ram_payload_full_overwrite_bytes",
+            static_cast<double>(bytes),
+            "allocate",
+            producer_device_.toString());
         return true;
     }
 
     bool RamPrefixStorageBackend::canStore(size_t bytes) const
     {
-        return used_bytes_ <= budget_bytes_ &&
-               bytes <= budget_bytes_ - used_bytes_ &&
-               (!reservation_.valid() || bytes <= reservation_.remainingBytes());
+        return bytes <= availableAllocationBytes();
+    }
+
+    size_t RamPrefixStorageBackend::availableAllocationBytes() const
+    {
+        const auto logical = budget_bytes_ - std::min(budget_bytes_, used_bytes_);
+        return reservation_.valid()
+                   ? std::min(logical, reservation_.remainingBytes())
+                   : logical;
     }
 
     PrefixBlockHandle RamPrefixStorageBackend::allocate(
@@ -212,30 +236,35 @@ namespace llaminar2
         const size_t kv_bytes = layout.faKVBytes();
         if (!allocateSection(
                 kv_bytes,
+                SectionWriteCoverage::Partial,
                 &handle.kv_storage,
                 &handle.pinned_kv_storage,
                 &handle.kv_payload,
                 handle.payload_readiness) ||
             !allocateSection(
                 layout.includes_hybrid_state ? layout.hybrid_state_bytes : 0,
+                SectionWriteCoverage::Complete,
                 &handle.hybrid_storage,
                 &handle.pinned_hybrid_storage,
                 &handle.hybrid_payload,
                 handle.payload_readiness) ||
             !allocateSection(
                 layout.includes_mtp_state ? layout.mtpKVBytes() : 0,
+                SectionWriteCoverage::Partial,
                 &handle.mtp_storage,
                 &handle.pinned_mtp_storage,
                 &handle.mtp_payload,
                 handle.payload_readiness) ||
             !allocateSection(
                 layout.includes_terminal_hidden ? layout.terminal_hidden_bytes : 0,
+                SectionWriteCoverage::Partial,
                 &handle.terminal_hidden_storage,
                 &handle.pinned_terminal_hidden_storage,
                 &handle.terminal_hidden,
                 handle.payload_readiness) ||
             !allocateSection(
                 layout.includes_terminal_logits ? layout.terminal_logits_bytes : 0,
+                SectionWriteCoverage::Partial,
                 &handle.terminal_logits_storage,
                 &handle.pinned_terminal_logits_storage,
                 &handle.terminal_logits,

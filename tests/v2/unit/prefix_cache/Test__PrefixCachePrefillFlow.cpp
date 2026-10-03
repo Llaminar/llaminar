@@ -167,6 +167,21 @@ namespace
             return lookup_result;
         }
 
+        /** @brief Prove preparation consumes the same frontiers as later execution. */
+        bool preparePrefixHarvest(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            const PrefixHarvestSchedule &schedule) override
+        {
+            EXPECT_EQ(admission.fingerprint_key, lookup_result.fingerprint_key);
+            EXPECT_EQ(tokens, lookup_tokens);
+            forward_calls_at_prepare = forward_calls;
+            prepared_checkpoint = schedule.reusableCheckpoint();
+            prepared_prompt = schedule.promptTokens();
+            ++prepare_calls;
+            return prepare_ok;
+        }
+
         bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override
         {
             (void)seq_idx;
@@ -479,6 +494,11 @@ namespace
         int grouped_mtp_publication_calls = 0;
         int clear_calls = 0;
         int lookup_calls = 0;
+        int prepare_calls = 0;
+        int prepared_prompt = 0;
+        int forward_calls_at_prepare = 0;
+        std::optional<int> prepared_checkpoint;
+        bool prepare_ok = true;
         int populate_calls = 0;
         int harvest_calls = 0;
         std::vector<int> harvested_frontiers;
@@ -687,6 +707,10 @@ TEST(Test__PrefixCachePrefillFlow, HybridPrefixArchivesReusableBoundaryBeforeTai
         EXPECT_EQ(observed->forward_token_batches[0].size(), 320u);
         EXPECT_EQ(observed->forward_token_batches[1].size(), 45u);
         EXPECT_EQ(observed->harvested_fingerprint, 17u);
+        EXPECT_EQ(observed->prepare_calls, 1);
+        EXPECT_EQ(observed->prepared_prompt, 365);
+        EXPECT_EQ(observed->prepared_checkpoint, 320);
+        EXPECT_EQ(observed->forward_calls_at_prepare, 0);
         EXPECT_EQ(runner->prefixStateProbe().prefix_request.matched_tokens, 0);
     }
 }
@@ -971,6 +995,22 @@ TEST(Test__PrefixCachePrefillFlow, MovementWithinLaterLookupCanInvalidateAnArchi
     EXPECT_TRUE(archived.movementPrecededAdmissionOf(next));
 }
 
+/** @test A rejected publication plan must fail before executing any model row. */
+TEST(Test__PrefixCachePrefillFlow, PrefixPreparationFailurePrecedesInference)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *observed = mock.get();
+    mock->lookup_result.supported = mock->lookup_result.cache_enabled = true;
+    mock->lookup_result.block_size = 2;
+    mock->prepare_ok = false;
+    auto runner = makeRunner(std::move(mock));
+    EXPECT_FALSE(runner->prefill({1, 2, 3, 4}));
+    EXPECT_EQ(observed->prepare_calls, 1);
+    EXPECT_EQ(observed->forward_calls, 0);
+    EXPECT_EQ(observed->harvest_calls, 0);
+    EXPECT_THAT(runner->lastError(), HasSubstr("archive preparation failed"));
+}
+
 TEST(Test__PrefixCachePrefillFlow, PrefixHarvestFailureIsFatalToRequest)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
@@ -1186,7 +1226,8 @@ TEST(Test__PrefixCachePrefillFlow, LLEPConfiguredPrefillWindowSegmentsUncachedPr
     EXPECT_EQ(mock_ptr->harvest_calls, 0);
 }
 
-TEST(Test__PrefixCachePrefillFlow, LLEPPrefixMissWithoutPrefixBlockSizeUsesSinglePrefill)
+/** @test Enabled prefix caching cannot advertise missing storage geometry. */
+TEST(Test__PrefixCachePrefillFlow, LLEPRejectsMalformedEnabledPrefixGeometry)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
     auto *mock_ptr = mock.get();
@@ -1200,13 +1241,14 @@ TEST(Test__PrefixCachePrefillFlow, LLEPPrefixMissWithoutPrefixBlockSizeUsesSingl
                              /*mtp_draft_tokens=*/1,
                              RoutedExpertAssignmentPolicy::LeastLoadedResident,
                              /*prefix_block_size=*/0);
-    ASSERT_TRUE(runner->prefill({1, 2, 3})) << runner->lastError();
+    EXPECT_FALSE(runner->prefill({1, 2, 3}));
+    EXPECT_THAT(runner->lastError(), HasSubstr("valid coordinated prefill admission"));
 
     EXPECT_EQ(mock_ptr->clear_calls, 0);
     EXPECT_EQ(mock_ptr->populate_calls, 0);
-    EXPECT_EQ(mock_ptr->forward_calls, 1);
-    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(1, 2, 3));
-    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->prepare_calls, 0);
+    EXPECT_EQ(mock_ptr->harvest_calls, 0);
 }
 
 TEST(Test__PrefixCachePrefillFlow, PopulateFailureHardFailsWithoutMissFallback)
@@ -1269,7 +1311,10 @@ TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixUsesChunkScheduleWhenRunnerSu
     EXPECT_THAT(mock_ptr->last_chunk_schedule_tokens, ElementsAre(3, 4, 5));
     EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_start, 2);
     EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_count, 3);
-    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.fixed_chunk_real_tokens, 2);
+    // A retained family selects each chunk's bucket independently. Even when
+    // this tiny fixture has just one width, the request must not pin its tail
+    // to a fixed maximum-width transaction.
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.fixed_chunk_real_tokens, 0);
     EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.min_rebalance_interval_tokens, 2);
     EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.max_rebalance_interval_tokens, 0);
     EXPECT_THAT(mock_ptr->last_chunk_schedule_policy.bucket_sizes, ElementsAre(2));

@@ -32,6 +32,8 @@
 #include "CUDANativeVNNIGemmPerfCommon.h"
 #include "../../../../utils/ScopedGPUStream.h"
 #include "kernels/cuda/gemm/CUDANativeVNNIPrefillDiagnostics.h"
+#include "backends/cuda/CUDAGraphCapture.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "fort.hpp"
 
@@ -1234,7 +1236,19 @@ namespace
         PreparedSweepExecution(const PreparedSweepExecution &) = delete;
         PreparedSweepExecution &operator=(const PreparedSweepExecution &) = delete;
 
-        RunResult measure(int warmup_runs, int bench_runs)
+        /** @brief Choose direct trainer submission or retained production replay. */
+        enum class Submission { Direct, Captured };
+
+        /**
+         * @brief Time the prepared projection, including its activation quantizer.
+         * @param warmup_runs Untimed submissions before measurement.
+         * @param bench_runs Number of independent event samples to retain.
+         * @param submission Capture amortizes host launch cost over sixteen operations.
+         * The captured probe leaves installed dispatch overlays enabled. It is
+         * a pipeline measurement, not a GEMM-only or multi-device speedup claim.
+         */
+        RunResult measure(int warmup_runs, int bench_runs,
+                          Submission submission = Submission::Direct)
         {
             if (warmup_runs <= 0 || bench_runs <= 0 ||
                 static_cast<size_t>(bench_runs) > start_events_.size())
@@ -1242,8 +1256,30 @@ namespace
                 throw std::invalid_argument(
                     "invalid CUDA NativeVNNI timing repetition count");
             }
+            const int operations = submission == Submission::Captured ? 16 : 1;
+            std::unique_ptr<llaminar2::CUDAGraphCapture> graph;
+            if (submission == Submission::Captured)
+            {
+                graph = std::make_unique<llaminar2::CUDAGraphCapture>(stream_, device_id_);
+                llaminar2::ScopedBackendGraphCapture recording(*graph, "CUDA projection scaling");
+                if (!recording.begin())
+                    throw std::runtime_error("cannot capture CUDA projection scaling probe");
+                for (int operation = 0; operation < operations; ++operation)
+                    launch(m_, input_.get(), output_.get());
+                recording.finish();
+                if (!graph->instantiate())
+                    throw std::runtime_error("cannot instantiate CUDA projection scaling probe");
+            }
+            const auto submit = [&] {
+                if (graph)
+                {
+                    if (!graph->launch())
+                        throw std::runtime_error("cannot replay CUDA projection scaling probe");
+                }
+                else launch(m_, input_.get(), output_.get());
+            };
             for (int iteration = 0; iteration < warmup_runs; ++iteration)
-                launch(m_, input_.get(), output_.get());
+                submit();
             checkStream("warmup");
 
             for (int iteration = 0; iteration < bench_runs; ++iteration)
@@ -1253,7 +1289,7 @@ namespace
                     cudaSuccess)
                     throw std::runtime_error(
                         "CUDA sweep start-event recording failed");
-                launch(m_, input_.get(), output_.get());
+                submit();
                 if (cudaEventRecord(stop_events_[index].get(), stream_) !=
                     cudaSuccess)
                     throw std::runtime_error(
@@ -1277,7 +1313,7 @@ namespace
                     throw std::runtime_error(
                         "CUDA sweep elapsed-time query failed");
                 times_us_[static_cast<size_t>(iteration)] =
-                    static_cast<double>(elapsed_ms) * 1000.0;
+                    static_cast<double>(elapsed_ms) * 1000.0 / operations;
             }
             if (const cudaError_t error = cudaGetLastError();
                 error != cudaSuccess)
@@ -1416,6 +1452,59 @@ namespace
         size_t last_timing_sample_count_ = 0;
         uint64_t first_byte_mismatch_ = std::numeric_limits<uint64_t>::max();
     };
+
+    /**
+     * @brief Measure installed dispatch at explicit physical projection shapes.
+     *
+     * Unlike the training tournament this test does not disable exact overlays.
+     * The shared manifest resolves shapes; full-output byte identity against
+     * the untimed production call is required before publishing any samples.
+     */
+    TEST_F(CUDANativeVNNIGemmPerf, CapturedProductionShapes)
+    {
+        RunConfig cfg = loadRunConfig();
+        // An unfiltered diagnostic stays bounded; broad format/shape training
+        // remains the explicit tournament's responsibility.
+        if (cfg.format_filters.empty()) cfg.format_filters.insert("q6_k");
+        if (cfg.shape_filters.empty()) cfg.shape_filters.insert("3b_attnout");
+        int cases = 0;
+        std::printf("format,shape,m,n,k,sample_index,latency_us,byte_mismatches,registers,scratch_bytes,threads,active_blocks_per_sm,operation\n");
+        for (const auto &format : kFormats)
+        {
+            if (!shouldRunName(cfg.format_filters, format.name)) continue;
+            for (const auto &shape : kQwenShapes)
+            {
+                if (!shouldRunName(cfg.shape_filters, shape.name)) continue;
+                auto weights = format.create(shape.n, shape.k);
+                auto prepared = llaminar2::test::makeGpuPreparedGemm(
+                    weights.get(), DeviceId::cuda(0), "cuda.scaling." + shape.name);
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(prepared.kernel);
+                ASSERT_NE(consumer, nullptr);
+                for (const int m : cfg.performance_prefill_m)
+                {
+                    PreparedSweepExecution execution(prepared.kernel, m, shape.n, shape.k,
+                        0, consumer->getWorkspaceRequirements(m, shape.n, shape.k), cfg.bench_runs);
+                    execution.measure(cfg.warmup_runs, cfg.bench_runs,
+                        PreparedSweepExecution::Submission::Captured);
+                    ASSERT_EQ(execution.byteMismatches(), 0u);
+                    CUDADensePrefillKernelResources primary{}, auxiliary{};
+                    ASSERT_TRUE(cudaNativeVNNIPrefill_queryLastLaunchResources(
+                        format.runtimeCodebook(), shape.n, shape.k, 0, &primary, &auxiliary));
+                    ASSERT_EQ(primary.local_memory_bytes_per_thread, 0u);
+                    ASSERT_EQ(auxiliary.local_memory_bytes_per_thread, 0u);
+                    const auto samples = execution.timingSamples();
+                    for (size_t index = 0; index < samples.size(); ++index)
+                        std::printf("%s,%s,%d,%d,%d,%zu,%.9f,0,%d,%zu,%d,%d,pipeline\n",
+                            format.name.c_str(), shape.name.c_str(), m, shape.n, shape.k,
+                            index, samples[index], primary.registers_per_thread,
+                            primary.local_memory_bytes_per_thread, primary.threads_per_block,
+                            primary.max_active_blocks_per_sm);
+                    ++cases;
+                }
+            }
+        }
+        ASSERT_GT(cases, 0) << "No production shapes matched the requested filters";
+    }
 
     static size_t estimateVramBytes(int m, int n, int k)
     {

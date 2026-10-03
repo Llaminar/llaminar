@@ -2,7 +2,7 @@
  * @file PlanningCPUExpertMeasurement.cpp
  * @brief Real source weights, canonical preparation, and one complete CPU FFN.
  *
- * Source reads and packing are bounded by one requested triplet. Every payload
+ * Source reads and packing are bounded by one requested payload. Every payload
  * is claimed before its allocation, and declaration order retires all engines
  * before their claims. Only immutable completed observations leave this scope.
  * The existing startup service producer owns invocation workspace and timing,
@@ -143,13 +143,13 @@ namespace llaminar2
         PlanningCPUExpertObservations result{device, workers, activeISALevel(), kCompiledISA,
             description.matrices[0].k, description.matrices[0].n, description.prepared_bytes,
             description.formats, request, {}};
-        const MoEOverlayPreparedExpertTriplet triplet{engines[0], engines[1], engines[2]};
+        const MoEOverlayPreparedExpertPayload payload{engines[0], engines[1], engines[2]};
         for (const auto phase : {ExpertHistogramSource::DecodeToken, ExpertHistogramSource::PrefillChunk,
                                 ExpertHistogramSource::GroupedVerifier})
         {
             const int rows = MoEOverlayCPUServiceMeasurement::rowsForPhase(phase);
             const uint64_t elapsed = MoEOverlayCPUServiceMeasurement::measurePrepared(
-                triplet, device, description.layer, phase, geometry(description), memory);
+                payload, device, description.layer, phase, geometry(description), memory);
             // Count the three full GEMM products, while timing the entire FFN
             // (including activation publication and SwiGLU). This is service
             // time for this exact repeated expert, not a DRAM-bandwidth probe.

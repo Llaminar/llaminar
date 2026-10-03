@@ -84,6 +84,18 @@ namespace llaminar2
     MoERoutingStage::MoERoutingStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        if (params_.owned_rows)
+        {
+            const auto &owned = *params_.owned_rows;
+            if (!params_.device_id.is_gpu() || !owned.layout.valid() ||
+                owned.layout.capacity != params_.seq_len || owned.layout.top_k != params_.top_k ||
+                !owned.packet || owned.packet->size_bytes() < owned.layout.packetBytes() ||
+                !owned.selected_bytes || !params_.active_row_count_device ||
+                params_.force_decode_equivalent_verifier_prefill ||
+                params_.grouped_verifier_histogram_role != MoEGroupedVerifierHistogramRole::NotOwner ||
+                params_.decode_histogram || params_.device_rebalance_route_apply)
+                throw std::invalid_argument("Owned router rows require complete ordinary-prefill bindings");
+        }
         if (params_.moe_runtime_table && params_.layer_idx >= 0)
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
         if (params_.decode_histogram)
@@ -835,6 +847,20 @@ namespace llaminar2
         //      No intermediate H2D transfers.
         IMoEKernel *kernel = ensureMoEKernel();
 
+        if (params_.owned_rows)
+        {
+            const auto &owned = *params_.owned_rows;
+            const bool ok = kernel->routeOwnedRowsWithTensors(
+                params_.input, params_.gate_weights, owned.layout, d_model, num_experts,
+                params_.norm_topk_prob, owned.packet, owned.selected_bytes, params_.active_row_count_device);
+            if (ok)
+                PerfStatsCollector::addCounter("moe", "routing_owned_rows_execute", 1.0, "prefill",
+                    params_.device_id.toString(), {{"physical_rows", std::to_string(seq_len)},
+                    {"participant", std::to_string(owned.layout.partition.participant())},
+                    {"participants", std::to_string(owned.layout.partition.participants())}});
+            return ok;
+        }
+
         if (isRuntimeTableDecodeGraphCapturable())
         {
             void *route_stream = gpuStream();
@@ -1529,6 +1555,12 @@ namespace llaminar2
         StageBufferRequirements reqs;
         if (params_.input)
             reqs.addInput("input", params_.input->shape(), toBufferTensorType(params_.input->native_type()));
+        if (params_.owned_rows)
+        {
+            auto *packet = params_.owned_rows->packet;
+            reqs.addOutput("router_packet", packet->shape(), toBufferTensorType(packet->native_type()));
+            return reqs;
+        }
         if (params_.output_indices)
             reqs.addOutput("output_indices", params_.output_indices->shape(), toBufferTensorType(params_.output_indices->native_type()));
         if (params_.output_weights)
@@ -1541,8 +1573,13 @@ namespace llaminar2
         auto contract = StageBufferContract::build();
 
         contract.addInput(params_.input_buffer_id);
-        contract.addOutput(params_.output_indices_buffer_id);
-        contract.addOutput(params_.output_weights_buffer_id);
+        if (params_.owned_rows)
+            contract.addOutput(params_.owned_rows->packet_id);
+        else
+        {
+            contract.addOutput(params_.output_indices_buffer_id);
+            contract.addOutput(params_.output_weights_buffer_id);
+        }
 
         // Gate weights are model weights, not arena-managed
         if (params_.gate_weights)
@@ -1567,9 +1604,17 @@ namespace llaminar2
          * publishes the interface-level probability contract after routing.
          */
         if (router_logits_device_view_)
+        {
             info.addOutput("router_logits", router_logits_device_view_.get(),
-                           static_cast<size_t>(params_.seq_len),
+                           router_logits_device_view_->rows(),
                            static_cast<size_t>(params_.num_experts));
+            if (params_.owned_rows)
+                info.outputs.back().row_layout = SnapshotCompactRows{
+                    params_.owned_rows->layout.partition, params_.seq_len};
+            else if (params_.probability_snapshot_partition)
+                info.outputs.back().row_layout = SnapshotCompactRows{
+                    *params_.probability_snapshot_partition, params_.seq_len, SnapshotRowStorage::CompleteReplicated};
+        }
         else if (!router_logits_.empty())
             info.addOutput("router_logits", router_logits_.data(),
                            static_cast<size_t>(params_.seq_len),
@@ -1584,11 +1629,11 @@ namespace llaminar2
                            static_cast<size_t>(params_.top_k));
 
         // Output tensors
-        if (params_.output_indices)
+        if (params_.output_indices && !params_.owned_rows)
             info.addOutput("output_indices_tensor", params_.output_indices,
                            static_cast<size_t>(params_.seq_len),
                            static_cast<size_t>(params_.top_k));
-        if (params_.output_weights)
+        if (params_.output_weights && !params_.owned_rows)
             info.addOutput("output_weights_tensor", params_.output_weights,
                            static_cast<size_t>(params_.seq_len),
                            static_cast<size_t>(params_.top_k));
@@ -1710,7 +1755,9 @@ namespace llaminar2
             return false;
         }
 
-        const size_t rows = static_cast<size_t>(params_.seq_len);
+        const size_t rows = params_.owned_rows
+            ? static_cast<size_t>(params_.owned_rows->layout.partition.capacityFor(params_.seq_len))
+            : static_cast<size_t>(params_.seq_len);
         const size_t experts = static_cast<size_t>(params_.num_experts);
         if (rows > std::numeric_limits<size_t>::max() / experts ||
             rows * experts > std::numeric_limits<size_t>::max() / sizeof(float))

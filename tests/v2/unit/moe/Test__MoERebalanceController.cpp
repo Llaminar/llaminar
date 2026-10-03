@@ -309,7 +309,9 @@ TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 15u);
+    // Version 16 authenticates complete-expert versus gate/up-only payloads
+    // without enlarging the generation-stamped transfer-slot records.
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 16u);
     EXPECT_NE(DeviceMoERebalanceWaveLifecycle::PreparedForPublication,
               DeviceMoERebalanceWaveLifecycle::Applied);
     EXPECT_EQ(

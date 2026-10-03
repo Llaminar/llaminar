@@ -585,22 +585,25 @@ namespace llaminar2
     // Event Access (Worker-Thread-Only)
     // ============================================================================
 
-    void *NvidiaDeviceContext::createEvent()
+    /** @copydoc IWorkerGPUContext::createEvent */
+    void *NvidiaDeviceContext::createEvent(GPUEventPurpose purpose)
     {
+        // Keep CUDA and ROCm ordering receipts symmetric. Timestamp work is
+        // explicit instrumentation, not part of every dependency edge.
+        const unsigned flags = gpuEventHasTiming(purpose) ? cudaEventDefault : cudaEventDisableTiming;
         cudaError_t set_err = cudaSetDevice(device_ordinal_);
         if (set_err != cudaSuccess)
         {
-            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
-                                                             << ") failed in createEvent: " << cudaGetErrorString(set_err));
-            return nullptr;
+            throw std::runtime_error("NvidiaDeviceContext::createEvent could not select device " +
+                std::to_string(device_ordinal_) + ": " + cudaGetErrorString(set_err));
         }
 
-        cudaEvent_t event;
-        cudaError_t err = cudaEventCreate(&event);
+        cudaEvent_t event{};
+        cudaError_t err = cudaEventCreateWithFlags(&event, flags);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[NvidiaDeviceContext] cudaEventCreate failed: " << cudaGetErrorString(err));
-            return nullptr;
+            throw std::runtime_error("NvidiaDeviceContext::createEvent on device " +
+                std::to_string(device_ordinal_) + ": " + cudaGetErrorString(err));
         }
         return static_cast<void *>(event);
     }

@@ -4,6 +4,8 @@
  *
  * Extracted from TPSnapshot.h so that both GraphSchema.h (ISchemaFactory)
  * and TPSnapshot.h can reference the same enum without circular includes.
+ * Token-row ownership is deliberately distinct from tensor row-parallel
+ * partial sums: the former is copied once per row, the latter is reduced.
  */
 
 #pragma once
@@ -25,7 +27,8 @@ namespace llaminar2
         ROW_PARALLEL,    ///< Split on input dimension, combined after AllReduce (Wo, FFN_DOWN)
         ROOT_ONLY,       ///< A rooted collective publishes one complete output on exactly one participant
         GATHERED,        ///< Column-parallel then AllGather (LM_HEAD)
-        UNKNOWN          ///< Sharding mode not determined
+        UNKNOWN,         ///< Sharding mode not determined
+        TOKEN_ROW_PARTITION ///< Disjoint explicit token-row intervals; copy rows, never reduce them
     };
 
     /**
@@ -47,6 +50,8 @@ namespace llaminar2
             return "ROOT_ONLY";
         case SnapshotShardingMode::GATHERED:
             return "GATHERED";
+        case SnapshotShardingMode::TOKEN_ROW_PARTITION:
+            return "TOKEN_ROW_PARTITION";
         case SnapshotShardingMode::UNKNOWN:
         default:
             return "UNKNOWN";

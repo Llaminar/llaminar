@@ -1,6 +1,11 @@
 /**
  * @file RamPrefixStorageBackend.h
- * @brief Capacity-tier prefix storage in pageable CPU or pinned GPU-host RAM.
+ * @brief Capacity-tier prefix storage with producer-owned payload initialization.
+ *
+ * GPU recurrent checkpoint sections are filled completely by their asynchronous
+ * producer. Clearing them on the CPU first duplicates a potentially large write.
+ * Attention padding and optional terminal sections retain zero initialization.
+ * The handle's readiness event, not allocation, makes either kind readable.
  */
 
 #pragma once
@@ -58,11 +63,20 @@ namespace llaminar2
             std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
             std::string *error = nullptr);
 
-        /** @return Whether the logical tier can accept @p bytes immediately. */
+        /** @return Whether logical capacity and PMA both admit @p bytes now. */
         bool canStore(size_t bytes) const override;
 
         /**
+         * @return Allocation headroom from the canonical reservation and index.
+         * This is an observation, not a reservation or a parallel byte ledger.
+         * Request/DMA aliases remain charged until their physical owners retire.
+         */
+        size_t availableAllocationBytes() const;
+
+        /**
          * @brief Allocate every serialized section and bind its lifetime lease.
+         * GPU recurrent bytes are unspecified until the complete producer write
+         * is published; attention and optional terminal storage start zeroed.
          */
         PrefixBlockHandle allocate(const PrefixCacheKey &key,
                                    const PrefixPayloadLayout &layout) override;
@@ -118,15 +132,35 @@ namespace llaminar2
         bool accounted() const noexcept { return reservation_.valid(); }
 
     private:
+        /** @brief Whether the archive producer writes every allocated byte. */
+        enum class SectionWriteCoverage
+        {
+            Partial,  ///< Short attention blocks or absent optional terminal rows.
+            Complete, ///< A recurrent checkpoint writes its entire serialized image.
+        };
+
         /**
-         * @brief Allocate one zeroed payload section in the correct RAM class.
+         * @brief Allocate one payload section with its exact initialization contract.
          *
          * GPU archives hard-require backend-pinned memory. There is no pageable
          * fallback because that would silently turn supposedly asynchronous
          * DMA into a blocking runtime staging operation.
+         * Complete GPU sections remain unreadable until their producer fills all
+         * bytes and publishes the handle's readiness event. Partial GPU sections
+         * are zeroed first so short/omitted payloads cannot expose stale bytes.
+         * CPU vector storage retains its ordinary value initialization.
+         *
+         * @param bytes Serialized capacity of this one section.
+         * @param coverage Complete producer overwrite or possibly partial payload.
+         * @param pageable_owner Receives CPU-owned vector storage, when applicable.
+         * @param pinned_owner Receives GPU-host allocation lifetime ownership.
+         * @param payload Receives the stable address, never a readiness guarantee.
+         * @param readiness Event edge retained until the last pinned owner retires.
+         * @return true when backing storage was allocated successfully.
          */
         bool allocateSection(
             size_t bytes,
+            SectionWriteCoverage coverage,
             std::shared_ptr<std::vector<uint8_t>> *pageable_owner,
             std::shared_ptr<void> *pinned_owner,
             void **payload,

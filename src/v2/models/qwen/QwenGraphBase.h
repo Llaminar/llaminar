@@ -406,6 +406,17 @@ namespace llaminar2
         bool mtp_kv_cache_only_graph_active_ = false;
         bool prefix_runtime_rehydration_graph_active_ = false;
         std::optional<ForwardExecutionPhase> forward_execution_phase_;
+        /// Borrowed only within a validated main-prefill graph construction scope.
+        std::optional<DeviceRowRange> prefill_collective_rows_;
+
+        /**
+         * @brief Borrow the exact chunk producer for a main-prefill collective.
+         * @param device Participant owning this graph.
+         * @param rows Physical query rows expected by the collective.
+         * @return Materializer-owned prefix, or no prefix for another graph role.
+         * @throws std::logic_error For geometry inconsistent with the bound producer.
+         */
+        std::optional<DeviceRowRange> prefillCollectiveRows(DeviceId device, int rows) const;
 
         // =====================================================================
         // Helpers
@@ -760,6 +771,21 @@ namespace llaminar2
         private:
             QwenGraphBase &owner_;
             std::optional<ForwardExecutionPhase> previous_;
+        };
+
+        /** @brief Keep one validated prefill count authority through nested main-layer builders. */
+        class PrefillCollectiveRowsScope final
+        {
+        public:
+            /** @brief Validate complete input ownership before exposing the borrowed count. */
+            PrefillCollectiveRowsScope(QwenGraphBase &owner, const ForwardInput &input);
+            /** @brief Restore the enclosing declaration, including on construction failure. */
+            ~PrefillCollectiveRowsScope();
+            PrefillCollectiveRowsScope(const PrefillCollectiveRowsScope &) = delete;
+            PrefillCollectiveRowsScope &operator=(const PrefillCollectiveRowsScope &) = delete;
+        private:
+            QwenGraphBase &owner_;
+            std::optional<DeviceRowRange> previous_;
         };
 
         /**

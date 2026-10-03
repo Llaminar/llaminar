@@ -1332,6 +1332,11 @@ namespace llaminar2
             const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override;
 
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
+        /** @copydoc IInferenceRunner::preparePrefixHarvest */
+        bool preparePrefixHarvest(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            const PrefixHarvestSchedule &schedule) override;
         bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
         /** @copydoc IInferenceRunner::harvestPrefix */
         bool harvestPrefix(

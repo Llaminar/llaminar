@@ -65,6 +65,34 @@ TEST(OrchestrationPlanConfig, AutomaticFilterOverridesReplaceYamlSetsWithoutWide
     EXPECT_FALSE(request.allows(OrchestrationStrategy::PipelineParallel));
 }
 
+/** @test Automatic intent is lossless and explicit physical modes remain distinct. */
+TEST(OrchestrationPlanConfig, GateUpProjectionOwnershipIsAnExplicitPhysicalMode)
+{
+    EXPECT_EQ(parse({}).routed_expert_compute_policy, RoutedExpertComputePolicy::Automatic);
+    const auto automatic = parse({"--moe-routed-expert-compute", "auto"});
+    EXPECT_EQ(deserializeOrchestrationConfig(serializeOrchestrationConfig(automatic))
+        .routed_expert_compute_policy, RoutedExpertComputePolicy::Automatic);
+    const auto request = parse({"--moe-routed-expert-compute", "gate-up-owned-down-columns"});
+    EXPECT_EQ(request.routed_expert_compute_policy, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+    const auto restored = deserializeOrchestrationConfig(serializeOrchestrationConfig(request));
+    EXPECT_EQ(restored.routed_expert_compute_policy, request.routed_expert_compute_policy);
+    for (const auto *backend : {"cuda", "rocm"})
+    {
+        const auto config = parse({"--expert-tier", std::string("native=") + backend + ":0," + backend +
+            ":1;priority=0;routed_compute=gate-up-owned-down-columns"});
+        ASSERT_TRUE(config.moe_routed_expert_plan);
+        const auto &domain = config.moe_routed_expert_plan->domains.front();
+        EXPECT_EQ(domain.routed_compute_policy, request.routed_expert_compute_policy);
+        EXPECT_TRUE(domain.toExecutionDomainDefinition().validate().empty());
+        auto invalid = domain;
+        invalid.scope = ExecutionDomainScope::GLOBAL;
+        EXPECT_FALSE(invalid.toExecutionDomainDefinition().validate().empty());
+        invalid = domain;
+        invalid.participants.front().device_type = DeviceType::CPU;
+        EXPECT_FALSE(invalid.toExecutionDomainDefinition().validate().empty());
+    }
+}
+
 TEST(OrchestrationPlanConfig, CommandPresentationPreservesTheCompleteServingPolicy)
 {
     const std::vector<std::string> policy{
@@ -150,7 +178,7 @@ TEST(OrchestrationPlanConfig, CompactTiersResolveRolesByPriorityNotDeclarationOr
         EXPECT_EQ(domain.backend, CollectiveBackendType::AUTO);
         EXPECT_EQ(domain.owner_rank, -1);
         EXPECT_TRUE(domain.world_ranks.empty());
-        EXPECT_EQ(domain.routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
+        EXPECT_EQ(domain.routed_compute_policy, RoutedExpertComputePolicy::Automatic);
     }
     // Normalization is idempotent: replaying a config does not append domains
     // or change which single authority owns the declaration.
@@ -181,9 +209,76 @@ TEST(OrchestrationPlanConfig, CompactDomainsHaveBackendSymmetricDefaults)
         SCOPED_TRACE(devices);
         const auto declaration = ExpertTierDefinition::parse(std::string("t=") + devices + ";priority=0");
         EXPECT_EQ(declaration.domain.scope, ExecutionDomainScope::AUTO);
-        EXPECT_EQ(declaration.domain.routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
+        EXPECT_EQ(declaration.domain.routed_compute_policy, RoutedExpertComputePolicy::Unspecified);
         EXPECT_EQ(declaration.tier.memory_budget_bytes, 0u);
     }
+}
+
+/** @test Only an eligible bound single tier selects projection ownership by default. */
+TEST(OrchestrationPlanConfig, AutomaticComputeUsesBoundTopologyAndPreservesExplicitModes)
+{
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        for (const int degree : {1, 2, 3, 4, 8})
+            for (const auto scope : {ExecutionDomainScope::SINGLE, ExecutionDomainScope::RANK_LOCAL,
+                                    ExecutionDomainScope::NODE_LOCAL, ExecutionDomainScope::GLOBAL})
+                for (const std::size_t tiers : {1u, 2u, 3u, 7u})
+                {
+                    ExecutionDomainDefinition domain;
+                    domain.scope = scope;
+                    domain.routed_compute_policy = RoutedExpertComputePolicy::Automatic;
+                    for (int index = 0; index < degree; ++index)
+                        domain.participants.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                            DeviceId(backend, index), "node", 0));
+                    const auto expected = backend != DeviceType::CPU && degree > 1 && tiers == 1 &&
+                        scope == ExecutionDomainScope::RANK_LOCAL
+                        ? RoutedExpertComputePolicy::GateUpOwnedDownColumns
+                        : RoutedExpertComputePolicy::Apportioned;
+                    EXPECT_EQ(domain.resolveRoutedComputePolicy(tiers), expected);
+                    for (const auto explicit_mode : {RoutedExpertComputePolicy::Apportioned,
+                            RoutedExpertComputePolicy::Replicated, RoutedExpertComputePolicy::TensorSharded,
+                            RoutedExpertComputePolicy::GateUpOwnedDownColumns})
+                    {
+                        domain.routed_compute_policy = explicit_mode;
+                        EXPECT_EQ(domain.resolveRoutedComputePolicy(tiers), explicit_mode);
+                    }
+                }
+    auto domain = ExecutionDomainDefinition::parse("mixed=cuda:0,rocm:0;scope=rank-local;routed_compute=auto");
+    EXPECT_EQ(domain.resolveRoutedComputePolicy(1), RoutedExpertComputePolicy::Apportioned);
+    for (const auto *gpu : {"cuda:0", "rocm:0"})
+    {
+        const auto mixed_cpu = ExecutionDomainDefinition::parse(
+            std::string("mixed=cpu:0,") + gpu + ";scope=rank-local;routed_compute=auto");
+        EXPECT_EQ(mixed_cpu.resolveRoutedComputePolicy(1), RoutedExpertComputePolicy::Apportioned);
+    }
+    domain = ExecutionDomainDefinition::parse("native=cuda:0,cuda:1;routed_compute=auto");
+    EXPECT_THROW(domain.resolveRoutedComputePolicy(1), std::invalid_argument);
+    domain.scope = ExecutionDomainScope::RANK_LOCAL;
+    domain.routed_prefill_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+    EXPECT_EQ(domain.resolveRoutedComputePolicy(1), RoutedExpertComputePolicy::Apportioned);
+}
+
+/** @test A global whole-expert override reaches omitted compact domains in either argv order. */
+TEST(OrchestrationPlanConfig, OmittedComputeInheritsGlobalRequestWithoutOverwritingExplicitTier)
+{
+    for (const bool policy_first : {false, true})
+    {
+        const std::vector<std::string> tier{"--expert-tier", "native=cuda:0,cuda:1;priority=0"};
+        const std::vector<std::string> policy{"--moe-routed-expert-compute", "apportioned"};
+        auto arguments = policy_first ? policy : tier;
+        const auto &tail = policy_first ? tier : policy;
+        arguments.insert(arguments.end(), tail.begin(), tail.end());
+        const auto config = parse(arguments);
+        EXPECT_EQ(config.moe_routed_expert_plan->domains.front().routed_compute_policy,
+                  RoutedExpertComputePolicy::Apportioned);
+    }
+    const auto config = parse({"--moe-routed-expert-compute", "apportioned", "--expert-tier",
+        "native=rocm:0,rocm:1;priority=0;routed_compute=auto"});
+    EXPECT_EQ(config.moe_routed_expert_plan->domains.front().routed_compute_policy,
+              RoutedExpertComputePolicy::Automatic);
+    const auto restored = deserializeOrchestrationConfig(serializeOrchestrationConfig(config));
+    EXPECT_EQ(restored.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
+    EXPECT_EQ(restored.moe_routed_expert_plan->domains.front().routed_compute_policy,
+              RoutedExpertComputePolicy::Automatic);
 }
 
 TEST(OrchestrationPlanConfig, DensePolicyExplicitnessSurvivesArgumentOrdering)

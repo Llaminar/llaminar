@@ -646,6 +646,19 @@ that same rank. A pipeline head cannot sample another rank's absent logits;
 the tail is selected by topology, not by rank numbering. Local graphs leave
 the enclosing plan's existing continuation authority unchanged.
 
+`ContinuationRequestGroup` retains the resolved continuation membership once
+during runner admission. The outer PREFILL tag and three-word progress header
+still reach the execution world; prompt tokens reach only continuation graphs.
+Expert-only followers allocate no prompt vector and receive no token payload:
+their model work is driven by authenticated sparse transaction tickets. A sole
+continuation rank needs no prompt collective. Multi-rank continuation uses the
+same persistent subgroup for prompt distribution and prefix/KV consensus, with
+the command root translated from execution-rank to subgroup order. Ordinary
+TP/PP retains its declared world-consumer policy. Real-MPI preflight observes
+actual collective extents, excluded followers and consecutive command ordering;
+`orchestration_command.prompt_payload_bytes` reports logical endpoint traffic
+without becoming membership or progress authority.
+
 ### 3.3 Three execution tiers
 
 `IInferenceRunner` is the common rank/device execution contract.
@@ -799,6 +812,15 @@ snapshot callbacks, cancellation, and stage-failure publication. Diagnostics
 may materialize tensors on the host, but that behavior is outside the normal
 inference path.
 
+Native capture owners run `NativeGraphDependencyReduction` once at executable
+instantiation, after composition is sealed. It removes only ordinary completion
+edges already implied by other retained full-completion paths. CUDA's special
+ports/programmatic dependencies remain untouched and never supply a completion
+proof; child/control node bodies retain their own ownership. This setup compiler
+preserves every happens-before relation while reducing redundant native scheduler
+storage. It changes no buffers, arithmetic or priorities and performs no replay
+work. Its observations are not another physical-memory ledger.
+
 Serving logs consume `IOrchestrationRunner::requestRuntimeSummary()`: a value
 projected from existing request outcomes and the validated terminal ledger.
 Obtaining it must not inspect child runners, query device state, transfer data,
@@ -848,6 +870,19 @@ common typed rank-initialization consensus before physical budgets are
 exchanged; a phase mismatch is fatal, not another rejected memory shape.
 Neither input builder owns live admission arithmetic or chooses a topology.
 
+For the explicit gate/up-owned projection mode, `MoEProjectionArenaGeometry`
+defines the shared packet envelope (original route IDs plus unchanged existing
+activation bits). `DeviceCountedAllGather::memoryFor` contributes the exact
+directed-channel and extent-bank BOM to `MemoryPlanner`. The rank-local domain
+materializes one fabric before graph construction on proven no-P2P membership;
+any enabled peer edge retains the native collective. Inventory projection uses
+backend-filtered matrix order, not physical ordinals or measured latency.
+`MoEProjectionPipeline` binds these admitted owners and exposes the exchange as
+a collective node. Runtime grouping writes the local live byte count; receivers
+consume only authenticated producer lengths. No layer owns a second transport
+bank or downloads counts. These intermediate-channel changes do not provide a
+live-count native P2P primitive or remove bucket padding from column reductions.
+
 KV admission requires both `KVCacheFamily` and storage precision. The main
 hybrid cache retains its family through FA-only pipeline slices; shifted MTP
 caches are independently attention-only. `KVCacheMemoryEstimator` supplies
@@ -868,6 +903,17 @@ materialization, and release ledger. Planners contribute typed BOMs, not live
 capacity arithmetic. Opaque native graph pools are admitted as complete retained
 families through `GPUGraphMemoryContract`; an individual pool-growth observation
 is diagnostic evidence, not bytes owned by the graph that triggered it.
+
+GPU planning samplers separate persistent native execution-context storage
+from executable storage before instantiation. After sealing a CUDA graph,
+`IGPUGraphCapture::prepareRuntimeContextStorage` inspects its actual kernel-local
+requirements and uses an exactly reversible cold footprint probe. The authority
+protects every unmaterialized owner, then grants `NativeExecutionContext` leases
+for the measured growth; the backend retains leases, never a parallel byte ledger.
+Graph retirement cannot release them. Only successful exclusive native-context
+reset releases this ownership. HIP authenticates the same preparation boundary
+without inventing CUDA's stack-limit expansion. These queries and limit changes
+are startup work, never recording or replay work.
 
 Explicit RAM/VRAM ceilings enter ordinary and overlay admission through the
 same `PhysicalMemoryAuthority::admissionCapacity` operation, including a GPU's
@@ -1025,6 +1071,13 @@ extends the source lifetime through its read. Retained PP replay imports its
 single newly written ingress buffer before launch; cached residency is not
 proof of fresh-byte readiness. CPU-visible and cross-vendor host boundaries
 likewise acquire the source event before observing its bytes.
+
+Native collective resource ownership is scoped to the declared device group.
+The rank-local coordinator's communicator family serves both collectives and
+copies; a backend must not create an additional all-visible-device copy group.
+Device visibility is inventory, not permission to acquire contexts, buffers or
+proxy threads outside that membership. The CUDA device-scope preflight observes
+primary-context activation without initializing the excluded devices itself.
 
 Every successful forward publishes its graph-declared result tensor after
 launch, including deferred decode and verifier execution. A private sampler
@@ -1262,6 +1315,32 @@ Prefix caching is integrated with live KV/GDN state. Lookup, restore, truncate,
 harvest, promotion/demotion, and device rehydration are explicit lifecycle
 operations. Cache fingerprints include model/graph policy needed to reject an
 incompatible state image.
+
+`PrefixHarvestSchedule` seals the common restored boundary's reusable and
+terminal publication frontiers before prefill. Rank and pipeline composites
+forward each child's own lookup identity with that same schedule. Participant
+storage prepares only the missing record geometry, counting shared KV/MTP keys
+once and retaining exact full-hit terminal archives. This starts necessary LRU
+victim persistence early enough to overlap computation; it never reserves RAM
+or treats queued bytes as physically free. The RAM backend's PMA reservation
+remains the sole allocation admission authority, including request/DMA aliases.
+
+`DiskPrefixStorageBackend` owns one ordered `PrefixArchivePersistence` worker
+per shared archive. Native payload readiness, checksum, write and fsync execute
+there; early request preparation polls immutable identity-bound receipts. At
+the intentional RAM/SSD storage boundary, required publication completes only
+the specific pending receipts needed for its actual PMA allocation, never the
+entire writer queue. A short producer finishing before durable writes is not
+permission to skip its terminal archive. Selected disk hydration similarly
+completes its known swap dependencies instead of manufacturing a miss. Queued
+payloads retain their original physical owners, including cancelled puts:
+completion publishes only after their source aliases retire. Replacements and
+tombstones preserve FIFO incarnation order, and native failure seals the
+authority. No GPU stream/device synchronization or native payload I/O moves to
+the request thread. Administrative purge and terminal storage disposal
+join its actual work before archive backing retires. They are not inference
+admission operations. Verified disk hydration retains its original inode across
+pending capacity and background archive replacement.
 
 Terminal-logit archival binds the latest ordered producer to the archive's
 logical vocabulary interval through `PrefixTerminalLogitsSlice`. A gathered

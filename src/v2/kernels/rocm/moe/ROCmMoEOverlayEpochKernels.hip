@@ -457,8 +457,16 @@ namespace
         }
     }
 
-    /** @brief Install a request reader in the exact selector it observes. */
-    __global__ void acquireEpochKernel(
+    /**
+     * @brief Install a request reader in the exact selector it observes.
+     *
+     * Admission is a single-thread publication transaction, as enforced by
+     * the launch bridge below. Declare that physical geometry to the compiler:
+     * budgeting registers for an impossible 1,024-thread block can otherwise
+     * spill the authenticated descriptor during its acquire-wait loop. This
+     * does not alter reader ordering or introduce another execution path.
+     */
+    __global__ __launch_bounds__(1) void acquireEpochKernel(
         DeviceMoEOverlayEpochControl *control,
         DeviceMoEOverlayEpochTicket *ticket,
         DeviceMoEOverlayEpochStatus *status,

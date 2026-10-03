@@ -3117,7 +3117,7 @@ namespace llaminar2
             std::string *error = nullptr) const;
 
         /**
-         * @brief Borrow the seeded stochastic sample-and-summary transaction.
+         * @brief Borrow the complete stochastic verification/summary transaction.
          *
          * This fragment consumes compact target distributions and resident
          * verifier/control rows.  It contains one fused sampler/reducer launch
@@ -3127,7 +3127,7 @@ namespace llaminar2
          */
         std::optional<
             DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
-        mtpStochasticSerialOutcomeDeviceLoopGraphTemplate(
+        mtpStochasticOutcomeDeviceLoopGraphTemplate(
             int request_count,
             int comparison_rows_per_request,
             std::string *error = nullptr) const;
@@ -3786,7 +3786,7 @@ namespace llaminar2
                     cache->resetSessionState();
             }
             mtp_speculative_state_publication_graph_.resetSessionState();
-            mtp_stochastic_serial_outcome_graph_.resetSessionState();
+            mtp_stochastic_outcome_graph_.resetSessionState();
             mtp_stochastic_target_distribution_graph_.resetSessionState();
             last_pos_offset_ = -1;
             defer_next_mtp_main_decode_sync_ = false;
@@ -4116,6 +4116,11 @@ namespace llaminar2
         DeviceResidentLogicalSequenceStateHandle deviceResidentLogicalSequenceState() const override;
 
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
+        /** @copydoc IInferenceRunner::preparePrefixHarvest */
+        bool preparePrefixHarvest(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            const PrefixHarvestSchedule &schedule) override;
         bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
         /** @copydoc IInferenceRunner::harvestPrefix */
         bool harvestPrefix(
@@ -4289,6 +4294,7 @@ namespace llaminar2
                  */
                 .lifetime_owner = snap,
                 .publication = snap->publication,
+                .row_ownership = snap->row_ownership,
             };
         }
 
@@ -8279,7 +8285,7 @@ namespace llaminar2
         std::shared_ptr<PipelinePublicationTransport> pipeline_publication_transport_;
 
         /**
-         * @brief Capture owner for seeded stochastic row sampling and reduction.
+         * @brief Capture owner for the request's stochastic verification law.
          *
          * The cache owns one active fixed-depth/request-count geometry. Dynamic
          * depth materialization replaces this owner during setup; parent-loop
@@ -8287,11 +8293,11 @@ namespace llaminar2
          * current. Request seeds are capture identity and therefore can never be
          * changed underneath a native executable.
          */
-        struct MTPStochasticSerialOutcomeGraphCache
+        struct MTPStochasticOutcomeGraphCache
         {
             std::unique_ptr<ComputeGraph> graph;
             DeviceGraphExecutor::GraphSegmentCache segment_cache;
-            MTPStochasticSerialOutcomeStage *stage = nullptr;
+            MTPStochasticOutcomeStage *stage = nullptr;
             uint64_t workspace_generation = 0;
             bool valid = false;
 
@@ -8496,9 +8502,9 @@ namespace llaminar2
         std::vector<MTPVerifierPreparationStage::MainKVCheckpointBinding>
             mtp_verifier_preparation_checkpoint_scratch_;
 
-        /// Active seeded stochastic outcome fragment used by fixed-depth tuning.
-        MTPStochasticSerialOutcomeGraphCache
-            mtp_stochastic_serial_outcome_graph_;
+        /// Active stochastic outcome fragment used by fixed-depth tuning.
+        MTPStochasticOutcomeGraphCache
+            mtp_stochastic_outcome_graph_;
 
         /// Active verifier penalty/distribution fragment for resident MTP.
         MTPStochasticTargetDistributionGraphCache
@@ -11343,24 +11349,24 @@ namespace llaminar2
         bool observeOrdinaryGenerationForwardCompletion(int64_t completed_invocations);
 
         /**
-         * @brief Build or validate the fixed-geometry seeded stochastic fragment.
+         * @brief Build or validate a fixed-geometry stochastic outcome fragment.
          *
          * Descriptor inspection is setup-only. The resulting stage captures no
          * host arrays: it retains immutable seeds/geometry and persistent device
          * addresses exclusively.
          */
-        bool materializeMTPStochasticSerialOutcomeGraph(
+        bool materializeMTPStochasticOutcomeGraph(
             const DeviceStochasticBatchOutcomeRequest *requests,
             int request_count,
             std::string *error = nullptr);
 
         /**
-         * @brief Execute the seeded stochastic fragment under mandatory capture.
+         * @brief Execute the declared stochastic law under mandatory capture.
          *
          * The producer stream owns completed target distributions on entry. The
          * same stream consumes compact output after an event-ordered graph replay.
          */
-        bool executeMTPStochasticSerialOutcomeCaptured(
+        bool executeMTPStochasticOutcomeCaptured(
             void *producer_stream,
             int request_count,
             int comparison_rows_per_request,

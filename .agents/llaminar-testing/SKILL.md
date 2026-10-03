@@ -315,6 +315,12 @@ cells. Receipt reuse does not reuse a cell's pass or certify an image.
 
 Run the same prerequisite phases directly when developing their infrastructure:
 
+CTest runs existing executables; it does not rebuild them. Build both gate
+targets before claiming a current-source aggregate pass: a focused fixture or
+fresh Release application does not refresh every header-dependent Unit and
+preflight executable. Reuse a passed receipt only after its build-freshness
+validation succeeds.
+
 ```bash
 cmake --build build_v2_integration --parallel \
   --target v2_unit_gate v2_production_test_preflight_gate
@@ -552,6 +558,18 @@ proof. MoE MTP inherits the same policy and placement movement contract.
 5. Map the first bad stage to graph wiring, tensor layout, kernel arithmetic,
    collective order, KV state, MoE movement, or MTP advancement.
 6. Reproduce with one exact CTest/GTest cell. Loop a flaky case up to 20 times.
+   For HIP capture/collective stalls, follow the ROCm skill's
+   [passive stall-inspection procedure](../rocm-tuning/references/hip-captured-stall-inspection.md)
+   before attributing a blocked rank to a communication bug. Short request
+   loops and warm-server passes do not replace fresh full E2E lifetimes.
+   If fresh lifetimes do not reproduce the defect and extended stress is
+   requested, use the [public HTTP lifecycle hammer](references/http-lifecycle-hammer.md)
+   with the preserved request order. It reuses the canonical cell and server
+   lifecycle, retains partial SSE bytes, and stops at the first failure.
+   Repeated finite workloads with `--lifetime-limit 0` exercise normal retirement
+   under one staging lease; one indefinite warm workload cannot reproduce a
+   shutdown-only edge. Neither mode can mint a certification or retry into
+   another execution path.
 7. Fix the production implementation. Do not weaken the reference, skip a
    checkpoint, raise a timeout, or enter another path.
 8. Add a focused device-free unit or backend integration regression for the

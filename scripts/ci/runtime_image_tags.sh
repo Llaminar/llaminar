@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Resolve Llaminar runtime image tags for a backend variant.
 set -euo pipefail
+source "$(dirname -- "${BASH_SOURCE[0]}")/../docker/rocm-release.env"
 
 usage() {
     cat <<'EOF'
@@ -12,7 +13,7 @@ Options:
   --branch BRANCH        Branch name. Default: GITHUB_REF_NAME or git branch.
   --sha SHA              Commit SHA. Default: GITHUB_SHA or git HEAD.
   --cuda-version VALUE   CUDA version for tag segment. Default: CUDA_VERSION or 13.0.
-  --rocm-version VALUE   ROCm version for tag segment. Default: ROCM_VERSION or 7.2.4.
+  --rocm-version VALUE   ROCm version for tag segment. Default: ROCM_VERSION or the SDK pin.
   --tag-suffix SUFFIX    Append a suffix to every emitted tag, for example -avx2.
   --format refs|tags     Output full refs or tag names only. Default: refs.
   -h, --help             Show this help.
@@ -20,9 +21,9 @@ Options:
 Tag shape:
   cpu   -> branch-sha-cpu, branch-cpu-latest
   cuda  -> branch-sha-cuda13.0, branch-cuda13.0-latest
-  rocm  -> branch-sha-rocm7.2.4, branch-rocm7.2.4-latest
-  full  -> branch-sha-cuda13.0-rocm7.2.4,
-           branch-cuda13.0-rocm7.2.4-latest,
+  rocm  -> branch-sha-rocmVERSION, branch-rocmVERSION-latest
+  full  -> branch-sha-cuda13.0-rocmVERSION,
+           branch-cuda13.0-rocmVERSION-latest,
            branch-latest
 
 The CPU segment avoids colliding with the full image's branch-latest alias while
@@ -40,7 +41,7 @@ image=""
 branch="${GITHUB_REF_NAME:-}"
 sha="${GITHUB_SHA:-}"
 cuda_version="${CUDA_VERSION:-13.0}"
-rocm_version="${ROCM_VERSION:-7.2.4}"
+rocm_version="${ROCM_VERSION:-${LLAMINAR_ROCM_VERSION}}"
 tag_suffix="${LLAMINAR_IMAGE_TAG_SUFFIX:-}"
 format="refs"
 

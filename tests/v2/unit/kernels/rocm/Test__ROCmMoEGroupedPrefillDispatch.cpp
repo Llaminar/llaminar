@@ -10,6 +10,41 @@
  */
 
 #include <gtest/gtest.h>
+#include "kernels/common/MoEPrefillProjectionExecution.h"
+
+/** @brief Output sharding keeps the full matrix's immutable arithmetic key. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, ProjectionTransactionsKeepCanonicalGeometry)
+{
+    using Execution = llaminar2::MoEPrefillProjectionExecution;
+    const auto complete = Execution::complete(2048);
+    EXPECT_TRUE(complete.executesGateUp());
+    EXPECT_TRUE(complete.executesDown());
+    EXPECT_EQ(complete.columnCount(), 2048);
+    const auto producer = Execution::gateUp(2048);
+    EXPECT_TRUE(producer.executesGateUp());
+    EXPECT_FALSE(producer.executesDown());
+    for (const int degree : {1, 2, 4, 8})
+        for (int shard = 0; shard < degree; ++shard)
+        {
+            const auto consumer = Execution::down(2048, shard * (2048 / degree), 2048 / degree);
+            EXPECT_FALSE(consumer.executesGateUp());
+            EXPECT_TRUE(consumer.executesDown());
+            EXPECT_EQ(consumer.modelColumns(), 2048);
+            EXPECT_EQ(consumer.firstColumn(), shard * (2048 / degree));
+            EXPECT_EQ(consumer.columnCount(), 2048 / degree);
+        }
+    EXPECT_THROW((void)Execution::complete(0), std::invalid_argument);
+    // Floating matrices support tails; only quantized launch admission owns
+    // block alignment. The phase contract must not restrict FP32 geometry.
+    EXPECT_EQ(Execution::gateUp(33).modelColumns(), 33);
+    EXPECT_EQ(Execution::down(33, 16, 17).columnCount(), 17);
+    EXPECT_THROW((void)Execution::gateUp(-1), std::invalid_argument);
+    EXPECT_THROW((void)Execution::down(2048, -1, 128), std::invalid_argument);
+    EXPECT_THROW((void)Execution::down(2048, 2048, 1), std::invalid_argument);
+    EXPECT_THROW((void)Execution::down(2048, 1024, 0), std::invalid_argument);
+    EXPECT_THROW((void)Execution::down(2048, 1024, 1025), std::invalid_argument);
+    EXPECT_THROW((void)Execution::down(2048, 1, 2147483647), std::invalid_argument);
+}
 
 #include "kernels/rocm/gemm/ROCmMoEGroupedPrefillDispatchGenerated.inc"
 #include "kernels/rocm/gemm/ROCmMoEGroupedPrefillRoutePolicy.h"
@@ -245,12 +280,17 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, LiveRouteAdmissionCoversEveryFormatAnd
                     key, &unread_device_storage, &unread_device_storage);
                 EXPECT_TRUE(admission.maySelect(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned));
                 EXPECT_TRUE(admission.maySelect(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled));
+                EXPECT_EQ(admission.maximumSlotsFor(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned),
+                          8 * top_k);
+                EXPECT_EQ(admission.maximumSlotsFor(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled),
+                          key.rows * top_k);
                 for (int slots = 0; slots <= key.rows * top_k; ++slots)
                 {
                     auto live = key;
                     live.rows = slots == 0 ? 1 : 1 + (slots - 1) / top_k;
                     EXPECT_EQ(admission.strategyForSlots(slots),
                               selectROCmMoEGroupedPrefillRouteStrategy(live).strategy);
+                    EXPECT_LE(slots, admission.maximumSlotsFor(admission.strategyForSlots(slots)));
                 }
                 EXPECT_EQ(admission.strategyForSlots(-1), ROCmMoEGroupedPrefillRouteStrategy::Invalid);
                 EXPECT_EQ(admission.strategyForSlots(key.rows * top_k + 1),
@@ -272,12 +312,18 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, LiveAdmissionPreservesExactKeysAndReje
         .hidden_size = 3072, .expert_width = 1024,
         .expert_count = 256, .top_k = 1, .rows = 64};
     const ROCmMoEGroupedRouteAdmission admission(key, &storage, &storage);
+    EXPECT_EQ(admission.maximumSlotsFor(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned), 32);
+    EXPECT_EQ(admission.maximumSlotsFor(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled), 64);
+    EXPECT_EQ(admission.maximumSlotsFor(ROCmMoEGroupedPrefillRouteStrategy::Invalid), 0);
     for (int rows : {16, 32})
         EXPECT_EQ(admission.strategyForSlots(rows), ROCmMoEGroupedPrefillRouteStrategy::RouteOwned);
     for (int rows : {9, 15, 17, 31, 33, 64})
         EXPECT_EQ(admission.strategyForSlots(rows), ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled);
     EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, nullptr, &storage)), std::invalid_argument);
     EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, &storage, nullptr)), std::invalid_argument);
+    key.rows = INT32_MAX;
+    key.top_k = 8;
+    EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, &storage, &storage)), std::invalid_argument);
     key.rows = 0;
     EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, &storage, &storage)), std::invalid_argument);
 }

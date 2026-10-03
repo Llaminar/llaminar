@@ -33,12 +33,11 @@ static const BufferDescriptor *findBuf(
 }
 
 /**
- * @brief Configure the non-GlobalTP placeholder for gathered MTP logits.
+ * @brief Configure sidecar dimensions shared by all terminal-head layouts.
  *
- * Production resolver configuration reserves the full gathered buffer only for
- * CPU GlobalTP, where the MTP head remains column-sharded. Single-device and
- * mirrored LocalTP lanes need the descriptor for one declarative schema, but a
- * 1x1 placeholder prevents them from wasting a full-vocabulary arena region.
+ * Gathered output geometry is supplied separately. Vocabulary-sharded heads
+ * reserve the complete distribution at every TP scope; mirrored heads retain
+ * a 1x1 placeholder because their primary output already covers all columns.
  */
 static void configureMTPBufferGeometry(GraphResolverConfig &config)
 {
@@ -77,12 +76,12 @@ static void configureMTPBufferGeometry(GraphResolverConfig &config)
     }
 }
 
-/** @brief Add the 1x1 gathered-logits placeholder for non-GlobalTP fixtures. */
-static void configureNoGlobalTPMTPGather(GraphResolverConfig &config)
+/** @brief Add the 1x1 gathered-logits placeholder for full-vocabulary fixtures. */
+static void configureMirroredMTPGather(GraphResolverConfig &config)
 {
     configureMTPBufferGeometry(config);
-    config.custom_formulas["mtp_global_gather_rows"] = 1;
-    config.custom_formulas["mtp_global_gather_vocab"] = 1;
+    config.custom_formulas["mtp_gather_rows"] = 1;
+    config.custom_formulas["mtp_gather_vocab"] = 1;
 }
 
 // ============================================================================
@@ -122,13 +121,13 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     config.custom_formulas["fa_q_full_dim"] = 8192;
     config.custom_formulas["attn_output_dim"] = 4096;
     config.custom_formulas["mtp_target_query_rows"] = 4;
-    configureNoGlobalTPMTPGather(config);
+    configureMirroredMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
     // Qwen3.5 has the main layer buffers, compact LM-head verifier row
     // scratch, and 21 MTP verifier sidecar buffers including the phase-split
-    // full-prefill KV handoff rows and conditional CPU GlobalTP gather arena.
+    // full-prefill KV handoff rows and layout-dependent MTP gather arena.
     EXPECT_EQ(reqs.buffers.size(), 42u) << "Expected 42 layer buffers";
 
     // ── Shared buffers ──
@@ -351,7 +350,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_SeparateVerifierAndIntegratedKVPrefil
     config.custom_formulas["attn_output_dim"] = 4096;
     constexpr size_t target_query_rows = 64;
     config.custom_formulas["mtp_target_query_rows"] = target_query_rows;
-    configureNoGlobalTPMTPGather(config);
+    configureMirroredMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
     const std::array<const char *, 21> row_capacity_buffers = {
@@ -432,7 +431,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPAttnOutputUsesHybridAttnOutputDim)
     config.custom_formulas["gdn_time_step_rank"] = 48;
     config.custom_formulas["fa_q_full_dim"] = 10240;
     config.custom_formulas["attn_output_dim"] = 6144;
-    configureNoGlobalTPMTPGather(config);
+    configureMirroredMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
@@ -553,8 +552,8 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_CPUGlobalTP2)
     config.custom_formulas["attn_output_dim"] = 2048;
     config.custom_formulas["mtp_target_query_rows"] = 4;
     config.custom_formulas["mtp_kv_prefill_rows"] = 4096;
-    config.custom_formulas["mtp_global_gather_rows"] = 4;
-    config.custom_formulas["mtp_global_gather_vocab"] = 248320;
+    config.custom_formulas["mtp_gather_rows"] = 4;
+    config.custom_formulas["mtp_gather_vocab"] = 248320;
     configureMTPBufferGeometry(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
@@ -648,7 +647,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2MirroredMTPHeadKeepsFullSidecarLog
     config.custom_formulas["fa_q_full_dim"] = 4096;
     config.custom_formulas["attn_output_dim"] = 2048;
     config.custom_formulas["mtp_vocab"] = 248320;
-    configureNoGlobalTPMTPGather(config);
+    configureMirroredMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
@@ -662,7 +661,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2MirroredMTPHeadKeepsFullSidecarLog
     ASSERT_NE(mtp_logits_gathered, nullptr);
     EXPECT_EQ(mtp_logits_gathered->shape[0], 1u);
     EXPECT_EQ(mtp_logits_gathered->shape[1], 1u)
-        << "Mirrored LocalTP must not also reserve the CPU GlobalTP gather arena.";
+        << "Mirrored LocalTP must not also reserve the sharded-head gather arena.";
 
     auto model_reqs = BufferAllocator::resolveModelBuffers(schema, config);
     auto *logits_local = findBuf(model_reqs, "logits_local");

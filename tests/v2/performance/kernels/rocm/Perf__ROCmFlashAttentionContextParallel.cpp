@@ -357,6 +357,7 @@ namespace
         double median_us = 0.0;
         int replays_per_sample = 0;
         std::size_t graph_nodes = 0;
+        std::array<double, 3> samples_us{}; ///< Unsorted native-event samples, retained for scaling evidence.
     };
 
     /**
@@ -955,6 +956,7 @@ namespace
                     static_cast<double>(elapsed_ms) * 1000.0 /
                     static_cast<double>(replay_count);
             }
+            result.samples_us = samples;
             std::sort(samples.begin(), samples.end());
             result.median_us = samples[sample_count / 2];
             result.replays_per_sample = replay_count;
@@ -1803,13 +1805,57 @@ namespace
     }
 
     /**
-     * @brief Gate generic mode selection across all Qwen/TP/native-format domains.
+     * @brief Measure captured FA2 at one, two and four participant head shapes.
      *
-     * Exact model aliases are deduplicated by the geometry visible to dispatch.
-     * M=16 exercises the grouped-verifier range and larger buckets exercise
-     * prefill geometry. Fixed 128K capture capacity is replayed at short,
-     * medium, and full live context without recapture.
+     * Reuse the catalog's TP placement, including replicated GQA beyond the
+     * physical K/V head count. The 64-row query appends to 448 resident rows;
+     * main chunks start at position zero. This diagnostic retains raw event
+     * samples and uses installed geometry policy, never a forced candidate.
      */
+    TEST_F(ROCmFlashAttentionContextParallelPerf, CapturedPrefillShardScaling)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "ROCm support is disabled";
+#else
+        if (!has_device_) GTEST_SKIP() << "No ROCm device is available";
+        const auto model = std::find_if(kQwenAttentionGeometries.begin(), kQwenAttentionGeometries.end(),
+            [](const ModelAttentionGeometry &value) {
+                return value.n_heads == 16 && value.n_kv_heads == 2 && value.head_dim == 256;
+            });
+        ASSERT_NE(model, kQwenAttentionGeometries.end());
+        std::cout << "case,degree,M,live_kv,heads,kv_heads,sample_index,latency_us\n";
+        for (const int degree : {1, 2, 4})
+        {
+            const auto geometry = resolveParticipantGeometry(*model, degree);
+            CapturedROCmFA2Benchmark benchmark(geometry, NativeKVFormat::FP16,
+                512, 4096, properties_.multiProcessorCount,
+                std::max<std::size_t>(properties_.sharedMemPerBlock, rocm_policy::kROCmFA2LDSCapacityBytes));
+            ASSERT_TRUE(benchmark.ready()) << benchmark.error();
+            for (const int rows : {64, 448, 512})
+            {
+                ASSERT_TRUE(benchmark.prepareQueryRows(rows)) << benchmark.error();
+                const auto policy = benchmark.policyPlan();
+                ASSERT_TRUE(policy.valid);
+                if (policy.usesContextParallelism())
+                    ASSERT_TRUE(benchmark.captureContextCandidate(0, 0)) << benchmark.error();
+                const int live_kv = rows == 64 ? 512 : rows;
+                for (int repeat = 0; repeat < 3; ++repeat)
+                {
+                    const auto timing = policy.usesContextParallelism()
+                        ? benchmark.measureContext(live_kv) : benchmark.measureDirect(live_kv);
+                    ASSERT_GT(timing.median_us, 0.0) << benchmark.error();
+                    for (size_t index = 0; index < timing.samples_us.size(); ++index)
+                        std::cout << "fa2_captured_shard," << degree << ',' << rows << ',' << live_kv
+                                  << ',' << geometry.n_heads << ',' << geometry.n_kv_heads
+                                  << ',' << repeat * 3 + index << ',' << std::setprecision(12)
+                                  << timing.samples_us[index] << '\n';
+                }
+            }
+        }
+#endif
+    }
+
+    /** @brief Certify generic captured attention policy across the complete Qwen catalog. */
     TEST_F(
         ROCmFlashAttentionContextParallelPerf,
         QwenCatalogGeometryPolicyAllNativeFormats)
@@ -2055,8 +2101,10 @@ namespace
      * Optional selectors are `..._KV`, `..._CAPACITY`, `..._SLOTS`,
      * `..._PHASE_BLOCKS`, `..._REDUCER_WAVEFRONTS`, `..._REDUCER_BLOCKS`,
      * `..._FORMAT`, `..._MODE`, and `..._GEOMETRY`. Named geometries are
-     * `qwen35_tp8` (the default), `qwen7_tp1`, and `qwen27_tp4`; they isolate
-     * the replicated-GQA, packed device-direct, and context-parallel regimes.
+     * `qwen35_tp1`, `qwen35_tp2`, `qwen35_tp4`, `qwen35_tp8` (the default),
+     * `qwen7_tp1`, and `qwen27_tp4`. The Qwen35 degrees reproduce the exact
+     * shard-scaling probe geometries, including replicated GQA after TP2;
+     * the other models isolate packed-direct and context-parallel regimes.
      */
     TEST_F(
         ROCmFlashAttentionContextParallelPerf,
@@ -2110,10 +2158,19 @@ namespace
             << "Unknown LLAMINAR_ROCM_FA2_PROFILE_MODE=" << requested_mode;
         ParticipantAttentionGeometry geometry{};
         if (requested_geometry.empty() ||
+            requested_geometry == "qwen35_tp1" ||
+            requested_geometry == "qwen35_tp2" ||
+            requested_geometry == "qwen35_tp4" ||
             requested_geometry == "qwen35_tp8")
         {
-            geometry = {
-                "Qwen3.6-35B-A3B@TP8", 2, 2, 256, 0, 8};
+            const int degree = requested_geometry == "qwen35_tp1" ? 1
+                               : requested_geometry == "qwen35_tp2" ? 2
+                               : requested_geometry == "qwen35_tp4" ? 4
+                                                                      : 8;
+            // Share the scaling fixture's sharding calculation. In particular,
+            // replicated GQA retains the full model's ratio, not the TP degree.
+            geometry = resolveParticipantGeometry(
+                {"Qwen3.6-35B-A3B", 16, 2, 256}, degree);
         }
         else if (requested_geometry == "qwen7_tp1")
         {

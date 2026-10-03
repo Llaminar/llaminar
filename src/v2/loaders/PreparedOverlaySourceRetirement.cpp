@@ -73,12 +73,14 @@ namespace llaminar2
                 const auto *request = plan.requestForParticipant(
                     id.overlay_domain, device, id.overlay_participant_world_rank,
                     id.overlay_participant_index, id.layer, expert, role);
+                if (!request)
+                    throw std::logic_error("Prepared overlay source has no exact projection preparation request");
                 const auto participant = engines.getEngineLifetimeForParticipant(
                     id.overlay_domain, device, id.overlay_participant_world_rank,
-                    id.overlay_participant_index, id.layer, expert, role);
+                    id.overlay_participant_index, id.layer, expert, role, request->projection_ownership);
                 const auto domain = engines.getEngineLifetimeForDomain(
-                    id.overlay_domain, device, id.layer, expert, role);
-                if (!request || !participant || !domain ||
+                    id.overlay_domain, device, id.layer, expert, role, request->projection_ownership);
+                if (!participant || !domain ||
                     participant.get() != domain.get() ||
                     participant.owner_before(domain) || domain.owner_before(participant))
                     throw std::logic_error("Prepared overlay source lacks complete participant ownership: " +

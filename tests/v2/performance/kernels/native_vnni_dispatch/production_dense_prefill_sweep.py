@@ -13,6 +13,10 @@ normalizes them to one runtime codebook. The generated runtime overlay may
 collapse such aliases only after their independently measured winners agree.
 This distinction makes the corpus comprehensive without pretending that an
 execution-codebook key can observe source metadata that production discarded.
+Auto observations authenticate the executed physical family, not just the
+subset of cooperative geometries exposed as forced tournament candidates.
+Q8 aliases independently measure the INT8 blockwise producer and its own
+controls; low-bit NativeVNNI override names cannot label those launches.
 """
 
 from __future__ import annotations
@@ -77,6 +81,7 @@ ROCM_AGGREGATE_COLUMNS = (
     "observed_full_tiles", "registers_per_thread",
     "local_memory_bytes_per_thread", "static_shared_memory_bytes",
     "max_threads_per_block", "max_active_blocks_per_sm",
+    "observed_producer", "dynamic_shared_memory_bytes",
 )
 
 CUDA_TIMING_COLUMNS = (
@@ -184,6 +189,20 @@ ROCM_Q6_FULL_TILE_CANDIDATE_IDS = tuple(
     for unroll in (0, 1, 2, 4)
 )
 
+ROCM_INT8_CANDIDATE_IDS = (
+    *(f"INT8V{version}/MT{m_tile}/U{unroll}"
+      for version in (3, 7) for m_tile in (16, 32, 64)
+      for unroll in (0, 1, 2, 4)),
+    "Auto",
+)
+
+# Stable physical identity, shared with ROCmVNNIPrefillLaunch.h and the exact
+# overlay's generated producer discriminator. Unknown identities fail closed.
+ROCM_PRODUCER_IDS = {
+    "native_cooperative": 0, "native_streaming": 1,
+    "int8_blockwise_v3": 2, "int8_blockwise_v7": 3,
+}
+
 # gfx906 resource queries prove that these checked-edge Q6_K instantiations
 # allocate 20 bytes of scratch per thread. Full-tile versions of the same
 # geometry are spill-free, while the checked fallback uses MB1. Candidate
@@ -199,7 +218,7 @@ ROCM_Q6_SPILLING_CHECKED_CANDIDATE_IDS = frozenset((
 DEFAULT_WARMUP_RUNS = 3
 DEFAULT_BENCH_RUNS = 10
 SWEEP_PLAN_FILENAME = "production_dense_prefill.plan.json"
-SWEEP_PLAN_SCHEMA = "native-vnni-production-dense-prefill-sweep-v2"
+SWEEP_PLAN_SCHEMA = "native-vnni-production-dense-prefill-sweep-v3"
 CELL_MANIFEST_SCHEMA = "native-vnni-production-dense-prefill-cell-v1"
 _UINT64_MAX = (1 << 64) - 1
 
@@ -325,6 +344,8 @@ def dense_prefill_candidate_ids(
             )
         return candidates
     if normalized == "rocm":
+        if source_format is not None and source_format.runtime_codebook(normalized) == 19:
+            return ROCM_INT8_CANDIDATE_IDS
         if (
             source_format is not None
             and source_format.runtime_codebook(normalized) == 8
@@ -734,18 +755,40 @@ def _read_aggregate_rows(
                     int(row["observed_unroll"]),
                     int(row["observed_full_tiles"]),
                 )
-                if observed[0] not in {64, 128} or observed[1] not in {
-                    16, 32, 64
-                } or observed[2] not in {1, 2, 3} or observed[3] not in {
-                    0, 1, 2, 4
-                } or observed[4] not in {0, 1}:
+                producer = row["observed_producer"]
+                int8 = cell.source_format.runtime_codebook("rocm") == 19
+                # Auto also owns the barrier-free streaming family. Its
+                # complete launch identity is fixed: 256 columns, 8/16 rows,
+                # three waves, no cooperative unroll, and checked edges.
+                # Adding 256/8 to independent axis sets would accept invented
+                # cross-family tuples and let a forced tile masquerade as Auto.
+                streaming_auto = not int8 and producer == "native_streaming" and candidate == "Auto" and observed in {
+                    (256, 8, 3, 0, 0), (256, 16, 3, 0, 0)
+                }
+                cooperative = (
+                    not int8 and producer == "native_cooperative"
+                    and observed[0] in {64, 128}
+                    and observed[1] in {16, 32, 64}
+                    and observed[2] in {1, 2, 3}
+                    and observed[3] in {0, 1, 2, 4}
+                    and observed[4] in {0, 1}
+                )
+                int8_blockwise = (
+                    int8 and producer in {"int8_blockwise_v3", "int8_blockwise_v7"}
+                    and observed[0] == (64 if producer == "int8_blockwise_v3" else 128)
+                    and observed[1] in {16, 32, 64}
+                    and observed[2] == 1 and observed[3] in {0, 1, 2, 4}
+                    and observed[4] == 0
+                )
+                if not (streaming_auto or cooperative or int8_blockwise):
                     raise ValueError(
-                        f"{context}: invalid observed ROCm launch tuple {observed}"
+                        f"{context}: invalid observed ROCm launch tuple {producer} {observed}"
                     )
                 if (
                     int(row["registers_per_thread"]) <= 0
                     or int(row["local_memory_bytes_per_thread"]) != 0
                     or int(row["static_shared_memory_bytes"]) < 0
+                    or int(row["dynamic_shared_memory_bytes"]) < 0
                     or int(row["max_threads_per_block"]) < 256
                     or int(row["max_active_blocks_per_sm"]) <= 0
                 ):
@@ -754,7 +797,18 @@ def _read_aggregate_rows(
                     )
                 if candidate != "Auto":
                     components = candidate.split("/")
-                    expected_observed = (
+                    if int8:
+                        expected_producer = {"INT8V3": "int8_blockwise_v3",
+                                             "INT8V7": "int8_blockwise_v7"}.get(components[0])
+                        if producer != expected_producer:
+                            raise ValueError(f"{context}: forced ROCm producer did not execute")
+                        expected_observed = (
+                            64 if components[0] == "INT8V3" else 128,
+                            int(components[1].removeprefix("MT")), 1,
+                            int(components[2].removeprefix("U")), 0,
+                        )
+                    else:
+                        expected_observed = (
                         int(components[0].removeprefix("N")),
                         int(components[1].removeprefix("MT")),
                         int(components[2].removeprefix("MB")),
@@ -762,7 +816,7 @@ def _read_aggregate_rows(
                         if len(components) >= 4 and components[3].startswith("U")
                         else 4,
                         int(components[-1] == "FULL"),
-                    )
+                        )
                     if observed != expected_observed:
                         raise ValueError(
                             f"{context}: forced ROCm launch did not execute; "
@@ -884,10 +938,15 @@ def validate_production_dense_prefill_cell(
                     f"{candidate}: aggregate stddev disagrees with sidecar"
                 )
 
-    winners = sorted(
-        aggregate,
-        key=lambda candidate: (float(aggregate[candidate]["min_us"]), candidate),
-    )
+    # The native trainer's min_element retains the first exact minimum in its
+    # declared candidate inventory. Rounded display microseconds and lexical
+    # names must not manufacture a different winner when HIP event ticks tie.
+    candidate_order = {
+        candidate: index for index, candidate in enumerate(
+            dense_prefill_candidate_ids(cell.backend, cell.source_format))
+    }
+    winners = sorted(aggregate,
+        key=lambda candidate: (min(timing[candidate]), candidate_order[candidate]))
     if cell.backend == "rocm":
         marked = [
             candidate for candidate, row in aggregate.items()
@@ -902,7 +961,7 @@ def validate_production_dense_prefill_cell(
         candidate_count=len(aggregate),
         sample_count=sum(len(values) for values in timing.values()),
         winner_id=winner,
-        winner_min_us=float(aggregate[winner]["min_us"]),
+        winner_min_us=min(timing[winner]),
     )
 
 

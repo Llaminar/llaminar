@@ -1,0 +1,53 @@
+From: Llaminar native graph progress repair
+Subject: [PATCH] Prove finite-work eligibility before collapsing parallel graphs
+
+The release's barrier-ROI heuristic treats waits, callbacks and child graphs
+as one finite unit of work. A small graph can then put a wait before the
+producer it expects to run on another branch, on the same in-order queue.
+The graph's declared partial order is insufficient to estimate the duration
+of these operations. Reject collapse for those typed nodes, including both
+batch-memory wait widths; retain the existing ROI decision for finite compute,
+copies and write-only batches. No environment override, larger queue limit,
+extra event, host wait or alternate graph execution path is introduced.
+
+Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
+             (therock-10.0, ROCm Core SDK 10.0.0)
+Regression: V2_Integration_HIPGraphWaitConcurrency (flat/child, 32/64-bit)
+
+diff --git a/hipamd/src/hip_graph_internal.cpp b/hipamd/src/hip_graph_internal.cpp
+--- a/hipamd/src/hip_graph_internal.cpp
++++ b/hipamd/src/hip_graph_internal.cpp
+@@ -1445,5 +1445,32 @@ bool GraphExecSegmented::ShouldCollapseToSingleStream() const {
+   for (const auto& seg : segments_) {
+     if (seg.dev_id != dev0) return false;
++    // The ROI model assumes finite, non-blocking work. A wait can require
++    // progress from another branch; putting both on one FIFO changes semantics
++    // and may deadlock. Child graphs/callbacks are opaque to this cost model.
++    // Keep their declared parallel streams rather than guessing a finite cost.
++    for (Node node : seg.nodes) {
++      switch (node->GetType()) {
++        case hipGraphNodeTypeGraph:
++        case hipGraphNodeTypeHost:
++        case hipGraphNodeTypeWaitEvent:
++        case hipGraphNodeTypeExtSemaphoreWait:
++          return false;
++        case hipGraphNodeTypeBatchMemOp: {
++          hipBatchMemOpNodeParams params{};
++          static_cast<hipGraphBatchMemOpNode*>(node)->GetParams(&params);
++          for (unsigned int i = 0; i < params.count; ++i) {
++            const auto operation = params.paramArray[i].operation;
++            if (operation == hipStreamMemOpWaitValue32 ||
++                operation == hipStreamMemOpWaitValue64) {
++              return false;
++            }
++          }
++          break;
++        }
++        default:
++          break;
++      }
++    }
+   }
+
+   size_t machine_threads = 0;
+

@@ -30,6 +30,9 @@
  * canonical NativeVNNI registry and enumerated below. Format-specific payload
  * decoding remains compile-time, while all formats share one explicit FP32
  * contribution/publication contract with serial GEMV and CUDA.
+ * Serial partition boundaries advance in monotonically increasing K order;
+ * a uniform boundary cursor avoids repeated integer remainder instructions
+ * without changing any floating-point contribution or partition fold.
  *
  * @see ROCmQuantisedGemmKernel_INT8_VNNI.hip for INT8 VNNI GEMM (V3/V7)
  * @see ROCmGemvKernel_native_VNNI.hip for native-VNNI GEMV (M=1 decode)
@@ -805,56 +808,68 @@ __device__ __forceinline__ void accumulate_block_gemm(
         // sum_a_buf (same layout as Pattern DA: per-half sums at bhi*M_TILE).
         // This eliminates M_PER_THREAD × 8 sdot4/block from the inner loop
         // and removes 4 VGPRs (sum_a[] array no longer live across groups).
-        int32_t block_acc[M_PER_THREAD][N_PER_THREAD];
+        // Bound wide correction tiles to two independent columns at a time.
+        // Both dots and their FP32 corrections retire before the next pair;
+        // the output's ordered K contributions are unchanged. The remaining
+        // A-operand reuse avoids turning a register-pressure repair into a
+        // one-column serial schedule.
+        constexpr int columns =
+            MINIMUM_WAVES >= 2 && N_PER_THREAD >= 4 ? 2 : N_PER_THREAD;
         #pragma unroll
-        for (int mm = 0; mm < M_PER_THREAD; ++mm)
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                block_acc[mm][nn] = 0;
-        #pragma clang loop unroll_count(4)
-        for (int g = 0; g < 8; ++g)
+        for (int column_base = 0; column_base < N_PER_THREAD; column_base += columns)
         {
-            const int kk = bp * 8 + g;
-            int32_t a_reg[M_PER_THREAD];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
-            int32_t b_reg[N_PER_THREAD];
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + nn];
+            int32_t block_acc[M_PER_THREAD][columns];
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
                 #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    block_acc[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], block_acc[mm][nn], false);
-        }
-        // The canonical helper rounds the scaled dot and minimum correction
-        // before one ordered accumulator publication. Read cooperative sum_a
-        // from LDS (lo + hi halves = full block sum).
-        int32_t sum_a[M_PER_THREAD];
-        #pragma unroll
-        for (int mm = 0; mm < M_PER_THREAD; ++mm)
-            sum_a[mm] = sum_a_buf[(bp * 2) * M_TILE + m_base + mm]
-                      + sum_a_buf[(bp * 2 + 1) * M_TILE + m_base + mm];
-        #pragma unroll
-        for (int nn = 0; nn < N_PER_THREAD; ++nn)
-        {
-            const int sn = bp * N_TILE + t_n * N_PER_THREAD + nn;
-            const float block_scale = __half2float(*reinterpret_cast<const __half*>(&s_buf[sn]));
-            const float block_min   = __half2float(*reinterpret_cast<const __half*>(&aux_buf[sn]));
+                for (int nn = 0; nn < columns; ++nn)
+                    block_acc[mm][nn] = 0;
+            #pragma clang loop unroll_count(4)
+            for (int g = 0; g < 8; ++g)
+            {
+                const int kk = bp * 8 + g;
+                int32_t a_reg[M_PER_THREAD];
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                    a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
+                int32_t b_reg[columns];
+                #pragma unroll
+                for (int nn = 0; nn < columns; ++nn)
+                    b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + column_base + nn];
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                    #pragma unroll
+                    for (int nn = 0; nn < columns; ++nn)
+                        block_acc[mm][nn] = __builtin_amdgcn_sdot4(
+                            a_reg[mm], b_reg[nn], block_acc[mm][nn], false);
+            }
+            // The canonical helper rounds the scaled dot and minimum correction
+            // before one ordered accumulator publication. Read cooperative sum_a
+            // from LDS (lo + hi halves = full block sum).
+            int32_t sum_a[M_PER_THREAD];
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                sum_a[mm] = sum_a_buf[(bp * 2) * M_TILE + m_base + mm]
+                          + sum_a_buf[(bp * 2 + 1) * M_TILE + m_base + mm];
+            #pragma unroll
+            for (int nn = 0; nn < columns; ++nn)
             {
-                acc[mm][nn] =
-                    rocm_native_vnni_commit_corrected_single_scale_block(
-                        acc[mm][nn],
-                        block_acc[mm][nn],
-                        block_scale,
-                        sum_a[mm],
-                        block_min,
-                        sa_blk[mm]);
+                const int column = column_base + nn;
+                const int sn = bp * N_TILE + t_n * N_PER_THREAD + column;
+                const float block_scale = __half2float(*reinterpret_cast<const __half*>(&s_buf[sn]));
+                const float block_min   = __half2float(*reinterpret_cast<const __half*>(&aux_buf[sn]));
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                {
+                    acc[mm][column] =
+                        rocm_native_vnni_commit_corrected_single_scale_block(
+                            acc[mm][column],
+                            block_acc[mm][nn],
+                            block_scale,
+                            sum_a[mm],
+                            block_min,
+                            sa_blk[mm]);
+                }
             }
         }
     }
@@ -942,7 +957,10 @@ __device__ __forceinline__ void accumulate_block_gemm(
  * @param global_block Zero-based 32-value weight block just accumulated.
  * @param blocks_per_row Total number of real weight blocks.
  * @param blocks_per_partition Serial-M1 partition span.
- * @param m_base Thread-local row origin within the workgroup tile.
+ * @param next_partition_end Next exclusive block boundary, advanced only on a commit.
+ * @param row_origin First global activation row owned by the register tile.
+ * @param live_rows Admitted live row count; inactive tail rows read no scale.
+ * @param whole_row_scales Null for blockwise scaling, otherwise one scale per row.
  * @param t_n Thread column-group index.
  */
 template <int N_TILE, int M_TILE, int M_PER_THREAD, int N_PER_THREAD>
@@ -952,7 +970,10 @@ __device__ __forceinline__ void commit_serial_m1_partition_if_complete(
     int global_block,
     int blocks_per_row,
     int blocks_per_partition,
-    int,
+    int &next_partition_end,
+    int row_origin,
+    int live_rows,
+    const float* whole_row_scales,
     int)
 {
     if (global_block >= blocks_per_row)
@@ -961,24 +982,55 @@ __device__ __forceinline__ void commit_serial_m1_partition_if_complete(
     const int completed_blocks = global_block + 1;
     const bool partition_complete =
         completed_blocks == blocks_per_row ||
-        (completed_blocks % blocks_per_partition) == 0;
+        completed_blocks == next_partition_end;
     if (!partition_complete)
         return;
 
-    const bool first_partition =
-        completed_blocks <= blocks_per_partition;
+    // All lanes visit every real K block once in ascending order. Advancing
+    // only at that boundary is equivalent to modulo, including a short final
+    // partition. This is integer bookkeeping, not a different reduction tree.
+    next_partition_end += blocks_per_partition;
+
+    // Finish the optional scale phase before opening the reduction phase.
+    // In-place publication prevents scale/mask temporaries from overlapping
+    // the ordered-sum register tile; blockwise execution reads no row scale.
+    if (whole_row_scales)
+    {
+        // Serial GEMV scales a completed partition before its ordered reducer.
+        // Multiplying the final grouped sum instead changes rounding, even
+        // though the two expressions are equal over real numbers. Only the
+        // whole-row contract needs this late load; the production blockwise
+        // lane retains its existing contributions and register lifetimes.
+        // A partition needs these addresses only after its dot products have
+        // retired. Prevent the compiler from keeping sign-extended row
+        // addresses and tail masks across the register-heavy K body. These
+        // identity operands emit no instruction and change no scale value.
+        int scale_row_origin = row_origin;
+        int scale_live_rows = live_rows;
+        asm volatile("" : "+v"(scale_row_origin), "+s"(scale_live_rows));
+        #pragma unroll
+        for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        {
+            const int global_row = scale_row_origin + mm;
+            if (global_row >= scale_live_rows)
+                continue;
+            const float row_scale = whole_row_scales[global_row];
+            #pragma unroll
+            for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                acc[mm][nn] = __fmul_rn(acc[mm][nn], row_scale);
+        }
+    }
     #pragma unroll
     for (int mm = 0; mm < M_PER_THREAD; ++mm)
     {
         #pragma unroll
         for (int nn = 0; nn < N_PER_THREAD; ++nn)
         {
-            ordered_sum[mm][nn] =
-                first_partition
-                    ? acc[mm][nn]
-                    : __fadd_rn(
-                          ordered_sum[mm][nn],
-                          acc[mm][nn]);
+            // The serial reducer starts at positive zero, including its first
+            // addition. Assignment is not interchangeable here: 0 + (-0) is
+            // positive zero, while assigning the first partial retains -0.
+            ordered_sum[mm][nn] = __fadd_rn(
+                ordered_sum[mm][nn], acc[mm][nn]);
             acc[mm][nn] = 0.0f;
         }
     }
@@ -1013,6 +1065,36 @@ __device__ __forceinline__ void load_serial_m1_partition_sum(
     }
 }
 
+/**
+ * @brief Evaluate one cooperative output tile with serial-row-exact arithmetic.
+ *
+ * Two LDS banks separate current readers from prefetched weight/activation
+ * tiles. Every output owner retains its own partition and ordered reduction
+ * registers. The serial-M1 policy defines K boundaries independently of tile
+ * geometry; whole-row scales are consumed before that ordered fold, while
+ * blockwise scales belong to each block contribution. No row is replayed and
+ * no extra reduction workspace is allocated by the grouped producer.
+ *
+ * @tparam N_TILE Output columns owned by this workgroup.
+ * @tparam BPT Number of 32-element K blocks in one staged tile.
+ * @tparam M_TILE Activation rows owned by this workgroup.
+ * @tparam FMT Physical packed codebook and contribution contract.
+ * @tparam MIN_BLOCKS Required resident-block register budget.
+ * @tparam UNROLL_G Integer-dot unroll choice; floating-point order is fixed.
+ * @tparam FULL_TILES Admission proved every M/N/K tile fully live.
+ * @param d_A_int8 Row-major prepared INT8 activations.
+ * @param d_payload Compact weight blocks in K-block/column order.
+ * @param d_block_scales Primary FP16 weight scale per block/column.
+ * @param d_block_mins Optional auxiliary weight scale or minimum plane.
+ * @param d_block_emins Optional packed FP16 minimum pairs for Q2_K.
+ * @param d_output Live row-major FP32 output extent.
+ * @param d_scales_A Whole-row activation scales when the block plane is absent.
+ * @param M Live activation rows; inactive tails never read row scales.
+ * @param N Live output columns.
+ * @param K Admitted activation width, divisible by the physical block width.
+ * @param d_scales_A_blockwise Optional per-row/per-block activation scales.
+ * @param serial_m1_kblocks Exact partition count resolved by serial decode policy.
+ */
 template <int N_TILE,
           int BPT,
           int M_TILE,
@@ -1100,6 +1182,7 @@ void native_vnni_gemm_kernel(
     const int num_block_tiles = (blocks_per_row + BPT - 1) / BPT;
     const int blocks_per_partition =
         (blocks_per_row + serial_m1_kblocks - 1) / serial_m1_kblocks;
+    int next_partition_end = blocks_per_partition;
 
     if (num_block_tiles == 0) return;
 
@@ -1434,7 +1517,10 @@ void native_vnni_gemm_kernel(
                         global_block,
                         blocks_per_row,
                         blocks_per_partition,
-                        m_base,
+                        next_partition_end,
+                        m_block + m_base,
+                        M,
+                        d_scales_A_blockwise ? nullptr : d_scales_A,
                         t_n);
             }
         }
@@ -1653,7 +1739,10 @@ void native_vnni_gemm_kernel(
                         global_block,
                         blocks_per_row,
                         blocks_per_partition,
-                        m_base,
+                        next_partition_end,
+                        m_block + m_base,
+                        M,
+                        d_scales_A_blockwise ? nullptr : d_scales_A,
                         t_n);
             }
         }
@@ -1757,7 +1846,10 @@ void native_vnni_gemm_kernel(
                         global_block,
                         blocks_per_row,
                         blocks_per_partition,
-                        m_base,
+                        next_partition_end,
+                        m_block + m_base,
+                        M,
+                        d_scales_A_blockwise ? nullptr : d_scales_A,
                         t_n);
             }
         }
@@ -1790,7 +1882,10 @@ void native_vnni_gemm_kernel(
         // array survived until this epilogue and forced three values into
         // scratch in the production Q6_K N128/M32 binary. Blockwise-scaled
         // rows already consumed their scale inside each ordered K block.
-        const float sa = d_scales_A_blockwise ? 1.0f : d_scales_A[m_idx];
+        // Partitioned whole-row execution already applied the scale at every
+        // canonical boundary. A single-partition launch applies it here once.
+        const float sa = d_scales_A_blockwise || serial_m1_kblocks > 1
+            ? 1.0f : d_scales_A[m_idx];
 
         if constexpr (N_PER_THREAD >= 4)
         {
@@ -1888,6 +1983,24 @@ void native_vnni_gemm_kernel(
 // A data broadcast: 256 threads read same address → L0/L1 cache broadcast.
 // ============================================================================
 
+/**
+ * @brief Stream compact weight blocks while preserving serial-row arithmetic.
+ * @tparam M_TILE Independent output rows owned by each output-column lane.
+ * @tparam FMT Packed codebook and its scale/correction contract.
+ * @tparam MIN_BLOCKS Minimum resident waves per SIMD used for register admission.
+ * @param d_A_int8 Packed row-major activation bytes.
+ * @param d_payload Compact block-major weight payload.
+ * @param d_block_scales First weight scale for each block and output column.
+ * @param d_block_mins Auxiliary weight scale/correction when the codebook needs it.
+ * @param d_block_emins Packed asymmetric half-block corrections when required.
+ * @param d_output Unique row-major FP32 destination for every output owner.
+ * @param d_scales_A Whole-row activation scales used by the final publication.
+ * @param d_scales_A_blockwise Optional per-block activation scale table.
+ * @param M Live output-row count, including a possible final partial row tile.
+ * @param N Live output-column count.
+ * @param K Logical activation/weight width, divisible by the block width.
+ * @param serial_m1_kblocks Canonical serial decode partition count.
+ */
 template <int M_TILE, NativeVNNIGemmFormat FMT, int MIN_BLOCKS = 3>
 __global__ __launch_bounds__(256, MIN_BLOCKS)
 void streaming_lm_head_kernel(
@@ -1916,6 +2029,9 @@ void streaming_lm_head_kernel(
     const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
     const int a_row_stride  = K / 4;   // k-groups per row
     const int blocks_per_row = K / 32;  // quantized blocks per row
+    const int blocks_per_partition =
+        (blocks_per_row + serial_m1_kblocks - 1) / serial_m1_kblocks;
+    int next_partition_end = blocks_per_partition;
 
     // Bounds: if entire M_TILE is within [0, M), skip per-element checks
     const bool m_safe = (m_block + M_TILE <= M);
@@ -2018,13 +2134,24 @@ void streaming_lm_head_kernel(
     // =========================================================================
     for (int block = 0; block < blocks_per_row; ++block)
     {
+        // Keep row-address and tail-mask lifetimes inside this block. LLVM can
+        // otherwise hoist every unrolled row's 64-bit address and exec mask
+        // across the entire K scan, overflowing scalar registers and then the
+        // vector lanes used to save them. This instruction-free compiler edge
+        // preserves the values, arithmetic, memory accesses and three-wave
+        // schedule; it is neither a GPU barrier nor a memory clobber.
+        int block_m_origin = m_block;
+        int block_m_limit = M;
+        asm volatile("" : "+s"(block_m_origin), "+s"(block_m_limit));
+        const bool block_rows_complete = block_m_origin + M_TILE <= block_m_limit;
+
         // --- 0. Compute per-block activation scales ---
         float sa_blk[M_TILE];
         if (d_scales_A_blockwise) {
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm) {
-                const int gm = m_block + mm;
-                sa_blk[mm] = (m_safe || gm < M) ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + block] : 0.0f;
+                const int gm = block_m_origin + mm;
+                sa_blk[mm] = (block_rows_complete || gm < block_m_limit) ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + block] : 0.0f;
             }
         } else {
             #pragma unroll
@@ -2079,8 +2206,8 @@ void streaming_lm_head_kernel(
                 #pragma unroll
                 for (int mm = 0; mm < M_TILE; ++mm)
                 {
-                    const int gm = m_block + mm;
-                    const int32_t a_val = (m_safe || gm < M)
+                    const int gm = block_m_origin + mm;
+                    const int32_t a_val = (block_rows_complete || gm < block_m_limit)
                         ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
                     temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
                     temp_sum[mm] = __builtin_amdgcn_sdot4(
@@ -2110,8 +2237,8 @@ void streaming_lm_head_kernel(
                 #pragma unroll
                 for (int mm = 0; mm < M_TILE; ++mm)
                 {
-                    const int gm = m_block + mm;
-                    const int32_t a_val = (m_safe || gm < M)
+                    const int gm = block_m_origin + mm;
+                    const int32_t a_val = (block_rows_complete || gm < block_m_limit)
                         ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
                     temp_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, temp_acc[mm], false);
                     temp_sum[mm] = __builtin_amdgcn_sdot4(
@@ -2130,131 +2257,149 @@ void streaming_lm_head_kernel(
         else if constexpr (Traits::is_dual_scale)
         {
             // Pattern D: retain both half-dots until one serial-order update.
+            // Retire four independent rows before preparing the next group.
+            // Weight operands stay shared by the complete row tile, but the
+            // two integer dot arrays and correction inputs need not all be
+            // live together. Every row still sees the same eight dot4 terms
+            // and exact FP32 contribution tree in this one grouped kernel.
+            constexpr int kRowsPerCommit = M_TILE < 4 ? M_TILE : 4;
             const int kg_base = block * 8;
-
-            int32_t low_dot[M_TILE];
-            int32_t high_dot[M_TILE];
             #pragma unroll
-            for (int mm = 0; mm < M_TILE; ++mm)
+            for (int row_base = 0; row_base < M_TILE; row_base += kRowsPerCommit)
             {
-                low_dot[mm] = 0;
-                high_dot[mm] = 0;
-            }
-            if (m_safe)
-            {
+                int32_t low_dot[kRowsPerCommit];
+                int32_t high_dot[kRowsPerCommit];
                 #pragma unroll
-                for (int kg = 0; kg < 4; ++kg)
+                for (int row = 0; row < kRowsPerCommit; ++row)
                 {
-                    const int32_t b_val = packed[kg];
-                    const int a_kg_idx = kg_base + kg;
-                    #pragma unroll
-                    for (int mm = 0; mm < M_TILE; ++mm)
-                    {
-                        const int32_t a_val = a_global[
-                            static_cast<int64_t>(m_block + mm) * a_row_stride + a_kg_idx];
-                        low_dot[mm] = __builtin_amdgcn_sdot4(
-                            a_val, b_val, low_dot[mm], false);
-                    }
+                    low_dot[row] = 0;
+                    high_dot[row] = 0;
                 }
-            }
-            else
-            {
-                #pragma unroll
-                for (int kg = 0; kg < 4; ++kg)
+                if (block_rows_complete)
                 {
-                    const int32_t b_val = packed[kg];
-                    const int a_kg_idx = kg_base + kg;
                     #pragma unroll
-                    for (int mm = 0; mm < M_TILE; ++mm)
+                    for (int kg = 0; kg < 4; ++kg)
                     {
-                        const int gm = m_block + mm;
-                        const int32_t a_val = (gm < M)
-                            ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                        low_dot[mm] = __builtin_amdgcn_sdot4(
-                            a_val, b_val, low_dot[mm], false);
+                        const int32_t b_val = packed[kg];
+                        const int a_kg_idx = kg_base + kg;
+                        #pragma unroll
+                        for (int row = 0; row < kRowsPerCommit; ++row)
+                        {
+                            const int mm = row_base + row;
+                            const int32_t a_val = a_global[
+                                static_cast<int64_t>(block_m_origin + mm) * a_row_stride + a_kg_idx];
+                            low_dot[row] = __builtin_amdgcn_sdot4(
+                                a_val, b_val, low_dot[row], false);
+                        }
                     }
-                }
-            }
-
-            if (m_safe)
-            {
-                #pragma unroll
-                for (int kg = 4; kg < 8; ++kg)
-                {
-                    const int32_t b_val = packed[kg];
-                    const int a_kg_idx = kg_base + kg;
-                    #pragma unroll
-                    for (int mm = 0; mm < M_TILE; ++mm)
-                    {
-                        const int32_t a_val = a_global[
-                            static_cast<int64_t>(m_block + mm) * a_row_stride + a_kg_idx];
-                        high_dot[mm] = __builtin_amdgcn_sdot4(
-                            a_val, b_val, high_dot[mm], false);
-                    }
-                }
-            }
-            else
-            {
-                #pragma unroll
-                for (int kg = 4; kg < 8; ++kg)
-                {
-                    const int32_t b_val = packed[kg];
-                    const int a_kg_idx = kg_base + kg;
-                    #pragma unroll
-                    for (int mm = 0; mm < M_TILE; ++mm)
-                    {
-                        const int gm = m_block + mm;
-                        const int32_t a_val = (gm < M)
-                            ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
-                        high_dot[mm] = __builtin_amdgcn_sdot4(
-                            a_val, b_val, high_dot[mm], false);
-                    }
-                }
-            }
-
-            const float slo =
-                __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-            const float shi = __half2float(*reinterpret_cast<const __half*>(&aux_bits));
-            uint16_t iq1_m_qh = 0;
-            if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                iq1_m_qh = static_cast<uint16_t>(b_payload_dw[1]);
-            #pragma unroll
-            for (int mm = 0; mm < M_TILE; ++mm)
-            {
-                if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                {
-                    constexpr int kGroupsPerBlock = 4;
-                    constexpr float kDelta = 0.125f;
-                    const int sum_base =
-                        (mm * blocks_per_row + block) * kGroupsPerBlock;
-                    const uint8_t qh0 = static_cast<uint8_t>(iq1_m_qh);
-                    const uint8_t qh1 =
-                        static_cast<uint8_t>(iq1_m_qh >> 8);
-                    acc[mm] = rocm_native_vnni_commit_iq1_m_block(
-                        acc[mm],
-                        low_dot[mm],
-                        high_dot[mm],
-                        sum_a_shared[sum_base],
-                        sum_a_shared[sum_base + 1],
-                        sum_a_shared[sum_base + 2],
-                        sum_a_shared[sum_base + 3],
-                        (qh0 & 0x08) ? -kDelta : kDelta,
-                        (qh0 & 0x80) ? -kDelta : kDelta,
-                        (qh1 & 0x08) ? -kDelta : kDelta,
-                        (qh1 & 0x80) ? -kDelta : kDelta,
-                        slo,
-                        shi,
-                        sa_blk[mm]);
                 }
                 else
                 {
-                    acc[mm] = rocm_native_vnni_commit_dual_scale_block(
-                        acc[mm],
-                        low_dot[mm],
-                        high_dot[mm],
-                        slo,
-                        shi,
-                        sa_blk[mm]);
+                    #pragma unroll
+                    for (int kg = 0; kg < 4; ++kg)
+                    {
+                        const int32_t b_val = packed[kg];
+                        const int a_kg_idx = kg_base + kg;
+                        #pragma unroll
+                        for (int row = 0; row < kRowsPerCommit; ++row)
+                        {
+                            const int mm = row_base + row;
+                            const int gm = block_m_origin + mm;
+                            const int32_t a_val = (gm < block_m_limit)
+                                ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
+                            low_dot[row] = __builtin_amdgcn_sdot4(
+                                a_val, b_val, low_dot[row], false);
+                        }
+                    }
+                }
+
+                if (block_rows_complete)
+                {
+                    #pragma unroll
+                    for (int kg = 4; kg < 8; ++kg)
+                    {
+                        const int32_t b_val = packed[kg];
+                        const int a_kg_idx = kg_base + kg;
+                        #pragma unroll
+                        for (int row = 0; row < kRowsPerCommit; ++row)
+                        {
+                            const int mm = row_base + row;
+                            const int32_t a_val = a_global[
+                                static_cast<int64_t>(block_m_origin + mm) * a_row_stride + a_kg_idx];
+                            high_dot[row] = __builtin_amdgcn_sdot4(
+                                a_val, b_val, high_dot[row], false);
+                        }
+                    }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int kg = 4; kg < 8; ++kg)
+                    {
+                        const int32_t b_val = packed[kg];
+                        const int a_kg_idx = kg_base + kg;
+                        #pragma unroll
+                        for (int row = 0; row < kRowsPerCommit; ++row)
+                        {
+                            const int mm = row_base + row;
+                            const int gm = block_m_origin + mm;
+                            const int32_t a_val = (gm < block_m_limit)
+                                ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
+                            high_dot[row] = __builtin_amdgcn_sdot4(
+                                a_val, b_val, high_dot[row], false);
+                        }
+                    }
+                }
+
+                const float slo =
+                    __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+                const float shi = __half2float(*reinterpret_cast<const __half*>(&aux_bits));
+                uint16_t iq1_m_qh = 0;
+                if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+                    iq1_m_qh = static_cast<uint16_t>(b_payload_dw[1]);
+                #pragma unroll
+                for (int row = 0; row < kRowsPerCommit; ++row)
+                {
+                    const int mm = row_base + row;
+                    if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+                    {
+                        constexpr int kGroupsPerBlock = 4;
+                        constexpr float kDelta = 0.125f;
+                        int sum_base =
+                            (mm * blocks_per_row + block) * kGroupsPerBlock;
+                        // Four LDS corrections belong to this row's commit, not
+                        // to all unrolled rows simultaneously. Keep the uniform
+                        // address local to this instruction-free compiler edge.
+                        asm volatile("" : "+s"(sum_base));
+                        const uint8_t qh0 = static_cast<uint8_t>(iq1_m_qh);
+                        const uint8_t qh1 =
+                            static_cast<uint8_t>(iq1_m_qh >> 8);
+                        acc[mm] = rocm_native_vnni_commit_iq1_m_block(
+                            acc[mm],
+                            low_dot[row],
+                            high_dot[row],
+                            sum_a_shared[sum_base],
+                            sum_a_shared[sum_base + 1],
+                            sum_a_shared[sum_base + 2],
+                            sum_a_shared[sum_base + 3],
+                            (qh0 & 0x08) ? -kDelta : kDelta,
+                            (qh0 & 0x80) ? -kDelta : kDelta,
+                            (qh1 & 0x08) ? -kDelta : kDelta,
+                            (qh1 & 0x80) ? -kDelta : kDelta,
+                            slo,
+                            shi,
+                            sa_blk[mm]);
+                    }
+                    else
+                    {
+                        acc[mm] = rocm_native_vnni_commit_dual_scale_block(
+                            acc[mm],
+                            low_dot[row],
+                            high_dot[row],
+                            slo,
+                            shi,
+                            sa_blk[mm]);
+                    }
                 }
             }
         }
@@ -2270,7 +2415,7 @@ void streaming_lm_head_kernel(
             for (int mm = 0; mm < M_TILE; ++mm)
                 block_acc[mm] = 0;
             const int kg_base = block * 8;
-            if (m_safe)
+            if (block_rows_complete)
             {
                 #pragma unroll
                 for (int kg = 0; kg < 8; ++kg)
@@ -2281,7 +2426,7 @@ void streaming_lm_head_kernel(
                     for (int mm = 0; mm < M_TILE; ++mm)
                     {
                         const int32_t a_val = a_global[
-                            static_cast<int64_t>(m_block + mm) * a_row_stride + a_kg_idx];
+                            static_cast<int64_t>(block_m_origin + mm) * a_row_stride + a_kg_idx];
                         block_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, block_acc[mm], false);
                     }
                 }
@@ -2296,8 +2441,8 @@ void streaming_lm_head_kernel(
                     #pragma unroll
                     for (int mm = 0; mm < M_TILE; ++mm)
                     {
-                        const int gm = m_block + mm;
-                        const int32_t a_val = (gm < M)
+                        const int gm = block_m_origin + mm;
+                        const int32_t a_val = (gm < block_m_limit)
                             ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
                         block_acc[mm] = __builtin_amdgcn_sdot4(a_val, b_val, block_acc[mm], false);
                     }
@@ -2326,7 +2471,7 @@ void streaming_lm_head_kernel(
             for (int mm = 0; mm < M_TILE; ++mm)
                 block_acc[mm] = 0;
             const int kg_base = block * 8;
-            if (m_safe)
+            if (block_rows_complete)
             {
                 #pragma unroll
                 for (int kg = 0; kg < 8; ++kg)
@@ -2337,7 +2482,7 @@ void streaming_lm_head_kernel(
                     for (int mm = 0; mm < M_TILE; ++mm)
                     {
                         const int32_t a_val = a_global[
-                            static_cast<int64_t>(m_block + mm) * a_row_stride + a_kg_idx];
+                            static_cast<int64_t>(block_m_origin + mm) * a_row_stride + a_kg_idx];
                         block_acc[mm] = __builtin_amdgcn_sdot4(
                             a_val, b_val, block_acc[mm], false);
                     }
@@ -2353,8 +2498,8 @@ void streaming_lm_head_kernel(
                     #pragma unroll
                     for (int mm = 0; mm < M_TILE; ++mm)
                     {
-                        const int gm = m_block + mm;
-                        const int32_t a_val = (gm < M)
+                        const int gm = block_m_origin + mm;
+                        const int32_t a_val = (gm < block_m_limit)
                             ? a_global[static_cast<int64_t>(gm) * a_row_stride + a_kg_idx] : 0;
                         block_acc[mm] = __builtin_amdgcn_sdot4(
                             a_val, b_val, block_acc[mm], false);
@@ -2379,26 +2524,35 @@ void streaming_lm_head_kernel(
          */
         if (serial_m1_kblocks > 1)
         {
-            const int blocks_per_partition =
-                (blocks_per_row + serial_m1_kblocks - 1) /
-                serial_m1_kblocks;
             const int completed_blocks = block + 1;
             const bool partition_complete =
                 completed_blocks == blocks_per_row ||
-                (completed_blocks % blocks_per_partition) == 0;
+                completed_blocks == next_partition_end;
             if (partition_complete)
             {
-                const bool first_partition =
-                    completed_blocks <= blocks_per_partition;
+                // The streaming and cooperative families retain identical
+                // ascending partition boundaries, including the final tail.
+                next_partition_end += blocks_per_partition;
+                if (!d_scales_A_blockwise)
+                {
+                    // Whole-row serial decode scales each completed partial,
+                    // not the final reduction; retain its rounding boundary.
+                    #pragma unroll
+                    for (int mm = 0; mm < M_TILE; ++mm)
+                    {
+                        const int global_row = m_block + mm;
+                        if (global_row < M)
+                            acc[mm] = __fmul_rn(
+                                acc[mm], d_scales_A[global_row]);
+                    }
+                }
                 #pragma unroll
                 for (int mm = 0; mm < M_TILE; ++mm)
                 {
-                    ordered_partition_sum[mm] =
-                        first_partition
-                            ? acc[mm]
-                            : __fadd_rn(
-                                  ordered_partition_sum[mm],
-                                  acc[mm]);
+                    // Include the serial reducer's initial positive-zero
+                    // addition, just as the cooperative family does.
+                    ordered_partition_sum[mm] = __fadd_rn(
+                        ordered_partition_sum[mm], acc[mm]);
                     acc[mm] = 0.0f;
                 }
             }
@@ -2421,7 +2575,8 @@ void streaming_lm_head_kernel(
         for (int mm = 0; mm < M_TILE; ++mm)
         {
             const int gm = m_block + mm;
-            const float sa = d_scales_A_blockwise ? 1.0f : d_scales_A[gm];
+            const float sa = d_scales_A_blockwise || serial_m1_kblocks > 1
+                ? 1.0f : d_scales_A[gm];
             d_output[static_cast<int64_t>(gm) * N + n_col] =
                 acc[mm] * sa;
         }
@@ -2433,7 +2588,8 @@ void streaming_lm_head_kernel(
         {
             const int gm = m_block + mm;
             if (gm < M) {
-                const float sa = d_scales_A_blockwise ? 1.0f : d_scales_A[gm];
+                const float sa = d_scales_A_blockwise || serial_m1_kblocks > 1
+                    ? 1.0f : d_scales_A[gm];
                 d_output[static_cast<int64_t>(gm) * N + n_col] =
                     acc[mm] * sa;
             }
@@ -2553,23 +2709,28 @@ static bool launch_native_vnni_gemm(
             (void)hipGetLastError();
     };
 
-    auto complete_launch = [&](const char* route,
+    auto complete_launch = [&](llaminar2::rocm::VNNIPrefillProducer producer,
+                               const char* route,
                                int n_tile,
                                int m_tile,
                                int min_blocks,
                                int unroll,
                                bool full_tiles,
-                               const void* function) -> bool
+                               const void* function,
+                               size_t dynamic_shared_bytes = 0) -> bool
     {
-        rocmNativeVNNIPrefill_recordLastLaunchSelection(
-            static_cast<uint8_t>(FMT),
-            n_tile,
-            m_tile,
-            min_blocks,
-            unroll,
-            full_tiles,
-            function,
-            BLOCK_SIZE);
+        llaminar2::rocm::publishVNNIPrefillLaunch({
+            .producer = producer,
+            .execution_codebook = static_cast<uint8_t>(FMT),
+            .n_tile = n_tile,
+            .m_tile = m_tile,
+            .min_blocks = min_blocks,
+            .unroll = unroll,
+            .full_tiles = full_tiles,
+            .function = function,
+            .block_threads = BLOCK_SIZE,
+            .dynamic_shared_memory_bytes = dynamic_shared_bytes,
+        });
         if (stream_capture_active)
             return true;
         return report_launch_status(
@@ -2603,6 +2764,7 @@ static bool launch_native_vnni_gemm(
                 serial_m1_kblocks);
 
         return complete_launch(
+            llaminar2::rocm::VNNIPrefillProducer::NativeCooperative,
             Q6_CHECKED_MB2_SPILLS ? "q6_checked_mb1" : "default",
             NT, MT, MB, 4, /*full_tiles=*/false, function);
     };
@@ -2628,6 +2790,7 @@ static bool launch_native_vnni_gemm(
                 serial_m1_kblocks);
 
         return complete_launch(
+            llaminar2::rocm::VNNIPrefillProducer::NativeCooperative,
             "small_grid", NT, MT, kMinimumWaves, 4,
             /*full_tiles=*/false, function);
     };
@@ -2667,13 +2830,15 @@ static bool launch_native_vnni_gemm(
                 serial_m1_kblocks);
 
         return complete_launch(
+            llaminar2::rocm::VNNIPrefillProducer::NativeStreaming,
             "streaming_lm_head",
             N_PER_WG,
             MT,
             kMinimumWaves,
             0,
             /*full_tiles=*/false,
-            function);
+            function,
+            shared_bytes);
     };
 
     auto launch_exact_config = [&](auto n_tile_tag,
@@ -2723,6 +2888,7 @@ static bool launch_native_vnni_gemm(
                     d_scales_A_blockwise,
                     serial_m1_kblocks);
             return complete_launch(
+                llaminar2::rocm::VNNIPrefillProducer::NativeCooperative,
                 FULL_TILES ? "configured_full_tiles" : "configured_checked",
                 NT,
                 MT,
@@ -2921,6 +3087,7 @@ static bool launch_native_vnni_gemm(
                     serial_m1_kblocks);
 
             return complete_launch(
+                llaminar2::rocm::VNNIPrefillProducer::NativeCooperative,
                 "simple_symmetric_mb1_ug2",
                 NT,
                 MT,

@@ -11,8 +11,10 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "execution/moe/MoEExpertProjectionOwnership.h"
 
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -96,16 +98,47 @@ namespace llaminar2
         void registerEngine(DeviceId device, int layer, int expert, WeightRole role,
                             ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership);
 
-        /// Register a single expert GEMM engine under a logical overlay domain.
+        /**
+         * @brief Publish a domain alias with the exact optional projection layout.
+         * @param domain_name Logical overlay domain, or empty for legacy device scope.
+         * @param device Physical execution device.
+         * @param layer Model layer index.
+         * @param expert Global router expert ID.
+         * @param role Gate, up or down projection.
+         * @param engine Borrowed execution handle published by this key.
+         * @param ownership Exact shared owner retaining the handle and weight allocation.
+         * @param projection Complete source/partition identity, absent for whole experts.
+         * @throws std::invalid_argument for inconsistent partition/engine identity.
+         * @throws std::logic_error if this key already names another layout.
+         */
         void registerEngineForDomain(const std::string &domain_name,
                          DeviceId device, int layer, int expert, WeightRole role,
-                         ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership);
+                         ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership,
+                         std::optional<MoEExpertProjectionOwnership> projection = std::nullopt);
 
-        /// Register a single expert GEMM engine under a logical overlay domain and participant.
+        /**
+         * @brief Publish a participant engine and its immutable physical projection identity.
+         * @param domain_name Logical overlay execution domain.
+         * @param device Physical execution device.
+         * @param participant_world_rank Resolved MPI owner rank, or -1 for a domain alias.
+         * @param participant_index Global domain coordinate, or -1 for a domain alias.
+         * @param layer Model layer index.
+         * @param expert Global router expert ID.
+         * @param role Gate, up or down projection.
+         * @param engine Borrowed execution handle published by this key.
+         * @param ownership Shared owner retaining that exact handle and allocation.
+         * @param projection Exact full-source/partition contract; absent for complete experts.
+         * @throws std::invalid_argument for inconsistent partition/engine identity.
+         * @throws std::logic_error when an existing key names a different physical layout.
+         *
+         * A down slice must never be adopted by an ordinary whole-expert caller.
+         * Shape alone cannot authenticate the original output-column interval.
+         */
         void registerEngineForParticipant(const std::string &domain_name,
                  DeviceId device, int participant_world_rank, int participant_index,
                  int layer, int expert, WeightRole role,
-                 ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership);
+                 ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership,
+                 std::optional<MoEExpertProjectionOwnership> projection = std::nullopt);
 
         /// Alias an existing device-scoped engine into a logical overlay domain.
         /// Copies the owning shared_ptr so the aliased key preserves lifetime.
@@ -120,13 +153,38 @@ namespace llaminar2
         /// Look up a single expert GEMM engine. Returns nullptr if not found.
         ITensorGemm *getEngine(DeviceId device, int layer, int expert, WeightRole role) const;
 
-        /// Look up a single expert GEMM engine in a logical overlay domain.
+        /**
+         * @brief Borrow an engine from a layout-authenticated domain alias.
+         * @param domain_name Logical overlay domain.
+         * @param device Physical execution device.
+         * @param layer Model layer index.
+         * @param expert Global router expert ID.
+         * @param role Gate, up or down projection.
+         * @param projection Expected source/partition identity; absent means a whole expert.
+         * @return Borrowed handle, or null only when the key is absent.
+         * @throws std::logic_error if an existing key has another physical layout.
+         */
         ITensorGemm *getEngineForDomain(const std::string &domain_name,
-                        DeviceId device, int layer, int expert, WeightRole role) const;
+                        DeviceId device, int layer, int expert, WeightRole role,
+                        const std::optional<MoEExpertProjectionOwnership> &projection = std::nullopt) const;
 
+        /**
+         * @brief Borrow an engine only from the requested participant and layout.
+         * @param domain_name Logical overlay domain.
+         * @param device Physical execution device.
+         * @param participant_world_rank Resolved MPI owner rank, or -1.
+         * @param participant_index Stable global domain coordinate.
+         * @param layer Model layer index.
+         * @param expert Global router expert ID.
+         * @param role Gate, up or down projection.
+         * @param projection Expected source/partition identity; absent means a whole expert.
+         * @return Borrowed handle, or null only when the key is absent.
+         * @throws std::logic_error if an existing key has another physical layout.
+         */
         ITensorGemm *getEngineForParticipant(const std::string &domain_name,
                 DeviceId device, int participant_world_rank, int participant_index,
-                int layer, int expert, WeightRole role) const;
+                int layer, int expert, WeightRole role,
+                const std::optional<MoEExpertProjectionOwnership> &projection = std::nullopt) const;
 
         /**
          * @brief Acquire shared ownership of one device-scoped engine.
@@ -149,7 +207,9 @@ namespace llaminar2
          * @param layer Transformer layer index.
          * @param expert Global expert id.
          * @param role Gate, up, or down projection.
+         * @param projection Exact expected layout; absent requires a complete expert.
          * @return Exact engine lifetime, or null when absent or not owned.
+         * @throws std::logic_error if an existing key has a different layout.
          */
         [[nodiscard]] std::shared_ptr<ITensorGemm>
         getEngineLifetimeForDomain(
@@ -157,7 +217,8 @@ namespace llaminar2
             DeviceId device,
             int layer,
             int expert,
-            WeightRole role) const;
+            WeightRole role,
+            const std::optional<MoEExpertProjectionOwnership> &projection = std::nullopt) const;
 
         /**
          * @brief Acquire shared ownership of one participant-scoped engine.
@@ -168,7 +229,9 @@ namespace llaminar2
          * @param layer Transformer layer index.
          * @param expert Global expert id.
          * @param role Gate, up, or down projection.
+         * @param projection Exact expected layout; absent requires a complete expert.
          * @return Exact engine lifetime, or null when absent or not owned.
+         * @throws std::logic_error if an existing key has a different layout.
          */
         [[nodiscard]] std::shared_ptr<ITensorGemm>
         getEngineLifetimeForParticipant(
@@ -178,9 +241,10 @@ namespace llaminar2
             int participant_index,
             int layer,
             int expert,
-            WeightRole role) const;
+            WeightRole role,
+            const std::optional<MoEExpertProjectionOwnership> &projection = std::nullopt) const;
 
-        /// Check if a full role is registered for every expert in a layer.
+        /// Check complete whole-expert projections only; partitioned entries never satisfy this query.
         bool hasCompleteRole(DeviceId device, int layer, int num_experts, WeightRole role) const;
 
         bool hasCompleteRoleForDomain(const std::string &domain_name,
@@ -196,7 +260,7 @@ namespace llaminar2
                                const std::vector<int> &expert_ids,
                                WeightRole role) const;
 
-        /// Check if gate/up/down engines are registered for every expert in a layer.
+        /// Check complete gate/up/down triplets only, excluding projection-partitioned layouts.
         bool hasCompleteLayer(DeviceId device, int layer, int num_experts) const;
 
         bool hasCompleteLayerInDomain(const std::string &domain_name,
@@ -255,6 +319,8 @@ namespace llaminar2
          * participant graph lowering observe one identity. The live map is
          * swapped only after complete validation and allocation succeed; a
          * caller can never observe a partially rebound model context.
+         * Projection-partitioned banks are rejected unchanged: a triplet-only
+         * replacement cannot retire their fixed all-expert down slices safely.
          *
          * This is a terminal model-lifecycle operation. Inference and graph
          * construction must already be quiescent, although ordinary readers
@@ -317,6 +383,7 @@ namespace llaminar2
         {
             ITensorGemm *engine = nullptr;
             std::shared_ptr<ITensorGemm> ownership;
+            std::optional<MoEExpertProjectionOwnership> projection_ownership;
         };
 
         mutable std::shared_mutex mutex_;

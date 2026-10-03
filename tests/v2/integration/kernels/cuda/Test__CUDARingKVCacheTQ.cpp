@@ -17,6 +17,9 @@
  * 11. Shadow buffer invalidation on append
  * 12. Head dim 128 support
  * 13. RoPE position correctness
+ *
+ * Captured consumers join each input's TransferEngine producer event before
+ * recording. A completed upload alone is not an authenticated capture edge.
  */
 
 #include <gtest/gtest.h>
@@ -36,6 +39,7 @@
 #include "kernels/cpu/turboquant/TurboQuantDequantizeTQ8.h"
 #include "kernels/cpu/turboquant/TurboQuantQuantizeTQ8.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "transfer/TransferEngine.h"
 #include "tensors/Tensors.h"
 #include "tensors/GpuTensorView.h"
 #include "utils/Logger.h"
@@ -1522,6 +1526,8 @@ TEST(Test__CUDARingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
             reference, DeviceId::cuda(0));
         ASSERT_TRUE(k_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
         ASSERT_TRUE(v_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+        TransferEngine::requireDeviceInput(k_tensor.get(), DeviceId::cuda(0), stream.opaque());
+        TransferEngine::requireDeviceInput(v_tensor.get(), DeviceId::cuda(0), stream.opaque());
 
         int32_t *device_lengths = nullptr;
         ASSERT_EQ(
@@ -1786,6 +1792,14 @@ TEST(Test__CUDARingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
         ASSERT_TRUE(history_v->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
         ASSERT_TRUE(continuation_k->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
         ASSERT_TRUE(continuation_v->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+        // Both the setup append and the retained continuation graph consume
+        // these exact publications, not an implicit/default-stream upload.
+        for (ITensor *input : {
+                 history_k.get(), history_v.get(),
+                 continuation_k.get(), continuation_v.get()})
+        {
+            TransferEngine::requireDeviceInput(input, DeviceId::cuda(0), stream.opaque());
+        }
         ASSERT_TRUE(appendWithTestStream(
             actual, 0, 0, history_k.get(), history_v.get(), history_rows, stream));
         ASSERT_TRUE(appendWithTestStream(

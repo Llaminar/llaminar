@@ -180,6 +180,41 @@ namespace llaminar2
     };
 
     /**
+     * @brief Immutable publication frontiers selected before prefix computation.
+     *
+     * The request coordinator selects the common restored boundary once. Both
+     * early storage preparation and later execution consume this same schedule,
+     * so a participant cannot invent a different recurrent checkpoint.
+     */
+    class PrefixHarvestSchedule final
+    {
+    public:
+        /**
+         * @brief Seal the existing admission's exact prefill checkpoint policy.
+         * @param admission Coordinated, enabled participant lookup.
+         * @param prompt_tokens Actual incoming prompt length.
+         * @param restored_tokens Actual common restored boundary.
+         * @param stable_segment_tokens Optional routed-prefill alignment.
+         * @return Immutable reusable and terminal publication boundaries.
+         * @throws std::invalid_argument for an invalid admission or token range.
+         */
+        static PrefixHarvestSchedule forPrefill(
+            const PrefixLookupResult &admission, int prompt_tokens,
+            int restored_tokens, int stable_segment_tokens = 0);
+        /** @return Exact final prompt frontier, never graph bucket capacity. */
+        int promptTokens() const noexcept { return prompt_tokens_; }
+        /** @return Optional recurrent frontier strictly before the prompt tail. */
+        std::optional<int> reusableCheckpoint() const noexcept { return checkpoint_; }
+
+    private:
+        /** @brief Construct only after the factory authenticates both frontiers. */
+        PrefixHarvestSchedule(int prompt_tokens, std::optional<int> checkpoint)
+            : prompt_tokens_(prompt_tokens), checkpoint_(checkpoint) {}
+        int prompt_tokens_;
+        std::optional<int> checkpoint_;
+    };
+
+    /**
      * @brief Scheduler-owned identity for one live rollback checkpoint.
      *
      * A GPU checkpoint archives device-owned KV and recurrent state

@@ -7,6 +7,10 @@
  * direction while retaining exact row, weight, epoch, and participant identity.
  * Directed follower pauses and fixed-slot reuse separately prove graph lifetime
  * completion; an empty numerical contribution must never retire remote work.
+ * The continuation-root return additionally proves exact residency-reader
+ * release across every two-rank contribution placement, including an empty
+ * root or follower. This complements the device-free single-participant proof;
+ * it does not substitute for real-weight server lifecycle certification.
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
@@ -18,6 +22,7 @@
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
+#include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoESparseRequestIdentity.h"
 #include "utils/MPIContext.h"
 #include "utils/PerfStatsCollector.h"
@@ -36,6 +41,62 @@ namespace llaminar2::test
 {
     namespace
     {
+        /** @brief Whether a numerical return also owes an exact epoch-reader release. */
+        enum class CanonicalReturnLeaseEvidence
+        {
+            ProtocolOnly, ///< Authenticate numerical transport without a residency owner.
+            ExactEpoch,   ///< Pin the root's real authority reader through collective completion.
+        };
+
+        /**
+         * @brief Construct one static CPU-pair residency authority for lease tests.
+         * @return Exact epoch owner with no migration worker or accelerator setup.
+         *
+         * These tiny metadata values describe protocol storage, not a real
+         * model or an allocation budget. The returned rows use the sole FP32
+         * activation format; no expert-weight arithmetic is certified here.
+         */
+        std::shared_ptr<MoEOverlayResidencyAuthority> canonicalCPUResidencyAuthority()
+        {
+            RoutedExpertDomain domain;
+            domain.name = "cpu_pair";
+            domain.scope = ExecutionDomainScope::NODE_LOCAL;
+            domain.backend = CollectiveBackendType::MPI;
+            domain.participants = {
+                GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
+            domain.world_ranks = {0, 1};
+            domain.owner_rank = 0;
+
+            RoutedExpertTier tier;
+            tier.name = "resident";
+            tier.domain = domain.name;
+            tier.priority = 0;
+            tier.fallback = true;
+
+            MoERoutedExpertPlacementPlan plan;
+            plan.enabled = true;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+            plan.continuation_domain = domain.name;
+            plan.shared_expert_domain = domain.name;
+            plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
+            plan.domains = {std::move(domain)};
+            plan.routed_tiers = {std::move(tier)};
+
+            MoERoutedExpertModelMetadata metadata;
+            metadata.num_layers = 1;
+            metadata.num_experts = 4;
+            metadata.d_model = 4;
+            metadata.routed_intermediate_size = 2;
+            metadata.routed_quant_type = "F32";
+            return std::make_shared<MoEOverlayResidencyAuthority>(
+                MoEOverlayResidencyAuthority::Config{
+                    .initial_plan = std::move(plan),
+                    .model_metadata = std::move(metadata),
+                    .maintenance_mode = MoERebalanceRuntimeMode::Off,
+                    .perf_device = "cpu_return_lease_test",
+                });
+        }
+
         /** @brief Enable one PerfStats domain without leaking environment into later tests. */
         class ScopedTransportPerfStats final
         {
@@ -131,9 +192,11 @@ namespace llaminar2::test
         };
     } // namespace
 
+    /** @brief Persistent two-rank transport fixture without model or GPU work. */
     class Test__MoEOverlaySparseTransport_MPI : public ::testing::Test
     {
     protected:
+        /** @brief Bind real MPI participants and reusable host-only transport storage. */
         void SetUp() override
         {
             MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
@@ -153,6 +216,7 @@ namespace llaminar2::test
             workspace_.resetForStep(1, 0);
         }
 
+        /** @return Stable ordinary-dispatch identity shared by both participants. */
         MoEOverlayCollectiveKey dispatchKey() const
         {
             MoEOverlayCollectiveKey key;
@@ -166,6 +230,7 @@ namespace llaminar2::test
             return key;
         }
 
+        /** @return Matching return identity with a distinct ordered sequence. */
         MoEOverlayCollectiveKey returnKey() const
         {
             auto key = dispatchKey();
@@ -174,6 +239,7 @@ namespace llaminar2::test
             return key;
         }
 
+        /** @return Namespaced verifier dispatch identity for one retained transaction. */
         MoEOverlayCollectiveKey mtpDispatchKey() const
         {
             return makeMTPMoEOverlayCollectiveKey(
@@ -187,6 +253,7 @@ namespace llaminar2::test
                 MoEOverlayCollectiveDirection::Dispatch);
         }
 
+        /** @return Final return identity for the same retained verifier transaction. */
         MoEOverlayCollectiveKey mtpReturnKey() const
         {
             return makeMTPMoEOverlayCollectiveKey(
@@ -199,6 +266,16 @@ namespace llaminar2::test
                 0,
                 MoEOverlayCollectiveDirection::ReturnReduce);
         }
+
+        /**
+         * @brief Prove the fixed FP32 fold over all sixteen rank placements.
+         * @param lease_evidence Also require exact root-reader retirement when selected.
+         *
+         * Each placement reuses the same bounded workspace after the previous
+         * collective completes. Empty contributors still participate; only the
+         * continuation accumulator may release the exact dispatch reader.
+         */
+        void expectCanonicalReturns(CanonicalReturnLeaseEvidence lease_evidence);
 
         int rank_ = -1;
         int world_size_ = 0;
@@ -315,9 +392,11 @@ namespace llaminar2::test
         EXPECT_FALSE(stale_return.ok);
     }
 
-    /** @brief Every two-rank expert placement preserves the serial FP32 fold. */
-    TEST_F(Test__MoEOverlaySparseTransport_MPI, CanonicalReturnIsPlacementInvariantAcrossRanks)
+    void Test__MoEOverlaySparseTransport_MPI::expectCanonicalReturns(
+        CanonicalReturnLeaseEvidence lease_evidence)
     {
+        const bool pin_epoch = lease_evidence == CanonicalReturnLeaseEvidence::ExactEpoch;
+        const auto authority = pin_epoch ? canonicalCPUResidencyAuthority() : nullptr;
         constexpr int columns = 4;
         const std::array<float, 4> values{0x1p24f, 1.0f, -0x1p24f, 1.0f};
         FP32Tensor bank(std::vector<size_t>{4 * (columns + 1) + 1});
@@ -340,12 +419,29 @@ namespace llaminar2::test
 
         for (int placement = 0; placement < 16; ++placement)
         {
+            std::shared_ptr<MoEExpertDispatchOutput> dispatch_lifetime;
+            std::uint64_t epoch = static_cast<std::uint64_t>(placement + 1);
+            if (pin_epoch)
+            {
+                epoch = authority->snapshot()->epoch;
+                if (rank_ == 0)
+                {
+                    auto reader = authority->tryAcquireTicketSnapshot();
+                    ASSERT_TRUE(reader.has_value());
+                    dispatch_lifetime = std::make_shared<MoEExpertDispatchOutput>();
+                    dispatch_lifetime->residency_epoch = reader->epoch();
+                    dispatch_lifetime->residency_lease =
+                        std::make_shared<MoEOverlayResidencyAuthority::TicketLease>(
+                            std::move(*reader));
+                    ASSERT_EQ(authority->activeTicketCount(), 1u);
+                }
+            }
             const auto key = makeMoEOverlayCollectiveKey(
                 71, static_cast<uint64_t>(placement + 1), 0, 0, 0, 0,
                 MoEOverlayCollectiveDirection::ReturnReduce);
             auto outbound = workspace_.localExpertOutput(0, 0);
             outbound.key = key;
-            outbound.residency_epoch = static_cast<uint64_t>(placement + 1);
+            outbound.residency_epoch = epoch;
             outbound.source_participant = rank_;
             outbound.target_participant = 0;
             outbound.layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
@@ -374,12 +470,31 @@ namespace llaminar2::test
             returned.d_model = columns;
             returned.clear_output_before_scatter = rank_ == 0;
             returned.require_explicit_transaction_identity = true;
+            if (dispatch_lifetime)
+            {
+                // Retain, then release through the production final-return edge;
+                // resetting this descriptor in the test would conceal a leak.
+                returned.dispatch_output_lifetime = dispatch_lifetime;
+                returned.residency_lease_terminal =
+                    MoEOverlayHostDispatchLeaseTerminal::Release;
+            }
             MoESparseReturnReduceStage return_stage(returned);
             return_stage.updateMoEOverlayCollectiveRuntimeParams({
                 .generation_id = 71,
                 .step_id = static_cast<uint64_t>(placement + 1),
             });
             ASSERT_TRUE(return_stage.execute(&context));
+            if (pin_epoch)
+            {
+                EXPECT_EQ(authority->activeTicketCount(), 0u) << "placement=" << placement;
+                if (dispatch_lifetime)
+                {
+                    EXPECT_EQ(dispatch_lifetime->residency_epoch, epoch);
+                    EXPECT_EQ(dispatch_lifetime->residency_lease, nullptr)
+                        << "The native continuation return must retire its own reader";
+                    EXPECT_TRUE(return_stage.manualGraphBoundaryComplete());
+                }
+            }
             if (rank_ != 0) continue;
             ASSERT_EQ(inbound.layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
             ASSERT_EQ(inbound.live_row_count, 4u);
@@ -387,6 +502,18 @@ namespace llaminar2::test
             for (int column = 0; column < columns; ++column)
                 EXPECT_EQ(output.data()[column], 1.0f) << "placement=" << placement;
         }
+    }
+
+    /** @brief Every two-rank expert placement preserves the serial FP32 fold. */
+    TEST_F(Test__MoEOverlaySparseTransport_MPI, CanonicalReturnIsPlacementInvariantAcrossRanks)
+    {
+        expectCanonicalReturns(CanonicalReturnLeaseEvidence::ProtocolOnly);
+    }
+
+    /** @brief Real MPI final returns retire the root reader even with empty contributors. */
+    TEST_F(Test__MoEOverlaySparseTransport_MPI, FinalContinuationReturnReleasesExactEpochAcrossRankPlacements)
+    {
+        expectCanonicalReturns(CanonicalReturnLeaseEvidence::ExactEpoch);
     }
 
     TEST_F(Test__MoEOverlaySparseTransport_MPI, MTPNamespacedDispatchAndReturnPreserveKeyAcrossRanks)

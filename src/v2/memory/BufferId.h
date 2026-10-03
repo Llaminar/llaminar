@@ -170,6 +170,13 @@ namespace llaminar2
         MTP_LOGICAL_SEQUENCE_STATE, ///< Arena-owned INT32 published logical-state rows that outlive graph workspace generations
         MTP_LOGICAL_SEQUENCE_STATE_DIAGNOSTIC_SNAPSHOTS, ///< Opt-in device-only phase history for fatal MTP publication diagnostics
 
+        // Fixed identity for the distinct gate/up-owned projection mode.
+        MOE_PROJECTION_LOCAL_PACKET, ///< Existing encoded gate/up intermediate, in route order
+        MOE_PROJECTION_GATHERED_PACKETS, ///< Participant-major native intermediate gather
+        MOE_PROJECTION_ROUTE_COLUMNS, ///< Full-K down dots before ordered top-k folding
+        MOE_PROJECTION_LOCAL_COLUMNS, ///< Folded participant output columns
+        MOE_PROJECTION_GATHERED_COLUMNS, ///< Participant-major down columns before row assembly
+
         _COUNT ///< Sentinel – must be last
     };
 
@@ -264,6 +271,16 @@ namespace llaminar2
             return "MOE_COMBINED_OUTPUT";
         case BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS:
             return "MOE_CANONICAL_ROUTE_CONTRIBUTIONS";
+        case BufferId::MOE_PROJECTION_LOCAL_PACKET:
+            return "MOE_PROJECTION_LOCAL_PACKET";
+        case BufferId::MOE_PROJECTION_GATHERED_PACKETS:
+            return "MOE_PROJECTION_GATHERED_PACKETS";
+        case BufferId::MOE_PROJECTION_ROUTE_COLUMNS:
+            return "MOE_PROJECTION_ROUTE_COLUMNS";
+        case BufferId::MOE_PROJECTION_LOCAL_COLUMNS:
+            return "MOE_PROJECTION_LOCAL_COLUMNS";
+        case BufferId::MOE_PROJECTION_GATHERED_COLUMNS:
+            return "MOE_PROJECTION_GATHERED_COLUMNS";
         case BufferId::MOE_SHARED_EXPERT_OUTPUT:
             return "MOE_SHARED_EXPERT_OUTPUT";
         case BufferId::MOE_SHARED_GATE_OUTPUT:

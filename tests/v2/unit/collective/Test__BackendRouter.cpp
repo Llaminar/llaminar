@@ -17,6 +17,34 @@
 
 namespace llaminar2::test
 {
+    /** @test Directed topology survives reordered/non-contiguous device ordinals. */
+    TEST(Test__LocalTPCollectiveInventory, PeerCoverageUsesObservedMatrixOrderAndNeverBypassesOneEnabledEdge)
+    {
+        for (const auto type : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            RankInventory rank;
+            for (const int ordinal : {7, 2, 5})
+            { DeviceInfo gpu; gpu.type = type; gpu.local_device_id = ordinal; rank.gpus.push_back(gpu); }
+            auto &count = type == DeviceType::CUDA ? rank.p2p_cuda_count : rank.p2p_rocm_count;
+            auto &matrix = type == DeviceType::CUDA ? rank.p2p_cuda : rank.p2p_rocm;
+            count = 3; matrix.assign(9, false);
+            const auto device = [&](int ordinal) { return type == DeviceType::CUDA ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal); };
+            const std::vector subset{device(5), device(7)};
+            EXPECT_EQ(localTPPeerAccessCoverage(rank, subset), PeerAccessCoverage::None);
+            matrix[1] = true; // Excluded device 2 cannot alter this subset.
+            EXPECT_EQ(localTPPeerAccessCoverage(rank, subset), PeerAccessCoverage::None);
+            matrix[2] = true; // Only 7 -> 5 is enough to preserve native routing.
+            EXPECT_EQ(localTPPeerAccessCoverage(rank, subset), PeerAccessCoverage::Partial);
+            matrix[6] = true;
+            EXPECT_EQ(localTPPeerAccessCoverage(rank, subset), PeerAccessCoverage::Complete);
+            EXPECT_THROW(localTPPeerAccessCoverage(rank, {device(7), device(7)}), std::invalid_argument);
+            EXPECT_THROW(localTPPeerAccessCoverage(rank, {device(7), device(1)}), std::invalid_argument);
+            matrix.pop_back();
+            EXPECT_THROW(localTPPeerAccessCoverage(rank, subset), std::invalid_argument);
+            matrix.clear(); count = 0;
+            EXPECT_THROW(localTPPeerAccessCoverage(rank, subset), std::invalid_argument);
+        }
+    }
 
     TEST(Test__LocalTPCollectiveInventory, ProjectsOnlyDeclaredROCmAndCPUParticipants)
     {

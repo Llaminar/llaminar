@@ -1,6 +1,10 @@
 /**
  * @file ExpertGemmRegistry.cpp
  * @brief Implements scoped prepared MoE GEMM registration and lifetime lookup.
+ *
+ * Physical projection layout is part of prepared identity, not mutable expert
+ * placement. A caller requesting a whole expert cannot borrow a down slice;
+ * partition-aware callers must authenticate the original source and interval.
  */
 
 #include "ExpertGemmRegistry.h"
@@ -11,6 +15,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <tuple>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -46,21 +51,32 @@ namespace llaminar2
 
     void ExpertGemmRegistry::registerEngineForDomain(const std::string &domain_name,
                                                      DeviceId device, int layer, int expert, WeightRole role,
-                                                     ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership)
+                                                     ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership,
+                                                     std::optional<MoEExpertProjectionOwnership> projection)
     {
-        registerEngineForParticipant(domain_name, device, -1, -1, layer, expert, role, engine, std::move(ownership));
+        registerEngineForParticipant(domain_name, device, -1, -1, layer, expert, role,
+            engine, std::move(ownership), std::move(projection));
     }
 
     void ExpertGemmRegistry::registerEngineForParticipant(const std::string &domain_name,
                                                           DeviceId device, int participant_world_rank, int participant_index,
                                                           int layer, int expert, WeightRole role,
-                                                          ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership)
+                                                          ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership,
+                                                          std::optional<MoEExpertProjectionOwnership> projection)
     {
+        if (projection && (!device.is_gpu() || domain_name.empty() || !engine || layer < 0 ||
+            static_cast<unsigned>(role) > static_cast<unsigned>(WeightRole::DOWN) ||
+            ownership.get() != engine || expert < 0 || expert >= projection->geometry().experts ||
+            (participant_index >= 0 && participant_index != projection->participant())))
+            throw std::invalid_argument("Projected expert registration has inconsistent participant/source identity");
         std::unique_lock lock(mutex_);
         Key key{domain_name, device, layer, expert, role};
         key.participant_world_rank = participant_world_rank;
         key.participant_index = participant_index;
-        engines_[key] = Entry{engine, std::move(ownership)};
+        const auto previous = engines_.find(key);
+        if (previous != engines_.end() && previous->second.projection_ownership != projection)
+            throw std::logic_error("Prepared expert registration cannot change projection layout: " + domain_name);
+        engines_[key] = Entry{engine, std::move(ownership), std::move(projection)};
     }
 
     bool ExpertGemmRegistry::aliasEngineForDomainFromDevice(const std::string &domain_name,
@@ -84,6 +100,9 @@ namespace llaminar2
         Key alias_key{domain_name, device, layer, expert, role};
         alias_key.participant_world_rank = participant_world_rank;
         alias_key.participant_index = participant_index;
+        const auto previous = engines_.find(alias_key);
+        if (previous != engines_.end() && previous->second.projection_ownership != source->second.projection_ownership)
+            throw std::logic_error("Prepared expert alias cannot replace another projection layout: " + domain_name);
         engines_[alias_key] = source->second;
         return true;
     }
@@ -94,14 +113,16 @@ namespace llaminar2
     }
 
     ITensorGemm *ExpertGemmRegistry::getEngineForDomain(const std::string &domain_name,
-                                                        DeviceId device, int layer, int expert, WeightRole role) const
+                                                        DeviceId device, int layer, int expert, WeightRole role,
+                                                        const std::optional<MoEExpertProjectionOwnership> &projection) const
     {
-        return getEngineForParticipant(domain_name, device, -1, -1, layer, expert, role);
+        return getEngineForParticipant(domain_name, device, -1, -1, layer, expert, role, projection);
     }
 
     ITensorGemm *ExpertGemmRegistry::getEngineForParticipant(const std::string &domain_name,
                                                              DeviceId device, int participant_world_rank, int participant_index,
-                                                             int layer, int expert, WeightRole role) const
+                                                             int layer, int expert, WeightRole role,
+                                                             const std::optional<MoEExpertProjectionOwnership> &projection) const
     {
         std::shared_lock lock(mutex_);
         Key key{domain_name, device, layer, expert, role};
@@ -110,6 +131,8 @@ namespace llaminar2
         auto it = engines_.find(key);
         if (it == engines_.end())
             return nullptr;
+        if (it->second.projection_ownership != projection)
+            throw std::logic_error("Prepared expert lookup disagrees with projection identity: " + domain_name);
         return it->second.engine;
     }
 
@@ -129,10 +152,11 @@ namespace llaminar2
         DeviceId device,
         int layer,
         int expert,
-        WeightRole role) const
+        WeightRole role,
+        const std::optional<MoEExpertProjectionOwnership> &projection) const
     {
         return getEngineLifetimeForParticipant(
-            domain_name, device, -1, -1, layer, expert, role);
+            domain_name, device, -1, -1, layer, expert, role, projection);
     }
 
     std::shared_ptr<ITensorGemm>
@@ -143,7 +167,8 @@ namespace llaminar2
         int participant_index,
         int layer,
         int expert,
-        WeightRole role) const
+        WeightRole role,
+        const std::optional<MoEExpertProjectionOwnership> &projection) const
     {
         std::shared_lock lock(mutex_);
         Key key{domain_name, device, layer, expert, role};
@@ -156,6 +181,8 @@ namespace llaminar2
         {
             return nullptr;
         }
+        if (found->second.projection_ownership != projection)
+            throw std::logic_error("Prepared expert lifetime disagrees with projection identity: " + domain_name);
         return found->second.ownership;
     }
 
@@ -174,7 +201,7 @@ namespace llaminar2
         for (int e = 0; e < num_experts; ++e)
         {
             auto it = engines_.find(Key{domain_name, device, layer, e, role});
-            if (it == engines_.end() || it->second.engine == nullptr)
+            if (it == engines_.end() || it->second.engine == nullptr || it->second.projection_ownership)
                 return false;
         }
 
@@ -199,7 +226,7 @@ namespace llaminar2
             if (expert < 0)
                 return false;
             auto it = engines_.find(Key{domain_name, device, layer, expert, role});
-            if (it == engines_.end() || it->second.engine == nullptr)
+            if (it == engines_.end() || it->second.engine == nullptr || it->second.projection_ownership)
                 return false;
         }
 
@@ -223,7 +250,7 @@ namespace llaminar2
             for (WeightRole role : {WeightRole::GATE, WeightRole::UP, WeightRole::DOWN})
             {
                 auto it = engines_.find(Key{domain_name, device, layer, e, role});
-                if (it == engines_.end() || it->second.engine == nullptr)
+                if (it == engines_.end() || it->second.engine == nullptr || it->second.projection_ownership)
                     return false;
             }
         }
@@ -250,7 +277,7 @@ namespace llaminar2
             for (WeightRole role : {WeightRole::GATE, WeightRole::UP, WeightRole::DOWN})
             {
                 auto it = engines_.find(Key{domain_name, device, layer, expert, role});
-                if (it == engines_.end() || it->second.engine == nullptr)
+                if (it == engines_.end() || it->second.engine == nullptr || it->second.projection_ownership)
                 {
                     complete = false;
                     break;
@@ -371,6 +398,8 @@ namespace llaminar2
             gate_key.participant_world_rank = participant_world_rank;
             gate_key.participant_index = participant_index;
             auto it_gate = engines_.find(gate_key);
+            if (it_gate != engines_.end() && it_gate->second.projection_ownership)
+                throw std::logic_error("Whole-expert population cannot consume a projected gate/up bank");
             if (it_gate != engines_.end())
                 gate_out[e] = it_gate->second.engine;
 
@@ -378,6 +407,8 @@ namespace llaminar2
             up_key.participant_world_rank = participant_world_rank;
             up_key.participant_index = participant_index;
             auto it_up = engines_.find(up_key);
+            if (it_up != engines_.end() && it_up->second.projection_ownership)
+                throw std::logic_error("Whole-expert population cannot consume a projected gate/up bank");
             if (it_up != engines_.end())
                 up_out[e] = it_up->second.engine;
 
@@ -385,6 +416,8 @@ namespace llaminar2
             down_key.participant_world_rank = participant_world_rank;
             down_key.participant_index = participant_index;
             auto it_down = engines_.find(down_key);
+            if (it_down != engines_.end() && it_down->second.projection_ownership)
+                throw std::logic_error("Whole-expert population cannot consume a projected down bank");
             if (it_down != engines_.end())
                 down_out[e] = it_down->second.engine;
 
@@ -538,6 +571,8 @@ namespace llaminar2
                                    key.device == scope.device &&
                                    key.layer == scope.layer;
                         });
+                if ((participant_match || domain_match) && entry->second.projection_ownership)
+                    throw std::logic_error("Whole-expert residency replacement cannot retire fixed projection slices");
                 if (participant_match || domain_match)
                     entry = replacement.erase(entry);
                 else
@@ -581,6 +616,9 @@ namespace llaminar2
     {
         std::unique_lock lock(mutex_);
         Key key{domain_name, device, layer, expert, role};
+        const auto previous = engines_.find(key);
+        if (previous != engines_.end() && previous->second.projection_ownership)
+            throw std::logic_error("Whole-expert replacement cannot change a projected engine");
         engines_[key] = Entry{engine, std::move(ownership)};
     }
 
@@ -594,6 +632,9 @@ namespace llaminar2
     {
         std::unique_lock lock(mutex_);
         Key key{domain_name, device, layer, expert, role};
+        const auto previous = engines_.find(key);
+        if (previous != engines_.end() && previous->second.projection_ownership)
+            throw std::logic_error("Whole-expert departure cannot retire a fixed projection layout");
         return engines_.erase(key) > 0;
     }
 

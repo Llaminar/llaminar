@@ -739,10 +739,47 @@ namespace
     }
 
     /**
-     * @brief Flash Attention 2 prefill kernel for MI50
+     * @brief Evaluate a direct attention scan or canonical context summaries.
      *
-     * Uses vectorized FP16 VALU operations for Q@K^T computation.
-     * No WMMA/Matrix Cores - pure ALU implementation optimized for Vega.
+     * The launch authority admits one 256-thread workgroup geometry. Context
+     * workgroups stride logical head/query/partition tasks, retain Q in LDS
+     * across their partitions, and publish disjoint summaries. Each partition
+     * owns a fresh register softmax tuple; the separate ordered reducer keeps
+     * the same arithmetic tree as the direct scan. All KV formats use the
+     * same FP16 dot-product and FP32 accumulation contract on gfx906.
+     *
+     * @tparam KV_TYPE Physical cache element format.
+     * @tparam THREADS_PER_ROW Lanes owning disjoint output dimensions per query.
+     * @tparam STATIC_HEAD_DIM Admitted static head width, or zero for dynamic width.
+     * @tparam STATIC_TILE_Q Static query tile, or zero for the supplied tile.
+     * @tparam STATIC_TILE_KV Static key tile, or zero for the supplied tile.
+     * @tparam WRITE_CONTEXT_PARTIAL Publish summaries instead of normalized output.
+     * @param Q FP32 query rows in batch/row/head/dimension order.
+     * @param K Physical key-cache storage in KV_TYPE's layout.
+     * @param V Physical value-cache storage in KV_TYPE's layout.
+     * @param O Final FP32 output, also used by the direct ordered partition fold.
+     * @param batch_size Admitted batch count.
+     * @param seq_len Live query count.
+     * @param kv_len Captured cache capacity, or live length without device_params.
+     * @param n_heads Local query-head count.
+     * @param n_kv_heads Physically available key/value heads.
+     * @param head_dim Dynamic head width; static specializations use their width.
+     * @param softmax_scale Scale applied after the ordered Q/K dot product.
+     * @param causal Apply the absolute-position causal mask.
+     * @param window_size Positive sliding-window radius, or zero for no window.
+     * @param position_offset Absolute position of the first query without device_params.
+     * @param device_params Optional device-owned live lengths and ring geometry.
+     * @param mask Optional additive mask, indexed with the live mask stride.
+     * @param tile_q Dynamic query-tile width.
+     * @param tile_kv Dynamic key-tile width.
+     * @param head_start Global query-head origin for replicated GQA caches.
+     * @param gqa_n_rep Replicated GQA ratio, or zero for locally sharded heads.
+     * @param O_partial Persistent unnormalized output summaries by logical partition.
+     * @param m_partial Persistent summary maxima, published by row lane zero.
+     * @param l_partial Persistent summary denominators, published by row lane zero.
+     * @param max_context_partitions Admitted summary capacity per query/head.
+     * @param context_partition_slots Physical persistent partition concurrency.
+     * @param device_direct_partition_limit Device-live direct/context crossover.
      */
     template <KVTypeTag KV_TYPE,
               int THREADS_PER_ROW,
@@ -774,7 +811,6 @@ namespace
         float *__restrict__ O_partial = nullptr,
         float *__restrict__ m_partial = nullptr,
         float *__restrict__ l_partial = nullptr,
-        int context_partition_size = 0,
         int max_context_partitions = 0,
         int context_partition_slots = 0,
         int device_direct_partition_limit = 0)
@@ -785,6 +821,13 @@ namespace
             STATIC_TILE_Q > 0 ? STATIC_TILE_Q : tile_q;
         const int kernel_tile_kv =
             STATIC_TILE_KV > 0 ? STATIC_TILE_KV : tile_kv;
+        // Admission accepts exactly this arithmetic partition width. Express
+        // that invariant here rather than retaining a runtime divider and its
+        // reciprocal/sign temporaries through every persistent task. The
+        // direct scan and summary reducer use the same canonical boundary.
+        constexpr int canonical_partition_keys =
+            llaminar2::rocm::fa2_policy::
+                kROCmFA2CanonicalContextPartitionKeys;
 
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
@@ -815,8 +858,8 @@ namespace
                 max_context_partitions,
                 max(
                     1,
-                    (kv_len_runtime + context_partition_size - 1) /
-                        context_partition_size));
+                    (kv_len_runtime + canonical_partition_keys - 1) /
+                        canonical_partition_keys));
             if (graph_live_context_partitions <=
                 device_direct_partition_limit)
             {
@@ -850,7 +893,11 @@ namespace
                                              ? static_cast<int>(gridDim.x)
                                              : 1;
         const int tid = threadIdx.x;
-        const int threads_per_block = blockDim.x;
+        // The sole launch authority always submits this exact workgroup size.
+        // Do not turn its cooperative LDS stride into another runtime value
+        // that must survive the persistent task/partition loops.
+        constexpr int threads_per_block =
+            llaminar2::rocm::fa2_policy::kROCmFA2ThreadsPerBlock;
         const int wavefront_id = tid / WAVEFRONT_SIZE;
         const int lane_id = tid % WAVEFRONT_SIZE;
 
@@ -871,14 +918,22 @@ namespace
             int context_partition_slot = 0;
             if constexpr (WRITE_CONTEXT_PARTIAL)
             {
+                // These admitted geometry extents and task IDs are positive
+                // or zero. Use their unsigned contract for quotient/remainder
+                // instead of keeping signed-divider correction temporaries
+                // live through the later attention scan.
+                const unsigned task_phase_blocks = phase_blocks_per_slot;
+                const unsigned task_heads = n_heads;
+                const unsigned task_query_tiles = logical_query_tiles;
+                unsigned participant_block =
+                    static_cast<unsigned>(logical_block);
                 context_partition_slot =
-                    logical_block / phase_blocks_per_slot;
-                int participant_block =
-                    logical_block % phase_blocks_per_slot;
-                head_idx = participant_block % n_heads;
-                participant_block /= n_heads;
-                q_tile_idx = participant_block % logical_query_tiles;
-                batch_idx = participant_block / logical_query_tiles;
+                    participant_block / task_phase_blocks;
+                participant_block %= task_phase_blocks;
+                head_idx = participant_block % task_heads;
+                participant_block /= task_heads;
+                q_tile_idx = participant_block % task_query_tiles;
+                batch_idx = participant_block / task_query_tiles;
             }
 
         // GQA mapping: multiple Q heads can share one KV head
@@ -887,8 +942,10 @@ namespace
         // KV heads are SHARDED (each device has only local_n_kv_heads), so use local indexing.
         const int effective_gqa_ratio = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
         const int kv_head_idx = (gqa_n_rep > 0)
-            ? (head_start + head_idx) / effective_gqa_ratio
-            : head_idx / effective_gqa_ratio;
+            ? static_cast<unsigned>(head_start + head_idx) /
+                  static_cast<unsigned>(effective_gqa_ratio)
+            : static_cast<unsigned>(head_idx) /
+                  static_cast<unsigned>(effective_gqa_ratio);
 
         // Q row range for this block
         const int q_block_start = q_tile_idx * kernel_tile_q;
@@ -974,17 +1031,8 @@ namespace
         constexpr int OUTPUTS_PER_THREAD =
             (COMPILED_HEAD_DIM + THREADS_PER_ROW - 1) /
             THREADS_PER_ROW;
-        float O_acc[OUTPUTS_PER_THREAD];
-        float m_i = -FLT_MAX;
-        float l_i = 0.0f;
         float merged_m = -FLT_MAX;
         float merged_l = 0.0f;
-
-        #pragma unroll
-        for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
-        {
-            O_acc[d_local] = 0.0f;
-        }
 
         // Batch/head pointers
         const float *Q_batch = Q + batch_idx * seq_len * n_heads * kernel_head_dim;
@@ -995,10 +1043,18 @@ namespace
         // =====================================================================
         // Load Q tile into LDS (done once per block)
         // =====================================================================
+        // Q-copy coordinates are dead before the K scan begins. Recreate
+        // them at this phase boundary rather than retaining a derived per-lane
+        // address through every persistent logical task. The physical thread
+        // identity is unchanged and this constraint emits no GPU instruction.
+        int query_copy_tid = tid;
+        asm volatile("" : "+v"(query_copy_tid));
         if ((kernel_head_dim & 1) == 0)
         {
             const int head_dim_vec2 = kernel_head_dim / 2;
-            for (int i = tid; i < q_tile_rows * head_dim_vec2; i += threads_per_block)
+            for (int i = query_copy_tid;
+                 i < q_tile_rows * head_dim_vec2;
+                 i += threads_per_block)
             {
                 int local_row = i / head_dim_vec2;
                 int d2 = i % head_dim_vec2;
@@ -1012,7 +1068,9 @@ namespace
         }
         else
         {
-            for (int i = tid; i < q_tile_rows * kernel_head_dim; i += threads_per_block)
+            for (int i = query_copy_tid;
+                 i < q_tile_rows * kernel_head_dim;
+                 i += threads_per_block)
             {
                 int local_row = i / kernel_head_dim;
                 int d = i % kernel_head_dim;
@@ -1029,30 +1087,32 @@ namespace
         {
             /*
              * A persistent physical slot may own several logical partitions.
-             * Reset only its private online-softmax tuple between them; Q stays
-             * resident in LDS and the graph launches no additional work.
+             * Own the private online-softmax tuple inside this exact partition;
+             * no accumulator survives into the next persistent task. Keeping
+             * its C++ lifetime aligned with that contract prevents LLVM from
+             * carrying a 32-value array through outer-loop register phis and
+             * spilling it while preparing the next task. Q stays resident in
+             * LDS and the graph launches no additional work.
              */
-            if (thread_has_row)
+            float O_acc[OUTPUTS_PER_THREAD];
+            float m_i = -FLT_MAX;
+            float l_i = 0.0f;
+            #pragma unroll
+            for (int d_local = 0;
+                 d_local < OUTPUTS_PER_THREAD;
+                 ++d_local)
             {
-                #pragma unroll
-                for (int d_local = 0;
-                     d_local < OUTPUTS_PER_THREAD;
-                     ++d_local)
-                {
-                    O_acc[d_local] = 0.0f;
-                }
-                m_i = -FLT_MAX;
-                l_i = 0.0f;
+                O_acc[d_local] = 0.0f;
             }
 
             const int kv_partition_begin = WRITE_CONTEXT_PARTIAL
                                                ? context_partition *
-                                                     context_partition_size
+                                                     canonical_partition_keys
                                                : 0;
             const int kv_partition_end = WRITE_CONTEXT_PARTIAL
                                              ? min(
                                                    kv_partition_begin +
-                                                       context_partition_size,
+                                                       canonical_partition_keys,
                                                    kv_len_runtime)
                                              : kv_len_runtime;
             const int partition_kv_len =
@@ -1228,8 +1288,13 @@ namespace
             // Score matrix is [q_tile_rows, actual_kv_len]
             // We distribute computation: thread t computes elements at stride
             const int total_score_elements = q_tile_rows * actual_kv_len;
-
-            for (int s_idx = tid; s_idx < total_score_elements; s_idx += threads_per_block)
+            int score_copy_tid = tid;
+            // In particular, do not hoist the score-row LDS offset over the
+            // register-heavy P/V accumulation that follows this phase.
+            asm volatile("" : "+v"(score_copy_tid));
+            for (int s_idx = score_copy_tid;
+                 s_idx < total_score_elements;
+                 s_idx += threads_per_block)
             {
                 int q_row = s_idx / actual_kv_len;
                 int kv_col = s_idx % actual_kv_len;
@@ -1401,9 +1466,6 @@ namespace
                 m_i = m_i_new;
             }
 
-            constexpr int canonical_partition_keys =
-                llaminar2::rocm::fa2_policy::
-                    kROCmFA2CanonicalContextPartitionKeys;
             const int maximum_visible_key =
                 q_block_start + kernel_tile_q - 1 +
                 position_offset_runtime;
@@ -1518,12 +1580,30 @@ namespace
 
             if constexpr (WRITE_CONTEXT_PARTIAL)
             {
+                // Form the summary address only after the register-heavy scan
+                // completes. Otherwise LLVM keeps both the per-lane base and
+                // the 64-bit query/head index live through every K tile. These
+                // identity constraints are instruction-free and preserve the
+                // original pointer provenance and disjoint publication map.
+                int summary_query_start = q_block_start;
+                int summary_tid = tid;
+                int summary_batch = batch_idx;
+                int summary_head = head_idx;
+                int summary_capacity = max_context_partitions;
+                asm volatile("" : "+s"(summary_query_start), "+v"(summary_tid),
+                                   "+s"(summary_batch), "+s"(summary_head),
+                                   "+s"(summary_capacity));
+                const unsigned summary_row =
+                    static_cast<unsigned>(summary_query_start) +
+                    static_cast<unsigned>(summary_tid) / THREADS_PER_ROW;
+                const unsigned summary_lane =
+                    static_cast<unsigned>(summary_tid) % THREADS_PER_ROW;
                 const size_t summary_index =
-                    ((static_cast<size_t>(batch_idx) * seq_len +
-                      global_q_row) *
+                    ((static_cast<size_t>(static_cast<unsigned>(summary_batch)) * seq_len +
+                      summary_row) *
                          n_heads +
-                     head_idx) *
-                        max_context_partitions +
+                     static_cast<unsigned>(summary_head)) *
+                        static_cast<unsigned>(summary_capacity) +
                     context_partition;
                 float *O_summary =
                     O_partial +
@@ -1534,7 +1614,7 @@ namespace
                      ++d_local)
                 {
                     const int d =
-                        row_lane + d_local * THREADS_PER_ROW;
+                        summary_lane + d_local * THREADS_PER_ROW;
                     if (d < kernel_head_dim)
                         O_summary[d] = O_acc[d_local];
                 }
@@ -2629,7 +2709,6 @@ static int launch_device_resident_prefill(
             tile_q, tile_kv,
             head_start, gqa_n_rep,
             O_partial, m_partial, l_partial,
-            context_partition_size,
             max_context_partitions,
             context_partition_slots,
             device_direct_partition_limit);
@@ -2648,7 +2727,6 @@ static int launch_device_resident_prefill(
             tile_q, tile_kv,
             head_start, gqa_n_rep,
             O_partial, m_partial, l_partial,
-            context_partition_size,
             max_context_partitions,
             context_partition_slots,
             device_direct_partition_limit);
@@ -2667,7 +2745,6 @@ static int launch_device_resident_prefill(
             tile_q, tile_kv,
             head_start, gqa_n_rep,
             O_partial, m_partial, l_partial,
-            context_partition_size,
             max_context_partitions,
             context_partition_slots,
             device_direct_partition_limit);
@@ -2686,7 +2763,6 @@ static int launch_device_resident_prefill(
             tile_q, tile_kv,
             head_start, gqa_n_rep,
             O_partial, m_partial, l_partial,
-            context_partition_size,
             max_context_partitions,
             context_partition_slots,
             device_direct_partition_limit);
@@ -2705,7 +2781,6 @@ static int launch_device_resident_prefill(
             tile_q, tile_kv,
             head_start, gqa_n_rep,
             O_partial, m_partial, l_partial,
-            context_partition_size,
             max_context_partitions,
             context_partition_slots,
             device_direct_partition_limit);

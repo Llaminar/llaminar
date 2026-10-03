@@ -7,6 +7,7 @@
  * - GPUDeviceContextPool singleton
  * - NvidiaDeviceContext (if CUDA available)
  * - AMDDeviceContext (if ROCm available)
+ * - Ordering receipts cover retained compute after DMA on reused stream lanes
  *
  * **Thread Safety Model**:
  * The device context follows a strict ownership model where all GPU state
@@ -21,6 +22,7 @@
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
+#include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
 #include "execution/mtp/OrdinaryGenerationGraphPlan.h"
@@ -30,14 +32,21 @@
 
 #if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 #include <hip/hip_runtime.h>
+#elif defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+#include <cuda_runtime_api.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <future>
 #include <mutex>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -81,6 +90,214 @@ using namespace llaminar2;
 
 namespace
 {
+    /**
+     * @brief Prove native ordering-only and timing worker-event semantics.
+     * @param ctx Exact initialized worker, used only on its owning thread.
+     *
+     * The public default and explicit Ordering policy must disable timing;
+     * Timing must retain it. A real native elapsed-time query authenticates
+     * the distinction; there is no public event-flags introspection API.
+     */
+    void expectNativeEventPurposes(IWorkerGPUContext &ctx)
+    {
+        ctx.submitAndWait([&] {
+            const auto destroy = [&ctx](void *event) { ctx.destroyEvent(event); };
+            using Event = std::unique_ptr<void, decltype(destroy)>;
+            Event ordinary(ctx.createEvent(), destroy);
+            Event ordering(ctx.createEvent(GPUEventPurpose::Ordering), destroy);
+            Event timing(ctx.createEvent(GPUEventPurpose::Timing), destroy);
+            const std::array<void *, 3> events{ordinary.get(), ordering.get(), timing.get()};
+            const std::array<bool, 3> expects_timing{false, false, true};
+            for (std::size_t index = 0; index < events.size(); ++index)
+            {
+                ASSERT_NE(events[index], nullptr);
+                EXPECT_TRUE(ctx.recordEventChecked(events[index], ctx.defaultStream()));
+                EXPECT_TRUE(ctx.synchronizeEventChecked(events[index]));
+                float elapsed{};
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+                const auto result = hipEventElapsedTime(&elapsed,
+                    static_cast<hipEvent_t>(events[index]), static_cast<hipEvent_t>(events[index]));
+                EXPECT_EQ(result, expects_timing[index] ? hipSuccess : hipErrorInvalidHandle);
+                (void)hipGetLastError(); // Clear only this intentional API-negative control.
+#elif defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+                const auto result = cudaEventElapsedTime(&elapsed,
+                    static_cast<cudaEvent_t>(events[index]), static_cast<cudaEvent_t>(events[index]));
+                EXPECT_EQ(result, expects_timing[index] ? cudaSuccess : cudaErrorInvalidResourceHandle);
+                (void)cudaGetLastError(); // Clear only this intentional API-negative control.
+#endif
+                if (expects_timing[index]) EXPECT_GE(elapsed, 0.0f);
+            }
+            // A real elapsed-time query confirms that instrumentation survived
+            // the default-policy change; it is not just a creation flag check.
+            EXPECT_GE(ctx.eventElapsedTime(timing.get(), timing.get()), 0.0f);
+            EXPECT_THROW((void)ctx.createEvent(static_cast<GPUEventPurpose>(255)), std::invalid_argument);
+        });
+    }
+
+    /**
+     * @brief An ordering receipt must cover compute queued after a DMA frontier.
+     * @param ctx Exact initialized worker; all resources use its owning thread.
+     * @param device Full backend/ordinal identity for every transfer and graph.
+     *
+     * Thirty-two independent lanes exceed typical physical DMA-engine counts.
+     * Each copies only its live bytes, launches the production mapped-timeline
+     * wait/publication graph, then records the same ordering event twice. A
+     * CPU-owned test gate holds the captured work pending, so an event which
+     * incorrectly reuses the preceding DMA completion cannot pass the negative
+     * assertion. After release, exact bytes, guards and device-written receipts
+     * prove progress rather than treating an event as a payload certificate.
+     * Five data-only resets reuse every pointer, stream, graph and event.
+     */
+    void expectOrderingAfterCapturedCompute(IWorkerGPUContext &ctx, DeviceId device)
+    {
+        ctx.submitAndWait([&] {
+            constexpr std::size_t lane_count = 32u;
+            constexpr std::size_t generations = 5u;
+            constexpr std::size_t payload_bytes = 4096u + 13u;
+            constexpr std::size_t guard_bytes = 64u;
+            constexpr std::size_t input_offset = 4096u;
+            // The deliberately odd live payload crosses one page. Start the
+            // result/guard region after its complete extent, not after its
+            // rounded-down page, so poisoning outputs cannot edit the oracle.
+            constexpr std::size_t output_offset =
+                input_offset + ((payload_bytes + 4095u) / 4096u) * 4096u;
+            static_assert(input_offset + payload_bytes <= output_offset);
+            constexpr std::size_t lane_stride = payload_bytes + 2u * guard_bytes;
+            constexpr unsigned char guard_pattern = 0xd3u;
+            TransferEngine transfers;
+            const std::array devices{device};
+            auto mapped = transfers.allocateMappedHostRegion(
+                output_offset + lane_count * lane_stride, devices);
+            auto source = transfers.allocateDeviceTransferBuffer(payload_bytes, device);
+            ASSERT_TRUE(mapped && source);
+            auto *const host = static_cast<unsigned char *>(mapped->mutableHostData());
+            auto *const words = reinterpret_cast<std::uint64_t *>(host);
+            std::atomic_ref<std::uint64_t> gate(words[0]);
+            gate.store(1u, std::memory_order_release);
+            for (std::size_t byte = 0; byte < payload_bytes; ++byte)
+                host[input_offset + byte] = static_cast<unsigned char>((byte * 37u + 0x6au) & 0xffu);
+
+            const auto destroy_stream = [&ctx](void *stream) { ctx.destroyStream(stream); };
+            const auto destroy_event = [&ctx](void *event) { ctx.destroyEvent(event); };
+            using Stream = std::unique_ptr<void, decltype(destroy_stream)>;
+            using Event = std::unique_ptr<void, decltype(destroy_event)>;
+            /** @brief Persistent exact-stream/event/graph ownership for one lane. */
+            struct Lane
+            {
+                Stream stream; ///< Destroyed last, after the retained graph and event.
+                Event terminal; ///< Re-recorded without changing its ordering purpose.
+                std::unique_ptr<IGPUGraphCapture> graph; ///< Stable production transaction.
+            };
+            std::vector<Lane> lanes;
+            lanes.reserve(lane_count);
+            // Failure cleanup releases the test-owned gate only after the
+            // assertion outcome is fixed. Blocking drains are fixture teardown,
+            // never a production ordering mechanism or part of the proof.
+            const auto cleanup = [&](void *) {
+                gate.store(1u, std::memory_order_release);
+                EXPECT_TRUE(ctx.synchronizeStreamChecked(ctx.defaultStream()));
+                for (const auto &lane : lanes)
+                    if (lane.stream) EXPECT_TRUE(ctx.synchronizeStreamChecked(lane.stream.get()));
+                lanes.clear();
+            };
+            std::unique_ptr<void, decltype(cleanup)> lifetime(host, cleanup);
+            Event source_ready(ctx.createEvent(GPUEventPurpose::Ordering), destroy_event);
+            ASSERT_NE(source_ready, nullptr);
+            transfers.enqueueMappedHostToDevice(
+                *mapped, input_offset, *source, 0u, payload_bytes, device, ctx.defaultStream());
+            ASSERT_TRUE(ctx.recordEventChecked(source_ready.get(), ctx.defaultStream()));
+            ASSERT_TRUE(ctx.synchronizeEventChecked(source_ready.get()));
+
+            for (std::size_t index = 0; index < lane_count; ++index)
+            {
+                lanes.push_back(Lane{
+                    Stream(ctx.createStream(), destroy_stream),
+                    Event(ctx.createEvent(GPUEventPurpose::Ordering), destroy_event),
+                    nullptr});
+                auto &lane = lanes.back();
+                ASSERT_NE(lane.stream, nullptr);
+                ASSERT_NE(lane.terminal, nullptr);
+                lane.graph = ctx.createGraphCapture(lane.stream.get());
+                ASSERT_NE(lane.graph, nullptr);
+                const std::array<MappedTimelineTransactionStep, 2> steps{
+                    MappedTimelineWait64{
+                        .name = "held_captured_compute", .region = mapped.get(),
+                        .signal_offset = 0u, .value = 1u},
+                    MappedTimelinePublish64{
+                        .name = "captured_compute_receipt", .region = mapped.get(),
+                        .signal_offset = (index + 1u) * sizeof(std::uint64_t), .value = 1u}};
+                transfers.buildMappedTimelineTransaction(*lane.graph, steps, device);
+                ASSERT_TRUE(lane.graph->instantiate());
+                ASSERT_TRUE(lane.graph->launch());
+                ASSERT_TRUE(ctx.recordEventChecked(lane.terminal.get(), lane.stream.get()));
+            }
+            // Resolve first-use graph/module/queue work before holding a gate.
+            // This cold warmup cannot satisfy any later pending assertion.
+            for (const auto &lane : lanes)
+                ASSERT_TRUE(ctx.synchronizeEventChecked(lane.terminal.get()));
+
+            for (std::size_t generation = 0; generation < generations; ++generation)
+            {
+                SCOPED_TRACE("generation=" + std::to_string(generation));
+                gate.store(0u, std::memory_order_release);
+                for (std::size_t index = 0; index < lane_count; ++index)
+                    std::atomic_ref<std::uint64_t>(words[index + 1u]).store(0u, std::memory_order_release);
+                std::memset(host + output_offset, guard_pattern, lane_count * lane_stride);
+                for (std::size_t index = 0; index < lane_count; ++index)
+                {
+                    auto &lane = lanes[index];
+                    const auto destination = output_offset + index * lane_stride + guard_bytes;
+                    std::memset(host + destination, 0xc7, payload_bytes);
+                    // Allocation capacity and padding never become DMA extent.
+                    // The retained compute and both records use this same lane.
+                    transfers.enqueueDeviceToMappedHost(
+                        *source, 0u, *mapped, destination, payload_bytes, device, lane.stream.get());
+                    ASSERT_TRUE(lane.graph->launch());
+                    ASSERT_TRUE(ctx.recordEventChecked(lane.terminal.get(), lane.stream.get()));
+                    ASSERT_TRUE(ctx.recordEventChecked(lane.terminal.get(), lane.stream.get()));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                for (std::size_t index = 0; index < lane_count; ++index)
+                {
+                    SCOPED_TRACE("lane=" + std::to_string(index));
+                    bool ready = false;
+                    ASSERT_TRUE(ctx.queryEventChecked(lanes[index].terminal.get(), ready));
+                    EXPECT_FALSE(ready) << "ordering event certified DMA but skipped pending captured compute";
+                    EXPECT_EQ(std::atomic_ref<std::uint64_t>(words[index + 1u]).load(std::memory_order_acquire), 0u);
+                }
+
+                gate.store(1u, std::memory_order_release);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                std::array<bool, lane_count> complete{};
+                bool all_complete = false;
+                while (!all_complete && std::chrono::steady_clock::now() < deadline)
+                {
+                    all_complete = true;
+                    for (std::size_t index = 0; index < lane_count; ++index)
+                    {
+                        if (!complete[index])
+                            ASSERT_TRUE(ctx.queryEventChecked(lanes[index].terminal.get(), complete[index]));
+                        all_complete = all_complete && complete[index];
+                    }
+                    if (!all_complete) std::this_thread::yield();
+                }
+                ASSERT_TRUE(all_complete) << "released captured compute did not retire within five seconds";
+                for (std::size_t index = 0; index < lane_count; ++index)
+                {
+                    SCOPED_TRACE("lane=" + std::to_string(index));
+                    const auto begin = output_offset + index * lane_stride;
+                    const auto destination = begin + guard_bytes;
+                    EXPECT_EQ(std::atomic_ref<std::uint64_t>(words[index + 1u]).load(std::memory_order_acquire), 1u);
+                    EXPECT_EQ(std::memcmp(host + destination, host + input_offset, payload_bytes), 0);
+                    const auto guard_matches = [](unsigned char byte) { return byte == guard_pattern; };
+                    EXPECT_TRUE(std::all_of(host + begin, host + destination, guard_matches));
+                    EXPECT_TRUE(std::all_of(host + destination + payload_bytes,
+                        host + begin + lane_stride, guard_matches));
+                }
+            }
+        });
+    }
+
     constexpr size_t kRuntimeRetirementAllocationBytes = 64u * 1024u * 1024u;
 
     void expectAuxiliaryStreamsReuseByName(IWorkerGPUContext &ctx)
@@ -956,6 +1173,20 @@ TEST(Test__NvidiaDeviceContext, EventQueryCheckedReportsCompletion)
     EXPECT_TRUE(ready_after_sync);
 }
 
+/** @test CUDA completion receipts and profiling events retain distinct semantics. */
+TEST(Test__NvidiaDeviceContext, NativeEventPurposeIsOrderingUnlessTimingIsExplicit)
+{
+    SKIP_IF_NO_CUDA();
+    expectNativeEventPurposes(GPUDeviceContextPool::instance().getNvidiaContext(0));
+}
+
+/** @test CUDA ordering events cover captured compute, exact bytes and replay generations. */
+TEST(Test__NvidiaDeviceContext, OrderingEventCoversCapturedComputeAfterDMAAcrossReusedLanes)
+{
+    SKIP_IF_NO_CUDA();
+    expectOrderingAfterCapturedCompute(GPUDeviceContextPool::instance().getNvidiaContext(0), DeviceId::cuda(0));
+}
+
 TEST(Test__NvidiaDeviceContext, ExactStreamQueryIsTypedAndNonBlocking)
 {
     SKIP_IF_NO_CUDA();
@@ -1345,6 +1576,20 @@ TEST(Test__AMDDeviceContext, EventQueryCheckedReportsCompletion)
     EXPECT_TRUE(query_before_sync_ok);
     EXPECT_TRUE(query_after_sync_ok);
     EXPECT_TRUE(ready_after_sync);
+}
+
+/** @test ROCm DMA receipts do not silently request shared-queue timestamp work. */
+TEST(Test__AMDDeviceContext, NativeEventPurposeIsOrderingUnlessTimingIsExplicit)
+{
+    SKIP_IF_NO_ROCM();
+    expectNativeEventPurposes(GPUDeviceContextPool::instance().getAMDContext(0));
+}
+
+/** @test ROCm ordering events cannot reuse an obsolete DMA-only completion frontier. */
+TEST(Test__AMDDeviceContext, OrderingEventCoversCapturedComputeAfterDMAAcrossReusedLanes)
+{
+    SKIP_IF_NO_ROCM();
+    expectOrderingAfterCapturedCompute(GPUDeviceContextPool::instance().getAMDContext(0), DeviceId::rocm(0));
 }
 
 TEST(Test__AMDDeviceContext, ExactStreamQueryIsTypedAndNonBlocking)

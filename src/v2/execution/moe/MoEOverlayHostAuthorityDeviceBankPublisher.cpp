@@ -946,9 +946,9 @@ namespace llaminar2
                     const auto &triplet = local_layer.experts[expert];
                     if (!triplet.complete() ||
                         !exportDeviceMoEExpertWeightDescriptors(
-                            triplet.gate.get(),
-                            triplet.up.get(),
-                            triplet.down.get(),
+                            triplet.gate().get(),
+                            triplet.up().get(),
+                            triplet.down().get(),
                             descriptor))
                     {
                         throw std::runtime_error(

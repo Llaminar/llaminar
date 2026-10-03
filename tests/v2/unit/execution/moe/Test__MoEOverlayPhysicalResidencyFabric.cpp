@@ -242,7 +242,7 @@ namespace
     }
 
     /** @brief Allocate and fill one immutable real CPU prepared expert. */
-    MoEOverlayPreparedExpertTriplet makeSourceExpertAtLayer(
+    MoEOverlayPreparedExpertPayload makeSourceExpertAtLayer(
         int participant_id,
         int layer_idx,
         int expert_id,
@@ -267,7 +267,7 @@ namespace
             throw std::runtime_error(
                 "CPU overlay test could not acquire a complete source expert");
 
-        MoEOverlayPreparedExpertTriplet result;
+        std::array<std::shared_ptr<ITensorGemm>, 3> engines{};
         for (const auto &projection : lease->projections)
         {
             for (std::size_t byte = 0;
@@ -281,24 +281,22 @@ namespace
             switch (projection.projection)
             {
             case ExpertTierWeightProjection::Gate:
-                result.gate = projection.engine;
+                engines[0] = projection.engine;
                 break;
             case ExpertTierWeightProjection::Up:
-                result.up = projection.engine;
+                engines[1] = projection.engine;
                 break;
             case ExpertTierWeightProjection::Down:
-                result.down = projection.engine;
+                engines[2] = projection.engine;
                 break;
             }
         }
-        if (!result.complete())
-            throw std::runtime_error(
-                "CPU overlay test source triplet is incomplete");
-        return result;
+        return MoEOverlayPreparedExpertPayload::fromProjections(
+            DeviceMoEProjectionSet::CompleteExpert, std::move(engines));
     }
 
     /** @brief One-layer compatibility helper for the existing format sweep. */
-    MoEOverlayPreparedExpertTriplet makeSourceExpert(
+    MoEOverlayPreparedExpertPayload makeSourceExpert(
         int participant_id,
         int expert_id,
         std::uint8_t seed,
@@ -316,7 +314,7 @@ namespace
     template <std::size_t ExpertCount>
     std::shared_ptr<MoEOverlayParticipantResidencyRegistry> makeRegistry(
         const std::shared_ptr<const MoEOverlayResidencySnapshot> &snapshot,
-        const std::array<MoEOverlayPreparedExpertTriplet, ExpertCount> &experts)
+        const std::array<MoEOverlayPreparedExpertPayload, ExpertCount> &experts)
     {
         static_assert(ExpertCount > 0);
         auto registry =
@@ -341,7 +339,7 @@ namespace
                 /* The registry constructor publishes this exact empty bank. */
                 continue;
             }
-            std::vector<MoEOverlayPreparedExpertTriplet> resident_engines(
+            std::vector<MoEOverlayPreparedExpertPayload> resident_engines(
                 ExpertCount);
             for (int expert_id = 0;
                  expert_id < static_cast<int>(ExpertCount);
@@ -380,7 +378,7 @@ namespace
     std::shared_ptr<MoEOverlayParticipantResidencyRegistry> makeRegistry(
         const std::shared_ptr<const MoEOverlayResidencySnapshot> &snapshot,
         const std::array<
-            std::array<MoEOverlayPreparedExpertTriplet, ExpertCount>,
+            std::array<MoEOverlayPreparedExpertPayload, ExpertCount>,
             LayerCount> &experts)
     {
         static_assert(LayerCount > 1);
@@ -412,7 +410,7 @@ namespace
                 {
                     continue;
                 }
-                std::vector<MoEOverlayPreparedExpertTriplet> resident_engines(
+                std::vector<MoEOverlayPreparedExpertPayload> resident_engines(
                     ExpertCount);
                 for (int expert_id = 0;
                      expert_id < static_cast<int>(ExpertCount);
@@ -443,20 +441,20 @@ namespace
     }
 
     /**
-     * @brief Snapshot the exact live CPU bytes for a prepared triplet.
+     * @brief Snapshot the exact live CPU bytes for a prepared payload.
      *
      * Quantized experts expose their final NativeVNNI buffer; floating experts
      * expose their exact row-major FP16, BF16, or FP32 buffer. Reading through
      * the engine interface keeps the assertion independent of slot ownership.
      */
     std::array<std::vector<std::uint8_t>, 3> preparedBytes(
-        const MoEOverlayPreparedExpertTriplet &triplet)
+        const MoEOverlayPreparedExpertPayload &payload)
     {
         std::array<std::vector<std::uint8_t>, 3> result;
         const std::array<std::shared_ptr<ITensorGemm>, 3> engines{
-            triplet.gate,
-            triplet.up,
-            triplet.down,
+            payload.gate(),
+            payload.up(),
+            payload.down(),
         };
         for (std::size_t projection = 0;
              projection < engines.size();
@@ -509,7 +507,7 @@ namespace
      * @brief Build one exact two-edge durable swap for the physical ledger.
      *
      * Device ids are inert topology identities in this device-free test; the
-     * retained triplets are real CPU engines and no backend is initialized.
+     * retained payloads are real CPU engines and no backend is initialized.
      */
     MoEOverlayDevicePhysicalMovementBatch deviceLedgerSwap(
         MoEOverlayDeviceControllerTransactionKind kind,
@@ -592,7 +590,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                         .expert_id = 0},
                 .entered_epoch = 1u,
                 .bootstrap_allocation = true,
-                .triplet = expert_zero,
+                .payload = expert_zero,
             },
             {
                 .key = {.participant_id = 1,
@@ -600,7 +598,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                         .expert_id = 1},
                 .entered_epoch = 1u,
                 .bootstrap_allocation = true,
-                .triplet = expert_one,
+                .payload = expert_one,
             },
         },
     });
@@ -619,13 +617,13 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                 .key = {.participant_id = 1,
                         .layer_idx = 0,
                         .expert_id = 0},
-                .triplet = expert_zero,
+                .payload = expert_zero,
             },
             {
                 .key = {.participant_id = 0,
                         .layer_idx = 0,
                         .expert_id = 1},
-                .triplet = expert_one,
+                .payload = expert_one,
             },
         },
         &error)) << error;
@@ -643,10 +641,10 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     ASSERT_EQ(moved->slots.size(), 2u);
     EXPECT_EQ(moved->slots[0].key.participant_id, 0);
     EXPECT_EQ(moved->slots[0].key.expert_id, 1);
-    EXPECT_TRUE(moved->slots[0].triplet.sameIdentity(expert_one));
+    EXPECT_TRUE(moved->slots[0].payload.sameIdentity(expert_one));
     EXPECT_EQ(moved->slots[1].key.participant_id, 1);
     EXPECT_EQ(moved->slots[1].key.expert_id, 0);
-    EXPECT_TRUE(moved->slots[1].triplet.sameIdentity(expert_zero));
+    EXPECT_TRUE(moved->slots[1].payload.sameIdentity(expert_zero));
 
     const auto restore = deviceLedgerSwap(
         MoEOverlayDeviceControllerTransactionKind::PreparedContextRestore,
@@ -661,13 +659,13 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                 .key = {.participant_id = 0,
                         .layer_idx = 0,
                         .expert_id = 0},
-                .triplet = expert_zero,
+                .payload = expert_zero,
             },
             {
                 .key = {.participant_id = 1,
                         .layer_idx = 0,
                         .expert_id = 1},
-                .triplet = expert_one,
+                .payload = expert_one,
             },
         },
         &error)) << error;
@@ -681,10 +679,10 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     ASSERT_EQ(restored->slots.size(), 2u);
     EXPECT_EQ(restored->slots[0].key.participant_id, 0);
     EXPECT_EQ(restored->slots[0].key.expert_id, 0);
-    EXPECT_TRUE(restored->slots[0].triplet.sameIdentity(expert_zero));
+    EXPECT_TRUE(restored->slots[0].payload.sameIdentity(expert_zero));
     EXPECT_EQ(restored->slots[1].key.participant_id, 1);
     EXPECT_EQ(restored->slots[1].key.expert_id, 1);
-    EXPECT_TRUE(restored->slots[1].triplet.sameIdentity(expert_one));
+    EXPECT_TRUE(restored->slots[1].payload.sameIdentity(expert_one));
     EXPECT_FALSE(ledger.snapshot(2u, &error).has_value());
     EXPECT_NE(error.find("exact current durable epoch"), std::string::npos);
 }
@@ -840,7 +838,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     const auto snapshot = authority->snapshot();
     ASSERT_NE(snapshot, nullptr);
 
-    const std::array<MoEOverlayPreparedExpertTriplet, 2> experts{
+    const std::array<MoEOverlayPreparedExpertPayload, 2> experts{
         makeSourceExpert(0, 0, 17),
         makeSourceExpert(0, 1, 93),
     };
@@ -934,7 +932,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     ASSERT_NE(initial_snapshot, nullptr);
 
     const std::array<
-        std::array<MoEOverlayPreparedExpertTriplet, kExpertCount>,
+        std::array<MoEOverlayPreparedExpertPayload, kExpertCount>,
         kLayerCount>
         experts{{
             {
@@ -1270,7 +1268,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         const auto initial_snapshot = authority->snapshot();
         ASSERT_NE(initial_snapshot, nullptr);
 
-        const std::array<MoEOverlayPreparedExpertTriplet, 3> experts{
+        const std::array<MoEOverlayPreparedExpertPayload, 3> experts{
             makeSourceExpert(0, 0, 11, format_case.format),
             makeSourceExpert(0, 1, 93, format_case.format),
             makeSourceExpert(1, 2, 177, format_case.format),
@@ -1451,11 +1449,11 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                 {
                     continue;
                 }
-                const auto &triplet = bank.layers.front().experts.at(
+                const auto &payload = bank.layers.front().experts.at(
                     static_cast<std::size_t>(expert_id));
-                ASSERT_TRUE(triplet.complete());
+                ASSERT_TRUE(payload.complete());
                 EXPECT_EQ(
-                    preparedBytes(triplet),
+                    preparedBytes(payload),
                     expected[static_cast<std::size_t>(expert_id)]);
                 observed[static_cast<std::size_t>(expert_id)] = true;
             }

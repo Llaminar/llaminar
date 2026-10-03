@@ -11,17 +11,20 @@ A repeatable, evidence-driven workflow for tuning Llaminar V2 HIP INT8 GEMM/GEMV
 on AMD Instinct MI50/MI60 (gfx906), distilled from the multi-session effort that produced
 the V7 native kernel matching/beating AMD's Composable Kernel (CK) on N-heavy LLM shapes.
 
-It chains three tools:
+It combines four evidence sources:
 
 1. **PerfStats GPU event timing** — production-graph replay timing and structured route/host counters.
-2. **`rocprof`** — per-dispatch GPU kernel timing (the *only* trustworthy latency number).
+2. **`rocprof`** — diagnostic per-dispatch GPU timing and hardware counters.
 3. **LLVM ISA toolchain** (`llvm-objcopy` / `llvm-readelf` / `llvm-objdump`) — extract code
    objects, read VGPR/SGPR/LDS metadata, disassemble, and census instructions.
 4. **The dispatch-comparison perf test + parity** — A/B variants and validate correctness.
 
-The golden rule of gfx906 tuning: **wallclock lies.** On PCIe-bottlenecked topologies,
->90% of GEMM wallclock is memory transfer. Always quote `rocprof` per-dispatch GPU time,
-not wallclock, when comparing kernels.
+Keep timing scopes explicit. Unprofiled production request times establish the
+user-visible result; captured native-event microbenchmarks isolate kernel
+economics; rocprof attributes work and resource use. Host launch-loop timing
+cannot isolate an asynchronous kernel, while profiler overhead and overlapping
+kernel intervals cannot be substituted for end-to-end throughput. Measure
+communication and overlap instead of assuming a fixed fraction of either.
 
 ## Production hot-path invariants
 
@@ -81,6 +84,13 @@ requests. It must never disable graph capture or select eager execution.
 
 ## Profiler attachment and evidence rules
 
+For a captured-graph or collective stall, use
+[passive HIP/HSA stall inspection](references/hip-captured-stall-inspection.md).
+Preserve the failed production process before adding instrumentation: a rank
+waiting in a collective is not evidence that the collective caused the stall.
+The reference covers exact-runtime provenance, CPU queue/signal metadata,
+ROCgdb dispatch snapshots and fresh-lifetime validation.
+
 - Pass `--no-mpi-bootstrap` only when profiling or debugging `llaminar2`
   directly so the profiler attaches to the compute process rather than the
   `mpirun` wrapper. Never use it for production or canonical benchmark timing;
@@ -98,6 +108,45 @@ requests. It must never disable graph capture or select eager execution.
 - Keep the profiler generation and metric groups required by the repository's
   evidence collector. Do not silently substitute `rocprofv3` output for a
   `rocprof`/rocprofiler schema expected by the trainer.
+
+For a planned MPI deployment, follow the shared
+[execution-rank attachment procedure](../cuda-tuning/SKILL.md#profiling-an-automatically-planned-mpi-topology):
+save an unprofiled plan, map its domain `owner_rank` through
+`execution_rank_selection`, and attach to that **discovery** process. Launch
+rank, log rank, socket and continuation/follower role are not interchangeable.
+An incorrectly selected process can expose ROCm startup probes and no inference
+kernels, even though retained HIP graph tracing works. Keep the production MPI
+binding and apply the saved plan for profiling; never let profiler overhead
+alter automatic topology selection.
+
+For native API/copy attribution without additional Llaminar GPU timing events,
+omit `stage_gpu` and `mtp_stage_gpu` from `LLAMINAR_PERF_STATS_FILTER` as well
+as leaving the GPU timing switches off. A stage-family filter independently
+opts into timing; `LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=0` does not negate it.
+Confirm the export has no GPU-stage timing rows. Otherwise profiling-event
+waits can change the apparent host submission and prefix-harvest critical path.
+Use `--hip-runtime-trace --memory-copy-trace` alongside the kernel trace to
+distinguish native submission, DMA, and compute intervals; never add their
+overlapping totals or substitute instrumented throughput for canonical timing.
+
+Use `LLAMINAR_PROFILER_NORMAL_EXIT=1` when profiling the CLI so `_exit` does not
+discard profiler finalizers. The validated whole-model command is
+`rocprofv3 --kernel-trace --stats --output-directory <result-dir> --
+llaminar2 benchmark --config <plan.json> --no-mpi-bootstrap <exact-workload>`
+inside the resolved rank. Check the resulting dispatch records for real MoE
+kernels on the intended agents during inference, not merely startup kernels.
+Current rocprofv3 can emit a ROCPD SQLite database rather than CSV; inspect the
+actual output/schema. Database/report generation after device shutdown is
+profiler overhead, not model loading or inference. Persistent waits and summed
+parallel-agent durations are not a critical-path measurement.
+
+Captured auxiliary-stream kernels can be attributed to the parent replay's
+stream ID in the dispatch trace. A shared `stream_id` therefore does not prove
+serialization. Establish overlap from same-agent start/end intervals and the
+captured event DAG; verify the producer, independent work, and final join all
+belong to the same retained executable. Report the intersecting intervals
+separately from whole-request throughput, and keep profiler runs out of timing
+comparisons.
 
 ---
 
@@ -173,9 +222,10 @@ event measurement and profile the isolated real kernel instead.
 Keep canonical timing unprofiled, then gather timing, counters, and ISA in a
 separate deterministic profiler invocation for that exact candidate. Read
 [`references/rocprof-isolated-kernel.md`](references/rocprof-isolated-kernel.md)
-for the tested rocprof v1 dispatch-range/counter commands, metric
-interpretation, wave64 vectorization checks, and ROCm 7 `.hip_fatbin`
-extraction workflow.
+for the tested dispatch-range/counter commands, native v3 HIP-graph record
+association, metric interpretation, wave64 vectorization checks, and exact
+loaded code-object extraction. Authenticate each graph launch's dispatch count
+before excluding preparation or oracle work from attribution.
 
 For ROCm FlashAttention2, build
 `v2_perf_rocm_flash_attention_prefill` and use its exact-candidate test so one
