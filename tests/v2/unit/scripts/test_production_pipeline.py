@@ -4001,13 +4001,30 @@ class InfrastructureTests(unittest.TestCase):
         All patch digests and the exact loaded DSO must participate. A repaired
         file alongside a stock SONAME target does not certify callers, and the
         package-stamped candidate may not resurrect stock code after ldconfig.
+        Tool discovery is private to this fixture: a slim installed runner need
+        not carry ccache or a compiler merely to reach the fake SDK boundary.
         """
         with tempfile.TemporaryDirectory() as directory:
+            commands = Path(directory) / "commands"
+            commands.mkdir()
+            # Receipt authentication uses real coreutils. Build-tool names are
+            # discoverable but must never execute: the deliberately incomplete
+            # SDK rejects stale receipts before any native work or network I/O.
+            for name in ("dirname", "sha256sum", "cut"):
+                (commands / name).symlink_to(Path("/usr/bin") / name)
+            for name in ("cmake", "ninja", "ccache", "curl", "git", "python3"):
+                tool = commands / name
+                tool.write_text(
+                    '#!/bin/sh\necho "unexpected build tool execution" >&2\nexit 97\n',
+                    encoding="utf-8")
+                tool.chmod(0o755)
             sdk = Path(directory) / "sdk"
             (sdk / ".info").mkdir(parents=True)
             pins = rocm_release_pins()
             (sdk / ".info/version").write_text(pins["LLAMINAR_ROCM_VERSION"] + "\n")
             output = Path(directory) / "output"
+            environment = {**os.environ, "PATH": str(commands), "ROCM_PATH": str(sdk),
+                           "HIP_RUNTIME_INSTALL_PREFIX": str(output)}
             (output / "lib").mkdir(parents=True)
             (output / "share/llaminar").mkdir(parents=True)
             library = output / f'lib/libamdhip64.so.{pins["LLAMINAR_HIP_LIBRARY_VERSION"]}'
@@ -4048,9 +4065,8 @@ class InfrastructureTests(unittest.TestCase):
                 with self.subTest(receipt=name):
                     marker.write_text(":".join(receipt) + "\n")
                     result = subprocess.run(
-                        ["bash", str(ROOT / "scripts/docker/install-hip-graph-runtime.sh")],
-                        env={**os.environ, "ROCM_PATH": str(sdk),
-                             "HIP_RUNTIME_INSTALL_PREFIX": str(output)},
+                        ["/bin/bash", str(ROOT / "scripts/docker/install-hip-graph-runtime.sh")],
+                        env=environment,
                         text=True, capture_output=True, timeout=10)
                     if current:
                         self.assertEqual(result.returncode, 0, result.stderr)
@@ -4076,17 +4092,20 @@ class InfrastructureTests(unittest.TestCase):
                         alias.unlink()
                         if operation == "stock":
                             alias.symlink_to(stock.name)
-                        result = subprocess.run(
-                            ["bash", str(ROOT / "scripts/docker/install-hip-graph-runtime.sh")],
-                            env={**os.environ, "ROCM_PATH": str(sdk),
-                                 "HIP_RUNTIME_INSTALL_PREFIX": str(output)},
-                            text=True, capture_output=True, timeout=10)
+                        try:
+                            result = subprocess.run(
+                                ["/bin/bash", str(ROOT / "scripts/docker/install-hip-graph-runtime.sh")],
+                                env=environment,
+                                text=True, capture_output=True, timeout=10)
+                        finally:
+                            # Restore each loader entry even when its negative
+                            # control fails, so later controls remain independent.
+                            if alias.is_symlink():
+                                alias.unlink()
+                            alias.symlink_to(target)
                         self.assertNotEqual(result.returncode, 0)
                         self.assertNotIn("already installed", result.stdout)
                         self.assertIn("matching amdrocm-llvm-dev", result.stderr)
-                        if alias.is_symlink():
-                            alias.unlink()
-                        alias.symlink_to(target)
 
     def test_hip_runtime_installer_rejects_an_unreviewed_sdk_before_building(self):
         """An SDK override must not silently mix a pinned HIP runtime ABI."""

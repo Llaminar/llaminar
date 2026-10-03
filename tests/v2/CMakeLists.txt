@@ -3381,6 +3381,7 @@ add_test(NAME V2_Integration_DevelopPRGateContract
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_develop_image_gate.py
             DevelopImageGateTests.test_develop_pr_builds_one_isa_and_runs_only_installed_prerequisites
             DevelopImageGateTests.test_prerequisites_execute_in_exact_test_image_without_model_mounts
+            DevelopImageGateTests.test_develop_auto_merge_waits_for_protected_pr_gate
 )
 set_tests_properties(V2_Integration_DevelopPRGateContract PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;PullRequest;Regression"
