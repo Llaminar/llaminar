@@ -1,6 +1,6 @@
 name: Arm develop PR auto-merge
 
-# This trusted base-branch workflow only enables GitHub's native auto-merge.
+# This trusted default-branch workflow only enables GitHub's native auto-merge.
 # It never checks out or executes PR code. The develop ruleset, not this job,
 # decides whether the required image-bound Unit/preflight check has passed.
 on:
@@ -9,10 +9,10 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
-  # Enabling a merge needs repository write authority, not only PR metadata
-  # writes. This trusted workflow never checks out or executes proposed code.
-  contents: write
-  pull-requests: write
+  # The dedicated repository credential owns merge authority. The built-in
+  # token stays read-only and must not suppress the develop push workflow.
+  contents: read
+  pull-requests: read
 
 jobs:
   arm:
@@ -23,9 +23,12 @@ jobs:
     steps:
       - name: Squash-merge automatically after the required check succeeds
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.DEVELOP_AUTOMERGE_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash
+          : "${GH_TOKEN:?Repository secret DEVELOP_AUTOMERGE_TOKEN is required for auto-merge and post-merge CI}"
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash \
+            --match-head-commit "$PR_HEAD_SHA"

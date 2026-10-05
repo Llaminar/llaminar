@@ -11,6 +11,18 @@ routes local development checks, model diagnostics, and this full image gate.
 
 ## Feature PRs into develop
 
+Ordinary work starts from current `develop` on a branch named
+`feat/short-feature-description`. Commit messages and PR titles use
+Conventional Commits. After its required checks pass, the feature PR
+squash-merges into `develop`. Only explicit user direction starts the separate
+`develop`-to-`master` release PR and its full certification/release workflow.
+
+Documentation and CI/CD workflow maintenance may be committed and pushed
+directly to `develop` with `[skip ci]` and `git commit --no-verify`. Keep this
+exception limited to those changes; production code still uses the feature PR
+and its required gates. Restore any temporary maintenance exception in the
+develop ruleset immediately after the push.
+
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
 `develop`. It builds only the AVX512 full-backend image pair and executes the
 complete Unit and `ProductionTestPreflight` transaction **inside its installed
@@ -21,10 +33,28 @@ include the proposed integration with `develop`.
 The active `develop` ruleset requires this exact GitHub Actions check, an
 up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
 are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
-auto-merge for same-repository, non-draft PRs. It runs on the trusted base
-branch, does not check out PR code, and cannot merge before the required
-image-bound check succeeds. Fork PRs cannot run on the privileged host runner;
-import a reviewed branch into this repository before requesting this gate.
+auto-merge for same-repository, non-draft PRs. GitHub loads this
+`pull_request_target` policy from the trusted default branch, `master`, even
+when the PR targets `develop`. That installed copy uses the dedicated
+`DEVELOP_AUTOMERGE_TOKEN` repository secret; changing only the develop copy
+cannot repair the live policy. It does not check out PR code and cannot merge
+before the required image-bound check succeeds. Fork PRs cannot run on the
+privileged host runner; import a reviewed branch into this repository before
+requesting this gate.
+
+The automation secret is a fine-grained personal access token limited to
+`Llaminar/llaminar`, with Contents and Pull requests write permissions. It has
+no Administration permission and no ruleset bypass. The built-in
+`GITHUB_TOKEN` remains read-only: using it to merge would suppress the ordinary
+develop push workflow. A missing automation secret fails the arm job explicitly;
+there is no substitution of credentials. The command also authenticates the
+event's exact head SHA so a stale job cannot arm a changed candidate.
+
+Create the token in GitHub's fine-grained token settings with resource owner
+`Llaminar` and only repository `llaminar`, then install or rotate it through
+`gh secret set DEVELOP_AUTOMERGE_TOKEN --repo Llaminar/llaminar`. This command
+prompts for the value; credential values do not belong in source or evidence
+files. Replace the secret before its configured expiration.
 
 The workflow calls the existing `run_develop_image_gate.py --cpu-isa AVX512`
 without `--publish`. It runs no AVX2 lane, model discovery/staging, generation,
