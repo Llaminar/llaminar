@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Wait for the exact develop push to publish its tested runtime image pair.
+"""Wait for exact develop image publication from a push or explicit CI run.
 
 The PR gate cannot use a mutable ``develop`` tag or assume GitHub scheduled
-push CI before pull-request CI. This metadata-only wait consumes no accelerator
-lease; the later E2E job pulls source-pinned tags and reauthenticates labels.
+image CI before pull-request CI. Both supported triggers execute the same
+build, Unit, preflight and publication transaction in ``ci.yml``. Explicit
+runs admit an exact source after documentation/CI maintenance skipped push CI.
+This metadata-only wait consumes no accelerator lease; the later E2E job pulls
+source-pinned tags and reauthenticates labels.
 """
 from __future__ import annotations
 
@@ -24,15 +27,38 @@ def github_json(endpoint: str, *fields: str) -> dict:
 
 
 def matching_ci_runs(response: dict, revision: str) -> list[dict]:
-    """Keep only exact develop push runs; never accept a nearby branch tag."""
+    """Select exact develop publication runs from the canonical CI endpoint.
+
+    Args:
+        response: Workflow-run metadata already scoped to ``ci.yml``.
+        revision: Full source commit required by the release candidate.
+
+    Returns:
+        Push or explicit manual runs for that commit on develop. Other
+        branches, revisions and triggers cannot admit the candidate.
+    """
     return [run for run in response.get("workflow_runs", [])
             if run.get("head_sha") == revision and run.get("head_branch") == "develop"
-            and run.get("event") == "push"]
+            and run.get("event") in {"push", "workflow_dispatch"}]
 
 
 def wait_for_image_gate(repository: str, revision: str, timeout_seconds: int,
                         poll_seconds: int = 20) -> int:
-    """Return the successful CI run ID or fail on a final red exact-source run."""
+    """Wait for the same exact-source publication contract on either CI trigger.
+
+    Args:
+        repository: GitHub owner/repository holding the canonical workflow.
+        revision: Full develop HEAD commit required by the release candidate.
+        timeout_seconds: Maximum metadata-admission wait.
+        poll_seconds: Delay between workflow metadata reads.
+
+    Returns:
+        Identifier of a successful exact-source develop image publication.
+
+    Raises:
+        ValueError: Develop has moved or all exact-source runs finished red.
+        TimeoutError: Publication did not finish within the admission budget.
+    """
     branch = github_json(f"repos/{repository}/branches/develop")
     if branch.get("commit", {}).get("sha") != revision:
         raise ValueError("PR head is no longer the current develop branch tip")
@@ -41,7 +67,7 @@ def wait_for_image_gate(repository: str, revision: str, timeout_seconds: int,
     while True:
         response = github_json(
             f"repos/{repository}/actions/workflows/ci.yml/runs",
-            "branch=develop", f"head_sha={revision}", "event=push", "per_page=20")
+            "branch=develop", f"head_sha={revision}", "per_page=20")
         runs = matching_ci_runs(response, revision)
         complete = [run for run in runs if run.get("status") == "completed"]
         passed = [run for run in complete if run.get("conclusion") == "success"]

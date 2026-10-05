@@ -247,7 +247,11 @@ tests and publishes both AVX512 and AVX2 develop images. These images are
 development artifacts; this gate does not certify a release.
 
 Only upon explicit user direction, open a release PR from `develop` into
-`master`. The master workflow admits the exact develop source and published
+`master`. First ensure the develop image gate has published both ISA images
+for the current develop HEAD. If documentation/CI maintenance skipped that
+head's push CI, run `gh workflow run ci.yml --ref develop --repo Llaminar/llaminar`
+and wait for the published pair before opening the PR.
+The master workflow admits the exact develop source and published
 image pair, runs the full canonical E2E suite on both ISAs, then the published
 benchmark gates. Merge only after all required checks pass. The merge cuts a
 release through the canonical release workflow, promoting the same tested

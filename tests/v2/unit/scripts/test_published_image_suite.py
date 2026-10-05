@@ -995,6 +995,40 @@ class PublishedImageSuiteTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no longer the current develop"):
                 image_wait.wait_for_image_gate("Llaminar/llaminar", revision, 1)
 
+    def test_pr_wait_accepts_exact_manual_image_publication_after_skipped_ci(self):
+        """An explicit develop CI run must pass before its exact pair is admitted."""
+        revision = "a" * 40
+        branch = {"commit": {"sha": revision}}
+        complete = {"id": 9, "head_sha": revision, "head_branch": "develop",
+                    "event": "workflow_dispatch", "status": "completed", "conclusion": "success"}
+        response = {"workflow_runs": [complete]}
+        self.assertEqual(image_wait.matching_ci_runs(response, revision), [complete])
+        active = {"workflow_runs": [{**complete, "status": "in_progress", "conclusion": None}]}
+        with patch.object(image_wait, "github_json", side_effect=[branch, active, response]) as github, \
+                patch.object(image_wait.time, "sleep") as sleep:
+            self.assertEqual(image_wait.wait_for_image_gate("Llaminar/llaminar", revision, 1), 9)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(github.call_count, 3)
+        self.assertNotIn("event=push", github.call_args.args)
+
+    def test_pr_wait_rejects_red_manual_image_publication_and_unrelated_events(self):
+        """Manual admission retains exact-source, develop-only and success requirements."""
+        revision = "a" * 40
+        branch = {"commit": {"sha": revision}}
+        candidate = {"id": 9, "head_sha": revision, "head_branch": "develop",
+                     "event": "workflow_dispatch", "status": "completed", "conclusion": "success"}
+        unrelated = [{**candidate, "head_sha": "b" * 40},
+                     {**candidate, "head_branch": "master"},
+                     {**candidate, "event": "pull_request"},
+                     {**candidate, "event": "workflow_run"}]
+        self.assertEqual(image_wait.matching_ci_runs({"workflow_runs": unrelated}, revision), [])
+        for conclusion in ("failure", "cancelled", "timed_out", "skipped"):
+            with self.subTest(conclusion=conclusion), \
+                    patch.object(image_wait, "github_json", side_effect=[branch, {
+                        "workflow_runs": [{**candidate, "conclusion": conclusion}]}]):
+                with self.assertRaisesRegex(ValueError, "without publishing both ISAs"):
+                    image_wait.wait_for_image_gate("Llaminar/llaminar", revision, 1)
+
     def test_master_release_dates_and_ref_tags_are_unambiguous(self):
         day = "2026-09-23"
         master = "d" * 40

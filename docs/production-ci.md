@@ -86,7 +86,8 @@ separate, broader gate.
 
 ## Develop branch image gate
 
-`.github/workflows/ci.yml` is enabled only for pushes to `develop`. It runs
+`.github/workflows/ci.yml` runs for pushes to `develop` and explicit manual
+dispatches on `develop`. It runs
 `scripts/ci/run_develop_image_gate.py`, which builds AVX512 and AVX2
 full-backend test-runner/runtime pairs, runs the complete Unit and
 `ProductionTestPreflight` transaction inside each test runner, then publishes
@@ -282,10 +283,17 @@ flowchart TD
 
 ## Master PR certification and release
 
+Upon explicit user direction to release, first ensure both develop images
+exist for the current develop HEAD. If documentation or CI/CD maintenance
+used `[skip ci]`, explicitly run
+`gh workflow run ci.yml --ref develop --repo Llaminar/llaminar` and wait for
+its published pair before opening the release PR. This executes the same
+complete image gate as a develop push; it does not replace any master PR check.
+
 A same-repository PR from `develop` to `master` triggers
 `.github/workflows/master-pr-certification.yml`. Its first job waits for the
-successful develop push image gate at the PR's **exact head SHA**. It never
-substitutes the mutable `develop` tag. The required E2E check pulls that
+successful develop push or manual image gate at the PR's **exact head SHA**.
+It never substitutes the mutable `develop` tag. The required E2E check pulls that
 source-pinned AVX512/AVX2 pair, verifies image labels and source tree, and runs
 the full canonical HTTP suite. The required benchmark check then consumes the
 completed E2E pair receipt and runs every tagged benchmark cell on those same
