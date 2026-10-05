@@ -68,6 +68,28 @@ namespace llaminar2
         { return static_cast<std::size_t>(rows_.capacity()) * elements_per_row_; }
 
         /**
+         * @brief Bind an optional persistent device-only useful-byte receipt.
+         * @param counter Aligned device UINT64 retained through graph retirement.
+         * @return A new immutable declaration; arithmetic and row authority are unchanged.
+         * @throws std::invalid_argument For a null/misaligned counter or fixed rows.
+         *
+         * This opt-in diagnostic observes native payload, never schedules work
+         * or creates a host count authority. Production declarations omit it.
+         */
+        [[nodiscard]] NativeCollectiveRows withPayloadReceipt(unsigned long long *counter) const
+        {
+            if (!counter || !rows_.countOwner() ||
+                reinterpret_cast<std::uintptr_t>(counter) % alignof(unsigned long long))
+                throw std::invalid_argument("Native payload receipt requires counted rows and an aligned device counter");
+            auto observed = *this;
+            observed.payload_receipt_ = counter;
+            return observed;
+        }
+
+        /** @return Optional device-only observation counter, never a row count authority. */
+        [[nodiscard]] unsigned long long *payloadReceipt() const noexcept { return payload_receipt_; }
+
+        /**
          * @brief Check the native byte ABI before recording any operation.
          * @param element_bytes Exact scalar storage width (1, 2, 4 or 8 bytes).
          * @param banks Number of physical rank banks in the largest operand.
@@ -88,5 +110,6 @@ namespace llaminar2
     private:
         DeviceRowRange rows_; ///< Borrowed device authority, or exact fixed rows.
         std::size_t elements_per_row_; ///< Immutable native scalar geometry.
+        unsigned long long *payload_receipt_ = nullptr; ///< Optional borrowed diagnostic storage, not execution state.
     };
 }

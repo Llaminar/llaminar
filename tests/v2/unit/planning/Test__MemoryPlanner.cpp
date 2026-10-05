@@ -3210,3 +3210,81 @@ TEST(Test__MemoryPlanner, EffectiveKVSnapshotRejectsIncompleteOrOverflowingInven
     cfg.graph_snapshot_memory.effective_kv->layer = profile.n_layers;
     EXPECT_THROW(MemoryPlanner::plan(profile, {cfg}), std::invalid_argument);
 }
+
+/**
+ * @test Prefix admission retains the complete native-gather publication.
+ *
+ * The physical head is half-width on both backends. Runtime archives the
+ * assembled FP32 vocabulary row, so its fixed prefix slot must use full width.
+ * A distributed shard without this local publication keeps its local row.
+ * Exact three-slot budgets expose the old rounding error before GPU startup.
+ */
+TEST(Test__MemoryPlanner, NativeVocabularyPrefixAdmissionUsesPublishedRows)
+{
+    auto profile = createQwen36HybridMTPStateProfile();
+    profile.n_heads = 24;
+    profile.n_kv_heads = 4;
+    profile.head_dim = 256;
+    profile.d_ff = 17408;
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        const auto assignments = TensorParallelConfig::proportionalSplit(
+            {device, DeviceId(device.type, 1)}, {1.0f, 1.0f},
+            profile.n_heads, profile.n_kv_heads, profile.d_ff, profile.vocab_size);
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ULL << 30;
+        cfg.device_compute_units = 60;
+        cfg.first_layer = 0;
+        cfg.last_layer = 63;
+        cfg.total_shards = 2;
+        cfg.bindTensorParallelAssignment(assignments.forRank(0));
+        cfg.batch_size = 1;
+        cfg.max_seq_len = 8192;
+        cfg.activation_seq_len = 512;
+        cfg.kv_precision = "fp16";
+        cfg.mtp_enabled = true;
+        cfg.mtp_target_query_rows = 16;
+        cfg.prefix_cache = PrefixCacheRuntimeConfig{};
+        cfg.mtp_terminal_logits_layout =
+            MTPTerminalLogitsLayout::VocabularyShardPerParticipant;
+        cfg.associated_host_memory = PhysicalMemoryResource{
+            .world_rank = -1, .device = DeviceId::cpu(),
+            .total_bytes = 64ULL << 30, .admission_available_bytes = 64ULL << 30};
+        const auto main_block = KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            KVCacheFamily::Hybrid, cfg.prefix_cache.block_size,
+            2, profile.head_dim, cfg.kv_precision, device);
+        const auto shifted_block = KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            KVCacheFamily::AttentionOnly, cfg.prefix_cache.block_size,
+            2, profile.head_dim, cfg.kv_precision, device);
+        const auto recurrent = HybridGDNStateGeometry::resolve(profile.n_heads,
+            0, 12, profile.gdn_group_count, profile.gdn_time_step_rank,
+            profile.gdn_state_size, profile.gdn_inner_size,
+            profile.gdn_conv_kernel_size).deviceSerializedPayloadBytes(48);
+        const size_t non_logit_payload = 16 * main_block.totalBytes() +
+            shifted_block.totalBytes() + recurrent + profile.d_model * sizeof(float);
+        for (const auto publication : {
+                 MTPTerminalLogitsCollective::None,
+                 MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather})
+        {
+            SCOPED_TRACE(device.toString() + ":" + std::to_string(static_cast<int>(publication)));
+            cfg.local_tp_backend = publication ==
+                    MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather
+                ? std::optional(device.is_cuda() ? CollectiveBackendType::NCCL
+                                                : CollectiveBackendType::RCCL)
+                : std::nullopt;
+            ASSERT_EQ(cfg.terminalLogitsCollective(true), publication);
+            const size_t published_columns = publication ==
+                    MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather
+                ? profile.vocab_size : assignments.forRank(0).vocab_count;
+            const size_t archive_slot = non_logit_payload + published_columns * sizeof(float);
+            cfg.prefix_cache.device_budget_bytes = 3 * archive_slot;
+            const auto plan = MemoryPlanner::plan(profile, {cfg});
+            const auto entry = std::find_if(plan.devices.begin(), plan.devices.end(),
+                [&](const auto &candidate) { return candidate.device() == device; });
+            ASSERT_NE(entry, plan.devices.end());
+            EXPECT_EQ(entry->prefix_cache_device_hot_bytes(), 3 * archive_slot)
+                << "The archived gathered surface must match the physical-memory certificate.";
+        }
+    }
+}

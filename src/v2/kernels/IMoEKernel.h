@@ -14,6 +14,9 @@
  *
  * CPU implementation: CPUMoEKernel (src/v2/kernels/cpu/moe/)
  * GPU implementations can override for device-native execution.
+ * Grouped projection publications permit unspecified prior output bytes.
+ * Complete writers and exact consumed extents precede ordered publication;
+ * active accumulation and persistent routing metadata retain their own state.
  */
 
 #pragma once
@@ -3314,6 +3317,11 @@ namespace llaminar2
          * until its consumer has completed; this call adds neither transport nor
          * a second placement authority. Descriptor IDs describe the same source
          * family in every phase, including phases that do not read their weights.
+         * Down output storage may contain arbitrary prior bytes. Its checked
+         * token/route extent must fit before enqueue; successful writers define
+         * every consumed slot, including absent-route zeros, before publishing
+         * the exact-stream completion event. Unused allocation capacity remains
+         * unspecified. Gate/up cannot publish or require this down output.
          *
          * @param hidden FP32 input [seq_len, d_model], required only for gate/up.
          * @param output FP32 [seq_len, columnCount()] down result, unless canonical output is supplied.

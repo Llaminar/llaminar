@@ -105,6 +105,11 @@ namespace llaminar2
         bool allreduceOnStream(TensorBase *tensor, const std::string &stage_name,
                                size_t count, void *stream,
                                const std::string &precision = "") override;
+
+        /** @copydoc ILocalTPContext::allreduceRequestRowsOnStream */
+        bool allreduceRequestRowsOnStream(TensorBase *tensor,
+            const std::string &stage_name, const NativeAllreduceRequestRows &request_rows,
+            void *producer_stream, const std::string &precision) override;
         /** @brief Reuse canonical sum/precision logic, deferring publication to the paired join. */
         bool allreduceAcquiredInput(
             const AcquiredDeviceTransferInput &input,
@@ -547,11 +552,12 @@ namespace llaminar2
         // =====================================================================
         // FP16 Mixed-Precision Allreduce Scratch Buffers
         // =====================================================================
-        // When allreduce precision is "fp16" (set per-layer via schema,
-        // GraphConfig override, or LLAMINAR_ALLREDUCE_PRECISION), FP32 allreduces cast to FP16 first.
-        // cast to FP16 first to halve PCIe transfer bandwidth. These device-local
-        // scratch buffers hold the FP16 temporary. They are reserved once during
-        // graph setup and are immutable throughout eager execution and capture.
+        // The global native GPU sum default casts resident FP32 activations to
+        // FP16 transport. Explicit graph/CLI/debug precision may select FP32;
+        // graph-declared lossless assembly retains its own FP32 contract. These
+        // participant-local buffers hold the FP16 temporary and belong to the
+        // canonical collective BOM. Setup reserves them once; captured replay
+        // reuses their immutable pointers and capacities without allocation.
 
         /// FP16 scratch buffer per device (void* to backend-owned device memory).
         std::vector<void *> fp16_scratch_buffers_;
@@ -627,7 +633,7 @@ namespace llaminar2
         bool allreduceImpl(TensorBase *tensor);
 
         /** @brief The caller either owns the exact producer or a paired graph join. */
-        enum class AllreducePublication { ExactProducer, PairedGraphJoin };
+        enum class AllreducePublication { ExactProducer, PairedGraphJoin, EnclosingRequestBanks };
 
         /**
          * @brief Sole explicit-stream sum implementation with explicit publication ownership.
@@ -643,13 +649,15 @@ namespace llaminar2
          * @param precision Graph-resolved wire precision.
          * @param publication Whether this operation or its paired join publishes.
          * @param live_rows Optional exact prefix binding, forwarded through precision conversion and grouping.
+         * @param element_offset Checked bank origin within the owning tensor; nonzero requires native live rows.
          * @return Whether the complete operation was successfully submitted.
          */
         bool enqueueAllreduceOnStream(TensorBase *tensor, const std::string &stage_name,
                                       size_t count, void *stream,
                                       const std::string &precision,
                                       AllreducePublication publication,
-                                      const NativeCollectiveRows *live_rows = nullptr);
+                                      const NativeCollectiveRows *live_rows = nullptr,
+                                      size_t element_offset = 0);
 
         bool rendezvousOnStreamCollective(int device_index,
                                           TensorBase *tensor,

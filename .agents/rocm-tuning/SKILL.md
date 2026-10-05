@@ -59,6 +59,16 @@ trade architecture for an isolated microbenchmark win:
   record/wait edges, and collectives must be capturable. Homogeneous GPU
   inference requires one complete captured graph; segmented execution is not a
   tuning fallback.
+- **Treat reusable scratch as dirty.** Use `WorkspaceOverwriteContract.h` for
+  checked consumed extents and successful producer-before-reader/publication
+  submission on the exact stream. Dense/shared projections and routed MoE must
+  overwrite every consumed slot; inactive public contributions are explicit
+  zeros, while unowned intermediate capacity stays unspecified. Preserve
+  initialization for atomic/read-modify-write accumulation, recurrent state and
+  routing/protocol sentinels. Poison quantization, activation and partial banks
+  across retained large/small/empty graphs, compare serial output bytes, and
+  prove actual native clear removal separately from correctness. Qualify an
+  installed change with all-format gates and matched Release HTTP/model runs.
 
 The full reference write-up lives at
 `src/v2/kernels/rocm/gemm/README.vnni-gemm-tuning.md` (and the companion
@@ -79,6 +89,16 @@ captured graph. They do not fabricate per-stage attribution inside a monolithic
 graph; use rocprof for that dispatch-level view. `LLAMINAR_PROFILING=1` is
 deprecated and exists only as a warning compatibility alias to these PerfStats
 requests. It must never disable graph capture or select eager execution.
+
+The named captured-stage report described by the
+[CUDA native-event workflow](../cuda-tuning/references/native-graph-events.md#captured-model-stage-timing)
+currently has a CUDA observer. Its shared setup annotation ABI can name ROCm
+stages, but that metadata alone does not implement HIP event observation; do
+not load the CUDA DSO into a ROCm process or claim HIP stage measurements from
+it. A HIP implementation must prove exact-stream event ownership, retained
+capture/replay bytes and paired token/MTP/prefix work before reporting stage
+intervals. Keep overlap, empty scopes and opaque conditional bodies explicit,
+and retain unprofiled Release timing as the throughput authority.
 
 ---
 

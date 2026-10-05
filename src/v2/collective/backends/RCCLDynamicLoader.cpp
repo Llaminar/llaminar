@@ -452,6 +452,9 @@ namespace llaminar2
             unsigned long long *payload_bytes, ncclComm_t comm, void *stream)
         {
             if (!send || !receive || !comm || !stream) return ncclInvalidArgument;
+            if (payload_bytes && rows.payloadReceipt() && payload_bytes != rows.payloadReceipt())
+                return ncclInvalidArgument;
+            if (rows.payloadReceipt()) payload_bytes = rows.payloadReceipt();
             // Fully-live rows retain exactly the ordinary native API. A passive
             // receipt is available only for the device-counted implementation.
             if (!rows.rows().countOwner())

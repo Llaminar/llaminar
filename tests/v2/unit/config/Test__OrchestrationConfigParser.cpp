@@ -13,6 +13,7 @@
  * - Error handling for malformed input
  * - Validation of enum-type arguments
  * - Startup CLI publication into an already-read kernel environment snapshot
+ * - Shared CUDA/ROCm capture buckets with an unchanged activation ceiling
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -97,7 +98,7 @@ TEST(Test__OrchestrationConfigParser, PrefillDefaultsCapWorkspaceNotContext)
     const auto config = parser.parseArgs(args.argc(), args.argv());
     EXPECT_EQ(config.max_seq_len, 131072);
     EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes,
-              (std::vector<int>{64, 128, 256, 384, 512}));
+              (std::vector<int>{64, 128, 256, 384, 448, 512}));
     for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
         EXPECT_EQ(resolveActivationBufferSeqLen(config.max_seq_len, device), 512);
 }

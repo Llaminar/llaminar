@@ -1,6 +1,13 @@
-/** @file GDNProjectionStage.cpp
- * @brief Implementation of GDN 4-projection stage
- * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
+/**
+ * @file GDNProjectionStage.cpp
+ * @brief Group GDN projections by their prepared engines' arithmetic contracts.
+ *
+ * Every projection owns its decoder and immutable prepared weights. Native
+ * codebooks can share activation quantization and persistent concurrent streams;
+ * floating engines still require equal physical weight precision. Verifier
+ * groups retain serial-row reduction order and borrow device-owned live counts.
+ * A failed group terminates the transaction without retrying already submitted
+ * work. Arena bindings outlive every retained graph that consumes their scratch.
  */
 
 #include "GDNProjectionStage.h"
@@ -21,6 +28,7 @@ namespace llaminar2
 {
     namespace
     {
+        /** @return The prepared native decoder identity, or no native descriptor. */
         std::optional<uint8_t> nativeVNNICodebook(ITensorGemm *kernel)
         {
             if (!kernel)
@@ -32,11 +40,20 @@ namespace llaminar2
             return desc.codebook_id;
         }
 
+        /** @return Whether both projections use the same backend engine class. */
         bool sameKernelType(const ITensorGemm *lhs, const ITensorGemm *rhs)
         {
             return lhs && rhs && typeid(*lhs) == typeid(*rhs);
         }
 
+        /**
+         * @brief Check the grouping contract independently of decoder identity.
+         * @param lhs Prepared engine that would submit the fused group.
+         * @param rhs Prepared engine owning another projection's weight decoder.
+         * @param lhs_codebook Immutable native metadata from @p lhs, if present.
+         * @param rhs_codebook Immutable native metadata from @p rhs, if present.
+         * @return Whether one backend fused entrypoint can consume both engines.
+         */
         bool fusedProjectionCompatible(
             ITensorGemm *lhs,
             ITensorGemm *rhs,
@@ -47,15 +64,17 @@ namespace llaminar2
                 return false;
 
             /*
-             * Native-VNNI engines are compatible only when the decoder
-             * codebook agrees.  A single grouped launch is driven by the seed
-             * engine, so accepting a different codebook here would make that
-             * engine reinterpret the following projection's packed bytes.
+             * TensorProjectionDesc retains each prepared engine. CUDA/ROCm
+             * select the decoder and canonical reduction policy from that
+             * projection, never from the seed engine. Different native
+             * codebooks therefore share quantization while keeping independent
+             * scratch and stream ownership. Splitting by codebook serializes
+             * those branches and needlessly quantizes the same input again.
              */
             if (lhs_codebook.has_value() != rhs_codebook.has_value())
                 return false;
             if (lhs_codebook.has_value())
-                return lhs_codebook.value() == rhs_codebook.value();
+                return true;
 
             /*
              * Floating GEMM implementations use one C++ class for FP16,
@@ -399,9 +418,9 @@ namespace llaminar2
         bindStageStream(gemm_a);
         bindStageStream(gemm_b);
 
-        // Fused 4-projection GEMM: quantizes input once, single OMP region
-        // for decode (M=1). For prefill (M>1), falls back to sequential GEMMs
-        // inside the kernel but still avoids 4 separate stage-level dispatches.
+        // Each compatible group quantizes once. GPU prefill can fork its
+        // persistent projection streams; CPU decode shares one OpenMP region.
+        // Every descriptor retains the prepared decoder and reduction policy.
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {gemm_qkv, C_qkv, params_.n_qkv, nullptr, "qkv"},
             {gemm_z, C_z, params_.n_z, nullptr, "z"},
@@ -421,9 +440,9 @@ namespace llaminar2
              * Group verifier projections only when the prepared GEMM engines
              * can legally share one fused decode path.  The verifier rows must
              * be bitwise-equivalent to running the decode stage once per row;
-             * mixing native VNNI projections with different codebooks under the
-             * first projection's kernel can decode the later projections with
-             * the wrong format even though the C++ kernel type is identical.
+             * every native descriptor keeps its own decoder and arithmetic
+             * policy. Floating projections still group by physical precision
+             * even when their C++ engine class is identical.
              */
             auto try_grouped_verifier_projections =
                 [&](const std::vector<ITensorGemm::TensorProjectionDesc> &all_projections) -> bool
@@ -486,15 +505,13 @@ namespace llaminar2
                 fusedProjectionCompatible(gemm_qkv, gemm_a, native_codebooks[0], native_codebooks[2]) &&
                 fusedProjectionCompatible(gemm_qkv, gemm_b, native_codebooks[0], native_codebooks[3]);
 
-            if ((homogeneous_projection_group &&
-                 gemm_qkv->multiply_fused_verifier_rows_decode_equivalent(
-                     A_base,
-                     projections,
-                     M,
-                     K,
-                     nullptr,
-                     bound_workspace_)) ||
-                try_grouped_verifier_projections(projections))
+            // Select the legal grouping before submission. Retrying a failed
+            // homogeneous group would duplicate an unknown prefix of GPU work.
+            const bool verifier_success = homogeneous_projection_group
+                ? gemm_qkv->multiply_fused_verifier_rows_decode_equivalent(
+                      A_base, projections, M, K, nullptr, bound_workspace_)
+                : try_grouped_verifier_projections(projections);
+            if (verifier_success)
             {
                 recordGDNProjectionRoute(
                     homogeneous_projection_group

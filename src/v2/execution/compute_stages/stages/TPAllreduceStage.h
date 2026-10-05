@@ -127,6 +127,7 @@ namespace llaminar2
         std::vector<LocalTPCollectiveSidebandBuffer> sidebands; ///< Optional same-stream control sidebands.
         std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings; ///< Workspace-resolved sidebands.
         std::optional<NativeCollectiveRows> live_rows; ///< Device-owned prefix; count retains the admitted bank stride.
+        std::optional<NativeAllreduceRequestRows> request_rows; ///< Independent prefixes in fixed request-major banks.
     };
 
     /**

@@ -2339,7 +2339,8 @@ namespace llaminar2
             int row_count,
             int32_t *out_tokens) override;
         bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
-        bool usesMirroredMTPHeadForVerifier() const override;
+        /** @return Whether the actual terminal graph publishes full logits through a head or native gather. */
+        bool publishesFullVocabularyMTPLogits() const override;
         bool verifyGreedyAllPositionBatchOutcomeOnDevice(
             const int32_t *draft_tokens,
             int draft_token_count,
@@ -4529,13 +4530,16 @@ namespace llaminar2
         size_t localLogitsRowStrideColumns(const TensorBase *tensor) const;
         int localLogitsVocabOffset() const;
         bool activeMainLogitsAreColumnParallel() const;
+        /** @return Whether the completed predictor graph publishes only local vocabulary columns. */
         bool mtpSidecarLogitsAreColumnParallel() const;
+        /** @return Exact predictor output bank after any graph-owned native vocabulary gather. */
+        BufferId mtpSamplingLogitsBufferId() const;
 
         /**
          * @brief Decide whether one MTP sidecar graph owns a logits allgather.
          * @param kv_cache_only True for the shifted-prefill cache-population graph.
          * @return True only for a full sidecar whose participant output is a
-         *         vocabulary shard inside a multi-rank GlobalTP domain.
+         *         vocabulary shard inside an explicit native local or global TP domain.
          *
          * The decision deliberately delegates participant output ownership to
          * `GraphConfig::mtpTerminalLogitsLayout()`. This prevents orchestration
@@ -4543,7 +4547,7 @@ namespace llaminar2
          * sharding bit and accidentally gathering a mirrored full-vocabulary
          * result.
          */
-        bool mtpSidecarRequiresGlobalLogitsGather(bool kv_cache_only) const;
+        bool mtpSidecarRequiresLogitsGather(bool kv_cache_only) const;
 
         bool allPositionVerifierGraphWritesLocalLogits(int graph_token_count = -1) const;
         bool activeAllPositionLogitsAreColumnParallel(int graph_token_count = -1) const;

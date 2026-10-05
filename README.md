@@ -227,7 +227,10 @@ previous prompts, is enabled by default. If you expose the server to other
 machines, use a trusted network or an authenticated proxy.
 
 Head placement is automatic too: CPU tensor-parallel execution splits the
-vocabulary projection across participants; CUDA and ROCm keep a mirrored head.
+vocabulary projection across participants. Dense Qwen3.8 27B with a Q6_K head
+and dynamic MTP also uses vocabulary shards on a local pair of RTX 3090 or
+MI50 cards with the measured two- or fifteen-draft graph envelope and a
+replicated sidecar. Other CUDA and ROCm configurations keep a mirrored head.
 For experiments, `--mtp-terminal-head-policy vocabulary-sharded` or
 `--mtp-terminal-head-policy mirrored-full-vocabulary` overrides that choice.
 
@@ -340,7 +343,10 @@ Before running a recipe, download its named GGUF into `MODEL_DIR` and select
 the matching NVIDIA, AMD, mixed-GPU, or CPU-only `DEVICE_ARGS` setup. All
 examples use dynamic MTP and FP16 KV-cache storage. Multi-device MoE examples
 also enable dynamic expert movement, so busy experts can move between devices
-as demand changes. Model activations remain FP32.
+as demand changes. Model activations remain FP32. Native GPU TP sums default
+to FP16 transport for dense and MoE models, including decode rows. Use
+`--tp-allreduce-precision fp32` for an explicit FP32 policy. Graph-declared
+lossless assembly and canonical rank-order folds keep their FP32 contracts.
 
 The commands ask auto to use a particular device count and strategy. The
 planner still chooses the individual devices, how layers or experts are

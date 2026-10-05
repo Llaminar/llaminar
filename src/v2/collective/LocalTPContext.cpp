@@ -3,8 +3,13 @@
  * @brief Implementation of LOCAL tensor parallelism context
  *
  * The explicit-stream sum implementation owns precision, casts, native grouping
- * and scratch admission. Ordinary calls publish their actual terminal producer;
+ * and scratch admission. Device-prefix casts and native sums consume the same
+ * ordered row authority; conversion never republishes inactive FP32 capacity.
+ * Ordinary calls publish their actual terminal producer;
  * authenticated graph forks defer only publication to their paired event join.
+ * Ragged request banks retain independent count authorities and checked tensor
+ * origins. Their ordinary casts reuse scratch after ordered cast-back, and the
+ * enclosing operation publishes only after all bank prefixes are reduced.
  * @author David Sanftenberg
  * @date January 2026
  */
@@ -62,6 +67,10 @@ extern "C"
                                    size_t count, int ordinal, cudaStream_t stream);
     cudaError_t cudaCastFP16ToFP32(const void *fp16_input, float *fp32_output,
                                    size_t count, int ordinal, cudaStream_t stream);
+    cudaError_t cudaCastLiveFP32ToFP16(const float *, void *, llaminar2::DeviceRowRange,
+        size_t columns, int ordinal, cudaStream_t stream);
+    cudaError_t cudaCastLiveFP16ToFP32(const void *, float *, llaminar2::DeviceRowRange,
+        size_t columns, int ordinal, cudaStream_t stream);
 }
 #endif
 
@@ -94,16 +103,15 @@ extern "C"
                            size_t count, int ordinal, void *stream);
     int rocmCastFP16ToFP32(const void *fp16_input, float *fp32_output,
                            size_t count, int ordinal, void *stream);
+    int rocmCastLiveFP32ToFP16(const float *, void *, llaminar2::DeviceRowRange,
+        size_t columns, int ordinal, void *stream);
+    int rocmCastLiveFP16ToFP32(const void *, float *, llaminar2::DeviceRowRange,
+        size_t columns, int ordinal, void *stream);
 }
 #endif
 
 namespace llaminar2
 {
-    namespace
-    {
-        constexpr const char *kDefaultAllreducePrecision = "fp32";
-    }
-
     std::atomic<uint64_t> LocalTPContext::next_context_id_{1};
 
     namespace
@@ -906,6 +914,52 @@ namespace llaminar2
                                         AllreducePublication::ExactProducer);
     }
 
+    bool LocalTPContext::allreduceRequestRowsOnStream(TensorBase *tensor,
+        const std::string &stage_name, const NativeAllreduceRequestRows &request_rows,
+        void *producer_stream, const std::string &precision)
+    {
+        if (!tensor || !producer_stream || degree() < 2 || request_rows.storageElements() > tensor->numel() ||
+            !tensor->current_device() || !tensor->current_device()->is_gpu() ||
+            request_rows.requestRows(0).elementsPerRow() != tensor->cols() ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL))
+            throw std::invalid_argument("Request-row allreduce requires exact resident native GPU tensor banks");
+
+        // Count publications belong outside the complete mutable tensor bank,
+        // not merely outside their own request's output. Otherwise a preceding
+        // bank could overwrite the authority that a later operation consumes.
+        const auto data = reinterpret_cast<std::uintptr_t>(tensor->gpu_data_ptr());
+        const auto counts = reinterpret_cast<std::uintptr_t>(request_rows.countOwners());
+        const auto count_bytes = static_cast<std::size_t>(request_rows.requests()) * sizeof(std::int32_t);
+        const auto element_bytes = collectiveDataTypeBytes(tensorDTypeToCollective(tensor));
+        const auto maximum = std::numeric_limits<std::uintptr_t>::max();
+        if (!data || !element_bytes || !request_rows.requestRows(0).byteGeometryValid(element_bytes, degree()) ||
+            request_rows.storageElements() > (maximum - data) / element_bytes)
+            throw std::invalid_argument("Request-row allreduce tensor byte range is invalid");
+        const auto data_end = data + request_rows.storageElements() * element_bytes;
+        if (counts < data_end && data < counts + count_bytes)
+            throw std::invalid_argument("Request-row allreduce output overlaps its count authorities");
+        const auto receipt = reinterpret_cast<std::uintptr_t>(request_rows.requestRows(0).payloadReceipt());
+        if (receipt && (receipt > maximum - sizeof(unsigned long long) ||
+            (receipt < data_end && data < receipt + sizeof(unsigned long long)) ||
+            (receipt < counts + count_bytes && counts < receipt + sizeof(unsigned long long))))
+            throw std::invalid_argument("Request-row payload receipt overlaps tensor banks or count authorities");
+
+        for (int request = 0; request < request_rows.requests(); ++request)
+        {
+            const auto rows = request_rows.requestRows(request);
+            // The bank identity is identical on every participant. Scratch is
+            // reused only after this stream's cast-back, so all request banks
+            // retain the ordinary native arithmetic and persistent reservation.
+            if (!enqueueAllreduceOnStream(tensor,
+                    stage_name + ":request_" + std::to_string(request), rows.bankElements(),
+                    producer_stream, precision, AllreducePublication::EnclosingRequestBanks,
+                    &rows, request_rows.requestElementOffset(request)))
+                return false;
+        }
+        TransferEngine::publishDeviceWrite(tensor, *tensor->current_device(), producer_stream);
+        return true;
+    }
+
     bool LocalTPContext::allreduceAcquiredInput(
         const AcquiredDeviceTransferInput &input,
         const std::string &stage_name, size_t count,
@@ -929,7 +983,8 @@ namespace llaminar2
                                                   size_t count, void *stream,
                                                   const std::string &precision,
                                                   AllreducePublication publication,
-                                                  const NativeCollectiveRows *live_rows)
+                                                  const NativeCollectiveRows *live_rows,
+                                                  size_t element_offset)
     {
         if (!stream)
         {
@@ -949,6 +1004,11 @@ namespace llaminar2
         }
 
         const size_t effective_count = (count > 0) ? count : tensor->numel();
+
+        if (element_offset > tensor->numel() || effective_count > tensor->numel() - element_offset ||
+            (element_offset && (!live_rows ||
+                (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL))))
+            throw std::invalid_argument("Allreduce bank exceeds its tensor or lacks a native prefix authority");
 
         // Counted rows are a native GPU operand, not a reason to download the
         // count at a host boundary. Precision casts retain their admitted bank;
@@ -1009,15 +1069,20 @@ namespace llaminar2
             return false;
         }
 
+        // This immutable origin selects a checked request bank. The tensor and
+        // its arena binding stay unchanged throughout capture and replay.
+        buffer = static_cast<std::byte *>(buffer) +
+            element_offset * collectiveDataTypeBytes(tensorDTypeToCollective(tensor));
+
         // =================================================================
         // FP16 mixed-precision allreduce path
         // =================================================================
-        // Precision can be set per-layer via the schema precision policy,
-        // via a graph-level override, or globally via LLAMINAR_ALLREDUCE_PRECISION.
-        // Per-call precision (from schema) takes priority over the global env.
+        // Graph construction resolves explicit selectors against the global
+        // FP16 dense/MoE default. A declared per-call arithmetic contract wins;
+        // direct callers without one consume the same parsed global policy.
         CollectiveDataType dtype = tensorDTypeToCollective(tensor);
         const std::string effective_precision =
-            precision.empty() ? std::string(kDefaultAllreducePrecision) : precision;
+            precision.empty() ? debugEnv().allreduce_precision : precision;
         const bool grouped_explicit_streams =
             backend_ == CollectiveBackendType::NCCL ||
             backend_ == CollectiveBackendType::RCCL ||
@@ -1073,19 +1138,26 @@ namespace llaminar2
 #ifdef HAVE_CUDA
                 if (devices_[device_index].device_type == DeviceType::CUDA)
                 {
-                    cast_ok = (cudaCastFP32ToFP16(
-                                   static_cast<const float *>(buffer), fp16_buf,
-                                   effective_count,
-                                   ordinal,
-                                   static_cast<cudaStream_t>(stream)) == 0);
+                    cast_ok = live_rows
+                        ? (cudaCastLiveFP32ToFP16(
+                              static_cast<const float *>(buffer), fp16_buf,
+                              live_rows->rows(), live_rows->elementsPerRow(), ordinal,
+                              static_cast<cudaStream_t>(stream)) == 0)
+                        : (cudaCastFP32ToFP16(
+                              static_cast<const float *>(buffer), fp16_buf,
+                              effective_count, ordinal, static_cast<cudaStream_t>(stream)) == 0);
                 }
 #endif
 #ifdef HAVE_ROCM
                 if (devices_[device_index].device_type == DeviceType::ROCm)
                 {
-                    cast_ok = (rocmCastFP32ToFP16(
-                                   static_cast<const float *>(buffer), fp16_buf,
-                                   effective_count, ordinal, stream) == 0);
+                    cast_ok = live_rows
+                        ? (rocmCastLiveFP32ToFP16(
+                              static_cast<const float *>(buffer), fp16_buf,
+                              live_rows->rows(), live_rows->elementsPerRow(), ordinal, stream) == 0)
+                        : (rocmCastFP32ToFP16(
+                              static_cast<const float *>(buffer), fp16_buf,
+                              effective_count, ordinal, stream) == 0);
                 }
 #endif
                 if (!cast_ok)
@@ -1132,21 +1204,26 @@ namespace llaminar2
 #ifdef HAVE_CUDA
                         if (devices_[device_index].device_type == DeviceType::CUDA)
                         {
-                            back_ok = (cudaCastFP16ToFP32(
-                                           fp16_buf,
-                                           static_cast<float *>(buffer),
-                                           effective_count,
-                                           ordinal,
-                                           static_cast<cudaStream_t>(stream)) == 0);
+                            back_ok = live_rows
+                                ? (cudaCastLiveFP16ToFP32(
+                                      fp16_buf, static_cast<float *>(buffer),
+                                      live_rows->rows(), live_rows->elementsPerRow(), ordinal,
+                                      static_cast<cudaStream_t>(stream)) == 0)
+                                : (cudaCastFP16ToFP32(
+                                      fp16_buf, static_cast<float *>(buffer),
+                                      effective_count, ordinal, static_cast<cudaStream_t>(stream)) == 0);
                         }
 #endif
 #ifdef HAVE_ROCM
                         if (devices_[device_index].device_type == DeviceType::ROCm)
                         {
-                            back_ok = (rocmCastFP16ToFP32(
-                                           fp16_buf,
-                                           static_cast<float *>(buffer),
-                                           effective_count, ordinal, stream) == 0);
+                            back_ok = live_rows
+                                ? (rocmCastLiveFP16ToFP32(
+                                      fp16_buf, static_cast<float *>(buffer),
+                                      live_rows->rows(), live_rows->elementsPerRow(), ordinal, stream) == 0)
+                                : (rocmCastFP16ToFP32(
+                                      fp16_buf, static_cast<float *>(buffer),
+                                      effective_count, ordinal, stream) == 0);
                         }
 #endif
                         if (back_ok)
@@ -2402,7 +2479,7 @@ namespace llaminar2
 
         CollectiveDataType dtype = tensorDTypeToCollective(tensor);
         const std::string effective_precision =
-            precision.empty() ? std::string(kDefaultAllreducePrecision) : precision;
+            precision.empty() ? debugEnv().allreduce_precision : precision;
         const bool use_fp16_allreduce =
             dtype == CollectiveDataType::FLOAT32 &&
             fp32SumUsesFP16Transport(effective_precision, effective_count,
@@ -2424,23 +2501,26 @@ namespace llaminar2
 #ifdef HAVE_CUDA
             if (device_group_.allCUDA())
             {
-                cast_ok = (cudaCastFP32ToFP16(
-                               static_cast<const float *>(buffer),
-                               collective_buffer,
-                               effective_count,
-                               ordinal,
-                               static_cast<cudaStream_t>(producer_stream)) == 0);
+                cast_ok = live_rows
+                    ? (cudaCastLiveFP32ToFP16(
+                          static_cast<const float *>(buffer), collective_buffer,
+                          live_rows->rows(), live_rows->elementsPerRow(), ordinal,
+                          static_cast<cudaStream_t>(producer_stream)) == 0)
+                    : (cudaCastFP32ToFP16(
+                          static_cast<const float *>(buffer), collective_buffer,
+                          effective_count, ordinal, static_cast<cudaStream_t>(producer_stream)) == 0);
             }
 #endif
 #ifdef HAVE_ROCM
             if (device_group_.allROCm())
             {
-                cast_ok = (rocmCastFP32ToFP16(
-                               static_cast<const float *>(buffer),
-                               collective_buffer,
-                               effective_count,
-                               ordinal,
-                               producer_stream) == 0);
+                cast_ok = live_rows
+                    ? (rocmCastLiveFP32ToFP16(
+                          static_cast<const float *>(buffer), collective_buffer,
+                          live_rows->rows(), live_rows->elementsPerRow(), ordinal, producer_stream) == 0)
+                    : (rocmCastFP32ToFP16(
+                          static_cast<const float *>(buffer), collective_buffer,
+                          effective_count, ordinal, producer_stream) == 0);
             }
 #endif
             if (!cast_ok)
@@ -2477,23 +2557,26 @@ namespace llaminar2
 #ifdef HAVE_CUDA
             if (device_group_.allCUDA())
             {
-                back_ok = (cudaCastFP16ToFP32(
-                               collective_buffer,
-                               static_cast<float *>(buffer),
-                               effective_count,
-                               ordinal,
-                               static_cast<cudaStream_t>(producer_stream)) == 0);
+                back_ok = live_rows
+                    ? (cudaCastLiveFP16ToFP32(
+                          collective_buffer, static_cast<float *>(buffer),
+                          live_rows->rows(), live_rows->elementsPerRow(), ordinal,
+                          static_cast<cudaStream_t>(producer_stream)) == 0)
+                    : (cudaCastFP16ToFP32(
+                          collective_buffer, static_cast<float *>(buffer),
+                          effective_count, ordinal, static_cast<cudaStream_t>(producer_stream)) == 0);
             }
 #endif
 #ifdef HAVE_ROCM
             if (device_group_.allROCm())
             {
-                back_ok = (rocmCastFP16ToFP32(
-                               collective_buffer,
-                               static_cast<float *>(buffer),
-                               effective_count,
-                               ordinal,
-                               producer_stream) == 0);
+                back_ok = live_rows
+                    ? (rocmCastLiveFP16ToFP32(
+                          collective_buffer, static_cast<float *>(buffer),
+                          live_rows->rows(), live_rows->elementsPerRow(), ordinal, producer_stream) == 0)
+                    : (rocmCastFP16ToFP32(
+                          collective_buffer, static_cast<float *>(buffer),
+                          effective_count, ordinal, producer_stream) == 0);
             }
 #endif
             if (!back_ok)

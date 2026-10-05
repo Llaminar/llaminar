@@ -10,6 +10,9 @@
  * device count; private regrouping scratch is not an alternate count authority.
  * Import restores the existing activation bits, without host inspection or an
  * extra quantization boundary, before the unchanged down projection.
+ * Grouped down publications admit dirty output storage through a checked live
+ * overwrite extent. Only a successfully enqueued complete writer can publish
+ * that output's exact-stream event; inactive routes still own explicit zeros.
  */
 
 #include "CUDAMoEKernel.h"
@@ -8804,39 +8807,47 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 return false;
             }
 
-            const bool ok = cudaMoE_grouped_floating_prefill_pipeline(
-                execution.executesGateUp() ? static_cast<const float *>(hidden->gpu_data_ptr()) : nullptr,
-                gateup_table.device_floating_gate_descs,
-                gateup_table.device_floating_up_descs,
-                down_table.device_floating_descs,
-                d_group_original_to_grouped_,
-                d_group_original_expert_ids_,
-                d_group_weights_,
-                d_prefill_gate_,
-                !execution.executesDown() || canonical_route_contributions
-                    ? nullptr
-                    : static_cast<float *>(output->gpu_data_ptr()),
-                execution.executesDown() && canonical_route_contributions
-                    ? static_cast<float *>(
-                          canonical_route_contributions->gpu_data_ptr())
-                    : nullptr,
-                seq_len,
-                total_slots,
-                top_k,
-                d_model,
-                intermediate,
-                num_experts,
-                gateup_table.weight_format,
-                device_ordinal_,
-                stream, execution);
+            const bool ok = execution.overwriteOutputThenPublish(
+                execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
+                execution.executesDown() ? publication_output->size_bytes() : 0u,
+                seq_len, top_k,
+                canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                              : MoEPrefillOutputLayout::TokenRows,
+                stream,
+                [&](std::span<float> live_output, void *producer_stream)
+                {
+                    return cudaMoE_grouped_floating_prefill_pipeline(
+                        execution.executesGateUp() ? static_cast<const float *>(hidden->gpu_data_ptr()) : nullptr,
+                        gateup_table.device_floating_gate_descs,
+                        gateup_table.device_floating_up_descs,
+                        down_table.device_floating_descs,
+                        d_group_original_to_grouped_,
+                        d_group_original_expert_ids_,
+                        d_group_weights_,
+                        d_prefill_gate_,
+                        canonical_route_contributions ? nullptr : live_output.data(),
+                        canonical_route_contributions ? live_output.data() : nullptr,
+                        seq_len,
+                        total_slots,
+                        top_k,
+                        d_model,
+                        intermediate,
+                        num_experts,
+                        gateup_table.weight_format,
+                        device_ordinal_,
+                        producer_stream, execution);
+                },
+                [&](const EnqueuedWorkspaceRead<float> &read)
+                {
+                    markDeviceWritten(publication_output, device, read.stream());
+                    return true;
+                });
             if (!ok)
             {
                 LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] "
                           "floating grouped CUDA pipeline failed");
                 return false;
             }
-            if (execution.executesDown())
-                markDeviceWritten(publication_output, device, stream);
             PerfStatsCollector::addCounter(
                 "kernel",
                 "cuda_moe_grouped_prefill_floating_calls",
@@ -9004,91 +9015,97 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                       "active grouped prefill routes require ordered scatter ownership");
             return false;
         }
-        if (execution.executesDown() && active_expert_slots == 0)
-        {
-            cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-            float *clear_target = d_canonical_route_contributions
-                                      ? d_canonical_route_contributions
-                                      : d_output;
-            const size_t clear_count =
-                static_cast<size_t>(seq_len) *
-                static_cast<size_t>(execution.columnCount()) *
-                (d_canonical_route_contributions
-                     ? static_cast<size_t>(top_k)
-                     : size_t{1});
-            cudaError_t err = cudaMemsetAsync(
-                clear_target,
-                0,
-                clear_count * sizeof(float),
-                cuda_stream);
-            if (err != cudaSuccess)
-            {
-                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] output memset failed: "
-                          << cudaGetErrorString(err));
-                return false;
-            }
-        }
 
-        const bool ok = cudaMoE_grouped_prefill_pipeline(
-            d_hidden,
-            reuse_router_q8_hidden
-                ? router_q8_hidden_publication_->quantized_rows
-                : nullptr,
-            reuse_router_q8_hidden
-                ? router_q8_hidden_publication_->row_scales
-                : nullptr,
-            gateup_table.device_gate_descs,
-            gateup_table.device_up_descs,
-            down_table.device_descs,
-            d_group_counts_,
-            d_group_offsets_,
-            use_grouped_imma ? d_prefill_imma_directory_ : nullptr,
-            use_grouped_imma
-                ? prefill_imma_directory_entries_cap_
-                : 0,
-            d_group_token_indices_,
-            ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
-            use_gateup_kpart || use_down_ordered_kpart
-                ? d_group_original_expert_ids_
-                : nullptr,
-            d_active_expert_ids,
-            d_group_weights_,
-            d_prefill_A_int8_,
-            d_prefill_A_scales_,
-            d_prefill_gate_,
-            d_prefill_up_,
-            use_gateup_kpart ? d_grouped_gateup_gate_partials_ : nullptr,
-            use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
-            d_prefill_swiglu_int8_,
-            d_prefill_swiglu_scales_,
-            use_down_ordered_kpart && publishes_canonical_routes
-                ? d_grouped_down_partials_
-                : nullptr,
-            d_prefill_gate_,
-            d_output,
-            d_canonical_route_contributions,
-            num_experts,
-            d_model,
-            intermediate,
-            max_tokens_per_expert,
-            total_slots,
-            top_k,
-            active_expert_slots,
-            0,
-            gateup_table.codebook_id,
-            down_table.codebook_id,
-            gateup_table.codebook_mask,
-            down_table.codebook_mask,
-            use_gateup_kpart ? CUDAMoEBatchInvariantPolicy::gate_up_k_partitions : 0,
-            prefill_policy.gateup_tile_n,
-            use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
-            splitk_tile_rows,
-            projection_engine,
-            prefill_policy.imma_gateup_columns,
-            prefill_policy.imma_down_columns,
-            prefill_policy.imma_gateup_schedule,
-            device_ordinal_,
-            stream, execution);
+        const bool ok = execution.overwriteOutputThenPublish(
+            execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
+            execution.executesDown() ? publication_output->size_bytes() : 0u,
+            seq_len, top_k,
+            canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                          : MoEPrefillOutputLayout::TokenRows,
+            stream,
+            [&](std::span<float> live_output, void *producer_stream)
+            {
+                if (execution.executesDown() && active_expert_slots == 0)
+                {
+                    cudaStream_t cuda_stream = static_cast<cudaStream_t>(producer_stream);
+                    cudaError_t err = cudaMemsetAsync(
+                        live_output.data(),
+                        0,
+                        live_output.size_bytes(),
+                        cuda_stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] output memset failed: "
+                                  << cudaGetErrorString(err));
+                        return false;
+                    }
+                }
+                return cudaMoE_grouped_prefill_pipeline(
+                    d_hidden,
+                    reuse_router_q8_hidden
+                        ? router_q8_hidden_publication_->quantized_rows
+                        : nullptr,
+                    reuse_router_q8_hidden
+                        ? router_q8_hidden_publication_->row_scales
+                        : nullptr,
+                    gateup_table.device_gate_descs,
+                    gateup_table.device_up_descs,
+                    down_table.device_descs,
+                    d_group_counts_,
+                    d_group_offsets_,
+                    use_grouped_imma ? d_prefill_imma_directory_ : nullptr,
+                    use_grouped_imma
+                        ? prefill_imma_directory_entries_cap_
+                        : 0,
+                    d_group_token_indices_,
+                    ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
+                    use_gateup_kpart || use_down_ordered_kpart
+                        ? d_group_original_expert_ids_
+                        : nullptr,
+                    d_active_expert_ids,
+                    d_group_weights_,
+                    d_prefill_A_int8_,
+                    d_prefill_A_scales_,
+                    d_prefill_gate_,
+                    d_prefill_up_,
+                    use_gateup_kpart ? d_grouped_gateup_gate_partials_ : nullptr,
+                    use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
+                    d_prefill_swiglu_int8_,
+                    d_prefill_swiglu_scales_,
+                    use_down_ordered_kpart && publishes_canonical_routes
+                        ? d_grouped_down_partials_
+                        : nullptr,
+                    d_prefill_gate_,
+                    canonical_route_contributions ? nullptr : live_output.data(),
+                    canonical_route_contributions ? live_output.data() : nullptr,
+                    num_experts,
+                    d_model,
+                    intermediate,
+                    max_tokens_per_expert,
+                    total_slots,
+                    top_k,
+                    active_expert_slots,
+                    0,
+                    gateup_table.codebook_id,
+                    down_table.codebook_id,
+                    gateup_table.codebook_mask,
+                    down_table.codebook_mask,
+                    use_gateup_kpart ? CUDAMoEBatchInvariantPolicy::gate_up_k_partitions : 0,
+                    prefill_policy.gateup_tile_n,
+                    use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
+                    splitk_tile_rows,
+                    projection_engine,
+                    prefill_policy.imma_gateup_columns,
+                    prefill_policy.imma_down_columns,
+                    prefill_policy.imma_gateup_schedule,
+                    device_ordinal_,
+                    producer_stream, execution);
+            },
+            [&](const EnqueuedWorkspaceRead<float> &read)
+            {
+                markDeviceWritten(publication_output, device, read.stream());
+                return true;
+            });
         if (!ok)
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjection] grouped CUDA pipeline failed");
@@ -9108,12 +9125,6 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                  {"descriptor_source", "static_table"}});
         }
 
-        if (execution.executesDown()) markDeviceWritten(
-            canonical_route_contributions
-                ? canonical_route_contributions
-                : output,
-            device,
-            stream);
         const int selected_tile_m = use_grouped_imma
                                         ? cuda::moe::kGroupedImmaTileRows
                                         : (use_gateup_kpart
@@ -9283,42 +9294,50 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             }
 
             group_active_expert_slots_ = active_expert_slots;
-            const bool ok = cudaMoE_grouped_floating_prefill_pipeline(
-                execution.executesGateUp() ? static_cast<const float *>(hidden->gpu_data_ptr()) : nullptr,
-                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                    runtime_gate_descs),
-                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                    runtime_up_descs),
-                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                    runtime_down_descs),
-                d_group_original_to_grouped_,
-                runtime_host_layer.route_expert_ids,
-                runtime_host_layer.grouped_route_weights,
-                d_prefill_gate_,
-                !execution.executesDown() || canonical_route_contributions
-                    ? nullptr
-                    : static_cast<float *>(output->gpu_data_ptr()),
-                execution.executesDown() && canonical_route_contributions
-                    ? static_cast<float *>(
-                          canonical_route_contributions->gpu_data_ptr())
-                    : nullptr,
-                seq_len,
-                total_slots,
-                top_k,
-                d_model,
-                intermediate,
-                num_experts,
-                gateup_table.weight_format,
-                device_ordinal_,
-                stream, execution);
+            const bool ok = execution.overwriteOutputThenPublish(
+                execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
+                execution.executesDown() ? publication_output->size_bytes() : 0u,
+                seq_len, top_k,
+                canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                              : MoEPrefillOutputLayout::TokenRows,
+                stream,
+                [&](std::span<float> live_output, void *producer_stream)
+                {
+                    return cudaMoE_grouped_floating_prefill_pipeline(
+                        execution.executesGateUp() ? static_cast<const float *>(hidden->gpu_data_ptr()) : nullptr,
+                        reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                            runtime_gate_descs),
+                        reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                            runtime_up_descs),
+                        reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                            runtime_down_descs),
+                        d_group_original_to_grouped_,
+                        runtime_host_layer.route_expert_ids,
+                        runtime_host_layer.grouped_route_weights,
+                        d_prefill_gate_,
+                        canonical_route_contributions ? nullptr : live_output.data(),
+                        canonical_route_contributions ? live_output.data() : nullptr,
+                        seq_len,
+                        total_slots,
+                        top_k,
+                        d_model,
+                        intermediate,
+                        num_experts,
+                        gateup_table.weight_format,
+                        device_ordinal_,
+                        producer_stream, execution);
+                },
+                [&](const EnqueuedWorkspaceRead<float> &read)
+                {
+                    markDeviceWritten(publication_output, device, read.stream());
+                    return true;
+                });
             if (!ok)
             {
                 LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                           "floating grouped CUDA pipeline failed");
                 return false;
             }
-            if (execution.executesDown())
-                markDeviceWritten(publication_output, device, stream);
             PerfStatsCollector::addCounter(
                 "kernel",
                 "cuda_moe_grouped_prefill_floating_calls",
@@ -9514,62 +9533,77 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
          * inverse map and removes reconstruction work from every MoE layer.
          */
 
-        const bool ok = cudaMoE_grouped_prefill_pipeline(
-            d_hidden,
-            reuse_router_q8_hidden ? d_decode_hidden_int8_ : nullptr,
-            reuse_router_q8_hidden ? d_decode_hidden_scales_ : nullptr,
-            runtime_gate_descs,
-            runtime_up_descs,
-            runtime_down_descs,
-            runtime_host_layer.expert_counts,
-            runtime_host_layer.expert_offsets,
-            use_grouped_imma ? d_prefill_imma_directory_ : nullptr,
-            use_grouped_imma
-                ? prefill_imma_directory_entries_cap_
-                : 0,
-            runtime_host_layer.grouped_token_ids,
-            d_group_original_to_grouped_,
-            use_gateup_kpart || use_down_ordered_kpart
-                ? runtime_host_layer.route_expert_ids
-                : nullptr,
-            d_group_active_expert_ids_,
-            runtime_host_layer.grouped_route_weights,
-            d_prefill_A_int8_,
-            d_prefill_A_scales_,
-            d_prefill_gate_,
-            d_prefill_up_,
-            use_gateup_kpart ? d_grouped_gateup_gate_partials_ : nullptr,
-            use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
-            d_prefill_swiglu_int8_,
-            d_prefill_swiglu_scales_,
-            use_down_ordered_kpart && publishes_canonical_routes
-                ? d_grouped_down_partials_
-                : nullptr,
-            d_prefill_gate_,
-            d_output,
-            d_canonical_route_contributions,
-            num_experts,
-            d_model,
-            intermediate,
-            max_tokens_per_expert,
-            total_slots,
-            top_k,
-            active_expert_slots,
-            1,
-            gateup_table.codebook_id,
-            down_table.codebook_id,
-            gateup_table.codebook_mask,
-            down_table.codebook_mask,
-            use_gateup_kpart ? CUDAMoEBatchInvariantPolicy::gate_up_k_partitions : 0,
-            prefill_policy.gateup_tile_n,
-            use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
-            splitk_tile_rows,
-            projection_engine,
-            prefill_policy.imma_gateup_columns,
-            prefill_policy.imma_down_columns,
-            prefill_policy.imma_gateup_schedule,
-            device_ordinal_,
-            stream, execution);
+        const bool ok = execution.overwriteOutputThenPublish(
+            execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
+            execution.executesDown() ? publication_output->size_bytes() : 0u,
+            seq_len, top_k,
+            canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                          : MoEPrefillOutputLayout::TokenRows,
+            stream,
+            [&](std::span<float> live_output, void *producer_stream)
+            {
+                return cudaMoE_grouped_prefill_pipeline(
+                    d_hidden,
+                    reuse_router_q8_hidden ? d_decode_hidden_int8_ : nullptr,
+                    reuse_router_q8_hidden ? d_decode_hidden_scales_ : nullptr,
+                    runtime_gate_descs,
+                    runtime_up_descs,
+                    runtime_down_descs,
+                    runtime_host_layer.expert_counts,
+                    runtime_host_layer.expert_offsets,
+                    use_grouped_imma ? d_prefill_imma_directory_ : nullptr,
+                    use_grouped_imma
+                        ? prefill_imma_directory_entries_cap_
+                        : 0,
+                    runtime_host_layer.grouped_token_ids,
+                    d_group_original_to_grouped_,
+                    use_gateup_kpart || use_down_ordered_kpart
+                        ? runtime_host_layer.route_expert_ids
+                        : nullptr,
+                    d_group_active_expert_ids_,
+                    runtime_host_layer.grouped_route_weights,
+                    d_prefill_A_int8_,
+                    d_prefill_A_scales_,
+                    d_prefill_gate_,
+                    d_prefill_up_,
+                    use_gateup_kpart ? d_grouped_gateup_gate_partials_ : nullptr,
+                    use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
+                    d_prefill_swiglu_int8_,
+                    d_prefill_swiglu_scales_,
+                    use_down_ordered_kpart && publishes_canonical_routes
+                        ? d_grouped_down_partials_
+                        : nullptr,
+                    d_prefill_gate_,
+                    canonical_route_contributions ? nullptr : live_output.data(),
+                    canonical_route_contributions ? live_output.data() : nullptr,
+                    num_experts,
+                    d_model,
+                    intermediate,
+                    max_tokens_per_expert,
+                    total_slots,
+                    top_k,
+                    active_expert_slots,
+                    1,
+                    gateup_table.codebook_id,
+                    down_table.codebook_id,
+                    gateup_table.codebook_mask,
+                    down_table.codebook_mask,
+                    use_gateup_kpart ? CUDAMoEBatchInvariantPolicy::gate_up_k_partitions : 0,
+                    prefill_policy.gateup_tile_n,
+                    use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
+                    splitk_tile_rows,
+                    projection_engine,
+                    prefill_policy.imma_gateup_columns,
+                    prefill_policy.imma_down_columns,
+                    prefill_policy.imma_gateup_schedule,
+                    device_ordinal_,
+                    producer_stream, execution);
+            },
+            [&](const EnqueuedWorkspaceRead<float> &read)
+            {
+                markDeviceWritten(publication_output, device, read.stream());
+                return true;
+            });
         if (!ok)
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] grouped CUDA pipeline failed");
@@ -9589,12 +9623,6 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                  {"descriptor_source", "runtime_table"}});
         }
 
-        if (execution.executesDown()) markDeviceWritten(
-            canonical_route_contributions
-                ? canonical_route_contributions
-                : output,
-            device,
-            stream);
         recordGroupedPrefillCounters(
             seq_len,
             top_k,

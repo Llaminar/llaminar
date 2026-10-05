@@ -6,12 +6,19 @@
 #include <gtest/gtest.h>
 
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixHostArena.h"
 #include "planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
+#include <array>
+#include <barrier>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <limits>
+#include <random>
 #include <string>
+#include <thread>
 
 using namespace llaminar2;
 
@@ -52,7 +59,226 @@ namespace
         return std::make_shared<PhysicalMemoryAuthority>(
             std::move(admission), 0);
     }
+
+    /** @brief Device-free backing exercises the identical production placement authority. */
+    std::shared_ptr<PrefixHostArena> makeArena(size_t bytes)
+    {
+        auto storage = std::make_shared<std::vector<uint8_t>>(bytes, 0xa5);
+        return PrefixHostArena::create(
+            std::shared_ptr<void>(storage, storage->data()), bytes, {});
+    }
 } // namespace
+
+/** @test Final aliases retain the backing and its sole canonical physical claim. */
+TEST(Test__RamPrefixStorageBackend, ArenaPhysicalLifetimeOutlastsBackendAndAliases)
+{
+    constexpr size_t capacity = 256u;
+    auto authority = makePrefixAuthority(capacity);
+    auto reservation = authority->reserveNewAllocations(
+        DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier, capacity);
+    auto claim = std::make_shared<PhysicalMemorySuballocationLease>(
+        reservation.claimAllocation(capacity));
+    bool freed = false;
+    auto storage = std::shared_ptr<std::vector<uint8_t>>(
+        new std::vector<uint8_t>(capacity), [&](auto *pointer) {
+            EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier,
+                PhysicalMemoryMaterializationKind::NewAllocation), capacity);
+            freed = true;
+            delete pointer;
+        });
+    auto arena = PrefixHostArena::create(
+        std::shared_ptr<void>(storage, storage->data()), capacity, std::move(claim));
+    storage.reset();
+    auto range = arena->acquire(capacity);
+    ASSERT_NE(range, nullptr);
+    auto alias = range;
+    range.reset();
+    EXPECT_EQ(arena->availableBytes(), 0u);
+    arena.reset();
+    EXPECT_FALSE(freed);
+    alias.reset();
+    EXPECT_TRUE(freed);
+    EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier,
+        PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+/** @test Nonadjacent holes and retained aliases cannot satisfy a larger archive. */
+TEST(Test__RamPrefixStorageBackend, ArenaFragmentationCoalescesOnlyReleasedNeighbors)
+{
+    auto arena = makeArena(256u);
+    std::array<std::shared_ptr<void>, 4> ranges;
+    for (auto &range : ranges)
+    {
+        range = arena->acquire(64u);
+        ASSERT_NE(range, nullptr);
+    }
+    auto first_alias = ranges[0];
+    void *const middle = ranges[1].get();
+    ranges[0].reset();
+    ranges[2].reset();
+    EXPECT_EQ(arena->availableBytes(), 64u);
+    EXPECT_EQ(arena->acquire(128u), nullptr);
+    ranges[1].reset();
+    auto joined = arena->acquire(128u);
+    ASSERT_NE(joined, nullptr);
+    EXPECT_EQ(joined.get(), middle);
+    EXPECT_EQ(arena->availableBytes(), 0u);
+    first_alias.reset();
+    joined.reset();
+    ranges[3].reset();
+    EXPECT_EQ(arena->availableBytes(), 256u);
+    EXPECT_NE(arena->acquire(256u), nullptr);
+}
+
+/** @test Randomized odd geometries retain exact byte capacity and disjoint live ranges. */
+TEST(Test__RamPrefixStorageBackend, ArenaRandomizedLargeSmallAliasReuse)
+{
+    constexpr size_t capacity = 4096u;
+    auto arena = makeArena(capacity);
+    struct LiveRange { std::shared_ptr<void> owner; size_t bytes; uint8_t value; };
+    std::vector<LiveRange> live;
+    std::mt19937 random(0x771af);
+    for (unsigned iteration = 0u; iteration < 4000u; ++iteration)
+    {
+        SCOPED_TRACE(iteration);
+        for (const auto &range : live)
+        {
+            const auto *begin = static_cast<const uint8_t *>(range.owner.get());
+            ASSERT_TRUE(std::all_of(begin, begin + range.bytes,
+                [&](uint8_t value) { return value == range.value; }));
+        }
+        if (!live.empty() && random() % 3u == 0u)
+        {
+            live.erase(live.begin() + random() % live.size());
+            continue;
+        }
+        const size_t bytes = 1u + random() % 521u;
+        auto owner = arena->acquire(bytes);
+        if (!owner)
+        {
+            if (!live.empty()) live.erase(live.begin() + random() % live.size());
+            continue;
+        }
+        const auto address = reinterpret_cast<uintptr_t>(owner.get());
+        for (const auto &range : live)
+        {
+            const auto other = reinterpret_cast<uintptr_t>(range.owner.get());
+            ASSERT_TRUE(address + bytes <= other || other + range.bytes <= address);
+        }
+        const auto value = static_cast<uint8_t>(iteration);
+        std::memset(owner.get(), value, bytes);
+        live.push_back({owner, bytes, value});
+        if (random() % 4u == 0u) live.push_back({std::move(owner), bytes, value});
+    }
+    live.clear();
+    EXPECT_EQ(arena->availableBytes(), capacity);
+    auto whole = arena->acquire(capacity);
+    ASSERT_NE(whole, nullptr);
+    std::memset(whole.get(), 0x39, capacity);
+    whole.reset();
+    auto small = arena->acquire(1u);
+    ASSERT_NE(small, nullptr);
+    EXPECT_EQ(*static_cast<uint8_t *>(small.get()), 0x39)
+        << "Placement must not silently clear complete-overwrite payloads";
+}
+
+/** @test Independent disk/request owners may retire range aliases concurrently. */
+TEST(Test__RamPrefixStorageBackend, ArenaConcurrentLastAliasRetirement)
+{
+    auto arena = makeArena(4096u);
+    constexpr unsigned workers = 8u;
+    std::barrier rendezvous(workers);
+    std::array<std::jthread, workers> threads;
+    for (unsigned worker = 0; worker < workers; ++worker)
+        threads[worker] = std::jthread([&, worker] {
+            for (unsigned replay = 0; replay < 200u; ++replay)
+            {
+                auto range = arena->acquire(17u + worker * 7u);
+                EXPECT_NE(range, nullptr);
+                auto alias = range;
+                if (range) std::memset(range.get(), worker + 1u, 17u + worker * 7u);
+                range.reset();
+                rendezvous.arrive_and_wait();
+                if (alias)
+                {
+                    const auto *begin = static_cast<const uint8_t *>(alias.get());
+                    EXPECT_TRUE(std::all_of(begin, begin + 17u + worker * 7u,
+                        [&](uint8_t value) { return value == worker + 1u; }));
+                }
+                alias.reset();
+                rendezvous.arrive_and_wait();
+            }
+        });
+    for (auto &thread : threads) thread.join();
+    EXPECT_EQ(arena->availableBytes(), 4096u);
+}
+
+/** @test A GPU archive can never lazily materialize through an unaccounted test constructor. */
+TEST(Test__RamPrefixStorageBackend, ArenaRequiresGPUSetupAdmission)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        RamPrefixStorageBackend backend(device, 64u);
+        EXPECT_EQ(backend.availableAllocationBytes(), 0u);
+        std::string error;
+        EXPECT_FALSE(backend.allocateWithDiagnostics(keyFor(0), makeLayout(), &error).valid());
+        EXPECT_NE(error.find("admitted persistent arena"), std::string::npos);
+    }
+    EXPECT_THROW(PrefixHostArena::create({}, 32u, {}), std::invalid_argument);
+    auto arena = makeArena(32u);
+    EXPECT_EQ(arena->acquire(0u), nullptr);
+    EXPECT_EQ(arena->acquire(std::numeric_limits<size_t>::max()), nullptr);
+    auto odd = arena->acquire(13u);
+    ASSERT_NE(odd, nullptr);
+    EXPECT_EQ(arena->availableBytes(), 19u);
+    EXPECT_NE(arena->acquire(19u), nullptr);
+}
+
+/** @test An evicted handle cannot release or mutate a newer incarnation of the same key. */
+TEST(Test__RamPrefixStorageBackend, ArenaRejectsStaleArchiveIncarnations)
+{
+    RamPrefixStorageBackend backend(128u);
+    auto old = backend.allocate(keyFor(0), makeLayout());
+    ASSERT_TRUE(old.valid());
+    ASSERT_TRUE(backend.release(old));
+    auto current = backend.allocate(keyFor(0), makeLayout());
+    ASSERT_TRUE(current.valid());
+    EXPECT_FALSE(backend.attachModelRuntimeState(&old,
+        std::make_shared<std::vector<uint8_t>>(3u, 0x44)));
+    EXPECT_FALSE(backend.release(old));
+    EXPECT_EQ(backend.usedBytes(), 32u);
+    EXPECT_TRUE(backend.release(current));
+}
+
+/** @test Malformed section arithmetic cannot turn a tiny arena lease into an oversized write. */
+TEST(Test__RamPrefixStorageBackend, ArenaRejectsPayloadExtentOverflow)
+{
+    RamPrefixStorageBackend backend(128u);
+    auto layout = makeLayout(std::numeric_limits<size_t>::max(), 33u);
+    EXPECT_FALSE(backend.allocate(keyFor(0), layout).valid());
+    layout = makeLayout(size_t{1} << (sizeof(size_t) * 8u - 1u), 16u);
+    layout.fa_layers = 2;
+    EXPECT_FALSE(backend.allocate(keyFor(1), layout).valid());
+    layout = makeLayout();
+    layout.includes_hybrid_state = true;
+    layout.hybrid_state_bytes = std::numeric_limits<size_t>::max() - 15u;
+    EXPECT_FALSE(backend.allocate(keyFor(2), layout).valid());
+    EXPECT_EQ(backend.usedBytes(), 0u);
+}
+
+/** @test Missing publication is fatal before backing can be returned to its allocator. */
+TEST(Test__RamPrefixStorageBackend, ArenaUnpublishedProducerFailsClosed)
+{
+    EXPECT_DEATH({
+        auto arena = makeArena(32u);
+        auto readiness = std::make_shared<PrefixPayloadReadiness>();
+        auto event = std::make_shared<uint8_t>(0u);
+        (void)readiness->prepare(event, DeviceId::cuda(0), reinterpret_cast<void *>(uintptr_t{1}));
+        auto range = arena->acquire(32u, readiness);
+        range.reset();
+        arena.reset();
+    }, "unsafe final backing retirement");
+}
 
 TEST(Test__RamPrefixStorageBackend, AllocatesTypedPayloadSegmentsWithinBudget)
 {
@@ -284,6 +510,9 @@ TEST(Test__RamPrefixStorageBackend, PayloadReadinessRequiresPreparationBeforePub
     EXPECT_FALSE(readiness.published());
     EXPECT_FALSE(readiness.publishRecorded())
         << "An unprepared event must never become visible to consumers.";
+    bool complete = false;
+    EXPECT_TRUE(readiness.queryComplete(&complete));
+    EXPECT_TRUE(complete);
 
     ASSERT_TRUE(readiness.prepare(
         std::static_pointer_cast<void>(event_owner),
@@ -294,6 +523,8 @@ TEST(Test__RamPrefixStorageBackend, PayloadReadinessRequiresPreparationBeforePub
     EXPECT_EQ(readiness.event(), event_owner.get());
     EXPECT_EQ(readiness.producerDevice(), DeviceId::cuda(0));
     EXPECT_EQ(readiness.producerStream(), stream);
+    EXPECT_FALSE(readiness.queryComplete(&complete));
+    EXPECT_FALSE(complete) << "Prepared-but-unpublished is not a reusable range";
 
     EXPECT_FALSE(readiness.prepare(
         std::static_pointer_cast<void>(event_owner),

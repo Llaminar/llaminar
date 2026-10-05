@@ -888,6 +888,17 @@ authenticate aggregate rows and every native-event sample back into independent
 cell artifacts before atomic promotion. Thus batching changes setup cost only,
 not timing semantics or resume granularity:
 
+Installable dense candidate timing uses a retained native graph on both GPU
+backends. One event sample replays sixteen complete projection operations;
+reported microseconds are normalized per operation and include activation
+quantization and required ordered reducers. The raw sidecar records
+`captured_operations`, while the immutable plan binds submission mode and
+latency basis. Direct-launch timing or a missing/partial captured batch must
+fail authentication. Changing this timing contract requires a new corpus
+generation; old direct-launch rows cannot be mixed into a captured refresh.
+Whole-model validation remains necessary because isolated capture does not
+reproduce overlap between different projection groups.
+
 The transaction accepts only a `Release` scorer. Its immutable plan hashes the
 exact trainer executable and its resolved `libllaminar2_core.so`; every cell
 publishes a manifest last that binds those hashes, the plan/timing cardinality,

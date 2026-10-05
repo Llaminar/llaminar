@@ -5,12 +5,11 @@
  * @date February 2026
  *
  * Owns all ncclComm_t communicators, CUDA streams for collectives, and
- * completion events. All NCCL operations (including ncclGroupStart/End)
- * execute on this single thread, ensuring proper threading semantics.
- *
- * This solves the threading mismatch where comms were created on worker
- * threads but used from the caller thread - NCCL requires all operations
- * on a communicator to happen from the same thread.
+ * completion events. Construction and host work queues use a coordinator
+ * thread. Captured participant-local operations record directly on their exact
+ * caller streams with consistent communicator order; they introduce no host
+ * queue or synchronization into retained generation graphs. An immutable
+ * topology profile owns communicator construction and channel admission.
  *
  * Usage:
  * @code
@@ -32,6 +31,7 @@
 
 #include "ICollectiveCoordinator.h"
 #include "../ICollectiveBackend.h" // For CollectiveDataType, CollectiveOp
+#include "../backends/NCCLNetworkPolicy.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -459,6 +459,9 @@ namespace llaminar2
          */
         int numDevices() const { return num_devices_; }
 
+        /** @return Frozen construction profile; observations never alter an existing communicator. */
+        NCCLCommunicatorPolicy communicatorPolicy() const noexcept { return communicator_policy_; }
+
         /**
          * @brief Get device ordinal for a local device index
          * @param device_idx Local device index (0 to num_devices-1)
@@ -521,6 +524,7 @@ namespace llaminar2
         // State
         std::vector<int> device_ordinals_;
         int num_devices_ = 0;
+        NCCLCommunicatorPolicy communicator_policy_; ///< Owns immutable communicator tuning identity.
         std::atomic<bool> initialized_{false};
         std::string last_error_;
 

@@ -3,7 +3,9 @@
  * @brief Unit tests for Phase C: GDN Kernels
  *
  * Tests GDNProjectionStage, ShortConv1dStage, and GDNRecurrenceStage
- * for correctness, state management, and OpenMP parallelization.
+ * for correctness, state management, and OpenMP parallelization. Prepared
+ * projection mocks additionally prove mixed decoder grouping and exactly-once
+ * failure handling without allocating or initializing any GPU.
  *
  * Three test categories:
  * 1. Stage tests with real CPU kernels (end-to-end correctness)
@@ -2892,10 +2894,12 @@ TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKer
 #endif
 }
 
+/** @brief Device-free prepared-engine probe with owned descriptor storage. */
 template <int Tag>
 class CountingProjectionGemm : public ITensorGemm
 {
 public:
+    /** @brief Configure the engine contract and the value written per projection. */
     explicit CountingProjectionGemm(float fill_value,
                                     bool supports_fused = false,
                                     bool fused_success = false,
@@ -2917,8 +2921,8 @@ public:
         if (!native_codebook_.has_value())
             return false;
 
-        out.payload = reinterpret_cast<const uint8_t *>(this);
-        out.scales = this;
+        out.payload = native_payload_.data();
+        out.scales = &native_scale_;
         out.n = 1;
         out.k = 32;
         out.blocks_per_row = 1;
@@ -2937,7 +2941,7 @@ public:
         const size_t element_bytes = type == TensorType::FP32
                                          ? sizeof(float)
                                          : sizeof(uint16_t);
-        out.data = this;
+        out.data = floating_weight_.data();
         out.type = type;
         out.n = 1;
         out.k = 1;
@@ -2998,11 +3002,26 @@ public:
         return true;
     }
 
+    /** @brief Record verifier submission through the same prepared descriptors. */
+    bool multiply_fused_verifier_rows_decode_equivalent(
+        const TensorBase *input,
+        const std::vector<TensorProjectionDesc> &projections,
+        int m, int k, const IMPIContext *mpi,
+        DeviceWorkspaceManager *workspace) override
+    {
+        ++verifier_calls;
+        return multiply_fused_tensor(input, projections, m, k, mpi, workspace);
+    }
+
     int multiply_calls = 0;
     int fused_calls = 0;
     int fused_projection_count = 0;
+    int verifier_calls = 0;
 
 private:
+    std::array<uint8_t, 32> native_payload_{};
+    uint16_t native_scale_ = 0;
+    std::array<uint8_t, sizeof(float)> floating_weight_{};
     float fill_value_;
     bool supports_fused_ = false;
     bool fused_success_ = false;
@@ -3213,64 +3232,132 @@ TEST(Test__GDNKernels, Projection_MixedKernelTypesFuseSupportedSubgroups)
     EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
 }
 
-TEST(Test__GDNKernels, Projection_SplitsNativeVNNIGroupsByCodebook)
+TEST(Test__GDNKernels, Projection_MixedNativeCodebooksShareOnePreparedGroup)
 {
-    auto ctx = makeCPUContext();
+    for (bool verifier : {false, true})
+    {
+        SCOPED_TRACE(verifier ? "verifier" : "ordinary");
+        auto ctx = makeCPUContext();
 
-    auto input = makeFP32Seq({2, 3});
-    auto w_qkv = makeFP32({3, 4});
-    auto out_qkv = makeFP32({2, 4});
-    auto w_z = makeFP32({3, 2});
-    auto out_z = makeFP32({2, 2});
-    auto w_a = makeFP32({3, 1});
-    auto out_a = makeFP32({2, 1});
-    auto w_b = makeFP32({3, 1});
-    auto out_b = makeFP32({2, 1});
+        auto input = makeFP32Seq({2, 3});
+        auto w_qkv = makeFP32({3, 4});
+        auto out_qkv = makeFP32({2, 4});
+        auto w_z = makeFP32({3, 2});
+        auto out_z = makeFP32({2, 2});
+        auto w_a = makeFP32({3, 1});
+        auto out_a = makeFP32({2, 1});
+        auto w_b = makeFP32({3, 1});
+        auto out_b = makeFP32({2, 1});
 
-    CountingProjectionGemm<0> qkv_gemm(1.0f, true, true, 5);
-    CountingProjectionGemm<0> z_gemm(2.0f, true, true, 7);
-    CountingProjectionGemm<0> a_gemm(3.0f, true, true, 5);
-    CountingProjectionGemm<0> b_gemm(4.0f, true, true, 7);
+        CountingProjectionGemm<0> qkv_gemm(1.0f, true, true, 5);
+        CountingProjectionGemm<0> z_gemm(2.0f, true, true, 7);
+        CountingProjectionGemm<0> a_gemm(3.0f, true, true, 4);
+        CountingProjectionGemm<0> b_gemm(4.0f, true, true, 0);
 
-    GDNProjectionStage::Params p;
-    p.input = input.get();
-    p.m = 2;
-    p.k = 3;
-    p.w_qkv = w_qkv.get();
-    p.output_qkv = out_qkv.get();
-    p.n_qkv = 4;
-    p.w_z = w_z.get();
-    p.output_z = out_z.get();
-    p.n_z = 2;
-    p.w_a = w_a.get();
-    p.output_a = out_a.get();
-    p.n_a = 1;
-    p.w_b = w_b.get();
-    p.output_b = out_b.get();
-    p.n_b = 1;
-    p.gemm_qkv = &qkv_gemm;
-    p.gemm_z = &z_gemm;
-    p.gemm_a = &a_gemm;
-    p.gemm_b = &b_gemm;
+        GDNProjectionStage::Params p;
+        p.input = input.get();
+        p.m = 2;
+        p.force_decode_equivalent_verifier_prefill = verifier;
+        p.k = 3;
+        p.w_qkv = w_qkv.get();
+        p.output_qkv = out_qkv.get();
+        p.n_qkv = 4;
+        p.w_z = w_z.get();
+        p.output_z = out_z.get();
+        p.n_z = 2;
+        p.w_a = w_a.get();
+        p.output_a = out_a.get();
+        p.n_a = 1;
+        p.w_b = w_b.get();
+        p.output_b = out_b.get();
+        p.n_b = 1;
+        p.gemm_qkv = &qkv_gemm;
+        p.gemm_z = &z_gemm;
+        p.gemm_a = &a_gemm;
+        p.gemm_b = &b_gemm;
 
-    GDNProjectionStage stage(p);
-    EXPECT_TRUE(stage.execute(ctx.get()));
+        GDNProjectionStage stage(p);
+        EXPECT_TRUE(stage.execute(ctx.get()));
 
-    EXPECT_EQ(qkv_gemm.fused_calls, 1);
-    EXPECT_EQ(qkv_gemm.fused_projection_count, 2);
-    EXPECT_EQ(z_gemm.fused_calls, 1);
-    EXPECT_EQ(z_gemm.fused_projection_count, 2);
-    EXPECT_EQ(a_gemm.fused_calls, 0);
-    EXPECT_EQ(b_gemm.fused_calls, 0);
-    EXPECT_EQ(qkv_gemm.multiply_calls, 0);
-    EXPECT_EQ(z_gemm.multiply_calls, 0);
-    EXPECT_EQ(a_gemm.multiply_calls, 0);
-    EXPECT_EQ(b_gemm.multiply_calls, 0);
+        EXPECT_EQ(qkv_gemm.fused_calls, 1);
+        EXPECT_EQ(qkv_gemm.fused_projection_count, 4);
+        EXPECT_EQ(z_gemm.fused_calls, 0);
+        EXPECT_EQ(z_gemm.fused_projection_count, 0);
+        EXPECT_EQ(qkv_gemm.verifier_calls, verifier ? 1 : 0);
+        EXPECT_EQ(a_gemm.fused_calls, 0);
+        EXPECT_EQ(b_gemm.fused_calls, 0);
+        EXPECT_EQ(qkv_gemm.multiply_calls, 0);
+        EXPECT_EQ(z_gemm.multiply_calls, 0);
+        EXPECT_EQ(a_gemm.multiply_calls, 0);
+        EXPECT_EQ(b_gemm.multiply_calls, 0);
 
-    EXPECT_FLOAT_EQ(out_qkv->data()[0], 1.0f);
-    EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
-    EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
-    EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+        EXPECT_FLOAT_EQ(out_qkv->data()[0], 1.0f);
+        EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
+        EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
+        EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+    }
+}
+
+TEST(Test__GDNKernels, Projection_FailedCompatibleGroupIsNeverRetried)
+{
+    for (bool verifier : {false, true})
+    {
+        SCOPED_TRACE(verifier ? "verifier" : "ordinary");
+        auto ctx = makeCPUContext();
+
+        auto input = makeFP32Seq({2, 3});
+        auto w_qkv = makeFP32({3, 4});
+        auto out_qkv = makeFP32({2, 4});
+        auto w_z = makeFP32({3, 2});
+        auto out_z = makeFP32({2, 2});
+        auto w_a = makeFP32({3, 1});
+        auto out_a = makeFP32({2, 1});
+        auto w_b = makeFP32({3, 1});
+        auto out_b = makeFP32({2, 1});
+
+        CountingProjectionGemm<0> qkv_gemm(1.0f, true, false, 5);
+        CountingProjectionGemm<0> z_gemm(2.0f, true, false, 5);
+        CountingProjectionGemm<0> a_gemm(3.0f, true, false, 5);
+        CountingProjectionGemm<0> b_gemm(4.0f, true, false, 5);
+
+        GDNProjectionStage::Params p;
+        p.input = input.get();
+        p.m = 2;
+        p.force_decode_equivalent_verifier_prefill = verifier;
+        p.k = 3;
+        p.w_qkv = w_qkv.get();
+        p.output_qkv = out_qkv.get();
+        p.n_qkv = 4;
+        p.w_z = w_z.get();
+        p.output_z = out_z.get();
+        p.n_z = 2;
+        p.w_a = w_a.get();
+        p.output_a = out_a.get();
+        p.n_a = 1;
+        p.w_b = w_b.get();
+        p.output_b = out_b.get();
+        p.n_b = 1;
+        p.gemm_qkv = &qkv_gemm;
+        p.gemm_z = &z_gemm;
+        p.gemm_a = &a_gemm;
+        p.gemm_b = &b_gemm;
+
+        GDNProjectionStage stage(p);
+        EXPECT_FALSE(stage.execute(ctx.get()));
+
+        EXPECT_EQ(qkv_gemm.fused_calls, 1);
+        EXPECT_EQ(qkv_gemm.fused_projection_count, 4);
+        EXPECT_EQ(z_gemm.fused_calls, 0);
+        EXPECT_EQ(z_gemm.fused_projection_count, 0);
+        EXPECT_EQ(qkv_gemm.verifier_calls, verifier ? 1 : 0);
+        EXPECT_EQ(a_gemm.fused_calls, 0);
+        EXPECT_EQ(b_gemm.fused_calls, 0);
+        EXPECT_EQ(qkv_gemm.multiply_calls, 0);
+        EXPECT_EQ(z_gemm.multiply_calls, 0);
+        EXPECT_EQ(a_gemm.multiply_calls, 0);
+        EXPECT_EQ(b_gemm.multiply_calls, 0);
+
+    }
 }
 
 TEST(Test__GDNKernels, Projection_SplitsOneFloatingKernelClassByPhysicalWeightType)

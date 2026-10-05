@@ -74,6 +74,9 @@ struct WorkspaceMemoryGeometry
     /** Terminal projection ownership retained by the MTP graph family. */
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+    /** Explicit graph publication; only a native local gather owns transpose scratch. */
+    MTPTerminalLogitsCollective mtp_terminal_logits_collective =
+        MTPTerminalLogitsCollective::None;
     /**
      * @brief Flattened token capacity of a retained local sparse-expert graph.
      *

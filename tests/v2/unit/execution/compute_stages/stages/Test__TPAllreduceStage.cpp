@@ -52,7 +52,10 @@ namespace
             const char *old = std::getenv(name);
             if (old)
                 old_value_ = std::string(old);
-            ::setenv(name_.c_str(), value, 1);
+            if (value)
+                ::setenv(name_.c_str(), value, 1);
+            else
+                ::unsetenv(name_.c_str());
             mutableDebugEnv().reload();
         }
 
@@ -600,6 +603,41 @@ TEST_F(Test__TPAllreduceStage, EmptyPrecisionResolvesBeforeOnStreamCollective)
     EXPECT_EQ(calls.front().precision, "fp32");
 }
 
+/** @test Unset GPU selectors publish FP16 for serial and grouped rows on both backends. */
+TEST_F(Test__TPAllreduceStage, GlobalGPUDefaultIsFP16ForSerialAndGroupedRows)
+{
+    ScopedEnv precision("LLAMINAR_ALLREDUCE_PRECISION", nullptr);
+    ScopedEnv threshold("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS", nullptr);
+    for (const bool cuda : {true, false})
+    {
+        const auto device = cuda ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        llaminar2::test::MockLocalTPContext tp_ctx;
+        tp_ctx.setDevices(cuda
+            ? std::vector<GlobalDeviceAddress>{GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}
+            : std::vector<GlobalDeviceAddress>{GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp_ctx.setBackend(cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        for (const size_t rows : {1u, 3u, 16u})
+        {
+            FP32Tensor tensor({rows, 5120u});
+            TPAllreduceStage::Params params;
+            params.device_id = device;
+            params.tp_ctx = &tp_ctx;
+            params.tensor = &tensor;
+            params.count = tensor.numel();
+            params.stage_name = "layer0_wo_allreduce";
+            TPAllreduceStage stage(params);
+            void *const stream = reinterpret_cast<void *>(0x1234);
+            stage.setGPUStream(stream);
+            ASSERT_TRUE(stage.execute(nullptr));
+            const auto calls = tp_ctx.getAllreduceCalls();
+            ASSERT_FALSE(calls.empty());
+            EXPECT_EQ(calls.back().precision, "fp16");
+            EXPECT_EQ(calls.back().count, rows * 5120);
+            EXPECT_EQ(calls.back().stream, stream);
+        }
+    }
+}
+
 // =============================================================================
 // Dump Info Tests
 // =============================================================================
@@ -809,6 +847,7 @@ TEST_F(Test__TPAllreduceStage, BillOfMaterialsHonorsFP16MinimumElementThreshold)
     auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
 
     TPAllreduceStage::Params params;
+    params.device_id = DeviceId::cuda(0);
     params.tp_ctx = tp_ctx.get();
     params.tensor = test_tensor_.get();
     params.count = 256;
@@ -860,6 +899,7 @@ TEST_F(Test__TPAllreduceStage,
         std::make_unique<FP32Tensor>(std::vector<size_t>{2u, 5120u});
 
     TPAllreduceStage::Params params;
+    params.device_id = DeviceId::cuda(0);
     params.tp_ctx = tp_ctx.get();
     params.tensor = grouped_tensor.get();
     params.count = grouped_tensor->numel();

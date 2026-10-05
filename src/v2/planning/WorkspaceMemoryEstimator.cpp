@@ -31,6 +31,7 @@
 #include "kernels/rocm/gemm/ROCmQuantisedGemmWorkspaceContract.h"
 #include "kernels/rope/RoPEWorkspaceContract.h"
 #include "utils/VramBillOfMaterials.h"
+#include "collective/VocabularyGatherWorkspaceContract.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
 #include <algorithm>
@@ -1958,6 +1959,17 @@ size_t WorkspaceMemoryEstimator::estimate(
                 hybrid_row_scratch_bytes,
                 "hybrid recurrent scratch");
         }
+    }
+
+    // Terminal graphs project one row per request, or the retained compact
+    // verifier width. Prompt/KV capacity is never this transpose geometry.
+    // This named scratch is disjoint from the projection's live output bank.
+    if (geometry.mtp_terminal_logits_collective ==
+        MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather)
+    {
+        bytes = checkedAdd(bytes, VocabularyGatherWorkspaceContract::requirements(
+            std::max({1, geometry.batch_size, geometry.mtp_target_query_rows}), profile.vocab_size)
+                .total_bytes_with_alignment(), "native terminal vocabulary transpose");
     }
 
     size_t compact_family_bytes = 0u;

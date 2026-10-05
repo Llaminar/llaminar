@@ -72,6 +72,24 @@ TEST(PlanningModelMetadata, DescriptorRoundTripPreservesExactProfileBytesAndMain
     }
 }
 
+/** @test The placement policy receives native head provenance from the canonical directory. */
+TEST(PlanningModelMetadata, TerminalHeadProvenanceSurvivesDescriptorPublication)
+{
+    auto profile = metadataProfile();
+    EXPECT_FALSE(PlanningModelMetadata(profile, 48).executionModelConfig().terminal_head_source.present);
+    profile.tensors.push_back({.name = "output.weight", .quant_type = "Q6_K"});
+    auto metadata = PlanningModelMetadata::deserialize(PlanningModelMetadata(profile, 48).serialize());
+    const auto source = metadata.executionModelConfig().terminal_head_source;
+    EXPECT_TRUE(source.present);
+    EXPECT_TRUE(source.is_superblock);
+    EXPECT_EQ(source.codebook_id, native_vnni_formats::Q6_K.codebook_id);
+    for (const auto format : {"F32", "F16", "BF16"})
+    {
+        profile.tensors.back().quant_type = format;
+        EXPECT_FALSE(PlanningModelMetadata(profile, 48).executionModelConfig().terminal_head_source.present);
+    }
+}
+
 TEST(PlanningModelMetadata, TruncationOrStaleDescriptorCannotBecomeAValidModel)
 {
     const auto bytes = PlanningModelMetadata(metadataProfile(), 48).serialize();

@@ -8162,7 +8162,7 @@ namespace llaminar2
             return false;
 
         const auto &config = graph_builder_->config();
-        if (!config.lm_head_column_parallel)
+        if (!config.lm_head_column_parallel || config.hasNativeLocalVocabularyGather())
             return false;
 
         /*
@@ -8181,7 +8181,7 @@ namespace llaminar2
          * transaction-lifetime proof that the full-vocabulary result is active.
          */
         if (request_batched_prefill_logits_row_count_ > 0 &&
-            usesMirroredMTPHeadForVerifier())
+            publishesFullVocabularyMTPLogits())
         {
             return false;
         }
@@ -8194,7 +8194,7 @@ namespace llaminar2
          * LOGITS_LOCAL remains allocated only as maximum-capacity arena state;
          * it is never authoritative while this policy is active.
          */
-        if (usesMirroredMTPHeadForVerifier())
+        if (publishesFullVocabularyMTPLogits())
         {
             return false;
         }
@@ -8214,29 +8214,26 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::mtpSidecarLogitsAreColumnParallel() const
     {
-        if (!graph_builder_)
-            return false;
-
-        const auto &config = graph_builder_->config();
-        return config.mtpParticipantLogitsAreVocabularySharded();
+        return graph_builder_ && graph_builder_->config().mtpParticipantLogitsAreVocabularySharded() &&
+            !graph_builder_->config().mtpPublishesNativeGatheredVocabulary();
     }
 
-    bool DeviceGraphOrchestrator::mtpSidecarRequiresGlobalLogitsGather(
-        bool kv_cache_only) const
+    BufferId DeviceGraphOrchestrator::mtpSamplingLogitsBufferId() const
     {
-        if (!graph_builder_)
-            return false;
+        return graph_builder_ && graph_builder_->config().mtpPublishesNativeGatheredVocabulary()
+            ? BufferId::MTP_LOGITS_GATHERED : BufferId::MTP_LOGITS;
+    }
 
-        const IGlobalTPContext *global_tp =
-            globalTPContextForMTPCoordination();
+    bool DeviceGraphOrchestrator::mtpSidecarRequiresLogitsGather(bool kv_cache_only) const
+    {
+        if (!graph_builder_) return false;
+        const auto *global_tp = globalTPContextForMTPCoordination();
         return resolveMTPTerminalLogitsCollective({
-                   .layout =
-                       graph_builder_->config().mtpTerminalLogitsLayout(),
-                   .sidecar_produces_logits = !kv_cache_only,
-                   .spans_multiple_global_ranks =
-                       global_tp && global_tp->degree() > 1,
-               }) ==
-               MTPTerminalLogitsCollective::GlobalVocabularyAllGather;
+            .layout = graph_builder_->config().mtpTerminalLogitsLayout(),
+            .sidecar_produces_logits = !kv_cache_only,
+            .spans_multiple_global_ranks = global_tp && global_tp->degree() > 1,
+            .native_local_gpu_tp = graph_builder_->config().hasNativeLocalVocabularyGather(),
+        }) != MTPTerminalLogitsCollective::None;
     }
 
     bool DeviceGraphOrchestrator::allPositionVerifierGraphWritesLocalLogits(
@@ -8271,7 +8268,8 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::activeAllPositionLogitsAreColumnParallel(
         int graph_token_count) const
     {
-        return state_.all_position_logits_local != nullptr &&
+        return state_.all_position_logits_local != nullptr && graph_builder_ &&
+               !graph_builder_->config().hasNativeLocalVocabularyGather() &&
                allPositionVerifierGraphWritesLocalLogits(graph_token_count);
     }
 
@@ -8461,7 +8459,7 @@ namespace llaminar2
         state_.all_position_logits_local.reset();
         auto full_owner = resolve_logits_owner(
             state_.all_position_logits_by_rows,
-            mtpSidecarLogitsAreColumnParallel()
+            graph_builder_->config().mtpParticipantLogitsAreVocabularySharded()
                 ? BufferId::MTP_LOGITS_GATHERED
                 : BufferId::MTP_LOGITS,
             static_cast<size_t>(state_.vocab_size),
@@ -15200,7 +15198,7 @@ namespace llaminar2
                 WorkspaceGraphFamilyPolicy::ExclusiveLifetime &&
             ((config.dense_tp_enabled &&
               config.dense_tp_decode_replicated) ||
-             usesMirroredMTPHeadForVerifier()))
+             config.mtpUsesMirroredTerminalHeadBinding()))
         {
             /*
              * Column-parallel prefill may be the first graph captured, but
@@ -24840,6 +24838,10 @@ namespace llaminar2
               dynamic_depth ? "dynamic" : "fixed_width"},
              {"sampling_mode",
               deviceGenerationSamplingModeName(sampling_mode)},
+             {"terminal_head_policy", mtpTerminalHeadPolicyToString(
+                  graph_builder_->config().mtp.terminal_head_policy)},
+             {"native_local_vocabulary",
+              graph_builder_->config().mtpPublishesNativeGatheredVocabulary() ? "true" : "false"},
              {"verifier_rows",
               std::to_string(verifier_rows_per_request)},
              {"physical_verifier_rows",
@@ -25163,16 +25165,16 @@ namespace llaminar2
             !mtp_logits || !mtp_hidden ||
             !mtp_attn_output || !mtp_attn_proj || !mtp_gate || !mtp_up ||
             !mtp_ffn_output;
-        const bool requires_global_mtp_logits_gather =
-            mtpSidecarRequiresGlobalLogitsGather(kv_cache_only);
+        const bool requires_mtp_logits_gather =
+            mtpSidecarRequiresLogitsGather(kv_cache_only);
         if (missing_common_buffers || (!kv_cache_only && missing_full_sidecar_buffers))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar missing required buffers");
             return false;
         }
-        if (requires_global_mtp_logits_gather && !mtp_logits_gathered)
+        if (requires_mtp_logits_gather && !mtp_logits_gathered)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] GlobalTP MTP sidecar is missing its gathered full-vocabulary logits buffer");
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar is missing its gathered full-vocabulary logits buffer");
             return false;
         }
         auto require_rows = [&](const char *name, const TensorBase *tensor) -> bool
@@ -25203,7 +25205,7 @@ namespace llaminar2
             !require_rows("mtp_q_gate", mtp_q_gate) ||
             (!kv_cache_only &&
              (!require_rows("mtp_logits", mtp_logits) ||
-              (requires_global_mtp_logits_gather &&
+              (requires_mtp_logits_gather &&
                !require_rows("mtp_logits_gathered", mtp_logits_gathered)) ||
               !require_rows("mtp_hidden", mtp_hidden) ||
               !require_rows("mtp_attn_output", mtp_attn_output) ||
@@ -25217,7 +25219,7 @@ namespace llaminar2
 
         MTPForwardOutput output;
         output.logits = mtp_logits;
-        output.gathered_logits = requires_global_mtp_logits_gather
+        output.gathered_logits = requires_mtp_logits_gather
                                      ? mtp_logits_gathered
                                      : nullptr;
         output.hidden = mtp_hidden;
@@ -26867,7 +26869,7 @@ namespace llaminar2
                 return false;
             }
         }
-        if (ok && requires_global_mtp_logits_gather)
+        if (ok && requires_mtp_logits_gather)
         {
             /*
              * CPU GlobalTP keeps the large MTP projection column-sharded and
@@ -26879,7 +26881,8 @@ namespace llaminar2
              */
             PerfStatsCollector::addCounter(
                 "mtp",
-                "global_tp_sidecar_logit_allgathers",
+                graph_builder_->config().mtpPublishesNativeGatheredVocabulary()
+                    ? "native_local_sidecar_logit_allgathers" : "global_tp_sidecar_logit_allgathers",
                 1.0,
                 phase,
                 device_key,
@@ -28197,7 +28200,7 @@ namespace llaminar2
             return false;
         }
 
-        auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        auto it = state_.extension_buffers.find(mtpSamplingLogitsBufferId());
         TensorBase *mtp_logits =
             (it == state_.extension_buffers.end() || !it->second)
                 ? nullptr
@@ -28307,7 +28310,7 @@ namespace llaminar2
             return false;
         }
 
-        auto logits_it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        auto logits_it = state_.extension_buffers.find(mtpSamplingLogitsBufferId());
         TensorBase *mtp_logits =
             (logits_it == state_.extension_buffers.end() || !logits_it->second)
                 ? nullptr
@@ -28531,7 +28534,7 @@ namespace llaminar2
         const auto &graph_config = graph_builder_->config();
         const bool has_full_vocabulary_main_head =
             !graph_config.lm_head_column_parallel ||
-            usesMirroredMTPHeadForVerifier();
+            publishesFullVocabularyMTPLogits();
         if (!has_full_vocabulary_main_head)
         {
             return fail(
@@ -29028,7 +29031,7 @@ namespace llaminar2
             return false;
         }
 
-        auto logits_it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        auto logits_it = state_.extension_buffers.find(mtpSamplingLogitsBufferId());
         TensorBase *mtp_logits =
             (logits_it == state_.extension_buffers.end() || !logits_it->second)
                 ? nullptr
@@ -29999,7 +30002,7 @@ namespace llaminar2
         if (source == DeviceLogitsSource::AllPosition)
             return state_.all_position_logits.get();
 
-        const auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        const auto it = state_.extension_buffers.find(mtpSamplingLogitsBufferId());
         return it == state_.extension_buffers.end()
                    ? nullptr
                    : it->second.get();
@@ -33104,7 +33107,7 @@ namespace llaminar2
         }
 
         IBackend *backend = getBackendFor(state_.device_id);
-        auto logits_it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        auto logits_it = state_.extension_buffers.find(mtpSamplingLogitsBufferId());
         TensorBase *logits =
             logits_it == state_.extension_buffers.end()
                 ? nullptr
@@ -36947,7 +36950,7 @@ namespace llaminar2
             mtpSidecarLogitsAreColumnParallel() &&
                     globalTPContextForMTPCoordination() != nullptr
                 ? BufferId::MTP_LOGITS_GATHERED
-                : BufferId::MTP_LOGITS;
+                : mtpSamplingLogitsBufferId();
         auto it = state_.extension_buffers.find(owner);
         if (it == state_.extension_buffers.end() || !it->second)
         {
@@ -42135,13 +42138,13 @@ namespace llaminar2
         return ctx && ctx->degree() > 1;
     }
 
-    bool DeviceGraphOrchestrator::usesMirroredMTPHeadForVerifier() const
+    bool DeviceGraphOrchestrator::publishesFullVocabularyMTPLogits() const
     {
         if (!graph_builder_)
             return false;
 
         const auto &config = graph_builder_->config();
-        return config.mtpUsesMirroredTerminalHeadBinding();
+        return config.mtpParticipantOwnsFullVocabulary() || config.mtpPublishesNativeGatheredVocabulary();
     }
 
     bool DeviceGraphOrchestrator::supportsMTPSidecarSampleFusion() const
@@ -42220,7 +42223,7 @@ namespace llaminar2
 
     int DeviceGraphOrchestrator::sampleGreedyFromMTPLogitsOnDevice()
     {
-        auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        auto it = state_.extension_buffers.find(mtpSamplingLogitsBufferId());
         if (it == state_.extension_buffers.end() || !it->second)
         {
             return -1;
@@ -43706,8 +43709,8 @@ namespace llaminar2
             currentDeviceResidentMTPTransactionLease();
         out_handle->device_generation_controller_owned = true;
         out_handle->sampling_mode = DeviceGenerationSamplingMode::Greedy;
-        out_handle->mirrored_local_tp_locally_complete =
-            usesMirroredMTPHeadForVerifier() &&
+        out_handle->local_tp_participant_complete =
+            publishesFullVocabularyMTPLogits() &&
             graph_builder_ &&
             graph_builder_->config().tp_ctx &&
             graph_builder_->config().tp_ctx->degree() > 1;
@@ -44011,8 +44014,8 @@ namespace llaminar2
         out_handle->response_ready_event = std::move(response_ready_event);
         out_handle->mtp_transaction =
             currentDeviceResidentMTPTransactionLease();
-        out_handle->mirrored_local_tp_locally_complete =
-            usesMirroredMTPHeadForVerifier() &&
+        out_handle->local_tp_participant_complete =
+            publishesFullVocabularyMTPLogits() &&
             graph_builder_ &&
             graph_builder_->config().tp_ctx &&
             graph_builder_->config().tp_ctx->isLocal() &&
@@ -46973,7 +46976,7 @@ namespace llaminar2
             }
             const PrefixCacheRuntimeRestoreResult restore_result =
                 graph_builder_->restorePrefixCacheRuntimeState(
-                    *terminal_block.model_runtime_state_storage,
+                    terminal_block.model_runtime_state_storage->bytes(),
                     stream);
             if (!restore_result)
             {
@@ -55203,7 +55206,7 @@ namespace llaminar2
         if (penalties.empty())
             return true;
 
-        auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        auto it = state_.extension_buffers.find(mtpSamplingLogitsBufferId());
         if (it == state_.extension_buffers.end() || !it->second)
             return false;
 
@@ -55526,7 +55529,7 @@ namespace llaminar2
             return false;
         }
 
-        auto logits_it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        auto logits_it = state_.extension_buffers.find(mtpSamplingLogitsBufferId());
         TensorBase *mtp_logits =
             logits_it == state_.extension_buffers.end()
                 ? nullptr
@@ -55610,14 +55613,13 @@ namespace llaminar2
             return false;
         /*
          * Ordinary column-parallel logits do not contain a full distribution on
-         * one participant, so the single-device stochastic verifier kernels
-         * must not consume them.  Mirrored LocalTP MTP heads are the explicit
-         * exception: each child binds a replicated full-vocabulary MTP head for
-         * verifier/proposal rows, while other TP projections remain sharded.
+         * one participant, so the stochastic verifier must consume either a
+         * complete head or the full publication from an explicit native gather.
+         * Projection weights remain sharded when the latter policy is active.
          */
         if (graph_builder_ &&
             graph_builder_->config().lm_head_column_parallel &&
-            !usesMirroredMTPHeadForVerifier())
+            !publishesFullVocabularyMTPLogits())
         {
             return false;
         }
@@ -56801,7 +56803,7 @@ namespace llaminar2
             return false;
         }
 
-        auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        auto it = state_.extension_buffers.find(mtpSamplingLogitsBufferId());
         TensorBase *tensor =
             it == state_.extension_buffers.end() ? nullptr : it->second.get();
         if (!tensor || !tensor->deviceValid() || !tensor->gpu_data_ptr())
@@ -58267,8 +58269,8 @@ namespace llaminar2
             currentDeviceResidentMTPTransactionLease();
         out_handle->device_generation_controller_owned = true;
         out_handle->sampling_mode = DeviceGenerationSamplingMode::Stochastic;
-        out_handle->mirrored_local_tp_locally_complete =
-            usesMirroredMTPHeadForVerifier() &&
+        out_handle->local_tp_participant_complete =
+            publishesFullVocabularyMTPLogits() &&
             graph_builder_ &&
             graph_builder_->config().tp_ctx &&
             graph_builder_->config().tp_ctx->isLocal() &&
@@ -61523,7 +61525,7 @@ namespace llaminar2
         MTPForwardOutput output{
             .logits = extension(BufferId::MTP_LOGITS),
             .gathered_logits =
-                mtpSidecarRequiresGlobalLogitsGather(
+                mtpSidecarRequiresLogitsGather(
                     /*kv_cache_only=*/false)
                     ? extension(BufferId::MTP_LOGITS_GATHERED)
                     : nullptr,
@@ -61900,8 +61902,53 @@ namespace llaminar2
                 return false;
             }
 
-            auto participant =
-                buildForwardGraph(participant_input);
+            /*
+             * The workspace manifest must bind the same all-position output
+             * owners as the live verifier. A recurrent-only declaration with
+             * serial logits omits its multi-row vocabulary gather, allowing
+             * that gather bank to alias snapshots consumed by accepted-state
+             * publication. Admission sees the complete participant before any
+             * captured pointer is published; ordinary bindings are restored
+             * when this declaration finishes, including failure exits.
+             */
+            ModelBuffers participant_buffers = managed_buffers_;
+            if (participant_role == WorkspaceGraphParticipantRole::GroupedVerifier)
+            {
+                if (!bindAllPositionLogitsOutputs(
+                        participant_input.execution_role,
+                        static_cast<std::size_t>(participant_input.batch_size) *
+                            static_cast<std::size_t>(participant_input.seq_len),
+                        participant_buffers.logits,
+                        participant_buffers.logits_local))
+                {
+                    LOG_ERROR("[DGO] Grouped-verifier workspace declaration lacks its complete logits owners");
+                    return false;
+                }
+            }
+            /** @brief Scope one setup participant's model-buffer selection. */
+            struct ScopedParticipantBuffers final
+            {
+                DeviceGraphOrchestrator &host;
+                const ModelBuffers previous;
+                /**
+                 * @brief Publish the participant's borrowed tensor owners.
+                 * @param owner Participant-local graph configuration authority.
+                 * @param prior Complete buffer selection restored on destruction.
+                 * @param selected Complete output selection for this declaration.
+                 */
+                ScopedParticipantBuffers(DeviceGraphOrchestrator &owner,
+                    const ModelBuffers &prior, const ModelBuffers &selected)
+                    : host(owner), previous(prior)
+                {
+                    host.setBuffers(selected);
+                }
+                /** @brief Restore ordinary output selection on every exit. */
+                ~ScopedParticipantBuffers() { host.setBuffers(previous); }
+                ScopedParticipantBuffers(const ScopedParticipantBuffers &) = delete;
+                ScopedParticipantBuffers &operator=(const ScopedParticipantBuffers &) = delete;
+            } participant_buffer_scope(*this, managed_buffers_, participant_buffers);
+
+            auto participant = buildForwardGraph(participant_input);
             if (!participant)
             {
                 LOG_ERROR("[DGO] Failed to declare forward workspace-family participant "
@@ -62090,40 +62137,23 @@ namespace llaminar2
              * impossible to materialize; retaining host rows beside GPU rows
              * would instead create two competing authorities.
              */
-            struct GroupedVerifierGraphPolicyScope
-            {
-                IGraphBuilder *builder = nullptr;
-                bool installed = false;
-
-                explicit GroupedVerifierGraphPolicyScope(
-                    IGraphBuilder *graph_builder)
-                    : builder(graph_builder),
-                      installed(
-                          builder &&
-                          builder->setGroupedMTPVerifier(true))
-                {
-                }
-
-                ~GroupedVerifierGraphPolicyScope()
-                {
-                    if (installed && builder)
-                    {
-                        (void)builder->setGroupedMTPVerifier(
-                            false);
-                    }
-                }
-            } grouped_verifier_scope(
-                graph_builder_.get());
-            if (!grouped_verifier_scope.installed)
-            {
-                LOG_ERROR("[DGO] Graph builder rejected grouped-verifier workspace-family policy");
-                return false;
-            }
-
             const int grouped_rows =
                 mtp_max_verifier_rows_;
             const int grouped_total_rows =
                 batch_size * grouped_rows;
+            ScopedGroupedMTPVerifierGraphPolicy grouped_verifier_scope(
+                graph_builder_.get(),
+                &compute_all_position_logits_,
+                &compute_row_indexed_all_position_logits_,
+                &row_indexed_all_position_logits_row_count_,
+                &mtp_verifier_outcome_graph_mode_,
+                grouped_total_rows,
+                MTPVerifierOutcomeGraphMode::Disabled);
+            if (!grouped_verifier_scope.ready())
+            {
+                LOG_ERROR("[DGO] Graph builder rejected complete grouped-verifier workspace-family policy");
+                return false;
+            }
             grouped_verifier_tokens.assign(
                 static_cast<size_t>(grouped_total_rows),
                 0);

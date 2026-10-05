@@ -1,77 +1,24 @@
 /**
  * @file ROCmQuantisedGemmKernel.cpp
- * @brief ITensorGemm adapter implementation for ComposableKernel INT8 quantized GEMM
+ * @brief Device-resident prepared quantized GEMM and captured launch admission.
  *
- * This is the C++ adapter that wraps the CK INT8 GEMM kernel. It implements
- * the full ITensorGemm interface and can be compiled with the regular C++ compiler
- * (not hipcc), avoiding MPI/TensorKernels.h compilation issues with HIP headers.
+ * Prepared weight handles and arena-owned activation/scratch surfaces survive
+ * graph recording and replay. Explicit producer policies select lossless
+ * NativeVNNI low-bit or blockwise INT8 kernels; execution quantizes resident
+ * activations on the exact caller stream and publishes resident FP32 output.
+ * The immutable dense-prefill overlay owns only its measured physical keys.
+ * Unmeasured geometry remains owned by the complete generic launch policy,
+ * while explicit diagnostic controls take precedence during construction.
+ * Workspace sizing and launch identity share the producer's typed contract;
+ * captured execution neither allocates scratch nor stages activations through
+ * host storage. TransferEngine owns setup weight publication and event edges.
  *
- * ## Architecture
- *
- * ```
- * ROCmQuantisedGemmKernel.cpp (this file, compiled with g++)
- *       │
- *       │ extern "C" function calls
- *       ▼
- * ROCmQuantisedGemmKernel_CK.hip (compiled with hipcc)
- *       │
- *       │ CK template instantiation (3-way dispatch)
- *       ▼
- * ComposableKernel DeviceGemmMultipleD_Dl (mk_nk_mn layout)
- *   - 32×32 kernel  for M ≤ 32  (decode: M=1 handled natively)
- *   - 64×64 kernel  for 32 < M < 128
- *   - 128×128 kernel for M ≥ 128 (prefill: peak throughput)
- * ```
- *
- * ## Weight Conversion Pipeline (packWeightsToROCm) - ONE-TIME AT LOAD
- *
- * Model weights are stored in various quantized formats (IQ4_NL, Q8_0, Q4_K, etc.).
- * This kernel requires symmetric INT8 quantization with per-output-feature scales.
- *
- * Weight conversion happens ONCE at model load time, entirely on CPU:
- *
- * 1. **Dequantize (CPU)**: Original quantized weights → FP32 via fp32_data()
- * 2. **Requantize (CPU)**: FP32 → INT8 with per-row scales (symmetric, [-127,127])
- * 3. **Upload (H2D)**: Copy INT8 weights + scales to GPU memory
- *
- * After loading, GPU only sees INT8 data - no format-specific decode on device.
- * This keeps VRAM usage minimal and avoids needing GPU kernels for each quant format.
- *
- * ## Memory Layout Convention (mk_nk_mn - optimized for 128x128 tiles)
- *
- * | Matrix        | Shape    | Memory Layout | Element Access          | CK View         |
- * |---------------|----------|---------------|-------------------------|-----------------|
- * | Model Weights | [N × K]  | Row-Major     | W[n,k] = data[n*K + k]  | ColMajor [K×N]  |
- * | Activations   | [M × K]  | Row-Major     | A[m,k] = data[m*K + k]  | RowMajor [M×K]  |
- * | Output        | [M × N]  | Row-Major     | C[m,n] = data[m*N + n]  | RowMajor [M×N]  |
- *
- * Key insight: Model weights [N×K] Row-Major == Column-Major [K×N]!
- * No transpose needed - we just reinterpret the layout for CK's mk_nk_mn convention.
- * This enables 128×128 tile sizes (4x larger than mk_kn_mn) for ~2-4x speedup.
- *
- * ## Two-Kernel Execution Path (PER-INFERENCE)
- *
- * Production path uses rocmQuantGemm_executeTwoKernel_cached():
- *   1. Upload FP32 activations to GPU (H2D)
- *   2. Quantize activations FP32→INT8 on GPU (rocmQuantGemm_quantizeActivationsBlockwise)
- *   3. CK INT8×INT8→INT32 GEMM (no scaling in kernel)
- *   4. Separate applyScales_kernel: E[m,n] = C_int32[m,n] * scale_A[m] * scale_B[n]
- *   5. Download FP32 output to host (D2H)
- *
- * Activation quantization happens ON GPU every inference call - this is the
- * per-row symmetric quantization that produces INT8 activations + scales.
- *
- * The two-kernel GEMM approach is required because CK's fused D-tensor scaling
- * doesn't support the per-row × per-column broadcast pattern we need.
- *
- * @see ROCmQuantisedGemmKernel_CK.hip for HIP kernel implementation
- * @see ROCmQuantisedGemmKernel.h for class documentation
- *
- * @author David Sanftenberg
- * @date January 2026
+ * @see ROCmQuantisedGemmWorkspaceContract.h
+ * @see ROCmDenseProductionPrefillOverlay.h
  */
 
 #include "ROCmQuantisedGemmKernel.h"
+#include "ROCmDenseProductionPrefillOverlay.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "ROCmQuantisedGemmWorkspaceContract.h"
 #include "transfer/TransferEngine.h"
@@ -1926,15 +1873,27 @@ namespace llaminar2
                     //   V7/MT64/U2 wins every shape×M in the perf sweep (1.02–1.45x
                     //   over best V3).  The old k>=n→V3 heuristic is retired.
                     //   Force overrides still take priority for experimentation.
-                    const bool use_v3 = bw_env.blockwise_force_v3   ? true
-                                        : bw_env.blockwise_force_v7 ? false
-                                                                    : false;
+                    // Q8 has a distinct prepared INT8 producer. Its measured
+                    // key cannot enter a low-bit decoder. Explicit diagnostic
+                    // controls retain precedence over the immutable overlay.
+                    const bool blockwise_override = bw_env.blockwise_force_v3 ||
+                        bw_env.blockwise_force_v7 || bw_env.blockwise_v3_mt >= 0 ||
+                        bw_env.blockwise_v7_mt >= 0 ||
+                        bw_env.blockwise_v3_unroll >= 0 ||
+                        bw_env.blockwise_v7_unroll >= 0;
+                    const auto exact = !has_manual_override && !blockwise_override
+                        ? selectDensePrefillExactConfig(
+                            19, m, n, k, DensePrefillWeightFamily::Int8)
+                        : std::nullopt;
+                    const bool use_v3 = exact
+                        ? exact->producer == VNNIPrefillProducer::Int8BlockwiseV3
+                        : bw_env.blockwise_force_v3;
 
                     if (use_v3)
                     {
                         // V3 M_TILE scales with M for K>=N region (tuning data):
                         //   M <= 128 → MT16, M <= 256 → MT32, M > 256 → MT64
-                        int v3_mt = bw_env.blockwise_v3_mt;
+                        int v3_mt = exact ? exact->m_tile : bw_env.blockwise_v3_mt;
                         if (v3_mt == 0)
                         {
                             if (m <= 128)
@@ -1952,7 +1911,7 @@ namespace llaminar2
                             m, n, k,
                             rocm_device_id_, effective_stream,
                             v3_mt,
-                            bw_env.blockwise_v3_unroll);
+                            exact ? exact->unroll : bw_env.blockwise_v3_unroll);
                     }
                     else
                     {
@@ -1963,8 +1922,8 @@ namespace llaminar2
                             d_scales_A_blockwise,
                             m, n, k,
                             rocm_device_id_, effective_stream,
-                            bw_env.blockwise_v7_mt,
-                            bw_env.blockwise_v7_unroll);
+                            exact ? exact->m_tile : bw_env.blockwise_v7_mt,
+                            exact ? exact->unroll : bw_env.blockwise_v7_unroll);
                     }
 
                     if (native_ok)

@@ -1157,7 +1157,8 @@ TEST(Test__PrefixCachePrefillFlow, LLEPFullHitWithTerminalRuntimeSnapshotRestore
                 std::make_shared<std::vector<uint8_t>>(4, 0x42);
             block.mtp_payload = block.mtp_storage->data();
             block.model_runtime_state_storage =
-                std::make_shared<std::vector<uint8_t>>(4, 0x7f);
+                std::make_shared<PrefixRuntimeStateStorage>(
+                    std::make_shared<std::vector<uint8_t>>(4, 0x7f));
         }
         return block;
     };

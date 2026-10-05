@@ -7,6 +7,7 @@
  * including aliases, empty publications, slices and arithmetic overflow.
  */
 #include "collective/NativeCollectiveRowsContract.h"
+#include "collective/NativeAllreduceRequestRows.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/compute_stages/stages/TPAllreduceStage.h"
 #include <gtest/gtest.h>
@@ -171,5 +172,86 @@ namespace
         reject([](auto &v) { ++v.count; });
         reject([](auto &v) { v.device_id = DeviceId::cpu(); });
         reject([](auto &v) { v.sideband_device_index = -1; });
+    }
+
+    TEST(NativeAllreduceRequestRows, RetainsIndependentAuthoritiesAndCheckedBankOrigins)
+    {
+        const NativeAllreduceRequestRows requests(3, 17, 37, countOwner());
+        EXPECT_EQ(requests.requests(), 3);
+        EXPECT_EQ(requests.storageElements(), 3u * 17 * 37);
+        for (int request = 0; request < 3; ++request)
+        {
+            const auto bank = requests.requestRows(request);
+            EXPECT_EQ(requests.requestElementOffset(request), std::size_t(request) * 17 * 37);
+            EXPECT_EQ(bank.rows().countOwner(), countOwner() + request);
+            EXPECT_EQ(bank.rows().capacity(), 17);
+            for (int live : {17, 0, 1, 16, 7, 17}) EXPECT_EQ(bank.rows().activeRowsFor(live), live);
+        }
+        for (int invalid : {-1, 3})
+        {
+            EXPECT_THROW(requests.requestRows(invalid), std::out_of_range);
+            EXPECT_THROW(requests.requestElementOffset(invalid), std::out_of_range);
+        }
+        EXPECT_THROW((NativeAllreduceRequestRows(0, 17, 37, countOwner())), std::invalid_argument);
+        EXPECT_THROW((NativeAllreduceRequestRows(3, 0, 37, countOwner())), std::invalid_argument);
+        EXPECT_THROW((NativeAllreduceRequestRows(3, 17, 0, countOwner())), std::invalid_argument);
+        EXPECT_THROW((NativeAllreduceRequestRows(3, 17, 37, nullptr)), std::invalid_argument);
+        EXPECT_THROW((NativeAllreduceRequestRows(3, 17, 37,
+            static_cast<const std::int32_t *>(opaque(4097)))), std::invalid_argument);
+        EXPECT_THROW((NativeAllreduceRequestRows(std::numeric_limits<int>::max(),
+            std::numeric_limits<int>::max(), std::numeric_limits<std::uint32_t>::max(), countOwner())),
+            std::overflow_error);
+    }
+
+    TEST(NativeAllreduceRequestRows, StageRejectsConflictingAuthoritiesAndPreservesValidBinding)
+    {
+        TPAllreduceStage::Params params;
+        params.device_id = DeviceId::cuda(0);
+        params.count = 3 * 17 * 37;
+        params.sideband_device_index = 0;
+        params.request_rows.emplace(3, 17, 37, countOwner());
+        TPAllreduceStage stage(params);
+        const auto reject = [&](auto mutation) {
+            auto invalid = params;
+            mutation(invalid);
+            EXPECT_THROW((TPAllreduceStage(invalid)), std::invalid_argument);
+            EXPECT_THROW(stage.setParams(invalid), std::invalid_argument);
+            EXPECT_EQ(stage.params().request_rows->countOwners(), countOwner());
+        };
+        reject([](auto &v) { v.count = 0; });
+        reject([](auto &v) { --v.count; });
+        reject([](auto &v) { v.device_id = DeviceId::cpu(); });
+        reject([](auto &v) { v.sideband_device_index = -1; });
+        reject([](auto &v) { v.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder; });
+        reject([](auto &v) { v.live_rows.emplace(DeviceRowRange::fullyActive(51), 37); });
+        reject([](auto &v) { v.sidebands.emplace_back(); });
+        reject([](auto &v) { v.sideband_workspace_bindings.emplace_back(); });
+    }
+
+    TEST(NativeAllreduceRequestRows, PayloadReceiptCannotAliasLiveCountsOrData)
+    {
+        const NativeAllreduceRequestRows requests(3, 17, 37, countOwner());
+        auto *receipt = static_cast<unsigned long long *>(opaque(8192));
+        const auto observed = requests.withPayloadReceipt(receipt);
+        for (int request = 0; request < 3; ++request)
+        {
+            const auto rows = observed.requestRows(request);
+            EXPECT_EQ(rows.payloadReceipt(), receipt);
+            EXPECT_TRUE(nativeCollectiveRowsValid(NativeRowCollective::AllReduce,
+                opaque(0x100000), opaque(0x100000), rows, CollectiveDataType::FLOAT32,
+                CollectiveOp::ALLREDUCE_SUM, 2, 0, opaque(1)));
+            const auto aliased = rows.withPayloadReceipt(static_cast<unsigned long long *>(opaque(0x100000)));
+            EXPECT_FALSE(nativeCollectiveRowsValid(NativeRowCollective::AllReduce,
+                opaque(0x100000), opaque(0x100000), aliased, CollectiveDataType::FLOAT32,
+                CollectiveOp::ALLREDUCE_SUM, 2, 0, opaque(1)));
+        }
+        EXPECT_EQ(requests.requestRows(0).payloadReceipt(), nullptr);
+        EXPECT_THROW(requests.withPayloadReceipt(nullptr), std::invalid_argument);
+        EXPECT_THROW(requests.withPayloadReceipt(static_cast<unsigned long long *>(opaque(8193))), std::invalid_argument);
+        const auto overlapping_count = observed.requestRows(0).withPayloadReceipt(
+            static_cast<unsigned long long *>(opaque(4096)));
+        EXPECT_FALSE(nativeCollectiveRowsValid(NativeRowCollective::AllReduce,
+            opaque(0x100000), opaque(0x100000), overlapping_count, CollectiveDataType::FLOAT32,
+            CollectiveOp::ALLREDUCE_SUM, 2, 0, opaque(1)));
     }
 }

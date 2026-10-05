@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "backends/DeviceId.h"
+#include "kernels/common/DeviceRowRange.h"
 
 namespace llaminar2
 {
@@ -27,4 +28,18 @@ namespace llaminar2
      */
     bool assembleColumnShardsFP32(DeviceId device, const float *rank_major, float *row_major,
         int rows, int participants, int columns, void *stream);
+
+    /**
+     * @brief Assemble only live rows from capacity-strided native rank banks.
+     * @param device Exact physical participant.
+     * @param rank_major Disjoint allgather bank with a fixed capacity stride per rank.
+     * @param row_major Complete row-major output; inactive rows remain untouched.
+     * @param rows Whole device-owned prefix, including its retained capacity.
+     * @param participants Number of equal vocabulary shards.
+     * @param columns Exact local vocabulary width.
+     * @param stream Non-null collective-to-consumer stream.
+     * @return Whether valid geometry was enqueued without allocation or count readback.
+     */
+    bool assembleLiveColumnShardsFP32(DeviceId device, const float *rank_major, float *row_major,
+        DeviceRowRange rows, int participants, int columns, void *stream);
 }

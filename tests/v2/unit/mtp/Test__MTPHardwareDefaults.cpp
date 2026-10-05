@@ -115,6 +115,75 @@ TEST(MTPHardwareDefaults, SingleAndHomogeneousLocalTPUseMeasuredCardProfile)
     }
 }
 
+/** @test The measured head choice follows complete model, format and physical membership. */
+TEST(MTPHardwareDefaults, DenseQwenGPUHeadDefaultsRequireMeasuredNativeLocalFamily)
+{
+    ModelConfig model{.name = "qwen35", .n_layers = 64, .n_heads = 24, .n_kv_heads = 4,
+        .hidden_size = 5120, .intermediate_size = 17408, .vocab_size = 248320, .head_dim = 256,
+        .terminal_head_source = {.codebook_id = native_vnni_formats::Q6_K.codebook_id,
+            .is_superblock = true, .present = true}};
+    ExecutionPlanBuilder builder;
+    for (const auto type : {DeviceType::ROCm, DeviceType::CUDA})
+    {
+        auto cluster = inventory({{card(type, 0), card(type, 1)}});
+        OrchestrationConfig config;
+        config.tp_devices = {address(type, 0), address(type, 1)};
+        config.mtp.enabled = true;
+        config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        const auto expected = MTPTerminalHeadPolicy::VocabularySharded;
+        const auto selected = [&] { return builder.buildAllPlans(config, model, cluster)
+            .front().runtime.mtp.terminal_head_policy; };
+        EXPECT_EQ(selected(), expected);
+        config.mtp.depth_policy.max_depth = 2;
+        config.mtp.graph_capacity_draft_tokens = 2;
+        EXPECT_EQ(selected(), expected);
+        config.mtp.graph_capacity_draft_tokens = 15;
+        EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        config.mtp.graph_capacity_draft_tokens = 0;
+        config.mtp.depth_policy.max_depth = 3;
+        EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        config.mtp.depth_policy.max_depth = 0;
+        auto unmeasured = cluster;
+        unmeasured.ranks.front().gpus.back().name = "unmeasured accelerator";
+        EXPECT_EQ(builder.buildAllPlans(config, model, unmeasured).front().runtime.mtp.terminal_head_policy,
+            MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        for (const auto explicit_policy : {MTPTerminalHeadPolicy::VocabularySharded,
+                MTPTerminalHeadPolicy::MirroredFullVocabulary})
+        {
+            config.mtp.terminal_head_policy = explicit_policy;
+            EXPECT_EQ(selected(), explicit_policy);
+        }
+        config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::Automatic;
+        config.mtp.enabled = false;
+        EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        config.mtp.enabled = true;
+        config.mtp.graph_capacity_draft_tokens = 17;
+        EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        config.mtp.graph_capacity_draft_tokens = 0;
+        config.mtp.max_request_batch = 2;
+        EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        config.mtp.max_request_batch = 1;
+        model.terminal_head_source.present = false;
+        EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        model.terminal_head_source.present = true;
+        model.terminal_head_source.codebook_id = native_vnni_formats::Q8_0.codebook_id;
+        EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        model.terminal_head_source.codebook_id = native_vnni_formats::Q6_K.codebook_id;
+        model.name = "qwen35moe";
+        EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        model.name = "qwen35";
+        config.tp_devices = {address(type, 0)};
+        EXPECT_EQ(selected(), MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        config.tp_devices.clear();
+        config.domain_definitions = {domain("terminal", {address(type, 0), address(type, 1)}, {0, 0})};
+        EXPECT_EQ(selected(), expected);
+        config.domain_definitions = {domain("terminal", {address(type, 0), address(type, 0)}, {0, 1})};
+        cluster = inventory({{card(type, 0)}, {card(type, 0)}});
+        for (const auto &plan : builder.buildAllPlans(config, model, cluster))
+            EXPECT_EQ(plan.runtime.mtp.terminal_head_policy, MTPTerminalHeadPolicy::MirroredFullVocabulary);
+    }
+}
+
 TEST(MTPHardwareDefaults, ExplicitSingleDeviceIgnoresUnselectedCards)
 {
     OrchestrationConfig config;

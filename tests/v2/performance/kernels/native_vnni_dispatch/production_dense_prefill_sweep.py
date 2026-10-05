@@ -88,13 +88,13 @@ CUDA_TIMING_COLUMNS = (
     "backend", "phase", "format", "codebook", "shape", "m", "n", "k",
     "tile", "tile_id", "strategy", "requested_k_partitions", "sample_index",
     "timed_replays", "latency_us", "latency_us_hex",
-    "staging_schedule",
+    "staging_schedule", "captured_operations",
 )
 
 ROCM_TIMING_COLUMNS = (
     "backend", "phase", "format", "codebook", "shape", "m", "n", "k",
     "variant", "sample_index", "timed_replays", "latency_us",
-    "latency_us_hex",
+    "latency_us_hex", "captured_operations",
 )
 
 CUDA_TILE_NAMES = (
@@ -218,7 +218,8 @@ ROCM_Q6_SPILLING_CHECKED_CANDIDATE_IDS = frozenset((
 DEFAULT_WARMUP_RUNS = 3
 DEFAULT_BENCH_RUNS = 10
 SWEEP_PLAN_FILENAME = "production_dense_prefill.plan.json"
-SWEEP_PLAN_SCHEMA = "native-vnni-production-dense-prefill-sweep-v3"
+SWEEP_PLAN_SCHEMA = "native-vnni-production-dense-prefill-sweep-v4"
+DENSE_PREFILL_CAPTURED_OPERATIONS = 16
 CELL_MANIFEST_SCHEMA = "native-vnni-production-dense-prefill-cell-v1"
 _UINT64_MAX = (1 << 64) - 1
 
@@ -879,6 +880,8 @@ def _read_timing_rows(
                 raise ValueError(f"{context}: non-contiguous sample index")
             if int(row["timed_replays"]) != 1:
                 raise ValueError(f"{context}: dense event sample must time one replay")
+            if int(row["captured_operations"]) != DENSE_PREFILL_CAPTURED_OPERATIONS:
+                raise ValueError(f"{context}: dense sample must measure the complete captured operation batch")
             readable = float(row["latency_us"])
             exact = float.fromhex(row["latency_us_hex"])
             if not math.isfinite(exact) or exact <= 0.0:
@@ -1007,6 +1010,9 @@ def _sweep_plan_payload(
         },
         "warmup_runs": warmup_runs,
         "bench_runs": bench_runs,
+        "submission": "native_graph",
+        "captured_operations": DENSE_PREFILL_CAPTURED_OPERATIONS,
+        "latency_basis": "per_complete_projection",
         "trainer_provenance": dict(trainer),
         "trainer_provenance_digest": _mapping_digest(trainer),
         "cells": [cell.canonical_mapping() for cell in cells],
@@ -1347,7 +1353,7 @@ def _batch_environment(
 
     Only M varies inside a batch. The C++ harness therefore retains the same
     prepared weight while constructing a fresh persistent execution object for
-    each bucket. Candidate timing remains one native event sample per launch;
+    each bucket. Candidate timing remains one native event sample per retained graph replay;
     batching removes setup work but does not combine or amortize timed kernels.
     """
 

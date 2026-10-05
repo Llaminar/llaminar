@@ -22,6 +22,7 @@
 #include "../NativeCollectiveRowsContract.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
+#include "../../utils/PerfStatsCollector.h"
 
 #include <cuda_runtime.h>
 
@@ -727,8 +728,41 @@ namespace llaminar2
         // netName configures only NCCL's network module. NCCL still evaluates
         // CUDA P2P first and shared memory second, so enabling P2P on this host
         // in the future requires no code change.
-        constexpr std::string_view network_module =
-            ncclNetworkModuleName(NCCLNetworkModule::Socket);
+        // Authenticate the complete physical pair once during construction.
+        // Peer reachability, not a launch-time guess, distinguishes this SHM
+        // measurement from a future peer/NVLink-connected installation.
+        std::vector<cudaDeviceProp> properties(num_devices_);
+        std::vector<NCCLCardIdentity> cards;
+        cards.reserve(num_devices_);
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (const auto error = cudaGetDeviceProperties(&properties[i], device_ordinals_[i]); error != cudaSuccess)
+            {
+                last_error_ = std::string("NCCL profile device identity: ") + cudaGetErrorString(error);
+                LOG_ERROR("[NCCLCoordinator] " << last_error_);
+                cleanupOnThread();
+                return;
+            }
+            const auto &card = properties[i];
+            cards.push_back({.name = card.name, .ordinal = device_ordinals_[i],
+                .architecture_major = card.major, .architecture_minor = card.minor,
+                .multiprocessors = card.multiProcessorCount, .memory_bytes = card.totalGlobalMem});
+        }
+        std::vector<NCCLPeerAccess> directed_peers;
+        if (num_devices_ == 2)
+            for (int i = 0; i < 2; ++i)
+            {
+                int available = 0;
+                if (const auto error = cudaDeviceCanAccessPeer(&available, device_ordinals_[i], device_ordinals_[1 - i]); error != cudaSuccess)
+                {
+                    last_error_ = std::string("NCCL profile peer identity: ") + cudaGetErrorString(error);
+                    LOG_ERROR("[NCCLCoordinator] " << last_error_);
+                    cleanupOnThread();
+                    return;
+                }
+                directed_peers.push_back(available ? NCCLPeerAccess::Available : NCCLPeerAccess::Unavailable);
+            }
+        communicator_policy_ = selectNCCLCommunicatorPolicy(CollectiveScope::LOCAL, cards, directed_peers);
         std::vector<nccl::ncclResult_t> init_results(
             num_devices_,
             nccl::ncclInternalError);
@@ -749,12 +783,12 @@ namespace llaminar2
                 }
 
                 nccl::ncclComm_t comm = nullptr;
-                init_results[i] = nccl::ncclCommInitRankWithNetwork(
+                init_results[i] = nccl::ncclCommInitRankWithPolicy(
                     &comm,
                     num_devices_,
                     unique_id,
                     i,
-                    network_module.data());
+                    communicator_policy_);
                 if (init_results[i] == nccl::ncclSuccess)
                 {
                     comms_[i] = static_cast<void *>(comm);
@@ -786,9 +820,17 @@ namespace llaminar2
                 return;
             }
             LOG_TRACE("[NCCLCoordinator] Initialized NCCL comm for device " << device_ordinals_[i]);
+            PerfStatsCollector::addCounter("collective", "native_communicator_profile_bindings", 1.0,
+                "setup", DeviceId::cuda(device_ordinals_[i]).toString(),
+                {{"profile", std::string(ncclCommunicatorProfileName(communicator_policy_.profile))},
+                 {"requested_channel_budget", std::to_string(ncclCommunicatorChannelBudget(communicator_policy_.profile))},
+                 {"network", "Socket"}});
         }
 
         init_success_.store(true);
+        LOG_INFO("[NCCLCoordinator] Native communicator profile="
+            << ncclCommunicatorProfileName(communicator_policy_.profile)
+            << " requested_channel_budget=" << ncclCommunicatorChannelBudget(communicator_policy_.profile));
         LOG_DEBUG("[NCCLCoordinator] NCCL resources initialized on coordinator thread");
 #else
         last_error_ = "NCCL not available (HAVE_NCCL not defined)";

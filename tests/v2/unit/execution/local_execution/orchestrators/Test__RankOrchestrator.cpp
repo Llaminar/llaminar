@@ -282,7 +282,7 @@ public:
         return supports_device_resident_mtp_spec_state_publication_;
     }
 
-    bool usesMirroredMTPHeadForVerifier() const override
+    bool publishesFullVocabularyMTPLogits() const override
     {
         return uses_mirrored_localtp_mtp_head_for_verifier_;
     }
@@ -1407,7 +1407,7 @@ public:
                 &resident_outcome_ready_event_token_,
                 [](void *) {});
         out_handle->sampling_mode = DeviceGenerationSamplingMode::Greedy;
-        out_handle->mirrored_local_tp_locally_complete =
+        out_handle->local_tp_participant_complete =
             uses_mirrored_localtp_mtp_head_for_verifier_;
         attachMockResidentMTPTransaction(out_handle, /*request_count=*/1);
         return out_handle->valid();
@@ -1892,7 +1892,7 @@ public:
                 &resident_outcome_ready_event_token_,
                 [](void *) {});
         out_handle->sampling_mode = DeviceGenerationSamplingMode::Stochastic;
-        out_handle->mirrored_local_tp_locally_complete =
+        out_handle->local_tp_participant_complete =
             uses_mirrored_localtp_mtp_head_for_verifier_;
         attachMockResidentMTPTransaction(out_handle, request_count);
         return out_handle->valid();
@@ -7714,7 +7714,7 @@ TEST_F(Test__RankOrchestrator,
 
     ASSERT_TRUE(orchestrator->supportsGreedyAllPositionBatchOutcomeOnDevice());
     ASSERT_TRUE(orchestrator->supportsDeviceResidentMTPSpecStatePublication());
-    ASSERT_TRUE(orchestrator->usesMirroredMTPHeadForVerifier());
+    ASSERT_TRUE(orchestrator->publishesFullVocabularyMTPLogits());
 
     const std::array<int32_t, 2> draft_tokens = {10, 4};
     DeviceSpeculativeOutcomeHandle handle;
@@ -7869,7 +7869,7 @@ TEST_F(Test__RankOrchestrator,
     ASSERT_NE(end, std::string::npos);
     const std::string body = source.substr(begin, end - begin);
 
-    EXPECT_NE(body.find("mirrored_local_tp_locally_complete"),
+    EXPECT_NE(body.find("local_tp_participant_complete"),
               std::string::npos);
     EXPECT_EQ(body.find("collectiveSidebandsMultiOnStreams("),
               std::string::npos);
@@ -7905,7 +7905,7 @@ TEST_F(Test__RankOrchestrator,
     const std::string body = source.substr(begin, end - begin);
 
     EXPECT_NE(
-        body.find("mirrored_local_tp_locally_complete"),
+        body.find("local_tp_participant_complete"),
         std::string::npos);
     EXPECT_EQ(
         body.find(
@@ -8059,7 +8059,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomePublishesEveryPar
         << "Mirrored LocalTP stochastic support requires every child to expose "
            "full-vocab resident stochastic verification.";
     ASSERT_TRUE(orchestrator->supportsDeviceResidentMTPSpecStatePublication());
-    ASSERT_TRUE(orchestrator->usesMirroredMTPHeadForVerifier());
+    ASSERT_TRUE(orchestrator->publishesFullVocabularyMTPLogits());
     ASSERT_TRUE(orchestrator->supportsMTPSidecarLogitsStreamHandoff());
     ASSERT_TRUE(orchestrator->supportsMTPDeviceDraftTokenInput());
 
@@ -8163,7 +8163,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomePublishesEveryPar
         /*inverse_sample_first_logical_position=*/64,
         /*use_vllm_probability_rejection=*/true));
     ASSERT_TRUE(handle.valid());
-    EXPECT_TRUE(handle.mirrored_local_tp_locally_complete);
+    EXPECT_TRUE(handle.local_tp_participant_complete);
     EXPECT_EQ(tp_ctx_ptr->collective_sideband_call_count(), 2u)
         << "The one still-sharded main-target broadcast enters the mock "
            "collective once per participant; draft samples and compact verifier "
@@ -8285,7 +8285,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredDeferredStochasticDraftSamplesEver
         makeRankConfigForRunnerCount(2));
 
     ASSERT_TRUE(orchestrator->supportsDeviceStochasticMTPVerification());
-    ASSERT_TRUE(orchestrator->usesMirroredMTPHeadForVerifier());
+    ASSERT_TRUE(orchestrator->publishesFullVocabularyMTPLogits());
     ASSERT_TRUE(orchestrator->supportsMTPDeviceDraftTokenInput());
 
     SamplingParams params;

@@ -24,7 +24,9 @@
 #include <mutex>
 #include <string>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <unistd.h>
 
@@ -42,6 +44,126 @@ void require(CUresult status, const char *operation) {
     std::fprintf(stderr, "native event trace: %s: %s\n", operation, name ? name : "unknown");
     std::abort();
 }
+/** @brief Reject ambiguous provenance rather than assigning a guessed stage. */
+[[noreturn]] void provenanceFailure(const char *reason) {
+    std::fprintf(stderr, "native event trace stage annotation: %s\n", reason);
+    std::abort();
+}
+/** @brief Immutable ownership of the native nodes introduced by one stage. */
+struct StageDefinition {
+    unsigned id{};
+    int parent{-1};
+    std::string name, type;
+    std::vector<CUgraphNode> nodes;
+};
+/** @brief Setup metadata owned until the original native graph is destroyed. */
+struct GraphAnnotations {
+    CUcontext context{};
+    int device{};
+    std::thread::id recording_thread;
+    unsigned open_scopes{};
+    bool aborted{};
+    std::vector<StageDefinition> stages;
+    std::unordered_map<CUgraphNode, unsigned> node_stage;
+};
+/** @brief A thread's exact begin frontier, including any enclosing stage. */
+struct AnnotationFrontier {
+    CUgraph graph{};
+    CUcontext context{};
+    void *stream{};
+    int device{};
+    StageDefinition stage;
+    std::unordered_set<CUgraphNode> prior_nodes;
+};
+std::mutex annotations_mutex;
+std::unordered_map<CUgraph, GraphAnnotations> annotations;
+thread_local std::vector<AnnotationFrontier> annotation_stack;
+std::atomic<unsigned> next_stage_id{0};
+
+/** @brief Read graph topology on the host; never inspect a tensor or wait on a GPU. */
+std::vector<CUgraphNode> graphNodes(CUgraph graph) {
+    std::size_t count = 0;
+    require(cuGraphGetNodes(graph, nullptr, &count), "annotation node count");
+    std::vector<CUgraphNode> nodes(count);
+    require(cuGraphGetNodes(graph, nodes.data(), &count), "annotation node frontier");
+    if (count != nodes.size()) provenanceFailure("native topology changed during a frontier query");
+    return nodes;
+}
+
+/**
+ * @brief Observe canonical capture boundaries through the versioned engine ABI.
+ * @details Snapshots describe native topology, not GPU execution state. Parallel
+ * recording into the same parent cannot be attributed by set difference and is
+ * rejected; independent device graphs remain independent. Nested scopes retain
+ * their inclusive node sets, with innermost ownership on each physical node.
+ */
+void annotateStage(unsigned phase, unsigned backend, int device, void *stream,
+                   const char *name, const char *type) {
+    if (!std::getenv("LLAMINAR_NATIVE_EVENT_TRACE_DIR")) return;
+    if (backend != 1) provenanceFailure("this standalone observer supports CUDA only");
+    if (!stream || device < 0 || !name || !*name || !type || !*type || phase > 2)
+        provenanceFailure("incomplete stage identity or invalid lifecycle phase");
+    CUcontext context{};
+    int current_device = -1;
+    require(cuCtxGetCurrent(&context), "annotation context");
+    require(cuCtxGetDevice(&current_device), "annotation device");
+    if (!context || current_device != device) provenanceFailure("stage device differs from its current capture context");
+    CUstreamCaptureStatus capture_status{};
+    CUgraph graph{};
+    require(cuStreamGetCaptureInfo(reinterpret_cast<CUstream>(stream), &capture_status,
+        nullptr, &graph, nullptr, nullptr, nullptr), "annotation exact capture stream");
+    if (capture_status != CU_STREAM_CAPTURE_STATUS_ACTIVE || !graph)
+        provenanceFailure("stage stream is not recording an active native graph");
+    if (phase == 0) {
+        AnnotationFrontier frontier;
+        frontier.graph = graph;
+        frontier.context = context;
+        frontier.device = device;
+        frontier.stream = stream;
+        frontier.stage = {next_stage_id++, -1, name, type, {}};
+        if (!annotation_stack.empty() && annotation_stack.back().graph == graph)
+            frontier.stage.parent = static_cast<int>(annotation_stack.back().stage.id);
+        const auto nodes = graphNodes(graph);
+        frontier.prior_nodes.insert(nodes.begin(), nodes.end());
+        {
+            std::lock_guard guard(annotations_mutex);
+            auto [found, inserted] = annotations.try_emplace(graph);
+            auto &owner = found->second;
+            if (inserted) { owner.context = context; owner.device = device; }
+            if (owner.context != context || owner.device != device || owner.aborted)
+                provenanceFailure("native graph identity was reused or recording already failed");
+            const auto thread = std::this_thread::get_id();
+            if (owner.open_scopes && owner.recording_thread != thread)
+                provenanceFailure("concurrent stages in one native parent have ambiguous node ownership");
+            owner.recording_thread = thread;
+            ++owner.open_scopes;
+        }
+        annotation_stack.push_back(std::move(frontier));
+        return;
+    }
+    if (annotation_stack.empty()) provenanceFailure("stage retirement has no begin frontier");
+    auto &frontier = annotation_stack.back();
+    if (frontier.graph != graph || frontier.context != context || frontier.device != device ||
+        frontier.stream != stream || frontier.stage.name != name || frontier.stage.type != type)
+        provenanceFailure("stage retirement differs from its exact begin identity");
+    if (phase == 1)
+        for (auto node : graphNodes(graph))
+            if (!frontier.prior_nodes.contains(node)) frontier.stage.nodes.push_back(node);
+    {
+        std::lock_guard guard(annotations_mutex);
+        auto &owner = annotations.at(graph);
+        if (!owner.open_scopes || owner.recording_thread != std::this_thread::get_id())
+            provenanceFailure("stage recording scope ownership was lost");
+        --owner.open_scopes;
+        if (phase == 2) owner.aborted = true;
+        else {
+            for (auto node : frontier.stage.nodes)
+                owner.node_stage.try_emplace(node, frontier.stage.id);
+            owner.stages.push_back(std::move(frontier.stage));
+        }
+    }
+    annotation_stack.pop_back();
+}
 /** @brief Keep timing handles alive through every replay of one executable. */
 struct Trace {
     unsigned id{};
@@ -50,6 +172,7 @@ struct Trace {
     CUevent begin{}, end{};
     std::vector<CUevent> before, after;
     Json nodes;
+    Json stages = Json::array();
     std::string graph_selector;
     std::vector<std::string> node_filters;
     unsigned launches{};
@@ -136,6 +259,33 @@ std::unique_ptr<Trace> instrument(CUgraph graph) {
     trace->id = next_id++;
     require(cuCtxGetCurrent(&trace->context), "trace context");
     require(cuCtxGetDevice(&trace->device), "trace device");
+    {
+        std::lock_guard guard(annotations_mutex);
+        const auto found = annotations.find(graph);
+        const bool require_stages = std::getenv("LLAMINAR_NATIVE_EVENT_TRACE_REQUIRE_STAGE_NAMES") != nullptr;
+        if (found == annotations.end()) {
+            if (require_stages) provenanceFailure("selected parent has no canonical stage annotations");
+        } else {
+            const auto &owner = found->second;
+            if (owner.context != trace->context || owner.device != trace->device ||
+                owner.open_scopes || owner.aborted)
+                provenanceFailure("selected parent has incomplete or stale stage recording");
+            for (const auto &stage : owner.stages) {
+                Json ids = Json::array();
+                for (auto node : stage.nodes) {
+                    const auto member = index.find(node);
+                    if (member == index.end()) provenanceFailure("stage node disappeared before instantiation");
+                    ids.push_back(member->second);
+                    if (owner.node_stage.at(node) == stage.id)
+                        trace->nodes[member->second]["stage"] =
+                            Json{{"id", stage.id}, {"name", stage.name}, {"type", stage.type}};
+                }
+                trace->stages.push_back(Json{{"id", stage.id}, {"parent", stage.parent},
+                    {"name", stage.name}, {"type", stage.type}, {"native_node_ids", std::move(ids)}});
+            }
+            if (require_stages && trace->stages.empty()) provenanceFailure("selected parent has no completed stages");
+        }
+    }
     std::vector<std::vector<CUgraphNode>> parents(size), children(size);
     for (std::size_t i = 0; i < size; ++i) {
         std::size_t count = 0;
@@ -228,13 +378,15 @@ void retire(Trace &trace) {
             trace.nodes[i]["start_ms"] = begin;
             trace.nodes[i]["end_ms"] = end;
         }
-        Json report{{"schema_version", 1}, {"diagnostic_only", true}, {"source", "native_cuda_graph_events"},
+        Json report{{"schema_version", 2}, {"diagnostic_only", true}, {"source", "native_cuda_graph_events"},
             {"intervals_include_scheduling_and_event_overhead", true},
             {"conditional_bodies_timed_as_opaque", true},
             {"selected_nodes_only", trace.selected_nodes_only},
             {"graph_selector", trace.graph_selector}, {"node_filters", trace.node_filters},
             {"device", trace.device}, {"graph", trace.id}, {"launches", trace.launches},
-            {"snapshot", "last_completed_replay"}, {"duration_ms", duration}, {"nodes", trace.nodes}};
+            {"snapshot", "last_completed_replay"}, {"duration_ms", duration},
+            {"stage_attribution", trace.stages.empty() ? "unavailable" : "canonical_capture_scopes"},
+            {"stages", trace.stages}, {"nodes", trace.nodes}};
         const std::string path = std::string(std::getenv("LLAMINAR_NATIVE_EVENT_TRACE_DIR")) +
             "/cuda-event-" + std::to_string(getpid()) + "-" + std::to_string(trace.id) + ".json";
         std::ofstream output(path);
@@ -249,6 +401,34 @@ void retire(Trace &trace) {
     CUcontext restored{};
     require(cuCtxPopCurrent(&restored), "restore trace context");
 }
+}
+
+/** @brief Setup-only stage observer; unexpected failures terminate the diagnostic. */
+extern "C" void llaminar_native_graph_stage_annotation_v1(
+    unsigned phase, unsigned backend, int device, void *stream,
+    const char *name, const char *type) noexcept {
+    try { annotateStage(phase, backend, device, stream, name, type); }
+    catch (const std::exception &error) { provenanceFailure(error.what()); }
+    catch (...) { provenanceFailure("unknown setup annotation failure"); }
+}
+
+/** @brief Retire original topology metadata before a native graph handle can be reused. */
+extern "C" cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
+    using Function = cudaError_t (*)(cudaGraph_t);
+    static auto native = reinterpret_cast<Function>(dlsym(RTLD_NEXT, "cudaGraphDestroy"));
+    if (!native) std::abort();
+    {
+        std::lock_guard guard(annotations_mutex);
+        const auto found = annotations.find(reinterpret_cast<CUgraph>(graph));
+        if (found != annotations.end() && found->second.open_scopes)
+            provenanceFailure("native graph destroyed while a stage annotation is open");
+    }
+    const auto status = native(graph);
+    if (status == cudaSuccess) {
+        std::lock_guard guard(annotations_mutex);
+        annotations.erase(reinterpret_cast<CUgraph>(graph));
+    }
+    return status;
 }
 
 /**

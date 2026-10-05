@@ -19,6 +19,7 @@
 #include "execution/compute_stages/stages/AttentionComputeStage.h"
 #include "execution/compute_stages/stages/MTPConcatStage.h"
 #include "execution/compute_stages/stages/MTPVerifierOutcomeStage.h"
+#include "execution/compute_stages/stages/NativeVocabularyAllGatherStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
@@ -177,6 +178,7 @@ namespace
     public:
         using Qwen35Graph::Qwen35Graph;
         using Qwen35Graph::resolveLMHeadDeviceRowIndexSource;
+        using Qwen35Graph::projectionVerifierRows;
 
         bool mirroredHeadActiveForProjectedRows(int total_tokens) const
         {
@@ -197,6 +199,63 @@ namespace
                 verifier_row_count,
                 device);
         }
+    };
+
+    /**
+     * @brief Observe the real grouped verifier declared before workspace admission.
+     *
+     * A recurrent checkpoint and a terminal vocabulary gather coexist in one
+     * verifier. Declaring only the recurrent policy with a serial output head
+     * lets the family allocator overlay their banks even though production
+     * later reads the checkpoint after the gather has written it.
+     */
+    class WorkspaceManifestQwen35Graph final : public Qwen35Graph
+    {
+    public:
+        using Qwen35Graph::Qwen35Graph;
+
+        /** @brief Immutable output ownership observed at graph construction. */
+        struct VerifierDeclaration
+        {
+            int physical_rows = 0;
+            bool all_positions = false;
+            bool row_indexed = false;
+            int selected_rows = 0;
+            std::size_t head_output_rows = 0;
+            std::size_t output_owner_rows = 0;
+        };
+
+        /** @copydoc Qwen35Graph::buildFullForwardGraph */
+        ComputeGraph buildFullForwardGraph(
+            const ForwardInput &input, ForwardOutput &output) override
+        {
+            auto graph = Qwen35Graph::buildFullForwardGraph(input, output);
+            if (config().grouped_mtp_verifier)
+            {
+                VerifierDeclaration declaration{
+                    .physical_rows = input.batch_size * input.seq_len,
+                    .all_positions = config().compute_all_position_logits,
+                    .row_indexed = config().compute_row_indexed_logits,
+                    .selected_rows = config().row_indexed_logits_row_count,
+                };
+                if (const auto *node = graph.getNode("lm_head"); node && node->stage)
+                {
+                    if (const auto *head = dynamic_cast<const LMHeadStage *>(node->stage.get()))
+                    {
+                        const auto info = head->buildDumpInfoImpl();
+                        if (!info.outputs.empty())
+                        {
+                            declaration.head_output_rows = info.outputs.front().rows;
+                            declaration.output_owner_rows = info.outputs.front().tensor->rows();
+                        }
+                    }
+                }
+                declarations.push_back(declaration);
+            }
+            return graph;
+        }
+
+        std::vector<VerifierDeclaration> declarations; ///< Setup-only metadata; no model execution.
     };
 
     /**
@@ -3622,6 +3681,68 @@ TEST(Test__MTPGraphConstruction, DenseSidecarAllreducesVocabParallelEmbedding)
     EXPECT_TRUE(contractWrites(contract, BufferId::MTP_EMBEDDING));
 }
 
+/** @brief Dense and MoE shifted sidecars retain each request's own append authority. */
+TEST(Test__MTPGraphConstruction, ShiftedMTPEmbeddingCollectiveUsesIndependentRequestRows)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const bool moe : {false, true})
+    for (const int requests : {1, 3})
+    {
+        SCOPED_TRACE(device.toString() + "/moe=" + std::to_string(moe) + "/requests=" + std::to_string(requests));
+        DenseMTPGraphFixture fixture(12);
+        MockLocalTPContext tp;
+        tp.setDevices(device.is_cuda()
+            ? std::vector{GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}
+            : std::vector{GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp.setBackend(device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        fixture.config.default_device = device;
+        fixture.config.tp_ctx = &tp;
+        fixture.config.tp_device_idx = 0;
+        if (moe)
+        {
+            fixture.config.moe.num_experts = 4;
+            fixture.config.moe.top_k = 2;
+            fixture.config.moe.intermediate_size = 32;
+            fixture.config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
+            fixture.config.moe.has_shared_expert = false;
+        }
+        fixture.embedding_table = TestTensorFactory::createFP32Random({
+            static_cast<size_t>(fixture.config.vocab_size / 2), static_cast<size_t>(fixture.config.d_model)});
+        std::unique_ptr<Qwen35Graph> builder = moe
+            ? std::unique_ptr<Qwen35Graph>(std::make_unique<Qwen35MoEGraph>(fixture.config, fixture.mpi))
+            : std::make_unique<Qwen35Graph>(fixture.config, fixture.mpi);
+        builder->setWeights(fixture.modelWeights());
+        auto input = fixture.input();
+        input.device = device;
+        input.device_state_publication_stream = reinterpret_cast<void *>(0x10000);
+        input.batch_size = requests;
+        input.seq_len = 4;
+        input.kv_cache_only = true;
+        // These opaque operands prove construction never reads device metadata.
+        input.sequence_lengths_device = reinterpret_cast<const std::int32_t *>(0x20000);
+        auto output = fixture.output();
+        const auto graph = builder->buildMTPGraph(0, fixture.mtpWeights(), input, output);
+        const auto *node = graph.getNode("mtp0_embedding_allreduce");
+        ASSERT_NE(node, nullptr);
+        const auto *sum = dynamic_cast<const TPAllreduceStage *>(node->stage.get());
+        ASSERT_NE(sum, nullptr);
+        ASSERT_TRUE(sum->params().request_rows);
+        EXPECT_FALSE(sum->params().live_rows);
+        const auto &layout = *sum->params().request_rows;
+        EXPECT_EQ(layout.requests(), requests);
+        EXPECT_EQ(layout.storageElements(), static_cast<size_t>(requests * 4 * fixture.config.d_model));
+        EXPECT_EQ(layout.storageElements(), sum->params().count);
+        for (int request = 0; request < requests; ++request)
+        {
+            EXPECT_EQ(layout.requestRows(request).rows().countOwner(), input.sequence_lengths_device + request);
+            EXPECT_EQ(layout.requestRows(request).rows().capacity(), 4);
+            EXPECT_EQ(layout.requestElementOffset(request), static_cast<size_t>(request * 4 * fixture.config.d_model));
+        }
+        EXPECT_TRUE(hasDependency(graph, "mtp0_embedding_allreduce", "mtp0_embedding"));
+        EXPECT_TRUE(hasDependency(graph, "mtp0_norm_embedding", "mtp0_embedding_allreduce"));
+    }
+}
+
 TEST(Test__MTPGraphConstruction, AllPositionLMHeadUsesVerifierLogitsContract)
 {
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
@@ -4903,6 +5024,54 @@ TEST(Test__MTPGraphConstruction,
             << buffer_name;
     }
     PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Workspace admission sees every live grouped head row with the verifier.
+ *
+ * This device-free regression constructs the real model graph through the
+ * production orchestrator. It covers singleton/batched requests and several
+ * retained depths, authenticates physical output storage as well as policy,
+ * and proves setup restores ordinary output ownership afterward.
+ */
+TEST(Test__MTPGraphConstruction, WorkspaceFamilyDeclaresCompleteVerifierOutputs)
+{
+    DeviceManager::instance().initialize(-1, false);
+    for (const int requests : {1, 2})
+    {
+        for (const int depth : {1, 3, 7})
+        {
+            SCOPED_TRACE("requests=" + std::to_string(requests) +
+                         " depth=" + std::to_string(depth));
+            TinyQwen35MTPForwardFixture fixture;
+            fixture.config.max_seq_len = 32;
+            fixture.config.mtp.draft_tokens = depth;
+            fixture.config.mtp.max_request_batch = requests;
+            auto builder = std::make_shared<WorkspaceManifestQwen35Graph>(
+                fixture.config, fixture.mpi);
+            DeviceGraphOrchestrator orchestrator(builder, fixture.mpi);
+            ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+                requests, fixture.config.max_seq_len, DeviceId::cpu()));
+            orchestrator.setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
+            PreparedWeightStore store;
+            prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+            builder->setPreparedWeightStore(&store);
+            ASSERT_TRUE(orchestrator.materializeForwardGraphForShape(1, requests));
+            ASSERT_EQ(builder->declarations.size(), 1U);
+            const auto &declaration = builder->declarations.front();
+            const int rows = requests * (depth + 1);
+            EXPECT_EQ(declaration.physical_rows, rows);
+            EXPECT_TRUE(declaration.all_positions);
+            EXPECT_TRUE(declaration.row_indexed);
+            EXPECT_EQ(declaration.selected_rows, rows);
+            EXPECT_EQ(declaration.head_output_rows, static_cast<std::size_t>(rows));
+            EXPECT_GE(declaration.output_owner_rows, static_cast<std::size_t>(rows));
+            EXPECT_FALSE(builder->config().grouped_mtp_verifier);
+            EXPECT_FALSE(builder->config().compute_all_position_logits);
+            EXPECT_FALSE(builder->config().compute_row_indexed_logits);
+            EXPECT_EQ(builder->config().row_indexed_logits_row_count, 0);
+        }
+    }
 }
 
 /**
@@ -7864,4 +8033,102 @@ TEST(Test__MTPGraphConstruction,
         DeviceGenerationSamplingMode::Greedy));
     EXPECT_TRUE(isValidDeviceGenerationSamplingMode(
         DeviceGenerationSamplingMode::Stochastic));
+}
+
+/**
+ * @brief A sharded CUDA/HIP predictor completes its explicit full-vocabulary graph output.
+ *
+ * Host tensors are metadata fixtures only. Native execution and dynamic live
+ * byte extents are authenticated by the paired backend integration regression.
+ */
+TEST(Test__MTPGraphConstruction, NativeLocalShardedHeadPublishesCompleteVerifierLogits)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int rows : {1, 4, 16})
+    {
+        SCOPED_TRACE(device.toString() + "/" + std::to_string(rows));
+        DenseMTPGraphFixture fixture(16);
+        MockLocalTPContext tp;
+        tp.setDevices(device.is_cuda()
+            ? std::vector{GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}
+            : std::vector{GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp.setBackend(device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        tp.setRawAllgatherGraphCaptureSupported(true);
+        fixture.config.default_device = device;
+        fixture.config.tp_ctx = &tp;
+        fixture.config.dense_tp_enabled = false;
+        fixture.config.lm_head_column_parallel = true;
+        fixture.config.vocab_local = fixture.config.vocab_size / 2;
+        fixture.config.mtp.enabled = true;
+        fixture.config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+        fixture.lm_head = TestTensorFactory::createFP32Random({
+            static_cast<size_t>(fixture.config.vocab_local), static_cast<size_t>(fixture.config.d_model)});
+        fixture.logits = TestTensorFactory::createFP32({16, static_cast<size_t>(fixture.config.vocab_local)});
+        Qwen35Graph builder(fixture.config, fixture.mpi);
+        builder.setWeights(fixture.modelWeights());
+        auto input = fixture.input();
+        input.device = device;
+        // Metadata-only stream identity: graph construction borrows this token
+        // and this Unit fixture never submits it to a GPU API.
+        input.device_state_publication_stream = reinterpret_cast<void *>(0x10000);
+        input.batch_size = rows;
+        input.seq_len = 1;
+        auto output = fixture.output();
+        const auto graph = builder.buildMTPGraph(0, fixture.mtpWeights(), input, output);
+        const auto *head = graph.getNode("mtp0_lm_head");
+        ASSERT_NE(head, nullptr);
+        EXPECT_EQ(dumpScalarInt(head->stage->getDumpInfoSnapshot(), "vocab_size"), fixture.config.vocab_local);
+        const auto *terminal = graph.getNode("mtp0_lm_head_allgather");
+        ASSERT_NE(terminal, nullptr);
+        const auto *gather = dynamic_cast<const NativeVocabularyAllGatherStage *>(terminal->stage.get());
+        ASSERT_NE(gather, nullptr);
+        EXPECT_EQ(gather->params().local_logits, output.logits);
+        EXPECT_EQ(gather->params().full_logits, output.gathered_logits);
+        EXPECT_EQ(gather->params().rows.capacity(), rows);
+        EXPECT_EQ(gather->params().input_id, BufferId::MTP_LOGITS);
+        EXPECT_EQ(gather->params().output_id, BufferId::MTP_LOGITS_GATHERED);
+        EXPECT_TRUE(hasDependency(graph, "mtp0_lm_head_allgather", "mtp0_lm_head"));
+        EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head_allgather");
+        EXPECT_FALSE(builder.config().mtpUsesMirroredTerminalHeadBinding());
+    }
+}
+
+/**
+ * @brief Serial terminal publication cannot borrow another graph's sequence count.
+ *
+ * A one-row condition/decode head projects one committed token. Its input may
+ * retain a prompt or verifier sequence count, including zero or a value larger
+ * than one. Borrowing that count made native vocabulary publication omit the
+ * serial logits or trap after a request reset. Grouped verifier matrices still
+ * borrow their exact source count, including an empty live prefix.
+ */
+TEST(Test__MTPGraphConstruction, SerialProjectionDoesNotBorrowVerifierSequenceCount)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const bool condition_batch : {false, true})
+    {
+        SCOPED_TRACE(device.toString() + "/condition=" + std::to_string(condition_batch));
+        DenseMTPGraphFixture fixture(16);
+        fixture.config.mtp.enabled = true;
+        fixture.config.compute_all_position_logits = !condition_batch;
+        fixture.config.live_mtp_request_batch_condition = condition_batch;
+        InspectableQwen35Graph builder(fixture.config, fixture.mpi);
+        for (const int source_count : {0, 1, 12, 37})
+        {
+            SCOPED_TRACE(source_count);
+            const int32_t retained_count = source_count;
+            EXPECT_FALSE(builder.projectionVerifierRows(device, 1, 1, &retained_count));
+        }
+        for (int capacity = 2; capacity <= 16; ++capacity)
+        {
+            const int32_t live_count = capacity - 1;
+            const auto rows = builder.projectionVerifierRows(device, capacity, 1, &live_count);
+            ASSERT_TRUE(rows);
+            EXPECT_EQ(rows->countOwner(), &live_count);
+            EXPECT_EQ(rows->capacity(), capacity);
+            EXPECT_EQ(rows->activeRowsFor(0), 0);
+            EXPECT_EQ(rows->activeRowsFor(live_count), live_count);
+            EXPECT_EQ(rows->activeRowsFor(capacity), capacity);
+        }
+    }
 }

@@ -1,6 +1,70 @@
 # vLLM-Style MTP Project Plan
 
+## October 4 dense TP2 steering
+
+The current dense Qwen3.8 27B target is 1.7x prefill scaling over the single
+card. The last qualified global-FP16/dirty-workspace slice passes both complete
+architecture builds, **1360 Unit/preflight registrations**, and **45/45** default
+canonical Release HTTP checks on each GPU pair. ROCm defaults reach
+**431.498 tok/s / 1.739015x** prefill scaling. CUDA's 448-row candidate reaches
+**1005.358 tok/s / 1.038109x** and passes its own 45/45 HTTP checks; it is not
+promoted. Fast/slow CUDA process variation remains unresolved. The
+[dense TP2 report](../2026-10/QWEN38_27B_TP2_TUNING.md) owns current evidence.
+
+The named CUDA stage report and stable skill instructions are qualified.
+Raw projection timing reaches 1.832x on actual bucket schedules, with
+non-projection work excluded; this is not a complete compute-scaling proof.
+The recursive launch audit verifies correctly sharded main matrices and one
+submission of each chunk graph per measured request. It also exposes repeated
+GDN quantization and fifteen physical first-transaction sidecar forwards on
+every admission despite selected depth three. Removing only redundant GDN
+quantizers preserves twelve token/MTP ledgers but shows no macro improvement.
+Native FP16 channel/protocol candidates do not justify another default change.
+
+The active correction replaces capacity-sized shifted-MTP embedding traffic
+with independent device-owned request prefixes on both native GPU backends.
+Its implementation, dense/MoE graph regression and actual-payload/poisoned-row
+replay tests are added; fresh focused and complete qualification are pending.
+The existing 1360-check/HTTP receipts do not certify this new source. The next
+economy obligation separates first-transaction materialization from selected
+draft execution. Arithmetic order and production dynamic-depth policy stay
+fixed. Read-only PCIe checks and frozen-plan authentication establish matching
+CUDA/ROCm x16/x8 branch paths and Gen3 x16 CPU uplinks; bus width alone does not
+explain their scaling difference.
+
 ## Objective
+
+2026-10-04 dense Qwen3.8 27B TP2 follow-up: the sharded-head divergence was
+caused by overlapping vocabulary-gather and recurrent checkpoint storage.
+The complete verifier lifetime declaration fixes the second transaction;
+retained matrices and local GDN state now agree byte-for-byte. Both full
+builds and all 1345 prerequisites pass. Canonical CUDA and ROCm Release HTTP
+both pass 45/45, and explicit CUDA sharding also passes 45/45. Sharding retains
+identical tokens/MTP work and improves decode 5.59% CUDA / 3.93% ROCm at the
+unchanged dynamic depth policy. Matched max-2 controls reach 727.67/115.31
+CUDA and 383.41/74.71 ROCm prefill/decode tokens/s, or 0.778x/1.258x and
+1.545x/1.351x against the same single-card depth policy. Both max-2 sharded
+HTTP cells pass 45/45. The 1.8x target remains open. Head sharding is now being
+promoted for the measured local GPU pairs and verifier families; depth defaults
+remain unchanged pending wider performance evidence. A separate FP16
+conversion defect changes inactive FP32 rows on both backends. Its live-prefix
+correction and explicit preflight regressions pass their focused gates. Both
+complete builds pass. The 1347-prerequisite run stops on a separate canonical
+rank-fold inactive-row defect after Unit/host pass. Focused before-fix cases
+reproduce it on CUDA TP2 and ROCm TP2/TP4 with clean drivers. The symmetric
+live-prefix fold and three explicit preflight registrations are installed.
+Both complete architecture builds and all nine focused checks pass. A test
+registration addition invalidated the first gate's sealed identity, so its
+receipts are retained. The refreshed complete 1350-prerequisite transaction
+passes with no failures or skips, under the unchanged production binaries.
+All 80 isolated conversion and 42 canonical-fold measurements pass exact byte
+oracles with clean drivers and authenticated resource evidence. Fresh Auto
+HTTP passes 45/45 on both topologies with complete evidence validation and
+clean driver intervals. Frozen transport model controls are now running.
+A frozen communicator control establishes a 9.70% prefill/1.77% decode win
+from the installed CUDA eight-channel policy, still below the 1.8x target. The
+[dense TP2 investigation](../2026-10/QWEN38_27B_TP2_TUNING.md)
+owns the frozen identities, raw scaling and current evidence.
 
 2026-09-30 follow-up: six public-auto Release stochastic matrices now pass
 fixed 3/15 and dynamic CUDA/ROCm, including ROCm 262,144 capacity. Single-CUDA

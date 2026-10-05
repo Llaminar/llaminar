@@ -354,14 +354,16 @@ namespace llaminar2
 
     protected:
         /**
-         * @brief Borrow the device count for a contiguous single-request verifier.
+         * @brief Borrow the device count for a grouped single-request verifier.
          * @param device Participant owning the activations and count.
          * @param seq_len Physical rows per request in the retained graph.
          * @param batch_size Number of independently padded requests.
          * @param lengths Stable device request lengths, already in capture identity.
-         * @return Counted geometry for one GPU request; otherwise the existing
-         *         full physical extent. Independently padded multi-request
-         *         matrices are not one contiguous live prefix.
+         * @return Counted geometry for one grouped GPU request; otherwise no
+         *         borrowed count. Serial transactions publish one committed
+         *         row independently of the retained sequence counter.
+         *         Independently padded multi-request matrices are not one
+         *         contiguous live prefix.
          */
         std::optional<DeviceRowRange> projectionVerifierRows(
             DeviceId device, int seq_len, int batch_size,
@@ -564,7 +566,6 @@ namespace llaminar2
          * @param buffer In-place FP32 tensor being reduced.
          * @param count Exact number of elements participating in the sum.
          * @param device Participant that owns @p buffer.
-         * @param layer_idx Layer used to resolve native transport precision.
          * @param precision_override Optional caller-selected native precision.
          * @return Complete immutable policy/precision plan for the stage.
          * @throws std::logic_error when a decode graph requiring canonical
@@ -575,7 +576,6 @@ namespace llaminar2
             const TensorBase *buffer,
             size_t count,
             DeviceId device,
-            int layer_idx,
             const std::optional<std::string> &precision_override) const;
 
         /**
@@ -636,7 +636,7 @@ namespace llaminar2
             int lm_head_vocab_size = 0;
             int serial_equivalent_partition_width = 0;
             bool column_parallel = false;
-            bool needs_allgather = false;
+            MTPTerminalLogitsCollective logits_collective = MTPTerminalLogitsCollective::None;
         };
 
         FinalProjectionPolicy resolveFinalProjectionPolicy(
@@ -672,18 +672,40 @@ namespace llaminar2
         int serialEquivalentLMHeadPartitionWidth(bool column_parallel) const;
 
         /**
-         * @brief Decide whether a column-parallel LM head needs an MPI gather.
+         * @brief Resolve the explicit collective completing a column-parallel head.
          *
-         * A single MPI rank is not a distributed vocabulary domain. LocalTP
-         * runners publish their shard-local tensor to RankOrchestrator, which
-         * coordinates sampling across local devices. Emitting a one-rank MPI
-         * allgather would instead route GPU logits through the legacy host path
-         * and falsely advertise the dormant full-vocabulary tensor as produced.
+         * Native local GPU domains gather inside the participant graph. Real
+         * multi-rank vocabulary domains retain their explicit MPI collective.
+         * A single MPI rank never authorizes the legacy host gather path.
          *
          * @param column_parallel Whether LMHeadStage writes the local-vocab tensor.
-         * @return true only for a real multi-rank MPI vocabulary gather.
+         * @return Typed native-local, global, or absent vocabulary collective.
          */
-        bool needsDistributedLMHeadAllGather(bool column_parallel) const;
+        MTPTerminalLogitsCollective terminalLogitsCollective(bool column_parallel) const;
+
+        /** @brief Declarative terminal collective over admitted participant-local buffers. */
+        struct TerminalLogitsCollectiveRequest
+        {
+            MTPTerminalLogitsCollective collective = MTPTerminalLogitsCollective::None;
+            TensorBase *local_logits = nullptr;
+            TensorBase *full_logits = nullptr;
+            DeviceRowRange rows = DeviceRowRange::fullyActive(1);
+            BufferId input_id = BufferId::LOGITS_LOCAL;
+            BufferId output_id = BufferId::LOGITS;
+            DeviceId device = DeviceId::cpu();
+            std::string stage_name;
+        };
+
+        /**
+         * @brief Lower one explicit terminal publication into a reusable collective stage.
+         * @param graph Participant-local graph owning the explicit dependency.
+         * @param dependency_node Terminal projection producer.
+         * @param request Complete typed topology, row, buffer and stream-owner declaration.
+         * @return The complete-vocabulary producer node, or the original producer when absent.
+         * @throws std::invalid_argument For incomplete or unsupported native geometry.
+         */
+        std::string addTerminalLogitsCollectiveToGraph(ComputeGraph &graph,
+            const std::string &dependency_node, const TerminalLogitsCollectiveRequest &request) const;
 
         /**
          * @brief Resolve the tensor actually produced at the graph boundary.
@@ -967,6 +989,21 @@ namespace llaminar2
             int layer_idx,
             const std::string &reason) const;
 
+        /**
+         * @brief Declare a TP sum with graph-owned precision and exact live-row geometry.
+         * @param buffer Arena-backed in-place participant tensor.
+         * @param count Admitted scalar bank extent, or exact fixed element count.
+         * @param device Participant device whose graph owns this stage.
+         * @param layer_idx Layer identity for domain selection.
+         * @param is_attention Whether the domain belongs to attention.
+         * @param stage_name Stable collective identity across participants.
+         * @param tensor_buffer_id Optional arena contract identity.
+         * @param sideband_workspace_bindings Same-stream control attachments.
+         * @param precision_override Explicit graph arithmetic policy when required.
+         * @param request_rows Optional independent request prefixes; never one ragged global prefix.
+         * @return Native or declared cross-rank collective stage, or null for single-device execution.
+         * @throws std::invalid_argument When request banks conflict with the native stage contract.
+         */
         std::unique_ptr<IComputeStage> createTPAllreduceStage(
             TensorBase *buffer,
             size_t count,
@@ -976,7 +1013,8 @@ namespace llaminar2
             const std::string &stage_name = "",
             std::optional<BufferId> tensor_buffer_id = std::nullopt,
             std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings = {},
-            std::optional<std::string> precision_override = std::nullopt) const;
+            std::optional<std::string> precision_override = std::nullopt,
+            std::optional<NativeAllreduceRequestRows> request_rows = std::nullopt) const;
 
         /**
          * @brief Create one FP32 allreduce for disjoint single-owner slots.

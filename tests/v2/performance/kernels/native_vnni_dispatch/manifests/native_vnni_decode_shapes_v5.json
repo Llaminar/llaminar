@@ -6141,6 +6141,72 @@
       "fast_partition": "development",
       "verifier_partition": null,
       "prefill_partition": null
+    },
+    {
+      "name": "QwenDense27B_TP2_FFN_GateUp",
+      "n": 8704,
+      "k": 5120,
+      "model_family": "qwen35-dense-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "QwenDense27B_TP2_FFN_DownProjection",
+      "n": 5120,
+      "k": 8704,
+      "model_family": "qwen35-dense-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "QwenDense27B_TP2_GDN_ZProjection",
+      "n": 3072,
+      "k": 5120,
+      "model_family": "qwen35-dense-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "QwenDense27B_TP2_GDN_OutputProjection",
+      "n": 5120,
+      "k": 3072,
+      "model_family": "qwen35-dense-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "QwenDense27B_TP2_AttnKVProjection",
+      "n": 512,
+      "k": 5120,
+      "model_family": "qwen35-dense-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "QwenDense27B_TP2_LM_Head",
+      "n": 124160,
+      "k": 5120,
+      "model_family": "qwen35-dense-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "very_wide",
+      "fast_partition": "development",
+      "verifier_partition": "development"
     }
   ]
 }

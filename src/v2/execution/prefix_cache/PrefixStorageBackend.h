@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace llaminar2
@@ -36,9 +37,9 @@ namespace llaminar2
      * - GPU restore queues a stream wait and immediately continues with H2D.
      * - Host consumers such as disk serialization wait for this one event.
      *
-     * The state is shared by every copy of PrefixBlockHandle and by each pinned
-     * allocation deleter. Consequently, an evicted block cannot free DMA
-     * destinations while the transfer that fills them is still in flight.
+     * The state is shared by every copy of PrefixBlockHandle and by its arena
+     * range. Consequently, an evicted block cannot recycle DMA destinations
+     * while the transfer that fills them is still in flight.
      */
     class PrefixPayloadReadiness
     {
@@ -88,10 +89,17 @@ namespace llaminar2
          * @brief Wait on the producer event at a true host-consumption boundary.
          *
          * Repeated calls are cheap after the first successful wait. This method
-         * is also used by pinned allocation deleters before returning storage to
-         * the backend.
+         * is also used at final arena teardown before returning pinned backing.
+         * Ordinary range retirement uses nonblocking queryComplete().
          */
         bool waitOnHost() const;
+
+        /**
+         * @brief Observe the exact producer frontier without blocking.
+         * @param ready Receives true when host bytes may safely be reused.
+         * @return false on an invalid edge or native query failure.
+         */
+        bool queryComplete(bool *ready) const;
 
         bool published() const { return published_; }
         bool prepared() const { return ready_event_ != nullptr; }
@@ -113,6 +121,37 @@ namespace llaminar2
         Disk,
     };
 
+    /**
+     * @brief Owned runtime-state bytes in a vector or a persistent arena range.
+     *
+     * MoE placement archives use the same RAM-tier capacity as tensor payloads.
+     * A byte view preserves independent runtime-state ownership when device-hot
+     * replicas retain only this metadata; restore never needs a vector copy.
+     */
+    class PrefixRuntimeStateStorage final
+    {
+    public:
+        /** @brief Adopt CPU serialization storage without copying its bytes. */
+        explicit PrefixRuntimeStateStorage(std::shared_ptr<std::vector<uint8_t>> storage);
+        /** @brief Adopt an arena range whose owner points at its first byte. */
+        PrefixRuntimeStateStorage(std::shared_ptr<void> storage, size_t bytes);
+        /** @return Read-only serialized byte view for model restore. */
+        std::span<const uint8_t> bytes() const noexcept { return {data(), size_}; }
+        /** @return Mutable destination used by bounded disk hydration. */
+        uint8_t *data() noexcept { return static_cast<uint8_t *>(storage_.get()); }
+        /** @return Immutable serialized bytes. */
+        const uint8_t *data() const noexcept { return static_cast<const uint8_t *>(storage_.get()); }
+        /** @return Exact serialized extent. */
+        size_t size() const noexcept { return size_; }
+        /** @return Whether the serialized extent is empty. */
+        bool empty() const noexcept { return size_ == 0u; }
+        /** @return First byte of a nonempty archive. */
+        uint8_t front() const { return bytes().front(); }
+    private:
+        std::shared_ptr<void> storage_;
+        size_t size_ = 0u;
+    };
+
     struct PrefixBlockHandle
     {
         PrefixCacheKey key;
@@ -132,11 +171,12 @@ namespace llaminar2
         /**
          * Rank-local RAM accounting owners for this handle's physical bytes.
          *
-         * The payload lease covers the serialized sections allocated by the
-         * RAM backend. The runtime-state lease covers optional model-specific
-         * host bytes attached after graph-owned state serialization. They are
+         * CPU payload leases cover serialized vector allocations. GPU archives
+         * retain the single arena claim through their shared range owners;
+         * these per-allocation members remain empty. CPU runtime-state leases
+         * cover optional model-specific serialized host bytes. They are
          * intentionally distinct: a device-hot replica retains only the
-         * runtime-state vector, whereas its serialized payload has moved to
+         * runtime-state byte owner, whereas its serialized payload has moved to
          * VRAM. These members precede the physical storage owners so reverse
          * member destruction frees every allocation before returning its bytes
          * to the canonical memory ledger.
@@ -160,10 +200,10 @@ namespace llaminar2
         std::shared_ptr<std::vector<uint8_t>> mtp_storage;
         std::shared_ptr<std::vector<uint8_t>> terminal_hidden_storage;
         std::shared_ptr<std::vector<uint8_t>> terminal_logits_storage;
-        std::shared_ptr<std::vector<uint8_t>> model_runtime_state_storage;
+        std::shared_ptr<PrefixRuntimeStateStorage> model_runtime_state_storage;
 
         /**
-         * Backend-pinned RAM owners used by GPU prefix archives.
+         * Aliasing persistent-arena range owners used by GPU prefix archives.
          *
          * The raw payload members above always point into either these owners
          * or the corresponding vector owner. Keeping ownership separate from
@@ -181,8 +221,8 @@ namespace llaminar2
          *
          * This member is declared after the pinned owners deliberately. During
          * ordinary handle destruction its reference is released first, while
-         * each pinned owner's deleter retains the state long enough to wait
-         * before freeing the corresponding DMA destination.
+         * the arena range retains it until a nonblocking query proves the DMA
+         * destination reusable. Only final arena destruction may wait.
          */
         std::shared_ptr<PrefixPayloadReadiness> payload_readiness;
 

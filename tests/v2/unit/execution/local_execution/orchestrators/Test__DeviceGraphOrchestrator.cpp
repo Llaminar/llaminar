@@ -2122,7 +2122,7 @@ TEST_F(Test__DeviceGraphOrchestrator,
     const std::string body = source.substr(begin, end - begin);
     EXPECT_NE(
         body.find(
-            "mtpSidecarRequiresGlobalLogitsGather(kv_cache_only)"),
+            "mtpSidecarRequiresLogitsGather(kv_cache_only)"),
         std::string::npos)
         << "MTP execution must resolve its collective from typed terminal-head ownership.";
     EXPECT_EQ(
@@ -2131,11 +2131,11 @@ TEST_F(Test__DeviceGraphOrchestrator,
         << "The primary LM-head sharding bit cannot independently authorize an MTP allgather.";
     EXPECT_NE(
         body.find(
-            "output.gathered_logits = requires_global_mtp_logits_gather"),
+            "output.gathered_logits = requires_mtp_logits_gather"),
         std::string::npos)
         << "A mirrored sidecar must expose null gathered output rather than a schema placeholder.";
     EXPECT_NE(
-        body.find("if (ok && requires_global_mtp_logits_gather)"),
+        body.find("if (ok && requires_mtp_logits_gather)"),
         std::string::npos)
         << "PerfStats may report a logits allgather only after that typed collective executes.";
 }

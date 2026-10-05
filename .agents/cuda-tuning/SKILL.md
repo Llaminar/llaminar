@@ -52,6 +52,16 @@ trade architecture for an isolated microbenchmark win:
   record/wait edges, and collectives must be capturable. Homogeneous GPU
   inference requires one complete captured graph; segmented execution is not a
   tuning fallback.
+- **Treat reusable scratch as dirty.** `WorkspaceOverwriteContract.h` binds
+  the checked consumed extent and exact stream; a complete producer must succeed
+  before its reducer or publication receives a read view. Prove every consumed
+  slot is written, including empty K partitions and absent-route zeros. Unused
+  capacity may remain garbage. Preserve initialization for read-modify-write
+  accumulators, recurrent state and protocol metadata. Dense/shared projections
+  and routed MoE need the same proof: poison all mutable scratch across retained
+  large/small/empty replays, compare output bytes, and inspect native graphs for
+  unnecessary clears. A timing-only clear deletion is diagnostic evidence;
+  installed changes require all-format gates and matched Release HTTP/model runs.
 
 ---
 
@@ -94,9 +104,13 @@ LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
 
 Rank `stage_gpu.graph_replay.total` and graph/segment rows alongside
 `forward_graph`, `forward_pass`, `kernel`, `mtp`, and model-specific route
-counters. A monolithic captured graph intentionally does not pretend to have
-per-stage event attribution inside replay. Use `nsys` to identify kernels
-inside that graph, then target a single launch with `ncu`.
+counters. Whole-graph PerfStats timing alone does not supply per-stage replay
+attribution. The opt-in native observer described in
+`references/native-graph-events.md` joins canonical capture-stage names to GPU
+event intervals and produces an interactive stage report without CUPTI.
+Conditional bodies remain opaque and event overhead must be measured against
+an uninstrumented control. When attachment is safe, use `nsys` to identify
+kernels inside the graph, then target a single launch with `ncu`.
 
 `LLAMINAR_PROFILING=1` is deprecated. It aliases the PerfStats summary and GPU
 replay-event request for compatibility, emits a warning, and must never disable
@@ -147,6 +161,18 @@ not a production dependency or an alternative execution mode. Selected-node
 brackets include scheduler/event overhead; they are not kernel service times,
 hardware counters, or proof of canonical performance.
 
+For named compute-stage attribution, set
+`LLAMINAR_NATIVE_EVENT_TRACE_REQUIRE_STAGE_NAMES=1` on the observer run and omit
+its kernel filter. Render the exact trace directory with
+`tests/v2/performance/kernels/native_graph_stage_report.py --trace-dir TRACE_DIR
+--output REPORT_DIR`. The standalone HTML timeline/table and JSON/CSV preserve
+GPU spans, covered intervals, exclusive native-node ownership, nested scopes,
+unowned graph plumbing and partial measurements. They show the last completed
+replay of each executable. Conditional bodies remain opaque. Stage spans and
+node sums can overlap, so neither is a whole-graph elapsed sum. Require the
+paired control's token IDs, live rows, prefix behavior and MTP work to match,
+and report instrumentation overhead separately from canonical throughput.
+
 The same reference documents the host-boundary tracer for prefill time outside
 those parents. Separate pinned prefix allocation, queued GPU completion and
 host computation; their nested/overlapping intervals must not be added as
@@ -158,6 +184,11 @@ inventory to source. Distinguish literal one-thread launches, many-thread
 kernels doing bulk work on lane zero, cooperative reductions with a scalar
 final store, and fixed-size controller publication. Captured occurrences are
 not replay counts; source matches alone are not evidence that a path ran.
+For duplicate-compute and NCCL investigations, use the reference's launch-count
+and native-extent audit: bind executable generations, separate setup/warmup
+from measured submissions, and prove argument/producer lifetimes. Enumerating
+conditional children establishes potential inventory; it does not measure
+their execution frequency or change the timing observer's opaque-body boundary.
 For communication-free estimates, recompute a dependency critical path rather
 than subtracting summed inclusive communication time. Preserve queue-order
 assumptions, identify unresolved peer joins and opaque conditional bodies, and

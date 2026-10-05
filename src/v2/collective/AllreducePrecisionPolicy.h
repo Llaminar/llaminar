@@ -2,7 +2,9 @@
  * @file AllreducePrecisionPolicy.h
  * @brief Batch-invariant transport precision policy for tensor-parallel reductions.
  *
- * Mixed-precision allreduce is selected from a minimum element threshold.  A
+ * Dense and MoE native GPU sums use FP16 transport by default, including one
+ * decode row. Explicit precision overrides remain available. A diagnostic
+ * minimum element threshold can opt into mixed transport. A
  * threshold applied to the aggregate matrix size is unsafe for grouped decode:
  * one serial row can select FP32 while the same row inside an M-row verifier
  * matrix selects FP16.  That changes the values published to the next layer and
@@ -22,6 +24,12 @@
 
 namespace llaminar2
 {
+    /// Sole default for native GPU TP sums, independent of model or layer type.
+    inline constexpr char kDefaultAllreducePrecision[] = "fp16";
+
+    /// All non-empty rows use the requested FP16 arithmetic by default.
+    inline constexpr std::size_t kDefaultAllreduceFP16MinimumElements = 0;
+
     /**
      * @brief Return the element count used to choose allreduce transport precision.
      *

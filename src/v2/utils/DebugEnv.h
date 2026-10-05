@@ -14,6 +14,7 @@
 
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
+#include "collective/AllreducePrecisionPolicy.h"
 
 /**
  * @file DebugEnv.h
@@ -3715,19 +3716,18 @@ namespace llaminar2
         /// Set to "0" to disable for benchmarking the rotation overhead.
         bool kv_rotation = true;
 
-        /// Global allreduce precision fallback: "fp16", "bf16", or "fp32"
-        /// (env: LLAMINAR_ALLREDUCE_PRECISION, default: "fp32")
-        /// This is the ULTIMATE FALLBACK — per-layer precision from the model schema
-        /// takes priority. Only used when no schema-level precision is configured.
-        /// FP16/BF16 halves PCIe transfer bandwidth; FP32 is lossless but slower on bandwidth-limited links.
-        std::string allreduce_precision = "fp32";
+        /// Global native GPU TP sum precision for dense and MoE models.
+        /// (env: LLAMINAR_ALLREDUCE_PRECISION, default: "fp16")
+        /// Explicit environment selection takes precedence over CLI selection.
+        /// Graph-declared lossless operations retain their FP32 arithmetic contract.
+        std::string allreduce_precision = kDefaultAllreducePrecision;
 
         /// Minimum element count required before an FP32 tensor requested as FP16
         /// actually takes the cast-to-FP16 collective path.
-        /// (env: LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS, default: 8192)
-        /// Tiny decode reductions can be faster in FP32 because the two cast kernels
-        /// cost more than the bandwidth savings.
-        size_t allreduce_fp16_min_elements = 8192;
+        /// (env: LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS, default: 0)
+        /// The default uses FP16 for every row; a nonzero diagnostic threshold
+        /// is evaluated against one logical row to preserve grouped equivalence.
+        size_t allreduce_fp16_min_elements = kDefaultAllreduceFP16MinimumElements;
 
         /// Timeout in ms for tensor-parallel collective/rendezvous waits,
         /// blocking MPI collectives, and their enclosing participant-worker
@@ -3827,9 +3827,8 @@ namespace llaminar2
             if (gpu_stage_timing_detail)
                 gpu_stage_timing = true;
             const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
-            if (ar_prec)
-                allreduce_precision = ar_prec;
-            allreduce_fp16_min_elements = 8192;
+            allreduce_precision = ar_prec ? ar_prec : kDefaultAllreducePrecision;
+            allreduce_fp16_min_elements = kDefaultAllreduceFP16MinimumElements;
             if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
                 allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
@@ -3989,9 +3988,8 @@ namespace llaminar2
             if (gpu_stage_timing_detail)
                 gpu_stage_timing = true;
             const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
-            if (ar_prec)
-                allreduce_precision = ar_prec;
-            allreduce_fp16_min_elements = 8192;
+            allreduce_precision = ar_prec ? ar_prec : kDefaultAllreducePrecision;
+            allreduce_fp16_min_elements = kDefaultAllreduceFP16MinimumElements;
             if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
                 allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");

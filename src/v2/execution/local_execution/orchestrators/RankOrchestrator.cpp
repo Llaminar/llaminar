@@ -5491,7 +5491,7 @@ namespace llaminar2
         }
         if (request_count <= 0 ||
             device_runners_.size() < 2 ||
-            !usesMirroredMTPHeadForVerifier() ||
+            !publishesFullVocabularyMTPLogits() ||
             !supportsDeviceResidentMTPSpecStatePublication())
         {
             return false;
@@ -5518,7 +5518,7 @@ namespace llaminar2
                 device_runners_[child_index].get();
             if (!child ||
                 !child->primaryDeviceId().is_gpu() ||
-                !child->usesMirroredMTPHeadForVerifier() ||
+                !child->publishesFullVocabularyMTPLogits() ||
                 !child->supportsDeviceResidentMTPSpecStatePublication())
             {
                 return false;
@@ -7134,7 +7134,7 @@ namespace llaminar2
                     "requires NCCL/RCCL device-slot publication, got backend=") +
                 collectiveBackendTypeToString(tp_ctx_->backend()));
         }
-        if (!usesMirroredMTPHeadForVerifier() ||
+        if (!publishesFullVocabularyMTPLogits() ||
             !supportsMTPDeviceDraftTokenInput() ||
             !supportsDeviceStochasticMTPVerification())
         {
@@ -7171,7 +7171,7 @@ namespace llaminar2
                 rank_resident_child_logical_state_handles_[participant];
             if (!child ||
                 !child->primaryDeviceId().is_gpu() ||
-                !child->usesMirroredMTPHeadForVerifier() ||
+                !child->publishesFullVocabularyMTPLogits() ||
                 !child->supportsMTPDeviceDraftTokenInput() ||
                 !child->supportsDeviceStochasticMTPVerification())
             {
@@ -8882,7 +8882,7 @@ namespace llaminar2
                 draft_sample_slot,
                 out_token);
         }
-        if (usesMirroredMTPHeadForVerifier())
+        if (publishesFullVocabularyMTPLogits())
         {
             /*
              * Mirrored LocalTP MTP heads expose full-vocabulary sidecar logits
@@ -8992,7 +8992,7 @@ namespace llaminar2
          * The main LM head and the MTP verifier head have independent
          * distribution policies.  In particular, LocalTP may shard the main
          * LM head while mirroring the much smaller MTP head.  Never infer the
-         * former from usesMirroredMTPHeadForVerifier(): doing so would
+         * former from publishesFullVocabularyMTPLogits(): doing so would
          * sample only participant zero's main-logits shard and then incorrectly
          * retire participant one as though it owned a redundant full-vocabulary
          * row.
@@ -9018,7 +9018,7 @@ namespace llaminar2
                 out_token);
         }
 
-        if (usesMirroredMTPHeadForVerifier())
+        if (publishesFullVocabularyMTPLogits())
         {
             if (target_sample_slot < 0 ||
                 target_sample_slot >= rank_stochastic_slot_capacity_ ||
@@ -9030,7 +9030,7 @@ namespace llaminar2
             {
                 const IInferenceRunner *runner = device_runners_[child].get();
                 if (!runner ||
-                    !runner->usesMirroredMTPHeadForVerifier() ||
+                    !runner->publishesFullVocabularyMTPLogits() ||
                     !runner->supportsDeviceStochasticMTPVerification())
                 {
                     LOG_ERROR("[RankOrchestrator] Mirrored LocalTP main-target argmax requires a full-head device sampler on participant "
@@ -9442,7 +9442,7 @@ namespace llaminar2
                     penalty_policy);
         }
         if (device_runners_.size() < 2 ||
-            !usesMirroredMTPHeadForVerifier())
+            !publishesFullVocabularyMTPLogits())
         {
             LOG_ERROR("[RankOrchestrator] Multi-device graph-owned greedy outcomes require a mirrored LocalTP MTP head");
             return false;
@@ -9453,7 +9453,7 @@ namespace llaminar2
             const auto &child = device_runners_[i];
             if (!child ||
                 !child->primaryDeviceId().is_gpu() ||
-                !child->usesMirroredMTPHeadForVerifier())
+                !child->publishesFullVocabularyMTPLogits())
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP graph-owned greedy outcome participant "
                           << i << " is not eligible");
@@ -9588,7 +9588,7 @@ namespace llaminar2
         rank_mirrored_child_outcomes_valid_ = false;
         rank_resident_child_logical_state_handles_.clear();
 
-        if (usesMirroredMTPHeadForVerifier())
+        if (publishesFullVocabularyMTPLogits())
         {
             return verifyGreedyMirroredLocalTPBatchOutcomeOnDeviceResident(
                 draft_tokens,
@@ -9746,7 +9746,7 @@ namespace llaminar2
             IInferenceRunner *child = device_runners_[i].get();
             if (!child ||
                 !child->primaryDeviceId().is_gpu() ||
-                !child->usesMirroredMTPHeadForVerifier() ||
+                !child->publishesFullVocabularyMTPLogits() ||
                 !child->supportsDeviceResidentMTPSpecStatePublication())
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP greedy MTP requires every child to expose a GPU mirrored-head resident publisher; participant "
@@ -9782,7 +9782,7 @@ namespace llaminar2
                 [](const DeviceSpeculativeOutcomeHandle &outcome)
                 {
                     return outcome
-                        .mirrored_local_tp_locally_complete;
+                        .local_tp_participant_complete;
                 });
         if (!every_child_published_in_graph)
         {
@@ -9853,7 +9853,7 @@ namespace llaminar2
         {
             return false;
         }
-        if (!usesMirroredMTPHeadForVerifier())
+        if (!publishesFullVocabularyMTPLogits())
         {
             if (primaryDeviceId().is_gpu())
             {
@@ -9869,7 +9869,7 @@ namespace llaminar2
             IInferenceRunner *child = device_runners_[i].get();
             if (!child ||
                 !child->primaryDeviceId().is_gpu() ||
-                !child->usesMirroredMTPHeadForVerifier() ||
+                !child->publishesFullVocabularyMTPLogits() ||
                 !child->supportsDeviceResidentMTPSpecStatePublication())
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP greedy request-batch MTP requires every child to expose a GPU mirrored-head resident publisher; participant "
@@ -9942,7 +9942,7 @@ namespace llaminar2
             IInferenceRunner *child = device_runners_[i].get();
             if (!child ||
                 !child->primaryDeviceId().is_gpu() ||
-                !child->usesMirroredMTPHeadForVerifier() ||
+                !child->publishesFullVocabularyMTPLogits() ||
                 !child->supportsDeviceStochasticMTPVerification() ||
                 !child->supportsDeviceResidentMTPSpecStatePublication())
             {
@@ -10078,7 +10078,7 @@ namespace llaminar2
                     "mirrored participant-local outcomes are GPU-only; participant " +
                     std::to_string(i) + " is " + child.device.toString());
             }
-            if (!child.mirrored_local_tp_locally_complete)
+            if (!child.local_tp_participant_complete)
                 return fail(
                     "participant " +
                     std::to_string(i) +
@@ -10849,7 +10849,7 @@ namespace llaminar2
     {
         if (device_runners_.size() < 2 ||
             !tp_ctx_ ||
-            !usesMirroredMTPHeadForVerifier() ||
+            !publishesFullVocabularyMTPLogits() ||
             slot < 0 ||
             slot >= rank_stochastic_slot_capacity_)
         {
@@ -10862,7 +10862,7 @@ namespace llaminar2
         {
             IInferenceRunner *runner = device_runners_[child].get();
             if (!runner ||
-                !runner->usesMirroredMTPHeadForVerifier() ||
+                !runner->publishesFullVocabularyMTPLogits() ||
                 !runner->supportsDeviceStochasticMTPVerification())
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP "
@@ -11175,20 +11175,20 @@ namespace llaminar2
         return supportsDeviceResidentMTPSpecStatePublication();
     }
 
-    bool RankOrchestrator::usesMirroredMTPHeadForVerifier() const
+    bool RankOrchestrator::publishesFullVocabularyMTPLogits() const
     {
         if (const IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
-            return pp_sidecar->usesMirroredMTPHeadForVerifier();
+            return pp_sidecar->publishesFullVocabularyMTPLogits();
         }
         if (device_runners_.empty())
             return false;
 
         /*
-         * The rank is only an aggregator here.  Mirroring is a property of the
-         * child graph builders and their verifier heads, so the aggregate answer
-         * is true exactly when every participant reports the mirrored full-vocab
-         * verifier head.  Do not route through any rank-side compact reducer:
+         * The rank is only an aggregator here. Complete vocabulary publication
+         * belongs to each child's graph, through a full head or an explicit
+         * native gather. The aggregate requires every participant's publication.
+         * Do not route through any rank-side compact reducer:
          * resident LocalTP MTP publication feeds each child its own device handle.
          */
         return std::all_of(
@@ -11197,7 +11197,7 @@ namespace llaminar2
             [](const std::unique_ptr<IInferenceRunner> &runner)
             {
                 return runner &&
-                       runner->usesMirroredMTPHeadForVerifier();
+                       runner->publishesFullVocabularyMTPLogits();
             });
     }
 
@@ -11265,7 +11265,7 @@ namespace llaminar2
         }
         if ((source == DeviceLogitsSource::Main ||
              source == DeviceLogitsSource::MainRequestBatch) &&
-            usesMirroredMTPHeadForVerifier())
+            publishesFullVocabularyMTPLogits())
         {
             if (buffer != DeviceDistributionBuffer::Target ||
                 slot < 0 ||
@@ -11278,7 +11278,7 @@ namespace llaminar2
             {
                 const IInferenceRunner *runner = device_runners_[child].get();
                 if (!runner ||
-                    !runner->usesMirroredMTPHeadForVerifier() ||
+                    !runner->publishesFullVocabularyMTPLogits() ||
                     !runner->supportsDeviceStochasticMTPVerification())
                 {
                     LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic main-target distribution requires full-head device support on participant "
@@ -11322,7 +11322,7 @@ namespace llaminar2
             return true;
         }
         if (source == DeviceLogitsSource::AllPosition &&
-            usesMirroredMTPHeadForVerifier())
+            publishesFullVocabularyMTPLogits())
         {
             for (size_t i = 0; i < device_runners_.size(); ++i)
             {
@@ -11403,7 +11403,7 @@ namespace llaminar2
         if (buffer != DeviceDistributionBuffer::Target)
             return false;
         if (source == DeviceLogitsSource::AllPosition &&
-            usesMirroredMTPHeadForVerifier())
+            publishesFullVocabularyMTPLogits())
         {
             for (size_t i = 0; i < device_runners_.size(); ++i)
             {
@@ -11477,7 +11477,7 @@ namespace llaminar2
                     vocab_size);
         }
         if (!primaryDeviceId().is_gpu() ||
-            !usesMirroredMTPHeadForVerifier())
+            !publishesFullVocabularyMTPLogits())
         {
             LOG_ERROR("[RankOrchestrator] Captured stochastic verifier target distributions require mirrored GPU verifier heads");
             return false;
@@ -11568,7 +11568,7 @@ namespace llaminar2
                 penalty_policy);
         }
         if (!primaryDeviceId().is_gpu() ||
-            !usesMirroredMTPHeadForVerifier())
+            !publishesFullVocabularyMTPLogits())
         {
             LOG_ERROR("[RankOrchestrator] Captured MTP draft publication requires mirrored full-vocabulary GPU MTP heads");
             return false;
@@ -11642,7 +11642,7 @@ namespace llaminar2
             return -1;
         }
 
-        if (usesMirroredMTPHeadForVerifier())
+        if (publishesFullVocabularyMTPLogits())
         {
             /*
              * This host-returning API is a response/diagnostic boundary, not
@@ -11655,7 +11655,7 @@ namespace llaminar2
             {
                 IInferenceRunner *runner = device_runners_[child].get();
                 if (!runner ||
-                    !runner->usesMirroredMTPHeadForVerifier() ||
+                    !runner->publishesFullVocabularyMTPLogits() ||
                     !runner->supportsDeviceStochasticMTPVerification())
                 {
                     LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic draft proposal requires every child to expose a mirrored full-head device sampler; participant "
@@ -11777,7 +11777,7 @@ namespace llaminar2
         }
 
         if (source == DeviceLogitsSource::MTP &&
-            usesMirroredMTPHeadForVerifier())
+            publishesFullVocabularyMTPLogits())
         {
             if (row < 0 ||
                 slot < 0 ||
@@ -11790,7 +11790,7 @@ namespace llaminar2
             {
                 IInferenceRunner *runner = device_runners_[child].get();
                 if (!runner ||
-                    !runner->usesMirroredMTPHeadForVerifier() ||
+                    !runner->publishesFullVocabularyMTPLogits() ||
                     !runner->supportsDeviceStochasticMTPVerification())
                 {
                     LOG_ERROR("[RankOrchestrator] Mirrored LocalTP deferred stochastic draft proposal requires every child to expose a mirrored full-head device sampler; participant "
@@ -12286,7 +12286,7 @@ namespace llaminar2
             draft_token_count + 1 > total_verifier_input_tokens)
             return nullptr;
 
-        if (usesMirroredMTPHeadForVerifier())
+        if (publishesFullVocabularyMTPLogits())
         {
             return prepareRankVerifierTokenSlotsForLocalTP(
                 /*first_token_from_device=*/false,
@@ -12463,7 +12463,7 @@ namespace llaminar2
             draft_token_count + 1 > total_verifier_input_tokens)
             return nullptr;
 
-        if (usesMirroredMTPHeadForVerifier())
+        if (publishesFullVocabularyMTPLogits())
         {
             return prepareRankVerifierTokenSlotsForLocalTP(
                 /*first_token_from_device=*/true,
@@ -13565,7 +13565,7 @@ namespace llaminar2
         rank_mirrored_child_outcomes_valid_ = false;
         rank_resident_child_logical_state_handles_.clear();
 
-        if (usesMirroredMTPHeadForVerifier())
+        if (publishesFullVocabularyMTPLogits())
         {
             return verifyStochasticMirroredLocalTPRequestBatchOutcomesOnDeviceResident(
                 requests,
@@ -13996,7 +13996,7 @@ namespace llaminar2
         {
             return false;
         }
-        if (!usesMirroredMTPHeadForVerifier())
+        if (!publishesFullVocabularyMTPLogits())
         {
             return false;
         }
@@ -14049,8 +14049,8 @@ namespace llaminar2
                     .device_generation_controller_owned &&
             outcome.sampling_mode ==
                 rank_mirrored_primary_outcome_.sampling_mode &&
-            outcome.mirrored_local_tp_locally_complete ==
-                rank_mirrored_primary_outcome_.mirrored_local_tp_locally_complete;
+            outcome.local_tp_participant_complete ==
+                rank_mirrored_primary_outcome_.local_tp_participant_complete;
 
         if (mirrored_kind &&
             rank_compact_outcome_valid_ &&
@@ -14095,10 +14095,10 @@ namespace llaminar2
                     << " primary_ready="
                     << rank_mirrored_primary_outcome_.response_ready_event.get()
                     << " candidate_local_complete="
-                    << outcome.mirrored_local_tp_locally_complete
+                    << outcome.local_tp_participant_complete
                     << " primary_local_complete="
                     << rank_mirrored_primary_outcome_
-                           .mirrored_local_tp_locally_complete;
+                           .local_tp_participant_complete;
             *error = message.str();
         }
         return false;
@@ -14111,7 +14111,7 @@ namespace llaminar2
         const bool mirrored_local_tp_domain =
             pp_stage_runners_.empty() &&
             device_runners_.size() > 1 &&
-            usesMirroredMTPHeadForVerifier();
+            publishesFullVocabularyMTPLogits();
         if (mirrored_local_tp_domain)
         {
             std::string outcome_error;
@@ -14141,7 +14141,7 @@ namespace llaminar2
                           << " output_stride=" << handle.output_token_stride
                           << " meta_stride=" << handle.meta_stride
                           << " local_complete="
-                          << handle.mirrored_local_tp_locally_complete);
+                          << handle.local_tp_participant_complete);
                 return false;
             }
 
@@ -15536,7 +15536,7 @@ namespace llaminar2
                        penalty_policy);
         }
         if (source != DeviceLogitsSource::AllPosition ||
-            !usesMirroredMTPHeadForVerifier())
+            !publishesFullVocabularyMTPLogits())
         {
             LOG_ERROR("[RankOrchestrator] Device-owned stochastic verifier penalties require mirrored full-vocabulary LocalTP heads");
             return false;
@@ -15579,7 +15579,7 @@ namespace llaminar2
                     penalty_policy);
         }
         if (device_runners_.empty() || prior_draft_count < 0 ||
-            !usesMirroredMTPHeadForVerifier())
+            !publishesFullVocabularyMTPLogits())
         {
             LOG_ERROR("[RankOrchestrator] Device-owned MTP branch penalties require mirrored full-vocabulary LocalTP heads");
             return false;
@@ -18230,7 +18230,7 @@ namespace llaminar2
             isMTPDepthQualifiedSnapshot(semantic_key);
         if (extractStageType(semantic_key) == "LM_HEAD" &&
             (condition_snapshot ||
-             (mtp_model_snapshot && usesMirroredMTPHeadForVerifier())))
+             (mtp_model_snapshot && publishesFullVocabularyMTPLogits())))
         {
             return SnapshotShardingMode::REPLICATED;
         }

@@ -702,6 +702,7 @@ if(HAVE_ROCM)
         collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend
         collective/coordinators/RCCLCoordinator.cpp          # RCCL collective coordinator
         kernels/rocm/gemm/ROCmNativeVNNIGemmDispatch.cpp     # Host-only public dispatcher for sharded NativeVNNI GEMM
+        kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.cpp # Typed common-generated exact prefill policy
         ${ROCM_KERNEL_SOURCES}
     )
     # Resolve HIP device symbols at library build time (same rationale as cuda_backend).
@@ -1428,6 +1429,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp
     execution/compute_stages/stages/TPKVCacheStateAllGatherStage.cpp
     execution/compute_stages/stages/NativeAllGatherStage.cpp
+    execution/compute_stages/stages/NativeVocabularyAllGatherStage.cpp
     execution/compute_stages/stages/TPColumnReduceScatterStage.cpp
     execution/compute_stages/stages/MoEProjectionPipeline.cpp
     execution/compute_stages/stages/MoERoutingPipeline.cpp
@@ -1552,6 +1554,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/prefix_cache/PrefixStateSnapshot.cpp
     execution/prefix_cache/PrefixStateCache.cpp
     execution/prefix_cache/PrefixStorageBackend.cpp
+    execution/prefix_cache/PrefixHostArena.cpp
     execution/prefix_cache/RamPrefixStorageBackend.cpp
     execution/mtp/MTPDecodeCatchup.cpp
     execution/mtp/MTPDepthController.cpp

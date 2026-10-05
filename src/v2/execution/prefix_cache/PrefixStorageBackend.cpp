@@ -1,6 +1,10 @@
 /**
  * @file PrefixStorageBackend.cpp
  * @brief Prefix payload addressing and asynchronous readiness implementation.
+ *
+ * Runtime extensions share owned byte views across RAM and device-hot tiers.
+ * Retired pinned ranges query their exact published producer event; prepared
+ * but unpublished edges cannot authorize reuse of an asynchronous destination.
  */
 
 #include "execution/prefix_cache/PrefixStorageBackend.h"
@@ -8,8 +12,27 @@
 #include "backends/BackendManager.h"
 #include "tensors/TensorClasses.h"
 
+#include <stdexcept>
+
 namespace llaminar2
 {
+    PrefixRuntimeStateStorage::PrefixRuntimeStateStorage(
+        std::shared_ptr<std::vector<uint8_t>> storage)
+    {
+        if (!storage || storage->empty())
+            throw std::invalid_argument("Prefix runtime state requires owned, nonempty bytes");
+        size_ = storage->size();
+        storage_ = std::shared_ptr<void>(storage, storage->data());
+    }
+
+    PrefixRuntimeStateStorage::PrefixRuntimeStateStorage(
+        std::shared_ptr<void> storage, size_t bytes)
+        : storage_(std::move(storage)), size_(bytes)
+    {
+        if (!storage_ || size_ == 0u)
+            throw std::invalid_argument("Prefix runtime state requires an owned, nonempty range");
+    }
+
     bool PrefixPayloadReadiness::prepare(
         std::shared_ptr<void> ready_event,
         DeviceId producer_device,
@@ -81,6 +104,35 @@ namespace llaminar2
             return false;
         }
         host_wait_complete_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    bool PrefixPayloadReadiness::queryComplete(bool *ready) const
+    {
+        if (!ready)
+            return false;
+        *ready = false;
+        if (!published_)
+        {
+            // Disk hydration has no GPU producer and needs no event. Once
+            // preparation starts, an absent publication is an invalid edge,
+            // never proof that a retired DMA destination can be overwritten.
+            *ready = !ready_event_;
+            return *ready;
+        }
+        if (host_wait_complete_.load(std::memory_order_acquire))
+        {
+            *ready = true;
+            return true;
+        }
+        if (!ready_event_ || !producer_device_.is_gpu())
+            return false;
+        IBackend *backend = getBackendFor(producer_device_);
+        if (!backend || !backend->queryEvent(
+                ready_event_.get(), producer_device_.gpu_ordinal(), ready))
+            return false;
+        if (*ready)
+            host_wait_complete_.store(true, std::memory_order_release);
         return true;
     }
 

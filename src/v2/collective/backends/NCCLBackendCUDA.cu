@@ -122,18 +122,25 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Initialize a communicator rank with an explicit network module.
+         * @brief Initialize a communicator rank with its typed construction policy.
          *
-         * The network module controls only NCCL's network transport. CUDA P2P
+         * The network member controls only NCCL's network transport. CUDA P2P
          * and shared-memory transports remain available and are still selected
-         * by NCCL before the configured network fallback where topology permits.
+         * by NCCL before the configured network module where topology permits.
+         * @param comm_out Receives the newly owned native communicator.
+         * @param nranks Complete clique membership count.
+         * @param unique_id Shared native identity, never regenerated per participant.
+         * @param rank Exact rank represented by the calling CUDA thread.
+         * @param policy Immutable typed network and channel construction policy.
+         * @param error_out Receives the native failure diagnostic.
+         * @return True only after successful native communicator construction.
          */
-        bool ncclCommInitRankWithNetworkWrapper(
+        bool ncclCommInitRankWithPolicyWrapper(
             void **comm_out,
             int nranks,
             void *unique_id,
             int rank,
-            const char *network_module,
+            NCCLCommunicatorPolicy policy,
             std::string &error_out)
         {
             if (!nccl::isLoaded() && !nccl::load())
@@ -144,12 +151,12 @@ namespace llaminar2
             }
 
             nccl::ncclComm_t comm = nullptr;
-            const nccl::ncclResult_t r = nccl::ncclCommInitRankWithNetwork(
+            const nccl::ncclResult_t r = nccl::ncclCommInitRankWithPolicy(
                 &comm,
                 nranks,
                 *static_cast<nccl::ncclUniqueId *>(unique_id),
                 rank,
-                network_module);
+                policy);
             if (r != nccl::ncclSuccess)
             {
                 error_out = nccl::ncclGetErrorString(r);

@@ -5,6 +5,8 @@ Synthetic trainer records exercise exact family/geometry identity, resource and
 byte-certificate rejection, and durable publication without launching devices.
 Auto may select a different physical family than a forced tournament tile;
 that distinction must survive validation without weakening either contract.
+Matrix cardinality follows the canonical capture, format and shape inventories,
+so adding a shared CUDA/ROCm bucket extends coverage without a second row list.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from native_vnni_dispatch.production_dense_prefill_sweep import (  # noqa: E402
     CUDA_GENERIC_CANDIDATE_IDS,
     CUDA_TILE_NAMES,
     CUDA_TIMING_COLUMNS,
+    DENSE_PREFILL_CAPTURED_OPERATIONS,
     SWEEP_PLAN_FILENAME,
     TRAINER_PROVENANCE_SCHEMA,
     ROCM_AGGREGATE_COLUMNS,
@@ -328,6 +331,7 @@ def _write_cell(
                     "k": cell.shape.k,
                     "sample_index": sample_index,
                     "timed_replays": 1,
+                    "captured_operations": DENSE_PREFILL_CAPTURED_OPERATIONS,
                     "latency_us": f"{latency_us:.9f}",
                     "latency_us_hex": latency_us.hex(),
                 }
@@ -389,7 +393,8 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             * len(gpu_prefill_measurements())
             * len(GPU_PREFILL_M_BUCKETS)
         )
-        self.assertEqual(expected_count, 35721)
+        self.assertEqual(len(FORMAT_SPECS), 21)
+        self.assertIn(448, GPU_PREFILL_M_BUCKETS)
         for backend in ("cuda", "rocm"):
             with self.subTest(backend=backend):
                 cells = production_dense_prefill_cells(backend)
@@ -487,6 +492,24 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                 )
                 self.assertEqual(result.sample_count, result.candidate_count * 3)
                 self.assertEqual(result.winner_min_us, 10.0)
+
+    def test_both_backends_reject_direct_or_partial_captured_timing(self) -> None:
+        """A valid byte oracle cannot certify the wrong execution/timing mode."""
+        for backend in ("cuda", "rocm"):
+            for count in (0, 1, DENSE_PREFILL_CAPTURED_OPERATIONS - 1):
+                with self.subTest(backend=backend, count=count), tempfile.TemporaryDirectory() as tmp:
+                    cell, paths = _write_cell(Path(tmp), backend, bench_runs=3)
+                    with paths.timing.open(newline="", encoding="utf-8") as handle:
+                        rows = list(csv.DictReader(handle))
+                    rows[0]["captured_operations"] = str(count)
+                    with paths.timing.open("w", newline="", encoding="utf-8") as handle:
+                        writer = csv.DictWriter(handle, fieldnames=(
+                            CUDA_TIMING_COLUMNS if backend == "cuda" else ROCM_TIMING_COLUMNS))
+                        writer.writeheader()
+                        writer.writerows(rows)
+                    with self.assertRaisesRegex(ValueError, "complete captured operation batch"):
+                        validate_production_dense_prefill_cell(
+                            paths.aggregate, paths.timing, cell, bench_runs=3)
 
     def test_rocm_auto_streaming_observation_is_distinct_from_forced_tiles(self) -> None:
         """Auto can select its existing barrier-free family outside the tournament tiles."""

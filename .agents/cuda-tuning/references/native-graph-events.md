@@ -33,10 +33,89 @@ incidents and timing results in the dated investigation, not in this reference.
 
 ## Standalone observer
 
+### Audit launch counts and native collective extents
+
+Keep three separate quantities: captured kernel inventory, actual executable
+submissions, and useful device work. Join submissions to an executable
+generation, device, exact stream, instantiation flags and retained topology.
+Native handles can be reused after retirement; a handle or node count alone
+is not an identity. Unused captured buckets contribute no replay work.
+
+Reconcile the request boundary before multiplying inventory by replay counts.
+Benchmark graph-readiness preparation, warmup, measured requests and serving
+reset are distinct phases. Preserve their source-owned counters or boundary
+records. A preparation prefill outside measurement is not a second measured
+prefill. Conversely, a terminal MTP ledger that counts selected drafts does
+not prove that capacity preparation avoided extra physical sidecar forwards.
+Audit the first transaction and retained subsequent requests explicitly.
+
+Record the admitted bucket inventory separately from the configured ladder.
+Prefix checkpoints can split a prompt into several retained parents even when
+its length matches a configured bucket. Measure every parent submission in a
+request; the last completed event interval multiplied by a chunk count is not
+a full-request measurement. Report each TP participant and the slower
+participant's complete span alongside any participant mean.
+
+For communication-elision diagnostics, enumerate every removed and retained
+collective, including vocabulary gathers and embedding sums. Matching compute
+inventories does not prove representative inputs: removing a vocabulary-shard
+embedding sum can leave an all-zero participant. Preserve an input-producing
+collective in a separately labelled communication-included control, or bind
+immutable replicated embeddings before capture. Subsequent elided layer sums
+still invalidate model arithmetic; neither control certifies inference
+correctness. Never promote the intervention into a production execution mode.
+
+For a metadata-only diagnostic, read native kernel names, geometry, edges and
+compiled parameter extents during setup. Copy only immutable host launch
+argument storage; retain device pointer identities without following their
+pointees. Matching names or grids do not prove duplicate work. Identical
+arguments across stages may reflect legitimate reuse of a mutable arena bank.
+To establish redundancy within one producer lifetime, identify the consumed
+input, every output, intervening writers and required ordering edges. An
+optional block-sum output also distinguishes two otherwise identical activation
+quantizers; retain the producer that supplies every required consumer value.
+
+A separate read-only structural observer may enumerate child graphs and retain
+CUDA-owned conditional body handles at their original node creation. It must
+forward creation/launch arguments unchanged, retire metadata with the owning
+graph, and never add events, flatten a conditional or expose device state.
+This is broader structural evidence than the event observer below supplies.
+Conditional bodies in the event timing report remain opaque. Body inventory
+is potential work; actual IF/WHILE/SWITCH multiplicity requires the production
+device controller's execution evidence. Mutually exclusive attention branches
+can contain similarly named kernels while only one performs arithmetic.
+
+For NCCL, bind evidence to the loaded project DSO and its exact patched source.
+Record the selected algorithm, protocol, channels, block size, node/stream
+priorities and transport. Authenticate any native work decoder against a
+compiled source layout and the actual kernel parameter ABI. Decode RING/TREE
+work unions according to their selected operation, rather than assuming a
+layout because its fields fit. A row-parallel projection halves K and still
+needs a sum over its full output width. Capacity in a graph BOM is not actual
+wire traffic: prove the device live-count owner and use native passive outgoing
+payload receipts for partial, empty and large-to-small replays. MTP shifted
+prefill needs its own row authority; the main prompt count cannot substitute
+for it, and ragged request banks cannot use the first request's prefix count.
+
+Host submission skew does not establish GPU compute overlap, and raw event
+clocks on different devices do not share an origin. Compiled local-memory size
+can include device call frames; static stack instructions alone do not prove
+executed spill traffic. Attribute resources to one exact loaded symbol and SM.
+Pinned SHM mappings absent from `/proc/PID/numa_maps` do not prove NUMA locality.
+Retain these limits alongside any isolated protocol or dispatch experiment;
+promote defaults only after matched unobserved Release/model and HTTP gates.
+
+Experimental GPU DSOs must match the production architecture, math flags and
+relocatable-device-code policy. Authenticate those options and loaded core
+symbols before attributing register or timing differences to a kernel change.
+Use one shared CUDA runtime with the application's ABI and link driver APIs to
+the real driver DSO; duplicate static runtimes or driver stubs do not establish
+a valid comparison.
+
 `.agents/cuda-tuning/scripts/native_graph_event_trace.cpp` is an opt-in
 `LD_PRELOAD` observer for CUDA 13's runtime graph entrypoints. It is deliberately
 not linked into Llaminar. It intercepts `cudaGraphInstantiateWithFlags`,
-`cudaGraphLaunch` and `cudaGraphExecDestroy`, and uses driver graph queries so
+`cudaGraphLaunch`, `cudaGraphDestroy` and `cudaGraphExecDestroy`, and uses driver graph queries so
 opaque NCCL kernel functions can be named without runtime-symbol assumptions.
 
 The observer retains every original node and dependency. Before/after event
@@ -63,6 +142,7 @@ Controls belong to the observer, not to production CLI configuration:
 | `LLAMINAR_NATIVE_EVENT_TRACE_MIN_NODES` | Minimum parent size, default 1000; use 1 only for a focused smoke test. |
 | `LLAMINAR_NATIVE_EVENT_TRACE_KERNEL_CONTAINS` | Comma-separated symbol substrings to bracket; omitted measures every supported parent node. Unmatched filters produce a skip diagnostic. |
 | `LLAMINAR_NATIVE_EVENT_TRACE_ALL_FLAT` | Bypass the parent symbol selector for a model-free smoke. Do not apply indiscriminately to fragments later imported into conditional bodies. |
+| `LLAMINAR_NATIVE_EVENT_TRACE_REQUIRE_STAGE_NAMES` | Require completed canonical stage capture scopes on each selected parent; missing or stale provenance is fatal. |
 | `LLAMINAR_PROFILER_NORMAL_EXIT` | Engine diagnostic exit mode; set to 1 so normal retirement writes evidence rather than `_exit` discarding it. |
 
 ## Build and run
@@ -70,6 +150,13 @@ Controls belong to the observer, not to production CLI configuration:
 Run from the source root. The host needs the real CUDA driver and the same CUDA
 toolkit ABI as the binary. The helper only uses host C++; it does not compile a
 new GPU kernel. Neither the helper nor the SDK belongs in the serving image.
+
+A CUDA-enabled build also produces the standalone CMake target
+`v2_cuda_native_graph_event_observer` as
+`tests/v2/libv2_cuda_native_graph_event_observer.so`. Prefer that build-bound
+artifact when validating a qualified tree; its C++20 requirement and real
+capture fixture are owned by CMake. The manual command below is useful for an
+isolated diagnostic helper and must retain its source/compiler/DSO identity.
 
 ```bash
 LLAMINAR_TRACE_DIR="$(mktemp -d /tmp/llaminar-cuda-events.XXXXXX)"
@@ -132,6 +219,39 @@ prefix-cache hits and model inputs as well. Report instrumentation overhead
 separately. Leave all observer variables and `LD_PRELOAD` unset for canonical
 timing. A filter or parent-selector miss is an investigation failure, not zero
 kernel cost.
+
+### Captured model stage timing
+
+The engine's optional `llaminar_native_graph_stage_annotation_v1` ABI publishes
+immutable stage identity only during setup recording. The observer snapshots
+native node frontiers on that stage's exact device/stream and joins them to the
+event trace before instantiation. No timing callback executes during replay.
+Absent observation introduces no serving dependency, GPU event or readback.
+The model-free `V2_Integration_CUDANativeGraphStageTiming` preflight proves that
+named RMSNorm/residual stages retain captured snapshot byte equality with this
+instrumentation. Scope lifecycle and report interpretation also have
+device-free Unit and explicit preflight gates.
+
+For a per-stage report, omit the kernel filter, set
+`LLAMINAR_NATIVE_EVENT_TRACE_REQUIRE_STAGE_NAMES=1`, and retain the same
+unprofiled plan and paired control. Render only that exact trace cohort:
+
+```bash
+python3 tests/v2/performance/kernels/native_graph_stage_report.py \
+  --trace-dir "$LLAMINAR_TRACE_DIR" \
+  --output "$LLAMINAR_TRACE_DIR/stages"
+```
+
+`stage-timing.html` is a standalone interactive table/timeline, accompanied by
+JSON and CSV. It reports each stage's GPU span, covered interval union, owned
+native-node interval sum, nesting and measurement completeness. Stage spans
+include gaps between their native operations. Concurrent and nested stages
+overlap; summing their spans or node intervals does not give graph elapsed
+time. Unowned native plumbing remains explicitly unattributed. Zero-node
+capture scopes are empty, while filtered or missing events are unmeasured.
+Conditional bodies remain opaque, so this observer does not claim per-stage
+attribution inside a conditional generation loop. Only the final completed
+replay of each retained executable is shown, not a whole-request sum.
 
 ### Distinguish queue delay from kernel execution
 
@@ -273,7 +393,7 @@ env -u LLAMINAR_PROFILING -u LLAMINAR_PERF_STATS_JSON \
   > "$LLAMINAR_HOST_TRACE_DIR/run.log" 2>&1
 
 jq -se 'any(.[]; .name == "benchmark_prefill") and
-  any(.[]; .name == "cuda_pinned_allocate" or .name == "rocm_pinned_allocate")' \
+  any(.[]; .name == "device_harvest")' \
   "$LLAMINAR_HOST_TRACE_DIR/spans.jsonl"
 jq -s 'group_by(.request) | map({request: .[0].request,
   spans: (group_by(.name) | map({name: .[0].name, calls: length,
@@ -297,6 +417,21 @@ Conversely, a runtime-state export may wait for earlier GPU work and must not
 be labeled serialization CPU time. The final terminal-event wait is already
 inside benchmark prefill, not an additional latency charge. Cross-reference
 the captured graph DAG before choosing which dependency to change.
+
+For process-to-process timing swings, bracket only the complete parent first
+and correlate each measured replay with the exact host request. A final-replay
+event value cannot explain an earlier iteration. If needed, trace the native
+host-allocation call separately from its enclosing backend method; this separates
+runtime page pinning from engine lock/bookkeeping. Preserve token IDs, chunk
+boundaries, MTP work and actual loaded-core identity throughout the comparison.
+An allocation-only diagnostic intervention can establish causality, but the
+production fix for repeated payload materialization is persistent admitted
+backing with event-aware range reuse. Do not promote a faster hot-path allocator.
+The GPU RAM prefix tier should report one `ram_arena_materializations` per tier
+at setup and `ram_arena_payload_leases` during harvest, with zero native pinned
+allocations inside timed prefill. Zero allocation trace rows are therefore an
+expected success state; require harvest/request provenance rather than inventing
+an allocation event to make the observer's authentication pass.
 
 ## Compiler resources without attachment
 

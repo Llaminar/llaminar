@@ -646,26 +646,6 @@ namespace llaminar2
         float kv_cache_scale_k = 256.0f; ///< Fixed K Q16 scale (FP32 range ±scale_k)
         float kv_cache_scale_v = 32.0f;  ///< Fixed V Q16 scale (FP32 range ±scale_v)
 
-        // =================================================================
-        // TP Allreduce Precision Policy
-        // =================================================================
-
-        /// Default allreduce precision for layers NOT covered by fp32_layer_count.
-        /// Valid values: "fp32", "fp16", "bf16"
-        /// The global DebugEnv default ("fp32") serves as the ultimate fallback.
-        std::string tp_allreduce_default_precision = "fp32";
-
-        /// Number of initial transformer layers forced to FP32 allreduce.
-        /// These early layers are the most sensitive to precision loss since
-        /// errors compound through subsequent layers. Layers beyond this count
-        /// use tp_allreduce_default_precision.
-        int tp_allreduce_fp32_layer_count = 0;
-
-        /// Layer indices that are ALWAYS forced to FP32 allreduce regardless
-        /// of their position relative to fp32_layer_count. Used for hybrid
-        /// architectures (e.g., Qwen3.5) where full-attention layers are more
-        /// sensitive to allreduce precision loss than GDN layers.
-        std::vector<int> tp_allreduce_fp32_forced_layers;
     };
 
     // =========================================================================

@@ -105,6 +105,7 @@ _FIXED_MODEL_FAMILY_SIZE_BILLIONS = {
     # sharded matrix is individually small.  Otherwise a 122B production
     # projection would accidentally inherit the deepest small-model CPU sweep.
     "qwen35-moe-tp-local": 122.0,
+    "qwen35-dense-tp-local": 27.0,
 }
 
 # Ordinary prefill never projects through the vocabulary-sized LM head.  This

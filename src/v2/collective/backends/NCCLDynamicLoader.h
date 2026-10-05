@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include "../NativeCollectiveRows.h"
+#include "NCCLNetworkPolicy.h"
 #include <string>
 
 namespace llaminar2
@@ -124,26 +125,25 @@ namespace llaminar2
         ncclResult_t ncclCommInitRank(ncclComm_t *comm, int nranks, ncclUniqueId commId, int rank);
 
         /**
-         * @brief Initialize one rank with an optional per-communicator network module.
+         * @brief Initialize one rank with a frozen topology/economy policy.
          *
-         * A null or empty module name uses ncclCommInitRank and preserves NCCL's
-         * automatic network selection. A non-empty name uses
-         * ncclCommInitRankConfig and writes only ncclConfig_t::netName, leaving
-         * every other configuration field at NCCL's documented default.
+         * Network and CTA limits belong to this communicator, without mutation
+         * of process-wide NCCL variables. The measured profile binds the exact
+         * canonical dependency ABI; native algorithms still adapt to message size.
          *
          * @param comm Receives the initialized communicator.
          * @param nranks Number of ranks in the communicator.
          * @param comm_id Unique communicator identifier shared by every rank.
          * @param rank Rank represented by the calling thread and CUDA device.
-         * @param network_module Exact NCCL network module name, or null for auto.
+         * @param policy Typed network module and measured channel profile.
          * @return NCCL status from communicator construction.
          */
-        ncclResult_t ncclCommInitRankWithNetwork(
+        ncclResult_t ncclCommInitRankWithPolicy(
             ncclComm_t *comm,
             int nranks,
             ncclUniqueId comm_id,
             int rank,
-            const char *network_module);
+            NCCLCommunicatorPolicy policy);
 
         ncclResult_t ncclCommDestroy(ncclComm_t comm);
         ncclResult_t ncclCommAbort(ncclComm_t comm);

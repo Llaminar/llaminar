@@ -299,14 +299,22 @@ namespace llaminar2
             return fp_ncclCommInitRank(comm, nranks, commId, rank);
         }
 
-        ncclResult_t ncclCommInitRankWithNetwork(
+        ncclResult_t ncclCommInitRankWithPolicy(
             ncclComm_t *comm,
             int nranks,
             ncclUniqueId comm_id,
             int rank,
-            const char *network_module)
+            NCCLCommunicatorPolicy policy)
         {
-            if (network_module == nullptr || network_module[0] == '\0')
+            const auto network_name = ncclNetworkModuleName(policy.network);
+            const char *network_module = network_name.empty() ? nullptr : network_name.data();
+            const int channel_budget = ncclCommunicatorChannelBudget(policy.profile);
+            if (channel_budget && (nranks != 2 || policy.network != NCCLNetworkModule::Socket))
+            {
+                LOG_ERROR("Measured NCCL channel profile requires a two-rank local Socket clique");
+                return ncclInvalidArgument;
+            }
+            if (!channel_budget && network_name.empty())
             {
                 return ncclCommInitRank(comm, nranks, comm_id, rank);
             }
@@ -324,6 +332,11 @@ namespace llaminar2
                 return version_result;
             }
 
+            if (channel_budget && library_version != 22809)
+            {
+                LOG_ERROR("Measured NCCL channel profile requires canonical version 22809; received " << library_version);
+                return ncclInvalidArgument;
+            }
             const int undefined = INT_MIN;
             NCCLConfigV22800 config{
                 .size = sizeof(NCCLConfigV22800),
@@ -331,8 +344,8 @@ namespace llaminar2
                 .version = static_cast<unsigned int>(library_version),
                 .blocking = undefined,
                 .cga_cluster_size = undefined,
-                .min_ctas = undefined,
-                .max_ctas = undefined,
+                .min_ctas = channel_budget ? channel_budget : undefined,
+                .max_ctas = channel_budget ? channel_budget : undefined,
                 .net_name = network_module,
                 .split_share = undefined,
                 .traffic_class = undefined,
@@ -464,6 +477,9 @@ namespace llaminar2
             unsigned long long *payload_bytes, ncclComm_t comm, void *stream)
         {
             if (!send || !receive || !comm || !stream) return ncclInvalidArgument;
+            if (payload_bytes && rows.payloadReceipt() && payload_bytes != rows.payloadReceipt())
+                return ncclInvalidArgument;
+            if (rows.payloadReceipt()) payload_bytes = rows.payloadReceipt();
             // Fully-live rows retain exactly the ordinary native API. A passive
             // receipt is available only for the device-counted implementation.
             if (!rows.rows().countOwner())

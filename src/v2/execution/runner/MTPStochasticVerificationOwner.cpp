@@ -47,7 +47,7 @@ namespace llaminar2
         // the accepted-state publisher; a full head alone is not sufficient.
         if (plan.usesLocalTP() &&
             (!runner.primaryDeviceId().is_gpu() ||
-             !runner.usesMirroredMTPHeadForVerifier() ||
+             !runner.publishesFullVocabularyMTPLogits() ||
              !runner.supportsDeviceStochasticMTPVerification() ||
              !runner.supportsDeviceResidentMTPSpecStatePublication()))
             return "MTP stochastic LocalTP requires mirrored child-resident verifier outcomes and publication";
