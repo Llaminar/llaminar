@@ -229,6 +229,38 @@ replays; correct output alone does not prove economical communication.
 - For additional V2-specific implementation details, see:
     - `.github/instructions/llaminar-v2-architecture.instructions.md`
 
+## Branch and Release Workflow
+
+Ordinary development starts from the current `develop` branch on a feature
+branch named `feat/short-feature-description`. Use a separate worktree when
+needed to preserve unrelated edits. Commit messages and PR titles follow
+Conventional Commits: `<type>(<optional-scope>): <description>`, for example
+`feat(planning): add explicit topology selection` or
+`perf(cuda): improve prefill projection dispatch`.
+
+Push the feature branch and open a PR into `develop`. Same-repository,
+non-draft feature PRs enable native squash auto-merge, which must wait for every
+required gate and an up-to-date merge candidate. The canonical PR workflow
+builds the AVX512 test image and runs complete Unit and
+`ProductionTestPreflight` gates. A successful develop merge then builds,
+tests and publishes both AVX512 and AVX2 develop images. These images are
+development artifacts; this gate does not certify a release.
+
+Only upon explicit user direction, open a release PR from `develop` into
+`master`. The master workflow admits the exact develop source and published
+image pair, runs the full canonical E2E suite on both ISAs, then the published
+benchmark gates. Merge only after all required checks pass. The merge cuts a
+release through the canonical release workflow, promoting the same tested
+images and publishing their evidence. Never start a master release merely
+because a feature PR or develop image gate succeeded.
+
+Normal changes do not push directly to protected branches, force-push them,
+skip CI, or bypass repository rules. An exception needs explicit user
+authorization for that operation; previous authorization for a specific
+maintenance action does not make it the normal workflow. Keep the active
+rulesets and `.github/workflows/` authoritative for exact checks and commands;
+see `docs/production-ci.md` for workflow ownership and publication boundaries.
+
 ## Project Agent Skills
 
 Project-local skills under `.agents/` are the canonical specialized workflows.

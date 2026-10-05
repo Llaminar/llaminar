@@ -11,6 +11,12 @@ routes local development checks, model diagnostics, and this full image gate.
 
 ## Feature PRs into develop
 
+Ordinary work starts from current `develop` on a branch named
+`feat/short-feature-description`. Commit messages and PR titles use
+Conventional Commits. After its required checks pass, the feature PR
+squash-merges into `develop`. Only explicit user direction starts the separate
+`develop`-to-`master` release PR and its full certification/release workflow.
+
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
 `develop`. It builds only the AVX512 full-backend image pair and executes the
 complete Unit and `ProductionTestPreflight` transaction **inside its installed
@@ -21,9 +27,12 @@ include the proposed integration with `develop`.
 The active `develop` ruleset requires this exact GitHub Actions check, an
 up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
 are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
-auto-merge for same-repository, non-draft PRs. It runs on the trusted base
-branch, does not check out PR code, and cannot merge before the required
-image-bound check succeeds. Fork PRs cannot run on the privileged host runner;
+auto-merge for same-repository, non-draft PRs. GitHub loads this
+`pull_request_target` policy from the trusted default branch, `master`, even
+when the PR targets `develop`. That installed copy requires both `contents:
+write` and `pull-requests: write`; changing only the develop copy cannot repair
+the live policy. It does not check out PR code and cannot merge before the
+required image-bound check succeeds. Fork PRs cannot run on the privileged host runner;
 import a reviewed branch into this repository before requesting this gate.
 
 The workflow calls the existing `run_develop_image_gate.py --cpu-isa AVX512`
