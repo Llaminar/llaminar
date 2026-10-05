@@ -52,6 +52,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
 #include "ROCmNativeVNNIGemmShard.h"
+#include "ROCmDenseProductionPrefillOverlay.h"
 
 #ifndef LLAMINAR_ROCM_NATIVE_VNNI_SHARD
 #error "ROCmNativeVNNIGemmShardImpl.hip.inc requires a physical shard index"
@@ -3047,6 +3048,41 @@ static bool launch_native_vnni_gemm(
             eff_min_blocks,
             eff_unroll,
             env.nvnni_full_tiles == 1);
+    }
+
+    // Exact entries come only from the common, complete all-format tournament.
+    // Diagnostic overrides above remain authoritative. Every unseen geometry
+    // continues through the same total generic dispatch below; an admitted
+    // measured producer that cannot launch is an error, never a second choice.
+    if (const auto exact = llaminar2::rocm::selectDensePrefillExactConfig(
+            static_cast<uint8_t>(FMT), M, N, K,
+            llaminar2::rocm::DensePrefillWeightFamily::NativeLowBit))
+    {
+        switch (exact->producer)
+        {
+        case llaminar2::rocm::VNNIPrefillProducer::NativeCooperative:
+            return launch_config(exact->n_tile, exact->m_tile,
+                                 exact->min_blocks, exact->unroll,
+                                 exact->full_tiles);
+        case llaminar2::rocm::VNNIPrefillProducer::NativeStreaming:
+            // Compile exactly the existing spill-qualified streaming surface.
+            // A runtime branch must not instantiate forbidden wide row tiles.
+            if constexpr (NVNNIGemmTraits<FMT>::prefer_streaming)
+            {
+                if constexpr (NVNNIGemmTraits<FMT>::is_dual_scale)
+                    return exact->m_tile == 8
+                        ? launch_streaming(std::integral_constant<int, 8>{}) : false;
+                else
+                    return exact->m_tile == 16
+                        ? launch_streaming(std::integral_constant<int, 16>{}) : false;
+            }
+            else if constexpr (FMT == NVNNI_GEMM_Q4_1 || FMT == NVNNI_GEMM_IQ1_S)
+                return exact->m_tile == 16
+                    ? launch_streaming(std::integral_constant<int, 16>{}) : false;
+            return false;
+        default:
+            return false;
+        }
     }
 
     // =========================================================================

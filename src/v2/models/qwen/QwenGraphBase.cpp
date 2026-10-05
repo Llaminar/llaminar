@@ -26,6 +26,7 @@
 #include "../../collective/ITPContext.h"
 #include "../../collective/BackendRouter.h"
 #include "../../execution/compute_stages/stages/TPAllreduceStage.h"
+#include "../../execution/compute_stages/stages/NativeVocabularyAllGatherStage.h"
 #include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
 #include "../../execution/compute_stages/stages/FusedResidualNormStage.h"
 #include "../../execution/compute_stages/stages/QKNormStage.h"
@@ -546,7 +547,7 @@ namespace llaminar2
             .lm_head_vocab_size = 0,
             .serial_equivalent_partition_width = 0,
             .column_parallel = false,
-            .needs_allgather = false,
+            .logits_collective = MTPTerminalLogitsCollective::None,
         };
 
         switch (request.norm_source)
@@ -574,8 +575,7 @@ namespace llaminar2
                 : request.full_vocab_output;
         policy.lm_head_vocab_size =
             policy.column_parallel ? config_.vocab_local : config_.vocab_size;
-        policy.needs_allgather =
-            needsDistributedLMHeadAllGather(policy.column_parallel);
+        policy.logits_collective = terminalLogitsCollective(policy.column_parallel);
         policy.serial_equivalent_partition_width =
             serialEquivalentLMHeadPartitionWidth(policy.column_parallel);
 
@@ -759,18 +759,71 @@ namespace llaminar2
         return !useDecodeReplicatedDenseWeights();
     }
 
-    bool QwenGraphBase::needsDistributedLMHeadAllGather(
+    MTPTerminalLogitsCollective QwenGraphBase::terminalLogitsCollective(
         bool column_parallel) const
     {
-        return column_parallel &&
-               mpi_ctx_ &&
-               mpi_ctx_->world_size() > 1;
+        return resolveMTPTerminalLogitsCollective({
+            .layout = column_parallel ? MTPTerminalLogitsLayout::VocabularyShardPerParticipant
+                                     : MTPTerminalLogitsLayout::FullVocabularyPerParticipant,
+            .sidecar_produces_logits = true,
+            .spans_multiple_global_ranks = mpi_ctx_ && mpi_ctx_->world_size() > 1,
+            .native_local_gpu_tp = config_.hasNativeLocalVocabularyGather(),
+        });
+    }
+
+    std::string QwenGraphBase::addTerminalLogitsCollectiveToGraph(ComputeGraph &graph,
+        const std::string &dependency_node, const TerminalLogitsCollectiveRequest &request) const
+    {
+        switch (request.collective)
+        {
+        case MTPTerminalLogitsCollective::None:
+            return dependency_node;
+        case MTPTerminalLogitsCollective::GlobalVocabularyAllGather:
+        {
+            AllGatherStage::Params params;
+            params.local_input = request.local_logits;
+            params.full_output = request.full_logits;
+            params.mpi_ctx = mpi_ctx_.get();
+            params.actual_seq_len = request.rows.capacity();
+            params.domain = nullptr;
+            params.input_buffer_id = request.input_id;
+            params.output_buffer_id = request.output_id;
+            graph.addNode(request.stage_name, ComputeStageFactory::createAllGather(params), request.device);
+            break;
+        }
+        case MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather:
+        {
+            auto *tp = dynamic_cast<ILocalTPContext *>(config_.tp_ctx);
+            if (!tp)
+                throw std::invalid_argument("Native terminal vocabulary gather requires its declared local context");
+            if (const auto *assignment = config_.getAssignment(); assignment &&
+                (assignment->vocab_count != config_.vocab_local ||
+                 assignment->vocab_start != config_.tp_device_idx * config_.vocab_local))
+                throw std::invalid_argument("Native terminal vocabulary gather requires equal communicator-ordered shards");
+            NativeVocabularyAllGatherStage::Params params;
+            params.device_id = request.device;
+            params.tp_ctx = tp;
+            params.local_logits = request.local_logits;
+            params.full_logits = request.full_logits;
+            params.rows = request.rows;
+            params.local_vocabulary = config_.vocab_local;
+            params.vocabulary = config_.vocab_size;
+            params.participant = config_.tp_device_idx;
+            params.input_id = request.input_id;
+            params.output_id = request.output_id;
+            params.stage_name = request.stage_name;
+            graph.addNode(request.stage_name, std::make_unique<NativeVocabularyAllGatherStage>(params), request.device);
+            break;
+        }
+        }
+        graph.addDependency(request.stage_name, dependency_node);
+        return request.stage_name;
     }
 
     TensorBase *QwenGraphBase::graphLMHeadOutput(
         bool column_parallel) const
     {
-        if (needsDistributedLMHeadAllGather(column_parallel))
+        if (terminalLogitsCollective(column_parallel) != MTPTerminalLogitsCollective::None)
             return buffers_.logits;
         return column_parallel ? buffers_.logits_local : buffers_.logits;
     }
@@ -1698,8 +1751,14 @@ namespace llaminar2
 
         const bool multi_participant_tp =
             config_.tp_ctx && config_.tp_ctx->degree() > 1;
-        const bool participant_full_vocabulary =
-            config_.mtpParticipantOwnsFullVocabulary();
+        const auto *producer = graph.getNode(dependency_node);
+        const auto *native_gather = producer
+            ? dynamic_cast<const NativeVocabularyAllGatherStage *>(producer->stage.get()) : nullptr;
+        // A policy bit alone cannot certify complete logits. Require the
+        // actual explicit gather producer to publish this exact tensor owner.
+        const bool participant_full_vocabulary = config_.mtpParticipantOwnsFullVocabulary() ||
+            (native_gather && native_gather->params().full_logits == logits &&
+                native_gather->params().vocabulary == config_.vocab_size);
         if (multi_participant_tp && !participant_full_vocabulary)
         {
             throw std::runtime_error(
@@ -2215,31 +2274,18 @@ namespace llaminar2
         prev_node = "lm_head";
 
         // Phase 5: AllGather stage for column-parallel LM head
-        if (needsDistributedLMHeadAllGather(use_column_parallel))
-        {
-            LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather in buildFullForwardGraph: world_size="
-                      << mpi_ctx_->world_size() << " total_tokens=" << total_tokens);
-
-            AllGatherStage::Params allgather_params;
-            allgather_params.local_input = buffers_.logits_local;
-            allgather_params.full_output = buffers_.logits;
-            allgather_params.mpi_ctx = mpi_ctx_.get();
-            allgather_params.actual_seq_len = lm_layout.compute_all_positions ? lm_layout.seq_len : 1;
-            // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
-            // Multi-domain TP typically doesn't route LM head to a specific domain
-            allgather_params.domain = nullptr;
-            allgather_params.input_buffer_id = logitsBufferId(
-                /*column_parallel=*/true,
-                lm_layout.compute_all_positions);
-            allgather_params.output_buffer_id = gatheredLogitsBufferId(
-                lm_layout.compute_all_positions);
-
-            graph.addNode("lm_head_allgather",
-                          ComputeStageFactory::createAllGather(allgather_params),
-                          device);
-            graph.addDependency("lm_head_allgather", prev_node);
-            prev_node = "lm_head_allgather";
-        }
+        prev_node = addTerminalLogitsCollectiveToGraph(graph, prev_node, {
+            .collective = terminalLogitsCollective(use_column_parallel),
+            .local_logits = buffers_.logits_local,
+            .full_logits = buffers_.logits,
+            .rows = lm_layout.compute_all_positions
+                ? lm_layout.verifier_rows.value_or(DeviceRowRange::fullyActive(lm_layout.seq_len))
+                : DeviceRowRange::fullyActive(1),
+            .input_id = logitsBufferId(true, lm_layout.compute_all_positions),
+            .output_id = gatheredLogitsBufferId(lm_layout.compute_all_positions),
+            .device = device,
+            .stage_name = "lm_head_allgather",
+        });
 
         prev_node = addMTPVerifierOutcomeToGraph(
             graph,
@@ -2561,29 +2607,18 @@ namespace llaminar2
             prev_node = "lm_head";
 
             // AllGather stage for column-parallel LM head
-            if (needsDistributedLMHeadAllGather(use_column_parallel))
-            {
-                LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather in buildPartialForwardGraph: world_size="
-                          << mpi_ctx_->world_size() << " total_tokens=" << total_tokens);
-
-                AllGatherStage::Params allgather_params;
-                allgather_params.local_input = buffers_.logits_local;
-                allgather_params.full_output = buffers_.logits;
-                allgather_params.mpi_ctx = mpi_ctx_.get();
-                allgather_params.actual_seq_len = lm_layout.compute_all_positions ? lm_layout.seq_len : 1;
-                allgather_params.domain = nullptr;
-                allgather_params.input_buffer_id = logitsBufferId(
-                    /*column_parallel=*/true,
-                    lm_layout.compute_all_positions);
-                allgather_params.output_buffer_id = gatheredLogitsBufferId(
-                    lm_layout.compute_all_positions);
-
-                graph.addNode("lm_head_allgather",
-                              ComputeStageFactory::createAllGather(allgather_params),
-                              device);
-                graph.addDependency("lm_head_allgather", prev_node);
-                prev_node = "lm_head_allgather";
-            }
+            prev_node = addTerminalLogitsCollectiveToGraph(graph, prev_node, {
+                .collective = terminalLogitsCollective(use_column_parallel),
+                .local_logits = buffers_.logits_local,
+                .full_logits = buffers_.logits,
+                .rows = lm_layout.compute_all_positions
+                    ? lm_layout.verifier_rows.value_or(DeviceRowRange::fullyActive(lm_layout.seq_len))
+                    : DeviceRowRange::fullyActive(1),
+                .input_id = logitsBufferId(true, lm_layout.compute_all_positions),
+                .output_id = gatheredLogitsBufferId(lm_layout.compute_all_positions),
+                .device = device,
+                .stage_name = "lm_head_allgather",
+            });
 
             prev_node = addMTPVerifierOutcomeToGraph(
                 graph,
@@ -2972,28 +3007,18 @@ namespace llaminar2
                 prev_node = "lm_head";
 
                 // AllGather stage for column-parallel LM head
-                if (needsDistributedLMHeadAllGather(use_column_parallel))
-                {
-                    LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather in unified PP: world_size="
-                              << mpi_ctx_->world_size());
-
-                    AllGatherStage::Params allgather_params;
-                    allgather_params.local_input = buffers_.logits_local;
-                    allgather_params.full_output = buffers_.logits;
-                    allgather_params.mpi_ctx = mpi_ctx_.get();
-                    allgather_params.actual_seq_len = lm_layout.compute_all_positions ? lm_layout.seq_len : 1;
-                    allgather_params.domain = nullptr;
-                    allgather_params.input_buffer_id = logitsBufferId(
-                        /*column_parallel=*/true,
-                        lm_layout.compute_all_positions);
-                    allgather_params.output_buffer_id = gatheredLogitsBufferId(
-                        lm_layout.compute_all_positions);
-
-                    graph.addNode("lm_head_allgather",
-                                  ComputeStageFactory::createAllGather(allgather_params),
-                                  stage_device);
-                    graph.addDependency("lm_head_allgather", prev_node);
-                }
+                prev_node = addTerminalLogitsCollectiveToGraph(graph, prev_node, {
+                    .collective = terminalLogitsCollective(use_column_parallel),
+                    .local_logits = buffers_.logits_local,
+                    .full_logits = buffers_.logits,
+                    .rows = lm_layout.compute_all_positions
+                        ? lm_layout.verifier_rows.value_or(DeviceRowRange::fullyActive(lm_layout.seq_len))
+                        : DeviceRowRange::fullyActive(1),
+                    .input_id = logitsBufferId(true, lm_layout.compute_all_positions),
+                    .output_id = gatheredLogitsBufferId(lm_layout.compute_all_positions),
+                    .device = stage_device,
+                    .stage_name = "lm_head_allgather",
+                });
 
                 output.logits = graphLMHeadOutput(use_column_parallel);
 
@@ -3374,29 +3399,16 @@ namespace llaminar2
         // =================================================================
         // AllGather stage for column-parallel LM head
         // =================================================================
-        if (final_projection.needs_allgather)
-        {
-            LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather: world_size=" << mpi_ctx_->world_size()
-                                                                              << " total_tokens=" << total_tokens);
-
-            AllGatherStage::Params allgather_params;
-            allgather_params.local_input = logits_local;
-            allgather_params.full_output = output_logits;
-            allgather_params.mpi_ctx = mpi_ctx_.get();
-            allgather_params.actual_seq_len = lm_head_compute_all_positions ? lm_head_seq_len : 1;
-            // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
-            allgather_params.domain = nullptr;
-            allgather_params.input_buffer_id = logitsBufferId(
-                /*column_parallel=*/true,
-                lm_head_compute_all_positions);
-            allgather_params.output_buffer_id = gatheredLogitsBufferId(
-                lm_head_compute_all_positions);
-
-            graph.addNode("lm_head_allgather",
-                          ComputeStageFactory::createAllGather(allgather_params),
-                          device);
-            graph.addDependency("lm_head_allgather", "lm_head");
-        }
+        addTerminalLogitsCollectiveToGraph(graph, "lm_head", {
+            .collective = final_projection.logits_collective,
+            .local_logits = logits_local,
+            .full_logits = output_logits,
+            .rows = DeviceRowRange::fullyActive(lm_head_compute_all_positions ? lm_head_seq_len : 1),
+            .input_id = logitsBufferId(true, lm_head_compute_all_positions),
+            .output_id = gatheredLogitsBufferId(lm_head_compute_all_positions),
+            .device = device,
+            .stage_name = "lm_head_allgather",
+        });
 
         return graph;
     }
@@ -3408,9 +3420,13 @@ namespace llaminar2
     std::optional<DeviceRowRange> QwenGraphBase::projectionVerifierRows(
         DeviceId device, int seq_len, int batch_size, const int32_t *lengths) const
     {
+        // A serial transaction publishes its one committed projection row.
+        // Its sequence counter can still describe the prompt or a retained
+        // verifier batch, so it is not the authority for that publication.
+        // Only grouped verifier graphs borrow the device-owned live prefix.
         // CPU owns its actual row count on the host. Ragged multi-request
         // matrices cannot borrow lengths[0] as a whole-matrix prefix count.
-        if (!device.is_gpu() || batch_size != 1 || !lengths ||
+        if (!device.is_gpu() || seq_len <= 1 || batch_size != 1 || !lengths ||
             !config_.usesMTPGroupedDecodeEquivalentRows())
             return std::nullopt;
         return DeviceRowRange::deviceCounted(seq_len, lengths);
@@ -4062,14 +4078,13 @@ namespace llaminar2
         const TensorBase *buffer,
         size_t count,
         DeviceId device,
-        int layer_idx,
         const std::optional<std::string> &precision_override) const
     {
         TPAllreducePlan plan{
             .arithmetic_policy =
                 TPAllreduceArithmeticPolicy::NativeCollective,
             .transport_precision = precision_override.value_or(
-                config_.getAllreducePrecisionForLayer(layer_idx)),
+                config_.getAllreducePrecision()),
         };
 
         /*
@@ -4124,8 +4139,13 @@ namespace llaminar2
         const std::string &stage_name,
         std::optional<BufferId> tensor_buffer_id,
         std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings,
-        std::optional<std::string> precision_override) const
+        std::optional<std::string> precision_override,
+        std::optional<NativeAllreduceRequestRows> request_rows) const
     {
+        if (request_rows && (!config_.tp_ctx || !config_.tp_ctx->isLocal() ||
+            (config_.tp_ctx->backend() != CollectiveBackendType::NCCL &&
+             config_.tp_ctx->backend() != CollectiveBackendType::RCCL)))
+            throw std::invalid_argument("Request-row TP sums require the declared native LocalTP implementation");
         // Unified path: use polymorphic ITPContext for both LOCAL and GLOBAL TP
         if (config_.tp_ctx && config_.tp_ctx->degree() > 1)
         {
@@ -4148,13 +4168,13 @@ namespace llaminar2
                     buffer,
                     count,
                     device,
-                    layer_idx,
                     precision_override);
             params.arithmetic_policy = arithmetic_plan.arithmetic_policy;
             params.precision = arithmetic_plan.transport_precision;
             params.tensor_buffer_id = tensor_buffer_id;
             params.sideband_device_index = config_.tp_device_idx;
             params.sideband_workspace_bindings = std::move(sideband_workspace_bindings);
+            params.request_rows = std::move(request_rows);
 
             // Only a homogeneous native domain can consume this device-owned
             // prefix directly. The matrix stride remains fixed in the arena;
@@ -4165,7 +4185,7 @@ namespace llaminar2
                 buffer && buffer->cols() > 0 && count % buffer->cols() == 0)
             {
                 const auto rows = prefillCollectiveRows(device, static_cast<int>(count / buffer->cols()));
-                if (rows) params.live_rows.emplace(*rows, buffer->cols());
+                if (rows && !params.request_rows) params.live_rows.emplace(*rows, buffer->cols());
             }
 
             return std::make_unique<TPAllreduceStage>(params);

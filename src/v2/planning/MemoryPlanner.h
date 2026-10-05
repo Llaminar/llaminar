@@ -347,6 +347,31 @@ struct DevicePlanConfig
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
 
+    /**
+     * @brief Resolve publication from the admitted communicator and graph owner.
+     * @param owns_terminal_main_layer Whether this interval owns the main head.
+     * @return The explicit native-local gather, or participant-local publication.
+     *
+     * The physical projection layout never implies the archived output width.
+     * Deriving this fact from the same immutable local transport declaration
+     * avoids a second policy field that ordinary and overlay BOM builders could
+     * leave inconsistent. Retained MTP capacity is independent of enablement.
+     */
+    [[nodiscard]] MTPTerminalLogitsCollective terminalLogitsCollective(
+        bool owns_terminal_main_layer) const noexcept
+    {
+        return resolveMTPTerminalLogitsCollective({
+            .layout = mtp_terminal_logits_layout,
+            .sidecar_produces_logits = mtp_enabled && owns_terminal_main_layer &&
+                execution_role == DeviceExecutionMemoryRole::ContinuationGraph,
+            .spans_multiple_global_ranks = false,
+            .native_local_gpu_tp = device.is_gpu() && total_shards > 1 &&
+                local_tp_backend.has_value() &&
+                (*local_tp_backend == CollectiveBackendType::NCCL ||
+                 *local_tp_backend == CollectiveBackendType::RCCL),
+        });
+    }
+
     /** Exact ownership contract for compact routed-expert activation packets. */
     RoutedExpertCompactBufferLifetime routed_expert_compact_buffer_lifetime =
         RoutedExpertCompactBufferLifetime::PerLayerGraphOwned;

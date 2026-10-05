@@ -1068,7 +1068,7 @@ namespace
             return supports_device_resident_mtp_spec_state_publication_;
         }
 
-        bool usesMirroredMTPHeadForVerifier() const override
+        bool publishesFullVocabularyMTPLogits() const override
         {
             return mirrors_localtp_mtp_head_for_verifier_;
         }
@@ -2500,7 +2500,7 @@ namespace
                 makeMockMTPTransactionLease(/*request_count=*/1);
             out_handle->device_generation_controller_owned = true;
             out_handle->sampling_mode = DeviceGenerationSamplingMode::Greedy;
-            out_handle->mirrored_local_tp_locally_complete =
+            out_handle->local_tp_participant_complete =
                 mirrors_localtp_mtp_head_for_verifier_;
             const bool valid = out_handle->valid();
             if (valid)
@@ -2705,7 +2705,7 @@ namespace
                 device_generation_admitted_ ||
                 device_generation_controller_owned_outcomes_;
             out_handle->sampling_mode = DeviceGenerationSamplingMode::Greedy;
-            out_handle->mirrored_local_tp_locally_complete =
+            out_handle->local_tp_participant_complete =
                 mirrors_localtp_mtp_head_for_verifier_;
             return out_handle->valid();
         }
@@ -4755,7 +4755,7 @@ namespace
                 device_generation_admitted_ ||
                 device_generation_controller_owned_outcomes_;
             out_handle->sampling_mode = DeviceGenerationSamplingMode::Stochastic;
-            out_handle->mirrored_local_tp_locally_complete =
+            out_handle->local_tp_participant_complete =
                 mirrors_localtp_mtp_head_for_verifier_;
             return out_handle->valid();
         }

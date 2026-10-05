@@ -22,6 +22,7 @@
 #include "../tensors/ITensor.h"
 #include "ICollectiveBackend.h"
 #include "ITPContext.h"
+#include "NativeAllreduceRequestRows.h"
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -502,6 +503,33 @@ namespace llaminar2
             if (!producer_stream)
                 throw std::invalid_argument("ILocalTPContext::allreduceWithSidebandsOnStream requires a non-null GPU stream");
             return false;
+        }
+
+        /**
+         * @brief Reduce independent live prefixes in request-major tensor banks.
+         * @param tensor Already-resident activation storage containing all banks.
+         * @param stage_name Common collective identity across participants.
+         * @param request_rows Checked bank geometry and device count authorities.
+         * @param producer_stream Exact non-null producer/consumer graph stream.
+         * @param precision Graph-resolved transport precision.
+         * @return True only after every bank and the final publication are enqueued.
+         * @throws std::logic_error If this context lacks the native implementation.
+         *
+         * The existing native prefix implementation owns arithmetic and casts.
+         * Empty banks exchange only protocol metadata. No count is downloaded,
+         * no inactive row is sent, and publication follows the complete stage.
+         */
+        virtual bool allreduceRequestRowsOnStream(TensorBase *tensor,
+            const std::string &stage_name, const NativeAllreduceRequestRows &request_rows,
+            void *producer_stream, const std::string &precision)
+        {
+            (void)tensor;
+            (void)stage_name;
+            (void)request_rows;
+            (void)precision;
+            if (!producer_stream)
+                throw std::invalid_argument("Request-row allreduce requires a non-null GPU stream");
+            throw std::logic_error("LocalTP context has no native request-row allreduce implementation");
         }
 
         /**

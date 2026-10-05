@@ -1292,6 +1292,25 @@ class CPUNativeVNNIPrefillTrainerTest(unittest.TestCase):
         )
         self.assertEqual(manifest.sealed_m_values, (64, 128, 256, 512))
 
+    def test_historical_split_keeps_original_production_ownership(self) -> None:
+        """Live TP shards belong only to the current certification split."""
+
+        current = load_cpu_prefill_split_manifest()
+        tp_shapes = {
+            measurement.shape.name
+            for measurement in cpu_prefill_measurements()
+            if measurement.shape.model_family == "qwen35-dense-tp-local"
+        }
+        self.assertEqual(len(tp_shapes), 5)
+        self.assertTrue(tp_shapes.issubset(current.development_shapes))
+        for version in (10, 11, 12):
+            with self.subTest(version=version):
+                path = KERNEL_PERF_ROOT / "native_vnni_dispatch" / "manifests" / (
+                    f"native_vnni_cpu_prefill_split_v{version}.json"
+                )
+                historical = load_cpu_prefill_split_manifest(path)
+                self.assertTrue(tp_shapes.isdisjoint(historical.development_shapes))
+
     def test_sealed_plan_reaches_every_frozen_generic_leaf(self) -> None:
         """A timing-free preflight must reject structurally untested rules."""
 

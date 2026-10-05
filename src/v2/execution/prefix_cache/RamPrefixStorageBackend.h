@@ -20,15 +20,16 @@
 
 namespace llaminar2
 {
+    class PrefixHostArena;
 
     /**
      * @brief Bounded rank-local RAM tier for durable prefix payloads.
      *
      * Production construction reserves the complete configured capacity from
-     * `PrefixHostTier` once. Every pageable or pinned backing allocation then
-     * carries a child lease in its PrefixBlockHandle, so an asynchronous
-     * consumer can outlive cache eviction or backend teardown without making
-     * the accounting authority report those bytes as free prematurely.
+     * `PrefixHostTier` once. GPU tiers materialize one persistent pinned arena
+     * before inference; handle aliases lease ranges until their producer and
+     * all consumers retire. CPU vectors retain individual physical claims.
+     * Neither cache eviction nor request reset frees GPU-tier backing.
      */
     class RamPrefixStorageBackend : public IPrefixStorageBackend
     {
@@ -44,7 +45,9 @@ namespace llaminar2
 
         /**
          * @brief Construct an unaccounted producer-specific test backend.
-         * @param producer_device CPU or GPU whose backend supplies pinned RAM.
+         * GPU materialization requires @ref create and canonical admission;
+         * this constructor does not establish a usable GPU archive tier.
+         * @param producer_device Exact intended producer identity.
          * @param budget_bytes Logical cache capacity.
          */
         RamPrefixStorageBackend(DeviceId producer_device, size_t budget_bytes);
@@ -67,9 +70,9 @@ namespace llaminar2
         bool canStore(size_t bytes) const override;
 
         /**
-         * @return Allocation headroom from the canonical reservation and index.
-         * This is an observation, not a reservation or a parallel byte ledger.
-         * Request/DMA aliases remain charged until their physical owners retire.
+         * @return Logical and physical placement headroom, without blocking.
+         * GPU ranges remain unavailable through aliases and unfinished DMA;
+         * their persistent backing stays charged to PMA for the arena lifetime.
          */
         size_t availableAllocationBytes() const;
 
@@ -132,6 +135,22 @@ namespace llaminar2
         bool accounted() const noexcept { return reservation_.valid(); }
 
     private:
+        /** @brief Cache-key incarnation authenticated by shared payload ownership. */
+        struct Allocation
+        {
+            size_t bytes = 0u;
+            std::weak_ptr<void> owner;
+            /** @return Whether a handle retains this exact allocation, not a reused address/key. */
+            bool matches(const std::shared_ptr<void> &candidate) const noexcept
+            {
+                return candidate && !owner.expired() &&
+                       !owner.owner_before(candidate) && !candidate.owner_before(owner);
+            }
+        };
+
+        /** @return The first real payload owner, whose control block seals this incarnation. */
+        static std::shared_ptr<void> payloadOwner(const PrefixBlockHandle &handle) noexcept;
+
         /** @brief Whether the archive producer writes every allocated byte. */
         enum class SectionWriteCoverage
         {
@@ -140,11 +159,10 @@ namespace llaminar2
         };
 
         /**
-         * @brief Allocate one payload section with its exact initialization contract.
+         * @brief Bind one payload section with its exact initialization contract.
          *
-         * GPU archives hard-require backend-pinned memory. There is no pageable
-         * fallback because that would silently turn supposedly asynchronous
-         * DMA into a blocking runtime staging operation.
+         * GPU sections alias one admitted arena range. Binding never calls a
+         * native allocator or changes backing identity.
          * Complete GPU sections remain unreadable until their producer fills all
          * bytes and publishes the handle's readiness event. Partial GPU sections
          * are zeroed first so short/omitted payloads cannot expose stale bytes.
@@ -155,7 +173,8 @@ namespace llaminar2
          * @param pageable_owner Receives CPU-owned vector storage, when applicable.
          * @param pinned_owner Receives GPU-host allocation lifetime ownership.
          * @param payload Receives the stable address, never a readiness guarantee.
-         * @param readiness Event edge retained until the last pinned owner retires.
+         * @param arena_payload Complete leased payload, empty for CPU vectors.
+         * @param offset This section's checked offset inside that payload.
          * @return true when backing storage was allocated successfully.
          */
         bool allocateSection(
@@ -164,7 +183,8 @@ namespace llaminar2
             std::shared_ptr<std::vector<uint8_t>> *pageable_owner,
             std::shared_ptr<void> *pinned_owner,
             void **payload,
-            const std::shared_ptr<PrefixPayloadReadiness> &readiness) const;
+            const std::shared_ptr<void> &arena_payload,
+            size_t offset) const;
 
         /**
          * @brief Claim one physical allocation from the reserved host tier.
@@ -177,8 +197,9 @@ namespace llaminar2
         DeviceId producer_device_ = DeviceId::cpu();
         size_t budget_bytes_ = 0;
         size_t used_bytes_ = 0;
-        std::unordered_map<PrefixCacheKey, size_t, PrefixCacheKeyHasher> allocations_;
+        std::unordered_map<PrefixCacheKey, Allocation, PrefixCacheKeyHasher> allocations_;
         PhysicalMemoryOwnerReservation reservation_;
+        std::shared_ptr<PrefixHostArena> arena_;
     };
 
 } // namespace llaminar2

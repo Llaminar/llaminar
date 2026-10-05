@@ -9,6 +9,9 @@
  * grouping's device-owned counts, never possibly stale private grouping counts.
  * Import reconstructs existing Q8/scales or FP32 bits before down projection;
  * it neither changes arithmetic nor observes live GPU extents on the host.
+ * Grouped down output starts with unspecified bytes. Checked live extents and
+ * successful complete writers precede every output publication, including
+ * zero contributions for inactive routes; gate/up alone owns no down output.
  */
 
 #include "ROCmMoEKernel.h"
@@ -11722,35 +11725,48 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                           "floating grouped-prefill route publication is incomplete");
                 return false;
             }
-            const bool ok = rocmMoE_grouped_floating_prefill_pipeline(
-                d_hidden,
-                gateup_table.device_floating_gate_descs,
-                gateup_table.device_floating_up_descs,
-                down_table.device_floating_descs,
-                d_group_original_to_grouped_,
-                d_original_expert_ids_for_pipeline,
-                d_group_weights_,
-                d_prefill_gate_,
-                d_output,
-                d_canonical_route_contributions,
-                seq_len,
-                total_slots,
-                top_k,
-                d_model,
-                intermediate,
-                num_experts,
-                gateup_table.weight_format,
-                device_ordinal_,
+            const bool ok = execution.overwriteOutputThenPublish(
+                execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
+                execution.executesDown() ? publication_output->size_bytes() : 0u,
+                seq_len, top_k,
+                canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                              : MoEPrefillOutputLayout::TokenRows,
                 stream,
-                execution);
+                [&](std::span<float> live_output, void *producer_stream)
+                {
+                    return rocmMoE_grouped_floating_prefill_pipeline(
+                        d_hidden,
+                        gateup_table.device_floating_gate_descs,
+                        gateup_table.device_floating_up_descs,
+                        down_table.device_floating_descs,
+                        d_group_original_to_grouped_,
+                        d_original_expert_ids_for_pipeline,
+                        d_group_weights_,
+                        d_prefill_gate_,
+                        canonical_route_contributions ? nullptr : live_output.data(),
+                        canonical_route_contributions ? live_output.data() : nullptr,
+                        seq_len,
+                        total_slots,
+                        top_k,
+                        d_model,
+                        intermediate,
+                        num_experts,
+                        gateup_table.weight_format,
+                        device_ordinal_,
+                        producer_stream,
+                        execution);
+                },
+                [&](const EnqueuedWorkspaceRead<float> &read)
+                {
+                    markDeviceWritten(publication_output, device, read.stream());
+                    return true;
+                });
             if (!ok)
             {
                 LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillProjection] "
                           "floating grouped ROCm pipeline failed");
                 return false;
             }
-            if (execution.executesDown())
-                markDeviceWritten(publication_output, device, stream);
             PerfStatsCollector::addCounter(
                 "kernel",
                 "rocm_moe_grouped_prefill_floating_calls",
@@ -11796,45 +11812,60 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             return false;
         }
         // Launch the fixed, fully grouped pipeline without a host synchronization.
-        const bool ok = rocmMoE_grouped_prefill_pipeline(
-            d_hidden,
-            reuse_router_q8_hidden
-                ? router_q8_hidden_publication_->quantized_rows
-                : nullptr,
-            reuse_router_q8_hidden
-                ? router_q8_hidden_publication_->row_scales
-                : nullptr,
-            gateup_table.device_gate_descs,
-            gateup_table.device_up_descs,
-            down_table.device_descs,
-            d_group_counts_,
-            d_group_offsets_,
-            d_group_token_indices_,
-            d_group_original_to_grouped_,
-            d_original_expert_ids_for_pipeline,
-            d_group_weights_,
-            reinterpret_cast<int *>(d_prefill_work_directory_),
-            d_prefill_A_int8_,
-            d_prefill_A_scales_,
-            d_prefill_gate_,
-            d_prefill_up_,
-            d_prefill_swiglu_int8_,
-            d_prefill_swiglu_scales_,
-            d_output,
-            d_canonical_route_contributions,
-            num_experts,
-            d_model,
-            intermediate,
-            total_slots,
-            top_k,
-            0,
-            gateup_table.codebook_mask,
-            down_table.codebook_mask,
-            gateup_table.policy_codebook_mask,
-            down_table.policy_codebook_mask,
-            device_ordinal_,
-            getStream(),
-            execution);
+        const bool ok = execution.overwriteOutputThenPublish(
+            execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
+            execution.executesDown() ? publication_output->size_bytes() : 0u,
+            seq_len, top_k,
+            canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                          : MoEPrefillOutputLayout::TokenRows,
+            stream,
+            [&](std::span<float> live_output, void *producer_stream)
+            {
+                return rocmMoE_grouped_prefill_pipeline(
+                    d_hidden,
+                    reuse_router_q8_hidden
+                        ? router_q8_hidden_publication_->quantized_rows
+                        : nullptr,
+                    reuse_router_q8_hidden
+                        ? router_q8_hidden_publication_->row_scales
+                        : nullptr,
+                    gateup_table.device_gate_descs,
+                    gateup_table.device_up_descs,
+                    down_table.device_descs,
+                    d_group_counts_,
+                    d_group_offsets_,
+                    d_group_token_indices_,
+                    d_group_original_to_grouped_,
+                    d_original_expert_ids_for_pipeline,
+                    d_group_weights_,
+                    reinterpret_cast<int *>(d_prefill_work_directory_),
+                    d_prefill_A_int8_,
+                    d_prefill_A_scales_,
+                    d_prefill_gate_,
+                    d_prefill_up_,
+                    d_prefill_swiglu_int8_,
+                    d_prefill_swiglu_scales_,
+                    canonical_route_contributions ? nullptr : live_output.data(),
+                    canonical_route_contributions ? live_output.data() : nullptr,
+                    num_experts,
+                    d_model,
+                    intermediate,
+                    total_slots,
+                    top_k,
+                    0,
+                    gateup_table.codebook_mask,
+                    down_table.codebook_mask,
+                    gateup_table.policy_codebook_mask,
+                    down_table.policy_codebook_mask,
+                    device_ordinal_,
+                    producer_stream,
+                    execution);
+            },
+            [&](const EnqueuedWorkspaceRead<float> &read)
+            {
+                markDeviceWritten(publication_output, device, read.stream());
+                return true;
+            });
 
         if (!ok)
         {
@@ -11855,12 +11886,6 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                  {"descriptor_source", "static_table"}});
         }
 
-        if (execution.executesDown()) markDeviceWritten(
-            canonical_route_contributions
-                ? canonical_route_contributions
-                : output,
-            DeviceId::rocm(device_ordinal_),
-            getStream());
             if (PerfStatsCollector::isDomainEnabled("kernel") &&
                 active_expert_slots > 0)
         {
@@ -12109,38 +12134,51 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
 
         if (floating)
         {
-            const bool ok = rocmMoE_grouped_floating_prefill_pipeline(
-                d_hidden,
-                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                    runtime_gate_descs),
-                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                    runtime_up_descs),
-                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                    runtime_down_descs),
-                d_group_original_to_grouped_,
-                runtime_host_layer.route_expert_ids,
-                runtime_host_layer.grouped_route_weights,
-                d_prefill_gate_,
-                d_output,
-                d_canonical_route_contributions,
-                seq_len,
-                total_slots,
-                top_k,
-                d_model,
-                intermediate,
-                num_experts,
-                gateup_table.weight_format,
-                device_ordinal_,
+            const bool ok = execution.overwriteOutputThenPublish(
+                execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
+                execution.executesDown() ? publication_output->size_bytes() : 0u,
+                seq_len, top_k,
+                canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                              : MoEPrefillOutputLayout::TokenRows,
                 stream,
-                execution);
+                [&](std::span<float> live_output, void *producer_stream)
+                {
+                    return rocmMoE_grouped_floating_prefill_pipeline(
+                        d_hidden,
+                        reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                            runtime_gate_descs),
+                        reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                            runtime_up_descs),
+                        reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                            runtime_down_descs),
+                        d_group_original_to_grouped_,
+                        runtime_host_layer.route_expert_ids,
+                        runtime_host_layer.grouped_route_weights,
+                        d_prefill_gate_,
+                        canonical_route_contributions ? nullptr : live_output.data(),
+                        canonical_route_contributions ? live_output.data() : nullptr,
+                        seq_len,
+                        total_slots,
+                        top_k,
+                        d_model,
+                        intermediate,
+                        num_experts,
+                        gateup_table.weight_format,
+                        device_ordinal_,
+                        producer_stream,
+                        execution);
+                },
+                [&](const EnqueuedWorkspaceRead<float> &read)
+                {
+                    markDeviceWritten(publication_output, device, read.stream());
+                    return true;
+                });
             if (!ok)
             {
                 LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
                           "floating grouped ROCm pipeline failed");
                 return false;
             }
-            if (execution.executesDown())
-                markDeviceWritten(publication_output, device, stream);
             PerfStatsCollector::addCounter(
                 "kernel",
                 "rocm_moe_grouped_prefill_floating_calls",
@@ -12158,41 +12196,56 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
 
         const bool reuse_router_q8_hidden = execution.executesGateUp() &&
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
-        const bool ok = rocmMoE_grouped_prefill_pipeline(
-            d_hidden,
-            reuse_router_q8_hidden ? d_router_q8_hidden_ : nullptr,
-            reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : nullptr,
-            runtime_gate_descs,
-            runtime_up_descs,
-            runtime_down_descs,
-            runtime_host_layer.expert_counts,
-            runtime_host_layer.expert_offsets,
-            runtime_host_layer.grouped_token_ids,
-            d_group_original_to_grouped_,
-            runtime_host_layer.route_expert_ids,
-            runtime_host_layer.grouped_route_weights,
-            reinterpret_cast<int *>(d_prefill_work_directory_),
-            d_prefill_A_int8_,
-            d_prefill_A_scales_,
-            d_prefill_gate_,
-            d_prefill_up_,
-            d_prefill_swiglu_int8_,
-            d_prefill_swiglu_scales_,
-            d_output,
-            d_canonical_route_contributions,
-            num_experts,
-            d_model,
-            intermediate,
-            total_slots,
-            top_k,
-            1,
-            gateup_table.codebook_mask,
-            down_table.codebook_mask,
-            gateup_table.policy_codebook_mask,
-            down_table.policy_codebook_mask,
-            device_ordinal_,
-            getStream(),
-            execution);
+        const bool ok = execution.overwriteOutputThenPublish(
+            execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
+            execution.executesDown() ? publication_output->size_bytes() : 0u,
+            seq_len, top_k,
+            canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                          : MoEPrefillOutputLayout::TokenRows,
+            stream,
+            [&](std::span<float> live_output, void *producer_stream)
+            {
+                return rocmMoE_grouped_prefill_pipeline(
+                    d_hidden,
+                    reuse_router_q8_hidden ? d_router_q8_hidden_ : nullptr,
+                    reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : nullptr,
+                    runtime_gate_descs,
+                    runtime_up_descs,
+                    runtime_down_descs,
+                    runtime_host_layer.expert_counts,
+                    runtime_host_layer.expert_offsets,
+                    runtime_host_layer.grouped_token_ids,
+                    d_group_original_to_grouped_,
+                    runtime_host_layer.route_expert_ids,
+                    runtime_host_layer.grouped_route_weights,
+                    reinterpret_cast<int *>(d_prefill_work_directory_),
+                    d_prefill_A_int8_,
+                    d_prefill_A_scales_,
+                    d_prefill_gate_,
+                    d_prefill_up_,
+                    d_prefill_swiglu_int8_,
+                    d_prefill_swiglu_scales_,
+                    canonical_route_contributions ? nullptr : live_output.data(),
+                    canonical_route_contributions ? live_output.data() : nullptr,
+                    num_experts,
+                    d_model,
+                    intermediate,
+                    total_slots,
+                    top_k,
+                    1,
+                    gateup_table.codebook_mask,
+                    down_table.codebook_mask,
+                    gateup_table.policy_codebook_mask,
+                    down_table.policy_codebook_mask,
+                    device_ordinal_,
+                    producer_stream,
+                    execution);
+            },
+            [&](const EnqueuedWorkspaceRead<float> &read)
+            {
+                markDeviceWritten(publication_output, device, read.stream());
+                return true;
+            });
         if (!ok)
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] grouped ROCm pipeline failed");
@@ -12212,12 +12265,6 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                  {"descriptor_source", "runtime_table"}});
         }
 
-        if (execution.executesDown()) markDeviceWritten(
-            canonical_route_contributions
-                ? canonical_route_contributions
-                : output,
-            DeviceId::rocm(device_ordinal_),
-            getStream());
             if (PerfStatsCollector::isDomainEnabled("kernel") &&
                 active_expert_slots > 0)
         {

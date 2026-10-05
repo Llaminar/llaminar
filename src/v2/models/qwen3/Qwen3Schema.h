@@ -124,11 +124,6 @@ namespace llaminar2
             schema.name = "qwen3";
             schema.version = "1.0";
 
-            // TP Allreduce Precision Policy — first 6 layers FP32 for
-            // numerical stability; remaining layers FP16
-            schema.tp_allreduce_default_precision = "fp16";
-            schema.tp_allreduce_fp32_layer_count = 6;
-
             schema.required_params = {
                 "n_layers", "d_model", "n_heads", "n_kv_heads",
                 "head_dim", "d_ff", "vocab_size",

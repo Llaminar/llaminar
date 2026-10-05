@@ -170,7 +170,8 @@ namespace llaminar2
             appendBytes(out, value.data(), value.size());
         }
 
-        bool readU32(const std::vector<uint8_t> &in, size_t &offset, uint32_t &value)
+        /** @brief Decode one little-endian word from an owned archive byte view. */
+        bool readU32(std::span<const uint8_t> in, size_t &offset, uint32_t &value)
         {
             if (offset + 4 > in.size())
                 return false;
@@ -180,7 +181,8 @@ namespace llaminar2
             return true;
         }
 
-        bool readI32(const std::vector<uint8_t> &in, size_t &offset, int32_t &value)
+        /** @brief Decode a signed word without requiring vector-backed storage. */
+        bool readI32(std::span<const uint8_t> in, size_t &offset, int32_t &value)
         {
             uint32_t raw = 0;
             if (!readU32(in, offset, raw))
@@ -189,7 +191,8 @@ namespace llaminar2
             return true;
         }
 
-        bool readU64(const std::vector<uint8_t> &in, size_t &offset, uint64_t &value)
+        /** @brief Decode a bounded little-endian histogram counter. */
+        bool readU64(std::span<const uint8_t> in, size_t &offset, uint64_t &value)
         {
             if (offset + 8 > in.size())
                 return false;
@@ -199,7 +202,8 @@ namespace llaminar2
             return true;
         }
 
-        bool readString(const std::vector<uint8_t> &in, size_t &offset, std::string &value)
+        /** @brief Decode a length-prefixed runtime-table identity. */
+        bool readString(std::span<const uint8_t> in, size_t &offset, std::string &value)
         {
             uint32_t size = 0;
             if (!readU32(in, offset, size) || offset + size > in.size())
@@ -3278,7 +3282,7 @@ namespace llaminar2
 
     PrefixCacheRuntimeRestoreResult
     Qwen35MoEGraph::restorePrefixCacheRuntimeState(
-        const std::vector<uint8_t> &state,
+        std::span<const uint8_t> state,
         void *stream)
     {
         prefix_runtime_device_rehydration_pending_ = false;

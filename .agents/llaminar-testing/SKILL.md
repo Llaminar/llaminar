@@ -140,6 +140,39 @@ substitute for the production path.
 - For HTTP needle/long-context tests, use `scripts/ci/run_model_parity_e2e.py`;
   for remote MPI, follow **Cross-host E2E certification** below. Both derive
   their eligible cells from the canonical definitions.
+- For captured GPU stage-timing diagnostics, use the CUDA tuning skill's
+  `references/native-graph-events.md` and its named-stage observer/report
+  procedure. The current standalone observer consumes CUDA graphs. Canonical
+  CMake registration includes the device-free annotation lifecycle/report
+  gates and `V2_Integration_CUDANativeGraphStageTiming`, which exercises real
+  capture and the captured-snapshot byte oracle. These are part of complete
+  Unit/preflight, not a substitute for Release model/HTTP qualification. A
+  model observation additionally requires a matched uninstrumented control
+  with identical token IDs, live rows, prefix behavior and MTP work. Preserve
+  trace/report identities and the complete driver window. Missing stage
+  provenance or intervals fails the diagnostic; an empty capture scope and
+  an unmeasured/opaque operation are different states. Overlapping stage spans
+  cannot be added as elapsed time, and observer throughput is not a benchmark.
+- For reusable scratch overwrite changes, first prove a focused regression
+  against the old implementation. `V2_Integration_CUDACanonicalPartialsOverwriteAllFormats`
+  poisons dense scratch and inspects retained native graphs; the
+  `V2_Integration_MoELiveRows_*` and `V2_Integration_MoEOriginalSourceRows_*`
+  gates poison shared/routed expert banks on CUDA and ROCm across all formats,
+  empty ownership and changing live rows. `V2_Unit_WorkspaceOverwriteContract`
+  proves checked extents and failed-producer publication rules without a GPU.
+  Unused capacity is not a read or clear extent. Keep required accumulator,
+  recurrent-state and protocol initialization. Refresh complete Unit/preflight
+  after source/test changes before admitting Release HTTP and model timing.
+- For GPU RAM prefix arena changes, run `V2_Integration_PrefixHostArenaLifecycle`
+  and the CUDA/ROCm `V2_Integration_GPURamPrefixInitialization_*` and
+  `V2_Integration_GPURamPrefixArena_*` gates. Prove fixed physical backing,
+  stale-key rejection, checked section extents, alias and disk-writer lifetime,
+  delayed producer/restore DMA, out-of-order completion, fragmentation,
+  large-to-small dirty reuse and final-owner teardown. Both vendor paths must
+  retain exact PMA charges through pending transfers. Repeat adversarial native
+  cases when changing ownership; then run complete prerequisites and Release
+  HTTP prefix/MTP cells. Allocation counters and a matched host-boundary trace
+  must show setup materialization with no native pinned allocation in prefill.
 - For complete AVX512/AVX2 image and benchmark certification, use
   `scripts/ci/run_production_pipeline.py` and `docs/production-ci.md`. Both full
   E2E server suites precede benchmarks; one-off benchmarks cannot certify images.

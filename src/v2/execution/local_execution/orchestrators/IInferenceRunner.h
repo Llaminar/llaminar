@@ -462,13 +462,13 @@ namespace llaminar2
         DeviceGenerationSamplingMode sampling_mode =
             DeviceGenerationSamplingMode::Unspecified;
         /**
-         * @brief True when this child produced a complete mirrored LocalTP outcome.
+         * @brief True when this child produced a complete participant-local TP outcome.
          *
-         * Every child in a mirrored domain must report this value. It proves
+         * Every child with complete terminal logits must report this value. It proves
          * that the child ran the participant-local terminal reducer and owns a
          * ready compact outcome; no rank outcome collective is permitted.
          */
-        bool mirrored_local_tp_locally_complete = false;
+        bool local_tp_participant_complete = false;
 
         bool valid() const
         {
@@ -2922,16 +2922,17 @@ namespace llaminar2
         virtual bool supportsMTPTokenCoordination() const { return false; }
 
         /**
-         * @brief True when MTP verifier graphs use a mirrored terminal head.
+         * @brief True when MTP graphs publish a complete vocabulary on this participant.
          *
          * This is a declarative ownership fact, not a fallback capability. In
-         * every TP scope, each participant owns full-vocabulary verifier logits
+         * every TP scope, a complete primary/mirrored head or an explicit native
+         * vocabulary gather owns full-vocabulary verifier logits
          * and may reduce its compact outcome locally before publishing from the
          * same device-resident handle. Returning false means the explicitly
-         * vocabulary-sharded policy is active and rank-scope candidate
-         * coordination is required.
+         * vocabulary-sharded result remains incomplete at the graph boundary
+         * and requires an explicit coordination authority.
          */
-        virtual bool usesMirroredMTPHeadForVerifier() const { return false; }
+        virtual bool publishesFullVocabularyMTPLogits() const { return false; }
 
         /**
          * @brief Sample the current MTP sidecar logits in greedy mode.

@@ -4,7 +4,9 @@
  *
  * Native fork submission retains this stage's precision and telemetry authority;
  * the explicit paired graph join, never an auxiliary-stream host shadow, owns
- * publication. Native sums and canonical rank folds share their ordinary
+ * publication. Canonical folds consume the same live row authority as native
+ * transport, preserving inactive in-place output bytes. Native sums and
+ * canonical rank folds share their ordinary
  * arithmetic implementation even when forked; control sidebands retain their
  * existing ordered execution contracts.
  * @author David Sanftenberg
@@ -83,7 +85,6 @@ namespace llaminar2
 
     namespace
     {
-        constexpr const char *kDefaultAllreducePrecision = "fp32";
         constexpr const char *kCanonicalRankBankWorkspace =
             "tp_allreduce_canonical_rank_banks";
 
@@ -102,6 +103,13 @@ namespace llaminar2
                 params.live_rows->bankElements() != params.count ||
                 !params.device_id.is_gpu() || params.sideband_device_index < 0))
                 throw std::invalid_argument("TP allreduce live prefix requires exact GPU bank and participant bindings");
+            if (params.request_rows && (params.live_rows || params.count == 0 ||
+                params.request_rows->storageElements() != params.count ||
+                !params.device_id.is_gpu() || params.sideband_device_index < 0 ||
+                (params.tensor && params.count > params.tensor->numel()) ||
+                params.arithmetic_policy != TPAllreduceArithmeticPolicy::NativeCollective ||
+                !params.sidebands.empty() || !params.sideband_workspace_bindings.empty()))
+                throw std::invalid_argument("TP request-row allreduce requires independent native GPU banks without sidebands");
         }
 
         const char *allreduceRoleForStage(const std::string &stage_name)
@@ -135,7 +143,7 @@ namespace llaminar2
 
         std::string requestedTransportPrecision(const TPAllreduceParams &params)
         {
-            return params.precision.empty() ? std::string(kDefaultAllreducePrecision) : params.precision;
+            return params.precision.empty() ? debugEnv().allreduce_precision : params.precision;
         }
 
         std::string effectiveTransportPrecision(
@@ -143,6 +151,10 @@ namespace llaminar2
             size_t effective_count)
         {
             const std::string requested_precision = requestedTransportPrecision(params);
+            // Host TP has a native FP32 tensor contract and does not consume
+            // the GPU transport selector. Its BOM must report the actual type.
+            if (!params.device_id.is_gpu())
+                return "fp32";
             const size_t logical_row_elements =
                 params.tensor ? params.tensor->cols() : 0;
             const size_t decision_elements =
@@ -366,7 +378,10 @@ namespace llaminar2
                 {"accounting", "graph_template_or_eager_launch"},
                 {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"}};
             common_tags.emplace("elements", std::to_string(effective_count));
-            common_tags.emplace("extent", params.live_rows ? "device_row_prefix" : "fixed_elements");
+            common_tags.emplace("extent", params.request_rows ? "device_request_row_prefixes" :
+                (params.live_rows ? "device_row_prefix" : "fixed_elements"));
+            if (params.request_rows)
+                common_tags.emplace("request_banks", std::to_string(params.request_rows->requests()));
             const size_t logical_row_elements = params.tensor->cols();
             common_tags.emplace(
                 "logical_row_elements", std::to_string(logical_row_elements));
@@ -386,7 +401,7 @@ namespace llaminar2
 
             PerfStatsCollector::addCounter(
                 "tp_allreduce_bom",
-                params.live_rows ? "capacity_bytes" : "bytes",
+                (params.live_rows || params.request_rows) ? "capacity_bytes" : "bytes",
                 static_cast<double>(reduced_bytes),
                 {},
                 params.device_id.toString(),
@@ -496,6 +511,15 @@ namespace llaminar2
             effectiveTransportPrecision(params_, effective_count);
         const bool gpu_stage =
             params_.device_id.is_gpu() || (ctx && ctx->isGPU());
+
+        if (params_.request_rows)
+        {
+            auto *local_tp = dynamic_cast<ILocalTPContext *>(params_.tp_ctx);
+            if (!local_tp || effective_count > params_.tensor->numel())
+                throw std::invalid_argument("Request-row allreduce requires a LocalTP owner and complete tensor banks");
+            return local_tp->allreduceRequestRowsOnStream(params_.tensor, params_.stage_name,
+                *params_.request_rows, stage_stream, transport_precision);
+        }
 
         std::vector<LocalTPCollectiveSidebandBuffer> sidebands = params_.sidebands;
         if (!params_.sideband_workspace_bindings.empty())
@@ -671,7 +695,7 @@ namespace llaminar2
         auto *local = dynamic_cast<ILocalTPContext *>(params_.tp_ctx);
         if (!local || !input.valid() || input.sourceOwner() != params_.tensor ||
             input.device() != params_.device_id ||
-            !params_.sidebands.empty() || !params_.sideband_workspace_bindings.empty())
+            !params_.sidebands.empty() || !params_.sideband_workspace_bindings.empty() || params_.request_rows)
             throw std::invalid_argument("TP allreduce fork requires its exact tensor without control sidebands");
         const auto count = params_.count ? params_.count : params_.tensor->numel();
         if (count == 0 || count > params_.tensor->numel())
@@ -908,25 +932,21 @@ namespace llaminar2
         if (params_.device_id.is_cuda())
         {
 #ifdef HAVE_CUDA
-            folded = launchCUDATPRankOrderedSumFP32(
-                rank_banks,
-                tensor_data,
-                effective_count,
-                degree,
-                params_.device_id.toKernelDeviceIndex(),
-                stage_stream);
+            folded = params_.live_rows
+                ? launchCUDATPRankOrderedSumFP32(rank_banks, tensor_data, *params_.live_rows,
+                    degree, params_.device_id.toKernelDeviceIndex(), stage_stream)
+                : launchCUDATPRankOrderedSumFP32(rank_banks, tensor_data, effective_count,
+                    degree, params_.device_id.toKernelDeviceIndex(), stage_stream);
 #endif
         }
         else if (params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
-            folded = launchROCmTPRankOrderedSumFP32(
-                rank_banks,
-                tensor_data,
-                effective_count,
-                degree,
-                params_.device_id.toKernelDeviceIndex(),
-                stage_stream);
+            folded = params_.live_rows
+                ? launchROCmTPRankOrderedSumFP32(rank_banks, tensor_data, *params_.live_rows,
+                    degree, params_.device_id.toKernelDeviceIndex(), stage_stream)
+                : launchROCmTPRankOrderedSumFP32(rank_banks, tensor_data, effective_count,
+                    degree, params_.device_id.toKernelDeviceIndex(), stage_stream);
 #endif
         }
         if (!folded)

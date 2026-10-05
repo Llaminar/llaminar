@@ -5,6 +5,8 @@
  * Device-free fixtures verify cache ownership and the physical prefill ladder.
  * The compact serving default must chunk long prompts without reducing context;
  * explicit larger inventories retain their selection and cache-budget coverage.
+ * Both GPU backends must preserve the 448-row checkpoint frontier inside the
+ * shared 512-row capacity rather than padding that frontier to the arena size.
  */
 
 #include <gtest/gtest.h>
@@ -443,6 +445,40 @@ TEST(Test__PrefillGraphCache, PrefillFloorReloadRestoresCanonicalDefault)
     EXPECT_EQ(execution.prefill_graph_min_seq, kDefaultPrefillGraphMinBucketSize);
 }
 
+/** @test Both backends admit the economical checkpoint bucket within the same arena. */
+TEST(Test__PrefillGraphCache, Default448BucketPreservesSharedCapacity)
+{
+    const auto buckets = rawPrefillGraphBucketsForResidentCapacity(
+        defaultPrefillGraphBuckets(), 512, kDefaultPrefillGraphMinBucketSize);
+    ASSERT_EQ(buckets.back(), 512);
+    ASSERT_EQ(buckets.size(), 6u);
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        PrefillGraphCache cache{PrefillGraphConfig{}};
+        const auto graph = buildCapturableGraph(device);
+        for (int live_rows = 385; live_rows <= 512; ++live_rows)
+        {
+            const auto selection = selectPrefillGraphBucket(live_rows, buckets);
+            ASSERT_TRUE(selection);
+            EXPECT_EQ(selection.bucket_seq_len, live_rows <= 448 ? 448 : 512);
+            auto key = makeGPUKey(selection.bucket_seq_len);
+            key.device_id = device;
+            EXPECT_EQ(cache.preflight(graph, key, nullptr, false, false,
+                          live_rows, selection.bucket_seq_len),
+                      PrefillGraphRejectReason::None);
+        }
+    }
+    // A participant admitted for 384 rows cannot grow its arena or capture
+    // family merely because the common supported inventory gained a bucket.
+    EXPECT_EQ(rawPrefillGraphBucketsForResidentCapacity(
+                  defaultPrefillGraphBuckets(), 384, kDefaultPrefillGraphMinBucketSize),
+              (std::vector<int>{64, 128, 256, 384}));
+    EXPECT_EQ(retainedPrefillGraphBucketLadder(
+                  buckets, 512, kDefaultPrefillGraphMaxCachedEntries -
+                                    kExpertOverlayPrefillGraphIdentityReserve),
+              buckets);
+}
+
 // =============================================================================
 // Test: Phase 6 bucket selection and chunk planning helpers
 // =============================================================================
@@ -548,7 +584,7 @@ TEST(Test__PrefillGraphCache,
         /*maximum_bucket_count=*/8);
     EXPECT_EQ(
         retained,
-        (std::vector<int>{64, 128, 256, 384, 512, 576, 672, 768}));
+        (std::vector<int>{64, 128, 256, 384, 448, 544, 640, 768}));
     EXPECT_EQ(
         retainedPrefillGraphBucketLadder(
             {64, 128, 256}, 256, /*maximum_bucket_count=*/1),

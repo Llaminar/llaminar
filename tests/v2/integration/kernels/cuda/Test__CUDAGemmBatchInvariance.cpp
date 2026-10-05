@@ -6,6 +6,9 @@
  * points with identical inputs, production launch policy, explicit streams,
  * persistent workspace, and both serial and concurrent projection schedules.
  * Every retained schedule must reproduce the same output bytes across repeats.
+ * Dirty-workspace regressions poison reusable partials before each replay and
+ * require complete live overwrite without a native graph clear. Unused output
+ * capacity remains poisoned, so allocation size cannot substitute for live M.
  *
  * These cases localize failures among kernel arithmetic, side-stream event
  * ordering, and workspace partition ownership. They deliberately use the real
@@ -33,6 +36,7 @@
 #include "utils/MPIContext.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
+#include "kernels/cuda/gemm/CUDANativeVNNIPrefillDiagnostics.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -1301,6 +1305,234 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNICanonicalKpartDeclaresPersistent
  * ordinary production policy controls throughout; forcing a tile would bypass
  * the installed overlay and would therefore fail to test the real path.
  */
+/**
+ * @brief Every production prefill format consumes fully overwritten dirty scratch.
+ *
+ * Capture the real prepared projection and retain large/small row graphs over
+ * one workspace. The untimed exact-M output is the arithmetic oracle; the
+ * broader all-format GEMM gates independently compare that arithmetic with
+ * serial decode. Native graph inspection separately rejects redundant clears.
+ * The two actual dense FFN-down shapes keep installed Auto dispatch enabled.
+ */
+TEST_F(Test__CUDAGemmBatchInvariance, CapturedCanonicalPartialsOverwriteAllFormats)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes modes;
+    const auto stream = static_cast<cudaStream_t>(explicitProducerStream());
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    int sm_count = 0;
+    ASSERT_EQ(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                    gpu_device_.ordinal), cudaSuccess);
+    auto verify = [&](const QuantizedVerifierFormatCase &format, int n, int k,
+                      bool installed_auto, bool require_empty_partition = false)
+    {
+        SCOPED_TRACE(::testing::Message() << format.label << " n=" << n
+            << " k=" << k << " installed_auto=" << installed_auto);
+        constexpr int max_rows = 65;
+        int ordered = 0, partitions = 0;
+        ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+            format.device_execution_codebook_id, n, k, sm_count, &ordered, &partitions));
+        cudaNativeVNNIPrefill_setForceTile(-1);
+        cudaNativeVNNIPrefill_setBK256Mode(installed_auto ? 0 : -1);
+        cudaNativeVNNIPrefill_setExactOverlayEnabled(installed_auto);
+        cudaNativeVNNIPrefill_setCanonicalKPartitionMode(!installed_auto && ordered && partitions > 1);
+        auto weight = format.create({size_t(n), size_t(k)}, 92721);
+        auto prepared = makeGpuPreparedGemm(weight.get(), gpu_device_,
+            std::string("test.overwrite.") + format.label + "." + std::to_string(k));
+        auto *kernel = prepared.kernel;
+        ASSERT_NE(kernel, nullptr);
+        kernel->setGPUStream(stream);
+        auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+        ASSERT_NE(consumer, nullptr);
+        const auto requirements = consumer->getWorkspaceRequirements(max_rows, n, k);
+        DeviceWorkspaceManager workspace(gpu_device_, requirements.total_bytes_with_alignment() + 4096);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        consumer->bindWorkspace(&workspace);
+        FP32Tensor input({size_t(max_rows), size_t(k)}), output({size_t(max_rows), size_t(n)});
+        for (size_t i = 0; i < input.numel(); ++i)
+            input.mutable_data()[i] = 0.015625f * float(int((i * 17 + 9) % 47) - 23);
+        ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+        ASSERT_TRUE(output.ensureOnDevice(gpu_device_, stream));
+        const auto launch = [&](int rows)
+        {
+            return kernel->multiply_tensor(&input, &output, rows, n, k,
+                true, 1.0f, 0.0f, nullptr, nullptr, gpu_device_.ordinal, &workspace);
+        };
+        std::array<int, 3> row_counts{65, 17, 64};
+        std::array<std::vector<float>, 3> expected;
+        std::array<int, 3> empty_partition_begin{};
+        std::array<int, 3> captured_partition_counts{};
+        std::array<cudaGraph_t, 3> graphs{};
+        std::array<cudaGraphExec_t, 3> executables{};
+        struct Retirement
+        {
+            cudaStream_t stream;
+            IWorkspaceConsumer *consumer;
+            std::array<cudaGraph_t, 3> &graphs;
+            std::array<cudaGraphExec_t, 3> &executables;
+            /** @brief Join diagnostic work before unbinding or releasing graph storage. */
+            ~Retirement()
+            {
+                (void)cudaStreamSynchronize(stream);
+                for (auto executable : executables) if (executable) (void)cudaGraphExecDestroy(executable);
+                for (auto graph : graphs) if (graph) (void)cudaGraphDestroy(graph);
+                consumer->unbindWorkspace();
+            }
+        } retirement{stream, consumer, graphs, executables};
+        bool exercised_partition_writer = false;
+        bool exercised_empty_partition = false;
+        for (size_t index = 0; index < row_counts.size(); ++index)
+        {
+            const int rows = row_counts[index];
+            expected[index].resize(size_t(rows) * n);
+            ASSERT_TRUE(launch(rows));
+            ASSERT_EQ(cudaMemcpyAsync(expected[index].data(), output.gpu_data_ptr(),
+                expected[index].size() * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+            bool launched = false;
+            {
+                GraphCaptureGuard guard;
+                launched = launch(rows);
+            }
+            const auto ended = cudaStreamEndCapture(stream, &graphs[index]);
+            ASSERT_TRUE(launched);
+            ASSERT_EQ(ended, cudaSuccess);
+            int tile = -1, count = 0, bk256 = 0, canonical = 0;
+            cudaNativeVNNIPrefill_getLastLaunchSelection(&tile, &count, &bk256, &canonical);
+            exercised_partition_writer |= canonical != 0;
+            captured_partition_counts[index] = count;
+            size_t node_count = 0;
+            ASSERT_EQ(cudaGraphGetNodes(graphs[index], nullptr, &node_count), cudaSuccess);
+            std::vector<cudaGraphNode_t> nodes(node_count);
+            ASSERT_EQ(cudaGraphGetNodes(graphs[index], nodes.data(), &node_count), cudaSuccess);
+            size_t clears = 0;
+            for (auto node : nodes)
+            {
+                cudaGraphNodeType type;
+                ASSERT_EQ(cudaGraphNodeGetType(node, &type), cudaSuccess);
+                clears += type == cudaGraphNodeTypeMemset;
+            }
+            EXPECT_EQ(clears, 0u) << "complete projection writers must not capture a scratch clear";
+            if (require_empty_partition)
+            {
+                // This diagnostic changes the retained producer/reducer
+                // partition count together, never installed policy. One fewer
+                // plane preserves complete K coverage and creates empty tail
+                // planes without requiring more scratch. Match both exact
+                // core symbols before editing their typed launch arguments.
+                ASSERT_NE(canonical, 0);
+                ASSERT_GT(count, 2);
+                const int diagnostic_count = count - 1;
+                captured_partition_counts[index] = diagnostic_count;
+                CUDADensePrefillKernelResources producer_resources{}, reducer_resources{};
+                ASSERT_TRUE(cudaNativeVNNIPrefill_queryLastLaunchResources(
+                    format.device_execution_codebook_id, n, k, gpu_device_.ordinal,
+                    &producer_resources, &reducer_resources));
+                bool changed_producer = false, changed_reducer = false;
+                for (auto node : nodes)
+                {
+                    cudaGraphNodeType type;
+                    ASSERT_EQ(cudaGraphNodeGetType(node, &type), cudaSuccess);
+                    if (type != cudaGraphNodeTypeKernel) continue;
+                    cudaKernelNodeParams params{};
+                    ASSERT_EQ(cudaGraphKernelNodeGetParams(node, &params), cudaSuccess);
+                    ASSERT_NE(params.kernelParams, nullptr);
+                    if (params.func == reducer_resources.kernel_symbol)
+                    {
+                        constexpr int reducer_partition_argument = 6;
+                        ASSERT_EQ(*static_cast<const int *>(params.kernelParams[reducer_partition_argument]), count);
+                        params.kernelParams[reducer_partition_argument] = const_cast<int *>(&diagnostic_count);
+                        ASSERT_EQ(cudaGraphKernelNodeSetParams(node, &params), cudaSuccess);
+                        changed_reducer = true;
+                        continue;
+                    }
+                    if (params.func != producer_resources.kernel_symbol) continue;
+                    constexpr int geometry_argument = 15;
+                    auto geometry = *static_cast<const llaminar2::cuda::prefill::CanonicalM1PartitionGeometry *>(
+                        params.kernelParams[geometry_argument]);
+                    ASSERT_EQ(geometry.count, count);
+                    geometry.count = diagnostic_count;
+                    geometry.blocks_per_partition = (k / 32 + diagnostic_count - 1) / diagnostic_count;
+                    params.kernelParams[geometry_argument] = &geometry;
+                    params.gridDim.z = diagnostic_count;
+                    ASSERT_EQ(cudaGraphKernelNodeSetParams(node, &params), cudaSuccess);
+                    empty_partition_begin[index] =
+                        (k / 32 + geometry.blocks_per_partition - 1) / geometry.blocks_per_partition;
+                    ASSERT_LT(empty_partition_begin[index], diagnostic_count);
+                    changed_producer = true;
+                }
+                ASSERT_TRUE(changed_producer);
+                ASSERT_TRUE(changed_reducer);
+                exercised_empty_partition = true;
+            }
+            ASSERT_EQ(cudaGraphInstantiate(&executables[index], graphs[index], nullptr, nullptr, 0), cudaSuccess);
+            if (require_empty_partition)
+            {
+                // Exact-M arithmetic oracle for this diagnostic partition
+                // geometry. Ordinary/Auto geometry above retains its original
+                // oracle and independent serial-decode certification gates.
+                ASSERT_EQ(cudaGraphLaunch(executables[index], stream), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(expected[index].data(), output.gpu_data_ptr(),
+                    expected[index].size() * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            }
+        }
+        if (installed_auto || (ordered && partitions > 1))
+            EXPECT_TRUE(exercised_partition_writer) << "the real canonical-partition producer must run";
+        if (require_empty_partition)
+            EXPECT_TRUE(exercised_empty_partition) << "the producer must define trailing empty K planes";
+        // Poison all mutable projection scratch, including currently dormant
+        // buffers. Immutable codebooks and prepared weights remain untouched.
+        const std::array scratch_names{
+            GemmWorkspaceBuffers::QUANT_A, GemmWorkspaceBuffers::SCALES_A,
+            GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,
+            GemmWorkspaceBuffers::ACC_INT32, GemmWorkspaceBuffers::TEMP_C_FP32,
+            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS};
+        std::vector<uint32_t> actual(output.numel());
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            const size_t index = size_t(replay) % row_counts.size();
+            SCOPED_TRACE(::testing::Message() << "replay=" << replay << " rows=" << row_counts[index]);
+            for (const auto *name : scratch_names)
+            {
+                const size_t bytes = workspace.getBufferSize(name);
+                if (bytes) ASSERT_EQ(cudaMemsetAsync(workspace.getBuffer(name), 0xff, bytes, stream), cudaSuccess);
+            }
+            ASSERT_EQ(cudaMemsetAsync(output.gpu_data_ptr(), 0xff, output.size_bytes(), stream), cudaSuccess);
+            ASSERT_EQ(cudaGraphLaunch(executables[index], stream), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(actual.data(), output.gpu_data_ptr(), output.size_bytes(),
+                                     cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            std::vector<uint32_t> empty_planes;
+            if (require_empty_partition)
+            {
+                const auto plane_elements = size_t(row_counts[index]) * n;
+                empty_planes.resize(size_t(captured_partition_counts[index] - empty_partition_begin[index]) * plane_elements);
+                const auto *partials = static_cast<const float *>(workspace.getBuffer(
+                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS));
+                ASSERT_EQ(cudaMemcpyAsync(empty_planes.data(),
+                    partials + size_t(empty_partition_begin[index]) * plane_elements,
+                    empty_planes.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            }
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            ASSERT_EQ(std::memcmp(actual.data(), expected[index].data(), expected[index].size() * sizeof(float)), 0)
+                << "dirty workspace changed exact-M output bytes";
+            for (size_t element = expected[index].size(); element < actual.size(); ++element)
+                ASSERT_EQ(actual[element], 0xffffffffu) << "writer touched unused output capacity";
+            for (const auto bits : empty_planes)
+                ASSERT_EQ(bits, 0u) << "an empty K plane must completely overwrite poison with +0";
+        }
+    };
+    for (const auto &format : quantizedVerifierFormats()) verify(format, 512, 2048, false);
+    for (const auto &format : quantizedVerifierFormats())
+        if (format.tensor_type == TensorType::IQ4_XS)
+            for (const int k : {17408, 8704}) verify(format, 5120, k, true);
+    for (const auto &format : quantizedVerifierFormats()) verify(format, 512, 2048, false, true);
+#endif
+}
+
 TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNI_Qwen36Q6ExactOverlayMatchesWorkspacePlan)
 {
 #ifndef HAVE_CUDA

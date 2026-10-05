@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Regression tests for model-tiered ordinary-prefill measurements."""
+"""Prove model-tiered measurements and the shared GPU capture row inventory.
+
+Offline CUDA/ROCm evidence must include the same checkpoint-aligned buckets
+that production capture selection can execute.
+"""
 
 from __future__ import annotations
 
@@ -50,6 +54,7 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
         )
         self.assertEqual(rows, sorted({*range(2, 17), *GPU_PREFILL_M_BUCKETS}))
         self.assertEqual(rows[-1], 4096)
+        self.assertIn(448, GPU_PREFILL_M_BUCKETS)
         self.assertIn(600, rows)
 
     def test_cpu_exact_projection_depths_follow_model_size_tier(self) -> None:
@@ -80,6 +85,22 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
             CPU_14B_PLUS_PREFILL_M_BUCKETS,
         )
         self.assertEqual(matrix["32B_AttnOut"].shape.n, 5120)
+
+    def test_tp_local_shards_keep_large_model_owner_tier(self) -> None:
+        """A small local matrix still belongs to the dense 27B checkpoint."""
+
+        matrix = {row.shape.name: row for row in cpu_prefill_measurements()}
+        shards = [shape for shape in load_shape_manifest().shapes
+                  if shape.model_family == "qwen35-dense-tp-local"]
+        self.assertEqual(len(shards), 6)
+        for shape in shards:
+            with self.subTest(shape=shape.name):
+                self.assertEqual(_shape_owner_size_billions(shape), 27.0)
+                if "LM_Head" in shape.name:
+                    self.assertNotIn(shape.name, matrix)
+                else:
+                    self.assertEqual(matrix[shape.name].m_values,
+                                     CPU_14B_PLUS_PREFILL_M_BUCKETS)
 
     def test_shared_release_geometry_uses_largest_owning_model_tier(self) -> None:
         """A geometry used by a large release must obey the large CPU cap."""

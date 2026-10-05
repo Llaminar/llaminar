@@ -14,6 +14,7 @@
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
+#include "collective/VocabularyGatherWorkspaceContract.h"
 #include "execution/local_execution/device/ReusableExecutionWorkspace.h"
 #include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
@@ -426,6 +427,31 @@ namespace
         mutable int max_m_ = -1;
         mutable bool saw_declared_m_ = false;
         mutable bool saw_decode_m_ = false;
+    };
+
+    /** @brief Device-free collective geometry for the production allocator scan. */
+    class VocabularyWorkspaceStage final : public DeclaredShapeWorkspaceStage
+    {
+    public:
+        /** @brief Declare CPU metadata with the native collective's row contract.
+         * @param rows Physical operation rows in this graph participant. */
+        explicit VocabularyWorkspaceStage(int rows)
+            : DeclaredShapeWorkspaceStage(DeviceId::cpu(),
+                  {static_cast<std::size_t>(rows), 16},
+                  {static_cast<std::size_t>(rows), 32}) {}
+        /** @return Collective identity; the terminal name must not override it. */
+        ComputeStageType type() const override { return ComputeStageType::NATIVE_ALLGATHER; }
+        /** @brief Contribute a row-dependent bank to the real workspace authority.
+         * @param m Family operation rows requested before publication.
+         * @param n Unused fixed vocabulary dimension.
+         * @param k Unused collective reduction dimension.
+         * @return Exact common transpose-bank requirement. */
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+        {
+            (void)n;
+            (void)k;
+            return VocabularyGatherWorkspaceContract::requirements(m, 32);
+        }
     };
 
     /**
@@ -2100,6 +2126,51 @@ TEST(Test__WorkspaceAllocator, ExactGroupedTerminalProjectionUsesVerifierCardina
 
     EXPECT_EQ(lm_head_ptr->maxM(), 15);
     EXPECT_TRUE(lm_head_ptr->sawDeclaredM());
+}
+
+/** @brief A terminal collective publishes the verifier bank from serial setup.
+ *
+ * The test allocates CPU scratch only. It exercises the production graph scan,
+ * physical-memory admission, sealed publication and later participant binding,
+ * so both name misclassification and late capacity growth fail the regression.
+ */
+TEST(Test__WorkspaceAllocator, NativeVocabularySerialFamilyPublishesVerifierBank)
+{
+    if (!hasCPUBackend())
+        initCPUBackend(-1);
+    constexpr std::size_t bank_bytes = 16u * 32u * sizeof(float);
+    WorkspaceAllocator allocator(makeWorkspaceAuthority(DeviceId::cpu(), 64u * 1024u));
+    auto hints = tinyHints();
+    hints.max_seq_len = 8192; // KV capacity must not become collective operation M.
+    hints.vocab_size = 32;
+    hints.serial_family_max_rows = 512;
+    hints.serial_family_max_compact_rows = 16;
+    hints.graph_family_policy = WorkspaceGraphFamilyPolicy::SerialDeviceFamilyLargestParticipant;
+    WorkspaceBudgetConfig budget;
+    budget.min_budget = budget.max_budget = 64u * 1024u;
+    ComputeGraph serial_graph;
+    serial_graph.addNode("lm_head_allgather", std::make_unique<VocabularyWorkspaceStage>(1), DeviceId::cpu());
+    ASSERT_TRUE(allocator.allocateForGraph(serial_graph, hints, {}, budget));
+    auto *workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
+    ASSERT_NE(workspace, nullptr);
+    ASSERT_EQ(workspace->getBufferSize(VocabularyGatherWorkspaceContract::rankMajorBank), bank_bytes);
+    void *const address = workspace->getBuffer(VocabularyGatherWorkspaceContract::rankMajorBank);
+    ASSERT_NE(address, nullptr);
+    const auto generation = allocator.deviceGeneration(DeviceId::cpu());
+    const auto physical_bytes = allocator.totalAllocated();
+
+    ComputeGraph grouped_graph;
+    auto grouped = std::make_unique<VocabularyWorkspaceStage>(16);
+    auto *grouped_stage = grouped.get();
+    grouped_graph.addNode("lm_head_allgather", std::move(grouped), DeviceId::cpu());
+    hints.max_seq_len = 16;
+    hints.graph_family_policy = WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
+    ASSERT_TRUE(allocator.allocateForGraph(grouped_graph, hints, {}, budget));
+    EXPECT_EQ(grouped_stage->getWorkspace(), workspace);
+    EXPECT_EQ(workspace->getBuffer(VocabularyGatherWorkspaceContract::rankMajorBank), address);
+    EXPECT_EQ(workspace->getBufferSize(VocabularyGatherWorkspaceContract::rankMajorBank), bank_bytes);
+    EXPECT_EQ(allocator.deviceGeneration(DeviceId::cpu()), generation);
+    EXPECT_EQ(allocator.totalAllocated(), physical_bytes);
 }
 
 TEST(Test__WorkspaceAllocator, GraphConsumerAllocatesAndBindsCPUWorkspaceForDeclaredStage)

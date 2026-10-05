@@ -29,7 +29,7 @@ namespace llaminar2
     using namespace graph_utils;
 
     // =============================================================================
-    // Constructors (delegate to QwenGraphBase, populate Qwen2 schema)
+    // Constructors (delegate to QwenGraphBase)
     // =============================================================================
 
     QwenStandardGraph::QwenStandardGraph(std::shared_ptr<ModelContext> model_ctx,
@@ -37,33 +37,12 @@ namespace llaminar2
                            const GraphConfig &config)
         : QwenGraphBase(std::move(model_ctx), std::move(mpi_ctx), config)
     {
-        // Qwen2-specific: populate per-layer allreduce precision from schema
-        if (config_.tp_allreduce_precision.empty() && config_.n_layers > 0)
-        {
-            Qwen2SchemaFactory factory;
-            auto schema = factory.createSchema();
-            config_.populateAllreducePrecision(
-                schema.tp_allreduce_default_precision,
-                schema.tp_allreduce_fp32_layer_count);
-            LOG_DEBUG("[QwenStandardGraph] Populated per-layer allreduce precision: "
-                      << "fp32_layers=" << schema.tp_allreduce_fp32_layer_count
-                      << " default=" << schema.tp_allreduce_default_precision);
-        }
     }
 
     QwenStandardGraph::QwenStandardGraph(const GraphConfig &config,
                            std::shared_ptr<IMPIContext> mpi_ctx)
         : QwenGraphBase(config, std::move(mpi_ctx))
     {
-        // Qwen2-specific: populate per-layer allreduce precision from schema
-        if (config_.tp_allreduce_precision.empty() && config_.n_layers > 0)
-        {
-            Qwen2SchemaFactory factory;
-            auto schema = factory.createSchema();
-            config_.populateAllreducePrecision(
-                schema.tp_allreduce_default_precision,
-                schema.tp_allreduce_fp32_layer_count);
-        }
     }
 
     // =============================================================================

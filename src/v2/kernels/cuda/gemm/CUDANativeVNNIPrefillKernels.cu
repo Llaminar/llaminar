@@ -17,9 +17,14 @@
  * CUDANativeVNNIPrefillDevice.cuh body; this file owns public planning, launch
  * selection and resource queries. Production staging remains RegisterDecode
  * until an authenticated candidate tournament authorizes a different schedule.
+ * A certified exact cell owns its complete producer before any generic Q4_0
+ * BK256 heuristic runs; workspace admission and execution share that identity.
  * CUDA function attributes belong to the current device context, not the host
  * process. Launch preparation applies them idempotently for that context; no
  * process-global readiness bit may outlive or alias a device/module lifetime.
+ * Canonical partial storage has unspecified prior bytes. Its complete writer
+ * defines every consumed partition, including empty K partitions, before the
+ * ordered reducer is admitted; no destination initialization is necessary.
  */
 
 #include <cuda_runtime.h>
@@ -29,6 +34,7 @@
 #include "CUDANativeVNNIPrefillDevice.cuh"
 #include "CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "kernels/common/WorkspaceOverwriteContract.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -108,27 +114,6 @@ static int querySmCount(CUDAPrefillContext_ *ctx)
     if (ctx->sm_count <= 0)
         ctx->sm_count = 82;
     return ctx->sm_count;
-}
-
-static float *getCanonicalKpartPartials(
-    CUDAPrefillContext_ *ctx,
-    size_t required_bytes,
-    cudaStream_t stream)
-{
-    // The ordered reducer consumes every public-M1 partition slot. Some legal
-    // schedules have trailing empty partitions, so stale workspace contents
-    // must not survive from an earlier request or projection.
-    if (ctx->workspace_canonical_kpart_partials &&
-        ctx->workspace_canonical_kpart_partials_size >= required_bytes)
-    {
-        cudaMemsetAsync(
-            ctx->workspace_canonical_kpart_partials,
-            0,
-            required_bytes,
-            stream);
-        return ctx->workspace_canonical_kpart_partials;
-    }
-    return nullptr;
 }
 
 namespace
@@ -1456,28 +1441,34 @@ namespace
           if (!prefill_ctx || serial_m1_k_partitions <= 1)
             return false;
 
-          const size_t partials_bytes =
-              static_cast<size_t>(serial_m1_k_partitions) * M * N *
-              sizeof(float);
-          float *partials = getCanonicalKpartPartials(
-              prefill_ctx, partials_bytes, cuda_stream);
-          if (!partials)
-            return false;
+          const auto partials = llaminar2::WorkspaceOverwrite<float>::bind(
+              prefill_ctx->workspace_canonical_kpart_partials,
+              prefill_ctx->workspace_canonical_kpart_partials_size,
+              llaminar2::WorkspaceOverwriteExtent::matrix(
+                  static_cast<size_t>(M), static_cast<size_t>(N),
+                  static_cast<size_t>(serial_m1_k_partitions)),
+              cuda_stream);
 
           const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN,
                           serial_m1_k_partitions);
           const dim3 block(WM * WN * 32);
 
-          (void)cudaGetLastError();
           constexpr int block_size = WM * WN * 32;
           constexpr int min_blocks =
               densePrefillMinBlocksHint<CODEBOOK_ID, BM, BN, WM, WN,
                                         /*CanonicalKpart=*/true>();
-          nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN,
+          // The epilogue writes all M*N slots in every plane. An empty
+          // trailing K partition still stores its zero accumulator. Only
+          // successful submission may expose these bytes to the fixed reducer.
+          return partials.overwriteThenRead(
+            [&](std::span<float> written, void *producer_stream)
+            {
+              (void)cudaGetLastError();
+              nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN,
                             /*STAGES_=*/2,
                             /*CANONICAL_KPART=*/true, block_size, min_blocks,
-                            Staging><<<grid, block, 0, cuda_stream>>>(
-              d_A_int8, d_payload, d_scales, d_mins, d_emins, partials,
+                            Staging><<<grid, block, 0, static_cast<cudaStream_t>(producer_stream)>>>(
+              d_A_int8, d_payload, d_scales, d_mins, d_emins, written.data(),
               d_scales_A_block, d_sums_A_block, d_C_existing, d_bias, M, N, K,
               alpha, beta,
               CanonicalM1PartitionGeometry{
@@ -1486,16 +1477,18 @@ namespace
                       (K / 32 + serial_m1_k_partitions - 1) /
                       serial_m1_k_partitions},
               /*serial_m1_uses_ordered_reducer=*/1);
-          if (cudaGetLastError() != cudaSuccess)
-            return false;
-
-          const int total = M * N;
-          constexpr int threads = 256;
-          const int blocks = (total + threads - 1) / threads;
-          canonical_kpart_reduce<<<blocks, threads, 0, cuda_stream>>>(
-              partials, d_C_fp32, d_C_existing, d_bias, M, N,
-              serial_m1_k_partitions, beta);
-          return cudaGetLastError() == cudaSuccess;
+              return cudaGetLastError() == cudaSuccess;
+            },
+            [&](const llaminar2::EnqueuedWorkspaceRead<float> &read)
+            {
+              const int total = M * N;
+              constexpr int threads = 256;
+              const int blocks = (total + threads - 1) / threads;
+              canonical_kpart_reduce<<<blocks, threads, 0, static_cast<cudaStream_t>(read.stream())>>>(
+                  read.values().data(), d_C_fp32, d_C_existing, d_bias, M, N,
+                  serial_m1_k_partitions, beta);
+              return cudaGetLastError() == cudaSuccess;
+            });
         }
         return false;
     }
@@ -1963,8 +1956,11 @@ namespace
                                 ? Q40PrefillRoute::BK256Narrow
                                 : Q40PrefillRoute::BK256Wide;
             }
-            else
+            else if (!use_exact_overlay)
             {
+                // An exact BK64 cell already owns this launch. Evaluating the
+                // generic Q4_0 route here could replace it with BK256 even
+                // though planning admitted the measured canonical producer.
                 q40_route = chooseQ40PrefillRoute(M, N, K, prefill_ctx);
             }
             if (q40_route == Q40PrefillRoute::BK256Narrow ||

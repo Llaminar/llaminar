@@ -517,12 +517,21 @@ namespace llaminar2
                     (lowered_name.find("embed") != std::string::npos);
                 const bool is_attention =
                     lowered_name.find("attention") != std::string::npos;
+                // Terminal collectives keep their participant row geometry.
+                // A name such as lm_head_allgather does not turn their scratch
+                // into the projection's selected-one-row prefill workspace.
                 const bool is_lm_head =
-                    (lowered_name == "lm_head") ||
-                    (lowered_name.find("lm_head") != std::string::npos);
+                    !isCollectiveComputeStageType(node->stage->type()) &&
+                    ((lowered_name == "lm_head") ||
+                     (lowered_name.find("lm_head") != std::string::npos));
 
                 ConsumerBinding binding;
                 binding.consumer = consumer;
+                // Native allgather banks follow the declared physical rows,
+                // rather than the enclosing prompt's largest bucket. Compact
+                // family queries still preview every retained verifier row.
+                binding.scales_with_serial_family_rows =
+                    node->stage->type() != ComputeStageType::NATIVE_ALLGATHER;
                 binding.exact_serial_shape = exact_serial_shape;
                 binding.participant_role = participant_role;
                 binding.debug_name =

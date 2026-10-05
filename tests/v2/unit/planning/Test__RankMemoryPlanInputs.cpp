@@ -431,3 +431,43 @@ TEST(RankMemoryPlanInputs, CapturedPipelineChannelsFollowDomainsNotDeviceOrdinal
         }
     }
 }
+
+/** @test Native publication follows retained graph capacity and the actual local communicator. */
+TEST(RankMemoryPlanInputs, NativeVocabularyPublicationFollowsResolvedOwnership)
+{
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    for (const int degree : {1, 2, 4})
+    for (const bool enabled : {false, true})
+    for (const int retained : {0, 15})
+    for (const auto head : {MTPTerminalHeadPolicy::MirroredFullVocabulary,
+                           MTPTerminalHeadPolicy::VocabularySharded})
+    {
+        Fixture fixture(backend, degree);
+        auto &mtp = fixture.plan.runtime.mtp;
+        mtp.enabled = enabled;
+        mtp.graph_capacity_draft_tokens = retained;
+        mtp.terminal_head_policy = head;
+        const bool native = backend != DeviceType::CPU && degree > 1 &&
+            retainsMTPGraphCapacity(mtp) && head == MTPTerminalHeadPolicy::VocabularySharded;
+        for (const auto &cfg : buildRankMemoryPlanInputs(fixture.request()))
+            EXPECT_EQ(cfg.terminalLogitsCollective(cfg.last_layer < 0 || cfg.last_layer >= fixture.model.n_layers - fixture.model.mtp_layer_count - 1), native
+                ? MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather
+                : MTPTerminalLogitsCollective::None);
+    }
+    Fixture distributed(DeviceType::CUDA, 1);
+    distributed.plan.weight_shard.total_shards = 2;
+    distributed.plan.runtime.mtp.enabled = true;
+    distributed.plan.runtime.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+    EXPECT_EQ(buildRankMemoryPlanInputs(distributed.request()).front().terminalLogitsCollective(true),
+              MTPTerminalLogitsCollective::None);
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        Fixture earlier(backend, 2);
+        earlier.plan.runtime.mtp.enabled = true;
+        earlier.plan.runtime.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+        earlier.plan.last_layer = 1;
+        earlier.plan.has_lm_head = false;
+        for (const auto &cfg : buildRankMemoryPlanInputs(earlier.request()))
+            EXPECT_EQ(cfg.terminalLogitsCollective(false), MTPTerminalLogitsCollective::None);
+    }
+}

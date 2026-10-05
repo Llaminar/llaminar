@@ -31,6 +31,7 @@
 #include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
 #include "../config/TPDomain.h"
+#include "../collective/ITPContext.h"
 #include "../loaders/WeightPlan.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/ToolCallTypes.h"
@@ -224,6 +225,28 @@ namespace llaminar2
         {
             return mtpTerminalLogitsLayout() ==
                    MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+        }
+
+        /**
+         * @brief Classify an explicit native local vocabulary publication edge.
+         * @return True for a retained MTP graph family in one native local GPU TP domain.
+         *
+         * Projection ownership remains sharded. This predicate describes the
+         * complete graph-boundary publication after its explicit collective,
+         * allowing samplers to consume the admitted full output bank.
+         */
+        [[nodiscard]] bool hasNativeLocalVocabularyGather() const noexcept
+        {
+            return retainsMTPGraphCapacity(mtp) && default_device.is_gpu() && tp_ctx && tp_ctx->isLocal() && tp_ctx->degree() > 1 &&
+                (tp_ctx->backend() == CollectiveBackendType::NCCL || tp_ctx->backend() == CollectiveBackendType::RCCL);
+        }
+
+        /** @brief Resolve the physical sidecar's explicit native full-logit publication.
+         * @return True only when a vocabulary-sharded predictor completes a local GPU gather.
+         * @throws std::logic_error For unresolved terminal-head intent. */
+        [[nodiscard]] bool mtpPublishesNativeGatheredVocabulary() const
+        {
+            return mtpParticipantLogitsAreVocabularySharded() && hasNativeLocalVocabularyGather();
         }
 
         /**
@@ -575,36 +598,26 @@ namespace llaminar2
         }
 
         // =================================================================
-        // Per-Layer TP Allreduce Precision
+        // Global TP Allreduce Precision
         // =================================================================
 
-        /// Per-layer allreduce precision map: layer_idx -> precision string.
-        /// Populated from the GraphSchema precision policy (first N layers FP32,
-        /// rest use schema default). Layers not in the map fall back to the
-        /// global DebugEnv::allreduce_precision ("fp32" by default).
-        std::unordered_map<int, std::string> tp_allreduce_precision;
-
-        /// Optional explicit transport precision for all TP allreduces.
-        /// Empty/auto/schema/default preserves the per-layer schema policy.
+        /// Optional native GPU TP sum precision. Empty/auto/schema/default uses
+        /// the global FP16 policy; no model layer can install a hidden override.
         std::string tp_allreduce_precision_override;
 
         /**
-         * @brief Get allreduce precision for a specific layer
+         * @brief Resolve native GPU TP sum precision for every dense or MoE layer.
+         * @return Explicit diagnostic environment selection, then CLI selection,
+         *         or the sole global FP16 default.
          *
-         * Resolution order:
-         * 1. LLAMINAR_ALLREDUCE_PRECISION, when explicitly set for perf/diagnostics
-         * 2. GraphConfig::tp_allreduce_precision_override, when explicitly set
-         * 3. Per-layer override from tp_allreduce_precision map
-         * 4. Empty string, which lets execution defer to DebugEnv's default
-         *
-         * @param layer_idx Transformer layer index (0-based)
-         * @return Precision string ("fp32", "fp16", "bf16")
+         * Layer number, attention kind and expert ownership do not select
+         * arithmetic. Graph-declared lossless operations carry their own typed
+         * arithmetic contract separately from this native-sum default.
          */
-        std::string getAllreducePrecisionForLayer(int layer_idx) const
+        [[nodiscard]] std::string getAllreducePrecision() const
         {
             const auto &env = debugEnv();
-            if (env.presence.has("LLAMINAR_ALLREDUCE_PRECISION") &&
-                !env.allreduce_precision.empty())
+            if (env.presence.has("LLAMINAR_ALLREDUCE_PRECISION"))
             {
                 auto normalized = normalizeAllreducePrecisionOverride(env.allreduce_precision);
                 if (!normalized.empty())
@@ -614,13 +627,14 @@ namespace llaminar2
                 normalizeAllreducePrecisionOverride(tp_allreduce_precision_override);
             if (!override_precision.empty())
                 return override_precision;
-
-            auto it = tp_allreduce_precision.find(layer_idx);
-            if (it != tp_allreduce_precision.end())
-                return it->second;
-            return ""; // Empty = defer to global DebugEnv default
+            return kDefaultAllreducePrecision;
         }
 
+        /**
+         * @brief Normalize public precision names and global-default aliases.
+         * @param value CLI, plan or diagnostic precision selection.
+         * @return Canonical precision or an empty string for the global default.
+         */
         static std::string normalizeAllreducePrecisionOverride(std::string value)
         {
             std::transform(value.begin(), value.end(), value.begin(),
@@ -635,55 +649,6 @@ namespace llaminar2
             if (value == "f16")
                 return "fp16";
             return value;
-        }
-
-        /**
-         * @brief Populate the precision map from a GraphSchema precision policy
-         *
-         * Applies the schema's fp32_layer_count + default_precision to build
-         * the per-layer map for this model's n_layers.
-         *
-         * @param schema_default Default precision for layers beyond fp32 count
-         * @param fp32_count Number of initial layers forced to FP32
-         */
-        void populateAllreducePrecision(const std::string &schema_default, int fp32_count)
-        {
-            tp_allreduce_precision.clear();
-            for (int i = 0; i < n_layers; ++i)
-            {
-                tp_allreduce_precision[i] = (i < fp32_count) ? "fp32" : schema_default;
-            }
-        }
-
-        /**
-         * @brief Populate the precision map with layer-type awareness
-         *
-         * For hybrid architectures (e.g., Qwen3.5 GDN+FA), certain layer types
-         * may require FP32 allreduce regardless of their position. This overload
-         * forces FP32 for layers in fp32_forced_layers, and applies the standard
-         * count-based policy to all other layers.
-         *
-         * @param schema_default Default precision for non-forced layers beyond fp32 count
-         * @param fp32_count Number of initial non-forced layers that get FP32
-         * @param fp32_forced_layers Layer indices always forced to FP32 (e.g., FA layers)
-         */
-        void populateAllreducePrecision(const std::string &schema_default, int fp32_count,
-                                        const std::set<int> &fp32_forced_layers)
-        {
-            tp_allreduce_precision.clear();
-            int non_forced_idx = 0; // Count of non-forced layers seen so far
-            for (int i = 0; i < n_layers; ++i)
-            {
-                if (fp32_forced_layers.count(i))
-                {
-                    tp_allreduce_precision[i] = "fp32";
-                }
-                else
-                {
-                    tp_allreduce_precision[i] = (non_forced_idx < fp32_count) ? "fp32" : schema_default;
-                    ++non_forced_idx;
-                }
-            }
         }
 
         /// Returns true when activation precision is HybridQ16.

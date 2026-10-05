@@ -22,6 +22,7 @@
 #include "../../config/OrchestrationConfig.h"
 #include <memory>
 #include <vector>
+#include "tensors/NativeVnniFormatInfo.h"
 
 namespace llaminar2
 {
@@ -47,6 +48,7 @@ namespace llaminar2
         int vocab_size = 0;                ///< Vocabulary size
         int head_dim = 0;                  ///< Per-head dimension (hidden_size / n_heads)
         size_t estimated_weight_bytes = 0; ///< Estimated weight size in bytes
+        NativeVnniSourceIdentity terminal_head_source; ///< Authoritative native head format; absent when unknown or floating.
 
         /**
          * @brief Create config for Qwen2-0.5B

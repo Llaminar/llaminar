@@ -1,7 +1,8 @@
 /**
  * @file Test__NCCLBackend.cpp
- * @brief Unit tests for NCCLBackend P2P operations
+ * @brief Device-free NCCL topology/channel policy and backend P2P admission tests.
  *
+ * Proves complete physical-pair selection and rejects unmeasured channel profiles.
  * Tests the point-to-point send/recv/sendrecv primitives for NCCL backend.
  * Validates error handling for uninitialized state, invalid parameters,
  * and edge cases.
@@ -18,6 +19,7 @@
 #include "v2/collective/backends/NCCLNetworkPolicy.h"
 #include "v2/collective/DeviceGroup.h"
 #include "v2/backends/DeviceId.h"
+#include <array>
 
 #ifdef HAVE_CUDA
 
@@ -53,6 +55,47 @@ namespace llaminar2::test
 
         EXPECT_EQ(module, NCCLNetworkModule::Automatic);
         EXPECT_TRUE(ncclNetworkModuleName(module).empty());
+    }
+
+    /** @test Only the fully observed local SHM pair receives the measured CTA budget. */
+    TEST(Test__NCCLNetworkPolicy, MeasuredChannelsRequireCompletePhysicalPair)
+    {
+        std::array cards{
+            NCCLCardIdentity{"NVIDIA GeForce RTX 3090", 0, 8, 6, 82, std::size_t{24} << 30},
+            NCCLCardIdentity{"NVIDIA GeForce RTX 3090", 1, 8, 6, 82, std::size_t{24} << 30}};
+        std::array peers{NCCLPeerAccess::Unavailable, NCCLPeerAccess::Unavailable};
+        const auto select = [&](CollectiveScope scope = CollectiveScope::LOCAL)
+            { return selectNCCLCommunicatorPolicy(scope, cards, peers); };
+        EXPECT_EQ(select().network, NCCLNetworkModule::Socket);
+        EXPECT_EQ(ncclCommunicatorChannelBudget(select().profile), 8);
+        EXPECT_EQ(ncclCommunicatorProfileName(select().profile), "rtx3090_shm_tp2");
+        for (const auto scope : {CollectiveScope::GLOBAL, CollectiveScope::HYBRID})
+            EXPECT_EQ(select(scope).profile, NCCLCommunicatorProfile::NativeAutomatic);
+        for (const auto access : {NCCLPeerAccess::Available, NCCLPeerAccess::Unobserved})
+            for (int direction = 0; direction < 2; ++direction)
+            {
+                peers[direction] = access;
+                EXPECT_EQ(select().profile, NCCLCommunicatorProfile::NativeAutomatic);
+                peers[direction] = NCCLPeerAccess::Unavailable;
+            }
+        cards[1].ordinal = 0;
+        EXPECT_EQ(select().profile, NCCLCommunicatorProfile::NativeAutomatic);
+        cards[1].ordinal = 1;
+        const auto measured = cards[1];
+        cards[1].name = "NVIDIA GeForce RTX 3090 Ti";
+        EXPECT_EQ(select().profile, NCCLCommunicatorProfile::NativeAutomatic);
+        cards[1] = measured;
+        cards[1].multiprocessors = 80;
+        EXPECT_EQ(select().profile, NCCLCommunicatorProfile::NativeAutomatic);
+        cards[1] = measured;
+        cards[1].architecture_minor = 9;
+        EXPECT_EQ(select().profile, NCCLCommunicatorProfile::NativeAutomatic);
+        cards[1] = measured;
+        cards[1].memory_bytes = std::size_t{22} << 30;
+        EXPECT_EQ(select().profile, NCCLCommunicatorProfile::NativeAutomatic);
+        EXPECT_EQ(selectNCCLCommunicatorPolicy(CollectiveScope::LOCAL, {}, {}).profile,
+            NCCLCommunicatorProfile::NativeAutomatic);
+        EXPECT_THROW(ncclCommunicatorChannelBudget(static_cast<NCCLCommunicatorProfile>(99)), std::invalid_argument);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

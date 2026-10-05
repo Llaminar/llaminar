@@ -201,7 +201,7 @@ namespace llaminar2
         size_t prefixCacheRuntimeStateCapacity() const override;
         bool capturePrefixCacheRuntimeState(std::vector<uint8_t> &state, void *stream) override;
         PrefixCacheRuntimeRestoreResult restorePrefixCacheRuntimeState(
-            const std::vector<uint8_t> &state,
+            std::span<const uint8_t> state,
             void *stream) override;
         bool prefixCacheRuntimeStateRequiresDeviceRehydration() const override
         {

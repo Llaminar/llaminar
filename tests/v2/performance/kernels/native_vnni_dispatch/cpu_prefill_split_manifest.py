@@ -35,6 +35,9 @@ keeps the full overlay inventory while profiling below-7B owners at M={32,128},
 Versions 8 through 12 remain readable so
 in-flight, digest-bound refinement rounds can finish without rewriting their
 historical split identities.
+Declarative historical versions resolve production ownership from their frozen
+inventory, while the current split includes newly admitted production shapes.
+This prevents a new TP shard from rewriting an already authenticated split.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -91,6 +95,35 @@ V9_QWEN36_MOE_PRODUCTION_SHAPES = frozenset((
 V10_HISTORICAL_ORDER_DIGESTS = frozenset((
     "sha256:f12fe2a80463f7e5ed756332b2fe72aa3034f7815c2c2d074c662a61791f2e01",
 ))
+
+
+@lru_cache(maxsize=1)
+def _historical_production_shapes() -> tuple[str, ...]:
+    """Read the published v10-v12 production inventory in its original order.
+
+    These schemas predate the dense 27B TP-local additions. Their original
+    declarative expansion contributes to signed split identities and must not
+    inherit later geometry admissions. The snapshot is data owned by those
+    historical schemas; the live matrix continues to own current certification.
+    """
+
+    path = MANIFEST_PATH.with_name(
+        "native_vnni_cpu_prefill_historical_production_v1.json"
+    )
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if set(raw) != {"schema_version", "production_shapes"} or raw.get(
+        "schema_version"
+    ) != "native-vnni-cpu-prefill-historical-production-v1":
+        raise ValueError("unsupported historical CPU production snapshot")
+    names = tuple(str(name) for name in raw["production_shapes"])
+    if not names or len(set(names)) != len(names):
+        raise ValueError("historical CPU production snapshot must be unique")
+    shapes = load_shape_manifest()
+    for name in names:
+        shape = shapes.by_name(name)
+        if shape.role != ShapeRole.PRODUCTION or not shape.exact_overlay:
+            raise ValueError(f"{name}: historical CPU owner is not production")
+    return names
 
 
 @dataclass(frozen=True)
@@ -151,10 +184,7 @@ class CPUPrefillSplitManifest:
                     "declarative CPU prefill split must include every "
                     "production shape"
                 )
-            production = {
-                measurement.shape.name
-                for measurement in cpu_prefill_measurements()
-            }
+            production = set(_historical_production_shapes())
             unknown = development.difference(production, declared_refinement)
             if not production.issubset(development) or unknown:
                 raise ValueError(
@@ -405,8 +435,12 @@ def load_cpu_prefill_split_manifest(
     ]
     if include_all_production_shapes:
         declared = set(development_shapes)
-        for measurement in cpu_prefill_measurements():
-            name = measurement.shape.name
+        production_names = (
+            tuple(measurement.shape.name for measurement in cpu_prefill_measurements())
+            if schema_version == SCHEMA_VERSION
+            else _historical_production_shapes()
+        )
+        for name in production_names:
             if name not in declared:
                 development_shapes.append(name)
                 declared.add(name)

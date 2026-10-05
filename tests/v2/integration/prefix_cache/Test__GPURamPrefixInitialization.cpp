@@ -6,8 +6,10 @@
  * A retained device producer fills the full checkpoint/terminal sections while
  * short attention copies leave zeroed capacity tails. Event publication is the
  * only host observation boundary. Twenty different archive identities exercise
- * retirement and PMA leases; poison bytes prove no section depends on malloc
- * returning clean memory. This is a functional gate, never a timing threshold.
+ * retirement and PMA leases inside one persistent arena; poison bytes prove no
+ * section depends on malloc returning clean memory. Delayed stream frontiers
+ * additionally prove eviction is nonblocking and cannot recycle in-flight DMA.
+ * This is a functional gate, never a timing threshold.
  */
 #include <gtest/gtest.h>
 
@@ -24,16 +26,56 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <limits>
 
 using namespace llaminar2;
 
 namespace
 {
+    /** @brief Keep every archive section in the reuse and initialization matrix. */
+    PrefixPayloadLayout archiveLayout(DeviceId device, size_t recurrent_bytes)
+    {
+        PrefixPayloadLayout layout;
+        layout.device = device;
+        layout.block_size = 64;
+        layout.total_layers = 3;
+        layout.fa_layers = 2;
+        layout.gdn_layers = 1;
+        layout.bytes_per_fa_layer_k = 128;
+        layout.bytes_per_fa_layer_v = 256;
+        layout.includes_mtp_state = true;
+        layout.mtp_kv_bytes = 384;
+        layout.includes_hybrid_state = true;
+        layout.hybrid_state_bytes = layout.hybrid_device_state_bytes = recurrent_bytes;
+        layout.includes_terminal_hidden = true;
+        layout.terminal_hidden_bytes = 132;
+        layout.includes_terminal_logits = true;
+        layout.terminal_logits_bytes = 260;
+        return layout;
+    }
+
+    /** @brief Admit exactly one fixed prefix backing allocation. */
+    std::shared_ptr<PhysicalMemoryAuthority> hostAuthority(size_t bytes)
+    {
+        PhysicalMemoryPlanBuilder plan;
+        plan.add(PhysicalMemoryResource{.world_rank = 0, .device = DeviceId::cpu(),
+                     .total_bytes = bytes, .admission_available_bytes = bytes},
+                 PhysicalMemoryOwner::PrefixHostTier, bytes);
+        return std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    }
+
+    /** @return Canonical live physical claim, independent of cache-index occupancy. */
+    size_t claimed(const std::shared_ptr<PhysicalMemoryAuthority> &authority)
+    {
+        return authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier,
+                                        PhysicalMemoryMaterializationKind::NewAllocation);
+    }
     /** @brief Read one bounded counter without making it a runtime authority. */
     double allocationCounter(const char *name)
     {
         double result = 0;
-        for (const auto &record : PerfStatsCollector::snapshot({"prefix_cache"}))
+        for (const auto &record : PerfStatsCollector::snapshot({"prefix_cache", "device_memory"}))
             if (record.name == name)
                 result += record.value;
         return result;
@@ -68,50 +110,37 @@ namespace
             }
             ASSERT_TRUE(capture->instantiate());
 
+            const size_t arena_bytes = archiveLayout(device, capacity).totalBytes() + 64u;
+            auto authority = hostAuthority(arena_bytes);
+            PerfStatsCollector::reset();
+            auto ram = RamPrefixStorageBackend::create(device, arena_bytes, authority);
+            ASSERT_NE(ram, nullptr);
+            EXPECT_EQ(claimed(authority), arena_bytes);
+
             for (int iteration = 0; iteration < 20; ++iteration)
             {
                 SCOPED_TRACE(iteration);
-                PrefixPayloadLayout layout;
-                layout.device = device;
-                layout.block_size = 64;
-                layout.total_layers = 3;
-                layout.fa_layers = 2;
-                layout.gdn_layers = 1;
-                layout.bytes_per_fa_layer_k = 128;
-                layout.bytes_per_fa_layer_v = 256;
-                layout.includes_mtp_state = true;
-                layout.mtp_kv_bytes = 384;
-                layout.includes_hybrid_state = true;
                 // Small odd tails and large checkpoint banks share the byte
                 // contract; no float/quantized format can acquire another path.
                 constexpr std::array<size_t, 4> extents{4u, 68u, 4100u, capacity};
-                layout.hybrid_state_bytes = layout.hybrid_device_state_bytes = extents[iteration % 4];
-                layout.includes_terminal_hidden = true;
-                layout.terminal_hidden_bytes = 132;
-                layout.includes_terminal_logits = true;
-                layout.terminal_logits_bytes = 260;
-
-                PhysicalMemoryPlanBuilder plan;
-                plan.add(PhysicalMemoryResource{.world_rank = 0,
-                                                .device = DeviceId::cpu(),
-                                                .total_bytes = layout.totalBytes(),
-                                                .admission_available_bytes = layout.totalBytes()},
-                         PhysicalMemoryOwner::PrefixHostTier, layout.totalBytes());
-                auto authority = std::make_shared<PhysicalMemoryAuthority>(
-                    std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
-                auto ram = RamPrefixStorageBackend::create(device, layout.totalBytes(), authority);
-                ASSERT_NE(ram, nullptr);
-                PerfStatsCollector::reset();
+                const auto layout = archiveLayout(device, extents[iteration % 4]);
+                const double zeroed_before = allocationCounter("ram_payload_cpu_zeroed_bytes");
+                const double overwritten_before = allocationCounter("ram_payload_full_overwrite_bytes");
                 auto handle = ram->allocate(
                     makePrefixCacheKey(0xfeed, 0, iteration, iteration * 64, {iteration, iteration + 1}),
                     layout);
                 ASSERT_TRUE(handle.valid());
-                EXPECT_EQ(allocationCounter("ram_payload_cpu_zeroed_bytes"),
+                EXPECT_EQ(allocationCounter("ram_payload_cpu_zeroed_bytes") - zeroed_before,
                           static_cast<double>(layout.faKVBytes() + layout.mtpKVBytes() +
                                               layout.terminal_hidden_bytes + layout.terminal_logits_bytes));
-                EXPECT_EQ(allocationCounter("ram_payload_full_overwrite_bytes"),
+                EXPECT_EQ(allocationCounter("ram_payload_full_overwrite_bytes") - overwritten_before,
                           static_cast<double>(layout.hybrid_state_bytes));
                 EXPECT_FALSE(handle.payload_readiness->published());
+                ASSERT_TRUE(ram->attachModelRuntimeState(&handle,
+                    std::make_shared<std::vector<uint8_t>>(13u, static_cast<uint8_t>(iteration))));
+                // A device-hot replica retains this independent metadata owner,
+                // while its common payload already resides in VRAM.
+                auto hot_runtime_alias = handle.model_runtime_state_storage;
 
                 const std::array<std::pair<void *, size_t>, 3> complete{
                     {{handle.hybrid_payload, layout.hybrid_state_bytes},
@@ -162,14 +191,27 @@ namespace
                 auto alias = handle;
                 ASSERT_TRUE(ram->release(handle));
                 handle = {};
-                EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier,
-                                                  PhysicalMemoryMaterializationKind::NewAllocation),
-                          layout.totalBytes());
+                EXPECT_EQ(claimed(authority), arena_bytes);
+                if (iteration % 4 == 3) EXPECT_FALSE(ram->canStore(layout.totalBytes()));
                 alias = {};
-                EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier,
-                                                  PhysicalMemoryMaterializationKind::NewAllocation),
-                          0u);
+                EXPECT_EQ(claimed(authority), arena_bytes);
+                EXPECT_TRUE(std::ranges::all_of(hot_runtime_alias->bytes(),
+                    [&](uint8_t value) { return value == iteration; }));
+                hot_runtime_alias.reset();
+                EXPECT_EQ(ram->availableAllocationBytes(), arena_bytes);
+                EXPECT_EQ(allocationCounter("ram_arena_materializations"), 1.0);
+                EXPECT_EQ(allocationCounter("pinned_host_allocations"), 1.0);
+                EXPECT_EQ(allocationCounter("pinned_host_allocation_bytes"), static_cast<double>(arena_bytes));
+                EXPECT_EQ(allocationCounter("ram_arena_payload_leases"), iteration + 1.0);
             }
+            auto retained = ram->allocate(makePrefixCacheKey(0xfeed, 0, 99, 0, {99}),
+                                          archiveLayout(device, capacity));
+            ASSERT_TRUE(retained.valid());
+            ASSERT_TRUE(ram->release(retained));
+            ram.reset();
+            EXPECT_EQ(claimed(authority), arena_bytes);
+            retained = {};
+            EXPECT_EQ(claimed(authority), 0u);
             capture->reset();
         });
     }

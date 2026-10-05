@@ -6,6 +6,10 @@
  * and CPU-acknowledgement edges. Concurrent native producers and mapped expert
  * copies use the production transfer pool. No model, numerical tolerance,
  * transport substitution, or inference-time host synchronization is involved.
+ * Collective setup derives its persistent FP16 scratch and boundary storage
+ * from the canonical BOM and admits those bytes through PhysicalMemoryAuthority
+ * before warmup or capture. Implicit precision therefore exercises the global
+ * GPU default without relying on a historical FP32 threshold exemption.
  */
 
 #include <gtest/gtest.h>
@@ -18,6 +22,8 @@
 #include "collective/ILocalTPContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/orchestrators/TPWorkerPool.h"
+#include "planning/CollectiveMemoryEstimator.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "transfer/TransferEngine.h"
 #include "../../utils/TestTensorFactory.h"
 
@@ -235,9 +241,33 @@ namespace
                 if (!p.graph) throw std::runtime_error("Missing native capture owner");
             });
         }
+        std::shared_ptr<PhysicalMemoryAuthority> collective_authority;
         auto collective = createLocalTPContext(addresses, {}, first_device.is_cuda()
             ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
         ASSERT_NE(collective, nullptr);
+
+        // Conversion scratch is a setup-owned collective resource even for a
+        // small tensor. Keep one authority alive until the captured graphs and
+        // their collective owner retire; replay must never repair admission.
+        const auto bom = CollectiveMemoryEstimator::localTP(
+            1, static_cast<int>(kElements), collective->backend());
+        PhysicalMemoryPlanBuilder collective_plan;
+        for (const auto &p : participants)
+        {
+            const PhysicalMemoryResource resource{
+                .world_rank = 0,
+                .device = p.device,
+                .total_bytes = bom.perDeviceBytes(),
+                .admission_available_bytes = bom.perDeviceBytes()};
+            collective_plan.add(resource, PhysicalMemoryOwner::LocalCollective,
+                                bom.perDeviceBytes());
+        }
+        collective_authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(
+                collective_plan.build()), 0);
+        ASSERT_TRUE(collective->reserveCollectiveResources(
+            bom.backend_payload_capacity_bytes, bom.fp16_scratch_elements,
+            collective_authority));
 
         // Warm only native communicator resources. Restore the exact input so
         // the later numerical assertion cannot pass using this eager result.

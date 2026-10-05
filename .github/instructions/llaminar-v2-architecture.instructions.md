@@ -1325,6 +1325,20 @@ victim persistence early enough to overlap computation; it never reserves RAM
 or treats queued bytes as physically free. The RAM backend's PMA reservation
 remains the sole allocation admission authority, including request/DMA aliases.
 
+GPU RAM tiers materialize their complete admitted pinned backing during setup
+through `TransferEngine`. `PrefixHostArena` places serialized byte ranges inside
+that fixed allocation; it does not maintain another physical-memory budget.
+Eviction retires a cache-key incarnation, while shared request, restore and disk
+writer handles retain its range. Once the last alias retires, a nonblocking query
+of its exact published producer event permits reuse. Pending ranges cannot be
+cleared or overwritten, and an unpublished prepared edge is fatal. Only final
+arena teardown may join pending events before freeing backing and returning its
+PMA claim. Request reset and archive hydration reuse that same allocation.
+MoE runtime extensions own independent ranges in the same arena, so device-hot
+replicas can retain only their portable metadata. CPU archives retain individual
+vector allocation claims. Cache-key equality does not establish allocation
+identity: stale aliases cannot retire or attach state to a newer incarnation.
+
 `DiskPrefixStorageBackend` owns one ordered `PrefixArchivePersistence` worker
 per shared archive. Native payload readiness, checksum, write and fsync execute
 there; early request preparation polls immutable identity-bound receipts. At

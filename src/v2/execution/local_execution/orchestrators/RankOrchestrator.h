@@ -883,7 +883,8 @@ namespace llaminar2
         bool supportsMTPDeviceDraftTokenInput() const override;
         bool supportsMTPSidecarPreservesMainState() const override;
         bool supportsMTPShiftedRowReuseFromSidecar() const override;
-        bool usesMirroredMTPHeadForVerifier() const override;
+        /** @return True only when every terminal child graph publishes a complete vocabulary. */
+        bool publishesFullVocabularyMTPLogits() const override;
         bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
         bool applyPenaltiesOnDevice(
             const std::vector<LogitPenalty> &penalties,

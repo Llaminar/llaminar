@@ -14,6 +14,8 @@
  *
  * Output: per-shape best variant table. Every candidate must be byte-identical
  * to the production exact-M Auto route before its timing can win.
+ * Installable timings replay retained native graphs and record their complete
+ * projection count, excluding host launch gaps from candidate comparisons.
  * The separate captured-production probe reuses this preparation and byte
  * oracle, but records the installed Auto route for isolated shard economics.
  * Its raw sample CSV is diagnostic evidence, never an installable tournament.
@@ -33,6 +35,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -46,6 +49,7 @@
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
+#include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
@@ -54,6 +58,7 @@
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/ScopedGPUStream.h"
 #include "../native_vnni_dispatch/GPUTrainerVerification.h"
+#include "../../../utils/DensePrefillTiming.h"
 #include "../native_vnni_dispatch/NativeVNNIShapeManifest.h"
 #include "fort.hpp"
 
@@ -626,6 +631,31 @@ namespace
         CapturedProducer ///< GEMM alone, consuming the oracle's prepared Q8 activations.
     };
 
+    /** @brief Construction policy; generic timing never measures installed exact entries. */
+    enum class SweepDispatch { GenericTournament, InstalledProduction };
+
+    /**
+     * @brief Scoped construction-thread lookup policy with nested oracle support.
+     * @param dispatch The policy to retain for this diagnostic object's lifetime.
+     * Existing graphs contain their exact producer and never consult this switch.
+     */
+    class ScopedDensePrefillLookup
+    {
+    public:
+        /** @brief Retain an explicit diagnostic lookup policy on this construction thread. */
+        explicit ScopedDensePrefillLookup(SweepDispatch dispatch)
+            : previous_(densePrefillExactOverlayEnabled())
+        {
+            setDensePrefillExactOverlayEnabled(dispatch == SweepDispatch::InstalledProduction);
+        }
+        /** @brief Restore the preceding construction policy, including on failure. */
+        ~ScopedDensePrefillLookup() { setDensePrefillExactOverlayEnabled(previous_); }
+        ScopedDensePrefillLookup(const ScopedDensePrefillLookup &) = delete;
+        ScopedDensePrefillLookup &operator=(const ScopedDensePrefillLookup &) = delete;
+    private:
+        bool previous_;
+    };
+
     /** @brief Production dispatcher with independent physical and source-math identities. */
     extern "C" bool rocmGemm_native_vnni_fp32_with_policy(
         const int8_t *, const uint8_t *, const void *, const void *, const void *,
@@ -655,8 +685,9 @@ namespace
             int m,
             TensorBase *weights,
             const std::vector<VariantConfig> &variants,
-            int maximum_bench_runs)
-            : shape_(shape), m_(m)
+            int maximum_bench_runs,
+            SweepDispatch dispatch = SweepDispatch::GenericTournament)
+            : overlay_lookup_(dispatch), shape_(shape), m_(m)
         {
             if (!weights || m_ <= 0 || shape_.N <= 0 || shape_.K <= 0 ||
                 maximum_bench_runs <= 0)
@@ -783,13 +814,12 @@ namespace
             }
             BenchResult result = inspectCandidate(variant);
 
-            // Capture only after all persistent resources and launch metadata
-            // exist. The ordinary trainer stays unchanged; shape scaling must
-            // time the graph path used by inference, not host submission cost.
-            // Repeat independent writes inside the retained diagnostic graph so
-            // tiny shards do not appear unscalable merely because one host
-            // graph submission and its timing events have a fixed cost.
-            const int operations_per_sample = submission == SweepSubmission::Direct ? 1 : 16;
+            // Capture after all persistent resources and launch metadata exist.
+            // Production tournaments and scaling probes measure the retained
+            // graph path used by inference. Independent complete projections
+            // amortize only the outer host submission and timing-event cost.
+            const int operations_per_sample = submission == SweepSubmission::Direct
+                ? 1 : llaminar2::test::kDensePrefillCapturedOperations;
             std::unique_ptr<HIPGraphCapture> graph;
             if (submission != SweepSubmission::Direct)
             {
@@ -1046,6 +1076,7 @@ namespace
 
         void buildExactMPrefillOracle()
         {
+            ScopedDensePrefillLookup generic_oracle(SweepDispatch::GenericTournament);
             override_.apply(autoVariant());
             launch(oracle_output_.get());
             checkStream("construct exact-M Auto oracle");
@@ -1082,6 +1113,7 @@ namespace
             return certificate;
         }
 
+        ScopedDensePrefillLookup overlay_lookup_;
         const GEMMShape &shape_;
         int m_ = 0;
         uint8_t expected_codebook_ = 0;
@@ -1400,7 +1432,8 @@ namespace
                 auto weights = format.create(shape.N, shape.K);
                 for (const int m : rows)
                 {
-                    PreparedROCmSweepExecution execution(shape, m, weights.get(), {*selected}, repetitions);
+                    PreparedROCmSweepExecution execution(shape, m, weights.get(), {*selected}, repetitions,
+                        SweepDispatch::InstalledProduction);
                     const auto result = execution.measure(*selected, warmups, repetitions, submission);
                     ASSERT_EQ(result.byte_mismatches_vs_auto, 0u) << shape.name << " M=" << m;
                     const auto samples = execution.timingSamples();
@@ -1417,6 +1450,90 @@ namespace
         ASSERT_GT(cases, 0) << "No canonical production geometry matched the requested filters";
 #endif
     }
+
+    /**
+     * @brief Prove every measured producer through real captured replay.
+     *
+     * Physical keys are read from the immutable table. Source-format fixtures
+     * retain all 21 registries, including aliases with different source math.
+     * The exact-M oracle deliberately uses generic Auto, so selecting the
+     * installed table cannot certify itself. Resource identity, poisoned output
+     * and complete byte equality are required for every captured candidate.
+     */
+    /**
+     * @brief Twelve disjoint source-format groups bound fixture preprocessing cost.
+     * The complete generated geometry inventory is retained in every group.
+     */
+    class InstalledDensePrefillOverlayTest : public NativeVNNISweepTest,
+                                            public ::testing::WithParamInterface<int> {};
+
+    /** @brief Keep every source format while bounding each registered setup transaction. */
+    inline constexpr int kInstalledDensePrefillSourceGroups = 12;
+
+    TEST_P(InstalledDensePrefillOverlayTest, AllSourceFormats)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        ASSERT_TRUE(has_device_);
+        std::map<std::pair<int, int>, std::set<int>> geometries;
+        std::size_t geometry_count = 0;
+        for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
+            if (geometries[{entry.n, entry.k}].insert(entry.m).second) ++geometry_count;
+        ASSERT_FALSE(geometries.empty());
+        ASSERT_GE(GetParam(), 0);
+        ASSERT_LT(GetParam(), kInstalledDensePrefillSourceGroups);
+        const auto selected = std::find_if(NVNNI_VARIANTS.begin(), NVNNI_VARIANTS.end(),
+            [](const VariantConfig &variant) { return variant.name == "Auto"; });
+        ASSERT_NE(selected, NVNNI_VARIANTS.end());
+        std::size_t cases = 0;
+        for (std::size_t format_index = static_cast<std::size_t>(GetParam());
+             format_index < NVNNI_FORMATS.size(); format_index += kInstalledDensePrefillSourceGroups)
+        {
+            const auto &format = NVNNI_FORMATS[format_index];
+            SCOPED_TRACE(format.name);
+            for (const auto &[projection, row_buckets] : geometries)
+            {
+                const auto [n, k] = projection;
+                const GEMMShape shape{"installed_dense_prefill", "measured", n, k};
+                // Source weights do not depend on M. Reuse their expensive
+                // random construction while each row bucket still prepares
+                // its own arena, independent oracle and captured producer.
+                auto weights = format.create(n, k);
+                const auto codebook = canonicalDeviceVnniCodebookId(
+                    requireNativeVnniInfo(weights.get(), "installed overlay source weights").codebook_id);
+                const auto family = codebook == 19
+                    ? DensePrefillWeightFamily::Int8 : DensePrefillWeightFamily::NativeLowBit;
+                for (const int m : row_buckets)
+                {
+                    SCOPED_TRACE(::testing::Message() << "M=" << m << " N=" << n << " K=" << k);
+                    const auto exact = selectDensePrefillExactConfig(codebook, m, n, k, family);
+                    ASSERT_TRUE(exact);
+                    PreparedROCmSweepExecution execution(shape, m, weights.get(), {*selected}, 1,
+                        SweepDispatch::InstalledProduction);
+                    const auto result = execution.verifyCaptured(*selected);
+                    EXPECT_EQ(result.observed_producer, exact->producer);
+                    EXPECT_EQ(result.observed_n_tile, exact->n_tile);
+                    EXPECT_EQ(result.observed_m_tile, exact->m_tile);
+                    EXPECT_EQ(result.observed_min_blocks, exact->min_blocks);
+                    EXPECT_EQ(result.observed_unroll, exact->unroll);
+                    EXPECT_EQ(result.observed_full_tiles, exact->full_tiles);
+                    EXPECT_EQ(result.local_memory_bytes_per_thread, 0u);
+                    EXPECT_GT(result.max_active_blocks_per_sm, 0);
+                    ASSERT_EQ(result.byte_mismatches_vs_auto, 0u);
+                    ++cases;
+                }
+            }
+        }
+        const std::size_t source_count =
+            (NVNNI_FORMATS.size() + kInstalledDensePrefillSourceGroups - 1u -
+                static_cast<std::size_t>(GetParam())) / kInstalledDensePrefillSourceGroups;
+        EXPECT_EQ(cases, source_count * geometry_count);
+#endif
+    }
+
+    INSTANTIATE_TEST_SUITE_P(InstalledDensePrefill, InstalledDensePrefillOverlayTest,
+                             ::testing::Range(0, kInstalledDensePrefillSourceGroups));
 
     TEST_F(NativeVNNISweepTest, TrainerCsv_CodebookTagged)
     {
@@ -1466,7 +1583,7 @@ namespace
             std::fprintf(
                 timing_csv,
                 "backend,phase,format,codebook,shape,m,n,k,variant,"
-                "sample_index,timed_replays,latency_us,latency_us_hex\n");
+                "sample_index,timed_replays,latency_us,latency_us_hex,captured_operations\n");
         }
 
         int executed_cases = 0;
@@ -1516,9 +1633,8 @@ namespace
                     for (const auto &variant : selected_variants)
                     {
                         auto r = execution.measure(
-                            variant,
-                            warmup_runs,
-                            bench_runs);
+                            variant, warmup_runs, bench_runs,
+                            SweepSubmission::Captured);
                         EXPECT_EQ(r.byte_mismatches_vs_auto, 0u)
                             << format.name << ' ' << shape.name << " M=" << M
                             << " candidate=" << variant.name
@@ -1537,12 +1653,13 @@ namespace
                                 std::fprintf(
                                     timing_csv,
                                     "rocm,prefill,%s,%u,%s,%d,%d,%d,%s,"
-                                    "%zu,1,%.9f,%a\n",
+                                    "%zu,1,%.9f,%a,%d\n",
                                     format.name.c_str(),
                                     static_cast<unsigned>(codebook_id),
                                     shape.name.c_str(), M, shape.N, shape.K,
                                     variant.name.c_str(), sample_index,
-                                    latency_us, latency_us);
+                                    latency_us, latency_us,
+                                    llaminar2::test::kDensePrefillCapturedOperations);
                             }
                         }
                         rows.push_back(std::move(r));

@@ -8,12 +8,14 @@
  * batch-invariant protocol: an earlier raw allgather publishes immutable
  * rank-major FP32 banks, then one device kernel folds those banks in ascending
  * participant order.  Transport therefore moves bytes without arithmetic and
- * the visible sum has one stable order for every runtime row count.
+ * the visible sum has one stable order for every runtime row count. Live-prefix
+ * overloads share the native row authority and preserve inactive in-place bytes.
  */
 
 #pragma once
 
 #include <cstddef>
+#include "collective/NativeCollectiveRows.h"
 
 namespace llaminar2
 {
@@ -54,4 +56,32 @@ namespace llaminar2
         int rank_count,
         int device_index,
         void *stream);
+
+    /**
+     * @brief Fold only a native collective's live FP32 row prefix on CUDA.
+     * @param rank_banks Immutable rank-major banks with admitted capacity strides.
+     * @param output Original in-place FP32 bank; inactive bytes are untouched.
+     * @param rows Same whole-prefix descriptor consumed by the preceding allgather.
+     * @param rank_count Physical participants folded in ascending rank order.
+     * @param device_index Exact participant ordinal owning both banks.
+     * @param stream Non-null ordered stream consuming the native publication.
+     * @return Whether the native kernel was admitted and enqueued successfully.
+     */
+    bool launchCUDATPRankOrderedSumFP32(
+        const float *rank_banks, float *output, const NativeCollectiveRows &rows,
+        int rank_count, int device_index, void *stream);
+
+    /**
+     * @brief Fold only a native collective's live FP32 row prefix on ROCm.
+     * @param rank_banks Immutable rank-major banks with admitted capacity strides.
+     * @param output Original in-place FP32 bank; inactive bytes are untouched.
+     * @param rows Same whole-prefix descriptor consumed by the preceding allgather.
+     * @param rank_count Physical participants folded in ascending rank order.
+     * @param device_index Exact participant ordinal owning both banks.
+     * @param stream Non-null ordered stream consuming the native publication.
+     * @return Whether the native kernel was admitted and enqueued successfully.
+     */
+    bool launchROCmTPRankOrderedSumFP32(
+        const float *rank_banks, float *output, const NativeCollectiveRows &rows,
+        int rank_count, int device_index, void *stream);
 } // namespace llaminar2

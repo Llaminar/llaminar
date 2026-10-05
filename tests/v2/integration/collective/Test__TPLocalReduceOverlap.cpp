@@ -14,6 +14,8 @@
  * admitted once through PhysicalMemoryAuthority, never allocated by replay.
  * Column-owned sums reuse the same lifecycle and compare each returned column
  * byte against that full allreduce, across singleton, odd and padded row sizes.
+ * In-place allreduce preserves every inactive FP32 byte through both precision
+ * conversions. Focused sweeps cover every live count and large-to-small replay.
  * Device-prefix cases replay full/partial/empty/growing inputs on those same
  * fork/join graphs. The fixed control is an arithmetic oracle, not a second
  * production dispatch path; native receipt tests separately prove wire bytes.
@@ -61,7 +63,7 @@ namespace
     enum class Operation { RootedReduce, AllGather, AllreduceFP32, AllreduceFP16,
         ColumnFP32, ColumnFP16, AllreduceSidebandFP32, AllreduceSidebandFP16, CanonicalRankOrder };
     /** @brief Immutable collective geometry or a replay-varying device-owned prefix. */
-    enum class RowExtent { Fixed, DevicePrefix };
+    enum class RowExtent { Fixed, DevicePrefix, EveryDevicePrefix };
 
     /** @brief Exercise the selected native operation through its unchanged public builder. */
     void verifyCapturedOverlap(DeviceId first, Operation operation = Operation::RootedReduce,
@@ -215,7 +217,7 @@ namespace
                             sum.stage_name = "reduce";
                             sum.tensor_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
                             sum.packing_buffer_id = BufferId::MOE_PROJECTION_GATHERED_COLUMNS;
-                            if (extent == RowExtent::DevicePrefix) sum.live_rows = device_rows;
+                            if (extent != RowExtent::Fixed) sum.live_rows = device_rows;
                             graph.addNode("reduce", std::make_unique<TPColumnReduceScatterStage>(sum), device);
                             graph.addDependency("reduce", "producer");
                             overlapTPLocalColumnReduceScatter(graph, "reduce", "compute");
@@ -232,7 +234,7 @@ namespace
                             sum.tensor_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
                             sum.sideband_device_index = participant;
                             if (canonical) sum.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder;
-                            if (extent == RowExtent::DevicePrefix) sum.live_rows.emplace(device_rows, columns);
+                            if (extent != RowExtent::Fixed) sum.live_rows.emplace(device_rows, columns);
                             if (grouped_sideband)
                             {
                                 LocalTPCollectiveSidebandBuffer sideband;
@@ -261,7 +263,7 @@ namespace
                             gather.stage_name = "reduce"; // One unchanged completion identity for both operations.
                             gather.input_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
                             gather.output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
-                            if (extent == RowExtent::DevicePrefix)
+                            if (extent != RowExtent::Fixed)
                                 gather.live_rows.emplace(device_rows, columns * sizeof(float));
                             graph.addNode("reduce", std::make_unique<NativeAllGatherStage>(gather), device);
                             graph.addDependency("reduce", "producer");
@@ -322,11 +324,15 @@ namespace
                         const auto result_count = column_scatter ? count / degree : operation == Operation::AllGather ? degree * count : count;
                         auto *result = operation == Operation::AllGather ? &gathered : &partial;
                         std::vector<float> host(count), actual(result_count), expected(count), norm_actual(64 * 256);
-                        for (int request = 1; request <= 20; ++request)
+                        const int replay_count = extent == RowExtent::EveryDevicePrefix ? rows + 8 : 20;
+                        for (int request = 1; request <= replay_count; ++request)
                         {
                             const std::array<std::int32_t, 5> prefixes{rows, rows - 1, 0, 1, rows};
-                            const std::int32_t live = extent == RowExtent::DevicePrefix
-                                ? prefixes[(request - 1) % prefixes.size()] : rows;
+                            const std::array<std::int32_t, 7> replay_tail{rows, 0, rows / 2, 0, rows, 1, rows - 1};
+                            const std::int32_t live = extent == RowExtent::EveryDevicePrefix
+                                ? (request <= rows + 1 ? request - 1 : replay_tail[request - rows - 2])
+                                : (extent == RowExtent::DevicePrefix
+                                    ? prefixes[(request - 1) % prefixes.size()] : rows);
                             const auto active_count = std::size_t(live) * columns;
                             for (size_t i = 0; i < count; ++i)
                             {
@@ -394,6 +400,10 @@ namespace
                                 {
                                     if (operation == Operation::AllGather)
                                         require(actual[i] == -12345.0f, "native stage wrote an inactive row");
+                                    // Allreduce is in-place: inactive rows are not operands of this replay.
+                                    if (allreduce && !column_scatter)
+                                        require(std::memcmp(&actual[i], &host[i], sizeof(float)) == 0,
+                                            "in-place allreduce wrote an inactive FP32 row");
                                     continue;
                                 }
                                 require(actual[i] == (allreduce ? expected[i] : static_cast<float>(
@@ -450,6 +460,37 @@ namespace
             verifyCapturedOverlap(device, operation, 17, 16384, RowExtent::DevicePrefix);
     }
 
+    /**
+     * @brief Prove live-only precision conversion through ordinary and sideband graph owners.
+     * @param device First native GPU in the admitted two-participant clique.
+     *
+     * Every count from zero through seventeen is followed by full/empty/partial
+     * transitions. FP16 runs use wide rows to cross the actual transport threshold;
+     * live values retain the fixed conversion oracle and every inactive FP32
+     * value retains its original bytes without graph recapture.
+     */
+    void verifyInactiveFP32Prefixes(DeviceId device)
+    {
+        for (const auto operation : {Operation::AllreduceFP32, Operation::AllreduceFP16,
+                Operation::AllreduceSidebandFP32, Operation::AllreduceSidebandFP16})
+            verifyCapturedOverlap(device, operation, 17, 16384, RowExtent::EveryDevicePrefix);
+    }
+
+    /**
+     * @brief Prove that canonical folds preserve every inactive in-place FP32 byte.
+     * @param device First native endpoint of the admitted homogeneous clique.
+     * @param degree Exact physical participant count, including four-rank cancellation.
+     *
+     * Every prefix from zero through seventeen precedes full/empty/partial
+     * replays on one retained graph. The fixed native-bank fold remains the
+     * exact ascending-rank arithmetic oracle for every live output value.
+     */
+    void verifyInactiveCanonicalPrefixes(DeviceId device, int degree)
+    {
+        verifyCapturedOverlap(device, Operation::CanonicalRankOrder, 17, 256,
+            RowExtent::EveryDevicePrefix, degree);
+    }
+
     /** @brief Prove canonical fork arithmetic for M1/grouped rows and retained live prefixes.
      * @param device Native backend endpoint, with no transport substitution.
      * @param degree Actual physical participants admitted by the fixture. */
@@ -467,8 +508,12 @@ TEST(Test__TPLocalAllGatherOverlap, CUDA) { verifyCapturedOverlap(DeviceId::cuda
 TEST(Test__TPLocalAllreduceOverlap, CUDA_FP32) { verifyCapturedOverlap(DeviceId::cuda(0), Operation::AllreduceFP32); }
 TEST(Test__TPLocalAllreduceOverlap, CUDA_FP16) { verifyCapturedOverlap(DeviceId::cuda(0), Operation::AllreduceFP16); }
 TEST(Test__TPLocalRankOrderOverlap, CUDA2) { verifyCanonicalRanks(DeviceId::cuda(0), 2); }
+/** @test Live canonical arithmetic retains inactive bytes on 2 physical participants. */
+TEST(Test__TPCanonicalInactiveRows, CUDA2) { verifyInactiveCanonicalPrefixes(DeviceId::cuda(0), 2); }
 TEST(Test__TPColumnReduceScatter, CUDA) { verifyColumns(DeviceId::cuda(0)); }
 TEST(Test__TPLiveRowsOverlap, CUDA) { verifyLivePrefixes(DeviceId::cuda(0)); }
+/** @test Both precision modes preserve all inactive FP32 bytes across every live prefix. */
+TEST(Test__TPLocalAllreduceInactiveRows, CUDA) { verifyInactiveFP32Prefixes(DeviceId::cuda(0)); }
 #endif
 #ifdef HAVE_ROCM
 TEST(Test__TPLocalReduceOverlap, ROCm) { verifyCapturedOverlap(DeviceId::rocm(0)); }
@@ -477,6 +522,12 @@ TEST(Test__TPLocalAllreduceOverlap, ROCm_FP32) { verifyCapturedOverlap(DeviceId:
 TEST(Test__TPLocalAllreduceOverlap, ROCm_FP16) { verifyCapturedOverlap(DeviceId::rocm(0), Operation::AllreduceFP16); }
 TEST(Test__TPLocalRankOrderOverlap, ROCm2) { verifyCanonicalRanks(DeviceId::rocm(0), 2); }
 TEST(Test__TPLocalRankOrderOverlap, ROCm4) { verifyCanonicalRanks(DeviceId::rocm(0), 4); }
+/** @test Live canonical arithmetic retains inactive bytes on 2 physical participants. */
+TEST(Test__TPCanonicalInactiveRows, ROCm2) { verifyInactiveCanonicalPrefixes(DeviceId::rocm(0), 2); }
+/** @test Live canonical arithmetic retains inactive bytes on 4 physical participants. */
+TEST(Test__TPCanonicalInactiveRows, ROCm4) { verifyInactiveCanonicalPrefixes(DeviceId::rocm(0), 4); }
 TEST(Test__TPColumnReduceScatter, ROCm) { verifyColumns(DeviceId::rocm(0)); }
 TEST(Test__TPLiveRowsOverlap, ROCm) { verifyLivePrefixes(DeviceId::rocm(0)); }
+/** @test Both precision modes preserve all inactive FP32 bytes across every live prefix. */
+TEST(Test__TPLocalAllreduceInactiveRows, ROCm) { verifyInactiveFP32Prefixes(DeviceId::rocm(0)); }
 #endif

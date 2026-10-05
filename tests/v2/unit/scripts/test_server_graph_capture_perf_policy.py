@@ -56,6 +56,7 @@ from llep_verifier_perf_policy import (  # noqa: E402
     validate_llep_verifier_policy,
 )
 from mtp_device_generation_perf_policy import (  # noqa: E402
+    _terminal_vocabulary_family_error,
     validate_cuda_dynamic_mtp_device_generation_policy,
     validate_rocm_host_scheduled_mtp_device_generation_policy,
 )
@@ -1012,6 +1013,33 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertEqual(result.policy, "static_owner_grouped")
 
+    def test_native_vocabulary_evidence_requires_each_participant_family(self) -> None:
+        """Sharded heads require serial and device-counted verifier capture proof."""
+
+        tags = {"terminal_head_policy": "vocabulary-sharded", "native_local_vocabulary": "true"}
+        for device in ("CUDA:0", "ROCm:0"):
+            captures = [counter("native_vocabulary_allgather_graph_nodes", device=device,
+                domain="collective", tags={"rows_capacity": str(rows), "live_rows": live})
+                for rows, live in ((1, "fixed"), (16, "device"))]
+            self.assertIsNone(_terminal_vocabulary_family_error(captures, device, tags, 16))
+            for kept, missing in ((captures[:1], 16), (captures[1:], 1)):
+                self.assertIn(f"{missing}-row capture",
+                    _terminal_vocabulary_family_error(kept, device, tags, 16) or "")
+            for mutation in ({"device": device + "other"}, {"value": 0, "count": 0}):
+                bad = [captures[0], captures[1] | mutation]
+                self.assertIn("16-row capture",
+                    _terminal_vocabulary_family_error(bad, device, tags, 16) or "")
+            wrong_count_owner = [captures[0], captures[1] | {
+                "tags": {"rows_capacity": "16", "live_rows": "fixed"}}]
+            self.assertIn("16-row capture",
+                _terminal_vocabulary_family_error(wrong_count_owner, device, tags, 16) or "")
+            self.assertIn("disagrees", _terminal_vocabulary_family_error(captures, device,
+                tags | {"terminal_head_policy": "mirrored-full-vocabulary"}, 16) or "")
+            self.assertIn("missing or invalid", _terminal_vocabulary_family_error(captures,
+                device, tags | {"native_local_vocabulary": "unknown"}, 16) or "")
+            self.assertIsNone(_terminal_vocabulary_family_error([], device,
+                {"terminal_head_policy": "mirrored-full-vocabulary", "native_local_vocabulary": "false"}, 16))
+
     def test_cuda_dynamic_mtp_policy_accepts_exact_switch_terminal_ledger(
         self,
     ) -> None:
@@ -1032,6 +1060,8 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     "draft_depth": "15",
                     "verifier_rows": "16",
                     "sampling_mode": "stochastic",
+                    "terminal_head_policy": "mirrored-full-vocabulary",
+                    "native_local_vocabulary": "false",
                 },
             ),
             counter(
@@ -1213,6 +1243,8 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     "verifier_rows": "4",
                     "physical_verifier_rows": "4",
                     "sampling_mode": "stochastic",
+                    "terminal_head_policy": "mirrored-full-vocabulary",
+                    "native_local_vocabulary": "false",
                 },
             ),
             counter(

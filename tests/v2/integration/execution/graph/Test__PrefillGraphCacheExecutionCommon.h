@@ -10,6 +10,8 @@
  * graph capture/replay. Deferred decode additionally proves that a private
  * sampler-stream handoff never suppresses public tensor event publication to
  * a pipeline transfer consumer.
+ * The shared retained-family probe covers the 448-row checkpoint boundary,
+ * exact small tails and repeated request reset on both native graph backends.
  * Backend-specific wrapper files provide the registration/support/device hooks.
  */
 
@@ -2597,20 +2599,32 @@ namespace
         EXPECT_EQ(snapshot->recapture_reason, "none");
     }
 
-    /** @test A long live range reuses its small retained tail, never a padded full chunk. */
-    TEST_F(PrefillGraphCacheExecutionTest, RetainedBucketFamilyReplaysSmallRemainder)
+    /** @brief Exercise shared retained-bucket selection at several admitted capacities. */
+    class RetainedPrefillBucketFamilyTest
+        : public PrefillGraphCacheExecutionTest,
+          public ::testing::WithParamInterface<int>
+    {
+    };
+
+    /** @test Request reset reuses the large capture and exact 64-row tail on either backend. */
+    TEST_P(RetainedPrefillBucketFamilyTest, ReplaysSmallRemainder)
     {
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
-            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,128"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", ""},
             {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
             {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
             {"LLAMINAR_VALIDATE_BUFFERS", "0"},
             {"LLAMINAR_VALIDATE_INPUTS", "0"},
             {"LLAMINAR_FAIL_ON_ZERO", "0"},
         });
-        constexpr int request_rows = 192;
+        const int main_bucket = GetParam();
+        const int request_rows = main_bucket + 64;
+        const auto admitted_buckets = rawPrefillGraphBucketsForResidentCapacity(
+            debugEnv().execution.prefill_graph_bucket_sizes,
+            main_bucket, kDefaultPrefillGraphMinBucketSize);
+        ASSERT_EQ(admitted_buckets.back(), main_bucket);
         host_->enablePreviousForwardOrderingForTesting();
         host_->setUseKVAppendProbe(true);
         ASSERT_TRUE(host_->setKVCacheCapacityForTesting(request_rows));
@@ -2630,15 +2644,15 @@ namespace
         // These are the production semantic arena slots. Both retained widths
         // must consume this one request bank and advance this one KV counter.
         auto *request_tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
-            BufferId::REQUEST_TOKEN_IDS, std::vector<size_t>{request_rows}, tokens);
+            BufferId::REQUEST_TOKEN_IDS, std::vector<size_t>{static_cast<size_t>(request_rows)}, tokens);
         auto *request_positions = graph_arena_.createPersistentTensor<INT32Tensor>(
-            BufferId::REQUEST_POSITION_IDS, std::vector<size_t>{request_rows}, positions);
+            BufferId::REQUEST_POSITION_IDS, std::vector<size_t>{static_cast<size_t>(request_rows)}, positions);
         auto *request_count = graph_arena_.createPersistentTensor<INT32Tensor>(
             BufferId::REQUEST_BATCH_GEOMETRY, std::vector<size_t>{1}, std::vector<int32_t>{request_rows});
         auto *chunk_tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
-            BufferId::PREFILL_CHUNK_TOKEN_IDS, std::vector<size_t>{128});
+            BufferId::PREFILL_CHUNK_TOKEN_IDS, std::vector<size_t>{static_cast<size_t>(main_bucket)});
         auto *chunk_positions = graph_arena_.createPersistentTensor<INT32Tensor>(
-            BufferId::PREFILL_CHUNK_POSITION_IDS, std::vector<size_t>{128});
+            BufferId::PREFILL_CHUNK_POSITION_IDS, std::vector<size_t>{static_cast<size_t>(main_bucket)});
         auto *chunk_geometry = graph_arena_.createPersistentTensor<INT32Tensor>(
             BufferId::PREFILL_CHUNK_GEOMETRY, std::vector<size_t>{2});
         for (auto *tensor : {request_tokens, request_positions, request_count})
@@ -2661,10 +2675,10 @@ namespace
                 .request_row_capacity = request_rows,
                 .bucket_seq_len = bucket,
                 .pad_token_id = kPadTokenId,
-                .capture_identity = UINT64_C(0x19200000) + static_cast<uint64_t>(bucket),
+                .capture_identity = UINT64_C(0x44800000) + static_cast<uint64_t>(bucket),
             };
         };
-        const std::array bindings{binding_for(128), binding_for(64)};
+        const std::array bindings{binding_for(main_bucket), binding_for(64)};
         ForwardInput input;
         input.token_ids_device = chunk_tokens->gpu_data_ptr();
         input.position_ids_device = chunk_positions->gpu_data_ptr();
@@ -2677,12 +2691,12 @@ namespace
         input.real_seq_len = request_rows;
         input.device = device_;
         const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
-            debugEnv().execution.prefill_graph_bucket_sizes, 0, input.real_seq_len);
+            admitted_buckets, 0, input.real_seq_len);
         const auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
             input, policy, kPadTokenId, /*allow_padded_execution=*/false);
         ASSERT_TRUE(schedule) << schedule.error;
         ASSERT_EQ(schedule.chunks.size(), 2u);
-        EXPECT_EQ(schedule.chunks[0].chunk.bucket_seq_len, 128);
+        EXPECT_EQ(schedule.chunks[0].chunk.bucket_seq_len, main_bucket);
         EXPECT_EQ(schedule.chunks[1].chunk.bucket_seq_len, 64);
 
         ForwardOutput output;
@@ -2701,7 +2715,7 @@ namespace
         EXPECT_EQ(host_->committed_forward_output_calls, 0);
 
         // Reset data, not graph topology. Repeated requests must retain both
-        // captured shapes while the smaller materializer resumes at KV row 128.
+        // captured shapes while the smaller materializer resumes at the large chunk's KV frontier.
         for (int round = 0; round < 3; ++round)
         {
             ASSERT_TRUE(host_->resetKVCacheProbeForTesting(admission_stream));
@@ -2721,12 +2735,12 @@ namespace
             backend->destroyEvent(completion, device_.toKernelDeviceIndex());
             EXPECT_EQ(geometry[0], 64);
             EXPECT_EQ(geometry[1], 64);
-            EXPECT_EQ(first_tail_token, tokens[128]);
+            EXPECT_EQ(first_tail_token, tokens[main_bucket]);
         }
         EXPECT_EQ(host_->build_calls, 2);
         EXPECT_EQ(host_->committed_forward_output_calls, 6);
         EXPECT_GE(host_->previous_forward_waits, 5);
-        for (const int bucket : {64, 128})
+        for (const int bucket : {64, main_bucket})
         {
             auto signature = bucketedPrefillSignature(device_, bucket, host_->placement_epoch,
                                                      input.sequence_lengths_device);
@@ -2743,6 +2757,10 @@ namespace
             EXPECT_GE(snapshot->replay_count, 1u);
         }
     }
+
+    INSTANTIATE_TEST_SUITE_P(
+        SharedBackendPolicy, RetainedPrefillBucketFamilyTest,
+        ::testing::Values(128, 448, 512));
 
     /**
      * @brief Prove 256K-context chunk totality through one captured GPU graph.

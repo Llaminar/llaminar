@@ -5,7 +5,9 @@
  * Every quantized and floating weight format exercises shared and routed experts. One graph
  * is replayed across empty, short, and full publications without rebinding or
  * recapture. Active output bytes must equal independent serial decode; padded
- * output must be zero even when reusable partials and outputs are poisoned.
+ * output must be zero even when all reusable projection scratch and outputs
+ * start with poisoned bytes. Only actually consumed intermediate slots must
+ * be overwritten; invalid routes may never read unowned compact scratch.
  * This detects stale scratch, double publication by two
  * dispatch families, and shared experts accidentally evaluating padded rows.
  */
@@ -24,6 +26,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -379,15 +382,26 @@ namespace
                         ASSERT_TRUE(upload(output.get(), poison.data(), poison.size() * sizeof(float)));
                         ASSERT_TRUE(upload(reduced_output.get(), poison.data(), poison.size() * sizeof(float)));
                         ASSERT_TRUE(upload(contributions.get(), route_poison.data(), route_poison.size() * sizeof(float)));
-                        // An absent route owns no intermediate scratch. Poison
-                        // the previous transaction's down partials: consumers
-                        // must reject that route before reading any partial,
-                        // yet still overwrite its public contribution with +0.
-                        // 0xff repeated is a NaN in every FP32 scratch element.
-                        const auto partial_bytes = workspace.getBufferSize(MoEWorkspaceBuffers::DOWN_PARTIALS);
-                        if (partial_bytes != 0)
-                            ASSERT_TRUE(backend->memset(workspace.getBuffer(MoEWorkspaceBuffers::DOWN_PARTIALS),
-                                0xff, partial_bytes, device.ordinal, stream));
+                        // Every mutable projection bank begins dirty. Complete
+                        // producers define consumed values before reading them;
+                        // absent routes must reject unowned intermediate slots
+                        // and still publish +0. Repeated 0xff is an FP32 NaN.
+                        const std::array projection_scratch{
+                            MoEWorkspaceBuffers::PREFILL_A_SCALES,
+                            MoEWorkspaceBuffers::PREFILL_SWIGLU_INT8,
+                            MoEWorkspaceBuffers::PREFILL_SWIGLU_SCALES,
+                            MoEWorkspaceBuffers::PREFILL_GATE,
+                            MoEWorkspaceBuffers::PREFILL_UP,
+                            MoEWorkspaceBuffers::GATEUP_GATE_PARTIALS,
+                            MoEWorkspaceBuffers::GATEUP_UP_PARTIALS,
+                            MoEWorkspaceBuffers::DOWN_PARTIALS};
+                        for (const auto *name : projection_scratch)
+                        {
+                            const auto bytes = workspace.getBufferSize(name);
+                            if (bytes != 0)
+                                ASSERT_TRUE(backend->memset(workspace.getBuffer(name),
+                                    0xff, bytes, device.ordinal, stream));
+                        }
                         // No top-k-expanded hidden representation is allowed.
                         // A borrowed router row must leave the entire private
                         // bank untouched; a local producer owns only M rows.

@@ -30,6 +30,44 @@ For backend kernel work, also use the relevant sibling skill:
 - `.agents/rocm-tuning/SKILL.md` for HIP/ROCm profiling, rocprof, ISA analysis,
   and generated NativeVNNI dispatch work.
 
+### Captured GPU stage timing
+
+For CUDA stage attribution without CUPTI, follow the CUDA skill's
+`references/native-graph-events.md`. Its optional setup-only stage observer
+joins canonical model stage names to native GPU event intervals; enable
+`LLAMINAR_NATIVE_EVENT_TRACE_REQUIRE_STAGE_NAMES=1` and render the exact trace
+cohort with `tests/v2/performance/kernels/native_graph_stage_report.py`.
+The report includes GPU spans, covered intervals, exclusive node ownership,
+nested stages and unowned graph plumbing. It describes the final completed
+replay of each selected executable, not every speculative transaction.
+
+CUDA conditional bodies remain opaque. An interval around an MTP controller
+or conditional parent does not identify its draft/verifier/sampler/publisher
+costs or execution counts. Do not disable MTP, flatten the parent, select eager
+execution or use serial row replay to manufacture that attribution. Preserve
+the production depth policy and prefix behavior, and require the paired
+uninstrumented run's token IDs, live rows and draft/accept/reject/verifier work
+to match. Report event/scheduling overhead separately. Concurrent and nested
+stage intervals overlap; summing them is not accepted-token latency. The
+current standalone observer is CUDA-only; common annotation metadata alone
+does not establish HIP per-stage timing support.
+
+For launch-count audits, distinguish retained graph inventory, actual native
+submissions and device-selected useful work. Correlate executable generation,
+participant and setup/warmup/measured request before counting. Conditional
+children establish possible work, not body execution multiplicity. A terminal
+draft ledger can omit physical capacity preparation; compare first-transaction
+sidecar submissions with the selected device depth on every fresh admission.
+Retaining a graph must not require executing all capacity slots again.
+
+Shifted-prefill append counts are separate from main-prompt counts. Ragged
+request banks need each request's own prefix authority and checked storage
+origin; `NativeAllreduceRequestRows` expresses that native sum contract without
+host readbacks or rebinding arena tensors. Never pass request zero's count as
+a global prefix. Focused CUDA/ROCm replay gates must check actual native
+useful-byte receipts, untouched inactive rows and large/small/empty/skewed
+request transitions, alongside dense and MoE graph construction.
+
 ## Architecture North Star
 
 Llaminar is moving toward vLLM-style speculative decode:

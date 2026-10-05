@@ -85,6 +85,38 @@ def _sum_by_device(
     }
 
 
+def _terminal_vocabulary_family_error(
+    records: Iterable[Mapping[str, Any]],
+    device: str,
+    tags: Mapping[str, Any],
+    verifier_rows: int,
+) -> str | None:
+    """Require declared head ownership and the native serial/verifier captures.
+
+    Capture counters prove graph construction, not an execution multiplier.
+    The generation launch and terminal ledger checks separately prove replay.
+    """
+
+    head = tags.get("terminal_head_policy")
+    native = tags.get("native_local_vocabulary")
+    if head not in {"mirrored-full-vocabulary", "vocabulary-sharded"} or native not in {"true", "false"}:
+        return f"MTP terminal vocabulary ownership is missing or invalid on {device}"
+    if native == "false":
+        return None
+    if head != "vocabulary-sharded":
+        return f"MTP native vocabulary publication disagrees with head ownership on {device}"
+    captures = _records_by_device(records, "native_vocabulary_allgather_graph_nodes")
+    device_captures = captures.get(device, ())
+    for rows in {1, verifier_rows}:
+        if not any(
+            _integer((record.get("tags") or {}).get("rows_capacity")) == rows
+            and (rows == 1 or (record.get("tags") or {}).get("live_rows") == "device")
+            for record in device_captures
+        ):
+            return f"MTP native vocabulary family lacks its {rows}-row capture on {device}"
+    return None
+
+
 def validate_cuda_dynamic_mtp_device_generation_policy(
     records: Iterable[Mapping[str, Any]],
     *,
@@ -131,6 +163,11 @@ def validate_cuda_dynamic_mtp_device_generation_policy(
         observed_sampling_modes: set[str] = set()
         for record in materializations[device]:
             tags = record.get("tags") or {}
+            head_error = _terminal_vocabulary_family_error(
+                records, device, tags, expected_maximum_depth + 1
+            )
+            if head_error:
+                return MTPDeviceGenerationValidation(error=head_error, devices=cuda_devices)
             sampling_mode = str(tags.get("sampling_mode", ""))
             observed_sampling_modes.add(sampling_mode)
             if (
@@ -402,6 +439,11 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
         observed_sampling_modes: set[str] = set()
         for record in materializations[device]:
             tags = record.get("tags") or {}
+            head_error = _terminal_vocabulary_family_error(
+                records, device, tags, expected_maximum_depth + 1
+            )
+            if head_error:
+                return MTPDeviceGenerationValidation(error=head_error, devices=rocm_devices)
             sampling_mode = str(tags.get("sampling_mode", ""))
             observed_sampling_modes.add(sampling_mode)
             if (

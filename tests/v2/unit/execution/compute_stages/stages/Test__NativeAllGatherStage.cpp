@@ -8,6 +8,11 @@
  */
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/NativeAllGatherStage.h"
+#include "execution/compute_stages/stages/NativeVocabularyAllGatherStage.h"
+#include "collective/VocabularyGatherWorkspaceContract.h"
+#include "models/GraphTypes.h"
+#include "models/qwen35/Qwen35Graph.h"
+#include "execution/compute_stages/stages/MTPVerifierOutcomeStage.h"
 #include "execution/compute_stages/stages/TPLocalReduceOverlap.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "memory/StageBufferContract.h"
@@ -296,3 +301,165 @@ namespace
         EXPECT_EQ(graph.getExecutionOrder().size(), 3u);
     }
 } // namespace
+
+/** @brief Native terminal geometry is validated without GPU discovery or allocation. */
+TEST_F(NativeAllGatherContract, VocabularyPublicationRetainsShardedProjectionOwnership)
+{
+    NativeVocabularyAllGatherStage::Params declaration;
+    declaration.device_id = params.device_id;
+    declaration.tp_ctx = &tp;
+    declaration.local_logits = &input;
+    declaration.full_logits = &output;
+    declaration.rows = DeviceRowRange::deviceCounted(4, reinterpret_cast<const int32_t *>(0x1000));
+    declaration.local_vocabulary = 16;
+    declaration.vocabulary = 32;
+    declaration.participant = 0;
+    declaration.stage_name = "lm_head_allgather";
+    NativeVocabularyAllGatherStage stage(declaration);
+    EXPECT_TRUE(stage.isGraphCapturable());
+    EXPECT_EQ(stage.getWorkspaceRequirements(4).buffers.front().size_bytes, 4u * 32u * sizeof(float));
+    EXPECT_EQ(stage.bufferContract().inputs.front().id, BufferId::LOGITS_LOCAL);
+    EXPECT_EQ(stage.bufferContract().outputs.front().id, BufferId::LOGITS);
+    EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::CPU));
+
+    GraphConfig config;
+    config.default_device = params.device_id;
+    config.tp_ctx = &tp;
+    config.lm_head_column_parallel = true;
+    config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+    EXPECT_FALSE(config.mtpPublishesNativeGatheredVocabulary());
+    config.mtp.graph_capacity_draft_tokens = 4;
+    EXPECT_TRUE(config.mtpParticipantLogitsAreVocabularySharded());
+    EXPECT_FALSE(config.mtpUsesMirroredTerminalHeadBinding());
+    EXPECT_TRUE(config.mtpPublishesNativeGatheredVocabulary());
+    config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    EXPECT_TRUE(config.mtpUsesMirroredTerminalHeadBinding());
+    EXPECT_FALSE(config.mtpPublishesNativeGatheredVocabulary());
+
+    auto invalid = declaration;
+    invalid.vocabulary = 33;
+    EXPECT_THROW(NativeVocabularyAllGatherStage{invalid}, std::invalid_argument);
+    invalid = declaration;
+    invalid.rows = declaration.rows.slice(1, 2);
+    EXPECT_THROW(NativeVocabularyAllGatherStage{invalid}, std::invalid_argument);
+    invalid = declaration;
+    invalid.full_logits = &input;
+    EXPECT_THROW(NativeVocabularyAllGatherStage{invalid}, std::invalid_argument);
+    invalid = declaration;
+    invalid.participant = 1;
+    EXPECT_THROW(NativeVocabularyAllGatherStage{invalid}, std::invalid_argument);
+    invalid = declaration;
+    invalid.rows = DeviceRowRange::fullyActive(1);
+    NativeVocabularyAllGatherStage singleton(invalid);
+    EXPECT_TRUE(singleton.getWorkspaceRequirements(1).buffers.empty());
+}
+
+/** @brief Serial setup must price larger retained rows before publishing scratch. */
+TEST_F(NativeAllGatherContract, NativeVocabularyWorkspaceFamilyPreviewsRows)
+{
+    NativeVocabularyAllGatherStage::Params declaration;
+    declaration.device_id = params.device_id;
+    declaration.tp_ctx = &tp;
+    declaration.local_logits = &input;
+    declaration.full_logits = &output;
+    declaration.rows = DeviceRowRange::fullyActive(1);
+    declaration.local_vocabulary = 16;
+    declaration.vocabulary = 32;
+    declaration.participant = 0;
+    declaration.stage_name = "lm_head_allgather";
+    NativeVocabularyAllGatherStage serial(declaration);
+    const auto geometry = serial.getBufferRequirements();
+    ASSERT_EQ(geometry.buffers.size(), 2u);
+    EXPECT_EQ(geometry.buffers[0].shape, (std::vector<std::size_t>{1, 16}));
+    EXPECT_EQ(geometry.buffers[1].shape, (std::vector<std::size_t>{1, 32}));
+    EXPECT_TRUE(serial.getWorkspaceRequirements(1).buffers.empty());
+    const auto family = serial.getWorkspaceRequirements(16);
+    ASSERT_EQ(family.buffers.size(), 1u);
+    EXPECT_EQ(family.buffers.front().name, VocabularyGatherWorkspaceContract::rankMajorBank);
+    EXPECT_EQ(family.buffers.front().size_bytes, 16u * 32u * sizeof(float));
+    EXPECT_EQ(serial.params().rows.capacity(), 1);
+    EXPECT_THROW(serial.getWorkspaceRequirements(0), std::invalid_argument);
+    EXPECT_THROW(serial.getWorkspaceRequirements(-1), std::invalid_argument);
+
+    declaration.rows = DeviceRowRange::fullyActive(4);
+    NativeVocabularyAllGatherStage grouped(declaration);
+    EXPECT_EQ(grouped.getWorkspaceRequirements(1).buffers.front().size_bytes,
+        4u * 32u * sizeof(float));
+}
+
+namespace
+{
+    /** @brief Expose only production terminal publication wiring, without device execution. */
+    class NativeVocabularyVerifierGraph final : public Qwen35Graph
+    {
+    public:
+        using Qwen35Graph::Qwen35Graph;
+        using Qwen35Graph::addMTPVerifierOutcomeToGraph;
+    };
+}
+
+/** @brief A sharded policy needs the actual full-tensor gather producer before local verification. */
+TEST_F(NativeAllGatherContract, ShardedVerifierRequiresCompletedVocabularyProducer)
+{
+    GraphConfig config;
+    config.default_device = params.device_id;
+    config.tp_ctx = &tp;
+    config.n_layers = 1;
+    config.d_model = 16;
+    config.d_ff = 32;
+    config.n_heads = config.n_kv_heads = 2;
+    config.head_dim = 8;
+    config.vocab_size = 32;
+    config.vocab_local = 16;
+    config.lm_head_column_parallel = true;
+    config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+    config.mtp.enabled = true;
+    config.grouped_mtp_verifier = true;
+    config.compute_all_position_logits = true;
+    config.compute_row_indexed_logits = true;
+    config.row_indexed_logits_row_count = 4;
+    config.mtp_verifier_outcome_graph_mode = MTPVerifierOutcomeGraphMode::Greedy;
+    config.mtp_verifier_outcome_ownership = MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal;
+    config.mtp_verifier_outcome_graph_binding = {
+        .verifier_input_tokens_device = reinterpret_cast<const int32_t *>(0x1000),
+        .active_verifier_row_count_device = reinterpret_cast<const int32_t *>(0x1100),
+        .transaction_commit_budget_device = reinterpret_cast<const uint32_t *>(0x1200),
+        .next_leading_committed_output_count_device = reinterpret_cast<const int32_t *>(0x1300),
+        .stop_tokens_device = reinterpret_cast<const int32_t *>(0x2000),
+        .penalty_policy_device = reinterpret_cast<const MTPGreedyPenaltyPolicy *>(0x2100),
+        .generated_token_counts_device = reinterpret_cast<int32_t *>(0x2200),
+        .generated_token_count_capacity = config.vocab_size,
+        .verifier_tokens_device = reinterpret_cast<int32_t *>(0x3000),
+        .argmax_values_device = reinterpret_cast<float *>(0x4000),
+        .argmax_partial_values_device = reinterpret_cast<float *>(0x5000),
+        .argmax_partial_indices_device = reinterpret_cast<int32_t *>(0x6000),
+        .argmax_partial_capacity = config.vocab_size,
+        .output_tokens_device = reinterpret_cast<int32_t *>(0x7000),
+        .output_meta_device = reinterpret_cast<int32_t *>(0x8000),
+        .output_token_capacity = 4,
+        .output_meta_capacity = sampling_math::kSpeculativeBatchMetaCount,
+    };
+    NativeVocabularyVerifierGraph builder(config);
+    graph.addNode("lm_head", std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::GEMM, "lm_head", params.device_id), params.device_id);
+    EXPECT_THROW(builder.addMTPVerifierOutcomeToGraph(graph, "lm_head", &output, 4, params.device_id), std::runtime_error);
+    NativeVocabularyAllGatherStage::Params declaration;
+    declaration.device_id = params.device_id;
+    declaration.tp_ctx = &tp;
+    declaration.local_logits = &input;
+    declaration.full_logits = &output;
+    declaration.rows = DeviceRowRange::deviceCounted(4, config.mtp_verifier_outcome_graph_binding.active_verifier_row_count_device);
+    declaration.local_vocabulary = 16;
+    declaration.vocabulary = 32;
+    declaration.participant = 0;
+    declaration.stage_name = "lm_head_allgather";
+    graph.addNode(declaration.stage_name, std::make_unique<NativeVocabularyAllGatherStage>(declaration), params.device_id);
+    graph.addDependency(declaration.stage_name, "lm_head");
+    FP32Tensor foreign_owner({4, 32}, DeviceId::cpu());
+    EXPECT_THROW(builder.addMTPVerifierOutcomeToGraph(graph, declaration.stage_name, &foreign_owner, 4, params.device_id), std::runtime_error);
+    EXPECT_EQ(builder.addMTPVerifierOutcomeToGraph(graph, declaration.stage_name, &output, 4, params.device_id), "mtp_verifier_outcome");
+    const auto *outcome = dynamic_cast<const MTPVerifierOutcomeStage *>(graph.getNode("mtp_verifier_outcome")->stage.get());
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_TRUE(outcome->getParams().participant_full_vocabulary);
+    EXPECT_EQ(outcome->getParams().logits, &output);
+}

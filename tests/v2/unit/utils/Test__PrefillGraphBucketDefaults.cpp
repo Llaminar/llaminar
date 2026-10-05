@@ -6,7 +6,8 @@
  * contract used before CUDA or ROCm workspace allocation so every positive M
  * remains dispatchable, speculative verifier calls remain genuinely grouped,
  * and large ordinary projections expose more row parallelism than the former
- * fixed sixteen-row implementation.
+ * fixed sixteen-row implementation. Serving and offline training also share
+ * the checkpoint-aligned 448-row capture while keeping the same arena ceiling.
  */
 
 #include "utils/PrefillGraphBucketDefaults.h"
@@ -27,7 +28,7 @@ namespace llaminar2
         TEST(Test__PrefillGraphBucketDefaults, ServingDefaultsCapAt512)
         {
             EXPECT_EQ(defaultPrefillGraphBucketSizes(),
-                      (std::vector<int>{64, 128, 256, 384, 512}));
+                      (std::vector<int>{64, 128, 256, 384, 448, 512}));
             EXPECT_EQ(kDefaultExpertOverlayPrefillSegmentRows, 512);
             EXPECT_EQ(supportedPrefillGraphBucketSizes().back(), 4096);
             EXPECT_EQ(defaultNativeVNNIDispatchTrainingRows().back(), 4096);
@@ -36,7 +37,7 @@ namespace llaminar2
         /** @test Explicit caps preserve larger, smaller and non-grid shapes. */
         TEST(Test__PrefillGraphBucketDefaults, ExplicitMaximumOwnsExactEndpoint)
         {
-            for (const int cap : {1, 32, 64, 255, 512, 600, 1024, 4096, 8192})
+            for (const int cap : {1, 32, 64, 255, 384, 448, 512, 600, 1024, 4096, 8192})
             {
                 const auto buckets = prefillGraphBucketSizes(cap);
                 ASSERT_FALSE(buckets.empty());

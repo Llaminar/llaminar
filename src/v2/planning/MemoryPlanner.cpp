@@ -562,6 +562,8 @@ MemoryPlan MemoryPlanner::plan(
             last_layer >= main_layer_count - 1;
         const auto mtp_state_role = resolveMTPStateRole(
             cfg.mtp_enabled, owns_terminal_main_layer);
+        const auto terminal_logits_collective =
+            cfg.terminalLogitsCollective(owns_terminal_main_layer);
         if (cfg.device.is_gpu() && cfg.graph_snapshot_memory.effective_kv &&
             cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
         {
@@ -977,7 +979,12 @@ MemoryPlan MemoryPlanner::plan(
 
                     size_t terminal_vocab = static_cast<size_t>(
                         std::max(0, profile.vocab_size));
+                    // Prefix state consumes the graph's published row. A
+                    // native gather assembles the full row even though each
+                    // participant projects only its physical vocabulary shard.
                     if (!replicated_dense_decode &&
+                        terminal_logits_collective !=
+                            MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather &&
                         cfg.mtp_terminal_logits_layout ==
                         MTPTerminalLogitsLayout::VocabularyShardPerParticipant)
                     {
@@ -1221,6 +1228,8 @@ MemoryPlan MemoryPlanner::plan(
                         replicated_dense_decode
                             ? MTPTerminalLogitsLayout::FullVocabularyPerParticipant
                             : cfg.mtp_terminal_logits_layout,
+                    .mtp_terminal_logits_collective =
+                        terminal_logits_collective,
                     .compact_routed_expert_token_rows = compact_routed_expert_token_rows,
                 });
         }

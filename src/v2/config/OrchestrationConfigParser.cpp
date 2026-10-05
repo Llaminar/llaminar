@@ -2466,7 +2466,7 @@ namespace llaminar2
             .aliases = {"--allreduce-precision"},
             .category = "Precision",
             .value_label = "<type>",
-            .description = "TP allreduce transport precision override: auto/schema (default), fp32, fp16, bf16",
+            .description = "Native GPU TP sum precision: fp16 (global dense/MoE default), fp32, bf16; auto/schema use the global default",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &value)
                 {

@@ -5,6 +5,8 @@
  * Implements IBackend with exact native streams and event-aware ownership.
  * CUDA preparation binds the required Driver API before graphs can be recorded;
  * CPU-only cluster ranks need no NVIDIA driver to load this full-backend binary.
+ * Pinned materialization counters expose accidental inference-time allocation;
+ * they are observations, never a second admission or live-memory ledger.
  *
  * @author David Sanftenberg
  */
@@ -1329,7 +1331,12 @@ namespace llaminar2
         requireContextMemoryOperation(cudaDeviceGetLimit(&actual_limit, cudaLimitStackSize), "verify materialized limit");
         requireContextMemoryOperation(cudaMemGetInfo(&actual_free, &actual_total), "verify materialized footprint");
         if (actual_limit != prepared_limit || actual_total != before_total || actual_free != prepared_free)
-            throw std::runtime_error("CUDA context storage did not reproduce its admitted physical footprint");
+            throw std::runtime_error("CUDA context storage did not reproduce its admitted physical footprint: device=" +
+                std::to_string(device_id) + " requested_stack=" + std::to_string(required_local_bytes) +
+                " probed_stack=" + std::to_string(prepared_limit) + " actual_stack=" + std::to_string(actual_limit) +
+                " free_before=" + std::to_string(before_free) + " free_probed=" + std::to_string(prepared_free) +
+                " free_actual=" + std::to_string(actual_free) + " total_probed=" + std::to_string(before_total) +
+                " total_actual=" + std::to_string(actual_total));
         if (lease) retained.push_back(std::move(*lease));
         materialization.retain();
         LOG_DEBUG("[CUDABackend] Prepared context-lifetime storage device=CUDA:" << device_id
@@ -6094,6 +6101,10 @@ namespace llaminar2
                 .bytes = bytes,
                 .device_id = device_id,
             });
+        PerfStatsCollector::addCounter("device_memory", "pinned_host_allocations",
+            1.0, "allocate_pinned", DeviceId::cuda(device_id).toString());
+        PerfStatsCollector::addCounter("device_memory", "pinned_host_allocation_bytes",
+            static_cast<double>(bytes), "allocate_pinned", DeviceId::cuda(device_id).toString());
         return ptr;
     }
 

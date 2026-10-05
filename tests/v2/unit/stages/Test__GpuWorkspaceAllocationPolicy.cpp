@@ -6594,7 +6594,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchStochasticOutcomeDiagnostic
               std::string::npos)
         << "Resident stochastic outcome handles must carry a response-ready event.";
     EXPECT_NE(compact_handle.find(
-                  "boolmirrored_local_tp_locally_complete=false"),
+                  "boollocal_tp_participant_complete=false"),
               std::string::npos)
         << "The compact outcome handle must prove that this participant ran "
            "the complete mirrored verifier outcome transaction locally.";
@@ -6941,7 +6941,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MirroredMTPTimingEventsAndOutcomesRemai
         << "Every fixed-pool borrow must first retire completed measurements.";
 
     EXPECT_NE(validation_body.find(
-                  "child.mirrored_local_tp_locally_complete"),
+                  "child.local_tp_participant_complete"),
               std::string::npos)
         << "Rank orchestration must fail closed unless every child proves local completion.";
     EXPECT_NE(validation_body.find("!child.stream||!child.response_ready_event"),

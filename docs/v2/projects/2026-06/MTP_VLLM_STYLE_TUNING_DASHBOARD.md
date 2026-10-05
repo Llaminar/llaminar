@@ -6,6 +6,40 @@ detail in project handoffs.
 RAG: **G** correct and economical, **A** correct but untuned/stale, **R**
 failing or not yet proven. Token equality alone is not verifier parity proof.
 
+## Dense TP2 follow-up (2026-10-04)
+
+**A — ROCm exceeds the revised 1.7x prefill target; CUDA tuning continues.**
+The last qualified global-FP16/dirty-workspace slice passes **693 Unit + 667
+preflight** registrations, both complete architecture builds and **45/45** default
+Release HTTP checks on each topology. ROCm defaults reach **431.498/46.141
+tok/s**, or **1.739015x** prefill scaling. CUDA cap 448 reaches **1005.358/66.362**,
+or **1.038109x**, and passes its own 45/45 HTTP cell; it is not promoted.
+CUDA's fast/slow process variation remains unresolved. Automatic head sharding
+and global FP16 sums are installed; dynamic depth defaults remain unchanged.
+
+Named CUDA GPU stage intervals and the interactive HTML/JSON/CSV report pass
+paired model/ownership checks. Skills document event overhead and opaque
+conditional-body limits. Raw projection scaling is **1.832x**, excluding
+recurrence, attention and other non-projection work. Main matrices are correctly
+sharded and each chunk executes once per participant. The launch audit finds
+96 repeated GDN quantizers per prompt and fifteen physical first-transaction
+sidecar forwards per admission despite selected depth three. Removing only
+duplicate quantizers preserves twelve token/MTP ledgers but shows no macro win.
+The installed eight-channel NCCL policy remains preferred; new sealed-dispatch
+and protocol/thread screens do not justify promotion.
+
+**A — shifted-MTP communication correction is implemented, qualification pending.**
+Independent request-prefix banks replace capacity-sized embedding traffic;
+dense/MoE declaration and captured CUDA/ROCm payload/poison regressions are added.
+The old 1360-check/HTTP receipts do not certify this new source. First-transaction
+capacity preparation remains an economy defect. Read-only PCIe checks and
+frozen-plan authentication find matching CUDA/ROCm x16/x8 paths and Gen3 x16 CPU
+uplinks; ROCm GPU 2's endpoint reports x16 above an x8 switch link. Loaded CUDA
+widths are stable and AER counters do not increase. Bus width alone does not
+explain the scaling gap. See the
+[dense TP2 report](../2026-10/QWEN38_27B_TP2_TUNING.md) for exact artifacts and
+workload limits. These are native binary qualifications, not image certificates.
+
 ## Latest verification (2026-10-03)
 
 **A — checkpoint correctness and corrected-runtime benchmarks are green;

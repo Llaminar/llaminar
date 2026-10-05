@@ -1,6 +1,6 @@
 /**
  * @file NCCLNetworkPolicy.h
- * @brief Declarative network-module policy for NCCL communicators.
+ * @brief Declarative transport and measured channel policy for NCCL communicators.
  *
  * NCCL distinguishes CUDA-local transports, such as peer access and shared
  * memory, from the network module used when those transports cannot carry a
@@ -20,6 +20,8 @@
 #include "../DeviceGroup.h"
 
 #include <string_view>
+#include <span>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -70,6 +72,80 @@ namespace llaminar2
         return module == NCCLNetworkModule::Socket
                    ? std::string_view{"Socket"}
                    : std::string_view{};
+    }
+
+    /** @brief Immutable construction profile; native algorithms remain size-adaptive. */
+    enum class NCCLCommunicatorProfile { NativeAutomatic, RTX3090SharedMemoryTP2 };
+
+    /** @brief Authenticated startup observation of one CUDA card. */
+    struct NCCLCardIdentity
+    {
+        std::string_view name; ///< Borrowed inventory name, used only during selection.
+        int ordinal = -1; ///< Exact physical CUDA ordinal.
+        int architecture_major = 0; ///< Native CUDA compute capability major.
+        int architecture_minor = 0; ///< Native CUDA compute capability minor.
+        int multiprocessors = 0; ///< Physical SM count.
+        std::size_t memory_bytes = 0; ///< Native physical capacity, not current free bytes.
+    };
+
+    /** @brief Peer reachability is known in both directions before profile selection. */
+    enum class NCCLPeerAccess { Unobserved, Available, Unavailable };
+
+    /** @brief Per-communicator construction policy, fixed before any graph is recorded. */
+    struct NCCLCommunicatorPolicy
+    {
+        NCCLNetworkModule network = NCCLNetworkModule::Automatic; ///< Topology-owned network module.
+        NCCLCommunicatorProfile profile = NCCLCommunicatorProfile::NativeAutomatic; ///< Measured economy profile.
+    };
+
+    /**
+     * @brief Select only the measured same-process pair with no peer transport.
+     * @param scope Declared collective scope.
+     * @param cards Complete physical membership, with distinct ordinals.
+     * @param directed_peers Ordered 0-to-1 and 1-to-0 observations for a pair.
+     * @return Eight-channel profile for two SM86/82-SM RTX 3090 cards on SHM;
+     * otherwise the native size-adaptive policy for that topology.
+     */
+    [[nodiscard]] inline NCCLCommunicatorPolicy selectNCCLCommunicatorPolicy(
+        CollectiveScope scope, std::span<const NCCLCardIdentity> cards,
+        std::span<const NCCLPeerAccess> directed_peers)
+    {
+        NCCLCommunicatorPolicy result{.network = selectNCCLNetworkModule(scope)};
+        if (scope != CollectiveScope::LOCAL || cards.size() != 2 ||
+            directed_peers.size() != 2 || cards[0].ordinal == cards[1].ordinal)
+            return result;
+        for (const auto &card : cards)
+            if (!card.name.ends_with("RTX 3090") || card.ordinal < 0 ||
+                card.architecture_major != 8 || card.architecture_minor != 6 ||
+                card.multiprocessors != 82 || card.memory_bytes < (std::size_t{23} << 30) ||
+                card.memory_bytes > (std::size_t{24} << 30))
+                return result;
+        for (const auto access : directed_peers)
+            if (access != NCCLPeerAccess::Unavailable) return result;
+        result.profile = NCCLCommunicatorProfile::RTX3090SharedMemoryTP2;
+        return result;
+    }
+
+    /** @brief Obtain the immutable CTA budget, or zero for native automatic selection. */
+    [[nodiscard]] constexpr int ncclCommunicatorChannelBudget(NCCLCommunicatorProfile profile)
+    {
+        switch (profile)
+        {
+        case NCCLCommunicatorProfile::NativeAutomatic: return 0;
+        case NCCLCommunicatorProfile::RTX3090SharedMemoryTP2: return 8;
+        }
+        throw std::invalid_argument("Unknown NCCL communicator profile");
+    }
+
+    /** @brief Stable policy name for setup logs and PerfStats evidence. */
+    [[nodiscard]] constexpr std::string_view ncclCommunicatorProfileName(NCCLCommunicatorProfile profile)
+    {
+        switch (profile)
+        {
+        case NCCLCommunicatorProfile::NativeAutomatic: return "native_automatic";
+        case NCCLCommunicatorProfile::RTX3090SharedMemoryTP2: return "rtx3090_shm_tp2";
+        }
+        throw std::invalid_argument("Unknown NCCL communicator profile");
     }
 
 } // namespace llaminar2

@@ -843,6 +843,9 @@ namespace llaminar2
 
         /** A multi-rank GlobalTP domain must assemble vocabulary shards. */
         GlobalVocabularyAllGather,
+
+        /** A homogeneous rank-local GPU graph assembles every participant's live rows. */
+        NativeLocalVocabularyAllGather,
     };
 
     /**
@@ -855,12 +858,13 @@ namespace llaminar2
             MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
         bool sidecar_produces_logits = false;
         bool spans_multiple_global_ranks = false;
+        bool native_local_gpu_tp = false; ///< Explicit local native domain, independent of MPI PP ranks.
     };
 
     /**
      * @brief Resolve the terminal logits collective from complete typed policy.
      * @param request Output ownership and execution-topology facts.
-     * @return `GlobalVocabularyAllGather` only when every prerequisite is true.
+     * @return The explicit native-local or global gather for a sharded projection.
      *
      * KV-only shifted-prefill graphs set `sidecar_produces_logits=false` and
      * therefore never acquire a dummy terminal collective. Mirrored heads set
@@ -870,12 +874,14 @@ namespace llaminar2
     inline MTPTerminalLogitsCollective resolveMTPTerminalLogitsCollective(
         const MTPTerminalLogitsCollectiveRequest &request) noexcept
     {
-        return request.sidecar_produces_logits &&
-                       request.spans_multiple_global_ranks &&
-                       request.layout ==
-                           MTPTerminalLogitsLayout::VocabularyShardPerParticipant
-                   ? MTPTerminalLogitsCollective::GlobalVocabularyAllGather
-                   : MTPTerminalLogitsCollective::None;
+        if (!request.sidecar_produces_logits || request.layout !=
+                MTPTerminalLogitsLayout::VocabularyShardPerParticipant)
+            return MTPTerminalLogitsCollective::None;
+        if (request.native_local_gpu_tp)
+            return MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather;
+        return request.spans_multiple_global_ranks
+            ? MTPTerminalLogitsCollective::GlobalVocabularyAllGather
+            : MTPTerminalLogitsCollective::None;
     }
 
     /**
@@ -946,7 +952,8 @@ namespace llaminar2
          * Low-level runtime construction starts with a concrete mirrored policy.
          * The public OrchestrationConfig instead starts with Automatic intent;
          * ExecutionPlanBuilder resolves it once to vocabulary shards for CPU
-         * continuation and mirrors otherwise, before admission. This runtime
+         * continuation and measured dense-Qwen RTX 3090/MI50 local TP2, and
+         * mirrors other accelerator domains before admission. This runtime
          * value then owns both graph layout and physical-weight accounting.
          */
         MTPTerminalHeadPolicy terminal_head_policy =
@@ -2147,7 +2154,7 @@ namespace llaminar2
         /// Explicit KV cache precision (AUTO defaults to FP16)
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
-        /// Optional explicit transport precision for TP allreduces.
+        /// Optional native GPU TP sum precision; empty selects global FP16.
         std::string tp_allreduce_precision_override;
 
         /// Routed MoE expert execution mode.

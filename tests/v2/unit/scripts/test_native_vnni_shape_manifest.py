@@ -79,7 +79,7 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         """Every spent prefill witness leaves a disjoint fresh holdout pool."""
 
         manifest = load_shape_manifest()
-        self.assertEqual(len(manifest.shapes), 600)
+        self.assertEqual(len(manifest.shapes), 606)
         fast_sealed = [
             shape
             for shape in manifest.shapes
@@ -706,7 +706,7 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         production = [
             shape for shape in manifest.shapes if shape.role == ShapeRole.PRODUCTION
         ]
-        self.assertEqual(len(production), 92)
+        self.assertEqual(len(production), 98)
         self.assertTrue(all(shape.exact_overlay for shape in production))
         tp_local = {
             shape.name: (shape.n, shape.k)
@@ -744,6 +744,34 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         manifest = load_shape_manifest()
         self.assertRegex(manifest.digest(), r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(manifest.digest(), load_shape_manifest().digest())
+
+    def test_dense_27b_tp2_projection_geometry_is_complete(self) -> None:
+        """Column and reduction shards must share one all-backend exact inventory."""
+
+        manifest = load_shape_manifest()
+        expected = {
+            "QwenDense27B_TP2_FFN_GateUp": (8704, 5120),
+            "QwenDense27B_TP2_FFN_DownProjection": (5120, 8704),
+            "QwenDense27B_TP2_GDN_ZProjection": (3072, 5120),
+            "QwenDense27B_TP2_GDN_OutputProjection": (5120, 3072),
+            "QwenDense27B_TP2_AttnKVProjection": (512, 5120),
+            "QwenDense27B_TP2_LM_Head": (124160, 5120),
+        }
+        for name, dimensions in expected.items():
+            with self.subTest(shape=name):
+                shape = manifest.by_name(name)
+                self.assertEqual((shape.n, shape.k), dimensions)
+                self.assertEqual(shape.role, ShapeRole.PRODUCTION)
+                self.assertTrue(shape.exact_overlay)
+                self.assertEqual(shape.fast_partition, ShapePartition.DEVELOPMENT)
+                self.assertEqual(shape.verifier_partition, ShapePartition.DEVELOPMENT)
+        # QKV and fused query/gate shards already have these physical keys.
+        # Reuse those entries so aliases cannot choose conflicting dispatches.
+        production_dimensions = {
+            (shape.n, shape.k) for shape in manifest.shapes
+            if shape.role == ShapeRole.PRODUCTION and shape.exact_overlay
+        }
+        self.assertTrue({(5120, 5120), (6144, 5120)}.issubset(production_dimensions))
 
     def test_all_backend_trainers_share_one_overlay_inventory(self) -> None:
         """CPU, CUDA, and ROCm may not name private shape catalog paths."""

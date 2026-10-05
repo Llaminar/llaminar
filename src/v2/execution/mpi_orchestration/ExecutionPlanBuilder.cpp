@@ -9,6 +9,8 @@
  * 2. Simple TP/PP: Uses --tp, --pp, --device for straightforward cases
  * Physical CPU locality comes only from the gathered observation, never from
  * communicator rank order or a presumed contiguous NUMA numbering scheme.
+ * Automatic terminal-head placement is bounded by authenticated model geometry,
+ * complete physical membership and measured retained verifier families.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -108,17 +110,26 @@ namespace llaminar2
          * @brief Seal terminal-head intent using its complete execution domain.
          * @param requested Automatic intent or an explicit physical policy.
          * @param devices Terminal/continuation participants, excluding expert-only tiers.
-         * @return CPU vocabulary shards or the existing accelerator mirror default.
+         * @param ranks Aligned physical owners, including repeated remote ordinals.
+         * @param inventory Canonical gathered hardware facts.
+         * @param model Authenticated architecture, geometry, and terminal format.
+         * @param mtp Requested retained graph/sidecar policy.
+         * @return CPU shards, measured dense-Qwen GPU TP2 shards, or accelerator mirrors.
          * @throws std::invalid_argument if automatic intent has no domain to inspect.
          *
          * CPU projection work benefits from sharing the vocabulary across sockets.
-         * GPU defaults retain their measured mirror economics. Scope and rank
-         * ordinals never select a policy; all peers receive the same resolved
-         * value, including sparse expert followers with a CPU control endpoint.
+         * The RTX 3090 and MI50 results are bounded to the native Q6_K head and
+         * three-/sixteen-row dynamic verifier families on one rank. Both retain
+         * the replicated sidecar and prove their native vocabulary publication.
+         * Other architectures,
+         * precision modes, distributed cliques and explicit choices retain
+         * their own policies. No model path or filename participates.
          */
         MTPTerminalHeadPolicy mtpHeadPolicyForDomain(
             MTPTerminalHeadPolicy requested,
-            const std::vector<GlobalDeviceAddress> &devices)
+            const std::vector<GlobalDeviceAddress> &devices,
+            const std::vector<int> &ranks, const ClusterInventory &inventory,
+            const ModelConfig &model, const MTPRuntimeConfig &mtp)
         {
             if (requested != MTPTerminalHeadPolicy::Automatic)
             {
@@ -127,6 +138,24 @@ namespace llaminar2
             }
             if (devices.empty())
                 throw std::invalid_argument("MTP terminal-head defaults require a resolved execution domain");
+            const bool measured_model = model.name == "qwen35" && model.n_layers == 64 &&
+                model.hidden_size == 5120 && model.intermediate_size == 17408 && model.vocab_size == 248320 &&
+                model.n_heads == 24 && model.n_kv_heads == 4 && model.head_dim == 256 &&
+                model.terminal_head_source.present && model.terminal_head_source.is_superblock &&
+                model.terminal_head_source.codebook_id == native_vnni_formats::Q6_K.codebook_id;
+            const int graph_maximum = resolveMTPMaximumDraftDepth(mtp);
+            const bool measured_verifier = (graph_maximum == 2 || graph_maximum == 15) &&
+                resolveMTPMaximumExecutionDraftDepth(mtp) == graph_maximum;
+            const auto profile = mtpProfileForDomain(devices, ranks, inventory);
+            const bool measured_cards = profile == MTPDepthDefaultsProfile::CUDARTX3090 ||
+                profile == MTPDepthDefaultsProfile::ROCmMI50;
+            if (measured_model && mtp.enabled && mtp.max_request_batch == 1 &&
+                mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic && measured_verifier &&
+                mtp.sidecar_dense_policy == MTPSidecarDensePolicy::ReplicatedPerParticipant &&
+                devices.size() == 2 && ranks.size() == 2 && ranks[0] == ranks[1] &&
+                devices[0] != devices[1] &&
+                measured_cards)
+                return MTPTerminalHeadPolicy::VocabularySharded;
             return std::all_of(devices.begin(), devices.end(), [](const auto &device)
                 { return device.device_type == DeviceType::CPU; })
                 ? MTPTerminalHeadPolicy::VocabularySharded
@@ -213,7 +242,8 @@ namespace llaminar2
                 if (found != domains.end()) terminal = &*found;
             }
             const auto head_policy = mtpHeadPolicyForDomain(config.mtp.terminal_head_policy,
-                terminal ? terminal->devices : std::vector<GlobalDeviceAddress>{});
+                terminal ? terminal->devices : std::vector<GlobalDeviceAddress>{},
+                terminal ? terminal->device_ranks : std::vector<int>{}, cluster_inventory, model_config, config.mtp);
             for (auto &plan : plans)
             {
                 plan.runtime.mtp.depth_defaults_profile = profile;
@@ -242,19 +272,30 @@ namespace llaminar2
             // Include every terminal TP peer before sealing policy. Earlier PP
             // stages may execute on another backend, but cannot change the head.
             std::vector<GlobalDeviceAddress> terminal_devices;
+            std::vector<int> terminal_ranks;
             for (const auto &plan : plans)
             {
                 if (!plan.has_lm_head) continue;
                 if (!plan.local_pp_devices.empty())
+                {
                     terminal_devices.push_back(plan.local_pp_devices.back());
+                    terminal_ranks.push_back(plan.rank);
+                }
                 else if (!plan.local_tp_devices.empty())
+                {
                     terminal_devices.insert(terminal_devices.end(),
                         plan.local_tp_devices.begin(), plan.local_tp_devices.end());
+                    terminal_ranks.insert(terminal_ranks.end(), plan.local_tp_devices.size(), plan.rank);
+                }
                 else
+                {
                     terminal_devices.push_back(plan.primary_device);
+                    terminal_ranks.push_back(plan.rank);
+                }
             }
             const auto head_policy = mtpHeadPolicyForDomain(
-                config.mtp.terminal_head_policy, terminal_devices);
+                config.mtp.terminal_head_policy, terminal_devices, terminal_ranks,
+                cluster_inventory, model_config, config.mtp);
             for (auto &plan : plans)
                 plan.runtime.mtp.terminal_head_policy = head_policy;
         }

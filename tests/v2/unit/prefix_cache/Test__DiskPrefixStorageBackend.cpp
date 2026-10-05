@@ -456,11 +456,9 @@ TEST(Test__DiskPrefixStorageBackend, PreservesModelRuntimeStatePayload)
     const auto layout = makeLayout();
     auto handle = ram.allocate(testKey(), layout);
     ASSERT_TRUE(handle.valid());
-    handle.model_runtime_state_storage =
+    ASSERT_TRUE(ram.attachModelRuntimeState(&handle,
         std::make_shared<std::vector<uint8_t>>(
-            std::initializer_list<uint8_t>{9, 8, 7, 6, 5});
-    handle.has_model_runtime_state = true;
-    handle.total_bytes += handle.model_runtime_state_storage->size();
+            std::initializer_list<uint8_t>{9, 8, 7, 6, 5})));
 
     DiskPrefixStorageBackend disk(
         archivePath(dir), 1024, kModelArtifactIdentity);
@@ -473,9 +471,8 @@ TEST(Test__DiskPrefixStorageBackend, PreservesModelRuntimeStatePayload)
     ASSERT_TRUE(disk.readBlock(testKey(), layout, &hydrated, &error)) << error;
     EXPECT_TRUE(hydrated.has_model_runtime_state);
     ASSERT_NE(hydrated.model_runtime_state_storage, nullptr);
-    EXPECT_EQ(
-        *hydrated.model_runtime_state_storage,
-        *handle.model_runtime_state_storage);
+    EXPECT_TRUE(std::ranges::equal(hydrated.model_runtime_state_storage->bytes(),
+                                  handle.model_runtime_state_storage->bytes()));
     EXPECT_EQ(hydrated.total_bytes, handle.total_bytes);
     cleanup();
 }

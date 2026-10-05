@@ -46,12 +46,12 @@ namespace llaminar2
         bool ncclGetUniqueIdWrapper(void *id_out);
 
         // NCCL communicator management
-        bool ncclCommInitRankWithNetworkWrapper(
+        bool ncclCommInitRankWithPolicyWrapper(
             void **comm_out,
             int nranks,
             void *unique_id,
             int rank,
-            const char *network_module,
+            NCCLCommunicatorPolicy policy,
             std::string &error_out);
         void ncclCommDestroyWrapper(void *comm);
         void ncclCommAbortWrapper(void *comm);
@@ -265,9 +265,7 @@ namespace llaminar2
 
         const std::string_view network_module = ncclNetworkModuleName(
             selectNCCLNetworkModule(group.scope));
-        const char *network_module_name = network_module.empty()
-                                              ? nullptr
-                                              : network_module.data();
+        const NCCLCommunicatorPolicy policy{.network = selectNCCLNetworkModule(group.scope)};
         LOG_DEBUG("[NCCLNetworkPolicy] group='" << group.name
                                                << "' scope="
                                                << (group.isLocal() ? "local" : (group.isGlobal() ? "global" : "hybrid"))
@@ -340,12 +338,12 @@ namespace llaminar2
             // Use MPI world_size and rank for the communicator
             std::string nccl_error;
             void *comm_ptr = nullptr;
-            if (!nccl_backend_detail::ncclCommInitRankWithNetworkWrapper(
+            if (!nccl_backend_detail::ncclCommInitRankWithPolicyWrapper(
                     &comm_ptr,
                     mpi_ctx_->world_size(),
                     unique_id_buffer.data(),
                     mpi_ctx_->rank(),
-                    network_module_name,
+                    policy,
                     nccl_error))
             {
                 last_error_ = "ncclCommInitRank failed: " + nccl_error;
@@ -380,12 +378,12 @@ namespace llaminar2
 
             std::string nccl_error;
             void *comm_ptr = nullptr;
-            if (!nccl_backend_detail::ncclCommInitRankWithNetworkWrapper(
+            if (!nccl_backend_detail::ncclCommInitRankWithPolicyWrapper(
                     &comm_ptr,
                     1,
                     unique_id_buffer.data(),
                     0,
-                    network_module_name,
+                    policy,
                     nccl_error))
             {
                 last_error_ = "ncclCommInitRankConfig failed: " + nccl_error;

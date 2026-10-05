@@ -72,6 +72,13 @@ namespace llaminar2
         // intervals, rather than tensor IDs, also catches aliases/views.
         if (count_address && (count_address > maximum - sizeof(std::int32_t) ||
             (count_address < b + receive_bytes && b < count_address + sizeof(std::int32_t)))) return false;
+        const auto receipt = reinterpret_cast<std::uintptr_t>(rows.payloadReceipt());
+        if (receipt && (receipt % alignof(unsigned long long) ||
+            receipt > maximum - sizeof(unsigned long long) ||
+            (receipt < a + send_bytes && a < receipt + sizeof(unsigned long long)) ||
+            (receipt < b + receive_bytes && b < receipt + sizeof(unsigned long long)) ||
+            (count_address < receipt + sizeof(unsigned long long) && receipt < count_address + sizeof(std::int32_t))))
+            return false;
         return (a == b && operation == NativeRowCollective::AllReduce) ||
             a + send_bytes <= b || b + receive_bytes <= a;
     }

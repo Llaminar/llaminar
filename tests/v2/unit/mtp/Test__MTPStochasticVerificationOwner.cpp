@@ -44,7 +44,7 @@ namespace llaminar2
             /** @return Backend identity without querying hardware. */
             DeviceId primaryDeviceId() const override { return device_; }
             /** @return Whether the full terminal head is installed. */
-            bool usesMirroredMTPHeadForVerifier() const override
+            bool publishesFullVocabularyMTPLogits() const override
                 { return missing_ != MissingOwner::MirroredHead; }
             /** @return Whether device-local stochastic resources are installed. */
             bool supportsDeviceStochasticMTPVerification() const override

@@ -9,6 +9,9 @@
  * individual captured nodes never write PCIe-mapped host pages. Keeping that
  * ordering explicit preserves every parity checkpoint without multiplying
  * host-memory packets or runtime completion objects.
+ * Optional native stage observers receive setup-only immutable capture scopes
+ * on each stage's exact bound stream. They remain outside the serving closure;
+ * graph replay never emits host callbacks or performs diagnostic readbacks.
  * @author David Sanftenberg
  * @date December 2025
  */
@@ -33,6 +36,7 @@
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
+#include "NativeGraphStageAnnotation.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../loaders/PreparedWeightStore.h"
@@ -3208,12 +3212,23 @@ namespace llaminar2
          * advances the frozen dependency plan only after the complete canonical
          * stage runner succeeds; exceptions and false returns leave the
          * transaction failed and cannot expose a partially recorded producer.
+         * Diagnostic attribution shares that success boundary, but owns only
+         * native topology metadata; the canonical stage still owns all work.
          */
         ScopedGraphCaptureStage capture_stage(node.stage.get());
+        std::optional<NativeGraphStageAnnotationScope> annotation;
+        const auto annotation_observer = nativeGraphStageAnnotationObserver();
+        const DeviceId stage_device = node.device.is_valid() ? node.device : node.stage->device();
+        if (isGraphCaptureActive() && annotation_observer && stage_device.is_gpu())
+            annotation.emplace(annotation_observer, stage_device, node.stage->gpuStream(),
+                node.name.c_str(), computeStageTypeName(node.stage->type()));
         const bool success = runStageImpl(
             node, ctx, policy, is_collective, snapshot_manifest);
         if (success)
+        {
             capture_stage.complete();
+            if (annotation) annotation->complete();
+        }
         return success;
     }
 
@@ -4362,7 +4377,14 @@ namespace llaminar2
                  * the exact manual boundary; no generic arena or graph-state
                  * transition remains to perform around execute().
                  */
+                std::optional<NativeGraphStageAnnotationScope> annotation;
+                const auto observer = nativeGraphStageAnnotationObserver();
+                const DeviceId stage_device = node->device.is_valid() ? node->device : node->stage->device();
+                if (isGraphCaptureActive() && observer && stage_device.is_gpu())
+                    annotation.emplace(observer, stage_device, node->stage->gpuStream(),
+                        node->name.c_str(), computeStageTypeName(node->stage->type()));
                 stage_ok = node->stage->execute(ctx);
+                if (stage_ok && annotation) annotation->complete();
             }
 
             if (cpu_stage_timing)

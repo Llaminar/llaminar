@@ -141,7 +141,14 @@ TEST(PlanningExecutionMeasurementIntegration, CUDA_NativeLocalTP)
  * public exclusive model-retirement transaction may release them, and the next
  * context generation must admit its own new leases before the same sample runs.
  */
-TEST(PlanningExecutionMeasurementIntegration, CUDA_NativeLocalTPContextStorageLifetime)
+namespace
+{
+/**
+ * @brief Prove cold admission, graph retirement and successor ownership at an exact collective geometry.
+ * @param columns Actual projection width communicated by each sample.
+ * @param rows Exact admitted prefill/collective capacity of the sample family.
+ */
+void proveContextStorageLifetime(int columns, int rows)
 {
     ensureNvidiaFactoryRegistered();
     if (!hasCPUBackend()) initCPUBackend(-1);
@@ -154,7 +161,7 @@ TEST(PlanningExecutionMeasurementIntegration, CUDA_NativeLocalTPContextStorageLi
     for (const auto device : devices)
         ASSERT_EQ(backend->nativeExecutionContextStorageBytes(device.ordinal), 0u)
             << "Run this cold-context proof as its independently registered preflight case";
-    const PlanningLocalTPRequest request(devices, 2048, 64, PlanningAllreducePrecision::FP32);
+    const PlanningLocalTPRequest request(devices, columns, rows, PlanningAllreducePrecision::FP32);
     std::vector<std::size_t> retained;
     std::weak_ptr<PhysicalMemoryAuthority> setup_lifetime;
     {
@@ -221,6 +228,19 @@ TEST(PlanningExecutionMeasurementIntegration, CUDA_NativeLocalTPContextStorageLi
     for (const auto device : devices)
         EXPECT_GT(backend->nativeExecutionContextStorageBytes(device.ordinal), 0u);
 }
+}
+
+TEST(PlanningExecutionMeasurementIntegration, CUDA_NativeLocalTPContextStorageLifetime)
+{
+    proveContextStorageLifetime(2048, 64);
+}
+
+/** @test The failing large prefill sample owns exact context bytes in both native generations. */
+TEST(PlanningExecutionMeasurementIntegration, CUDA_NativeLocalTPContextStoragePrefillBucket)
+{
+    proveContextStorageLifetime(5120, 384);
+}
+
 #endif
 #ifdef HAVE_ROCM
 TEST(PlanningExecutionMeasurementIntegration, ROCm_NativeLocalTP)

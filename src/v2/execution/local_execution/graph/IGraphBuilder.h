@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace llaminar2
@@ -1047,8 +1048,8 @@ namespace llaminar2
          * @brief Geometry-only upper bound of a model's terminal archive extension.
          * @return Serializer-owned bytes, zero when no model extension is emitted.
          * The bound uses immutable table geometry, never captured execution
-         * values. Early eviction may overlap inference; PMA still admits the
-         * actual serialized allocation at harvest.
+         * values. Early eviction may overlap inference; GPU harvest leases
+         * serialized bytes from its already admitted persistent RAM arena.
          */
         virtual size_t prefixCacheRuntimeStateCapacity() const { return 0u; }
 
@@ -1073,10 +1074,11 @@ namespace llaminar2
          * The typed result is the sole publication of restore validity,
          * placement effect, and pending device work. A successful import with
          * Unchanged placement must not invalidate graph identity or advance an
-         * MoE movement epoch.
+         * MoE movement epoch. The read-only span borrows its archive owner and
+         * accepts CPU vectors or persistent GPU-tier ranges without copying.
          */
         virtual PrefixCacheRuntimeRestoreResult restorePrefixCacheRuntimeState(
-            const std::vector<uint8_t> &state,
+            std::span<const uint8_t> state,
             void *stream)
         {
             (void)stream;

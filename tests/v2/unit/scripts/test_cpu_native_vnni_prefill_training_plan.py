@@ -668,11 +668,13 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
         )
         self.assertEqual(
             sorted(len(group) for group in groups),
-            [441, 1890, 2772],
+            [441, 1890, 3087],
         )
         self.assertEqual(
             sum((len(group) + 1) // 2 for group in groups),
-            (len(records) + 1) // 2,
+            # Each distinct M inventory owns its final unpaired process.
+            # Pairing across those boundaries would violate MPMD admission.
+            (len(records) + sum(len(group) % 2 for group in groups)) // 2,
         )
         self.assertEqual(
             estimated_group_work,

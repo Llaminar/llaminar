@@ -5,11 +5,14 @@
  * Implements IBackend for AMD GPUs and isolates HIP kernels from CUDA translation
  * units. Resource ownership, explicit streams and runtime generations are
  * checked here before entering the vendor API.
+ * Pinned materialization counters expose hot-path allocation without making
+ * backend observations a second physical-memory admission authority.
  *
  * @author David Sanftenberg
  */
 
 #include "ROCmBackend.h"
+#include "../DeviceId.h"
 #include "ROCmRuntimeStartup.h"
 #include "HipDeviceGuard.h"
 #include "HIPGraphTimelineKernels.h"
@@ -6128,6 +6131,10 @@ namespace llaminar2
             std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
             rocmPinnedAllocations()[ptr] = device_id;
         }
+        PerfStatsCollector::addCounter("device_memory", "pinned_host_allocations",
+            1.0, "allocate_pinned", DeviceId::rocm(device_id).toString());
+        PerfStatsCollector::addCounter("device_memory", "pinned_host_allocation_bytes",
+            static_cast<double>(bytes), "allocate_pinned", DeviceId::rocm(device_id).toString());
         return ptr;
     }
 

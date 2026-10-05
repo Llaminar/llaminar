@@ -56,69 +56,6 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Helper: populate allreduce precision with FA-layer awareness
-    // =========================================================================
-
-    static void populateHybridAllreducePrecision(GraphConfig &config)
-    {
-        if (!config.tp_allreduce_precision.empty() || config.n_layers <= 0)
-            return;
-
-        Qwen35SchemaFactory factory;
-        auto schema = factory.createSchema();
-
-        // Build the forced-FP32 set from FA layer indices.
-        // FA layers are more sensitive to allreduce precision drift because
-        // they carry the full sequence-length attention context, whereas
-        // GDN layers operate on compressed recurrent state.
-        std::set<int> fa_layers;
-        for (int i = 0; i < config.n_layers; ++i)
-        {
-            if (i < static_cast<int>(config.layer_types.size()) &&
-                config.layer_types[i] == "full_attention")
-            {
-                fa_layers.insert(i);
-            }
-        }
-
-        if (!fa_layers.empty())
-        {
-            // Use layer-type-aware overload: FA layers always FP32,
-            // first N GDN layers FP32, rest GDN layers use schema default
-            config.populateAllreducePrecision(
-                schema.tp_allreduce_default_precision,
-                schema.tp_allreduce_fp32_layer_count,
-                fa_layers);
-
-            int gdn_fp32 = 0, gdn_fp16 = 0;
-            for (int i = 0; i < config.n_layers; ++i)
-            {
-                if (!fa_layers.count(i))
-                {
-                    if (config.tp_allreduce_precision[i] == "fp32")
-                        ++gdn_fp32;
-                    else
-                        ++gdn_fp16;
-                }
-            }
-            LOG_DEBUG("[Qwen35Graph] Hybrid allreduce precision: "
-                      << fa_layers.size() << " FA layers=fp32, "
-                      << gdn_fp32 << " GDN layers=fp32, "
-                      << gdn_fp16 << " GDN layers=" << schema.tp_allreduce_default_precision);
-        }
-        else
-        {
-            // No layer types available — fall back to count-based policy
-            config.populateAllreducePrecision(
-                schema.tp_allreduce_default_precision,
-                schema.tp_allreduce_fp32_layer_count);
-            LOG_DEBUG("[Qwen35Graph] Allreduce precision (count-based): "
-                      << "fp32_layers=" << schema.tp_allreduce_fp32_layer_count
-                      << " default=" << schema.tp_allreduce_default_precision);
-        }
-    }
-
-    // =========================================================================
     // Constructors
     // =========================================================================
 
@@ -128,7 +65,6 @@ namespace llaminar2
         const GraphConfig &config)
         : QwenGraphBase(std::move(model_ctx), std::move(mpi_ctx), config)
     {
-        populateHybridAllreducePrecision(config_);
     }
 
     Qwen35Graph::ScopedMTPGraphContext::ScopedMTPGraphContext(
@@ -167,7 +103,6 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx)
         : QwenGraphBase(config, std::move(mpi_ctx))
     {
-        populateHybridAllreducePrecision(config_);
     }
 
     // =========================================================================
@@ -520,14 +455,14 @@ namespace llaminar2
             (config_.tp_ctx == nullptr &&
              mpi_ctx_ != nullptr &&
              mpi_ctx_->world_size() > 1);
-        const bool gather_global_tp_mtp_logits =
+        const auto mtp_logits_collective =
             resolveMTPTerminalLogitsCollective({
                 .layout = config_.mtpTerminalLogitsLayout(),
                 .sidecar_produces_logits = !kv_cache_only,
-                .spans_multiple_global_ranks =
-                    spans_multiple_global_ranks,
-            }) ==
-            MTPTerminalLogitsCollective::GlobalVocabularyAllGather;
+                .spans_multiple_global_ranks = spans_multiple_global_ranks,
+                .native_local_gpu_tp = config_.hasNativeLocalVocabularyGather(),
+            });
+        const bool gather_mtp_logits = mtp_logits_collective != MTPTerminalLogitsCollective::None;
 
         if (missing("embedding table", modelEmbeddingTable()) ||
             (!kv_cache_only &&
@@ -547,7 +482,7 @@ namespace llaminar2
             missing("output.projected", output.projected) ||
             (!kv_cache_only && missing("output.hidden", output.hidden)) ||
             (!kv_cache_only && missing("output.logits", output.logits)) ||
-            (gather_global_tp_mtp_logits &&
+            (gather_mtp_logits &&
              missing("output.gathered_logits", output.gathered_logits)) ||
             (!kv_cache_only && missing("output.q", output.q)) ||
             missing("output.k", output.k) ||
@@ -623,7 +558,13 @@ namespace llaminar2
                 -1,
                 /*is_attention=*/false,
                 prefix + "embedding_allreduce",
-                BufferId::MTP_EMBEDDING);
+                BufferId::MTP_EMBEDDING,
+                {},
+                std::nullopt,
+                input.kv_cache_only && input.sequence_lengths_device && device.is_gpu()
+                    ? std::make_optional<NativeAllreduceRequestRows>(input.batch_size,
+                        input.seq_len, static_cast<size_t>(config_.d_model), input.sequence_lengths_device)
+                    : std::nullopt);
             if (allreduce_stage)
             {
                 graph.addNode(prefix + "embedding_allreduce", std::move(allreduce_stage), device);
@@ -876,31 +817,16 @@ namespace llaminar2
                       device);
         graph.addDependency(prefix + "lm_head", prefix + "final_norm");
 
-        std::string terminal_node = prefix + "lm_head";
-        if (gather_global_tp_mtp_logits)
-        {
-            /*
-             * This branch is reachable only for the explicit
-             * vocabulary-sharded terminal-head policy. Mirrored ownership is
-             * scope-independent and writes a full distribution on every rank,
-             * so it must never pay this per-draft collective.
-             */
-            AllGatherStage::Params gather_params;
-            gather_params.local_input = output.logits;
-            gather_params.full_output = output.gathered_logits;
-            gather_params.mpi_ctx = mpi_ctx_.get();
-            gather_params.actual_seq_len = total_tokens;
-            gather_params.domain = nullptr;
-            gather_params.input_buffer_id = BufferId::MTP_LOGITS;
-            gather_params.output_buffer_id = BufferId::MTP_LOGITS_GATHERED;
-
-            terminal_node = prefix + "lm_head_allgather";
-            graph.addNode(
-                terminal_node,
-                ComputeStageFactory::createAllGather(gather_params),
-                device);
-            graph.addDependency(terminal_node, prefix + "lm_head");
-        }
+        const std::string terminal_node = addTerminalLogitsCollectiveToGraph(graph, prefix + "lm_head", {
+            .collective = mtp_logits_collective,
+            .local_logits = output.logits,
+            .full_logits = output.gathered_logits,
+            .rows = DeviceRowRange::fullyActive(total_tokens),
+            .input_id = BufferId::MTP_LOGITS,
+            .output_id = BufferId::MTP_LOGITS_GATHERED,
+            .device = device,
+            .stage_name = prefix + "lm_head_allgather",
+        });
         sealInferenceTransactionGraph(graph, terminal_node);
 
         return graph;
