@@ -80,6 +80,32 @@ namespace llaminar2
     }
 
     /**
+     * @brief Enumerate the complete admitted scalar verifier family largest first.
+     * @param mtp Immutable graph capacity and initial serving policy.
+     * @param maximum_verifier_rows Exact arena-owned per-request row capacity.
+     * @return Every bounded physical width; empty when execution is disabled.
+     * @throws std::invalid_argument when arena and retained capacity disagree.
+     *
+     * The first graph fixes shared snapshot addresses at their largest extent.
+     * Smaller fixed/observe requests then use already retained bucket identities;
+     * dynamic requests retain the widest device-controlled envelope. No live
+     * request grows storage or records an additional graph.
+     */
+    [[nodiscard]] inline std::vector<MTPServingForwardCaptureGeometry>
+    resolveMTPServingForwardCaptureFamily(const MTPRuntimeConfig &mtp, int maximum_verifier_rows)
+    {
+        const auto widest = resolveMTPServingForwardCaptureGeometry(mtp, maximum_verifier_rows);
+        if (!widest.enabled) return {};
+        if (!widest.valid() || widest.draft_depth != maximum_verifier_rows - 1 ||
+            widest.verifier_rows != maximum_verifier_rows)
+            throw std::invalid_argument("MTP serving verifier family differs from admitted arena capacity");
+        std::vector<MTPServingForwardCaptureGeometry> family{widest};
+        for (unsigned width = std::bit_floor(static_cast<unsigned>(widest.verifier_rows - 1)); width >= 2; width /= 2)
+            family.push_back({.enabled = true, .draft_depth = int(width) - 1, .verifier_rows = int(width)});
+        return family;
+    }
+
+    /**
      * @brief Select which wide checkpoint graph freezes the shared address.
      *
      * Snapshot storage for a fixed graph topology grows monotonically with

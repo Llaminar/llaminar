@@ -11,6 +11,11 @@
  * - Various matrix sizes (decode, prefill, large)
  * - Real tensor objects through KernelFactory dispatch
  *
+ * CPU references receive their exact consumer-declared invocation workspace
+ * from the shared PMA fixture. Prepared engines do not own implicit scratch;
+ * the native CUDA grouped path is additionally compared byte-for-byte with
+ * serial CUDA decode, independently of numerical CPU reference tolerances.
+ *
  * **Pass Criteria**:
  * - Cosine similarity >= 0.999 (very high correlation)
  * - No NaN/Inf in outputs
@@ -59,6 +64,7 @@
 // Now include test utils
 #include "../../../utils/CUDATestUtils.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/CPUProjectionTestWorkspace.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/NativeVNNIEquivalenceInventory.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -850,7 +856,17 @@ namespace
     };
 
     /**
-     * @brief CPU multiply via tensor interface — wraps raw float* in FP32Tensors.
+     * @brief Execute the CPU reference with its own admitted invocation arena.
+     * @param kernel Prepared CPU engine declaring the required scratch banks.
+     * @param A_data Input matrix bytes copied into the reference tensor.
+     * @param C_data Output matrix, also the initial value when beta is nonzero.
+     * @param M Live reference rows.
+     * @param N Output columns.
+     * @param K Input columns.
+     * @param transpose_B Weight-layout contract passed to the prepared engine.
+     * @param alpha Input product multiplier.
+     * @param beta Existing output multiplier.
+     * @return Whether the exact reference invocation completed successfully.
      */
     bool cpuMultiplyToVector(ITensorGemm *kernel, const float *A_data,
                              float *C_data, int M, int N, int K,
@@ -861,7 +877,9 @@ namespace
         auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
         if (beta != 0.0f)
             std::memcpy(C_tensor->mutable_data(), C_data, (size_t)M * N * sizeof(float));
-        bool ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K, transpose_B, alpha, beta);
+        CPUProjectionTestWorkspace workspace(cpuProjectionTestRequirements(M, {kernel}));
+        bool ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K,
+            transpose_B, alpha, beta, nullptr, nullptr, -1, workspace.get());
         if (ok)
             std::memcpy(C_data, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;

@@ -1,6 +1,6 @@
 name: Master release — promote PR-certified images
 
-# Master accepts only a develop PR whose published-image E2E and benchmark
+# Master accepts only a develop PR whose published-image E2E, benchmark and coding
 # checks passed. The merge is normally squashed, so the release validates the
 # resulting tree against the tested develop image rather than equating SHAs.
 on:

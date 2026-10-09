@@ -1605,7 +1605,8 @@ namespace llaminar2
         oss << "    moe_policy: " << prefixCacheMoEPolicyToString(prefix_cache.moe_policy) << "\n";
 
         oss << "  mtp:\n";
-        oss << "    enabled: " << (mtp.enabled ? "true" : "false") << "\n";
+        oss << "    enabled: " << (mtp_activation_policy == MTPActivationPolicy::Automatic && !mtp.enabled
+            ? "auto" : (mtp_activation_policy == MTPActivationPolicy::Disabled ? "false" : "true")) << "\n";
         oss << "    draft_tokens: " << mtp.draft_tokens << "\n";
         oss << "    graph_capacity_draft_tokens: "
             << mtp.graph_capacity_draft_tokens << "\n";

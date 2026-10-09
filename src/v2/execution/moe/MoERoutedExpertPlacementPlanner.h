@@ -7,6 +7,8 @@
  * never inspects tier labels or probes devices. Histogram-driven placement is
  * deterministic across ranks: exact integer phase costs are minimized first,
  * incumbent movement second, and expert identity last.
+ * Stage metadata names a compact retained interval while all externally visible
+ * placement and evidence coordinates preserve model-global layer identities.
  */
 
 #pragma once
@@ -49,6 +51,29 @@ namespace llaminar2
          * boundary selection.
          */
         int main_inference_layer_count = 0;
+
+        /** First model-global routed layer retained by this planning authority. */
+        int first_model_layer = 0;
+
+        /** @return Whether a model-global layer belongs to this stage. */
+        [[nodiscard]] bool containsModelLayer(int layer) const noexcept
+        {
+            return first_model_layer >= 0 && layer >= first_model_layer &&
+                   layer - first_model_layer < num_layers;
+        }
+
+        /**
+         * @brief Map a placement/evidence identity into compact planning arrays.
+         * @param layer Model-global layer identity.
+         * @return Owned zero-based row.
+         * @throws std::out_of_range for another stage's layer.
+         */
+        [[nodiscard]] std::size_t storageIndexForModelLayer(int layer) const
+        {
+            if (!containsModelLayer(layer))
+                throw std::out_of_range("MoE planner layer belongs outside its stage");
+            return static_cast<std::size_t>(layer - first_model_layer);
+        }
     };
 
     struct MoERoutedExpertLayerTierMask

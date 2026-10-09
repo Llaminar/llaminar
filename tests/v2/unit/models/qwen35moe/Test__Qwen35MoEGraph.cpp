@@ -48,7 +48,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -57,6 +59,62 @@
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+namespace llaminar2
+{
+    /** Device-free access to graph-owned runtime geometry and prefix inventory. */
+    struct Qwen35MoEPrefixRuntimeTestPeer
+    {
+        using Role = Qwen35MoEGraph::MoERuntimeTableRole;
+
+        /**
+         * @brief Resolve the production table recipe without materializing GPU owners.
+         * @param graph Graph whose authored stage and placement are authoritative.
+         * @param device Inert device identity carried into the eventual table.
+         * @param role Retained graph role under test.
+         * @param rows Compact requested rows, or -1 for the main stage.
+         * @param overlay Whether the placement manifest owns durable banks.
+         * @return Unmodified production configuration, including global layer origin.
+         */
+        static DeviceMoERuntimeTable::Config layout(const Qwen35MoEGraph &graph,
+            DeviceId device, Role role, int rows, bool overlay)
+        {
+            return graph.moeRuntimeTableConfig(device,
+                {.role = role, .mtp_depth = role == Role::MTPDepth ? 0 : -1}, rows, overlay);
+        }
+
+        /**
+         * @brief Resolve the exact identity used by runtime lookup and prefix archives.
+         * @param graph Immutable authored stage.
+         * @param device Inert device identity.
+         * @param role Captured runtime role.
+         * @param depth Sidecar depth, or -1 for a main/prefill role.
+         * @return Production cache identity; invalid role/depth pairs throw.
+         */
+        static std::string key(const Qwen35MoEGraph &graph, DeviceId device, Role role, int depth = -1)
+        {
+            return graph.moeRuntimeTableKey(device, {.role = role, .mtp_depth = depth});
+        }
+
+        /**
+         * @brief Install a real CPU table without creating GPU graph resources.
+         * @param graph Graph whose production prefix codec is under test.
+         * @param key Unique archive identity supplied by the fixture.
+         * @param first First global layer in the table's compact interval.
+         * @return Graph-owned table used to verify actual restore effects.
+         */
+        static MoERuntimeTable &install(Qwen35MoEGraph &graph, const std::string &key, int first)
+        {
+            auto table = std::make_unique<MoERuntimeTable>(MoERuntimeTable::Config{
+                .device_id = DeviceId::cpu(), .num_layers = 2, .num_experts = 2,
+                .top_k = 1, .first_model_layer = first});
+            auto *result = table.get();
+            if (!graph.moe_runtime_tables_.emplace(key, std::move(table)).second)
+                throw std::logic_error("Prefix fixture reused a table identity");
+            return *result;
+        }
+    };
+}
 
 namespace
 {
@@ -747,6 +805,8 @@ namespace
 
         DeviceMoELayerRuntime *deviceLayerState(int) override { return nullptr; }
         int layerCount() const override { return 1; }
+        /** @return The single global layer represented by this histogram fixture. */
+        int firstModelLayer() const noexcept override { return 0; }
         const DeviceMoELayerRuntime &hostLayerState(int) const override
         {
             static DeviceMoELayerRuntime state{};
@@ -834,9 +894,11 @@ namespace
             const uint64_t *,
             size_t layer_count,
             size_t expert_count,
+            int first_model_layer,
             void * = nullptr) override
         {
-            if (layer_count != 1 || expert_count != counts.size() || !selected_counts)
+            if (first_model_layer != 0 || layer_count != 1 ||
+                expert_count != counts.size() || !selected_counts)
                 return false;
             counts.assign(selected_counts, selected_counts + expert_count);
             return true;
@@ -4257,6 +4319,228 @@ TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedPos
         attention->getParams().execution_policy.key_cache.transformsOnRead());
 }
 
+/** Runtime construction retains only owned rows on either GPU backend. */
+TEST(Test__Qwen35MoEGraph, PipelineStageRuntimeLayoutUsesCompactGlobalRows)
+{
+    using Peer = Qwen35MoEPrefixRuntimeTestPeer;
+    for (const auto device : {DeviceId::cuda(1), DeviceId::rocm(1)})
+    for (const int first : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+    for (const auto role : {Peer::Role::MainDecodeDurablePlacement, Peer::Role::CurrentBatchLLEPPrefill, Peer::Role::MTPDepth})
+    {
+        auto config = makeMoEConfig();
+        config.pp_layer_offset = first;
+        Qwen35MoEGraph graph(config);
+        auto layout = Peer::layout(graph, device, role, -1, false);
+        EXPECT_EQ(layout.device_id, device);
+        EXPECT_EQ(layout.first_model_layer, first);
+        EXPECT_EQ(layout.num_layers, 2);
+        EXPECT_TRUE(layout.mirror_to_device);
+        // Exercise the exact recipe's geometry using real host storage. Unit
+        // tests never initialize the inert GPU identity or allocate on it.
+        layout.device_id = DeviceId::cpu();
+        layout.mirror_to_device = false;
+        MoERuntimeTable table(layout);
+        EXPECT_EQ(table.layerCount(), 2);
+        EXPECT_EQ(table.storageIndexForModelLayer(first + 1), 1u);
+        EXPECT_THROW(table.hostLayerState(first - 1), std::out_of_range);
+        EXPECT_THROW(table.hostLayerState(first + 2), std::out_of_range);
+    }
+}
+
+/** Parent and child graph recipes share a stage origin and bounded NextN inventory. */
+TEST(Test__Qwen35MoEGraph, PipelineStageRuntimeLayoutCoversTerminalManifest)
+{
+    using Peer = Qwen35MoEPrefixRuntimeTestPeer;
+    for (const int first : {0, 32, 40})
+    {
+        auto config = makeMoEConfig();
+        config.pp_layer_offset = first;
+        auto plan = makeOverlayPlan("stage_routed");
+        plan->first_model_layer = first;
+        plan->placements.clear();
+        for (int layer = first; layer < first + 3; ++layer)
+            plan->placements.push_back({.layer = layer, .routed_expert_tier = {0, 0}});
+        config.moe.routed_expert_plan = plan;
+        Qwen35MoEGraph graph(config);
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            const auto parent = Peer::layout(graph, device, Peer::Role::MainDecodeDurablePlacement, -1, true);
+            const auto prefill = Peer::layout(graph, device, Peer::Role::CurrentBatchLLEPPrefill, 2, true);
+            const auto sidecar = Peer::layout(graph, device, Peer::Role::MTPDepth, 3, true);
+            EXPECT_EQ(parent.first_model_layer, first);
+            EXPECT_EQ(prefill.first_model_layer, first);
+            EXPECT_EQ(sidecar.first_model_layer, first);
+            EXPECT_EQ(parent.num_layers, 3);
+            EXPECT_EQ(prefill.num_layers, 2);
+            EXPECT_EQ(sidecar.num_layers, 3);
+            EXPECT_THROW(Peer::layout(graph, device, Peer::Role::MTPDepth, 4, true), std::invalid_argument);
+        }
+    }
+}
+
+/** Same-size foreign manifests and invalid geometry fail before allocating scratch. */
+TEST(Test__Qwen35MoEGraph, PipelineStageRuntimeLayoutRejectsForeignOrInvalidScope)
+{
+    using Peer = Qwen35MoEPrefixRuntimeTestPeer;
+    const auto device = DeviceId::cuda(0);
+    auto config = makeMoEConfig();
+    config.pp_layer_offset = 32;
+    Qwen35MoEGraph unbound(config);
+    EXPECT_THROW(Peer::layout(unbound, device, Peer::Role::MainDecodeDurablePlacement, -1, true), std::logic_error);
+    auto plan = makeOverlayPlan("foreign_stage_routed");
+    plan->first_model_layer = 40;
+    plan->placements = {{.layer = 40, .routed_expert_tier = {0, 0}},
+        {.layer = 41, .routed_expert_tier = {0, 0}}};
+    config.moe.routed_expert_plan = plan;
+    Qwen35MoEGraph foreign(config);
+    EXPECT_THROW(Peer::layout(foreign, device, Peer::Role::MainDecodeDurablePlacement, 2, true), std::invalid_argument);
+    EXPECT_THROW(Peer::layout(foreign, device, Peer::Role::MTPDepth, 2, true), std::invalid_argument);
+    EXPECT_THROW(Peer::layout(unbound, device, Peer::Role::MainDecodeDurablePlacement, 1, false), std::invalid_argument);
+    for (const int first : {-1, std::numeric_limits<int>::max() - 1})
+    {
+        config = makeMoEConfig();
+        config.pp_layer_offset = first;
+        Qwen35MoEGraph invalid(config);
+        EXPECT_THROW(Peer::layout(invalid, device, Peer::Role::MainDecodeDurablePlacement, -1, false), std::invalid_argument);
+    }
+}
+
+/** Equal-cardinality stages, devices, roles and depths cannot alias retained metadata. */
+TEST(Test__Qwen35MoEGraph, PipelineStageRuntimeLayoutIdentityNamesCompleteStage)
+{
+    using Peer = Qwen35MoEPrefixRuntimeTestPeer;
+    std::unordered_set<std::string> identities;
+    for (const int first : {0, 32, 40})
+    for (const int count : {2, 3})
+    for (const auto device : {DeviceId::cuda(0), DeviceId::cuda(1), DeviceId::rocm(0), DeviceId::rocm(1)})
+    {
+        auto config = makeMoEConfig();
+        config.pp_layer_offset = first;
+        config.n_layers = count;
+        Qwen35MoEGraph graph(config);
+        for (const auto role : {Peer::Role::MainDecodeDurablePlacement, Peer::Role::CurrentBatchLLEPPrefill})
+        {
+            const auto key = Peer::key(graph, device, role);
+            EXPECT_TRUE(identities.insert(key).second);
+            EXPECT_EQ(Peer::key(graph, device, role), key);
+            EXPECT_THROW(Peer::key(graph, device, role, 0), std::invalid_argument);
+        }
+        for (int depth = 0; depth < 15; ++depth)
+            EXPECT_TRUE(identities.insert(Peer::key(graph, device, Peer::Role::MTPDepth, depth)).second);
+        EXPECT_THROW(Peer::key(graph, device, Peer::Role::MTPDepth), std::invalid_argument);
+    }
+    EXPECT_EQ(identities.size(), 3u * 2u * 4u * 17u);
+}
+
+/** The production serializer retains global identities within its exact byte budget. */
+TEST(Test__Qwen35MoEGraph, PipelineStagePrefixRoundTripUsesGlobalLayerIdentity)
+{
+    for (const int first : {0, 32, 40, 64})
+    {
+        SCOPED_TRACE(first);
+        Qwen35MoEGraph graph(makeMoEConfig(), nullptr);
+        auto &table = Qwen35MoEPrefixRuntimeTestPeer::install(graph, "stage", first);
+        table.hostLayerState(first).decode_histogram[0] = 11;
+        table.hostLayerState(first + 1).decode_histogram[1] = 17;
+        std::vector<uint8_t> archive;
+        ASSERT_TRUE(graph.capturePrefixCacheRuntimeState(archive, nullptr));
+        ASSERT_FALSE(archive.empty());
+        EXPECT_EQ(archive.size(), graph.prefixCacheRuntimeStateCapacity());
+        uint32_t wire_version = 0;
+        std::memcpy(&wire_version, archive.data() + 8, sizeof(wire_version));
+        PrefixFingerprintMaterial material;
+        graph.appendPrefixCacheFingerprintMaterial(material);
+        EXPECT_TRUE(hasFingerprintField(material, "graph.portable_runtime_version",
+                                        std::to_string(wire_version)));
+        table.hostLayerState(first).decode_histogram[0] = 101;
+        table.hostLayerState(first + 1).decode_histogram[1] = 107;
+        ASSERT_TRUE(graph.restorePrefixCacheRuntimeState(archive, nullptr));
+        EXPECT_EQ(table.hostLayerState(first).decode_histogram[0], 11u);
+        EXPECT_EQ(table.hostLayerState(first + 1).decode_histogram[1], 17u);
+        EXPECT_EQ(table.firstModelLayer(), first);
+    }
+}
+
+/** Equal row counts and expert counts cannot substitute for model-stage identity. */
+TEST(Test__Qwen35MoEGraph, PipelineStagePrefixRejectsSameSizedForeignStage)
+{
+    Qwen35MoEGraph source(makeMoEConfig(), nullptr);
+    auto &source_table = Qwen35MoEPrefixRuntimeTestPeer::install(source, "stage", 32);
+    source_table.hostLayerState(32).decode_histogram[0] = 11;
+    std::vector<uint8_t> archive;
+    ASSERT_TRUE(source.capturePrefixCacheRuntimeState(archive, nullptr));
+    for (const int first : {0, 31, 33, 40})
+    {
+        Qwen35MoEGraph destination(makeMoEConfig(), nullptr);
+        auto &table = Qwen35MoEPrefixRuntimeTestPeer::install(destination, "stage", first);
+        table.hostLayerState(first).decode_histogram[0] = 101;
+        EXPECT_FALSE(destination.restorePrefixCacheRuntimeState(archive, nullptr));
+        EXPECT_EQ(table.hostLayerState(first).decode_histogram[0], 101u);
+        EXPECT_EQ(table.hostLayerState(first).active_epoch, 0u);
+    }
+}
+
+/** Malformed suffixes are rejected before any earlier valid table is applied. */
+TEST(Test__Qwen35MoEGraph, PipelineStagePrefixAuthenticatesWholeArchiveBeforeRestore)
+{
+    Qwen35MoEGraph graph(makeMoEConfig(), nullptr);
+    auto &first = Qwen35MoEPrefixRuntimeTestPeer::install(graph, "a", 32);
+    auto &second = Qwen35MoEPrefixRuntimeTestPeer::install(graph, "b", 32);
+    first.hostLayerState(32).decode_histogram[0] = 11;
+    second.hostLayerState(32).decode_histogram[0] = 17;
+    std::vector<uint8_t> archive;
+    ASSERT_TRUE(graph.capturePrefixCacheRuntimeState(archive, nullptr));
+    ASSERT_EQ(archive.size(), graph.prefixCacheRuntimeStateCapacity());
+    first.hostLayerState(32).decode_histogram[0] = 101;
+    second.hostLayerState(32).decode_histogram[0] = 107;
+    // Two equal-sized table records follow the fixed magic/version/top-k/count
+    // header. Locating the second record by the first captured key length keeps
+    // the negative controls independent of unordered-map iteration order.
+    constexpr size_t archive_header = 8 + 3 * sizeof(uint32_t);
+    uint32_t key_bytes = 0;
+    std::memcpy(&key_bytes, archive.data() + archive_header, sizeof(key_bytes));
+    ASSERT_EQ(key_bytes, 1u);
+    const size_t table_bytes = (archive.size() - archive_header) / 2;
+    const size_t second_record = archive_header + table_bytes;
+    const size_t second_layer = second_record + 3 * sizeof(uint32_t) + key_bytes;
+    const auto unchanged = [&] {
+        EXPECT_EQ(first.hostLayerState(32).decode_histogram[0], 101u);
+        EXPECT_EQ(second.hostLayerState(32).decode_histogram[0], 107u);
+        EXPECT_EQ(first.hostLayerState(32).active_epoch, 0u);
+        EXPECT_EQ(second.hostLayerState(32).active_epoch, 0u);
+    };
+    for (const size_t bytes : {size_t{1}, size_t{8}, archive_header - 1,
+                              second_record, second_record + 1, second_layer,
+                              second_layer + 1, archive.size() - 1})
+    {
+        SCOPED_TRACE(bytes);
+        EXPECT_FALSE(graph.restorePrefixCacheRuntimeState(
+            std::span<const uint8_t>(archive.data(), bytes), nullptr));
+        unchanged();
+    }
+    auto trailing = archive;
+    trailing.push_back(0);
+    EXPECT_FALSE(graph.restorePrefixCacheRuntimeState(trailing, nullptr));
+    unchanged();
+    auto foreign = archive;
+    const int32_t foreign_layer = 40;
+    std::memcpy(foreign.data() + second_layer, &foreign_layer, sizeof(foreign_layer));
+    EXPECT_FALSE(graph.restorePrefixCacheRuntimeState(foreign, nullptr));
+    unchanged();
+    auto duplicate = archive;
+    duplicate[second_record + sizeof(uint32_t)] = archive[archive_header + sizeof(uint32_t)];
+    EXPECT_FALSE(graph.restorePrefixCacheRuntimeState(duplicate, nullptr));
+    unchanged();
+    auto obsolete = archive;
+    const uint32_t old_version = 5;
+    std::memcpy(obsolete.data() + 8, &old_version, sizeof(old_version));
+    EXPECT_FALSE(graph.restorePrefixCacheRuntimeState(obsolete, nullptr));
+    unchanged();
+    ASSERT_TRUE(graph.restorePrefixCacheRuntimeState(archive, nullptr));
+    EXPECT_EQ(first.hostLayerState(32).decode_histogram[0], 11u);
+    EXPECT_EQ(second.hostLayerState(32).decode_histogram[0], 17u);
+}
+
 TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopology)
 {
     GraphConfig config = makeMoEConfig();
@@ -4640,10 +4924,7 @@ TEST(Test__Qwen35MoEGraph,
         prefix_capture.find("if (table->usesOverlayEpochTicket())"),
         std::string::npos)
         << "Main and MTP placement share one live RCU authority, not prefix payloads";
-    EXPECT_NE(
-        source.find("constexpr uint32_t kMoEPrefixRuntimeVersion = 5"),
-        std::string::npos)
-        << "The incompatible ticketed-placement payload schema must be rejected";
+
 }
 
 TEST(Test__Qwen35MoEGraph, PhaseSplitMTPSidecarDisablesGroupedSharedExpertDecodeShortcut)

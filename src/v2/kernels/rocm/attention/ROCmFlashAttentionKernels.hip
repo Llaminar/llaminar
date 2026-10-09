@@ -14,6 +14,9 @@
  *   - Explicit wavefront reductions via DPP
  *   - NO WMMA/Matrix Cores - pure VALU implementation
  * - Flash Decoding: Split-K parallelism for single-token decode
+ *   - Compile immutable 256-dimension geometry into the decode body.
+ *   - Retain FP16 query operands in registers and advance native ring rows
+ *     without repeating integer division for every historical token.
  *   - Ordinary and grouped rows share the same ordered parallel reduction,
  *     including deterministic mode; there is no serial-only policy branch.
  *
@@ -1867,10 +1870,15 @@ namespace
     }
 
     /**
-     * @brief Flash Decoding kernel for single-query decode on MI50
-     *        v3: wavefront-cooperative KV processing + exp2f intrinsic
+     * @brief Scalar-equivalent, wavefront-cooperative decode over native K/V.
+     * @tparam KV_TYPE Physical K/V storage format, shared by scalar and grouped rows.
+     * @tparam HEAD_DIM Immutable head width, or zero for the runtime-width body.
+     *
+     * A static width removes inner-loop bounds and variable register indexing;
+     * it does not change KV partitions, dot-product order, or softmax merges.
+     * Both row modes select the same compiled specialization for a given width.
      */
-    template <KVTypeTag KV_TYPE = KVTypeTag::FP32>
+    template <KVTypeTag KV_TYPE = KVTypeTag::FP32, int HEAD_DIM = 0>
     __global__ __launch_bounds__(256, 4)
     void flash_decoding_mi50_kernel(
         const float *__restrict__ Q,
@@ -1882,7 +1890,7 @@ namespace
         int kv_len,
         int n_heads,
         int n_kv_heads,
-        int head_dim,
+        int runtime_head_dim,
         int num_splits,
         float softmax_scale,
         const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
@@ -1896,11 +1904,12 @@ namespace
         int head_start = 0,
         int gqa_n_rep = 0)
     {
+        const int head_dim = HEAD_DIM > 0 ? HEAD_DIM : runtime_head_dim;
         /*
-         * Ownership is runtime metadata, not a template axis. Keeping one
-         * compiled kernel per physical KV format guarantees that ordinary M=1
-         * and grouped verifier rows execute the same arithmetic instruction
-         * stream. The mode affects addresses only.
+         * Ownership is runtime metadata, not a template axis. Ordinary M=1
+         * and grouped verifier rows select the same format/width specialization
+         * and therefore the same arithmetic instruction stream. Row mode
+         * affects addresses only; live lengths remain device-owned.
          */
         const bool row_local_params =
             row_mode != FlashDecodeRowMode::OrdinaryBatch;
@@ -2101,6 +2110,35 @@ namespace
         const char *K_base = reinterpret_cast<const char*>(K_cache) + base_byte_off;
         const char *V_base = reinterpret_cast<const char*>(V_cache) + base_byte_off;
 
+        // LDS publication is complete. Hoist each lane's immutable FP16 query
+        // operands into registers so historical tokens incur no query LDS reads.
+        // The odd-width body retains its original ordered scalar arithmetic.
+        __half2 query_pair[2]{};
+        float query_odd[4]{};
+        if constexpr (KV_TYPE == KVTypeTag::FP16)
+        {
+            if ((head_dim & 1) == 0)
+            {
+                #pragma unroll
+                for (int i = 0; i < 2; ++i)
+                {
+                    const int d2 = lane_id + i * WAVEFRONT_SIZE;
+                    if (d2 < head_dim / 2)
+                        query_pair[i] = reinterpret_cast<const __half2 *>(Q_shared_h)[d2];
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                {
+                    const int d = lane_id + i * WAVEFRONT_SIZE;
+                    if (d < head_dim)
+                        query_odd[i] = __half2float(Q_shared_h[d]);
+                }
+            }
+        }
+
         // =====================================================================
         // Main loop: wavefront-cooperative KV processing
         //
@@ -2108,14 +2146,23 @@ namespace
         // Within each position, all 64 lanes cooperate on loads and dot product.
         // K/V loads are fully coalesced (adjacent lanes → adjacent addresses).
         // =====================================================================
+        // Normalize once, then advance by a residue strictly below capacity.
+        // One subtraction therefore restores the ring range after each step,
+        // even when a tiny ring is narrower than the logical wavefront count.
+        // Unsigned addition admits the complete positive int-capacity range.
+        const unsigned ring_capacity = static_cast<unsigned>(ring_row_capacity);
+        const unsigned physical_stride = ring_row_capacity > 0
+            ? static_cast<unsigned>(num_wavefronts) % ring_capacity
+            : static_cast<unsigned>(num_wavefronts);
+        unsigned physical_kv_pos = ring_row_capacity > 0
+            ? (static_cast<unsigned>(ring_row_origin) + kv_start + wavefront_id) % ring_capacity
+            : static_cast<unsigned>(kv_start + wavefront_id);
         for (int kv_pos = kv_start + wavefront_id;
              active_thread && kv_pos < kv_end;
-             kv_pos += num_wavefronts)
+             kv_pos += num_wavefronts, physical_kv_pos += physical_stride)
         {
-            const int physical_kv_pos = ring_row_capacity > 0
-                                            ? (ring_row_origin + kv_pos) %
-                                                  ring_row_capacity
-                                            : kv_pos;
+            if (ring_row_capacity > 0 && physical_kv_pos >= ring_capacity)
+                physical_kv_pos -= ring_capacity;
             const char *K_pos =
                 K_base + physical_kv_pos * row_byte_stride;
 
@@ -2130,20 +2177,23 @@ namespace
                 if ((head_dim & 1) == 0)
                 {
                     const int head_dim_vec2 = head_dim / 2;
-                    const __half2 *Q_ptr2_h = reinterpret_cast<const __half2 *>(Q_shared_h);
                     const __half2 *K_ptr2 = reinterpret_cast<const __half2 *>(Kh);
-                    for (int d2 = lane_id; d2 < head_dim_vec2; d2 += WAVEFRONT_SIZE)
+                    #pragma unroll
+                    for (int i = 0; i < 2; ++i)
                     {
-                        const __half2 qh2 = Q_ptr2_h[d2]; // Pre-converted FP16 from LDS
-                        const __half2 kh2 = K_ptr2[d2];
-                        partial_dot = __builtin_amdgcn_fdot2(qh2, kh2, partial_dot, false);
+                        const int d2 = lane_id + i * WAVEFRONT_SIZE;
+                        if (d2 < head_dim_vec2)
+                            partial_dot = __builtin_amdgcn_fdot2(query_pair[i], K_ptr2[d2], partial_dot, false);
                     }
                 }
                 else
                 {
-                    for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i)
                     {
-                        partial_dot += __half2float(Q_shared_h[d]) * __half2float(Kh[d]);
+                        const int d = lane_id + i * WAVEFRONT_SIZE;
+                        if (d < head_dim)
+                            partial_dot += query_odd[i] * __half2float(Kh[d]);
                     }
                 }
             }
@@ -2206,23 +2256,32 @@ namespace
             l_local = l_local * scale_old + p;
 
             // Type-dispatched V load + O accumulation
-            // Each lane updates only its own output dims (head_dim/64 per lane)
+            // Each lane owns at most four dimensions. Constant accumulator
+            // indices avoid runtime register selection for every cached token;
+            // all formats retain their original ordered arithmetic.
             const char *V_pos =
                 V_base + physical_kv_pos * row_byte_stride;
-            int o_idx = 0;
             if constexpr (KV_TYPE == KVTypeTag::FP16)
             {
                 const __half *Vh = reinterpret_cast<const __half*>(V_pos);
-                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
+                #pragma unroll
+                for (int o_idx = 0; o_idx < 4; ++o_idx)
                 {
+                    const int d = lane_id + o_idx * WAVEFRONT_SIZE;
+                    if (d >= head_dim)
+                        continue;
                     O_lane[o_idx] = O_lane[o_idx] * scale_old + p * __half2float(Vh[d]);
                 }
             }
             else if constexpr (KV_TYPE == KVTypeTag::Q8_1)
             {
                 const llaminar2::Q8_1Block *Vq = reinterpret_cast<const llaminar2::Q8_1Block*>(V_pos);
-                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
+                #pragma unroll
+                for (int o_idx = 0; o_idx < 4; ++o_idx)
                 {
+                    const int d = lane_id + o_idx * WAVEFRONT_SIZE;
+                    if (d >= head_dim)
+                        continue;
                     const int bi = d / Q8_BS;
                     const int bo = d % Q8_BS;
                     const float vs = __half2float(*reinterpret_cast<const __half*>(&Vq[bi].d));
@@ -2233,10 +2292,12 @@ namespace
             {
                 const auto *V_bf16 =
                     reinterpret_cast<const hip_bfloat16 *>(V_pos);
-                for (int d = lane_id;
-                     d < head_dim;
-                     d += WAVEFRONT_SIZE, ++o_idx)
+                #pragma unroll
+                for (int o_idx = 0; o_idx < 4; ++o_idx)
                 {
+                    const int d = lane_id + o_idx * WAVEFRONT_SIZE;
+                    if (d >= head_dim)
+                        continue;
                     O_lane[o_idx] =
                         O_lane[o_idx] * scale_old +
                         p * static_cast<float>(V_bf16[d]);
@@ -2245,8 +2306,12 @@ namespace
             else
             {
                 const float *V_ptr = reinterpret_cast<const float*>(V_pos);
-                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
+                #pragma unroll
+                for (int o_idx = 0; o_idx < 4; ++o_idx)
                 {
+                    const int d = lane_id + o_idx * WAVEFRONT_SIZE;
+                    if (d >= head_dim)
+                        continue;
                     O_lane[o_idx] = O_lane[o_idx] * scale_old + p * V_ptr[d];
                 }
             }
@@ -2908,7 +2973,9 @@ static int launch_decode(
     constexpr int physical_threads = 256;
 
     hipLaunchKernelGGL(
-        (flash_decoding_mi50_kernel<KV_TYPE>),
+        (head_dim == 256
+             ? flash_decoding_mi50_kernel<KV_TYPE, 256>
+             : flash_decoding_mi50_kernel<KV_TYPE, 0>),
         grid_split, dim3(physical_threads), smem_size, hip_stream,
         Q, K_cache, V_cache,
         O_partial, m_partial, l_partial,
@@ -3043,7 +3110,9 @@ static int launch_grouped_decode(
     const dim3 split_grid(n_heads, max_num_splits, row_count);
     constexpr int physical_threads = 256;
     hipLaunchKernelGGL(
-        (flash_decoding_mi50_kernel<KV_TYPE>),
+        (head_dim == 256
+             ? flash_decoding_mi50_kernel<KV_TYPE, 256>
+             : flash_decoding_mi50_kernel<KV_TYPE, 0>),
         split_grid,
         dim3(physical_threads),
         smem_size,

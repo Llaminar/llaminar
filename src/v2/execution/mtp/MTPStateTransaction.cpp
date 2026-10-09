@@ -501,6 +501,10 @@ namespace llaminar2
             return mismatch("initialized flag mismatch");
         if (!oracle.initialized)
             return MTPStateValidationResult::success();
+        if (!oracle.moe_runtime_movement_epoch.sameScope(candidate.moe_runtime_movement_epoch) ||
+            (cached_prefix && !oracle.moe_runtime_movement_epoch.sameScope(
+                cached_prefix->get().moe_runtime_movement_epoch)))
+            return mismatch("MoE movement diagnostic stage scope mismatch");
         auto format_values = [](const std::vector<int> &values)
         {
             std::ostringstream message;

@@ -155,7 +155,13 @@ def public_release_bundle(root, tag="2026-09-24.1"):
             "workload": {"decode_tokens": 256}}
     write_json(benchmark_root / "results.json", result)
     (benchmark_root / "benchmarks.svg").write_text(chart.render_chart(result))
-    paths = master_release.release_assets(e2e_root, benchmark_root, root)
+    # Historical releases predate coding certification. Their display fixture
+    # uses the publisher's common asset inventory without minting new proof.
+    assets = root / 'assets'
+    assets.mkdir()
+    for name, source in master_release.release_asset_sources(e2e_root, benchmark_root).items():
+        (assets / name).write_bytes(source.read_bytes())
+    paths = list(assets.iterdir())
     metadata = {"id": int(tag.split(".")[1]), "tag_name": tag,
                 "draft": False, "prerelease": False,
                 "published_at": "2026-09-24T00:00:00Z",
@@ -315,7 +321,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
                 code = next(outcomes)
                 if code == 0:
                     write_json(Path(environment["LLAMINAR_E2E_LOG_DIR"]) / "cell.driver-diagnostics.json",
-                               clean_driver_evidence())
+                               clean_driver_evidence(Path(environment["LLAMINAR_E2E_LOG_DIR"])))
                     write_json(Path(environment["LLAMINAR_E2E_LOG_DIR"]) / "tool_calling_results.json",
                                {"schema": 1, "complete": True,
                                 "results": [row_for(probe) for probe in tools.PROBES]})
@@ -1112,12 +1118,15 @@ class PublishedImageSuiteTests(unittest.TestCase):
         self.assertTrue(all(not event[1] for event in events[upload + 1:] if event[0] == "tag"))
         self.assertEqual(events[-1], ("gh", ["gh", "release", "edit"]))
 
-    def test_release_revalidates_every_attached_e2e_and_benchmark_report(self):
+    @patch.object(master_release, 'validate_coding_matrix', return_value={'expected_jobs': 2})
+    def test_release_revalidates_every_attached_e2e_and_benchmark_report(self, coding_validator):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             e2e_root, benchmark_root = root / "e2e", root / "benchmarks"
             e2e_root.mkdir()
             benchmark_root.mkdir()
+            coding_root = root / 'opencode'
+            write_json(coding_root / 'opencode.json', {'scope': 'coding-boundary-fixture'})
             pair = image_pair()
             pair["workflow_revision"] = pair["source"]["revision"]
             manifest = write_e2e_bundle(e2e_root, pair)
@@ -1139,13 +1148,17 @@ class PublishedImageSuiteTests(unittest.TestCase):
             write_json(benchmark_root / "results.json", result)
             admitted = master_release.validate_proof(
                 e2e_root, benchmark_root, pair["repository"],
-                pair["source"]["revision"], pair["source"]["tree"])
+                pair["source"]["revision"], pair["source"]["tree"], coding_directory=coding_root)
             self.assertEqual(admitted["pair"], pair)
+            coding_validator.assert_called_once_with({'scope': 'coding-boundary-fixture'},
+                pair, manifest, admitted['e2e'], admitted['benchmarks'])
+            self.assertEqual(admitted['coding'], {'expected_jobs': 2})
             initial = master_release.release_notes("2026-09-23.1", None, [], admitted,
                 pair["repository"], "https://github.com/example/actions/runs/1", "d" * 40)
             self.assertIn("Initial dated release", initial)
             self.assertIn("e2e-avx512.json", initial)
             self.assertIn("benchmark-results.json", initial)
+            self.assertIn('opencode.json', initial)
             self.assertNotIn("- 123abc", initial)
             later = master_release.release_notes("2026-09-23.2", "2026-09-23.1",
                 ["123abc fix: restore prefix"], admitted, pair["repository"],
@@ -1153,12 +1166,18 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertIn("123abc fix: restore prefix", later)
             with self.assertRaisesRegex(ValueError, "master tree"):
                 master_release.validate_proof(e2e_root, benchmark_root, pair["repository"],
-                                              pair["source"]["revision"], "f" * 40)
+                                              pair["source"]["revision"], "f" * 40, coding_directory=coding_root)
+            coding_validator.side_effect = ValueError('coding audit failed')
+            with self.assertRaisesRegex(ValueError, 'coding audit failed'):
+                master_release.validate_proof(e2e_root, benchmark_root, pair['repository'],
+                    pair['source']['revision'], pair['source']['tree'], coding_directory=coding_root)
+            coding_validator.side_effect = None
             result["variants"]["AVX2"]["report_digest"] = "wrong"
             write_json(benchmark_root / "results.json", result)
             with self.assertRaisesRegex(ValueError, "compact benchmark numbers"):
                 master_release.validate_proof(e2e_root, benchmark_root, pair["repository"],
-                                              pair["source"]["revision"], pair["source"]["tree"])
+                                              pair["source"]["revision"], pair["source"]["tree"],
+                                              coding_directory=coding_root)
 
     def test_master_ruleset_requires_source_and_both_phase_checks(self):
         current = {"name": "master", "target": "branch", "enforcement": "disabled",
@@ -1362,7 +1381,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
                               return_value={"head": {"sha": source}, "number": 7}), \
                  patch.object(master_release, "certified_pr_run", return_value={"id": 99}), \
                  patch.object(master_release, "download_proof",
-                              return_value=(root / "e2e", benchmark_directory)), \
+                              return_value=(root / "e2e", benchmark_directory, root / 'opencode')), \
                  patch.object(master_release, "validate_proof", return_value=evidence):
                 first = high_water.publish("Llaminar/llaminar", master, root / "proof",
                                            str(remote))
@@ -1394,7 +1413,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
                                 text.index("actions/checkout@v6"))
                 self.assertIn("exec python3 scripts/ci/run_published_image_suite.py", text)
         pr = (ROOT / ".github/workflows/master-pr-certification.yml").read_text()
-        self.assertEqual(pr.count("exec python3 scripts/ci/run_published_image_suite.py"), 2)
+        self.assertEqual(pr.count("exec python3 scripts/ci/run_published_image_suite.py"), 3)
 
     def test_metadata_companion_does_not_build_a_replacement_runtime(self):
         from types import SimpleNamespace

@@ -11,6 +11,7 @@
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "planning/ResolvedRankOrchestration.h"
+#include "config/OrchestrationStartupPolicy.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "planning/MoEOverlayPlanningInputs.h"
@@ -38,17 +39,40 @@ namespace llaminar2
         AutomaticOrchestrationCandidate candidate, std::vector<RankExecutionPlan> ranks,
         std::vector<DevicePlanConfig> devices,
         std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> admission,
-        std::shared_ptr<const MoEOverlayResolvedCapacityPlan> overlay)
+        std::shared_ptr<const MoEOverlayResolvedCapacityPlan> overlay,
+        std::shared_ptr<const AdmittedMoEPipelineMemory> pipeline)
         : candidate_(std::move(candidate)), ranks_(std::move(ranks)), devices_(std::move(devices)),
-          admission_(std::move(admission)), overlay_(std::move(overlay))
+          admission_(std::move(admission)), overlay_(std::move(overlay)), pipeline_(std::move(pipeline))
     {
         if (!admission_ || ranks_.size() != candidate_.membership.discoveryRanks().size())
             throw std::logic_error("Candidate admission did not seal its complete rank/physical plan");
+        if (pipeline_ && (overlay_ || pipeline_->physicalAdmission() != admission_))
+            throw std::logic_error("Candidate pipeline admission has conflicting expert or physical authorities");
         // All rank references in the compiled configuration are already in
         // this compact namespace. Saving only that configuration would lose
         // which discovery processes must actually construct its runners.
         candidate_.config.execution_rank_selection = candidate_.membership.selection();
         candidate_.config.mpi_procs = candidate_.membership.discoverySize();
+    }
+
+    std::optional<AdmittedMoELayerView> AdmittedOrchestrationCandidate::expertLayer(int layer) const
+    {
+        const auto owns = [layer](const auto &capacity) {
+            return std::any_of(capacity.layer_footprints.begin(), capacity.layer_footprints.end(),
+                [layer](const auto &entry) { return entry.layer_idx == layer; });
+        };
+        if (pipeline_)
+        {
+            for (const auto &stage : pipeline_->stages())
+                if (owns(*stage.capacity()))
+                    return AdmittedMoELayerView{*stage.topology().config().moe_routed_expert_plan, *stage.capacity()};
+        }
+        else if (overlay_)
+        {
+            if (owns(*overlay_)) return AdmittedMoELayerView{*candidate_.config.moe_routed_expert_plan, *overlay_};
+        }
+        else return std::nullopt;
+        throw std::invalid_argument("Candidate has no admitted expert authority for global layer " + std::to_string(layer));
     }
 
     AdmittedOrchestrationCandidate AdmittedOrchestrationCandidate::admit(
@@ -65,6 +89,7 @@ namespace llaminar2
         const auto &model = source.metadata();
         const auto &profile = model.memoryProfile();
         const auto &loader = source.loader();
+        resolveMTPStartupPolicy(candidate.config, profile);
         // Direct callers of candidate admission must obey the same learned-
         // predictor contract as automatic startup, before publishing a BOM.
         if (retainsMTPGraphCapacity(candidate.config.mtp))
@@ -89,6 +114,30 @@ namespace llaminar2
         // frontend reconstruction of continuation and expert-only roles.
         candidate.config = compiled.front().config();
         const auto &config = candidate.config;
+        if (!compiled.front().pipelineStages().empty())
+        {
+            if (compiled.size() != 1)
+                throw std::logic_error("MoE local pipeline admission requires its exact process-local rank namespace");
+            if (std::any_of(compiled.front().pipelineStages().begin(), compiled.front().pipelineStages().end(),
+                    [](const auto &stage) {
+                        const auto &devices = stage.overlayExecution().currentRankPlan().local_devices;
+                        return std::any_of(devices.begin(), devices.end(), [](DeviceId device) { return device.is_gpu(); });
+                    }) && (!debugEnv().execution.gpu_graphs || !debugEnv().execution.prefill_graph_buckets))
+                throw std::logic_error("Automatic GPU pipeline admission requires production captured generation");
+            auto pipeline = std::make_shared<const AdmittedMoEPipelineMemory>(AdmittedMoEPipelineMemory::admit(
+                compiled.front(), model, loader, inventory, {
+                    .prefill = {.bucket_rows = policy.prefill_bucket_rows,
+                        .minimum_sequence_rows = policy.minimum_prefill_sequence_rows,
+                        .maximum_cached_buckets = policy.maximum_cached_prefill_buckets},
+                    .gpu_weight_load = {.policy = policy.weight_load, .maximum_source_bytes = weight_load.maximum_source_bytes}}));
+            std::vector<DevicePlanConfig> devices;
+            for (const auto &stage : pipeline->stages())
+                devices.insert(devices.end(), stage.devicePlans().begin(), stage.devicePlans().end());
+            ranks.front() = pipeline->rankPlan();
+            auto certificate = pipeline->physicalAdmission();
+            return {std::move(candidate), std::move(ranks), std::move(devices),
+                std::move(certificate), nullptr, std::move(pipeline)};
+        }
         const bool overlay = compiled.front().overlayExecution().has_value();
         if (std::any_of(compiled.begin(), compiled.end(), [&](const auto &rank) {
                 return rank.overlayExecution().has_value() != overlay;

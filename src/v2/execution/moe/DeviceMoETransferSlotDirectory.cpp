@@ -395,6 +395,12 @@ namespace llaminar2
             throw std::invalid_argument(
                 "DeviceMoETransferSlotDirectory requires a non-empty model manifest");
         }
+        const int first_model_layer = layer_weight_manifest.front().layer_idx;
+        if (first_model_layer < 0 ||
+            layer_weight_manifest.size() > static_cast<std::size_t>(
+                std::numeric_limits<int>::max() - first_model_layer))
+            throw std::invalid_argument(
+                "DeviceMoETransferSlotDirectory manifest has an invalid owned layer interval");
 
         std::vector<std::vector<ProjectionSpec>> layer_formats;
         layer_formats.reserve(layer_weight_manifest.size());
@@ -404,10 +410,10 @@ namespace llaminar2
         {
             const auto &layer = layer_weight_manifest[layer_offset];
             if (!layer.valid() ||
-                layer.layer_idx != static_cast<int>(layer_offset))
+                layer.layer_idx != first_model_layer + static_cast<int>(layer_offset))
             {
                 throw std::invalid_argument(
-                    "DeviceMoETransferSlotDirectory manifest must be valid and contiguous from layer zero");
+                    "DeviceMoETransferSlotDirectory manifest must be valid and contiguous within its owned interval");
             }
 
             std::vector<ProjectionSpec> specs;

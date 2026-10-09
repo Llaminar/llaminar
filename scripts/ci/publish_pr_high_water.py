@@ -100,9 +100,10 @@ def publish(repository: str, master_sha: str, output: Path,
     head = pr["head"]["sha"]
     number = int(pr["number"])
     run = release.certified_pr_run(repository, number, head)
-    e2e, benchmarks = release.download_proof(repository, int(run["id"]), number,
+    e2e, benchmarks, coding = release.download_proof(repository, int(run["id"]), number,
                                              head, output)
-    evidence = release.validate_proof(e2e, benchmarks, repository, head, master_tree)
+    evidence = release.validate_proof(e2e, benchmarks, repository, head, master_tree,
+                                     coding_directory=coding)
     evidence["benchmark_directory"] = benchmarks
     git("fetch", "origin", "refs/heads/develop")
     current = git("rev-parse", "FETCH_HEAD")

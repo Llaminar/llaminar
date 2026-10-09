@@ -1,0 +1,8 @@
+{
+  "url": "https://huggingface.co/Qwen/Qwen3.8-27B/raw/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/chat_template.jinja",
+  "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+  "bytes": 8952,
+  "license": "Apache-2.0",
+  "license_file": "LICENSE.qwen38.txt",
+  "purpose": "Device-free exact upstream template fixture; production uses the loaded GGUF template for Qwen3.8."
+}

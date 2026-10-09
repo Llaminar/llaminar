@@ -7,12 +7,16 @@
  * 2. Outputs float-cast expert indices and normalized weights
  * 3. Reports correct metadata (type, name, flops)
  * 4. Handles edge cases (null inputs, single token)
+ * 5. Translates global pipeline layer selectors into compact command rows,
+ *    rejecting foreign geometry before the kernel boundary using CPU storage.
  */
 
 #include <gtest/gtest.h>
+#include "backends/BackendManager.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "kernels/cpu/moe/CPUMoEKernel.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
@@ -22,6 +26,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <algorithm>
 #include <vector>
@@ -36,6 +41,39 @@ using namespace llaminar2::testing;
 
 namespace
 {
+    /**
+     * @brief Observe the real route stage's launch arguments without a GPU.
+     *
+     * CPU-owned tensors, runtime rows and scratch back the inert launch. The
+     * override records pointers and scalar geometry only; native suites own
+     * kernel arithmetic and captured execution coverage.
+     */
+    class RecordingStageRouteKernel final : public CPUMoEKernel
+    {
+    public:
+        int calls = 0;
+        int apply_row = -9;
+        DeviceMoELayerRuntime *rows = nullptr;
+        DeviceMoELayerRuntime *selected = nullptr;
+
+        /** @copydoc IMoEKernel::decodeRouteSelectWithReadyRebalanceApply */
+        bool decodeRouteSelectWithReadyRebalanceApply(
+            DeviceMoELayerRuntime *runtime_rows, DeviceMoELayerRuntime *runtime_layer,
+            ITensor *, ITensor *, int, int, int, bool, ITensor *, ITensor *, bool, bool,
+            const DeviceMoERebalancePlanEntry *, uint32_t,
+            DeviceMoERebalanceCommandBufferHeader *, const DeviceMoEExpertDirectoryEntry *,
+            uint32_t, const DeviceMoERebalanceConfig &, DeviceMoERebalanceApplyStatus *,
+            DeviceMoERebalanceGraphControllerState *, int target_row, uint32_t,
+            const int32_t *, RoutedExpertRowExecutionPolicy) override
+        {
+            ++calls;
+            rows = runtime_rows;
+            selected = runtime_layer;
+            apply_row = target_row;
+            return true;
+        }
+    };
+
 #ifdef HAVE_CUDA
     struct ScopedCudaStream
     {
@@ -136,6 +174,95 @@ protected:
 // =========================================================================
 // Routing Tests
 // =========================================================================
+
+/** Real stage execution translates global selectors before issuing its kernel call. */
+TEST_F(MoERoutingStageTest, PipelineStageRouteApplyUsesCompactRowsAndPreservesAllLayerSelection)
+{
+    initCPUBackend(-1);
+    ScopedRocmMoEFlags flags(true, true);
+    std::vector<DeviceId> devices;
+#ifdef HAVE_CUDA
+    devices.push_back(DeviceId::cuda(0));
+#endif
+#ifdef HAVE_ROCM
+    devices.push_back(DeviceId::rocm(0));
+#endif
+    for (const auto device : devices)
+    for (const int origin : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+    {
+        SCOPED_TRACE(::testing::Message() << device.toString() << " origin=" << origin);
+        DeviceMoERuntimeTable table({.device_id = DeviceId::cpu(), .num_layers = 2,
+            .num_experts = NUM_EXPERTS, .top_k = TOP_K, .first_model_layer = origin});
+        for (int row = 0; row < 2; ++row)
+        {
+            ASSERT_TRUE(table.prepareInactiveBank(origin + row, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
+            ASSERT_TRUE(table.flipActiveBank(origin + row, 1, nullptr));
+        }
+        auto input = TestTensorFactory::createFP32({1, D_MODEL});
+        auto gate = TestTensorFactory::createFP32({NUM_EXPERTS, D_MODEL});
+        auto indices = TestTensorFactory::createFP32({TOP_K, 1});
+        auto weights = TestTensorFactory::createFP32({TOP_K, 1});
+        MoERoutingStage::Params params;
+        params.device_id = device;
+        params.seq_len = 1;
+        params.d_model = D_MODEL;
+        params.num_experts = NUM_EXPERTS;
+        params.top_k = TOP_K;
+        params.layer_idx = origin + 1;
+        params.moe_runtime_table = &table;
+        params.input = input.get();
+        params.gate_weights = gate.get();
+        params.output_indices = indices.get();
+        params.output_weights = weights.get();
+        params.collect_device_runtime_histogram = false;
+        params.device_rebalance_route_apply = true;
+        params.device_rebalance_workspace_name = "stage_coordinate_regression";
+        params.device_rebalance_plan_capacity = 4u;
+        params.device_rebalance_config.num_layers = 2u;
+        params.device_rebalance_config.num_experts = NUM_EXPERTS;
+        params.device_rebalance_config.top_k = TOP_K;
+        params.device_rebalance_config.participant_count = 2u;
+        params.device_rebalance_config.window_size_tokens = 1u;
+        ASSERT_TRUE(validateDeviceMoERebalanceConfig(params.device_rebalance_config));
+
+        for (const int selector : {-2, -1, origin, origin + 1, -3, origin + 2})
+        for (const int geometry : {0, 1, 2, 3})
+        {
+            SCOPED_TRACE(::testing::Message() << "selector=" << selector << " geometry=" << geometry);
+            params.device_rebalance_apply_layer_idx = selector;
+            params.device_rebalance_config.num_layers = geometry == 1 ? 3u : 2u;
+            params.device_rebalance_config.num_experts = geometry == 2 ? NUM_EXPERTS + 1u : NUM_EXPERTS;
+            params.device_rebalance_config.top_k = geometry == 3 ? 1u : TOP_K;
+            MoERoutingStage stage(params);
+            RecordingStageRouteKernel kernel;
+            stage.setMoEKernelForTesting(&kernel);
+            // No backend receives this identity: the recording kernel owns the
+            // entire launch boundary and never dereferences a device pointer.
+            int stream_identity = 0;
+            stage.setGPUStream(&stream_identity);
+            DeviceWorkspaceManager workspace(DeviceId::cpu(), 1u << 20);
+            ASSERT_TRUE(workspace.allocate(stage.getWorkspaceRequirements(1)));
+            stage.bindWorkspace(&workspace);
+            if (geometry != 0)
+            {
+                EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
+                EXPECT_EQ(kernel.calls, 0);
+                continue;
+            }
+            if (selector == -3 || selector == origin + 2)
+            {
+                EXPECT_THROW(stage.execute(cpu_ctx_.get()), std::out_of_range);
+                EXPECT_EQ(kernel.calls, 0);
+                continue;
+            }
+            ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+            ASSERT_EQ(kernel.calls, 1);
+            EXPECT_EQ(kernel.rows, table.deviceLayerState(origin));
+            EXPECT_EQ(kernel.selected, table.deviceLayerState(origin + 1));
+            EXPECT_EQ(kernel.apply_row, selector == -1 ? -1 : (selector == origin ? 0 : 1));
+        }
+    }
+}
 
 TEST_F(MoERoutingStageTest, BasicRouting)
 {

@@ -18,6 +18,7 @@
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "execution/runner/ModelContextRetirement.h"
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
+#include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "execution/local_execution/device/ReusableExecutionWorkspace.h"
 #include "loaders/ModelContext.h"
@@ -102,6 +103,42 @@ namespace
             EXPECT_EQ(modelContextOverlayDrainIntent(nullptr, mode),
                       MoEOverlayDeviceControllerDrainIntent::ReleaseResources);
         }
+    }
+
+    /** Physical storage ownership selects sealing order for dense and every declared width. */
+    TEST(Test__ModelContextRetirement, ImmutableSourcesSealOnlyAfterParticipantRetirement)
+    {
+        using Storage = MoEOverlayMigrationStorageKind;
+        using Boundary = ModelContextPhysicalSealBoundary;
+        auto authority = std::make_shared<ModelContextReuseAuthority>();
+        for (const auto width : {1u, 2u, 4u, 8u})
+        {
+            std::vector<Storage> native(width, Storage::DeviceTransferDirectory);
+            std::vector<Storage> disabled(width, Storage::Disabled);
+            EXPECT_EQ(modelContextPhysicalSealBoundary(authority, native), Boundary::RetiredImmutableSources);
+            EXPECT_EQ(modelContextPhysicalSealBoundary(authority, disabled), Boundary::RetiredImmutableSources);
+            EXPECT_EQ(modelContextPhysicalSealBoundary(nullptr, native), Boundary::Unretained);
+            native.back() = Storage::PhysicalResidencyFabric;
+            EXPECT_EQ(modelContextPhysicalSealBoundary(authority, native), Boundary::LiveMutableResidency);
+        }
+        EXPECT_EQ(modelContextPhysicalSealBoundary(authority, {}), Boundary::RetiredImmutableSources);
+        ASSERT_TRUE(authority->beginSealing());
+        EXPECT_EQ(modelContextPhysicalSealBoundary(authority, {Storage::DeviceTransferDirectory}), Boundary::RetiredImmutableSources);
+        EXPECT_EQ(authority->state(), ModelContextReuseAuthority::State::Sealing);
+        EXPECT_FALSE(authority->sealedDeviceMemoryRetention());
+    }
+
+    /** An unowned context or unknown storage cannot masquerade as immutable weights. */
+    TEST(Test__ModelContextRetirement, PhysicalSealBoundaryRejectsInvalidOwnership)
+    {
+        auto authority = std::make_shared<ModelContextReuseAuthority>();
+        EXPECT_THROW((void)modelContextPhysicalSealBoundary(authority,
+            {static_cast<MoEOverlayMigrationStorageKind>(255)}), std::logic_error);
+        ASSERT_TRUE(authority->beginSealing());
+        ASSERT_TRUE(authority->publishReusable({}));
+        EXPECT_THROW((void)modelContextPhysicalSealBoundary(authority, {}), std::logic_error);
+        authority->invalidate("negative control");
+        EXPECT_THROW((void)modelContextPhysicalSealBoundary(authority, {}), std::logic_error);
     }
 
     /** Both entry points to retained teardown preserve its physical obligation. */

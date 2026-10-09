@@ -111,6 +111,8 @@ namespace llaminar2
             std::string perf_device;
             /// Admitted route geometry and local physical owner, when required.
             std::optional<ExpertHistogramTransactionConfig> transaction_demand;
+            /// Global origin authenticated by the histogram inside every packet.
+            int first_model_layer = 0;
         };
 
         /**

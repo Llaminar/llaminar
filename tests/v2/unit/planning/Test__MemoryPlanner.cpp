@@ -954,7 +954,7 @@ TEST(Test__MemoryPlanner,
         resolveCapturedServingGraphMemoryInventory(
             {32, 64, 128},
             retained_mtp);
-    EXPECT_EQ(cfg.captured_serving_graphs.fixed_executable_count, 6u);
+    EXPECT_EQ(cfg.captured_serving_graphs.fixed_executable_count, 12u);
     const MTPGraphOwnerPlan owner_plan(retained_mtp);
     EXPECT_EQ(owner_plan.sidecarGraphSlots(), 21u);
     EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 35u);
@@ -980,7 +980,7 @@ TEST(Test__MemoryPlanner,
             cfg.device,
             CapturedGraphExecutableInventory{
                 .model_graph_identity_count =
-                    /*two prefill + decode + prefix bridge + four MTP forwards=*/8u,
+                    /*two prefill + decode + prefix bridge + ten MTP forwards=*/14u,
                 .model_graph_topology_variant_count = 1u,
                 .auxiliary_executable_count =
                     owner_plan.generalAuxiliaryExecutableSlotCount() +
@@ -992,7 +992,7 @@ TEST(Test__MemoryPlanner,
         plan.devices.front().captured_graph_bytes(),
         estimateCapturedGraphExecutableBytes(
             cfg.device,
-            /*two prefill + decode + prefix bridge + four MTP forwards=*/8u));
+            /*two prefill + decode + prefix bridge + ten MTP forwards=*/14u));
 }
 
 TEST(Test__MemoryPlanner,
@@ -1306,7 +1306,7 @@ TEST(Test__MemoryPlanner,
  *
  * The runtime registry keys durable archives by rank and normalized path.
  * Admission must use that same identity: RAM cache tiers remain participant
- * owned, while checksum/compaction scratch is one allocation shared by every
+ * owned, while archive I/O scratch is one allocation shared by every
  * local participant opening the archive.
  */
 TEST(Test__MemoryPlanner,
@@ -1350,6 +1350,109 @@ TEST(Test__MemoryPlanner,
         host->bom().bytes(PhysicalMemoryOwner::PrefixArchiveStaging),
         PrefixArchiveIOGeometry::scratchBytes())
         << "One rank/path archive owns exactly one reusable I/O scratch";
+}
+
+/** @test Stage grouping cannot duplicate common backing or erase private RAM tiers. */
+TEST(Test__MemoryPlanner, PipelineGroupsMatchOneCompletePhysicalPlan)
+{
+    const auto profile = createTestProfile();
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    {
+        SCOPED_TRACE(deviceTypeToString(backend));
+        std::vector<std::vector<DevicePlanConfig>> groups(2);
+        std::vector<DevicePlanConfig> flat;
+        for (int stage = 0; stage < 2; ++stage)
+        {
+            DevicePlanConfig cfg;
+            cfg.world_rank = 0;
+            cfg.device = DeviceId(backend, backend == DeviceType::CPU ? 0 : stage);
+            cfg.device_total_bytes = cfg.device_free_bytes = 256ULL << 30;
+            cfg.device_compute_units = 8;
+            if (backend == DeviceType::CPU) cfg.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+            cfg.first_layer = stage * 12;
+            cfg.last_layer = cfg.first_layer + 11;
+            cfg.owns_embedding = stage == 0;
+            cfg.max_seq_len = 256;
+            cfg.activation_seq_len = 32;
+            cfg.prefix_cache = PrefixCacheRuntimeConfig{};
+            cfg.prefix_cache.ram_budget_bytes = 16ULL << 30;
+            cfg.prefix_cache.disk_budget_bytes = 32ULL << 30;
+            cfg.prefix_cache.disk_dir = stage ? "/cache/./shared" : "/cache/shared";
+            if (cfg.device.is_gpu()) cfg.associated_host_memory = PhysicalMemoryResource{
+                .world_rank = 0, .device = DeviceId::cpu(),
+                .total_bytes = 256ULL << 30, .admission_available_bytes = 256ULL << 30};
+            groups[stage].push_back(cfg);
+            flat.push_back(cfg);
+        }
+        const auto planned = MemoryPlanner::planGroups(profile, groups);
+        const auto together = MemoryPlanner::plan(profile, flat);
+        ASSERT_EQ(planned.size(), 2u);
+        PhysicalMemoryPlanBuilder combined;
+        for (const auto &group : planned)
+            for (const auto &bom : group.physicalPlan().resources()) combined.add(bom);
+        const auto aggregate = combined.build();
+        EXPECT_EQ(aggregate.totalBytes(), together.physicalPlan().totalBytes());
+        for (const auto &bom : together.physicalPlan().resources())
+        {
+            const auto *actual = aggregate.find({bom.resource().world_rank, bom.resource().device});
+            ASSERT_NE(actual, nullptr);
+            for (size_t owner = 0; owner < PhysicalMemoryBOM::ownerCount(); ++owner)
+                EXPECT_EQ(actual->bytes(static_cast<PhysicalMemoryOwner>(owner)), bom.bytes(static_cast<PhysicalMemoryOwner>(owner)));
+        }
+        const auto *host = aggregate.find({0, DeviceId::cpu()});
+        ASSERT_NE(host, nullptr);
+        EXPECT_EQ(host->bytes(PhysicalMemoryOwner::PrefixHostTier), 32ULL << 30);
+        EXPECT_EQ(host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), PrefixArchiveIOGeometry::scratchBytes());
+        const auto *second_host = planned[1].physicalPlan().find({0, DeviceId::cpu()});
+        ASSERT_NE(second_host, nullptr);
+        EXPECT_EQ(second_host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), 0u);
+    }
+}
+
+/** @test Failed or completed planning cannot leave a process-global archive credit. */
+TEST(Test__MemoryPlanner, PipelineGroupSharedOwnersAreTransactionLocal)
+{
+    const auto profile = createTestProfile();
+    DevicePlanConfig cfg;
+    cfg.world_rank = 0;
+    cfg.device = DeviceId::cuda(0);
+    cfg.device_total_bytes = cfg.device_free_bytes = 64ULL << 30;
+    cfg.device_compute_units = 80;
+    cfg.max_seq_len = 256;
+    cfg.activation_seq_len = 32;
+    cfg.prefix_cache = PrefixCacheRuntimeConfig{};
+    cfg.associated_host_memory = PhysicalMemoryResource{
+        .world_rank = 0, .device = DeviceId::cpu(),
+        .total_bytes = 256ULL << 30, .admission_available_bytes = 256ULL << 30};
+    std::vector<std::vector<DevicePlanConfig>> groups{{cfg}, {cfg}};
+    groups[1][0].concurrent_workspace_owners = 0;
+    EXPECT_THROW((void)MemoryPlanner::planGroups(profile, groups), std::invalid_argument);
+    groups[1][0].concurrent_workspace_owners = 1;
+    for (int iteration = 0; iteration < 3; ++iteration)
+    {
+        const auto planned = MemoryPlanner::planGroups(profile, groups);
+        ASSERT_EQ(planned.size(), 2u);
+        const auto *first = planned.front().physicalPlan().find({0, DeviceId::cpu()});
+        const auto *last = planned.back().physicalPlan().find({0, DeviceId::cpu()});
+        ASSERT_NE(first, nullptr);
+        ASSERT_NE(last, nullptr);
+        EXPECT_EQ(first->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), PrefixArchiveIOGeometry::scratchBytes());
+        EXPECT_EQ(last->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), 0u);
+    }
+    EXPECT_THROW((void)MemoryPlanner::planGroups(profile, {}), std::invalid_argument);
+    const std::vector<std::vector<DevicePlanConfig>> empty_owner{{}};
+    EXPECT_TRUE(MemoryPlanner::planGroups(profile, empty_owner).front().physicalPlan().resources().empty());
+    groups.front().front().prefix_cache.enabled = false;
+    auto enabled_tail = MemoryPlanner::planGroups(profile, groups);
+    const auto *tail_host = enabled_tail.back().physicalPlan().find({0, DeviceId::cpu()});
+    ASSERT_NE(tail_host, nullptr);
+    EXPECT_EQ(tail_host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), PrefixArchiveIOGeometry::scratchBytes());
+    groups.back().front().prefix_cache.disk_budget_bytes = 0;
+    const auto ram_only = MemoryPlanner::planGroups(profile, groups);
+    tail_host = ram_only.back().physicalPlan().find({0, DeviceId::cpu()});
+    ASSERT_NE(tail_host, nullptr);
+    EXPECT_EQ(tail_host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), 0u);
+    EXPECT_EQ(tail_host->bytes(PhysicalMemoryOwner::PrefixHostTier), cfg.prefix_cache.ram_budget_bytes);
 }
 
 TEST(Test__MemoryPlanner, SingleGPU_DoesNotFit)

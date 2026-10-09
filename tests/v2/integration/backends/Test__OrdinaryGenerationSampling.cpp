@@ -426,8 +426,9 @@ TEST_P(OrdinaryDeviceGenerationSampling, CapturedSamplesMatchSerialLawAcrossRese
                 // address. Exercise positive penalties and negative rewards.
                 const float presence = epoch ? -0.5F : 0.75F;
                 const float frequency = epoch ? -0.25F : 0.125F;
+                const float repetition = epoch ? 1.1F : 1.05F;
                 ASSERT_TRUE(backend->enqueueConfigureMTPGreedyPenaltyPolicyDevice(
-                    d_penalties.get(), presence, frequency, false, 0, stream));
+                    d_penalties.get(), presence, frequency, false, 0, stream, repetition));
                 // Freeze an independent serial-sampler oracle outside capture.
                 // The existing serial API uses the exact public seed/offset law.
                 std::array<std::array<int, budget>, requests> expected_samples{};
@@ -440,8 +441,13 @@ TEST_P(OrdinaryDeviceGenerationSampling, CapturedSamplesMatchSerialLawAcrossRese
                         for (int token = 0; token < vocab; ++token)
                         {
                             oracle_logits[token] = logits[request * stride + token];
-                            if (apply_penalties && oracle_history[token] != 0)
-                                oracle_logits[token] -= presence + frequency * static_cast<float>(oracle_history[token]);
+                            if (apply_penalties && (oracle_history[token] != 0 || token == 2))
+                            {
+                                const float value = oracle_logits[token];
+                                volatile float scaled = value < 0 ? value * repetition : value / repetition;
+                                oracle_logits[token] = scaled - (oracle_history[token] ?
+                                    presence + frequency * static_cast<float>(oracle_history[token]) : 0.0F);
+                            }
                         }
                         const int position = 7 + request + row +
                             (leading == DeviceGenerationLeadingRowDisposition::AlreadyEmitted ? 1 : 0);
@@ -468,6 +474,9 @@ TEST_P(OrdinaryDeviceGenerationSampling, CapturedSamplesMatchSerialLawAcrossRese
                     for (int request = 0; request < requests; ++request)
                         for (int pad = vocab; pad < history_stride; ++pad)
                             initial_history[request * history_stride + pad] = -77;
+                    if (apply_penalties)
+                        for (int request = 0; request < requests; ++request)
+                            initial_history[request * history_stride + 2] = TokenPenaltyHistory::withPrompt(0);
                     ASSERT_TRUE(backend->hostToDevice(d_history.get(), initial_history.data(),
                         sizeof(initial_history), 0, stream));
                     std::array<int32_t, requests * stop_stride> stops;

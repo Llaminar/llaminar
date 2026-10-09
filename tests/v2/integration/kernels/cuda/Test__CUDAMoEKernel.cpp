@@ -5,6 +5,8 @@
  * Exercises production kernels with explicit streams and adversarial transfer
  * slot lifetimes. Terminal movement evidence must distinguish copied payloads
  * from resident-only assignments and survive an empty final apply poll.
+ * Collective fixtures admit their maximum live payload and conversion scratch
+ * through the same physical-memory BOM used by production graph setup.
  */
 #include <gtest/gtest.h>
 
@@ -38,6 +40,7 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "planning/CollectiveMemoryEstimator.h"
 #include "transfer/TransferEngine.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
@@ -18937,8 +18940,9 @@ TEST_F(
  * must produce the same bytes for every row.  This test uses the production
  * `LocalTPContext::allreduceOnStream()` path on two CUDA devices and compares
  * the NCCL grouped result against row-wise NCCL serial decode.  The requested
- * FP16 transport and 5120-wide Qwen hidden state reproduce the threshold bug:
- * one row is below the 8192 cutoff while every grouped depth is above it.
+ * FP16 transport and 5120-wide Qwen hidden state straddle the retired 8192
+ * threshold. Every live row count must use the same explicitly requested
+ * precision, with admitted conversion storage and exact live-byte traffic.
  */
 TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerialRows)
 {
@@ -18971,11 +18975,34 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerial
         llaminar2::CollectiveBackendType::NCCL);
     ASSERT_NE(tp_ctx, nullptr);
 
+    // The test spans the FP16 threshold and every supported verifier depth.
+    // Admit one reusable conversion slot before any participant starts work;
+    // execution must never allocate scratch when a larger live row count arrives.
+    const auto collective_bom = llaminar2::CollectiveMemoryEstimator::localTP(
+        1, static_cast<size_t>(llaminar2::test::kGroupedVerifierRuntimeRows.back()) * d_model,
+        tp_ctx->backend());
+    llaminar2::PhysicalMemoryPlanBuilder collective_plan;
+    for (const auto device : devices)
+        collective_plan.add(
+            {.world_rank = 0, .device = device,
+             .total_bytes = collective_bom.perDeviceBytes(),
+             .admission_available_bytes = collective_bom.perDeviceBytes()},
+            llaminar2::PhysicalMemoryOwner::LocalCollective,
+            collective_bom.perDeviceBytes());
+    auto collective_authority = std::make_shared<llaminar2::PhysicalMemoryAuthority>(
+        std::make_shared<const llaminar2::PhysicalMemoryPlanAdmissionCertificate>(
+            collective_plan.build()), 0);
+    ASSERT_TRUE(tp_ctx->reserveCollectiveResources(
+        collective_bom.backend_payload_capacity_bytes,
+        collective_bom.fp16_scratch_elements, collective_authority));
+
+    std::map<std::string, size_t> expected_live_elements;
     auto run_allreduce =
         [&](std::array<std::shared_ptr<llaminar2::FP32Tensor>, 2> &partials,
             size_t count,
             const std::string &stage_name)
     {
+        expected_live_elements[stage_name] = count;
         std::array<bool, 2> ok = {false, false};
         std::thread worker0([&]()
                             { ok[0] = tp_ctx->allreduceOnStream(
@@ -19074,11 +19101,16 @@ TEST_F(Test__CUDAMoEKernel, LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerial
     ASSERT_FALSE(transport_records.empty());
     for (const auto &record : transport_records)
     {
-        ASSERT_EQ(record.tags.at("path"), "on_stream_grouped")
+        ASSERT_EQ(record.tags.at("path"), "on_stream_grouped_fp16_scratch")
             << "unexpected LocalTP transport record " << record.name;
-        ASSERT_EQ(record.tags.at("dtype"), "fp32")
+        ASSERT_EQ(record.tags.at("dtype"), "fp16")
             << "a grouped row count changed the requested FP16 transport policy";
         ASSERT_EQ(record.tags.at("requested_precision"), "fp16");
+        ASSERT_EQ(record.tags.at("element_bytes"), "2");
+        ASSERT_EQ(record.tags.at("extent"), "fixed_elements");
+        ASSERT_EQ(record.tags.at("elements"),
+            std::to_string(expected_live_elements.at(record.tags.at("stage"))))
+            << "collective storage capacity must not become the communication extent";
     }
     llaminar2::PerfStatsCollector::reset();
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);

@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -335,6 +336,22 @@ namespace llaminar2
     };
 
     /**
+     * @brief One stage's immutable inputs to a joint capacity transaction.
+     *
+     * References live only for the setup call. Fixed BOMs contribute distinct
+     * stage allocations; shared backing and mutually exclusive setup envelopes
+     * must be contributed once by their owner before constructing these views.
+     */
+    struct MoEOverlayStageCapacityRequest
+    {
+        const MoERoutedExpertPlacementPlan &plan; ///< Hardware-bound stage topology.
+        int num_experts; ///< Complete expert count in each owned layer.
+        const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest; ///< Exact owned interval.
+        const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets; ///< Stage's typed fixed BOM contributions.
+        const MoEOverlayCapacityAdmissionPolicy &policy; ///< Stage's explicit migration-storage lifecycle.
+    };
+
+    /**
      * @brief Convert a hardware-bound placement plan into exact resolver input.
      *
      * This adapter is deterministic and device-free. It rejects unbound
@@ -438,6 +455,24 @@ namespace llaminar2
             const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
             const MoEOverlayCapacityAdmissionPolicy &policy = {});
+
+        /**
+         * @brief Admit a complete pipeline and its bounded replica caches together.
+         * @param stages Immutable stage requests in increasing global layer order.
+         * @return Stage quota/cache grants retaining one physical-memory certificate.
+         * @throws MoEOverlayCapacityExhausted if complete mandatory coverage and
+         *         each enabled cache's minimum grant cannot fit together.
+         * @throws std::invalid_argument for invalid geometry, topology or a stale
+         *         retained grant; these failures are never treated as capacity pressure.
+         *
+         * First try every requested maximum. If that complete BOM cannot fit,
+         * prove all minimum grants together before maximizing each stage's grant
+         * in authored order. Retained grants remain exact, transfer lanes stay
+         * fixed, and no storage mode is disabled. Single-stage callers use this
+         * same admission transaction, so shared resources have one authority.
+         */
+        [[nodiscard]] static std::vector<MoEOverlayResolvedCapacityPlan>
+        resolvePipelineCapacity(std::span<const MoEOverlayStageCapacityRequest> stages);
 
         /**
          * @brief Resolve capacity and install its exact quotas into a plan copy.

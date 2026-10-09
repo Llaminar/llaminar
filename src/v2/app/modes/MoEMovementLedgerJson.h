@@ -28,9 +28,21 @@ namespace llaminar2::movement_json_detail
         {
         case MoEOptimizationAuthority::Host: return "host";
         case MoEOptimizationAuthority::Device: return "device";
+        case MoEOptimizationAuthority::Pipeline: return "pipeline";
         case MoEOptimizationAuthority::None: break;
         }
         throw std::invalid_argument("Completed movement has no valid authority");
+    }
+
+    /** @return Exact scope shared by status, topology and terminal transport. */
+    inline nlohmann::json stageIdentityJson(const MoEOptimizationStageIdentity &identity)
+    {
+        auto participants = nlohmann::json::array();
+        for (const auto &participant : identity.participants())
+            participants.push_back(participant.toString());
+        return {{"stage_index", identity.index()}, {"first_layer", identity.firstLayer()},
+            {"main_last_layer", identity.mainLastLayer()}, {"routed_last_layer", identity.routedLastLayer()},
+            {"participants", std::move(participants)}, {"terminal", identity.terminal()}};
     }
 
     /** @return Stable wire name for one authority lifecycle state. */
@@ -66,6 +78,7 @@ namespace llaminar2::movement_json_detail
         case MoEOptimizationActivityState::Draining: return "draining";
         case MoEOptimizationActivityState::Failed: return "failed";
         case MoEOptimizationActivityState::DeviceOwned: return "device_owned";
+        case MoEOptimizationActivityState::StageOwned: return "stage_owned";
         }
         throw std::invalid_argument("MoE optimization has an invalid activity state");
     }
@@ -245,6 +258,8 @@ namespace llaminar2
     inline nlohmann::json moeOptimizationStatusJson(
         const MoEOptimizationStatus &status)
     {
+        if ((status.authority == MoEOptimizationAuthority::Pipeline) != !status.stages.empty())
+            throw std::invalid_argument("Pipeline optimization authority requires scoped stage observations");
         const bool has_authority =
             status.authority != MoEOptimizationAuthority::None;
         nlohmann::json last_decision = nullptr;
@@ -287,8 +302,8 @@ namespace llaminar2
                 {"layer_scan_next", decision.layer_scan_next},
             };
         }
-        return {
-            {"schema", 1},
+        nlohmann::json result = {
+            {"schema", status.stages.empty() ? 1 : 2},
             {"scope", "model_lifetime"},
             {"authority", has_authority
                 ? movement_json_detail::authorityName(status.authority)
@@ -322,6 +337,20 @@ namespace llaminar2
             {"last_decision", std::move(last_decision)},
             {"diagnostic", status.diagnostic},
         };
+        if (!status.stages.empty())
+        {
+            if (status.authority != MoEOptimizationAuthority::Pipeline || status.last_decision ||
+                status.demand_window.valid() || status.published_progress_generation || status.reconciled_progress_generation)
+                throw std::invalid_argument("Pipeline optimization status contains unscoped authority state");
+            result["demand_window"] = nullptr;
+            result["published_progress_generation"] = nullptr;
+            result["reconciled_progress_generation"] = nullptr;
+            result["stages"] = nlohmann::json::array();
+            for (const auto &stage : status.stages.entries())
+                result["stages"].push_back({{"identity", movement_json_detail::stageIdentityJson(stage.identity)},
+                    {"status", moeOptimizationStatusJson(stage.value)}});
+        }
+        return result;
     }
 
     /**
@@ -339,10 +368,18 @@ namespace llaminar2
             axes.push_back("tier_residency");
         if (hasParticipantPlacementAxis(topology.axes))
             axes.push_back("participant_placement");
-        return {{"schema", 1}, {"scope", "model_lifetime"},
+        nlohmann::json result = {{"schema", topology.stages.empty() ? 1 : 2}, {"scope", "model_lifetime"},
             {"authority", topology.authority == MoEOptimizationAuthority::None
                 ? "none" : movement_json_detail::authorityName(topology.authority)},
             {"available_axes", std::move(axes)}};
+        if (!topology.stages.empty())
+        {
+            result["stages"] = nlohmann::json::array();
+            for (const auto &stage : topology.stages.entries())
+                result["stages"].push_back({{"identity", movement_json_detail::stageIdentityJson(stage.identity)},
+                    {"topology", moeMovementTopologyJson(stage.value)}});
+        }
+        return result;
     }
 
     /**
@@ -359,6 +396,14 @@ namespace llaminar2
     {
         if (!ledger.complete())
             throw std::invalid_argument("Completed movement ledger is truncated or has conflicting authorities");
+        if (!ledger.stages.empty())
+        {
+            auto stages = nlohmann::json::array();
+            for (const auto &stage : ledger.stages.entries())
+                stages.push_back({{"identity", movement_json_detail::stageIdentityJson(stage.identity)},
+                    {"movement", moeMovementLedgerJson(stage.value)}});
+            return {{"schema", 3}, {"scope", "model_lifetime"}, {"complete", true}, {"stages", std::move(stages)}};
+        }
         nlohmann::json result = {{"schema", 2}, {"scope", "model_lifetime"},
             {"complete", true}, {"discarded_edges", ledger.discarded_edges},
             {"discarded_economy_records", ledger.discarded_economy_records},

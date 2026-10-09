@@ -18,6 +18,8 @@
  * Planning metadata is read once by the admission root and published through
  * the common rank-initialization lifecycle before participant placement. A
  * missing model cannot manufacture a synthetic geometry in production admission.
+ * Admission-only completion remains distinct from inference readiness, so dry
+ * runs neither enter inference shutdown collectives nor seal unprepared weights.
  * Model-aware topology is resolved by ResolvedRankOrchestration; this runner
  * installs that result without a second overlay-binding or role-selection path.
  * Overlay candidates use the shared BOM adapter inside the common typed rank
@@ -25,14 +27,16 @@
  * peer may enter the physical-budget collective.
  * Prompt tokens and prefix/KV admission share one frozen continuation group;
  * expert-only followers receive command metadata and sparse tickets, not tokens.
+ * Admission publishes the already resolved stochastic request seeds. Sampling
+ * and verification share that entropy across response windows and graph reuse.
  *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include "OrchestrationRunner.h"
-#include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "planning/ResolvedRankOrchestration.h"
+#include "execution/runner/PreparedWeightAuthorityIdentity.h"
 #include "IOrchestrationRunnerFactory.h"
 #include "ModelContextRetirement.h"
 #include "MTPVerifierForwardExecutor.h"
@@ -78,6 +82,10 @@
 #include "../moe/MoEOverlayMigrationMeasurementExchange.h"
 #include "../moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "../moe/MoEOverlayResidencyAuthority.h"
+#include "../moe/MoEOverlayResidencySetup.h"
+#include "../moe/MoEPipelinePreparedPlan.h"
+#include "../moe/MoEOptimizationPipeline.h"
+#include "../moe/MoEOverlayPipelineStageBinding.h"
 #include "../moe/MoEOverlayResidencyMaintenanceService.h"
 #include "../moe/MoEOverlayInferenceInterferenceProbe.h"
 #include "../moe/MoEOverlayTierMigrationTransport.h"
@@ -450,158 +458,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Serialize the exact requested topology that changes prepared weights.
-         *
-         * This is a collision-free process-local identity, not a display string
-         * or a probabilistic hash. Length-prefixing every string and spelling
-         * every ordered field lets a retained ModelContext reject a changed
-         * participant, shard policy, owner order, tier quota, or explicit
-         * placement before memory admission credits existing device payloads.
-         * Capacity-affecting controller policy and normalized retained-graph
-         * geometry are included because automatic tier filling consumes the
-         * bytes left after those fixed owners. The active cycles-per-wave cap
-         * is deliberately excluded: it can use fewer already-materialized
-         * lanes without changing any prepared byte. Model-aware resolved
-         * quotas are carried separately by the reuse contract and are never
-         * re-solved against VRAM that already contains the retained weights.
-         */
-        std::string routedWeightAuthorityRequestIdentity(
-            const std::shared_ptr<MoERoutedExpertPlacementPlan> &plan,
-            const OrchestrationConfig &config)
-        {
-            if (!plan)
-                return {};
-
-            std::ostringstream out;
-            const auto append_string = [&out](const std::string &value)
-            {
-                out << value.size() << ':' << value << ';';
-            };
-            const auto append_ints = [&out](const auto &values)
-            {
-                out << values.size() << '[';
-                for (const auto value : values)
-                    out << value << ',';
-                out << ']';
-            };
-            const auto append_floats = [&out](const auto &values)
-            {
-                out << values.size() << '[' << std::hexfloat;
-                for (const float value : values)
-                    out << value << ',';
-                out << std::defaultfloat << ']';
-            };
-
-            out << "enabled=" << plan->enabled
-                << ";topology=" << static_cast<int>(plan->topology)
-                << ";residency="
-                << static_cast<int>(plan->residency_policy)
-                << ";owner_order=" << static_cast<int>(plan->owner_order)
-                << ';';
-            append_string(plan->continuation_domain);
-            append_string(plan->base_model_domain);
-            append_string(plan->shared_expert_domain);
-
-            const auto &continuation = plan->continuation_domain_spec;
-            append_string(continuation.domain);
-            out << continuation.logical_root_participant << ','
-                << continuation.dense_tp_enabled << ','
-                << continuation.dense_decode_replicated << ','
-                << continuation.dense_decode_mirrored_embedding << ','
-                << static_cast<int>(continuation.dense_policy) << ','
-                << static_cast<int>(continuation.hidden_layout) << ','
-                << continuation.shared_expert_uses_dense_tp << ';';
-
-            out << "dense=" << plan->dense_domains.size() << '{';
-            for (const auto &domain : plan->dense_domains)
-                append_string(domain.toString());
-            out << "};routed=" << plan->domains.size() << '{';
-            for (const auto &domain : plan->domains)
-            {
-                append_string(domain.name);
-                out << static_cast<int>(domain.scope) << ','
-                    << static_cast<int>(domain.backend) << ','
-                    << domain.owner_rank << ','
-                    << static_cast<int>(domain.routed_compute_policy) << ','
-                    << static_cast<int>(domain.routed_phase_policy) << ','
-                    << static_cast<int>(domain.routed_decode_assignment_policy)
-                    << ','
-                    << static_cast<int>(domain.routed_prefill_assignment_policy)
-                    << ';';
-                out << domain.participants.size() << '[';
-                for (const auto &participant : domain.participants)
-                    append_string(participant.toString());
-                out << ']';
-                append_ints(domain.world_ranks);
-                append_floats(domain.weights);
-            }
-            out << "};tiers=" << plan->routed_tiers.size() << '{';
-            for (const auto &tier : plan->routed_tiers)
-            {
-                append_string(tier.name);
-                append_string(tier.domain);
-                out << tier.priority << ','
-                    << tier.max_experts_per_layer << ','
-                    << tier.memory_budget_bytes << ','
-                    << tier.fallback << ';';
-            }
-            out << "};initial_order_overrides="
-                << plan->initial_layer_order_overrides.size() << '{';
-            for (const auto &order : plan->initial_layer_order_overrides)
-            {
-                out << order.layer << ':';
-                append_ints(order.expert_ids);
-            }
-            out << "};placements=" << plan->placements.size() << '{';
-            for (const auto &placement : plan->placements)
-            {
-                out << placement.layer << ':';
-                append_ints(placement.routed_expert_tier);
-            }
-            out << '}';
-
-            const auto graph_candidates =
-                segmentedPrefillGraphRowCandidates(
-                    debugEnv().execution.prefill_graph_bucket_sizes,
-                    config.max_seq_len,
-                    config.moe_routed_prefill.overlay_segment_rows);
-            const int requested_graph_rows = graph_candidates.empty()
-                                                 ? 0
-                                                 : resolveRetainedGraphRowCapacity(
-                                                       graph_candidates.front(),
-                                                       config.mtp);
-            const auto append_optional_bytes = [&out](const auto &value)
-            {
-                if (value)
-                    out << *value;
-                else
-                    out << "auto";
-                out << ',';
-            };
-            out << ";capacity="
-                << static_cast<int>(config.moe_rebalance.mode) << ','
-                << config.moe_rebalance.migration_transfer_slots << ','
-                << config.moe_rebalance.dynamic_max_swaps_per_layer << ','
-                // Both values affect the admitted evidence banks, even when
-                // expert quotas and retained graph geometry are unchanged.
-                << config.moe_rebalance.window_size << ','
-                << config.moe_rebalance.max_window_size << ','
-                << requested_graph_rows << ','
-                << resolveMTPRetainedDraftCapacity(config.mtp) << ','
-                << config.mtp.max_request_batch << ','
-                << static_cast<int>(config.mtp.terminal_head_policy) << ','
-                << config.batch_size << ','
-                << config.max_seq_len << ','
-                << debugEnv().execution.prefill_graph_max_cached_buckets
-                << ',';
-            append_optional_bytes(config.max_gpu_memory_mb);
-            append_optional_bytes(config.max_cpu_memory_mb);
-            append_string(config.activation_precision);
-            append_string(config.kv_cache_precision);
-            return out.str();
-        }
-
-        /**
          * @brief Name the exact physical-transfer profile reuse class.
          *
          * The routed-weight identity supplies participant devices, integer
@@ -661,6 +517,7 @@ namespace llaminar2
                    a.seed == b.seed &&
                    a.presence_penalty == b.presence_penalty &&
                    a.frequency_penalty == b.frequency_penalty &&
+                   a.repetition_penalty == b.repetition_penalty &&
                    a.dry_multiplier == b.dry_multiplier &&
                    a.dry_base == b.dry_base &&
                    a.dry_allowed_length == b.dry_allowed_length &&
@@ -760,12 +617,6 @@ namespace llaminar2
                     params, sampler, logical_position, MTPSpecStochasticDrawPurpose::Sample));
         }
 
-        std::string formatStochasticThreshold(float threshold)
-        {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(9) << threshold;
-            return oss.str();
-        }
 
         uint64_t mtpSpecInverseSampleSeedForThresholds(
             const SamplingParams &params,
@@ -1583,55 +1434,6 @@ namespace llaminar2
             std::string error_;
         };
 
-        const char *prefixStorageTierName(PrefixStorageTier tier)
-        {
-            switch (tier)
-            {
-            case PrefixStorageTier::Ram:
-                return "ram";
-            case PrefixStorageTier::DeviceHot:
-                return "device-hot";
-            case PrefixStorageTier::Disk:
-                return "disk-hydrated";
-            }
-            return "none";
-        }
-
-        std::string summarizePrefixStorageTiers(const std::vector<PrefixBlockHandle> &blocks)
-        {
-            if (blocks.empty())
-                return "none";
-
-            PrefixStorageTier first_tier = blocks.front().tier;
-            for (const auto &block : blocks)
-            {
-                if (block.tier != first_tier)
-                    return "mixed";
-            }
-            return prefixStorageTierName(first_tier);
-        }
-
-        bool prefixBlocksContainHybridState(const std::vector<PrefixBlockHandle> &blocks)
-        {
-            return std::any_of(blocks.begin(), blocks.end(),
-                               [](const PrefixBlockHandle &block)
-                               {
-                                   return block.has_hybrid_state;
-                               });
-        }
-
-        bool prefixBlocksContainMTPState(const std::vector<PrefixBlockHandle> &blocks)
-        {
-            return std::any_of(blocks.begin(), blocks.end(),
-                               [](const PrefixBlockHandle &block)
-                               {
-                                   return block.mtp_payload != nullptr ||
-                                          (block.mtp_storage && !block.mtp_storage->empty()) ||
-                                          block.device_mtp_storage != nullptr ||
-                                          block.device_mtp_allocation != nullptr;
-                               });
-        }
-
         int snapshotShiftedMTPTokens(const PrefixStateSnapshot &snapshot)
         {
             int tokens = -1;
@@ -1691,13 +1493,58 @@ namespace llaminar2
         }
 
         /**
+         * @brief Resolve the request publisher from the complete admitted graph family.
+         * @param flat_plan Placement of a non-pipeline ExpertOverlay runner.
+         * @param pipeline Independent immutable placements of every PP stage.
+         * @param context Communicator that owns this request lifecycle.
+         * @return The common continuation root, or nullopt when no overlay exists.
+         * @throws std::logic_error for missing, mixed or conflicting authorities.
+         *
+         * PP deliberately has no model-wide routed placement. Its stage plans
+         * must nevertheless share one request publisher before any sparse graph
+         * can execute. Inspect immutable topology at admission/reset, never
+         * replace the stage placements or derive identity from graph lifetimes.
+         */
+        std::optional<int> resolveMoEOverlayRequestAuthorityRank(
+            const std::shared_ptr<const MoERoutedExpertPlacementPlan> &flat_plan,
+            const std::shared_ptr<const MoEPipelinePreparedPlan> &pipeline,
+            const std::shared_ptr<IMPIContext> &context)
+        {
+            const bool flat_overlay = flat_plan && flat_plan->usesExpertOverlayAuthority();
+            if (!flat_overlay && !pipeline)
+                return std::nullopt;
+            if (!context || (flat_overlay && pipeline))
+                throw std::logic_error("MoE request publication requires one unambiguous admitted graph family and communicator");
+
+            std::optional<int> authority_rank;
+            const auto require_plan = [&](const auto &placement)
+            {
+                const auto execution = resolveOverlayExecutionPlanForRunner(placement, context);
+                if (!execution || (authority_rank && *authority_rank != execution->continuation_root_rank))
+                    throw std::logic_error("MoE request publication requires the same continuation authority in every stage");
+                authority_rank = execution->continuation_root_rank;
+            };
+            if (pipeline)
+            {
+                if (pipeline->stages().empty())
+                    throw std::logic_error("MoE pipeline request publication has no admitted stages");
+                for (const auto &stage : pipeline->stages())
+                    require_plan(stage.placement);
+            }
+            else
+                require_plan(flat_plan);
+            return authority_rank;
+        }
+
+        /**
          * @brief Resolve every local device whose prepared weights one rank owns.
          *
          * An ExpertOverlay follower has a synthetic CPU primary because it does
          * not build the continuation graph, yet it can own several CUDA/ROCm
          * expert participants.  Reuse certification must inspect those actual
          * endpoints, not the synthetic primary.  Ordinary LocalTP resolves the
-         * same authority set from the rank plan.
+         * same authority set from the rank plan. PP includes every inner TP
+         * participant, not merely the primary device of each pipeline stage.
          */
         std::vector<DeviceId> rankLocalPreparedWeightAuthorityDevices(
             const RankExecutionPlan &rank_plan,
@@ -1725,6 +1572,16 @@ namespace llaminar2
                 {
                     append_unique(device);
                 }
+                return devices;
+            }
+
+            if (rank_plan.usesLocalPP())
+            {
+                for (const auto &device : rank_plan.local_pp_devices)
+                    append_unique(device.toLocalDeviceId());
+                for (const auto &stage : rank_plan.local_pp_stage_tp_info)
+                    for (const auto &device : stage.devices)
+                        append_unique(device.toLocalDeviceId());
                 return devices;
             }
 
@@ -1897,15 +1754,10 @@ namespace llaminar2
             }
             const auto &prepared_mtp = prepared.runtime.mtp;
             const auto &current_mtp = current.runtime.mtp;
-            if (resolveMTPRetainedDraftCapacity(prepared_mtp) !=
-                    resolveMTPRetainedDraftCapacity(current_mtp) ||
-                prepared_mtp.max_request_batch !=
-                    current_mtp.max_request_batch ||
-                prepared_mtp.terminal_head_policy !=
-                    current_mtp.terminal_head_policy)
+            if (!retainedMTPWeightAuthorityMatches(prepared_mtp, current_mtp))
             {
                 return "Retained prepared weights have a different MTP "
-                       "setup-capacity or terminal-head authority";
+                       "setup-capacity, predictor or terminal-head authority";
             }
             return std::nullopt;
         }
@@ -2396,6 +2248,7 @@ namespace llaminar2
           retained_expert_overlay_memory_admission_(
               std::move(
                   reuse_contract.expert_overlay_memory_admission)),
+          moe_pipeline_prepared_plan_(std::move(reuse_contract.pipeline_prepared_plan)),
           physical_memory_authority_(
               std::move(reuse_contract.physical_memory_authority)),
           retained_routed_weight_authority_identity_(
@@ -2468,6 +2321,10 @@ namespace llaminar2
             throw std::invalid_argument(
                 "OrchestrationRunner reuse contract split its ExpertOverlay and physical-memory authorities");
         }
+        if (moe_pipeline_prepared_plan_ &&
+            (retained_prepared_routed_weight_plan_ || retained_expert_overlay_memory_admission_ ||
+             moe_pipeline_prepared_plan_->admission()->physicalAdmission() != physical_memory_admission_))
+            throw std::invalid_argument("Prepared MoE pipeline must retain one exclusive aggregate physical authority");
         const auto installed_memory_authority =
             model_ctx_->concreteWeightManager()
                 ? model_ctx_->concreteWeightManager()
@@ -2517,7 +2374,7 @@ namespace llaminar2
         std::unique_ptr<IInferenceRunner> runner)
         : config_(std::move(config)), plan_(std::move(plan)), plan_built_(true),
           runner_(std::move(runner)),
-          initialized_(true), sampler_(0)
+          initialization_lifecycle_(OrchestrationInitializationLifecycle::Completion::Inference), sampler_(0)
     {
         requested_routed_weight_authority_identity_ =
             routedWeightAuthorityRequestIdentity(
@@ -2532,7 +2389,7 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx)
         : config_(std::move(config)), plan_(std::move(plan)), plan_built_(true),
           mpi_ctx_(std::move(mpi_ctx)), runner_(std::move(runner)),
-          initialized_(true), sampler_(0)
+          initialization_lifecycle_(OrchestrationInitializationLifecycle::Completion::Inference), sampler_(0)
     {
         requested_routed_weight_authority_identity_ =
             routedWeightAuthorityRequestIdentity(
@@ -2655,9 +2512,13 @@ namespace llaminar2
 
     bool OrchestrationRunner::initialize()
     {
-        if (initialized_)
+        if (initialization_lifecycle_.readyForInference())
         {
             return true;
+        }
+        if (initialization_lifecycle_.admissionComplete())
+        {
+            return setError("Admission-only initialization cannot serve inference; shut down this runner before full initialization");
         }
 
         std::uint32_t phase_ordinal = 0;
@@ -2989,9 +2850,10 @@ namespace llaminar2
                 return false;
             }
 
-            // Cache model-recommended sampling params (for API consumers)
+            // One loaded-revision policy owns sampling and prompt defaults.
+            // Tensor architecture alone cannot select a later model's template.
             if (!run_phase(
-                    "cacheModelSamplingMetadata",
+                    "cacheModelGenerationMetadata",
                     [&]
                     {
                         if (!model_ctx_)
@@ -3006,26 +2868,30 @@ namespace llaminar2
                         if (!factory)
                             return true;
 
-                        recommended_sampling_params_ =
-                            factory->getRecommendedSamplingParams();
+                        model_generation_policy_ = ModelGenerationPolicy::fromMetadata(*model_ctx_->loader());
+                        if (tokenizer_)
+                            model_generation_policy_.applyChatTemplate(*tokenizer_);
+                        const auto &recommended_sampling_params =
+                            model_generation_policy_.forMode(ThinkingMode::ModelDefault);
                         stop_thinking_prompt_ =
                             factory->getStopThinkingPrompt();
                         tool_call_format_ = factory->getToolCallFormat();
-                        if (recommended_sampling_params_.has_penalties() ||
-                            recommended_sampling_params_.temperature != 1.0f)
+                        if (recommended_sampling_params.has_penalties() ||
+                            recommended_sampling_params.temperature != 1.0f)
                         {
                             LOG_DEBUG(
                                 "[OrchestrationRunner] Model-recommended sampling: "
                                 << "temp="
-                                << recommended_sampling_params_.temperature
+                                << recommended_sampling_params.temperature
                                 << " top_p="
-                                << recommended_sampling_params_.top_p
+                                << recommended_sampling_params.top_p
                                 << " top_k="
-                                << recommended_sampling_params_.top_k
+                                << recommended_sampling_params.top_k
                                 << " presence_penalty="
-                                << recommended_sampling_params_.presence_penalty
+                                << recommended_sampling_params.presence_penalty
                                 << " frequency_penalty="
-                                << recommended_sampling_params_.frequency_penalty);
+                                << recommended_sampling_params.frequency_penalty
+                                << " repetition_penalty=" << recommended_sampling_params.repetition_penalty);
                         }
                         if (!stop_thinking_prompt_.empty())
                         {
@@ -3091,7 +2957,8 @@ namespace llaminar2
                 }
             }
 
-            initialized_ = true;
+            initialization_lifecycle_.publish(
+                OrchestrationInitializationLifecycle::Completion::Inference);
             LOG_DEBUG("OrchestrationRunner initialized successfully");
             return true;
         }
@@ -3099,7 +2966,7 @@ namespace llaminar2
 
     bool OrchestrationRunner::initializeForDryRun()
     {
-        if (initialized_)
+        if (initialization_lifecycle_.admissionComplete())
         {
             return true;
         }
@@ -3190,7 +3057,8 @@ namespace llaminar2
         if (!run_phase("dryRunComplete", [] { return true; }))
             return false;
 
-        initialized_ = true;
+        initialization_lifecycle_.publish(
+            OrchestrationInitializationLifecycle::Completion::Admission);
         if (!mpi_ctx_ ||
             mpi_ctx_->rank() == mpi_coordinated_root_rank_)
         {
@@ -3201,8 +3069,7 @@ namespace llaminar2
 
     void OrchestrationRunner::shutdown()
     {
-        const bool was_initialized = initialized_.load(
-            std::memory_order_acquire);
+        const bool was_inference_ready = initialization_lifecycle_.readyForInference();
         const bool has_live_resources =
             runner_ || model_ctx_ || local_tp_ctx_ || local_pp_ctx_ ||
             moe_overlay_inference_transaction_coordinator_ ||
@@ -3215,7 +3082,7 @@ namespace llaminar2
             moe_expert_overlay_maintenance_service_ ||
             moe_expert_overlay_economy_calibration_ ||
             continuation_request_group_;
-        if (!was_initialized && !has_live_resources)
+        if (!was_inference_ready && !has_live_resources)
         {
             return;
         }
@@ -3242,7 +3109,7 @@ namespace llaminar2
          * so the topology-wide worker remains complete until its last admitted
          * transaction reaches a durable terminal epoch.
          */
-        if (was_initialized && mpi_coordinated_mode_ && mpi_ctx_ &&
+        if (was_inference_ready && mpi_coordinated_mode_ && mpi_ctx_ &&
             mpi_ctx_->rank() == mpi_coordinated_root_rank_ &&
             mpi_ctx_->world_size() > 1)
         {
@@ -3257,7 +3124,7 @@ namespace llaminar2
 
         if (runner_)
         {
-            if (was_initialized)
+            if (was_inference_ready)
             {
                 try
                 {
@@ -3268,17 +3135,24 @@ namespace llaminar2
                     auto native_status = runner_->moeOptimizationStatus();
                     if (native_status.authority != MoEOptimizationAuthority::None)
                     {
-                        native_status.state = MoEOptimizationLifecycleState::Drained;
-                        native_status.activity = MoEOptimizationActivityState::Draining;
-                        terminal_moe_optimization_status_ = std::move(native_status);
+                        terminal_moe_optimization_status_ = drainedMoEOptimizationStatus(std::move(native_status));
                         terminal_moe_optimization_movement_ledger_ = runner_->moeOptimizationMovementLedger();
                     }
                 }
                 catch (const std::exception &e)
                 {
-                    LOG_ERROR("[OrchestrationRunner] shutdown cache reset failed: " << e.what());
-                    if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
-                        rank->clearPendingGpuDirectExpertTransfersForAllDevices();
+                    // A failed terminal reset leaves producer ownership unproven.
+                    // Publishing reuse or dropping transfer leases would disguise
+                    // that failure. Match the participant reset's fatal boundary.
+                    std::fprintf(stderr, "[FATAL] OrchestrationRunner terminal request retirement failed: %s\n", e.what());
+                    std::fflush(stderr);
+                    std::terminate();
+                }
+                catch (...)
+                {
+                    std::fprintf(stderr, "[FATAL] OrchestrationRunner terminal request retirement raised a non-standard exception\n");
+                    std::fflush(stderr);
+                    std::terminate();
                 }
             }
         }
@@ -3304,6 +3178,18 @@ namespace llaminar2
         moe_overlay_inference_transaction_follower_.reset();
         moe_overlay_inference_transaction_coordinator_.reset();
         runner_.reset();
+        if (preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::RetiredImmutableSources)
+        {
+            std::string error;
+            if (!sealReusableModelContextPhysicalState(&error))
+            {
+                model_context_reuse_seal_succeeded_ = false;
+                if (model_context_reuse_seal_error_.empty())
+                    model_context_reuse_seal_error_ = std::move(error);
+                LOG_ERROR("[OrchestrationRunner] " << model_context_reuse_seal_error_);
+            }
+        }
+        moe_pipeline_stage_bindings_.clear();
         if (reusable_execution_workspaces_ &&
             !reusable_execution_workspaces_->valid())
         {
@@ -3378,7 +3264,7 @@ namespace llaminar2
         const bool exports_reusable_model_context =
             model_context_reuse_authority_ != nullptr;
         const bool retires_exclusive_model_context =
-            was_initialized && !exports_reusable_model_context &&
+            was_inference_ready && !exports_reusable_model_context &&
             model_ctx_ && reusable_workspace_complete &&
             model_ctx_.use_count() == 1u &&
             reusable_execution_workspaces_.use_count() == 1u;
@@ -3482,7 +3368,7 @@ namespace llaminar2
             }
         }
 
-        initialized_.store(false, std::memory_order_release);
+        initialization_lifecycle_.retire();
         LOG_DEBUG("OrchestrationRunner shut down");
     }
 
@@ -3858,7 +3744,7 @@ namespace llaminar2
 
     bool OrchestrationRunner::prefill(const std::vector<int32_t> &prompt_tokens)
     {
-        if (!initialized_)
+        if (!initialization_lifecycle_.readyForInference())
         {
             setError("Runner not initialized");
             return false;
@@ -3907,6 +3793,7 @@ namespace llaminar2
                         active_sampling_params_.presence_penalty,
                     .frequency_penalty =
                         active_sampling_params_.frequency_penalty,
+                    .repetition_penalty = active_sampling_params_.repetition_penalty,
                 }))
         {
             return setError(
@@ -4043,6 +3930,20 @@ namespace llaminar2
 
         const auto complete_distributed_prefill = [&]() -> bool
         {
+            if (active_sampling_params_.repetition_penalty != 1.0f &&
+                !moe_overlay_inference_transaction_follower_)
+            {
+                if (runner_->primaryDeviceId().is_gpu())
+                {
+                    auto unique_tokens = prompt_tokens;
+                    std::sort(unique_tokens.begin(), unique_tokens.end());
+                    unique_tokens.erase(std::unique(unique_tokens.begin(), unique_tokens.end()), unique_tokens.end());
+                    if (!runner_->initializePromptRepetitionHistory(unique_tokens))
+                        return setError("Prompt repetition history admission failed");
+                }
+                else
+                    for (int token : prompt_tokens) sampler_.record_prompt_token(token);
+            }
             std::string command_error;
             if (!overlay_prefill_command.complete(&command_error))
             {
@@ -4294,8 +4195,7 @@ namespace llaminar2
 
                     const auto &terminal_block = common_hit.blocks.back();
                     return terminal_block.has_model_runtime_state &&
-                           terminal_block.model_runtime_state_storage &&
-                           !terminal_block.model_runtime_state_storage->empty();
+                           terminal_block.total_bytes > terminal_block.layout.totalBytes();
                 };
 
                 if (stable_prefix_prefill_segment_tokens > 0 &&
@@ -4375,6 +4275,27 @@ namespace llaminar2
                 const auto harvest_schedule = PrefixHarvestSchedule::forPrefill(
                     coordinated_hit, static_cast<int>(prompt_tokens.size()),
                     matched_tokens, stable_prefix_prefill_segment_tokens);
+                // Preserve only diagnostic values from the consumed restore
+                // chain. The later harvest witness deliberately owns fewer
+                // blocks and must not redefine what this request restored.
+                const int summary_block_size =
+                    common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
+                const int restored_block_count = !common_hit.blocks.empty()
+                    ? static_cast<int>(common_hit.blocks.size())
+                    : (summary_block_size > 0 ? matched_tokens / summary_block_size : 0);
+                auto restored_metadata = runner_->prefixRestoreMetadata(common_hit);
+                if (prefix_coordination_comm != MPI_COMM_NULL)
+                {
+                    MPIPrefixCollectiveCoordinator domain_coordinator(prefix_coordination_comm);
+                    if (!domain_coordinator.allRestoreMetadata(restored_metadata, &restored_metadata))
+                        return setError("Prefix restore metadata coordination failed");
+                }
+                // The restore producer now owns every DMA source through its
+                // completion event. Retain just the terminal reuse witness in
+                // both local admissions so LRU pressure can reclaim consumed
+                // attention blocks and earlier recurrent snapshots.
+                local_hit = local_hit.forHarvest(matched_tokens);
+                common_hit = common_hit.forHarvest(matched_tokens);
                 if (!runner_->preparePrefixHarvest(
                         local_hit, prompt_tokens, harvest_schedule))
                 {
@@ -4458,17 +4379,17 @@ namespace llaminar2
                     return true;
                 };
 
-                if (const auto checkpoint = harvest_schedule.reusableCheckpoint())
+                for (const int checkpoint : harvest_schedule.reusableCheckpoints())
                 {
-                    if (!forward_prefix_interval(*checkpoint))
+                    if (!forward_prefix_interval(checkpoint))
                         return false;
                     // Harvest authenticates exactly the tokens already run,
                     // never the still-unexecuted chat-template tail. Saving
                     // here is essential: recurrent state cannot be rewound
                     // from the final prompt checkpoint on the next request.
                     const std::vector<int32_t> checkpoint_tokens(
-                        prompt_tokens.begin(), prompt_tokens.begin() + *checkpoint);
-                    if (!runner_->harvestPrefix(local_hit, checkpoint_tokens, *checkpoint))
+                        prompt_tokens.begin(), prompt_tokens.begin() + checkpoint);
+                    if (!runner_->harvestPrefix(local_hit, checkpoint_tokens, checkpoint))
                         return setError("Prefix cache reusable-boundary harvest failed");
                 }
 
@@ -4530,27 +4451,28 @@ namespace llaminar2
                  * the next identical request may correctly miss while
                  * background movement remains fully asynchronous.
                  */
-                prefix_request_summary_.completion_movement_epoch =
-                    runner_->moeRuntimeMovementEpoch();
+                prefix_request_summary_.movement_stages = runner_->prefixMovementStages();
+                if (prefix_request_summary_.movement_stages.empty())
+                    prefix_request_summary_.completion_movement_epoch = runner_->moeRuntimeMovementEpoch();
+                else
+                {
+                    // Independent stage epochs have no model-wide ordering.
+                    // Only their scoped observations can explain this harvest.
+                    prefix_request_summary_.admission_placement_epochs = {};
+                    prefix_request_summary_.completion_movement_epoch = 0;
+                }
 
                 const bool full_hit = matched_tokens == static_cast<int>(prompt_tokens.size());
                 prefix_request_summary_.hit = matched_tokens > 0 && full_hit;
                 prefix_request_summary_.partial_hit = matched_tokens > 0 && !full_hit;
                 prefix_request_summary_.matched_tokens = matched_tokens;
-                const int summary_block_size =
-                    common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
-                prefix_request_summary_.matched_blocks =
-                    !common_hit.blocks.empty()
-                        ? static_cast<int>(common_hit.blocks.size())
-                        : (summary_block_size > 0 ? matched_tokens / summary_block_size : 0);
+                prefix_request_summary_.matched_blocks = restored_block_count;
                 prefix_request_summary_.terminal_logits_restored = terminal_state_restored;
                 prefix_request_summary_.terminal_hidden_restored =
                     terminal_state_restored && common_hit.has_terminal_hidden;
-                prefix_request_summary_.mtp_state_restored =
-                    matched_tokens > 0 && prefixBlocksContainMTPState(common_hit.blocks);
-                prefix_request_summary_.hybrid_state_restored =
-                    matched_tokens > 0 && prefixBlocksContainHybridState(common_hit.blocks);
-                prefix_request_summary_.storage_tier = summarizePrefixStorageTiers(common_hit.blocks);
+                prefix_request_summary_.mtp_state_restored = restored_metadata.hasMTPState();
+                prefix_request_summary_.hybrid_state_restored = restored_metadata.hasHybridState();
+                prefix_request_summary_.storage_tier = restored_metadata.storageTierName();
 
                 /*
                  * This is request-local diagnostic traffic, not a lifecycle
@@ -4631,7 +4553,7 @@ namespace llaminar2
 
     bool OrchestrationRunner::supportsPrefillBatch(int request_batch) const
     {
-        if (!initialized_ || !runner_ || request_batch <= 1)
+        if (!initialization_lifecycle_.readyForInference() || !runner_ || request_batch <= 1)
             return false;
 
         const MTPRuntimeConfig mtp = activeMTPRequestConfig();
@@ -4663,7 +4585,7 @@ namespace llaminar2
     bool OrchestrationRunner::prefillBatch(
         const std::vector<std::vector<int32_t>> &token_batches)
     {
-        if (!initialized_)
+        if (!initialization_lifecycle_.readyForInference())
             return setError("Runner not initialized");
         if (!runner_)
             return setError("Runner unavailable");
@@ -4740,6 +4662,8 @@ namespace llaminar2
                     active_sampling_params_, request_index);
             state.prefill_logits_ready = true;
             state.sampler = Sampler(active_sampling_params_.seed);
+            if (!runner_->primaryDeviceId().is_gpu() && active_sampling_params_.repetition_penalty != 1.0f)
+                for (int token : tokens) state.sampler.record_prompt_token(token);
             next_states.push_back(std::move(state));
         }
 
@@ -4769,6 +4693,17 @@ namespace llaminar2
             clearBatchedDecodeState();
             return setError("Forward batch failed during request-batched prefill");
         }
+        if (runner_->primaryDeviceId().is_gpu() && active_sampling_params_.repetition_penalty != 1.0f)
+        {
+            for (size_t request = 0; request < token_batches.size(); ++request)
+            {
+                auto unique_tokens = token_batches[request];
+                std::sort(unique_tokens.begin(), unique_tokens.end());
+                unique_tokens.erase(std::unique(unique_tokens.begin(), unique_tokens.end()), unique_tokens.end());
+                if (!runner_->initializePromptRepetitionHistory(unique_tokens, static_cast<int>(request)))
+                    return setError("Batched prompt repetition history admission failed");
+            }
+        }
         if (runner_->primaryDeviceId().is_gpu() &&
             !device_generation_admission_.openAfterPrefill())
         {
@@ -4790,7 +4725,7 @@ namespace llaminar2
 
     bool OrchestrationRunner::supportsDecodeStepBatch(int request_batch) const
     {
-        if (!initialized_ || !runner_ || request_batch <= 1)
+        if (!initialization_lifecycle_.readyForInference() || !runner_ || request_batch <= 1)
             return false;
         if (!batched_decode_active_)
             return false;
@@ -4875,7 +4810,7 @@ namespace llaminar2
     {
         GenerationBatchResult batch_result;
 
-        if (!initialized_)
+        if (!initialization_lifecycle_.readyForInference())
         {
             batch_result.error = "Runner not initialized";
             return batch_result;
@@ -7058,14 +6993,14 @@ namespace llaminar2
             state.logical_tokens =
                 scheduled_base_cached_tokens[i] +
                 catchup.target_verifier_state_commit_count;
-            PerfStatsCollector::addCounter(
+            PerfStatsCollector::addCounterWithSequence(
                 "mtp",
                 "request_batch_resident_planning_position_commits",
                 1.0,
+                {static_cast<uint64_t>(state.logical_tokens)},
                 "decode",
                 {},
-                {{"request", std::to_string(request)},
-                 {"position", std::to_string(state.logical_tokens)}});
+                {{"request", std::to_string(request)}});
 
             /*
              * A resident GPU batch has already consumed the previously emitted
@@ -7357,14 +7292,14 @@ namespace llaminar2
             return setError(
                 "GPU prefill could not open its unique device-generation admission boundary");
         }
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "mtp",
             "gpu_decode_transaction_position_initializations",
             1.0,
+            {static_cast<uint64_t>(committed_tokens)},
             "prefill",
             {},
-            {{"position", std::to_string(committed_tokens)},
-             {"source", source && source[0] != '\0' ? source : "unknown"},
+            {{"source", source && source[0] != '\0' ? source : "unknown"},
              {"position_owner", "request_scheduler"}});
         return true;
     }
@@ -7406,10 +7341,12 @@ namespace llaminar2
         const DeviceGenerationAdmissionRequest admission{
             .request_count = 1,
             .max_new_tokens = response_budget,
+            .kind = device_generation_admission_.admissionKind(),
             .depth_policy = resolveMTPDeviceGenerationDepthPolicy(
                 activeMTPRequestConfig()),
             .initial_leading_row_disposition =
                 initial_leading_row_disposition,
+            .sampling_seeds = generation_request_seeds_,
         };
         if (!runner_->beginDeviceResidentGeneration(admission))
         {
@@ -7456,6 +7393,9 @@ namespace llaminar2
         }
 
         int maximum_committed_tokens = 0;
+        std::vector<uint64_t> position_seeds;
+        if (!active_sampling_params_.is_greedy())
+            position_seeds.reserve(static_cast<size_t>(request_count));
         for (const BatchedDecodeRequestState &state : batched_request_states_)
         {
             if (state.logical_tokens <= 0 || state.is_complete ||
@@ -7466,6 +7406,8 @@ namespace llaminar2
             }
             maximum_committed_tokens =
                 std::max(maximum_committed_tokens, state.logical_tokens);
+            if (!active_sampling_params_.is_greedy())
+                position_seeds.push_back(state.stochastic_position_seed);
         }
 
         int response_budget = decode_step_token_budget_;
@@ -7483,16 +7425,24 @@ namespace llaminar2
                 "Request-batched device generation admission has no common positive response capacity");
         }
 
+        // Prefill already resolved each row's entropy. Reuse those exact seeds
+        // in the admitted bank; generating fresh values here would give the
+        // retained verifier a different sampling law from the leading token.
+        std::optional<GenerationRequestSeeds> sampling_seeds;
+        if (!position_seeds.empty())
+            sampling_seeds.emplace(std::move(position_seeds));
         if (!runner_->beginDeviceResidentGeneration(
                 DeviceGenerationAdmissionRequest{
                     .request_count = request_count,
                     .max_new_tokens = response_budget,
+                    .kind = device_generation_admission_.admissionKind(),
                     .depth_policy = resolveMTPDeviceGenerationDepthPolicy(
                         activeMTPRequestConfig()),
                     .initial_leading_row_disposition =
                         sampling_math::
                             DeviceGenerationLeadingRowDisposition::
                                 PendingResponse,
+                    .sampling_seeds = std::move(sampling_seeds),
                 }))
         {
             return setError(
@@ -7529,15 +7479,14 @@ namespace llaminar2
         }
 
         ++(*decode_transaction_planning_position_);
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "mtp",
             "gpu_decode_transaction_position_forward_advances",
             1.0,
+            {static_cast<uint64_t>(*decode_transaction_planning_position_)},
             "decode",
             {},
-            {{"position",
-              std::to_string(*decode_transaction_planning_position_)},
-             {"source", source && source[0] != '\0' ? source : "unknown"},
+            {{"source", source && source[0] != '\0' ? source : "unknown"},
              {"position_owner", "orchestration_transaction"}});
         return true;
     }
@@ -7583,15 +7532,14 @@ namespace llaminar2
          */
         decode_transaction_planning_position_ =
             transaction_base_tokens + committed_rows;
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "mtp",
             "gpu_decode_transaction_position_publications",
             1.0,
+            {static_cast<uint64_t>(*decode_transaction_planning_position_)},
             "decode",
             {},
             {{"path", source && source[0] != '\0' ? source : "unknown"},
-             {"position",
-              std::to_string(*decode_transaction_planning_position_)},
              {"advanced_tokens", std::to_string(committed_rows)},
              {"position_owner", "orchestration_transaction"}});
         return true;
@@ -7613,15 +7561,14 @@ namespace llaminar2
             if (decode_transaction_planning_position_.has_value() &&
                 *decode_transaction_planning_position_ >= 0)
             {
-                PerfStatsCollector::addCounter(
+                PerfStatsCollector::addCounterWithSequence(
                     "mtp",
                     "gpu_decode_transaction_position_reads",
                     1.0,
+                    {static_cast<uint64_t>(*decode_transaction_planning_position_)},
                     "decode",
                     {},
                     {{"context", context ? context : "unknown"},
-                     {"position",
-                      std::to_string(*decode_transaction_planning_position_)},
                      {"position_owner", "orchestration_transaction"}});
                 return *decode_transaction_planning_position_;
             }
@@ -7643,14 +7590,14 @@ namespace llaminar2
             return std::nullopt;
         }
 
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "mtp",
             "cpu_decode_position_planning_reads",
             1.0,
+            {static_cast<uint64_t>(position)},
             "decode",
             {},
             {{"context", context ? context : "unknown"},
-             {"position", std::to_string(position)},
              {"position_owner", "cpu_runner"}});
         return position;
     }
@@ -9027,14 +8974,14 @@ namespace llaminar2
             transaction_base_cached_tokens = *base_position;
             verifier_base_checkpoint =
                 makeLogicalMTPVerifierBaseSnapshot(transaction_base_cached_tokens);
-            PerfStatsCollector::addCounter(
+            PerfStatsCollector::addCounterWithSequence(
                 "mtp",
                 "live_prefix_checkpoint_skipped_direct_publication",
                 1.0,
+                {static_cast<uint64_t>(transaction_base_cached_tokens)},
                 "decode",
                 {},
-                {{"cached_tokens", std::to_string(transaction_base_cached_tokens)},
-                 {"verifier_path", "grouped_decode_equivalent_outcome"}});
+                {{"verifier_path", "grouped_decode_equivalent_outcome"}});
         }
         else
         {
@@ -9595,14 +9542,14 @@ namespace llaminar2
              * row zero.  The token is already visible to the response stream, so
              * commit code below must start output emission after row zero.
              */
-            PerfStatsCollector::addCounter(
+            PerfStatsCollector::addCounterWithSequence(
                 "mtp",
                 "pending_condition_verifier_rows",
                 1.0,
+                {static_cast<uint64_t>(transaction_base_cached_tokens)},
                 "decode",
                 {},
-                {{"token", std::to_string(condition_token)},
-                 {"cached_tokens", std::to_string(transaction_base_cached_tokens)}});
+                {{"token", std::to_string(condition_token)}});
             PerfStatsCollector::addCounter(
                 "mtp",
                 "condition_forward_skipped_pending_condition",
@@ -9754,14 +9701,14 @@ namespace llaminar2
                     return fail_after_checkpoint(position_error);
                 verifier_base_checkpoint =
                     makeLogicalMTPVerifierBaseSnapshot(*verifier_base_position);
-                PerfStatsCollector::addCounter(
+                PerfStatsCollector::addCounterWithSequence(
                     "mtp",
                     "capture_verifier_base_prefix_state_skipped_all_position_publication",
                     1.0,
+                    {static_cast<uint64_t>(verifier_base_checkpoint.cached_tokens)},
                     "decode",
                     {},
-                    {{"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)},
-                     {"verifier_path", "grouped_decode_equivalent_outcome"}});
+                    {{"verifier_path", "grouped_decode_equivalent_outcome"}});
             }
             else
             {
@@ -9852,25 +9799,6 @@ namespace llaminar2
         const bool admit_device_generation_this_step =
             use_grouped_outcome_device_resident_publication_verifier &&
             pre_sample_effective_draft_count > 0;
-        if (device_generation_admission_.awaitsAdmission() &&
-            admit_device_generation_this_step)
-        {
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "device_generation_execution_policy_selections",
-                1.0,
-                "decode",
-                runner_->primaryDeviceId().toString(),
-                {{"policy",
-                  deviceGenerationExecutionPolicyName(
-                      generation_execution_policy)},
-                 {"topology",
-                  generation_loop_topology ==
-                          DeviceGenerationLoopTopology::DynamicDepth
-                      ? "dynamic_depth"
-                      : "fixed_depth"},
-                 {"selection_boundary", "pre_first_draft"}});
-        }
         if (!admitScalarDeviceResidentGeneration(
                 admit_device_generation_this_step,
                 first_condition_was_already_emitted
@@ -9947,17 +9875,15 @@ namespace llaminar2
              */
             first_token = kDeferredMTPFirstTokenShadow;
             first_token_device_target_slot_available = true;
-            PerfStatsCollector::addCounter(
+            PerfStatsCollector::addCounterWithSequence(
                 "mtp",
                 "first_token_resident_continuation_uses",
                 1.0,
+                {static_cast<uint64_t>(ready_condition->resident_state
+                          ->publication_generation)},
                 "decode",
                 {},
-                {{"publication_generation",
-                  std::to_string(
-                      ready_condition->resident_state
-                          ->publication_generation)},
-                 {"host_token_materializations", "0"}});
+                {{"host_token_materializations", "0"}});
         }
         else
         {
@@ -9985,6 +9911,7 @@ namespace llaminar2
                                     active_sampling_params_.presence_penalty,
                                 .frequency_penalty =
                                     active_sampling_params_.frequency_penalty,
+                    .repetition_penalty = active_sampling_params_.repetition_penalty,
                             }))
                     {
                         return fail_after_checkpoint(
@@ -10001,15 +9928,14 @@ namespace llaminar2
                             sample_threshold_for_position(
                                 sampler_,
                                 first_token_logical_position);
-                        PerfStatsCollector::addCounter(
+                        PerfStatsCollector::addCounterWithSequence(
                             "mtp",
                             "first_token_stochastic_draw",
                             1.0,
+                            {static_cast<uint64_t>(first_token_logical_position), std::bit_cast<uint64_t>(static_cast<double>(first_token_threshold))},
                             "decode",
                             {},
-                            {{"logical_position", std::to_string(first_token_logical_position)},
-                             {"threshold", formatStochasticThreshold(first_token_threshold)},
-                             {"deferred", can_defer_stochastic_first_host_read ? "true" : "false"}});
+                            {{"deferred", can_defer_stochastic_first_host_read ? "true" : "false"}});
                         if (!runner_->buildStochasticDistributionOnDevice(
                                 DeviceLogitsSource::Main,
                                 0,
@@ -10081,16 +10007,14 @@ namespace llaminar2
                             first_token = sampleMTPDistributionWithThreshold(
                                 distribution,
                                 threshold);
-                            PerfStatsCollector::addCounter(
+                            PerfStatsCollector::addCounterWithSequence(
                                 "mtp",
                                 "first_token_stochastic_serial_equivalent_host_samples",
                                 1.0,
+                                {static_cast<uint64_t>(logical_position), std::bit_cast<uint64_t>(static_cast<double>(threshold)), static_cast<uint64_t>(first_token)},
                                 "decode",
                                 {},
-                                {{"logical_position", std::to_string(logical_position)},
-                                 {"threshold", formatStochasticThreshold(threshold)},
-                                 {"sampled_token", std::to_string(first_token)},
-                                 {"position_owner", "transaction_base_cached_tokens"},
+                                {{"position_owner", "transaction_base_cached_tokens"},
                                  {"source", "cpu_rank_terminal_logits"}});
                         }
                         else
@@ -10118,6 +10042,7 @@ namespace llaminar2
                                           active_sampling_params_.presence_penalty,
                                       .frequency_penalty =
                                           active_sampling_params_.frequency_penalty,
+                    .repetition_penalty = active_sampling_params_.repetition_penalty,
                                   })
                             : runner_->applyPenaltiesOnDevice(
                                   sampler_.compute_penalty_map(
@@ -10759,15 +10684,14 @@ namespace llaminar2
                         token = sampleMTPDistributionWithThreshold(
                             distribution,
                             threshold);
-                        PerfStatsCollector::addCounter(
+                        PerfStatsCollector::addCounterWithSequence(
                             "mtp",
                             "mtp_token_stochastic_position_keyed_host_samples",
                             1.0,
+                            {static_cast<uint64_t>(logical_position), std::bit_cast<uint64_t>(static_cast<double>(threshold))},
                             "decode",
                             {},
-                            {{"draft_idx", std::to_string(draft_idx)},
-                             {"logical_position", std::to_string(logical_position)},
-                             {"threshold", formatStochasticThreshold(threshold)}});
+                            {{"draft_idx", std::to_string(draft_idx)}});
                     }
                     else
                     {
@@ -10789,6 +10713,7 @@ namespace llaminar2
                                       active_sampling_params_.presence_penalty,
                                   .frequency_penalty =
                                       active_sampling_params_.frequency_penalty,
+                    .repetition_penalty = active_sampling_params_.repetition_penalty,
                               })
                         : runner_->applyPenaltiesToMTPLogitsOnDevice(
                               draft_sampler.compute_penalty_map(
@@ -12701,14 +12626,14 @@ namespace llaminar2
             bool restored_verifier_base = sidecar_preserves_main_state;
             if (sidecar_preserves_main_state)
             {
-                PerfStatsCollector::addCounter(
+                PerfStatsCollector::addCounterWithSequence(
                     "mtp",
                     "all_position_verifier_base_restore_skipped_sidecar_preserved",
                     1.0,
+                    {static_cast<uint64_t>(verifier_base_checkpoint.cached_tokens)},
                     "decode",
                     {},
-                    {{"draft_tokens", std::to_string(draft_tokens.size())},
-                     {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)}});
+                    {{"draft_tokens", std::to_string(draft_tokens.size())}});
             }
             else
             {
@@ -12720,14 +12645,14 @@ namespace llaminar2
                     runner_->restoreLivePrefixState(verifier_base_checkpoint);
                 if (restored_verifier_base)
                 {
-                    PerfStatsCollector::addCounter(
+                    PerfStatsCollector::addCounterWithSequence(
                         "mtp",
                         "all_position_verifier_base_restores",
                         1.0,
+                        {static_cast<uint64_t>(verifier_base_checkpoint.cached_tokens)},
                         "decode",
                         {},
-                        {{"draft_tokens", std::to_string(draft_tokens.size())},
-                         {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)}});
+                        {{"draft_tokens", std::to_string(draft_tokens.size())}});
                 }
             }
             if (!restored_verifier_base)
@@ -13108,16 +13033,14 @@ namespace llaminar2
                     }
 
                     ++mtp_stats_.stochastic_accept_tests;
-                    PerfStatsCollector::addCounter(
+                    PerfStatsCollector::addCounterWithSequence(
                         "mtp",
                         "stochastic_accept_tests",
                         1.0,
+                        {static_cast<uint64_t>(draft_token), std::bit_cast<uint64_t>(static_cast<double>(row_result.accept_probability)), std::bit_cast<uint64_t>(static_cast<double>(row_result.accept_threshold))},
                         "decode",
                         {},
                         {{"row", std::to_string(row)},
-                         {"draft_token", std::to_string(draft_token)},
-                         {"accept_probability", std::to_string(row_result.accept_probability)},
-                         {"threshold", std::to_string(row_result.accept_threshold)},
                          {"device_resident", "false"},
                          {"stochastic_coupling",
                           use_serial_sample_equivalent_host_stochastic
@@ -13128,14 +13051,14 @@ namespace llaminar2
 
                     if (use_serial_sample_equivalent_host_stochastic)
                     {
-                        PerfStatsCollector::addCounter(
+                        PerfStatsCollector::addCounterWithSequence(
                             "mtp",
                             "stochastic_serial_equivalent_host_verifier_rows",
                             1.0,
+                            {static_cast<uint64_t>(logical_position)},
                             "decode",
                             {},
-                            {{"row", std::to_string(row)},
-                             {"logical_position", std::to_string(logical_position)}});
+                            {{"row", std::to_string(row)}});
                     }
 
                     const int32_t output_token = row_result.token;
@@ -13164,17 +13087,16 @@ namespace llaminar2
                         sampled_verifier_rows[static_cast<size_t>(row)] =
                             output_token;
                         ++mtp_stats_.stochastic_residual_samples;
-                        PerfStatsCollector::addCounter(
+                        PerfStatsCollector::addCounterWithSequence(
                             "mtp",
                             use_serial_sample_equivalent_host_stochastic
                                 ? "stochastic_serial_equivalent_correction_host_samples"
                                 : "stochastic_residual_host_samples",
                             1.0,
+                            {static_cast<uint64_t>(draft_token), static_cast<uint64_t>(output_token)},
                             "decode",
                             {},
                             {{"row", std::to_string(row)},
-                             {"draft_token", std::to_string(draft_token)},
-                             {"correction_token", std::to_string(output_token)},
                              {"stochastic_coupling",
                               use_serial_sample_equivalent_host_stochastic
                                   ? "serial_sample_equivalent"
@@ -13825,14 +13747,14 @@ namespace llaminar2
             bool restored_verifier_base = sidecar_preserves_main_state;
             if (sidecar_preserves_main_state)
             {
-                PerfStatsCollector::addCounter(
+                PerfStatsCollector::addCounterWithSequence(
                     "mtp",
                     "grouped_decode_equivalent_verifier_base_restore_skipped_sidecar_preserved",
                     1.0,
+                    {static_cast<uint64_t>(verifier_base_checkpoint.cached_tokens)},
                     "decode",
                     {},
                     {{"draft_tokens", std::to_string(draft_tokens.size())},
-                     {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)},
                      {"discarded_sidecar_checkpoint",
                       sidecar_checkpoint ? "true" : "false"}});
             }
@@ -13846,14 +13768,14 @@ namespace llaminar2
                     runner_->restoreLivePrefixState(verifier_base_checkpoint);
                 if (restored_verifier_base)
                 {
-                    PerfStatsCollector::addCounter(
+                    PerfStatsCollector::addCounterWithSequence(
                         "mtp",
                         "grouped_decode_equivalent_verifier_base_restores",
                         1.0,
+                        {static_cast<uint64_t>(verifier_base_checkpoint.cached_tokens)},
                         "decode",
                         {},
                         {{"draft_tokens", std::to_string(draft_tokens.size())},
-                         {"cached_tokens", std::to_string(verifier_base_checkpoint.cached_tokens)},
                          {"discarded_sidecar_checkpoint",
                           sidecar_checkpoint ? "true" : "false"}});
                 }
@@ -14055,6 +13977,7 @@ namespace llaminar2
                         active_sampling_params_.presence_penalty,
                     .frequency_penalty =
                         active_sampling_params_.frequency_penalty,
+                    .repetition_penalty = active_sampling_params_.repetition_penalty,
                 };
                 if (!runner_
                          ->buildCapturedStochasticVerifierTargetDistributions(
@@ -14262,6 +14185,7 @@ namespace llaminar2
                             active_sampling_params_.presence_penalty,
                         .frequency_penalty =
                             active_sampling_params_.frequency_penalty,
+                    .repetition_penalty = active_sampling_params_.repetition_penalty,
                     };
                 PerfStatsCollector::addCounter(
                     "mtp",
@@ -14495,6 +14419,7 @@ namespace llaminar2
                                      .frequency_penalty =
                                          active_sampling_params_
                                              .frequency_penalty,
+                    .repetition_penalty = active_sampling_params_.repetition_penalty,
                                  }))
                     {
                         return fail_active_greedy_verifier(
@@ -14674,6 +14599,7 @@ namespace llaminar2
                             active_sampling_params_.presence_penalty,
                         .frequency_penalty =
                             active_sampling_params_.frequency_penalty,
+                    .repetition_penalty = active_sampling_params_.repetition_penalty,
                     };
 
                 std::string publication_error;
@@ -14798,6 +14724,7 @@ namespace llaminar2
         const DeviceGenerationAdmissionRequest admission{
             .request_count = 1,
             .max_new_tokens = budget,
+            .kind = device_generation_admission_.admissionKind(),
             .depth_policy = sampling_math::DeviceGenerationPolicy::ordinary(),
             .initial_leading_row_disposition = leading,
             .sampling_seeds = generation_request_seeds_,
@@ -14870,7 +14797,7 @@ namespace llaminar2
     {
         GenerationResult result;
 
-        if (!initialized_)
+        if (!initialization_lifecycle_.readyForInference())
         {
             result.error = "Runner not initialized";
             return result;
@@ -15274,15 +15201,14 @@ namespace llaminar2
                     *logical_position);
             if (sampled_token >= 0)
             {
-                PerfStatsCollector::addCounter(
+                PerfStatsCollector::addCounterWithSequence(
                     "sampling",
                     "main_stochastic_logical_position_samples",
                     1.0,
+                    {static_cast<uint64_t>(*logical_position), std::bit_cast<uint64_t>(static_cast<double>(threshold))},
                     "decode",
                     {},
-                    {{"logical_position", std::to_string(*logical_position)},
-                     {"threshold", formatStochasticThreshold(threshold)},
-                     {"logical_position_sampler", "true"}});
+                    {{"logical_position_sampler", "true"}});
             }
             return sampled_token;
         };
@@ -15552,7 +15478,7 @@ namespace llaminar2
     {
         GenerationResult result;
 
-        if (!initialized_)
+        if (!initialization_lifecycle_.readyForInference())
         {
             result.error = "Runner not initialized";
             return result;
@@ -16073,7 +15999,7 @@ namespace llaminar2
     {
         GenerationResult result;
 
-        if (!initialized_)
+        if (!initialization_lifecycle_.readyForInference())
         {
             result.error = "Runner not initialized";
             return result;
@@ -16185,6 +16111,25 @@ namespace llaminar2
                     ->completedDurableMovementEpochs());
         }
         return epoch;
+    }
+
+    MoEOptimizationMovementTopology OrchestrationRunner::moeOptimizationMovementTopology() const
+    {
+        if (!moe_pipeline_prepared_plan_)
+            return describeMoEOptimizationMovementTopology(config_.moe_routed_expert_plan.get());
+        const auto &prepared = moe_pipeline_prepared_plan_->stages();
+        const auto &admitted = moe_pipeline_prepared_plan_->admission()->stages();
+        std::vector<MoEOptimizationStages<MoEOptimizationMovementTopology>::Entry> stages;
+        stages.reserve(prepared.size());
+        for (std::size_t i = 0; i < prepared.size(); ++i)
+        {
+            const auto &scope = admitted.at(i).topology().scope();
+            const auto &metadata = prepared[i].metadata;
+            stages.push_back({MoEOptimizationStageIdentity{i, scope.first_layer, scope.last_layer,
+                metadata.first_model_layer + metadata.num_layers, admitted[i].rankPlan().local_tp_devices, scope.has_lm_head},
+                describeMoEOptimizationMovementTopology(prepared[i].placement.get())});
+        }
+        return composeMoEOptimizationMovementTopology(MoEOptimizationStages<MoEOptimizationMovementTopology>::seal(std::move(stages)));
     }
 
     MoEOptimizationStatus OrchestrationRunner::moeOptimizationStatus() const
@@ -16433,7 +16378,7 @@ namespace llaminar2
             return true;
         }
 
-        if (usesSingleDomainNativeGpuDeviceResidentMoEOverlayAuthority())
+        if (usesNativeGpuStageMoEOverlayAuthority())
         {
             if (config_.moe_rebalance.mode !=
                 MoERebalanceRuntimeMode::Dynamic)
@@ -16446,7 +16391,7 @@ namespace llaminar2
                         DeviceResident)
             {
                 return setError(
-                    "Single-domain native device-resident ExpertOverlay lost its graph-family authority binding");
+                    "Native GPU-stage device-resident ExpertOverlay lost its graph-family authority binding");
             }
             try
             {
@@ -16454,14 +16399,14 @@ namespace llaminar2
                         committed_tokens))
                 {
                     return setError(
-                        "Single-domain native device-resident ExpertOverlay maintenance enqueue failed");
+                        "Native GPU-stage device-resident ExpertOverlay maintenance enqueue failed");
                 }
             }
             catch (const std::exception &error)
             {
                 return setError(
                     std::string(
-                        "Single-domain native device-resident ExpertOverlay maintenance failed: ") +
+                        "Native GPU-stage device-resident ExpertOverlay maintenance failed: ") +
                     error.what());
             }
 
@@ -16588,7 +16533,7 @@ namespace llaminar2
         /* Every listed value is request-owned. The retained graph family,
          * prefix archive, prepared weights, and ExpertOverlay placement epoch
          * intentionally do not participate in this admission decision. */
-        return initialized_ && runner_ && runner_->get_position() == 0 &&
+        return initialization_lifecycle_.readyForInference() && runner_ && runner_->get_position() == 0 &&
                !prefill_logits_ready_ && !ready_mtp_condition_ &&
                !pending_mtp_condition_token_ &&
                !pending_mtp_condition_params_ &&
@@ -16668,7 +16613,7 @@ namespace llaminar2
 
     bool OrchestrationRunner::isInitialized() const
     {
-        return initialized_;
+        return initialization_lifecycle_.readyForInference();
     }
 
     const std::string &OrchestrationRunner::lastError() const
@@ -16866,16 +16811,16 @@ namespace llaminar2
     {
         PrefixRuntimeStateSnapshot snapshot = runner_ ? runner_->prefixStateProbe(capture_policy)
                                                       : PrefixRuntimeStateSnapshot{};
-        snapshot.initialized = initialized_;
+        snapshot.initialized = initialization_lifecycle_.readyForInference();
         snapshot.prefill_logits_ready = prefill_logits_ready_;
         /*
          * The heterogeneous controller's mapped durable word is the only
          * movement authority for this regime. The narrow epoch accessor also
          * preserves the child runner's device-local movement evidence.
          */
-        snapshot.moe_runtime_movement_epoch = std::max(
-            snapshot.moe_runtime_movement_epoch,
-            moeRuntimeMovementEpoch());
+        if (snapshot.moe_runtime_movement_epoch.isLeaf())
+            snapshot.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(std::max(
+                snapshot.moe_runtime_movement_epoch.epoch(), moeRuntimeMovementEpoch()));
         /*
          * The child probe owns the meaning of live position. GPU runners read
          * it from the device-resident logical-state mailbox, while
@@ -17088,6 +17033,18 @@ namespace llaminar2
             const int rank = mpi_ctx_->rank();
             const auto resolved = ResolvedRankOrchestration::resolve(
                 config_, *planning_model_metadata_, cluster_inventory_, *plan_builder_, rank);
+            if (!resolved.pipelineStages().empty())
+            {
+                // Each native GPU stage owns its own controller and native
+                // collective. A host maintenance composer is not substituted.
+                for (const auto &stage : resolved.pipelineStages())
+                    if (MoEOverlayCapacityAdmission::selectMigrationStorage(
+                            *stage.config().moe_routed_expert_plan, MoERebalanceRuntimeMode::Dynamic) !=
+                        MoEOverlayMigrationStorageKind::DeviceTransferDirectory)
+                        return setError("Local MoE pipeline stages require native GPU controller domains");
+                moe_pipeline_topology_ = std::make_shared<const ResolvedRankOrchestration>(resolved);
+                requested_routed_weight_authority_identity_ = pipelineRoutedWeightAuthorityRequestIdentity(resolved);
+            }
             config_ = resolved.config();
             plan_ = resolved.rankPlan();
             mpi_coordinated_root_rank_ = resolved.overlayExecution()
@@ -17280,7 +17237,7 @@ namespace llaminar2
                 return setError(
                     "Preloaded ModelContext has no concrete WeightManager");
             }
-            if (config_.moe_routed_expert_plan &&
+            if ((config_.moe_routed_expert_plan || moe_pipeline_topology_) &&
                 !retained_prepared_weight_plan_)
             {
                 return setError(
@@ -17295,7 +17252,7 @@ namespace llaminar2
                     !requested_routed_weight_authority_identity_.empty();
                 if (retained_has_routed_authority !=
                     static_cast<bool>(
-                        retained_prepared_routed_weight_plan_))
+                        retained_prepared_routed_weight_plan_ || moe_pipeline_prepared_plan_))
                 {
                     return setError(
                         "Retained ExpertOverlay identity and model-frozen "
@@ -17723,6 +17680,8 @@ namespace llaminar2
 
     bool OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()
     {
+        if (moe_pipeline_topology_)
+            return freezeMoEPipelinePlanForLoadedModel();
         if (!model_ctx_ || !config_.moe_routed_expert_plan)
             return true;
 
@@ -18257,6 +18216,63 @@ namespace llaminar2
         return true;
     }
 
+    bool OrchestrationRunner::freezeMoEPipelinePlanForLoadedModel()
+    {
+        try
+        {
+            if (!model_ctx_ || !moe_pipeline_topology_ || config_.moe_routed_expert_plan ||
+                !mpi_ctx_ || mpi_ctx_->rank() != 0 || mpi_ctx_->world_size() != 1)
+                throw std::invalid_argument("MoE pipeline admission requires the exact local model and compiled stage topology");
+            if (snapshot_capture_setup_.enabled() && !snapshot_capture_setup_.memory_capacity.valid())
+                throw std::invalid_argument("MoE pipeline snapshots require admitted setup capacity");
+            if (retained_prepared_weight_plan_)
+            {
+                if (!retained_prepared_weight_plan_validated_ || !moe_pipeline_prepared_plan_)
+                    throw std::invalid_argument("Retained MoE pipeline has no validated stage placement authority");
+                if (pipelineRoutedWeightAuthorityRequestIdentity(*moe_pipeline_topology_) != retained_routed_weight_authority_identity_)
+                    throw std::invalid_argument("Retained MoE pipeline stage policy differs from the requested model authority");
+                if (snapshot_capture_setup_.enabled())
+                    for (const auto &bom : moe_pipeline_prepared_plan_->admission()->physicalAdmission()->plan().resources())
+                        if (bom.resource().device.is_gpu() && bom.bytes(PhysicalMemoryOwner::GraphSnapshotArena) <
+                            snapshot_capture_setup_.memory_capacity.per_accelerator_bytes)
+                            throw std::invalid_argument("Retained MoE pipeline does not admit the requested snapshot capacity");
+            }
+            else
+            {
+                const auto devices = rankLocalGPUExecutionDevices(plan_, nullptr, mpi_ctx_);
+                if (!refreshRankLocalGPUCapacityObservations(devices, "pipeline_physical_capacity_resolution"))
+                    return false;
+                const auto &execution = debugEnv().execution;
+                if (!execution.gpu_graphs || !execution.prefill_graph_buckets)
+                    throw std::invalid_argument("MoE pipeline GPU admission requires complete captured serving families");
+                auto admission = std::make_shared<const AdmittedMoEPipelineMemory>(AdmittedMoEPipelineMemory::admit(
+                    *moe_pipeline_topology_, planningModelMetadata(), model_ctx_->concreteLoader(), cluster_inventory_,
+                    {.prefill = {.bucket_rows = execution.prefill_graph_bucket_sizes,
+                         .minimum_sequence_rows = execution.prefill_graph_min_seq,
+                         .maximum_cached_buckets = execution.prefill_graph_max_cached_buckets},
+                     .gpu_weight_load = {.policy = configuredGPUWeightLoadMemoryPolicy(),
+                         .maximum_source_bytes = maximumGGUFTensorPayloadBytes(model_ctx_->concreteLoader().getModel())},
+                     .snapshot_capacity = snapshot_capture_setup_.enabled()
+                         ? snapshot_capture_setup_.memory_capacity : GraphSnapshotMemoryCapacity{},
+                     .model_graph_topology_variant_count = snapshot_capture_setup_.retainedModelGraphTopologyVariantCount()}));
+                moe_pipeline_prepared_plan_ = MoEPipelinePreparedPlan::create(std::move(admission), model_ctx_);
+            }
+            const auto &admission = *moe_pipeline_prepared_plan_->admission();
+            physical_memory_admission_ = admission.physicalAdmission();
+            plan_.runtime.resident_graph_rows = admission.rankPlan().runtime.resident_graph_rows;
+            plan_.runtime.moe_routed_prefill.overlay_segment_rows = admission.rankPlan().runtime.moe_routed_prefill.overlay_segment_rows;
+            if (!publishPhysicalMemoryAuthority()) return false;
+            PerfStatsCollector::addCounter("moe_overlay_capacity", "pipeline_capacity_plan_installed", 1.0,
+                "model_setup", {}, {{"stages", std::to_string(admission.stages().size())},
+                    {"retained", retained_prepared_weight_plan_ ? "true" : "false"}, {"single_authority", "true"}});
+            return true;
+        }
+        catch (const std::exception &error)
+        {
+            return setError(std::string("Failed to admit model-owned MoE pipeline stages: ") + error.what());
+        }
+    }
+
     bool OrchestrationRunner::initializeContinuationRequestGroup()
     {
         if (continuation_request_group_)
@@ -18323,6 +18339,22 @@ namespace llaminar2
         moe_overlay_prefill_interference_owner_ =
             MoEOverlayPrefillInterferenceOwner::OrchestrationScope;
 
+        if (moe_pipeline_topology_)
+        {
+            try
+            {
+                if (!moe_pipeline_prepared_plan_ || !model_ctx_ || !moe_pipeline_stage_bindings_.empty())
+                    throw std::logic_error("MoE pipeline residency requires one admitted model and fresh runtime owners");
+                moe_pipeline_stage_bindings_ = moe_pipeline_prepared_plan_->createRuntimeBindings(
+                    model_ctx_->concreteLoader(), physical_memory_authority_, mpi_ctx_, *moe_pipeline_topology_);
+                return true;
+            }
+            catch (const std::exception &error)
+            {
+                return setError(std::string("Failed to construct MoE pipeline stage runtime: ") + error.what());
+            }
+        }
+
         const auto &plan = config_.moe_routed_expert_plan;
         if (!model_ctx_ || !plan ||
             !plan->usesExpertOverlayAuthority())
@@ -18335,36 +18367,23 @@ namespace llaminar2
                 resolveMoERoutedExpertModelMetadataForModel(
                     *model_ctx_,
                     mtp);
-            if (metadata.num_layers <= 0 || metadata.num_experts <= 0)
-            {
-                return setError(
-                    "Tiered ExpertOverlay residency could not resolve positive model geometry");
-            }
-
-            /*
-             * Build the exact layer-equivalence partition once, before any
-             * graph or controller consumes it. The residency authority keeps
-             * this immutable catalog alive and lends the same object to graph
-             * telemetry and economy certification. Rebuilding independent
-             * sampling lists later would permit graph evidence and the
-             * certifier to disagree about which layer represents a class.
-             */
-            std::shared_ptr<
-                const MoEOverlayEconomyCalibrationLayerCatalog>
-                economy_layer_catalog;
-            if (config_.moe_rebalance.mode ==
-                MoERebalanceRuntimeMode::Dynamic)
-            {
-                economy_layer_catalog = std::make_shared<
-                    MoEOverlayEconomyCalibrationLayerCatalog>(
-                    buildMoEOverlayLayerWeightManifestFromGGUF(
-                        model_ctx_->concreteLoader().getModel(),
-                        metadata.num_layers,
-                        metadata.num_experts));
-            }
-
-            const MoEExpertOwnerMap owner_map =
-                MoEExpertOwnerMap::build(*plan);
+            if (!moe_expert_overlay_memory_admission_)
+                throw std::logic_error("Expert runtime setup has no admitted physical capacity");
+            const auto overlay_world =
+                moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            const int current_rank = overlay_world ? overlay_world->rank() : 0;
+            const int world_size = overlay_world ? overlay_world->world_size() : 1;
+            const auto capacity_policy = resolveMoEOverlayCapacityAdmissionPolicy(
+                *plan, config_, world_size, metadata.num_layers, metadata.num_experts);
+            // Main-model and PP stage owners use one checked constructor. Its
+            // unpublished result retires as a unit if controller setup fails.
+            const auto setup = MoEOverlayResidencySetup::create({
+                .plan = *plan, .metadata = metadata, .loader = model_ctx_->concreteLoader(),
+                .rebalance = config_.moe_rebalance, .storage_policy = capacity_policy,
+                .capacity = *moe_expert_overlay_memory_admission_,
+                .memory = physical_memory_authority_, .world_rank = current_rank, .world_size = world_size});
+            const auto &economy_layer_catalog = setup.authority()->economyLayerCatalog();
+            const auto &owner_map = setup.authority()->snapshot()->owner_map;
             if (plan->authority_execution ==
                 MoEOverlayAuthorityExecutionKind::DeviceResident)
             {
@@ -18478,7 +18497,8 @@ namespace llaminar2
                         const auto initial_layered_ownership =
                             owner_map.layeredOwnership(
                                 metadata.num_layers,
-                                metadata.num_experts);
+                                metadata.num_experts,
+                                metadata.first_model_layer);
                         std::vector<std::uint32_t>
                             initial_owner_participants;
                         initial_owner_participants.reserve(
@@ -18493,7 +18513,7 @@ namespace llaminar2
                                 initial_owner_participants.push_back(
                                     static_cast<std::uint32_t>(
                                         initial_layered_ownership.owner(
-                                            layer, expert)));
+                                            metadata.first_model_layer + layer, expert)));
                             }
                         }
                         moe_overlay_device_controller_fabric_ =
@@ -18546,6 +18566,7 @@ namespace llaminar2
                                         .dynamic_maximum_commands_per_wave =
                                             config_.moe_rebalance
                                                 .dynamic_max_plan_entries_per_wave,
+                                        .first_model_layer = metadata.first_model_layer,
                                     });
                         PerfStatsCollector::addCounter(
                             "moe_overlay_controller",
@@ -18595,256 +18616,10 @@ namespace llaminar2
                  * retained controller family before request admission.
                  */
             }
-            const bool observes_residency =
-                config_.moe_rebalance.mode !=
-                MoERebalanceRuntimeMode::Off;
-            const bool dynamic_residency =
-                config_.moe_rebalance.mode ==
-                MoERebalanceRuntimeMode::Dynamic;
-            const bool host_dynamic_residency =
-                dynamic_residency &&
-                plan->authority_execution ==
-                    MoEOverlayAuthorityExecutionKind::HostResident;
-
-            if (observes_residency)
-            {
-                DecodeExpertHistogramConfig histogram_config;
-                histogram_config.num_layers = metadata.num_layers;
-                histogram_config.num_experts = metadata.num_experts;
-                histogram_config.top_k =
-                    model_ctx_->concreteLoader().getInt(
-                        model_ctx_->architecture() + ".expert_used_count",
-                        0);
-                histogram_config.window_size =
-                    std::max(1, config_.moe_rebalance.window_size);
-                if (metadata.main_inference_layer_count <= 0 ||
-                    metadata.main_inference_layer_count > metadata.num_layers)
-                {
-                    return setError(
-                        "Dynamic ExpertOverlay residency has no valid main-inference layer interval");
-                }
-                const auto token_boundary_layer =
-                    plan->lastPlacementLayerBefore(
-                        metadata.main_inference_layer_count);
-                if (!token_boundary_layer)
-                {
-                    return setError(
-                        "Dynamic ExpertOverlay residency found no routed layer in the main-inference interval");
-                }
-                histogram_config.token_boundary_layer_idx =
-                    *token_boundary_layer;
-                for (const auto &participant : owner_map.participants())
-                    histogram_config.sockets.push_back(participant.device);
-                histogram_config.ownership = owner_map.layeredOwnership(
-                    metadata.num_layers,
-                    metadata.num_experts);
-
-                if (histogram_config.top_k <= 0 ||
-                    histogram_config.sockets.empty())
-                {
-                    return setError(
-                        "Dynamic ExpertOverlay residency could not resolve routing or participant geometry");
-                }
-                if (host_dynamic_residency)
-                {
-                    if (!moe_expert_overlay_memory_admission_ ||
-                        !moe_expert_overlay_memory_admission_->host_demand_memory)
-                        return setError("Host Dynamic ExpertOverlay has no admitted transaction-demand geometry");
-                    histogram_config.transaction_demand =
-                        moe_expert_overlay_memory_admission_->host_demand_memory->bind(
-                            histogram_config, physical_memory_authority_);
-                }
-                moe_expert_overlay_decode_histogram_ =
-                    std::make_shared<DecodeExpertHistogram>(
-                        std::move(histogram_config));
-                PerfStatsCollector::addCounter(
-                    "moe_overlay_residency",
-                    "histogram_token_boundary_configured",
-                    1.0,
-                    "model_setup",
-                    "",
-                    {{"boundary_layer", std::to_string(*token_boundary_layer)},
-                     {"main_layer_count",
-                      std::to_string(metadata.main_inference_layer_count)},
-                     {"resident_layer_capacity",
-                      std::to_string(metadata.num_layers)},
-                     {"retained_auxiliary_layers",
-                      std::to_string(
-                          metadata.num_layers -
-                          metadata.main_inference_layer_count)}});
-                if (dynamic_residency)
-                {
-                    moe_expert_overlay_interference_probe_ =
-                        std::make_shared<
-                            MoEOverlayInferenceInterferenceProbe>();
-                }
-            }
-
-            std::string perf_device;
-            for (const auto &tier : plan->routed_tiers)
-            {
-                if (!perf_device.empty())
-                    perf_device += '/';
-                perf_device += tier.name;
-            }
-            if (perf_device.empty())
-                perf_device = "expert_overlay";
-
-            const auto authority_world =
-                moe_expert_overlay_mpi_ctx_
-                    ? moe_expert_overlay_mpi_ctx_
-                    : mpi_ctx_;
-            const auto authority_capacity_policy =
-                resolveMoEOverlayCapacityAdmissionPolicy(
-                    *plan,
-                    config_,
-                    authority_world ? authority_world->world_size() : 1,
-                    metadata.num_layers,
-                    metadata.num_experts);
-
-            moe_expert_overlay_residency_authority_ =
-                std::make_shared<MoEOverlayResidencyAuthority>(
-                    MoEOverlayResidencyAuthority::Config{
-                        .initial_plan = *plan,
-                        .model_metadata = metadata,
-                        .maintenance_mode =
-                            config_.moe_rebalance.mode,
-                        .histogram =
-                            moe_expert_overlay_decode_histogram_.get(),
-                        .histogram_max_window_tokens =
-                            static_cast<std::uint64_t>(std::max(
-                                0,
-                                config_.moe_rebalance.max_window_size)),
-                        .histogram_window_growth_factor =
-                            static_cast<double>(
-                                config_.moe_rebalance
-                                    .window_growth_factor),
-                        .economy_layer_catalog =
-                            economy_layer_catalog,
-                        .participant_rebalance_policy = {
-                            .enabled = host_dynamic_residency,
-                            .imbalance_threshold_per_mille =
-                                config_.moe_rebalance
-                                    .dynamic_imbalance_threshold_per_mille,
-                            .minimum_improvement_per_mille =
-                                config_.moe_rebalance
-                                    .dynamic_min_improvement_per_mille,
-                            .maximum_swaps_per_layer =
-                                config_.moe_rebalance
-                                    .dynamic_max_swaps_per_layer,
-                            .maximum_plan_entries_per_wave =
-                                config_.moe_rebalance
-                                    .dynamic_max_plan_entries_per_wave,
-                            .minimum_window_activations =
-                                config_.moe_rebalance
-                                    .dynamic_min_window_activations,
-                        },
-                        /* Use the same worst-case arrival-slot equation as
-                         * setup admission and physical materialization. */
-                        .shadow_slots_per_endpoint_layer =
-                            authority_capacity_policy
-                                .shadow_slots_per_endpoint_layer,
-                        .max_concurrent_cycles =
-                            config_.moe_rebalance
-                                .resolvedMigrationCyclesPerWave(),
-                        .perf_device = std::move(perf_device),
-                    });
-
-            const auto initial_snapshot =
-                moe_expert_overlay_residency_authority_->snapshot();
-            if (!initial_snapshot || !initial_snapshot->valid())
-            {
-                return setError(
-                    "Tiered ExpertOverlay residency authority did not publish "
-                    "a valid initial epoch");
-            }
-
-            const auto overlay_world =
-                moe_expert_overlay_mpi_ctx_
-                    ? moe_expert_overlay_mpi_ctx_
-                    : mpi_ctx_;
-            const int current_rank = overlay_world ? overlay_world->rank() : 0;
-            const int world_size =
-                overlay_world ? overlay_world->world_size() : 1;
-            std::vector<int> local_participant_ids;
-            local_participant_ids.reserve(owner_map.participants().size());
-            for (const auto &participant : owner_map.participants())
-            {
-                if (!participant.world_rank_known)
-                {
-                    /*
-                     * A one-rank plan has no remote placement ambiguity.  In a
-                     * real multi-rank world, however, accepting an unresolved
-                     * endpoint would let two ranks prepare or omit the same
-                     * bank, so the hardware-binding phase must resolve it.
-                     */
-                    if (world_size != 1)
-                    {
-                        return setError(
-                            "Tiered ExpertOverlay participant " +
-                            std::to_string(participant.participant_id) +
-                            " has no resolved world-rank owner");
-                    }
-                    local_participant_ids.push_back(
-                        participant.participant_id);
-                    continue;
-                }
-                if (participant.world_rank == current_rank)
-                {
-                    local_participant_ids.push_back(
-                        participant.participant_id);
-                }
-            }
-
-            std::shared_ptr<const MoEExpertOverlayPreparationPlan> projection_preparation;
-            if (std::any_of(plan->domains.begin(), plan->domains.end(), [](const auto &domain) {
-                    return domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns;
-                }))
-            {
-                const auto runtime = resolveMoEExpertOverlayRuntimePlan(plan,
-                    {.current_world_rank = current_rank, .validate_mvp_root_reachability = false});
-                projection_preparation = std::make_shared<const MoEExpertOverlayPreparationPlan>(
-                    MoEExpertOverlayPreparationPlan::build(*runtime, *model_ctx_->loader()));
-            }
-            moe_expert_overlay_participant_residency_ =
-                std::make_shared<
-                    MoEOverlayParticipantResidencyRegistry>(
-                    MoEOverlayParticipantResidencyRegistry::Config{
-                        .owner_map = initial_snapshot->owner_map,
-                        .local_participant_ids =
-                            std::move(local_participant_ids),
-                        .num_layers = metadata.num_layers,
-                        .num_experts = metadata.num_experts,
-                        .initial_epoch = initial_snapshot->epoch,
-                        .retained_epoch_capacity = 2,
-                        .collect_economy_service_measurements =
-                            dynamic_residency,
-                        .projection_preparation = std::move(projection_preparation),
-                    });
-
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                "production_authorities_created",
-                1.0,
-                "model_setup",
-                {},
-                {
-                    {"dynamic", dynamic_residency ? "true" : "false"},
-                    {"maintenance_mode",
-                     moeRebalanceRuntimeModeToString(
-                         config_.moe_rebalance.mode)},
-                    {"participants",
-                     std::to_string(owner_map.participants().size())},
-                    {"local_participants",
-                     std::to_string(
-                         moe_expert_overlay_participant_residency_
-                             ->localParticipantIds()
-                             .size())},
-                    {"tiers", std::to_string(plan->routed_tiers.size())},
-                    {"world_rank",
-                     std::to_string(current_rank)},
-                    {"world_size", std::to_string(world_size)},
-                });
+            moe_expert_overlay_decode_histogram_ = setup.histogram();
+            moe_expert_overlay_residency_authority_ = setup.authority();
+            moe_expert_overlay_participant_residency_ = setup.residency();
+            moe_expert_overlay_interference_probe_ = setup.interference();
         }
         catch (const std::exception &error)
         {
@@ -18858,8 +18633,14 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::
-        usesSingleDomainNativeGpuDeviceResidentMoEOverlayAuthority() const
+        usesNativeGpuStageMoEOverlayAuthority() const
     {
+        if (moe_pipeline_prepared_plan_)
+            return std::all_of(moe_pipeline_prepared_plan_->stages().begin(), moe_pipeline_prepared_plan_->stages().end(),
+                [](const auto &stage) {
+                    return MoEOverlayCapacityAdmission::selectMigrationStorage(*stage.placement,
+                        MoERebalanceRuntimeMode::Dynamic) == MoEOverlayMigrationStorageKind::DeviceTransferDirectory;
+                });
         const auto &plan = config_.moe_routed_expert_plan;
         return plan &&
                MoEOverlayCapacityAdmission::selectMigrationStorage(
@@ -18889,6 +18670,41 @@ namespace llaminar2
                 InitializationConsensusScope::ExpertOverlayContext,
                 step);
         };
+        if (moe_pipeline_prepared_plan_)
+        {
+            if (!runner_ || moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size() ||
+                !usesNativeGpuStageMoEOverlayAuthority() ||
+                runner_->moeOverlayAuthorityExecution() != MoEOverlayAuthorityExecutionKind::DeviceResident)
+                return setError("MoE pipeline maintenance lost its complete native stage ownership");
+            if (!run_maintenance_phase("finalizePipelinePreparedResidencyBanks", [&] {
+                    const auto weights = model_ctx_->concreteWeightManager();
+                    if (!weights) return setError("MoE pipeline has no prepared-engine registry");
+                    for (const auto &binding : moe_pipeline_stage_bindings_)
+                    {
+                        std::string error;
+                        if (!binding->owners().residency->finalizeInitialBanksFromPreparedRegistry(weights->expertGemmRegistry(), &error))
+                            return setError("MoE pipeline prepared banks are incomplete: " + error);
+                        recordInitialMoEOverlayBankSelections(*binding->owners().residency,
+                            binding->plan()->owner_order, binding->metadata().main_inference_layer_count);
+                    }
+                    return true;
+                }))
+                return false;
+            // Nested TP-in-PP construction prepares weights and persistent
+            // state, but deliberately leaves the graph family unmaterialized.
+            // Finalized expert banks must precede capture; readiness can only
+            // be checked after that capture has built every stage controller.
+            if (!run_maintenance_phase("materializePipelineServingGraphs",
+                    [&] { return materializeCurrentServingGraphFamilyVariantWithoutLaunch(); }))
+                return false;
+            if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+                !runner_->deviceResidentMoEOverlayMaintenanceReady())
+                return setError("MoE pipeline did not materialize every native maintenance family");
+            PerfStatsCollector::addCounter("moe_overlay_residency", "pipeline_maintenance_composed", 1.0,
+                "model_setup", {}, {{"stages", std::to_string(moe_pipeline_stage_bindings_.size())},
+                    {"authority_execution", "device_resident"}, {"host_maintenance_service", "false"}});
+            return true;
+        }
         if (!moe_expert_overlay_residency_authority_)
             return true;
         if (!run_maintenance_phase(
@@ -19449,12 +19265,12 @@ namespace llaminar2
             return true;
         }
 
-        if (usesSingleDomainNativeGpuDeviceResidentMoEOverlayAuthority())
+        if (usesNativeGpuStageMoEOverlayAuthority())
         {
             if (!runner_)
             {
                 return setError(
-                    "Single-domain native device-resident ExpertOverlay authority has no constructed inference runner");
+                    "Native GPU-stage device-resident ExpertOverlay authority has no constructed inference runner");
             }
             const auto runner_execution =
                 runner_->moeOverlayAuthorityExecution();
@@ -19469,7 +19285,7 @@ namespace llaminar2
                      ->deviceResidentMoEOverlayMaintenanceReady())
             {
                 return setError(
-                    "Single-domain native device-resident ExpertOverlay did not materialize its complete captured maintenance family");
+                    "Native GPU-stage device-resident ExpertOverlay did not materialize its complete captured maintenance family");
             }
 
             if (!run_maintenance_phase(
@@ -19633,6 +19449,7 @@ namespace llaminar2
                             .transaction_demand =
                                 moe_expert_overlay_decode_histogram_
                                     ->config().transaction_demand,
+                            .first_model_layer = metadata.first_model_layer,
                         });
                 economy_evidence_exchange = std::make_shared<
                     MoEOverlayMPIEconomyEvidenceExchange>(
@@ -20292,8 +20109,8 @@ namespace llaminar2
         }
         moe_expert_overlay_proposal_publisher_.reset();
 
-        if (intent ==
-            MoEOverlayMaintenanceDrainIntent::TerminalContextSeal)
+        if (intent == MoEOverlayMaintenanceDrainIntent::TerminalContextSeal &&
+            preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::LiveMutableResidency)
         {
             /*
              * The background scheduler is now quiescent, while transport
@@ -20465,7 +20282,8 @@ namespace llaminar2
                         participant_id,
                         participant->device,
                         endpoint->numLayers(),
-                        endpoint->numExperts()))
+                        endpoint->numExperts(),
+                        endpoint->firstModelLayer()))
                 {
                     if (error)
                     {
@@ -20479,10 +20297,9 @@ namespace llaminar2
                 const int world_rank = participant->world_rank_known
                                            ? participant->world_rank
                                            : -1;
-                for (int layer = 0; layer < endpoint->numLayers(); ++layer)
+                for (int layer = endpoint->firstModelLayer(); layer < endpoint->endModelLayer(); ++layer)
                 {
-                    const auto &layer_bank =
-                        bank->layers.at(static_cast<std::size_t>(layer));
+                    const auto &layer_bank = bank->layerForModelLayer(layer);
                     const auto expected_mask =
                         canonical_owner_map.expertMaskForParticipant(
                             layer,
@@ -20586,6 +20403,21 @@ namespace llaminar2
         return false;
     }
 
+    ModelContextPhysicalSealBoundary OrchestrationRunner::preparedContextSealBoundary() const
+    {
+        if (!model_context_reuse_authority_)
+            return ModelContextPhysicalSealBoundary::Unretained;
+        std::vector<MoEOverlayMigrationStorageKind> storage;
+        if (moe_pipeline_prepared_plan_)
+        {
+            for (const auto &stage : moe_pipeline_prepared_plan_->stages())
+                storage.push_back(MoEOverlayCapacityAdmission::selectMigrationStorage(*stage.placement, config_.moe_rebalance.mode));
+        }
+        else if (config_.moe_routed_expert_plan)
+            storage.push_back(MoEOverlayCapacityAdmission::selectMigrationStorage(*config_.moe_routed_expert_plan, config_.moe_rebalance.mode));
+        return modelContextPhysicalSealBoundary(model_context_reuse_authority_, storage);
+    }
+
     bool OrchestrationRunner::sealReusableModelContextPhysicalState(
         std::string *error) noexcept
     {
@@ -20601,6 +20433,41 @@ namespace llaminar2
 
         try
         {
+            if (preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::RetiredImmutableSources)
+            {
+                if (runner_)
+                    throw std::logic_error("Immutable prepared sources cannot be sealed before participant retirement");
+                std::size_t resident_sources = 0;
+                const auto verify_sources = [&](const std::shared_ptr<MoEOverlayParticipantResidencyRegistry> &residency)
+                {
+                    const auto weights = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
+                    if (!residency || !weights)
+                        throw std::logic_error("Immutable prepared source seal lost its model or participant registry");
+                    resident_sources += residency->verifyImmutablePreparedSources(weights->expertGemmRegistry());
+                };
+                if (moe_pipeline_prepared_plan_)
+                {
+                    if (moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size())
+                        throw std::logic_error("Immutable prepared source seal lost a pipeline stage");
+                    for (const auto &binding : moe_pipeline_stage_bindings_)
+                    {
+                        if (!binding) throw std::logic_error("Immutable prepared source seal has an absent pipeline binding");
+                        verify_sources(binding->owners().residency);
+                    }
+                }
+                else if (config_.moe_routed_expert_plan && config_.moe_routed_expert_plan->usesExpertOverlayAuthority())
+                {
+                    if (!moe_expert_overlay_residency_authority_)
+                        throw std::logic_error("Immutable prepared source seal lost its admitted residency authority");
+                    verify_sources(moe_expert_overlay_participant_residency_);
+                }
+                model_context_physical_state_sealed_ = true;
+                PerfStatsCollector::addCounter("moe_overlay_residency", "immutable_prepared_context_seals", 1.0,
+                    "model_teardown", {}, {{"resident_sources", std::to_string(resident_sources)}});
+                return true;
+            }
+            if (moe_pipeline_prepared_plan_)
+                throw std::logic_error("Pipeline prepared-context sealing requires immutable native source storage");
             if (!moe_expert_overlay_residency_authority_)
             {
                 const bool requires_dynamic_overlay_seal =
@@ -21245,6 +21112,16 @@ namespace llaminar2
                 "Graph snapshot capture requires a complete pre-initialization device-memory capacity declaration");
         }
 
+        if (moe_pipeline_topology_)
+        {
+            if (!moe_pipeline_prepared_plan_ || !physical_memory_authority_ ||
+                physical_memory_authority_->admission() != moe_pipeline_prepared_plan_->admission()->physicalAdmission() ||
+                physical_memory_admission_ != physical_memory_authority_->admission() ||
+                !physical_memory_admission_->plan().fits())
+                return setError("MoE pipeline final validation lost its aggregate physical authority");
+            return true;
+        }
+
         const bool has_expert_overlay =
             config_.moe_routed_expert_plan &&
             config_.moe_routed_expert_plan
@@ -21578,7 +21455,7 @@ namespace llaminar2
         const auto overlay_execution = resolveOverlayExecutionPlanForRunner(
             config_.moe_routed_expert_plan,
             overlay_context);
-        if (!overlay_execution || !overlay_context)
+        if ((!overlay_execution && !moe_pipeline_topology_) || !overlay_context)
         {
             return true;
         }
@@ -21623,7 +21500,7 @@ namespace llaminar2
         }
 
         const int continuation_root_rank =
-            overlay_execution->continuation_root_rank;
+            overlay_execution ? overlay_execution->continuation_root_rank : plan_.rank;
         if (continuation_root_rank < 0 ||
             continuation_root_rank >= overlay_context->world_size())
         {
@@ -21855,7 +21732,9 @@ namespace llaminar2
                     max_graph_rows,
                     max_decode_rows,
                     std::max(1, plan_.runtime.batch_size),
-                    max_mtp_draft_depth);
+                    max_mtp_draft_depth).forRoutedLayerInterval(
+                        placement.first_model_layer,
+                        placement.placementLayerCapacity());
             const auto activation_graph_families =
                 makeMoEOverlayActivationGraphFamilyManifests(graph_family);
             const MoEOverlayActivationLaneEndpoint source_endpoint{
@@ -22480,7 +22359,7 @@ namespace llaminar2
         }
 
         const auto &overlay_plan = config_.moe_routed_expert_plan;
-        if (overlay_plan && overlay_plan->usesExpertOverlayAuthority())
+        if (moe_pipeline_prepared_plan_ || (overlay_plan && overlay_plan->usesExpertOverlayAuthority()))
         {
             /*
              * Overlay graph capture is inseparable from its exact background
@@ -22600,7 +22479,7 @@ namespace llaminar2
         }
 
         const auto &overlay_plan = config_.moe_routed_expert_plan;
-        if (!overlay_plan || !overlay_plan->usesExpertOverlayAuthority())
+        if (!moe_pipeline_prepared_plan_ && (!overlay_plan || !overlay_plan->usesExpertOverlayAuthority()))
             return materializeOrdinaryServingGraphFamilyWithoutLaunch();
 
         const auto overlay_context =
@@ -22608,7 +22487,7 @@ namespace llaminar2
                                         : mpi_ctx_;
         const auto execution = resolveOverlayExecutionPlanForRunner(
             overlay_plan, overlay_context);
-        if (!execution || !overlay_context)
+        if ((!execution && !moe_pipeline_prepared_plan_) || !overlay_context)
         {
             return setError(
                 "ExpertOverlay serving graph variant lost its rank execution plan");
@@ -22979,7 +22858,9 @@ namespace llaminar2
                 max_graph_rows,
                 max_decode_rows,
                 max_request_count,
-                max_mtp_draft_depth);
+                max_mtp_draft_depth).forRoutedLayerInterval(
+                    config_.moe_routed_expert_plan->first_model_layer,
+                    config_.moe_routed_expert_plan->placementLayerCapacity());
         const std::size_t slot_count =
             moeOverlayInferenceTransactionSlotCount(
                 max_mtp_draft_depth);
@@ -23560,12 +23441,12 @@ namespace llaminar2
          */
         const RunnerModelAuthorityScope authority_scope =
             resolveRunnerModelAuthorityScope(config_);
-        if (!initialized_ || !model_ctx_ ||
+        if (!initialization_lifecycle_.readyForInference() || !model_ctx_ ||
             authority_scope != RunnerModelAuthorityScope::RankLocal)
         {
             LOG_DEBUG(
                 "[ModelContextReuseContract] unavailable: initialized="
-                << initialized_.load()
+                << initialization_lifecycle_.readyForInference()
                 << " model=" << static_cast<bool>(model_ctx_)
                 << " authority_scope="
                 << (authority_scope == RunnerModelAuthorityScope::RankLocal
@@ -23573,7 +23454,7 @@ namespace llaminar2
                         : "multi_rank_set"));
             return std::nullopt;
         }
-        if (config_.moe_routed_expert_plan &&
+        if ((config_.moe_routed_expert_plan || moe_pipeline_topology_) &&
             requested_routed_weight_authority_identity_.empty())
         {
             LOG_DEBUG(
@@ -23701,6 +23582,7 @@ namespace llaminar2
                     : nullptr,
             .expert_overlay_memory_admission =
                 moe_expert_overlay_memory_admission_,
+            .pipeline_prepared_plan = moe_pipeline_prepared_plan_,
             .routed_weight_authority_identity =
                 requested_routed_weight_authority_identity_,
             .expert_overlay_migration_profile =
@@ -23857,18 +23739,24 @@ namespace llaminar2
 
         // Build config from execution plan via canonical factory
         auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
-        mdo_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
-        mdo_config.moe_expert_overlay_residency_authority =
-            moe_expert_overlay_residency_authority_;
-        mdo_config.moe_expert_overlay_participant_residency =
-            moe_expert_overlay_participant_residency_;
-        mdo_config.moe_expert_overlay_decode_histogram =
-            moe_expert_overlay_decode_histogram_;
-        mdo_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
-        mdo_config.moe_rank_batch_transport_registry =
-            moe_overlay_rank_batch_transport_registry_;
-        mdo_config.moe_device_controller_fabric =
-            moe_overlay_device_controller_fabric_;
+        if (retained_prepared_weight_plan_validated_)
+        {
+            const auto prepared = model_ctx_->concreteWeightManager()->preparedWeightStoreIfInitialized();
+            if (!prepared) return setError("Retained PP weights lost their prepared-store authority");
+            mdo_config.prepared_weight_admission = PreparedWeightAdmission::ReuseCertifiedCompleteSet;
+            mdo_config.prepared_weight_store = prepared;
+        }
+        if (config_.moe_routed_expert_plan || moe_expert_overlay_residency_authority_ ||
+            moe_expert_overlay_participant_residency_ || moe_expert_overlay_decode_histogram_ ||
+            moe_overlay_rank_batch_transport_registry_ || moe_overlay_device_controller_fabric_)
+            return setError("LOCAL PP requires stage-owned expert admission; a model-wide overlay cannot be installed");
+        if (!moe_pipeline_stage_bindings_.empty())
+        {
+            if (moe_pipeline_stage_bindings_.size() != mdo_config.pp_stages.size())
+                return setError("LOCAL PP expert admission omitted an authored pipeline stage");
+            for (std::size_t stage = 0; stage < mdo_config.pp_stages.size(); ++stage)
+                mdo_config.pp_stages[stage].moe_runtime = moe_pipeline_stage_bindings_[stage];
+        }
         mdo_config.reusable_execution_workspaces =
             reusable_execution_workspaces_;
 
@@ -24088,7 +23976,7 @@ namespace llaminar2
     bool OrchestrationRunner::setSnapshotMemoryCapacity(
         GraphSnapshotMemoryCapacity capacity)
     {
-        if (initialized_.load(std::memory_order_acquire) || runner_)
+        if (initialization_lifecycle_.admissionComplete() || runner_)
         {
             return setError(
                 "Graph snapshot memory capacity must be declared before runner initialization");
@@ -24113,7 +24001,7 @@ namespace llaminar2
     bool OrchestrationRunner::prepareInactiveSnapshotCapture(
         const std::string &output_dir)
     {
-        if (initialized_.load(std::memory_order_acquire) || runner_)
+        if (initialization_lifecycle_.admissionComplete() || runner_)
         {
             return setError(
                 "Prepared-inactive snapshot topology must be declared before runner initialization");
@@ -24128,7 +24016,7 @@ namespace llaminar2
 
     bool OrchestrationRunner::activatePreparedSnapshotCapture()
     {
-        if (!initialized_.load(std::memory_order_acquire) || !runner_ ||
+        if (!initialization_lifecycle_.readyForInference() || !runner_ ||
             snapshot_capture_setup_.mode !=
                 SnapshotCaptureSetup::Mode::PreparedInactive ||
             !prepared_inactive_snapshot_capture_ready_)
@@ -24317,10 +24205,11 @@ namespace llaminar2
     {
         const auto overlay_context =
             moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
-        const auto overlay_execution = resolveOverlayExecutionPlanForRunner(
+        const auto request_authority = resolveMoEOverlayRequestAuthorityRank(
             config_.moe_routed_expert_plan,
+            moe_pipeline_prepared_plan_,
             overlay_context);
-        if (!overlay_execution || !overlay_context)
+        if (!request_authority)
         {
             return true;
         }
@@ -24330,7 +24219,7 @@ namespace llaminar2
                 "MoE ExpertOverlay has no runner for collective "
                 "generation publication");
         }
-        const int authority_rank = overlay_execution->continuation_root_rank;
+        const int authority_rank = *request_authority;
         if (authority_rank < 0 || authority_rank >= overlay_context->world_size())
         {
             return setError(
@@ -24430,15 +24319,16 @@ namespace llaminar2
     {
         const auto overlay_context =
             moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
-        const auto overlay_execution = resolveOverlayExecutionPlanForRunner(
+        const auto request_authority = resolveMoEOverlayRequestAuthorityRank(
             config_.moe_routed_expert_plan,
+            moe_pipeline_prepared_plan_,
             overlay_context);
         const bool distributed_overlay =
-            overlay_execution && overlay_context &&
+            request_authority && overlay_context &&
             overlay_context->world_size() > 1;
         const bool is_authority_rank =
             distributed_overlay &&
-            overlay_context->rank() == overlay_execution->continuation_root_rank;
+            overlay_context->rank() == *request_authority;
 
         if ((!distributed_overlay || is_authority_rank) &&
             request_epoch_ >= std::numeric_limits<uint64_t>::max() - 1)
@@ -24704,6 +24594,8 @@ namespace llaminar2
 
     void OrchestrationRunner::setSamplingParams(const SamplingParams &params)
     {
+        if (!std::isfinite(params.repetition_penalty) || params.repetition_penalty <= 0.0f)
+            throw std::invalid_argument("repetition_penalty must be positive and finite");
         // Reject unsupported laws before an MPI command or any retained request
         // mutation. A failed admission must leave the previous law intact.
         if (runner_)
@@ -24715,15 +24607,16 @@ namespace llaminar2
             mpi_ctx_->world_size() > 1)
         {
             broadcastCommand(MPICommand::SET_SAMPLING);
-            float params_buf[6] = {
+            float params_buf[7] = {
                 params.temperature,
                 params.top_p,
                 static_cast<float>(params.top_k),
                 static_cast<float>(params.seed),
                 params.presence_penalty,
-                params.frequency_penalty};
+                params.frequency_penalty,
+                params.repetition_penalty};
             mpi_ctx_->broadcast(
-                params_buf, 6, mpi_coordinated_root_rank_);
+                params_buf, 7, mpi_coordinated_root_rank_);
         }
 
         // Depth observations belong to one sampling law. A long-lived service
@@ -24740,6 +24633,7 @@ namespace llaminar2
                 MTPRequestPenaltyPolicy{
                     .presence_penalty = params.presence_penalty,
                     .frequency_penalty = params.frequency_penalty,
+                    .repetition_penalty = params.repetition_penalty,
                 }))
         {
             throw std::runtime_error(
@@ -24747,9 +24641,9 @@ namespace llaminar2
         }
     }
 
-    SamplingParams OrchestrationRunner::getRecommendedSamplingParams() const
+    SamplingParams OrchestrationRunner::getRecommendedSamplingParams(ThinkingMode mode) const
     {
-        return recommended_sampling_params_;
+        return model_generation_policy_.forMode(mode);
     }
 
     std::string OrchestrationRunner::getStopThinkingPrompt() const
@@ -25007,9 +24901,9 @@ namespace llaminar2
             case MPICommand::SET_SAMPLING:
             {
                 // Receive sampling params
-                float params_buf[6]; // temperature, top_p, top_k, seed, penalties
+                float params_buf[7]; // temperature, top_p, top_k, seed, penalties
                 mpi_ctx_->broadcast(
-                    params_buf, 6, mpi_coordinated_root_rank_);
+                    params_buf, 7, mpi_coordinated_root_rank_);
                 SamplingParams sp;
                 sp.temperature = params_buf[0];
                 sp.top_p = params_buf[1];
@@ -25017,6 +24911,7 @@ namespace llaminar2
                 sp.seed = static_cast<uint64_t>(params_buf[3]);
                 sp.presence_penalty = params_buf[4];
                 sp.frequency_penalty = params_buf[5];
+                sp.repetition_penalty = params_buf[6];
                 setSamplingParams(sp);
                 break;
             }
@@ -25436,6 +25331,11 @@ namespace llaminar2
                     "received unsupported command tag " + std::to_string(tag));
             }
         }
+    }
+
+    PrefixCacheTelemetrySources OrchestrationRunner::prefixCacheTelemetrySources() const
+    {
+        return runner_ ? runner_->prefixCacheTelemetrySources() : PrefixCacheTelemetrySources{};
     }
 
 } // namespace llaminar2

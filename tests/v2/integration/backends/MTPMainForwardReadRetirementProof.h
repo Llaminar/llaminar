@@ -11,6 +11,8 @@
  * waiting on an unrelated metadata stream is not ownership of the write frontier.
  * The same single test peer can seed terminal logits on an exact owned surface;
  * prefix tests then exercise production archive, diagnostic and restore operations.
+ * Pipeline admission proofs hold restoration behind a native timeline gate and
+ * require the retained verifier's exact execution stream to borrow readiness.
  */
 #pragma once
 
@@ -237,12 +239,20 @@ namespace llaminar2
             return runner.recordShiftedMTPKVReady(stream, "held_sidecar_read_test");
         }
 
-        /** @brief Enter the installed prelude; never recreate its waits in the test. */
+        /**
+         * @brief Enter the installed prelude; never recreate its waits in the test.
+         * @param runner Participant owning the production publication lifecycle.
+         * @param stream Exact stream that will execute the retained forward.
+         * @param device Complete identity of that execution stream's device.
+         * @param role Main, condition or grouped-verifier graph policy.
+         * @param rows Physical width of the retained graph.
+         * @return Whether the production prelude acquired its required frontiers.
+         */
         static bool prepareMain(DeviceGraphOrchestrator &runner, void *stream,
-                                DeviceId device, ForwardExecutionRole role)
+                                DeviceId device, ForwardExecutionRole role, int rows = 1)
         {
             ForwardInput input;
-            input.seq_len = 1;
+            input.seq_len = rows;
             input.batch_size = 1;
             input.execution_role = role;
             return runner.prepareLiveStateForForwardGraphExecution(input, stream, device);
@@ -312,10 +322,224 @@ namespace llaminar2
         {
             return runner.stochastic_target_sample_ready_[0].event.get();
         }
+
+        /**
+         * @brief Publish real restore-source ownership without loading a model.
+         * @param runner Participant whose installed completion lifecycle is under test.
+         * @param device Exact source-read producer device.
+         * @param stream Stream on which the fixture already enqueued archive reads.
+         * @param sources Source aliases transferred into the production event owner.
+         * @return Whether publication retained the exact event and source chain.
+         */
+        static bool publishPrefixRestore(DeviceGraphOrchestrator &runner, DeviceId device,
+            void *stream, std::vector<PrefixBlockHandle> sources)
+        {
+            runner.state_.device_id = device;
+            return runner.prepareLivePrefixMutationReadyEvent(stream, "prefix_retention_test") &&
+                runner.recordLivePrefixMutationReady(stream, "prefix_retention_test", wholePrefixReads(std::move(sources)));
+        }
+
+        /** @brief Convert complete fixture archives into explicit whole-payload read leases. */
+        static std::vector<PrefixPayloadReadLease> wholePrefixReads(std::vector<PrefixBlockHandle> sources)
+        {
+            std::vector<PrefixPayloadReadLease> reads;
+            for (auto &source : sources)
+                reads.push_back(PrefixPayloadReadLease::wholeArchive(std::move(source)));
+            return reads;
+        }
+
+        /** @brief Publish selected section reads through the installed producer/event lifecycle. */
+        static bool publishPrefixReadSources(DeviceGraphOrchestrator &runner, DeviceId device,
+            void *stream, std::vector<PrefixPayloadReadLease> sources)
+        {
+            runner.state_.device_id = device;
+            return runner.prepareLivePrefixMutationReadyEvent(stream, "prefix_section_retention_test") &&
+                runner.recordLivePrefixMutationReady(stream, "prefix_section_retention_test", std::move(sources));
+        }
+
+        /** @brief Poll the installed nonblocking source retirement before consuming the handoff. */
+        static void retirePrefixRestoreSources(DeviceGraphOrchestrator &runner)
+        { runner.retirePendingPrefixPayloadUses(false); }
+
+        /** @return Whether source reclamation preserved the original consumer ordering authority. */
+        static bool prefixRestoreHandoffRetained(const DeviceGraphOrchestrator &runner, void *event)
+        { return runner.live_prefix_mutation_ready_.valid && runner.live_prefix_mutation_ready_.event.get() == event; }
+
+        /** @return Exact native restore completion, borrowed for fixture observations only. */
+        static void *prefixRestoreEvent(const DeviceGraphOrchestrator &runner)
+        { return runner.live_prefix_mutation_ready_.event.get(); }
+
+        /** @brief Retire the consumed publication through the production lifecycle boundary. */
+        static void consumePrefixRestore(DeviceGraphOrchestrator &runner)
+        { runner.clearPendingLivePrefixMutationReady(); }
+
+        /**
+         * @brief Bind only the follower's real event authority, without model storage.
+         * @param runner Model-free participant exercising the installed forward prelude.
+         * @param device Exact device that owns the restore and verifier streams.
+         * @return Whether all persistent native events were allocated before replay.
+         */
+        static bool initializePipelineAdmission(DeviceGraphOrchestrator &runner, DeviceId device)
+        {
+            if (!initialize(runner, device)) return false;
+            runner.setPPStageConfig({.first_layer = 0, .last_layer = 1,
+                .has_embedding = true, .has_lm_head = false});
+            auto *backend = getBackendFor(device);
+            auto *event = backend ? backend->createEvent(device.gpu_ordinal()) : nullptr;
+            if (!event) return false;
+            runner.device_generation_state_ready_.event = std::shared_ptr<void>(event,
+                [backend, device](void *value) { backend->destroyEvent(value, device.gpu_ordinal()); });
+            return true;
+        }
+
+        /**
+         * @brief Join real prefix publication and seed the typed controller admission.
+         * @param runner Follower whose minimal controller has one active request.
+         * @param backend Exact device's native event publisher.
+         * @param stream Admission stream, distinct from restore and verifier streams.
+         * @return Whether the production prefix join and readiness publication succeeded.
+         *
+         * The fixture replaces controller payload initialization only. Prefix
+         * ownership, the typed event handoff and the forward prelude are real.
+         */
+        static bool publishPipelineAdmission(DeviceGraphOrchestrator &runner,
+            IBackend &backend, void *stream)
+        {
+            if (!runner.waitForLiveInferenceStateReadyForObservation(stream,
+                "pipeline_follower_admission", DeviceTimelineRole::DeviceGenerationController))
+                return false;
+            runner.device_generation_storage_.active_request_count = 1;
+            auto &ready = runner.device_generation_state_ready_;
+            return ready.handoff.publish(DeviceGenerationStatePublicationKind::Admission,
+                stream, 1, [&] { return backend.recordEvent(ready.event.get(),
+                    runner.state_.device_id.gpu_ordinal(), stream); });
+        }
+
+        /** @return Whether the real verifier owns this exact stream's controller frontier. */
+        static bool pipelineAdmissionBorrowedOn(const DeviceGraphOrchestrator &runner, void *stream)
+        {
+            const auto &handoff = runner.device_generation_state_ready_.handoff;
+            return handoff.borrowed() && handoff.frontierStream() == stream &&
+                handoff.borrowerRole() == DeviceTimelineRole::AllPositionVerifier;
+        }
+
+        /**
+         * @brief Retire through the actual reset edge before the next fixture request.
+         * @param runner Follower retaining either a published or borrowed frontier.
+         * @param stream Exact reset stream for the next request's initialization.
+         * @return Whether reset acquired the old frontier and cleared active ownership.
+         */
+        static bool retirePipelineAdmission(DeviceGraphOrchestrator &runner, void *stream)
+        {
+            if (!runner.retireDeviceGenerationStateForRequestReset(stream, 1,
+                "pipeline_admission_regression_reset")) return false;
+            runner.device_generation_storage_.active_request_count = 0;
+            return true;
+        }
     };
 
     namespace test
     {
+        /**
+         * @brief A retained follower verifier must join admission on its own stream.
+         * @param context Current worker owning the three exact streams and graphs.
+         * @param backend Backend of that worker, including its native timeline gate.
+         * @param device Complete device identity for events and persistent test storage.
+         *
+         * A held restore writes a scalar on stream A. Production admission joins
+         * A on stream B and consumes the restore handoff. The real forward prelude
+         * must transfer the resulting controller frontier to stream C before its
+         * retained graph reads the scalar. Twenty requests alternate all physical
+         * verifier widths; reset retires each borrow before reusing the events.
+         * The gate belongs to the fixture and always opens during unwind, so an
+         * ordering failure produces assertions rather than a collective deadlock.
+         */
+        inline void provePipelineVerifierAdmissionStream(
+            IWorkerGPUContext &context, IBackend &backend, DeviceId device)
+        {
+            using Peer = DeviceGraphOrchestratorLiveStateTestAccess;
+            const int ordinal = context.deviceOrdinal();
+            ASSERT_TRUE(backend.supportsStreamTimelineSignal64(ordinal));
+            TransferEngine transfers;
+            const DeviceId devices[] = {device};
+            auto control = transfers.allocateMappedHostRegion(4096, devices);
+            auto state = transfers.allocateDeviceTransferBuffer(2 * sizeof(std::int32_t), device);
+            ASSERT_TRUE(control && state);
+            auto *word = static_cast<std::uint64_t *>(control->mutableHostData());
+            auto *values = static_cast<std::int32_t *>(state->mutableDeviceData());
+            std::atomic_ref<std::uint64_t>(*word).store(0u, std::memory_order_release);
+            std::array<void *, 3> streams{};
+            void *finished = nullptr;
+            std::array<std::unique_ptr<IGPUGraphCapture>, 2> graphs;
+            std::unique_ptr<DeviceGraphOrchestrator> runner;
+            auto cleanup = [&](void *) {
+                std::atomic_ref<std::uint64_t>(*word).store(1000u, std::memory_order_release);
+                for (auto stream : streams)
+                    if (stream) context.synchronizeStream(stream);
+                runner.reset();
+                for (auto &graph : graphs) graph.reset();
+                if (finished) context.destroyEvent(finished);
+                for (auto stream : streams)
+                    if (stream) context.destroyStream(stream);
+            };
+            std::unique_ptr<void, decltype(cleanup)> lifetime(word, cleanup);
+            for (auto &stream : streams)
+            {
+                stream = context.createStream();
+                ASSERT_NE(stream, nullptr);
+            }
+            finished = context.createEvent();
+            ASSERT_NE(finished, nullptr);
+            auto builder = std::make_shared<QwenStandardGraph>(GraphConfig{}, nullptr);
+            runner = std::make_unique<DeviceGraphOrchestrator>(builder, nullptr);
+            ASSERT_TRUE(Peer::initializePipelineAdmission(*runner, device));
+            constexpr std::int32_t restored = 0x54327619;
+            for (std::size_t phase = 0; phase < graphs.size(); ++phase)
+            {
+                void *stream = streams[phase == 0 ? 0 : 2];
+                auto &graph = graphs[phase];
+                graph = context.createGraphCapture(stream);
+                ASSERT_TRUE(graph && graph->beginCapture());
+                const bool submitted = phase == 0
+                    ? backend.enqueuePublishInt32ControlScalarDevice(restored, values, ordinal, stream)
+                    : backend.deviceCopyAsync(values + 1, values, sizeof(restored), ordinal, stream);
+                const bool ended = graph->endCapture();
+                ASSERT_TRUE(submitted && ended && graph->instantiate());
+            }
+            for (std::uint64_t round = 1; round <= 20; ++round)
+            {
+                const int rows = 2 << ((round - 1) % 4);
+                SCOPED_TRACE(::testing::Message() << "request=" << round << " rows=" << rows);
+                // Standalone capture setup has no controller admission to borrow.
+                ASSERT_TRUE(Peer::prepareMain(*runner, streams[2], device,
+                    ForwardExecutionRole::GroupedMTPVerifier, rows));
+                const std::array<std::int32_t, 2> empty{};
+                ASSERT_TRUE(backend.hostToDevice(values, empty.data(), sizeof(empty), ordinal, streams[0]));
+                ASSERT_TRUE(backend.streamWaitTimelineSignal64(
+                    streams[0], control->deviceAlias(device), round, ordinal));
+                ASSERT_TRUE(graphs[0]->launch());
+                ASSERT_TRUE(Peer::publishPrefixRestore(*runner, device, streams[0], {}));
+                ASSERT_TRUE(Peer::publishPipelineAdmission(*runner, backend, streams[1]));
+                EXPECT_FALSE(Peer::prefixRestoreHandoffRetained(*runner, Peer::prefixRestoreEvent(*runner)))
+                    << "admission must own the restore frontier before the verifier";
+                ASSERT_TRUE(Peer::prepareMain(*runner, streams[2], device,
+                    ForwardExecutionRole::GroupedMTPVerifier, rows));
+                EXPECT_TRUE(Peer::pipelineAdmissionBorrowedOn(*runner, streams[2]));
+                ASSERT_TRUE(graphs[1]->launch());
+                ASSERT_TRUE(context.recordEventChecked(finished, streams[2]));
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                bool complete = false;
+                ASSERT_TRUE(context.queryEventChecked(finished, complete));
+                EXPECT_FALSE(complete) << "verifier ran before admitted prefix restoration";
+                std::atomic_ref<std::uint64_t>(*word).store(round, std::memory_order_release);
+                context.synchronizeEvent(finished);
+                std::int32_t observed = 0;
+                ASSERT_TRUE(backend.deviceToHost(&observed, values + 1, sizeof(observed), ordinal, streams[2]));
+                EXPECT_EQ(observed, restored);
+                ASSERT_TRUE(Peer::retirePipelineAdmission(*runner, streams[0]));
+            }
+        }
+
         /** @brief Two distinct production consumers of a retained sidecar read. */
         enum class MTPReadRetirementBoundary
         {

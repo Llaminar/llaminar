@@ -195,8 +195,10 @@ def _overlay_boundary_evidence(
     One immutable plan per continuation rank must agree with its materialized
     inventory and every retired sequence. A command may contain many prefill
     chunks or device-selected generation rounds; the coordinator's existing
-    sequence identity distinguishes them without inferring another lifecycle
-    from counter multiplicities. Physical GPU executable/launch proof
+    sequence identity is retained in bounded ordered witnesses. The owner-wide
+    retirement witness reconciles every phase/depth family to the coordinator's
+    contiguous sequence span; per-request identities never become map keys.
+    Physical GPU executable/launch proof
     remains independently mandatory in ``_incomplete_graph_contexts``.
     """
     owners: dict[str, list[Mapping[str, Any]]] = {}
@@ -208,12 +210,29 @@ def _overlay_boundary_evidence(
     errors = []
     geometry_keys = ("continuation_rank", "graph_family_generation", "follower_segments",
                      "native_segments", "eager_host_segments", "native_participants")
+
+    def sequence_summary(record: Mapping[str, Any]) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+        """Read exact uint64 command/sequence extrema without float conversion."""
+        count = record.get("count")
+        minimum, maximum = record.get("sequence_minimum_words"), record.get("sequence_maximum_words")
+        if (type(count) is not int or count <= 0 or record.get("sequence_word_count") != count * 2
+                or not isinstance(minimum, list) or not isinstance(maximum, list)
+                or len(minimum) != 2 or len(maximum) != 2
+                or any(type(word) is not int or not 0 < word < 1 << 64 for word in minimum + maximum)
+                or any(low > high for low, high in zip(minimum, maximum))
+                or maximum[1] - minimum[1] + 1 < count
+                or any(type(record.get(key)) is not int or not 0 <= record[key] < 1 << 64
+                       for key in ("sequence_digest_lo", "sequence_digest_hi"))):
+            raise ValueError("missing or malformed bounded retirement identities")
+        return count, tuple(minimum), tuple(maximum)
+
     for owner, rows in owners.items():
         plans = [r for r in rows if r.get("name") == "segmented_plan_segments"]
         captures = [r for r in rows if r.get("name") == "segmented_graph_capture_segments"]
         replays = [r for r in rows if r.get("name") == "segmented_replay_segments"]
+        ledgers = [r for r in rows if r.get("name") == "segmented_retirement_sequence"]
         try:
-            if len(plans) != 1 or len(captures) != 1 or not replays:
+            if len(plans) != 1 or len(captures) != 1 or len(ledgers) != 1 or not replays:
                 raise ValueError("missing/ambiguous plan, materialization or retirement")
             tags = plans[0].get("tags") or {}
             geometry = tuple(int(tags[key]) for key in geometry_keys)
@@ -231,22 +250,39 @@ def _overlay_boundary_evidence(
                         or _numeric(record.get("count", 1)) != 1
                         or _record_value(record) != expected):
                     raise ValueError("materialized inventory differs from overlay plan")
-            phases, sequences = set(), set()
+            ledger_count, ledger_minimum, ledger_maximum = sequence_summary(ledgers[0])
+            if (ledgers[0].get("phase") != "inference"
+                    or _record_value(ledgers[0]) != ledger_count
+                    or ledger_maximum[1] - ledger_minimum[1] + 1 != ledger_count
+                    or (ledgers[0].get("tags") or {}).get("terminal") != "sparse_return_retired"):
+                raise ValueError("incomplete owner-wide retirement span")
+            phases, families = set(), set()
+            retired_count = 0
+            minima, maxima = [], []
             for record in replays:
                 evidence = record.get("tags") or {}
-                command, sequence, groups, depth = (int(evidence[key]) for key in
-                    ("command", "sequence", "graph_groups", "draft_depth"))
+                groups, depth = (int(evidence[key]) for key in ("graph_groups", "draft_depth"))
+                count, minimum, maximum = sequence_summary(record)
                 phase = record.get("phase")
+                family = (phase, groups, depth)
                 if (int(evidence["plan_segments"]) != total or groups <= 0 or depth < 0
-                        or command <= 0 or sequence <= 0 or sequence in sequences
+                        or family in families or {"command", "sequence"} & evidence.keys()
                         or evidence.get("terminal") != "sparse_return_retired"
                         or phase not in {"prefill", "decode", "mtp"}
                         or (phase != "mtp" and depth != 0)
-                        or _numeric(record.get("count", 1)) != 1
-                        or _record_value(record) != total * groups):
+                        or _record_value(record) != total * groups * count
+                        or any(low < bound for low, bound in zip(minimum, ledger_minimum))
+                        or any(high > bound for high, bound in zip(maximum, ledger_maximum))):
                     raise ValueError("incomplete or duplicate overlay transaction")
                 phases.add(phase)
-                sequences.add(sequence)
+                families.add(family)
+                retired_count += count
+                minima.append(minimum)
+                maxima.append(maximum)
+            if (retired_count != ledger_count
+                    or tuple(map(min, zip(*minima))) != ledger_minimum
+                    or tuple(map(max, zip(*maxima))) != ledger_maximum):
+                raise ValueError("retired families differ from the complete owner sequence")
             if any((r.get("tags") or {}).get("scope") != "cross_rank_expert_overlay" for r in rows):
                 raise ValueError("wrong overlay boundary scope")
             if "prefill" not in phases or not {"decode", "mtp"} & phases:

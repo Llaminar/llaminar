@@ -193,6 +193,10 @@ device-group IDs instead of assuming a particular `render` or `video` GID.
 The examples use host networking and a private 16 GiB shared-memory allowance
 for MPI/GPU collectives. Do not add Docker `-p` port mappings with host networking,
 or combine `--ipc=host` with `--shm-size` expecting it to resize the host's memory.
+Keep private IPC for independent containers: ROCm SMI's shared recursive mutexes
+identify owners by thread ID. If IPC sharing is explicitly needed, pair
+`--ipc=host` with `--pid=host`, or pair `--ipc=container:NAME` with
+`--pid=container:NAME`, so unrelated threads cannot appear to own the same lock.
 
 </details>
 
@@ -216,15 +220,43 @@ You can add these options to the command when you need them:
 |---|---|
 | Use only AMD, NVIDIA, or CPU compute | `--only-backends rocm`, `cuda`, or `cpu` |
 | Allow a longer conversation | Increase `--context-length`, within available memory |
-| Enable multi-token prediction (MTP) | Add `--mtp --mtp-depth-policy dynamic`; the GGUF must include MTP weights |
+| Require multi-token prediction (MTP) | Add `--mtp`; the GGUF must include complete MTP weights |
+| Disable MTP on a GGUF with MTP weights | Add `--no-mtp` |
 | Connect from another machine | Change to `--host 0.0.0.0` and use the server's IP address |
 
-MTP lets the model propose and verify several output tokens at a time. Dynamic
-depth adapts how many it proposes. It works with both ordinary temperature-based
+MTP is enabled automatically when the GGUF includes complete learned MTP heads.
+Dynamic depth is the default and adapts how many tokens the model proposes and
+verifies at a time. `--no-mtp` supports ordinary decoding on the same GGUF across
+single-device, TP, PP, and multi-device MoE layouts. It works with ordinary temperature-based
 chat sampling and greedy requests; you do not need an extra verification flag.
 Prefix caching, which reuses work from
 previous prompts, is enabled by default. If you expose the server to other
 machines, use a trusted network or an authenticated proxy.
+
+Chat requests use the loaded model card's general text sampling recommendations;
+explicit request values take precedence per field. Embedded GGUF identity selects
+the audited Qwen2.5 Instruct, Qwen3, Qwen3.5 dense/MoE, Qwen3.6 dense/MoE and
+Qwen3.8 dense profiles in `src/v2/models/ModelGenerationPolicy.cpp`. Pinned official
+sources and independent numeric expectations live in
+`tests/v2/unit/models/Test__ModelGenerationPolicy.cpp`. Task-specific coding or
+vision presets remain explicit client overrides.
+
+The omitted thinking option uses the model's default. Qwen2.5 Instruct and
+Qwen3.5 0.8B/2B default to non-thinking; the other audited models default to
+thinking. Both `enable_thinking` and `chat_template_kwargs.enable_thinking`
+select the sampling and template mode; conflicting values are rejected.
+Qwen3.8-27B's thinking defaults are temperature 1.0, top-p 0.95, top-k 20 and
+presence penalty 0; non-thinking uses 0.7, 0.8, 20 and 1.5 respectively.
+
+`repetition_penalty` is a positive finite factor, with 1 meaning neutral. It
+scales logits for tokens in the prompt or generated output before additive
+presence/frequency penalties, which count generated tokens only. Qwen2.5's
+model defaults are 1.1 for 0.5B/1.5B and 1.05 for larger Instruct models.
+Clients can send earlier assistant reasoning in `messages[].reasoning_content`.
+Template policy follows the loaded revision: Qwen3.8 retains its GGUF template,
+including default `xhigh` reasoning and reasoning history across user turns.
+The maintained Qwen3.5/3.6 template applies only to those identified revisions.
+An explicit `--chat-template` selection takes precedence.
 
 Head placement is automatic too: CPU tensor-parallel execution splits the
 vocabulary projection across participants. Dense Qwen3.8 27B with a Q6_K head
@@ -963,8 +995,8 @@ Build in Release mode for representative performance:
 
 </details>
 
-To measure MTP, add `--mtp --mtp-depth-policy dynamic` for a model that includes
-MTP weights. Save it as a separate result so you can compare with MTP off.
+Models with complete MTP weights use dynamic MTP by default. Add `--no-mtp` to
+measure ordinary decoding and save a separate result for comparison.
 
 ### Read the numbers
 
@@ -1033,6 +1065,10 @@ Tested image source: [`557f0f97d15d`](https://github.com/Llaminar/llaminar/commi
 </details>
 
 Release benchmarks run after both images pass their full HTTP E2E suites.
+Master PRs then run real OpenCode app-development sessions across every blessed
+E2E configuration on both images, checking tool parsing, progress, native output
+and bounded resource use. Model-authored app quality is reported separately;
+tool errors must remain below 5%.
 CI also tracks [previous best results](benchmarks/production/high_water.json)
 to catch performance regressions. See the
 [production CI guide](docs/production-ci.md) for the release process and the
@@ -1040,8 +1076,95 @@ to catch performance regressions. See the
 
 ## HTTP diagnostics
 
-For debugging or automated checks, the API can return token IDs and runtime
-statistics alongside an answer.
+Query lightweight serving statistics while a generation is running:
+
+```bash
+curl -s http://localhost:8080/stats | python3 -m json.tool
+curl -X PUT http://localhost:8080/stats
+```
+
+`GET /stats` reports the admitted model, topology, context and cache budgets;
+active/queued requests; cumulative and last-request token counts, timings,
+prefix reuse and MTP acceptance; and actual HTTP status-code counts. It reads
+bounded host observations and never queries or synchronizes the GPU. The
+inference worker stays serialized; up to 32 generation responses may be
+admitted, with excess requests receiving HTTP 503. Independent HTTP capacity
+keeps stats and discovery available while generations wait.
+
+`resources` contains process RSS/peak RSS, anonymous/file/shared RSS, swap,
+threads, open descriptors, CPU time/interval utilization and I/O counters;
+host memory, load averages and pressure; cgroup memory limits/events and CPU
+counters; and capacity, available space and inodes for the working, model and
+enabled cache filesystems. Filesystem figures describe the containing volume;
+prefix-tier occupancy remains in `prefix_cache.storage`. RSS, cgroup file cache
+and shared-memory mappings describe different scopes and must not be summed.
+
+One background sampler collects these OS observations every five seconds.
+GET and PUT only use its cached publication and never trigger or wait for an
+OS probe. `resources.collection` reports sample time, age, cadence, attempts,
+staleness and the last collection error. A failed refresh retains the last
+successful sample with its original timestamp. Unavailable sections are
+explicit, rather than reporting zero usage. PUT does not reset OS gauges.
+
+`PUT /stats` starts a new measurement epoch and returns its `epoch` number.
+It resets counters and the last-request record without clearing the prefix
+cache, changing the model, or interrupting inference. A request already
+executing remains visible under `requests.active`, but its eventual outcome
+is excluded from the new epoch. `active_in_current_epoch` makes that boundary
+explicit. Queued requests are counted when the inference worker starts them.
+Uptime and request sequence numbers continue across resets.
+
+| Field | Meaning |
+|---|---|
+| `timings.ttft` | Time from chat-route arrival to the first nonterminal model token observed by the handler, including reasoning; measured at native batch publication boundaries |
+| `timings.first_output` | Time to the first successfully written SSE text, reasoning or tool delta; role announcements and usage/finish frames do not count |
+| `timings.queue`, `service`, `latency` | Route arrival to handler start, handler lifetime including cleanup, and their sum |
+| `throughput.prefill_tokens_per_second` | Sum of logical uncached prompt tokens divided by summed prefill wall time, including cache lookup/restore |
+| `throughput.effective_prompt_tokens_per_second` | Full prompt tokens divided by the same prefill time, showing cache-assisted effective throughput |
+| `throughput.decode_tokens_per_second` | Committed output tokens, including stop tokens, divided by decode/publication wall time |
+| `prefix_cache.request_hit_rate` | Requests with a full or partial match divided by eligible lookups |
+| `prefix_cache.token_reuse_rate` | Matched tokens divided by requested tokens, weighted across requests |
+| `prefix_cache.storage.tiers.ram`, `.disk` | Enabled/initialized state, payload `used_bytes`, `capacity_bytes`, and `utilization_percent`; RAM sums participant bytes, while shared disk archives count once |
+| `prefix_cache.storage.churn` | Completed RAM-to-disk demotions, disk-to-RAM hydrations, per-tier capacity evictions, actual disk payload writes and metadata-only backing reuse; each has `operations` and `bytes` |
+| `mtp.acceptance_rate` | Accepted speculative tokens divided by accepted plus rejected tokens |
+| `last_request` | Atomically published terminal outcome, with sequence, age in seconds, usage and per-request rates; remains the previous outcome while the next request runs |
+| `http.status_codes` | Finished responses from all routes, including errors and stats calls; an SSE generation error can follow HTTP 200 headers |
+
+Cache occupancy remains visible after `PUT /stats`; churn counters start from
+zero. A background transfer committed after the reset belongs to the new epoch,
+even if its request began earlier. Disabled tiers report zero capacity/usage and
+null utilization. Enabled tiers report null usage/utilization until their cache
+initializes. The RAM gauge counts installed payload keys; outstanding restore or
+writer aliases can retain physical storage after a key retires. The disk gauge
+counts active payloads, excluding append history, metadata and retained obsolete
+inodes. Per-instance revisions and observation ages describe the owner's last
+publication; HTTP polling does not refresh them. Statistics cover the serving
+rank and its process-shared archives. Peer-process archive changes appear when
+the archive owner next refreshes its index during normal work. No stats request
+scans storage, hashes payloads, joins maintenance or contacts remote ranks.
+
+Timing distributions contain sample counts, totals, averages, minima and maxima.
+Rates without a denominator and unobserved timings are `null`. Throughput uses
+ratios of totals; it never averages per-request rates. Prefill token counts are
+logical request-authority observations, not padded or per-device kernel work.
+Failed requests without a terminal summary do not invent token/cache counters.
+HTTP counts update after transmission, so each stats/reset response enters the
+next snapshot. `schema_version`, `epoch`, `snapshot_unix_seconds`,
+`collection_seconds` and `last_request.age_seconds` identify freshness and scope.
+
+For debugging or automated checks, the API can also return token IDs and
+runtime statistics alongside an answer.
+
+RAM and disk prefix payloads are immutable and carry an opaque version identity.
+Reuse checks only that identity, layout and section metadata; it never hashes or
+checksums cache payloads. Disk restore reads consumed sections once into their
+final RAM owners. Archive format 3 keeps the metadata journal in `.kvcache` and
+immutable payload files in the adjacent `.blocks` directory. Durable eviction
+unlinks retired payloads immediately; readers retain only their selected inodes.
+Compaction copies metadata only, so ongoing writes cannot accumulate obsolete
+payload copies while maintenance catches up. Small metadata records retain
+integrity checks. Older formats are rejected intact; use a fresh cache directory
+when upgrading the archive format.
 
 <details>
 <summary>Request token IDs, prefix-cache statistics, and MTP details</summary>
@@ -1149,6 +1272,13 @@ ownership, and the NUMA node for that rank. From there, model-specific config
 builders create a `GraphConfig`, and the runtime chooses either a
 `DeviceGraphOrchestrator` for one device or a `RankOrchestrator` for local
 multi-device tensor or pipeline parallelism.
+
+Prompt tokenization uses the GGUF's declared byte-BPE pre-tokenizer (`qwen2`,
+`qwen35`, `llama-bpe`, or `gpt-2`) and preserves its Unicode and whitespace
+boundaries before merging. Qwen policies apply their declared NFC normalization,
+including canonical composition of accented characters. Missing or unsupported
+policies fail admission. CMake fetches pinned PCRE2 and utf8proc source archives
+and links them statically; serving needs no additional Unicode runtime packages.
 
 ### MPI, NUMA, and CPU Scaling
 

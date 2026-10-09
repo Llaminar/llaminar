@@ -42,6 +42,7 @@
 #include "execution/mtp/MTPRejectionSampler.h"
 #include "execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "execution/compute_stages/stages/MTPDraftTokenPublicationStage.h"
+#include "execution/compute_stages/stages/MTPStochasticOutcomeStage.h"
 #include "execution/compute_stages/stages/MTPStochasticTargetDistributionStage.h"
 #include "execution/compute_stages/stages/MTPVerifierPreparationStage.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -551,6 +552,486 @@ namespace
 
         for (void *allocation : allocations)
             backend_->free(allocation, device_id_);
+    }
+
+    /**
+     * @brief Reproduce dynamic probability-rejection carry crossing the live depth.
+     *
+     * The same graph executable is replayed twice without changing any node
+     * parameters.  Only the persistent generation-controller row changes.  A
+     * captured capacity exceeds the controller's live depth. A carried row
+     * must never grant permission to consume an inactive draft or capacity bonus.
+     * Byte-for-byte comparison with SamplingMath proves both CUDA and ROCm read
+     * the controller at replay time instead of capturing a stale host scalar.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        DynamicProbabilityRejectionSummaryUsesLiveDepthWithCarriedRows)
+    {
+        using namespace sampling_math;
+
+        constexpr int row_count = 3;
+        constexpr int output_capacity = row_count + 1;
+        const std::array<int32_t, row_count> verify_tokens = {101, 102, 103};
+        const std::array<int32_t, output_capacity> draft_tokens = {
+            55, 101, 102, 103};
+        const std::array<int32_t, kSpeculativeBatchMaxStopTokens> stop_tokens = {
+            -1, -1, -1, -1, -1, -1, -1, -1};
+        const int32_t bonus_token = 104;
+
+        auto make_control = [](int leading_count)
+        {
+            std::array<int, kDeviceGenerationControlCount> control{};
+            EXPECT_TRUE(initialize_device_generation_control(
+                /*max_new_tokens=*/8,
+                /*response_capacity=*/8,
+                [] {
+                    DeviceGenerationPolicy policy;
+                    policy.mode = DeviceGenerationPolicyMode::Dynamic;
+                    policy.initial_depth = 1;
+                    policy.minimum_depth = 1;
+                    policy.maximum_depth = row_count;
+                    return policy;
+                }(),
+                control.data()));
+            control[kDeviceGenerationControlTransactionCommitBudget] = 2;
+            control[kDeviceGenerationControlNextLeadingCommittedOutputCount] =
+                leading_count;
+            return control;
+        };
+        auto make_expected = [&](int leading_count)
+        {
+            std::pair<
+                std::array<int32_t, output_capacity>,
+                std::array<int, kSpeculativeBatchMetaCount>> expected;
+            expected.first.fill(-1);
+            expected.second.fill(0);
+            summarize_speculative_verify_batch_at_commit_boundary(
+                draft_tokens[0],
+                verify_tokens.data(),
+                /*row_accepted=*/nullptr,
+                /*active_draft_depth=*/1,
+                stop_tokens.data(),
+                static_cast<int>(stop_tokens.size()),
+                /*active_bonus_token=*/verify_tokens[1],
+                /*has_bonus_ready_token=*/1,
+                /*max_state_commit_rows=*/2,
+                expected.first.data(),
+                output_capacity,
+                expected.second.data(),
+                draft_tokens.data(),
+                leading_count);
+            return expected;
+        };
+
+        const auto control_without_carry = make_control(0);
+        const auto control_with_carry = make_control(1);
+        const auto expected_without_carry = make_expected(0);
+        const auto expected_with_carry = make_expected(1);
+        ASSERT_EQ(expected_without_carry.first, expected_with_carry.first);
+
+        void *d_verify_tokens = backend_->allocate(
+            sizeof(verify_tokens), device_id_);
+        void *d_draft_tokens = backend_->allocate(
+            sizeof(draft_tokens), device_id_);
+        void *d_stop_tokens = backend_->allocate(
+            sizeof(stop_tokens), device_id_);
+        void *d_bonus_token = backend_->allocate(
+            sizeof(bonus_token), device_id_);
+        void *d_control = backend_->allocate(
+            sizeof(control_without_carry), device_id_);
+        void *d_output = backend_->allocate(
+            sizeof(int32_t) * output_capacity, device_id_);
+        void *d_meta = backend_->allocate(
+            sizeof(int) * kSpeculativeBatchMetaCount, device_id_);
+        const std::array<void *, 7> allocations = {
+            d_verify_tokens,
+            d_draft_tokens,
+            d_stop_tokens,
+            d_bonus_token,
+            d_control,
+            d_output,
+            d_meta};
+        for (void *allocation : allocations)
+            ASSERT_NE(allocation, nullptr);
+
+        std::array<int32_t, output_capacity> actual_without_carry{};
+        std::array<int, kSpeculativeBatchMetaCount> meta_without_carry{};
+        std::array<int32_t, output_capacity> actual_with_carry{};
+        std::array<int, kSpeculativeBatchMetaCount> meta_with_carry{};
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                ASSERT_TRUE(copyHostToDevice(
+                    d_verify_tokens, verify_tokens.data(), sizeof(verify_tokens),
+                    device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_draft_tokens, draft_tokens.data(), sizeof(draft_tokens),
+                    device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_stop_tokens, stop_tokens.data(), sizeof(stop_tokens),
+                    device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_bonus_token, &bonus_token, sizeof(bonus_token),
+                    device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_control, control_without_carry.data(),
+                    sizeof(control_without_carry), device_id_, stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                EXPECT_FALSE(
+                    backend_->enqueueSummarizeSpeculativeVerifyBatchDeviceGenerationControls(
+                        d_verify_tokens,
+                        /*verify_accepted_device=*/nullptr,
+                        d_draft_tokens,
+                        row_count,
+                        d_draft_tokens,
+                        d_stop_tokens,
+                        d_bonus_token,
+                        /*has_bonus_token=*/true,
+                        d_control,
+                        device_id_,
+                        /*stream=*/nullptr,
+                        output_capacity,
+                        d_output,
+                        d_meta));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(
+                    backend_->enqueueSummarizeSpeculativeVerifyBatchDeviceGenerationControls(
+                        d_verify_tokens,
+                        /*verify_accepted_device=*/nullptr,
+                        d_draft_tokens,
+                        row_count,
+                        d_draft_tokens,
+                        d_stop_tokens,
+                        d_bonus_token,
+                        /*has_bonus_token=*/true,
+                        d_control,
+                        device_id_,
+                        stream,
+                        output_capacity,
+                        d_output,
+                        d_meta));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(copyDeviceToHost(
+                    actual_without_carry.data(), d_output,
+                    sizeof(actual_without_carry), device_id_, stream));
+                ASSERT_TRUE(copyDeviceToHost(
+                    meta_without_carry.data(), d_meta,
+                    sizeof(meta_without_carry), device_id_, stream));
+
+                ASSERT_TRUE(copyHostToDevice(
+                    d_control, control_with_carry.data(),
+                    sizeof(control_with_carry), device_id_, stream));
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(copyDeviceToHost(
+                    actual_with_carry.data(), d_output,
+                    sizeof(actual_with_carry), device_id_, stream));
+                ASSERT_TRUE(copyDeviceToHost(
+                    meta_with_carry.data(), d_meta,
+                    sizeof(meta_with_carry), device_id_, stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx =
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        EXPECT_EQ(actual_without_carry, expected_without_carry.first);
+        EXPECT_EQ(meta_without_carry, expected_without_carry.second);
+        EXPECT_EQ(actual_with_carry, expected_with_carry.first);
+        EXPECT_EQ(meta_with_carry, expected_with_carry.second);
+
+        for (void *allocation : allocations)
+            backend_->free(allocation, device_id_);
+    }
+
+    /**
+     * @brief Reject impossible verifier counts before captured response publication.
+     *
+     * Learning is optional in fixed and budget-limited modes; count validation
+     * is mandatory. One retained production commit kernel consumes adversarial
+     * persistent inputs at every depth, policy, carry and budget boundary.
+     */
+    TEST_P(GPUSamplingTest, InvalidVerifierCountsFailBeforeCapturedPublicationInEveryMode)
+    {
+        using namespace sampling_math;
+        constexpr int slots = 16, poison = -777;
+        std::array<int32_t, slots> tokens{}, response{};
+        std::array<int, kDeviceGenerationControlCount> control{};
+        std::array<int, kSpeculativeBatchMetaCount> meta{};
+        const int base = 37;
+        tokens.fill(42);
+        const std::array<size_t, 11> sizes = {
+            sizeof(tokens), sizeof(meta), sizeof(base), sizeof(response), sizeof(control),
+            sizeof(int), sizeof(int), sizeof(int), sizeof(int), sizeof(int), sizeof(int)};
+        std::array<void *, sizes.size()> buffers{};
+        for (size_t index = 0; index < sizes.size(); ++index)
+        {
+            buffers[index] = backend_->allocate(sizes[index], device_id_);
+            ASSERT_NE(buffers[index], nullptr);
+        }
+        auto run = [&](IWorkerGPUContext &worker)
+        {
+            worker.submitAndWait([&]
+            {
+                void *stream = worker.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                ASSERT_TRUE(copyHostToDevice(buffers[0], tokens.data(), sizeof(tokens), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(buffers[2], &base, sizeof(base), device_id_, stream));
+                ASSERT_TRUE(backend_->memset(buffers[1], 0, sizeof(meta), device_id_, stream));
+                ASSERT_TRUE(backend_->memset(buffers[4], 0, sizeof(control), device_id_, stream));
+                auto capture = worker.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
+                    buffers[0], slots, buffers[1], kSpeculativeBatchMetaCount, buffers[2], 1, slots,
+                    buffers[3], slots, buffers[4], kDeviceGenerationControlCount, device_id_, stream,
+                    buffers[5], buffers[6], buffers[7], buffers[8], buffers[9],
+                    nullptr, nullptr, nullptr, nullptr, buffers[10]));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                for (const auto mode : {DeviceGenerationPolicyMode::Fixed,
+                                        DeviceGenerationPolicyMode::Observe,
+                                        DeviceGenerationPolicyMode::Dynamic})
+                for (int depth = 1; depth <= 15; ++depth)
+                for (const int carry : {0, 1})
+                for (const int budget : {2, slots})
+                for (const int field : {kSpecBatchMetaAcceptedSpeculativePrefix,
+                                        kSpecBatchMetaConsumedVerifierRows,
+                                        kSpecBatchMetaTargetVerifierStateCommitCount})
+                {
+                    SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<int>(mode)
+                                 << " depth=" << depth << " carry=" << carry
+                                 << " budget=" << budget << " field=" << field);
+                    auto policy = DeviceGenerationPolicy::fixed(depth);
+                    policy.mode = mode;
+                    if (mode != DeviceGenerationPolicyMode::Fixed)
+                    {
+                        policy.minimum_depth = 1;
+                        policy.maximum_depth = 15;
+                    }
+                    ASSERT_TRUE(initialize_device_generation_control(slots, slots, policy, control.data()));
+                    control[kDeviceGenerationControlNextLeadingCommittedOutputCount] = carry;
+                    control[kDeviceGenerationControlTransactionCommitBudget] = budget;
+                    meta.fill(0);
+                    meta[kSpecBatchMetaOk] = 1;
+                    meta[kSpecBatchMetaOutputCount] = field == kSpecBatchMetaTargetVerifierStateCommitCount ? slots : 2;
+                    meta[kSpecBatchMetaLeadingCommittedOutputCount] = carry;
+                    meta[kSpecBatchMetaTargetVerifierStateCommitCount] = 1;
+                    meta[kSpecBatchMetaConsumedVerifierRows] = 1;
+                    meta[field] = field == kSpecBatchMetaAcceptedSpeculativePrefix ? depth + 1 : depth + 2;
+                    response.fill(poison);
+                    ASSERT_TRUE(copyHostToDevice(buffers[1], meta.data(), sizeof(meta), device_id_, stream));
+                    ASSERT_TRUE(copyHostToDevice(buffers[3], response.data(), sizeof(response), device_id_, stream));
+                    ASSERT_TRUE(copyHostToDevice(buffers[4], control.data(), sizeof(control), device_id_, stream));
+                    ASSERT_TRUE(capture->launch());
+                    int publication_ok = -1;
+                    ASSERT_TRUE(copyDeviceToHost(response.data(), buffers[3], sizeof(response), device_id_, stream));
+                    ASSERT_TRUE(copyDeviceToHost(control.data(), buffers[4], sizeof(control), device_id_, stream));
+                    ASSERT_TRUE(copyDeviceToHost(&publication_ok, buffers[8], sizeof(publication_ok), device_id_, stream));
+                    ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+                    EXPECT_TRUE(std::all_of(response.begin(), response.end(), [poison](int token) { return token == poison; }));
+                    EXPECT_EQ(publication_ok, 0);
+                    EXPECT_EQ(control[kDeviceGenerationControlOk], 0);
+                    EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 1);
+                    const auto expected_error = field == kSpecBatchMetaTargetVerifierStateCommitCount && depth == 15
+                        ? DeviceGenerationError::InvalidPublicationMetadata : DeviceGenerationError::InvalidVerifierCounts;
+                    EXPECT_EQ(control[kDeviceGenerationControlErrorCode], static_cast<int>(expected_error));
+                    EXPECT_EQ(control[kDeviceGenerationControlResponseTokenCount], 0);
+                    EXPECT_EQ(control[kDeviceGenerationControlRemainingTokenCount], slots);
+                    EXPECT_EQ(control[kDeviceGenerationControlTransactionCount], 0);
+                }
+            });
+        };
+        if (GetParam() == "CUDA")
+            run(GPUDeviceContextPool::instance().getNvidiaContext(device_id_));
+        else
+            run(GPUDeviceContextPool::instance().getAMDContext(device_id_));
+        for (void *buffer : buffers) backend_->free(buffer, device_id_);
+    }
+
+    /**
+     * @brief Stress the production unseeded stochastic stage at every live depth.
+     *
+     * A retained graph sees depth, carry, budget and rejection transitions only
+     * through persistent device inputs. Its live bonus and complete compact
+     * bytes must match serial-width probability rejection; inactive decisions
+     * retain poison. Large-to-small replays reproduce the OpenCode failure.
+     */
+    TEST_P(GPUSamplingTest, ProbabilityRejectionStageReplaysEveryModeDepthAndCarry)
+    {
+        using namespace sampling_math;
+        constexpr int max_depth = 15, slots = 16, poison = -777;
+        constexpr uint64_t seed = 0xA57E5EED1234ull;
+        const int position = 37;
+        std::array<int32_t, slots> ids{}, drafts{}, sampled{}, output{};
+        std::array<float, slots> probabilities{};
+        std::array<int32_t, max_depth> accepted{};
+        std::array<int32_t, kSpeculativeBatchMaxStopTokens> stops{};
+        std::array<int, kDeviceGenerationControlCount> control{};
+        std::array<int, kSpeculativeBatchMetaCount> meta{};
+        for (int row = 0; row < slots; ++row) ids[row] = 100 + row;
+        probabilities.fill(1.0F);
+        stops.fill(-1);
+        const std::array<size_t, 11> sizes = {
+            sizeof(ids), sizeof(probabilities), sizeof(drafts), sizeof(stops),
+            sizeof(position), sizeof(control), sizeof(sampled), sizeof(accepted),
+            sizeof(output), sizeof(meta), sizeof(seed)};
+        std::array<void *, sizes.size()> allocations{};
+        for (size_t index = 0; index < sizes.size(); ++index)
+        {
+            allocations[index] = backend_->allocate(sizes[index], device_id_);
+            ASSERT_NE(allocations[index], nullptr);
+        }
+        auto run = [&](IWorkerGPUContext &worker)
+        {
+            worker.submitAndWait([&]
+            {
+                auto execution_context = IDeviceContext::create(
+                    GetParam() == "CUDA" ? DeviceId::cuda(device_id_) : DeviceId::rocm(device_id_));
+                void *const stream = worker.defaultStream();
+                ASSERT_NE(stream, nullptr);
+                ASSERT_TRUE(copyHostToDevice(allocations[0], ids.data(), sizeof(ids), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(allocations[1], probabilities.data(), sizeof(probabilities), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(allocations[4], &position, sizeof(position), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(allocations[10], &seed, sizeof(seed), device_id_, stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+                for (const auto verification : {MTPStochasticOutcomeStage::Verification::OneHotProbabilityRejection,
+                                                 MTPStochasticOutcomeStage::Verification::SerialEquivalent})
+                for (int retained = 1; retained <= max_depth; ++retained)
+                {
+                    MTPStochasticOutcomeStage::Params params;
+                    params.device_id = GetParam() == "CUDA" ? DeviceId::cuda(device_id_) : DeviceId::rocm(device_id_);
+                    params.backend = backend_;
+                    params.verification = verification;
+                    params.vocabulary_size = 512;
+                    params.target_token_ids_device = static_cast<int32_t *>(allocations[0]);
+                    params.target_probs_device = static_cast<float *>(allocations[1]);
+                    params.target_distribution_row_stride = params.top_k = 1;
+                    params.verifier_input_tokens_device = static_cast<int32_t *>(allocations[2]);
+                    params.verifier_input_token_stride = slots;
+                    params.stop_tokens_device = static_cast<int32_t *>(allocations[3]);
+                    params.threshold_base_positions_device = static_cast<int32_t *>(allocations[4]);
+                    params.threshold_seeds_device = static_cast<const uint64_t *>(allocations[10]);
+                    params.generation_control_device = static_cast<int *>(allocations[5]);
+                    params.generation_control_stride = control.size();
+                    params.verifier_row_capacity = retained + 1;
+                    params.sampled_target_tokens_device = static_cast<int32_t *>(allocations[6]);
+                    params.sampled_target_token_stride = slots;
+                    params.accepted_rows_device = static_cast<int32_t *>(allocations[7]);
+                    params.accepted_row_stride = max_depth;
+                    params.output_tokens_device = static_cast<int32_t *>(allocations[8]);
+                    params.output_token_stride = slots;
+                    params.output_meta_device = static_cast<int *>(allocations[9]);
+                    params.output_meta_stride = meta.size();
+                    params.request_count = 1;
+                    params.comparison_rows_per_request = retained;
+                    MTPStochasticOutcomeStage stage(params);
+                    stage.setGPUStream(stream);
+                    auto capture = worker.createGraphCapture(stream);
+                    ASSERT_TRUE(capture->beginCapture());
+                    const bool enqueued = stage.execute(execution_context.get());
+                    ASSERT_TRUE(capture->endCapture());
+                    ASSERT_TRUE(enqueued);
+                    ASSERT_EQ(capture->nodeCount(), verification == MTPStochasticOutcomeStage::Verification::OneHotProbabilityRejection ? 2U : 1U);
+                    ASSERT_TRUE(capture->instantiate());
+                    for (const auto mode : {DeviceGenerationPolicyMode::Fixed,
+                                            DeviceGenerationPolicyMode::Observe,
+                                            DeviceGenerationPolicyMode::Dynamic})
+                    for (int replay = 0; replay < (retained == max_depth ? 20 : 1); ++replay)
+                        for (int depth = retained; depth >= 1; --depth)
+                            for (int carry : {0, 1})
+                                for (int rejection : {-1, 0, depth - 1})
+                                    for (int budget : {1, depth + 1})
+                                    {
+                                        SCOPED_TRACE(::testing::Message() << "retained=" << retained
+                                            << " depth=" << depth << " carry=" << carry
+                                            << " rejection=" << rejection << " budget=" << budget
+                                            << " replay=" << replay);
+                                        DeviceGenerationPolicy policy;
+                                        policy.mode = mode;
+                                        policy.initial_depth = depth;
+                                        policy.minimum_depth = mode == DeviceGenerationPolicyMode::Fixed ? depth : 1;
+                                        policy.maximum_depth = mode == DeviceGenerationPolicyMode::Fixed ? depth : retained;
+                                        ASSERT_TRUE(initialize_device_generation_control(
+                                            256, 256, policy, control.data(), carry
+                                                ? DeviceGenerationLeadingRowDisposition::AlreadyEmitted
+                                                : DeviceGenerationLeadingRowDisposition::PendingResponse));
+                                        control[kDeviceGenerationControlTransactionCommitBudget] = budget;
+                                        drafts.fill(poison);
+                                        drafts[0] = 99;
+                                        for (int row = 0; row < depth; ++row)
+                                            drafts[row + 1] = row == rejection ? 511 : ids[row];
+                                        sampled.fill(poison);
+                                        accepted.fill(poison);
+                                        stops.fill(-1);
+                                        if (replay % 3 == 1) stops[0] = ids[depth - 1];
+                                        ASSERT_TRUE(copyHostToDevice(allocations[2], drafts.data(), sizeof(drafts), device_id_, stream));
+                                        ASSERT_TRUE(copyHostToDevice(allocations[3], stops.data(), sizeof(stops), device_id_, stream));
+                                        ASSERT_TRUE(copyHostToDevice(allocations[5], control.data(), sizeof(control), device_id_, stream));
+                                        ASSERT_TRUE(copyHostToDevice(allocations[6], sampled.data(), sizeof(sampled), device_id_, stream));
+                                        ASSERT_TRUE(copyHostToDevice(allocations[7], accepted.data(), sizeof(accepted), device_id_, stream));
+                                        ASSERT_TRUE(capture->launch());
+                                        ASSERT_TRUE(copyDeviceToHost(sampled.data(), allocations[6], sizeof(sampled), device_id_, stream));
+                                        ASSERT_TRUE(copyDeviceToHost(accepted.data(), allocations[7], sizeof(accepted), device_id_, stream));
+                                        ASSERT_TRUE(copyDeviceToHost(output.data(), allocations[8], sizeof(output), device_id_, stream));
+                                        ASSERT_TRUE(copyDeviceToHost(meta.data(), allocations[9], sizeof(meta), device_id_, stream));
+                                        ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+                                        std::array<int, slots> expected_tokens{}, expected_decisions{};
+                                        for (int row = 0; row < depth; ++row)
+                                            speculative_verify_with_thresholds_one_hot_draft_vllm_recovered(
+                                                ids.data() + row, probabilities.data() + row, 1, 512,
+                                                drafts[row + 1], mtp_spec_threshold_from_seed(seed, position + 1 + row, 1),
+                                                seed, position + 1 + row, &expected_tokens[row],
+                                                &expected_decisions[row], nullptr, nullptr);
+                                        const int bonus = sample_distribution_with_threshold(
+                                            ids.data() + depth, probabilities.data() + depth, 1,
+                                            mtp_spec_threshold_from_seed(seed, position + 1 + depth, 0));
+                                        std::array<int32_t, slots> expected_output{};
+                                        std::array<int, kSpeculativeBatchMetaCount> expected_meta{};
+                                        summarize_speculative_verify_batch_at_commit_boundary(
+                                            drafts[0], expected_tokens.data(), expected_decisions.data(), depth,
+                                            stops.data(), stops.size(), bonus, 1, budget,
+                                            expected_output.data(), slots, expected_meta.data(), nullptr, carry);
+                                        ASSERT_EQ(output, expected_output);
+                                        ASSERT_EQ(meta, expected_meta);
+                                        EXPECT_EQ(sampled[depth], bonus);
+                                        for (int row = depth + 1; row < slots; ++row)
+                                            EXPECT_EQ(sampled[row], verification == MTPStochasticOutcomeStage::Verification::SerialEquivalent && row <= retained ? -1 : poison);
+                                        for (int row = verification == MTPStochasticOutcomeStage::Verification::SerialEquivalent ? 0 : depth; row < max_depth; ++row)
+                                            EXPECT_EQ(accepted[row], poison);
+                                        std::array<int32_t, 256> response{};
+                                        ASSERT_TRUE(append_speculative_outcome_to_device_generation(
+                                            output.data(), slots, meta.data(), meta.size(),
+                                            response.data(), response.size(), control.data()));
+                                        EXPECT_EQ(control[kDeviceGenerationControlOk], 1);
+                                    }
+                }
+            });
+        };
+        if (GetParam() == "CUDA") run(GPUDeviceContextPool::instance().getNvidiaContext(device_id_));
+        else run(GPUDeviceContextPool::instance().getAMDContext(device_id_));
+        for (void *allocation : allocations) backend_->free(allocation, device_id_);
     }
 
     /**
@@ -7108,6 +7589,7 @@ namespace
         constexpr int vocab_size = 248320;
         constexpr float presence_penalty = 0.37f;
         constexpr float frequency_penalty = 0.13f;
+        constexpr float repetition_penalty = 1.05f;
         constexpr std::array<int, 5> row_cases = {1, 2, 4, 8, 16};
 
         auto run_case = [&](IWorkerGPUContext &ctx,
@@ -7163,8 +7645,9 @@ namespace
                     float penalty = 0.0f;
                     penalty += presence_penalty;
                     penalty += frequency_penalty * static_cast<float>(count);
-                    expected[static_cast<size_t>(row) * vocab_size + token] -=
-                        penalty;
+                    auto &value = expected[static_cast<size_t>(row) * vocab_size + token];
+                    volatile float scaled = value < 0 ? value * repetition_penalty : value / repetition_penalty;
+                    value = scaled - penalty;
                 }
             }
 
@@ -7214,7 +7697,7 @@ namespace
                         frequency_penalty,
                         first_token_already_in_history,
                         device_id_,
-                        stream));
+                        stream, repetition_penalty));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 auto capture = ctx.createGraphCapture(stream);
@@ -8957,6 +9440,7 @@ namespace
         constexpr int vocab_size = 248320;
         constexpr float presence_penalty = 0.37f;
         constexpr float frequency_penalty = 0.13f;
+        constexpr float repetition_penalty = 1.1f;
         constexpr int maximum_prior_drafts = 15;
         constexpr int first_condition_token = 19;
 
@@ -9000,8 +9484,14 @@ namespace
                 float penalty = 0.0f;
                 penalty += presence_penalty;
                 penalty += frequency_penalty * static_cast<float>(count);
-                expected[static_cast<size_t>(token)] -= penalty;
+                auto &value = expected[static_cast<size_t>(token)];
+                volatile float scaled = value < 0 ? value * repetition_penalty : value / repetition_penalty;
+                value = scaled - penalty;
             }
+
+            // Prompt-only token is repeated without a generated presence count.
+            counts[127] = sampling_math::TokenPenaltyHistory::withPrompt(0);
+            expected[127] = input[127] < 0 ? input[127] * repetition_penalty : input[127] / repetition_penalty;
 
             void *d_logits = backend_->allocate(
                 input.size() * sizeof(float), device_id_);
@@ -9053,7 +9543,7 @@ namespace
                         frequency_penalty,
                         first_token_already_in_history,
                         device_id_,
-                        stream));
+                        stream, repetition_penalty));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 auto capture = ctx.createGraphCapture(stream);
@@ -11148,17 +11638,22 @@ namespace
 
     // Helper: apply CPU penalties in-place (same as Sampler::apply_penalties)
     static void applyCpuPenalties(std::vector<float> &logits,
-                                  const std::vector<LogitPenalty> &penalties)
+                                  const LogitPenaltyBatch &penalties)
     {
         for (const auto &entry : penalties)
-            logits[entry.token_id] -= entry.penalty;
+        {
+            auto &value = logits[entry.token_id];
+            if (penalties.repetitionPenalty() != 1.0f)
+                value = value < 0 ? value * penalties.repetitionPenalty() : value / penalties.repetitionPenalty();
+            value -= entry.penalty;
+        }
     }
 
     // Helper: apply GPU penalties, download result
     static std::vector<float> applyGpuPenalties(
         IBackend *backend, int device_id,
         const std::vector<float> &logits,
-        const std::vector<LogitPenalty> &penalties,
+        const LogitPenaltyBatch &penalties,
         void *stream)
     {
         size_t bytes = logits.size() * sizeof(float);
@@ -11182,7 +11677,7 @@ namespace
             ok = backend->applyLogitPenaltiesF32(
                 d_ptr, token_ids.data(), penalty_vals.data(),
                 static_cast<int>(penalties.size()),
-                static_cast<int>(logits.size()), device_id, stream);
+                static_cast<int>(logits.size()), device_id, stream, penalties.repetitionPenalty());
             EXPECT_TRUE(ok);
         }
 
@@ -11191,6 +11686,155 @@ namespace
                                      stream);
         backend->free(d_ptr, device_id);
         return result;
+    }
+
+    /**
+     * @test One retained graph honors repetition, prompt membership and live row changes.
+     *
+     * The independent oracle separates prompt membership from generated counts.
+     * Exercise positive/negative/zero logits, all verifier widths, carried first
+     * tokens, neutral request reset, sparse prompt admission and poisoned tails.
+     */
+    TEST_P(GPUSamplingTest, RepetitionPenaltyCapturedHistoryAndAllLiveWidths)
+    {
+        constexpr int vocab = 257, capacity = 16, partial_capacity = 4096;
+        auto run = [&](IWorkerGPUContext &ctx)
+        {
+            const auto release = [&](void *p) { if (p) backend_->free(p, device_id_); };
+            const auto allocate = [&](size_t bytes) {
+                return std::unique_ptr<void, decltype(release)>(backend_->allocate(bytes, device_id_), release);
+            };
+            auto data = allocate(capacity * vocab * sizeof(float));
+            auto counts = allocate(vocab * sizeof(int));
+            auto policy = allocate(sizeof(MTPGreedyPenaltyPolicy));
+            auto tokens = allocate(capacity * sizeof(int));
+            auto active = allocate(sizeof(int));
+            auto values = allocate(capacity * sizeof(float));
+            auto indices = allocate(capacity * sizeof(int));
+            auto partial_values = allocate(partial_capacity * sizeof(float));
+            auto partial_indices = allocate(partial_capacity * sizeof(int));
+            ASSERT_TRUE(data && counts && policy && tokens && active && values && indices && partial_values && partial_indices);
+            std::array<int32_t, capacity> branch{};
+            for (int i = 0; i < capacity; ++i) branch[i] = 2 + i % 5;
+            const std::vector<int32_t> prompt = {0, 2, 19, 128, 256};
+            std::vector<float> input(capacity * vocab);
+            for (size_t i = 0; i < input.size(); ++i) input[i] = (static_cast<int>((i * 13) % 79) - 39) / 8.0f;
+            // Seen negative/zero values and unpenalized positive competitors.
+            input[0] = 5.0f; input[1] = 4.875f; input[2] = -2.0f; input[19] = 0.0f;
+            ctx.submitAndWait([&]
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_TRUE(copyHostToDevice(tokens.get(), branch.data(), sizeof(branch), device_id_, stream));
+                for (bool speculative : {false, true})
+                {
+                    auto graph = ctx.createGraphCapture(stream);
+                    ASSERT_TRUE(graph && graph->beginCapture());
+                    const int rows = speculative ? capacity : 1;
+                    const auto history = speculative
+                        ? GenerationPenaltyHistory::speculative(counts.get(), policy.get(), tokens.get(), active.get())
+                        : GenerationPenaltyHistory::committed(counts.get(), policy.get());
+                    ASSERT_TRUE(backend_->enqueueArgmaxF32RowsWithHistoryDevice(data.get(), rows, vocab,
+                        history, device_id_, stream, values.get(), indices.get(),
+                        partial_values.get(), partial_indices.get(), partial_capacity));
+                    ASSERT_TRUE(backend_->enqueueApplyMTPPenaltiesToF32RowsDevice(data.get(), rows, vocab, vocab,
+                        speculative ? tokens.get() : nullptr, counts.get(), policy.get(), device_id_, stream,
+                        speculative ? active.get() : nullptr));
+                    ASSERT_TRUE(graph->endCapture() && graph->instantiate());
+                    for (float repetition : {1.05f, 1.1f, 0.5f, 2.0f, 1.0f})
+                    for (bool additive : {false, true})
+                    for (bool carried : {false, true})
+                    for (bool prompt_present : {true, false})
+                    {
+                        const float presence = additive ? 0.75f : 0.0f;
+                        const float frequency = additive ? 0.125f : 0.0f;
+                        ASSERT_TRUE(backend_->enqueueConfigureMTPGreedyPenaltyPolicyDevice(policy.get(),
+                            presence, frequency, carried, device_id_, stream, repetition));
+                        for (int live = speculative ? capacity : 1; live >= (speculative ? 0 : 1); --live)
+                        {
+                            SCOPED_TRACE(::testing::Message() << repetition << '/' << additive << '/' << carried
+                                << '/' << prompt_present << '/' << speculative << '/' << live);
+                            std::vector<int32_t> host_counts(vocab, 0);
+                            host_counts[1] = 3; host_counts[2] = carried ? 3 : 2; host_counts[7] = 1;
+                            ASSERT_TRUE(copyHostToDevice(counts.get(), host_counts.data(), vocab * sizeof(int), device_id_, stream));
+                            if (prompt_present)
+                                ASSERT_TRUE(backend_->initializePromptRepetitionHistory(counts.get(), prompt.data(),
+                                    prompt.size(), vocab, device_id_, stream));
+                            ASSERT_TRUE(copyHostToDevice(data.get(), input.data(), input.size() * sizeof(float), device_id_, stream));
+                            ASSERT_TRUE(copyHostToDevice(active.get(), &live, sizeof(live), device_id_, stream));
+                            std::array<int, capacity> poison{};
+                            poison.fill(-77);
+                            ASSERT_TRUE(copyHostToDevice(indices.get(), poison.data(), sizeof(poison), device_id_, stream));
+                            ASSERT_TRUE(graph->launch());
+                            ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+                            std::vector<float> actual(input.size()), expected = input;
+                            std::array<int, capacity> selected{};
+                            ASSERT_TRUE(copyDeviceToHost(actual.data(), data.get(), actual.size() * sizeof(float), device_id_, stream));
+                            ASSERT_TRUE(copyDeviceToHost(selected.data(), indices.get(), sizeof(selected), device_id_, stream));
+                            for (int row = 0; row < live; ++row)
+                            {
+                                for (int token = 0; token < vocab; ++token)
+                                {
+                                    int count = host_counts[token];
+                                    if (speculative)
+                                        for (int prior = carried ? 1 : 0; prior <= row; ++prior) count += branch[prior] == token;
+                                    const bool seen_prompt = prompt_present && std::binary_search(prompt.begin(), prompt.end(), token);
+                                    if (!count && !seen_prompt) continue;
+                                    auto &value = expected[row * vocab + token];
+                                    volatile float scaled = value < 0 ? value * repetition : value / repetition;
+                                    const float penalty = count ? presence + frequency * count : 0.0f;
+                                    value = scaled - penalty;
+                                }
+                                const auto first = expected.begin() + row * vocab;
+                                EXPECT_EQ(selected[row], std::max_element(first, first + vocab) - first);
+                            }
+                            for (int row = live; row < capacity; ++row) EXPECT_EQ(selected[row], -77);
+                            EXPECT_EQ(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)), 0);
+                        }
+                    }
+                }
+                // The packed prompt flag survives ordinary committed output.
+                const std::vector<int32_t> empty(vocab, 0);
+                ASSERT_TRUE(copyHostToDevice(counts.get(), empty.data(), vocab * sizeof(int), device_id_, stream));
+                ASSERT_TRUE(backend_->initializePromptRepetitionHistory(counts.get(), prompt.data(), prompt.size(), vocab, device_id_, stream));
+                ASSERT_TRUE(backend_->enqueueCommitGenerationTokenHistoryDevice(tokens.get(), vocab, counts.get(), device_id_, stream));
+                std::vector<int32_t> observed(vocab);
+                ASSERT_TRUE(copyDeviceToHost(observed.data(), counts.get(), vocab * sizeof(int), device_id_, stream));
+                EXPECT_EQ(sampling_math::TokenPenaltyHistory::generatedCount(observed[2]), 1);
+                EXPECT_TRUE(sampling_math::TokenPenaltyHistory::inPrompt(observed[2]));
+                const int32_t duplicates[] = {2, 2};
+                EXPECT_FALSE(backend_->initializePromptRepetitionHistory(counts.get(), duplicates, 2, vocab, device_id_, stream));
+                EXPECT_FALSE(backend_->initializePromptRepetitionHistory(counts.get(), prompt.data(), prompt.size(), vocab, device_id_, nullptr));
+            });
+        };
+        auto &pool = GPUDeviceContextPool::instance();
+        if (GetParam() == "CUDA") run(pool.getNvidiaContext(device_id_));
+        else run(pool.getAMDContext(device_id_));
+    }
+
+    /** @test Sparse host/device entry points apply the same Qwen repetition law. */
+    TEST_P(GPUSamplingTest, RepetitionPenaltySparseMatchesIndependentOracle)
+    {
+        const std::vector<float> logits = {4.0f, -2.0f, 0.0f, 1.5f, -0.5f, 3.0f};
+        for (float repetition : {0.5f, 1.0f, 1.05f, 1.1f, 2.0f})
+        {
+            Sampler sampler(1);
+            sampler.record_prompt_token(0);
+            for (int token : {1, 1, 2, 3}) sampler.record_token(token);
+            SamplingParams params;
+            params.repetition_penalty = repetition;
+            params.presence_penalty = 0.75f;
+            params.frequency_penalty = 0.125f;
+            const auto batch = sampler.compute_penalty_map(params, logits.size());
+            const int counts[] = {0, 2, 1, 1, 0, 0};
+            std::vector<float> expected = logits;
+            for (int token = 0; token < 4; ++token)
+            {
+                volatile float scaled = logits[token] < 0 ? logits[token] * repetition : logits[token] / repetition;
+                expected[token] = scaled - (counts[token] ? 0.75f + 0.125f * counts[token] : 0.0f);
+            }
+            const auto actual = applyGpuPenalties(backend_, device_id_, logits, batch, stream_);
+            EXPECT_EQ(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)), 0);
+        }
     }
 
     TEST_P(GPUSamplingTest, LogitPenaltyDeviceInputsAreGraphCapturable)

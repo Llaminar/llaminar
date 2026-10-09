@@ -12,6 +12,7 @@
 #pragma once
 
 #include "MoERoutedExpertPlacementPlan.h"
+#include "execution/factory/FactoryPPStageConfig.h"
 
 #include <memory>
 #include <vector>
@@ -24,6 +25,7 @@ namespace llaminar2
         NotApplicable,
         ExplicitPlan,
         SynthesizedLocalTP,
+        SynthesizedPipeline,
     };
 
     /**
@@ -93,5 +95,23 @@ namespace llaminar2
     MoEExpertOverlayAuthorityPlanResult
     normalizeMoEExpertOverlayAuthorityPlan(
         const MoEExpertOverlayAuthorityPlanRequest &request);
+
+    /**
+     * @brief Synthesize the expert authority of one already projected PP stage.
+     * @param request Exact participants and policy of the child, without parent
+     *        pipeline/global-TP flags or a model-wide requested expert plan.
+     * @param scope Owned main-model interval and global edge roles, authenticated
+     *        against complete model metadata by the enclosing topology compiler.
+     * @return One stage-owned plan, including the single-participant case.
+     * @throws std::invalid_argument for missing participants, invalid scope,
+     *         inherited parent topology or an unsupported compute policy.
+     *
+     * This performs topology normalization only. It neither allocates memory nor
+     * publishes a runnable stage; joint admission and runtime sealing follow.
+     */
+    [[nodiscard]] std::shared_ptr<MoERoutedExpertPlacementPlan>
+    normalizeMoEExpertOverlayPipelineStagePlan(
+        const MoEExpertOverlayAuthorityPlanRequest &request,
+        const FactoryPPStageConfig &scope);
 
 } // namespace llaminar2

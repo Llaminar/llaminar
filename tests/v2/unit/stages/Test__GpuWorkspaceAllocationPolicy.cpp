@@ -1605,7 +1605,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MirroredMTPDiagnosticsUseTypedForwardRo
 
     const auto forward_impl = sliceBetween(
         orchestrator,
-        "const float *DeviceGraphOrchestrator::forwardImpl(",
+        "std::optional<const float *> DeviceGraphOrchestrator::forwardImpl(",
         "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(");
     const auto compact_forward_impl =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(forward_impl));
@@ -4461,7 +4461,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DeferredSampleReadinessPreservesVerifie
     const auto device_first_plan_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
         source,
         "const void *DeviceGraphOrchestrator::prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(",
-        "const float *DeviceGraphOrchestrator::forwardImpl(")));
+        "std::optional<const float *> DeviceGraphOrchestrator::forwardImpl(")));
 
     EXPECT_NE(compact_header.find("boolverifier_consumer_pending=false"),
               std::string::npos)
@@ -5345,7 +5345,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LiveLogicalCheckpointsUseEventBackedSou
               std::string::npos)
         << "Logical restore must import every shifted recurrent bank after truncation.";
     EXPECT_NE(compact_restore.find(
-                  "snapshot.mtp_blocks.begin(),snapshot.mtp_blocks.end()"),
+                  "for(constauto&source:snapshot.mtp_blocks)"
+                  "retained_snapshot_sources.push_back(PrefixPayloadReadLease::wholeArchive(source))"),
               std::string::npos)
         << "Restore publication must retain shifted checkpoint sources until the import stream completes.";
     EXPECT_NE(compact_capture.find("queued_async_device_checkpoint_payload"), std::string::npos);
@@ -5545,7 +5546,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
               std::string::npos);
     EXPECT_NE(
         compact_header.find(
-            "recordLivePrefixMutationReady(void*producer_stream,constchar*producer_name,std::vector<PrefixBlockHandle>retained_payload_sources={},std::vector<std::shared_ptr<void>>retained_device_sources={})"),
+            "recordLivePrefixMutationReady(void*producer_stream,constchar*producer_name,std::vector<PrefixPayloadReadLease>retained_payload_sources={},std::vector<std::shared_ptr<void>>retained_device_sources={})"),
               std::string::npos);
     EXPECT_NE(
         compact_header.find(
@@ -10875,7 +10876,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto main_forward = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
-            "const float *DeviceGraphOrchestrator::forwardImpl(",
+            "std::optional<const float *> DeviceGraphOrchestrator::forwardImpl(",
             "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(")));
     EXPECT_NE(main_forward.find(
                   "admitRequestInputsOnDevice(tokens,position_ids.data(),request_real_lengths,total_tokens,batch_size,seq_len)"),
@@ -11200,7 +11201,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ResidentRequestBatchConditionHasNoHostR
     const auto forward_body = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             source,
-            "const float *DeviceGraphOrchestrator::forwardImpl(",
+            "std::optional<const float *> DeviceGraphOrchestrator::forwardImpl(",
             "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(")));
 
     EXPECT_EQ(condition_body.find("condition_shadows"), std::string::npos)
@@ -11299,7 +11300,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto forward_impl = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
-            "const float *DeviceGraphOrchestrator::forwardImpl(",
+            "std::optional<const float *> DeviceGraphOrchestrator::forwardImpl(",
             "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(")));
 
     EXPECT_NE(
@@ -12108,10 +12109,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMTPSidecarUsesPersistentDepthScopedM
         << "MTP sidecars must select the depth-scoped runtime-table role";
     EXPECT_NE(compact_ffn.find(".mtp_depth=use_mtp_runtime_table?mtp_depth_idx:-1"),
               std::string::npos);
-    EXPECT_NE(compact_raw_graph.find("returndevice.to_string()+\"#mtp_depth\"+std::to_string(identity.mtp_depth);"),
+    EXPECT_NE(compact_raw_graph.find("conststd::stringstage_key=device.to_string()+\"#layers_\"+std::to_string(config_.pp_layer_offset)+\"_\"+std::to_string(config_.n_layers);"),
               std::string::npos)
-        << "Sidecar metadata must be depth-scoped so captured graphs do not "
-           "share main-decode top-k/runtime slots.";
+        << "Runtime metadata identity must retain the stage's exact global layer interval.";
+    EXPECT_NE(compact_raw_graph.find("returnstage_key+\"#mtp_depth\"+std::to_string(identity.mtp_depth);"),
+              std::string::npos)
+        << "Sidecar metadata must retain both its stage and MTP depth so captured "
+           "graphs cannot share another stage's or main-decode runtime slots.";
     EXPECT_NE(compact_ffn.find("device,runtime_table_identity,total_tokens"),
               std::string::npos)
         << "Every runtime-table lookup must consume the typed identity";
@@ -12295,7 +12299,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, TypedMTPLogitsReuseOnlyPreplannedDevice
         "bool DeviceGraphOrchestrator::initializeMTPKVCaches(");
     const auto forward_body = sliceBetween(
         orchestrator_source,
-        "const float *DeviceGraphOrchestrator::forwardImpl(",
+        "std::optional<const float *> DeviceGraphOrchestrator::forwardImpl(",
         "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(");
     const auto compact_helper =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(helper_body));
@@ -15928,7 +15932,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 
     const auto live_forward_body = sliceBetween(
         source,
-        "const float *DeviceGraphOrchestrator::forwardImpl(",
+        "std::optional<const float *> DeviceGraphOrchestrator::forwardImpl(",
         "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(");
     EXPECT_NE(
         live_forward_body.find("bindAllPositionLogitsOutputs("),

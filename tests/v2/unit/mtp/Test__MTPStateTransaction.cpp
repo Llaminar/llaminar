@@ -254,9 +254,9 @@ namespace
                 state->mtp_kv_caches.front().device = device;
                 state->mtp_kv_caches.front().layers.front().cached_tokens = 7;
             }
-            serial.moe_runtime_movement_epoch = 4;
-            seed.moe_runtime_movement_epoch = 6;
-            restored.moe_runtime_movement_epoch = 7;
+            serial.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+            seed.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(6);
+            restored.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(7);
             auto &seed_layer = seed.kv_caches.front().layers.front();
             seed_layer.leading_k_payload_hash ^= 0x10;
             seed_layer.leading_v_payload_hash ^= 0x20;
@@ -384,7 +384,7 @@ TEST(Test__MTPStateTransaction,
     {
         ReseededPrefixProof proof(ActivationPrecision::FP32, device);
         proof.restored = proof.serial;
-        proof.restored.moe_runtime_movement_epoch = 7;
+        proof.restored.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(7);
         ASSERT_TRUE(compareMTPRuntimeStateSnapshots(
             proof.serial, proof.restored, proof.options));
         const auto result = proof.compare();
@@ -729,8 +729,8 @@ TEST(Test__MTPStateTransaction,
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 4;
-    candidate.moe_runtime_movement_epoch = 4;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
     oracle.terminal_hidden_values.assign(64, 1.0f);
     candidate.terminal_hidden_values = oracle.terminal_hidden_values;
     candidate.terminal_hidden_values.front() += 1.0e-4f;
@@ -748,13 +748,56 @@ TEST(Test__MTPStateTransaction,
         << result.reason;
 }
 
+/** @brief A larger sibling epoch must not hide legitimate placement-aware evidence. */
+TEST(Test__MTPStateTransaction, RuntimeSnapshotPipelineMovementUsesEveryStage)
+{
+    using Epoch = PrefixMovementEpochSnapshot;
+    auto oracle = makeRuntimeSnapshot(7);
+    oracle.moe_runtime_movement_epoch = Epoch::pipeline({Epoch::leaf(100), Epoch::leaf(1)});
+    oracle.terminal_hidden_values.assign(64, 1.0f);
+    auto candidate = oracle;
+    candidate.terminal_hidden_values.front() += 1.0e-3f;
+    candidate.terminal_hidden_hash ^= 1;
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.terminal_hidden_policy = MTPTerminalPayloadComparisonPolicy::ExactUnlessMoEPlacementChanged;
+    EXPECT_FALSE(compareMTPRuntimeStateSnapshots(oracle, candidate, options));
+
+    candidate.moe_runtime_movement_epoch = Epoch::pipeline({Epoch::leaf(100), Epoch::leaf(2)});
+    const auto result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_TRUE(result) << result.reason;
+    EXPECT_TRUE(result.terminal_hidden_numerical.compared);
+    EXPECT_TRUE(result.terminal_hidden_numerical.passed);
+    // Changing one stage permits only the explicit numerical policy. Exact
+    // comparisons and complete retained-value evidence remain mandatory.
+    EXPECT_FALSE(compareMTPRuntimeStateSnapshots(oracle, candidate));
+    candidate.terminal_hidden_values.clear();
+    EXPECT_FALSE(compareMTPRuntimeStateSnapshots(oracle, candidate, options));
+}
+
+/** @brief A missing stage must never masquerade as a placement change. */
+TEST(Test__MTPStateTransaction, RuntimeSnapshotPipelineMovementRejectsChangedScope)
+{
+    using Epoch = PrefixMovementEpochSnapshot;
+    auto oracle = makeRuntimeSnapshot(7);
+    oracle.moe_runtime_movement_epoch = Epoch::pipeline({Epoch::leaf(100), Epoch::leaf(1)});
+    for (const auto &epochs : {Epoch::leaf(100), Epoch::pipeline({Epoch::leaf(100)}),
+             Epoch::pipeline({Epoch::leaf(100), Epoch::pipeline({Epoch::leaf(1)})})})
+    {
+        auto candidate = oracle;
+        candidate.moe_runtime_movement_epoch = epochs;
+        const auto result = compareMTPRuntimeStateSnapshots(oracle, candidate);
+        EXPECT_FALSE(result);
+        EXPECT_NE(result.reason.find("stage scope mismatch"), std::string::npos) << result.reason;
+    }
+}
+
 TEST(Test__MTPStateTransaction,
      RuntimeSnapshotPlacementAwareTerminalHiddenAcceptsFullNumericalEvidence)
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 4;
-    candidate.moe_runtime_movement_epoch = 5;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
     oracle.terminal_hidden_values.assign(64, 1.0f);
     candidate.terminal_hidden_values = oracle.terminal_hidden_values;
     candidate.terminal_hidden_values.front() += 1.0e-3f;
@@ -783,8 +826,8 @@ TEST(Test__MTPStateTransaction,
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 4;
-    candidate.moe_runtime_movement_epoch = 5;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
     candidate.terminal_hidden_hash ^= 0x1;
 
     MTPRuntimeSnapshotComparisonOptions options;
@@ -814,8 +857,8 @@ TEST(Test__MTPStateTransaction,
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 9;
-    candidate.moe_runtime_movement_epoch = 9;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(9);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(9);
     oracle.terminal_logits_values.assign(128, 1.0f);
     candidate.terminal_logits_values = oracle.terminal_logits_values;
     candidate.terminal_logits_values.front() += 1.0e-4f;
@@ -838,8 +881,8 @@ TEST(Test__MTPStateTransaction,
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 9;
-    candidate.moe_runtime_movement_epoch = 10;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(9);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(10);
     oracle.terminal_logits_values.assign(128, 1.0f);
     candidate.terminal_logits_values = oracle.terminal_logits_values;
     candidate.terminal_logits_values.front() += 1.0e-3f;
@@ -868,8 +911,8 @@ TEST(Test__MTPStateTransaction,
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 9;
-    candidate.moe_runtime_movement_epoch = 10;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(9);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(10);
     candidate.terminal_logits_hash ^= 0x1;
 
     MTPRuntimeSnapshotComparisonOptions options;
@@ -942,8 +985,8 @@ TEST(Test__MTPStateTransaction,
         encodeKVValues({1.0f, 2.0f, 3.0f, 4.0f}, ActivationPrecision::FP32),
         encodeKVValues({5.0f, 6.0f, 7.0f, 8.0f}, ActivationPrecision::FP32));
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 4;
-    candidate.moe_runtime_movement_epoch = 4;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
     candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
 
     MTPRuntimeSnapshotComparisonOptions options;
@@ -980,8 +1023,8 @@ TEST(Test__MTPStateTransaction,
             precision,
             encodeKVValues({1.1f, 2.0f, 3.0f, 4.0f}, precision),
             encodeKVValues({5.1f, 6.0f, 7.0f, 8.0f}, precision));
-        oracle.moe_runtime_movement_epoch = 4;
-        candidate.moe_runtime_movement_epoch = 5;
+        oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+        candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
         candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
         candidate.kv_caches.front().layers.front().v_payload_hash ^= 0x2;
         candidate.kv_caches.front().layers.front()
@@ -1021,8 +1064,8 @@ TEST(Test__MTPStateTransaction,
         encodeKVValues({1.0f, 2.0f, 3.0f, 4.0f}, ActivationPrecision::FP32),
         encodeKVValues({5.0f, 6.0f, 7.0f, 8.0f}, ActivationPrecision::FP32));
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 4;
-    candidate.moe_runtime_movement_epoch = 5;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
     candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
     candidate.kv_caches.front().layers.front().leading_k_payload_hash ^= 0x1;
 
@@ -1050,8 +1093,8 @@ TEST(Test__MTPStateTransaction,
         encodeKVValues({1.0f, 2.0f, 3.0f, 4.0f}, ActivationPrecision::FP32),
         encodeKVValues({5.0f, 6.0f, 7.0f, 8.0f}, ActivationPrecision::FP32));
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 4;
-    candidate.moe_runtime_movement_epoch = 5;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
     candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
 
     MTPRuntimeSnapshotComparisonOptions options;
@@ -1070,7 +1113,7 @@ TEST(Test__MTPStateTransaction,
         << result.reason;
 
     candidate = oracle;
-    candidate.moe_runtime_movement_epoch = 5;
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
     candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
     PrefixKVSegmentProbe &bad_suffix =
         candidate.kv_caches.front().layers.front().segments.front();
@@ -1164,8 +1207,8 @@ TEST(Test__MTPStateTransaction,
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 4;
-    candidate.moe_runtime_movement_epoch = 4;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
     candidate.gdn_layers.front().recurrence_hash ^= 0x1;
 
     MTPRuntimeSnapshotComparisonOptions options;
@@ -1186,8 +1229,8 @@ TEST(Test__MTPStateTransaction,
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 4;
-    candidate.moe_runtime_movement_epoch = 5;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
     candidate.gdn_layers.front().recurrence_hash ^= 0x1;
     candidate.gdn_layers.front().conv_hash ^= 0x2;
     candidate.gdn_layers.front().recurrence_sample_values[1] += 1e-4f;
@@ -1216,8 +1259,8 @@ TEST(Test__MTPStateTransaction,
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
     PrefixRuntimeStateSnapshot candidate = oracle;
-    oracle.moe_runtime_movement_epoch = 4;
-    candidate.moe_runtime_movement_epoch = 5;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
     candidate.gdn_layers.front().recurrence_hash ^= 0x1;
 
     MTPRuntimeSnapshotComparisonOptions options;
@@ -1238,7 +1281,7 @@ TEST(Test__MTPStateTransaction,
         << result.reason;
 
     candidate = oracle;
-    candidate.moe_runtime_movement_epoch = 5;
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
     candidate.gdn_layers.front().recurrence_hash ^= 0x1;
     std::fill(
         candidate.gdn_layers.front().recurrence_sample_values.begin(),

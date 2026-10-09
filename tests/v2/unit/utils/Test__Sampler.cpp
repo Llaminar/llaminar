@@ -1365,6 +1365,106 @@ namespace
     // SamplingParams Penalty Helpers
     // =============================================================================
 
+    /** @test Multiplicative history precedes additive penalties and respects both logit signs. */
+    TEST_F(SamplerTest, RepetitionPenaltyMatchesIndependentProbabilityLaw)
+    {
+        const std::vector<float> logits = {4.0f, -2.0f, 0.0f, 1.5f, -0.5f, 3.0f};
+        for (float repetition : {0.5f, 1.0f, 1.05f, 1.1f, 2.0f})
+        for (float presence : {0.0f, 0.75f, -0.5f})
+        for (float frequency : {0.0f, 0.125f})
+        {
+            SCOPED_TRACE(::testing::Message() << repetition << '/' << presence << '/' << frequency);
+            Sampler sampler(123);
+            // Prompt-only tokens must never acquire additive presence/frequency.
+            for (int token : {0, 0, 1, 2, -1, 100}) sampler.record_prompt_token(token);
+            for (int token : {1, 1, 3, 3, 3}) sampler.record_token(token);
+            SamplingParams params;
+            params.repetition_penalty = repetition;
+            params.presence_penalty = presence;
+            params.frequency_penalty = frequency;
+            const int counts[] = {0, 2, 0, 3, 0, 0};
+            const bool seen[] = {true, true, true, true, false, false};
+            std::vector<double> expected(logits.begin(), logits.end());
+            for (size_t token = 0; token < expected.size(); ++token)
+            {
+                if (seen[token])
+                    expected[token] = expected[token] < 0 ? expected[token] * repetition : expected[token] / repetition;
+                if (counts[token]) expected[token] -= presence + frequency * counts[token];
+            }
+            const auto winner = std::max_element(expected.begin(), expected.end()) - expected.begin();
+            const double maximum = *std::max_element(expected.begin(), expected.end());
+            double sum = 0;
+            for (auto &value : expected) { value = std::exp(value - maximum); sum += value; }
+            const auto distribution = sampler.compute_distribution(logits.data(), logits.size(), params);
+            ASSERT_EQ(distribution.size(), expected.size());
+            for (const auto &entry : distribution)
+                EXPECT_NEAR(entry.probability, expected.at(entry.token_id) / sum, 2e-7);
+            params.temperature = 0;
+            EXPECT_EQ(sampler.sample(logits, params), winner);
+            const auto sparse = sampler.compute_penalty_map(params, logits.size());
+            EXPECT_FLOAT_EQ(sparse.repetitionPenalty(), repetition);
+            for (const auto &entry : sparse) EXPECT_GE(entry.token_id, 0);
+            sampler.reset_history();
+            EXPECT_TRUE(sampler.compute_penalty_map(params, logits.size()).empty());
+            EXPECT_EQ(sampler.sample(logits, params), 0);
+        }
+    }
+
+    /** @test Repetition composes before DRY, including a neutral explicit override. */
+    TEST_F(SamplerTest, RepetitionPenaltyComposesWithDRY)
+    {
+        for (int token : {1, 2, 3, 1, 2}) sampler_->record_token(token);
+        const std::vector<float> logits = {0.0f, 1.0f, -1.0f, 4.0f};
+        SamplingParams params;
+        params.repetition_penalty = 2.0f;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 2.0f;
+        params.dry_allowed_length = 1;
+        params.temperature = 0.0f;
+        // The repeated suffix [1,2] penalizes its continuation 3 by 2.
+        // Scaling 4 first gives 2-2=0, so seen token 1 wins at 0.5.
+        const auto map = sampler_->compute_penalty_map(params, logits.size());
+        bool found = false;
+        for (const auto &entry : map) if (entry.token_id == 3)
+        { EXPECT_FLOAT_EQ(entry.penalty, 2.0f); found = true; }
+        EXPECT_TRUE(found);
+        EXPECT_EQ(sampler_->sample(logits, params), 1);
+        params.repetition_penalty = 1.0f;
+        EXPECT_EQ(sampler_->sample(logits, params), 3);
+    }
+
+    /** @test Invalid factors fail even with empty history; valid factors below one are supported. */
+    TEST_F(SamplerTest, RepetitionPenaltyAdmissionAndPackedHistoryBounds)
+    {
+        for (float invalid : {0.0f, -1.0f, std::numeric_limits<float>::infinity(),
+                              -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()})
+        {
+            SamplingParams params;
+            params.repetition_penalty = invalid;
+            EXPECT_THROW(sampler_->compute_penalty_map(params, 4), std::invalid_argument);
+            EXPECT_THROW(sampler_->sample(standard_logits_, params), std::invalid_argument);
+            EXPECT_THROW((LogitPenaltyBatch({}, invalid)), std::invalid_argument);
+        }
+        SamplingParams neutral;
+        EXPECT_FALSE(neutral.has_penalties());
+        neutral.repetition_penalty = 1.05f;
+        EXPECT_TRUE(neutral.has_penalties());
+        using History = sampling_math::TokenPenaltyHistory;
+        for (int count : {0, 1, 27, History::count_mask})
+        {
+            const auto encoded = History::withPrompt(count);
+            EXPECT_EQ(History::generatedCount(encoded), count);
+            EXPECT_TRUE(History::inPrompt(encoded));
+            EXPECT_EQ(History::canIncrement(encoded), count < History::count_mask);
+            if (History::canIncrement(encoded))
+            {
+                EXPECT_EQ(History::generatedCount(encoded + 1), count + 1);
+                EXPECT_TRUE(History::inPrompt(encoded + 1));
+            }
+        }
+        EXPECT_FALSE(History::canIncrement(-1));
+    }
+
     TEST_F(SamplerTest, HasPenalties_DefaultFalse)
     {
         SamplingParams params;

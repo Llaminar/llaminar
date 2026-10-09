@@ -8,6 +8,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include "execution/prefix_cache/PrefixCacheStateProbe.h"
 #include "kernels/cpu/CPURingKVCache.h"
@@ -17,9 +18,44 @@
 #include <algorithm>
 #include <cstdlib>
 #include <optional>
+#include <sstream>
 #include <string>
 
 using namespace llaminar2;
+
+/** @brief Preserve every independent epoch through comparisons, JSON, and CSV. */
+TEST(Test__PrefixCacheStateProbe, PipelineMovementEpochsPreserveEveryCoordinate)
+{
+    using Epoch = PrefixMovementEpochSnapshot;
+    EXPECT_THROW(Epoch::pipeline({}), std::invalid_argument);
+    EXPECT_THROW(Epoch::leaf(1).epoch() + Epoch::pipeline({Epoch::leaf(1)}).epoch(), std::logic_error);
+    const auto leaf = Epoch::leaf(100);
+    EXPECT_THROW(leaf.stages(), std::logic_error);
+    EXPECT_EQ(nlohmann::json(leaf), 100);
+    for (size_t width = 2; width <= 8; ++width)
+    {
+        std::vector<Epoch> children(width, Epoch::leaf(1));
+        children.front() = leaf;
+        const auto before = Epoch::pipeline(children);
+        EXPECT_THROW(before.epoch(), std::logic_error);
+        for (size_t changed = 1; changed < width; ++changed)
+        {
+            children[changed] = Epoch::leaf(2);
+            const auto after = Epoch::pipeline(children);
+            EXPECT_TRUE(before.sameScope(after));
+            EXPECT_NE(before, after);
+            const nlohmann::json encoded = after;
+            ASSERT_EQ(encoded.at("stages").size(), width);
+            EXPECT_EQ(encoded.at("stages").at(0), 100);
+            EXPECT_EQ(encoded.at("stages").at(changed), 2);
+            std::ostringstream text;
+            text << after;
+            EXPECT_EQ(text.str().find(','), std::string::npos);
+            children[changed] = Epoch::leaf(1);
+        }
+        EXPECT_EQ(before, Epoch::pipeline(children));
+    }
+}
 
 namespace
 {

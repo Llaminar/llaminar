@@ -172,6 +172,9 @@ namespace llaminar2
             error->clear();
         if (state_ != State::Ready ||
             !batch.valid() ||
+            !config_.runtime_binding.matchesLayerScope(
+                batch.first_model_layer, batch.num_layers) ||
+            config_.runtime_binding.expert_count != batch.num_experts ||
             batch.transaction_id <= retired_transaction_ ||
             !batch.movesWeights() ||
             (batch.kind !=

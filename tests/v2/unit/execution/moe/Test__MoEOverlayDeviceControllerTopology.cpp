@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <limits>
 #include <type_traits>
 #include <vector>
 #include <sys/mman.h>
@@ -402,6 +403,48 @@ namespace llaminar2::test
             (void)MoEOverlayNodeLocalDeviceControllerFabric::planLayout(
                 topology, 48u, 256u, 0u),
             std::invalid_argument);
+    }
+
+    /** Global stage origins alter identity without adding stored or communicated rows. */
+    TEST(Test__MoEOverlayDeviceControllerTopology, PipelineStageFabricKeepsCompactGeometry)
+    {
+        const auto topology = resolve(cudaContinuationPlan(), std::vector<int>{9, 9});
+        const auto stage_layout = [&](int first)
+        {
+            return MoEOverlayNodeLocalDeviceControllerFabric::planLayout(
+                topology, 2u, 12u, 7u, 4096u, {4096, 8192},
+                1u, 1u, 1200u, 1u, 1u, 7u, 1u, first);
+        };
+        const auto control = stage_layout(0);
+        for (const int first : {20, 40, std::numeric_limits<int>::max() - 2})
+        {
+            const auto layout = stage_layout(first);
+            ASSERT_TRUE(layout.valid());
+            EXPECT_EQ(layout.header.first_model_layer, first);
+            EXPECT_EQ(layout.mapping_bytes, control.mapping_bytes);
+            EXPECT_EQ(layout.header.demand_history_words, control.header.demand_history_words);
+            EXPECT_EQ(layout.header.economy_service_cost_words, control.header.economy_service_cost_words);
+            EXPECT_NE(layout.header.payload_geometry_fingerprint, control.header.payload_geometry_fingerprint);
+            for (std::size_t group = 0; group < layout.groups.size(); ++group)
+            {
+                EXPECT_EQ(layout.groups[group].collected_state_words,
+                          control.groups[group].collected_state_words);
+                EXPECT_EQ(layout.groups[group].service_telemetry_stride_bytes,
+                          control.groups[group].service_telemetry_stride_bytes);
+            }
+            EXPECT_EQ(layout.storageIndexForModelLayer(first), 0u);
+            EXPECT_EQ(layout.storageIndexForModelLayer(first + 1), 1u);
+            EXPECT_FALSE(layout.containsModelLayer(first - 1));
+            EXPECT_FALSE(layout.containsModelLayer(first + 2));
+            EXPECT_THROW(layout.storageIndexForModelLayer(first - 1), std::out_of_range);
+            EXPECT_THROW(layout.storageIndexForModelLayer(first + 2), std::out_of_range);
+        }
+        for (const int first : {-1, std::numeric_limits<int>::max() - 1})
+            EXPECT_THROW((void)stage_layout(first), std::invalid_argument);
+        auto malformed = control;
+        malformed.header.first_model_layer = std::numeric_limits<int>::max();
+        EXPECT_FALSE(malformed.valid());
+        EXPECT_FALSE(malformed.containsModelLayer(std::numeric_limits<int>::max()));
     }
 
     /**

@@ -4,7 +4,7 @@
  *
  * Run probability rejection first, without warming a seeded graph. Every depth
  * from one through fifteen captures the production stage once, then changes
- * only resident positions, distributions, drafts and controller budgets. A CPU
+ * only resident positions, seeds, distributions, drafts and controller budgets. A CPU
  * arithmetic oracle checks all output/metadata bytes, including untouched row
  * tails. Large logical positions expose captured-position bugs without loading
  * model weights; full-context allocation and HTTP proofs are separate gates.
@@ -49,6 +49,7 @@ TEST_P(StochasticOutcome, UnseededFirstCaptureAndEveryDepthAtLongPositions)
         std::array<int32_t, kSpeculativeBatchMaxOutputTokens> output;
         std::array<int, kSpeculativeBatchMetaCount> meta;
         int32_t position;
+        uint64_t seed;
     };
     IBackend *backend = GetParam() == "CUDA" ? getCUDABackend() : getROCmBackend();
     ASSERT_NE(backend, nullptr);
@@ -88,7 +89,7 @@ TEST_P(StochasticOutcome, UnseededFirstCaptureAndEveryDepthAtLongPositions)
             params.verifier_input_token_stride = rows;
             params.stop_tokens_device = d->stops.data();
             params.threshold_base_positions_device = &d->position;
-            params.threshold_seeds = {seed};
+            params.threshold_seeds_device = &d->seed;
             params.generation_control_device = d->control.data();
             params.generation_control_stride = kDeviceGenerationControlCount;
             params.verifier_row_capacity = depth + 1;
@@ -112,7 +113,7 @@ TEST_P(StochasticOutcome, UnseededFirstCaptureAndEveryDepthAtLongPositions)
             ++changed.vocabulary_size;
             EXPECT_FALSE(stage.hasSameCaptureIdentity(changed));
             changed = params;
-            ++changed.threshold_seeds.front();
+            ++changed.threshold_seeds_device;
             EXPECT_FALSE(stage.hasSameCaptureIdentity(changed));
 
             auto graph = worker.createGraphCapture(stream);
@@ -124,11 +125,15 @@ TEST_P(StochasticOutcome, UnseededFirstCaptureAndEveryDepthAtLongPositions)
             ASSERT_TRUE(graph->instantiate());
             ASSERT_GT(graph->nodeCount(), 0u);
 
-            for (int replay = 0; replay < 20; ++replay)
+            for (int replay = 0; replay < 22; ++replay)
             {
                 SCOPED_TRACE(::testing::Message() << GetParam() << " law=" << static_cast<int>(law)
                     << " top_k=" << top_k << " depth=" << depth << " replay=" << replay);
                 State initial{};
+                // Change both seed words under one retained graph. Replay 20
+                // rejects an unadmitted bank; 21 proves recovery after reset.
+                initial.seed = replay == 20 ? 0 : seed ^
+                    (static_cast<uint64_t>(replay) << 32) ^ (0x9E3779B9ull * replay);
                 initial.stops.fill(-1);
                 initial.sampled.fill(-777);
                 initial.accepted.fill(-777);
@@ -169,12 +174,12 @@ TEST_P(StochasticOutcome, UnseededFirstCaptureAndEveryDepthAtLongPositions)
                     {
                         speculative_verify_with_thresholds_one_hot_draft_vllm_recovered(
                             ids, probs, top_k, vocabulary, initial.inputs[row + 1],
-                            mtp_spec_threshold_from_seed(seed, position, 1), seed, position,
+                            mtp_spec_threshold_from_seed(initial.seed, position, 1), initial.seed, position,
                             &expected.sampled[row], &expected.accepted[row], nullptr, nullptr);
                     }
                     else
                         expected.sampled[row] = sample_distribution_with_threshold(
-                            ids, probs, top_k, mtp_spec_threshold_from_seed(seed, position, 0));
+                            ids, probs, top_k, mtp_spec_threshold_from_seed(initial.seed, position, 0));
                 }
                 summarize_speculative_verify_batch_at_commit_boundary(
                     initial.inputs[0], expected.sampled.data(),
@@ -191,6 +196,16 @@ TEST_P(StochasticOutcome, UnseededFirstCaptureAndEveryDepthAtLongPositions)
                 State observed{};
                 ASSERT_TRUE(backend->deviceToHost(&observed, d, sizeof(State), 0, stream));
                 ASSERT_TRUE(backend->synchronizeStream(stream, 0)); // Test oracle boundary only.
+                EXPECT_EQ(observed.seed, initial.seed);
+                if (initial.seed == 0)
+                {
+                    EXPECT_EQ(observed.control[kDeviceGenerationControlOk], 0);
+                    EXPECT_EQ(observed.control[kDeviceGenerationControlErrorCode],
+                        static_cast<int>(DeviceGenerationError::InvalidRequestSeed));
+                    EXPECT_EQ(observed.meta[kSpecBatchMetaOk], 0);
+                    continue;
+                }
+                EXPECT_TRUE(stage.hasSameCaptureIdentity(params));
                 EXPECT_EQ(observed.sampled, expected.sampled);
                 EXPECT_EQ(observed.accepted, expected.accepted);
                 EXPECT_EQ(observed.output, expected.output);

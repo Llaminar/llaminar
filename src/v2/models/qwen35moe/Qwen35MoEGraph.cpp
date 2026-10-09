@@ -85,6 +85,8 @@ namespace llaminar2
     {
         constexpr char kMoEPrefixRuntimeMagic[8] = {'L', 'M', 'O', 'E', 'R', 'U', 'N', '1'};
         /*
+         * Version 6 binds each portable row to its global model layer, so equal
+         * stage shapes cannot restore another stage's request state.
          * Version 5 excludes epoch-ticketed durable placement entirely. Expert
          * residency is model-lifetime state owned by the live RCU authority,
          * whereas a prefix block is request state. Version 4 could snapshot a
@@ -93,7 +95,7 @@ namespace llaminar2
          * selector. Rejecting it prevents a cache hit from creating two
          * placement authorities or rewinding model-wide residency.
          */
-        constexpr uint32_t kMoEPrefixRuntimeVersion = 5;
+        constexpr uint32_t kMoEPrefixRuntimeVersion = 6;
 
         /**
          * @brief Return whether graph-captured mirrored-layer diagnostics are armed.
@@ -1910,11 +1912,11 @@ namespace llaminar2
                         "prefix_cache",
                         device.toString(),
                         {{"table", table_key},
-                         {"layer", std::to_string(layer_idx)},
+                         {"layer", std::to_string(layer.model_layer)},
                          {"snapshot_participants", std::to_string(layer.participant_count)},
                          {"expected_participants", std::to_string(*expected_participant_count)}});
                     LOG_DEBUG("[Qwen35MoEGraph] Skipping prefix-cache MoE runtime state for "
-                              << table_key << " layer=" << layer_idx
+                              << table_key << " layer=" << layer.model_layer
                               << ": snapshot participant_count=" << layer.participant_count
                               << " does not match restore domain participant_count="
                               << *expected_participant_count);
@@ -2623,7 +2625,8 @@ namespace llaminar2
             }
 
             const auto *runtime_layers =
-                binding.moe_runtime_table->deviceLayerState(0);
+                binding.moe_runtime_table->deviceLayerState(
+                    binding.moe_runtime_table->firstModelLayer());
             const int layer_count =
                 binding.moe_runtime_table->layerCount();
             if (!runtime_layers)
@@ -2752,7 +2755,7 @@ namespace llaminar2
         auto *const table = table_it->second.get();
         auto &registry = weight_manager->expertGemmRegistry();
         std::uint64_t finalized_layers = 0u;
-        for (int layer = 0; layer < table->layerCount(); ++layer)
+        for (int layer = table->firstModelLayer(); layer < table->endModelLayer(); ++layer)
         {
             const bool publication_missing =
                 table->decodeRuntimePublicationRequired(layer) ||
@@ -2962,7 +2965,7 @@ namespace llaminar2
         }
 
         auto *const table = table_it->second.get();
-        const auto &runtime = table->hostLayerState(0);
+        const auto &runtime = table->hostLayerState(table->firstModelLayer());
         auto *const epoch_arena = table->overlayEpochArena();
         if (!epoch_arena || epoch_arena->deviceId() != device)
         {
@@ -2972,12 +2975,12 @@ namespace llaminar2
         }
         MoEOverlayDeviceControllerRuntimeBinding binding{
             .device = device,
-            .runtime_layers_device = table->deviceLayerState(0),
+            .runtime_layers_device = table->deviceLayerState(table->firstModelLayer()),
             .runtime_table_host = table,
             .service_telemetry_device =
                 table->deviceOverlayServiceTelemetry(),
             .service_samples_device =
-                table->deviceOverlayServiceTelemetrySample(0),
+                table->deviceOverlayServiceTelemetrySample(table->firstModelLayer()),
             .overlay_participant_id = selected->participant_id,
             .domain_participant_id = runtime.participant_id,
             .domain_participant_count = runtime.participant_count,
@@ -2989,6 +2992,7 @@ namespace llaminar2
                 epoch_arena->deviceMaintenanceEpochAddress(),
             .maintenance_status =
                 epoch_arena->deviceMaintenanceStatusAddress(),
+            .first_model_layer = table->firstModelLayer(),
         };
         if (!binding.publicationValid() ||
             binding.domain_participant_id !=
@@ -3091,6 +3095,10 @@ namespace llaminar2
     {
         material.moe.push_back({"graph.num_experts", std::to_string(config_.moe.num_experts)});
         material.moe.push_back({"graph.top_k", std::to_string(config_.moe.top_k)});
+        // Wire compatibility is immutable metadata, independent of lazy table
+        // creation. Old archive schemas must miss before payload restoration.
+        material.moe.push_back({"graph.portable_runtime_version",
+                                std::to_string(kMoEPrefixRuntimeVersion)});
         material.moe.push_back({"graph.owner_order",
                                 routedExpertOwnerOrderToString(config_.moe.owner_order)});
         material.moe.push_back({"graph.owner_participant_index",
@@ -3135,11 +3143,11 @@ namespace llaminar2
             if (layers < 0 || experts < 0)
                 throw std::logic_error("invalid MoE prefix serializer geometry");
             // Match the portable serializer below: length-prefixed table name,
-            // two geometry words, six words per layer, then seven words and
+            // two geometry words, seven words per layer, then seven words and
             // two 64-bit histogram values per expert. Mutable eligibility may
             // omit a table, but cannot make its serialized geometry larger.
             constexpr size_t expert_bytes = 7u * sizeof(uint32_t) + 2u * sizeof(uint64_t);
-            constexpr size_t layer_header = 6u * sizeof(uint32_t);
+            constexpr size_t layer_header = 7u * sizeof(uint32_t);
             constexpr size_t table_header = 3u * sizeof(uint32_t);
             constexpr size_t archive_header = sizeof(kMoEPrefixRuntimeMagic) + 3u * sizeof(uint32_t);
             const auto limit = std::numeric_limits<size_t>::max();
@@ -3244,6 +3252,7 @@ namespace llaminar2
             appendU32(state, captured.experts);
             for (const auto &layer : captured.runtime_layers)
             {
+                appendI32(state, layer.model_layer);
                 appendU32(state, layer.active_epoch);
                 appendU32(state, layer.expert_count);
                 appendU32(state, layer.top_k);
@@ -3324,9 +3333,23 @@ namespace llaminar2
             return {};
         }
 
-        uint32_t restored_tables = 0;
-        bool requires_device_rehydration = false;
-        bool placement_changed = false;
+        // Parse and authenticate all stage identities before restoring any
+        // table. A foreign later table or a truncated suffix must not overwrite
+        // a valid earlier table merely because it appears first in the archive.
+        struct ParsedTable
+        {
+            std::string key;
+            MoERuntimeTable *table = nullptr;
+            std::vector<DeviceMoEPortableLayerRuntimeState> layers;
+        };
+        if (table_count > moe_runtime_tables_.size())
+        {
+            LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE archive exceeds the live table inventory");
+            return {};
+        }
+        std::vector<ParsedTable> parsed_tables;
+        parsed_tables.reserve(table_count);
+        std::unordered_set<std::string> seen_keys;
         for (uint32_t table_idx = 0; table_idx < table_count; ++table_idx)
         {
             std::string key;
@@ -3344,6 +3367,11 @@ namespace llaminar2
                 LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime expert-count mismatch for "
                           << key << ": blob=" << experts
                           << " graph=" << config_.moe.num_experts);
+                return {};
+            }
+            if (!seen_keys.insert(key).second)
+            {
+                LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE archive repeats runtime table " << key);
                 return {};
             }
             auto it = moe_runtime_tables_.find(key);
@@ -3372,7 +3400,8 @@ namespace llaminar2
             for (uint32_t layer_idx = 0; layer_idx < layers; ++layer_idx)
             {
                 auto &layer = runtime_layers[static_cast<size_t>(layer_idx)];
-                if (!readU32(state, offset, layer.active_epoch) ||
+                if (!readI32(state, offset, layer.model_layer) ||
+                    !readU32(state, offset, layer.active_epoch) ||
                     !readU32(state, offset, layer.expert_count) ||
                     !readU32(state, offset, layer.top_k) ||
                     !readU32(state, offset, layer.participant_id) ||
@@ -3385,7 +3414,8 @@ namespace llaminar2
                     LOG_ERROR("[Qwen35MoEGraph] Malformed prefix-cache MoE portable runtime layer header");
                     return {};
                 }
-                if (layer.expert_count != experts ||
+                if (layer.model_layer != it->second->firstModelLayer() + static_cast<int>(layer_idx) ||
+                    layer.expert_count != experts ||
                     layer.top_k != static_cast<uint32_t>(config_.moe.top_k))
                 {
                     LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime layer metadata mismatch for "
@@ -3446,23 +3476,35 @@ namespace llaminar2
                 }
             }
 
-            /*
-             * Portable version 5 contains only pointer-free, request-transient
-             * logical placement. Model-lifetime ExpertOverlay placement is
-             * selected by the shared RCU epoch ticket and is rejected above so
-             * an old prefix can never rewind main or MTP residency.
-             *
-             * Transfer-slot descriptors for the remaining request-local state
-             * are reconstructed from immutable owner payloads by the dedicated
-             * captured rehydration transaction. Blob parsing must never consult
-             * a rolling slot directory whose bytes may have been reused since
-             * the prefix was harvested.
-             */
+            parsed_tables.push_back(ParsedTable{
+                .key = std::move(key),
+                .table = it->second.get(),
+                .layers = std::move(runtime_layers),
+            });
+        }
+        if (offset != state.size())
+        {
+            LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE runtime state has trailing bytes");
+            return {};
+        }
+
+        /*
+         * Portable version 6 contains pointer-free, stage-bound request state.
+         * Model-lifetime ExpertOverlay placement is selected by the shared RCU
+         * ticket and rejected above, so an old prefix cannot rewind residency.
+         * Transient payload descriptors are rehydrated from immutable owner
+         * weights by a captured transaction, never from rolling slot contents.
+         */
+        uint32_t restored_tables = 0;
+        bool requires_device_rehydration = false;
+        bool placement_changed = false;
+        for (const auto &parsed : parsed_tables)
+        {
             const DeviceMoEPortableRuntimeRestoreResult table_restore =
-                it->second->restorePortableRuntimeState(runtime_layers, stream);
+                parsed.table->restorePortableRuntimeState(parsed.layers, stream);
             if (!table_restore)
             {
-                LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime restore failed for " << key);
+                LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE portable runtime restore failed for " << parsed.key);
                 return {};
             }
             placement_changed =
@@ -3473,11 +3515,6 @@ namespace llaminar2
                 requires_device_rehydration ||
                 table_restore.requires_device_payload_rehydration;
             ++restored_tables;
-        }
-        if (offset != state.size())
-        {
-            LOG_ERROR("[Qwen35MoEGraph] Prefix-cache MoE runtime state has trailing bytes");
-            return {};
         }
 
         prefix_runtime_device_rehydration_pending_ =
@@ -3531,8 +3568,10 @@ namespace llaminar2
 
     std::string Qwen35MoEGraph::moeRuntimeTableKey(
         DeviceId device,
-        const MoERuntimeTableIdentity &identity)
+        const MoERuntimeTableIdentity &identity) const
     {
+        const std::string stage_key = device.to_string() + "#layers_" +
+            std::to_string(config_.pp_layer_offset) + "_" + std::to_string(config_.n_layers);
         switch (identity.role)
         {
         case MoERuntimeTableRole::MainDecodeDurablePlacement:
@@ -3541,21 +3580,21 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "Durable main-decode MoE runtime identity cannot carry an MTP depth");
             }
-            return device.to_string();
+            return stage_key;
         case MoERuntimeTableRole::CurrentBatchLLEPPrefill:
             if (identity.mtp_depth >= 0)
             {
                 throw std::invalid_argument(
                     "Current-batch LLEP prefill runtime identity cannot carry an MTP depth");
             }
-            return device.to_string() + "#current_batch_llep_prefill";
+            return stage_key + "#current_batch_llep_prefill";
         case MoERuntimeTableRole::MTPDepth:
             if (identity.mtp_depth < 0)
             {
                 throw std::invalid_argument(
                     "MTP MoE runtime identity requires a non-negative depth");
             }
-            return device.to_string() + "#mtp_depth" +
+            return stage_key + "#mtp_depth" +
                    std::to_string(identity.mtp_depth);
         }
         throw std::logic_error("Unknown MoE runtime table role");
@@ -3880,7 +3919,9 @@ namespace llaminar2
                 static_cast<int>(planned_rows),
                 max_decode_rows,
                 config_.max_request_count,
-                max_mtp_draft_depth);
+                max_mtp_draft_depth).forRoutedLayerInterval(
+                    overlay_plan.first_model_layer,
+                    overlay_plan.placementLayerCapacity());
         const auto transaction_topology =
             makeMoEOverlayInferenceTopologyIdentity(
                 owner_map,
@@ -3903,6 +3944,8 @@ namespace llaminar2
 
         std::ostringstream key_stream;
         key_stream << graph_device.to_string()
+                   << "#layers" << graph_family.first_model_layer
+                   << ':' << graph_family.routedLayerCapacity()
                    << "#tier" << tier_index
                    << "#domain" << domain_ordinal
                    << "#rank" << source_world_rank << "to"
@@ -4002,6 +4045,45 @@ namespace llaminar2
         return transport;
     }
 
+    DeviceMoERuntimeTable::Config Qwen35MoEGraph::moeRuntimeTableConfig(
+        DeviceId device,
+        const MoERuntimeTableIdentity &identity,
+        int num_layers_override,
+        bool bind_overlay_epoch) const
+    {
+        // Overrides are storage counts. The model-global origin comes only
+        // from the authored PP stage, never from a currently executing layer.
+        const int requested_layers = num_layers_override > 0
+            ? num_layers_override : config_.n_layers;
+        if (config_.pp_layer_offset < 0 || config_.n_layers <= 0 ||
+            requested_layers < config_.n_layers ||
+            requested_layers > std::numeric_limits<int>::max() - config_.pp_layer_offset)
+            throw std::invalid_argument("Qwen35 MoE runtime table requires a valid complete stage interval");
+
+        int table_layers = requested_layers;
+        if (bind_overlay_epoch)
+        {
+            const auto runtime_plan = runtimePlanForGraph(config_);
+            const auto &source_plan = runtime_plan
+                ? runtime_plan->sourcePlanPtr() : config_.moe.routed_expert_plan;
+            if (!source_plan || !source_plan->usesExpertOverlayAuthority())
+                throw std::logic_error("Qwen35 MoE canonical overlay runtime table has no routed placement authority");
+            if (source_plan->first_model_layer != config_.pp_layer_offset)
+                throw std::invalid_argument("Qwen35 MoE runtime table placement belongs to a different pipeline stage");
+            if (identity.role == MoERuntimeTableRole::MainDecodeDurablePlacement)
+            {
+                // The parent retains the entire stage manifest, including
+                // terminal NextN banks, regardless of graph construction order.
+                table_layers = source_plan->placementLayerCapacity(requested_layers);
+            }
+            else if (source_plan->placementLayerCapacity(config_.n_layers) < requested_layers)
+                throw std::invalid_argument("Qwen35 MoE child runtime exceeds its stage placement manifest");
+        }
+        return {.device_id = device, .num_layers = table_layers,
+            .num_experts = config_.moe.num_experts, .top_k = config_.moe.top_k,
+            .mirror_to_device = true, .first_model_layer = config_.pp_layer_offset};
+    }
+
     IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(
         DeviceId device,
         const MoERuntimeTableIdentity &identity,
@@ -4014,6 +4096,7 @@ namespace llaminar2
         (void)device;
         (void)identity;
         (void)prefill_token_capacity;
+        (void)num_layers_override;
         (void)histogram_producer_role;
         (void)bind_overlay_epoch;
         return nullptr;
@@ -4024,36 +4107,10 @@ namespace llaminar2
         // so CUDA and ROCm are both valid here. Gating on is_rocm() previously
         // left CUDA without a runtime table, which forced every MoE routing/expert
         // decode stage into a non-capturable manual graph segment.
-        const int requested_table_layers =
-            num_layers_override > 0 ? num_layers_override : config_.n_layers;
-        int table_layers = requested_table_layers;
-        if (bind_overlay_epoch &&
-            identity.role ==
-                MoERuntimeTableRole::MainDecodeDurablePlacement)
-        {
-            const auto runtime_plan = runtimePlanForGraph(config_);
-            const auto &source_plan = runtime_plan
-                                          ? runtime_plan->sourcePlanPtr()
-                                          : config_.moe.routed_expert_plan;
-            if (!source_plan || !source_plan->usesExpertOverlayAuthority())
-            {
-                throw std::logic_error(
-                    "Qwen35 MoE canonical overlay runtime table has no "
-                    "routed placement authority");
-            }
-
-            /*
-             * The durable parent owns banks for the complete weight manifest,
-             * including any routed NextN/MTP source layers after the main
-             * transformer interval. Child tables may cover a smaller role,
-             * but they must never outgrow their canonical parent merely
-             * because the main decode graph happened to be built first.
-             */
-            table_layers =
-                source_plan->placementLayerCapacity(requested_table_layers);
-        }
-        if (!device.is_gpu() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || table_layers <= 0)
+        if (!device.is_gpu() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0)
             return nullptr;
+        auto table_config = moeRuntimeTableConfig(device, identity, num_layers_override, bind_overlay_epoch);
+        const int table_layers = table_config.num_layers;
 
         /*
          * Graph executables freeze direct route-scratch pointers. Allocate the
@@ -4159,6 +4216,9 @@ namespace llaminar2
         auto it = moe_runtime_tables_.find(key);
         if (it != moe_runtime_tables_.end())
         {
+            if (!it->second || it->second->firstModelLayer() != table_config.first_model_layer ||
+                it->second->layerCount() != table_layers)
+                throw std::logic_error("Qwen35 MoE runtime table " + key + " changed its immutable stage interval");
             if (it->second->usesOverlayEpochTicket() != bind_overlay_epoch)
             {
                 throw std::logic_error(
@@ -4206,12 +4266,6 @@ namespace llaminar2
             return it->second.get();
         }
 
-        DeviceMoERuntimeTable::Config table_config;
-        table_config.device_id = device;
-        table_config.num_layers = table_layers;
-        table_config.num_experts = config_.moe.num_experts;
-        table_config.top_k = config_.moe.top_k;
-        table_config.mirror_to_device = true;
         table_config.grouped_verifier_histogram_publication =
             identity.role ==
                     MoERuntimeTableRole::MainDecodeDurablePlacement &&
@@ -4261,7 +4315,8 @@ namespace llaminar2
             const auto manager = model_ctx_->concreteWeightManager();
             if (!manager) throw std::logic_error("Projection runtime has no prepared engine registry");
             table_config.fixed_down_banks.reserve(table_layers);
-            for (int layer = 0; layer < table_layers; ++layer)
+            for (int layer = table_config.first_model_layer;
+                 layer < table_config.first_model_layer + table_layers; ++layer)
             {
                 // Child graph identities retain the parent's exact immutable
                 // bank; only routing scratch belongs to the child lifecycle.
@@ -4788,8 +4843,10 @@ namespace llaminar2
          * by the sidecar graph fragment.
          */
         const bool use_mtp_runtime_table = mtp_sidecar_context;
+        if (layer_idx < config_.pp_layer_offset || layer_idx == std::numeric_limits<int>::max())
+            throw std::invalid_argument("Qwen35 MoE graph layer is outside its runtime stage interval");
         const int runtime_table_layers = use_mtp_runtime_table
-                                             ? std::max(config_.n_layers, layer_idx + 1)
+                                             ? std::max(config_.n_layers, layer_idx - config_.pp_layer_offset + 1)
                                              : config_.n_layers;
         /*
          * Static placement has no histogram consumer. Keep its captured
@@ -5306,6 +5363,8 @@ namespace llaminar2
             moe_runtime_table
                 ? moe_runtime_table->layerCount()
                 : runtime_table_layers;
+        const int bound_runtime_first_layer = moe_runtime_table
+            ? moe_runtime_table->firstModelLayer() : config_.pp_layer_offset;
 
         std::optional<DeviceMoETransferSlotDirectory::FormatProfile>
             graph_rebalance_transfer_profile;
@@ -5318,7 +5377,8 @@ namespace llaminar2
                 if (!model_ctx_) throw std::logic_error("Projection transfer profile has no model metadata");
                 return DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(
                     buildMoEOverlayLayerWeightManifestFromGGUF(model_ctx_->concreteLoader().getModel(),
-                        bound_runtime_table_layers, config_.moe.num_experts), DeviceMoEProjectionSet::GateUp);
+                        bound_runtime_table_layers, config_.moe.num_experts,
+                        bound_runtime_first_layer), DeviceMoEProjectionSet::GateUp);
             }
             /*
              * One transfer directory is shared by the complete device-local MoE
@@ -5345,8 +5405,8 @@ namespace llaminar2
             }
             const auto &registry = weight_mgr->expertGemmRegistry();
 
-            for (int scan_layer = 0;
-                 scan_layer < bound_runtime_table_layers;
+            for (int scan_layer = bound_runtime_first_layer;
+                 scan_layer < bound_runtime_first_layer + bound_runtime_table_layers;
                  ++scan_layer)
             {
                 auto append_registered_formats =
@@ -5466,6 +5526,7 @@ namespace llaminar2
             std::ostringstream key;
             key << device.to_string()
                 << ":participant=" << config_.tp_device_idx
+                << ":first_layer=" << bound_runtime_first_layer
                 << ":layers=" << bound_runtime_table_layers
                 << ":experts=" << config_.moe.num_experts
                 << ":topk=" << config_.moe.top_k;
@@ -5505,6 +5566,7 @@ namespace llaminar2
             std::ostringstream key;
             key << "backend=" << static_cast<int>(local_tp_ctx ? local_tp_ctx->backend() : CollectiveBackendType::AUTO)
                 << ":degree=" << (local_tp_ctx ? local_tp_ctx->degree() : 0)
+                << ":first_layer=" << bound_runtime_first_layer
                 << ":layers=" << bound_runtime_table_layers
                 << ":experts=" << config_.moe.num_experts
                 << ":topk=" << config_.moe.top_k;
@@ -5822,7 +5884,7 @@ namespace llaminar2
                 rebalance_config.num_layers > 0)
             {
                 const uint32_t current_layer =
-                    static_cast<uint32_t>(std::max(0, layer_idx));
+                    static_cast<uint32_t>(moe_runtime_table->storageIndexForModelLayer(layer_idx));
                 if (current_layer + 1u < rebalance_config.num_layers)
                 {
                     rebalance_config.layer_window_start = current_layer + 1u;
@@ -6868,7 +6930,8 @@ namespace llaminar2
                     !deviceMoERebalanceModeUsesTransferSlots(graph_rebalance_transfer_mode.value());
                 const bool producer_covers_current_layer =
                     rebalance_config.layer_window_count == 1u &&
-                    rebalance_config.layer_window_start == static_cast<uint32_t>(std::max(0, layer_idx));
+                    rebalance_config.layer_window_start ==
+                        static_cast<uint32_t>(moe_runtime_table->storageIndexForModelLayer(layer_idx));
                 if (!producer_covers_current_layer && !resident_boundary_apply_candidate)
                     return {};
             }

@@ -5,7 +5,9 @@
  * Logical participants are joined to physical memory through typed rank/device
  * keys before the pure byte resolver runs.  All policy decisions come from
  * scoped enums and integer priorities. Opaque tier and domain labels are used
- * solely for identity and diagnostics.
+ * solely for identity and diagnostics. A pipeline's bounded cache search uses
+ * complete joint candidates, preserving one CPU/GPU admission certificate for
+ * all stages even when one participant limits its local replica grant.
  */
 
 #include "MoEOverlayCapacityAdmission.h"
@@ -497,6 +499,9 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay capacity admission requires positive model geometry");
         }
+        if (plan.first_model_layer != layer_weight_manifest.front().layer_idx)
+            throw std::invalid_argument(
+                "ExpertOverlay capacity admission received another stage's layer manifest");
         if (policy.overlay_world_size <= 0 ||
             (policy.migration_storage !=
                  MoEOverlayMigrationStorageKind::Disabled &&
@@ -842,91 +847,117 @@ namespace llaminar2
         const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
         const MoEOverlayCapacityAdmissionPolicy &policy)
     {
-        // Validate the complete requested geometry before searching. In
-        // particular a missing workspace is not an out-of-memory condition.
-        if (policy.usesDeviceTransferDirectory() &&
-            !policy.device_rebalance_workspace_capacity)
-            throw std::invalid_argument("Native replica admission requires its workspace capacity");
+        const MoEOverlayStageCapacityRequest stage{
+            plan, num_experts, layer_weight_manifest, physical_budgets, policy};
+        auto result = resolvePipelineCapacity(std::span(&stage, 1u));
+        return std::move(result.front());
+    }
 
-        const auto resolve_exact = [&](const MoEOverlayCapacityAdmissionPolicy &candidate)
+    std::vector<MoEOverlayResolvedCapacityPlan>
+    MoEOverlayCapacityAdmission::resolvePipelineCapacity(
+        std::span<const MoEOverlayStageCapacityRequest> stages)
+    {
+        if (stages.empty())
+            throw std::invalid_argument("ExpertOverlay pipeline admission requires at least one stage");
+
+        std::vector<std::uint32_t> requested(stages.size(), 0u);
+        std::vector<std::uint32_t> minimum(stages.size(), 0u);
+        for (std::size_t index = 0; index < stages.size(); ++index)
         {
-            return MoEOverlayCapacityResolver::resolve(buildResolverInput(
-                plan, num_experts, layer_weight_manifest, physical_budgets, candidate));
-        };
-        if (!policy.usesDeviceTransferDirectory())
-            return resolve_exact(policy);
+            const auto &stage = stages[index];
+            if (!stage.policy.usesDeviceTransferDirectory()) continue;
+            if (!stage.policy.device_rebalance_workspace_capacity)
+                throw std::invalid_argument("Native replica admission requires its workspace capacity");
+            const auto &workspace = *stage.policy.device_rebalance_workspace_capacity;
+            const auto maximum = workspace.max_hot_replicas_per_participant;
+            if (maximum > static_cast<std::uint32_t>(std::max(0, stage.num_experts)))
+                throw std::invalid_argument("Replica-cache upper bound exceeds the model expert count");
+            const auto &directory = stage.policy.device_transfer_directory_capacity;
+            if (directory.active_slots != static_cast<std::uint64_t>(workspace.num_layers) * std::max(1u, maximum) ||
+                static_cast<std::uint64_t>(directory.active_slots) + directory.staging_slots != directory.total_slots ||
+                workspace.local_transfer_slot_count != directory.total_slots)
+                throw std::invalid_argument("Replica admission requires exact requested directory geometry");
+            requested[index] = maximum;
+            if (stage.plan.replica_cache_capacity)
+            {
+                if (maximum != static_cast<std::uint32_t>(stage.plan.replica_cache_capacity->admitted()))
+                    throw std::logic_error("Retained replica-cache policy differs from its admitted grant");
+                minimum[index] = maximum;
+            }
+            else
+                minimum[index] = std::min(1u, maximum);
+        }
 
-        const auto &requested_workspace = *policy.device_rebalance_workspace_capacity;
-        const auto maximum = requested_workspace.max_hot_replicas_per_participant;
-        if (maximum > static_cast<std::uint32_t>(std::max(0, num_experts)))
-            throw std::invalid_argument("Replica-cache upper bound exceeds the model expert count");
-        const auto &directory = policy.device_transfer_directory_capacity;
-        if (directory.active_slots !=
-                static_cast<std::uint64_t>(requested_workspace.num_layers) * std::max(1u, maximum) ||
-            static_cast<std::uint64_t>(directory.active_slots) + directory.staging_slots != directory.total_slots ||
-            requested_workspace.local_transfer_slot_count != directory.total_slots)
-            throw std::invalid_argument("Replica admission requires exact requested directory geometry");
-
-        const auto resolve_replica_count = [&](std::uint32_t count)
+        // Every candidate is a complete pipeline BOM. Failed candidates own no
+        // allocations, and a successful result has one certificate for all stages.
+        const auto resolve_exact = [&](const std::vector<std::uint32_t> &grants)
         {
-            auto candidate = policy;
-            auto &workspace = *candidate.device_rebalance_workspace_capacity;
-            workspace.max_hot_replicas_per_participant = count;
-            // The rolling staging pool is independent of persistent replica
-            // residency. Resize only active slots, never transfer parallelism.
-            candidate.device_transfer_directory_capacity =
-                DeviceMoETransferSlotDirectory::planBufferedCapacity(
-                    static_cast<std::uint64_t>(workspace.num_layers) *
-                        std::max(1u, count),
-                    policy.device_transfer_directory_capacity.staging_slots,
-                    /*one already-combined staging pool=*/1u);
-            workspace.local_transfer_slot_count =
-                candidate.device_transfer_directory_capacity.total_slots;
-            workspace.collective_payload_slot_capacity = std::min(
-                requested_workspace.collective_payload_slot_capacity,
-                workspace.local_transfer_slot_count);
-            auto result = resolve_exact(candidate);
-            result.replica_cache_capacity = plan.replica_cache_capacity
-                ? plan.replica_cache_capacity
-                : std::optional<MoEOverlayReplicaCacheCapacity>{
-                      std::in_place, static_cast<int>(maximum), static_cast<int>(count)};
+            std::vector<MoEOverlayCapacityResolverInput> inputs;
+            inputs.reserve(stages.size());
+            for (std::size_t index = 0; index < stages.size(); ++index)
+            {
+                const auto &stage = stages[index];
+                auto candidate = stage.policy;
+                if (candidate.usesDeviceTransferDirectory())
+                {
+                    auto &workspace = *candidate.device_rebalance_workspace_capacity;
+                    workspace.max_hot_replicas_per_participant = grants[index];
+                    // Persistent replicas scale independently of the admitted
+                    // rolling transfer pool and its actual communication extent.
+                    candidate.device_transfer_directory_capacity = DeviceMoETransferSlotDirectory::planBufferedCapacity(
+                        static_cast<std::uint64_t>(workspace.num_layers) * std::max(1u, grants[index]),
+                        stage.policy.device_transfer_directory_capacity.staging_slots,
+                        /*one already-combined staging pool=*/1u);
+                    workspace.local_transfer_slot_count = candidate.device_transfer_directory_capacity.total_slots;
+                    workspace.collective_payload_slot_capacity = std::min(
+                        stage.policy.device_rebalance_workspace_capacity->collective_payload_slot_capacity,
+                        workspace.local_transfer_slot_count);
+                }
+                inputs.push_back(buildResolverInput(stage.plan, stage.num_experts,
+                    stage.layer_weight_manifest, stage.physical_budgets, candidate));
+            }
+            auto result = MoEOverlayCapacityResolver::resolvePipeline(inputs);
+            for (std::size_t index = 0; index < stages.size(); ++index)
+                if (stages[index].policy.usesDeviceTransferDirectory())
+                    result[index].replica_cache_capacity = stages[index].plan.replica_cache_capacity
+                        ? stages[index].plan.replica_cache_capacity
+                        : std::optional<MoEOverlayReplicaCacheCapacity>{std::in_place, requested[index], grants[index]};
             return result;
         };
 
-        // Retained runners reuse their exact grant; a new free-memory sample
-        // must not renegotiate geometry embedded in retained prepared state.
-        if (plan.replica_cache_capacity)
-        {
-            if (maximum != static_cast<std::uint32_t>(plan.replica_cache_capacity->admitted()))
-                throw std::logic_error("Retained replica-cache policy differs from its admitted grant");
-            return resolve_replica_count(maximum);
-        }
         try
         {
-            return resolve_replica_count(maximum);
+            return resolve_exact(requested);
         }
         catch (const MoEOverlayCapacityExhausted &)
         {
-            if (maximum <= 1u)
-                throw;
+            if (requested == minimum) throw;
         }
-
-        // An enabled cache always keeps at least one slot per layer. Prove
-        // that floor first: failure here is fatal, never static/off execution.
-        auto best = resolve_replica_count(1u);
-        std::uint32_t low = 2u;
-        std::uint32_t high = maximum - 1u;
-        while (low <= high)
+        // An enabled cache keeps its minimum on every stage. This is a capacity
+        // search within the selected mode, never a change of execution policy.
+        auto grants = minimum;
+        auto best = resolve_exact(grants);
+        for (std::size_t index = 0; index < stages.size(); ++index)
         {
-            const auto middle = low + (high - low) / 2u;
-            try
+            if (requested[index] == minimum[index]) continue;
+            std::uint32_t low = minimum[index] + 1u;
+            std::uint32_t high = requested[index];
+            while (low <= high)
             {
-                best = resolve_replica_count(middle);
-                low = middle + 1u;
-            }
-            catch (const MoEOverlayCapacityExhausted &)
-            {
-                high = middle - 1u;
+                const auto middle = low + (high - low) / 2u;
+                auto candidate = grants;
+                candidate[index] = middle;
+                try
+                {
+                    auto admitted = resolve_exact(candidate);
+                    grants = std::move(candidate);
+                    best = std::move(admitted);
+                    low = middle + 1u;
+                }
+                catch (const MoEOverlayCapacityExhausted &)
+                {
+                    high = middle - 1u;
+                }
             }
         }
         return best;

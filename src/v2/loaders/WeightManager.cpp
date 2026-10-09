@@ -11,6 +11,9 @@
  * Loading and packing occur before graph capture.  Production inference must
  * never call these paths, allocate replacement payloads, or repair residency
  * by synchronizing an execution stream.
+ * A participant's completed upload does not end another participant's source
+ * lifetime. Frozen host policies survive preparation and the complete graph
+ * lifecycle owns reclamation of shared model bytes.
  *
  * @author David Sanftenberg
  */
@@ -5280,26 +5283,10 @@ namespace llaminar2
         // ------------------------------------------------------------------
         struct DenseGemmJob
         {
-            /**
-             * @brief Lifetime promised by the job's immutable host source.
-             *
-             * Transaction sources may be reclaimed after their one device
-             * kernel owns the payload. ModelContext sources are cached derived
-             * representations shared by later frozen graph families and must
-             * remain readable until the WeightManager itself is destroyed.
-             */
-            enum class HostSourceLifetime
-            {
-                Transaction,
-                ModelContext,
-            };
-
             std::string name;
             TensorBase *tensor = nullptr;
             std::shared_ptr<TensorBase> owner;
             std::optional<WeightBinding> binding;
-            HostSourceLifetime host_source_lifetime =
-                HostSourceLifetime::Transaction;
         };
 
         std::vector<DenseGemmJob> gemm_weights;
@@ -5814,8 +5801,6 @@ namespace llaminar2
 
             dense_job.owner = fp32_override;
             dense_job.tensor = fp32_override.get();
-            dense_job.host_source_lifetime =
-                DenseGemmJob::HostSourceLifetime::ModelContext;
             if (dense_job.binding.has_value())
             {
                 dense_job.binding->tensor_owner = fp32_override;
@@ -5866,124 +5851,19 @@ namespace llaminar2
             gemm_weights = std::move(pending_gemm_weights);
         }
 
-        if (frozen_weights)
+        // Prepared adoption above is the only valid post-retirement route.
+        // A pending job still owns an upload obligation, so missing immutable
+        // bytes prove an invalid source lifecycle. Reloading would conceal the
+        // early release and replace the frozen graph's physical source identity.
+        for (const auto &dense_job : gemm_weights)
         {
-            auto refresh_dense_job = [&](DenseGemmJob &dense_job,
-                                         std::shared_ptr<TensorBase> fresh,
-                                         WeightDerivationKind derivation,
-                                         const WeightSliceSpec &slice,
-                                         const std::string &source_name) -> bool
+            if (!dense_job.tensor || dense_job.tensor->is_raw_data_released() ||
+                dense_job.tensor->size_bytes() == 0 || dense_job.tensor->raw_data() == nullptr)
             {
-                if (!fresh || !dense_job.binding.has_value() || !dense_job.tensor)
-                    return false;
-                if (fresh->shape() != dense_job.tensor->shape())
-                {
-                    LOG_WARN("[WeightManager] GPU pipeline: reloaded raw source " << source_name
-                                                                                  << " for " << dense_job.binding->identity.canonical_name
-                                                                                  << " but shape changed from ["
-                                                                                  << dense_job.tensor->rows() << "," << dense_job.tensor->cols()
-                                                                                  << "] to [" << fresh->rows() << "," << fresh->cols()
-                                                                                  << "]; keeping existing binding");
-                    return false;
-                }
-                if (fresh->size_bytes() == 0 || fresh->raw_data() == nullptr)
-                    return false;
-
-                registerDerivedMetadata(
-                    dense_job.binding->identity.canonical_name,
-                    fresh,
-                    derivation,
-                    slice,
-                    target_device);
-
-                dense_job.owner = fresh;
-                dense_job.tensor = fresh.get();
-                dense_job.binding->tensor_owner = fresh;
-                dense_job.binding->tensor = fresh.get();
-                if (dense_job.binding->slice.source_rows == 0 &&
-                    dense_job.binding->slice.source_cols == 0 &&
-                    dense_job.binding->slice.row_count == 0 &&
-                    dense_job.binding->slice.col_count == 0)
-                {
-                    dense_job.binding->slice = fullSliceSpec(*fresh);
-                }
-                LOG_DEBUG("[WeightManager] GPU pipeline: reloaded raw source " << source_name
-                                                                               << " for frozen binding "
-                                                                               << dense_job.binding->identity.canonical_name
-                                                                               << " on " << target_device.to_string());
-                return true;
-            };
-
-            auto full_binding_can_reload_raw = [](const WeightBinding &binding) -> bool
-            {
-                if (!binding.tensor || binding.tensor->shape().size() < 2)
-                    return false;
-                const auto &slice = binding.slice;
-                const auto &shape = binding.tensor->shape();
-                if (slice.inner_is_presliced ||
-                    slice.expert_count != 0 ||
-                    slice.expert_start != 0 ||
-                    !slice.expert_ids.empty())
-                    return false;
-                if (slice.row_start != 0 || slice.col_start != 0)
-                    return false;
-                const bool row_is_full = slice.row_count == 0 || slice.row_count == shape[0];
-                const bool col_is_full = slice.col_count == 0 || slice.col_count == shape[1];
-                const bool source_rows_ok = slice.source_rows == 0 || slice.source_rows == shape[0];
-                const bool source_cols_ok = slice.source_cols == 0 || slice.source_cols == shape[1];
-                return row_is_full && col_is_full && source_rows_ok && source_cols_ok;
-            };
-
-            for (auto &dense_job : gemm_weights)
-            {
-                if (!dense_job.binding.has_value() || !dense_job.tensor)
-                    continue;
-                if (dense_job.tensor->size_bytes() != 0 && dense_job.tensor->raw_data() != nullptr)
-                    continue;
-
-                const auto &binding = *dense_job.binding;
-                if (binding.identity.derivation == WeightDerivationKind::TiedAlias &&
-                    binding.identity.canonical_name == "output.weight" &&
-                    binding.slice.inner_is_presliced &&
-                    binding.slice.row_count > 0 &&
-                    binding.slice.col_start == 0 &&
-                    binding.slice.expert_count == 0 &&
-                    binding.slice.expert_ids.empty())
-                {
-                    auto fresh = loader_.loadTensorRowSlice(
-                        "token_embd.weight",
-                        binding.slice.row_start,
-                        binding.slice.row_start + binding.slice.row_count,
-                        target_device,
-                        weight_precision_);
-                    if (refresh_dense_job(
-                            dense_job,
-                            std::move(fresh),
-                            WeightDerivationKind::TiedAlias,
-                            binding.slice,
-                            "token_embd.weight"))
-                    {
-                        continue;
-                    }
-                }
-
-                if (!full_binding_can_reload_raw(binding))
-                    continue;
-
-                std::string source_name = binding.identity.canonical_name;
-                if (binding.identity.derivation == WeightDerivationKind::TiedAlias &&
-                    source_name == "output.weight")
-                {
-                    source_name = "token_embd.weight";
-                }
-
-                auto fresh = getReplicatedWeight(source_name, target_device);
-                (void)refresh_dense_job(
-                    dense_job,
-                    std::move(fresh),
-                    binding.identity.derivation,
-                    binding.slice,
-                    source_name);
+                throw std::runtime_error(
+                    "[WeightManager] GPU preparation requires a live immutable source for '" +
+                    dense_job.name + "' on " + target_device.toString() +
+                    "; source retired before preparation completed");
             }
         }
 
@@ -6312,26 +6192,13 @@ namespace llaminar2
 
         if (max_raw_bytes == 0)
         {
-            size_t adopted_dense = 0;
-            size_t missing_dense = 0;
-            for (auto &dense_job : gemm_weights)
-            {
-                if (!dense_job.binding.has_value())
-                    continue;
-                auto &binding = *dense_job.binding;
-                if (preparedWeightStore()->adoptPreparedGemmForBinding(binding, target_device))
-                {
-                    markPrepState(dense_job.name, target_device, WeightPrepState::READY, true,
-                                  "GPU pipeline: adopted already-loaded prepared GEMM handle");
-                    ++adopted_dense;
-                }
-                else
-                {
-                    ++missing_dense;
-                    LOG_WARN("[WeightManager] GPU pipeline: no already-loaded prepared GEMM handle for "
-                             << dense_job.name << " on " << target_device.to_string());
-                }
-            }
+            // Dense jobs either adopted their exact prepared owner before
+            // planning or retain a nonempty source. Reaching this boundary
+            // with pending dense work means its storage plan is incomplete.
+            if (!gemm_weights.empty())
+                throw std::logic_error(
+                    "[WeightManager] GPU dense source jobs have no planned upload storage on " +
+                    target_device.toString());
 
             size_t aliased_experts = 0;
             size_t missing_experts = 0;
@@ -6435,12 +6302,10 @@ namespace llaminar2
                       << (gemm_weights.size() + moe_jobs.size())
                       << " logical weights from existing prepared state for "
                       << target_device.to_string()
-                      << " with no host-backed raw bytes; adopted_dense=" << adopted_dense
-                      << " missing_dense=" << missing_dense
-                      << " aliased_experts=" << aliased_experts
+                      << " with no host-backed raw bytes; aliased_experts=" << aliased_experts
                       << " missing_experts=" << missing_experts);
 
-            return missing_dense == 0 && missing_experts == 0;
+            return missing_experts == 0;
         }
 
         // ------------------------------------------------------------------
@@ -6650,7 +6515,8 @@ namespace llaminar2
             }
             binding.residency.home_device = target_device;
             binding.residency.resident_device = target_device;
-            binding.residency.host_policy = WeightHostPolicy::ReleasableAfterPreparation;
+            // Preparing this device cannot weaken the frozen source lifetime
+            // promised to another participant sharing the same TensorBase.
             binding.immutable = true;
 
             try
@@ -6692,31 +6558,10 @@ namespace llaminar2
                                   "GPU pipeline: GEMM weight ready");
                     ++registered;
 
-                    // Release host weight data — the GEMM kernel now owns device copies
-                    // in the WeightVRAMPool. PreparedWeightStore registration marks
-                    // has_prepared_device_state_, so releaseAllHostWeightData() would
-                    // also catch these, but releasing inline saves peak host memory.
-                    // Skip for token_embd.weight: it's also used for embedding lookup,
-                    // which runs concurrently (Steps 2/2b). Its host data is freed
-                    // later by releaseAllHostWeightData().
-                    const bool tied_alias = dense_job.binding.has_value() &&
-                                            dense_job.binding->identity.derivation == WeightDerivationKind::TiedAlias;
-                    const bool model_context_host_source =
-                        dense_job.host_source_lifetime ==
-                        DenseGemmJob::HostSourceLifetime::ModelContext;
-                    if (name != "token_embd.weight" && !tied_alias &&
-                        !model_context_host_source)
-                    {
-                        try
-                        {
-                            tensor->release_host_weight_data();
-                        }
-                        catch (const std::exception &e)
-                        {
-                            LOG_DEBUG("[WeightManager] GPU pipeline: failed to release host data for "
-                                      << name << ": " << e.what());
-                        }
-                    }
+                    // Preparation never retires shared source bytes. The
+                    // complete model graph gate and physical source's CPU
+                    // retention policy own reclamation together, regardless
+                    // of this individual binding's shorter lifetime.
                 }
                 else
                 {

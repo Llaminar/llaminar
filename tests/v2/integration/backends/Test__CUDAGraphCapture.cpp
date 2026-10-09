@@ -126,6 +126,14 @@ TEST_F(Test__CUDAGraphCapture, MTPForcedTokenWaitsForCurrentForward)
     ctx().submitAndWait([&] { test::proveMTPForcedTokenForwardBoundary(ctx(), *backend, DeviceId::cuda(0)); });
 }
 
+/** @test Cached-prefix admission reaches the retained follower verifier's exact stream. */
+TEST_F(Test__CUDAGraphCapture, PipelineVerifierWaitsForAdmissionOnExecutionStream)
+{
+    auto *backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::provePipelineVerifierAdmissionStream(ctx(), *backend, DeviceId::cuda(0)); });
+}
+
 /** @test General control metadata must not receive a bounded helper charge. */
 TEST_F(Test__CUDAGraphCapture, BoundedHelperRejectsEventNode)
 {

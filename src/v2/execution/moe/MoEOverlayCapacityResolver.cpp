@@ -7,6 +7,8 @@
  * GpuExpertSlotPool, then admits logical residents one at a time while charging
  * their actual physical copy multiplicity.  No runtime allocator or backend is
  * consulted, which keeps the same decision reproducible on every MPI rank.
+ * Pipeline stages share the same typed physical BOM throughout admission;
+ * compact stage quota/count metadata never becomes an independent byte budget.
  */
 
 #include "MoEOverlayCapacityResolver.h"
@@ -48,22 +50,16 @@ namespace llaminar2
             return lhs * rhs;
         }
 
-        /** @brief Mutable setup-only extension of one certified base BOM. */
+        /** @brief One setup-only physical BOM shared by all pipeline stages. */
         struct ResourceState
         {
-            std::string resource_id;
             PhysicalMemoryBOMBuilder memory;
-            std::vector<int> live_copies_per_layer;
-            std::vector<int> shadow_arrival_capacity_per_layer;
-
-            ResourceState(
-                std::string identity,
-                const PhysicalMemoryAdmissionCertificate &base,
-                std::size_t layer_count)
-                : resource_id(std::move(identity)),
-                  memory(base.bom()),
-                  live_copies_per_layer(layer_count, 0),
-                  shadow_arrival_capacity_per_layer(layer_count, 0)
+            /**
+             * @brief Extend one canonical fixed BOM during setup admission.
+             * @param base Aggregate stage contributions for this allocator.
+             */
+            explicit ResourceState(const PhysicalMemoryBOM &base)
+                : memory(base)
             {
             }
         };
@@ -343,9 +339,7 @@ namespace llaminar2
                     static_cast<std::size_t>(previous_quota) %
                     tier.request->participants.size();
                 ++tier.output.participant_live_copies[participant][layer];
-                auto &resource = resources[resource_index.at(
-                    tier.request->participants[participant].resource_id)];
-                ++resource.live_copies_per_layer[layer];
+
             }
             else
             {
@@ -354,9 +348,7 @@ namespace llaminar2
                      ++participant)
                 {
                     ++tier.output.participant_live_copies[participant][layer];
-                    auto &resource = resources[resource_index.at(
-                        tier.request->participants[participant].resource_id)];
-                    ++resource.live_copies_per_layer[layer];
+
                 }
             }
             return true;
@@ -504,6 +496,12 @@ namespace llaminar2
         if (manifest.empty() || !deviceMoEProjectionSetValid(projections))
             throw std::invalid_argument("ExpertOverlay capacity resolver requires a layer manifest and a valid projection family");
 
+        const int first_model_layer = manifest.front().layer_idx;
+        if (first_model_layer < 0 ||
+            manifest.size() > static_cast<std::size_t>(
+                std::numeric_limits<int>::max() - first_model_layer))
+            throw std::invalid_argument("ExpertOverlay capacity layer interval is invalid or overflows");
+
         std::vector<MoEOverlayPreparedExpertFootprint> footprints;
         footprints.reserve(manifest.size());
         for (std::size_t layer_offset = 0;
@@ -512,10 +510,10 @@ namespace llaminar2
         {
             const auto &layer = manifest[layer_offset];
             if (!layer.valid() ||
-                layer.layer_idx != static_cast<int>(layer_offset))
+                layer.layer_idx != first_model_layer + static_cast<int>(layer_offset))
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay capacity layer manifest must be valid, unique, and contiguous from zero");
+                    "ExpertOverlay capacity layer manifest must be valid, unique, and contiguous within its owned interval");
             }
 
             MoEOverlayPreparedExpertFootprint footprint;
@@ -555,343 +553,268 @@ namespace llaminar2
         return footprints;
     }
 
-    MoEOverlayResolvedCapacityPlan MoEOverlayCapacityResolver::resolve(
-        const MoEOverlayCapacityResolverInput &input)
+    namespace
     {
-        if (input.num_experts <= 0)
-            throw std::invalid_argument("ExpertOverlay capacity requires a positive expert count");
-        if (input.initial_residency_policy !=
-                MoEOverlayInitialResidencyPolicy::PriorityFillOnly &&
-            input.initial_residency_policy !=
-                MoEOverlayInitialResidencyPolicy::
-                    MigrationSourcePerParticipant)
+        /** @brief Stage-local geometry and quotas; physical bytes have one shared BOM. */
+        struct StageState
         {
-            throw std::invalid_argument(
-                "ExpertOverlay capacity received an unknown initial-residency policy");
-        }
-        const auto footprints = preparedFootprints(
-            input.layer_weight_manifest);
-        const std::size_t layer_count = footprints.size();
-        if (input.physical_budgets.empty() || input.tiers.empty())
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay capacity requires physical budgets and routed tiers");
-        }
+            const MoEOverlayCapacityResolverInput *input;
+            std::vector<MoEOverlayPreparedExpertFootprint> footprints;
+            std::vector<TierState> tiers;
+            std::vector<int> unassigned;
+        };
 
-        std::vector<ResourceState> resources;
-        resources.reserve(input.physical_budgets.size());
-        std::unordered_map<std::string, std::size_t> resource_index;
-        for (const auto &budget : input.physical_budgets)
-        {
-            const auto &base_bom = budget.certificate().bom();
-            if (budget.resourceId().empty() ||
-                !budget.device().is_valid() ||
-                (!budget.device().is_cpu() && !budget.device().is_gpu()) ||
-                base_bom.resource().admission_available_bytes == 0 ||
-                !resource_index.emplace(
-                     budget.resourceId(), resources.size()).second)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay physical budgets require unique non-empty identities, valid devices, and positive usable bytes");
-            }
-            resources.emplace_back(
-                budget.resourceId(), budget.certificate(), layer_count);
-        }
-
-        std::set<int> tier_indices;
-        std::set<int> priorities;
-        std::set<int> participant_ids;
-        int fallback_count = 0;
-        int fallback_priority = std::numeric_limits<int>::min();
-        std::vector<TierState> tiers;
-        tiers.reserve(input.tiers.size());
-        for (const auto &request : input.tiers)
-        {
-            if (request.tier_index < 0 || request.tier_name.empty() ||
-                request.participants.empty() ||
-                !tier_indices.insert(request.tier_index).second ||
-                !priorities.insert(request.priority).second)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay tiers require unique indices, names, strict priorities, and participants");
-            }
-            if (request.fallback)
-            {
-                ++fallback_count;
-                fallback_priority = request.priority;
-            }
-            if (request.quota_mode == MoEOverlayLiveQuotaMode::Automatic)
-            {
-                if (!request.fixed_live_experts_per_layer.empty())
-                {
-                    throw std::invalid_argument(
-                        "Automatic ExpertOverlay tier cannot carry fixed per-layer quotas");
-                }
-            }
-            else if (request.fixed_live_experts_per_layer.size() != layer_count)
-            {
-                throw std::invalid_argument(
-                    "Fixed ExpertOverlay tier requires exactly one quota per model layer");
-            }
-            if (!request.max_live_experts_per_layer.empty() &&
-                request.max_live_experts_per_layer.size() != layer_count)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay tier maximum requires exactly one cap per model layer");
-            }
-            for (std::size_t layer = 0;
-                 layer < request.max_live_experts_per_layer.size();
-                 ++layer)
-            {
-                const int maximum = request.max_live_experts_per_layer[layer];
-                if (maximum < 0 || maximum > input.num_experts ||
-                    (request.quota_mode ==
-                         MoEOverlayLiveQuotaMode::FixedPerLayer &&
-                     request.fixed_live_experts_per_layer[layer] > maximum))
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay tier per-layer maximum is invalid or smaller than its fixed quota");
-                }
-            }
-
-            for (const auto &participant : request.participants)
-            {
-                if (participant.participant_id < 0 ||
-                    participant.resource_id.empty() ||
-                    resource_index.count(participant.resource_id) == 0 ||
-                    !participant_ids.insert(participant.participant_id).second ||
-                    ((participant.shadow_slots_per_layer == 0) !=
-                     (participant.maximum_concurrent_shadow_slots == 0)) ||
-                    participant.maximum_concurrent_shadow_slots <
-                        participant.shadow_slots_per_layer)
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay capacity participants require unique ids, known resources, and a coherent shared shadow capacity");
-                }
-            }
-
-            TierState state;
-            state.request = &request;
-            state.movable_footprints = preparedFootprints(
-                input.layer_weight_manifest, moeOverlayMovableProjections(request.copy_policy));
-            state.output.tier_index = request.tier_index;
-            state.output.tier_name = request.tier_name;
-            state.output.priority = request.priority;
-            state.output.fallback = request.fallback;
-            state.output.live_experts_per_layer.assign(layer_count, 0);
-            state.output.participant_live_copies.assign(
-                request.participants.size(),
-                std::vector<int>(layer_count, 0));
-            tiers.push_back(std::move(state));
-        }
-        if (fallback_count != 1 ||
-            std::any_of(tiers.begin(), tiers.end(), [&](const auto &tier)
-            {
-                return !tier.request->fallback &&
-                       tier.request->priority > fallback_priority;
-            }))
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay requires exactly one fallback tier with the greatest strict priority");
-        }
-
-        std::sort(tiers.begin(), tiers.end(), [](const auto &lhs, const auto &rhs)
-        {
-            return lhs.request->priority < rhs.request->priority;
-        });
-
-        // Fixed down slices cover every expert, including on a participant
-        // whose movable quota is zero. Add them to the same physical BOM before
-        // quota search; no second ledger or post-admission discount is involved.
-        const auto fixed_down = fixedDownCharges(input, resource_index, resources);
-        if (!chargesFit(fixed_down, resource_index, resources))
-            throw MoEOverlayCapacityExhausted("ExpertOverlay fixed down banks exceed the complete physical BOM");
-        commitCharges(fixed_down, resource_index, resources, /*shadow=*/false);
-
-        /*
-         * The physical fabric materializes every configured endpoint/layer
-         * shadow bank during model setup, even when that tier initially owns no
-         * live expert.  Charge the complete topology before admitting any live
-         * quota so an empty tier cannot hide an overcommit. Aggregating
-         * first also makes shared-resource accounting independent of tier order.
+        /**
+         * @brief Validate a complete stage before any capacity search can reject it.
+         * @param input Stage-owned manifest, resource contributions and tier policies.
+         * @param resource_index Complete physical-resource namespace of the pipeline.
+         * @return Compact stage quota state with no private memory budget.
+         * @throws std::invalid_argument for malformed geometry, quotas or bindings.
+         * @throws std::overflow_error for unrepresentable expert footprints.
          */
-        std::map<std::string, std::size_t> all_shadow_charges;
-        for (const auto &tier : tiers)
+        [[nodiscard]] StageState prepareStage(
+            const MoEOverlayCapacityResolverInput &input,
+            const std::unordered_map<std::string, std::size_t> &resource_index)
         {
-            const auto tier_charges = tierShadowCharges(
-                tier,
-                input.layer_weight_manifest,
-                resource_index,
-                resources);
-            for (const auto &[resource_id, bytes] : tier_charges)
+            if (input.num_experts <= 0)
+                throw std::invalid_argument("ExpertOverlay capacity requires a positive expert count");
+            if (input.initial_residency_policy !=
+                    MoEOverlayInitialResidencyPolicy::PriorityFillOnly &&
+                input.initial_residency_policy !=
+                    MoEOverlayInitialResidencyPolicy::
+                        MigrationSourcePerParticipant)
             {
-                all_shadow_charges[resource_id] = checkedAdd(
-                    all_shadow_charges[resource_id],
-                    bytes,
-                    "all tier shadows");
+                throw std::invalid_argument(
+                    "ExpertOverlay capacity received an unknown initial-residency policy");
             }
-        }
-        if (!chargesFit(all_shadow_charges, resource_index, resources))
-        {
-            std::ostringstream error;
-            error << "ExpertOverlay endpoint shadow banks exceed the complete physical BOM";
-            for (const auto &[resource_id, shadow_bytes] : all_shadow_charges)
+            auto footprints = MoEOverlayCapacityResolver::preparedFootprints(
+                input.layer_weight_manifest);
+            const std::size_t layer_count = footprints.size();
+            if (input.physical_budgets.empty() || input.tiers.empty())
             {
-                const auto &resource = resources[resource_index.at(resource_id)];
-                const auto bom = resource.memory.build();
-                const auto used = bom.incrementalBytes();
-                const auto available = bom.resource().admission_available_bytes;
-                if (used <= available && shadow_bytes <= available - used)
-                    continue;
-                error << "; resource='" << resource_id << "' device="
-                      << bom.resource().device.toString()
-                      << " fixed_bytes=" << used
-                      << " shadow_bytes=" << shadow_bytes
-                      << " usable_bytes=" << available;
+                throw std::invalid_argument(
+                    "ExpertOverlay capacity requires physical budgets and routed tiers");
             }
-            throw MoEOverlayCapacityExhausted(error.str());
-        }
-        commitCharges(
-            all_shadow_charges, resource_index, resources, /*shadow=*/true);
-        for (const auto &tier : tiers)
-        {
-            for (const auto &participant : tier.request->participants)
-            {
-                auto &resource =
-                    resources[resource_index.at(participant.resource_id)];
-                for (std::size_t layer = 0; layer < layer_count; ++layer)
-                {
-                    if (participant.shadow_slots_per_layer >
-                        static_cast<std::size_t>(
-                            std::numeric_limits<int>::max() -
-                            resource.shadow_arrival_capacity_per_layer[layer]))
-                    {
-                        throw std::overflow_error(
-                            "ExpertOverlay shadow copy count exceeds int");
-                    }
-                    resource.shadow_arrival_capacity_per_layer[layer] +=
-                        static_cast<int>(participant.shadow_slots_per_layer);
-                }
-            }
-        }
 
-        std::vector<int> unassigned(
-            layer_count, input.num_experts);
-
-        /*
-         * Fixed quotas are exact constraints, so reserve and charge them before
-         * any automatic tier consumes remaining capacity. This prevents a more-preferred
-         * automatic tier from shrinking an explicitly requested later tier.
-         */
-        for (auto &tier : tiers)
-        {
-            if (tier.request->quota_mode !=
-                MoEOverlayLiveQuotaMode::FixedPerLayer)
+            std::set<int> tier_indices;
+            std::set<int> priorities;
+            std::set<int> participant_ids;
+            int fallback_count = 0;
+            int fallback_priority = std::numeric_limits<int>::min();
+            std::vector<TierState> tiers;
+            tiers.reserve(input.tiers.size());
+            for (const auto &request : input.tiers)
             {
-                continue;
-            }
-            for (std::size_t layer = 0; layer < layer_count; ++layer)
-            {
-                const int quota =
-                    tier.request->fixed_live_experts_per_layer[layer];
-                if (quota < 0 || quota > input.num_experts ||
-                    quota > unassigned[layer])
+                if (request.tier_index < 0 || request.tier_name.empty() ||
+                    request.participants.empty() ||
+                    !tier_indices.insert(request.tier_index).second ||
+                    !priorities.insert(request.priority).second)
                 {
                     throw std::invalid_argument(
-                        "ExpertOverlay fixed tier quotas over-assign a model layer");
+                        "ExpertOverlay tiers require unique indices, names, strict priorities, and participants");
                 }
-                for (int copy = 0; copy < quota; ++copy)
+                if (request.fallback)
                 {
-                    if (!addOneLiveExpert(
-                            tier,
-                            static_cast<int>(layer),
-                            resource_index,
-                            resources))
+                    ++fallback_count;
+                    fallback_priority = request.priority;
+                }
+                if (request.quota_mode == MoEOverlayLiveQuotaMode::Automatic)
+                {
+                    if (!request.fixed_live_experts_per_layer.empty())
                     {
-                        throwTierCapacityFailure(
-                            tier,
-                            static_cast<int>(layer),
-                            quota,
-                            "fixed live quota",
-                            resource_index,
-                            resources);
+                        throw std::invalid_argument(
+                            "Automatic ExpertOverlay tier cannot carry fixed per-layer quotas");
                     }
                 }
-                unassigned[layer] -= quota;
+                else if (request.fixed_live_experts_per_layer.size() != layer_count)
+                {
+                    throw std::invalid_argument(
+                        "Fixed ExpertOverlay tier requires exactly one quota per model layer");
+                }
+                if (!request.max_live_experts_per_layer.empty() &&
+                    request.max_live_experts_per_layer.size() != layer_count)
+                {
+                    throw std::invalid_argument(
+                        "ExpertOverlay tier maximum requires exactly one cap per model layer");
+                }
+                for (std::size_t layer = 0;
+                     layer < request.max_live_experts_per_layer.size();
+                     ++layer)
+                {
+                    const int maximum = request.max_live_experts_per_layer[layer];
+                    if (maximum < 0 || maximum > input.num_experts ||
+                        (request.quota_mode ==
+                             MoEOverlayLiveQuotaMode::FixedPerLayer &&
+                         request.fixed_live_experts_per_layer[layer] > maximum))
+                    {
+                        throw std::invalid_argument(
+                            "ExpertOverlay tier per-layer maximum is invalid or smaller than its fixed quota");
+                    }
+                }
+
+                for (const auto &participant : request.participants)
+                {
+                    if (participant.participant_id < 0 ||
+                        participant.resource_id.empty() ||
+                        resource_index.count(participant.resource_id) == 0 ||
+                        std::none_of(input.physical_budgets.begin(), input.physical_budgets.end(),
+                            [&](const auto &budget) { return budget.resourceId() == participant.resource_id; }) ||
+                        !participant_ids.insert(participant.participant_id).second ||
+                        ((participant.shadow_slots_per_layer == 0) !=
+                         (participant.maximum_concurrent_shadow_slots == 0)) ||
+                        participant.maximum_concurrent_shadow_slots <
+                            participant.shadow_slots_per_layer)
+                    {
+                        throw std::invalid_argument(
+                            "ExpertOverlay capacity participants require unique ids, known resources, and a coherent shared shadow capacity");
+                    }
+                }
+
+                TierState state;
+                state.request = &request;
+                state.movable_footprints = MoEOverlayCapacityResolver::preparedFootprints(
+                    input.layer_weight_manifest, moeOverlayMovableProjections(request.copy_policy));
+                state.output.tier_index = request.tier_index;
+                state.output.tier_name = request.tier_name;
+                state.output.priority = request.priority;
+                state.output.fallback = request.fallback;
+                state.output.live_experts_per_layer.assign(layer_count, 0);
+                state.output.participant_live_copies.assign(
+                    request.participants.size(),
+                    std::vector<int>(layer_count, 0));
+                tiers.push_back(std::move(state));
             }
+            if (fallback_count != 1 ||
+                std::any_of(tiers.begin(), tiers.end(), [&](const auto &tier)
+                {
+                    return !tier.request->fallback &&
+                           tier.request->priority > fallback_priority;
+                }))
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay requires exactly one fallback tier with the greatest strict priority");
+            }
+
+            std::sort(tiers.begin(), tiers.end(), [](const auto &lhs, const auto &rhs)
+            {
+                return lhs.request->priority < rhs.request->priority;
+            });
+
+            return {&input, std::move(footprints), std::move(tiers),
+                    std::vector<int>(layer_count, input.num_experts)};
         }
 
-        if (input.initial_residency_policy ==
-            MoEOverlayInitialResidencyPolicy::
-                MigrationSourcePerParticipant)
+        /**
+         * @brief Charge all projection and shadow banks before automatic placement.
+         * @param stage Validated compact stage quotas and immutable geometry.
+         * @param resource_index Diagnostic identities joined to physical allocators.
+         * @param resources The one setup BOM shared by every pipeline stage.
+         * @throws MoEOverlayCapacityExhausted when required owners cannot fit.
+         * @throws std::invalid_argument for unsatisfiable exact quota constraints.
+         * @throws std::overflow_error when a typed charge cannot be represented.
+         */
+        void chargeFixedBanks(StageState &stage,
+            const std::unordered_map<std::string, std::size_t> &resource_index,
+            std::vector<ResourceState> &resources)
         {
+            const auto &input = *stage.input;
+            auto &tiers = stage.tiers;
+            // Fixed down slices cover every expert, including on a participant
+            // whose movable quota is zero. Add them to the same physical BOM before
+            // quota search; no second ledger or post-admission discount is involved.
+            const auto fixed_down = fixedDownCharges(input, resource_index, resources);
+            if (!chargesFit(fixed_down, resource_index, resources))
+                throw MoEOverlayCapacityExhausted("ExpertOverlay fixed down banks exceed the complete physical BOM");
+            commitCharges(fixed_down, resource_index, resources, /*shadow=*/false);
+
             /*
-             * Economy certification measures every directed edge with a real
-             * closed transfer cycle. Reserve only the topology-derived source
-             * minimum before ordinary priority fill so no declared endpoint is
-             * empty at certification time. This is initial data, not durable
-             * topology: the published runtime authority may later migrate the
-             * final source away when doing so is economical.
+             * The physical fabric materializes every configured endpoint/layer
+             * shadow bank during model setup, even when that tier initially owns no
+             * live expert.  Charge the complete topology before admitting any live
+             * quota so an empty tier cannot hide an overcommit. Aggregating
+             * first also makes shared-resource accounting independent of tier order.
+             */
+            std::map<std::string, std::size_t> all_shadow_charges;
+            for (const auto &tier : tiers)
+            {
+                const auto tier_charges = tierShadowCharges(
+                    tier,
+                    input.layer_weight_manifest,
+                    resource_index,
+                    resources);
+                for (const auto &[resource_id, bytes] : tier_charges)
+                {
+                    all_shadow_charges[resource_id] = checkedAdd(
+                        all_shadow_charges[resource_id],
+                        bytes,
+                        "all tier shadows");
+                }
+            }
+            if (!chargesFit(all_shadow_charges, resource_index, resources))
+            {
+                std::ostringstream error;
+                error << "ExpertOverlay endpoint shadow banks exceed the complete physical BOM";
+                for (const auto &[resource_id, shadow_bytes] : all_shadow_charges)
+                {
+                    const auto &resource = resources[resource_index.at(resource_id)];
+                    const auto bom = resource.memory.build();
+                    const auto used = bom.incrementalBytes();
+                    const auto available = bom.resource().admission_available_bytes;
+                    if (used <= available && shadow_bytes <= available - used)
+                        continue;
+                    error << "; resource='" << resource_id << "' device="
+                          << bom.resource().device.toString()
+                          << " fixed_bytes=" << used
+                          << " shadow_bytes=" << shadow_bytes
+                          << " usable_bytes=" << available;
+                }
+                throw MoEOverlayCapacityExhausted(error.str());
+            }
+            commitCharges(
+                all_shadow_charges, resource_index, resources, /*shadow=*/true);
+        }
+
+        /**
+         * @brief Reserve exact quotas and migration sources across every stage.
+         * @param stage Validated compact stage quotas and immutable geometry.
+         * @param resource_index Diagnostic identities joined to physical allocators.
+         * @param resources The one setup BOM shared by every pipeline stage.
+         * @throws MoEOverlayCapacityExhausted when required owners cannot fit.
+         * @throws std::invalid_argument for unsatisfiable exact quota constraints.
+         * @throws std::overflow_error when a typed charge cannot be represented.
+         */
+        void admitRequiredQuotas(StageState &stage,
+            const std::unordered_map<std::string, std::size_t> &resource_index,
+            std::vector<ResourceState> &resources)
+        {
+            const auto &input = *stage.input;
+            auto &tiers = stage.tiers;
+            const auto layer_count = stage.footprints.size();
+            auto &unassigned = stage.unassigned;
+            /*
+             * Fixed quotas are exact constraints, so reserve and charge them before
+             * any automatic tier consumes remaining capacity. This prevents a more-preferred
+             * automatic tier from shrinking an explicitly requested later tier.
              */
             for (auto &tier : tiers)
             {
-                const std::size_t participant_count =
-                    tier.request->participants.size();
-                if (tier.request->copy_policy !=
-                        MoEOverlayTierCopyPolicy::Replicated &&
-                    participant_count >
-                        static_cast<std::size_t>(input.num_experts))
+                if (tier.request->quota_mode !=
+                    MoEOverlayLiveQuotaMode::FixedPerLayer)
                 {
-                    std::ostringstream error;
-                    error << "ExpertOverlay tier '"
-                          << tier.request->tier_name
-                          << "' has " << participant_count
-                          << " migration participants but the model has only "
-                          << input.num_experts
-                          << " experts per layer";
-                    throw std::invalid_argument(error.str());
+                    continue;
                 }
-                const int source_quota =
-                    tier.request->copy_policy ==
-                            MoEOverlayTierCopyPolicy::Replicated
-                        ? 1
-                        : static_cast<int>(participant_count);
-
                 for (std::size_t layer = 0; layer < layer_count; ++layer)
                 {
-                    if (tier.request->quota_mode ==
-                        MoEOverlayLiveQuotaMode::FixedPerLayer)
+                    const int quota =
+                        tier.request->fixed_live_experts_per_layer[layer];
+                    if (quota < 0 || quota > input.num_experts ||
+                        quota > unassigned[layer])
                     {
-                        if (tier.output.live_experts_per_layer[layer] <
-                            source_quota)
-                        {
-                            std::ostringstream error;
-                            error << "ExpertOverlay fixed tier '"
-                                  << tier.request->tier_name
-                                  << "' provides "
-                                  << tier.output.live_experts_per_layer[layer]
-                                  << " experts for layer " << layer
-                                  << " but migration certification requires "
-                                  << source_quota
-                                  << " to seed every participant";
-                            throw std::invalid_argument(error.str());
-                        }
-                        continue;
+                        throw std::invalid_argument(
+                            "ExpertOverlay fixed tier quotas over-assign a model layer");
                     }
-
-                    while (tier.output.live_experts_per_layer[layer] <
-                           source_quota)
+                    for (int copy = 0; copy < quota; ++copy)
                     {
-                        if (unassigned[layer] == 0)
-                        {
-                            std::ostringstream error;
-                            error << "ExpertOverlay cannot seed every migration "
-                                     "participant for tier '"
-                                  << tier.request->tier_name << "' layer "
-                                  << layer << ": all " << input.num_experts
-                                  << " model experts are already assigned";
-                            throw std::invalid_argument(error.str());
-                        }
                         if (!addOneLiveExpert(
                                 tier,
                                 static_cast<int>(layer),
@@ -901,141 +824,356 @@ namespace llaminar2
                             throwTierCapacityFailure(
                                 tier,
                                 static_cast<int>(layer),
-                                source_quota,
-                                "initial migration-source seed",
+                                quota,
+                                "fixed live quota",
                                 resource_index,
                                 resources);
                         }
-                        --unassigned[layer];
+                    }
+                    unassigned[layer] -= quota;
+                }
+            }
+
+            if (input.initial_residency_policy ==
+                MoEOverlayInitialResidencyPolicy::
+                    MigrationSourcePerParticipant)
+            {
+                /*
+                 * Economy certification measures every directed edge with a real
+                 * closed transfer cycle. Reserve only the topology-derived source
+                 * minimum before ordinary priority fill so no declared endpoint is
+                 * empty at certification time. This is initial data, not durable
+                 * topology: the published runtime authority may later migrate the
+                 * final source away when doing so is economical.
+                 */
+                for (auto &tier : tiers)
+                {
+                    const std::size_t participant_count =
+                        tier.request->participants.size();
+                    if (tier.request->copy_policy !=
+                            MoEOverlayTierCopyPolicy::Replicated &&
+                        participant_count >
+                            static_cast<std::size_t>(input.num_experts))
+                    {
+                        std::ostringstream error;
+                        error << "ExpertOverlay tier '"
+                              << tier.request->tier_name
+                              << "' has " << participant_count
+                              << " migration participants but the model has only "
+                              << input.num_experts
+                              << " experts per layer";
+                        throw std::invalid_argument(error.str());
+                    }
+                    const int source_quota =
+                        tier.request->copy_policy ==
+                                MoEOverlayTierCopyPolicy::Replicated
+                            ? 1
+                            : static_cast<int>(participant_count);
+
+                    for (std::size_t layer = 0; layer < layer_count; ++layer)
+                    {
+                        if (tier.request->quota_mode ==
+                            MoEOverlayLiveQuotaMode::FixedPerLayer)
+                        {
+                            if (tier.output.live_experts_per_layer[layer] <
+                                source_quota)
+                            {
+                                std::ostringstream error;
+                                error << "ExpertOverlay fixed tier '"
+                                      << tier.request->tier_name
+                                      << "' provides "
+                                      << tier.output.live_experts_per_layer[layer]
+                                      << " experts for layer " << layer
+                                      << " but migration certification requires "
+                                      << source_quota
+                                      << " to seed every participant";
+                                throw std::invalid_argument(error.str());
+                            }
+                            continue;
+                        }
+
+                        while (tier.output.live_experts_per_layer[layer] <
+                               source_quota)
+                        {
+                            if (unassigned[layer] == 0)
+                            {
+                                std::ostringstream error;
+                                error << "ExpertOverlay cannot seed every migration "
+                                         "participant for tier '"
+                                      << tier.request->tier_name << "' layer "
+                                      << layer << ": all " << input.num_experts
+                                      << " model experts are already assigned";
+                                throw std::invalid_argument(error.str());
+                            }
+                            if (!addOneLiveExpert(
+                                    tier,
+                                    static_cast<int>(layer),
+                                    resource_index,
+                                    resources))
+                            {
+                                throwTierCapacityFailure(
+                                    tier,
+                                    static_cast<int>(layer),
+                                    source_quota,
+                                    "initial migration-source seed",
+                                    resource_index,
+                                    resources);
+                            }
+                            --unassigned[layer];
+                        }
                     }
                 }
             }
+
         }
 
-        /* Automatic non-coverage tiers consume balanced slots by priority. */
-        for (auto &tier : tiers)
+        /**
+         * @brief Fill this stage's preferred tiers in its authored priority order.
+         * @param stage Validated compact stage quotas and immutable geometry.
+         * @param resource_index Diagnostic identities joined to physical allocators.
+         * @param resources The one setup BOM shared by every pipeline stage.
+         * @throws MoEOverlayCapacityExhausted when required owners cannot fit.
+         * @throws std::invalid_argument for unsatisfiable exact quota constraints.
+         * @throws std::overflow_error when a typed charge cannot be represented.
+         */
+        void admitPreferredQuotas(StageState &stage,
+            const std::unordered_map<std::string, std::size_t> &resource_index,
+            std::vector<ResourceState> &resources)
         {
-            if (tier.request->fallback ||
-                tier.request->quota_mode !=
-                    MoEOverlayLiveQuotaMode::Automatic)
+            auto &tiers = stage.tiers;
+            const auto layer_count = stage.footprints.size();
+            auto &unassigned = stage.unassigned;
+            /* Automatic non-coverage tiers consume balanced slots by priority. */
+            for (auto &tier : tiers)
             {
-                continue;
+                if (tier.request->fallback ||
+                    tier.request->quota_mode !=
+                        MoEOverlayLiveQuotaMode::Automatic)
+                {
+                    continue;
+                }
+
+                while (true)
+                {
+                    std::vector<int> candidates;
+                    for (std::size_t layer = 0; layer < layer_count; ++layer)
+                    {
+                        if (unassigned[layer] > 0)
+                            candidates.push_back(static_cast<int>(layer));
+                    }
+                    std::sort(candidates.begin(), candidates.end(), [&](int lhs, int rhs)
+                    {
+                        const int left = tier.output.live_experts_per_layer[
+                            static_cast<std::size_t>(lhs)];
+                        const int right = tier.output.live_experts_per_layer[
+                            static_cast<std::size_t>(rhs)];
+                        return left != right ? left < right : lhs < rhs;
+                    });
+
+                    bool admitted = false;
+                    for (const int layer : candidates)
+                    {
+                        if (addOneLiveExpert(
+                                tier, layer,
+                                resource_index, resources))
+                        {
+                            --unassigned[static_cast<std::size_t>(layer)];
+                            admitted = true;
+                            break;
+                        }
+                    }
+                    if (!admitted)
+                        break;
+                }
             }
 
-            while (true)
+        }
+
+        /**
+         * @brief Complete this stage's expert coverage against the shared BOM.
+         * @param stage Validated compact stage quotas and immutable geometry.
+         * @param resource_index Diagnostic identities joined to physical allocators.
+         * @param resources The one setup BOM shared by every pipeline stage.
+         * @throws MoEOverlayCapacityExhausted when required owners cannot fit.
+         * @throws std::invalid_argument for unsatisfiable exact quota constraints.
+         * @throws std::overflow_error when a typed charge cannot be represented.
+         */
+        void admitCoverage(StageState &stage,
+            const std::unordered_map<std::string, std::size_t> &resource_index,
+            std::vector<ResourceState> &resources)
+        {
+            auto &tiers = stage.tiers;
+            const auto layer_count = stage.footprints.size();
+            auto &unassigned = stage.unassigned;
+            auto fallback = std::find_if(
+                tiers.begin(), tiers.end(), [](const auto &tier)
+                { return tier.request->fallback; });
+            if (fallback == tiers.end())
+                throw std::logic_error("Validated ExpertOverlay fallback disappeared");
+            if (fallback->request->quota_mode ==
+                MoEOverlayLiveQuotaMode::Automatic)
             {
-                std::vector<int> candidates;
                 for (std::size_t layer = 0; layer < layer_count; ++layer)
                 {
-                    if (unassigned[layer] > 0)
-                        candidates.push_back(static_cast<int>(layer));
-                }
-                std::sort(candidates.begin(), candidates.end(), [&](int lhs, int rhs)
-                {
-                    const int left = tier.output.live_experts_per_layer[
-                        static_cast<std::size_t>(lhs)];
-                    const int right = tier.output.live_experts_per_layer[
-                        static_cast<std::size_t>(rhs)];
-                    return left != right ? left < right : lhs < rhs;
-                });
-
-                bool admitted = false;
-                for (const int layer : candidates)
-                {
-                    if (addOneLiveExpert(
-                            tier, layer,
-                            resource_index, resources))
+                    const int remainder = unassigned[layer];
+                    for (int copy = 0; copy < remainder; ++copy)
                     {
-                        --unassigned[static_cast<std::size_t>(layer)];
-                        admitted = true;
-                        break;
+                        if (!addOneLiveExpert(
+                                *fallback,
+                                static_cast<int>(layer),
+                                resource_index,
+                                resources))
+                        {
+                            throwTierCapacityFailure(
+                                *fallback,
+                                static_cast<int>(layer),
+                                remainder,
+                                "fallback remainder",
+                                resource_index,
+                                resources);
+                        }
                     }
+                    unassigned[layer] = 0;
                 }
-                if (!admitted)
-                    break;
             }
+
+            if (std::any_of(unassigned.begin(), unassigned.end(),
+                            [](int count) { return count != 0; }))
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay fixed fallback quota leaves uncovered experts after automatic priority fill");
+            }
+
         }
 
-        auto fallback = std::find_if(
-            tiers.begin(), tiers.end(), [](const auto &tier)
-            { return tier.request->fallback; });
-        if (fallback == tiers.end())
-            throw std::logic_error("Validated ExpertOverlay fallback disappeared");
-        if (fallback->request->quota_mode ==
-            MoEOverlayLiveQuotaMode::Automatic)
+        /**
+         * @brief Publish stage-local counts beside the sole aggregate byte authority.
+         * @param stage Fully covered stage with exact compact participant quotas.
+         * @param authority Completed admission of all fixed and routed owners.
+         * @return Stage quota plan whose resource views retain that same certificate.
+         * @throws std::overflow_error if a diagnostic copy count exceeds int.
+         */
+        [[nodiscard]] MoEOverlayResolvedCapacityPlan finishStage(
+            StageState &&stage,
+            const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &authority)
         {
-            for (std::size_t layer = 0; layer < layer_count; ++layer)
+            MoEOverlayResolvedCapacityPlan result;
+            result.num_experts = stage.input->num_experts;
+            result.layer_footprints = std::move(stage.footprints);
+            result.physical_memory_admission = authority;
+            const auto layer_count = result.layer_footprints.size();
+            for (const auto &budget : stage.input->physical_budgets)
             {
-                const int remainder = unassigned[layer];
-                for (int copy = 0; copy < remainder; ++copy)
-                {
-                    if (!addOneLiveExpert(
-                            *fallback,
-                            static_cast<int>(layer),
-                            resource_index,
-                            resources))
+                std::vector<int> live(layer_count, 0);
+                std::vector<int> shadows(layer_count, 0);
+                for (const auto &tier : stage.tiers)
+                    for (std::size_t participant = 0; participant < tier.request->participants.size(); ++participant)
                     {
-                        throwTierCapacityFailure(
-                            *fallback,
-                            static_cast<int>(layer),
-                            remainder,
-                            "fallback remainder",
-                            resource_index,
-                            resources);
+                        const auto &endpoint = tier.request->participants[participant];
+                        if (endpoint.resource_id != budget.resourceId()) continue;
+                        for (std::size_t layer = 0; layer < layer_count; ++layer)
+                        {
+                            const auto copies = tier.output.participant_live_copies[participant][layer];
+                            if (copies > std::numeric_limits<int>::max() - live[layer] ||
+                                endpoint.shadow_slots_per_layer > static_cast<std::size_t>(
+                                    std::numeric_limits<int>::max() - shadows[layer]))
+                                throw std::overflow_error("ExpertOverlay stage copy count exceeds int");
+                            live[layer] += copies;
+                            shadows[layer] += static_cast<int>(endpoint.shadow_slots_per_layer);
+                        }
                     }
-                }
-                unassigned[layer] = 0;
+                const auto &resource = budget.certificate().bom().resource();
+                result.physical_resources.emplace_back(budget.resourceId(), authority,
+                    PhysicalMemoryAllocatorIdentity{resource.world_rank, resource.device},
+                    std::move(live), std::move(shadows));
             }
+            for (auto &tier : stage.tiers) result.tiers.push_back(std::move(tier.output));
+            std::sort(result.tiers.begin(), result.tiers.end(),
+                [](const auto &left, const auto &right) { return left.tier_index < right.tier_index; });
+            return result;
         }
+    } // namespace
 
-        if (std::any_of(unassigned.begin(), unassigned.end(),
-                        [](int count) { return count != 0; }))
+    MoEOverlayResolvedCapacityPlan MoEOverlayCapacityResolver::resolve(
+        const MoEOverlayCapacityResolverInput &input)
+    {
+        auto resolved = resolvePipeline(std::span(&input, 1u));
+        return std::move(resolved.front());
+    }
+
+    std::vector<MoEOverlayResolvedCapacityPlan> MoEOverlayCapacityResolver::resolvePipeline(
+        std::span<const MoEOverlayCapacityResolverInput> inputs)
+    {
+        if (inputs.empty())
+            throw std::invalid_argument("ExpertOverlay pipeline capacity requires at least one stage");
+
+        // Every contribution joins by allocator identity. The name is only its
+        // authenticated protocol label; aliases must not create extra capacity.
+        PhysicalMemoryPlanBuilder base_builder;
+        std::vector<std::pair<std::string, PhysicalMemoryAllocatorIdentity>> bindings;
+        std::unordered_map<std::string, std::size_t> resource_index;
+        for (const auto &input : inputs)
         {
-            throw std::invalid_argument(
-                "ExpertOverlay fixed fallback quota leaves uncovered experts after automatic priority fill");
-        }
-
-        MoEOverlayResolvedCapacityPlan result;
-        result.num_experts = input.num_experts;
-        result.layer_footprints = footprints;
-        result.tiers.reserve(tiers.size());
-        for (auto &tier : tiers)
-            result.tiers.push_back(std::move(tier.output));
-        std::sort(result.tiers.begin(), result.tiers.end(),
-                  [](const auto &lhs, const auto &rhs)
-                  { return lhs.tier_index < rhs.tier_index; });
-
-        PhysicalMemoryPlanBuilder physical_plan_builder;
-        for (const auto &resource : resources)
-        {
-            auto final_bom = resource.memory.build();
-            if (!final_bom.fits())
+            std::set<std::string> stage_resources;
+            for (const auto &budget : input.physical_budgets)
             {
-                throw std::logic_error(
-                    "ExpertOverlay capacity resolver committed an over-budget resource");
+                const auto &bom = budget.certificate().bom();
+                const auto &physical = bom.resource();
+                const PhysicalMemoryAllocatorIdentity identity{physical.world_rank, physical.device};
+                if ((!physical.device.is_cpu() && !physical.device.is_gpu()) ||
+                    !physical.device.is_valid() || physical.admission_available_bytes == 0u ||
+                    !stage_resources.insert(budget.resourceId()).second)
+                    throw std::invalid_argument("ExpertOverlay stage requires unique valid physical budgets");
+                const auto named = resource_index.find(budget.resourceId());
+                if (named == resource_index.end())
+                {
+                    if (std::any_of(bindings.begin(), bindings.end(),
+                        [&](const auto &binding) { return binding.second == identity; }))
+                        throw std::invalid_argument("ExpertOverlay physical allocator has multiple resource identities");
+                    resource_index.emplace(budget.resourceId(), bindings.size());
+                    bindings.emplace_back(budget.resourceId(), identity);
+                }
+                else if (bindings[named->second].second != identity)
+                    throw std::invalid_argument("ExpertOverlay resource identity names different physical allocators");
+                // The canonical builder verifies a common capacity observation
+                // and accumulates typed owners; never subtract stage budgets.
+                base_builder.add(bom);
             }
-            physical_plan_builder.add(final_bom);
         }
-        result.physical_memory_admission = std::make_shared<
-            const PhysicalMemoryPlanAdmissionCertificate>(
-            physical_plan_builder.build());
+        const auto base = base_builder.build();
+        std::vector<ResourceState> resources;
+        resources.reserve(bindings.size());
+        for (const auto &binding : bindings)
+            resources.emplace_back(*base.find(binding.second));
 
-        result.physical_resources.reserve(resources.size());
-        for (auto &resource : resources)
+        std::vector<StageState> stages;
+        stages.reserve(inputs.size());
+        int previous_last_layer = -1;
+        for (const auto &input : inputs)
         {
-            const auto final_bom = resource.memory.build();
-            const PhysicalMemoryAllocatorIdentity identity{
-                .world_rank = final_bom.resource().world_rank,
-                .device = final_bom.resource().device,
-            };
-            result.physical_resources.emplace_back(
-                std::move(resource.resource_id),
-                result.physical_memory_admission,
-                identity,
-                std::move(resource.live_copies_per_layer),
-                std::move(resource.shadow_arrival_capacity_per_layer));
+            auto stage = prepareStage(input, resource_index);
+            if (stage.footprints.front().layer_idx <= previous_last_layer)
+                throw std::invalid_argument("ExpertOverlay pipeline stages require ordered disjoint layer intervals");
+            previous_last_layer = stage.footprints.back().layer_idx;
+            stages.push_back(std::move(stage));
         }
-        return result;
+        if (!base.fits())
+            throw MoEOverlayCapacityExhausted("ExpertOverlay pipeline fixed owners exceed the complete physical BOM: " + base.summary());
+
+        // Fixed obligations of every stage precede optional priority fill. A
+        // preceding stage cannot spend a later stage's fixed or migration bank.
+        for (auto &stage : stages) chargeFixedBanks(stage, resource_index, resources);
+        for (auto &stage : stages) admitRequiredQuotas(stage, resource_index, resources);
+        for (auto &stage : stages) admitPreferredQuotas(stage, resource_index, resources);
+        for (auto &stage : stages) admitCoverage(stage, resource_index, resources);
+
+        PhysicalMemoryPlanBuilder completed;
+        for (const auto &resource : resources) completed.add(resource.memory.build());
+        const auto authority = std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(completed.build());
+        std::vector<MoEOverlayResolvedCapacityPlan> results;
+        results.reserve(stages.size());
+        for (auto &stage : stages) results.push_back(finishStage(std::move(stage), authority));
+        return results;
     }
 
     MoERoutedExpertPlacementPlan
@@ -1045,10 +1183,24 @@ namespace llaminar2
     {
         if (capacity.num_experts <= 0 ||
             capacity.layer_footprints.empty() ||
+            plan.first_model_layer < 0 ||
+            capacity.layer_footprints.size() > static_cast<std::size_t>(
+                std::numeric_limits<int>::max() - plan.first_model_layer) ||
             capacity.tiers.size() != plan.routed_tiers.size())
         {
             throw std::invalid_argument(
                 "ExpertOverlay resolved capacity does not match placement-plan geometry");
+        }
+
+        // Equal row counts do not establish stage identity. The footprint
+        // manifest is the authority for global layer IDs; quota arrays retain
+        // only the compact owned interval, never preceding-stage padding.
+        for (std::size_t row = 0; row < capacity.layer_footprints.size(); ++row)
+        {
+            if (capacity.layer_footprints[row].layer_idx !=
+                plan.first_model_layer + static_cast<int>(row))
+                throw std::invalid_argument(
+                    "ExpertOverlay resolved capacity belongs to a different placement-plan layer interval");
         }
 
         MoERoutedExpertPlacementPlan result = plan;

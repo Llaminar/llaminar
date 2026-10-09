@@ -7,13 +7,16 @@
  * condition that exposed accidental foreign primary contexts during parity
  * campaign concurrency. CUDA provides an exact primary-context activity query;
  * ROCm isolation is observed at the Linux KFD device boundary without calling
- * HIP and thereby perturbing the state under test.
+ * HIP and thereby perturbing the state under test. Both public discovery
+ * authorities, HardwareInventory and DeviceRegistry, must respect the same
+ * policy through initial discovery and refresh.
  */
 
 #include <gtest/gtest.h>
 
 #include "app/MPIBootstrapPhase.h"
 #include "backends/HardwareInventory.h"
+#include "backends/DeviceRegistry.h"
 #include "backends/cuda/CUDADriverApi.h"
 #include "planning/ClusterInventoryGatherer.h"
 #include "utils/DebugEnv.h"
@@ -63,6 +66,14 @@ namespace
             if (found == devices.end())
                 throw std::runtime_error("Published GPU absent from hardware observation");
             EXPECT_EQ(gpu.uuid, found->uuid);
+        }
+        auto &registry = DeviceRegistry::instance();
+        registry.discover();
+        for (int refresh = 0; refresh < 2; ++refresh)
+        {
+            EXPECT_EQ(registry.deviceCount(DeviceType::CUDA), observed->cuda_devices.size());
+            EXPECT_EQ(registry.deviceCount(DeviceType::ROCm), observed->rocm_devices.size());
+            registry.refresh();
         }
         return *observed;
     }

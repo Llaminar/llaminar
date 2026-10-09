@@ -35,6 +35,8 @@ namespace llaminar2
         int vocab_size() const override;
         void clear_cache() override;
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::prefixCacheTelemetrySources */
+        PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override;
         int get_position() const override;
         DeviceId primaryDeviceId() const override;
         ExecutionPath executionPath() const override;

@@ -20,6 +20,7 @@
 #include "../mtp/MTPConditionForwardPurpose.h"
 #include "../moe/DeviceMoERebalancePolicyShared.h"
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cstddef>
 #include <cmath>
@@ -1265,13 +1266,30 @@ namespace llaminar2
     }
 
     /**
+     * @brief Count the bounded scalar verifier widths in the retained family.
+     * @param config Immutable admitted capacity, independent of active depth.
+     * @return Power-of-two buckets plus a possibly clipped final bucket.
+     *
+     * Rows run from two through retained depth plus one. The number of those
+     * buckets is bit_width(depth); no signed depth-plus-one overflow is needed.
+     */
+    [[nodiscard]] inline std::size_t resolveMTPRetainedVerifierWidthCount(
+        const MTPRuntimeConfig &config) noexcept
+    {
+        return retainsMTPGraphCapacity(config)
+            ? std::bit_width(static_cast<unsigned int>(resolveMTPRetainedDraftCapacity(config)))
+            : 0u;
+    }
+
+    /**
      * @brief Count complete model forwards retained by the MTP serving family.
      * @param config Frozen runtime and graph-capacity policy.
-     * @return All condition purposes and two verifiers when capacity is retained.
+     * @return All condition purposes and both outcomes at every retained width.
      *
-     * The MTP serving family owns speculative and committed condition forwards plus two grouped
-     * verifier forwards (greedy terminal reduction and stochastic/disabled
-     * terminal reduction). These are complete transformer graphs, not small
+     * The MTP serving family owns speculative and committed condition forwards
+     * plus greedy and stochastic/disabled grouped verifiers at every bounded
+     * width. Fixed request depth may be smaller than retained capacity without
+     * discovering a new graph after admission. These are complete transformer graphs, not small
      * controller fragments, and must therefore pay the per-layer graph-memory
      * charge. Keeping this count beside retained-depth resolution prevents the
      * materializer and memory admission from classifying the same graphs
@@ -1282,7 +1300,8 @@ namespace llaminar2
         const MTPRuntimeConfig &config) noexcept
     {
         return retainsMTPGraphCapacity(config)
-                   ? kMTPConditionForwardPurposes.size() + std::size_t{2}
+                   ? kMTPConditionForwardPurposes.size() +
+                         std::size_t{2} * resolveMTPRetainedVerifierWidthCount(config)
                    : std::size_t{0};
     }
 

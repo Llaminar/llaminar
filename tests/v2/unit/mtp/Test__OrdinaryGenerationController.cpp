@@ -433,7 +433,7 @@ TEST(OrdinaryGenerationController, HistoryAdmissionAndCommitAreExclusiveAndFailu
 
 TEST(OrdinaryGenerationController, PolicyIsExplicitAndSharesTheResidentStorageABI)
 {
-    static_assert(kDeviceGenerationControlCount == 51);
+    static_assert(kDeviceGenerationControlCount == 52);
     static_assert(sizeof(DeviceGenerationPolicy) == 15 * sizeof(int));
     EXPECT_FALSE(DeviceGenerationPolicy::fixed(0).valid());
     EXPECT_TRUE(DeviceGenerationPolicy::ordinary().valid());

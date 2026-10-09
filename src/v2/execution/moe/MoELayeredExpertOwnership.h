@@ -8,13 +8,16 @@
  * logical expert id to different participants.  This value type makes the
  * complete `(layer, expert) -> participant` relation explicit and validates it
  * at construction time.  Rebalance planning, migration, mask publication, and
- * graph/prefix identity all consume this same object.
+ * graph/prefix identity all consume this same object. A pipeline stage retains
+ * only its own rows while preserving model-global layer identities; preceding
+ * stages never create padding rows in its ownership or mask storage.
  */
 
 #pragma once
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -58,14 +61,17 @@ namespace llaminar2
          * @brief Construct and validate an explicit per-layer ownership table.
          *
          * @param participant_count Number of participants that may own experts.
-         * @param owner_participant_by_layer Dense `[layer][expert]` owner table.
+         * @param owner_participant_by_layer Compact `[local row][expert]` table.
+         * @param first_model_layer Model-global identity of the first stored row.
          * @throws std::invalid_argument if dimensions are empty or ragged, or
-         *         an owner lies outside `[0, participant_count)`.
+         *         an owner or the model-layer interval is invalid.
          */
         MoELayeredExpertOwnership(
             int participant_count,
-            std::vector<std::vector<int>> owner_participant_by_layer)
+            std::vector<std::vector<int>> owner_participant_by_layer,
+            int first_model_layer = 0)
             : participant_count_(participant_count),
+              first_model_layer_(first_model_layer),
               owner_participant_by_layer_(std::move(owner_participant_by_layer))
         {
             validate();
@@ -81,23 +87,27 @@ namespace llaminar2
          * @param layer_count Positive number of routed layers.
          * @param participant_count Positive number of ownership participants.
          * @param owner_participant_by_expert One complete expert owner row.
+         * @param first_model_layer First represented model-global layer identity.
          * @return Validated layered ownership value.
          */
         static MoELayeredExpertOwnership uniform(
             int layer_count,
             int participant_count,
-            const std::vector<int> &owner_participant_by_expert)
+            const std::vector<int> &owner_participant_by_expert,
+            int first_model_layer = 0)
         {
-            if (layer_count <= 0)
+            if (layer_count <= 0 || first_model_layer < 0 ||
+                layer_count > std::numeric_limits<int>::max() - first_model_layer)
             {
                 throw std::invalid_argument(
-                    "MoE layered ownership requires a positive layer count");
+                    "MoE layered ownership requires a valid nonempty model-layer interval");
             }
             return MoELayeredExpertOwnership(
                 participant_count,
                 std::vector<std::vector<int>>(
                     static_cast<size_t>(layer_count),
-                    owner_participant_by_expert));
+                    owner_participant_by_expert),
+                first_model_layer);
         }
 
         /** @brief Return whether this value has not yet been bound to a model. */
@@ -110,6 +120,48 @@ namespace llaminar2
         int layerCount() const noexcept
         {
             return static_cast<int>(owner_participant_by_layer_.size());
+        }
+
+        /** @return First stored model-global layer identity; zero when unbound. */
+        int firstModelLayer() const noexcept
+        {
+            return first_model_layer_;
+        }
+
+        /** @return Exclusive model-global layer boundary, authenticated at construction. */
+        int endModelLayer() const noexcept
+        {
+            return first_model_layer_ + layerCount();
+        }
+
+        /** @return Whether a model-global layer has an owned storage row. */
+        bool containsModelLayer(int layer_idx) const noexcept
+        {
+            return layer_idx >= firstModelLayer() && layer_idx < endModelLayer();
+        }
+
+        /**
+         * @brief Translate an owned model-global layer to its compact storage row.
+         * @param layer_idx Exact layer identity used by weights and movement receipts.
+         * @return Zero-based row within this ownership value only.
+         * @throws std::out_of_range if the layer belongs outside this interval.
+         */
+        size_t storageIndexForModelLayer(int layer_idx) const
+        {
+            return checkedLayerIndex(layer_idx);
+        }
+
+        /**
+         * @brief Translate a compact storage row to its model-global identity.
+         * @param storage_index Row in the ownership or participant-mask table.
+         * @return Exact layer identity used by weights and movement receipts.
+         * @throws std::out_of_range if the row is absent.
+         */
+        int modelLayerForStorageIndex(size_t storage_index) const
+        {
+            if (storage_index >= owner_participant_by_layer_.size())
+                throw std::out_of_range("MoE layered ownership storage row is out of range");
+            return first_model_layer_ + static_cast<int>(storage_index);
         }
 
         /** @brief Return the number of logical routed experts per layer. */
@@ -143,12 +195,7 @@ namespace llaminar2
          */
         const std::vector<int> &ownersForLayer(int layer_idx) const
         {
-            if (layer_idx < 0 || layer_idx >= layerCount())
-            {
-                throw std::out_of_range(
-                    "MoE layered ownership layer index is out of range");
-            }
-            return owner_participant_by_layer_[static_cast<size_t>(layer_idx)];
+            return owner_participant_by_layer_[checkedLayerIndex(layer_idx)];
         }
 
         /**
@@ -170,8 +217,9 @@ namespace llaminar2
         /**
          * @brief Build all layer masks for one ownership participant.
          *
-         * The returned table is `[layer][expert]`; every expert appears in
-         * exactly one participant's masks because ownership itself is total.
+         * The returned table is `[local row][expert]`; translate a model layer
+         * with `storageIndexForModelLayer()`. Every expert appears in exactly
+         * one participant's masks, with no storage for other pipeline stages.
          *
          * @throws std::out_of_range if `participant_id` is invalid.
          */
@@ -186,11 +234,11 @@ namespace llaminar2
             std::vector<std::vector<bool>> masks(
                 static_cast<size_t>(layerCount()),
                 std::vector<bool>(static_cast<size_t>(expertCount()), false));
-            for (int layer_idx = 0; layer_idx < layerCount(); ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
                 for (int expert_id = 0; expert_id < expertCount(); ++expert_id)
                 {
-                    masks[static_cast<size_t>(layer_idx)][static_cast<size_t>(expert_id)] =
+                    masks[checkedLayerIndex(layer_idx)][static_cast<size_t>(expert_id)] =
                         owner(layer_idx, expert_id) == participant_id;
                 }
             }
@@ -209,7 +257,7 @@ namespace llaminar2
             requireSameGeometry(previous, "compare");
 
             std::vector<MoELayeredExpertOwnershipChange> changes;
-            for (int layer_idx = 0; layer_idx < layerCount(); ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
                 for (int expert_id = 0; expert_id < expertCount(); ++expert_id)
                 {
@@ -239,7 +287,7 @@ namespace llaminar2
             const MoELayeredExpertOwnership &other) const
         {
             requireSameGeometry(other, "compare capacities");
-            for (int layer_idx = 0; layer_idx < layerCount(); ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
                 std::vector<int> lhs_counts(static_cast<size_t>(participant_count_), 0);
                 std::vector<int> rhs_counts(static_cast<size_t>(participant_count_), 0);
@@ -258,18 +306,31 @@ namespace llaminar2
 
     private:
         int participant_count_ = 0;
+        int first_model_layer_ = 0;
         std::vector<std::vector<int>> owner_participant_by_layer_;
 
+        /**
+         * @brief Authenticate a global layer before indexing compact storage.
+         * @param layer_idx Model-global layer coordinate, never a storage offset.
+         * @return Validated local row index.
+         * @throws std::out_of_range for a layer outside the owned interval.
+         */
         size_t checkedLayerIndex(int layer_idx) const
         {
-            if (layer_idx < 0 || layer_idx >= layerCount())
+            if (!containsModelLayer(layer_idx))
             {
                 throw std::out_of_range(
                     "MoE layered ownership layer index is out of range");
             }
-            return static_cast<size_t>(layer_idx);
+            return static_cast<size_t>(layer_idx - first_model_layer_);
         }
 
+        /**
+         * @brief Validate an expert coordinate before accessing an ownership row.
+         * @param expert_id Logical routed expert identity.
+         * @return Validated expert index.
+         * @throws std::out_of_range for a missing expert.
+         */
         size_t checkedExpertIndex(int expert_id) const
         {
             if (expert_id < 0 || expert_id >= expertCount())
@@ -280,11 +341,18 @@ namespace llaminar2
             return static_cast<size_t>(expert_id);
         }
 
+        /**
+         * @brief Reject comparisons between different stages or participant geometries.
+         * @param other Ownership value being compared.
+         * @param operation Diagnostic name for the attempted comparison.
+         * @throws std::invalid_argument when any identity or dimension differs.
+         */
         void requireSameGeometry(
             const MoELayeredExpertOwnership &other,
             const char *operation) const
         {
-            if (layerCount() == other.layerCount() &&
+            if (firstModelLayer() == other.firstModelLayer() &&
+                layerCount() == other.layerCount() &&
                 expertCount() == other.expertCount() &&
                 participant_count_ == other.participant_count_)
             {
@@ -296,8 +364,19 @@ namespace llaminar2
                 " MoE layered ownership values with different geometries");
         }
 
+        /**
+         * @brief Seal compact storage, model-layer identity and total ownership.
+         * @throws std::invalid_argument for invalid coordinates, geometry or owners.
+         */
         void validate() const
         {
+            if (first_model_layer_ < 0 ||
+                owner_participant_by_layer_.size() >
+                    static_cast<size_t>(std::numeric_limits<int>::max() - first_model_layer_))
+            {
+                throw std::invalid_argument(
+                    "MoE layered ownership model-layer interval is out of range");
+            }
             if (participant_count_ <= 0)
             {
                 throw std::invalid_argument(

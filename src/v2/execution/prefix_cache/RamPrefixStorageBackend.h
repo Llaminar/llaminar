@@ -11,6 +11,7 @@
 #pragma once
 
 #include "execution/prefix_cache/PrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "backends/DeviceId.h"
 #include "planning/PhysicalMemoryAuthority.h"
 
@@ -69,6 +70,23 @@ namespace llaminar2
         /** @return Whether logical capacity and PMA both admit @p bytes now. */
         bool canStore(size_t bytes) const override;
 
+        /** @brief Admit the exact section BOM without requiring unrelated sections to be adjacent. */
+        bool canStore(const PrefixPayloadAllocationPlan &allocation) const;
+        /**
+         * @brief Bound a restore's complete read set by the configured tier capacity.
+         * @param working_set Checked byte BOM, excluding device-resident sections.
+         * @return Whether the tier could retain these simultaneous consumers.
+         *
+         * This is a static window policy, not live allocation admission. Every
+         * actual section still passes the arena and PMA checks in canStore().
+         * @param working_set Checked BOM for the sections simultaneously consumed by restore.
+         * @return Whether the configured tier envelope can retain that complete read set.
+         */
+        bool canRetainWorkingSet(const PrefixPayloadAllocationPlan &working_set) const
+        { return working_set.totalBytes() <= budget_bytes_; }
+        /** @return Physical free storage for victim selection; allocation still proves every section fits. */
+        size_t availableArchiveBytes() const;
+
         /**
          * @return Logical and physical placement headroom, without blocking.
          * GPU ranges remain unavailable through aliases and unfinished DMA;
@@ -126,8 +144,14 @@ namespace llaminar2
 
         /** @return Configured logical capacity. */
         size_t budgetBytes() const { return budget_bytes_; }
+        /** @return Passive metadata publisher, retaining no payload or storage owner. */
+        std::shared_ptr<const PrefixCacheTierTelemetry> telemetry() const { return telemetry_; }
         /** @return Bytes charged to keys currently installed in this backend. */
         size_t usedBytes() const { return used_bytes_; }
+        /** @brief Observe a cache-owned capacity retirement after its source alias is removed. */
+        void recordEviction(size_t bytes) { telemetry_->record(PrefixTierEvent::Eviction, bytes); }
+        /** @brief Observe a completed RAM-to-disk residency transition, including reused backing. */
+        void recordDemotion(size_t bytes) { telemetry_->record(PrefixTierEvent::Demotion, bytes); }
         /** @return Number of currently installed keys. */
         size_t allocationCount() const { return allocations_.size(); }
 
@@ -161,8 +185,8 @@ namespace llaminar2
         /**
          * @brief Bind one payload section with its exact initialization contract.
          *
-         * GPU sections alias one admitted arena range. Binding never calls a
-         * native allocator or changes backing identity.
+         * Each GPU section owns its independently leased range in the admitted
+         * arena. Binding never calls a native allocator or changes backing identity.
          * Complete GPU sections remain unreadable until their producer fills all
          * bytes and publishes the handle's readiness event. Partial GPU sections
          * are zeroed first so short/omitted payloads cannot expose stale bytes.
@@ -173,8 +197,7 @@ namespace llaminar2
          * @param pageable_owner Receives CPU-owned vector storage, when applicable.
          * @param pinned_owner Receives GPU-host allocation lifetime ownership.
          * @param payload Receives the stable address, never a readiness guarantee.
-         * @param arena_payload Complete leased payload, empty for CPU vectors.
-         * @param offset This section's checked offset inside that payload.
+         * @param arena_section Exact independently leased range, empty for CPU vectors.
          * @return true when backing storage was allocated successfully.
          */
         bool allocateSection(
@@ -183,8 +206,7 @@ namespace llaminar2
             std::shared_ptr<std::vector<uint8_t>> *pageable_owner,
             std::shared_ptr<void> *pinned_owner,
             void **payload,
-            const std::shared_ptr<void> &arena_payload,
-            size_t offset) const;
+            const std::shared_ptr<void> &arena_section) const;
 
         /**
          * @brief Claim one physical allocation from the reserved host tier.
@@ -196,6 +218,8 @@ namespace llaminar2
 
         DeviceId producer_device_ = DeviceId::cpu();
         size_t budget_bytes_ = 0;
+        std::shared_ptr<PrefixCacheTierTelemetry> telemetry_ =
+            std::make_shared<PrefixCacheTierTelemetry>(budget_bytes_);
         size_t used_bytes_ = 0;
         std::unordered_map<PrefixCacheKey, Allocation, PrefixCacheKeyHasher> allocations_;
         PhysicalMemoryOwnerReservation reservation_;

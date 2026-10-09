@@ -8,6 +8,8 @@
  * tensor-sharded domains without changing its topology name. Automatic compute
  * intent remains unresolved until hardware binding; one homogeneous native GPU
  * tier then defaults to gate/up ownership with fixed down-column shards.
+ * Pipeline stages retain compact quota/placement rows and a model-global origin;
+ * preceding stages never contribute padding to this authority's storage.
  */
 
 #pragma once
@@ -431,6 +433,9 @@ namespace llaminar2
         MoEContinuationDensePolicyIntent continuation_dense_policy_intent =
             MoEContinuationDensePolicyIntent::Resolved;
 
+        /** Model-global origin of compact per-layer quotas and runtime banks. */
+        int first_model_layer = 0;
+
         bool isTieredOverlay() const
         {
             return enabled && topology == RoutedExpertPlacementTopology::TieredOverlay;
@@ -454,12 +459,12 @@ namespace llaminar2
         /**
          * @brief Return storage capacity for every declared routed layer.
          *
-         * Runtime placement banks are indexed by the model-global layer id.
+         * Runtime placement banks use model-global layer id minus stage origin.
          * Qwen NextN/MTP weights may occupy routed layers after the ordinary
          * transformer interval, so sizing a canonical authority from only the
          * main graph's layer count would make its child sidecar table depend on
          * graph-construction order. The returned capacity covers the caller's
-         * minimum and the greatest explicit placement index.
+         * minimum and the greatest stage-local placement index.
          *
          * @param minimum_layers Minimum graph-family layer capacity.
          * @return Number of addressable layer slots required by the plan.
@@ -470,28 +475,27 @@ namespace llaminar2
         [[nodiscard]] int placementLayerCapacity(
             int minimum_layers = 0) const
         {
-            if (minimum_layers < 0)
+            if (minimum_layers < 0 || first_model_layer < 0 ||
+                minimum_layers > std::numeric_limits<int>::max() - first_model_layer)
             {
                 throw std::invalid_argument(
-                    "routed expert placement layer capacity cannot use a "
-                    "negative minimum");
+                    "routed expert placement layer capacity requires a valid stage interval");
             }
 
             int capacity = minimum_layers;
             for (const auto &placement : placements)
             {
-                if (placement.layer < 0)
+                if (placement.layer < first_model_layer)
                 {
                     throw std::invalid_argument(
-                        "routed expert placement layer capacity cannot include "
-                        "a negative layer index");
+                        "routed expert placement layer capacity cannot include a layer before its stage origin");
                 }
                 if (placement.layer == std::numeric_limits<int>::max())
                 {
                     throw std::overflow_error(
                         "routed expert placement layer capacity overflows int");
                 }
-                capacity = std::max(capacity, placement.layer + 1);
+                capacity = std::max(capacity, placement.layer - first_model_layer + 1);
             }
             return capacity;
         }
@@ -608,7 +612,7 @@ namespace llaminar2
 
     struct MoERoutedExpertPlacementValidationOptions
     {
-        /// When > 0 and placements are provided, require one placement per layer [0, layer_count).
+        /// When positive, require exactly this many layers from the plan's origin.
         int layer_count = 0;
 
         /// When > 0 and placements are provided, each placement must cover exactly this many experts.
@@ -1013,6 +1017,13 @@ namespace llaminar2
         if (!plan.enabled)
             return result;
 
+        if (plan.first_model_layer < 0 || options.layer_count < 0 ||
+            options.layer_count > std::numeric_limits<int>::max() - plan.first_model_layer)
+        {
+            addError("routed expert plan has an invalid model-layer interval");
+            return result;
+        }
+
         std::unordered_map<std::string, const ExecutionDomainDefinition *> execution_domains_by_name;
         for (const auto &domain : plan.dense_domains)
         {
@@ -1358,6 +1369,7 @@ namespace llaminar2
 
         if (any_resolved_quota)
         {
+            bool complete_resolved_quotas = true;
             const size_t resolved_layer_count =
                 plan.routed_tiers.empty()
                     ? 0u
@@ -1368,12 +1380,13 @@ namespace llaminar2
                 if (tier.resolved_live_experts_per_layer.size() !=
                     resolved_layer_count)
                 {
+                    complete_resolved_quotas = false;
                     addError(
                         "every routed tier must carry the same complete resolved live-quota geometry");
                     break;
                 }
             }
-            if (options.routed_expert_count > 0)
+            if (options.routed_expert_count > 0 && complete_resolved_quotas)
             {
                 for (size_t layer = 0; layer < resolved_layer_count; ++layer)
                 {
@@ -1443,15 +1456,15 @@ namespace llaminar2
             std::unordered_set<int> ordered_layers;
             for (const auto &order : plan.initial_layer_order_overrides)
             {
-                if (order.layer < 0)
+                if (order.layer < plan.first_model_layer)
                 {
                     addError(
-                        "deferred initial expert order has invalid negative "
-                        "layer index");
+                        "deferred initial expert order precedes its model-layer interval");
                     continue;
                 }
                 if (options.layer_count > 0 &&
-                    order.layer >= options.layer_count)
+                    (order.layer < plan.first_model_layer ||
+                     order.layer - plan.first_model_layer >= options.layer_count))
                 {
                     addError(
                         "deferred initial expert order references layer "
@@ -1514,13 +1527,13 @@ namespace llaminar2
             std::unordered_set<int> covered_layers;
             for (const auto &placement : plan.placements)
             {
-                if (placement.layer < 0)
+                if (placement.layer < plan.first_model_layer)
                 {
-                    addError("expert layer placement has invalid negative layer index");
+                    addError("expert layer placement precedes its model-layer interval");
                     continue;
                 }
 
-                if (options.layer_count > 0 && placement.layer >= options.layer_count)
+                if (options.layer_count > 0 && placement.layer - plan.first_model_layer >= options.layer_count)
                 {
                     addError("expert layer placement references layer outside validation range: " + std::to_string(placement.layer));
                 }
@@ -1569,11 +1582,11 @@ namespace llaminar2
                     const auto &tier = plan.routed_tiers[tier_idx];
                     if (!tier.resolved_live_experts_per_layer.empty() &&
                         placement.layer >= 0 &&
-                        static_cast<size_t>(placement.layer) <
+                        static_cast<size_t>(placement.layer - plan.first_model_layer) <
                             tier.resolved_live_experts_per_layer.size() &&
                         tier_assignment_counts[tier_idx] !=
                             tier.resolved_live_experts_per_layer[
-                                static_cast<size_t>(placement.layer)])
+                                static_cast<size_t>(placement.layer - plan.first_model_layer)])
                     {
                         addError(
                             "expert layer placement for layer " +
@@ -1584,7 +1597,7 @@ namespace llaminar2
                             "' but its resolved live quota is " +
                             std::to_string(
                                 tier.resolved_live_experts_per_layer[
-                                    static_cast<size_t>(placement.layer)]));
+                                    static_cast<size_t>(placement.layer - plan.first_model_layer)]));
                     }
                     if (tier.max_experts_per_layer > 0 &&
                         tier_assignment_counts[tier_idx] > tier.max_experts_per_layer)
@@ -1600,7 +1613,8 @@ namespace llaminar2
 
             if (options.layer_count > 0)
             {
-                for (int layer = 0; layer < options.layer_count; ++layer)
+                for (int layer = plan.first_model_layer;
+                     layer < plan.first_model_layer + options.layer_count; ++layer)
                 {
                     if (covered_layers.find(layer) == covered_layers.end())
                     {

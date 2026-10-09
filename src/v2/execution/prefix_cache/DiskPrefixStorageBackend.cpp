@@ -5,20 +5,29 @@
  * The format is deliberately simple:
  *
  *   archive header
- *   [record preamble][JSON metadata][raw payload sections][commit footer]
- *   [record preamble][JSON metadata][raw payload sections][commit footer]
+ *   [record preamble][JSON metadata][commit footer]
+ *   [record preamble][JSON metadata][commit footer]
+ *
+ * Payload sections live in immutable files named by opaque storage generations
+ * in the adjacent `.blocks` directory. Their native file and directory entries
+ * become durable before the journal references them. After a replacement or
+ * eviction commits, its retired file is unlinked; existing readers retain only
+ * that exact inode. Restart removes files not named by committed live metadata.
  *
  * Metadata is parsed with nlohmann::json rather than ad-hoc string searching.
  * A record is visible only when its footer is present and its metadata
- * checksum matches. Payload sections are verified lazily during hydration.
- * Compaction copies a committed snapshot and subsequent append history on one
- * background worker. Foreground operations keep using the source inode until
- * a short, atomic publication; verified hydration owns its original descriptor.
+ * checksum matches. Payload sections are read once into their final owners;
+ * no checksum, hash or equality scan ever examines their contents.
+ * Compaction copies metadata only. Payload reclamation does not depend on the
+ * worker catching a moving append frontier, so continuous cache churn cannot
+ * accumulate obsolete multi-gigabyte payload copies in either journal inode.
  * Bulk maintenance uses bounded O_DSYNC writes on that worker. A bounded
  * scratch allocation alone cannot prevent a whole-archive dirty-page backlog
  * from starving the small fsync that a live RAM-capacity receipt depends on.
  * Range writeback is insufficient on container OverlayFS mappings, so there
  * is no separate submit/join lifecycle or filesystem-dependent alternate path.
+ * RAM demotion authenticates its backing under the existing archive lock.
+ * Unchanged payload identity, layout and flags reuse durable bytes with a small touch.
  */
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
@@ -37,11 +46,13 @@
 #include <exception>
 #include <fcntl.h>
 #include <limits>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <utility>
+#include <unordered_set>
 #include <unistd.h>
 
 namespace llaminar2
@@ -53,8 +64,8 @@ namespace llaminar2
         constexpr std::array<char, 8> kArchiveMagic = {'L', 'L', 'K', 'V', 'C', '0', '0', '1'};
         constexpr std::array<char, 8> kRecordMagic = {'L', 'L', 'K', 'V', 'R', '0', '0', '1'};
         constexpr std::array<char, 8> kCommitMagic = {'L', 'L', 'K', 'V', 'D', 'O', 'N', 'E'};
-        constexpr uint32_t kArchiveVersion = 1;
-        constexpr uint32_t kRecordVersion = 1;
+        constexpr uint32_t kArchiveVersion = 3;
+        constexpr uint32_t kRecordVersion = 3;
         constexpr uint32_t kPutRecord = 1;
         constexpr uint32_t kDeleteRecord = 2;
         constexpr uint32_t kTouchRecord = 3;
@@ -62,7 +73,8 @@ namespace llaminar2
         constexpr uint64_t kRecordPreambleBytes = 56;
         constexpr uint64_t kRecordFooterBytes = 16;
         constexpr uint64_t kMaximumMetadataBytes = 1024ull * 1024ull;
-        constexpr uint64_t kMaximumRecordBytes = 1ull << 40;
+        constexpr uint64_t kMaximumRecordBytes =
+            kRecordPreambleBytes + kMaximumMetadataBytes + kRecordFooterBytes;
         constexpr std::array<const char *, 6> kSectionNames = {
             "kv",
             "hybrid",
@@ -104,7 +116,7 @@ namespace llaminar2
             }
             /** @return Borrowed descriptor; ownership stays with this handle. */
             int get() const { return value_; }
-            /** @return Transfer inode ownership to a verified hydration ticket. */
+            /** @return Transfer inode ownership to a selected hydration ticket. */
             int release() noexcept { return std::exchange(value_, -1); }
             /** @return Whether a native descriptor was successfully acquired. */
             explicit operator bool() const { return value_ >= 0; }
@@ -244,12 +256,9 @@ namespace llaminar2
                 });
         }
 
-        uint64_t checksumBytes(const void *bytes, size_t byte_count)
-        {
-            return byte_count == 0
-                       ? hashPrefixBytes("", 0)
-                       : hashPrefixBytes(bytes, byte_count);
-        }
+        /** @return Digest of the small serialized metadata record, never payload storage. */
+        uint64_t metadataChecksum(const std::string &metadata)
+        { return hashPrefixBytes(metadata.data(), metadata.size()); }
 
         uint64_t recordCommitChecksum(
             uint32_t type,
@@ -264,9 +273,6 @@ namespace llaminar2
                 checksum = combinePrefixHash(
                     checksum,
                     section.value("bytes", uint64_t{0}));
-                checksum = combinePrefixHash(
-                    checksum,
-                    section.value("checksum", uint64_t{0}));
             }
             return checksum;
         }
@@ -483,7 +489,7 @@ namespace llaminar2
                 {"sections", json::array()},
             };
             const std::string metadata = metadata_json.dump();
-            const uint64_t checksum = checksumBytes(metadata.data(), metadata.size());
+            const uint64_t checksum = metadataChecksum(metadata);
             *record_bytes = kRecordPreambleBytes + metadata.size() + kRecordFooterBytes;
             std::array<uint8_t, kRecordPreambleBytes> preamble{};
             std::memcpy(preamble.data(), kRecordMagic.data(), kRecordMagic.size());
@@ -527,6 +533,22 @@ namespace llaminar2
         };
     } // namespace
 
+    /** @brief Immutable native file lifetime shared by one lookup inode cohort. */
+    class PrefixArchiveReadInode final
+    {
+    public:
+        /** @brief Adopt the authenticated descriptor exactly once. */
+        PrefixArchiveReadInode(int descriptor, uint64_t device, uint64_t inode)
+            : descriptor(descriptor), device(device), inode(inode) {}
+        /** @brief Close after the final metadata/read ticket retires. */
+        ~PrefixArchiveReadInode() { if (descriptor >= 0) (void)::close(descriptor); }
+        PrefixArchiveReadInode(const PrefixArchiveReadInode &) = delete;
+        PrefixArchiveReadInode &operator=(const PrefixArchiveReadInode &) = delete;
+        const int descriptor;
+        const uint64_t device;
+        const uint64_t inode;
+    };
+
     DiskPrefixStorageBackend::HydrationTicket::~HydrationTicket()
     {
         release();
@@ -536,15 +558,12 @@ namespace llaminar2
         HydrationTicket &&other) noexcept
         : backend_(std::move(other.backend_)),
           handle_(std::move(other.handle_)),
-          archive_fd_(std::exchange(other.archive_fd_, -1)),
-          archive_device_(other.archive_device_),
-          archive_inode_(other.archive_inode_),
+          inode_(std::move(other.inode_)),
           sections_(other.sections_),
-          consumed_(other.consumed_)
+          phase_(std::exchange(other.phase_, Phase::Consumed)),
+          read_set_(other.read_set_),
+          hydrated_payload_bytes_(std::exchange(other.hydrated_payload_bytes_, 0u))
     {
-        other.archive_device_ = 0;
-        other.archive_inode_ = 0;
-        other.consumed_ = true;
     }
 
     DiskPrefixStorageBackend::HydrationTicket &
@@ -556,36 +575,29 @@ namespace llaminar2
         release();
         backend_ = std::move(other.backend_);
         handle_ = std::move(other.handle_);
-        archive_fd_ = std::exchange(other.archive_fd_, -1);
-        archive_device_ = other.archive_device_;
-        archive_inode_ = other.archive_inode_;
+        inode_ = std::move(other.inode_);
         sections_ = other.sections_;
-        consumed_ = other.consumed_;
-        other.archive_device_ = 0;
-        other.archive_inode_ = 0;
-        other.consumed_ = true;
+        phase_ = std::exchange(other.phase_, Phase::Consumed);
+        read_set_ = other.read_set_;
+        hydrated_payload_bytes_ = std::exchange(other.hydrated_payload_bytes_, 0u);
         return *this;
     }
 
     DiskPrefixStorageBackend::HydrationTicket::HydrationTicket(
         std::shared_ptr<DiskPrefixStorageBackend> backend,
         PrefixBlockHandle handle,
-        int archive_fd,
-        uint64_t archive_device,
-        uint64_t archive_inode,
+        std::shared_ptr<PrefixArchiveReadInode> inode,
         std::array<SectionSnapshot, 6> sections)
         : backend_(std::move(backend)),
           handle_(std::move(handle)),
-          archive_fd_(archive_fd),
-          archive_device_(archive_device),
-          archive_inode_(archive_inode),
+          inode_(std::move(inode)),
           sections_(std::move(sections))
     {
     }
 
     bool DiskPrefixStorageBackend::HydrationTicket::valid() const noexcept
     {
-        return backend_ && archive_fd_ >= 0 && handle_.valid() && !consumed_;
+        return backend_ && inode_ && handle_.valid() && phase_ != Phase::Consumed;
     }
 
     size_t DiskPrefixStorageBackend::HydrationTicket::totalBytes() const noexcept
@@ -601,10 +613,9 @@ namespace llaminar2
 
     void DiskPrefixStorageBackend::HydrationTicket::release() noexcept
     {
-        if (archive_fd_ >= 0)
-            (void)::close(std::exchange(archive_fd_, -1));
+        inode_.reset();
         backend_.reset();
-        consumed_ = true;
+        phase_ = Phase::Consumed;
     }
 
     DiskPrefixStorageBackend::DiskPrefixStorageBackend(
@@ -626,6 +637,7 @@ namespace llaminar2
         std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
         : archive_path_(std::move(archive_path)),
           lock_path_(archive_path_.string() + ".lock"),
+          payload_directory_(archive_path_.string() + ".blocks"),
           budget_bytes_(budget_bytes),
           model_artifact_identity_(std::move(model_artifact_identity)),
           memory_authority_(std::move(memory_authority))
@@ -869,7 +881,137 @@ namespace llaminar2
             }
         }
 
-        return refreshIndexLocked(archive.get(), error);
+        if (!refreshIndexLocked(archive.get(), error))
+            return false;
+        std::filesystem::create_directory(payload_directory_, filesystem_error);
+        if (filesystem_error || std::filesystem::is_symlink(payload_directory_))
+        {
+            if (error) *error = "failed to create prefix payload directory: " + filesystem_error.message();
+            return false;
+        }
+        std::filesystem::permissions(payload_directory_, std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace, filesystem_error);
+        if (filesystem_error)
+        {
+            if (error) *error = filesystem_error.message();
+            return false;
+        }
+        // Recovery may have discarded an incomplete journal tail. Commit that
+        // frontier before orphan reclamation so a later crash cannot resurrect
+        // a journal reference to a file which recovery already unlinked.
+        FileDescriptor parent(::open(archive_path_.parent_path().c_str(),
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        if (::fsync(archive.get()) != 0 || !parent || ::fsync(parent.get()) != 0)
+        {
+            if (error) *error = errnoMessage("failed to commit prefix archive recovery");
+            return false;
+        }
+        return recoverPayloadFilesLocked(error);
+    }
+
+    std::filesystem::path DiskPrefixStorageBackend::payloadPath(
+        const PrefixPayloadIdentity &identity) const
+    {
+        std::ostringstream name;
+        name << std::hex << std::setfill('0') << std::setw(16) << identity.high
+             << std::setw(16) << identity.low << ".kvblock";
+        return payload_directory_ / name.str();
+    }
+
+    bool DiskPrefixStorageBackend::failMutationLocked(std::string message, std::string *error)
+    {
+        ready_ = false;
+        initialization_error_ = std::move(message);
+        if (error) *error = initialization_error_;
+        return false;
+    }
+
+    bool DiskPrefixStorageBackend::syncPayloadDirectory(std::string *error) const
+    {
+        FileDescriptor directory(::open(payload_directory_.c_str(),
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+        if (!directory || ::fsync(directory.get()) != 0)
+        {
+            if (error) *error = errnoMessage("failed to persist prefix payload directory");
+            return false;
+        }
+        return true;
+    }
+
+    bool DiskPrefixStorageBackend::retirePayloadsLocked(
+        std::span<const PrefixPayloadIdentity> identities, std::string *error)
+    {
+        for (const auto &identity : identities)
+        {
+            if (::unlink(payloadPath(identity).c_str()) != 0)
+            {
+                initialization_error_ = errnoMessage("failed to retire committed prefix payload");
+                ready_ = false;
+                if (error) *error = initialization_error_;
+                return false;
+            }
+        }
+        if (identities.empty()) return true;
+        if (!syncPayloadDirectory(error))
+        {
+            ready_ = false;
+            initialization_error_ = error ? *error : "failed to persist prefix payload retirement";
+            return false;
+        }
+        return true;
+    }
+
+    bool DiskPrefixStorageBackend::recoverPayloadFilesLocked(std::string *error)
+    {
+        std::unordered_set<std::string> live;
+        for (auto &[key, record] : records_)
+        {
+            (void)key;
+            if (!openPayloadLocked(record, error)) return false;
+            live.insert(payloadPath(record.storage_identity).filename().string());
+        }
+        for (const auto &entry : std::filesystem::directory_iterator(payload_directory_))
+        {
+            const auto name = entry.path().filename().string();
+            if (name.size() != 40u || name.substr(32u) != ".kvblock" ||
+                !std::all_of(name.begin(), name.begin() + 32u,
+                    [](char ch) { return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'); }) ||
+                !std::filesystem::is_regular_file(entry.symlink_status()))
+            {
+                if (error) *error = "unexpected entry in prefix payload directory: " + name;
+                return false;
+            }
+            // The archive lock excludes writers while this small metadata
+            // inventory is inspected. A file absent from the committed index
+            // is an interrupted put or an eviction whose unlink was interrupted.
+            if (!live.contains(name) && ::unlink(entry.path().c_str()) != 0)
+            {
+                if (error) *error = errnoMessage("failed to reclaim orphan prefix payload");
+                return false;
+            }
+        }
+        return syncPayloadDirectory(error);
+    }
+
+    std::shared_ptr<PrefixArchiveReadInode> DiskPrefixStorageBackend::openPayloadLocked(
+        RecordIndex &record, std::string *error)
+    {
+        auto retained = record.lookup_inode.lock();
+        if (retained) return retained;
+        FileDescriptor payload(::open(payloadPath(record.storage_identity).c_str(),
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+        struct stat state{};
+        if (!payload || ::fstat(payload.get(), &state) != 0 ||
+            !S_ISREG(state.st_mode) || state.st_size < 0 ||
+            static_cast<uint64_t>(state.st_size) != record.handle.total_bytes)
+        {
+            if (error) *error = "prefix payload file is absent or has an invalid committed extent";
+            return nullptr;
+        }
+        retained = std::make_shared<PrefixArchiveReadInode>(
+            payload.release(), static_cast<uint64_t>(state.st_dev), static_cast<uint64_t>(state.st_ino));
+        record.lookup_inode = retained;
+        return retained;
     }
 
     bool DiskPrefixStorageBackend::refreshIndexLocked(
@@ -896,7 +1038,6 @@ namespace llaminar2
         std::array<uint8_t, kArchiveHeaderBytes> header{};
         if (!preadAll(archive_fd, header.data(), header.size(), 0) ||
             !std::equal(kArchiveMagic.begin(), kArchiveMagic.end(), header.begin()) ||
-            loadU32(header.data() + 8) != kArchiveVersion ||
             loadU32(header.data() + 12) != kArchiveHeaderBytes ||
             std::string(
                 reinterpret_cast<const char *>(header.data() + 16),
@@ -905,6 +1046,13 @@ namespace llaminar2
         {
             if (error)
                 *error = "prefix archive header or model artifact identity mismatch";
+            return false;
+        }
+        if (loadU32(header.data() + 8) != kArchiveVersion)
+        {
+            if (error) *error = "unsupported prefix archive header format version " +
+                std::to_string(loadU32(header.data() + 8)) + "; expected " +
+                std::to_string(kArchiveVersion) + "; use a fresh cache directory";
             return false;
         }
 
@@ -916,6 +1064,7 @@ namespace llaminar2
         {
             records_.clear();
             active_bytes_ = 0;
+            active_record_bytes_ = 0;
             next_sequence_ = 1;
             scan_offset_ = kArchiveHeaderBytes;
         }
@@ -945,6 +1094,7 @@ namespace llaminar2
             return false;
         }
         scan_offset_ = valid_end;
+        telemetry_->publishUsage(active_bytes_, records_.size());
         return true;
     }
 
@@ -976,7 +1126,7 @@ namespace llaminar2
                 (type != kPutRecord &&
                  type != kDeleteRecord &&
                  type != kTouchRecord) ||
-                metadata_bytes == 0 ||
+                payload_bytes != 0 || metadata_bytes == 0 ||
                 metadata_bytes > kMaximumMetadataBytes ||
                 record_bytes > kMaximumRecordBytes ||
                 record_bytes != kRecordPreambleBytes + metadata_bytes +
@@ -993,7 +1143,7 @@ namespace llaminar2
                     metadata.data(),
                     metadata.size(),
                     cursor + kRecordPreambleBytes) ||
-                checksumBytes(metadata.data(), metadata.size()) != metadata_checksum)
+                metadataChecksum(metadata) != metadata_checksum)
             {
                 break;
             }
@@ -1045,6 +1195,16 @@ namespace llaminar2
                 record.handle.key = key;
                 record.handle.tier = PrefixStorageTier::Disk;
                 record.handle.layout = layout;
+                const auto identity = parsed.value("payload_identity", json::array());
+                if (!identity.is_array() || identity.size() != 2u ||
+                    !identity[0].is_number_unsigned() || !identity[1].is_number_unsigned()) break;
+                record.handle.payload_identity = {identity[0].get<uint64_t>(), identity[1].get<uint64_t>()};
+                if (!record.handle.payload_identity.valid()) break;
+                const auto storage = parsed.value("storage_identity", json::array());
+                if (!storage.is_array() || storage.size() != 2u ||
+                    !storage[0].is_number_unsigned() || !storage[1].is_number_unsigned()) break;
+                record.storage_identity = {storage[0].get<uint64_t>(), storage[1].get<uint64_t>()};
+                if (!record.storage_identity.valid()) break;
                 record.handle.has_hybrid_state =
                     parsed.value("has_hybrid_state", false);
                 record.handle.has_terminal_hidden =
@@ -1057,8 +1217,8 @@ namespace llaminar2
                 record.record_bytes = record_bytes;
                 record.sequence = sequence;
 
-                uint64_t section_offset =
-                    cursor + kRecordPreambleBytes + metadata_bytes;
+                const uint64_t stored_payload_bytes = parsed.value("total_bytes", uint64_t{0});
+                uint64_t section_offset = 0;
                 uint64_t section_total = 0;
                 bool sections_valid = true;
                 for (size_t index = 0; index < sections.size(); ++index)
@@ -1071,21 +1231,43 @@ namespace llaminar2
                     }
                     const uint64_t section_bytes =
                         sections[index].value("bytes", uint64_t{0});
+                    if (section_total > stored_payload_bytes || section_bytes > stored_payload_bytes - section_total)
+                    {
+                        sections_valid = false;
+                        break;
+                    }
                     record.sections[index] = {
                         section_offset,
                         section_bytes,
-                        sections[index].value("checksum", uint64_t{0}),
                     };
                     section_offset += section_bytes;
                     section_total += section_bytes;
                 }
                 if (!sections_valid ||
-                    section_total != payload_bytes ||
+                    section_total != stored_payload_bytes ||
                     section_total != parsed.value("total_bytes", uint64_t{0}) ||
                     section_total < layout.totalBytes())
                 {
                     break;
                 }
+                // Geometry authenticates section extents without examining
+                // their contents. Malformed metadata cannot invent padding or
+                // move bytes between KV, recurrent and terminal sections.
+                try
+                {
+                    const auto expected = PrefixPayloadAllocationPlan::archive(
+                        layout, record.sections[5].bytes);
+                    for (size_t index = 0; index < kSectionCount; ++index)
+                        if (record.sections[index].bytes != expected.sections()[index])
+                            sections_valid = false;
+                    if (record.handle.has_model_runtime_state != (record.sections[5].bytes != 0u))
+                        sections_valid = false;
+                }
+                catch (const std::exception &)
+                {
+                    sections_valid = false;
+                }
+                if (!sections_valid) break;
                 record.handle.total_bytes = static_cast<size_t>(section_total);
                 applyPutRecord(std::move(record));
             }
@@ -1106,11 +1288,13 @@ namespace llaminar2
         auto existing = records_.find(record.handle.key);
         if (existing != records_.end())
         {
+            active_record_bytes_ -= existing->second.record_bytes;
             active_bytes_ -= std::min<uint64_t>(
                 active_bytes_,
                 existing->second.handle.total_bytes);
         }
         active_bytes_ += record.handle.total_bytes;
+        active_record_bytes_ += record.record_bytes;
         records_[record.handle.key] = std::move(record);
     }
 
@@ -1122,6 +1306,7 @@ namespace llaminar2
         active_bytes_ -= std::min<uint64_t>(
             active_bytes_,
             existing->second.handle.total_bytes);
+        active_record_bytes_ -= existing->second.record_bytes;
         records_.erase(existing);
     }
 
@@ -1149,7 +1334,7 @@ namespace llaminar2
         };
         const std::string metadata = metadata_json.dump();
         const uint64_t metadata_checksum =
-            checksumBytes(metadata.data(), metadata.size());
+            metadataChecksum(metadata);
         const uint64_t record_bytes =
             kRecordPreambleBytes + metadata.size() + kRecordFooterBytes;
 
@@ -1217,9 +1402,10 @@ namespace llaminar2
         const PrefixBlockHandle &handle,
         PrefixBlockHandle *disk_handle,
         std::vector<PrefixCacheKey> *evicted_keys,
-        std::string *error)
+        std::string *error,
+        PrefixArchiveWriteDisposition *disposition)
     {
-        if (!handle.valid() || !canStore(handle.total_bytes))
+        if (!handle.valid() || !handle.payload_identity.valid() || !canStore(handle.total_bytes))
         {
             if (error)
                 *error = "invalid prefix block or block exceeds disk budget";
@@ -1249,7 +1435,6 @@ namespace llaminar2
             section_metadata.push_back({
                 {"name", kSectionNames[index]},
                 {"bytes", bytes},
-                {"checksum", checksumBytes(pointer, bytes)},
             });
         }
         if (payload_bytes != handle.total_bytes)
@@ -1278,9 +1463,47 @@ namespace llaminar2
             return false;
 
         std::vector<PrefixCacheKey> evicted;
+        std::vector<uint64_t> evicted_payload_bytes;
         auto same_key = records_.find(handle.key);
+        if (same_key != records_.end())
+        {
+            const auto &existing = same_key->second;
+            bool identical = existing.handle.payload_identity == handle.payload_identity &&
+                fullLayoutMatch(existing.handle.layout, handle.layout) &&
+                existing.handle.total_bytes == handle.total_bytes &&
+                existing.handle.has_hybrid_state == handle.has_hybrid_state &&
+                existing.handle.has_terminal_hidden == handle.has_terminal_hidden &&
+                existing.handle.has_terminal_logits == handle.has_terminal_logits &&
+                existing.handle.has_model_runtime_state == handle.has_model_runtime_state;
+            for (size_t index = 0; index < sections.size() && identical; ++index)
+            {
+                identical = existing.sections[index].bytes == sections[index].second;
+            }
+            if (identical)
+            {
+                // A participant-local index cannot certify shared backing.
+                // The archive lock authenticates that backing; publish recency
+                // without copying a potentially large recurrent checkpoint.
+                if (!appendTouchLocked(archive.get(), handle.key, error))
+                    return failMutationLocked(error ? *error : "failed to append prefix backing reuse", error);
+                if (::fsync(archive.get()) != 0)
+                {
+                    return failMutationLocked(errnoMessage("failed to commit existing prefix backing"), error);
+                }
+                if (disk_handle)
+                    *disk_handle = records_.at(handle.key).handle;
+                if (evicted_keys)
+                    evicted_keys->clear();
+                telemetry_->record(PrefixTierEvent::BackingReuse, 0);
+                if (disposition)
+                    *disposition = PrefixArchiveWriteDisposition::Reused;
+                return compactIfNeededLocked(archive.get(), error);
+            }
+        }
         const uint64_t replace_bytes =
             same_key == records_.end() ? 0 : same_key->second.handle.total_bytes;
+        std::vector<PrefixPayloadIdentity> retirements;
+        if (same_key != records_.end()) retirements.push_back(same_key->second.storage_identity);
         while (budget_bytes_ != 0 &&
                active_bytes_ - std::min(active_bytes_, replace_bytes) +
                        handle.total_bytes >
@@ -1304,16 +1527,22 @@ namespace llaminar2
                 return false;
             }
             const PrefixCacheKey victim_key = victim->first;
+            const uint64_t victim_bytes = victim->second.handle.total_bytes;
+            retirements.push_back(victim->second.storage_identity);
             if (!appendDeleteLocked(archive.get(), victim_key, error))
-                return false;
+                return failMutationLocked(error ? *error : "failed to append capacity retirement", error);
+            evicted_payload_bytes.push_back(victim_bytes);
             evicted.push_back(victim_key);
         }
 
         const uint64_t sequence = next_sequence_++;
+        const PrefixPayloadIdentity storage_identity = PrefixPayloadIdentity::fresh();
         const json metadata_json = {
             {"type", "put"},
             {"key", keyToJson(handle.key)},
             {"layout", layoutToJson(handle.layout)},
+            {"payload_identity", {handle.payload_identity.high, handle.payload_identity.low}},
+            {"storage_identity", {storage_identity.high, storage_identity.low}},
             {"total_bytes", payload_bytes},
             {"has_hybrid_state", handle.has_hybrid_state},
             {"has_terminal_hidden", handle.has_terminal_hidden},
@@ -1323,10 +1552,9 @@ namespace llaminar2
         };
         const std::string metadata = metadata_json.dump();
         const uint64_t metadata_checksum =
-            checksumBytes(metadata.data(), metadata.size());
+            metadataChecksum(metadata);
         const uint64_t record_bytes =
-            kRecordPreambleBytes + metadata.size() +
-            payload_bytes + kRecordFooterBytes;
+            kRecordPreambleBytes + metadata.size() + kRecordFooterBytes;
 
         std::array<uint8_t, kRecordPreambleBytes> preamble{};
         std::memcpy(preamble.data(), kRecordMagic.data(), kRecordMagic.size());
@@ -1334,7 +1562,7 @@ namespace llaminar2
         storeU32(preamble.data() + 12, kPutRecord);
         storeU64(preamble.data() + 16, record_bytes);
         storeU64(preamble.data() + 24, metadata.size());
-        storeU64(preamble.data() + 32, payload_bytes);
+        storeU64(preamble.data() + 32, 0);
         storeU64(preamble.data() + 40, sequence);
         storeU64(preamble.data() + 48, metadata_checksum);
 
@@ -1348,34 +1576,40 @@ namespace llaminar2
                 metadata_checksum,
                 section_metadata));
 
-        const off_t record_offset = ::lseek(archive.get(), 0, SEEK_END);
-        if (record_offset < 0 ||
-            !writeAll(archive.get(), preamble.data(), preamble.size()) ||
-            !writeAll(archive.get(), metadata.data(), metadata.size()))
+        // One new inode owns one durable payload generation. No compactor will
+        // ever read it. Publication ordering is file -> directory -> journal;
+        // a crash before the last edge leaves a reclaimable orphan, never a
+        // committed reference to missing bytes. O_EXCL rejects identity reuse.
+        FileDescriptor payload(::open(payloadPath(storage_identity).c_str(),
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+        if (!payload)
         {
-            if (error)
-                *error = errnoMessage("failed to append prefix record metadata");
-            return false;
+            return failMutationLocked(errnoMessage("failed to create immutable prefix payload"), error);
         }
         for (const auto &[pointer, bytes] : sections)
         {
-            if (bytes > 0 && !writeAll(archive.get(), pointer, bytes))
+            if (bytes > 0 && !writeAll(payload.get(), pointer, bytes))
             {
-                if (error)
-                    *error = errnoMessage("failed to append prefix payload");
-                return false;
+                return failMutationLocked(errnoMessage("failed to append prefix payload"), error);
             }
         }
-        if (!writeAll(archive.get(), footer.data(), footer.size()) ||
+        if (::fsync(payload.get()) != 0)
+            return failMutationLocked(errnoMessage("failed to commit immutable prefix payload"), error);
+        if (!syncPayloadDirectory(error))
+            return failMutationLocked(error ? *error : "failed to persist prefix payload directory", error);
+        const off_t record_offset = ::lseek(archive.get(), 0, SEEK_END);
+        if (record_offset < 0 ||
+            !writeAll(archive.get(), preamble.data(), preamble.size()) ||
+            !writeAll(archive.get(), metadata.data(), metadata.size()) ||
+            !writeAll(archive.get(), footer.data(), footer.size()) ||
             ::fsync(archive.get()) != 0)
         {
-            if (error)
-                *error = errnoMessage("failed to commit prefix archive record");
-            return false;
+            return failMutationLocked(errnoMessage("failed to commit prefix archive record"), error);
         }
 
         RecordIndex record;
         record.handle = handle;
+        record.storage_identity = storage_identity;
         record.handle.tier = PrefixStorageTier::Disk;
         record.handle.kv_payload = nullptr;
         record.handle.hybrid_payload = nullptr;
@@ -1388,7 +1622,7 @@ namespace llaminar2
         record.handle.terminal_hidden_storage.reset();
         record.handle.terminal_logits_storage.reset();
         record.handle.model_runtime_state_storage.reset();
-        record.handle.ram_payload_memory_lease.reset();
+        record.handle.ram_section_memory_leases = {};
         record.handle.ram_runtime_state_memory_lease.reset();
         record.handle.payload_readiness.reset();
         record.handle.pinned_kv_storage.reset();
@@ -1409,24 +1643,28 @@ namespace llaminar2
         record.record_offset = static_cast<uint64_t>(record_offset);
         record.record_bytes = record_bytes;
         record.sequence = sequence;
-        uint64_t section_offset =
-            record.record_offset + kRecordPreambleBytes + metadata.size();
+        uint64_t section_offset = 0;
         for (size_t index = 0; index < sections.size(); ++index)
         {
             record.sections[index] = {
                 section_offset,
                 static_cast<uint64_t>(sections[index].second),
-                section_metadata[index]["checksum"].get<uint64_t>(),
             };
             section_offset += sections[index].second;
         }
         applyPutRecord(std::move(record));
+        telemetry_->publishUsage(active_bytes_, records_.size());
+        telemetry_->record(PrefixTierEvent::Write, payload_bytes);
+        for (const auto bytes : evicted_payload_bytes) telemetry_->record(PrefixTierEvent::Eviction, bytes);
         scan_offset_ = static_cast<uint64_t>(record_offset) + record_bytes;
+        if (!retirePayloadsLocked(retirements, error)) return false;
 
         if (disk_handle)
             *disk_handle = records_.at(handle.key).handle;
         if (evicted_keys)
             *evicted_keys = std::move(evicted);
+        if (disposition)
+            *disposition = PrefixArchiveWriteDisposition::Stored;
 
         /*
          * The record is already durable. Request background reclamation here;
@@ -1450,9 +1688,13 @@ namespace llaminar2
             return false;
         if (records_.find(handle.key) == records_.end())
             return true;
-        if (!appendDeleteLocked(archive.get(), handle.key, &error) ||
-            ::fsync(archive.get()) != 0)
-            return false;
+        const std::array retired{records_.at(handle.key).storage_identity};
+        if (!appendDeleteLocked(archive.get(), handle.key, &error))
+            return failMutationLocked(error, nullptr);
+        if (::fsync(archive.get()) != 0)
+            return failMutationLocked(errnoMessage("failed to commit prefix retirement"), nullptr);
+        telemetry_->publishUsage(active_bytes_, records_.size());
+        if (!retirePayloadsLocked(retired, &error)) return false;
         return compactIfNeededLocked(archive.get(), &error);
     }
 
@@ -1465,7 +1707,7 @@ namespace llaminar2
         /*
          * This convenience path is only a unit-test oracle.  Production owns
          * a bounded, admitted RamPrefixStorageBackend and calls the typed
-         * direct-hydration transaction after beginVerifiedHydration().
+         * direct-hydration transaction after beginHydration().
          */
         RamPrefixStorageBackend ram(std::numeric_limits<size_t>::max());
         return readBlockIntoRamBackend(
@@ -1477,12 +1719,24 @@ namespace llaminar2
     }
 
     std::optional<DiskPrefixStorageBackend::HydrationTicket>
-    DiskPrefixStorageBackend::beginVerifiedHydration(
+    DiskPrefixStorageBackend::beginHydration(
         const PrefixCacheKey &key,
         const PrefixPayloadLayout &layout,
         std::string *error)
     {
+        auto ticket = captureLookupSource(key, layout, error);
+        if (!ticket || !selectHydrationSections(*ticket, PrefixPayloadReadSet::WholeArchive, error))
+            return std::nullopt;
+        return ticket;
+    }
+
+    std::optional<DiskPrefixStorageBackend::HydrationTicket>
+    DiskPrefixStorageBackend::captureLookupSource(
+        const PrefixCacheKey &key, const PrefixPayloadLayout &layout,
+        std::string *error)
+    {
         std::lock_guard<std::mutex> process_lock(mutex_);
+        if (error) error->clear();
         if (!ready_)
         {
             if (error)
@@ -1497,60 +1751,102 @@ namespace llaminar2
             return std::nullopt;
         }
         FileDescriptor archive(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
-        if (!archive || !refreshIndexLocked(archive.get(), error))
+        if (!archive)
+        {
+            if (error) *error = errnoMessage("failed to open prefix archive lookup source");
+            return std::nullopt;
+        }
+        if (!refreshIndexLocked(archive.get(), error))
             return std::nullopt;
 
         const auto record_it = records_.find(key);
         if (record_it == records_.end() ||
             !fullLayoutMatch(record_it->second.handle.layout, layout))
         {
-            if (error)
-                *error = "prefix archive record not found or layout mismatch";
             return std::nullopt;
         }
-        if (!verifyRecordPayloadLocked(
-                archive.get(), record_it->second, error))
-        {
-            return std::nullopt;
-        }
-
         std::shared_ptr<DiskPrefixStorageBackend> self = weak_from_this().lock();
         if (!self)
         {
             if (error)
-                *error = "verified hydration requires a shared archive lifetime";
+                *error = "selected hydration requires a shared archive lifetime";
             return std::nullopt;
         }
 
-        /*
-         * Match ordinary read semantics by making the requested payload most
-         * recent before RAM pressure writes a victim.  The physical snapshot
-         * below still makes a capacity-one RAM/disk swap correct if that write
-         * must evict this logical record anyway.
-         */
-        if (!appendTouchLocked(archive.get(), key, error))
-            return std::nullopt;
-
-        const RecordIndex &touched_record = records_.at(key);
+        RecordIndex &touched_record = records_.at(key);
         std::array<HydrationTicket::SectionSnapshot, kSectionCount> sections{};
         for (size_t index = 0; index < sections.size(); ++index)
         {
             sections[index] = {
                 .offset = touched_record.sections[index].offset,
                 .bytes = touched_record.sections[index].bytes,
-                .checksum = touched_record.sections[index].checksum,
             };
         }
-        return HydrationTicket(
-            std::move(self),
-            touched_record.handle,
-            archive.release(),
-            archive_device_,
-            archive_inode_,
-            std::move(sections));
+        auto inode = openPayloadLocked(touched_record, error);
+        if (!inode) return std::nullopt;
+        return HydrationTicket(std::move(self), touched_record.handle,
+            std::move(inode), std::move(sections));
     }
 
-    bool DiskPrefixStorageBackend::hydrateVerified(
+    bool DiskPrefixStorageBackend::selectHydrationSections(
+        HydrationTicket &ticket, PrefixPayloadReadSet read_set, std::string *error)
+    {
+        std::lock_guard lock(mutex_);
+        if (!ticket.valid() || ticket.backend_.get() != this ||
+            ticket.phase_ != HydrationTicket::Phase::Captured)
+        {
+            if (error) *error = "prefix read-set selection requires a fresh local snapshot";
+            return false;
+        }
+        ticket.phase_ = HydrationTicket::Phase::Consumed;
+        struct stat state{};
+        if (::fstat(ticket.inode_->descriptor, &state) != 0 || state.st_size < 0 ||
+            static_cast<uint64_t>(state.st_dev) != ticket.inode_->device ||
+            static_cast<uint64_t>(state.st_ino) != ticket.inode_->inode)
+        {
+            if (error) *error = "prefix read-set source lost its inode metadata";
+            return false;
+        }
+        const auto bytes = static_cast<uint64_t>(state.st_size);
+        for (size_t index = 0; index < ticket.sections_.size(); ++index)
+        {
+            if (read_set == PrefixPayloadReadSet::SequenceRows && index != 0u && index != 2u) continue;
+            const auto &section = ticket.sections_[index];
+            if (section.offset > bytes || section.bytes > bytes - section.offset)
+            {
+                if (error) *error = "prefix read-set section exceeds retained file extent";
+                return false;
+            }
+        }
+        // Selection is the use frontier: admission may immediately demote RAM
+        // victims into this archive. Publish recency before those writes choose
+        // disk victims, without reading the selected payload. A retained older
+        // version remains readable but must not touch a replacement's recency.
+        AdvisoryLock file_lock(lock_path_);
+        if (!file_lock.locked())
+        {
+            if (error) *error = errnoMessage("failed to lock selected prefix archive");
+            return false;
+        }
+        FileDescriptor current(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
+        if (!current)
+        {
+            if (error) *error = errnoMessage("failed to open selected prefix archive");
+            return false;
+        }
+        if (!refreshIndexLocked(current.get(), error))
+            return false;
+        const auto resident = records_.find(ticket.handle_.key);
+        if (resident != records_.end() &&
+            resident->second.handle.payload_identity == ticket.handle_.payload_identity &&
+            !appendTouchLocked(current.get(), ticket.handle_.key, error))
+            return false;
+        ticket.read_set_ = read_set;
+        ticket.phase_ = HydrationTicket::Phase::Selected;
+        return true;
+    }
+
+    bool DiskPrefixStorageBackend::hydrateSelected(
         HydrationTicket &ticket,
         RamPrefixStorageBackend &ram_backend,
         PrefixBlockHandle *ram_handle,
@@ -1564,13 +1860,14 @@ namespace llaminar2
         }
 
         std::lock_guard<std::mutex> process_lock(mutex_);
-        if (!ticket.valid() || ticket.backend_.get() != this)
+        if (!ticket.valid() || ticket.backend_.get() != this ||
+            ticket.phase_ != HydrationTicket::Phase::Selected)
         {
             if (error)
-                *error = "verified hydration ticket is invalid, foreign, or consumed";
+                *error = "selected hydration ticket is invalid, foreign, or consumed";
             return false;
         }
-        ticket.consumed_ = true;
+        ticket.phase_ = HydrationTicket::Phase::Consumed;
 
         AdvisoryLock file_lock(lock_path_);
         if (!file_lock.locked())
@@ -1582,18 +1879,20 @@ namespace llaminar2
         struct stat archive_state
         {
         };
-        if (::fstat(ticket.archive_fd_, &archive_state) != 0 ||
-            static_cast<uint64_t>(archive_state.st_dev) != ticket.archive_device_ ||
-            static_cast<uint64_t>(archive_state.st_ino) != ticket.archive_inode_)
+        if (::fstat(ticket.inode_->descriptor, &archive_state) != 0 ||
+            static_cast<uint64_t>(archive_state.st_dev) != ticket.inode_->device ||
+            static_cast<uint64_t>(archive_state.st_ino) != ticket.inode_->inode)
         {
             if (error)
-                *error = "verified prefix archive descriptor lost its inode identity";
+                *error = "selected prefix archive descriptor lost its inode identity";
             return false;
         }
 
-        const PrefixBlockHandle &verified = ticket.handle_;
+        const PrefixBlockHandle &selected = ticket.handle_;
+        const bool whole = ticket.read_set_ == PrefixPayloadReadSet::WholeArchive;
+        const auto read_layout = prefixReadLayout(selected.layout, ticket.read_set_);
         PrefixBlockHandle out =
-            ram_backend.allocate(verified.key, verified.layout);
+            ram_backend.allocate(selected.key, read_layout);
         if (!out.valid())
         {
             if (error)
@@ -1602,7 +1901,7 @@ namespace llaminar2
         }
 
         const size_t runtime_bytes =
-            static_cast<size_t>(ticket.sections_[5].bytes);
+            whole ? static_cast<size_t>(ticket.sections_[5].bytes) : 0u;
         if (runtime_bytes > 0)
         {
             auto runtime_state =
@@ -1616,11 +1915,12 @@ namespace llaminar2
                 return false;
             }
         }
-        out.has_hybrid_state = verified.has_hybrid_state;
-        out.has_terminal_hidden = verified.has_terminal_hidden;
-        out.has_terminal_logits = verified.has_terminal_logits;
-        if (out.total_bytes != verified.total_bytes ||
-            out.has_model_runtime_state != verified.has_model_runtime_state)
+        out.payload_identity = selected.payload_identity;
+        out.has_hybrid_state = whole && selected.has_hybrid_state;
+        out.has_terminal_hidden = whole && selected.has_terminal_hidden;
+        out.has_terminal_logits = whole && selected.has_terminal_logits;
+        if (out.total_bytes != read_layout.totalBytes() + runtime_bytes ||
+            out.has_model_runtime_state != (whole && selected.has_model_runtime_state))
         {
             ram_backend.release(out);
             if (error)
@@ -1641,30 +1941,31 @@ namespace llaminar2
         }};
         for (size_t index = 0; index < destinations.size(); ++index)
         {
+            if (!whole && index != 0u && index != 2u)
+                continue;
             const auto &[destination, destination_bytes] = destinations[index];
             const auto &section = ticket.sections_[index];
             if (section.bytes != destination_bytes ||
                 (destination_bytes > 0 &&
                  (!destination ||
                   !preadAll(
-                      ticket.archive_fd_,
+                      ticket.inode_->descriptor,
                       destination,
                       destination_bytes,
-                      section.offset) ||
-                  checksumBytes(destination, destination_bytes) !=
-                      section.checksum)))
+                      section.offset))))
             {
                 ram_backend.release(out);
                 if (error)
-                    *error = std::string("prefix payload checksum or size mismatch in ") +
+                    *error = std::string("prefix payload read or size mismatch in ") +
                              kSectionNames[index];
                 return false;
             }
+            ticket.hydrated_payload_bytes_ += destination_bytes;
         }
 
         /*
          * Refresh the logical index after any intervening demotion.  Touch only
-         * when the verified record remains resident on disk; an evicted record
+         * when the selected record remains resident on disk; an evicted record
          * now has RAM as its sole payload authority.
          */
         // The payload was read from its retained inode; logical recency belongs
@@ -1675,14 +1976,17 @@ namespace llaminar2
             ram_backend.release(out);
             return false;
         }
-        if (records_.find(verified.key) != records_.end() &&
-            !appendTouchLocked(current.get(), verified.key, error))
+        const auto resident = records_.find(selected.key);
+        if (resident != records_.end() &&
+            resident->second.handle.payload_identity == selected.payload_identity &&
+            !appendTouchLocked(current.get(), selected.key, error))
         {
             ram_backend.release(out);
             return false;
         }
 
         *ram_handle = std::move(out);
+        telemetry_->record(PrefixTierEvent::Read, ticket.hydrated_payload_bytes_);
         return true;
     }
 
@@ -1726,7 +2030,9 @@ namespace llaminar2
                 *error = "prefix archive record not found or layout mismatch";
             return false;
         }
-        const RecordIndex &record = record_it->second;
+        RecordIndex &record = record_it->second;
+        const auto payload = openPayloadLocked(record, error);
+        if (!payload) return false;
 
         PrefixBlockHandle out = ram_backend.allocate(key, layout);
         if (!out.valid())
@@ -1751,6 +2057,7 @@ namespace llaminar2
                 return false;
             }
         }
+        out.payload_identity = record.handle.payload_identity;
         out.has_hybrid_state = record.handle.has_hybrid_state;
         out.has_terminal_hidden = record.handle.has_terminal_hidden;
         out.has_terminal_logits = record.handle.has_terminal_logits;
@@ -1782,25 +2089,23 @@ namespace llaminar2
                 (destination_bytes > 0 &&
                  (!destination ||
                   !preadAll(
-                      archive.get(),
+                      payload->descriptor,
                       destination,
                       destination_bytes,
-                      section.offset) ||
-                  checksumBytes(destination, destination_bytes) !=
-                      section.checksum)))
+                      section.offset))))
             {
                 ram_backend.release(out);
                 if (error)
-                    *error = std::string("prefix payload checksum or size mismatch in ") +
+                    *error = std::string("prefix payload read or size mismatch in ") +
                              kSectionNames[index];
                 return false;
             }
         }
 
         /*
-         * Payload verification completes before recency publication. A failed
-         * checksum must never make a corrupt record look newly used. Touches
-         * are payload-free append records, so this preserves durable LRU without
+         * Complete reads precede recency publication. A short native read must
+         * never make a failed restore look newly used. Touches are metadata-only
+         * append records, preserving durable LRU without
          * rewriting a multi-megabyte KV payload on every cache hit.
          */
         if (!appendTouchLocked(archive.get(), key, error))
@@ -1810,56 +2115,6 @@ namespace llaminar2
         }
         *ram_handle = std::move(out);
         return compactIfNeededLocked(archive.get(), error);
-    }
-
-    bool DiskPrefixStorageBackend::verifyRecordPayloadLocked(
-        int archive_fd,
-        const RecordIndex &record,
-        std::string *error)
-    {
-        if (archive_scratch_.empty())
-        {
-            if (error)
-                *error = "prefix archive I/O scratch is unavailable";
-            return false;
-        }
-
-        for (size_t index = 0; index < record.sections.size(); ++index)
-        {
-            const SectionIndex &section = record.sections[index];
-            uint64_t remaining = section.bytes;
-            uint64_t source_offset = section.offset;
-            uint64_t checksum = hashPrefixBytes("", 0);
-            while (remaining > 0)
-            {
-                const size_t chunk = static_cast<size_t>(
-                    std::min<uint64_t>(remaining,
-                        PrefixArchiveIOGeometry::verificationBytes()));
-                if (!preadAll(
-                        archive_fd,
-                        archive_scratch_.data(),
-                        chunk,
-                        source_offset))
-                {
-                    if (error)
-                        *error = std::string("failed to stream prefix payload section ") +
-                                 kSectionNames[index];
-                    return false;
-                }
-                checksum = hashPrefixBytes(
-                    archive_scratch_.data(), chunk, checksum);
-                source_offset += chunk;
-                remaining -= chunk;
-            }
-            if (checksum != section.checksum)
-            {
-                if (error)
-                    *error = std::string("prefix payload checksum mismatch in ") +
-                             kSectionNames[index];
-                return false;
-            }
-        }
-        return true;
     }
 
     std::vector<PrefixBlockHandle> DiskPrefixStorageBackend::compatibleEntries(
@@ -1914,13 +2169,9 @@ namespace llaminar2
     {
         const uint64_t physical_bytes = fileSize(archive_fd);
         const uint64_t threshold = std::max<uint64_t>(
-            64ull * 1024ull * 1024ull,
-            kArchiveHeaderBytes +
-                (budget_bytes_ == 0
-                     ? active_bytes_ * 2
-                     : static_cast<uint64_t>(budget_bytes_) * 2));
-        if (physical_bytes <= threshold ||
-            physical_bytes <= kArchiveHeaderBytes + active_bytes_ * 3 / 2)
+            64ull * 1024ull,
+            kArchiveHeaderBytes + active_record_bytes_ * 2);
+        if (physical_bytes <= threshold)
         {
             return true;
         }
@@ -2099,8 +2350,7 @@ namespace llaminar2
         enum class CopyOutcome { Complete, Cancelled, Failed };
         const auto copy_range = [&](uint64_t source_offset, uint64_t remaining)
         {
-            uint8_t *const scratch = archive_scratch_.data() +
-                PrefixArchiveIOGeometry::verificationBytes();
+            uint8_t *const scratch = archive_scratch_.data();
             while (remaining > 0)
             {
                 if (stop.stop_requested())
@@ -2143,73 +2393,65 @@ namespace llaminar2
                 return CompactionOutcome::Failed;
         }
 
-        // Catch up only complete committed records. A writer may append while
-        // this worker copies/fsyncs; the next short inspection captures that
-        // tail. Publication is allowed only at an identical committed frontier.
-        for (;;)
+        // Join one finite metadata tail while holding the journal writer lease.
+        // No payload bytes are in this file: copying the tail therefore cannot
+        // chase ongoing bulk demotions, pin obsolete payloads, or make foreground
+        // capacity depend on a full-cache rewrite. Reclamation already happened
+        // at each durable eviction, independently of this worker's progress.
         {
             if (stop.stop_requested())
                 return CompactionOutcome::Cancelled;
-            // Every bulk write already completed on the background worker.
-            // The final file fsync still owns the complete archive's durability
-            // before the short committed-frontier inspection and publication.
-            if (::fsync(destination.get()) != 0)
+            std::lock_guard lock(mutex_);
+            AdvisoryLock archive_lock(lock_path_);
+            FileDescriptor current(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
+            if (!archive_lock.locked() || !current ||
+                !refreshIndexLocked(current.get(), error))
+                return CompactionOutcome::Failed;
+            if (archive_device_ != source_device || archive_inode_ != source_inode ||
+                scan_offset_ < copied_end)
             {
-                if (error)
-                    *error = errnoMessage("failed to commit compact prefix archive");
+                if (error) *error = "prefix compaction source changed outside its writer lease";
                 return CompactionOutcome::Failed;
             }
-            uint64_t next_end = 0;
-            {
-                std::lock_guard lock(mutex_);
-                AdvisoryLock archive_lock(lock_path_);
-                FileDescriptor current(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
-                if (!archive_lock.locked() || !current ||
-                    !refreshIndexLocked(current.get(), error))
-                    return CompactionOutcome::Failed;
-                if (archive_device_ != source_device || archive_inode_ != source_inode ||
-                    scan_offset_ < copied_end)
-                {
-                    if (error)
-                        *error = "prefix compaction source changed outside its writer lease";
-                    return CompactionOutcome::Failed;
-                }
-                next_end = scan_offset_;
-                if (next_end == copied_end)
-                {
-                    compaction_status_.state = CompactionState::Publishing;
-                    if (::rename(temporary.path().c_str(), archive_path_.c_str()) != 0)
-                    {
-                        if (error)
-                            *error = errnoMessage("failed to publish compact prefix archive");
-                        return CompactionOutcome::Failed;
-                    }
-                    // Index refresh is metadata-only. Retained hydration tickets
-                    // still own source, so no reader loses its verified payload.
-                    if (!refreshIndexLocked(destination.get(), error))
-                        return CompactionOutcome::Failed;
-                    ++compaction_status_.publications;
-                    compaction_status_.last_executor = std::this_thread::get_id();
-                    compaction_status_.last_writeback = maintenance_writer.evidence();
-                    break;
-                }
-            }
+            const uint64_t next_end = scan_offset_;
             const auto outcome = copy_range(copied_end, next_end - copied_end);
             if (outcome != CopyOutcome::Complete)
                 return outcome == CopyOutcome::Cancelled
                     ? CompactionOutcome::Cancelled : CompactionOutcome::Failed;
             copied_end = next_end;
-        }
-
-        // Durability belongs to the published directory entry as well as the
-        // already-fsynced file. Neither writeback is done under cache locks.
-        FileDescriptor directory(::open(
-            archive_path_.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-        if (!directory || ::fsync(directory.get()) != 0)
-        {
-            if (error)
-                *error = errnoMessage("failed to persist prefix archive publication");
-            return CompactionOutcome::Failed;
+            if (::fsync(destination.get()) != 0)
+            {
+                if (error) *error = errnoMessage("failed to commit compact prefix archive");
+                return CompactionOutcome::Failed;
+            }
+            compaction_status_.state = CompactionState::Publishing;
+            if (::rename(temporary.path().c_str(), archive_path_.c_str()) != 0)
+            {
+                if (error) *error = errnoMessage("failed to publish compact prefix archive");
+                return CompactionOutcome::Failed;
+            }
+            // Retain the writer lease through rename durability. Otherwise a
+            // peer could commit into the new inode and unlink an old payload
+            // while a crash can still restore the old journal's directory entry.
+            // Only small metadata is involved; payload writeback never joins
+            // this publication frontier.
+            FileDescriptor directory(::open(archive_path_.parent_path().c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            if (!directory || ::fsync(directory.get()) != 0)
+            {
+                (void)failMutationLocked(
+                    errnoMessage("failed to persist prefix archive publication"), error);
+                return CompactionOutcome::Failed;
+            }
+            if (!refreshIndexLocked(destination.get(), error))
+            {
+                (void)failMutationLocked(
+                    error ? *error : "failed to authenticate compact prefix archive", error);
+                return CompactionOutcome::Failed;
+            }
+            ++compaction_status_.publications;
+            compaction_status_.last_executor = std::this_thread::get_id();
+            compaction_status_.last_writeback = maintenance_writer.evidence();
         }
 
         // Observability is emitted after unlocking; it cannot make publication
@@ -2219,6 +2461,7 @@ namespace llaminar2
             "maintenance", "disk",
             {{"source_bytes", std::to_string(copied_end)},
              {"published_bytes", std::to_string(fileSize(destination.get()))},
+             {"payload_bytes_copied", "0"},
              {"authority", "archive_worker"}});
         return CompactionOutcome::Published;
     }

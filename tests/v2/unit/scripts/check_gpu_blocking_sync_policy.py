@@ -262,7 +262,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/collective/coordinators/NCCLCoordinator.cu", "NCCLCoordinator::doCopy", "raw_stream", 2),
         ("src/v2/collective/coordinators/NCCLCoordinator.cu", "NCCLCoordinator::doSynchronizeAll", "raw_stream", 1),
         ("src/v2/collective/coordinators/NCCLCoordinator.cu", "NCCLCoordinator::copy", "raw_stream", 1),
-        ("src/v2/collective/coordinators/RCCLCoordinator.cpp", "RCCLCoordinator::cleanupOnThread", "raw_stream", 3),
+        ("src/v2/collective/coordinators/RCCLCoordinator.cpp", "RCCLCoordinator::cleanupOnThread", "raw_stream", 2),
         ("src/v2/collective/coordinators/RCCLCoordinator.cpp", "RCCLCoordinator::copy", "raw_stream", 1),
         ("src/v2/collective/coordinators/RCCLCoordinator.cpp", "RCCLCoordinator::doCopy", "raw_stream", 2),
         ("src/v2/collective/coordinators/RCCLCoordinator.cpp", "RCCLCoordinator::doSynchronizeAll", "raw_stream", 1),

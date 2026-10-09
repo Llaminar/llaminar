@@ -41,7 +41,7 @@ namespace llaminar2
         /** Complete one-group mapped record family with disjoint writers. */
         struct Fixture
         {
-            Fixture()
+            explicit Fixture(int first_model_layer = 0)
                 : device(
                       controller,
                       groups,
@@ -60,6 +60,7 @@ namespace llaminar2
                 layout.participant_count = 2u;
                 layout.group_count = 1u;
                 layout.num_layers = 2u;
+                layout.first_model_layer = first_model_layer;
                 layout.num_experts = 8u;
                 layout.command_capacity = entries.size();
                 layout.mapping_bytes = 4096u;
@@ -156,6 +157,27 @@ namespace llaminar2
                 return *transaction;
             }
 
+            /** Publish a transient physical-arrival record for host lifecycle tests. */
+            std::uint64_t publishLLEP()
+            {
+                const auto transaction = publishDynamic();
+                entries[0].op = static_cast<std::uint32_t>(MoEOverlayDeviceMovementOp::TransientArrival);
+                entries[0].candidate_epoch = 7u;
+                command = {};
+                command.kind = static_cast<std::uint32_t>(
+                    MoEOverlayDeviceControllerTransactionKind::CurrentBatchLLEP);
+                command.command_count = 1u;
+                command.topology_fingerprint = kFingerprint;
+                command.transaction_id = transaction;
+                command.base_epoch = command.candidate_epoch = 7u;
+                command.command_digest = digest(entries[0]);
+                command.packed_weight_bytes = entries[0].payload_bytes;
+                command.parallel_command_count = command.movement_round_count = 1u;
+                controller.transaction_kind = command.kind;
+                controller.candidate_epoch = 7u;
+                return transaction;
+            }
+
             MoEOverlayDeviceControllerFabricLayoutHeader layout;
             MoEOverlayDeviceControllerSharedHeader controller;
             std::array<MoEOverlayDeviceControllerGroupRecord, 1> groups;
@@ -233,6 +255,162 @@ namespace llaminar2
             std::invalid_argument);
         fixture.groups[0].topology_fingerprint = 0u;
         EXPECT_EQ(transport.describeLifecycle(), "group=1,binding=invalid");
+    }
+
+    /** Acquisition keeps device command rows compact while retaining immutable stage origin. */
+    TEST(MoEOverlayDeviceTransportProtocol, PipelineStageAcquisitionAndCheckedTranslation)
+    {
+        for (const int origin : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+        {
+            Fixture fixture(origin);
+            ASSERT_TRUE(fixture.binding.valid());
+            MoEOverlayDeviceTransportProtocol transport(fixture.binding);
+            fixture.publishDynamic();
+            const auto acquired = transport.tryAcquire(0u);
+            ASSERT_EQ(acquired.status, MoEOverlayDeviceTransportAcquireStatus::Ready) << acquired.error;
+            const auto &batch = acquired.batch;
+            ASSERT_TRUE(batch.valid());
+            EXPECT_EQ(batch.first_model_layer, origin);
+            ASSERT_EQ(batch.entries.size(), 1u);
+            EXPECT_EQ(batch.entries[0].layer, 1u);
+            EXPECT_EQ(batch.header.packed_weight_bytes, 4096u);
+            EXPECT_EQ(batch.modelLayerForStorageIndex(0u), origin);
+            EXPECT_EQ(batch.modelLayerForStorageIndex(1u), origin + 1);
+            EXPECT_THROW((void)batch.modelLayerForStorageIndex(2u), std::out_of_range);
+            EXPECT_THROW((void)batch.modelLayerForStorageIndex(UINT32_MAX), std::out_of_range);
+            for (const int invalid : {-1, std::numeric_limits<int>::max() - 1})
+            {
+                auto malformed = batch;
+                malformed.first_model_layer = invalid;
+                EXPECT_FALSE(malformed.valid());
+                EXPECT_THROW((void)malformed.modelLayerForStorageIndex(0u), std::out_of_range);
+            }
+        }
+        for (const int invalid : {-1, std::numeric_limits<int>::max() - 1})
+        {
+            Fixture fixture(invalid);
+            EXPECT_FALSE(fixture.binding.valid());
+            EXPECT_THROW(MoEOverlayDeviceTransportProtocol{fixture.binding}, std::invalid_argument);
+        }
+    }
+
+    /** Every read-only scheduling edge must distinguish equal-shaped foreign stages. */
+    TEST(MoEOverlayDeviceTransportProtocol, PipelineStageLifecyclePredicatesAuthenticateGeometry)
+    {
+        Fixture fixture(32);
+        MoEOverlayDeviceTransportProtocol transport(fixture.binding);
+        const auto transaction = fixture.publishDynamic();
+        const auto acquired = transport.tryAcquire(0u);
+        ASSERT_EQ(acquired.status, MoEOverlayDeviceTransportAcquireStatus::Ready);
+        const auto &batch = acquired.batch;
+        const auto check = [&](auto predicate)
+        {
+            ASSERT_TRUE((transport.*predicate)(batch));
+            for (int mutation = 0; mutation < 4; ++mutation)
+            {
+                auto foreign = batch;
+                if (mutation == 0) foreign.first_model_layer = 0;
+                if (mutation == 1) ++foreign.num_layers;
+                if (mutation == 2) ++foreign.num_experts;
+                if (mutation == 3) ++foreign.participant_count;
+                ASSERT_TRUE(foreign.valid());
+                EXPECT_FALSE((transport.*predicate)(foreign)) << "geometry mutation=" << mutation;
+            }
+        };
+        std::string error;
+        ASSERT_TRUE(transport.publishPrepared(batch, &error)) << error;
+        for (auto &participant : fixture.participant_records)
+            participant.prepared_transaction = transaction;
+        check(&MoEOverlayDeviceTransportProtocol::preparationReady);
+        ASSERT_TRUE(transport.publishPublished(batch, &error)) << error;
+        ASSERT_TRUE(fixture.device.acknowledgePrepared(0u, transaction));
+        check(&MoEOverlayDeviceTransportProtocol::allGroupsPrepared);
+        ASSERT_TRUE(fixture.device.beginCommit(transaction));
+        check(&MoEOverlayDeviceTransportProtocol::commitRequested);
+        for (auto &participant : fixture.participant_records)
+            participant.published_transaction = transaction;
+        check(&MoEOverlayDeviceTransportProtocol::publicationReady);
+        check(&MoEOverlayDeviceTransportProtocol::groupPublicationReady);
+        ASSERT_TRUE(fixture.device.acknowledgePublished(0u, transaction));
+        check(&MoEOverlayDeviceTransportProtocol::allGroupsPublished);
+        ASSERT_TRUE(fixture.device.publishAdmission(transaction));
+        ASSERT_TRUE(fixture.device.beginDynamicRetirement(transaction));
+        check(&MoEOverlayDeviceTransportProtocol::retirementOpen);
+        for (auto &participant : fixture.participant_records)
+        {
+            participant.retirement_ready_epoch = 7u;
+            participant.retired_epoch = 7u;
+        }
+        check(&MoEOverlayDeviceTransportProtocol::runtimeReadersReady);
+        check(&MoEOverlayDeviceTransportProtocol::retirementRequested);
+        ASSERT_TRUE(transport.publishRetired(batch, &error)) << error;
+        check(&MoEOverlayDeviceTransportProtocol::groupRetirementReady);
+        ASSERT_TRUE(fixture.device.acknowledgeRetired(0u, transaction, 7u));
+        check(&MoEOverlayDeviceTransportProtocol::allGroupsRetired);
+        ASSERT_TRUE(fixture.device.completeDynamicRetirement(transaction));
+        check(&MoEOverlayDeviceTransportProtocol::transactionComplete);
+        fixture.controller.state = static_cast<std::uint32_t>(MoEOverlayDeviceControllerState::Error);
+        check(&MoEOverlayDeviceTransportProtocol::authorityRejected);
+    }
+
+    /** All physical completion writers reject foreign geometry before publishing any receipt. */
+    TEST(MoEOverlayDeviceTransportProtocol, PipelineStageCompletionCannotAcknowledgeForeignGeometry)
+    {
+        using Publish = bool (MoEOverlayDeviceTransportProtocol::*)(
+            const MoEOverlayDeviceTransportCommandBatch &, std::string *) noexcept;
+        const std::array<Publish, 4> methods{
+            &MoEOverlayDeviceTransportProtocol::publishPrepared,
+            &MoEOverlayDeviceTransportProtocol::publishPublished,
+            &MoEOverlayDeviceTransportProtocol::publishRetired,
+            &MoEOverlayDeviceTransportProtocol::publishRestored};
+        for (std::size_t edge = 0; edge < methods.size(); ++edge)
+        for (int mutation = -1; mutation < 4; ++mutation)
+        {
+            SCOPED_TRACE(::testing::Message() << "edge=" << edge << " mutation=" << mutation);
+            Fixture fixture(32);
+            MoEOverlayDeviceTransportProtocol transport(fixture.binding);
+            const auto transaction = edge == 3 ? fixture.publishLLEP() : fixture.publishDynamic();
+            auto acquired = transport.tryAcquire(0u);
+            ASSERT_EQ(acquired.status, MoEOverlayDeviceTransportAcquireStatus::Ready) << acquired.error;
+            std::uint64_t *receipt = &fixture.transport.prepared_transaction;
+            if (edge == 1)
+            {
+                fixture.transport.prepared_transaction = transaction;
+                receipt = &fixture.transport.published_transaction;
+            }
+            if (edge >= 2)
+            {
+                fixture.transport.published_transaction = transaction;
+                fixture.controller.state = static_cast<std::uint32_t>(edge == 2
+                    ? MoEOverlayDeviceControllerState::RetiringDurableEpoch
+                    : MoEOverlayDeviceControllerState::RestoringLLEP);
+                for (auto &participant : fixture.participant_records)
+                {
+                    participant.retired_epoch = 7u;
+                    participant.restored_transaction = transaction;
+                }
+                receipt = edge == 2 ? &fixture.transport.retired_epoch
+                                    : &fixture.transport.restored_transaction;
+            }
+            if (edge == 3)
+                ASSERT_TRUE(transport.restorationRequested(acquired.batch));
+            auto &batch = acquired.batch;
+            if (mutation == 0) batch.first_model_layer = 0;
+            if (mutation == 1) ++batch.num_layers;
+            if (mutation == 2) ++batch.num_experts;
+            if (mutation == 3) ++batch.participant_count;
+            ASSERT_TRUE(batch.valid());
+            if (edge == 3 && mutation >= 0)
+                EXPECT_FALSE(transport.restorationRequested(batch));
+            std::string error;
+            EXPECT_EQ((transport.*methods[edge])(batch, &error), mutation < 0) << error;
+            EXPECT_EQ(*receipt != 0u, mutation < 0);
+            if (mutation >= 0)
+            {
+                EXPECT_FALSE(error.empty());
+                EXPECT_NE(fixture.transport.status_code, 0u);
+            }
+        }
     }
 
     TEST(MoEOverlayDeviceTransportProtocol,

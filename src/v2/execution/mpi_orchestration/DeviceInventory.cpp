@@ -90,6 +90,7 @@ namespace llaminar2
                     const auto &previous = *it->second;
                     if (previous.memory_bytes != gpu.memory_bytes ||
                         previous.compute_units != gpu.compute_units ||
+                        previous.pci_bus_address != gpu.pci_bus_address ||
                         previous.last_level_cache_bytes != gpu.last_level_cache_bytes)
                         throw std::invalid_argument("Conflicting observations of GPU UUID " + gpu.uuid);
                     continue;

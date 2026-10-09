@@ -1,5 +1,3091 @@
 # vLLM-Style MTP Project Plan
 
+## 2026-10-09 r41: DRM memory units in the resource observer
+
+The first hybrid app launch stopped before sending any model request. The
+external monitor rejected the valid fdinfo value `33315 MiB` because its parser
+accepted only KiB. Server and observer retired normally, and driver evidence is
+clean. A staged parser correction normalizes bare bytes and B/KiB/MiB/GiB/TiB,
+rejects malformed/negative/fractional/extra-field counts, and preserves descriptor
+alias deduplication. Three new unit cases reproduce the old failure and cover
+all observed memory field prefixes; the resource/growth/scope suites pass 53
+cases. A dedicated `V2_Integration_HTTPResourceDRMMemoryUnits` entry is staged.
+The next local app driver mounts only this corrected observer over the canonical
+monitor directory; the exact patch and tests are recorded separately. Inference
+source, both compiled builds, image, smoke, and timing evidence remain unchanged.
+The dense-then-MoE r41 app run is active. The two source/test files and CMake entry
+must be integrated into the final candidate before commit. No commit or push has
+occurred.
+
+Evidence: `hybrid-resource-observer-20261009-r41/` and
+`hybrid-app-sessions-20261009-r41/`, under the ignored resource-growth work root.
+
+## 2026-10-09 r40: local benchmark observer and hybrid app admission
+
+Both r39 real-model smoke lifetimes passed: exact repeated tokens, full/partial
+prefix restore, Unicode, default dynamic MTP and maximum context 262,144. Dense
+short benchmark medians are 692.26 prefill and 33.25 decode tokens/s; MoE measures
+1,661.09 and 182.49. The full model driver window is clean and owners retired.
+The local benchmark observer incorrectly required every prepared bucket to have
+executed. MoE prepares a 128-row bucket that this workload does not use. The
+canonical observer already permits unused materializations; the local consumer
+now uses that lifecycle policy and additionally proves all 1,536 measured rows
+on each of four devices. Both saved benchmark artifacts pass without changing
+the binary or rerunning measurements. Three focused tests reproduce the old
+reader failure and reject twelve damaged-evidence variants. The original failed
+receipt remains intact. Speed review accepts both models for the long coding
+workload, and the dense then MoE app sessions have been launched sequentially.
+The earlier single prerequisite firmware finding remains an explicit user waiver,
+not a clean canonical prerequisite driver result. No commit or push has occurred.
+
+Evidence: `hybrid-benchmark-observer-20261009-r40/` and
+`hybrid-app-sessions-20261009-r39/`, under the ignored resource-growth work root.
+
+## 2026-10-09 r39: pipeline terminal artifact admission and diagnostic scope
+
+Real r37 MoE smoke produced all three expected answers with default dynamic MTP,
+maximum context, exact repeated tokens and full/partial prefix reuse. Its terminal
+auditor then rejected the correct schema-2 stage-scoped movement sidecar because
+the collector admitted only flat schema 1. The server exited normally, all owners
+retired, and the complete driver window had no findings. The original failed
+receipt is retained; a separate replay of its saved evidence passes the corrected
+capture, transfer and MTP checks. The MoE benchmark and hybrid apps did not start.
+
+The collector now uses the movement observer's shared stage-scope parser. It
+preserves every rank and stage, exact large integer metadata, and original raw
+files. Focused tests reject 22 malformed metadata variants, absent/foreign ranks,
+flat/pipeline mixing and nested stage namespaces. Four/eight-device fixtures in
+both vendor orders fail with the old reader and pass with the correction. The
+complete server-policy suite passes 154 cases and movement validation passes 32.
+The new production-preflight entry is
+`V2_Integration_PipelineTerminalMovementArtifactMembership`.
+
+The separately prepared r38 diagnostic fix is integrated in the same candidate.
+Optional intrusive snapshots now retain an ordered tree of independent pipeline
+epochs rather than their maximum. The focused 100/1 to 100/2 controls demonstrate
+the old local/global false equality; 54 focused cases and all affected producer
+compilations passed before integration. Four explicit preflight registrations
+cover metadata, MTP comparison, local aggregation and global aggregation. Live
+HTTP prefix observations and actual cache admission already retained stage scope.
+
+Matching Integration/Release builds and fresh complete prerequisites are required
+for the changed snapshot value layout. Both builds passed. Complete prerequisites
+finished with 1,682 passes, 26 hardware skips and no failed tests. One AMDGPU
+SetWorkloadMask response-zero message failed the outer driver audit. All 100
+focused follow-up test executions passed without new driver records. The user
+explicitly waived the single archived message for local diagnostic progress;
+the original failed receipt is preserved beside the exact-window admission
+decision. No driver policy or production check was relaxed. The verified local
+Release overlay is now running dense/MoE smoke and short benchmarks before
+the speed review and two ten-phase apps. No hybrid app, commit or push has occurred.
+
+Evidence: `hybrid-terminal-artifact-20261009-r39/` and
+`hybrid-diagnostic-epochs-20261009-r38/`, under the ignored resource-growth work root.
+
+
+## 2026-10-09 r37: sparse pipeline request and captured epoch ownership
+
+The r36 full prerequisite gate passed 1,671 outcomes with 20 hardware skips and
+no failures. Dense hybrid Release smoke and the short benchmark passed
+(693.17 prefill tokens/s, 24.80 decode tokens/s). Real MoE then exposed missing
+root request-identity publication for stage-scoped placements. Its focused
+four-GPU negative control initialized with zero publications instead of one.
+
+After repairing publication, actual grouped replay exposed absent upstream
+epoch acquire/release fragments; they now enclose the retained verifier and
+accepted-state publication. A third-request one-token prefix suffix exposed a
+scalar completion guard that demanded shifted-KV ownership on verifier-only PP
+participants. That guard now uses the existing runtime-role resolver. The same
+bridge conflated successful no-logits followers with failed execution and used
+the sequential stage loop despite captured activation channels. A typed optional
+completion now separates those outcomes; the frozen pipeline owner submits all
+domains together through their existing native edges.
+
+Disabled MTP exposed two companion defects. A terminal with both pipeline
+placement and sparse ownership now selects an explicit combined ordinary
+generation composition, preserving semantic replay, request identity, and
+maintenance. Its one-token restored-prefix input also uses the concurrent
+captured pipeline owner. It no longer enters the sequential activation-transfer
+loop after native receive banks have been frozen. The focused disabled-MTP
+regression passes twice in each four-GPU vendor order with clean driver evidence.
+
+The production lifecycle regression covers three requests and 1/17/1 token
+budgets with the same maintenance acknowledgement as the HTTP frontend. Both
+vendor orders and disabled/fixed/dynamic MTP are registered in preflight at four
+and optional eight GPUs. Twelve runnable MoE/dense four-GPU cases each passed
+twice, with clean driver diagnostics and all native owners retired. Six eight-GPU
+registrations skipped for missing hardware. Ten related device-free CTest
+registrations passed. Matching Integration/Release builds passed. Complete r37
+prerequisites passed 1,677 outcomes with 26 hardware skips and zero failures;
+driver diagnostics were clean and all native owners retired. Dense hybrid smoke
+passed all three requests with default dynamic MTP, exact repeated tokens and
+maximum context 262,144. The short untraced benchmark measured 691.97 prefill
+tokens/s and 24.59 decode tokens/s. MoE smoke and its benchmark remain in progress.
+No hybrid app run has started.
+
+Evidence: `parity-results/opencode-tool-calling/resource-growth-work/hybrid-request-generation-20261009-r37/`.
+The compact [dashboard](MTP_VLLM_STYLE_TUNING_DASHBOARD.md) owns the current gate
+sequence; its prior 4,767-line history is preserved in a linked dated archive.
+
+
+## 2026-10-08 r22: prepared-context retirement and configuration codec
+
+Terminal reset failures now stop before retirement/reuse publication. The focused
+regression rejects the previous swallowed-exception behavior. Native transfer
+directories retain immutable prepared sources, so their reuse seal follows
+participant destruction and verifies exact original engine handles in each stage.
+Mutable physical residency still restores through its live fabric. This checks
+metadata and shared ownership only; it does not read or hash weight/cache bytes.
+
+The full configure caught 39 new NO_MPI Integration registrations inheriting a
+two-rank default; they now declare one process explicitly. The complete build
+also caught the missing first_model_layer field in the strict saved-configuration
+codec. That field now round-trips with nonzero stage origins and terminal MTP
+rows. Four stale source checks now enforce the compact stage representation.
+
+Validation: 240 focused C++ cases, 200 repeated case executions, four explicit
+preflight gates and the failing old-reset negative control. All 290 qualified
+ACTIVE production bindings remain unchanged. The consistent Integration build is
+tracked separately at `/workspaces/llaminar/parity-results/opencode-tool-calling/resource-growth-work/hybrid-candidate-build-20261008-r22c/controller.json`; it is not yet a native serving
+certificate. Focused receipt: `/workspaces/llaminar/parity-results/opencode-tool-calling/resource-growth-work/hybrid-stage-ownership-20261008/result-r22.json`.
+
+Remaining: full candidate prerequisites, native reuse/retirement and prefix
+restore/resource proofs, setup-scratch lifetime, intrusive/global epoch audit,
+matching Release overlay and both hybrid app sessions. No image rebuild, commit
+or push occurred.
+
+
+## 2026-10-08 r21: stage-scoped completed prefix observations
+
+Completed rank-local PP request summaries now preserve each stage's actual
+admission interval and completion epoch. Stable stages at epochs 100 and 1
+previously looked like movement under a flattened MIN/MAX comparison. A maximum
+also hid movement in the smaller-epoch stage. Scoped comparisons now distinguish
+unchanged placement, publication during a request and publication before the
+next admission. Missing, changed or stale scopes fail. Actual cache restoration
+already validates each participant's own fingerprint and retained lookup; these
+observations remain passive metadata and perform no payload hashing or reading.
+
+Root harvest captures the scoped values once. Cached request summaries and the
+HTTP response reuse that observation without a live probe. Pipeline HTTP summaries
+use schema 2 with null unscoped epoch fields; benchmark prefix metadata uses the
+same serializer. Python validates exact unsigned integers and independent scopes
+and still requires actual fresh/full prefix outcomes. Both runtime-summary
+schemas retain movement-observer coverage.
+
+Validation: 24 pipeline, 43 prefix-flow and 169 HTTP C++ cases; 225 production
+Python and 32 movement Python cases pass. Seven focused canonical preflight
+registrations pass, including three new explicit entries. Four new pipeline
+cases pass twenty repeats under partial ASan (80 case executions). The C++/Python
+bridge covers both declared four/eight widths and both vendor orders, with
+72 rejected metadata corruptions plus fresh/full restore validation. These are
+device-free tests; no GPU execution or model serving was run in this slice.
+
+The broader HTTP check exposed an old topology object in the standalone diagnostic
+link. Explicit current topology and HTTP-stats producers fix that diagnostic
+composition; the full 169-case HTTP run is green. All 290 qualified
+ACTIVE production source bindings remain intact. The candidate changes public
+value layouts and IInferenceRunner's vtable, so a consistently rebuilt serving
+binary remains required. Evidence: `/workspaces/llaminar/parity-results/opencode-tool-calling/resource-growth-work/hybrid-stage-ownership-20261008/result-r21.json`.
+
+Remaining: intrusive/global scalar-epoch consumers; native maintenance and
+prepared-context physical sealing/teardown; setup-scratch lifetime; complete
+candidate qualification; then both hybrid app sessions and branch publication.
+No image rebuild, commit or push occurred.
+
+
+## 2026-10-08 r20: independent pipeline movement publications
+
+The candidate now retains one publication namespace per PP stage and elects one
+root inside each native TP domain. Completed work totals add; transaction IDs,
+policy receipts, demand windows and progress generations stay with their owner.
+Native archive exports translate compact journal rows into global layer IDs.
+Counter keys include the fixed layer interval, including when stages reuse a
+device. HTTP and terminal JSON, the Python observer, and frozen topology reports
+retain identical stage identities. Shutdown publication marks each already-retired
+stage drained while preserving failures. This is passive reporting, not a proof
+of physical prepared-context restoration.
+
+Validation: 20 pipeline C++ cases, 18 counter cases, 32 movement Python cases and
+151 server-policy cases pass. Twenty repeats pass normally and under partial
+ASan (400 case executions each). Six negative-control cases reproduce the old
+rank selection and archive layer defects. Four new focused preflight gates pass,
+including production C++ JSON/counter exports consumed by Python for declared
+four/eight-device topologies. Registration auditing resolves 58 selected C++
+gates / 94 case selections; 14 optional native eight-GPU skip properties remain.
+These tests are device-free. No real model or GPU serving ran in this slice.
+
+ASan also caught a temporary-view lifetime mistake in the new fixture. Retaining
+the owner fixes it, and the metadata API now rejects such rvalue views at compile
+time. All 290 qualified ACTIVE production source bindings remain intact.
+The candidate's publication values and orchestration virtual interface changed;
+real serving requires a consistent rebuild, not an old ABI diagnostic executable.
+
+Evidence: `/workspaces/llaminar/parity-results/opencode-tool-calling/resource-growth-work/hybrid-stage-ownership-20261008/result-r20.json`.
+
+Next work: audit scalar movement-epoch consumers (the old max reduction remains),
+prove native maintenance/prepared-context sealing and teardown, then prefix
+restore, bounded resources, complete candidate qualification and the two hybrid
+OpenCode app sessions. No Docker image rebuild or branch publication occurred.
+
+
+## October 8, 17:54 UTC: pipeline startup and retained placement handoff
+
+The live root now admits all MoE PP stages jointly, freezes each global layer
+interval with the model-aware placement resolver, and carries those immutable
+placements through the prepared-context contract. Runtime construction creates
+fresh checked stage authorities and registries from the original PMA. Source
+identity is tied to the actual ModelContext without extending its lifetime;
+metadata checks compare projection shapes/formats, never model/cache payloads.
+The first native dry run exposed the production loader adapter, and the focused
+fixture now exercises that exact adapter rather than a concrete-loader mock.
+
+A focused negative control found that retained MTP reuse omitted predictor
+replication versus TP sharding. The shared dense/MoE gate and pipeline metadata
+identity now reject that ownership change. Active off/fixed/dynamic policies
+remain legal inside unchanged retained capacity and weight ownership.
+
+**1,038 focused cases in 34 groups pass**, including 94 planning/setup cases.
+Seven new cases pass twenty normal and twenty partial-ASan iterations
+(**140 executions each**). The prepared handoff sweeps 23 source formats,
+both vendor orders, four MTP storage/execution lanes and all three maintenance
+modes at four/eight participants: **1,104 combinations**, with two fresh runtime
+lifetimes and two stages per combination. The canonical registration audit
+finds **56 relevant entries selecting 74 cases**, including explicit regressions
+for the predictor ownership defect and both pipeline widths.
+
+**All 16 real-model dry runs pass**: Qwen 3.8 dense and Qwen 3.6 MoE, both
+ROCm/CUDA stage orders, default dynamic MTP, fixed depth 7 with retained 15,
+MTP disabled, and disabled with retained capacity. Each admits **262,144 context**,
+16 GiB RAM prefix capacity per participant and a shared 32 GiB disk tier. The
+MoE cases prove one aggregate authority across both stages. Native process and
+driver cleanup pass. These are current-root admission checks against the local
+qualified support library; they do not certify serving or captured model graphs.
+The earlier 18 native component passes/14 hardware skips retain their unchanged
+source bindings. Eight-GPU native hybrid coverage still needs unavailable GPUs.
+
+All 290 qualified production source files remain unchanged; free workspace
+space is 218.2 GiB. Evidence:
+`hybrid-stage-ownership-20261008/result-r19.json` and
+`pipeline-model-admission-20261008-r19c/controller.json`.
+
+Remaining: stage-aware movement/status aggregation, native maintenance and
+prepared-context sealing/teardown, actual prefix restore, sequential CPU scratch
+lifetime, complete candidate qualification, and both hybrid OpenCode app sessions.
+The stage handoff is wired and component-tested; live serving is not yet green.
+No Docker image build, commit or push was performed.
+
+## October 8, 17:16 UTC: shared stage-owned residency setup
+
+The ordinary live runner now uses one checked `MoEOverlayResidencySetup`
+constructor for histogram, residency authority, Dynamic economy catalog and
+empty prepared-bank endpoints. The replaced inline constructor is removed.
+Compact histogram and endpoint storage retain the exact model-global origin;
+terminal MTP banks do not move the main-token histogram boundary. The factory
+rejects foreign certificates, sibling-stage physical resources, unfinished or
+changed quotas and mismatched maintenance storage before publishing owners.
+
+**1,031 focused cases in 34 groups pass**, including 87 planning/setup cases.
+The four/eight-participant matrix composes actual admission, placement freezing,
+runtime construction and the sealed pipeline binding: **23 source formats**,
+both vendor orders, disabled/fixed/dynamic MTP, Off/Observe/Dynamic maintenance
+and apportioned/projection compute (**1,656 combinations; 3,312 stage sets**).
+The ordinary control covers CPU and CUDA/ROCm widths 1/2/4/8. Host demand claims
+retire on normal destruction and on failure after histogram construction.
+Thirty foreign-owner rejections per pass cover both pipeline widths.
+
+The five new cases pass twenty repetitions (**100 executions**) and twenty
+partial-ASan repetitions (**100 executions**). The canonical registration audit
+resolves 53 relevant explicit entries to 67 cases. The previous **18 native
+passes and 14 hardware skips** retain exact unchanged native source bindings;
+the new runtime constructor has component coverage, not a native model claim.
+All 290 qualified production source files remain unchanged. Free workspace
+space is 218.4 GiB. Evidence:
+`hybrid-stage-ownership-20261008/result-r18.json`.
+
+The initial ordinary control needed a valid CPU NUMA observation and its
+rank-local demand descriptor, which live setup retains separately from discovery
+capacity. Its original small Qwen query geometry correctly rejected eight TP
+slices; the final source supplies enough real directory geometry.
+
+The live MoE PP guard remains: startup still needs to retain stage admission
+through prepared-weight reuse, install every stage binding, and compose native
+maintenance, movement/statistics and teardown. CPU setup lifetime, actual prefix
+payload and full-model cleanup proofs, complete candidate qualification and
+both hybrid app sessions remain. No image, commit or push was produced.
+
+## October 8, 16:49 UTC: joint MoE pipeline admission
+
+The candidate planner now uses `AdmittedMoEPipelineMemory` to derive exact
+stage GGUF manifests, assemble all fixed owners, and resolve every stage's
+expert capacity in one PMA transaction. Every immutable stage result retains
+that same aggregate certificate. Automatic quotas remain adaptive. Request
+costing resolves each layer's own expert authority, including the later PP
+root, instead of consulting a model-wide parent plan.
+
+The shared adapter accepts the current physical observation and performs no
+model payload reads or device allocations. It retains verifier geometry on
+nonterminal stages while assigning predictor sources only to the terminal
+stage. Only typed capacity exhaustion advances the declared graph-row search;
+malformed input remains fatal.
+
+**1,026 focused cases in 34 groups pass**, including 82 admission/planning/cost
+cases. Four/eight-device metadata coverage exercises **23 loadable GGUF source
+formats**, off/fixed/dynamic MTP, auto/apportioned/projection compute and both
+vendor orders (**828 combinations**). Shared host exhaustion, GPU exhaustion,
+failed-transaction reuse and missing transfer evidence have focused checks.
+The eight new cases pass twenty repetitions (**160 executions**); the six
+admission cases pass twenty partial-ASan repetitions (**120 executions**).
+The registration audit now resolves 50 explicit entries to 62 cases.
+
+The previous **18 native passes and 14 hardware skips** retain exact unchanged
+native source bindings; no native run was repeated for this metadata change.
+An initial incremental diagnostic mixed the new candidate value with the old
+automatic-startup caller ABI; rebuilding the complete caller/producer closure
+resolved the tooling abort. All 290 qualified production source files remain
+unchanged, and 133 candidate files are bound. Free workspace space is
+218.5 GiB. Evidence is `hybrid-stage-ownership-20261008/result-r17.json`.
+
+This is component evidence, not a complete candidate or Release certificate.
+The live runner still rejects MoE PP before weights because stage runtime
+owners have not yet been constructed. Remaining work is that runtime producer,
+CPU setup lifetime sharing, actual prefix payload and admission-only cleanup
+proofs, complete qualification, and both hybrid Python-app sessions. No image,
+commit or push was produced.
+
+## October 8, 16:25 UTC: unused RCCL retirement
+
+The hybrid admission-error process-exit crash is reproduced and repaired in the
+candidate. An unused pooled RCCL coordinator launched a synthetic allreduce
+during process teardown, which crashed inside HIP. The focused regression
+passes its test body on the original implementation, then exits with SIGSEGV;
+the process exit code is essential evidence.
+
+Cleanup now requires native communicator finalization, retires unused and used
+owners through that same path, and performs no priming allocation/collective.
+Missing finalization is rejected at initialization. Native teardown errors are
+fatal with a precise diagnostic; handles are not silently abandoned.
+
+**18 current native cases pass**: two/four-ROCm unused teardown and pooled exit,
+runtime-generation reset/reuse, rejected hybrid admission and all 12 four-GPU
+ordinary/fixed/dynamic generation cases. The direct cases include **20 cycles at
+each device count (40 total)**. Fourteen native eight-device cases are skipped
+for missing hardware. Driver and owner-retirement evidence is clean. KFD can
+publish process removal shortly after waitpid; the diagnostic records that
+latency and waits for the same retirement boundary without retrying a test.
+
+The prior **944 focused cases in 33 groups**, 400 repetitions and 640 ASan
+executions remain bound to unchanged implementation sources. Registration was
+refreshed: 48 explicit registrations select 54 cases, with six new unused-RCCL
+preflights. Evidence is `hybrid-stage-ownership-20261008/result-r16.json` and
+`unused-rccl-retirement-native-20261008-r2/controller.json` under the work root.
+All 290 qualified production source files remain unchanged;
+126 candidate files are bound. Workspace free space is
+218.9 GiB. No image, commit or push was produced.
+
+This remains focused evidence. The MoE pipeline startup producer, CPU setup
+lifetime sharing, actual prefix payload movement, full-model admission-only
+cleanup, complete candidate qualification and both hybrid Python-app sessions
+remain outstanding before committing/pushing.
+
+## October 8, 16:05 UTC: four/eight-device preflight and retained forwards
+
+Preflight now projects four and eight devices through middle PP stages, uneven
+TP groups, both vendor orders, MTP off/fixed/observe/dynamic policies, exact
+channel owners and joint memory admission. Shared disk archive scratch is priced
+once across the pipeline; RAM tiers remain independent per participant. The
+stage planner feeds all fixed contributions into one capacity transaction.
+
+Native four-GPU tests found and fixed a retained-width defect: active fixed
+depth 7 selected eight verifier rows, while followers assumed the retained
+16-row capacity. Setup now captures widths 16/8/4/2, both outcome variants,
+and admission prices them all. Every supported retained depth 1–15 and legal
+request depth is covered. A capture-reuse assertion also exposed the ordinary
+device-token forward being deferred until first decode; that already-admitted
+executable is now captured during serving setup.
+
+All **944 focused cases in 33 groups**, **400 repeated case executions** and
+**640 additional ASan executions** pass. ASan covers changed implementations,
+not the complete supporting dependency DSO. All **12 native four-GPU cases**
+pass: ordinary/fixed/dynamic, both vendor orders, rows 128/256, exact token/KV
+oracles, verifier inventory, main-forward reuse from startup and all-helper
+reuse after request reset. Driver and retirement evidence is clean. Twelve
+eight-GPU cases are explicitly skipped: this host has two CUDA and four ROCm
+devices; the extension requires four of each. Device-free eight-device cases
+passed. The canonical registration audit resolves 42 registrations to 48 cases.
+
+Evidence: `resource-growth-work/hybrid-stage-ownership-20261008/result-r15.json`
+and `four-eight-gpu-preflight-native-20261008-r5/controller.json`. The receipt
+binds 124 candidate source files and verifies all 290
+qualified production files remain unchanged. This is focused component/native
+evidence, not full candidate preflight or a hybrid model certificate. No new
+image, commit or push occurred. Workspace free space: 219.1 GiB.
+
+The MoE startup producer still must install these jointly admitted stage owners;
+the precise fail-closed checks remain. CPU setup lifetime sharing, actual prefix
+payload movement, admission-only cleanup and the earlier failure-unwind crash
+still need closure, followed by complete candidate qualification and both hybrid
+Python-app sessions on the locally rebuilt Release overlay.
+
+## October 8, 14:24 UTC: authored pipeline and fixed-memory scopes
+
+The isolated compiler now retains the authored MoE PP parent and immutable
+stage projections, with actual devices, collective policy, global main-layer
+bounds and terminal roles. Child configuration removes parent placement
+selectors. Repeated normalization preserves each stage's compute policy;
+automatic/off/fixed/dynamic MTP keeps the parent serving policy. These are
+metadata projections, not installed runtime owners.
+
+Fixed-memory assembly now requires the exact retained graph family. Main
+capture frontiers use owned main layers; CPU setup sizing uses the owned routed
+interval, including terminal sidecars when retained. Full parent source metadata
+stays intact. Foreign scopes, mismatched continuation/histogram/controller
+geometry and nonterminal sidecars fail before physical admission.
+
+All **822 focused cases in 29 groups** pass. The **nine new cases pass 20
+repetitions (180 executions)** and **180 additional ASan executions with leak
+detection**. The changed compiler, normalizer and memory adapters are instrumented;
+supporting objects/DSO are not a whole-program sanitizer build. Three previous
+implementations fail the exact regressions: PP rejection, a raw-block capture
+overcount and foreign-stage CPU descriptor access. Scope coverage includes both
+GPU orders, widths 1/2 and all 24 CPU source formats. The combined diagnostic
+startup consumers compile. Three explicit preflights register topology, memory
+projection and CPU setup scope.
+
+Evidence: `resource-growth-work/hybrid-stage-ownership-20261008/result-r14.json`,
+`all-focused-r27-full.log`, and the `projection-*-r14` logs. The receipt binds
+**112 candidate files**, revalidates **290 unchanged
+qualified production files**, and retains historical native evidence separately.
+This is not complete candidate preflight or a hybrid server certificate. No new
+native/model run, image, commit or push occurred; **220.0 GiB** remains free.
+
+Startup still rejects missing stage owners before weights or ordinary dense
+admission. The next producer must retain parent pipeline-channel buffers and
+price shared archive scratch once across stage BOMs, while preserving independent
+RAM tiers and correctly typed serial setup ownership. Then submit one joint
+capacity transaction, construct/seal the runtime bindings, resolve native cleanup
+and failure unwinding, qualify the local Release overlay and complete both hybrid
+app sessions. Details are in `startup-next-r14.txt`. The preceding goal turn
+completed joint capacity; this turn advances its topology and fixed-scope inputs.
+
+## October 8, 13:40 UTC: joint pipeline capacity and replica grants
+
+The isolated candidate now admits one or several owned routed-layer intervals
+through the same production capacity implementation. Distinct fixed allocations
+on shared CPU/GPU resources contribute to one typed BOM. Every stage retains the
+same final `PhysicalMemoryPlanAdmissionCertificate`, while its quota and copy
+counts remain compact and retain global layer identity. All fixed banks, exact
+quotas and migration sources precede optional placement. Conflicting observations
+and alternate names for one physical allocator are rejected before publication.
+
+`MoEOverlayCapacityAdmission::resolvePipelineCapacity` searches complete pipeline
+candidates. It first tries all requested cache maxima, proves every enabled
+minimum together when bounded selection is needed, and then maximizes grants in
+authored stage order. Retained grants remain exact and transfer lanes retain
+their admitted geometry. Explicit movement-off and replica-cache-off remain
+separate supported policies. Ordinary single-stage callers use this same path;
+there is no alternate byte ledger or automatic execution-mode change.
+
+All **794 focused cases in 27 groups** pass. The **13 new regressions pass 20
+repetitions (260 case executions)**, and another **260 case executions pass
+AddressSanitizer with leak detection enabled**. The resolver, policy adapter,
+transfer-directory geometry, PMA and fixture are instrumented; the supporting
+DSO is not a whole-program sanitizer build. Coverage includes all **21 quantized
+source formats plus FP16/BF16/FP32**, CPU/CUDA/ROCm, both GPU orderings, TP widths
+1/2, compact nonzero intervals, shared RAM/GPU overcommit, exact byte boundaries,
+later-stage fixed/minimum/retained grants and independent ledger-lease retirement.
+The previous resolver fails the exact new resource-alias rejection test. The
+changed startup, factory, graph and orchestrator consumers compile together.
+Unit registration and the explicit
+`V2_Integration_MoEPipelineAggregateCapacity` preflight entry own the regressions.
+
+Evidence: `resource-growth-work/hybrid-stage-ownership-20261008/result-r13.json`,
+`all-focused-r26-full.log`, and the `pipeline-capacity-*-r13` logs. The receipt
+binds **101 candidate files** and revalidates **290 unchanged qualified-source
+files**. This remains component evidence, not a complete candidate preflight or
+hybrid server certificate. No model/cache payload hashing, native GPU execution,
+new Docker image, commit or push occurred in this slice; about **221 GiB** is free.
+
+Startup does **not yet produce the stage bindings**. Preserve authored PP during
+normalization, construct each stage's fixed BOM with its own captured-graph and
+CPU-service geometry, submit the contributions to the joint API, publish one PMA,
+and construct/seal the runtime owners. The implicit MoE PP guard remains until
+that producer is complete. Then validate actual prefix payload movement,
+admission-only cleanup and failure unwinding, build the local Release overlay,
+and finish both dense/MoE hybrid app sessions before review and commit/push.
+The preceding goal turn was status-only and was revalidated; this turn changed
+production admission and established the evidence above.
+
+## October 8, 13:01 UTC: PP children retain their own expert runtime
+
+The production PP child projection now selects a sealed
+`MoEOverlayPipelineStageBinding`. It authenticates the owned main interval,
+terminal routed MTP banks, ordered continuation devices, TP weights/backend,
+maintenance mode, initial expert owner map, histogram lifetime and prepared-bank
+registry. Equal dimensions and devices cannot conceal a different expert map.
+Single-device PP and nested TP use the same projection. The old model-wide
+runtime broadcast into every stage has been removed. Every child handoff is
+checked before the first stage prepares weights, and stage owners retire after
+child graph destruction. This adds no payload hashing or physical-memory ledger.
+
+The pure configuration methods now live in `RankOrchestratorConfig.cpp`, letting
+focused regressions execute the production projection without initializing GPU
+runners. Three existing nested-TP tests now call that projection instead of
+copying its implementation. The new binding tests are registered in both Unit
+and the explicit `V2_Integration_MoEPipelineStageRuntimeBinding` preflight entry.
+
+All **781 focused cases in 27 groups** pass. The **nine new cases pass 20
+repetitions (180 case executions)** and cover CPU/CUDA/ROCm topology metadata,
+single-device/TP widths, Off/Observe/Dynamic residency, nonzero stage origins,
+terminal auxiliary banks, foreign owners, changed destinations and incomplete
+installation. Exact original configuration validation fails two focused negative
+controls: it accepts model-wide expert inheritance and missing/swapped stage
+bindings. The current startup, factory and graph consumers compile. Build/link
+failures from the diagnostic harness's initial dependency/include setup are
+retained; the final combined build and test transaction passed.
+
+Evidence: `resource-growth-work/hybrid-stage-ownership-20261008/result-r12.json`
+and `all-focused-r25-full.log`. The receipt binds **99 candidate files** and
+revalidates all **290 unchanged qualified-source files**. No native/model test or
+new sanitizer execution is claimed by this slice. This remains focused evidence,
+not complete candidate preflight or hybrid inference certification. No commit or
+push was made; about **221 GiB** remains free.
+
+The caller audit redirects the earlier controller/replica task: the legacy host
+rebalance controller has no production construction site. The remaining target
+is the device-owned production startup path. Preserve authored PP through
+normalization, admit the complete pipeline through one PMA, construct each
+stage's runtime and publish `moe_pipeline_stage_bindings_`. **That producer is
+not implemented yet**, and the implicit MoE PP guard remains. Then qualify
+actual prefix payload movement and admission-only/failure cleanup, build the
+local Release overlay, complete both requested hybrid app sessions, and
+review/commit/push. The preceding goal turn was status-only; this turn produced
+production changes and reproducible regression evidence.
+
+## October 8, 12:21 UTC: residency planning and proposals authenticate their pipeline stage
+
+The residency authority now owns one exact global layer interval. Snapshot
+construction, frozen-window intake, transaction validation and authoritative
+export/adoption reject equal-shaped evidence from a different stage. Participant
+ownership and service/movement cost tables retain only compact owned rows;
+public plans, routing observations and migration records retain global model
+identities. Forecast updates and publication hysteresis use the same checked
+translation. Off, Observe and Dynamic maintenance all retain stage ownership.
+
+Distributed proposals derive their origin from the existing authenticated
+histogram metadata. Receivers require their admitted origin, without adding
+payload rows or packet bytes. The MPI publisher validates that origin at setup,
+send and receive; its consumer and startup call site compile. This turn does not
+claim live MPI proposal transport or complete hybrid inference.
+
+All **735 focused cases in 24 groups** pass. Five new cases each pass **20
+repetitions**, covering origins 0, 32, 40 and near the integer limit; actual
+observed decode/prefill/verifier batches; foreign/ragged cost evidence; temporal
+smoothing; and publication/follower adoption. The four authority cases also
+pass **20 AddressSanitizer repetitions (80 case executions)** without reported
+memory errors. The authority and fixture are instrumented; this is not a
+whole-program sanitizer build. Exact prior authority and decoder source fail
+three regressions normally. Two explicit ProductionTestPreflight registrations
+cover these defects. The first fixture build referenced a nonexistent histogram
+config field; ownership already owns its origin. The first economy oracle summed
+overlapping endpoint transfers; it now checks their actual critical path. Those
+failed attempts are retained alongside the corrected evidence.
+
+Evidence: `resource-growth-work/hybrid-stage-ownership-20261008/result-r11.json`
+and `all-focused-r24-full.log`. All **91 candidate source bindings** and all
+**290 qualified-source bindings** were checked. The earlier physical inbox and
+transport receipt remains source-identical. The broad r10 native prefill receipt
+has five changed source bindings and is historical evidence, not qualification
+of this combined candidate. No new native/model run occurred, and no commit or
+push was made.
+
+Remaining: stage-aware controller/replica consumers, authored PP preservation
+through startup normalization, and per-stage PMA-owned plan/authority/runtime
+bundles. The MoE PP guard remains until that implementation is complete. Then
+qualify actual prefix payload movement and admission/failure cleanup, build the
+local Release overlay, complete dense/MoE hybrid app sessions, and review/commit/
+push. The preceding goal turn was status-only; this turn produced code and
+reproducible regression evidence.
+
+## October 8, 11:51 UTC: stage routing and captured rebalance use compact runtime rows
+
+The local routing, rebalance and prefill consumers now obtain the runtime base
+from its first owned global model layer. Kernel commands retain compact storage
+rows; graph parameters, public runtime lookups and per-layer identities retain
+global model IDs. Routing preserves the all-layer selector. Rebalance preparation
+and capture admission reject foreign apply selectors or mismatched table geometry.
+Current-batch prefill additionally authenticates layer, expert and top-k geometry.
+Prefix rehydration uses the same checked row translation; real payload execution
+of that path still needs the combined Release/model qualification.
+
+The new device-free routing regression executes the production stage with a
+recording kernel and CPU-owned storage for both backend launch identities. It
+covers default/current/all/explicit selectors, nonzero and near-integer-limit
+origins, foreign rows and malformed geometry. It passes twenty repetitions; the
+original implementation fails by looking up model layer zero in a later stage.
+
+Two explicit native regressions cover CUDA and ROCm at stage origins 0, 32 and 40.
+Real prefill graph construction and mirrored-table preparation accept every owned
+row and reject foreign layer or shape bindings. A retained production rebalance
+graph collects exact changing demand at scales 1, 1000, 0 and 7; the same graph
+survives large-to-zero replay without stale counters. Both cases pass twenty
+repetitions (40 case executions), with a clean driver window and complete owner
+retirement. The original prefill and rebalance stage implementations fail both
+new regressions normally, without a native crash.
+
+Focused validation is **671 cases in 23 groups**, including the existing prefill
+capture-contract suite. The new routing, prefill-preparation and captured-rebalance
+regressions have explicit `ProductionTestPreflight` registrations. Evidence is
+`resource-growth-work/hybrid-stage-ownership-20261008/result-r10.json`,
+`hybrid-stage-prefill-native-20261008-r4/` and
+`hybrid-stage-prefill-original-20261008-r2/`. The 86 candidate source bindings and
+all 290 qualified-source bindings were checked. Earlier transport/inbox native
+proof remains source-identical. This is focused evidence, not combined preflight
+or a Release hybrid-model certificate.
+
+Remaining work is stage-aware residency/controller planning, authored PP startup
+normalization, per-stage PMA-owned plan/authority/runtime installation, combined
+qualification including prefix payload movement and failure cleanup, then the
+dense and MoE hybrid app runs. The MoE PP guard remains until its implementation
+is complete. No commit, push, Docker rebuild or new model stress run occurred.
+
+## October 8, 11:14 UTC: physical movement and mapped inboxes bind exact pipeline stages
+
+The immutable command batch now retains the fabric's stage origin. Acquisition,
+read-only scheduler predicates and every physical completion edge authenticate
+origin, row count, expert count and participant count before acknowledging work.
+Device commands keep compact rows. Physical owner endpoints, durable cycles and
+shadow-slot keys translate those rows once into global model layers; transfer
+bytes, command counts and device command ABI remain unchanged. Execution identity
+includes only the additional setup metadata, never model or cache payloads.
+
+Physical allocation-lifetime tracking now requires explicit immutable stage
+geometry, including ranks with no local expert allocations. Initial enrollment,
+wave admission, source lookup, staging, publication, abort and retirement reject
+foreign stages. The production fabric supplies that geometry from its admitted
+ownership. Mapped destination inboxes also reject foreign geometry before they
+claim a wave or publish descriptors, and stage identity remains required for reuse.
+
+All **566 focused cases across 21 groups** pass. Ten new device-free cases pass
+**20 repetitions** each, covering Dynamic, prepared-context restore, LLEP,
+no-movement receipts, near-limit origins, empty ranks and overlapping allocation
+lifetimes. Exact original physical-movement and lifetime implementations both
+fail the new regressions; their copied source bindings and failing results are
+retained. Three focused entries explicitly register these defects in preflight.
+
+Six native CUDA/ROCm cases pass **20 repetitions (120 executions)**, including
+two new stage-origin inbox cases, the two existing inbox controls and both
+captured service-publication cases. A fourth preflight entry registers the new
+native inbox proof. Complete driver windows and final GPU-owner retirement pass.
+Evidence: `resource-growth-work/hybrid-stage-ownership-20261008/result-r9.json`
+(**80 candidate files**, **290 qualified source bindings unchanged**) and
+`resource-growth-work/hybrid-stage-device-boundary-native-20261008-r1/controller.json`.
+These are focused device-free/native Integration results; combined canonical
+preflight and Release/model hybrid inference remain unverified.
+
+Remaining: local rebalance/routing/prefill row coordinates, stage-aware residency
+planning, authored PP preservation and per-stage PMA-owned orchestration bundles.
+Then verify native admission/failure cleanup, qualify the combined binary, run
+dense/MoE hybrid Release app sessions and review/commit/push. The prior status
+turn made no implementation progress; this turn produced code and native proof.
+
+## October 8, 10:53 UTC: stage-bound controller metadata and captured service publication proven
+
+The follower and activation transport now retain model-global layer identities
+while storing only the owned stage rows. Main-only, terminal NextN and nested
+stage families reject foreign or incomplete intervals; topology fingerprints
+include the origin. The exact original activation-manifest function fails the
+new regression because it emits zero-based layer IDs for a later stage.
+
+Controller runtime bindings authenticate the same interval as residency and
+runtime tables. Host bank publication translates compact recipe rows at the
+physical boundary. Controller fabric ABI 18 and service publication ABI 2 carry
+the origin in existing reserved metadata, without increasing record size,
+row counts or communication extents. Shared channel names, profile admission
+and telemetry decode distinguish equal-shaped stages. The current controller,
+follower, DGO, rank and orchestration consumers compile with the new interfaces.
+
+All **525 focused cases across 18 groups** pass. Ten new device-free cases pass
+**20 repetitions** each, covering depths 0–15, retained sidecar geometry,
+near-limit origins, foreign stages, malformed headers and unchanged storage
+extents. Graph-family, controller-fabric, service-decoder and native-publication
+regressions have explicit ProductionTestPreflight registrations; the existing
+stage-runtime entry also covers the two controller-binding regressions.
+
+The real CUDA and ROCm service publication kernels now have a captured replay
+proof for origins 0 and 32. Both cases pass **20 repetitions (40 executions)**;
+each case exercises both vendors and two advancing publications from the same
+retained graph. Driver diagnostics and final native owner retirement pass.
+The local sm_86/gfx906 compiler spill checks pass. This is scoped native
+Integration evidence; full shipped-architecture and combined Release/model
+qualification remain pending. No model or prefix payload hashing was added.
+
+Evidence: `resource-growth-work/hybrid-stage-ownership-20261008/result-r8.json`
+(**69 candidate files**, **290 qualified source bindings unchanged**) and
+`resource-growth-work/hybrid-stage-service-native-20261008-r1/controller.json`.
+The negative-control build initially mixed headers from two worktrees; its
+preserved r35 failure was resolved by compiling the exact original pure helper
+against the current descriptor. The expected failing helper regression is
+retained. A subsequent Doxygen-only header delta is recorded explicitly beside
+the native test's unchanged compiled-source receipt.
+
+Remaining: translate compact device movement commands into authenticated global
+physical layer identities; finish local rebalance/routing/prefill coordinates
+and stage-aware residency planning; preserve authored PP and install per-stage
+PMA-owned runtime bundles. Combined qualification, admission/failure cleanup,
+dense/MoE hybrid Release app sessions and feature-branch commit/push remain open.
+The last turn was a status-only no-progress turn; this turn produced code,
+focused regressions and native evidence. No image or model app was started.
+
+## October 8, 10:14 UTC: dense pipeline admission fixed natively; MoE runtime construction binds its stage
+
+The first dense hybrid Release startup failed before readiness: its captured
+transport recomputed the global 512-row ceiling after PMA had admitted only
+128 resident rows. It requested 10,489,856 host staging bytes against 2,629,632
+admitted. The candidate now uses the initialized arenas' common admitted
+capacity and rejects unequal stage geometry. No reserve or timeout was enlarged.
+
+The native negative control reproduces the same PMA failure. The corrected
+production pipeline passes all **16** captured cross-vendor numerical cases:
+both vendor orders, one/two participants per domain, ordinary/dynamic MTP, and
+256/128 admitted rows. Requests exercise chunked prefill, exact stochastic token
+oracles, continuation, reset, KV payloads and exact physical-memory claims. All
+eight added cases are explicitly registered in ProductionTestPreflight. The
+first regression fixture omitted the root plan's admitted row count; production
+already publishes it. That failed receipt remains beside the corrected proof.
+The original negative control exits with SIGSEGV after reporting its expected
+admission failure; the repaired cases retire normally and driver checks pass.
+Evidence: `resource-growth-work/hybrid-channel-capacity-native-20261008-r2/proof.json`.
+
+Qwen MoE runtime construction now derives its global origin from the authored
+PP stage and uses compact storage counts for main, transient prefill and MTP
+tables. Durable parents cover the complete owned placement manifest, including
+terminal NextN banks; children cannot exceed it. Foreign-stage plans fail before
+scratch allocation. Runtime keys and graph rebalance identities include stage
+geometry, reused tables must match it, and fixed projection bindings and prepared
+transfer-format discovery iterate only owned global layers.
+
+All fifteen focused groups pass **467** tests. Four new device-free construction
+cases pass **20 repetitions** each, covering both inert GPU identities, nonzero
+and near-limit origins, parent/child NextN geometry, invalid/foreign intervals,
+and unique device/stage/role/depth identities. Their production recipe is tested
+without allocating mirrored GPU owners. An initially incomplete fixture plan
+was rejected by ordinary plan validation; the final fixture supplies the complete
+production-shaped plan. The focused construction cases have an explicit preflight
+entry. Source-bound evidence is `resource-growth-work/hybrid-stage-ownership-20261008/result-r7.json`
+(**52 candidate files**); all **290** qualified c20 source bindings remain unchanged.
+
+This is focused Integration/CPU evidence, not native MoE or a new Release-model
+certificate. Stage-aware controller/epoch/service and follower wiring, residency
+planning, per-stage orchestration bundles, native dry-run cleanup, actual dense
+and MoE hybrid app sessions, complete candidate qualification and commit/push
+remain open. No new model session or Docker image build was started in this slice.
+
+## October 8, 09:23 UTC: compact runtime tables and stage-bound prefix archives proven locally
+
+The isolated hybrid candidate now binds runtime tables to immutable global layer
+intervals while keeping their arrays compact. Placement access, fixed down banks,
+initial-state replay, request reset and histogram capture/restore use checked
+stage coordinates. Async histogram admission rejects foreign geometry before
+querying or rotating any device bank. Child telemetry views address their owned
+interval in the canonical parent's storage; native GPU proof remains pending.
+
+Portable prefix runtime archive v6 carries global layer IDs, and its schema version
+is part of immutable cache compatibility metadata. The real Qwen serializer now
+checks the entire archive's syntax, table identities and layer geometry before
+restoring tables. Duplicate tables, foreign later rows, obsolete versions,
+truncated suffixes and trailing bytes leave live tables unchanged. Runtime-level
+restore also validates all row identities and shapes before mutating an earlier
+row. No model or prefix payload hashing was introduced.
+
+All fifteen focused groups pass **463 tests**, including eleven new cases. The
+seven stage-runtime tests, three real graph codec tests and one fixed-projection
+binding test each pass **20 repetitions**. CPU execution and inert CUDA/ROCm
+metadata cover ordinary, nonzero and near-limit stage origins; this does not
+certify native GPU telemetry or hybrid inference. Two explicit preflight entries
+register runtime and prefix-archive coverage; fixed projection coverage joins the
+existing stage-residency entry. The source-bound receipt is
+`resource-growth-work/hybrid-stage-ownership-20261008/result-r6.json`, with
+`all-focused-r16-full.log`; it binds **50 candidate files**. All 290 qualified
+c20 production source bindings remain unchanged.
+
+Remaining work is graph-owned table construction, device controller/epoch and
+service bindings, stage-aware residency controller planning and orchestration
+bundles. MoE PP admission remains guarded. Native admission-only cleanup,
+dense/MoE hybrid inference, complete candidate qualification and commit/push are
+still open. This slice started no model run, image rebuild or remote publication.
+
+## October 8, 08:43 UTC: compact stage residency and physical CPU waves proven locally
+
+Participant banks now bind an immutable global layer interval and retain only
+owned rows. Registration, missing-layer diagnostics, service imports, migration
+preparation, epoch publication, reusable seals and prepared-context rebinds use
+checked global-layer lookups. Same-sized foreign owner maps, snapshots, manifests
+and banks are rejected; physical admission rejects a foreign stage before any
+shadow memory is claimed. The CPU service measurement consumer and the local
+expert stage use the same bank access contract.
+
+All thirteen focused groups pass **337 tests**, including ten new residency and
+physical-fabric cases. The eight stage bank/registry/migration cases and the two
+physical admission/transfer cases each pass **20 repetitions**. Real CPU copies
+cover every **21 quantized formats plus FP16/BF16/FP32**, origins 32 and 40, two
+owned layers and one shared shadow slot per participant. Complete move/restore
+cycles preserve exact prepared bytes, retire through both admission fences,
+retain bounded PMA claims and produce valid reusable-context seals. GPU bank
+identities and both movable projection families are exercised as device-free
+metadata; this does not certify native GPU publication.
+
+The new CPU fixture initially polled individual operations serially, starving
+the whole-wave launch barrier. It now uses the production composite transport.
+Its next attempt correctly hit the fatal retirement guard because the fixture
+omitted the two-phase grace period; the test now proves active-reader deferral
+and both fences before retirement. Both failed logs and the confirming backtrace
+remain in the evidence directory. No production timeout or execution mode was
+changed to make those tests pass.
+
+The production local-expert stage, factory and orchestrator compile with the
+candidate interfaces. Two explicit ProductionTestPreflight registrations cover
+stage residency and physical residency. Evidence is bound to **44 candidate
+source files** in `resource-growth-work/hybrid-stage-ownership-20261008/result-r5.json`
+and `all-focused-r14-full.log`. All 290 qualified c20 production source bindings
+remain unchanged. This remains focused local evidence, not complete canonical
+preflight or native hybrid certification.
+
+Next work is device runtime tables, controller/epoch state, stage-aware residency
+planning and orchestration bundles. MoE PP admission remains guarded. Native
+dry-run cleanup verification, actual dense/MoE hybrid inference, final candidate
+qualification and commit/push remain open. No model run, image rebuild, commit,
+push or remote CI was started in this slice.
+
+## October 8, 07:54 UTC: stage-local model admission and calibration proven locally
+
+The isolated hybrid candidate now admits compact nonzero-origin GGUF manifests,
+prepared-weight BOMs and reusable transfer directories. Capacity installation
+rejects a different stage even when its row count and tier geometry match.
+Factory metadata and placement resolution retain only the requested main-layer
+interval; routed NextN banks belong solely to the terminal stage. Serial, retained
+MTP-off, fixed depths 1/15 and dynamic policies cover fifteen stage/policy cases.
+Calibration classes, prepared evidence, rank merges and certified service/migration
+profiles retain global layer IDs while their storage contains only owned rows.
+
+All twelve focused groups pass **294 tests**, including thirteen newly added
+stage regressions. Capacity tests sweep the source-format catalog across CPU,
+CUDA and ROCm, both movable projection families, and ordinary/nonzero/near-limit
+origins. Equal-sized foreign-stage evidence, missing rows and invalid intervals
+are rejected. Five additional focused ProductionTestPreflight entries register
+capacity, GGUF manifest, MTP admission, calibration and economy coverage. The
+production factory and orchestrator compile against the candidate interfaces.
+
+This remains focused model-free evidence, not full canonical preflight or native
+hybrid certification. The first local calibration run linked an old evidence-
+merger object; rebuilding that dependency clears both failures. A subsequent
+new directory test incorrectly supplied changing matrix shapes to a directory
+whose contract requires fixed shapes; its corrected fixture preserves that
+contract while retaining heterogeneous-shape BOM tests. Both failed logs remain.
+The final complete native output and all source bindings are retained in
+`resource-growth-work/hybrid-stage-ownership-20261008/result-r4.json` and
+`all-focused-r8-full.log`. Qualified c20 production source bindings still match.
+
+Next work is stage-local runtime tables, participant banks, controller/epoch
+state and orchestration bundles. MoE PP admission remains guarded until those
+production owners exist. Native dry-run cleanup verification, actual dense/MoE
+hybrid inference, complete candidate qualification and commit/push remain open.
+No model run, image rebuild, commit, push or remote CI was started in this slice.
+
+## October 8, 07:15 UTC: compact stage planning and histogram transport proven locally
+
+The isolated hybrid candidate now preserves model-global layer identities through
+compact expert-placement quotas, incumbent/cost-driven planning, histogram RCU
+banks and retained MTP phase topology. Frozen demand and transaction packets bind
+the stage origin; histogram ABI v4 rejects equal-sized foreign-stage data and old
+packets. No preceding-stage rows are allocated or communicated by these paths.
+The serving candidate is still the qualified c20 local overlay; its bound source
+files remain unchanged. Hybrid MoE runtime admission is not enabled yet.
+
+Seven focused local groups pass 161 tests, including ten new stage cases. A
+nonzero-origin concurrent routing/rotation test passes 20 repetitions. The test
+build recompiles changed implementations and their residency/calibration callers
+together, using unchanged qualified-core dependencies. This is focused evidence,
+not full canonical preflight or native hybrid certification. Early mixed-object
+and diagnostic-message failures are retained in the result directory; the final
+seven-group CTest receipt is green. OrchestrationRunner also compiles against the
+candidate headers; the dry-run lifecycle fix still needs rebuilt-native evidence.
+
+The work exposed a separate quota-validator defect: a ragged tier's missing row
+was read even after geometry validation recorded an error. AddressSanitizer
+reproduces a heap-buffer-overflow in the original validator and observes a clean
+rejection in the repaired candidate. The regression covers both whole-model and
+stage-offset plans and has its own ProductionTestPreflight registration,
+`V2_Integration_MoERaggedQuotaValidation`, alongside the stage planning/histogram
+entries.
+
+Evidence: `resource-growth-work/hybrid-stage-ownership-20261008/result-r3.json`,
+`all-focused-r4.xml`, `quota-asan-proof.json`, and
+`resource-growth-work/hybrid-progress-20261008.json`. Remaining work is the stage
+mapping in model catalogs, capacity resolution, device runtime/controller state
+and orchestration bundles, followed by complete candidate qualification and real
+dense/MoE mixed ROCm/CUDA inference. No commit, push or remote CI action occurred.
+
+## October 8, 06:40 UTC: bounded telemetry qualified; hybrid admission and lifecycle followup
+
+The incremental local qualification completed all 723 Unit and 839 preflight
+registrations, retaining unchanged passes for the CMake-only repair. Release
+was rebuilt incrementally and copied into the existing develop-image overlay
+`c20f470baa4019dddb05a9c5097f7fa230771abf3a35f0e6453fe5f7a570aeb0`.
+Both exact Qwen3.6 MoE whole-expert dynamic-MTP HTTP cells pass 45/45 checks.
+Their bounded native movement counters join the complete terminal histories:
+46 CUDA and 50 ROCm publications. These cells exercise native load-spread
+movement, not a positive topology-wide controller journal. Original failed
+local-wrapper evidence is retained: the wrapper initially omitted the canonical
+private model-tmpfs publication step. The corrected run uses that existing
+publication authority and has clean native retirement and driver evidence.
+
+Dense hybrid admission now preserves one MPI rank owning both authored TP
+stages. The local launcher previously inherited the host's two-rank bootstrap,
+so an extra rank attempted an unrelated full-model admission on CUDA. Its
+explicit `--mpi-procs 1` contract and seven local regressions now pass. The exact
+ROCm-then-CUDA pipeline admits all 262,144 context tokens with default dynamic
+MTP, 16 GiB RAM prefix storage per participant and a shared 32 GiB disk budget.
+This is admission evidence only; no hybrid app session has run yet.
+
+The successful dry run exposed a production cleanup defect: admission-only
+initialization shared the inference-ready boolean and then attempted to seal
+unprepared model weights. The isolated candidate now uses one typed completion
+authority for admission versus inference, rejects implicit promotion, and gates
+prepared retention and inference shutdown on actual inference readiness. Five
+focused lifecycle cases pass and the changed production orchestrator compiles
+with the qualified build's options. Native verification of this new fix is
+still pending; the earlier admission receipt's error log remains intact.
+
+Hybrid MoE work also now has compact stage-scoped ownership tables that retain
+global model-layer IDs without padding earlier stages. All 16 owner-map unit
+cases pass, including five new cases and 54 backend/order/layer combinations.
+The two new invariants are registered explicitly in ProductionTestPreflight.
+The candidate still needs stage-scoped planner/catalog/histogram/controller
+integration and runtime bundles; the MoE admission guard remains in place.
+These candidate changes are isolated from the qualified source. No commit or
+push has occurred.
+
+Evidence: `controller-counter-incremental-coverage-20261008-r2/`,
+`bounded-counter-native-release-20261008-r2/`, `dense-hybrid-admission-20261008-r3/`,
+and `resource-growth-work/hybrid-stage-ownership-20261008/result-r2.json`.
+`resource-growth-work/hybrid-progress-20261008.json` records outstanding work.
+
+## October 8, 05:38 UTC: fixture dependency repaired; remaining native gates running
+
+The current build passed all 723 Unit registrations and 417 of 418 host
+preflight registrations. The new C++/Python movement transport check failed
+before execution because its direct Python CTest registration did not make the
+canonical preflight build depend on its native fixture. It now uses the shared
+`add_v2_test` registration. Building only the canonical gates produced the
+previously absent fixture; the focused regression passes. Executable metadata
+and semantic CTest comparisons prove that every retained passing test is
+unchanged. No completed long app session or unaffected host test is repeated
+for this registration repair.
+
+The original failed transaction remains intact. Separate incremental local
+coverage retains those 1,140 passes, adds the repaired test, and runs the complete
+unrun CUDA, ROCm and exclusive lanes. One local observer initially classified
+regenerated `compile_commands.json` as a binary; it stopped before any GPU work.
+Its failure is preserved, and the corrected observer tracks executable files.
+This evidence is explicitly local qualification, not a fabricated canonical
+full-transaction or published-image certificate.
+
+The owner then incrementally builds Release and creates a copy-only overlay
+from the existing develop image. A live-process-authenticated queue admits two
+exact canonical Qwen3.6 MoE whole-expert HTTP cells only after qualification.
+Their short-request policies require real economical movement; the independent
+retirement audit checks each rank's full movement sidecar and all bounded
+counter families. The four completed OpenCode app receipts remain unchanged.
+The hybrid MoE stage ownership implementation and commit/push remain pending.
+
+Evidence: `controller-counter-qualification-20261008-r1/`,
+`controller-counter-incremental-coverage-20261008-r2/`, and
+`bounded-counter-native-release-queue-20261008-r1/`. The reviewed source delta is
+bound by `resource-growth-work/ci-followup-candidate-20261008-r8.json`.
+
+## October 8, 04:58 UTC: controller movement evidence bounded and independently verified
+
+The remaining topology-wide controller counter conversion is complete. An
+unchanged original publisher produced 15,360 wave/capacity rows for 512 waves
+across three participant labels, before its per-edge rows. The replacement
+retains all twelve wave/edge families in 36 fixed rows. The typed completed
+receipt preserves actual bytes, base/candidate epochs, policy economics,
+physical capacity certification and exact edge identity. Both the native C++
+parity fixture and the Python HTTP consumer check the complete ordered history.
+Followers retain physical receipts without acquiring leader-owned economics.
+Policy cycles and physical circuits are counted separately because physical
+projection can merge policy cycles sharing participants.
+
+Validation passes: 64 focused native tests, 729 Python tests across 26 modules,
+and two cross-language tests consuming the actual C++ counter/JSON export.
+Negative cases cover missing interior waves with equal totals/extrema, adjacent
+uint64 IDs, wrong actual bytes, invalid capacity/economy, missing or duplicated
+rank evidence, and later valid terminal waves beyond the HTTP cutoff. The
+changed controller, server and native publisher translation units and the real
+node-overlay parity fixture compile with the qualified build's options. New
+focused preflight entries register this coverage explicitly. These are
+metadata-only diagnostics; a complete rebuilt binary still needs qualification.
+Evidence: `resource-growth-work/controller-movement-bounded-20261008/result-r5.json`
+and `resource-growth-work/ci-integration-focused-tests-20261008-r8/result.json`.
+
+The four completed app runs remain green on `fc98`. Their exact qualified source
+is preserved at `resource-growth-work/fc98-qualified-source-20261008` before
+promoting the reviewed followups into the feature worktree. No original app,
+resource, driver or archive evidence is removed. The next action is the local
+incremental build and complete Unit/preflight refresh, then a focused native
+movement/terminal-export proof. The hybrid launch remains held pending real
+stage-scoped MoE ownership. No commit, push or remote CI action has occurred.
+
+## October 8, 04:09 UTC: all four app cells passed; native movement counters bounded
+
+All four requested homogeneous OpenCode app lifetimes passed the independent
+completion audit on the locally qualified sparse-checkpoint Release overlay
+`fc98a6799ad78a62159fae003c3d894025e073060be6ea7b00163a1e819f1010`.
+Each completed all ten phases with default dynamic MTP, PMA-admitted maximum
+context, 32,768 output tokens, 16 GiB RAM prefix cache per participant and a
+shared 32 GiB disk tier. The exact client requests were preserved. All native
+parsing, graph/MTP, resource, driver, archive and native-shutdown checks pass.
+This is local qualification, not a published-image certificate.
+
+| Model / TP backend | Responses | Tool errors / attempts | Token reuse | Mean / median TTFT | Workload |
+|---|---:|---:|---:|---:|---:|
+| Qwen 3.8 dense / CUDA | 58 | 0 / 112 | 92.30% | 12.55 / 3.61 s | 56.6 min |
+| Qwen 3.8 dense / ROCm | 95 | 0 / 129 | 96.29% | 39.28 / 20.14 s | 146.7 min |
+| Qwen 3.6 MoE / CUDA | 220 | 3 / 226 | 97.08% | 5.44 / 3.44 s | 49.4 min |
+| Qwen 3.6 MoE / ROCm | 236 | 4 / 235 | 98.47% | 21.30 / 14.60 s | 193.3 min |
+
+The final MoE ROCm app independently passes all 78 web-app acceptance checks;
+its authored suite also reports 114 passing tests. Its four model edit mistakes
+are 1.70%, under the strict 5% gate. The original report's strict task verdict
+remains false because it retains those errors; the authorized engine verdict is
+true. Dense ROCm and MoE CUDA app-quality failures remain visible. Across all
+cells, 609 HTTP responses and 702 tool attempts completed, with no engine/parser
+failures. The independent audit replays every resource journal and rechecks the
+exact exited Docker IDs. Evidence:
+`resource-growth-work/four-cell-completion-audit-20261008-r3/result.json`.
+
+The separate candidate now also fixes the native-load-spread transaction-key
+cardinality defect: 512 waves over three participant labels retain **12 rows**,
+versus **6,144** in the preserved original-publisher negative control. The
+canonical movement ledger retains actual physical receipts independently of
+leader economics, including transport followers. Clean server retirement emits
+a rank-owned terminal metadata sidecar. Bounded wave/edge witnesses are joined
+to this full history before an earlier HTTP prefix is accepted. There is no
+cache/model payload I/O or hashing. Topology-wide controller positive
+movement/economy/capacity/edge families still need their corresponding conversion;
+the native change does not weaken those existing per-wave consumers.
+
+All **60 focused native tests** pass (six receipt/export, forty collector and
+fourteen bounded-counter cases). Five changed production translation units
+compile with the qualified build's options. A metadata-only C++ probe using the
+production journal/archive/publisher is independently checked by Python: four
+bounded rows cover three final waves while the HTTP cutoff contains two. Wrong
+actual bytes, a missing middle wave, a missing edge and a changed backend all
+fail. The candidate also passes **726 Python tests across 26 modules** in 15.05
+seconds. Explicit focused preflight registrations are added, but not yet
+configured/promoted into the serving build. Evidence:
+`resource-growth-work/completed-movement-publication-20261008/result-r4.json`
+and `resource-growth-work/ci-integration-focused-tests-20261008-r6/result.json`.
+
+The completed serving image/source and original receipts remain unchanged.
+Remaining work is the controller-specific positive telemetry conversion,
+reviewed candidate promotion and local rebuild/qualification, followed by the
+requested hybrid PP(TP(2xROCm), TP(2xCUDA)) cells after real stage-scoped MoE
+ownership exists. The old hybrid launch stays held. No feature commit/push,
+remote workflow, ruleset or release action has occurred.
+
+## October 8: three app cells passed; canonical CI candidate prepared
+
+The sparse-checkpoint Qwen 3.6 MoE 2xCUDA app completed all ten phases in
+49.4 minutes: 220 responses, 226 tool calls and three model edit errors (1.33%).
+Its engine/protocol, native-response, graph/MTP, resource, archive and continuous
+driver audits pass, with native exit zero and no surviving inference process.
+The generated app failed its independent quality checks; that remains visible
+and does not fail the authorized engine gate. Dense ROCm has also completed at
+262,144 context in 146.7 minutes: 95 responses, 129 tool calls, zero tool errors
+or native alterations, and clean runtime/resource/archive/driver retirement.
+Its authored-test discovery check failed because the model placed the tests
+under a package; that app-quality failure remains separate. Three of four new
+local Release-overlay cells are complete. MoE ROCm began after dense retirement.
+The serving source remains frozen.
+
+MoE CUDA reuses 97.08% of all prompt tokens (97.78% for ordinary turns), with
+mean TTFT 5.441 s and median 3.442 s. Its first post-compaction request restores
+4,096 of 17,772 tokens (23.05%) with 15.807 s TTFT, after both tiers reached
+capacity and disk evictions totaled 47.47 GB. The final metadata audit reports
+6,092 live payload files, no orphans and zero payload bytes read. Resource
+observations cover 553 samples; anonymous plus swapped memory peaks at
+2,043,412,480 bytes and each CUDA GPU at 22,273,851,392 bytes, within admission.
+The continuous driver window has 2,788 snapshots and no faults. This is live
+reuse evidence under churn; the matched replay owns the causal speed comparison.
+
+Dense ROCm's request 78 legitimately performed a 1,176.77-second prefill.
+At UTC midnight the real OpenCode client changed only the date in its first
+system message, invalidating the later causal state. The sparse 4,096-token
+checkpoint survived; 99,507 prompt tokens needed prefill. The turn completed
+naturally and later requests resumed cache reuse. Its exact prompt-mutation
+receipt is `qwen38-rocm-sparse/live-midnight-prefix-change.json`. No generation
+timeout, prompt rewrite or special client rule was introduced.
+
+The separate CI candidate now wires master-PR-only coding after both benchmark
+lanes. It derives 27 blessed canonical cells across two ISAs (54 jobs), preserves
+production placement and PMA context, independently validates every app/native,
+runtime/resource/driver/archive receipt, and rejects missing, stale or cancelled
+jobs. Release promotion requires the same complete coding proof. No workflow,
+ruleset, release or published-image matrix has been executed or changed remotely.
+The candidate passes 678 focused device-free regressions in 12.25 seconds.
+CMake contains explicit Unit/preflight entries for the new lifecycle/evidence
+checks; these candidate registrations have not yet been promoted/configured in
+the frozen serving build.
+
+Real model-free Docker probes additionally prove init signal forwarding and
+outer parent-before-child retirement. The first outer probe exposed case-varying
+Docker missing-object diagnostics; the final implementation uses exact daemon
+inventory instead of error-text parsing. The repaired native probe retires both
+containers in 1.53 seconds while preserving the interrupted job's failed verdict.
+A failed-create reply retains ownership, and worker cancellation is propagated
+before executor join. The original failures and their negative controls remain
+available. Every production device lease also checks native coding-owner
+inventory, so a cancelled runner cannot admit a successor beside a survivor.
+
+A second real Docker defect dropped fast helper output from attached streams
+despite exit zero. The helper now reads retained stdout/stderr after native
+retirement. Twenty real Docker repetitions preserve stdin, emoji text and both
+output streams. The exact serving image decoder re-audits the completed dense
+CUDA session: all 58 responses and 112 calls match. A small control-image build
+installs pinned OpenCode 1.18.34 over an existing local runtime; the non-root
+offline client probe passes with its complete XDG environment. No inference
+image was rebuilt. No cache/model payload hashing is used.
+
+Evidence is under `resource-growth-work/ci-integration-focused-tests-20261008-r5/`,
+`coding-outer-lifetime-proof-20261008-r2/`, and
+`prefix-checkpoint-app-20261007-r3/qwen36-moe-cuda-sparse/`.
+`resource-growth-work/ci-followup-candidate-20261008-r4.json` binds the reviewed
+candidate source deltas. The final MoE ROCm app, promotion/registration of the CI
+candidate, and hybrid MoE stage ownership remain outstanding. Nothing has been
+committed or pushed.
+
+An additional device-free production-coordinator regression exposes unbounded
+cross-rank transaction telemetry: 256 commands grow 13 records to 2,818 in the
+frozen implementation. The isolated candidate folds command/sequence identities
+into fixed-width ordered evidence and preserves exact retired work. All 34
+native coordinator tests pass; the HTTP graph consumer validates bounded
+families against an owner-wide contiguous retirement span, including large
+uint64 IDs after reset. Both producer and consumer have explicit preflight
+entries. The serving source and image remain unmodified; this focused native
+diagnostic links the changed publisher against the qualified shared core and
+does not constitute a rebuilt-image certificate. Evidence:
+`resource-growth-work/bounded-overlay-telemetry-20261008/`.
+
+The physical-fabric follow-up now bounds six lifecycle counter families; the
+no-movement controller publisher also retains numeric decision evidence without
+per-transaction keys. Negative controls extracted from the original publishing
+bodies retain 9,216 versus 18 physical rows and 12,288 versus six idle-controller
+rows for identical workloads. Ten native counter tests and seven production CPU
+fabric tests pass, including the complete weight-format sweep. The changed
+fabric and controller translation units compile against the qualified shared
+core. New focused preflight entries cover both fixes. This is device-free local
+evidence, not a native GPU movement run or a rebuilt-image certificate. The
+positive movement/economy/edge families and their strict per-wave consumers
+still need a coherent bounded conversion; other controller diagnostic keys are
+also under review. Evidence:
+`resource-growth-work/bounded-physical-telemetry-20261008/result-r2.json`.
+
+The independent four-cell completion audit revalidates all three retired cells,
+including native Docker identity/exit, exact app counts, full resource journals,
+MTP/graph policy, archive ownership and HTTP/driver observations. It binds the
+three test-only image-receipt differences to the subsequent green incremental
+qualification. Original cell receipts remain untouched. MoE ROCm remains pending;
+at 02:09 UTC it has completed 130 responses and six phases, with zero failed HTTP
+requests and 97.07% prefix-token reuse. Its live client events report three model
+edit mistakes in 130 tool calls, below the authorized 5% threshold; final wire
+and native validation still awaits retirement. Evidence:
+`resource-growth-work/four-cell-completion-audit-20261008-r2/result.json`.
+
+The next isolated follow-up also removes varying cadence sizes, service-snapshot
+counts/generations and physical polling counts from controller map keys. Completed
+prepared-context restoration remains distinct from useful optimization work.
+Twelve counter tests and seven real CPU fabric tests pass. Both changed host
+translation units compile, and the corresponding maintenance regression is
+explicitly registered for preflight. The positive movement/economy/capacity/edge
+publication families still require their coherent bounded consumer conversion;
+that proof has not been weakened. Evidence:
+`resource-growth-work/bounded-physical-telemetry-20261008/result-r3.json`.
+
+The final ROCm MoE run completed phase seven at 02:45 UTC (177 responses,
+175 tool calls, three model edit errors). Its next user phase appended messages
+without changing earlier client history, yet the Qwen template legitimately
+removed the previous turn's reasoning. Request 178 restored 93,568 of 151,227
+tokens and finished a 545.148-second prefill with 548.375-second TTFT. A separate
+metadata-only native-tokenizer probe reproduces all three observed prompt
+lengths and proves 93,591 common leading tokens: the cache restored the longest
+complete 64-token block, leaving only 23 reusable tokens. It therefore did not
+miss a reusable long prefix. No debugger or GPU instrumentation was used.
+Evidence: `qwen36-moe-rocm-sparse/live-phase-reasoning-prefix-change.json` and
+`phase-seven-prefix-diagnostic/` in the current app root.
+
+The movement-audit dependency review also found native-load-spread mirrors with
+transaction keys, and a canonical generation join requiring exact earlier edge
+identities even when shutdown records later legitimate movement. Three new
+adversarial regressions preserve that contract: equal totals/ranges cannot hide
+a missing middle wave, later terminal waves cannot replace earlier HTTP history,
+and adjacent uint64 identities beyond double precision cannot alias. All 21
+movement-ledger tests and the explicitly registered four-case
+`V2_Integration_MovementTransportHistoryEvidence` command pass. Production
+consumers remain unchanged pending a coherent bounded conversion; actual copied
+bytes must not be inferred from estimated edge sizes. Evidence:
+`resource-growth-work/movement-transport-history-contract-20261008/result.json`.
+
+A metadata-only negative control now also reproduces the native-load-spread
+publisher's growth: 512 waves and three participant labels create 6,144 retained
+rows from unmodified publishing bodies. The cardinality assertion fails as
+intended; no model or GPU path ran. This additional publisher must participate
+in the same bounded-history repair. The reproduction is preserved at
+`resource-growth-work/positive-movement-metadata-growth-20261008/result.json`.
+At 03:17 UTC the final ROCm MoE app has completed eight phases and 201 requests,
+with no failed/disconnected HTTP requests and four model tool errors in 198
+calls (2.02%). Its 92 authored tests passed at the end of the persistence phase;
+final independent engine/native/resource audits remain pending.
+
+## October 7: sparse checkpoint reuse and app-only measurements
+
+All four earlier app workloads have retired. Their strict native audit covers
+675 responses and 693 tool calls without argument or reasoning changes. Both
+dense apps passed acceptance; MoE app-quality failures remain separate from
+engine/protocol results. The last ROCm MoE driver's bookend log cursor was lost,
+so that old cell is not a complete certificate. The collector now journals the
+whole interval continuously and its focused lifecycle/rotation tests pass.
+
+A captured compaction transition retained 6,212 leading coding-prompt tokens
+but restored none; the summary request itself shares only three. The general
+recurrent checkpoint schedule now preserves aligned 4K, 8K, 16K and subsequent
+doubling frontiers, plus the existing pre-tail checkpoint. It adds at most six
+images at 256K context, uses existing PMA tier budgets and never reexecutes
+restored history. No OpenCode-specific engine logic or payload hashing is added.
+Metadata-only inspection measured approximately 95 MiB per MoE checkpoint and
+225 MiB per dense checkpoint per TP participant, making sparse writes necessary.
+
+The current incremental Integration build passes 14 focused CTest registrations,
+including restored-history RAM/disk churn, MTP off/fixed/dynamic scheduling,
+request measurement accuracy and TP/PP propagation. Native CPU/CUDA/ROCm prefix
+state and MPI coordination pass four further registrations with a complete,
+clean continuous driver interval. These are focused proofs, not renewed full
+candidate certification. Both paired incremental Release overlays are built and
+authenticated. A standalone decoder regression also passes after exporting its
+public JSON dependency; complete Unit/preflight targets are built.
+The new process-stats test needed its mock include directory registered.
+The first complete Unit run found three stale dynamic-tag assertions in two
+MTP suites. They now assert exact bounded sequence coordinates; both suites
+and focused preflight registrations pass. These test-only repairs preserve
+both serving image identities. The subsequent canonical transaction passed
+713 Unit, 394 host, 127 CUDA and 92 completed ROCm registrations before two
+more obsolete tag assertions failed in the shared native prefill test header.
+All six affected CUDA/ROCm registrations now pass with exact bounded-coordinate
+assertions. The original canonical receipt stays red. Separate incremental
+coverage now passes all 713 Unit and 815 preflight registrations, retaining
+unchanged completed cases and freshly running the six affected registrations,
+70 remaining ROCm and 129 exclusive registrations. Its continuous driver window
+is clean. No serving binary changed for these test-only repairs.
+
+OpenCode's optional `--measure-prefix-reuse` mode binds every sequential exchange
+to exact `/stats` request counters and wire usage. It reports ordinary,
+compaction and post-compaction TTFT/reuse separately, bounded tier occupancy and
+committed write/churn traffic including tool-execution intervals. Its real
+HTTP/SSE regression preserves request/response bytes. The matched Qwen 3.6 MoE
+2xCUDA replay now passes both policies with identical 4,313 committed token IDs.
+After compaction, sparse checkpoints restore 4,096 of 20,391 prompt tokens
+(20.09%) versus zero for the near-tail control. TTFT falls from 23.208 to 18.962
+seconds (4.246 seconds, 18.3%) in this single trace-enabled comparison. Cold
+prefill is effectively unchanged. Request-boundary RAM-cache peaks rise from
+14,771,847,168 to 17,366,568,960 bytes across both participants (2.42 GiB more),
+within the aggregate 32 GiB RAM capacity. This short replay does not exercise disk
+churn. Both lifetimes pass native-output, captured runtime/MTP, resource, archive
+metadata and continuous-driver audits with clean administrative shutdown.
+
+The current Qwen 3.8 2xCUDA app has completed all ten phases and all 78
+independent app checks in 56.6 minutes. Its 58 responses and 112 tool calls have
+zero tool errors or native argument/reasoning changes. Runtime graph/MTP,
+resource-growth, archive ownership and continuous-driver audits all pass, with
+clean administrative shutdown. This is one exact local Release-overlay cell,
+not a published image certificate or completion of the other model/topology cells.
+
+The app's real post-compaction request restores 4,096 of 22,164 tokens (18.48%),
+with 30.521 s TTFT, after the 32 GiB disk tier exercised eviction at capacity.
+The separate 96,490-token summary prompt restores zero and takes 240.906 s to
+its first token. Ordinary requests reuse 95.83% of prompt tokens, with mean TTFT
+8.149 s and median 3.533 s. All 58 requests together reuse 92.30%, with mean
+TTFT 12.548 s. The live transition proves retained reuse under churn; the earlier
+matched MoE replay owns the causal timing comparison. The final metadata audit
+finds 2,088 live payload files, no orphans and zero payload bytes read.
+
+Dense ROCm remains active at the model maximum of 262,144 tokens. MoE CUDA has
+started after dense CUDA's complete retirement, at its PMA-proven 195,328-token
+context; MoE ROCm is queued behind dense ROCm. Every app retains default dynamic
+MTP, 16 GiB RAM cache per participant and 32 GiB shared disk cache, and observes
+all requests without a generation deadline. Concurrent vendor-pool observations
+are stress evidence, not isolated throughput benchmarks.
+
+The observer's unrelated-process probes, unconditional NVIDIA telemetry on
+CPU/ROCm cells, failed collector retirement and suite-driver Docker COPY context
+have staged fixes with negative controls. A scoped one-shot observer authenticates
+both live native PIDs without errors. Failed-collector retirement passes 20
+repetitions (100 tests). A separate `resource-growth-work/ci-integration-source`
+checkout now holds these changes and the shared benchmark/app receipt validators;
+all 158 focused device-free harness/CI regressions pass there. The app validator
+also independently admits the completed CUDA app's full native coverage.
+Seven new Unit/preflight registration pairs are prepared; the active serving
+source stays frozen while the remaining cells run. Earlier local-driver mistakes
+remain failed artifacts. The three remaining fresh app cells, master-PR
+post-benchmark workflow wiring and hybrid MoE ownership remain outstanding.
+Nothing has been committed or pushed.
+
+Evidence: `parity-results/opencode-tool-calling/resource-growth-work/build/`
+(`sparse-checkpoint-all-focused.xml`, `sparse-native-checkpoint-20261007/`) and
+`app-only-scope-20261007/compaction-prefix-transition.json`.
+
+## October 7 13:44 UTC Release registration repair and new image
+
+The full HTTP-fix qualification passed all 703 Unit and 791 production-preflight
+registrations (371 host, 128 CUDA, 164 ROCm and 128 shared-device), without
+failures, skips or new driver records. Release then exposed two unconditional
+HTTP-affinity registrations referencing its intentionally omitted test target.
+The production registration module now follows target selection. A configure-only
+regression proves both native policies remain intact in Integration and are absent
+in Release; the old declaration fails the new Release control.
+
+Per the user's explicit instruction, the complete gate was retained rather than
+repeated for this test-only correction. Five focused CTest registrations pass,
+including both native affinity modes. Only three test/CMake files differ from
+the full-gate snapshot. The incremental Release build and local overlay
+`sha256:ff9bbf2ece7404474e6f392196ed45f89129e6cdcce830695f3382343dc10292`
+pass exact binary, native-loader and rebuilt prompt/parser probe checks.
+The Release core is `aa824b75b0924b5fd43f68143064cf24a8642ec226e6765a08115df91725f1f3`.
+
+`mtp-seed-http-registration-fix/` retains the old failures and names the inherited
+1,494-test gate separately from its focused recheck. Campaign PID 2948268 has
+started new-image context admission, followed by all four ten-phase app plus
+240-session OpenCode cells. Source remains frozen at 193 bound files. Hybrid MoE
+ownership remains unresolved; no commit or push has occurred.
+
+## October 7 12:45 UTC complete original cells and fresh HTTP qualification
+
+All four original server lifetimes and their parent controllers have retired.
+MoE CUDA completed ten app phases, all seven required tools, all 78 app
+acceptance checks, and 240 primitive sessions. Its original primitive result
+remains 239 protocol passes / one failure, with 149 task passes. The final
+native audit verified 1,204 responses and 1,043 tool calls without argument or
+reasoning changes; stats, runtime policies, archive storage, shutdown and GPU
+driver checks passed.
+
+The single failure was the harness treating OpenCode's completed Bash error
+for a model-authored missing working directory as a protocol defect. The actual
+client exited normally. Three real OpenCode 1.18.34 loopback reproductions cover
+an absent internal tool-output directory, an absolute workdir and a relative
+Unicode workdir. Commands never executed. The narrow classifier requires an
+exact authenticated workdir and the exact FileSystem.access NotFound diagnostic;
+changed input, identity, schema, continuation and unknown errors still fail.
+All 36 harness units and 20 repetitions of its focused preflight pass; the old
+implementation fails all six positive path/transport controls. A separate
+reassessment of retained evidence passes protocol while keeping failed tasks
+and unsuccessful Bash coverage. Original reports are unchanged.
+
+The first HTTP repair gate applied its source, then failed six 30-second Unit
+timeouts. The queued campaign was retired before any serving work. A complete
+unchanged Unit diagnostic subsequently passed, while process observations
+exposed under-reserved CPU work: the kernel sweep used 56 workers against a
+four-core reservation, and Python references created 182 threads against one
+core. CMake now shares one width with the compiled sweep and reserves its full
+physical demand; native numerical libraries use one worker for tiny reference
+fixtures. Four inventory/runtime regressions and their negative controls pass.
+No generation or test deadline was increased, and global concurrency remains
+unrestricted.
+
+Fresh owner PID 2702735 at `mtp-seed-http-requalified/run.py` authenticates 191
+source files and runs the complete 703 Unit + 791 preflight inventory before an
+incremental Release build, local image overlay and native probe qualification.
+Campaign PID 2821112 waits on that exact owner and then runs all four fresh
+cells with the explicit glob/grep/read final review. Six campaign-admission
+negative controls pass. Hybrid MoE admission remains unresolved. No commit,
+push, full dependency image build or new GPU profiler attachment occurred.
+
+MoE CUDA's terminal stats show 89.40% prompt-token reuse, 79.82% request hit
+rate, 83.38% MTP acceptance and 1,754 depth updates. Mean TTFT is 10.87 s,
+including 7.89 s queueing; weighted decode is 82.65 tokens/s and uncached prefill
+762.07 tokens/s. RAM is 92.71% full, disk 99.86%; no disk-to-RAM restores occurred
+in this MoE cell. All 7,987 HTTP responses at the final reset-epoch frontier are
+200. These are traced stress observations, not benchmark certification.
+
+Evidence: `opencode-bash-workdir-reproduction/`,
+`mtp-seed-http-followup/unit-contention/`, and `mtp-seed-http-requalified/`.
+
+## October 7 11:42 UTC complete ROCm MoE cell
+
+Qwen 3.6 MoE on two ROCm devices completed the full current-image cell and
+retired normally with Docker exit code zero. All ten app phases and all seven
+required tools were exercised; all 240 primitive sessions passed protocol and
+aggregate successful-tool coverage. The model's wrong-workspace app failure
+and 160 primitive task-quality failures remain recorded separately. They have
+not been relabelled as successful tasks.
+
+The complete native audit matched 1,268 responses and 1,133 tool calls with no
+argument changes or reasoning mismatches. Full workload statistics, captured
+execution/MTP/transfer policies, prefix ownership and capacity, metadata-only
+archive storage/compaction checks and the driver window all passed. The actual
+cell process has retired. This complete audit supersedes its partial frontiers.
+
+At the terminal stats frontier, prompt-token reuse was 91.23%, request hit rate
+80.99%, MTP acceptance 83.05%, and mean TTFT 16.19 seconds including 11.07 seconds
+mean queue time. Weighted decode was 25.26 tokens/s and uncached prefill 544.53
+tokens/s. The workload generated 270,420 tokens, with 1,951 dynamic-depth
+updates. RAM occupancy was 93.44% and disk 99.79%; disk-to-RAM restore remained
+zero for this MoE workload. The 16,754 completed HTTP responses at this reset
+epoch's final stats frontier were all 200. These are traced stress observations,
+not benchmark certification.
+
+MoE CUDA remains live in its primitive sweep (93/240 at observation). The HTTP
+repair/build controller PID 2340509 and next full campaign PID 2381938 still
+wait for its actual retirement and the original parent owners. Dense failures
+remain unchanged; the new source/image/full HTTP qualification and hybrid MoE
+support are still outstanding. Nothing has been committed or pushed.
+
+## October 7 11:33 UTC queued full HTTP campaign
+
+The next four-cell campaign is live as PID 2381938 at
+`mtp-seed-http-followup/campaign/run.py`, waiting for the exact HTTP build
+handoff PID 2340509. Its operation list is empty. It authenticates 33 local
+inputs and the observer replacement, requires the handoff's complete new
+Unit/preflight and Release overlay receipts, and rechecks CUDA context admission
+on that image before starting inference. Actual process/container/KFD ownership
+and the positively checked host-PID CUDA view guard GPU admission. No source
+has changed yet; all 185 active source and 18 original helper bindings match.
+
+The workload remains four real OpenCode 1.18.34 cells, each with the ten-phase
+Python app and 240 primitive sessions, all seven successful tools required,
+maximal admitted context, 16 GiB RAM per participant and 32 GiB shared disk.
+The reviewed explicit final-review prompt supplies concrete glob/grep/read
+operations. Rebuilt native probes own the new image's prompt/parser evidence.
+GPU profiling evidence is explicitly inherited only for unchanged GPU code and
+native DSOs; it is not presented as a fresh profile. Six device-free admission
+regressions pass, including changed-kernel, deleted-source, changed-runtime,
+changed-base-commit and incomplete-build negative controls. A stats-observer
+failure remains fatal to cell qualification while allowing an already completed
+app result and the separately declared primitive phase to be collected.
+
+MoE CUDA completed all ten app phases, all seven required tools, and all 78
+independent acceptance checks. Its task result still records three ambiguous
+edits and an incorrect result.txt marker. MoE ROCm retains its earlier wrong-
+workspace app failure. The primitive sweeps reached 223/240 ROCm and 49/240 CUDA
+sessions without protocol failures. Both remain live, without GPU driver
+findings. No generation deadline was introduced.
+
+Partial native audits now match 1,140 responses / 1,020 calls for MoE ROCm and
+336 responses / 304 calls for MoE CUDA, with no argument changes or reasoning
+mismatches. These frontiers supersede earlier partial counts. Live public stats
+show 91.64% / 94.79% prompt-token reuse, 83.06% / 86.22% MTP acceptance and
+16.49 s / 10.51 s cumulative TTFT for ROCm / CUDA. These include queue time in
+concurrent stress, and are not benchmark certification. RAM is 93.20% / 91.91%
+full and disk 99.75% / 99.81%; these MoE frontiers have no disk-to-RAM restores.
+The completed dense cells did exercise disk restores.
+
+Evidence is retained under `mtp-seed-http-followup/campaign/`,
+`mtp-seed-live-audit-20261007-1128-*`, and
+`mtp-seed-live-stats-20261007-1133/`. Workspace availability is approximately
+256 GiB, and completed duplicate client dependencies continue to be retired.
+The queued campaign will start its own cleanup observer after the prior owner
+retires. Both hybrid holds remain unresolved. Nothing is committed or pushed.
+
+## October 7 11:07 UTC guarded HTTP qualification handoff
+
+The local `mtp-seed-http-followup/run.py` handoff is running as PID 2340509.
+Its admission check authenticates the exact eleven-file repair, all 185 current
+source bindings, all 18 helper bindings, focused regression receipts, build
+tools, boot identity, and the four original container/process identities.
+It currently observes both live MoE owners and their two parent controllers;
+its operation list is empty and no source has been changed. A completed status
+file alone cannot start the transition.
+
+Once those actual owners retire normally, the handoff preserves the old source
+and both cores, applies the reviewed patches and observer adapter, runs the
+complete canonical Unit/ProductionTestPreflight transaction with driver-window
+evidence, builds Release incrementally, and creates a two-binary overlay on
+`ab29f1b5fb52`. Binary/loader authentication and the existing metadata-only
+prompt/parser controls follow. Required new registrations must appear as
+executed, non-skipped tests in the canonical JUnit evidence. It stops on any
+failed operation, without an automatic retry, and ends at `ready_for_http`;
+full live HTTP qualification remains a separate required stage. Both hybrid
+holds remain unresolved and it has no commit/push operation.
+
+The host-PID CUDA observer was positively checked against the live MoE server:
+NVML reported PID 2510082 on both CUDA devices, matching `docker top`. This
+prevents the devcontainer's incomplete process view from falsely admitting
+overlapping GPU tests. Evidence is in
+`mtp-seed-http-followup/host-pid-cuda-observation-proof.json`.
+
+The latest partial native audits matched 826 ROCm responses / 746 calls and
+175 CUDA responses / 167 calls, with zero argument or reasoning changes. These
+are cumulative partial frontiers, not additional independent samples to add to
+earlier partial audits. ROCm had completed 143/240 primitive sessions without a
+protocol failure; CUDA had completed nine app phases and was adding final
+edge-case tests at roughly 161,000 prompt tokens. There is no generation
+deadline. The active driver windows remain free of GPU findings.
+
+## October 7 10:41 UTC app results and HTTP follow-up
+
+Dense ROCm retired normally at 09:49 UTC. All ten app phases and all 78
+independent app acceptance checks completed. Its final native audit matched
+103 responses and 116 tool calls with no argument or reasoning changes. The
+cell remains failed: it omitted required `grep` coverage, and its original
+stats observer timed out after 1,801 observations. That observer exception
+prevented the primitive sweep from starting; no primitive pass is claimed.
+
+The supplementary observer retained 3,523 successful observations and a second
+five-second socket timeout at 09:44:59 UTC, during continuing decode. It
+journaled the failed poll immediately, continued observation, and retained a
+failed final result. The native handler took 0.3 ms after the delayed arrival.
+Both actual exceptions are now known; neither was a statistics-validation
+failure or a shutdown race. The delay's cause remains unproven. After dense
+ROCm retired, 720 paired workspace/host-loopback probes against the remaining
+servers all passed, with a maximum 7.2 ms response time. They did not reproduce
+the earlier two-ROCm-server contention window. Complete file-backed probe
+records are in `mtp-seed-http-timeout-transport/file-backed/`.
+
+The isolated HTTP placement repair now exercises the actual production
+listener and HTTP worker pool. All 24 focused executions across six placement
+configurations, all 30 combined server tests, and twenty repeated loopback
+executions pass. Omitting only the production listener's placement scope makes
+the real pool test fail. Evidence is in
+`mtp-seed-http-affinity-repair/production-listener/`. The nine-file HTTP/observer
+patch and separate explicit-review-prompt patch remain unapplied; full updated
+Unit/preflight, Release overlay and live qualification are still required.
+
+MoE ROCm has also completed all ten app phases and all seven required tools.
+The model created `/tmp/opencode-workspace-yfna1q35` instead of the supplied
+`/tmp/llaminar-opencode-workspace-yfna1q35`, leaving the expected app workspace
+empty. The independent launch consequently reports `No module named taskboard`.
+Its task result remains failed. The partial native audit matched 215 responses
+and 218 calls, including the misplaced-directory command, without changed
+arguments or reasoning. Its protocol/coverage gate passes, and 69/240 primitive
+sessions have completed without protocol failures. Dense CUDA completed all
+240 primitive sessions and retired normally. Its final native audit matched
+979 responses and 860 calls without argument or reasoning changes; workload
+stats validation also passed. Its app still lacks `grep`. MoE CUDA has started,
+passed ordinary/dynamic 512-token and stats controls, and completed five app
+phases with its admitted 195,328-token context.
+
+The exact eleven-file HTTP/harness transition is prepared in
+`mtp-seed-http-followup/transition.json`, including all 189 expected source
+bindings and the local observer-helper replacement. It remains unapplied.
+Subsequent Docker work explicitly uses `unix:///var/run/docker-host.sock`:
+the canonical delayed-output/exit-23 probe passes there, while the default
+socket truncated attached diagnostic output. Existing server evidence was
+retained through files and verified container exits. This separate Docker
+transport finding does not establish the cause of the HTTP stats timeout.
+
+After authenticating both dense containers' normal retirement and final
+metadata-only storage audits, 63.8 GiB of derived cache files were removed from
+the model-cache filesystem. Four complete metadata journals and the per-file
+retirement records remain in
+`workspace-cleanup-20261007/retired-mtp-seed-dense-caches/`. Payloads were never
+read, copied or hashed. An initial untranslated workspace mount was rejected
+before container creation; its failed receipt is retained, and the successful
+run uses the canonical Docker path resolver. The separate workspace filesystem
+still has approximately 258 GiB available.
+
+All 185 bound source files and 18 helper files still match the live candidate.
+No GPU driver findings have appeared, the hybrid MoE authority hold remains
+unresolved, and no commit or push has been made. The follow-up image must retain
+these failed receipts and rerun the required coverage on the repaired source.
+
+## October 7 09:02 UTC HTTP observation and CPU-affinity follow-up
+
+The unchanged `ab29f1b5fb52` candidate remains under the live TP2 campaign.
+Qwen 3.8 CUDA completed all ten coding phases and all 78 independent app
+acceptance checks. Its recorded tool transport passes, but it omitted `grep`,
+so the app coverage gate remains failed. Its 240-session primitive sweep is
+continuing. Both ROCm apps have completed eight phases; MoE CUDA still follows
+normal dense-CUDA retirement. The latest partial native audit joined 480
+responses and 476 tool calls with zero argument or reasoning changes. These
+observations do not replace the unfinished full-cell and retirement gates.
+
+An independent read-only stats audit matched native/SSE counters for 249
+completed requests. CUDA dense and ROCm MoE also matched all 192 retained
+per-request timing rows at those frontiers. Dense ROCm's original stats polling
+thread stopped after 1,801 observations at 07:57:34 UTC while inference kept
+progressing. Its actual exception remains pending until the original workload
+context exits. The nearby access log reports a 0.3 ms handler after a longer
+pre-handler gap; the original cause is not yet proven. A separate, read-only
+observer now retains later observations without changing the original result,
+resetting statistics, or interrupting generation.
+
+The old observer silently stopped on its first polling exception. The isolated
+replacement immediately journals failed polls, retains its failed qualification
+status, and continues scheduled reads of the same endpoint after transport
+errors. Invalid statistics still terminate observation. Ten device-free tests
+pass, including a real socket stall repeated twenty times; the old behavior
+fails that regression. Both Unit and focused ProductionTestPreflight entries
+are prepared. Evidence and the pending local helper replacement are in
+`mtp-seed-stats-observer-repair/`.
+
+Native scheduler masks also exposed an independent HTTP placement defect:
+ordinary listener/HTTP children inherited the OpenMP initial thread's first
+physical core despite a 28-place rank partition. Both ROCm servers shared that
+core. A scoped repair uses the admitted OpenMP partition for the HTTP listener
+and newly created HTTP children, preserves the existing inference worker, and
+restores the caller before shutdown. Eighteen native checks pass across bound
+and unbound modes, direct execution, and MPI placement on either CPU socket.
+The previous inheritance behavior fails the focused mask regression; the
+updated server translation unit compiles, and the combined 29-test HTTP server
+suite passes with that object. This has not yet been qualified in a new serving image and does not prove the cause of the original delayed poll.
+
+These follow-up changes remain isolated from the running candidate. The six-file
+`mtp-seed-http-affinity-repair/http-observer-fix.patch` applies cleanly to the
+active source and excludes the still-red MoE PP admission regression. All 185
+active source bindings and 18 helper bindings remain unchanged. Apply and
+qualify the HTTP follow-up only after the bound campaign owners retire. Keep the
+original dense ROCm observer failure and dense CUDA tool-coverage failure in the
+campaign evidence. Current runs now report actual SSD-to-RAM restores for both
+dense cells; no prefix payload hash or checksum pass was added. The live driver
+windows have no GPU findings; three unrelated AppArmor records remain visible.
+The next app-review prompt specifies concrete `glob`, `grep`, and `read`
+operations. All 34 existing harness regressions pass with that isolated prompt
+change; the current missing-`grep` result is retained.
+No commit or push has been made.
+
+## October 7 08:05 UTC live campaign and hybrid admission findings
+
+The repaired `ab29f1b5fb52` Release overlay remains under the three active app
+runs: Qwen 3.8 on CUDA2 and ROCm2, and Qwen 3.6 MoE on ROCm2. MoE CUDA follows
+normal dense-CUDA retirement. All three passed ordinary/dynamic 512-token and
+HTTP stats controls. The latest partial native-token audits matched 171
+responses and 185 tool calls with no changed arguments or reasoning. These
+partial audits do not certify the unfinished apps or primitive sweeps. The
+serving driver intervals remain clean; long tool arguments continue advancing
+in native token logs even while the client waits for a complete tool call.
+
+A device-free check of the queued hybrid command found two launcher defects:
+`--pp-stage` accepts inclusive ends, while the helper emitted half-open ends;
+and GPU declarations accidentally pinned NUMA node zero. An isolated helper
+corrects both, with nine passing regressions including real GGUF metadata and
+the actual parser/rank compiler at NUMA IDs 0, 1 and 7. The original homogeneous
+campaign's 185 source bindings and 18 helper bindings remain byte-for-byte
+unchanged. The repaired helper is not installed into those active bindings.
+
+After correcting the command, MoE PP still fails before inference because the
+current normalization cannot represent its pipeline expert ownership. The
+isolated `hybrid-admission-source` worktree now contains a focused
+`V2_Integration_AuthoredPipelineMTPAdmission` registration: 160 device-free
+cases cover both vendor orders, homogeneous pipelines, widths one/two, sparse
+NUMA IDs, MTP off, retained-capacity off, dynamic, fixed one and fixed fifteen.
+All 80 dense cases pass; all 80 MoE cases reproduce that exact ownership error
+in 0.076 seconds, with no skips. This is an expected-red regression, not a
+completed implementation or a new qualified binary.
+
+The idle hybrid handoff was retired through its authenticated PID handle after
+proving it had no children or GPU work. The original image waiter remains held.
+Homogeneous stress and completed-fixture disk cleanup continue. Hybrid execution
+now also requires the complete stage-scoped expert authority and physical-memory
+admission implementation; bypassing its current rejection would not satisfy
+that requirement. Evidence is in `mtp-seed-hybrid-admission-audit/`, with the
+explicit pending hold in `mtp-seed-hybrid-admission-hold.json`. No commit or push
+has been made.
+
+## October 7 completed baseline and capture-repair qualification
+
+All four original TP2 servers retired normally with clean driver intervals.
+The 960 primitive sessions passed protocol validation. Full native-token audits
+joined 4,363 responses and 3,822 tool calls with zero argument or reasoning
+changes. Dense CUDA and ROCm completed all ten app phases and all 78 independent
+app checks. Both MoE apps passed 77 independent checks but retained authored-test
+discovery failures; MoE CUDA also lacked a successful `glob` call. The original
+four-cell campaign therefore remains failed. No coverage requirement is waived.
+
+| Model / backend | Audited responses / calls | Primitive task passes / failures | Reused prompt tokens | Mean TTFT, including queue |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen 3.8 dense / CUDA2 | 949 / 843 | 220 / 20 | 83.16% | 20.89 s |
+| Qwen 3.8 dense / ROCm2 | 938 / 839 | 217 / 23 | 81.26% | 44.30 s |
+| Qwen 3.6 MoE / CUDA2 | 1,203 / 1,043 | 132 / 108 | 88.85% | 16.32 s |
+| Qwen 3.6 MoE / ROCm2 | 1,273 / 1,097 | 86 / 154 | 92.00% | 20.70 s |
+
+These figures describe the preceding binary, not the pending capture repair.
+Per-cell final receipts are `prefix-economy-*-cell-checkpoint.json`. Disk tiers
+filled and evicted metadata-backed entries, but these workloads recorded no
+SSD-to-RAM restore. They do not certify that separate restoration path.
+
+Dense ROCm's zero depth updates were an evaluated dynamic-policy hold at depth
+one: terminal snapshots show evaluated windows and learned-rule matches under
+bounds 1–15. Snapshot counts are observations, not independent policy windows.
+Its long delimiter task emitted incorrect literals in native text; the wire and
+client preserved those bytes. Neither observation establishes a parser defect.
+
+The publication-limit defect now reproduces on both backends and passes with
+the isolated repair. The changing-request-seed regression also reproduces on
+both backends against the preceding core. The combined fixes and narrow grep
+classifier change are applied to the feature worktree. Initial canonical
+qualification stopped during CMake configuration because two new device-free
+Integration registrations lacked `NO_MODELS`. That failed receipt is preserved;
+the declarations are corrected, and generated CTest metadata confirms the
+focused registrations are model-free preflight members. The next full gate
+passed all 701 Unit and 365 host-preflight registrations, then stopped on three
+CUDA registrations: stochastic MTP resolved request seeds but omitted them from
+scalar and batched device admission. The new verifier correctly rejected its
+zero-initialized seed bank with `InvalidRequestSeed` (error 17). ROCm's lane was
+interrupted by the CUDA failure; that interruption is not a separate failure.
+
+Four focused admission regressions reproduced the omission on the preceding
+core. Both callers now pass the already resolved seeds, and stochastic graph
+preparation checks descriptors against immutable admission metadata before
+capture. The four regressions and all 164 prefill/decode unit cases pass on the
+repair. CUDA and ROCm fixed/dynamic request-reset and retained seed-replay
+native gates also pass, with no skipped cases and clean driver intervals. The new focused registration is
+`V2_Integration_MTPRequestSeedAdmission` in ProductionTestPreflight. The failed
+canonical receipt and exact core remain under
+`mtp-seed-followup/admission-failure-20261007/`; focused evidence is under
+`mtp-seed-followup/admission-repair/`. The canonical rerun completed at
+06:50 UTC: 701 Unit and 786 ProductionTestPreflight registrations passed
+(366 host, 128 CUDA, 164 ROCm, and 128 shared-device/MPI). Its driver window
+contains no new records. All ten focused registrations retained their full
+execution logs: 20 test executions and zero skipped cases. These focused counts
+include intentionally shared fixtures, not 20 distinct tests. The incremental
+Release rebuild, local overlay `ab29f1b5fb52`, exact loader proof and parser/prompt
+probes have completed. All 96 paired native timing/oracle samples passed with a
+clean driver window. The first CUDA NCU attachment completed its oracle but
+raised six driver assertions in the driver's unsupported SM-throttle metadata
+query; that diagnostic remains failed, and further CUDA attachment is suspended.
+All 16 post-attachment unprofiled health cases passed with a clean driver window.
+The CUDA review uses native graph inventories and the final linked SASS/resource
+inspection, as required by the CUDA skill after an attachment failure. It does
+not claim clean CUDA hardware-counter or achieved-occupancy evidence.
+
+After correcting profiler-only visibility aliases, all 40 isolated ROCm profiles
+passed with clean driver windows. Native graph IDs, dispatch correlation, code
+object paths and candidate-only counters authenticate the rebuilt core, with no
+copies inside those captured graphs. Register counts, launch geometry, native
+occupancy capacity and intentional private storage are unchanged on both
+backends. The three paired samples per shape show at most 1.413 microseconds
+(1.307%) added to the rejection verifier; serial-equivalent medians are at or
+below baseline. Overlapping CUDA ranges do not prove a speedup. The reviewed
+kernel receipt explicitly retains the failed NCU attempt separately from the
+clean execution/ROCm windows. A stale duplicate kernel-field check in the local per-cell wrapper initially
+stopped three cells before any native work; its exact failed wrapper and reports
+are preserved. The cell now calls the shared kernel validator. Three focused
+caller tests reproduce the old failure, and all 37 local admission, cell,
+resume and handoff test executions pass after the fix.
+
+The completed six native CUDA admission cases prove dense context 155840 and
+MoE context 195328; each next 64-token bucket and model-max 262144 are rejected
+by capacity. The restarted HTTP owner explicitly authenticates and reuses that
+completed receipt. Dense CUDA and dense ROCm have passed their ordinary/dynamic
+512-token controls and entered the webapp phase. MoE ROCm is in its dynamic
+control; MoE CUDA follows dense CUDA retirement. The hybrid owner waits for all
+four complete HTTP cells, and duplicate dependency cleanup follows its lifetime.
+All four fresh HTTP cells and both `PP(TP(2xROCm), TP(2xCUDA))` models remain
+required. No full image certificate, commit, or push has been issued. The continuation keeps native-model context,
+16 GiB RAM per participant and 32 GiB shared disk prefix capacity, with no
+coding-turn deadline. Retired npm dependency cleanup recovered 13.03 GiB while
+preserving logs, generated apps, client databases and unauthenticated installs.
+
+## October 7 MoE app completion and authenticated grep failure
+
+Both MoE sessions completed all ten app phases and passed the 77 independent
+HTTP/Unicode/concurrency/persistence checks. Their final authored-test discovery
+failed because they placed tests outside the requested `tests/` directory. ROCm
+retained passing protocol and all seven successful tools; CUDA omitted `glob`,
+so its app remains a failed coverage gate. These task failures are retained.
+
+CUDA also produced an invalid regex escape in a `grep` call. Two native-token
+snapshot audits matched 594 responses and 554 calls with no changed arguments
+or reasoning. The failing regex is byte-identical in native text, HTTP and
+OpenCode input; standalone ripgrep reproduces its exact parse error. The
+isolated harness fix accepts only an authenticated full-pattern diagnostic and
+caret annotation, keeps it as a task failure, and cannot satisfy successful
+search coverage. Old-code negative controls fail as expected; both focused
+regressions and all 34 harness tests pass. The dedicated preflight registration
+is `V2_Integration_OpenCodeGrepRegexEvidence`. Saved original results are intact;
+read-only reanalysis still rejects CUDA's missing `glob` coverage.
+
+The waiting MTP refresh now includes this four-file harness patch after its
+22-file capture repair (25 unique files; 185 production/test inventory entries).
+The original native red/green owners and active binaries remain unchanged.
+Fresh homogeneous and hybrid drivers are queued against the exact next source
+and require a separate kernel qualification before HTTP admission. The local
+captured-verifier probe compiles against both preceding and repaired interfaces,
+with no GPU symbol interposition; 96 counterbalanced native timing/oracle
+samples are queued after the rebuilt Release prerequisite gate. Profiler
+attachment, economy review, all fresh HTTP cells and hybrid inference remain
+pending. No commit or push has occurred. See `mtp-seed-followup/checkpoint.json`
+and `opencode-grep-followup/` for retained local evidence.
+
+
+## October 7 request-seed capture reuse follow-up
+
+The completed dense CUDA inventory also contains 950 stochastic-outcome graph
+materializations per participant, alongside 949 workload responses and the
+earlier dynamic control. Source inspection identifies the second request-varying
+capture scalar: the outcome stage stores each resolved request seed by value.
+The existing admission path already publishes an arena-owned
+`SAMPLING_REQUEST_SEEDS` bank. The isolated `mtp-seed-source` change connects
+both verifier laws to that bank; its address participates in graph identity,
+while changing seed contents does not. Zero seed data fails on device, and
+ambiguous scalar/device seed bindings are rejected. No extra transfer or
+allocation is introduced into captured execution.
+
+Two device-free recording-backend tests pass. The native sweep now changes both
+seed words, rejects zero seed data, recovers on the next replay, and retains the
+same graph over both laws, five top-k widths and every depth 1–15. The public
+pipeline proof now retains publication, outcome and parent counts across twenty
+changing-seed request resets, as well as within streaming chunks. Five focused
+seed/reset preflight registrations complement the original publication gates.
+All eleven isolated translation-unit checks pass, including CUDA sm80/86/89/90
+and ROCm gfx906 with the canonical spill policies. Compiler/ISA evidence reports
+zero register spills; runtime profiling and native execution remain pending.
+
+The original homogeneous cells and publication red/green owner are unchanged.
+Four idle downstream publication waiters were retired before doing work.
+`run-mtp-seed-native-red.py` follows the original native proof and uses the old
+core plus only the publication fix, isolating the new cross-request regression.
+`run-mtp-seed-refresh.py` then admits the combined 22-file patch, complete
+Unit/preflight and incremental Release overlay against a 185-file source
+inventory. Its terminal state requires kernel profiling before a fresh full
+HTTP campaign. The earlier HTTP/hybrid waiters are superseded, and the original
+hybrid qualification hold remains unresolved. See `mtp-seed-followup/` and
+`mtp-seed-refresh-intent.json`. No new image or model pass is claimed yet,
+and nothing has been committed or pushed.
+
+
+## October 7 dense CUDA complete on the archive-economy candidate
+
+The complete dense CUDA cell on image `76a30339ee73` passes its engine and
+protocol gate: ten app phases, all seven required tools, 78 independent app
+checks, and 240/240 primitive protocol sessions with successful coverage.
+Twenty primitive sessions retain model task failures; 220/240 pass their
+task checks. The terminal native audit joins 949 responses and 843 calls
+with unchanged arguments and reasoning. Stats accounting, the 512-token
+ordinary/dynamic controls, runtime checks, archive storage, driver checks
+and normal container retirement all pass.
+
+Terminal prefix token reuse is 83.155%, request hit rate is 74.289%, and MTP
+acceptance is 82.368%. TTFT averages 20.891 seconds including 16.257 seconds
+of queue time during the concurrent primitive sweep; the last TTFT is
+1.871 seconds. RAM and shared disk occupancy are 98.303% and 99.794%.
+All 39 metadata compactions copy zero payload bytes. The retired archive
+audit reads no payload bytes and finds no orphan payload files.
+See `prefix-economy-dense-cuda-cell-checkpoint.json`.
+
+MoE CUDA has started on the cleanly released pair. The original dense ROCm
+primitive sweep and MoE ROCm final app review remain active. This completed
+cell does not qualify the isolated MTP publication capture repair; its native
+proof, full prerequisites, rebuilt Release workload and hybrid workloads
+remain pending. Nothing has been committed or pushed.
+
+
+## October 7 dense ROCm app milestone
+
+Dense ROCm has passed all ten app phases, all seven required tools and all
+78 independent app checks. Its complete app history joins 68 responses and
+109 tool calls to native tokens with unchanged arguments and reasoning.
+No OpenCode compaction was needed. Dense CUDA's earlier full app pass remains
+valid for this same image; both 240-session primitive sweeps remain incomplete.
+See `prefix-economy-dense-rocm-app-checkpoint.json`. MoE ROCm is still working
+on persistence, and MoE CUDA has not started.
+
+The saved observer history also proves that the stats endpoint remained
+responsive throughout MoE's long request: 406 observations, 2.102 ms mean,
+2.360 ms p95 and 4.395 ms maximum HTTP latency. Request age increased
+monotonically across setup, prefill and decode; the largest gap between polls
+was 1.009 seconds. No additional requests or GPU instrumentation were needed
+for this audit. See `long-prefill-0146-diagnostic/stats-responsiveness.json`
+under the MoE ROCm cell. These are live observations of image `76a30339ee73`,
+not qualification of the pending MTP capture repair.
+
+## October 7 long-prefill diagnosis
+
+MoE ROCm request 146 completed normally after a 388.951-second prefill.
+The native renderer/tokenizer probe found 139,434 prompt tokens and a
+97,491-token common prefix with request 145. Its 64-token checkpoint boundary,
+97,472, exactly matches the production cache restore. The HTTP history was
+append-only, but the Qwen template removes earlier reasoning after a later
+user message; that render change starts at the prior app phase. The remaining
+41,962 tokens required prefill. This proves reuse of the checkpointable prefix
+shared with the immediately preceding request, not optimal reuse across all
+historical branches.
+
+The terminal stats observation reports 391.827-second TTFT, 0.023-second queue
+time and a normal HTTP 200. Request 147 then restored all 139,434 tokens from
+the preceding prompt and prefilled in 12.590 seconds. No debugger, profiler,
+restart, generation deadline or cache-payload scan was used. Evidence is under
+`native-opencode-qwen36-moe-rocm-prefix-economy-shared-archive/long-prefill-0146-diagnostic/`.
+This is expected template behavior, not a newly established cache defect.
+
+## October 7 streaming publication capture regression
+
+The fresh workloads exposed unnecessary MTP publication recapture: the
+controller-owned publication graph retained `max_state_commit_rows` from the
+host compact-outcome plan, although its kernel derives the live commit limit
+from the device response ledger. Streaming boundaries changed that unused
+scalar and invalidated publication and the complete parent. A live sample
+observed 452/608/1,521 publication materializations per participant in dense
+ROCm, MoE ROCm and dense CUDA respectively. These are inventory observations,
+not a measured latency attribution or evidence of token corruption.
+
+Work is isolated in `parity-results/opencode-tool-calling/mtp-publication-source`;
+all 176 files bound to the active source and image remain unchanged. The
+materializer now supplies a host limit only for `CompactOutcome`, and the
+bounded stage rejects a conflicting host limit. The device-free regression
+fails against the existing library on both backend identities, then all 85
+capture unit cases pass with the changed stage. The changed orchestrator
+translation unit also compiles. The retained red/green diagnostic lives in
+`mtp-publication-cpu-proof/`; this is not native or image qualification.
+
+`V2_Integration_MTPPublicationCommitAuthority` explicitly registers the focused
+host regression. New CUDA and ROCm
+`V2_Integration_MTPStreamingPublicationGraphReuse_*` entries exercise the
+public pipeline request boundary, fixed/adaptive depth, greedy/stochastic
+sampling, twenty request resets, both stage orders and budgets 65/16/17/15/16.
+They require exact serial-oracle tokens and unchanged publication/parent graph
+materialization counts after the first chunk. Native execution, complete
+prerequisites and the rebuilt Release candidate remain outstanding.
+
+The original hybrid waiter was retired before it owned any devices. Its
+replacement, whose five local admission tests pass, explicitly waits on
+`prefix-economy-mtp-publication-hold.json`. It cannot launch the requested
+hybrid cells while this defect is unresolved; a resolved receipt must name
+the exact qualified image. Current homogeneous runs continue to completion.
+The live dense CUDA emoji audit already authenticates 45 responses/46 calls,
+including all eight requested Unicode examples through native, HTTP and client
+arguments, and the app's 24 authored Unicode tests pass. Full workload audits
+and independent final app checks remain mandatory. Disk cache eviction has
+begun under the 32 GiB shared active payload limit; no payload hash, checksum
+or scan was used. Nothing has been committed or pushed.
+
+The native diagnostic executables have now compiled and are queued behind
+clean retirement of all four current homogeneous cells. Their controller and
+365-file execution binding are retained under `mtp-publication-cpu-proof/`.
+They do not clear the Release qualification hold. The additional three-cell
+Unicode audit authenticates 178 responses and 196 native calls; all requested
+emoji remain exact through the wire and client arguments. MoE's first Unicode
+edit reported the known exact-match-not-found outcome, then its subsequent
+edit completed with the same preserved Unicode inventory. These are partial
+session audits, not final workload passes.
+
+The incremental refresh is now queued as `run-mtp-publication-refresh.py`.
+Its 13-input plan authenticates the eight-file patch and existing Ninja trees
+without starting GPU work. Only a successful four-case native red/green proof
+and clean retirement of every current owner admit source promotion. It then
+preserves the old Integration core, runs the complete canonical prerequisites,
+builds Release and copies a small local image layer. Release HTTP validation
+and the hybrid hold remain outstanding; this queue cannot resolve that hold.
+The later partial audit in `prefix-economy-review-native-checkpoint.json`
+authenticates 249 responses and 280 native calls with unchanged arguments and
+reasoning. MoE's identical-old/new edit is independently authenticated as the
+existing `edit_no_change` task outcome, not reclassified as a success.
+
+Dense CUDA has now passed all ten app phases, all seven required tools and
+all 78 independent app checks. Its 100 responses and 116 native tool calls
+match exactly, including the one OpenCode context-compaction response. The
+240-session primitive sweep has started. Dense ROCm remains at seven completed
+app phases and MoE ROCm at six; their sessions are still active. These results
+belong to image `76a30339ee73`; the isolated capture repair is not yet certified.
+See `prefix-economy-dense-cuda-app-checkpoint.json` for the bounded milestone.
+
+The full repaired-image HTTP campaign is also queued behind that refresh as
+`run-mtp-publication-stages.py`. Its plan binds the expected 182-file source
+and 15 local driver/helper inputs. Seven device-free admission cases reject
+stale source/binaries, another image, incomplete refresh and missing focused
+MTP gates. The workload remains all four requested homogeneous cells with
+512-token controls, ten app phases and 240 primitive sessions per cell; the
+same context, cache budgets, native parsing, stats, storage and driver gates
+remain mandatory. It does not resolve the hybrid hold or reuse the preceding
+image's model passes.
+
+The dense CUDA primitive sweep's first 21 completed sessions have valid
+protocol evidence; one delimiter session retains a task failure. Native token
+decoding confirms the model omitted the requested literal closing tool-call
+tag. The parser preserved that generated value exactly, and only the terminal
+token was excluded from emitted text. See
+`prefix-economy-dense-cuda-delimiter-task-evidence.json`; this failure is
+retained rather than counted as task success.
+
+The repaired-image hybrid handoff is now queued as
+`run-mtp-publication-hybrid-handoff.py`, with 23 bound local inputs. Nine
+device-free handoff tests and five tests of the actual hybrid driver pass.
+The handoff requires the exact native red/green cases, complete prerequisites
+and all four repaired-image HTTP cells. Only then does it preserve and retire
+the old image's idle waiter using a native process handle, resolve this
+specific capture hold for the qualified image, and run both requested hybrid
+models sequentially. The present hold is still unresolved and no hybrid GPU
+work has started. A serial cleanup-observer handoff is queued behind the
+existing observer; these workers cannot prune the same dependencies
+concurrently. See `mtp-publication-hybrid-handoff-intent.json` and the two
+`mtp-publication-hybrid-*-tests.log` artifacts. The read-only summary now
+includes the complete repair, homogeneous and hybrid queue.
+
+
+
+## October 6 hybrid validator and client execution evidence
+
+The frozen dense runs have now passed all ten app phases and 240 primitive
+sessions on both ROCm and CUDA. Dense ROCm retired with 952 requests, 83.60%
+prefix-token reuse and 83.45% MTP acceptance; its last request TTFT was 2.85 s.
+These remain evidence for the preceding image, not certification of the new
+bounded-storage candidate. The additional MoE ROCm session has also retired
+normally. Its complete native audit joins 1,254 responses and 1,095 tool calls
+with no changed arguments or reasoning. Runtime, stats and driver checks pass.
+The corrected harness independently grades all 240 primitive sessions as
+protocol passes with complete tool coverage; 85 also pass their task checks.
+The app retains its missing successful `glob` coverage and task failure.
+Final prefix-token reuse is 88.10%, request hit rate 80.78%, and last TTFT
+2.95 s. The 17.58 s average TTFT includes the four-client sweep's queue time
+(13.38 s average), so it is not an unloaded latency measurement.
+
+Preparation for the requested ROCm-first/CUDA-terminal pipeline found a
+validator defect: the production terminal CUDA controller correctly selects
+ticket-dispatched captured transactions across a heterogeneous boundary, but
+the HTTP MTP validator accepted only HIP controller records. A failing focused
+regression now passes with backend-specific identity and rank/device-owned
+graph, ticket and ledger joins. Homogeneous CUDA ticket dispatch, missing or
+cross-rank boundaries, borrowed device replay, absent participant launches,
+wrong backend/ABI and stale ticket ledgers all fail. Both vendor orders and
+pinned/adaptive bounds pass. The explicit preflight is
+`V2_Integration_HTTPHybridMTPBackendEvidence`; the complete HTTP evidence Unit
+module passes 147 tests.
+
+MoE primitive session 177 also exposed a distinct client execution outcome:
+OpenCode returned its exact `glob` ripgrep execution failure after accepting
+the unchanged wire arguments. The harness now retains that failed operation
+separately from protocol corruption; neither task failure nor successful-tool
+coverage is waived. Negative fixtures reject changed inputs, identities,
+tools, invalid schemas and altered messages. All 32 harness Unit tests pass,
+with `V2_Integration_OpenCodeGlobExecutionEvidence` registered explicitly.
+The original session report is intact beside
+`prefix-economy-moe-glob-error-offline.json`; the underlying filesystem/process
+cause is not established by that message alone.
+
+Both queued qualification controllers were stopped while still waiting for
+native-device retirement, preserved under
+`prefix-economy-queued-before-validation-fixes`, and replaced with fresh
+source-bound waiters. The serving image and binaries are unchanged. The
+qualification binding now covers 176 modified production/test files, and its
+complete discovered preflight inventory is 776 registrations. Five affected
+CTest registrations and 19 local controller/storage/topology tests pass.
+The last two retired cache namespaces reclaimed another 619 GiB without
+reading payloads. The fresh complete qualification now runs on the authenticated
+four-ROCm/two-CUDA inventory: all 700 Unit registrations pass,
+and all 776 production-preflight registrations subsequently passed. The four
+new native workloads have started; the two requested hybrid workloads await
+their successful completion and retirement. Nothing has been committed or pushed.
+
+The host portion subsequently passed all 362 registrations, followed by all
+125 CUDA and 161 ROCm socket-lane registrations. Their CTest results contain no
+failed or skipped registrations. The exclusive 128-registration lane also
+passed, including all eight mixed-backend ordinary/dynamic generation cases.
+The complete driver interval is clean. The local hybrid
+observer now independently requires both terminal
+CUDA TP controller owners, rejecting an entirely omitted participant, a ROCm
+follower controller, a foreign rank/backend, a native-conditional substitution,
+or invalid/zero materialization evidence. Its generic controller-ledger checks
+remain mandatory. Twenty local controller/storage/topology tests pass; the
+production source binding and binary are unchanged by this local observer check.
+
+CTest registration success must not be described as proof that every nested
+GTest case executed. Inspection of the Unit XML exposed truncated skip output
+in three unchanged legacy loader fixtures. A device-free verbose diagnostic
+retains the complete evidence: `LayerWeightStreamer` has five skipped and
+twelve disabled cases; `WeightManager_LayerPartitioned` skips eleven cases;
+`ModelLoaderRowSlice` passes 138 synthetic cases and skips six optional
+real-model cases. The latter seventeen skips require an external Qwen2.5
+fixture. All three files match the feature base; none are new MTP, HTTP, stats,
+tokenizer or prefix-cache regressions. Preserve these coverage limitations in
+`prefix-economy-unit-loader-coverage-observation.json` and its untruncated
+log/XML rather than counting the 22 skipped cases as passes. The canonical
+gate remains unchanged. `summarize-prefix-economy.py` now projects both native
+queues, live stats/tier occupancy and bounded exchange tails without touching
+cache payloads or changing workload state.
+
+The complete canonical prerequisite transaction took 2,514.25 seconds.
+`prefix-economy-prerequisite-registration-audit.json` independently joins all
+1,476 Unit/preflight registration identities with no duplicates, missing
+results or unexpected entries; its scope explicitly excludes model/image
+certification and retains the loader coverage caveat above. Fresh CUDA dry runs
+confirm 155,840 tokens for Qwen3.8 dense and 195,328 for Qwen3.6 MoE, rejecting
+the next 64-token bucket and the 262,144-token model maximum in both cases.
+Both ROCm cells retain 262,144 tokens. The dense ROCm, MoE ROCm and dense CUDA
+cells passed their ordinary-decoding controls and exact 512-token ordinary/
+dynamic/streaming equivalence on image `76a30339ee73`, including native trace
+IDs and live stats/reset checks. All three are now in the web-app workload with
+dynamic bounds 1–15. `prefix-economy-native-start-checkpoint.json` retains their
+owners and evidence; MoE CUDA follows the dense CUDA owner's clean retirement.
+
+## October 6 requested hybrid GPU continuation
+
+After the active v3 owners retire and the new candidate passes complete
+prerequisites plus its four homogeneous OpenCode cells, run both tested GGUFs
+in `PP(TP(ROCm:0,ROCm:1), TP(CUDA:0,CUDA:1))`, sequentially on the shared CUDA
+pair. Explicit named RCCL/NCCL domains retain ROCm first and CUDA second.
+The initial backbone splits are 0–32/32–64 for dense and 0–20/20–40 for MoE;
+the GGUFs' trailing predictor blocks remain outside these half-open ranges.
+Production dry-run admission owns the largest 64-token-aligned context, up to
+262,144. No admission or inference probe starts before the preceding candidate
+passes and all its serving owners retire.
+
+`prefix-economy-hybrid-stages.json` owns this dependency and the two future
+cells. They reuse the same ten-phase app, 240 tool sessions, exact ordinary/
+dynamic/streaming controls, native parser audit, stats/reset checks, 16 GiB RAM
+per participant and shared 32 GiB active disk payload. Both `/stats` and retired
+PerfStats must prove every ordered TP domain and exact layer boundary; the
+canonical mixed-backend graph/transfer and observed MTP-controller validators
+remain mandatory. Nineteen local controller/storage/topology tests pass,
+including negative controls for failed qualification, altered GPU groups,
+missing stages and unexpected admission failures. Hybrid native work is queued,
+not yet run or qualified. Commit/push still waits for all requested work.
+
+## October 6 bounded disk payload ownership
+
+The metadata-only v3 serving candidate exposed a separate disk-space defect:
+whole-archive compaction chased a continuously growing payload tail. A native
+metadata inspection observed 227.4 GB of published archive and 108.3 GB of
+compaction output for 34.2 GB of live payload, reading zero payload bytes.
+Format 3 now journals metadata only and gives every stored generation its own
+immutable payload inode. Payload file and directory durability precede journal
+publication; durable eviction/replacement unlinks the obsolete inode. Selected
+readers retain only their exact file. Restart validates committed extents and
+removes uncommitted orphans without checksumming, hashing or scanning payloads.
+Maintenance copies only metadata and joins a finite tail under its writer lease.
+Formats 1/2 fail with a precise fresh-directory diagnostic and remain intact.
+
+The bounded-churn and zero-maintenance-payload-read tests reproduce the old
+defect. The initial new disk suite passes 30 tests, including restart, retained
+readers, concurrency and native retirement failure. Review identified a second
+ordering obligation: retain the writer lease until the compacted journal's
+directory entry is durable, before any writer can retire referenced payloads.
+The focused native fsync/lease regression reproduces that gap and passes after
+moving directory durability inside the writer lease. Twenty-four focused
+registrations and all 700 Unit registrations pass. Three selected archive
+gates pass twenty repetitions each. The concurrent background gate hit one
+30-second timeout during overlapping large cleanup/full relinking; preserve
+that failure beside its unchanged passing twenty-repetition recheck.
+An additional syscall-traced twenty-repetition diagnostic passes. It observes
+native filesystem flushes up to 1.21 seconds and lock waits up to 1.47 seconds;
+it does not reconstruct or establish the cause of the earlier untraced timeout.
+The queued full gate reclaims the final retired v3 archives before CTest begins.
+The subsequent CMake-owned host preflight subset passes all 361 registrations
+with no skips. The fresh complete inventory contains 774 preflight registrations;
+the native portions still wait for serving-device retirement.
+Release image `76a30339ee730f7f6666d89effcf5c197c4531a56f223baa99d6f9d3da81064f`
+has verified binaries, native loader closure and 175 bound source/test files.
+Fresh metadata-only prompt/parser probes match both models' saved controls.
+Eight affected CUDA prefix ownership/restoration preflights also pass on the
+idle CUDA pair with a clean driver interval (`prefix-economy-focused-cuda.*`).
+This focused diagnostic does not replace the queued complete prerequisite gate.
+`prefix-economy-stages.json` queues complete prerequisites, context admission
+and all four native cells after the frozen owners retire. Every fresh cell
+will also prove zero-payload compaction counters and exact retired payload-file
+ownership. The unstarted old stats queue was cancelled and its source/image
+evidence remains separate. Full native qualification is still pending.
+
+The second MoE ROCm app finished ten phases. Candidate re-evaluation clears
+the false tool-protocol errors in all 154 requests while preserving model task
+mistakes and missing `glob` coverage. The separate partial native audit joins
+388 responses/349 calls without changed arguments or reasoning. Authenticated
+OpenCode no-change edit errors now have a focused unit regression and explicit
+preflight registration; all 31 harness tests pass. Keep the original reports
+alongside `opencode-moe-rocm-no-change-*` diagnostic receipts.
+
+The additional requested cleanup reclaimed 149.9 GiB of stopped-container
+writable layers and 356.5 GiB of retired cache files, plus completed client
+dependency copies. Each target had a stopped owner and retained evidence;
+active caches, models and source were preserved. MoE CUDA subsequently retired
+normally with a clean driver interval; its cache reclaimed another 444.9 GiB.
+All 240 primitive sessions pass tool protocol/coverage (133 task passes), and
+the terminal audit verifies 1,174 responses/1,047 calls exactly. The retained
+app failure still prevents that older cell from passing. Continue monitoring the old
+active archives until those frozen lifetimes retire, then qualify the new
+bounded implementation using fresh cache directories.
+
+## October 6 live tier occupancy and churn
+
+This section records the earlier stats candidate, superseded by the storage
+change above before its queued native qualification started.
+
+`prefix_cache.storage` now projects cache-owner metadata: enabled/initialized
+RAM and disk tiers, active payload bytes, capacities, utilization percentages,
+per-owner revisions/ages and completed traffic counts/bytes. Shared TP/PP disk
+archives contribute once, including aliases of the same storage publisher.
+`PUT /stats` resets traffic baselines while preserving occupancy; concurrent
+background completions enter the new epoch. Polls perform no payload I/O,
+checksums, GPU queries, cache maintenance or remote-rank communication. RAM
+occupancy names installed keys; retained aliases and append-file history are
+explicitly outside that payload gauge.
+
+The feature branch now lives in `prefix-stats-source/`; the older `source/`
+checkout remains frozen and all 165 v3 qualified file hashes are unchanged, so
+existing native sessions retain their exact evidence. No commit/push occurred.
+The new candidate builds with CUDA sm86 and ROCm gfx906. Eighteen selected Unit
+and explicit preflight registrations pass in 5.99 seconds, including real HTTP
+GET/PUT, concurrent publication, lazy/disabled tiers, nested TP/PP, local-only
+MPI scope, archive restart, exact selected read extents and repeated eviction.
+All 28 OpenCode harness unit tests also pass, including the new narrow
+ambiguous-edit classification regression. Full candidate gates and a new
+Release overlay remain required before its live server rollout.
+The complete candidate Unit recheck passes all 700 registrations in 80 seconds.
+The initial run passed 699 and failed the build-flags guard because this new
+build had not exported `compile_commands.json`; enabling CMake's compile
+database export resolves the setup defect without a source change. Preserve
+both `prefix-stats-full-unit.xml` and `prefix-stats-full-unit-recheck.xml`.
+All 357 CMake-owned host preflight registrations also pass without skips. The
+local wrapper initially caught its own successful `SystemExit(0)` and marked
+the wrapper failed; preserve that report and use the separate CTest-verified
+`prefix-stats-host-preflight-result.json` with its exact inventory. This remains
+a host-only diagnostic subset, not the complete prerequisite receipt.
+The local Release build and small overlay are complete. Image
+`123bbca769ebccdc0536a0e5a853fbcd7ff728682ac042c8c8a75ba7633c55fd`
+has matching copied binaries, a complete loader closure and the repaired HIP
+receipt, bound to 174 modified source/test files. `prefix-stats-stages.json`
+waits for the preceding campaign's clean device retirement, then owns fresh
+complete prerequisites, context admission and all four native cells. Candidate
+live checks validate weighted tier occupancy, shared disk capacity, publication
+freshness fields and monotonic churn through the whole OpenCode workload.
+Both read-only prompt/parser probes now link the candidate Release core; prompt
+IDs/rendering and 512-token decoding match the preserved dense and MoE controls.
+Partial audits of the still-running dense sessions authenticate 723 CUDA and
+77 ROCm responses, with 634 and 105 native tool calls respectively. Neither
+audit finds changed arguments, reasoning mismatches or independent native
+argument failures. These 800 responses/739 calls are partial observations;
+normal completion, final full audits and clean retirement remain required.
+The candidate parser also passes partial replays of the fresh MoE workloads:
+100 CUDA responses/104 calls and 57 responses/55 calls from the second ROCm
+session, with no changed arguments or reasoning text. Preserve the separate
+`prefix-stats-parser-check-qwen36-*` receipts as partial observations; they do
+not replace the terminal cell audits.
+
+MoE CUDA completed all ten app phases and exercised OpenCode's automatic
+compaction after a 173,812-token coding prompt. The separate 96,844-token
+summary request took 190.76 seconds, then coding resumed at 10,105 prompt tokens.
+Two diagnostic assumptions failed: local native auditors required a `tools`
+field on summary requests, and the canonical harness treated the auxiliary
+summary as the next coding continuation. Both now preserve the summary in the
+audit while keeping the pending tool join until the actual resumed request.
+Five local audit regressions and all 30 harness unit tests pass, with the new
+explicit `V2_Integration_OpenCodeCompactionContinuation` preflight passing.
+Its negative controls retain missing/changed tool and client arguments, absent
+continuations and invalid summary failures. Both native decoders independently
+replay 198 completed responses/199 calls exactly, including summary and resumed
+reasoning; their 4,222/902 content characters also match. These remain partial
+audits because the 240-session tool sweep is still running.
+The preserved v3 app result remains failed: the candidate replay clears only
+the false history error, retaining omitted `grep` coverage, the missing final
+sentinel and an edit-target task error. Its independent app acceptance is a
+separate result. The queued candidate's 174-file harness binding has been
+refreshed for full qualification; the preflight inventory is now 771 registrations.
+Keep `opencode-compaction-*` before/after receipts and the original image-build
+binding, plus `prefix-stats-qualification-binding-before-compaction.json`.
+This test/harness change does not alter the Release binaries.
+
+The second MoE ROCm session reached phase six. Exchange 117 generated a read
+block with `limit` and `offset` but no required `filePath`. Its 735 native token
+IDs contain no forced token; the complete 121 content characters and 2,666
+reasoning characters match HTTP output. The parser preserves the incomplete
+block as text and publishes no executable call. Existing
+`QwenRequiredArgumentsFailClosed` covers that invariant across every streaming
+split, and its `V2_Integration_QwenMixedParameterFraming` preflight recheck passes.
+The fresh partial audit joins 118 responses/113 calls without changed arguments
+or reasoning. Keep `opencode-moe-rocm-incomplete-call-*`; this is parser-fidelity
+evidence, not a serial/dynamic numerical comparison or a completed app result.
+
+Both dense backends have completed all ten app phases. Dense ROCm continues its
+240-session tool sweep; its completed app passes both protocol and task checks.
+The MoE ROCm app was deliberately interrupted
+when it repeated the same test command across more than 24 requests. Preserve
+its incomplete result and clean normal shutdown/driver report. Replaying the
+preserved looping request produces identical native prompt/completion IDs with
+warm dynamic MTP, cold cache-disabled dynamic MTP and ordinary MTP-off decoding.
+The loop-onset controls also pass: exchanges 84 and 90 have identical prompt
+and completion IDs across cold/warm dynamic MTP, cache-disabled dynamic MTP
+and cache-disabled ordinary decode. Exchange 84 finishes normally under the
+diagnostic seed; exchange 90 repeats the test command in every configuration.
+Together with the late-loop replay this points to model decisions conditioned
+on the conversation, with no observed MTP/cache or tool-argument divergence.
+It does not establish why the conversation triggered the model behavior,
+certify the interrupted app or complete the four-cell native objective. The
+original campaign admits its CUDA models sequentially after clean retirement.
+
+The v3 dense CUDA cell is now complete and passes the engine/protocol gate:
+all ten app phases, 240/240 protocol-valid tool sessions and complete per-case
+tool coverage, with 972 workload requests reconciled against `/stats`. The
+native audit joins all 972 responses and verifies all 850 tool calls with no
+changed response, argument or reasoning bytes. Ordinary/dynamic controls,
+capture, transfers, prefix ownership, capacity, normal exit and driver checks
+all pass. Its task score remains 221/240 for primitive sessions; the app's final
+independent acceptance passes while a recovered edit-target mistake remains
+recorded. Do not hide those task errors or treat this older image's result as
+qualification of the new stats candidate. MoE CUDA has now started on the
+retired pair with its own driver interval and passive observer.
+A second independent v3 MoE ROCm session now uses the otherwise idle `rocm:2,3`
+pair while dense ROCm and MoE CUDA continue. Its separate
+`qwen36-moe-rocm-metadata-v3-second-session` artifacts own unchanged controls,
+ten app phases, 240 tool sessions and complete retirement checks. The original
+interrupted result remains failed/incomplete. The queued stats qualification
+authenticates this additional controller's live PID and actual Docker/driver
+retirement before admitting any GPU gate; six focused local scheduling tests
+cover valid and failed workload retirement, missing/reused PIDs, driver findings
+and a still-running container. The manifest is
+`prefix-metadata-v3-additional-cells.json`; both source/image bindings remain
+unchanged. The additional run is not a replacement for fresh stats-image gates.
+
+The queued local campaign and context-admission controllers now propagate a
+failed workload, observer or final driver interval through their process exit
+status. Five device-free controller tests pass; three negative controls first
+reproduced false-success exits. Keep `prefix-stats-controller-tests.json` and
+its before/after logs. This changes only unstarted local orchestration scripts,
+not the 174-file candidate or live servers. Older aggregate wrapper exits must
+not supersede their retained per-cell failure evidence.
+
+Workspace cleanup removed 805 obsolete ELF/archive/object files absent from
+their existing Ninja target inventories, reclaiming 64.7 GiB. Current targets,
+compiler caches, sources, active feature worktrees and all test reports remain.
+The inventory and deletion receipt live in `workspace-cleanup-20261006/`.
+The active tool sweeps additionally retained two generated npm installations
+per completed fixture, about 125 MiB each session. Retirement of 975 duplicate
+installation directories recovered another 59.4 GiB, leaving about 171 GiB
+free at that observation. One installation per resolved dependency lock is
+retained, together with every original package/lockfile, prompt, exchange,
+client database, app and result. Five device-free cleanup regressions prove
+completed-only selection, active-process rejection, distinct lock retention,
+symlink rejection and preservation of all other bytes. The local
+`opencode-dependency-retirement/` observer continues that cleanup after each
+fixture finishes through the queued candidate's terminal state; running
+clients and both qualified source worktrees remain untouched.
+The cleanup observer later encountered an inaccessible procfs environment and
+stopped before deletion in that sweep. Its replacement records an unavailable
+ownership observation, performs no deletion, and requires a fresh complete
+observation on the next scheduled sweep. Other errors still fail. Eight local
+regressions pass, including unavailable first/second snapshots and recovery
+freshness; original failure evidence remains beside `observer-recheck.json`
+and `tests-recheck.json` in the cleanup directory.
+
+## October 6 metadata-only cache I/O
+
+Remove every prefix-payload hash/checksum pass as requested. Immutable owners
+carry version metadata across tiers and restart; disk selection bounds exact
+sections and hydration copies each consumed section once. Keep small metadata
+integrity checks, reject incompatible archives intact, and reduce the admitted
+archive scratch to its 4 MiB compaction buffer. The regressions observe actual
+native bytes and protected payload addresses, plus stale-version recency,
+restart, compaction and fatal native storage failures. The preceding
+`prefix-readset` qualification was stopped before GPU fixtures and closed with
+clean driver evidence. Repeat focused regressions, then full Unit/preflight and
+all four Release OpenCode cells using a fresh locally copied binary overlay.
+Focused results now pass: seven complete affected executables (271 passing tests
+and three existing hardware-dependent skips) and six registered preflights
+repeated twenty times. Complete image-bound gates and the four native coding
+sessions remain outstanding.
+The first complete Unit transaction stopped with five failed registrations.
+Repairs update metadata-first MTP assertions, enforce device-free registrations,
+move native MoE scratch testing into both accelerator lanes and fix a genuine
+host-resident activation no-op that incorrectly allocated GPU storage. All five
+affected Unit registrations pass; eight host and three native focused preflights
+pass twenty repetitions with a clean native driver interval. Preserve the failed
+`prefix-metadata` gate and qualify the fresh `prefix-metadata-v2` candidate.
+The v2 full Unit gate passes all 700 registrations; host preflight exposes two
+remaining eager-lookup assumptions in the pipeline-prefix fixture (348/350 pass).
+After explicit materialization and fresh selection for an independent restore,
+all six CPU/CUDA/ROCm prefix registrations pass twenty repetitions with clean
+driver evidence. Production bytes are unchanged. Preserve that failed host gate
+and run complete qualification with fresh `prefix-metadata-v3` evidence.
+
+The v3 candidate now passes all 700 Unit and 763 production preflight
+registrations in 2,513.28 seconds, including a clean complete driver interval.
+The locally copied Release overlay is `f8baf85b31ab`; its receipt binds all 165
+changed production/test files. CUDA admission proves maximum aligned contexts
+of 155,840 tokens for Qwen 3.8 and 195,328 for Qwen 3.6 MoE; the next 64-token
+buckets reject capacity. ROCm uses the model's 262,144-token context. Dense
+CUDA/ROCm and MoE/ROCm pass their 512-token MTP-off/dynamic, streaming/nonstreaming
+controls and live stats assertions, and have entered fresh ten-phase OpenCode
+webapp sessions. Native runs retain 16 GiB RAM per participant, one shared 32 GiB
+SSD archive, raw token logs and passive driver observations. Full coding/tools
+workloads, parser audits and clean retirement remain outstanding; MoE/CUDA
+follows dense CUDA retirement. No commit or push has occurred.
+
+## October 6 recovery and focused regression results
+
+The user requested a normal host reboot and added a fan at the PCIe switch.
+The new boot restores all four MI50 endpoints to x16 at 16 GT/s and the upstream
+port to x16 at 8 GT/s; a thermal cutoff remains a hypothesis. The interrupted
+native runs, original driver checkpoints, complete logs and generated apps are
+preserved in `reboot-pause-20261006T142549Z/`. They are not successful gates.
+
+The cache read-set repair now passes its complete 38-case ownership suite and
+three focused preflight registrations repeated 20 times. Coverage includes
+cold/mixed tiers, attention/hybrid/recurrent payloads, MTP rows, shortened TP/PP
+frontiers, exact consumed sections, immutable inode leases and alias retirement.
+A separate lazy `BackendManager` accessor ignored CPU-only/vendor exclusion;
+native-entry traps reproduce the defect without entering a driver. Its fixed
+focused preflight registration also passes 20 repetitions, and the full
+device-free DGO suite completes. Exact PerfStats checks cover retained rows,
+endpoint bytes, omitted checkpoints and actual verified/hydrated disk bytes.
+An inaccessible archive is now a fatal storage diagnostic rather than an
+ordinary miss, with an old-code failing regression. Fresh complete
+Unit/preflight and Release OpenCode runs are required for these changes;
+no commit or push has occurred.
+
+## October 6 long-prefix read-set defect and native hardware interruption
+
+The running `ef21a8aaa1e02` coding sessions exposed a dense-model cache cliff.
+Lookup hydrated every historical recurrent checkpoint, retaining state that
+only the selected endpoint consumes. A real device-free DGO regression restores
+34 of 48 available tokens on that implementation despite enough RAM for all
+KV rows and one recurrent state. The first corrected test restores all 48 with
+exact KV bytes inside the same budget. Metadata-first selection, bounded restore
+windows, exact disk section reads, shared inode leases and alias retirement are
+under broader regression validation; they are not yet in the running image.
+Preserve `hybrid-prefix-lookup-regression-red2.log`, its first green result,
+and both `*-cache-cliff-metadata/` observations. Archive capacity/ancestor eviction
+still needs separate long-session validation after the read-set repair.
+
+At 14:18 UTC both ROCm runs are stalled and all four MI50 PCI configuration
+headers read all FF, with unknown link speed. New SMC communication errors began
+around 13:58 UTC. Preserve `native-rocm-stall-pci-observation.json` and
+`native-stall-driver-read-only-observation.json`; no reset was attempted and the
+original driver windows remain armed. Dense CUDA continues. The prior 700 Unit
+and 753 preflight pass applies to the preceding source/image, not these new
+cache edits. Fresh GPU validation requires restoration of healthy device access.
+
+## October 6 stats, event lifetime and mixed parameter framing
+
+Local Release overlay `ef21a8aaa1e02` binds the app, core, RCCL and repaired
+HIP runtime with authenticated copied hashes and native loader closure. It
+includes the stats, parser and event-lifetime fixes plus DeviceRegistry startup
+policy enforcement. Complete 700 Unit and 753 preflight registrations pass in
+2,564.66 seconds with clean driver evidence. The three initial model/backend
+cells pass their exact MTP-off/dynamic and stream/nonstream controls and live
+stats checks, and are executing the ten-phase OpenCode webapp workload. MoE on
+CUDA follows dense CUDA retirement; all four full workloads remain required.
+
+The preceding 700-Unit run passed, but its GPU phase was cancelled after a
+broader ownership audit. Twenty observed registrations either needed full
+CUDA/ROCm inventory ownership or a CPU-only guard for device-free construction.
+Their generated CTest metadata now has focused positive/negative regression
+coverage. DeviceRegistry itself ignored the startup policy and entered excluded
+vendor runtimes; the production guard and CPU/native regressions now pass all
+20 focused registrations with clean driver evidence. Preserve the original
+failures and cancelled gate under `.before-startup-policy` and the new focused
+evidence in `device-registry-startup-evidence/`. The earlier HIP visibility-mask
+fix still authenticates all four ROCm and both CUDA devices before the gate.
+
+The four native cells retain default dynamic MTP, maximum admitted context,
+16 GiB RAM per participant, a 32 GiB live disk budget and unrestricted generation
+duration. No commit or push follows focused passes alone.
+
+Following the user's MoE quality clarification, qualification separates the
+protocol from task quality. The explicit protocol gate retains wrong paths,
+incorrect source/app behavior and authenticated tool-domain outcomes as task
+failures. Schema/transport/client failures remain fatal, and every planned case
+must successfully exercise its requested tool surface. Twenty-seven device-free
+harness tests and ten focused CTest registrations pass, including the new
+preflight entry. An independent inverse renderer also verifies complete wire
+arguments against joined native token output. The final 1,278-response audit
+confirms 1,086 calls and rejects the four known old-image incomplete calls; two
+were parser corruption and two were incomplete native model calls. Production
+replay and the inverse check are required for each new native cell. The new
+image and qualification receipts bind the same complete production/test source
+set; the full gate runs against those exact files and binaries.
+Each native cell first runs an explicit `--no-mtp` server lifetime with the same
+model, image, topology, context and cache budgets and a separate archive. Its
+512-token seeded stream/nonstream control must retire normally with captured
+execution and transfer evidence. The default dynamic-MTP lifetime must reproduce
+every prompt/completion ID from that ordinary control before admitting OpenCode.
+Both lifetimes also exercise the new stats endpoint, including zero MTP work
+when disabled. The full coding workload continues to use default dynamic MTP.
+
+The ten-phase MoE app finished after 166 requests and 81,887 completion tokens,
+reaching a 215,693-token prompt. Two valid native writes lost their `filePath`
+argument during parsing when the preceding value's closing tag was inline.
+The fix accepts a line boundary on either side of that tag and rejects missing
+required keys before publication. Old-code negative evidence, full parser and
+HTTP coverage, all SSE split points and twenty focused preflight repetitions
+are retained in `mixed-qwen-framing-evidence/`. The app's independent routing
+and HTML-formatting failures remain red; they are not emoji byte corruption.
+All 240 original tool sessions finished: 81 strict task passes and 239 protocol
+passes, with complete required-tool coverage for every case. The sole protocol
+failure contains the two native model calls missing a required path that the old
+parser published. This assessment retains the original failed campaign and all
+task mistakes; it is not qualification of the new candidate.
+
+A native HIP event could dereference its retired producer stream, or adopt a
+different stream reusing that address. ASan and a real address-reuse test prove
+the old defect. Stream registry leases now validate the original monotonic
+identity and lifetime without retaining hardware queues. Twelve focused native
+cases and 23 prefill lifecycle cases pass twenty repetitions. The installed
+runtime passes all seventeen HIP integration gates with a clean driver window.
+The new repair participates in the canonical installer receipt and Docker
+packaging; `V2_Integration_HIPEventProducerLifetime` belongs to preflight.
+
+`GET /stats` and `PUT /stats` expose/reset passive host-owned observations.
+Unit and HTTP regressions cover weighted throughput/reuse/MTP acceptance,
+TTFT, last-request freshness, queue responsiveness, HTTP status codes, active
+reset epochs and disconnects. Idle observation never queries the runner.
+Queued native cells compare these counters with their exact-token controls
+and log snapshots throughout the OpenCode app and tool workloads, retaining
+strict task scores alongside protocol qualification. A final whole-workload
+check reconciles every saved SSE usage record and native prefix/MTP summary
+with the HTTP snapshot; TTFT sample counts come from nonterminal native token
+traces, including valid no-token completions. No model request is added by
+that passive check.
+
+## October 6 native startup isolation and context admission
+
+The shared-archive repair passes complete 697 Unit/744 preflight gates and
+ships in local overlay `6d8342114e86`. Qwen3.6 MoE's exact 512-token streaming
+control passes with default dynamic MTP, including twelve depth changes. Its
+OpenCode app subsequently completed with the failures recorded above. The
+strict 240-session tool sweep remains required for each model/backend pair.
+
+A dense ROCm startup crash was reduced to shared SMI recursive mutexes whose
+owners came from different PID namespaces. The old host-IPC/private-PID launch
+admits two unrelated TID-1 owners. Twenty matched-PID controls exclude them.
+Production launchers now default to private IPC, and explicit host/peer sharing
+couples the PID namespace as well. Nine focused tests execute the policy,
+cross-host acquisition, HTTP shell launch and owned-process retirement;
+`V2_Integration_DockerIPCIdentity` is in preflight. The first full requalification
+failed because its two-device mask excluded required four-device cases and
+exposed the separate native lifecycle defect recorded above. The next complete
+gate waits for all participants without interrupting the live MoE sweep.
+
+Production dry-run BOM admission rejects 262,144 context on both CUDA models.
+The maximum admitted 64-token-aligned contexts are 155,840 for Qwen3.8 dense
+and 195,328 for Qwen3.6 MoE, retaining default MTP and both cache budgets. Their
+immediately larger buckets are rejected. Future CUDA sessions must retain these
+receipts and prove actual native materialization; admission alone is not a pass.
+
+## October 6 delimiter generation control and terminal observation
+
+The revision-corrected image still fails the exact literal-delimiter fixture.
+Three explicit-seed observations retain all completion IDs; each ends on
+`248046` (`<|im_end|>`), and independently decoded write payloads match the
+HTTP arguments byte for byte. The incorrect text is already present in the
+generated reasoning and raw token stream.
+
+A pinned existing llama.cpp executable (build 10826, commit `73a43d1f6`)
+reproduces both symptoms with the same GGUF and all 6,390 prompt token IDs.
+The explicit control uses two CUDA devices in layer-split mode, MTP off,
+262,144 context, FP16 KV, 32,000 output budget and the same card sampling.
+All three seeds fail the exact content task: one emits `<|im_end|>` after an
+opening `<tool_call>` inside reasoning, one inserts line breaks, and one
+substitutes `_kernel` for the literal closing tag. Every request authenticates
+6,390 prefill tokens, zero cached tokens and no truncation. This establishes
+that these symptoms can occur outside Llaminar's parser and outside MTP; it
+does not establish numerical or distributional parity across engines,
+backends or topologies. The separate experimental reference tensor-split
+attempt crashed during loading inside `libnccl.so.2.28.9` and provides no
+inference result. Both reference lifetimes retain clean GPU-driver reports.
+The executable revision differs from its subsequently advanced source checkout;
+each reference directory retains that distinction in its provenance receipt.
+
+A higher-precision control downloads the pinned Unsloth Q8_0 artifact at
+`4ca720788d1e01f1bff70c033e0d0028fd02e502`, authenticating all 29,047,086,048
+bytes against SHA-256
+`a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348`.
+The same reference admits full context and identical prompt IDs. One of three
+seeds writes exact content; two change literal tags in the raw token stream.
+No request truncates, all terminate on EOS, and the server retires normally with
+a clean driver interval. This does not isolate quantization from other artifact
+revision differences or eliminate the known quality failure. Preserve
+`template-delimiter-q8-reference-comparison.json` and its original responses.
+
+Preserve `template-delimiter-terminal-probes/`,
+`template-delimiter-llama-reference/`,
+`template-delimiter-llama-layer-reference/`, and
+`template-delimiter-reference-comparison.json`. The native stress failures
+remain red. No prompt substitution, fixture removal or retry promotes them
+to passes. The ten-phase app and 240-session sweep continue unchanged.
+
+Live token logging omitted the terminal token because both handlers stopped
+before their trace call. Both paths now trace that ID and its typed disposition
+before filtering client text. The focused red reproduces the omission; all
+twelve streaming/nonstreaming, trace-enabled/disabled and tokenizer/runner
+termination combinations pass after the repair. Explicit call counts prove
+disabled tracing never decodes a withheld terminal preview. The complete
+chat-handler suite and `V2_Integration_HTTPGeneratedTokenTrace` pass in 2.54
+seconds; an intermediate mock-expectation mistake and its correction remain
+in the retained logs. Integration gate targets and Release both build. Overlay
+`4d2165798fe9` binds the same 76 production files at aggregate
+`9e85f7961775a52c960d39f4cc5736c755710af2e4ad39a06dc896bcf719cb8d`;
+both image binaries match the build. The 697/738 prerequisite receipt qualifies
+the still-running preceding image, not this trace change. That trace-only
+qualification was superseded before execution by the additional parser repair
+below; its original controller snapshots remain retained.
+
+The long delimiter session later generated four native writes while the wire
+carried three. The missing call was preserved as assistant text because
+`A</parameter><parameter=x>KEEP</parameter>B` inside its content was mistaken
+for an argument boundary. Its raw token IDs, decoded output and exact wire
+response are joined in
+`template-delimiter-long-generation-observation/parser-defect.json`. The
+original wrong-content generations and this parser defect are separate findings.
+The parser now binds boundaries to native newline framing and the admitted
+argument schema. The reduced old-code regression fails; all split points,
+adjacent known/unknown tag names, emoji, compact calls and invalid argument
+controls pass after the fix. HTTP JSON and byte-fragmented SSE cover the same
+payloads. `V2_Integration_QwenLiteralAdjacentParameters` explicitly registers
+the focused production defect; eight combined CTest registrations pass.
+
+The harness also had a false-positive gap: correct final file bytes plus any
+write/read call could pass without proving the requested tool operation. It
+now joins the actual wire arguments to completed client inputs, the original
+workspace path and exact UTF-8 content, followed by the completed read. Six
+negative cases reproduce the old gaps, with
+`V2_Integration_OpenCodeExactFileToolEvidence` registered in preflight.
+A second false positive accepted a workflow's unrelated or failed bash command
+as proof of testing. Require its exact unittest command and workspace, matching
+wire/client arguments, zero native exit and nonempty discovery summary. Eight
+old-code false positives are retained; the repaired suite covers nine negatives
+and three workspace positives. All 21 Python tests pass directly, as do the
+exact-file and `V2_Integration_OpenCodeWorkflowTestEvidence` focused entries.
+The combined Unit CTest invocation exposed a two-second transport-test timeout
+under live disk I/O; its original failure and focused repetitions are retained.
+Twenty unchanged focused repetitions pass. The combined three CTest entries
+subsequently pass in 1.26 seconds; no deadline was increased.
+Read-only revalidation of all 98 completed native sessions retains 91 passes and
+seven failures; original results are untouched.
+
+The old-parser primitive campaign is now deliberately incomplete at those 98
+sessions, with four interrupted workspaces retained separately. The known parser
+defect already has a repaired overlay, so further broad stress moves to that
+image after fresh prerequisites and native controls. The old tool server served
+its queued administrative shutdown and exited zero with passing runtime and
+driver checks; the five-second admin-client observation failure remains logged.
+The queued `final-tools-controller.json` was superseded before execution by the
+shared-archive repair. Fresh runs keep the same model, TP, dynamic MTP, context
+and tier budgets. Task-owned model-volume cache directories supply archive
+maintenance headroom without claiming an economy fix.
+
+The app reached phase ten, after 47 authored tests passed.
+A 105,154-token request reports a 104,883-token RAM prefix match but 777.287
+seconds of prefill, followed by a coherent answer. Independent HF rendering and
+tokenization match three saved 104,883/105,154/105,451-token requests; each next
+prompt retains the previous prompt's complete prefix. This rules out prompt
+rewriting. The next request missed all 105,451 tokens, spent 1,220.369 seconds
+in prefill and then produced coherent tool output. Native host stacks sampled
+queue-space backpressure inside HIP packet submission; subsequent completion
+rules out a permanent deadlock for that request. Preserve the diagnostic
+attachment receipts; do not count their latency as clean timing evidence.
+
+The archive snapshot contains 24.767 GiB of recurrent state and 6.950 GiB of
+attention/MTP rows, with one TP participant's initial prefix blocks evicted.
+`SharedArchiveEvictionRepersistsResidentOwner` reduces a stale disk-index bug:
+a peer evicts durable backing, then the participant discards its remaining RAM
+copy without repersisting it. The original implementation fails; an initial
+in-process residency observer still fails the independent-writer case. The
+final implementation revalidates every selected victim through the canonical
+archive writer, retires its RAM alias on the fresh receipt, and reuses identical
+backing without copying the payload again. All 53 focused cache tests pass,
+including retains arriving during publication, independent writers, exact
+snapshot sections and metadata-only reuse. Twenty repetitions of the eviction
+cases and both explicit preflight registrations pass. Four queued
+validation controllers are superseded before this source change, with their
+states retained in `shared-archive-fix-queued-controller-retirement.json`.
+
+The later turn interruption terminated the OpenCode client during phase ten.
+The retained workspace independently passes 78 HTTP checks and all 47 authored
+tests; this does not complete the interrupted ten-phase session. The server's
+normal administrative shutdown exits zero, with passing graph, transfer, MTP,
+prefix, capacity and driver evidence. Both incremental builds pass, and
+`shared-archive-qualification-controller.json` runs complete Unit/preflight
+before building and authenticating the next local Release overlay.
+
+Final app acceptance remains pending. After fresh full gates,
+validate both Qwen3.8 dense and Qwen3.6 MoE on both 2xROCm TP and 2xCUDA TP.
+Retain complete native tool/session, graph, MTP, prefix, capacity and driver
+evidence for each combination; no single-model/backend result closes the goal.
+
+Overlay `74576c0cd143` binds both source repairs at aggregate
+`c77a5736b4908d6e2c12ffc499719b409aa539a55d66c566c57f608e1c996ad5`.
+Release and complete Integration gate targets built, and the image binaries
+matched that earlier build. The adjacent-parameter prerequisite and native
+controllers were superseded before execution; their original state remains
+retained. The new image still needs 512-token stream equivalence, explicit
+terminal-ID observation and runtime retirement proofs, followed by complete
+OpenCode stress. No commit or push is allowed
+by the requested green gate while any required result remains unresolved.
+
+Archive compaction during the primitive sweep requires substantial additional
+filesystem space while writers keep appending. The observer retains both live
+file extents and free capacity every thirty seconds. Reclaimed 31.71 GiB from
+two completed local debug caches after verifying their normal process exit and
+completed driver intervals; all requests, logs and PerfStats remain intact.
+Preserve `inactive-prefix-cache-reclamation.json`. Neither active server cache
+was removed or reconfigured.
+
+The primitive server's archive plus compaction copy subsequently exceeded
+262 GiB. The active-payload budget remained 32 GiB; continuing writers prevented
+the background copy from reaching its committed frontier promptly. This is an
+unqualified storage-economy result. Paused only the four owned primitive
+OpenCode clients, leaving in-flight inference, maintenance and the independent
+app active. A first 31.53-second attempt resumed after Docker returned empty
+stdout for a short metadata command; its failed observation is retained. The
+second observer-driven pause lasted 212.44 seconds until the archive shrank
+from about 148 GiB to 116 GiB at publication. Clients resumed and filesystem
+headroom recovered. Preserve `primitive-compaction-admission-pause*.json` and
+the primitive run's `filesystem-interventions.json`. The run can still measure
+strict client-session correctness, but cannot certify uninterrupted sustained
+pressure or a physical 32 GiB bound. An economical archive admission/maintenance
+contract remains unresolved; the operator pause is not a production fix.
+
+Session 44 additionally omitted the required `content` parameter when asked to
+write an empty file. Native token IDs decode to a first call with only
+`filePath`; after OpenCode's schema error, the next call explicitly emits the
+empty parameter and the parser preserves it. The model repairs the file, but
+the strict session stays red. Preserve
+`template-empty-write-generation-observation/`; this is a generated omission,
+not loss of an emitted empty string. Existing parser tests cover explicit empty
+strings at every streaming boundary, and the harness regression rejects
+repaired tool errors even when final file bytes are correct.
+
+## October 6 revision-owned templates and interrupted filesystem evidence
+
+The stdin/deadline-corrected native runs did not finish. The app completed four
+phases and 19 authored tests; the primitive sweep's last intact report passed
+28 of 29 sessions. One delimiter session produced altered file content. Its
+three native generated token streams decode to exactly the wire arguments,
+including the unwanted line breaks and reordered closing tag. Preserve
+`opencode-delimiter-generation-observation.json`; this rules out parser byte
+mutation for those calls, but does not establish the model's generation cause.
+
+Independent prompt rendering exposed a separate production defect: startup
+replaced Qwen3.8's embedded template with the Qwen3.5 architecture template.
+The embedded template includes the documented default xhigh instruction and
+preserves reasoning before earlier user turns. Architecture-only replacement
+lost both. The initial eleven-request GGUF/HF rendering check passes on the
+same parsed JSON, but its token counts differ from serving by 38 tokens in
+the first turn because serving installed that other template. Original JSON
+key order is retained as a distinct diagnostic observation; sorting during
+native JSON parsing explains the separate seven-token ordering difference.
+These observations live in `opencode-delimiter-prompt-observation*`.
+
+`ModelGenerationPolicy` now resolves sampling and template policy from the same
+loaded revision identity. Identified Qwen3.5/3.6 revisions retain the maintained
+template; Qwen3.8 and unrelated revisions retain their GGUF template. Removed
+the graph-builder template hook and the later frontend replacement. Independent
+parity prompt preparation consumes the same policy. Five focused tests pass in
+142 ms, including a pinned official Qwen3.8 fixture, 25 cards across eight
+metadata forms, historical emoji reasoning and explicit CLI precedence. The
+two new template tests fail on the migrated old architecture rule; retain
+`qwen38-template-focused-{red,green}.log`. The focused preflight entry is
+`V2_Integration_QwenRevisionChatTemplate`.
+
+Both native clients later failed artifact writes with ENOSPC. The 32 GiB disk
+option is active-payload capacity; append history and compaction occupied about
+83 GiB in the tool server. The run setup underestimated filesystem headroom
+while retaining older task archives. Both servers shut down with exit zero.
+Recovered `post-enospc` PerfStats pass graph, transfer, MTP, prefix ownership
+and RAM/output-capacity checks; both driver reports pass without findings.
+Failed run directories remain incomplete. Normally retired task containers
+were reclaimed only after retaining logs and inspection under
+`retired-cache-cleanup/`. No unrelated container or cache was removed.
+
+The exception also exposed destructive harness cleanup: `TemporaryDirectory`
+deleted the unfinished app before its artifact copy succeeded. The harness
+now publishes `workspace-location.json` before client work and retires that
+directory only after copying. The ENOSPC negative control fails on the old
+cleanup; all 19 focused harness tests pass after the repair. Explicit preflight
+entry `V2_Integration_OpenCodeWorkspaceRetention` protects the ownership rule.
+The earlier 697/736 receipt does not qualify these new edits. Both complete
+builds now pass, and the fresh 697 Unit/738 preflight transaction passes in
+2,262.232 seconds with no driver findings. The local Release overlay
+`ee16ac3d49c5` binds 76 production files and both extracted image binaries match
+the Release build. Eleven saved requests match the policy-aware native renderer
+and independent HF tokenization, including default xhigh. Both fresh native
+workloads start only after the prerequisite receipt and driver report pass.
+Their full completion and normal-retirement evidence remain required before
+commit/push; earlier partial sessions do not count as acceptance.
+
+## October 6 client deadlines during long prefill
+
+The corrected-tokenizer diagnostic completed six app phases, 66 tool executions
+without a client tool error, and 38 authored tests. Phase seven exposed an
+independent OpenCode default: both provider header and SSE-idle deadlines are
+300 seconds. A legitimate 51,231-token cache miss took 347.558 seconds in prefill.
+The client retried the identical request after 302.582 seconds; the first relay
+recorded a connection reset. This is preserved in
+`opencode-provider-timeout-defect.json`. The incomplete workspace and original
+CLI-input evidence remain under `dynamic-opencode-webapp-qwen38-unicode-mtp/`.
+The run was stopped for this confirmed defect, with normal server exit and clean
+graph, transfer, MTP, prefix ownership, memory and driver checks.
+Its terminal PerfStats record 24,251 controller transactions and 1,422 evaluated
+depth windows per GPU, with zero depth updates: this workload retained depth
+one while evaluating across streaming publications. Preserve
+`qwen38-unicode-mtp-app-depth-observation.json`; it is learner-lifecycle evidence,
+not a measured speculative speedup.
+
+The harness now explicitly disables the provider's total, header and chunk
+deadlines. Optional operator limits remain owned by the harness. All eighteen
+focused tests pass, including a regression that failed against the old client
+launch configuration; `V2_Integration_OpenCodeClientDeadlines` registers it and
+the quiet-stream/deadline controls in preflight. A real-client model-free probe
+holds headers and SSE output quiet for 310 seconds in separate sessions.
+Both real OpenCode probes pass with one request and normal completion after
+310-second quiet intervals (313.7/314.0 seconds including client startup),
+without retries. Preserve `opencode-client-deadline-probe/`.
+The complete refresh passes all 697 Unit and 736 preflight entries (327 host,
+147 CUDA, 173 ROCm, 89 exclusive) in 2,260.446 seconds. The fresh driver window
+passes with no findings. Preserve `stdin-mtp-prerequisites/` and
+`stdin-mtp-prerequisites.driver-report.json`. The final stdin-driven ten-phase
+app and 240-session client sweep are running on separate ROCm pairs. The
+production image remains `2a7155bd307f`; these corrections change only the harness.
+
+## October 5 OpenCode prompt transport
+
+The corrected-tokenizer image passes the 220-request HTTP sweep, all five native
+MTP policies (default dynamic, fixed 1/3/15, observe 3), and explicit disabled
+single/TP/PP/MoE controls. Default dynamic records 53 evaluated depth windows
+per participant. The Qwen2.5 live card-default comparison also passes, including
+four of five prompts changing under the neutral repetition-penalty control.
+
+The native client sweep exposed a harness input defect. OpenCode 1.18.34's
+`run` positional-argument path escapes quotes before constructing the user
+message. All eleven inspected first requests differ from their saved prompts.
+Six of the first seven completed sessions pass; the quoted-string fixture fails
+exact bytes after receiving altered input. The sweep was deliberately stopped,
+its active workspaces preserved, and its server retired normally with clean
+prefix, MTP, capture, transfer, capacity and driver checks. Preserve
+`native-opencode-tools-qwen38-unicode-mtp/` and
+`opencode-cli-prompt-transport-defect.json`; this is not a green client sweep.
+
+Prompts now enter OpenCode through UTF-8 stdin. Each phase authenticates the
+first request's latest user text against its intended prompt and retains both
+hashes. All seventeen focused harness tests pass, including real-child input
+delivery and negative wire controls, with explicit
+`V2_Integration_OpenCodePromptTransport` preflight registration. A model-free
+real OpenCode probe passes all 22 intended prompts plus the deliberately
+incorrect positional-argument control; it proves transport, not inference.
+The earlier CLI invocation continued diagnostically until the client-deadline
+defect above. Refresh the complete gate and run the final app/client sweeps
+with authenticated stdin input before publication.
+
+## October 5 model-declared tokenization defect
+
+Token tracing during the latest unbounded OpenCode app run exposed repeated
+indentation repairs. A read-only probe of the actual Release tokenizer then
+confirmed 14 of 23 targeted inputs disagree with the pinned official Qwen3.8
+Hugging Face tokenizer, despite every byte round trip passing. The native IDs
+match a reference with pre-tokenization removed: production ignored
+`tokenizer.ggml.pre` and allowed BPE merges across declared boundaries. For
+`    def answer():` the reference begins `[262, 687]`, while native used
+`[257, 727]`. This is a confirmed tokenizer defect; its contribution to the app's
+behavior still requires the corrected native rerun.
+
+Both live runs were deliberately interrupted for this defect, without a turn
+deadline. The app completed two of ten phases; its unfinished workspace and raw
+SSE/client logs are retained under `dynamic-opencode-webapp-qwen38-streaming-mtp/`.
+The parallel tool run passed 220 HTTP cases and eight of its first nine native
+OpenCode sessions. One session's valid `wc -c result.txt && od -c result.txt |
+tail -3` inspection was denied by the harness's shell allowlist. The harness
+now permits ordinary shell verification while independently requiring real
+write/read calls, exact schemas, completed call identities and exact file bytes.
+All fifteen harness regressions pass. The incomplete 240-session campaign is
+preserved under `native-opencode-tools-qwen38-streaming-mtp/`.
+
+Both servers retired normally with clean graph, transfer, prefix ownership,
+MTP and driver checks. Five current-image policy controls pass (default dynamic,
+fixed depths 1/3/15, observe depth 3); explicit MTP-off controls pass single, TP,
+PP and multi-device MoE. These results precede the tokenizer correction. The boundary regression reproduces incorrect indentation IDs on the old path,
+then passes with declared splitting. A larger native comparison of 1,217 inputs
+per model, including archived OpenCode prompts and Python source, exposed a
+second missing stage: NFC normalization declared by every audited Qwen tokenizer.
+All six GGUFs (Qwen2.5, Qwen3, Qwen3.5, Qwen3.6 dense/MoE, Qwen3.8) showed 415
+remaining differences on decomposed/canonically equivalent Unicode. The official
+reference's normalizer remains authoritative; expected text is its decoded NFC
+form, not an assumed byte round trip. NFC now has separate
+preflight coverage for accents, Hangul composition, embedded NULs and unchanged
+emoji sequences. All ten focused tokenizer tests pass in 0.73 seconds, including
+one-million-character runs and concurrent reuse. The corrected Release tokenizer
+matches every official reference across all 7,302 real-GGUF comparisons, with zero
+ID or decoded-text differences. Preserve the boundary-only failure in
+`qwen38-tokenizer-audit/native-expanded-comparison.json` and the final proof in
+`qwen38-tokenizer-audit/nfc-native-final/native-expanded-comparison.json`.
+The fresh complete gate passes all 697 Unit and 734 production-preflight
+registrations (325 host, 147 CUDA, 173 ROCm, 89 exclusive), with clean driver
+diagnostics. Evidence is retained in `unicode-mtp-prerequisites/` and
+`unicode-mtp-prerequisites.driver-report.json`. Six separate native sampling
+observations also pass their output oracles and driver checks without profiler
+attachment; event-bracket observations do not measure achieved occupancy or
+model throughput. The local Release overlay `2a7155bd307f` now drives fresh,
+unbounded app and tool-stress runs. Current-image acceptance remains pending.
+
+## October 5 model-card audit and observable coding turns
+
+The official card audit now covers 25 Qwen2.5 Instruct/Qwen3/Qwen3.5/Qwen3.6/
+Qwen3.8 revisions. Qwen2.5 generation configs supply size-specific repetition
+factors; general-text recommendations on later cards take precedence over
+specialized examples and differing generation configs. The complete card/mode
+expectation table is pinned in the device-free sampling-policy regression.
+The focused model-card/HTTP/CPU sampler gates and native CUDA/ROCm repetition
+history gates pass (7/7). The complete prerequisite transaction passes all 697
+Unit and 731 production-preflight registrations. The final native coding session
+and current-image stress remain outstanding before publication.
+
+The conversation-policy local Release image completed the first two web-app
+increments. The harness stopped the third turn at its former 600-second limit.
+Treat that result as harness-interrupted and incomplete, not proof of a model
+failure. Its 36 completed responses emitted 17,183 tokens, with an 86.73-second
+longest response. An offline stream inspection found no sustained exact repeated
+phrase; repeated read/test tools occurred during indentation repairs. Independent
+app acceptance remained incomplete. The server retired normally with clean driver,
+prefix ownership, graph and transfer checks, but the complete dynamic-MTP ledger
+validator rejected zero evaluated depth windows after 9,527 transactions. Its
+other printed counters did not independently violate the validator. The focused
+regression reproduces a controller reset at every 16-token publication window,
+before the 32-transaction learner window could complete. Continuations now retain
+partial observations, current depth, cooldown and hysteresis on device, while
+per-publication reporting counters reset. A typed request boundary and resident
+ticket authenticate epoch, arena generation and unchanged policy. All 32 pure
+controller tests pass, along with 46,080 captured short publication windows per
+GPU backend. The complete Unit and production-preflight gates pass, including
+both native continuation regressions, with a clean native driver interval.
+The [dashboard](MTP_VLLM_STYLE_TUNING_DASHBOARD.md#october-5-model-card-audit-and-observable-coding-turns)
+owns the current gate and profiler-driver evidence.
+
+Coding turns now have no default elapsed-time, socket-inactivity or agent-step
+cutoff. Prefill and buffered XML tool calls can remain active without SSE bytes.
+Readiness remains bounded; operator turn and inactivity limits are opt-in.
+Raw SSE streams and per-exchange progress JSON retain live text/reasoning/tool
+activity, output tails, terminal token counts and diagnostic repetition signals.
+All 14 harness tests pass, including malformed JSON-shape observation and quiet
+buffered tool calls that must retain their raw wire evidence.
+The next native run must enable the existing generated-token trace for exact IDs,
+complete all ten turns and independent acceptance, and retire with valid MTP
+counters. Trace-enabled diagnostics do not establish timing performance.
+
+
+## October 5 OpenCode correctness and coverage
+
+The Qwen3.8-27B ROCm TP2 OpenCode reproduction exposed an unseeded stochastic
+verifier defect: captured comparison capacity was reduced as live depth, and
+the bonus sample came from the capacity row. A carried condition then admitted
+two accepted drafts at device depth one and invalidated the generation ticket.
+Both native GPU backends now use the controller's live depth for comparison,
+bonus sampling and outcome reduction, while leaving inactive storage untouched.
+No host outcome bridge or inference retry is introduced.
+
+Focused production-stage captures pass all depths 1–15, fixed/observe/dynamic
+policies, both sampling laws, carry states, budget/stop/rejection boundaries and
+repeated large-to-small replay: 29,160 replays per GPU backend. The independent
+CPU reducer/controller oracle and explicit preflight entries pass. GGUF startup
+intent defaults to automatic MTP with dynamic depth; explicit disabled admission
+has an all-format/backend/topology planning sweep. Native disabled-mode controls
+pass single-device, TP, PP and two-device MoE, twenty requests each. Fixed depths
+1, 3 and 15 and observe depth 3 each pass three eleven-case sampling matrices.
+Every native cell passes captured-graph/host-transfer policy validation and
+normal retirement with clean driver intervals.
+
+The isolated default-dynamic TP2 HTTP stress passes twenty eleven-case matrices.
+The complete prerequisite transaction passed 695 Unit and 697 production-preflight
+registrations before subsequent live testing found two more lifecycle defects.
+Compact continuation expert projections now admit their real top-k-expanded
+workspace on both GPU backends; all quantized/floating codebooks have focused
+regressions. A restored prefix chain must release both request lookup owners and
+completed device-read owners before suffix harvest. The latter lifetime is
+independent of the still-valid live-state ordering event. Native regressions
+reproduce the unconsumed-handoff defect on both backends and pass twenty held-read
+interleavings after the fix. Diagnostic block/tier/state summaries retain the
+original restore facts without retaining its payload chain.
+
+The next live attempt exposed a later admission boundary: the restore event
+completed during harvest, after its initial nonblocking poll. Debugger evidence
+found 364 source aliases retained after every cache metadata entry had retired.
+RAM admission now asks the typed restore authority to reap completed readers
+on every capacity check, including checks after required archive receipts.
+The focused regression fails before that connection on both GPU backends and
+passes after it, with twenty interleavings for each handoff state. CPU admission
+also covers dense, hybrid and MTP archive geometries. No backing growth or
+inference synchronization is introduced.
+
+The next reduced replay still failed: the exact native read event remained
+pending, so completion polling could not legally release its actual KV/MTP
+sources. Debugger evidence found 17 rich checkpoints retained inside a 4 GiB
+arena, with 4,211,048,448 leased bytes and only 83,918,848 reusable bytes. Earlier
+blocks did not supply their recurrent/terminal sections to this restore, yet
+one archive-wide range token retained those large images too. Typed read leases
+now retain sequence sections from earlier blocks and the complete terminal
+checkpoint; archive sections have independent physical range owners. Admission
+and acquisition share the same section placement plan, including fragmented
+holes, without changing admitted backing capacity. The focused native baseline
+fails on both CUDA and ROCm with normal teardown and clean driver diagnostics.
+The fixed 23-case prefix/lifecycle selection passes, including 80 held-read
+cases per native backend; the device-free 205-case source-policy suite also
+passes after updating its typed ownership assertions. Fresh replay of all 26
+saved OpenCode requests passes, including the previously failing admission and
+subsequent longer histories. Another twenty eleven-case default-dynamic matrices
+pass. The complete server lifetime passes prefix ownership, capture, transfer,
+MTP and driver checks with normal shutdown; each participant materializes its
+RAM backing once. A startup overlapped with the full dependency rebuild exceeded the
+120-second harness readiness bound, then became healthy and retired normally;
+that failed timing observation and clean driver interval remain preserved.
+
+Paged live KV and prefix storage is the strategic follow-up requested on
+October 5. It should reuse admitted pages under typed ownership and exact
+last-reader events, keep GPU request metadata/device decisions on device, and
+communicate only consumed rows. MTP advancement, partial-block restore,
+large-to-small replay, alias retirement and byte-equivalent verifier arithmetic
+must be proven through the existing capture and backend gates. The present
+section correction is needed independently of that broader allocator work.
+
+The next actual OpenCode conversation completed the first app increment but
+failed its second: the harness denied normal external scratch files, and the
+600-second phase budget expired. The generated app remains incomplete. The
+coding case now admits temporary test files and divides the workload into ten
+smaller increments without increasing its timeout. This run also exposed missing
+requested SSE usage in 25 authentic exchanges: OpenCode reported zero input
+tokens and could not trigger normal context compaction. Terminal streaming usage
+now publishes existing committed-token accounting once, after the final choice
+and before DONE; parsing, cancellation and SDK evidence have focused regressions.
+
+The first complete grouped-verifier run passed 77 of 81 registrations. Four
+registrations exposed stale test admission, synthetic overflow/nonzero witnesses
+and transport expectations. Their fixture corrections have focused registrations;
+the complete rerun passes all 81 with clean driver diagnostics. The latest requested serving configuration uses
+the GGUF's 262,144-token maximum if physical admission succeeds, a 32,768-token
+configured output budget, 16 GiB RAM prefix storage and 32 GiB disk storage.
+The refreshed complete gate, the completed real app and final same-image HTTP repetitions remain required
+before push. Failed predecessor evidence remains preserved.
+Full-context startup then exposed missing replicated MTP head geometry in
+attention/KV workspace admission: the runtime needed 9,791,823,876 bytes but the
+planner admitted 9,011,427,328. The failure retired cleanly. Admission now merges
+the full-head compact member with the sharded main member by canonical workspace
+name. The focused baseline fails before the correction; the corrected CPU/CUDA/
+ROCm sweep covers TP 1/2/4/8, context 4K/32K/256K, four graph-row geometries and
+explicit disabled controls. The entire workspace-estimator unit suite passes;
+the next native attempt selects 256 resident graph rows while retaining the
+262,144-token KV horizon. That attempt then exceeded readiness while zeroing an
+unrelated host logits aggregate. A native stack identifies `LogitsGatherer`:
+it used context times vocabulary (242.5 GiB) although the main output exposes
+only one terminal row. The cancelled attempt has clean driver diagnostics.
+A device-free TP/PP regression reproduces the capacity error on CPU/CUDA/ROCm
+identities with MTP enabled and disabled. Main output now retains one row;
+the PP copy interface no longer accepts a context length. Replicated gather
+copies also reject output-capacity overruns before writing. Both focused
+preflight entries and the complete rank-orchestrator/logits-gatherer unit suites
+pass. The fresh local Release overlay reaches readiness in 25.3 seconds at the
+full 262,144-token context with 16 GiB RAM per participant and a shared 32 GiB disk archive.
+Its native JSON/SSE probe confirms exact emoji output, identical positive token
+accounting, and default dynamic MTP over depths 1–15. The ten-turn real OpenCode
+app session failed its second 600-second phase; it is still incomplete. The
+server retired normally with clean driver diagnostics and passing graph,
+transfer, MTP, prefix-ownership and capacity policies. Six saved-prompt greedy
+continuations match exactly with MTP on/off, including warm-prefix repeats.
+Two further integration defects are under correction: the qwen35 architecture
+default supplies temperature 0.6/presence penalty 1.5 to Qwen3.8 thinking requests
+(the published recommendation is 1.0/0), and HTTP message parsing drops the
+reasoning_content that actual OpenCode requests send back on every tool turn.
+Schema-owned string parsing, protocol literals, byte-fragment emoji streaming
+and single-terminal SSE errors have focused regressions. These local proofs
+do not certify a new published image or the wider performance objectives below.
+Release/Integration compile and static resource audits pass for native gfx906
+and sm86; both modified CUDA translation units additionally compile with fatal
+spill guards for the shipping sm80/sm86/sm89/sm90 set. Their inspected kernels
+have zero stack/local bytes. This is compiler-resource qualification, not a
+runtime occupancy measurement or a complete shipping-image build.
+
 ## October 4 dense TP2 steering
 
 The current dense Qwen3.8 27B target is 1.7x prefill scaling over the single

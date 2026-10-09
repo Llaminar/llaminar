@@ -107,6 +107,8 @@ namespace llaminar2
         std::vector<MoEOverlayTierMigration> migrations;
         std::vector<MoEOverlayTierMigrationCycle> migration_cycles;
         std::vector<MoEOverlayTierShadowRequirement> shadow_requirements;
+        /** Global layer of row zero; every physical coordinate uses this scope. */
+        std::int32_t first_model_layer = 0;
 
         /**
          * @return Whether identities, epochs, physical bytes, cycles, and slot

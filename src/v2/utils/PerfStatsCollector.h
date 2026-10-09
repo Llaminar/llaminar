@@ -55,6 +55,9 @@ namespace llaminar2
         uint64_t sequence_digest_lo = 0;
         /** Independent second half of the ordered sequence fingerprint. */
         uint64_t sequence_digest_hi = 0;
+        /** Exact per-word extrema for fixed-schema counter/timer observations. */
+        std::vector<uint64_t> sequence_minimum_words;
+        std::vector<uint64_t> sequence_maximum_words;
     };
 
     class PerfStatsCollector
@@ -153,6 +156,27 @@ namespace llaminar2
             std::string device = {},
             Tags tags = {});
 
+        /**
+         * @brief Count events while folding changing identities into bounded evidence.
+         * @param domain Stable event domain.
+         * @param name Stable event family.
+         * @param value Amount added to the existing counter, independently of word count.
+         * @param words Ordered numeric lifecycle observations; never cache/tensor payloads.
+         * @param phase Stable execution phase.
+         * @param device Stable participant identity.
+         * @param tags Bounded dimensions such as role, operation and policy.
+         *
+         * The counter retains its count/value semantics. Session epochs, token
+         * positions and mutation generations belong in words, never map keys.
+         * Both order-sensitive witnesses use the existing sequence encoding;
+         * storage remains one row per bounded dimension tuple. Empty words are
+         * rejected rather than silently discarding lifecycle evidence.
+         */
+        static void addCounterWithSequence(
+            std::string domain, std::string name, double value,
+            std::initializer_list<uint64_t> words,
+            std::string phase = {}, std::string device = {}, Tags tags = {});
+
         static void recordTimingNs(
             std::string domain,
             std::string name,
@@ -160,6 +184,21 @@ namespace llaminar2
             std::string phase = {},
             std::string device = {},
             Tags tags = {});
+
+        /**
+         * @brief Time events without retaining changing token positions as keys.
+         * @param domain Stable timing domain.
+         * @param name Stable timing family.
+         * @param duration_ns Duration accumulated into total/min/max time.
+         * @param words Canonical lifecycle observations, excluding tensor/cache payloads.
+         * @param phase Stable execution phase.
+         * @param device Stable participant identity.
+         * @param tags Bounded policy and admitted geometry dimensions.
+         */
+        static void recordTimingNsWithSequence(
+            std::string domain, std::string name, uint64_t duration_ns,
+            std::initializer_list<uint64_t> words,
+            std::string phase = {}, std::string device = {}, Tags tags = {});
 
         /**
          * @brief Fold one ordered lifecycle step into a bounded evidence row.
@@ -217,6 +256,16 @@ namespace llaminar2
         static void printSummary(
             const std::vector<std::string> &filters = {},
             size_t max_records = 120);
+
+        /**
+         * @brief Resolve this process's configured JSON artifact ownership.
+         * @return Expanded output path, or empty when JSON is disabled or another
+         *         MPI rank owns an unqualified path. No file I/O is performed.
+         *
+         * Terminal metadata sidecars use this same path authority so they cannot
+         * diverge from the counter artifact or race another participant's export.
+         */
+        static std::string jsonExportPath();
 
         /**
          * @brief Export configured reports without allowing MPI ranks to race.

@@ -425,9 +425,42 @@ namespace llaminar2
             bool state_sideband_enabled = false;
         };
 
-        static std::string moeRuntimeTableKey(
+        /**
+         * @brief Name one immutable device, stage interval and runtime role.
+         * @param device Exact participant whose graph owns the table.
+         * @param identity Durable, transient-prefill or depth-scoped role.
+         * @return Stage-bound identity shared by construction and prefix metadata.
+         * @throws std::invalid_argument If the role carries an invalid depth.
+         */
+        std::string moeRuntimeTableKey(
             DeviceId device,
-            const MoERuntimeTableIdentity &identity);
+            const MoERuntimeTableIdentity &identity) const;
+        /**
+         * @brief Resolve compact runtime storage before any device allocation.
+         * @param device Exact participant that will own the mirrored table.
+         * @param identity Runtime role, including canonical-parent ownership.
+         * @param num_layers_override Requested compact row count, or -1 for main rows.
+         * @param bind_overlay_epoch Whether the stage's placement manifest owns banks.
+         * @return Base table configuration with checked global origin and local count.
+         * @throws std::invalid_argument If geometry is invalid or the placement belongs to another stage.
+         * @throws std::logic_error If an overlay table has no placement authority.
+         */
+        DeviceMoERuntimeTable::Config moeRuntimeTableConfig(
+            DeviceId device,
+            const MoERuntimeTableIdentity &identity,
+            int num_layers_override,
+            bool bind_overlay_epoch) const;
+        /**
+         * @brief Construct or reuse a graph-owned runtime with immutable stage geometry.
+         * @param device Exact participant that owns all mirrored banks.
+         * @param identity Runtime role and optional sidecar depth.
+         * @param prefill_token_capacity Live graph's required persistent route capacity.
+         * @param num_layers_override Compact row count, or -1 for the main stage.
+         * @param histogram_producer_role Whether this graph publishes decode evidence.
+         * @param bind_overlay_epoch Whether banks consume the canonical placement ticket.
+         * @return Retained table, or null for a non-GPU participant.
+         * @throws std::logic_error If a retained resource or placement identity changes.
+         */
         IMoERuntimeTable *moeRuntimeTableForDevice(
             DeviceId device,
             const MoERuntimeTableIdentity &identity,
@@ -526,6 +559,9 @@ namespace llaminar2
             MoERuntimeHistogramProducerRole histogram_producer_role);
 
     private:
+        /** Device-free archive tests install real tables without admitting GPU work. */
+        friend struct Qwen35MoEPrefixRuntimeTestPeer;
+
         /**
          * @brief Return model-lifetime mapped ticket storage for one GPU.
          *

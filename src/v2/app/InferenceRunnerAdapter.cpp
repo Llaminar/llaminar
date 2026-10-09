@@ -277,8 +277,14 @@ namespace llaminar2
         }
         sampling_params_.presence_penalty = policy.presence_penalty;
         sampling_params_.frequency_penalty = policy.frequency_penalty;
+        sampling_params_.repetition_penalty = policy.repetition_penalty;
         orch_runner_->setSamplingParams(sampling_params_);
         return true;
+    }
+
+    PrefixCacheTelemetrySources InferenceRunnerAdapter::prefixCacheTelemetrySources() const
+    {
+        return orch_runner_->prefixCacheTelemetrySources();
     }
 
 } // namespace llaminar2

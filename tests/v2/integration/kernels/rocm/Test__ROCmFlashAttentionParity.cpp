@@ -6585,6 +6585,213 @@ TEST_F(Test__ROCmFlashAttentionParity, NativeFP16RingWrappedDecodeAndPrefillAreB
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
+/**
+ * @brief Replay optimized decode through tiny rings, wrap, and shrinking histories.
+ *
+ * One immutable graph consumes device-owned lengths, origins, and active row
+ * counts. Its live rows must equal independent scalar decode over physically
+ * contiguous copies of the same cache bytes at the same allocated capacity.
+ * Odd and boundary head widths exercise the generic body. Q8_1 admits complete
+ * 32-element blocks only. Tiny rings exercise strides larger than capacity;
+ * long non-power-of-two rings exercise the normalized cursor and the optimized
+ * 256-dimension kernel. Native graph identity proves that the
+ * compiled dimension specialization actually executes without a timing limit.
+ */
+TEST_F(Test__ROCmFlashAttentionParity,
+       CapturedNativeDecodeDimensionAndRingCursorAreByteExact)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    test::ScopedGPUStream owner(device);
+    const auto stream = static_cast<hipStream_t>(owner.get());
+    auto &transfer = TransferEngine::instance();
+    constexpr int heads = 4;
+    constexpr int kv_heads = 1;
+
+    // Quantization is row-local for every native format below. Moving complete
+    // rows therefore preserves storage bytes as well as mathematical values.
+    const auto makeKV = [](const std::vector<float> &values, int rows, int width,
+                           ActivationPrecision precision) -> std::shared_ptr<TensorBase>
+    {
+        const std::vector<size_t> shape{static_cast<size_t>(rows), static_cast<size_t>(width)};
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+        {
+            auto tensor = std::make_shared<FP32Tensor>(shape);
+            std::copy(values.begin(), values.end(), tensor->mutable_data());
+            return tensor;
+        }
+        case ActivationPrecision::FP16:
+        {
+            std::vector<uint16_t> data(values.size());
+            quantizeToFP16(values.data(), data.data(), data.size());
+            return std::make_shared<FP16Tensor>(shape, std::move(data));
+        }
+        case ActivationPrecision::BF16:
+        {
+            auto tensor = std::make_shared<BF16Tensor>(shape);
+            tensor->from_fp32(values.data(), values.size());
+            return tensor;
+        }
+        case ActivationPrecision::Q8_1:
+            return Q8_1Tensor::quantize_from_fp32(values.data(), shape);
+        default:
+            return nullptr;
+        }
+    };
+
+    for (const auto precision : {ActivationPrecision::FP32, ActivationPrecision::FP16,
+                                ActivationPrecision::BF16, ActivationPrecision::Q8_1})
+    for (const int width : {32, 63, 64, 65, 96, 127, 128, 129, 192, 255, 256})
+    for (const int capacity : {1, 3, 64, 8193, 65537})
+    {
+        if (precision == ActivationPrecision::Q8_1 && width % 32 != 0)
+            continue;
+        SCOPED_TRACE("precision=" + std::to_string(static_cast<int>(precision)) +
+                     " width=" + std::to_string(width) + " capacity=" + std::to_string(capacity));
+        const int rows =
+            std::min(std::max(1, capacity - 1), attention::kMaxGroupedVerifierAttentionRows);
+        const size_t q_columns = static_cast<size_t>(heads) * width;
+        const size_t kv_columns = static_cast<size_t>(kv_heads) * width;
+        const auto physical_k = randomFP32Scaled(static_cast<size_t>(capacity) * kv_columns, 0.25f);
+        const auto physical_v = randomFP32Scaled(physical_k.size(), 0.25f);
+        auto ring_k = makeKV(physical_k, capacity, kv_columns, precision);
+        auto ring_v = makeKV(physical_v, capacity, kv_columns, precision);
+        ASSERT_NE(ring_k, nullptr);
+        ASSERT_NE(ring_v, nullptr);
+        FP32Tensor query({static_cast<size_t>(rows), q_columns});
+        FP32Tensor output({static_cast<size_t>(rows), q_columns});
+        FP32Tensor serial_query({size_t{1}, q_columns});
+        FP32Tensor serial_output({size_t{1}, q_columns});
+        const auto query_values = randomFP32Scaled(static_cast<size_t>(rows) * q_columns, 0.25f);
+        std::copy(query_values.begin(), query_values.end(), query.mutable_data());
+        INT32Tensor cached({size_t{1}}, std::vector<int32_t>{capacity});
+        INT32Tensor head({size_t{1}}, std::vector<int32_t>{0});
+        INT32Tensor active({size_t{1}}, std::vector<int32_t>{rows});
+        for (TensorBase *tensor : std::array<TensorBase *, 9>{ring_k.get(), ring_v.get(),
+                               &query, &output, &serial_query, &serial_output,
+                               &cached, &head, &active})
+            ASSERT_TRUE(transfer.uploadFull(tensor, device, stream).success);
+
+        rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> grouped(0), serial(0);
+        grouped.setGPUStream(stream);
+        serial.setGPUStream(stream);
+        const auto requirements = grouped.getWorkspaceRequirements(rows, heads, width);
+        DeviceWorkspaceManager grouped_workspace(device, requirements.total_bytes_with_alignment());
+        DeviceWorkspaceManager serial_workspace(device, requirements.total_bytes_with_alignment());
+        ASSERT_TRUE(grouped_workspace.allocate(requirements));
+        ASSERT_TRUE(serial_workspace.allocate(requirements));
+        grouped.bindWorkspace(&grouped_workspace);
+        serial.bindWorkspace(&serial_workspace);
+        const auto enqueueGrouped = [&]
+        {
+            if (!grouped.prepareDynamicAttnParamsFromDeviceSequenceState(
+                    static_cast<const int *>(cached.gpu_data_ptr()), rows, rows, stream,
+                    capacity, static_cast<const int *>(active.gpu_data_ptr()), {},
+                    static_cast<const int *>(head.gpu_data_ptr()), capacity))
+                return false;
+            // The explicit grouped contract admits every native KV format,
+            // including FP32, without relying on tensor-entrypoint dispatch.
+            return rows > 1
+                ? grouped.compute_verifier_rows_decode_equivalent(
+                    &query, ring_k.get(), ring_v.get(), &output, rows, capacity,
+                    heads, kv_heads, width, true, -1, &mpi_ctx_, 0)
+                : grouped.compute_tensor(&query, ring_k.get(), ring_v.get(), &output,
+                    1, rows, capacity, heads, kv_heads, width, true, -1,
+                    nullptr, nullptr, &mpi_ctx_, 0);
+        };
+        ASSERT_TRUE(enqueueGrouped());
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        HIPGraphCapture graph(stream, 0);
+        {
+            GraphCaptureGuard guard;
+            ASSERT_TRUE(graph.beginCapture());
+            const bool recorded = enqueueGrouped();
+            ASSERT_TRUE(graph.endCapture());
+            ASSERT_TRUE(recorded);
+        }
+        std::vector<GPUGraphKernelNodeInfo> nodes;
+        std::string error;
+        ASSERT_TRUE(graph.inspectKernelNodes(nodes, &error)) << error;
+        const auto producer = std::find_if(nodes.begin(), nodes.end(), [](const auto &node)
+        {
+            return node.name.find("flash_decoding_mi50_kernel") != std::string::npos;
+        });
+        ASSERT_NE(producer, nodes.end());
+        if (width == 256)
+        {
+            // HIP exposes the native Itanium symbol. Its second template
+            // argument must encode the compiled 256-element head width.
+            EXPECT_NE(producer->name.find("ELi256EE"), std::string::npos) << producer->name;
+        }
+        ASSERT_TRUE(graph.instantiate());
+
+        // Deliberately replay large -> small -> large with one retained graph.
+        const std::array<int, 6> lengths{capacity, std::min(capacity, 37), 1,
+                                       std::min(capacity, 8192), capacity, 1};
+        const std::array<int, 6> active_rows{rows, 4, 1, 8, rows, 1};
+        for (size_t replay = 0; replay < lengths.size(); ++replay)
+        {
+            const int length = lengths[replay];
+            const int live_rows = std::min({rows, length, active_rows[replay]});
+            const int origin = (capacity - 1 + static_cast<int>(replay) * 7) % capacity;
+            // Test input publication precedes graph replay. Production append
+            // publishes these counters on device; no copy belongs to the graph.
+            const int ring_head = (origin + length) % capacity;
+            ASSERT_EQ(hipMemcpyAsync(cached.gpu_data_ptr(), &length, sizeof(length),
+                                    hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(head.gpu_data_ptr(), &ring_head, sizeof(ring_head),
+                                    hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(active.gpu_data_ptr(), &live_rows, sizeof(live_rows),
+                                    hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_TRUE(graph.launch());
+            std::vector<float> actual(query_values.size());
+            ASSERT_EQ(hipMemcpyAsync(actual.data(), output.gpu_data_ptr(), actual.size() * sizeof(float),
+                                    hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+            // Capacity is part of the captured split envelope. Keep the
+            // scalar cache capacity identical while changing only its physical
+            // row order; unused rows must not affect either result.
+            std::vector<float> logical_k(static_cast<size_t>(capacity) * kv_columns);
+            std::vector<float> logical_v(logical_k.size());
+            for (int row = 0; row < length; ++row)
+            {
+                const size_t source = static_cast<size_t>((origin + row) % capacity) * kv_columns;
+                std::copy_n(physical_k.data() + source, kv_columns, logical_k.data() + row * kv_columns);
+                std::copy_n(physical_v.data() + source, kv_columns, logical_v.data() + row * kv_columns);
+            }
+            auto reference_k = makeKV(logical_k, capacity, kv_columns, precision);
+            auto reference_v = makeKV(logical_v, capacity, kv_columns, precision);
+            ASSERT_TRUE(transfer.uploadFull(reference_k.get(), device, stream).success);
+            ASSERT_TRUE(transfer.uploadFull(reference_v.get(), device, stream).success);
+            for (int row = 0; row < live_rows; ++row)
+            {
+                const int visible = length - live_rows + row + 1;
+                std::copy_n(query_values.data() + row * q_columns, q_columns, serial_query.mutable_data());
+                ASSERT_TRUE(transfer.uploadFull(&serial_query, device, stream).success);
+                ASSERT_TRUE(serial.prepareDynamicAttnParams(visible, visible - 1, 1, stream, capacity));
+                ASSERT_TRUE(serial.compute_tensor(&serial_query, reference_k.get(), reference_v.get(),
+                    &serial_output, 1, 1, visible, heads, kv_heads, width, true, -1,
+                    nullptr, nullptr, &mpi_ctx_, 0));
+                std::vector<float> expected(q_columns);
+                ASSERT_EQ(hipMemcpyAsync(expected.data(), serial_output.gpu_data_ptr(),
+                    expected.size() * sizeof(float), hipMemcpyDeviceToHost, stream), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                ASSERT_EQ(std::memcmp(actual.data() + row * q_columns, expected.data(),
+                                      expected.size() * sizeof(float)), 0)
+                    << "replay=" << replay << " row=" << row << " origin=" << origin;
+            }
+        }
+        graph.reset();
+        serial.unbindWorkspace();
+        grouped.unbindWorkspace();
+    }
+}
+
 #endif // HAVE_ROCM
 
 // ============================================================================

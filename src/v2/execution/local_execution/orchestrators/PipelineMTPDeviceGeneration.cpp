@@ -7,6 +7,8 @@
  * receives a continuation command inside a complete native parent; HIP submits
  * one complete follower transaction from the tail's authenticated scheduler
  * ticket. Neither path copies mutable model or controller state to the host.
+ * Each sparse follower retains its own device epoch acquire/release around
+ * verification and publication; the tail's lease covers only its own domain.
  */
 #include "PipelineDeviceGeneration.h"
 #include "DeviceGraphOrchestrator.h"
@@ -16,7 +18,9 @@
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/mtp/DeviceGenerationGraphProgram.h"
+#include "utils/PerfStatsCollector.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <barrier>
@@ -122,17 +126,56 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
             return false;
         }
         auto &loop = stage.mtp_device_generation_loop_graph_;
+        std::vector<DeviceControlledLoopFragment> fragments;
+        const bool owns_epoch = static_cast<bool>(stage.moe_overlay_epoch_execution_binding_);
+        if (owns_epoch)
+        {
+            // The first, externally scheduled verifier has published its
+            // release. Join the committed state and close any ambient reader
+            // before the retained parent's first acquire, just as on the tail.
+            if (!stage.waitForLiveInferenceStateReadyForObservation(loop.stream.get(),
+                    "pipeline_mtp_follower_materialization", DeviceTimelineRole::DeviceGenerationController) ||
+                !stage.prepareMoEOverlayEpochForInternalParent(loop.stream.get(),
+                    "pipeline_mtp_follower_materialization"))
+                return false;
+            const auto acquire = stage.moeOverlayEpochBoundaryDeviceLoopGraphTemplate(
+                MoEOverlayEpochBoundaryStage::Operation::Acquire, &error);
+            if (!acquire)
+            {
+                LOG_ERROR("Pipeline follower lacks its captured epoch acquire: " << error);
+                return false;
+            }
+            const auto release = stage.moeOverlayEpochBoundaryDeviceLoopGraphTemplate(
+                MoEOverlayEpochBoundaryStage::Operation::Release, &error);
+            if (!release)
+            {
+                LOG_ERROR("Pipeline follower lacks its captured epoch release: " << error);
+                return false;
+            }
+            fragments.push_back({"pipeline expert epoch acquire", acquire->capture});
+            fragments.push_back({"pipeline grouped verifier", forward->capture});
+            fragments.push_back({"pipeline accepted-state publication", publication->capture});
+            fragments.push_back({"pipeline expert epoch release", release->capture});
+        }
+        else
+        {
+            fragments.push_back({"pipeline grouped verifier", forward->capture});
+            fragments.push_back({"pipeline accepted-state publication", publication->capture});
+        }
         const auto generation = stage.workspaceGeneration(stage.state_.device_id);
         if (loop.valid && loop.workspace_generation == generation &&
             loop.pipeline_verifier_identity == verifier->signature &&
-            loop.source_fragments.size() == 2 &&
-            loop.source_fragments[0].capture == forward->capture &&
-            loop.source_fragments[1].capture == publication->capture)
+            std::equal(loop.source_fragments.begin(), loop.source_fragments.end(),
+                fragments.begin(), fragments.end(),
+                [](const auto &left, const auto &right) { return left.capture == right.capture; }))
+        {
+            PerfStatsCollector::addCounter("generation", "pipeline_mtp_follower_graph_reuses", 1.0,
+                "graph_setup", stage.state_.device_id.toString());
             return true;
+        }
         loop.invalidateGraph();
         loop.pipeline_verifier_identity = verifier->signature;
-        loop.source_fragments.push_back({"pipeline grouped verifier", forward->capture});
-        loop.source_fragments.push_back({"pipeline accepted-state publication", publication->capture});
+        loop.source_fragments = std::move(fragments);
         loop.workspace_generation = generation;
         loop.request_count = 1;
         loop.draft_depth = depth;
@@ -164,7 +207,11 @@ bool PipelineDeviceGeneration::composeSpeculativeParticipants()
             for (const auto &fragment : loop.source_fragments)
                 steps.push_back({.name = fragment.name, .capture = fragment.capture});
             loop.capture->reset();
-            return loop.capture->buildOrderedTimelineTransaction(steps) && loop.capture->instantiate();
+            if (!loop.capture->buildOrderedTimelineTransaction(steps) || !loop.capture->instantiate())
+                return false;
+            PerfStatsCollector::addCounter("generation", "pipeline_mtp_follower_graph_materializations", 1.0,
+                "graph_setup", stage.state_.device_id.toString());
+            return true;
         }
 
         // Record the two terminal command words symmetrically. No participant
@@ -265,7 +312,8 @@ bool PipelineDeviceGeneration::launchHostedSpeculativeTransactions()
         if (!loop.valid || loop.launched || !loop.capture->hasExecutable() ||
             loop.workspace_generation != stage.workspaceGeneration(stage.state_.device_id) ||
             !stage.consumeDeviceGenerationStateReady(loop.stream.get(),
-                DeviceTimelineRole::DeviceGenerationController, 1, "pipeline_mtp_hosted_admission"))
+                DeviceTimelineRole::DeviceGenerationController, 1, "pipeline_mtp_hosted_admission") ||
+            !stage.prepareMoEOverlayEpochForInternalParent(loop.stream.get(), "pipeline_mtp_hosted_admission"))
             return false;
         loop.launched = true;
     }
@@ -277,8 +325,12 @@ bool PipelineDeviceGeneration::launchHostedSpeculativeTransactions()
         if (!ticket.complete)
             for (size_t index = 0; index < terminalIndex(); ++index)
             {
-                auto &loop = stages_[index]->mtp_device_generation_loop_graph_;
+                auto &stage = *stages_[index];
+                auto &loop = stage.mtp_device_generation_loop_graph_;
                 if (!loop.capture->launchOnStream(loop.stream.get())) return false;
+                PerfStatsCollector::addCounter("generation", "pipeline_mtp_follower_transaction_submissions", 1.0,
+                    "decode", stage.state_.device_id.toString(),
+                    {{"epoch_boundary", stage.moe_overlay_epoch_execution_binding_ ? "captured" : "not_required"}});
             }
         // Submit every follower before the tail can rendezvous in its verifier.
         // The existing tail API authenticates the ticket and selects the branch.

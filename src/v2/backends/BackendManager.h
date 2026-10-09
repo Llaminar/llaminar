@@ -6,7 +6,9 @@
  * Supports heterogeneous multi-GPU where both NVIDIA and AMD GPUs coexist,
  * plus CPU backend for unified memory management.
  *
- * **Thread Safety**: Initialization is thread-safe via call_once.
+ * **Thread Safety**: Initialization is thread-safe via call_once. GPU accessors
+ * consult the explicit startup policy before initialization so CPU-only or
+ * vendor-excluded clients never enter an excluded native runtime.
  *
  * @author David Sanftenberg
  */
@@ -39,14 +41,16 @@ namespace llaminar2
     /**
      * @brief Get CUDA backend specifically
      *
-     * @return CUDABackend* or nullptr if CUDA not available
+     * @return CUDABackend* or nullptr if CUDA is unavailable or excluded by the
+     * startup policy. Exclusion is checked before native initialization.
      */
     IBackend *getCUDABackend();
 
     /**
      * @brief Get ROCm backend specifically
      *
-     * @return ROCmBackend* or nullptr if ROCm not available
+     * @return ROCmBackend* or nullptr if ROCm is unavailable or excluded by the
+     * startup policy. Exclusion is checked before native initialization.
      */
     IBackend *getROCmBackend();
 

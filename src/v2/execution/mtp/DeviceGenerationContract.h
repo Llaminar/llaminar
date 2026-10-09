@@ -31,6 +31,8 @@ struct DeviceGenerationAdmissionRequest
 {
     int request_count = 0; ///< Independent controller rows.
     int max_new_tokens = 0; ///< New response tokens permitted per row.
+    sampling_math::DeviceGenerationAdmissionKind kind =
+        sampling_math::DeviceGenerationAdmissionKind::NewRequest; ///< Request or response-window boundary.
     sampling_math::DeviceGenerationPolicy depth_policy =
         sampling_math::DeviceGenerationPolicy::fixed(0); ///< Explicit algorithm and depth policy.
     sampling_math::DeviceGenerationLeadingRowDisposition initial_leading_row_disposition =
@@ -49,11 +51,16 @@ struct DeviceGenerationAdmissionRequest
     [[nodiscard]] bool valid() const noexcept
     {
         return request_count > 0 &&
+            (kind == sampling_math::DeviceGenerationAdmissionKind::NewRequest ||
+             (kind == sampling_math::DeviceGenerationAdmissionKind::ContinueResponse &&
+              !depth_policy.isForwardOnly())) &&
             (!ordinary_sampling || (depth_policy.isOrdinary() &&
                 std::isfinite(ordinary_sampling->temperature) && ordinary_sampling->temperature >= 0 &&
                 std::isfinite(ordinary_sampling->top_p) && ordinary_sampling->top_p > 0 && ordinary_sampling->top_p <= 1 &&
                 std::isfinite(ordinary_sampling->presence_penalty) &&
                 std::isfinite(ordinary_sampling->frequency_penalty) &&
+                std::isfinite(ordinary_sampling->repetition_penalty) &&
+                ordinary_sampling->repetition_penalty > 0.0f &&
                 (ordinary_sampling->is_greedy() || (sampling_seeds &&
                     ordinary_sampling->top_k > 0 && ordinary_sampling->top_k <= sampling_math::kMaxTopK)) &&
                 (ordinary_sampling->dry_multiplier == 0 || ordinary_sampling->dry_penalty_last_n == 0))) &&
@@ -120,20 +127,7 @@ enum class DeviceGenerationTerminalError
     // Policy is request metadata, not a tunable device shadow. Dynamic mode
     // may change its current depth, but never rewrite its admitted boundaries.
     const auto &policy = admission.depth_policy;
-    if (row[kDeviceGenerationControlDepthPolicyMode] != static_cast<int>(policy.mode) ||
-        row[kDeviceGenerationControlMinimumDraftDepth] != policy.minimum_depth ||
-        row[kDeviceGenerationControlMaximumDraftDepth] != policy.maximum_depth ||
-        row[kDeviceGenerationControlDepthWindowSize] != policy.window_size ||
-        row[kDeviceGenerationControlDepthMinimumSamples] != policy.minimum_samples ||
-        row[kDeviceGenerationControlDepthCooldownSteps] != policy.cooldown_steps ||
-        row[kDeviceGenerationControlDepthPromoteConsecutiveWindows] != policy.promote_consecutive_windows ||
-        row[kDeviceGenerationControlDepthPromoteFullAcceptRatePPM] != policy.promote_full_accept_rate_ppm ||
-        row[kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM] != policy.demote_zero_accept_rate_ppm ||
-        row[kDeviceGenerationControlDepthDemoteAcceptanceRatePPM] != policy.demote_acceptance_rate_ppm ||
-        row[kDeviceGenerationControlLearnedDepthEnabled] != static_cast<int>(policy.learned.enabled) ||
-        row[kDeviceGenerationControlLearnedDepthBackend] != static_cast<int>(policy.learned.backend) ||
-        row[kDeviceGenerationControlLearnedDepthModelClass] != static_cast<int>(policy.learned.model_class) ||
-        row[kDeviceGenerationControlLearnedDepthVerifyMode] != static_cast<int>(policy.learned.verify_mode))
+    if (!device_generation_policy_matches(row.data(), policy))
         return Error::ChangedPolicy;
 
     const int learned_matches = row[kDeviceGenerationControlLearnedDepthMatchedWindows];

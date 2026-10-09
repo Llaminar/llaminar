@@ -50,7 +50,8 @@ namespace llaminar2
         : config_(std::move(config))
     {
         require(config_.workspace_generation && config_.layers && config_.experts &&
-            config_.layers <= INT32_MAX && config_.experts <= INT32_MAX &&
+            config_.first_model_layer <= INT32_MAX && config_.layers <= INT32_MAX - config_.first_model_layer &&
+            config_.experts <= INT32_MAX &&
             config_.wave_capacity && config_.edge_capacity >= 2 &&
             config_.wave_capacity <= config_.edge_capacity / 2 &&
             config_.participants.size() >= 2 && config_.participants.size() <= INT32_MAX,
@@ -172,8 +173,12 @@ namespace llaminar2
             {
                 next.discarded_edges = saturatingAdd(next.discarded_edges, wave.edge_count);
                 next.discarded_economy_records = saturatingAdd(next.discarded_economy_records, 1);
+                next.discarded_device_publications = saturatingAdd(next.discarded_device_publications, 1);
                 continue;
             }
+            next.device_publications.push_back({.transaction = wave.candidate_epoch,
+                .candidate_epoch = wave.candidate_epoch, .command_count = wave.edge_count,
+                .physical_payload_bytes = wave.physical_payload_bytes});
             next.economy.push_back({.authority = MoEOptimizationAuthority::Device,
                 .transaction = wave.candidate_epoch, .candidate_epoch = wave.candidate_epoch,
                 .command_count = wave.edge_count, .cycle_count = wave.edge_count / 2, .proof = wave.proof});
@@ -184,7 +189,7 @@ namespace llaminar2
                 const auto &destination = config_.participants[edge.destination_participant];
                 next.edges.push_back({.authority = MoEOptimizationAuthority::Device,
                     .transaction = wave.candidate_epoch, .candidate_epoch = wave.candidate_epoch,
-                    .layer = static_cast<int>(edge.layer), .expert = static_cast<int>(edge.expert),
+                    .layer = static_cast<int>(config_.first_model_layer + edge.layer), .expert = static_cast<int>(edge.expert),
                     .cycle_index = i / 2, .cycle_size = 2,
                     .direction = MoEOptimizationMovementDirection::SamePriority,
                     .axis = MoEOptimizationMovementAxis::ParticipantPlacement,
@@ -200,6 +205,8 @@ namespace llaminar2
         next.discarded_edges = saturatingAdd(next.discarded_edges,
             state.discarded_edges - (same_request ? previous_state_.discarded_edges : 0));
         next.discarded_economy_records = saturatingAdd(next.discarded_economy_records,
+            state.discarded_waves - (same_request ? previous_state_.discarded_waves : 0));
+        next.discarded_device_publications = saturatingAdd(next.discarded_device_publications,
             state.discarded_waves - (same_request ? previous_state_.discarded_waves : 0));
         ledger_ = std::move(next);
         totals_ = totals;

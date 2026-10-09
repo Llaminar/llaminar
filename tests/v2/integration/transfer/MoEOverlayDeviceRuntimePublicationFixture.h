@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -47,7 +48,19 @@ namespace llaminar2::test
     class MoEOverlayDeviceRuntimePublicationFixture final
     {
     public:
-        /** Construct and publish one exact participant view of the base epoch. */
+        /**
+         * @brief Construct and publish one exact participant view of the base epoch.
+         * @param backend Native backend owning the participant's persistent buffers.
+         * @param participant Exact immutable endpoint and device identity.
+         * @param topology Complete participant catalogue retained by the caller.
+         * @param input Compact stage rows, placement and command capacity.
+         * @param external_admission_epoch Optional shared device admission word.
+         * @param external_admission_lifetime Owner retaining that word.
+         * @param demand_source Production histogram plane to initialize.
+         * @param first_model_layer Global layer represented by compact row zero.
+         * @throws std::invalid_argument for incomplete topology or stage geometry.
+         * @throws std::runtime_error if native setup cannot materialize its resources.
+         */
         MoEOverlayDeviceRuntimePublicationFixture(
             IBackend *backend,
             const MoEExpertOwnerParticipant &participant,
@@ -56,7 +69,8 @@ namespace llaminar2::test
             const std::uint64_t *external_admission_epoch = nullptr,
             std::shared_ptr<const void> external_admission_lifetime = {},
             moe_runtime_abi::HistogramSource demand_source =
-                moe_runtime_abi::HistogramSource::Decode)
+                moe_runtime_abi::HistogramSource::Decode,
+            int first_model_layer = 0)
             : backend_(backend),
               participant_(participant),
               topology_(&topology),
@@ -66,6 +80,9 @@ namespace llaminar2::test
                 participant.participant_id);
             if (!backend_ || !participant.device.is_gpu() || !group ||
                 input.num_layers == 0u || input.num_experts == 0u ||
+                first_model_layer < 0 ||
+                input.num_layers > static_cast<std::uint32_t>(
+                    std::numeric_limits<int>::max() - first_model_layer) ||
                 input.command_capacity == 0u || input.base_epoch == 0u ||
                 participant.domain_participant_index < 0)
             {
@@ -190,6 +207,7 @@ namespace llaminar2::test
                     .epoch_control = epoch_arena_->control(),
                     .maintenance_epoch = epoch_arena_->maintenanceEpoch(),
                     .maintenance_status = epoch_arena_->maintenanceStatus(),
+                    .first_model_layer = first_model_layer,
                 };
                 if (!runtime_binding_.publicationValid())
                 {

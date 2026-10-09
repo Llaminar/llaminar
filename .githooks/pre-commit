@@ -8,7 +8,7 @@ set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
-BUILD_DIR="$REPO_ROOT/build_v2_integration"
+BUILD_DIR="${LLAMINAR_PRECOMMIT_BUILD_DIR:-$REPO_ROOT/build_v2_integration}"
 LLAMINAR_NINJA_BIN="$(command -v ninja)"
 
 echo '[pre-commit] Configuring the Integration build...'
@@ -26,12 +26,18 @@ echo '[pre-commit] Building only Unit and production-preflight dependencies...'
 cmake --build "$BUILD_DIR" --parallel \
     --target v2_unit_gate v2_production_test_preflight_gate
 
-echo '[pre-commit] [1/2] Running the full Unit suite...'
-ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
-    --no-tests=error -R '^V2_Unit_'
+if [[ -n "${LLAMINAR_PRECOMMIT_PREREQUISITES:-}" ]]; then
+    echo '[pre-commit] Authenticating completed Unit and preflight evidence...'
+    python3 "$REPO_ROOT/scripts/ci/run_production_prerequisites.py" \
+        --build-dir "$BUILD_DIR" --reuse-report "$LLAMINAR_PRECOMMIT_PREREQUISITES"
+else
+    echo '[pre-commit] [1/2] Running the full Unit suite...'
+    ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
+        --no-tests=error -R '^V2_Unit_'
 
-echo '[pre-commit] [2/2] Running the full ProductionTestPreflight suite...'
-ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
-    --no-tests=error -L '^ProductionTestPreflight$'
+    echo '[pre-commit] [2/2] Running the full ProductionTestPreflight suite...'
+    ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
+        --no-tests=error -L '^ProductionTestPreflight$'
+fi
 
 echo '[pre-commit] Unit and ProductionTestPreflight passed.'

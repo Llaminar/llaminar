@@ -901,12 +901,14 @@ namespace llaminar2
           overlay_epoch_arena_(std::move(config.overlay_epoch_arena)),
           overlay_epoch_ticket_slot_(config.overlay_epoch_ticket_slot),
           overlay_placement_source_(config.overlay_placement_source),
-          fixed_down_banks_(std::move(config.fixed_down_banks))
+          fixed_down_banks_(std::move(config.fixed_down_banks)),
+          first_model_layer_(config.first_model_layer)
     {
         if (!device_id_.is_valid())
             throw std::invalid_argument("[MoERuntimeTable] device_id must be valid");
-        if (num_layers_ <= 0)
-            throw std::invalid_argument("[MoERuntimeTable] num_layers must be positive");
+        if (num_layers_ <= 0 || first_model_layer_ < 0 ||
+            num_layers_ > std::numeric_limits<int>::max() - first_model_layer_)
+            throw std::invalid_argument("[MoERuntimeTable] requires a positive, non-overflowing owned model-layer interval");
         if (num_experts_ <= 0 || num_experts_ > static_cast<int>(kDeviceMoEMaxExperts))
             throw std::invalid_argument("[MoERuntimeTable] num_experts must be in [1, " +
                                         std::to_string(kDeviceMoEMaxExperts) + "]");
@@ -922,7 +924,7 @@ namespace llaminar2
             for (int layer = 0; layer < num_layers_; ++layer)
             {
                 const auto &bank = fixed_down_banks_[static_cast<size_t>(layer)];
-                if (!bank || bank->device() != device_id_ || bank->layer() != layer ||
+                if (!bank || bank->device() != device_id_ || bank->layer() != firstModelLayer() + layer ||
                     bank->ownership().geometry().experts != num_experts_ ||
                     bank->ownership().movableProjections() != DeviceMoEProjectionSet::GateUp ||
                     (layer > 0 && (bank->participantId() != fixed_down_banks_.front()->participantId() ||
@@ -964,8 +966,12 @@ namespace llaminar2
             break;
         case MoEOverlayServiceTelemetryCoverage::CatalogStratifiedSample:
             if (!overlay_service_telemetry_catalog_ ||
-                overlay_service_telemetry_catalog_->layerCount() <
-                    static_cast<std::size_t>(num_layers_))
+                overlay_service_telemetry_catalog_->firstModelLayer() > firstModelLayer() ||
+                overlay_service_telemetry_catalog_->firstModelLayer() +
+                        static_cast<int>(overlay_service_telemetry_catalog_->layerCount()) < endModelLayer() ||
+                (!overlay_placement_source_ &&
+                    (overlay_service_telemetry_catalog_->firstModelLayer() != firstModelLayer() ||
+                     overlay_service_telemetry_catalog_->layerCount() != static_cast<std::size_t>(num_layers_))))
             {
                 throw std::invalid_argument(
                     "[MoERuntimeTable] stratified service telemetry requires a catalog covering every runtime layer");
@@ -1062,9 +1068,12 @@ namespace llaminar2
         {
             if (movableProjections() != overlay_placement_source_->movableProjections())
                 throw std::invalid_argument("[MoERuntimeTable] child and canonical table cannot change movable projection family");
+            if (overlay_placement_source_->firstModelLayer() > firstModelLayer() ||
+                overlay_placement_source_->endModelLayer() < endModelLayer())
+                throw std::invalid_argument("[MoERuntimeTable] child interval is outside its canonical placement source");
             for (int layer = 0; !fixed_down_banks_.empty() && layer < num_layers_; ++layer)
             {
-                const auto *source = overlay_placement_source_->fixedDownProjectionBank(layer);
+                const auto *source = overlay_placement_source_->fixedDownProjectionBank(firstModelLayer() + layer);
                 if (!source || !fixed_down_banks_[static_cast<size_t>(layer)]->sameIdentity(*source))
                     throw std::invalid_argument("[MoERuntimeTable] child and canonical table require identical fixed down bindings");
             }
@@ -1105,9 +1114,9 @@ namespace llaminar2
         (void)checkedRouteCapacity(deferred_verifier_token_capacity_, top_k_);
 
         host_layers_.resize(static_cast<size_t>(num_layers_));
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
             resetLayer(state);
             if (overlay_placement_source_)
             {
@@ -1137,7 +1146,7 @@ namespace llaminar2
                 }
                 if (serial_route_scratch_arena_)
                 {
-                    for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+                    for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
                     {
                         bindPrefillRouteScratchToLayer(
                             layer_idx,
@@ -1147,7 +1156,7 @@ namespace llaminar2
                 else if (prefill_token_capacity_ > 0)
                 {
                     prefill_route_scratch_.resize(host_layers_.size());
-                    for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+                    for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
                         allocatePrefillRouteScratchForLayer(layer_idx, prefill_token_capacity_);
                 }
                 if (deferred_verifier_token_capacity_ > 0)
@@ -1192,24 +1201,28 @@ namespace llaminar2
     {
         validateLayerIndex(layer_idx);
         if (mirror_to_device_)
-            return device_layers_ + layer_idx;
-        return host_layers_.data() + layer_idx;
+            return device_layers_ + storageIndexForModelLayer(layer_idx);
+        return host_layers_.data() + storageIndexForModelLayer(layer_idx);
     }
 
     DeviceMoEOverlayServiceTelemetryCell *
     DeviceMoERuntimeTable::deviceOverlayServiceTelemetry() const noexcept
     {
-        return overlay_placement_source_
-                   ? overlay_placement_source_
-                         ->deviceOverlayServiceTelemetry()
-                   : device_overlay_service_telemetry_;
+        if (!overlay_placement_source_)
+            return device_overlay_service_telemetry_;
+        auto *const base = overlay_placement_source_->deviceOverlayServiceTelemetry();
+        // A child exposes its own compact interval within the parent's single
+        // telemetry allocation. Its public layer lookups still use global IDs.
+        return base ? base + static_cast<std::size_t>(
+            firstModelLayer() - overlay_placement_source_->firstModelLayer()) *
+                kDeviceMoEOverlayServicePhaseCount : nullptr;
     }
 
     DeviceMoEOverlayServiceTelemetrySample *
     DeviceMoERuntimeTable::deviceOverlayServiceTelemetrySample(
         int layer_idx) const noexcept
     {
-        if (layer_idx < 0 || layer_idx >= num_layers_)
+        if (!containsModelLayer(layer_idx))
             return nullptr;
         if (overlay_placement_source_)
         {
@@ -1217,7 +1230,7 @@ namespace llaminar2
                 ->deviceOverlayServiceTelemetrySample(layer_idx);
         }
         return device_overlay_service_samples_
-                   ? device_overlay_service_samples_ + layer_idx
+                   ? device_overlay_service_samples_ + storageIndexForModelLayer(layer_idx)
                    : nullptr;
     }
 
@@ -1225,7 +1238,7 @@ namespace llaminar2
         collectsDeviceOverlayServiceTelemetryForLayer(
             int layer_idx) const noexcept
     {
-        if (layer_idx < 0 || layer_idx >= num_layers_)
+        if (!containsModelLayer(layer_idx))
             return false;
         if (overlay_placement_source_)
         {
@@ -1249,13 +1262,13 @@ namespace llaminar2
     DeviceMoELayerRuntime &DeviceMoERuntimeTable::hostLayerState(int layer_idx)
     {
         validateLayerIndex(layer_idx);
-        return host_layers_[static_cast<size_t>(layer_idx)];
+        return host_layers_[storageIndexForModelLayer(layer_idx)];
     }
 
     const DeviceMoELayerRuntime &DeviceMoERuntimeTable::hostLayerState(int layer_idx) const
     {
         validateLayerIndex(layer_idx);
-        return host_layers_[static_cast<size_t>(layer_idx)];
+        return host_layers_[storageIndexForModelLayer(layer_idx)];
     }
 
     const DeviceMoEOverlayEpochTicket *
@@ -1282,8 +1295,8 @@ namespace llaminar2
         validateLayerIndex(layer_idx);
         const DeviceMoELayerRuntime *layer =
             mirror_to_device_
-                ? device_layers_ + layer_idx
-                : host_layers_.data() + layer_idx;
+                ? device_layers_ + storageIndexForModelLayer(layer_idx)
+                : host_layers_.data() + storageIndexForModelLayer(layer_idx);
         return reinterpret_cast<const DeviceMoEPlacementBank *>(
             reinterpret_cast<const std::byte *>(layer) +
             offsetof(DeviceMoELayerRuntime, banks));
@@ -1301,7 +1314,7 @@ namespace llaminar2
                 "[MoERuntimeTable] inactive-bank publication recipe requires a mirrored GPU table");
         }
 
-        auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+        auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
         const uint32_t inactive_bank = 1u - state.active_bank;
         auto &prepared = state.banks[inactive_bank];
         if (epoch == 0u || prepared.epoch != epoch ||
@@ -1313,7 +1326,7 @@ namespace llaminar2
                 "requested GPU publication does not match the prepared inactive bank");
         }
 
-        auto *const device_runtime = device_layers_ + layer_idx;
+        auto *const device_runtime = device_layers_ + storageIndexForModelLayer(layer_idx);
         DeviceMoERuntimeBankPublicationRecipe recipe{
             .bank = inactive_bank,
             .epoch = epoch,
@@ -1342,7 +1355,7 @@ namespace llaminar2
                 "[MoERuntimeTable] device publication acknowledgement requires a mirrored GPU table");
         }
 
-        const size_t layer = static_cast<size_t>(layer_idx);
+        const size_t layer = storageIndexForModelLayer(layer_idx);
         auto &state = host_layers_[layer];
         const uint32_t inactive_bank = 1u - state.active_bank;
         if (bank != inactive_bank || bank >= kDeviceMoEOverlayEpochBankCount ||
@@ -1408,7 +1421,7 @@ namespace llaminar2
     bool DeviceMoERuntimeTable::decodeRuntimePublicationRequired(int layer_idx) const
     {
         validateLayerIndex(layer_idx);
-        return decode_runtime_publication_required_[static_cast<size_t>(layer_idx)] != 0u;
+        return decode_runtime_publication_required_[storageIndexForModelLayer(layer_idx)] != 0u;
     }
 
     bool DeviceMoERuntimeTable::hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const
@@ -1416,7 +1429,7 @@ namespace llaminar2
         validateLayerIndex(layer_idx);
         if (token_count <= 0)
             return false;
-        const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+        const auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
         const uint32_t route_count = checkedRouteCapacity(token_count, top_k_);
         return state.prefill_token_capacity >= static_cast<uint32_t>(token_count) &&
                state.prefill_route_capacity >= route_count &&
@@ -1443,7 +1456,7 @@ namespace llaminar2
         validateLayerIndex(layer_idx);
         if (token_count <= 0)
             return false;
-        const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+        const auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
         const uint32_t route_count = checkedRouteCapacity(token_count, top_k_);
         return state.deferred_verifier_route_capacity >= route_count &&
                state.deferred_verifier_route_expert_ids &&
@@ -1660,6 +1673,17 @@ namespace llaminar2
                 "Runtime histogram drain was polled before model-setup enablement");
         }
 
+        const auto &geometry = histogram.config();
+        if (histogram.firstModelLayer() != firstModelLayer() ||
+            geometry.num_layers != num_layers_ ||
+            geometry.num_experts != num_experts_ || geometry.top_k != top_k_)
+        {
+            // Validate before querying or rotating any device bank: rejecting
+            // after D2H would already have consumed this stage's generation.
+            return RuntimeExpertHistogramDrainResult::failed(
+                "Runtime histogram drain requires its exact owned model-layer interval and geometry");
+        }
+
         if (!mirror_to_device_)
         {
             return syncDecodeHistogramToHost(
@@ -1746,14 +1770,14 @@ namespace llaminar2
                 std::move(publication_failure));
         }
 
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
             auto *source =
                 device_runtime_histogram_banks_ +
-                static_cast<std::size_t>(layer_idx) * 2u + frozen_bank;
+                storageIndexForModelLayer(layer_idx) * 2u + frozen_bank;
             auto *destination =
                 host_runtime_histogram_snapshot_ +
-                static_cast<std::size_t>(layer_idx);
+                storageIndexForModelLayer(layer_idx);
             if (!backend->deviceToHostOnStream(
                     destination,
                     source,
@@ -1859,13 +1883,16 @@ namespace llaminar2
         bool reset_runtime_counts)
     {
         const auto &hist_config = histogram.config();
-        if (hist_config.num_layers != num_layers_ ||
+        if (histogram.firstModelLayer() != firstModelLayer() ||
+            hist_config.num_layers != num_layers_ ||
             hist_config.num_experts != num_experts_ ||
             hist_config.top_k != top_k_)
         {
             LOG_ERROR("[MoERuntimeTable] decode histogram config mismatch: table layers="
-                      << num_layers_ << " experts=" << num_experts_ << " top_k=" << top_k_
-                      << " histogram layers=" << hist_config.num_layers
+                      << num_layers_ << " first=" << firstModelLayer()
+                      << " experts=" << num_experts_ << " top_k=" << top_k_
+                      << " histogram first=" << histogram.firstModelLayer()
+                      << " layers=" << hist_config.num_layers
                       << " experts=" << hist_config.num_experts
                       << " top_k=" << hist_config.top_k);
             return false;
@@ -1906,9 +1933,9 @@ namespace llaminar2
 
         if (!mirror_to_device_)
         {
-            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
-                const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+                const auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
                 const std::array<const uint64_t *,
                                  kExpertHistogramProductionSourceCount>
                     selected_sources{
@@ -1924,7 +1951,7 @@ namespace llaminar2
                         state.grouped_verifier_local_histogram,
                     };
                 const std::size_t layer_offset =
-                    static_cast<size_t>(layer_idx) *
+                    storageIndexForModelLayer(layer_idx) *
                     static_cast<size_t>(num_experts_);
                 for (std::size_t source = 0;
                      source < kExpertHistogramProductionSourceCount;
@@ -1943,9 +1970,9 @@ namespace llaminar2
         }
         else
         {
-            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
-                const auto &state = device_layers_[layer_idx];
+                const auto &state = device_layers_[storageIndexForModelLayer(layer_idx)];
                 const std::array<const uint64_t *,
                                  kExpertHistogramProductionSourceCount>
                     selected_sources{
@@ -1961,7 +1988,7 @@ namespace llaminar2
                         state.grouped_verifier_local_histogram,
                     };
                 const std::size_t layer_offset =
-                    static_cast<size_t>(layer_idx) *
+                    storageIndexForModelLayer(layer_idx) *
                     static_cast<size_t>(num_experts_);
                 for (std::size_t source = 0;
                      source < kExpertHistogramProductionSourceCount;
@@ -1987,10 +2014,10 @@ namespace llaminar2
             }
         }
 
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
             const std::size_t layer_offset =
-                static_cast<size_t>(layer_idx) *
+                storageIndexForModelLayer(layer_idx) *
                 static_cast<size_t>(num_experts_);
             uint64_t selected_slots = 0;
             uint64_t local_slots = 0;
@@ -2024,7 +2051,7 @@ namespace llaminar2
                 if (PerfStatsCollector::isDomainEnabled("moe_rebalance"))
                 {
                     const auto &state =
-                        host_layers_[static_cast<size_t>(layer_idx)];
+                        host_layers_[storageIndexForModelLayer(layer_idx)];
                     const PerfStatsCollector::Tags phase_tags{
                         {"layer", std::to_string(layer_idx)},
                         {"phase", source_names[source]},
@@ -2051,7 +2078,7 @@ namespace llaminar2
 
             if (PerfStatsCollector::isDomainEnabled("moe_rebalance"))
             {
-                const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+                const auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
                 const PerfStatsCollector::Tags tags{
                     {"layer", std::to_string(layer_idx)},
                     {"participant", std::to_string(state.participant_id)},
@@ -2093,15 +2120,15 @@ namespace llaminar2
                 offsetof(DeviceMoELayerRuntime,
                          router_hot_cache_eligible_dispatches) -
                 offsetof(DeviceMoELayerRuntime, decode_histogram);
-            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
-                auto *dst = device_layers_[layer_idx].decode_histogram;
+                auto *dst = device_layers_[storageIndexForModelLayer(layer_idx)].decode_histogram;
                 memsetMirror(device_id_, dst, 0,
                              histogram_bytes,
                              stream,
                              layerPrefix(layer_idx) + "all phase histograms reset");
                 auto *counter_dst =
-                    reinterpret_cast<std::byte *>(device_layers_ + layer_idx) + counters_offset;
+                    reinterpret_cast<std::byte *>(device_layers_ + storageIndexForModelLayer(layer_idx)) + counters_offset;
                 memsetMirror(device_id_, counter_dst, 0,
                              counters_bytes,
                              stream,
@@ -2125,13 +2152,13 @@ namespace llaminar2
 
         if (!mirror_to_device_)
         {
-            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
-                const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+                const auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
                 auto *selected_dst =
-                    selected_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                    selected_counts.data() + storageIndexForModelLayer(layer_idx) * static_cast<size_t>(num_experts_);
                 auto *local_dst =
-                    local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                    local_counts.data() + storageIndexForModelLayer(layer_idx) * static_cast<size_t>(num_experts_);
                 std::copy(state.decode_histogram,
                           state.decode_histogram + num_experts_,
                           selected_dst);
@@ -2146,19 +2173,19 @@ namespace llaminar2
             throw std::invalid_argument(
                 "[MoERuntimeTable] mirrored decode histogram capture requires an explicit stream");
 
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            const auto *selected_src = device_layers_[layer_idx].decode_histogram;
+            const auto *selected_src = device_layers_[storageIndexForModelLayer(layer_idx)].decode_histogram;
             auto *selected_dst =
-                selected_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                selected_counts.data() + storageIndexForModelLayer(layer_idx) * static_cast<size_t>(num_experts_);
             copyMirrorToHost(device_id_, selected_dst, selected_src,
                              static_cast<size_t>(num_experts_) * sizeof(uint64_t),
                              stream,
                              layerPrefix(layer_idx) + "decode histogram capture");
 
-            const auto *local_src = device_layers_[layer_idx].decode_local_histogram;
+            const auto *local_src = device_layers_[storageIndexForModelLayer(layer_idx)].decode_local_histogram;
             auto *local_dst =
-                local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                local_counts.data() + storageIndexForModelLayer(layer_idx) * static_cast<size_t>(num_experts_);
             copyMirrorToHost(device_id_, local_dst, local_src,
                              static_cast<size_t>(num_experts_) * sizeof(uint64_t),
                              stream,
@@ -2173,28 +2200,31 @@ namespace llaminar2
         const uint64_t *local_counts,
         size_t layer_count,
         size_t expert_count,
+        int first_model_layer,
         void *stream)
     {
         if (!selected_counts || !local_counts)
             return false;
-        if (layer_count != static_cast<size_t>(num_layers_) ||
+        if (first_model_layer != firstModelLayer() ||
+            layer_count != static_cast<size_t>(num_layers_) ||
             expert_count != static_cast<size_t>(num_experts_))
         {
             LOG_ERROR("[MoERuntimeTable] decode histogram restore shape mismatch: table layers="
-                      << num_layers_ << " experts=" << num_experts_
-                      << " blob layers=" << layer_count
+                      << num_layers_ << " first=" << firstModelLayer()
+                      << " experts=" << num_experts_
+                      << " blob first=" << first_model_layer << " layers=" << layer_count
                       << " experts=" << expert_count);
             return false;
         }
 
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
             resetRuntimeHistogramFields(state, num_experts_);
             const auto *selected_src =
-                selected_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                selected_counts + storageIndexForModelLayer(layer_idx) * static_cast<size_t>(num_experts_);
             const auto *local_src =
-                local_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                local_counts + storageIndexForModelLayer(layer_idx) * static_cast<size_t>(num_experts_);
             std::copy(selected_src, selected_src + num_experts_, state.decode_histogram);
             std::copy(local_src, local_src + num_experts_, state.decode_local_histogram);
             resetRouterHotCacheCounters(state);
@@ -2214,34 +2244,34 @@ namespace llaminar2
             offsetof(DeviceMoELayerRuntime,
                      router_hot_cache_eligible_dispatches) -
             offsetof(DeviceMoELayerRuntime, decode_histogram);
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
             memsetMirror(
                 device_id_,
-                device_layers_[layer_idx].decode_histogram,
+                device_layers_[storageIndexForModelLayer(layer_idx)].decode_histogram,
                 0,
                 histogram_bytes,
                 stream,
                 layerPrefix(layer_idx) +
                     "phase histogram restore reset");
             const auto *selected_src =
-                selected_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
-            auto *selected_dst = device_layers_[layer_idx].decode_histogram;
+                selected_counts + storageIndexForModelLayer(layer_idx) * static_cast<size_t>(num_experts_);
+            auto *selected_dst = device_layers_[storageIndexForModelLayer(layer_idx)].decode_histogram;
             copyHostToMirror(device_id_, selected_dst, selected_src,
                              static_cast<size_t>(num_experts_) * sizeof(uint64_t),
                              stream,
                              layerPrefix(layer_idx) + "decode histogram restore");
 
             const auto *local_src =
-                local_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
-            auto *local_dst = device_layers_[layer_idx].decode_local_histogram;
+                local_counts + storageIndexForModelLayer(layer_idx) * static_cast<size_t>(num_experts_);
+            auto *local_dst = device_layers_[storageIndexForModelLayer(layer_idx)].decode_local_histogram;
             copyHostToMirror(device_id_, local_dst, local_src,
                              static_cast<size_t>(num_experts_) * sizeof(uint64_t),
                              stream,
                              layerPrefix(layer_idx) + "decode local histogram restore");
 
             auto *counter_dst =
-                reinterpret_cast<std::byte *>(device_layers_ + layer_idx) + counters_offset;
+                reinterpret_cast<std::byte *>(device_layers_ + storageIndexForModelLayer(layer_idx)) + counters_offset;
             memsetMirror(device_id_, counter_dst, 0,
                          counters_bytes,
                          stream,
@@ -2268,15 +2298,15 @@ namespace llaminar2
             offsetof(DeviceMoELayerRuntime,
                      router_hot_cache_eligible_dispatches) -
             offsetof(DeviceMoELayerRuntime, decode_histogram);
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            auto *dst = device_layers_[layer_idx].decode_histogram;
+            auto *dst = device_layers_[storageIndexForModelLayer(layer_idx)].decode_histogram;
             memsetMirror(device_id_, dst, 0,
                          histogram_bytes,
                          stream,
                          layerPrefix(layer_idx) + "all phase histograms reset");
             auto *counter_dst =
-                reinterpret_cast<std::byte *>(device_layers_ + layer_idx) + counters_offset;
+                reinterpret_cast<std::byte *>(device_layers_ + storageIndexForModelLayer(layer_idx)) + counters_offset;
             memsetMirror(device_id_, counter_dst, 0,
                          counters_bytes,
                          stream,
@@ -2315,9 +2345,9 @@ namespace llaminar2
             return;
         }
 
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
             /*
              * Scratch bindings are model-lifetime graph identities, not
              * request state.  Capture them from the authoritative live table
@@ -2378,7 +2408,7 @@ namespace llaminar2
     bool DeviceMoERuntimeTable::hasInitialLayerRuntimeState(int layer_idx) const
     {
         validateLayerIndex(layer_idx);
-        const auto layer = static_cast<std::size_t>(layer_idx);
+        const auto layer = storageIndexForModelLayer(layer_idx);
         return initial_layer_captured_[layer] != 0u &&
                decode_runtime_publication_required_[layer] == 0u;
     }
@@ -2481,17 +2511,17 @@ namespace llaminar2
             return;
         }
 
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
             const auto scratch = captureRuntimePersistentBindings(state);
-            state = initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u
-                        ? initial_host_layers_[static_cast<size_t>(layer_idx)]
-                        : empty_host_layers_[static_cast<size_t>(layer_idx)];
+            state = initial_layer_captured_[storageIndexForModelLayer(layer_idx)] != 0u
+                        ? initial_host_layers_[storageIndexForModelLayer(layer_idx)]
+                        : empty_host_layers_[storageIndexForModelLayer(layer_idx)];
             restoreRuntimePersistentBindings(state, scratch);
             resetPerRequestRuntimeFields(state, num_experts_);
-            decode_runtime_publication_required_[static_cast<size_t>(layer_idx)] =
-                initial_layer_captured_[static_cast<size_t>(layer_idx)] == 0u ? 1u : 0u;
+            decode_runtime_publication_required_[storageIndexForModelLayer(layer_idx)] =
+                initial_layer_captured_[storageIndexForModelLayer(layer_idx)] == 0u ? 1u : 0u;
         }
     }
 
@@ -2511,11 +2541,11 @@ namespace llaminar2
 
         try
         {
-            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
                 copyMirrorToHost(device_id_,
-                                 host_layers_.data() + layer_idx,
-                                 device_layers_ + layer_idx,
+                                 host_layers_.data() + storageIndexForModelLayer(layer_idx),
+                                 device_layers_ + storageIndexForModelLayer(layer_idx),
                                  sizeof(DeviceMoELayerRuntime),
                                  active_stream,
                                  layerPrefix(layer_idx) + "runtime table D2H");
@@ -2542,12 +2572,14 @@ namespace llaminar2
     void DeviceMoERuntimeTable::restoreRuntimeStateSnapshot(
         const DeviceMoELayerRuntime *layers,
         size_t layer_count,
+        int first_model_layer,
         void *stream)
     {
         if (!layers)
             throw std::invalid_argument("[MoERuntimeTable] runtime snapshot restore requires layer data");
-        if (layer_count != static_cast<size_t>(num_layers_))
-            throw std::invalid_argument("[MoERuntimeTable] runtime snapshot layer count mismatch");
+        if (layer_count != static_cast<size_t>(num_layers_) ||
+            first_model_layer != firstModelLayer())
+            throw std::invalid_argument("[MoERuntimeTable] runtime snapshot owned model-layer interval mismatch");
 
         // Authenticate the entire snapshot before mutating any layer. Model
         // topology is never restored from request data, even for this legacy
@@ -2557,25 +2589,25 @@ namespace llaminar2
             const auto &snapshot = layers[static_cast<size_t>(layer)];
             if (snapshot.expert_count != static_cast<uint32_t>(num_experts_) ||
                 snapshot.top_k != static_cast<uint32_t>(top_k_) || snapshot.active_bank > 1u)
-                throw std::invalid_argument(layerPrefix(layer) + "runtime snapshot metadata mismatch");
+                throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "runtime snapshot metadata mismatch");
             if (snapshot.active_epoch == 0u) continue;
             if (snapshot.banks[snapshot.active_bank].epoch != snapshot.active_epoch)
-                throw std::invalid_argument(layerPrefix(layer) + "runtime snapshot active bank epoch mismatch");
-            if (const auto *fixed = fixedDownProjectionBank(layer))
+                throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "runtime snapshot active bank epoch mismatch");
+            if (const auto *fixed = fixedDownProjectionBank(firstModelLayer() + layer))
             {
                 if (snapshot.participant_id != static_cast<uint32_t>(fixed->ownership().participant()) ||
                     snapshot.participant_count != static_cast<uint32_t>(fixed->ownership().participants()))
-                    throw std::invalid_argument(layerPrefix(layer) + "snapshot cannot replace the fixed output-column partition");
+                    throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "snapshot cannot replace the fixed output-column partition");
             }
             for (const auto &bank : snapshot.banks)
             {
                 if (bank.epoch == 0u) continue;
                 if (bank.expert_count != static_cast<uint32_t>(num_experts_))
-                    throw std::invalid_argument(layerPrefix(layer) + "runtime snapshot bank geometry mismatch");
+                    throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "runtime snapshot bank geometry mismatch");
                 for (int expert = 0; expert < num_experts_; ++expert)
                     if (bank.experts[expert].projection_set != movableProjections() ||
                         !deviceMoEProjectionPayloadValid(bank.experts[expert]))
-                        throw std::invalid_argument(layerPrefix(layer) + "snapshot cannot replace the movable projection family");
+                        throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "snapshot cannot replace the movable projection family");
             }
         }
 
@@ -2590,11 +2622,11 @@ namespace llaminar2
 
         try
         {
-            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
-                auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+                auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
                 const auto scratch = captureRuntimePersistentBindings(state);
-                const auto &snapshot = layers[static_cast<size_t>(layer_idx)];
+                const auto &snapshot = layers[storageIndexForModelLayer(layer_idx)];
                 if (snapshot.active_epoch == 0u)
                 {
                     resetPerRequestRuntimeFields(state, num_experts_);
@@ -2608,7 +2640,7 @@ namespace llaminar2
                 resetPerRequestRuntimeFields(state, num_experts_);
                 if (mirror_to_device_)
                     uploadLayerState(layer_idx, active_stream);
-                decode_runtime_publication_required_[static_cast<size_t>(layer_idx)] = 0u;
+                decode_runtime_publication_required_[storageIndexForModelLayer(layer_idx)] = 0u;
             }
 
             if (mirror_to_device_)
@@ -2659,9 +2691,9 @@ namespace llaminar2
 
         layers.reserve(static_cast<size_t>(num_layers_));
         uint32_t rehydratable_placement_layers = 0;
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            const auto &state = source_layers[static_cast<size_t>(layer_idx)];
+            const auto &state = source_layers[storageIndexForModelLayer(layer_idx)];
             if (state.expert_count != static_cast<uint32_t>(num_experts_) ||
                 state.top_k != static_cast<uint32_t>(top_k_) ||
                 state.active_bank > 1u)
@@ -2698,7 +2730,7 @@ namespace llaminar2
             const bool domain_has_transient_placement =
                 live_bank.transient_placement_observed != 0u ||
                 local_transient_payload;
-            const size_t idx = static_cast<size_t>(layer_idx);
+            const size_t idx = storageIndexForModelLayer(layer_idx);
             const DeviceMoELayerRuntime *initial_state = nullptr;
             if (domain_has_transient_placement)
             {
@@ -2726,6 +2758,7 @@ namespace llaminar2
 
             const auto &bank = live_bank;
             DeviceMoEPortableLayerRuntimeState captured;
+            captured.model_layer = layer_idx;
             captured.active_epoch = state.active_epoch;
             captured.expert_count = state.expert_count;
             captured.top_k = state.top_k;
@@ -2815,11 +2848,16 @@ namespace llaminar2
             throw std::invalid_argument(
                 "[MoERuntimeTable] mirrored portable runtime restore requires an explicit stream");
 
-        bool placement_changed = false;
-        bool requires_device_payload_rehydration = false;
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        // Authenticate every row before a matching earlier row can be restored.
+        // A foreign final row must not leave this stage partially mutated.
+        for (std::size_t row = 0; row < layers.size(); ++row)
         {
-            const auto &snapshot = layers[static_cast<size_t>(layer_idx)];
+            if (layers[row].model_layer != firstModelLayer() + static_cast<int>(row))
+            {
+                LOG_ERROR("[MoERuntimeTable] portable runtime snapshot belongs to another model-layer interval");
+                return {};
+            }
+            const auto &snapshot = layers[row];
             if (snapshot.expert_count != static_cast<uint32_t>(num_experts_) ||
                 snapshot.top_k != static_cast<uint32_t>(top_k_) ||
                 snapshot.experts.size() != static_cast<size_t>(num_experts_) ||
@@ -2834,13 +2872,19 @@ namespace llaminar2
                 snapshot.grouped_verifier_local_histogram.size() !=
                     static_cast<size_t>(num_experts_))
             {
-                LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
+                LOG_ERROR("[MoERuntimeTable] layer " << snapshot.model_layer
                                                      << ": portable runtime restore metadata mismatch");
                 return {};
             }
 
-            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
-            const size_t layer_offset = static_cast<size_t>(layer_idx);
+        }
+        bool placement_changed = false;
+        bool requires_device_payload_rehydration = false;
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
+        {
+            const auto &snapshot = layers[storageIndexForModelLayer(layer_idx)];
+            auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
+            const size_t layer_offset = storageIndexForModelLayer(layer_idx);
             const bool has_initial_baseline =
                 layer_offset < initial_layer_captured_.size() &&
                 initial_layer_captured_[layer_offset] != 0u;
@@ -2867,7 +2911,7 @@ namespace llaminar2
                  * the explicit RAM/disk prefix import boundary; expert payload
                  * bytes themselves never leave the GPU domain.
                  */
-                const size_t idx = static_cast<size_t>(layer_idx);
+                const size_t idx = storageIndexForModelLayer(layer_idx);
                 if (!mirror_to_device_ ||
                     !device_id_.is_gpu() ||
                     idx >= initial_layer_captured_.size() ||
@@ -3166,7 +3210,7 @@ namespace llaminar2
                 return {};
             }
 
-            auto &restored = host_layers_[static_cast<size_t>(layer_idx)];
+            auto &restored = host_layers_[storageIndexForModelLayer(layer_idx)];
             std::copy(snapshot.selected_histogram.begin(),
                       snapshot.selected_histogram.end(),
                       restored.decode_histogram);
@@ -3241,9 +3285,9 @@ namespace llaminar2
             prefill_route_scratch_.resize(static_cast<size_t>(num_layers_));
 
         bool changed = false;
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            const auto &allocation = prefill_route_scratch_[static_cast<size_t>(layer_idx)];
+            const auto &allocation = prefill_route_scratch_[storageIndexForModelLayer(layer_idx)];
             if (!prefillRouteScratchAllocationHasCapacity(allocation, token_capacity))
             {
                 allocatePrefillRouteScratchForLayer(layer_idx, token_capacity);
@@ -3254,7 +3298,7 @@ namespace llaminar2
         if (changed)
         {
             prefill_token_capacity_ = std::max(prefill_token_capacity_, token_capacity);
-            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
                 uploadLayerState(layer_idx, stream);
                 uploadResetTemplatesForLayer(layer_idx, stream);
@@ -3267,7 +3311,7 @@ namespace llaminar2
     {
         validateLayerIndex(layer_idx);
 
-        const size_t layer = static_cast<size_t>(layer_idx);
+        const size_t layer = storageIndexForModelLayer(layer_idx);
         if (decode_runtime_publication_required_[layer] != 0u)
         {
             /*
@@ -3328,7 +3372,7 @@ namespace llaminar2
                 "explicit non-null producer stream");
         }
         validateLayerIndex(layer_idx);
-        auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+        auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
         const uint32_t inactive_bank = 1u - state.active_bank;
         const auto &prepared_bank = state.banks[inactive_bank];
 
@@ -3346,27 +3390,29 @@ namespace llaminar2
         if (mirror_to_device_)
             uploadLayerState(layer_idx, stream);
 
-        decode_runtime_publication_required_[static_cast<size_t>(layer_idx)] = 0u;
+        decode_runtime_publication_required_[storageIndexForModelLayer(layer_idx)] = 0u;
         return true;
     }
 
     void DeviceMoERuntimeTable::validateLayerIndex(int layer_idx) const
     {
-        if (layer_idx < 0 || layer_idx >= num_layers_)
-            throw std::out_of_range("[MoERuntimeTable] layer index out of range: " + std::to_string(layer_idx));
+        if (!containsModelLayer(layer_idx))
+            throw std::out_of_range("[MoERuntimeTable] model layer " + std::to_string(layer_idx) +
+                " is outside owned interval [" + std::to_string(firstModelLayer()) +
+                ", " + std::to_string(endModelLayer()) + ")");
     }
 
     const MoEOverlayFixedDownProjectionBank *DeviceMoERuntimeTable::fixedDownProjectionBank(int layer_idx) const
     {
         validateLayerIndex(layer_idx);
-        return fixed_down_banks_.empty() ? nullptr : fixed_down_banks_[static_cast<size_t>(layer_idx)].get();
+        return fixed_down_banks_.empty() ? nullptr : fixed_down_banks_[storageIndexForModelLayer(layer_idx)].get();
     }
 
     void DeviceMoERuntimeTable::validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const
     {
         if (update.epoch == 0)
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update epoch must be non-zero");
-        const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+        const auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
         if (update.epoch <= state.active_epoch)
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update epoch must be newer than active epoch");
         if (update.expert_count != static_cast<uint32_t>(num_experts_))
@@ -3461,7 +3507,7 @@ namespace llaminar2
         int layer_idx,
         void *stream)
     {
-        const auto idx = static_cast<size_t>(layer_idx);
+        const auto idx = storageIndexForModelLayer(layer_idx);
         if (idx >= initial_layer_captured_.size() ||
             initial_layer_captured_[idx] != 0u)
         {
@@ -3508,7 +3554,7 @@ namespace llaminar2
         if (static_cast<int>(prefill_route_scratch_.size()) != num_layers_)
             prefill_route_scratch_.resize(static_cast<size_t>(num_layers_));
 
-        auto &allocation = prefill_route_scratch_[static_cast<size_t>(layer_idx)];
+        auto &allocation = prefill_route_scratch_[storageIndexForModelLayer(layer_idx)];
         if (prefillRouteScratchAllocationHasCapacity(allocation, token_capacity))
             return;
 
@@ -3539,7 +3585,7 @@ namespace llaminar2
                 layerPrefix(layer_idx) +
                 "cannot bind incomplete prefill route scratch");
         }
-        auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+        auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
         state.route_expert_ids = allocation.route_expert_ids;
         state.route_weights = allocation.route_weights;
         state.route_participant_ids = allocation.route_participant_ids;
@@ -3564,18 +3610,18 @@ namespace llaminar2
          * This happens only during setup/replanning, never in inference.
          */
         const auto scratch = captureRuntimePersistentBindings(state);
-        auto &empty = empty_host_layers_[static_cast<size_t>(layer_idx)];
+        auto &empty = empty_host_layers_[storageIndexForModelLayer(layer_idx)];
         resetLayer(empty);
         restoreRuntimePersistentBindings(empty, scratch);
-        if (initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u)
+        if (initial_layer_captured_[storageIndexForModelLayer(layer_idx)] != 0u)
         {
             restoreRuntimePersistentBindings(
-                initial_host_layers_[static_cast<size_t>(layer_idx)],
+                initial_host_layers_[storageIndexForModelLayer(layer_idx)],
                 scratch);
         }
         else
         {
-            initial_host_layers_[static_cast<size_t>(layer_idx)] = empty;
+            initial_host_layers_[storageIndexForModelLayer(layer_idx)] = empty;
         }
     }
 
@@ -3679,10 +3725,10 @@ namespace llaminar2
 
         const size_t route_capacity =
             static_cast<size_t>(deferred_verifier_route_capacity_);
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            const size_t offset = static_cast<size_t>(layer_idx) * route_capacity;
-            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            const size_t offset = storageIndexForModelLayer(layer_idx) * route_capacity;
+            auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
             state.deferred_verifier_route_expert_ids =
                 deferred_verifier_route_expert_ids_ + offset;
             state.deferred_verifier_route_participant_ids =
@@ -3691,18 +3737,18 @@ namespace llaminar2
                 deferred_verifier_route_capacity_;
 
             const auto bindings = captureRuntimePersistentBindings(state);
-            auto &empty = empty_host_layers_[static_cast<size_t>(layer_idx)];
+            auto &empty = empty_host_layers_[storageIndexForModelLayer(layer_idx)];
             resetLayer(empty);
             restoreRuntimePersistentBindings(empty, bindings);
-            if (initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u)
+            if (initial_layer_captured_[storageIndexForModelLayer(layer_idx)] != 0u)
             {
                 restoreRuntimePersistentBindings(
-                    initial_host_layers_[static_cast<size_t>(layer_idx)],
+                    initial_host_layers_[storageIndexForModelLayer(layer_idx)],
                     bindings);
             }
             else
             {
-                initial_host_layers_[static_cast<size_t>(layer_idx)] = empty;
+                initial_host_layers_[storageIndexForModelLayer(layer_idx)] = empty;
             }
         }
     }
@@ -4001,10 +4047,10 @@ namespace llaminar2
             /* Each layer points at its adjacent two-bank pair. Request-reset
              * templates receive the same model-lifetime addresses, so a D2D
              * reset changes request state without erasing routing evidence. */
-            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
             {
                 const auto layer_offset =
-                    static_cast<std::size_t>(layer_idx) * 2u;
+                    storageIndexForModelLayer(layer_idx) * 2u;
                 const auto bind = [&](DeviceMoELayerRuntime &state)
                 {
                     state.runtime_histogram_banks =
@@ -4012,9 +4058,9 @@ namespace llaminar2
                     state.runtime_histogram_active_bank =
                         device_runtime_histogram_active_bank_;
                 };
-                bind(host_layers_[static_cast<std::size_t>(layer_idx)]);
-                bind(initial_host_layers_[static_cast<std::size_t>(layer_idx)]);
-                bind(empty_host_layers_[static_cast<std::size_t>(layer_idx)]);
+                bind(host_layers_[storageIndexForModelLayer(layer_idx)]);
+                bind(initial_host_layers_[storageIndexForModelLayer(layer_idx)]);
+                bind(empty_host_layers_[storageIndexForModelLayer(layer_idx)]);
             }
 
             /* Enabling is model-setup only, immediately after construction.
@@ -4465,6 +4511,7 @@ namespace llaminar2
     {
         const auto &hist_config = histogram.config();
         if (!host_runtime_histogram_snapshot_ ||
+            histogram.firstModelLayer() != firstModelLayer() ||
             hist_config.num_layers != num_layers_ ||
             hist_config.num_experts != num_experts_ ||
             hist_config.top_k != top_k_)
@@ -4483,11 +4530,11 @@ namespace llaminar2
                              moe_runtime_abi::kHistogramSourceCount>
             source_names{"decode", "prefill", "grouped_verifier"};
 
-        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
             const auto &bank =
                 host_runtime_histogram_snapshot_[
-                    static_cast<std::size_t>(layer_idx)];
+                    storageIndexForModelLayer(layer_idx)];
             for (std::size_t source = 0;
                  source < moe_runtime_abi::kHistogramSourceCount;
                  ++source)
@@ -4557,8 +4604,8 @@ namespace llaminar2
                 "[MoERuntimeTable] GPU runtime-table upload requires an "
                 "explicit non-null producer stream");
         }
-        auto *dst = device_layers_ + layer_idx;
-        auto *src = host_layers_.data() + layer_idx;
+        auto *dst = device_layers_ + storageIndexForModelLayer(layer_idx);
+        auto *src = host_layers_.data() + storageIndexForModelLayer(layer_idx);
         copyHostToMirror(device_id_, dst, src, sizeof(DeviceMoELayerRuntime), stream,
                          layerPrefix(layer_idx) + "runtime table upload");
     }
@@ -4574,17 +4621,17 @@ namespace llaminar2
                 "explicit non-null producer stream");
         }
         validateLayerIndex(layer_idx);
-        const auto idx = static_cast<size_t>(layer_idx);
+        const auto idx = storageIndexForModelLayer(layer_idx);
         copyHostToMirror(
             device_id_,
-            device_initial_layers_ + layer_idx,
+            device_initial_layers_ + storageIndexForModelLayer(layer_idx),
             initial_host_layers_.data() + idx,
             sizeof(DeviceMoELayerRuntime),
             stream,
             layerPrefix(layer_idx) + "initial runtime template upload");
         copyHostToMirror(
             device_id_,
-            device_empty_layers_ + layer_idx,
+            device_empty_layers_ + storageIndexForModelLayer(layer_idx),
             empty_host_layers_.data() + idx,
             sizeof(DeviceMoELayerRuntime),
             stream,

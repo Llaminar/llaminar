@@ -2650,8 +2650,11 @@ namespace llaminar2::test
 
         EXPECT_NE(ffn_body.find("use_mtp_runtime_table = mtp_sidecar_context"),
                   std::string::npos);
-        EXPECT_NE(ffn_body.find("std::max(config_.n_layers, layer_idx + 1)"),
+        EXPECT_NE(ffn_body.find("std::max(config_.n_layers, layer_idx - config_.pp_layer_offset + 1)"),
                   std::string::npos);
+        EXPECT_EQ(ffn_body.find("std::max(config_.n_layers, layer_idx + 1)"),
+                  std::string::npos)
+            << "MTP table capacity must count only the owning stage's rows";
         EXPECT_NE(ffn_body.find("MoERuntimeTableRole::MTPDepth"),
                   std::string::npos);
         EXPECT_NE(ffn_body.find(".mtp_depth = use_mtp_runtime_table ? mtp_depth_idx : -1"),
@@ -5736,7 +5739,7 @@ namespace llaminar2::test
             maintenance_boundary_end - maintenance_boundary_start);
         const size_t device_authority_selection =
             maintenance_boundary_body.find(
-                "usesSingleDomainNativeGpuDeviceResidentMoEOverlayAuthority()");
+                "usesNativeGpuStageMoEOverlayAuthority()");
         const size_t device_maintenance_launch =
             maintenance_boundary_body.find(
                 "runner_->maybeApplyDecodeBoundaryMaintenance(");
@@ -7121,18 +7124,18 @@ namespace llaminar2::test
         require_capacity_typed_unpack(readFile(rocm_path), "ROCm");
 
         const std::string graph = readFile(graph_path);
-        EXPECT_NE(graph.find("for (int scan_layer = 0;"),
+        EXPECT_NE(graph.find("for (int scan_layer = bound_runtime_first_layer;"),
                   std::string::npos)
-            << "Decode-maintenance allocation capacity must be derived from every model layer";
-        EXPECT_NE(graph.find("scan_layer < bound_runtime_table_layers"),
+            << "Decode-maintenance capacity must start at the owning stage's first global layer";
+        EXPECT_NE(graph.find("scan_layer < bound_runtime_first_layer + bound_runtime_table_layers"),
                   std::string::npos)
-            << "The model format preflight must cover the complete materialized runtime-table domain, including MTP layers";
+            << "Format admission must cover the complete stage runtime interval, including terminal MTP layers";
         EXPECT_NE(graph.find("DeviceMoETransferSlotDirectory::profileForLayerFormats"),
                   std::string::npos)
             << "Qwen MoE graph construction must merge exact layer formats into one explicit profile";
         EXPECT_NE(graph.find("collectGraphRebalanceTransferProfile"),
                   std::string::npos)
-            << "Prefill LLEP and decode maintenance must share the same model-wide format preflight";
+            << "Prefill LLEP and decode maintenance must share the same stage-scoped format admission";
         EXPECT_NE(graph.find("graphRebalanceTransferDirectoryKey"),
                   std::string::npos)
             << "Prefill and maintenance must derive persistent transfer storage "
@@ -9968,7 +9971,7 @@ namespace llaminar2::test
                   std::string::npos)
             << "Portable restore must not resurrect rolling transfer-slot "
                "payloads through a resolver after those bytes may be reused.";
-        EXPECT_NE(graph.find("constexpr uint32_t kMoEPrefixRuntimeVersion = 5;"),
+        EXPECT_NE(graph.find("constexpr uint32_t kMoEPrefixRuntimeVersion = 6;"),
                   std::string::npos)
             << "Changing the prefix ownership boundary requires an explicit "
                "portable schema version.";
@@ -11057,9 +11060,12 @@ namespace llaminar2::test
         ASSERT_FALSE(shutdown.empty());
         EXPECT_NE(
             shutdown.find(
-                "intent ==\n            MoEOverlayMaintenanceDrainIntent::TerminalContextSeal"),
+                "intent == MoEOverlayMaintenanceDrainIntent::TerminalContextSeal &&"),
             std::string::npos)
             << "Physical restoration must remain guarded by the typed terminal intent";
+        EXPECT_NE(shutdown.find("ModelContextPhysicalSealBoundary::LiveMutableResidency"),
+                  std::string::npos)
+            << "Mutable residency must restore while its live fabric still owns the physical slots";
         EXPECT_NE(
             shutdown.find("sealReusableModelContextPhysicalState"),
             std::string::npos);

@@ -5,6 +5,8 @@
  * Tests the MPI worker loop protocol where the resolved command root publishes
  * metadata to peers. Prompt payloads reach only continuation consumers; expert
  * followers retain their sparse ticket lifecycle without unused token traffic.
+ * Sampling checks authenticate the complete law, including prompt repetition,
+ * on both the command publisher and worker receiver.
  *
  * Uses a RecordingMPIContext that records all broadcast calls (data + types)
  * so we can verify the protocol without real MPI.
@@ -758,10 +760,11 @@ namespace
         params.top_p = 0.9f;
         params.top_k = 40;
         params.seed = 42;
+        params.repetition_penalty = 1.1f;
 
         runner->setSamplingParams(params);
 
-        // Expected: command tag + the complete six-field sampling policy.
+        // Expected: command tag plus all seven fields of the sampling policy.
         ASSERT_EQ(mpi->broadcastCount(), 2u);
 
         // Command tag
@@ -769,16 +772,17 @@ namespace
         EXPECT_EQ(cmd.int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_SAMPLING));
 
-        // Params buffer: temperature, top_p, top_k, seed, and both penalties.
+        // Params buffer includes multiplicative repetition after additive penalties.
         const auto &data = mpi->broadcasts()[1];
         EXPECT_EQ(data.type, RecordingMPIContext::BroadcastRecord::Type::FLOAT);
-        ASSERT_EQ(data.float_data.size(), 6u);
+        ASSERT_EQ(data.float_data.size(), 7u);
         EXPECT_FLOAT_EQ(data.float_data[0], 0.7f);
         EXPECT_FLOAT_EQ(data.float_data[1], 0.9f);
         EXPECT_FLOAT_EQ(data.float_data[2], 40.0f);
         EXPECT_FLOAT_EQ(data.float_data[3], 42.0f);
         EXPECT_FLOAT_EQ(data.float_data[4], 0.0f);
         EXPECT_FLOAT_EQ(data.float_data[5], 0.0f);
+        EXPECT_FLOAT_EQ(data.float_data[6], 1.1f);
     }
 
     // =========================================================================
@@ -1745,7 +1749,7 @@ namespace
     {
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_SAMPLING)});
-        scripted->scriptFloat({0.7f, 0.9f, 40.0f, 42.0f}); // temp, top_p, top_k, seed
+        scripted->scriptFloat({0.7f, 0.9f, 40.0f, 42.0f, 0.0f, 0.0f, 1.1f});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
         auto [runner, mock, mpi] = createWorkerRunner(scripted);
@@ -1757,6 +1761,7 @@ namespace
         EXPECT_FLOAT_EQ(params.top_p, 0.9f);
         EXPECT_EQ(params.top_k, 40);
         EXPECT_EQ(params.seed, 42u);
+        EXPECT_FLOAT_EQ(params.repetition_penalty, 1.1f);
     }
 
     TEST_F(Test__MPICoordinatedMode, WorkerLoopInstallsRootStopPolicyBeforeInference)
@@ -1809,7 +1814,7 @@ namespace
         // Typical server sequence: clear → set sampling → prefill → decode → decode → shutdown
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_SAMPLING)});
-        scripted->scriptFloat({0.0f, 1.0f, 0.0f, 0.0f}); // greedy params
+        scripted->scriptFloat({0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f}); // greedy params
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
         scripted->scriptInt32({2, 0, 0}); // token count and retired progress
         scripted->scriptInt32({10, 20}); // tokens

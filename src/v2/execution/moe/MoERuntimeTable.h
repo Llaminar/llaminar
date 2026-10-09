@@ -5,6 +5,8 @@
  * Placement epochs own movable projection descriptors. A gate/up-only epoch
  * never owns the fixed down-column bank; its typed payload contract is distinct
  * from the complete-expert contract used by ordinary grouped execution.
+ * Tables own compact storage for an immutable global model-layer interval;
+ * reset and prefix restore preserve that stage identity.
  */
 
 #pragma once
@@ -734,6 +736,8 @@ namespace llaminar2
 
     struct DeviceMoEPortableLayerRuntimeState
     {
+        /** Global model identity; invalid until capture or wire decoding assigns it. */
+        int32_t model_layer = -1;
         uint32_t active_epoch = 0;
         uint32_t expert_count = 0;
         uint32_t top_k = 0;
@@ -1011,10 +1015,21 @@ namespace llaminar2
         virtual bool captureDecodeHistogramCounts(std::vector<uint64_t> &selected_counts,
                                                   std::vector<uint64_t> &local_counts,
                                                   void *stream = nullptr) = 0;
+        /**
+         * @brief Restore compact histogram rows only into their original stage.
+         * @param selected_counts Layer-major expert selections.
+         * @param local_counts Layer-major local execution counts.
+         * @param layer_count Number of compact rows in both arrays.
+         * @param expert_count Number of experts in each row.
+         * @param first_model_layer Global identity of the first serialized row.
+         * @param stream Exact publication stream for a mirrored GPU table.
+         * @return False for foreign stage geometry or missing arrays.
+         */
         virtual bool restoreDecodeHistogramCounts(const uint64_t *selected_counts,
                                                   const uint64_t *local_counts,
                                                   size_t layer_count,
                                                   size_t expert_count,
+                                                  int first_model_layer,
                                                   void *stream = nullptr) = 0;
         virtual void resetDecodeHistogramCounts(void *stream = nullptr) = 0;
         virtual void resetDecodeRuntimeState(void *stream = nullptr) = 0;
@@ -1023,7 +1038,7 @@ namespace llaminar2
          *
          * A null result means this table was deliberately constructed without
          * Dynamic economy telemetry.  Child MTP/LLEP tables return their
-         * canonical main table's allocation so every graph family contributes
+         * own interval within the canonical main table's allocation, so every graph family contributes
          * to one participant/layer/phase measurement authority.
          */
         virtual DeviceMoEOverlayServiceTelemetryCell *
@@ -1070,7 +1085,7 @@ namespace llaminar2
         DeviceMoEOverlayServiceTelemetryBinding
         deviceOverlayServiceTelemetryBinding(int layer_idx)
         {
-            if (layer_idx < 0 || layer_idx >= layerCount())
+            if (!containsModelLayer(layer_idx))
             {
                 throw std::out_of_range(
                     "MoE service telemetry binding layer is outside the runtime table");
@@ -1093,7 +1108,7 @@ namespace llaminar2
             DeviceMoEOverlayServiceTelemetryBinding binding{
                 .runtime_layer = deviceLayerState(layer_idx),
                 .layer_telemetry =
-                    telemetry + static_cast<std::size_t>(layer_idx) *
+                    telemetry + storageIndexForModelLayer(layer_idx) *
                                     kDeviceMoEOverlayServicePhaseCount,
                 .sample = sample,
             };
@@ -1116,6 +1131,33 @@ namespace llaminar2
         {
             (void)layer_idx;
             return {};
+        }
+        /** @return Immutable first global model layer owned by this table. */
+        [[nodiscard]] virtual int firstModelLayer() const noexcept = 0;
+
+        /** @return Exclusive end of the validated owned model-layer interval. */
+        [[nodiscard]] int endModelLayer() const noexcept { return firstModelLayer() + layerCount(); }
+
+        /**
+         * @param layer Global main or routed-sidecar layer.
+         * @return Whether the table owns the requested model identity.
+         */
+        [[nodiscard]] bool containsModelLayer(int layer) const noexcept
+        {
+            return layer >= firstModelLayer() && layer < endModelLayer();
+        }
+
+        /**
+         * @brief Translate a global identity into compact persistent storage.
+         * @param layer Global model layer owned by this table.
+         * @return Checked zero-based storage row.
+         * @throws std::out_of_range For a model layer outside the owned interval.
+         */
+        [[nodiscard]] std::size_t storageIndexForModelLayer(int layer) const
+        {
+            if (!containsModelLayer(layer))
+                throw std::out_of_range("MoE runtime layer is outside the table's owned interval");
+            return static_cast<std::size_t>(layer - firstModelLayer());
         }
     };
 
@@ -1204,6 +1246,8 @@ namespace llaminar2
              * prefix restore and placement epochs cannot replace these banks.
              */
             std::vector<std::shared_ptr<const MoEOverlayFixedDownProjectionBank>> fixed_down_banks;
+            /** First global model layer represented by the compact table. */
+            int first_model_layer = 0;
         };
 
         explicit DeviceMoERuntimeTable(Config config);
@@ -1227,7 +1271,7 @@ namespace llaminar2
         [[nodiscard]] std::shared_ptr<const MoEOverlayFixedDownProjectionBank> retainFixedDownProjectionBank(int layer_idx) const
         {
             (void)fixedDownProjectionBank(layer_idx); // Validate the same layer boundary before indexing.
-            return fixed_down_banks_.empty() ? nullptr : fixed_down_banks_[static_cast<std::size_t>(layer_idx)];
+            return fixed_down_banks_.empty() ? nullptr : fixed_down_banks_[storageIndexForModelLayer(layer_idx)];
         }
         /** @return The exact movable family authenticated by the fixed graph binding. */
         [[nodiscard]] DeviceMoEProjectionSet movableProjections() const noexcept
@@ -1276,6 +1320,7 @@ namespace llaminar2
                                           const uint64_t *local_counts,
                                           size_t layer_count,
                                           size_t expert_count,
+                                          int first_model_layer,
                                           void *stream = nullptr) override;
         void resetDecodeHistogramCounts(void *stream = nullptr) override;
         /**
@@ -1336,8 +1381,17 @@ namespace llaminar2
          */
         void restoreInitialRuntimeState(void *stream = nullptr);
         void syncRuntimeStateToHost(void *stream = nullptr);
+        /**
+         * @brief Restore a diagnostic snapshot without changing model topology.
+         * @param layers Compact pointer-bearing runtime rows from this process.
+         * @param layer_count Number of rows in the diagnostic snapshot.
+         * @param first_model_layer First global layer authenticated by its owner.
+         * @param stream Explicit publication stream when supplied for GPU state.
+         * @throws std::invalid_argument For foreign stage or projection geometry.
+         */
         void restoreRuntimeStateSnapshot(const DeviceMoELayerRuntime *layers,
                                          size_t layer_count,
+                                         int first_model_layer,
                                          void *stream = nullptr);
         /**
          * @brief Resolver used when a portable restore must rebind local expert payloads.
@@ -1372,6 +1426,8 @@ namespace llaminar2
 
         const DeviceId &deviceId() const noexcept { return device_id_; }
         int layerCount() const noexcept override { return num_layers_; }
+        /** @copydoc IMoERuntimeTable::firstModelLayer */
+        int firstModelLayer() const noexcept override { return first_model_layer_; }
         int expertCount() const noexcept { return num_experts_; }
         int topK() const noexcept { return top_k_; }
         bool isMirroredToDevice() const noexcept { return mirror_to_device_; }
@@ -1652,6 +1708,13 @@ namespace llaminar2
         InitialRuntimeFamilyLifecycle initial_runtime_family_lifecycle_ =
             InitialRuntimeFamilyLifecycle::Collecting;
 
+        /** Immutable topology identity; reset and prefix restore cannot rebind it. */
+        const int first_model_layer_;
+
+        /**
+         * @param layer_idx Global model layer owned by this table.
+         * @throws std::out_of_range When that identity belongs to another stage.
+         */
         void validateLayerIndex(int layer_idx) const;
         void validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const;
         void resetLayer(DeviceMoELayerRuntime &state) const;

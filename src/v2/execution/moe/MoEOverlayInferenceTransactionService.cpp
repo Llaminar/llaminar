@@ -6,9 +6,10 @@
  * pins its placement epoch and admits symmetric graph groups, whose follower
  * slots retire only after local graph completion and the follower's authenticated
  * terminal receipt. Numerical returns cannot prove empty-route retirement. Observability uses
- * those existing protocol identities; it never owns execution progress. In
- * particular, chunked prefill and ticketed generation may retire many sequences
- * under one command without being duplicate transactions.
+ * those existing protocol identities in fixed-width sequence witnesses, never
+ * per-command map keys. Chunked prefill and ticketed generation may retire many
+ * sequences under one command; bounded evidence preserves their exact ordered
+ * identities and aggregate work without retaining an unbounded event history.
  */
 
 #include "MoEOverlayInferenceTransactionService.h"
@@ -64,7 +65,12 @@ namespace llaminar2
             return false;
         }
 
-        /** @brief Publish one control-plane witness without model-state payloads. */
+        /**
+         * @brief Publish a bounded control witness without model-state payloads.
+         * @param ticket Authenticated command, logical-step and ordinal identity.
+         * @param endpoint Stable producer or follower role.
+         * @param result Stable protocol outcome, never a free-form diagnostic.
+         */
         void recordTicket(
             const MoEOverlayInferenceTransactionTicket &ticket,
             const char *endpoint,
@@ -91,24 +97,29 @@ namespace llaminar2
                 << ticket.logical_rows_per_request << "/"
                 << ticket.physical_rows_per_request
                 << " target_rank=" << ticket.target_world_rank);
-            PerfStatsCollector::addCounter(
+            PerfStatsCollector::addCounterWithSequence(
                 "moe_overlay_transaction",
                 "control_tickets",
                 1.0,
+                {ticket.command_id, ticket.logical_step_id, ticket.transaction_ordinal},
                 "inference",
                 "mpi",
                 {{"action", std::to_string(static_cast<std::uint32_t>(ticket.action))},
-                 {"command", std::to_string(ticket.command_id)},
                  {"draft_depth", std::to_string(ticket.draft_depth)},
                  {"endpoint", endpoint},
-                 {"logical_step", std::to_string(ticket.logical_step_id)},
-                 {"ordinal", std::to_string(ticket.transaction_ordinal)},
                  {"result", result},
                  {"role", std::to_string(static_cast<std::uint32_t>(ticket.graph_role))},
                  {"target_world_rank", std::to_string(ticket.target_world_rank)}});
         }
 
-        /** @brief Attribute one follower control or lifecycle interval. */
+        /**
+         * @brief Attribute one follower interval without retaining per-ticket rows.
+         * @param ticket Authenticated identity folded into ordered numeric evidence.
+         * @param name Stable timing family for this protocol boundary.
+         * @param endpoint Stable producer or follower role.
+         * @param begin Host control interval start; no device state is sampled.
+         * @param end Completed host interval frontier.
+         */
         void recordTicketTiming(
             const MoEOverlayInferenceTransactionTicket &ticket,
             const char *name,
@@ -125,16 +136,14 @@ namespace llaminar2
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     end - begin)
                     .count();
-            PerfStatsCollector::recordTimingNs(
+            PerfStatsCollector::recordTimingNsWithSequence(
                 "moe_overlay_transaction",
                 name,
                 static_cast<std::uint64_t>(std::max<std::int64_t>(1, elapsed)),
+                {ticket.command_id, ticket.logical_step_id, ticket.transaction_ordinal},
                 "inference",
                 "mpi",
-                {{"command", std::to_string(ticket.command_id)},
-                 {"endpoint", endpoint},
-                 {"logical_step", std::to_string(ticket.logical_step_id)},
-                 {"ordinal", std::to_string(ticket.transaction_ordinal)},
+                {{"endpoint", endpoint},
                  {"role", std::to_string(
                               static_cast<std::uint32_t>(ticket.graph_role))},
                  {"target_world_rank",
@@ -1326,18 +1335,16 @@ namespace llaminar2
             !declared_prefill_probe_ticket_.valid();
         declared_prefill_terminal_published_ = false;
 
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "moe_overlay_residency",
             "aggregate_prefill_calibration_schedules",
             1.0,
+            {static_cast<std::uint64_t>(workload.real_rows),
+             static_cast<std::uint64_t>(workload.execution_rows),
+             static_cast<std::uint64_t>(workload.transaction_count)},
             "prefill",
             "continuation_rank",
-            {{"real_rows", std::to_string(workload.real_rows)},
-             {"execution_rows",
-              std::to_string(workload.execution_rows)},
-             {"transactions",
-              std::to_string(workload.transaction_count)},
-             {"probe_claimed",
+            {{"probe_claimed",
               declared_prefill_probe_ticket_.valid() ? "true" : "false"}});
         return true;
     }
@@ -1512,14 +1519,14 @@ namespace llaminar2
             }
         }
         state_ = MoEOverlayInferenceProtocolState::Active;
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "moe_overlay_transaction",
             "coordinator_commands",
             1.0,
+            {command.command_id, command.request_generation},
             "inference",
             "continuation_rank",
             {{"action", "begin"},
-             {"command", std::to_string(command.command_id)},
              {"participants",
               std::to_string(config_.continuation_participant_count)},
              {"ticket_authority_participant",
@@ -2154,15 +2161,14 @@ namespace llaminar2
             }
         }
         transaction.state = GraphGroupSlotState::Armed;
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "moe_overlay_transaction",
             "coordinator_graph_arms",
             1.0,
+            {active_command_.command_id, transaction.group_id},
             "inference",
             "continuation_rank",
-            {{"command", std::to_string(active_command_.command_id)},
-             {"group", std::to_string(transaction.group_id)},
-             {"role", std::to_string(static_cast<std::uint32_t>(
+            {{"role", std::to_string(static_cast<std::uint32_t>(
                           transaction.descriptor.graph_role))},
              {"participant", std::to_string(binding.participant_index)}});
         return true;
@@ -2534,33 +2540,40 @@ namespace llaminar2
          * fence. Reaching this edge proves both the local captured submissions
          * and every authenticated follower transaction completed; earlier arm
          * or terminal-submission states are deliberately insufficient. The
-         * sequence ID already authenticates each graph binding. Include it so
-         * distinct prefill chunks or MTP rounds under one command cannot merge
-         * into a single PerfStats counter; no observer-owned cursor is needed. */
-        PerfStatsCollector::addCounter(
+         * sequence ID already authenticates each graph binding and increases
+         * across commands. Fold its exact value into bounded ordered evidence;
+         * the record count still names every distinct retired sequence. Keep a
+         * common owner-wide witness so consumers can reconcile all phase/depth
+         * families with the complete contiguous sequence span. */
+        PerfStatsCollector::addCounterWithSequence(
             "forward_graph",
             "segmented_replay_segments",
             static_cast<double>(completed_segments),
+            {active_command_.command_id, execution_sequence_.sequence_id},
             replay_phase,
             "continuation_rank",
             {{"authority", "typed_overlay_transaction_plan"},
-             {"command", std::to_string(active_command_.command_id)},
-             {"sequence", std::to_string(execution_sequence_.sequence_id)},
              {"draft_depth", std::to_string(retired_draft_depth)},
              {"graph_groups", std::to_string(retired_count)},
              {"plan_segments",
               std::to_string(config_.graph_plan.segmentCount())},
              {"scope", "cross_rank_expert_overlay"},
              {"terminal", "sparse_return_retired"}});
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
+            "forward_graph", "segmented_retirement_sequence", 1.0,
+            {active_command_.command_id, execution_sequence_.sequence_id},
+            "inference", "continuation_rank",
+            {{"authority", "typed_overlay_transaction_plan"},
+             {"scope", "cross_rank_expert_overlay"},
+             {"terminal", "sparse_return_retired"}});
+        PerfStatsCollector::addCounterWithSequence(
             "moe_overlay_transaction",
             "coordinator_graph_sequences",
             1.0,
+            {active_command_.command_id, execution_sequence_.sequence_id},
             "inference",
             "continuation_rank",
             {{"action", "retire"},
-             {"command", std::to_string(active_command_.command_id)},
-             {"sequence", std::to_string(execution_sequence_.sequence_id)},
              {"draft_depth", std::to_string(retired_draft_depth)},
              {"transactions", std::to_string(retired_count)}});
         resetGraphSequenceLocked();
@@ -2704,24 +2717,20 @@ namespace llaminar2
             }
             std::terminate();
         }();
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "moe_overlay_transaction",
             "hosted_sequence_transitions",
             1.0,
+            {transaction_id, completed_delta, committed_output_tokens},
             "decode",
             "continuation_rank",
-            {{"transaction", std::to_string(transaction_id)},
-             {"terminal", transition.kind() ==
+            {{"terminal", transition.kind() ==
                      HostedGraphSequenceTransition::Kind::Terminal
                  ? "true" : "false"},
              {"successor", successor},
              {"next_depth", transition.kind() ==
                      HostedGraphSequenceTransition::Kind::Terminal
                  ? "terminal" : std::to_string(transition.draftDepth())},
-             {"completed_logical_tokens",
-              std::to_string(completed_delta)},
-             {"committed_output_tokens",
-              std::to_string(committed_output_tokens)},
              {"retired_sparse_sequence",
               initial_sample_without_sparse_graph ? "false" : "true"},
              {"authority", "idempotent_ticket"}});
@@ -2788,16 +2797,14 @@ namespace llaminar2
             }
         }
         state_ = MoEOverlayInferenceProtocolState::Complete;
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "moe_overlay_transaction",
             "coordinator_commands",
             1.0,
+            {active_command_.command_id, total_transaction_count_, graph_sequence_count_},
             "inference",
             "continuation_rank",
-            {{"action", "complete"},
-             {"command", std::to_string(active_command_.command_id)},
-             {"transactions", std::to_string(total_transaction_count_)},
-             {"graph_sequences", std::to_string(graph_sequence_count_)}});
+            {{"action", "complete"}});
         declared_prefill_schedule_.reset();
         declared_prefill_schedule_begin_ordinal_ = 0;
         declared_prefill_schedule_end_ordinal_ = 0;
@@ -3128,14 +3135,14 @@ namespace llaminar2
                 return false;
             }
             last_retired_decode_progress_tokens = frontier;
-            PerfStatsCollector::addCounter(
+            PerfStatsCollector::addCounterWithSequence(
                 "moe_overlay_transaction",
                 "follower_decode_progress_notifications",
                 static_cast<double>(delta),
+                {frontier},
                 "decode",
                 "expert_follower_rank",
                 {{"boundary", boundary},
-                 {"cumulative_tokens", std::to_string(frontier)},
                  {"blocking", "false"},
                  {"sideband", "existing_transaction_ticket"}});
             return true;

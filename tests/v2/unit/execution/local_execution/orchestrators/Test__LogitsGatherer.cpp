@@ -4,6 +4,8 @@
  *
  * Tests buffer allocation, skip-gather control, needsGather() logic,
  * single-device gather path, copyFromStage delegation, and host pinning cleanup.
+ * Bounded-output regressions reject oversized reads before touching storage and
+ * prove that lazy terminal PP output has only one vocabulary row of capacity.
  */
 
 #include <gtest/gtest.h>
@@ -485,7 +487,7 @@ TEST_F(Test__LogitsGatherer, CopyFromStage_CopiesLogits)
     auto g = createGatherer();
     auto one_token_runner = std::make_unique<LogitsGathererMockRunner>(1);
     one_token_runner->setLogitsData({123.0f});
-    g->copyFromStage(*one_token_runner, 1, 1, 16);
+    g->copyFromStage(*one_token_runner, 1);
     ASSERT_EQ(g->lastGatheredSize(), 1u);
 
     auto runner = std::make_unique<LogitsGathererMockRunner>(VOCAB);
@@ -494,7 +496,7 @@ TEST_F(Test__LogitsGatherer, CopyFromStage_CopiesLogits)
         expected[i] = static_cast<float>(i) * -0.5f;
     runner->setLogitsData(expected);
 
-    g->copyFromStage(*runner, 0, 1, 16);
+    g->copyFromStage(*runner);
 
     // Verify data was copied
     const float *result = g->data();
@@ -514,12 +516,36 @@ TEST_F(Test__LogitsGatherer, CopyFromStage_AllocatesIfNull)
     runner->fillLogits(7.0f);
 
     // copyFromStage should allocate the buffer on demand
-    g->copyFromStage(*runner, 0, 1, 16);
+    g->copyFromStage(*runner);
 
     EXPECT_TRUE(g->isAllocated());
+    EXPECT_EQ(g->bufferNumel(), static_cast<size_t>(VOCAB));
     const float *result = g->data();
     ASSERT_NE(result, nullptr);
     EXPECT_FLOAT_EQ(result[0], 7.0f);
+}
+
+/** @brief Both replicated gather paths reject capacity overruns before copying. */
+TEST_F(Test__LogitsGatherer, ReplicatedGatherRejectsRowsOutsideRetainedOutput)
+{
+    for (const size_t participants : {1u, 2u})
+    {
+        SCOPED_TRACE(participants);
+        auto g = createGatherer(VOCAB, 1);
+        auto runners = makeSingleRunner();
+        if (participants == 2)
+            runners.push_back(std::make_unique<LogitsGathererMockRunner>(VOCAB));
+        ASSERT_TRUE(g->gather(runners, 1, VOCAB));
+        EXPECT_FALSE(g->gather(runners, 2, VOCAB));
+        EXPECT_EQ(g->data(), nullptr);
+        EXPECT_EQ(g->lastGatheredSize(), 0u);
+        EXPECT_FALSE(g->gather(runners, size_t(-1), VOCAB));
+        EXPECT_FALSE(g->gather(runners, 1, 0));
+        EXPECT_FALSE(g->gather(runners, 1, -1));
+        EXPECT_FALSE(g->gather(runners, 0, VOCAB));
+        EXPECT_TRUE(g->gather(runners, 1, VOCAB));
+        EXPECT_EQ(g->bufferNumel(), static_cast<size_t>(VOCAB));
+    }
 }
 
 // =============================================================================

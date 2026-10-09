@@ -72,7 +72,7 @@ protected:
             gpu.name = "NVIDIA A100-SXM4-80GB";
             gpu.uuid = "GPU-" + std::to_string(rank) + "-cuda-" + std::to_string(i);
             gpu.supports_p2p = true;
-            gpu.pcie_bus_id = 0x41 + i;
+            gpu.pci_bus_address = "0001:4" + std::to_string(i) + ":03.1";
             gpu.numa_node = i % 2;
             inv.gpus.push_back(gpu);
         }
@@ -94,7 +94,7 @@ protected:
             gpu.name = "AMD Instinct MI250X";
             gpu.uuid = "GPU-" + std::to_string(rank) + "-rocm-" + std::to_string(i);
             gpu.supports_p2p = true;
-            gpu.pcie_bus_id = 0x81 + i;
+            gpu.pci_bus_address = "0002:8" + std::to_string(i) + ":1f.7";
             gpu.numa_node = i % 2;
             inv.gpus.push_back(gpu);
         }
@@ -120,7 +120,7 @@ protected:
         EXPECT_EQ(a.name, b.name) << context << " name mismatch";
         EXPECT_EQ(a.uuid, b.uuid) << context << " uuid mismatch";
         EXPECT_EQ(a.supports_p2p, b.supports_p2p) << context << " supports_p2p mismatch";
-        EXPECT_EQ(a.pcie_bus_id, b.pcie_bus_id) << context << " pcie_bus_id mismatch";
+        EXPECT_EQ(a.pci_bus_address, b.pci_bus_address) << context << " PCI endpoint mismatch";
         EXPECT_EQ(a.numa_node, b.numa_node) << context << " numa_node mismatch";
     }
 

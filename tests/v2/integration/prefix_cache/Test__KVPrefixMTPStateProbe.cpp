@@ -3824,6 +3824,8 @@ namespace
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
+        config.mtp_activation_policy = enable_mtp
+            ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled;
         config.mtp.draft_tokens = 1;
 
         switch (test_case.topology)
@@ -4614,7 +4616,7 @@ TEST(Test__KVPrefixMTPStateProbe,
     oracle.current_position = 7;
     oracle.positions = {7};
     oracle.sequence_lengths = {7};
-    oracle.moe_runtime_movement_epoch = 4;
+    oracle.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(4);
     oracle.gdn_layers = inspectHybridGDNForPrefixProbe(
         cache,
         /*stream=*/nullptr,
@@ -4641,7 +4643,7 @@ TEST(Test__KVPrefixMTPStateProbe,
     ASSERT_FALSE(same_epoch);
     EXPECT_FALSE(same_epoch.gdn_numerical.compared);
 
-    candidate.moe_runtime_movement_epoch = 5;
+    candidate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(5);
     const auto changed_epoch =
         compareMTPRuntimeStateSnapshots(oracle, candidate, options);
     ASSERT_TRUE(changed_epoch) << changed_epoch.reason;
@@ -5116,6 +5118,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
         config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
         config.kv_cache_precision = "auto";
         config.mtp.enabled = enable_mtp;
+        config.mtp_activation_policy = enable_mtp
+            ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled;
         config.mtp.draft_tokens = 1;
         return config;
     };
@@ -5513,6 +5517,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsBaselineThenMTPRegressio
         config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
         config.kv_cache_precision = "auto";
         config.mtp.enabled = enable_mtp;
+        config.mtp_activation_policy = enable_mtp
+            ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled;
         config.mtp.draft_tokens = 1;
         return config;
     };
@@ -5883,6 +5889,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
+        config.mtp_activation_policy = enable_mtp
+            ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled;
         config.mtp.draft_tokens = 1;
         return config;
     };
@@ -6057,6 +6065,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
+        config.mtp_activation_policy = enable_mtp
+            ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled;
         config.mtp.draft_tokens = 1;
         return config;
     };
@@ -7370,6 +7380,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36SingleCUDAPaddedPrefillMatchesExactActiv
         config.prefix_cache.enabled = false;
         config.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
         config.mtp.enabled = false;
+        config.mtp_activation_policy = MTPActivationPolicy::Disabled;
         config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
         return config;
     };

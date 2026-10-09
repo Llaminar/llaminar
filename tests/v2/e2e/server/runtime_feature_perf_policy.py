@@ -17,9 +17,13 @@ from __future__ import annotations
 from collections import defaultdict
 from enum import Enum
 import math
-import json
+from pathlib import Path
+import sys
 from typing import Any, Iterable, Mapping
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts/ci"))
+from generation_movement_ledger import (validate_native_movement_transport, validate_controller_movement_transport,
+                                        CONTROLLER_MOVEMENT_TAGS, native_movement_scope)
 from server_execution_contract import RuntimeFeaturePolicy
 
 
@@ -63,18 +67,57 @@ def _overlay_transaction(record: Mapping[str, Any]) -> tuple[Any, ...] | None:
     tags = record.get("tags") or {}
     if tags.get("policy_owner") != "device":
         return None
-    identity = []
-    for name in ("transaction", "candidate_epoch"):
-        value = tags.get(name)
-        if not isinstance(value, str) or not value.isascii() or not value.isdecimal() or not 0 < int(value) < 2**64:
+    if tags.get("policy") == "native_load_spread":
+        count = record.get("count")
+        minimum, maximum = record.get("sequence_minimum_words"), record.get("sequence_maximum_words")
+        unsigned = lambda value: type(value) is int and 0 <= value < 2**64
+        try:
+            scope = native_movement_scope(record)
+        except ValueError:
             return None
-        identity.append(int(value))
-    return (record.get("rank"), record.get("device"), record.get("phase"), *identity)
+        if (record.get("kind") != "counter" or not unsigned(count) or count == 0
+                or record.get("sequence_word_count") != count * 4
+                or not isinstance(minimum, list) or not isinstance(maximum, list)
+                or len(minimum) != 4 or len(maximum) != 4
+                or not all(unsigned(lo) and unsigned(hi) and 0 < lo <= hi for lo, hi in zip(minimum, maximum))
+                or not unsigned(record.get("sequence_digest_lo")) or not unsigned(record.get("sequence_digest_hi"))):
+            return None
+        return (*scope, record.get("device"), record.get("phase"), "native_load_spread",
+                count, record["sequence_word_count"], record["sequence_digest_lo"], record["sequence_digest_hi"],
+                *minimum, *maximum)
+    if tags != CONTROLLER_MOVEMENT_TAGS:
+        return None
+    # Full history and all twelve families were checked before this join.
+    # Include the same exact receipt witness in each completed trio member.
+    return (record.get("rank"), record.get("device"), record.get("phase"), "time_ns",
+            record.get("count"), record.get("sequence_word_count"), record.get("sequence_digest_lo"),
+            record.get("sequence_digest_hi"), *record.get("sequence_minimum_words", []),
+            *record.get("sequence_maximum_words", []))
+
+
+def _completed_native_movement(record: Mapping[str, Any]) -> bool:
+    """Require a joint copy/apply/completion/byte proof from each publication."""
+    count, words = record.get("count"), record.get("sequence_word_count")
+    minimum, maximum = record.get("sequence_minimum_words"), record.get("sequence_maximum_words")
+    unsigned = lambda value: type(value) is int and 0 <= value < 2**64
+    if (record.get("kind") != "counter" or not unsigned(count) or not count
+            or type(record.get("value")) not in (int, float) or record["value"] != count
+            or not unsigned(words) or words != count * 4
+            or not isinstance(minimum, list) or not isinstance(maximum, list)
+            or len(minimum) != 4 or len(maximum) != 4
+            or not unsigned(record.get("sequence_digest_lo"))
+            or not unsigned(record.get("sequence_digest_hi"))):
+        return False
+    if not all(unsigned(lo) and unsigned(hi) and 0 < lo <= hi for lo, hi in zip(minimum, maximum)):
+        return False
+    # A subset's extrema cannot exceed those of either containing population.
+    return all(minimum[2] <= minimum[index] and maximum[2] <= maximum[index] for index in (0, 1))
 
 
 def validate_runtime_feature_policy(
     records: Iterable[Mapping[str, Any]], features: RuntimeFeaturePolicy,
     movement_evidence: MovementEvidence,
+    *, terminal_movement: Iterable[Mapping[str, Any]] = (),
 ) -> str | None:
     """Require actual execution of the admitted runtime's selected feature contract.
 
@@ -91,9 +134,15 @@ def validate_runtime_feature_policy(
         return "runtime certification requires typed movement evidence"
     if not isinstance(features, RuntimeFeaturePolicy):
         return "runtime certification requires typed feature policy"
+    records, terminal_movement = list(records), list(terminal_movement)
+    try:
+        validate_native_movement_transport(records, terminal_movement)
+        validate_controller_movement_transport(records, terminal_movement)
+    except (ValueError, TypeError, KeyError) as error:
+        return "dynamic movement certification has inconsistent completed transport evidence: " + str(error)
 
     totals: dict[tuple[str, str], float] = defaultdict(float)
-    native_observations: dict[tuple[Any, ...], dict[str, float]] = defaultdict(dict)
+    completed_native = False
     host_publications: dict[tuple[Any, ...], dict[str, Mapping[str, Any]]] = defaultdict(dict)
     host_edge_scopes: set[tuple[Any, ...]] = set()
     overlay_observations: dict[tuple[Any, ...], dict[str, float]] = defaultdict(dict)
@@ -138,13 +187,12 @@ def validate_runtime_feature_policy(
                 # aggregate only after retaining rank/transaction identity.
                 observation = overlay_observations[identity]
                 observation[name] = observation.get(name, 0.0) + value
-        if domain == "moe_rebalance":
-            # These are snapshots, not additive movement events. Keep each
-            # publication intact; do not pair copy/apply evidence across ranks,
-            # devices, phases, or request-reset observations.
-            identity = (record.get("rank"), record.get("device"), record.get("phase"),
-                        json.dumps(record.get("tags") or {}, sort_keys=True))
-            native_observations[identity][name] = value
+        if domain == "moe_rebalance" and name == "device_rebalance_completed_movement_observations":
+            # One bounded row certifies a coherent snapshot. Separate positive
+            # totals from different incomplete requests cannot create this proof.
+            valid = _completed_native_movement(record)
+            invalid_publication |= not valid
+            completed_native |= valid
         if (domain == "prefix_cache" and name == "populate_restores"
                 and (record.get("tags") or {}).get("includes_mtp_state") == "true"):
             mtp_restores += value
@@ -173,8 +221,6 @@ def validate_runtime_feature_policy(
     native_names = ("device_rebalance_request_copied_payload_lower_bound",
                     "device_rebalance_request_applied_payload_lower_bound",
                     "device_rebalance_request_useful_payload_bytes_lower_bound")
-    completed_native = any(all(observation.get(name, 0) > 0 for name in native_names)
-                           for observation in native_observations.values())
     overlay_edges = totals[("moe_overlay_controller", "dynamic_migration_edges")]
     overlay_transactions = totals[("moe_overlay_controller", "dynamic_movement_transactions")]
     overlay_bytes = totals[("moe_overlay_controller", "dynamic_physical_bytes")]
@@ -207,6 +253,7 @@ def validate_runtime_feature_policy(
     if movement_evidence is MovementEvidence.FORBIDDEN and (
             committed_edges > 0 or applied > 0 or physical_bytes > 0
             or any(totals[("moe_rebalance", name)] > 0 for name in native_names)
+            or completed_native
             or overlay_edges > 0 or overlay_transactions > 0 or overlay_bytes > 0
             or placement_payload > 0 or host_publications):
         return "static movement certification observed expert movement"

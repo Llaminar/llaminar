@@ -22,7 +22,6 @@
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceAllocator.h"
-#include "planning/ActivationBufferSizing.h"
 #include "planning/PipelineTransferMemory.h"
 #include <barrier>
 #include <algorithm>
@@ -149,9 +148,14 @@ void PipelineDeviceGeneration::prepareDomainBoundaries()
         auto &earlier = *stages_[domains_[i - 1].first];
         auto &later = *stages_[domains_[i].first];
         const auto &config = earlier.graph_builder_->config();
+        // PMA may admit a smaller common resident family than the global
+        // bucket ceiling. The initialized arena owns that final geometry;
+        // re-reading startup policy here would allocate an unadmitted channel.
+        const int admitted_rows = earlier.state_.activation_seq_len;
+        if (admitted_rows <= 0 || later.state_.activation_seq_len != admitted_rows)
+            throw std::logic_error("Captured pipeline boundary requires one common admitted activation capacity");
         const auto geometry = PipelineTransferMemory::forRows(config.d_model,
-            resolveActivationBufferSeqLen(earlier.state_.max_seq_len, earlier.state_.device_id),
-            std::max(1, resolveMTPRetainedTargetQueryRows(config.mtp)));
+            admitted_rows, std::max(1, resolveMTPRetainedTargetQueryRows(config.mtp)));
         auto &transfer = TransferEngine::instance();
         const auto create = [&](auto &source, auto &destination, size_t capacity) {
             return transfer.createCapturedTransferChannel(*earlier.physical_memory_authority_, DeviceId::cpu(),
@@ -298,6 +302,46 @@ bool PipelineDeviceGeneration::forwardMTPCondition(MTPConditionForwardPurpose pu
     return forwardMTP(purpose, terminal);
 }
 
+bool PipelineDeviceGeneration::forwardDecodeInput(int32_t token_id)
+{
+    const int token = token_id;
+    return forwardMainInput([&](IInferenceRunner &runner) { return runner.forward(&token, 1); });
+}
+
+bool PipelineDeviceGeneration::restoredPrefixMTPDecodeBridge(
+    const RestoredPrefixMTPDecodeBridgeRequest &request)
+{
+    return request.valid() && forwardMainInput([&](IInferenceRunner &runner) {
+        return runner.forwardRestoredPrefixMTPDecodeBridge(request);
+    });
+}
+
+bool PipelineDeviceGeneration::forwardMainInput(
+    const std::function<bool(IInferenceRunner &)> &forward)
+{
+    if (phase_ != Phase::Idle || !prefillPrepared() || !forward) return false;
+    phase_ = Phase::Failed;
+    // Each domain's existing forward API owns TP admission and exact history
+    // validation. Native activation edges, not the host's stage loop, deliver
+    // intermediate rows; every sender and receiver must therefore be admitted.
+    workers_->dispatch([&, this](size_t index) {
+        const auto &domain = domainFor(index);
+        if (index != domain.first) return true;
+        if (!forward(*domain.runner)) return false;
+        // As with an ordinary pipeline MTP condition, upstream domains have
+        // no sampler to consume a main-logits handoff. Their activation edge
+        // has already published the real output. Retire the unused deferral
+        // before the next condition graph publishes on that same participant.
+        if (!terminalParticipant(index))
+            for (size_t member = domain.first; member < domain.first + domain.count; ++member)
+                stages_[member]->setMTPMainDecodeSyncDeferralEnabled(false);
+        return true;
+    });
+    if (!collectPreparation(*workers_)) return false;
+    phase_ = Phase::Idle;
+    return true;
+}
+
 bool PipelineDeviceGeneration::forwardMTPVerifier(int logical_rows,
     const std::function<bool(IInferenceRunner &)> &terminal)
 {
@@ -308,15 +352,18 @@ bool PipelineDeviceGeneration::forwardMTPVerifier(int logical_rows,
         tail.mtp_max_verifier_rows_);
     const int physical_rows = width_policy ? mtpVerifierPhysicalPaddedSeqLen(
         1, logical_rows, tail.mtp_max_verifier_rows_, *width_policy) : 0;
-    if (!geometry.enabled || !geometry.valid() || logical_rows < 2 || physical_rows != geometry.verifier_rows)
+    if (!geometry.enabled || !geometry.valid() || logical_rows < 2 || physical_rows < logical_rows ||
+        physical_rows > geometry.verifier_rows ||
+        mtpVerifierPhysicalRowBucket(physical_rows, geometry.verifier_rows) != physical_rows)
     {
-        LOG_ERROR("Pipeline verifier does not match its retained physical envelope: " << error);
+        LOG_ERROR("Pipeline verifier is not a retained graph member: logical_rows=" << logical_rows
+            << " physical_rows=" << physical_rows << " retained_rows=" << geometry.verifier_rows << " " << error);
         return false;
     }
     // The callback installs the tail's greedy/stochastic outcome policy.
     // Followers only produce layer state and activations; asking them to arm
     // an outcome transaction would invent a second sampler/head authority.
-    return forwardMTP(MTPVerifierOutcomeGraphMode::Disabled, terminal);
+    return forwardMTP(MTPVerifierForwardPolicy(MTPVerifierOutcomeGraphMode::Disabled, physical_rows, geometry), terminal);
 }
 
 bool PipelineDeviceGeneration::forwardMTP(const MTPMainForwardPolicy &policy,
@@ -332,14 +379,9 @@ bool PipelineDeviceGeneration::forwardMTP(const MTPMainForwardPolicy &policy,
             return index != terminalIndex() || terminal(*domains_.back().runner);
         std::string error;
         void *const stream = stage.explicitGPUStreamForOperation("pipeline_mtp_main_forward");
-        // Admission hands the first speculative transaction to its verifier.
-        // The later commit closes that same borrow; no second controller or
-        // publication-time re-admission is created on a follower.
-        if (previous == Phase::Admitted &&
-            std::holds_alternative<MTPVerifierOutcomeGraphMode>(policy) &&
-            !stage.consumeDeviceGenerationStateReady(stream,
-                DeviceTimelineRole::AllPositionVerifier, 1, "pipeline_initial_mtp_verifier"))
-            return false;
+        // This stream publishes inputs; the retained verifier may execute on
+        // another stream. Its live-state prelude must borrow admission on that
+        // actual consumer so restored KV/GDN writes precede every graph root.
         const bool ok = stage.executeMTPMainForward(policy,
             domainFor(index).first ? stage.state_.hidden.get() : nullptr,
             stream,

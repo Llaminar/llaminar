@@ -12,6 +12,9 @@
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "backends/IGPUGraphCapture.h"
+#include "execution/compute_stages/stages/MoEDeviceRebalanceStage.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MoEGPUCurrentBatchLLEPStage.h"
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
@@ -23,8 +26,10 @@
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "execution/compute_stages/stages/TPAllreduceStage.h"
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "execution/moe/MoEOverlayEconomyCalibrationPlanner.h"
 #include "execution/moe/MoEOverlayInferenceTransaction.h"
 #include "execution/moe/MoEOverlayDeviceControllerTopology.h"
 #include "execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
@@ -36,8 +41,11 @@
 #include "execution/moe/MoERuntimeTable.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/ModelContext.h"
+#include "loaders/PreparedWeightStore.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "mocks/MockLocalTPContext.h"
+#include "mocks/MockComputeStage.h"
 #include "mocks/MockMPIContext.h"
 #include "mocks/MockMPITopology.h"
 #include "tensors/TensorKernels.h"
@@ -49,6 +57,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -71,6 +81,124 @@ namespace llaminar2::test
         constexpr int kTopK = 2;
         constexpr int kSeqLen = 3;
         constexpr int kBatchSize = 1;
+
+        /**
+         * @brief Admit the bounded migration BOM used by tiny graph-lowering fixtures.
+         * @param prepared Model-owned store that retains the sole allocation authority.
+         * @param device Participant whose transfer directory is being lowered.
+         *
+         * The tiny six-expert fixture needs only metadata and rolling transfer
+         * slots. Admission does not allocate a second payload pool; the directory
+         * materializes and releases its actual storage through this authority.
+         */
+        void admitLoweringMigrationStorage(PreparedWeightStore &prepared, DeviceId device)
+        {
+            constexpr std::size_t migration_capacity = 16u << 20;
+            PhysicalMemoryPlanBuilder memory_plan;
+            memory_plan.add({.world_rank = 0, .device = device,
+                .total_bytes = migration_capacity, .admission_available_bytes = migration_capacity},
+                PhysicalMemoryOwner::ExpertMigrationStaging, migration_capacity);
+            prepared.installPhysicalMemoryAuthority(std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(memory_plan.build()), 0));
+        }
+
+        /**
+         * @brief Own a complete tiny main/NextN directory for channel discovery.
+         *
+         * Graph lowering supplies its tensors separately. This sparse file is
+         * only parsed for source roles and geometry; its holes are never loaded
+         * as weights. The real loader therefore authenticates the same retained
+         * family on both channel endpoints without a second synthetic manifest.
+         */
+        class LoweringMTPDirectory final
+        {
+        public:
+            /** @brief Write one main block and one routed NextN source block. */
+            LoweringMTPDirectory()
+            {
+                char name[] = "/tmp/llaminar-lowering-mtp-XXXXXX.gguf";
+                const int descriptor = ::mkstemps(name, 5);
+                if (descriptor < 0) throw std::runtime_error("Cannot create lowering MTP directory");
+                ::close(descriptor);
+                path_ = name;
+                try
+                {
+                    std::vector<std::pair<std::string, std::vector<uint64_t>>> tensors{
+                        {"token_embd.weight", {kDModel, 32}},
+                        {"output.weight", {kDModel, 32}}, {"output_norm.weight", {kDModel}}};
+                    for (int layer = 0; layer < 2; ++layer)
+                    {
+                        const auto prefix = "blk." + std::to_string(layer) + ".";
+                        for (const auto role : {"attn_norm.weight", "post_attention_norm.weight"})
+                            tensors.push_back({prefix + role, {kDModel}});
+                        for (const auto role : {"attn_q_norm.weight", "attn_k_norm.weight"})
+                            tensors.push_back({prefix + role, {4}});
+                        tensors.push_back({prefix + "attn_q.weight", {kDModel, 16}});
+                        for (const auto role : {"attn_k.weight", "attn_v.weight"})
+                            tensors.push_back({prefix + role, {kDModel, 8}});
+                        tensors.push_back({prefix + "attn_output.weight", {8, kDModel}});
+                        tensors.push_back({prefix + "ffn_gate_inp.weight", {kDModel, kNumExperts}});
+                        for (const auto role : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
+                            tensors.push_back({prefix + role, {kDModel, kIntermediate, kNumExperts}});
+                        tensors.push_back({prefix + "ffn_down_exps.weight", {kIntermediate, kDModel, kNumExperts}});
+                        for (const auto role : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight"})
+                            tensors.push_back({prefix + role, {kDModel, kIntermediate}});
+                        tensors.push_back({prefix + "ffn_down_shexp.weight", {kIntermediate, kDModel}});
+                        tensors.push_back({prefix + "ffn_gate_inp_shexp.weight", {kDModel}});
+                        if (layer == 1)
+                        {
+                            tensors.push_back({prefix + "nextn.eh_proj.weight", {2 * kDModel, kDModel}});
+                            for (const auto role : {"nextn.hnorm.weight", "nextn.enorm.weight", "nextn.shared_head_norm.weight"})
+                                tensors.push_back({prefix + role, {kDModel}});
+                        }
+                    }
+                    const std::vector<std::pair<std::string, uint32_t>> metadata{
+                        {"qwen35moe.block_count", 2}, {"qwen35moe.nextn_predict_layers", 1},
+                        {"qwen35moe.embedding_length", kDModel}, {"qwen35moe.feed_forward_length", kIntermediate},
+                        {"qwen35moe.attention.head_count", 2}, {"qwen35moe.attention.head_count_kv", 2},
+                        {"qwen35moe.attention.key_length", 4}, {"qwen35moe.context_length", 64},
+                        {"tokenizer.ggml.token_count", 32}, {"qwen35moe.expert_count", kNumExperts},
+                        {"qwen35moe.expert_used_count", kTopK},
+                        {"qwen35moe.expert_feed_forward_length", kIntermediate}};
+                    std::ofstream stream(path_, std::ios::binary | std::ios::trunc);
+                    stream.exceptions(std::ios::badbit | std::ios::failbit);
+                    const auto scalar = [&]<typename T>(T value) {
+                        stream.write(reinterpret_cast<const char *>(&value), sizeof(value));
+                    };
+                    const auto string = [&](const std::string &value) {
+                        scalar(uint64_t(value.size())); stream.write(value.data(), value.size());
+                    };
+                    stream.write("GGUF", 4); scalar(uint32_t{3}); scalar(uint64_t(tensors.size()));
+                    scalar(uint64_t(metadata.size() + 1));
+                    string("general.architecture"); scalar(uint32_t{8}); string("qwen35moe");
+                    for (const auto &[key, value] : metadata)
+                    { string(key); scalar(uint32_t{4}); scalar(value); }
+                    uint64_t offset = 0;
+                    for (const auto &[name, shape] : tensors)
+                    {
+                        string(name); scalar(uint32_t(shape.size()));
+                        uint64_t bytes = sizeof(float);
+                        for (const auto dimension : shape) { scalar(dimension); bytes *= dimension; }
+                        scalar(uint32_t(GGUFTensorType::F32)); scalar(offset);
+                        offset = (offset + bytes + 31) / 32 * 32;
+                    }
+                    const auto aligned = (uint64_t(stream.tellp()) + 31) / 32 * 32;
+                    stream.seekp(static_cast<std::streamoff>(aligned + offset - 1));
+                    stream.put('\0');
+                }
+                catch (...) { remove(); throw; }
+            }
+            /** @brief Retire the exact directory after every graph and loader. */
+            ~LoweringMTPDirectory() { remove(); }
+            LoweringMTPDirectory(const LoweringMTPDirectory &) = delete;
+            LoweringMTPDirectory &operator=(const LoweringMTPDirectory &) = delete;
+            /** @return Stable directory path; no payload is needed for graph lowering. */
+            const std::string &path() const noexcept { return path_; }
+        private:
+            /** @brief Unlink only this fixture's unique file, including after construction failure. */
+            void remove() noexcept { std::error_code error; std::filesystem::remove(path_, error); }
+            std::string path_;
+        };
 
         /**
          * @brief Own the exact stream used to publish graph-build device state.
@@ -1723,6 +1851,24 @@ namespace llaminar2::test
             owner_map.layeredOwnership(/*num_layers=*/1, kNumExperts);
         auto histogram = std::make_shared<DecodeExpertHistogram>(
             std::move(histogram_config));
+        // Match the exact geometry and NativeVNNI provenance exported by
+        // TestExpertGemm. Dynamic lowering must consume the same immutable
+        // layer partition as its residency authority's service observations.
+        const auto expert_format = ExpertWeightFormat::nativeVnni({
+            .codebook_id = 4, .is_superblock = false, .present = true});
+        auto economy_catalog =
+            std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(
+                std::vector<MoEOverlayLayerWeightManifest>{{
+                    .layer_idx = 0,
+                    .projections = {{
+                        {.projection = ExpertTierWeightProjection::Gate,
+                         .N = kIntermediate, .K = kDModel, .format = expert_format},
+                        {.projection = ExpertTierWeightProjection::Up,
+                         .N = kIntermediate, .K = kDModel, .format = expert_format},
+                        {.projection = ExpertTierWeightProjection::Down,
+                         .N = kDModel, .K = kIntermediate, .format = expert_format},
+                    }},
+                }});
         auto residency_authority = std::make_shared<
             MoEOverlayResidencyAuthority>(
             MoEOverlayResidencyAuthority::Config{
@@ -1735,6 +1881,7 @@ namespace llaminar2::test
                 },
                 .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
                 .histogram = histogram.get(),
+                .economy_layer_catalog = economy_catalog,
                 .perf_device = "cuda_rocm_dynamic_lowering",
             });
         const auto initial_snapshot = residency_authority->snapshot();
@@ -1803,6 +1950,17 @@ namespace llaminar2::test
                 graph_family,
                 /*source_world_rank=*/0,
                 /*target_world_rank=*/1);
+        // Both endpoints retain the same explicit layout for every admitted
+        // graph family; channel identity alone cannot prove payload geometry.
+        const auto activation_graph_families =
+            makeMoEOverlayActivationGraphFamilyManifests(graph_family);
+        const auto activation_layout = planMoEOverlayNodeLocalActivationLayout({
+            .participant_count = 1,
+            .max_rows_per_participant = static_cast<std::size_t>(kSeqLen),
+            .max_entries_per_participant = static_cast<std::size_t>(kSeqLen * kTopK),
+            .d_model = kDModel,
+            .activation_graph_family_count = activation_graph_families.size(),
+        });
         auto peer_workspace =
             std::make_shared<MoEOverlayRankBatchWireWorkspace>(
                 MoEOverlayRankBatchWireWorkspace::Config{
@@ -1845,9 +2003,8 @@ namespace llaminar2::test
                                 .domain_ordinal = 0,
                             },
                             .target_tier_priority = 1,
-                            .activation_graph_families =
-                                makeMoEOverlayActivationGraphFamilyManifests(
-                                    graph_family),
+                            .activation_graph_families = activation_graph_families,
+                            .activation_layout = activation_layout,
                             .local_lanes = {{
                                 .participant_id = 1,
                                 .device = DeviceId::cpu(),
@@ -1893,9 +2050,8 @@ namespace llaminar2::test
                     .domain_ordinal = 0,
                 },
                 .target_tier_priority = 1,
-                .activation_graph_families =
-                    makeMoEOverlayActivationGraphFamilyManifests(
-                        graph_family),
+                .activation_graph_families = activation_graph_families,
+                .activation_layout = activation_layout,
                 .local_lanes = {{
                     .participant_id = 1,
                     .device = DeviceId::cuda(0),
@@ -2245,6 +2401,11 @@ namespace llaminar2::test
         tp_ctx.setBackend(CollectiveBackendType::RCCL);
 
         GraphConfig config0 = makeConfig(plan, /*layer_count=*/1);
+        config0.total_n_layers = kMTPSourceLayer + 1;
+        config0.mtp.enabled = true;
+        config0.mtp.draft_tokens = 1;
+        config0.mtp.graph_capacity_draft_tokens = 1;
+        config0.mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
         config0.max_activation_rows = kSeqLen;
         config0.default_device = DeviceId::rocm(0);
         config0.tp_ctx = &tp_ctx;
@@ -2277,9 +2438,11 @@ namespace llaminar2::test
         config1.default_device = DeviceId::rocm(1);
         config1.tp_device_idx = 1;
 
+        LoweringMTPDirectory directory;
         auto model_ctx = ModelContext::createForTesting(
-            "test.gguf", nullptr, 1, /*with_weight_manager=*/true);
+            directory.path(), nullptr, kMTPSourceLayer + 1, /*with_weight_manager=*/true);
         ASSERT_NE(model_ctx, nullptr);
+        ASSERT_TRUE(model_ctx->concreteLoader().loadModel(directory.path()));
         ASSERT_NE(model_ctx->concreteWeightManager(), nullptr);
         auto &registry =
             model_ctx->concreteWeightManager()->expertGemmRegistry();
@@ -2344,19 +2507,16 @@ namespace llaminar2::test
                 /*rank=*/1,
                 /*world_size=*/2,
                 /*ranks_per_node=*/2));
-        /* The test loader has no GGUF metadata to discover. Install the exact
-         * validated family that production derives from the model manifest so
-         * both mapped endpoints retain main and MTP activation slots. */
-        const MoEOverlayInferenceGraphFamilyIdentity graph_family{
-            .graph_family_generation = 1,
-            .main_layer_count = 1,
-            .mtp_source_layers = {kMTPSourceLayer},
-            .max_graph_rows = kSeqLen,
-            .max_decode_rows = 1,
-            .max_request_count = config0.max_request_count,
-            .max_mtp_draft_depth = 1,
-        };
+        // Both endpoint fixtures and the production graph builder discover the
+        // same source roles and retained capacity from the loaded directory.
+        const auto graph_family = resolveMoEOverlayInferenceGraphFamilyIdentity(
+            model_ctx->concreteLoader(), model_ctx->architecture(), model_ctx->totalBlockCount(),
+            MoEOverlayMTPGraphFamilyPolicy::RetainModelSidecars, /*graph_family_generation=*/1,
+            kSeqLen, resolveMTPRetainedTargetQueryRows(config0.mtp), config0.max_request_count,
+            resolveMTPRetainedDraftCapacity(config0.mtp));
         ASSERT_TRUE(graph_family.valid());
+        ASSERT_EQ(graph_family.main_layer_count, 1);
+        ASSERT_EQ(graph_family.mtp_source_layers, (std::vector<int>{kMTPSourceLayer}));
         const auto transaction_topology =
             makeMoEOverlayInferenceTopologyIdentity(
                 owner_map,
@@ -3968,7 +4128,10 @@ namespace llaminar2::test
 
         auto model_ctx =
             makeTestingModelContextWithHotDomainExperts(config.n_layers);
+        PreparedWeightStore prepared;
+        admitLoweringMigrationStorage(prepared, config.default_device);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        graph_builder.setPreparedWeightStore(&prepared);
         ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
         ComputeGraph graph = graph_builder.buildFFNGraph(
             layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0),
@@ -4073,7 +4236,10 @@ namespace llaminar2::test
         auto buffers = makeActivationBuffers(activation_arena);
         auto model_ctx =
             makeTestingModelContextWithHotDomainExperts(config.n_layers);
+        PreparedWeightStore prepared;
+        admitLoweringMigrationStorage(prepared, config.default_device);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        graph_builder.setPreparedWeightStore(&prepared);
         ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
         ComputeGraph graph = graph_builder.buildFFNGraph(
             layer,
@@ -4237,6 +4403,267 @@ namespace llaminar2::test
             expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
     }
 
+    /**
+     * @brief Captured production rebalance collects only the stage's compact rows.
+     *
+     * A terminal copy checks changing demand, including a large-to-zero replay,
+     * from one retained CUDA/HIP graph. Initial fixture writes use its exact
+     * stream; no fabricated prepared weight pointer is executed.
+     */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         PipelineStageCapturedRebalanceCollectsOwnedRows)
+    {
+        constexpr int layers = 2, experts = 4, top_k = 2;
+        std::vector<DeviceId> devices;
+#ifdef HAVE_CUDA
+        devices.push_back(DeviceId::cuda(0));
+#endif
+#ifdef HAVE_ROCM
+        devices.push_back(DeviceId::rocm(0));
+#endif
+        for (const auto device : devices)
+        for (const int origin : {0, 32, 40})
+        {
+            SCOPED_TRACE(::testing::Message() << device.toString() << " origin=" << origin);
+            auto *backend = getBackendFor(device);
+            ASSERT_NE(backend, nullptr);
+            DeviceMoERuntimeTable table({.device_id = device, .num_layers = layers,
+                .num_experts = experts, .top_k = top_k, .mirror_to_device = true,
+                .first_model_layer = origin});
+            ScopedDevicePublicationStream publication(device);
+            auto *stream = publication.get();
+            auto states = std::make_unique<std::array<DeviceMoELayerRuntime, layers>>();
+            for (int row = 0; row < layers; ++row)
+            {
+                auto &state = states->at(row);
+                state.expert_count = experts;
+                state.top_k = top_k;
+                state.participant_id = 0;
+                state.participant_count = 2;
+                state.active_bank = 0;
+            }
+            ASSERT_TRUE(backend->hostToDeviceOnStream(table.deviceLayerState(origin),
+                states->data(), sizeof(*states), device.ordinal, stream));
+            MockLocalTPContext tp;
+            tp.setDevices(device.is_cuda()
+                ? std::vector{GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}
+                : std::vector{GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+            tp.setBackend(device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+            tp.setRawAllgatherGraphCaptureSupported(true);
+            MoEDeviceRebalanceStage::Params params;
+            params.device_id = device;
+            params.tp_ctx = &tp;
+            params.tp_device_idx = 0;
+            params.moe_runtime_table = &table;
+            params.config.num_layers = layers;
+            params.config.num_experts = experts;
+            params.config.top_k = top_k;
+            params.config.participant_count = 2;
+            params.config.window_size_tokens = 1;
+            params.phase = DeviceMoERebalanceStagePhase::CollectState;
+            params.workspace_name = "pipeline_stage_collect";
+            testing::MockDeviceContext context(device, device.is_cuda()
+                ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+            MoEDeviceRebalanceStage stage(params);
+            const auto requirements = stage.getWorkspaceRequirements(1);
+            DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment());
+            ASSERT_TRUE(workspace.allocate(requirements));
+            stage.bindWorkspace(&workspace);
+            ASSERT_TRUE(stage.prepareGraphLaunch(&context, stream));
+            ASSERT_TRUE(stage.isGraphCapturable());
+            ASSERT_TRUE(stage.execute(&context)); // Materialize the retained kernel before capture.
+            auto &worker = GPUDeviceContextPool::instance().getContext(device);
+            std::unique_ptr<IGPUGraphCapture> captured;
+            bool recorded = false;
+            worker.submitAndWait([&] {
+                captured = worker.createGraphCapture(stream);
+                if (!captured || !captured->beginCapture()) return;
+                const bool launched = stage.execute(&context);
+                const bool ended = captured->endCapture();
+                recorded = launched && ended && captured->instantiate();
+            });
+            ASSERT_TRUE(recorded);
+            auto *packed = workspace.getBuffer(MoEDeviceRebalanceStage::workspaceBufferName(
+                MoEDeviceRebalanceStage::WS_LOCAL_HISTOGRAM, params.workspace_name));
+            ASSERT_NE(packed, nullptr);
+            for (const uint64_t scale : {1u, 1000u, 0u, 7u})
+            {
+                std::array<std::array<uint64_t, experts>, layers> expected{};
+                for (int row = 0; row < layers; ++row)
+                {
+                    for (int expert = 0; expert < experts; ++expert)
+                        expected[row][expert] = scale * (1u + 10u * row + expert);
+                    ASSERT_TRUE(backend->hostToDeviceOnStream(
+                        table.deviceLayerState(origin + row)->decode_local_histogram,
+                        expected[row].data(), sizeof(expected[row]), device.ordinal, stream));
+                }
+                ASSERT_TRUE(captured->launch());
+                std::array<uint64_t, layers * experts> observed{};
+                ASSERT_TRUE(backend->deviceToHost(observed.data(), packed, sizeof(observed),
+                    device.ordinal, stream));
+                ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                for (int row = 0; row < layers; ++row)
+                for (int expert = 0; expert < experts; ++expert)
+                    EXPECT_EQ(moe_rebalance_policy::collectedStateActivationCount(
+                        observed[row * experts + expert]), expected[row][expert]);
+            }
+            for (const int selector : {-1, origin, origin + 1, origin + layers, -2})
+            {
+                auto selected = params;
+                selected.phase = DeviceMoERebalanceStagePhase::Apply;
+                selected.apply_layer_idx = selector;
+                MoEDeviceRebalanceStage candidate(selected);
+                const bool owned = selector == -1 || table.containsModelLayer(selector);
+                EXPECT_EQ(candidate.prepareGraphLaunch(&context, stream), owned);
+                EXPECT_EQ(candidate.isGraphCapturable(), owned);
+            }
+        }
+    }
+
+    /**
+     * @brief Native prefill setup retains each pipeline stage's global interval.
+     *
+     * Real mirrored tables, publication streams and GPU workspaces exercise the
+     * production capture-preparation boundary for both halves of current-batch
+     * movement. Synthetic prepared weights are never executed: model E2E owns
+     * arithmetic, collectives and captured inference qualification.
+     */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         PipelineStagePrefillPreparationRequiresOwnedGlobalRows)
+    {
+        constexpr int layer_count = 3;
+        std::vector<DeviceId> devices;
+#ifdef HAVE_CUDA
+        devices.push_back(DeviceId::cuda(0));
+#endif
+#ifdef HAVE_ROCM
+        devices.push_back(DeviceId::rocm(0));
+#endif
+        for (const auto device : devices)
+        for (const int origin : {0, 32, 40})
+        {
+            SCOPED_TRACE(::testing::Message() << device.toString() << " origin=" << origin);
+            const auto participants = device.is_cuda()
+                ? std::vector{GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}
+                : std::vector{GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+            const auto backend = device.is_cuda()
+                ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+            auto plan = makeLocalTPApportionedHotPlan(layer_count);
+            plan->first_model_layer = origin;
+            for (auto &placement : plan->placements)
+                placement.layer += origin;
+            plan->domains[0].participants = participants;
+            plan->domains[0].backend = backend;
+            plan->domains[0].routed_prefill_assignment_policy =
+                RoutedExpertAssignmentPolicy::LeastLoadedResident;
+            validateMoERoutedExpertPlacementPlanOrThrow(*plan,
+                {.layer_count = layer_count, .routed_expert_count = kNumExperts});
+
+            GraphConfig config = makeConfig(plan, layer_count);
+            config.pp_layer_offset = origin;
+            config.total_n_layers = origin + layer_count;
+            config.max_activation_rows = kSeqLen;
+            config.default_device = device;
+            config.moe.has_shared_expert = true;
+            config.moe.shared_intermediate_size = kIntermediate;
+            config.moe.routed_prefill_config.least_loaded_min_routed_rows = 0;
+            config.moe.routed_prefill_assignment_policy =
+                RoutedExpertAssignmentPolicy::LeastLoadedResident;
+            MockLocalTPContext tp_ctx;
+            tp_ctx.setDevices(participants);
+            tp_ctx.setBackend(backend);
+            tp_ctx.setRawAllgatherGraphCaptureSupported(true);
+            config.tp_ctx = &tp_ctx;
+            config.tp_device_idx = 0;
+
+            auto model_ctx = ModelContext::createForTesting("test.gguf", nullptr,
+                static_cast<uint32_t>(origin + layer_count), true);
+            ASSERT_NE(model_ctx, nullptr);
+            ASSERT_NE(model_ctx->concreteWeightManager(), nullptr);
+            auto &registry = model_ctx->concreteWeightManager()->expertGemmRegistry();
+            for (int row = 0; row < layer_count; ++row)
+            for (int participant = 0; participant < 2; ++participant)
+                registerCompleteDomainExpertLayer(registry, "hot_domain",
+                    device.is_cuda() ? DeviceId::cuda(participant) : DeviceId::rocm(participant),
+                    origin + row);
+
+            TensorArena weights;
+            auto layer_weights = makeLayerWeights(weights);
+            layer_weights.shared_expert_gate = weights.fp32({kIntermediate, kDModel});
+            layer_weights.shared_expert_up = weights.fp32({kIntermediate, kDModel});
+            layer_weights.shared_expert_down = weights.fp32({kDModel, kIntermediate});
+            layer_weights.shared_expert_gate_inp = weights.fp32({1, kDModel});
+            // This model-free fixture admits a bounded transfer-directory BOM
+            // through the production authority. Only actual slot allocations
+            // materialize; the fixture never reserves a second physical pool.
+            constexpr std::size_t migration_capacity = 16u << 20;
+            PhysicalMemoryPlanBuilder memory_plan;
+            memory_plan.add({.world_rank = 0, .device = device,
+                .total_bytes = migration_capacity, .admission_available_bytes = migration_capacity},
+                PhysicalMemoryOwner::ExpertMigrationStaging, migration_capacity);
+            PreparedWeightStore prepared;
+            prepared.installPhysicalMemoryAuthority(std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(memory_plan.build()), 0));
+            Qwen35MoEGraph builder(model_ctx, nullptr, config);
+            builder.setPreparedWeightStore(&prepared);
+            ScopedDevicePublicationStream publication(device);
+            testing::MockDeviceContext context(device, device.is_cuda()
+                ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+            for (int row = 0; row < layer_count; ++row)
+            {
+                const int model_layer = origin + row;
+                SCOPED_TRACE(model_layer);
+                TensorArena activations;
+                auto buffers = makeActivationBuffers(activations);
+                auto graph = builder.buildFFNGraph(layer_weights, buffers, model_layer,
+                    kSeqLen, kBatchSize, device, publication.get());
+                for (const char *suffix : {"_moe_current_batch_llep_plan_pack",
+                                         "_moe_current_batch_llep_unpack_apply_assign"})
+                {
+                    const auto *lowered = gpuCurrentBatchLLEPStage(graph,
+                        "layer" + std::to_string(model_layer) + suffix);
+                    ASSERT_NE(lowered, nullptr);
+                    const auto &params = lowered->params();
+                    ASSERT_NE(params.moe_runtime_table, nullptr);
+                    EXPECT_EQ(params.layer_idx, model_layer);
+                    EXPECT_EQ(params.config.num_layers, layer_count);
+                    EXPECT_EQ(params.moe_runtime_table->firstModelLayer(), origin);
+                    EXPECT_EQ(params.moe_runtime_table->layerCount(), layer_count);
+                    auto *child = dynamic_cast<DeviceMoERuntimeTable *>(params.moe_runtime_table);
+                    ASSERT_NE(child, nullptr);
+                    ASSERT_NE(child->overlayPlacementSource(), nullptr);
+                    EXPECT_EQ(child->overlayPlacementSource()->firstModelLayer(), origin);
+                    EXPECT_EQ(child->overlayPlacementSource()->layerCount(), layer_count);
+                    EXPECT_EQ(child->hostLayerState(model_layer).overlay_placement_banks,
+                              child->overlayPlacementSource()->devicePlacementBanks(model_layer));
+
+                    MoEGPUCurrentBatchLLEPStage stage(params);
+                    const auto requirements = stage.getWorkspaceRequirements(kSeqLen);
+                    DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment());
+                    ASSERT_TRUE(workspace.allocate(requirements));
+                    stage.bindWorkspace(&workspace);
+                    ASSERT_TRUE(stage.prepareGraphLaunch(&context, publication.get()));
+                    EXPECT_TRUE(stage.isGraphCapturable());
+                    for (const int mismatch : {0, 1, 2, 3})
+                    {
+                        auto invalid = params;
+                        if (mismatch == 0)
+                            invalid.layer_idx = origin + layer_count;
+                        else if (mismatch == 1)
+                            ++invalid.config.num_layers;
+                        else if (mismatch == 2)
+                            ++invalid.config.num_experts;
+                        else
+                            ++invalid.config.top_k;
+                        MoEGPUCurrentBatchLLEPStage rejected(invalid);
+                        rejected.bindWorkspace(&workspace);
+                        EXPECT_FALSE(rejected.prepareGraphLaunch(&context, publication.get()));
+                    }
+                }
+            }
+        }
+    }
+
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          LocalTPApportionedLeastLoadedPrefillTransferWorkspacesUseBoundedRollingLanes)
     {
@@ -4280,7 +4707,10 @@ namespace llaminar2::test
         auto buffers2 = makeActivationBuffers(activation_arena2);
 
         auto model_ctx = makeTestingModelContextWithHotDomainExperts(kLayerCount);
+        PreparedWeightStore prepared;
+        admitLoweringMigrationStorage(prepared, config.default_device);
         Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        graph_builder.setPreparedWeightStore(&prepared);
         ScopedDevicePublicationStream publication_stream(DeviceId::rocm(0));
         ComputeGraph graph0 = graph_builder.buildFFNGraph(
             layer_weights, buffers0, 0, kSeqLen, kBatchSize, DeviceId::rocm(0),

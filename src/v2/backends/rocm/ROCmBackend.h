@@ -121,7 +121,7 @@ namespace llaminar2
             float frequency_penalty,
             bool first_token_already_in_history,
             int device_id,
-            void *stream) override;
+            void *stream, float repetition_penalty = 1.0f) override;
         bool enqueueArgmaxF32RowsWithHistoryDevice(
             const void *data_device,
             int rows,
@@ -386,7 +386,9 @@ namespace llaminar2
             int inverse_sample_first_logical_position = 0,
             int inverse_sample_vocab_size = 0,
             const void *threshold_base_position_device = nullptr,
-            int threshold_position_offset = 0) override;
+            int threshold_position_offset = 0,
+            const int *generation_control_device = nullptr,
+            const uint64_t *threshold_seed_device = nullptr) override;
         bool enqueueSpeculativeVerifyProcessedLogitsF32DeviceThresholdsBatchDeviceTokens(
             const void *target_logits_device,
             const void *draft_logits_device,
@@ -525,7 +527,8 @@ namespace llaminar2
             void *sampled_target_tokens_device,
             void *out_tokens_device,
             void *out_meta_device,
-            void *first_transaction_diagnostic_device = nullptr) override;
+            void *first_transaction_diagnostic_device = nullptr,
+            const uint64_t *threshold_seed_device = nullptr) override;
         bool enqueueSummarizeGreedySpeculativeVerifyBatch(
             const void *verify_tokens_device,
             const void *draft_tokens_device,
@@ -606,7 +609,8 @@ namespace llaminar2
             int control_stride,
             void *control_device,
             int device_id,
-            void *stream) override;
+            void *stream,
+            const sampling_math::DeviceGenerationInitialization &initialization = {}) override;
         /** @copydoc IBackend::enqueuePublishOrdinaryGenerationSample */
         bool enqueuePublishOrdinaryGenerationSample(
             const sampling_math::OrdinaryGenerationPublication &publication,
@@ -769,16 +773,30 @@ namespace llaminar2
         bool prepareLogitPenaltyWorkspace(
             int vocab_size,
             int device_id) override;
+        /**
+         * @brief Admit immutable prompt membership into the device-owned token history.
+         * @param counts_device Persistent packed history row, already reset on its producer.
+         * @param unique_tokens Sorted unique host token IDs; only this live extent is transferred.
+         * @param token_count Number of unique prompt tokens.
+         * @param vocab_size Logical vocabulary size and preallocated sparse workspace bound.
+         * @param device_id Owning GPU ordinal.
+         * @param stream Exact non-null admission stream; no capture or synchronization.
+         * @return Whether the complete copy, transform and reuse publication were enqueued.
+         */
+        bool initializePromptRepetitionHistory(
+            void *counts_device, const int32_t *unique_tokens, int token_count,
+            int vocab_size, int device_id, void *stream) override;
+
         bool applyLogitPenaltiesF32(void *logits_device,
                                     const int *token_ids_host,
                                     const float *penalties_host,
                                     int num_penalties, int vocab_size,
-                                    int device_id, void *stream) override;
+                                    int device_id, void *stream, float repetition_penalty = 1.0f) override;
         bool enqueueLogitPenaltiesF32Device(void *logits_device,
                                             const void *token_ids_device,
                                             const void *penalties_device,
                                             int num_penalties, int vocab_size,
-                                            int device_id, void *stream) override;
+                                            int device_id, void *stream, float repetition_penalty = 1.0f) override;
 
         // Event operations (fine-grained synchronization)
         void *createEvent(int device_id) override;

@@ -1,3 +1,11 @@
+/**
+ * @file Test__PerfStatsCollector.cpp
+ * @brief Device-free aggregation, persistence and production-path evidence contracts.
+ *
+ * Exercise the real collector and independent native generation validator with
+ * bounded lifecycle witnesses. Malformed or missing observations must fail the
+ * same proof used by production parity, including retained HIP transaction graphs.
+ */
 #include "utils/PerfStatsCollector.h"
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
@@ -168,11 +176,16 @@ namespace
                 .name = "device_generation_dispatch_tickets_observed",
                 .device = device,
                 .tags = {
-                    {"transaction", std::to_string(transaction)},
                     {"next_depth", "2"},
                     {"complete", transaction == 3 ? "true" : "false"},
                     {"maintenance_due", "false"}},
+                .count = 1,
                 .value = 1.0,
+                .sequence_word_count = 1,
+                .sequence_digest_lo = 123,
+                .sequence_digest_hi = 456,
+                .sequence_minimum_words = {static_cast<uint64_t>(transaction)},
+                .sequence_maximum_words = {static_cast<uint64_t>(transaction)},
             });
         }
         records.push_back(PerfStatRecord{
@@ -288,11 +301,16 @@ namespace
                 .name = "device_generation_dispatch_tickets_observed",
                 .device = device,
                 .tags = {
-                    {"transaction", "1"},
                     {"next_depth", "2"},
                     {"complete", "true"},
                     {"maintenance_due", "false"}},
+                .count = 1,
                 .value = 1.0,
+                .sequence_word_count = 1,
+                .sequence_digest_lo = 123,
+                .sequence_digest_hi = 456,
+                .sequence_minimum_words = {1},
+                .sequence_maximum_words = {1},
             });
         }
         return records;
@@ -698,6 +716,30 @@ TEST(Test__ProductionParityEvidence, CertifiesMirroredHostedTicketBoundary)
     EXPECT_EQ(
         evidence.policy,
         ProductionDeviceGenerationPolicy::HostScheduledCapturedTransactions);
+}
+
+/** @brief Fixed-width ticket ranges retain positivity and completeness checks. */
+TEST(Test__ProductionParityEvidence, RejectsIncompleteBoundedTicketRanges)
+{
+    for (unsigned mutation = 0; mutation < 8; ++mutation)
+    {
+        auto records = certifiedHostedTicketRecords();
+        auto &ticket = *std::find_if(records.begin(), records.end(), [](const auto &record)
+        { return record.name == "device_generation_dispatch_tickets_observed"; });
+        switch (mutation)
+        {
+        case 0: ticket.sequence_minimum_words = {0}; break;
+        case 1: ticket.sequence_maximum_words.clear(); break;
+        case 2: ticket.sequence_minimum_words = {2}; break;
+        case 3: ticket.sequence_word_count = 2; break;
+        case 4: ticket.count = 0; break;
+        case 5: ticket.tags["transaction"] = "1"; break;
+        case 6: ticket.sequence_minimum_words = {1, 2}; break;
+        case 7: ticket.sequence_maximum_words = {uint64_t{1} << 31}; break;
+        }
+        EXPECT_FALSE(collectProductionDeviceGenerationEvidence(records).hosted_ticket_boundary_certified)
+            << "mutation=" << mutation;
+    }
 }
 
 TEST(Test__ProductionParityEvidence, CertifiesTerminalOnlyHostedTicketBoundary)
@@ -1270,6 +1312,7 @@ TEST(Test__PerfStatsCollector, RankQualifiedExportWritesParticipantLocalEvidence
         PerfStatsCollector::addCounter(
             "stage_cpu", "rank_local_probe", 1.0, "prefill", "cpu");
 
+        EXPECT_EQ(PerfStatsCollector::jsonExportPath(), expected_path_text);
         ASSERT_TRUE(PerfStatsCollector::flushFromEnv());
         ASSERT_TRUE(std::filesystem::exists(expected_path));
         const auto document = nlohmann::json::parse(readFile(expected_path));
@@ -1279,6 +1322,36 @@ TEST(Test__PerfStatsCollector, RankQualifiedExportWritesParticipantLocalEvidence
 
     std::error_code error;
     std::filesystem::remove(expected_path, error);
+}
+
+TEST(Test__PerfStatsCollector, TerminalSidecarUsesTheSameRankAndDisabledPathAuthority)
+{
+    for (const int rank_value : {-1, 0, 7})
+    {
+        ScopedLoggerRank rank(rank_value);
+        for (const char *disabled : {"0", "false", "off", ""})
+        {
+            ScopedEnv json("LLAMINAR_PERF_STATS_JSON", disabled);
+            EXPECT_TRUE(PerfStatsCollector::jsonExportPath().empty());
+        }
+        {
+            ScopedEnv json("LLAMINAR_PERF_STATS_JSON", nullptr);
+            EXPECT_TRUE(PerfStatsCollector::jsonExportPath().empty());
+        }
+        {
+            ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+            EXPECT_EQ(PerfStatsCollector::jsonExportPath(), rank_value > 0 ? "" : "/tmp/llaminar_perf_stats.json");
+        }
+        {
+            ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "/tmp/owned-perf.json");
+            EXPECT_EQ(PerfStatsCollector::jsonExportPath(), rank_value > 0 ? "" : "/tmp/owned-perf.json");
+        }
+        {
+            ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "/tmp/perf-{rank}/rank-{rank}.json");
+            const auto name = std::to_string(std::max(rank_value, 0));
+            EXPECT_EQ(PerfStatsCollector::jsonExportPath(), "/tmp/perf-" + name + "/rank-" + name + ".json");
+        }
+    }
 }
 
 TEST(Test__PerfStatsCollector, ExistingProfilersPublishStructuredRecords)

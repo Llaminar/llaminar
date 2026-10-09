@@ -1,0 +1,68 @@
+diff --git a/src/rccl_wrap.cc b/src/rccl_wrap.cc
+--- a/src/rccl_wrap.cc
++++ b/src/rccl_wrap.cc
+@@ -1,3 +1,12 @@
++/**
++ * @file rccl_wrap.cc
++ * @brief ROCm collective policy derived from each communicator's topology.
++ *
++ * Protocol thread limits and buffer sizes belong to the communicator being
++ * configured. Publish complete local defaults; process-global lazy arrays can
++ * expose a zero LL limit during concurrent initialization and retain another
++ * architecture's limits across independent communicator lifetimes.
++ */
+ /*
+ Copyright (c) 2025 Advanced Micro Devices, Inc. All rights reserved.
+ 
+@@ -419,6 +428,11 @@
+   rcclP2pNetChunkSize = p2pNetChunkSize;
+ }
+ 
++/**
++ * @brief Fill every protocol limit from the current immutable GPU topology.
++ * @param comm Communicator whose first GPU supplies the architecture.
++ * @param maxNthreads Caller-owned output with NCCL_NUM_PROTOCOLS elements.
++ */
+ void rcclGetMaxNthreads(struct ncclComm* comm, int maxNthreads[]) {
+   if (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950")) {
+     maxNthreads[NCCL_PROTO_SIMPLE] = maxNthreads[NCCL_PROTO_LL128] = RCCL_GFX950_MAX_NTHREADS;
+@@ -428,9 +442,18 @@
+   maxNthreads[NCCL_PROTO_LL] = RCCL_LL_MAX_NTHREADS;
+ }
+ 
++/**
++ * @brief Apply communicator-local protocol, topology and message-size limits.
++ * @param comm Current communicator; no process-global geometry is reused.
++ * @param info Collective algorithm, protocol and operation selected by tuning.
++ * @param nBytes Live collective message size in bytes.
++ * @param nThreads In/out selected launch size with applicable overrides applied.
++ */
+ void rcclOptThreadBlockSize(struct ncclComm* comm, struct ncclTaskColl* info, size_t nBytes, int& nThreads) {
+-  static int maxNthreads[NCCL_NUM_PROTOCOLS] = {0};
+-  if (maxNthreads[NCCL_PROTO_SIMPLE] == 0) rcclGetMaxNthreads(comm, maxNthreads);
++  // Each caller owns the complete array, including the LL element. A shared
++  // SIMPLE sentinel neither publishes the other elements nor owns this arch.
++  int maxNthreads[NCCL_NUM_PROTOCOLS];
++  rcclGetMaxNthreads(comm, maxNthreads);
+   if (info->algorithm == NCCL_ALGO_TREE) nThreads = maxNthreads[NCCL_PROTO_SIMPLE]; // Tree now uses all threads always.
+   if (info->algorithm == NCCL_ALGO_PAT)  nThreads = maxNthreads[NCCL_PROTO_SIMPLE];
+   if (comm->nNodes == 1) nThreads = RCCL_SINGLE_NODE_MAX_NTHREADS; // For single node, we use half the number of threads for perf reasons.
+@@ -441,9 +464,16 @@
+   if (info->func == ncclFuncReduceScatter && divUp(nBytes, comm->nRanks) <= 524288) nThreads = maxNthreads[NCCL_PROTO_LL];
+ }
+ 
++/**
++ * @brief Compute complete protocol backing sizes without shared mutable state.
++ * @param comm Communicator whose architecture owns the protocol thread limits.
++ * @param defaultBuffSizes Caller-owned output with NCCL_NUM_PROTOCOLS elements.
++ */
+ void rcclSetDefaultBuffSizes(struct ncclComm* comm, int defaultBuffSizes[]) {
+-  static int maxNthreads[NCCL_NUM_PROTOCOLS] = {0};
+-  if (maxNthreads[NCCL_PROTO_SIMPLE] == 0) rcclGetMaxNthreads(comm, maxNthreads);
++  // Each caller owns the complete array, including the LL element. A shared
++  // SIMPLE sentinel neither publishes the other elements nor owns this arch.
++  int maxNthreads[NCCL_NUM_PROTOCOLS];
++  rcclGetMaxNthreads(comm, maxNthreads);
+   defaultBuffSizes[NCCL_PROTO_LL]     = NCCL_LL_LINES_PER_THREAD*maxNthreads[NCCL_PROTO_LL]*NCCL_STEPS*sizeof(union ncclLLFifoLine);
+   defaultBuffSizes[NCCL_PROTO_LL128]  = NCCL_LL128_ELEMS_PER_THREAD*maxNthreads[NCCL_PROTO_LL128]*NCCL_STEPS*sizeof(uint64_t);
+   defaultBuffSizes[NCCL_PROTO_SIMPLE] = (1 << 22); /* 4MiB */

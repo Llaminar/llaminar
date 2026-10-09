@@ -10,6 +10,7 @@
 
 #include "execution/mtp/MTPVerifierPolicy.h"
 #include "execution/mtp/MTPServingForwardCaptureGeometry.h"
+#include "execution/mtp/MTPMainForwardPolicy.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/DeviceRowWorkGrid.h"
 #include "tensors/TensorKernels.h"
@@ -102,6 +103,72 @@ TEST(Test__MTPVerifierPolicy, RetainedVerifierWinsSharedArenaCaptureOrdering)
     EXPECT_FALSE(disabled.enabled);
     EXPECT_TRUE(disabled.valid());
     EXPECT_FALSE(materializeMTPWideCheckpointLaneFirst(true, 8, disabled));
+}
+
+/** @test Every admissible request width was captured and charged before request admission. */
+TEST(Test__MTPVerifierPolicy, RetainedVerifierFamilyCoversEveryRequestWidth)
+{
+    for (int depth = 1; depth <= kMaximumSupportedMTPDraftDepth; ++depth)
+    for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Observe, MTPDepthPolicyMode::Dynamic})
+    for (int selected = 1; selected <= depth; ++selected)
+    {
+        SCOPED_TRACE(::testing::Message() << depth << '/' << int(mode) << '/' << selected);
+        MTPRuntimeConfig mtp;
+        mtp.enabled = true;
+        mtp.draft_tokens = selected;
+        mtp.graph_capacity_draft_tokens = depth;
+        mtp.depth_policy.mode = mode;
+        mtp.depth_policy.initial_depth = selected;
+        mtp.depth_policy.max_depth = selected;
+        const auto family = resolveMTPServingForwardCaptureFamily(mtp, depth + 1);
+        ASSERT_FALSE(family.empty());
+        EXPECT_EQ(family.front().verifier_rows, depth + 1);
+        EXPECT_EQ(family.back().verifier_rows, 2);
+        EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp),
+            kMTPConditionForwardPurposes.size() + 2 * family.size());
+        int previous = depth + 2;
+        for (const auto &geometry : family)
+        {
+            EXPECT_LT(geometry.verifier_rows, previous);
+            previous = geometry.verifier_rows;
+            EXPECT_EQ(geometry.draft_depth + 1, geometry.verifier_rows);
+            for (const auto outcome : {MTPVerifierOutcomeGraphMode::Greedy, MTPVerifierOutcomeGraphMode::Disabled})
+            {
+                const MTPVerifierForwardPolicy policy(outcome, geometry.verifier_rows, family.front());
+                EXPECT_EQ(policy.physicalRows(), geometry.verifier_rows);
+                EXPECT_EQ(policy.outcome(), outcome);
+            }
+        }
+        const auto width_policy = mode == MTPDepthPolicyMode::Dynamic
+            ? MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope : MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket;
+        const int rows = mtpVerifierPhysicalPaddedSeqLen(1, selected + 1, depth + 1, width_policy);
+        EXPECT_EQ(std::count_if(family.begin(), family.end(), [&](const auto &geometry) {
+            return geometry.verifier_rows == rows;
+        }), 1) << "A live request must select exactly one pre-existing graph";
+    }
+}
+
+/** @test Fixed depth seven retains four widths; malformed members cannot enter a replay. */
+TEST(Test__MTPVerifierPolicy, FixedDepthOvercapacityRetainsExactVerifierMembers)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 7;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    mtp.graph_capacity_draft_tokens = 15;
+    const auto family = resolveMTPServingForwardCaptureFamily(mtp, 16);
+    std::vector<int> widths;
+    for (const auto &geometry : family) widths.push_back(geometry.verifier_rows);
+    EXPECT_EQ(widths, (std::vector<int>{16, 8, 4, 2}));
+    EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp), 10u);
+    EXPECT_EQ(resolveMTPDeviceGenerationDepthPolicy(mtp).maximum_depth, 7);
+    for (const int invalid : {-1, 0, 1, 3, 5, 7, 9, 15, 17, std::numeric_limits<int>::max()})
+        EXPECT_THROW((void)MTPVerifierForwardPolicy(MTPVerifierOutcomeGraphMode::Disabled, invalid, family.front()), std::invalid_argument);
+    EXPECT_THROW((void)MTPVerifierForwardPolicy(static_cast<MTPVerifierOutcomeGraphMode>(99), 8, family.front()), std::invalid_argument);
+    EXPECT_THROW((void)MTPVerifierForwardPolicy(MTPVerifierOutcomeGraphMode::Disabled, 8, {}), std::invalid_argument);
+    for (const int mismatched : {0, 8, 32})
+        EXPECT_THROW((void)resolveMTPServingForwardCaptureFamily(mtp, mismatched), std::invalid_argument);
+    EXPECT_TRUE(resolveMTPServingForwardCaptureFamily({}, 0).empty());
 }
 
 /** @brief Bounded grids cover every live row exactly once without consulting its owner. */

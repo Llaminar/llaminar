@@ -175,6 +175,7 @@ namespace llaminar2
             gpu.last_level_cache_bytes = device.last_level_cache_bytes;
             gpu.name = device.name;
             gpu.uuid = device.uuid;
+            gpu.pci_bus_address = device.pci_bus_address;
             gpu.numa_node = device.numa_node;
             gpu.compute_capability_major = device.compute_capability / 10;
             gpu.compute_capability_minor = device.compute_capability % 10;

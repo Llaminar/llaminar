@@ -304,7 +304,34 @@ prefill and decode numbers. A red phase fails the required benchmark check;
 amber is below the prior high-water mark but inside the configured tolerance.
 The branch-policy check admits only `develop`.
 
-`scripts/ci/apply_master_ruleset.py` installs the four required GitHub Actions
+After both benchmark lanes pass, `run_opencode_matrix.py prepare` authenticates
+their complete image-bound evidence and derives one coding job per blessed
+E2E cell and shipping ISA. It keeps the native inventory's model shards and
+production topology policy. Each job runs one pinned, real OpenCode ten-phase
+Python app session, with PMA-admitted maximum context, a 32,768-token reasoning
+and output budget, 16 GiB RAM cache per participant and 32 GiB shared disk cache.
+There is no request-inactivity, generation-turn or session deadline. The Actions
+self-hosted job ceiling is an infrastructure limit; cancellation remains a
+failed job and must retire every owned native process.
+
+Coding jobs retain the shared hardware lease and run with matrix fail-fast
+disabled. Engine/protocol correctness, all ten phases, native response/call
+coverage, captured runtime policy, continuous driver/resource observations and
+metadata-only cache ownership audits are mandatory. Model-authored application
+acceptance is reported independently; unique tool errors must remain strictly
+below 5%. Prefix reuse, TTFT and tier churn are measured for every request, with
+ordinary, compaction and resumed turns reported separately. Retired cache files
+are reclaimed only after native ownership is closed; payload bytes are never
+read or hashed for this audit. Per-cell artifacts exclude cache/model payloads.
+
+The `Published OpenCode (AVX512 and AVX2)` check replays every cell's independent
+evidence and requires the complete canonical product. Missing, duplicate, stale,
+failed or cancelled jobs cannot become a green matrix, including a failed rerun
+beside an older artifact. `pr-opencode-<PR>-<SHA>` retains the complete
+`opencode.json` proof. This gate belongs only to master PRs after benchmarks;
+feature PRs, develop pushes and manual benchmark workflows retain their scope.
+
+`scripts/ci/apply_master_ruleset.py` installs the five required GitHub Actions
 checks on the existing master ruleset with strict up-to-date PR semantics and
 squash-only merge. It also installs the `develop` PR and AVX512 prerequisite
 check requirements, while retaining deletion and force-push protection.
@@ -333,12 +360,13 @@ validates that the resulting **master tree** equals the tested develop image
 tree. GitHub's commit-to-PR association may lag a new squash commit, so the
 publisher also searches closed PR metadata for the exact
 `merge_commit_sha`; it never infers PR identity from a commit title. It
-revalidates both E2E reports, both complete benchmark reports, the exact
+revalidates both E2E reports, both complete benchmark reports, the full coding matrix, the exact
 image pair and the successful PR workflow before making any registry change.
 It creates a dated GitHub release such as `2026-09-23.1`,
 then `.2` if another merge releases that UTC day. The first release has concise
 bootstrap notes; later releases list commits since the previous release. The
-release attaches the E2E receipts/reports, benchmark JSON and SVG chart. It
+release attaches the E2E receipts/reports, benchmark JSON and SVG chart, and
+the complete `opencode.json` proof. It
 promotes the certified image digests to the dated tags,
 `master-<full master SHA>` / `master-avx2-<full master SHA>`, and finally the
 movable `master` / `master-avx2` tags. No image is rebuilt on master.
@@ -612,6 +640,66 @@ JUnit XML evidence. ISA runs are sequential on the same node. Both E2E suites
 must finish successfully before either benchmark suite
 starts. A passing AVX512 report never certifies AVX2 (or vice versa).
 
+Multi-device preflight includes explicit four- and eight-device topology and
+aggregate memory-admission cases without opening GPU contexts. These exercise
+middle PP stages, uneven TP groups, retained MTP policies, independent RAM cache
+budgets and shared archive ownership.
+GGUF-to-admission coverage composes the real metadata loader with the topology,
+fixed-owner and expert-capacity planners. Four/eight-device cases cover every
+loadable source format, disabled/fixed/dynamic MTP and both vendor orders; phase
+costs consume each stage's own global-layer authority. Capacity exhaustion must
+reject the complete pipeline, while malformed inputs remain distinct errors.
+Runtime-owner setup uses those same admissions to construct compact histograms,
+residency authorities and prepared endpoints, then seals the pipeline handoff.
+The device-free four/eight-participant sweep covers every source format,
+Off/Observe/Dynamic maintenance and terminal-only MTP banks. A model-wide
+CPU/CUDA/ROCm control also checks that host demand allocations retire on both
+normal destruction and failed construction. Foreign stage intervals, capacity
+certificates and incomplete quotas must fail before publishing runtime owners.
+Prepared-context handoff uses the same model-aware placement resolver as startup
+and binds every stage to its original source directory and aggregate certificate.
+Four/eight-device regressions prove fresh runtime owners across reuse, retained
+capacity across active MTP depths, and rejection of changed source formats,
+participants, cache budgets or controller capacity before publication.
+Four/eight-device movement-publication regressions exercise actual rank composition
+with device-free receipt owners. Independent stages retain their global layer
+intervals, participant domains, transaction IDs, demand windows and progress
+generations. The parent sums completed work only. Missing stage receipts, one
+stage regressing while another advances, and duplicate TP publishers must fail.
+The native archive translates compact journal rows to global layers at export;
+bounded PerfStats keys include the frozen layer interval even when stages reuse
+one device. A separate preflight sends production C++ HTTP/terminal JSON and
+counter records through the Python movement observer. These checks certify
+publication contracts and do not claim GPU execution or captured maintenance.
+Pipeline prefix observations preserve each stage's actual admission interval and
+completion epoch. A large sibling epoch must neither invent movement on a stable
+request nor hide movement in another stage. Four/eight-participant tests exercise
+real nested rank lookups, repeated admissions and stale completion rejection.
+The prefix preflight validates the C++ wire metadata with the HTTP consumer,
+including missing/foreign scopes, integer precision and stage-local ordering.
+Pipeline summaries use schema 2 and publish scoped epochs; scalar epoch fields
+are null because independent stage epochs have no model-wide ordering.
+Prepared-context retirement uses the admitted migration storage contract.
+Mutable physical residency restores through its live fabric; native transfer
+directories retain immutable source weights and seal only after participant
+retirement. Four/eight-participant, CPU/CUDA/ROCm metadata tests reject missing,
+replaced or retired prepared source handles without reading weight bytes.
+A failed terminal request reset is fatal and cannot publish a reusable context.
+These ownership and reset cases have explicit production-preflight entries.
+The native hybrid generation cases require
+two CUDA and two ROCm devices for their four-GPU baseline. Their eight-GPU
+extensions use four devices of each vendor and report missing hardware as
+**skipped** in CTest/JUnit; that status is not evidence of eight-GPU execution.
+Both vendor orders cover ordinary, fixed-depth and dynamic-depth MTP at two
+admitted row capacities. Fixed execution uses a shallower depth than the retained
+family. The cases assert complete verifier setup, main-forward capture reuse and
+generation-helper reuse after request reset, alongside exact tokens and KV state.
+Each native case retains the 120-second preflight limit and loads no model.
+Unused RCCL communicator retirement also runs on two and four ROCm devices,
+with an optional eight-device extension. It covers twenty native setup/teardown
+cycles and process exit with a pooled owner that never submitted a collective;
+the process exit code is part of the regression result.
+
 For a model-free prerequisite transaction only:
 
 ```bash
@@ -651,6 +739,20 @@ and economy checks; `--through parity` requires that flag. For token drift or
 suspected accuracy errors, run the matching individual HF cell first and use
 its checkpoint CSVs to identify the earliest divergence. Never regenerate a
 golden stream to hide drift.
+
+When JSON PerfStats includes the movement domains, a clean server shutdown also
+writes `<ranked-perf-path>.movement.json`. This metadata-only sidecar retains the
+drained owner's canonical movement history and actual per-wave payload counts.
+It uses the same MPI-rank path authority as the counter file. The ranked collector
+requires a complete matching set once any participant publishes a sidecar.
+Native and topology-wide controller movement certification join bounded counter
+witnesses to that complete history. Controller receipts also preserve the
+physical capacity proof and both policy and physical-cycle counts; follower
+receipts cannot replace the sole leader's admitting economics. Generation
+additionally proves that the last HTTP journal is its exact
+earlier prefix. Later legitimate maintenance cannot replace an earlier missing
+wave, and estimated expert sizes cannot stand in for copied bytes. These exports
+do not read or checksum model or prefix-cache payloads.
 
 ### Devcontainer model staging
 

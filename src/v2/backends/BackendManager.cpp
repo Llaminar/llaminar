@@ -3,6 +3,10 @@
  * @brief Global backend accessor implementation (Phase 6: Heterogeneous Multi-GPU + CPU)
  *
  * Supports CPU, CUDA, and ROCm backends simultaneously for heterogeneous compute.
+ * Lazy vendor construction is an accelerator-startup boundary: exclusions must
+ * be checked before call_once, including accesses made by workspace planning.
+ * Returning an excluded backend would initialize a driver in a device-free
+ * caller and could wait indefinitely on hardware it never intended to use.
  *
  * @author David Sanftenberg
  */
@@ -10,6 +14,7 @@
 #include "BackendManager.h"
 #include "CPUBackend.h"
 #include "../utils/Logger.h"
+#include "../utils/DebugEnv.h"
 
 #ifdef HAVE_CUDA
 #include "cuda/CUDABackend.h"
@@ -39,6 +44,7 @@ namespace llaminar2
         // Each MPI process owns one immutable rank-local CPU backend identity.
         std::mutex g_cpu_init_mutex;
 
+        /** @brief Construct the allowed CUDA owner once, after startup-policy admission. */
         void initCUDABackend()
         {
 #ifdef HAVE_CUDA
@@ -50,6 +56,7 @@ namespace llaminar2
 #endif
         }
 
+        /** @brief Construct the allowed ROCm owner once, after startup-policy admission. */
         void initROCmBackend()
         {
 #ifdef HAVE_ROCM
@@ -65,12 +72,16 @@ namespace llaminar2
 
     IBackend *getCUDABackend()
     {
+        if (!debugEnv().backend_startup.cudaEnabled())
+            return nullptr;
         std::call_once(g_cuda_init_flag, initCUDABackend);
         return g_cuda_backend;
     }
 
     IBackend *getROCmBackend()
     {
+        if (!debugEnv().backend_startup.rocmEnabled())
+            return nullptr;
         std::call_once(g_rocm_init_flag, initROCmBackend);
         return g_rocm_backend;
     }

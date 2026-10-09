@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Validate fully device-owned GPU dynamic MTP generation evidence.
 
-CUDA composes one maximum-capacity graph family and selects an exact draft-depth
-prefix inside a native selector-gated WHILE. HIP does not expose conditional graph
-nodes, so ROCm publishes one authenticated immutable scheduler ticket and the
-host submits the named already-captured transaction; all mutable generation
-state and outcome reduction remain device-owned. These validators correlate
-the per-device PerfStats records and fail closed if either backend returns to a
-host outcome bridge or reports an incomplete controller ledger.
+Homogeneous CUDA composes one maximum-capacity graph family and selects an exact
+draft-depth prefix inside a native selector-gated WHILE. HIP lacks conditional
+nodes; a heterogeneous CUDA controller also cannot compose its remote boundary
+inside one native parent. Those policies publish one authenticated immutable
+scheduler ticket and submit the named captured transaction. Mutable generation
+state and outcome reduction remain device-owned. Evidence joins by rank and
+device, so another participant cannot certify a missing boundary or ledger.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from typing import Any, Iterable, Mapping
 from gpu_host_transfer_perf_policy import (
     device_generation_dispatch_ticket_abi_is_canonical,
 )
+from graph_capture_perf_policy import DecodeGraphRequirement, validate_graph_capture_policy
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,38 @@ def _integer(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return -1
+
+
+def _positive_transaction_sequence(record: Mapping[str, Any]) -> bool:
+    """Prove every observed ticket carried a positive native transaction ID.
+
+    Lifecycle IDs belong to a fixed-width ordered witness, never to a map key.
+    Exact integer extrema retain the per-observation positivity check without
+    retaining one counter per transaction. Missing or malformed evidence fails.
+    """
+
+    def unsigned(value: Any) -> bool:
+        return type(value) is int and 0 <= value < 1 << 64
+
+    count = record.get("count")
+    words = record.get("sequence_word_count")
+    minimum = record.get("sequence_minimum_words")
+    maximum = record.get("sequence_maximum_words")
+    return (
+        record.get("kind") == "counter"
+        and "transaction" not in (record.get("tags") or {})
+        and unsigned(count) and count > 0
+        and type(record.get("value")) in (int, float) and record["value"] == count
+        and unsigned(words) and words == count
+        and isinstance(minimum, list) and isinstance(maximum, list)
+        and len(minimum) == len(maximum) == 1
+        and unsigned(minimum[0]) and unsigned(maximum[0])
+        # ABI-v2 publishes a signed 32-bit transaction count. A negative
+        # native value converted to an unsigned observation must still fail.
+        and 0 < minimum[0] <= maximum[0] <= (1 << 31) - 1
+        and unsigned(record.get("sequence_digest_lo"))
+        and unsigned(record.get("sequence_digest_hi"))
+    )
 
 
 def _records_by_device(
@@ -372,209 +405,61 @@ def validate_cuda_dynamic_mtp_device_generation_policy(
     return MTPDeviceGenerationValidation(error=None, devices=cuda_devices)
 
 
-def validate_rocm_host_scheduled_mtp_device_generation_policy(
+def _cuda_hosted_boundary_error(
+    records: tuple[Mapping[str, Any], ...],
+    device: str,
+    device_kinds: frozenset[str],
+) -> str | None:
+    """Require a real heterogeneous boundary and this controller's native replay.
+
+    The caller has already isolated the rank. First authenticate its complete
+    graph plan, then restrict native graph evidence to the controller owner.
+    Coordinator records stay available because they own the external boundary;
+    neighboring devices' executable and replay counters cannot fill a hole.
+    """
+    if len(device_kinds) < 2:
+        return f"CUDA hosted MTP requires a heterogeneous execution boundary on {device}"
+    graph = validate_graph_capture_policy(records, device_kinds)
+    if graph.error or not (graph.has_pipeline_boundary_evidence or graph.has_overlay_boundary_evidence):
+        return (f"CUDA hosted MTP has no authenticated heterogeneous boundary on {device}: "
+                + (graph.error or "no completed pipeline/overlay boundary"))
+    owner_records = tuple(row for row in records if row.get("domain") != "forward_graph"
+                          or str(row.get("device", "")).lower() == device.lower()
+                          or row.get("device") in {"pipeline_coordinator", "continuation_rank"})
+    owner = validate_graph_capture_policy(
+        owner_records, device_kinds, decode_requirement=DecodeGraphRequirement.REPLAY)
+    if owner.error:
+        return f"CUDA hosted MTP lacks its own captured replay on {device}: {owner.error}"
+    return None
+
+
+def validate_host_scheduled_mtp_device_generation_policy(
     records: Iterable[Mapping[str, Any]],
     *,
+    device_kinds: frozenset[str],
     expected_minimum_depth: int,
     expected_maximum_depth: int,
 ) -> MTPDeviceGenerationValidation:
-    """Require authenticated ticket-selected captured graphs on every ROCm GPU.
-
-    The host-visible ticket is an ABI-v2 52-byte immutable graph-branch
-    decision, not a
-    generation-state payload. This proof couples each ticket to exactly one
-    device-controller transaction and exactly one captured transaction or
-    terminal submission. A pinned dynamic range is valid and useful for fixed
-    geometry baselines, so ``minimum == maximum`` is intentionally accepted.
+    """Require ticket-selected captured MTP on HIP or heterogeneous CUDA.
 
     Args:
-        records: PerfStats records from one canonical server cell.
-        expected_minimum_depth: Inclusive CLI-configured dynamic selector floor.
-        expected_maximum_depth: Inclusive CLI-configured dynamic selector cap.
+        records: PerfStats from one server cell, optionally qualified by rank.
+        device_kinds: Device kinds authenticated by the resolved service plan.
+        expected_minimum_depth: Inclusive configured dynamic selector floor.
+        expected_maximum_depth: Inclusive configured selector cap; a pinned
+            range remains valid for fixed-geometry dynamic controller probes.
 
     Returns:
-        A fail-closed validation result naming every proven ROCm participant.
+        A fail-closed result naming every proven controller participant. Rank
+        ledgers are validated separately before combining participant names.
+        The ABI-v2 52-byte ticket contains only an immutable branch decision.
     """
-
+    if (not isinstance(device_kinds, frozenset) or not device_kinds
+            or not device_kinds <= {"cpu", "cuda", "rocm"}):
+        raise ValueError("hosted MTP certification requires resolved device kinds")
     records = tuple(records)
-    if (
-        expected_minimum_depth <= 0
-        or expected_maximum_depth < expected_minimum_depth
-    ):
-        return MTPDeviceGenerationValidation(
-            error="invalid expected ROCm dynamic MTP selector range",
-            devices=(),
-        )
-
-    materializations = _records_by_device(
-        records, "device_generation_loop_graph_materializations"
-    )
-    rocm_devices = tuple(
-        sorted(device for device in materializations if device.startswith("ROCm:"))
-    )
-    if not rocm_devices:
-        return MTPDeviceGenerationValidation(
-            error=(
-                "ROCm dynamic MTP emitted no ticket-selected captured graph "
-                "materialization"
-            ),
-            devices=(),
-        )
-
-    policy_selections = _records_by_device(
-        records, "device_generation_execution_policy_selections"
-    )
-    launches = _records_by_device(records, "device_generation_loop_graph_launches")
-    ticket_submissions = _records_by_device(
-        records, "device_generation_dispatch_ticket_d2h_submissions"
-    )
-    ticket_observations = _records_by_device(
-        records, "device_generation_dispatch_tickets_observed"
-    )
-    transaction_submissions = _records_by_device(
-        records, "hosted_device_generation_transaction_submissions"
-    )
-
-    for device in rocm_devices:
-        observed_sampling_modes: set[str] = set()
-        for record in materializations[device]:
-            tags = record.get("tags") or {}
-            head_error = _terminal_vocabulary_family_error(
-                records, device, tags, expected_maximum_depth + 1
-            )
-            if head_error:
-                return MTPDeviceGenerationValidation(error=head_error, devices=rocm_devices)
-            sampling_mode = str(tags.get("sampling_mode", ""))
-            observed_sampling_modes.add(sampling_mode)
-            if (
-                tags.get("backend") != "HIP"
-                or tags.get("depth_policy") != "dynamic"
-                or tags.get("execution")
-                != "hosted_captured_transactions_with_ticket_only_dispatch"
-                or tags.get("conditional_fragments") != "0"
-                or _integer(tags.get("fragments")) <= 0
-                or _integer(tags.get("minimum_draft_depth"))
-                != expected_minimum_depth
-                or _integer(tags.get("maximum_draft_depth"))
-                != expected_maximum_depth
-                or _integer(tags.get("draft_depth"))
-                != expected_maximum_depth
-                or _integer(tags.get("verifier_rows"))
-                != expected_maximum_depth + 1
-                or _integer(tags.get("physical_verifier_rows"))
-                != expected_maximum_depth + 1
-                or sampling_mode not in {"greedy", "stochastic"}
-            ):
-                return MTPDeviceGenerationValidation(
-                    error=(
-                        "ROCm dynamic MTP materialized an incomplete or "
-                        f"mismatched hosted graph family on {device}: {record}"
-                    ),
-                    devices=rocm_devices,
-                )
-        if "stochastic" not in observed_sampling_modes:
-            return MTPDeviceGenerationValidation(
-                error=(
-                    "ROCm dynamic MTP never materialized its stochastic "
-                    f"ticket-selected graph family on {device}"
-                ),
-                devices=rocm_devices,
-            )
-
-        if not any(
-            (record.get("tags") or {}).get("policy")
-            == "host_scheduled_captured_transactions"
-            and (record.get("tags") or {}).get("selection_boundary")
-            == "pre_first_draft"
-            and (record.get("tags") or {}).get("topology") == "dynamic_depth"
-            for record in policy_selections.get(device, ())
-        ):
-            return MTPDeviceGenerationValidation(
-                error=(
-                    "ROCm dynamic MTP did not select its hosted captured-graph "
-                    f"policy before the first draft on {device}"
-                ),
-                devices=rocm_devices,
-            )
-
-        if not any(
-            (record.get("tags") or {}).get("backend") == "HIP"
-            and (record.get("tags") or {}).get("execution")
-            == "hosted_ticket_selected_captured_transactions"
-            and (record.get("tags") or {}).get("conditional_fragments") == "0"
-            and _integer((record.get("tags") or {}).get("fragments")) > 0
-            and _integer((record.get("tags") or {}).get("minimum_draft_depth"))
-            == expected_minimum_depth
-            and _integer((record.get("tags") or {}).get("maximum_draft_depth"))
-            == expected_maximum_depth
-            for record in launches.get(device, ())
-        ):
-            return MTPDeviceGenerationValidation(
-                error=(
-                    "ROCm dynamic MTP never launched a ticket-selected captured "
-                    f"transaction on {device}"
-                ),
-                devices=rocm_devices,
-            )
-
-        device_ticket_submissions = ticket_submissions.get(device, ())
-        if not device_ticket_submissions or any(
-            not device_generation_dispatch_ticket_abi_is_canonical(
-                record.get("tags") or {}
-            )
-            or (record.get("tags") or {}).get("authority")
-            != "immutable_scheduler_snapshot"
-            or (record.get("tags") or {}).get("state_payload") != "false"
-            for record in device_ticket_submissions
-        ):
-            return MTPDeviceGenerationValidation(
-                error=(
-                    "ROCm dynamic MTP scheduler ticket boundary is missing or "
-                    f"malformed on {device}"
-                ),
-                devices=rocm_devices,
-            )
-
-        if not ticket_observations.get(device) or any(
-            _integer((record.get("tags") or {}).get("transaction")) <= 0
-            or not (
-                expected_minimum_depth
-                <= _integer((record.get("tags") or {}).get("next_depth"))
-                <= expected_maximum_depth
-            )
-            or (record.get("tags") or {}).get("complete")
-            not in {"true", "false"}
-            or (record.get("tags") or {}).get("maintenance_due")
-            not in {"true", "false"}
-            for record in ticket_observations[device]
-        ):
-            return MTPDeviceGenerationValidation(
-                error=(
-                    "ROCm dynamic MTP observed an unauthenticated scheduler "
-                    f"decision on {device}"
-                ),
-                devices=rocm_devices,
-            )
-
-        if not transaction_submissions.get(device) or any(
-            not (
-                expected_minimum_depth
-                <= _integer((record.get("tags") or {}).get("depth"))
-                <= expected_maximum_depth
-            )
-            or (record.get("tags") or {}).get("dynamic_depth_source")
-            != "device_controller_ticket"
-            or _integer((record.get("tags") or {}).get("fragments")) <= 0
-            for record in transaction_submissions[device]
-        ):
-            return MTPDeviceGenerationValidation(
-                error=(
-                    "ROCm dynamic MTP transaction submission did not consume "
-                    f"the authenticated device-controller ticket on {device}"
-                ),
-                devices=rocm_devices,
-            )
-
+    # Capacity warmup belongs to the service orchestrator. Unlike device
+    # ledgers it has no participant owner and need not be repeated on every rank.
     capture_transactions = [
         record
         for record in records
@@ -594,11 +479,242 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
     ):
         return MTPDeviceGenerationValidation(
             error=(
-                "ROCm dynamic MTP did not warm its maximum-capacity captured "
+                "Hosted dynamic MTP did not warm its maximum-capacity captured "
                 "transaction family under device selector ownership"
             ),
-            devices=rocm_devices,
+            devices=(),
         )
+
+    ranks = {row.get("rank") for row in records
+             if row.get("domain") == "mtp"
+             and row.get("name") == "device_generation_loop_graph_materializations"
+             and _value(row) > 0
+             and (str(row.get("device", "")).startswith("ROCm:")
+                  or (row.get("tags") or {}).get("execution")
+                  == "hosted_captured_transactions_with_ticket_only_dispatch")}
+    if not ranks:
+        return MTPDeviceGenerationValidation("Hosted MTP emitted no controller materialization", ())
+    devices: list[str] = []
+    for rank in sorted(ranks, key=str):
+        rows = tuple(row for row in records if row.get("rank") == rank)
+        result = _validate_host_scheduled_rank(
+            rows, device_kinds=device_kinds, expected_minimum_depth=expected_minimum_depth,
+            expected_maximum_depth=expected_maximum_depth)
+        if result.error:
+            prefix = f"rank={rank}: " if rank is not None else ""
+            return MTPDeviceGenerationValidation(prefix + result.error, tuple(devices))
+        devices.extend(f"rank={rank}/{device}" if len(ranks) > 1 else device
+                       for device in result.devices)
+    return MTPDeviceGenerationValidation(None, tuple(devices))
+
+
+def _validate_host_scheduled_rank(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    device_kinds: frozenset[str],
+    expected_minimum_depth: int,
+    expected_maximum_depth: int,
+) -> MTPDeviceGenerationValidation:
+    """Join one rank's controller, native graph, scheduler ticket and ledgers.
+
+    CUDA ticket dispatch requires a captured heterogeneous execution boundary;
+    HIP also supports this policy in homogeneous domains. All other arithmetic,
+    depth, stochastic sampling and per-participant evidence is backend symmetric.
+    """
+
+    records = tuple(records)
+    if (
+        expected_minimum_depth <= 0
+        or expected_maximum_depth < expected_minimum_depth
+    ):
+        return MTPDeviceGenerationValidation(
+            error="invalid expected hosted dynamic MTP selector range",
+            devices=(),
+        )
+
+    materializations = _records_by_device(
+        records, "device_generation_loop_graph_materializations"
+    )
+    devices = tuple(
+        sorted(device for device, rows in materializations.items()
+               if device.startswith("ROCm:") or (
+                   device.startswith("CUDA:") and any(
+                       (row.get("tags") or {}).get("execution")
+                       == "hosted_captured_transactions_with_ticket_only_dispatch"
+                       for row in rows)))
+    )
+    if not devices:
+        return MTPDeviceGenerationValidation(
+            error=(
+                "Hosted dynamic MTP emitted no ticket-selected captured graph "
+                "materialization"
+            ),
+            devices=(),
+        )
+
+    policy_selections = _records_by_device(
+        records, "device_generation_execution_policy_selections"
+    )
+    launches = _records_by_device(records, "device_generation_loop_graph_launches")
+    ticket_submissions = _records_by_device(
+        records, "device_generation_dispatch_ticket_d2h_submissions"
+    )
+    ticket_observations = _records_by_device(
+        records, "device_generation_dispatch_tickets_observed"
+    )
+    transaction_submissions = _records_by_device(
+        records, "hosted_device_generation_transaction_submissions"
+    )
+
+    for device in devices:
+        kind = device.partition(":")[0].lower()
+        if kind not in device_kinds:
+            return MTPDeviceGenerationValidation(
+                error=f"Hosted MTP controller {device} is outside the resolved device kinds",
+                devices=devices)
+        if kind == "cuda":
+            boundary_error = _cuda_hosted_boundary_error(records, device, device_kinds)
+            if boundary_error:
+                return MTPDeviceGenerationValidation(error=boundary_error, devices=devices)
+        expected_backend = "CUDA" if kind == "cuda" else "HIP"
+        observed_sampling_modes: set[str] = set()
+        for record in materializations[device]:
+            tags = record.get("tags") or {}
+            head_error = _terminal_vocabulary_family_error(
+                records, device, tags, expected_maximum_depth + 1
+            )
+            if head_error:
+                return MTPDeviceGenerationValidation(error=head_error, devices=devices)
+            sampling_mode = str(tags.get("sampling_mode", ""))
+            observed_sampling_modes.add(sampling_mode)
+            if (
+                tags.get("backend") != expected_backend
+                or tags.get("depth_policy") != "dynamic"
+                or tags.get("execution")
+                != "hosted_captured_transactions_with_ticket_only_dispatch"
+                or tags.get("conditional_fragments") != "0"
+                or _integer(tags.get("fragments")) <= 0
+                or _integer(tags.get("minimum_draft_depth"))
+                != expected_minimum_depth
+                or _integer(tags.get("maximum_draft_depth"))
+                != expected_maximum_depth
+                or _integer(tags.get("draft_depth"))
+                != expected_maximum_depth
+                or _integer(tags.get("verifier_rows"))
+                != expected_maximum_depth + 1
+                or _integer(tags.get("physical_verifier_rows"))
+                != expected_maximum_depth + 1
+                or sampling_mode not in {"greedy", "stochastic"}
+            ):
+                return MTPDeviceGenerationValidation(
+                    error=(
+                        "Hosted dynamic MTP materialized an incomplete or "
+                        f"mismatched hosted graph family on {device}: {record}"
+                    ),
+                    devices=devices,
+                )
+        if "stochastic" not in observed_sampling_modes:
+            return MTPDeviceGenerationValidation(
+                error=(
+                    "Hosted dynamic MTP never materialized its stochastic "
+                    f"ticket-selected graph family on {device}"
+                ),
+                devices=devices,
+            )
+
+        if not any(
+            (record.get("tags") or {}).get("policy")
+            == "host_scheduled_captured_transactions"
+            and (record.get("tags") or {}).get("selection_boundary")
+            == "pre_first_draft"
+            and (record.get("tags") or {}).get("topology") == "dynamic_depth"
+            for record in policy_selections.get(device, ())
+        ):
+            return MTPDeviceGenerationValidation(
+                error=(
+                    "Hosted dynamic MTP did not select its hosted captured-graph "
+                    f"policy before the first draft on {device}"
+                ),
+                devices=devices,
+            )
+
+        if not any(
+            (record.get("tags") or {}).get("backend") == expected_backend
+            and (record.get("tags") or {}).get("execution")
+            == "hosted_ticket_selected_captured_transactions"
+            and (record.get("tags") or {}).get("conditional_fragments") == "0"
+            and _integer((record.get("tags") or {}).get("fragments")) > 0
+            and _integer((record.get("tags") or {}).get("minimum_draft_depth"))
+            == expected_minimum_depth
+            and _integer((record.get("tags") or {}).get("maximum_draft_depth"))
+            == expected_maximum_depth
+            for record in launches.get(device, ())
+        ):
+            return MTPDeviceGenerationValidation(
+                error=(
+                    "Hosted dynamic MTP never launched a ticket-selected captured "
+                    f"transaction on {device}"
+                ),
+                devices=devices,
+            )
+
+        device_ticket_submissions = ticket_submissions.get(device, ())
+        if not device_ticket_submissions or any(
+            not device_generation_dispatch_ticket_abi_is_canonical(
+                record.get("tags") or {}
+            )
+            or (record.get("tags") or {}).get("authority")
+            != "immutable_scheduler_snapshot"
+            or (record.get("tags") or {}).get("state_payload") != "false"
+            for record in device_ticket_submissions
+        ):
+            return MTPDeviceGenerationValidation(
+                error=(
+                    "Hosted dynamic MTP scheduler ticket boundary is missing or "
+                    f"malformed on {device}"
+                ),
+                devices=devices,
+            )
+
+        if not ticket_observations.get(device) or any(
+            not _positive_transaction_sequence(record)
+            or not (
+                expected_minimum_depth
+                <= _integer((record.get("tags") or {}).get("next_depth"))
+                <= expected_maximum_depth
+            )
+            or (record.get("tags") or {}).get("complete")
+            not in {"true", "false"}
+            or (record.get("tags") or {}).get("maintenance_due")
+            not in {"true", "false"}
+            for record in ticket_observations[device]
+        ):
+            return MTPDeviceGenerationValidation(
+                error=(
+                    "Hosted dynamic MTP observed an unauthenticated scheduler "
+                    f"decision on {device}"
+                ),
+                devices=devices,
+            )
+
+        if not transaction_submissions.get(device) or any(
+            not (
+                expected_minimum_depth
+                <= _integer((record.get("tags") or {}).get("depth"))
+                <= expected_maximum_depth
+            )
+            or (record.get("tags") or {}).get("dynamic_depth_source")
+            != "device_controller_ticket"
+            or _integer((record.get("tags") or {}).get("fragments")) <= 0
+            for record in transaction_submissions[device]
+        ):
+            return MTPDeviceGenerationValidation(
+                error=(
+                    "Hosted dynamic MTP transaction submission did not consume "
+                    f"the authenticated device-controller ticket on {device}"
+                ),
+                devices=devices,
+            )
 
     transactions = _sum_by_device(records, "device_generation_terminal_transactions")
     compact_reductions = _sum_by_device(
@@ -645,7 +761,7 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
         records, "hosted_device_generation_terminal_submissions"
     )
 
-    for device in rocm_devices:
+    for device in devices:
         transaction_count = transactions.get(device, 0.0)
         attempted_drafts = drafts.get(device, 0.0)
         logical_verifier_tokens = verifier_tokens.get(device, 0.0)
@@ -676,7 +792,7 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
         ):
             return MTPDeviceGenerationValidation(
                 error=(
-                    "ROCm hosted dynamic MTP ledger is incomplete or "
+                    "Hosted dynamic MTP ledger is incomplete or "
                     f"inconsistent on {device}: transactions={transaction_count} "
                     f"tickets={ticket_submission_totals.get(device, 0.0)}/"
                     f"{ticket_observation_totals.get(device, 0.0)} "
@@ -690,7 +806,7 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
                     f"evaluated_windows={evaluated_windows.get(device, 0.0)} "
                     f"updates={updates.get(device, 0.0)}"
                 ),
-                devices=rocm_devices,
+                devices=devices,
             )
 
         compact_records = _records_by_device(
@@ -717,10 +833,10 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
         ):
             return MTPDeviceGenerationValidation(
                 error=(
-                    "ROCm dynamic MTP terminal compact-outcome provenance is "
+                    "Hosted dynamic MTP terminal compact-outcome provenance is "
                     f"missing or malformed on {device}"
                 ),
-                devices=rocm_devices,
+                devices=devices,
             )
 
     mirrored_totals = (
@@ -738,14 +854,14 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
         consumed_rows,
     )
     for totals in mirrored_totals:
-        values = {totals.get(device, -1.0) for device in rocm_devices}
+        values = {totals.get(device, -1.0) for device in devices}
         if len(values) != 1:
             return MTPDeviceGenerationValidation(
                 error=(
-                    "ROCm dynamic MTP device ledgers disagree across mirrored "
+                    "Hosted dynamic MTP device ledgers disagree across mirrored "
                     f"participants: {totals}"
                 ),
-                devices=rocm_devices,
+                devices=devices,
             )
 
-    return MTPDeviceGenerationValidation(error=None, devices=rocm_devices)
+    return MTPDeviceGenerationValidation(error=None, devices=devices)

@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
 
 namespace llaminar2
 {
@@ -30,6 +31,10 @@ namespace llaminar2
     {
         std::string role;    ///< Role: "system", "user", "assistant", "tool"
         std::string content; ///< Message content (may be empty for tool-call assistant messages)
+
+        /// Separate assistant reasoning returned by an earlier completion.
+        /// The loaded template owns whether to retain it in subsequent turns.
+        std::optional<std::string> reasoning_content;
 
         /// Tool calls emitted by the assistant (role="assistant" only).
         /// Each entry is a serialized JSON string of an OpenAI-format tool_call object:

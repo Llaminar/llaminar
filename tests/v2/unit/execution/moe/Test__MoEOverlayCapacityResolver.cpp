@@ -400,6 +400,13 @@ namespace llaminar2
             return profile;
         }
 
+        /** @return Explicit whole-model graph scope for fixed-memory unit fixtures. */
+        MoEOverlayInferenceGraphFamilyIdentity testGraphFamily(const ModelMemoryProfile &profile)
+        {
+            return {.graph_family_generation = 1, .main_layer_count = profile.n_layers,
+                .max_graph_rows = 4096, .max_decode_rows = 1, .max_request_count = 1};
+        }
+
         /** @brief Add exact expert matrices for CPU metadata-only workspace admission. */
         void addRoutedExpertMetadata(ModelMemoryProfile &profile)
         {
@@ -1869,6 +1876,7 @@ namespace llaminar2
                 /*model_graph_topology_variant_count=*/1u,
                 /*auxiliary_executable_count=*/0u),
             .gpu_weight_load = gpu_load,
+            .graph_family = testGraphFamily(profile),
         });
         const auto budgetFor = [&](DeviceId device)
             -> const MoEOverlayBoundPhysicalMemoryBudget &
@@ -2382,6 +2390,7 @@ namespace llaminar2
                     OverlayRankExecutionKind::ContinuationAuthority,
                 .resident_graph_rows = 8,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),
+                .graph_family = testGraphFamily(profile),
             });
 
             ASSERT_EQ(result.device_inputs.size(), 2u);
@@ -2437,6 +2446,90 @@ namespace llaminar2
                     planned->weight_bytes(),
                     expected_full.device_bytes);
             }
+        }
+    }
+
+    /** @test Setup probes must not interpret source matrices owned by another stage. */
+    TEST(MoEOverlayLocalCapacityPlanner, PipelineCPUSetupUsesOwnedSourceIntervalAllFormats)
+    {
+        std::vector<std::string> formats{"F16", "BF16", "F32"};
+        for (const auto &format : native_vnni_formats::kAllSourceFormats)
+            formats.emplace_back(format.quant_type);
+        for (const auto &format : formats)
+        {
+            SCOPED_TRACE(format);
+            auto profile = smallModelProfile();
+            profile.n_layers = 3;
+            profile.d_model = profile.expert_feed_forward_length = 256;
+            profile.head_dim = 64;
+            addRoutedExpertMetadata(profile);
+            for (auto &tensor : profile.tensors) tensor.quant_type = format;
+
+            RankExecutionPlan rank;
+            rank.rank = 0;
+            rank.first_layer = rank.last_layer = 1;
+            rank.has_embedding = rank.has_lm_head = false;
+            rank.primary_device = GlobalDeviceAddress::cpu();
+            rank.runtime.max_seq_len = 32;
+            rank.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+            rank.runtime.prefix_cache.enabled = false;
+            rank.runtime.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
+            RankInventory inventory;
+            inventory.rank = 0;
+            inventory.cpu_cores = inventory.cpu_worker_threads = 8;
+            inventory.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+            inventory.cpu.memory_bytes = inventory.cpu.free_memory_bytes = inventory.cpu_memory_bytes = 4ULL << 30;
+            MoERoutedExpertPlacementPlan overlay;
+            overlay.enabled = true;
+            overlay.topology = RoutedExpertPlacementTopology::SingleDomain;
+            overlay.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+            overlay.first_model_layer = 1;
+            overlay.continuation_domain = overlay.base_model_domain = overlay.shared_expert_domain = "child";
+            overlay.domains = {boundDomain("child", 0, GlobalDeviceAddress::cpu())};
+            overlay.routed_tiers = {{.name = "owned", .domain = "child", .priority = 0, .fallback = true}};
+            auto family = testGraphFamily(profile);
+            family.first_model_layer = 1;
+            family.main_layer_count = 1;
+            MoEOverlayLocalCapacityPlannerInput input{
+                .model_profile = &profile, .rank_plan = &rank, .overlay_plan = &overlay,
+                .rank_inventory = &inventory, .rank_execution_kind = OverlayRankExecutionKind::ContinuationAuthority,
+                .resident_graph_rows = 8,
+                .host_demand_memory = MoEOverlayHostDemandMemoryPlan(MoEOverlayHostDemandGeometry{
+                    .num_layers = 1, .num_experts = profile.expert_count, .top_k = profile.expert_used_count,
+                    .initial_window_rows = rank.runtime.moe_rebalance.window_size,
+                    .maximum_window_rows = rank.runtime.moe_rebalance.max_window_size,
+                    .maximum_invocation_rows = 8}),
+                .graph_family = family};
+            const auto complete = MoEOverlayLocalCapacityPlanner::plan(input);
+            // Deliberately unreadable neighboring source descriptors prove the
+            // child never interprets them. Keep their global directory entries
+            // and geometry; truncating the parent profile would hide the bug.
+            for (auto &tensor : profile.tensors)
+                if (tensor.layer_index != 1) tensor.quant_type = "FOREIGN_STAGE_DESCRIPTOR";
+            std::optional<MoEOverlayLocalCapacityPlannerResult> isolated;
+            ASSERT_NO_THROW(isolated.emplace(MoEOverlayLocalCapacityPlanner::plan(input)));
+            ASSERT_EQ(complete.physical_budgets.size(), isolated->physical_budgets.size());
+            for (size_t index = 0; index < complete.physical_budgets.size(); ++index)
+                EXPECT_EQ(complete.physical_budgets[index].fixedBytes(), isolated->physical_budgets[index].fixedBytes());
+
+            input.graph_family = {};
+            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            input.graph_family = family;
+            input.graph_family.first_model_layer = 0;
+            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            input.graph_family = family;
+            input.graph_family.mtp_source_layers = {3};
+            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            input.graph_family = family;
+            rank.last_layer = 2;
+            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
+            rank.last_layer = 1;
+            input.host_demand_memory.emplace(MoEOverlayHostDemandGeometry{
+                .num_layers = 3, .num_experts = profile.expert_count, .top_k = profile.expert_used_count,
+                .initial_window_rows = rank.runtime.moe_rebalance.window_size,
+                .maximum_window_rows = rank.runtime.moe_rebalance.max_window_size,
+                .maximum_invocation_rows = 8});
+            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
         }
     }
 
@@ -2518,6 +2611,7 @@ namespace llaminar2
             .max_cpu_memory_bytes = 512u * 1024u * 1024u,
             .resident_graph_rows = 8,
             .gpu_weight_load = gpu_weight_load,
+            .graph_family = testGraphFamily(profile),
         };
         const auto result = MoEOverlayLocalCapacityPlanner::plan(capacity_input);
         rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
@@ -2734,6 +2828,7 @@ namespace llaminar2
                     OverlayRankExecutionKind::ContinuationAuthority,
                 .resident_graph_rows = 8,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),
+                .graph_family = testGraphFamily(profile),
             });
             const auto cpu_input = std::find_if(
                 result.device_inputs.begin(), result.device_inputs.end(),
@@ -2802,6 +2897,7 @@ namespace llaminar2
             .rank_execution_kind =
                 OverlayRankExecutionKind::ExpertOnlyFollower,
             .require_host_memory_authority = true,
+            .graph_family = testGraphFamily(profile),
         });
         EXPECT_TRUE(result.fixed_memory_plan.devices.empty());
         ASSERT_EQ(result.physical_budgets.size(), 1u);
@@ -2978,6 +3074,7 @@ namespace llaminar2
                 .require_host_memory_authority = true,
                 .resident_graph_rows = rows,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),
+                .graph_family = testGraphFamily(profile),
             });
         };
         auto small = planForRows(8);
@@ -3493,5 +3590,104 @@ namespace llaminar2
         EXPECT_THROW(
             (void)footprints.front().liveBytes(DeviceId::invalid()),
             std::invalid_argument);
+    }
+    /** @brief Stage origins change identity, never physical bytes or row counts. */
+    TEST(MoEOverlayCapacityResolver, PipelineStageCapacityUsesOnlyOwnedRowsAcrossFormatsAndBackends)
+    {
+        for (const auto &format : native_vnni_formats::kAllSourceFormats)
+        for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            const auto base_manifest = manifest(2, *format.metadata, true);
+            const auto base_footprints = MoEOverlayCapacityResolver::preparedFootprints(base_manifest);
+            const auto budget = exactBudget("stage", device, base_footprints, {2, 2}, 1);
+            for (const int first : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+            {
+                SCOPED_TRACE(::testing::Message() << format.quant_type << '/' << device.toString() << '/' << first);
+                auto stage_manifest = base_manifest;
+                for (auto &entry : stage_manifest) entry.layer_idx += first;
+                for (const auto projections : {DeviceMoEProjectionSet::CompleteExpert, DeviceMoEProjectionSet::GateUp})
+                {
+                    using Directory = DeviceMoETransferSlotDirectory;
+                    // A reusable directory requires fixed matrix shapes across
+                    // layers. Capacity admission below independently covers
+                    // heterogeneous shapes without inventing directory support.
+                    const auto directory_manifest = manifest(2, *format.metadata);
+                    auto directory_stage_manifest = directory_manifest;
+                    for (auto &entry : directory_stage_manifest) entry.layer_idx += first;
+                    const auto base = Directory::profileForLayerWeightManifest(directory_manifest, projections);
+                    const auto owned = Directory::profileForLayerWeightManifest(directory_stage_manifest, projections);
+                    const auto slots = Directory::planBufferedCapacity(4, 2, 2);
+                    EXPECT_EQ(owned.max_wire_payload_bytes, base.max_wire_payload_bytes);
+                    EXPECT_EQ(Directory::allocationBOM(slots, owned).total_bytes,
+                              Directory::allocationBOM(slots, base).total_bytes);
+                }
+                MoEOverlayCapacityResolverInput input;
+                input.num_experts = 2;
+                input.layer_weight_manifest = stage_manifest;
+                input.physical_budgets = {budget};
+                input.tiers = {tier(0, "owned", 0, true, MoEOverlayLiveQuotaMode::Automatic,
+                                    {participant(0, "stage")})};
+                const auto resolved = MoEOverlayCapacityResolver::resolve(input);
+                ASSERT_EQ(resolved.layer_footprints.size(), 2u);
+                ASSERT_NE(resolved.resource("stage"), nullptr);
+                EXPECT_EQ(resolved.resource("stage")->usedBytes(), budget.usableBudgetBytes());
+                EXPECT_EQ(resolved.resource("stage")->remainingBytes(), 0u);
+                EXPECT_EQ(resolved.resource("stage")->live_copies_per_layer, (std::vector<int>{2, 2}));
+                EXPECT_EQ(resolved.tier(0)->live_experts_per_layer, (std::vector<int>{2, 2}));
+                for (std::size_t row = 0; row < 2; ++row)
+                {
+                    EXPECT_EQ(resolved.layer_footprints[row].layer_idx, first + static_cast<int>(row));
+                    EXPECT_EQ(resolved.layer_footprints[row].liveBytes(device), base_footprints[row].liveBytes(device));
+                }
+
+                MoERoutedExpertPlacementPlan plan;
+                plan.enabled = true;
+                plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+                plan.first_model_layer = first;
+                plan.continuation_domain = plan.shared_expert_domain = "stage";
+                plan.domains = {boundDomain("stage", 0, GlobalDeviceAddress::cpu(0))};
+                plan.routed_tiers = {{.name = "owned", .domain = "stage", .priority = 0, .fallback = true}};
+                const auto installed = MoEOverlayCapacityResolver::installResolvedQuotas(plan, resolved);
+                EXPECT_EQ(installed.first_model_layer, first);
+                EXPECT_EQ(installed.routed_tiers.front().resolved_live_experts_per_layer, (std::vector<int>{2, 2}));
+                plan.first_model_layer = first == 0 ? 32 : 0;
+                EXPECT_THROW((void)MoEOverlayCapacityResolver::installResolvedQuotas(plan, resolved), std::invalid_argument);
+            }
+        }
+    }
+
+    /** @brief Gaps, duplicates and overflow cannot become compact quota indices. */
+    TEST(MoEOverlayCapacityResolver, PipelineStageRejectsMalformedIntervals)
+    {
+        for (const auto ids : {std::array{-1, 0}, std::array{32, 34}, std::array{32, 32},
+                               std::array{33, 32}, std::array{std::numeric_limits<int>::max() - 1,
+                                                          std::numeric_limits<int>::max()}})
+        {
+            const std::vector malformed{layer(ids[0], native_vnni_formats::Q4_K), layer(ids[1], native_vnni_formats::Q4_K)};
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::preparedFootprints(malformed), std::invalid_argument);
+            EXPECT_THROW((void)DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(malformed), std::invalid_argument);
+        }
+    }
+
+    /** @brief Physical admission rejects foreign manifests before installing quotas. */
+    TEST(MoEOverlayCapacityResolver, PipelineStageAdmissionAuthenticatesManifestOrigin)
+    {
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan.first_model_layer = 32;
+        plan.continuation_domain = plan.shared_expert_domain = "stage";
+        plan.domains = {boundDomain("stage", 0, GlobalDeviceAddress::cpu(0))};
+        plan.routed_tiers = {{.name = "owned", .domain = "stage", .priority = 0, .fallback = true}};
+        const std::vector owned{layer(32, native_vnni_formats::Q4_K), layer(33, native_vnni_formats::Q4_K)};
+        const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(owned);
+        const std::vector budgets{boundBudget(0, exactBudget("stage", DeviceId::cpu(), footprints, {2, 2}, 0))};
+        const auto input = MoEOverlayCapacityAdmission::buildResolverInput(plan, 2, owned, budgets, {});
+        const auto admitted = MoEOverlayCapacityResolver::resolve(input);
+        EXPECT_EQ(admitted.layer_footprints.size(), 2u);
+        EXPECT_EQ(admitted.resource("stage")->remainingBytes(), 0u);
+        auto foreign = owned;
+        for (auto &entry : foreign) entry.layer_idx -= 32;
+        EXPECT_THROW((void)MoEOverlayCapacityAdmission::buildResolverInput(plan, 2, foreign, budgets, {}), std::invalid_argument);
     }
 } // namespace llaminar2

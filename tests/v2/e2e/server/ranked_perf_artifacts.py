@@ -8,6 +8,8 @@ Collection validates membership before publishing the cell's aggregate and
 keeps every original row, with its rank attached, without summing measurements
 or conflating process-local graph identities. Raw files remain diagnostic
 artifacts alongside the aggregate. No inference state is read or modified.
+Flat and pipeline movement sidecars use the same scope authentication as the
+downstream movement observer, preserving each stage's independent identities.
 """
 
 from __future__ import annotations
@@ -17,7 +19,11 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts/ci"))
+from generation_movement_ledger import validate_terminal_movement_metadata  # noqa: E402
 
 
 def _natural(value: object, field: str) -> int:
@@ -37,10 +43,12 @@ def collect_ranked_perf_stats(output: Path) -> dict:
     """
     prefix = output.name.removesuffix(".json") + ".rank-"
     files = sorted(p for p in output.parent.iterdir()
-                   if p.name.startswith(prefix) and p.name.endswith(".json"))
+                   if p.name.startswith(prefix) and p.name.endswith(".json")
+                   and not p.name.endswith(".json.movement.json"))
     if not files:
         raise ValueError("missing rank-qualified PerfStats artifacts")
     participants: dict[int, list[dict]] = {}
+    terminal_movement: dict[int, dict] = {}
     membership: tuple[int, int] | None = None
     for path in files:
         rank = _natural(path.name[len(prefix):-5], "filename rank")
@@ -79,12 +87,31 @@ def collect_ranked_perf_stats(output: Path) -> dict:
             # Original rank files and all measurement values remain unchanged.
             record["rank"] = rank
         participants[rank] = records
+        movement_path = path.with_name(path.name + ".movement.json")
+        if movement_path.exists():
+            movement = json.loads(movement_path.read_text(encoding="utf-8"))
+            try:
+                validate_terminal_movement_metadata(movement, expected_rank=rank)
+            except ValueError as error:
+                raise ValueError(f"invalid terminal movement artifact: {movement_path.name}: {error}") from error
+            terminal_movement[rank] = movement
     assert membership is not None
     size, authority = membership
     if set(participants) != set(range(size)):
         raise ValueError(f"missing rank evidence: expected {size} ranks, got {sorted(participants)}")
+    # A filtered counter export may intentionally omit movement diagnostics.
+    # Once any rank exports that family, the whole communicator must be present.
+    # Detailed wave/counter joins belong to the movement observer, after these
+    # files have acquired the same authenticated rank identities as PerfStats.
+    movement_files = {p.name for p in output.parent.iterdir()
+                      if p.name.startswith(prefix) and p.name.endswith(".json.movement.json")}
+    expected_movement_files = {f"{prefix}{rank}.json.movement.json" for rank in participants}
+    if movement_files and (movement_files != expected_movement_files
+                           or set(terminal_movement) != set(participants)):
+        raise ValueError("missing or foreign rank in terminal movement artifacts")
     return {"schema": "llaminar.perf_stats.v1", "world_size": size,
             "authority_rank": authority,
+            "terminal_movement": [terminal_movement[rank] for rank in sorted(terminal_movement)],
             "records": [row for rank in sorted(participants) for row in participants[rank]]}
 
 

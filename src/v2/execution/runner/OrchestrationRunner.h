@@ -14,6 +14,8 @@
  * - Compute graphs (with PP Send/Recv stages)
  * - LOCAL TP context for intra-rank collectives
  * - KV cache state
+ * - Per-stage expert runtime lifetimes for local PP composition; each stage
+ *   shares its owners only among that stage's TP participants.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -21,7 +23,10 @@
 
 #pragma once
 
+#include "../../models/ModelGenerationPolicy.h"
+
 #include "IOrchestrationRunner.h"
+#include "OrchestrationInitializationLifecycle.h"
 #include "RankInitializationLifecycle.h"
 #include "ContinuationRequestGroup.h"
 #include "../mpi_orchestration/IExecutionPlanBuilder.h"
@@ -54,10 +59,14 @@
 
 namespace llaminar2
 {
+    enum class ModelContextPhysicalSealBoundary;
 
     class MoEOverlayResidencyAuthority;
     class MoEOverlayParticipantResidencyRegistry;
     class MoEOverlayPhysicalResidencyFabric;
+    class MoEOverlayPipelineStageBinding;
+    class MoEPipelinePreparedPlan;
+    class ResolvedRankOrchestration;
     struct MoEOverlayReusableContextSeal;
     class MoEOverlayHostAuthorityDeviceBankPublisher;
     class MoEOverlayParticipantPreparedWaveFactory;
@@ -243,8 +252,19 @@ namespace llaminar2
         // IOrchestrationRunner: Lifecycle
         // =====================================================================
 
+        /**
+         * @brief Prepare and publish a complete inference lifetime.
+         * @return Whether model, graph and capture preparation completed.
+         * An admission-only lifetime must be shut down before full preparation.
+         */
         bool initialize() override;
+        /**
+         * @brief Validate admission without publishing inference readiness.
+         * @return Whether planning and memory admission completed successfully.
+         * No prepared-weight retention seal is owed by this lifecycle.
+         */
         bool initializeForDryRun() override;
+        /** @brief Retire exactly the resources owned by the completed preparation kind. */
         void shutdown() override;
 
         // =====================================================================
@@ -267,6 +287,8 @@ namespace llaminar2
         bool maybeApplyMoERebalance(uint64_t committed_tokens) override;
         uint64_t moeRuntimeMovementEpoch() const override;
         MoEOptimizationStatus moeOptimizationStatus() const override;
+        /** @copydoc IOrchestrationRunner::moeOptimizationMovementTopology */
+        MoEOptimizationMovementTopology moeOptimizationMovementTopology() const override;
         MoEOptimizationMovementLedger
         moeOptimizationMovementLedger() const override;
 
@@ -290,6 +312,8 @@ namespace llaminar2
         int currentPosition() const override;
         void clearCache() override;
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::prefixCacheTelemetrySources */
+        PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override;
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
         /** @return Existing prefix outcome and validated terminal MTP observations. */
         RequestRuntimeSummary requestRuntimeSummary() const override;
@@ -364,7 +388,18 @@ namespace llaminar2
         void flushStageTimeline() override;
         void setSamplingParams(const SamplingParams &params) override;
         SamplingParams getSamplingParams() const { return active_sampling_params_; }
-        SamplingParams getRecommendedSamplingParams() const override;
+        /**
+         * @brief Return loaded-model defaults for the request's template reasoning mode.
+         * @param mode Reasoning choice also supplied to prompt rendering.
+         * @return Recommendations prior to explicit per-field request overrides.
+         */
+        SamplingParams getRecommendedSamplingParams(
+            ThinkingMode mode = ThinkingMode::ModelDefault) const override;
+        /** @return The loaded revision's documented reasoning default. */
+        ThinkingMode getDefaultThinkingMode() const override
+        {
+            return model_generation_policy_.defaultThinkingMode();
+        }
         std::string getStopThinkingPrompt() const override;
         ToolCallFormat getToolCallFormat() const override;
 
@@ -530,6 +565,12 @@ namespace llaminar2
         bool awaitMmapReclaimBeforeRuntimeAllocation();
 
         bool freezeMoEExpertOverlayPlanForLoadedModel();
+        /**
+         * @brief Admit all local MoE pipeline stages and freeze model-owned placements.
+         * @return True after the exact aggregate PMA is published to the weight manager.
+         * Reuse retains the original certificate and never resamples already-owned bytes.
+         */
+        bool freezeMoEPipelinePlanForLoadedModel();
 
         /**
          * @brief Freeze the one recipient group for prompt and prefix/KV state.
@@ -555,22 +596,12 @@ namespace llaminar2
         bool initializeMoEExpertOverlayResidencyAuthority();
 
         /**
-         * @brief Return whether the frozen authority is a homogeneous GPU tier.
-         *
-         * The authority execution enum deliberately also covers homogeneous
-         * CPU tiers, where host and participant memory are the same domain.
-         * This narrower predicate selects the captured CUDA/ROCm executor and
-         * prevents the host maintenance service from becoming a second writer.
+         * @brief Identify native GPU controllers in one domain or every PP stage.
+         * @return True only for the captured NCCL/RCCL stage implementation.
+         * A heterogeneous pipeline boundary does not change each child
+         * controller's device ownership or introduce a host maintenance writer.
          */
-        /**
-         * @brief Return whether the installed one-domain native GPU controller can own this plan.
-         *
-         * Every all-GPU plan is logically device-resident. This narrower
-         * predicate identifies only the already-composed homogeneous,
-         * single-tier NCCL/RCCL implementation; it must never be used to
-         * choose host authority for another all-GPU topology.
-         */
-        bool usesSingleDomainNativeGpuDeviceResidentMoEOverlayAuthority() const;
+        bool usesNativeGpuStageMoEOverlayAuthority() const;
 
         /**
          * @brief Materialize the topology-selected authority executor.
@@ -708,6 +739,12 @@ namespace llaminar2
          */
         bool beginModelContextReuseSealIfNeeded(
             std::string *error = nullptr) noexcept;
+
+        /**
+         * @return Physical sealing edge selected by every frozen stage storage contract.
+         * @throws std::logic_error when the exported reuse authority is not owned.
+         */
+        ModelContextPhysicalSealBoundary preparedContextSealBoundary() const;
 
         /**
          * @brief Restore Dynamic placement and atomically rebind prepared keys.
@@ -1345,6 +1382,13 @@ namespace llaminar2
         /** Shared route evidence retained by authority and every child graph. */
         std::shared_ptr<DecodeExpertHistogram>
             moe_expert_overlay_decode_histogram_;
+        /**
+         * Exact PP-stage expert owners retained until all child graphs retire.
+         * The ordinary model-wide authority below is never broadcast into this
+         * vector. Stage admission must publish the complete authored order.
+         */
+        std::vector<std::shared_ptr<const MoEOverlayPipelineStageBinding>>
+            moe_pipeline_stage_bindings_;
         /** The only live owner-map publication authority in this process. */
         std::shared_ptr<MoEOverlayResidencyAuthority>
             moe_expert_overlay_residency_authority_;
@@ -1472,6 +1516,10 @@ namespace llaminar2
         /** Sole physical-memory proof selected for this runner's overlay. */
         std::shared_ptr<const MoEOverlayResolvedCapacityPlan>
             moe_expert_overlay_memory_admission_;
+        /** Compiled immutable stage topology retained through live model admission. */
+        std::shared_ptr<const ResolvedRankOrchestration> moe_pipeline_topology_;
+        /** Exact initial stage placements and their joint model-owned admission. */
+        std::shared_ptr<const MoEPipelinePreparedPlan> moe_pipeline_prepared_plan_;
         /**
          * Sole topology-wide CPU/GPU admission proof for this runner.
          *
@@ -1583,8 +1631,8 @@ namespace llaminar2
          */
         mutable std::unordered_map<std::string, std::vector<float>> snapshot_combined_cache_;
 
-        // Status
-        std::atomic<bool> initialized_{false};
+        /** Admission-only completion never grants inference or prepared-retention ownership. */
+        OrchestrationInitializationLifecycle initialization_lifecycle_;
         std::string last_error_;
         mutable std::mutex error_mutex_;
         /** Serializes the idempotent application-startup preparation boundary. */
@@ -1596,7 +1644,7 @@ namespace llaminar2
         SamplingParams active_sampling_params_;                         // Current sampling params for decodeStep()
         /** Immutable request entropy for ordinary/MTP draws, retained across budget continuations. */
         std::optional<GenerationRequestSeeds> generation_request_seeds_;
-        SamplingParams recommended_sampling_params_;                    // Model-specific defaults
+        ModelGenerationPolicy model_generation_policy_;              ///< Loaded revision's mode-specific defaults.
         std::string stop_thinking_prompt_;                              // Model-specific stop-thinking prompt
         ToolCallFormat tool_call_format_{ToolCallFormat::HERMES_2_PRO}; // Model-specific tool call format
         int32_t last_token_{0};                                         // Last token for decode step
@@ -1814,6 +1862,8 @@ namespace llaminar2
                 Inactive,
                 /** A live request awaits a positive caller response budget. */
                 AwaitingBudget,
+                /** A published window awaits another budget in the same request. */
+                AwaitingContinuationBudget,
                 /** One resident controller owns the recorded response budget. */
                 ControllerActive,
             };
@@ -1854,7 +1904,7 @@ namespace llaminar2
              */
             [[nodiscard]] bool admitController(int token_budget) noexcept
             {
-                if (phase != Phase::AwaitingBudget ||
+                if (!awaitsAdmission() ||
                     admitted_token_budget != 0 || token_budget <= 0)
                 {
                     return false;
@@ -1883,7 +1933,7 @@ namespace llaminar2
                 }
                 phase = request_complete
                             ? Phase::Inactive
-                            : Phase::AwaitingBudget;
+                            : Phase::AwaitingContinuationBudget;
                 admitted_token_budget = 0;
                 return true;
             }
@@ -1891,7 +1941,21 @@ namespace llaminar2
             /** @return true when the next grouped decode must admit a controller. */
             [[nodiscard]] bool awaitsAdmission() const noexcept
             {
-                return phase == Phase::AwaitingBudget;
+                return phase == Phase::AwaitingBudget || phase == Phase::AwaitingContinuationBudget;
+            }
+
+            /**
+             * @brief Name the only legal initialization for this admission edge.
+             * @return Fresh initialization after prefill, otherwise continuation.
+             * @throws std::logic_error when no budget admission is currently open.
+             */
+            [[nodiscard]] sampling_math::DeviceGenerationAdmissionKind admissionKind() const
+            {
+                if (!awaitsAdmission())
+                    throw std::logic_error("Device-generation admission kind requires an open budget boundary");
+                return phase == Phase::AwaitingBudget
+                    ? sampling_math::DeviceGenerationAdmissionKind::NewRequest
+                    : sampling_math::DeviceGenerationAdmissionKind::ContinueResponse;
             }
 
             /** @return true while exactly one resident controller is active. */

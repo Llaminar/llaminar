@@ -6,6 +6,8 @@
  * addresses, padding bytes, STL object representations, and pointer identities
  * never enter the wire identity, so independently constructed rank state can
  * authenticate the same declarative residency transaction.
+ * Compact pipeline-stage histograms and ownership tables bind their global
+ * origin; equal dimensions alone cannot authenticate another stage's state.
  */
 
 #include "MoEOverlayDistributedResidencyProtocol.h"
@@ -127,10 +129,11 @@ namespace llaminar2
             StableDigestBuilder &digest,
             const MoELayeredExpertOwnership &ownership)
         {
+            digest.addScalar(ownership.firstModelLayer());
             digest.addScalar(ownership.layerCount());
             digest.addScalar(ownership.expertCount());
             digest.addScalar(ownership.participantCount());
-            for (int layer_idx = 0; layer_idx < ownership.layerCount();
+            for (int layer_idx = ownership.firstModelLayer(); layer_idx < ownership.endModelLayer();
                  ++layer_idx)
             {
                 for (int expert_id = 0;
@@ -174,6 +177,7 @@ namespace llaminar2
             StableDigestBuilder &digest,
             const MoERoutedExpertPlacementPlan &plan) noexcept
         {
+            digest.addScalar(plan.first_model_layer);
             digest.addScalar(plan.enabled);
             digest.addScalar(plan.topology);
             digest.addScalar(plan.residency_policy);
@@ -266,6 +270,7 @@ namespace llaminar2
             digest.addScalar(window.generation);
             digest.addScalar(window.token_count);
             for (const auto count : window.source_token_counts) digest.addScalar(count);
+            digest.addScalar(window.first_model_layer);
             digest.addScalar(window.num_layers);
             digest.addScalar(window.num_experts);
             digest.addScalar(static_cast<uint64_t>(window.expert_counts.size()));
@@ -277,7 +282,8 @@ namespace llaminar2
             const auto &demand = *window.transaction_demand;
             digest.addScalar(demand.topK());
             digest.addScalar(demand.tokenBoundaryLayer());
-            for (int layer = 0; layer < window.num_layers; ++layer)
+            for (int layer = window.first_model_layer;
+                 layer < window.first_model_layer + window.num_layers; ++layer)
             {
                 const auto records = demand.layerTransactions(layer);
                 digest.addScalar(static_cast<uint64_t>(records.size()));
@@ -490,7 +496,8 @@ namespace llaminar2
             num_layers <= 0 || num_experts <= 0 ||
             production_source_count !=
                 kExpertHistogramProductionSourceCount ||
-            reserved != 0 || counts_fingerprint == 0)
+            first_model_layer < 0 ||
+            num_layers > std::numeric_limits<int>::max() - first_model_layer || counts_fingerprint == 0)
         {
             return false;
         }
@@ -601,7 +608,7 @@ namespace llaminar2
             .production_source_count =
                 static_cast<std::uint32_t>(
                     kExpertHistogramProductionSourceCount),
-            .reserved = 0,
+            .first_model_layer = window.first_model_layer,
             .expert_count_entries = static_cast<std::uint64_t>(
                 window.expert_counts.size()),
             .source_expert_count_entries = static_cast<std::uint64_t>(
@@ -627,7 +634,7 @@ namespace llaminar2
         writeLittleEndian(destination, offset, header.num_experts);
         writeLittleEndian(
             destination, offset, header.production_source_count);
-        writeLittleEndian(destination, offset, header.reserved);
+        writeLittleEndian(destination, offset, header.first_model_layer);
         writeLittleEndian(
             destination, offset, header.expert_count_entries);
         writeLittleEndian(
@@ -667,9 +674,11 @@ namespace llaminar2
         int expected_experts,
         DecodeExpertHistogramWindow *window,
         std::string *error,
-        const ExpertHistogramTransactionConfig *transactions)
+        const ExpertHistogramTransactionConfig *transactions,
+        int expected_first_model_layer)
     {
-        if (!window || expected_layers <= 0 || expected_experts <= 0)
+        if (!window || expected_layers <= 0 || expected_experts <= 0 || expected_first_model_layer < 0 ||
+            expected_layers > std::numeric_limits<int>::max() - expected_first_model_layer)
         {
             setError(
                 error,
@@ -681,6 +690,7 @@ namespace llaminar2
         window->token_count = 0;
         window->source_token_counts.fill(0);
         window->num_layers = 0;
+        window->first_model_layer = 0;
         window->num_experts = 0;
         window->expert_counts.clear();
         window->source_expert_counts.clear();
@@ -713,8 +723,8 @@ namespace llaminar2
             readLittleEndian<std::int32_t>(packet, offset);
         header.production_source_count =
             readLittleEndian<std::uint32_t>(packet, offset);
-        header.reserved =
-            readLittleEndian<std::uint32_t>(packet, offset);
+        header.first_model_layer =
+            readLittleEndian<std::int32_t>(packet, offset);
         header.expert_count_entries =
             readLittleEndian<std::uint64_t>(packet, offset);
         header.source_expert_count_entries =
@@ -722,7 +732,8 @@ namespace llaminar2
         header.counts_fingerprint =
             readLittleEndian<std::uint64_t>(packet, offset);
         header.transaction_bytes = readLittleEndian<uint64_t>(packet, offset);
-        if (!header.valid() || header.num_layers != expected_layers ||
+        if (!header.valid() || header.first_model_layer != expected_first_model_layer ||
+            header.num_layers != expected_layers ||
             header.num_experts != expected_experts)
         {
             setError(
@@ -741,6 +752,7 @@ namespace llaminar2
         window->token_count = header.token_count;
         for (auto &count : window->source_token_counts)
             count = readLittleEndian<std::uint64_t>(packet, offset);
+        window->first_model_layer = header.first_model_layer;
         window->num_layers = header.num_layers;
         window->num_experts = header.num_experts;
         window->expert_counts.resize(
@@ -1062,9 +1074,12 @@ namespace llaminar2
         int expected_experts,
         MoEOverlayDistributedResidencyProposal *proposal,
         std::string *error,
-        const ExpertHistogramTransactionConfig *transactions)
+        const ExpertHistogramTransactionConfig *transactions,
+        int expected_first_model_layer)
     {
-        if (!proposal || expected_layers <= 0 || expected_experts <= 0)
+        if (!proposal || expected_layers <= 0 || expected_experts <= 0 ||
+            expected_first_model_layer < 0 ||
+            expected_layers > std::numeric_limits<int>::max() - expected_first_model_layer)
         {
             setError(
                 error,
@@ -1133,7 +1148,7 @@ namespace llaminar2
                 expected_layers,
                 expected_experts,
                 histogram.get(),
-                error, transactions))
+                error, transactions, expected_first_model_layer))
         {
             return false;
         }

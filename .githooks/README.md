@@ -5,7 +5,7 @@ The tracked hooks in this directory are used directly through Git's
 
 ## Pre-commit
 
-Every branch runs exactly the same two suites, in order:
+Every branch requires the same two complete suites, in order:
 
 1. The full `^V2_Unit_` CTest namespace.
 2. The full `^ProductionTestPreflight$` CTest label.
@@ -18,6 +18,18 @@ and `v2_production_test_preflight_gate`, whose dependencies derive from the
 canonical CMake test registrations. Script-only tests need no executable build;
 shared fixtures are built once. Build and test parallelism is unrestricted,
 with CTest retaining the registered resource locks and timeouts.
+
+Set `LLAMINAR_PRECOMMIT_BUILD_DIR` to select an existing Integration build
+without losing its pinned compiler and dependency configuration. The default
+remains `build_v2_integration`. After a complete canonical prerequisite run,
+`LLAMINAR_PRECOMMIT_PREREQUISITES` may name its `prerequisites.json` receipt.
+The hook still configures and builds both gate targets, then uses the shared
+validator to authenticate the unchanged build and complete test inventory.
+A rebuilt target, changed registration, failed receipt or mismatched build
+blocks the commit. Source-file and directory timestamps also reject later
+changes to interpreted tests and policies that do not trigger compilation.
+Explicit receipt reuse never starts another test mode or
+refreshes the old evidence timestamp.
 
 Configuration, compilation, missing tests, or test failures block the commit
 immediately and leave the underlying diagnostics visible. The hook does not
@@ -68,5 +80,7 @@ git commit --no-verify -m 'WIP: checkpoint'
 Hook command selection and failure propagation are covered by
 `V2_Unit_PreCommitHook`, using command recorders without running real builds,
 models, accelerators, or modifying Git registration. Compiler-metadata
-regeneration is also registered in `ProductionTestPreflight` as
-`V2_Integration_PreCommitCompilerMetadata`.
+regeneration, build selection and receipt freshness are also registered in
+`ProductionTestPreflight` as `V2_Integration_PreCommitCompilerMetadata`,
+`V2_Integration_PreCommitSelectedBuild` and
+`V2_Integration_ProductionPrerequisiteReuse`.

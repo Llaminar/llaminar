@@ -58,7 +58,7 @@ from llep_verifier_perf_policy import (  # noqa: E402
 from mtp_device_generation_perf_policy import (  # noqa: E402
     _terminal_vocabulary_family_error,
     validate_cuda_dynamic_mtp_device_generation_policy,
-    validate_rocm_host_scheduled_mtp_device_generation_policy,
+    validate_host_scheduled_mtp_device_generation_policy,
 )
 from request_input_lifetime_perf_policy import (  # noqa: E402
     validate_request_input_lifetime_policy,
@@ -88,6 +88,16 @@ def counter(
     return record
 
 
+def native_movement_record(device: str = "ROCm:0") -> dict:
+    """One bounded witness of coherent copied/applied/completed physical work."""
+    return counter("device_rebalance_completed_movement_observations", domain="moe_rebalance",
+                   device=device, tags={"source": "maintenance_status"}) | {
+        "kind": "counter", "rank": 0, "phase": "decode", "count": 1,
+        "sequence_word_count": 4, "sequence_minimum_words": [2, 1, 1, 3277312],
+        "sequence_maximum_words": [2, 1, 1, 3277312],
+        "sequence_digest_lo": 123, "sequence_digest_hi": 456}
+
+
 def host_movement_records() -> list[dict]:
     """One published wave with bounded, independently authored ordering proof."""
     scope = {"rank": 0, "device": "priority0/priority1", "phase": "maintenance"}
@@ -99,14 +109,6 @@ def host_movement_records() -> list[dict]:
                     value=4096, tags=tags) | scope,
             *[counter(name, domain="moe_overlay_residency", tags=tags) | scope | sequence
               for name in ("placement_transport_publications", "placement_owner_publications")]]
-
-
-def device_overlay_movement_records() -> list[dict]:
-    """One completed all-GPU wave; unrelated rank/transaction rows cannot join."""
-    scope = {"rank": 0, "device": "priority0/priority1", "phase": "maintenance"}
-    tags = {"transaction": "3", "candidate_epoch": "4", "policy_owner": "device"}
-    return [counter(name, domain="moe_overlay_controller", tags=tags) | scope
-            for name in ("dynamic_movement_transactions", "dynamic_migration_edges", "dynamic_physical_bytes")]
 
 
 def device_generation_ticket_tags() -> dict[str, str]:
@@ -215,9 +217,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                   counter("depth_policy_windows", domain="mtp")]
         host = [counter("draft_steps", domain="mtp"), *host_movement_records()]
         native = [counter("device_generation_terminal_attempted_draft_tokens", domain="mtp"),
-                  counter("device_rebalance_request_copied_payload_lower_bound", domain="moe_rebalance"),
-                  counter("device_rebalance_request_applied_payload_lower_bound", domain="moe_rebalance"),
-                  counter("device_rebalance_request_useful_payload_bytes_lower_bound", domain="moe_rebalance")]
+                  native_movement_record()]
         for backend, completed in (("cpu", host), ("cuda", native), ("rocm", native)):
             with self.subTest(backend=backend):
                 records = [record | {"device": backend + ":0"} for record in common + completed]
@@ -275,72 +275,86 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertIsNotNone(validate_runtime_feature_policy(records + [records[-1]], RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
 
     def test_runtime_features_native_movement_survives_empty_final_wave(self) -> None:
-        """Terminal scratch reuse must not erase a qualified physical commit."""
+        """One coherent proof survives reuse; unrelated partial totals never join."""
         names = ("device_rebalance_request_copied_payload_lower_bound",
                  "device_rebalance_request_applied_payload_lower_bound",
                  "device_rebalance_request_useful_payload_bytes_lower_bound")
         for backend in ("CUDA", "ROCm"):
-            records = [counter(name, domain="moe_rebalance", device=f"{backend}:0",
-                               value=value, tags={"launch_count": "384"}) |
-                       {"rank": 0, "phase": "decode"}
-                       for name, value in zip(names, (2, 1, 3277312))]
+            record = native_movement_record(f"{backend}:0")
             scratch = counter("device_rebalance_transfer_useful_payload_bytes",
                               domain="moe_rebalance", value=0)
             with self.subTest(backend=backend):
-                self.assertIsNone(validate_runtime_feature_policy(records + [scratch], RuntimeFeaturePolicy(),
+                self.assertIsNone(validate_runtime_feature_policy([record, scratch], RuntimeFeaturePolicy(),
                                   MovementEvidence.REQUIRED))
-                self.assertIn("static", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
+                self.assertIn("static", validate_runtime_feature_policy([record], RuntimeFeaturePolicy(),
                               MovementEvidence.FORBIDDEN) or "")
-                for omitted in range(3):
-                    partial = records[:omitted] + records[omitted + 1:]
-                    self.assertIn("committed physical", validate_runtime_feature_policy(
-                        partial, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED) or "")
-                # Pairing a copy from one participant/request with another's
-                # apply can fabricate a transaction that never completed.
-                for field, value in (("device", f"{backend}:1"), ("rank", 1),
-                                     ("phase", "prefill"),
-                                     ("tags", {"launch_count": "768"})):
-                    mismatched = [records[0] | {field: value}, *records[1:]]
-                    self.assertIn("committed physical", validate_runtime_feature_policy(
-                        mismatched, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED) or "")
-                for invalid in (0, -1, float("nan"), float("inf"), "invalid"):
-                    incomplete = [records[0] | {"value": invalid}, *records[1:]]
-                    self.assertIn("committed physical", validate_runtime_feature_policy(
-                        incomplete, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED) or "")
+                # Independent partial publications can have positive aggregate
+                # totals, but only their owner may attest a joint completion.
+                partial = [counter(name, domain="moe_rebalance", value=1,
+                                   device=f"{backend}:{index % 2}") for index, name in enumerate(names)]
+                self.assertIn("committed physical", validate_runtime_feature_policy(
+                    partial, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED) or "")
+                for mutation in ({"sequence_minimum_words": [0, 1, 1, 3277312]},
+                                 {"sequence_minimum_words": [1, 0, 1, 3277312]},
+                                 {"sequence_minimum_words": [2, 1, 0, 3277312]},
+                                 {"sequence_minimum_words": [2, 1, 1, 0]},
+                                 {"sequence_maximum_words": [2, 1, 2, 3277312]},
+                                 {"sequence_word_count": 3}, {"sequence_word_count": True},
+                                 {"count": 2}, {"value": True}, {"value": float("nan")},
+                                 {"sequence_digest_lo": None}, {"sequence_digest_hi": -1},
+                                 {"sequence_minimum_words": [2, True, 1, 3277312]},
+                                 {"sequence_maximum_words": [2, 1, 1, 1 << 64]},
+                                 {"sequence_minimum_words": []}):
+                    with self.subTest(mutation=mutation):
+                        self.assertIsNotNone(validate_runtime_feature_policy(
+                            partial + [record | mutation], RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
+                # A valid neighbor cannot hide a corrupt publication.
+                self.assertIsNotNone(validate_runtime_feature_policy(
+                    [record, record | {"device": f"{backend}:1", "sequence_word_count": 3}],
+                    RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
 
     def test_runtime_features_certify_device_overlay_commits_symmetrically(self) -> None:
-        """The sole overlay authority emits a completed transaction/edge/byte trio."""
-        for backend in ("cuda", "rocm"):
-            records = [record | {"device": backend + ":0"} for record in device_overlay_movement_records()]
+        """The sole overlay authority retains exact bounded completion receipts."""
+        from test_generation_movement_ledger import controller_transport, ledger
+        for backend in ("CUDA", "ROCm"):
+            journal = ledger()
+            for edge in journal["edges"]:
+                edge["source_device"] = f'{backend}:{edge["source_participant"]}'
+                edge["destination_device"] = f'{backend}:{edge["destination_participant"]}'
+            records, terminal = controller_transport(journal)
             with self.subTest(backend=backend):
                 self.assertIsNone(validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
-                    MovementEvidence.REQUIRED))
+                    MovementEvidence.REQUIRED, terminal_movement=terminal))
                 self.assertIn("static", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
-                    MovementEvidence.FORBIDDEN) or "")
+                    MovementEvidence.FORBIDDEN, terminal_movement=terminal) or "")
                 for omitted in range(len(records)):
                     partial = records[:omitted] + records[omitted + 1:]
-                    self.assertIn("committed physical", validate_runtime_feature_policy(
-                        partial, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED) or "")
+                    self.assertIn("completed transport", validate_runtime_feature_policy(
+                        partial, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED, terminal_movement=terminal) or "")
 
     def test_device_overlay_completion_cannot_join_unrelated_transactions_or_ranks(self) -> None:
         """Global positive totals cannot fabricate one completed transaction."""
-        records = device_overlay_movement_records()
+        from test_generation_movement_ledger import controller_transport, ledger
+        records, terminal = controller_transport(ledger())
+        self.assertIsNone(validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
+            MovementEvidence.REQUIRED, terminal_movement=terminal))
         for field, value in (("rank", 1), ("device", "another-domain"), ("phase", "prefill")):
             with self.subTest(field=field):
                 self.assertIsNotNone(validate_runtime_feature_policy(
-                    [records[0] | {field: value}, *records[1:]], RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
+                    [records[0] | {field: value}, *records[1:]], RuntimeFeaturePolicy(), MovementEvidence.REQUIRED,
+                    terminal_movement=terminal))
         for field, value in (("transaction", "4"), ("candidate_epoch", "5"), ("policy_owner", "host")):
             with self.subTest(field=field):
                 self.assertIsNotNone(validate_runtime_feature_policy(
                     [records[0] | {"tags": records[0]["tags"] | {field: value}}, *records[1:]],
-                    RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
+                    RuntimeFeaturePolicy(), MovementEvidence.REQUIRED, terminal_movement=terminal))
 
     def test_runtime_features_reject_device_overlay_proposals(self) -> None:
         """Submitted commands and prepared arrivals cannot certify a commit."""
         records = [counter(name, domain="moe_overlay_controller") for name in
                    ("dynamic_movement_commands", "prepared_arrival_descriptor_publications",
                     "physical_wave_parallel_operations_started")]
-        self.assertIn("committed physical", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
+        self.assertIn("completed transport", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
             MovementEvidence.REQUIRED) or "")
 
     def test_runtime_features_reject_proposals_and_unapplied_payloads(self) -> None:
@@ -1219,19 +1233,16 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         )
         self.assertIn("terminal depth ledger", result.error or "")
 
-    def test_rocm_dynamic_mtp_policy_accepts_authenticated_host_dispatch(
-        self,
-    ) -> None:
-        """HIP host scheduling exposes decisions while state stays on device."""
-
-        device = "ROCm:0"
-        records = [
+    @staticmethod
+    def hosted_mtp_records(device: str = "ROCm:0") -> list[dict]:
+        """One complete stochastic ticket/controller ledger for either GPU ABI."""
+        return [
             counter(
                 "device_generation_loop_graph_materializations",
                 domain="mtp",
                 device=device,
                 tags={
-                    "backend": "HIP",
+                    "backend": "CUDA" if device.startswith("CUDA:") else "HIP",
                     "depth_policy": "dynamic",
                     "execution":
                         "hosted_captured_transactions_with_ticket_only_dispatch",
@@ -1262,7 +1273,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 domain="mtp",
                 device=device,
                 tags={
-                    "backend": "HIP",
+                    "backend": "CUDA" if device.startswith("CUDA:") else "HIP",
                     "execution": "hosted_ticket_selected_captured_transactions",
                     "conditional_fragments": "0",
                     "fragments": "12",
@@ -1292,12 +1303,13 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 domain="mtp",
                 device=device,
                 tags={
-                    "transaction": "1",
                     "next_depth": "3",
                     "complete": "false",
                     "maintenance_due": "false",
                 },
-            ),
+            ) | {"kind": "counter", "count": 3, "sequence_word_count": 3,
+                 "sequence_minimum_words": [1], "sequence_maximum_words": [3],
+                 "sequence_digest_lo": 123, "sequence_digest_hi": 456},
             counter(
                 "hosted_device_generation_transaction_submissions",
                 value=2,
@@ -1373,23 +1385,205 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             ),
         ]
 
-        result = validate_rocm_host_scheduled_mtp_device_generation_policy(
-            records,
+
+    def test_rocm_dynamic_mtp_policy_accepts_authenticated_host_dispatch(
+        self,
+    ) -> None:
+        """HIP host scheduling exposes decisions while state stays on device."""
+
+        device = "ROCm:0"
+        records = self.hosted_mtp_records(device)
+
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            records, device_kinds=frozenset({"rocm"}),
             expected_minimum_depth=3,
             expected_maximum_depth=3,
         )
         self.assertIsNone(result.error)
         self.assertEqual(result.devices, (device,))
 
+        # TP coordinates the loop above the individual participant launch API.
+        # Each participant's authenticated terminal frontier must nevertheless
+        # publish its own launch evidence; a rank-only aggregate cannot certify it.
+        participants = records + [record | {"device": "ROCm:1"}
+                                  for record in records if record.get("device") == device]
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            participants, device_kinds=frozenset({"rocm"}), expected_minimum_depth=3, expected_maximum_depth=3)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.devices, (device, "ROCm:1"))
+        missing = [record for record in participants
+                   if not (record.get("device") == "ROCm:1"
+                           and record.get("name") == "device_generation_loop_graph_launches")]
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            missing, device_kinds=frozenset({"rocm"}), expected_minimum_depth=3, expected_maximum_depth=3)
+        self.assertIn("never launched", result.error or "")
+        self.assertIn("ROCm:1", result.error or "")
+
+        missing_selection = [record for record in participants
+                             if not (record.get("device") == "ROCm:1"
+                                     and record.get("name") == "device_generation_execution_policy_selections")]
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            missing_selection, device_kinds=frozenset({"rocm"}), expected_minimum_depth=3, expected_maximum_depth=3)
+        self.assertIn("before the first draft", result.error or "")
+        self.assertIn("ROCm:1", result.error or "")
+
         records[4] = records[4] | {
             "tags": (records[4].get("tags") or {}) | {"bytes": "64"}
         }
-        result = validate_rocm_host_scheduled_mtp_device_generation_policy(
-            records,
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            records, device_kinds=frozenset({"rocm"}),
             expected_minimum_depth=3,
             expected_maximum_depth=3,
         )
         self.assertIn("scheduler ticket boundary", result.error or "")
+
+    def test_hosted_mtp_transaction_ranges_reject_incomplete_evidence(self) -> None:
+        """Bounded ticket evidence must prove every positive 64-bit observation."""
+        valid = {"sequence_minimum_words": [(1 << 31) - 3],
+                 "sequence_maximum_words": [(1 << 31) - 1]}
+        mutations = [
+            {"sequence_minimum_words": [0]},
+            {"sequence_minimum_words": [-1]},
+            {"sequence_minimum_words": [True]},
+            {"sequence_maximum_words": [1 << 64]},
+            {"sequence_maximum_words": [(1 << 64) - 1]},
+            {"sequence_maximum_words": [1 << 31]},
+            {"sequence_maximum_words": [2]},
+            {"sequence_minimum_words": []},
+            {"sequence_minimum_words": [1, 2]},
+            {"sequence_maximum_words": None},
+            {"sequence_word_count": 2},
+            {"sequence_word_count": True},
+            {"sequence_word_count": 3.0},
+            {"count": 3.0},
+            {"count": 0},
+            {"value": True},
+            {"value": 4},
+            {"sequence_digest_hi": None},
+            {"sequence_digest_lo": -1},
+            {"kind": "ordered_sequence"},
+        ]
+        for device in ("ROCm:0", "CUDA:0"):
+            for mutation in [None, *mutations, "legacy_key", "missing_ranges"]:
+                with self.subTest(device=device, mutation=mutation):
+                    records = (self.hosted_mtp_records(device) if device.startswith("ROCm")
+                               else self.hybrid_hosted_mtp_records())
+                    ticket = next(row for row in records if row.get("device") == device
+                                  and row["name"] == "device_generation_dispatch_tickets_observed")
+                    ticket.update(valid)
+                    if mutation == "legacy_key":
+                        ticket["tags"]["transaction"] = "1"
+                    elif mutation == "missing_ranges":
+                        del ticket["sequence_minimum_words"]
+                    elif mutation is not None:
+                        ticket.update(mutation)
+                    result = validate_host_scheduled_mtp_device_generation_policy(
+                        records, device_kinds=frozenset({"cuda", "rocm"}),
+                        expected_minimum_depth=3, expected_maximum_depth=3)
+                    if mutation is None:
+                        self.assertIsNone(result.error)
+                    else:
+                        self.assertIn("unauthenticated scheduler", result.error or "")
+
+    def test_hybrid_cuda_terminal_mtp_accepts_authenticated_boundary(self) -> None:
+        """A CUDA PP tail needs captured ticket dispatch across the ROCm boundary."""
+        records = self.hybrid_hosted_mtp_records()
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            records, device_kinds=frozenset({"cuda", "rocm"}),
+            expected_minimum_depth=3, expected_maximum_depth=3)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.devices, ("CUDA:0", "CUDA:1"))
+
+    @classmethod
+    def hybrid_hosted_mtp_records(cls, tail: str = "CUDA", rank: int | None = None) -> list[dict]:
+        """Two native TP domains; only the two terminal members own MTP ledgers."""
+        first = "ROCm" if tail == "CUDA" else "CUDA"
+        records = cls.pipeline_boundary_records(tail.lower() + ":0")[:4]
+        for row in records[:2]:
+            row["tags"] = row["tags"] | {"native_segments": "2", "host_segments": "0"}
+        records[1]["value"] = 2
+        for kind in (first, tail):
+            for index in range(2):
+                device = f"{kind}:{index}"
+                records += cls.pipeline_boundary_records(device.lower())[4:]
+                if kind == tail:
+                    records += cls.hosted_mtp_records(device)
+        for row in records:
+            row.pop("rank", None)
+            if rank is not None:
+                row["rank"] = rank
+        return records
+
+    def test_hybrid_hosted_mtp_preserves_backend_depth_and_rank_contracts(self) -> None:
+        """Both vendor orders and pinned/adaptive ranges retain exact ledgers."""
+        for tail in ("CUDA", "ROCm"):
+            for minimum in (1, 3):
+                with self.subTest(tail=tail, minimum=minimum):
+                    records = self.hybrid_hosted_mtp_records(tail)
+                    for row in records:
+                        if "minimum_draft_depth" in row.get("tags", {}):
+                            row["tags"]["minimum_draft_depth"] = str(minimum)
+                    result = validate_host_scheduled_mtp_device_generation_policy(
+                        records, device_kinds=frozenset({"cuda", "rocm"}),
+                        expected_minimum_depth=minimum, expected_maximum_depth=3)
+                    self.assertIsNone(result.error)
+                    self.assertEqual(result.devices, (tail + ":0", tail + ":1"))
+        records = self.hybrid_hosted_mtp_records(rank=0) + self.hybrid_hosted_mtp_records(rank=1)
+        # Warmup is service-owned; rank 1 must not manufacture its own copy.
+        records = [row for row in records if not (row.get("rank") == 1
+            and row["name"] == "dynamic_device_generation_capacity_capture_transactions")]
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            records, device_kinds=frozenset({"cuda", "rocm"}),
+            expected_minimum_depth=3, expected_maximum_depth=3)
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.devices), 4)
+
+    def test_hybrid_hosted_mtp_rejects_borrowed_or_incomplete_evidence(self) -> None:
+        """A neighboring graph, rank, vendor or controller cannot fill a hole."""
+        mutations = {
+            "missing_boundary": lambda rows: rows.__setitem__(slice(None), [
+                row for row in rows if row.get("device") != "pipeline_coordinator"]),
+            "wrong_rank_boundary": lambda rows: [row.update(rank=1) for row in rows
+                if row.get("device") == "pipeline_coordinator"],
+            "missing_boundary_replay": lambda rows: rows.pop(3),
+            "wrong_owner_graph": lambda rows: [row.update(device="cuda:2") for row in rows
+                if row.get("domain") == "forward_graph" and row.get("device") == "cuda:1"],
+            "missing_participant_launch": lambda rows: rows.__setitem__(slice(None), [
+                row for row in rows if not (row.get("device") == "CUDA:1"
+                    and row["name"] == "device_generation_loop_graph_launches")]),
+            "wrong_rank_launch": lambda rows: [row.update(rank=1) for row in rows
+                if row.get("device") == "CUDA:1"
+                    and row["name"] == "device_generation_loop_graph_launches"],
+            "wrong_backend": lambda rows: [row["tags"].update(backend="HIP") for row in rows
+                if row.get("device") == "CUDA:1" and "backend" in row.get("tags", {})],
+            "wrong_ticket_abi": lambda rows: [row["tags"].update(bytes="64") for row in rows
+                if row["name"] == "device_generation_dispatch_ticket_d2h_submissions"],
+            "stale_ticket_ledger": lambda rows: [row.update(value=2) for row in rows
+                if row.get("device") == "CUDA:1"
+                    and row["name"] == "device_generation_dispatch_tickets_observed"],
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                records = self.hybrid_hosted_mtp_records(rank=0)
+                mutate(records)
+                result = validate_host_scheduled_mtp_device_generation_policy(
+                    records, device_kinds=frozenset({"cuda", "rocm"}),
+                    expected_minimum_depth=3, expected_maximum_depth=3)
+                self.assertIsNotNone(result.error)
+        records = self.hybrid_hosted_mtp_records()
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            records, device_kinds=frozenset({"cuda"}),
+            expected_minimum_depth=3, expected_maximum_depth=3)
+        self.assertIn("heterogeneous execution boundary", result.error or "")
+        # Having complete valid ledgers on another rank cannot repair a hole.
+        records = self.hybrid_hosted_mtp_records(rank=0) + self.hybrid_hosted_mtp_records(rank=1)
+        records = [row for row in records if not (row.get("rank") == 0
+            and row["name"] == "device_generation_loop_graph_launches")]
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            records, device_kinds=frozenset({"cuda", "rocm"}),
+            expected_minimum_depth=3, expected_maximum_depth=3)
+        self.assertIn("rank=0", result.error or "")
+        self.assertIn("never launched", result.error or "")
 
     def test_llep_verifier_policy_rejects_prefill_assignment_bleed(self) -> None:
         """Least-loaded current-batch assignment is never a verifier policy."""
@@ -1760,7 +1954,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             '"FAIL: stochastic GPU MTP entered the retired request-batched "',
             'get("sampling_mode") == "stochastic"',
             '"hosted_captured_transactions_with_ticket_only_dispatch"',
-            'validate_rocm_host_scheduled_mtp_device_generation_policy',
+            'validate_host_scheduled_mtp_device_generation_policy',
             '"device_generation_terminal_compact_outcome_reductions"',
             '"captured_stochastic_compact_outcome"',
             '"stochastic_serial_equivalent_host_verifier_rows"',
@@ -2420,9 +2614,9 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                                  generation_phase: str = "decode") -> list[dict]:
         """Reduce a real sparse-overlay server artifact without fabricating TP.
 
-        The coordinator emits one frozen rank plan and one retirement per
-        sequence; many sequences may share one command. GPU parents separately
-        prove physical capture and launches.
+        The coordinator emits one frozen rank plan, bounded retirement families
+        and one complete owner sequence. GPU parents separately prove physical
+        capture and launches.
         Exercise CPU/GPU and mixed-vendor GPU boundaries using the same schema.
         """
         total = native + host
@@ -2439,10 +2633,16 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             groups = 3 if phase == "mtp" else 1
             rows.append(dict(counter("segmented_replay_segments", value=total * groups,
                 device="continuation_rank", tags=identity | {
-                    "command": str(command), "sequence": str(command),
                     "draft_depth": "2" if phase == "mtp" else "0",
                     "graph_groups": str(groups), "plan_segments": str(total),
-                    "terminal": "sparse_return_retired"}), rank=rank, phase=phase))
+                    "terminal": "sparse_return_retired"}), count=1, rank=rank, phase=phase,
+                    sequence_word_count=2, sequence_digest_lo=11, sequence_digest_hi=29,
+                    sequence_minimum_words=[command, command], sequence_maximum_words=[command, command]))
+        rows.append(dict(counter("segmented_retirement_sequence", value=2,
+            device="continuation_rank", tags=identity | {"terminal": "sparse_return_retired"}),
+            count=2, rank=rank, phase="inference", sequence_word_count=4,
+            sequence_digest_lo=31, sequence_digest_hi=47,
+            sequence_minimum_words=[1, 1], sequence_maximum_words=[2, 2]))
         for offset in range(native):
             participant = device if offset == 0 else ("rocm:0" if device == "cuda:0" else "cuda:0")
             child = cls.retained_parent_records(participant, rank + offset)
@@ -2484,11 +2684,21 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             lambda r: r[3]["tags"].update(command="0"),
             lambda r: r[3]["tags"].update(sequence="1"),
             lambda r: r[3]["tags"].update(sequence="0"),
-            lambda r: r[3]["tags"].pop("sequence"),
+            lambda r: r[3].pop("sequence_minimum_words"),
             lambda r: r[3].update(count=2, value=4),
             lambda r: r[3]["tags"].update(graph_groups="0"),
             lambda r: r[3]["tags"].update(draft_depth="2"),
             lambda r: r[3]["tags"].update(scope="unrelated"),
+            lambda r: r.pop(4), lambda r: r.append(copy.deepcopy(r[4])),
+            lambda r: r[4].update(value=1), lambda r: r[4].update(phase="decode"),
+            lambda r: r[4].update(sequence_word_count=2),
+            lambda r: r[4].update(sequence_maximum_words=[2, 3]),
+            lambda r: r[3].update(sequence_minimum_words=[2, 0]),
+            lambda r: r[3].update(sequence_minimum_words=[True, 2]),
+            lambda r: r[3].update(sequence_maximum_words=[2, 1 << 64]),
+            lambda r: r[3].update(sequence_digest_lo="11"),
+            lambda r: r[3].pop("sequence_digest_hi"),
+            lambda r: r[3].update(sequence_minimum_words=[1, 1], sequence_maximum_words=[1, 1]),
         )
         for index, mutate in enumerate(mutations):
             with self.subTest(index=index):
@@ -2502,9 +2712,9 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
     def test_overlay_boundary_distinguishes_many_sequences_in_one_command(self) -> None:
         """Four-row prefill and ticketed MTP retire sequences, not commands.
 
-        The failing server artifact coalesced 54 prefill returns because its
-        counter omitted the already authoritative sequence ID. Require that ID
-        for every return; accepting a multiplied count would hide duplicates.
+        Fifty-four returns aggregate into one bounded family while the complete
+        owner span retains every retired sequence. Duplicating an aggregate or
+        multiplying a count without its identity witness still fails.
         """
         for device in ("cuda:0", "rocm:0"):
             for phase in ("prefill", "decode", "mtp"):
@@ -2512,17 +2722,30 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     rows = self.overlay_boundary_records(
                         device, generation_phase="mtp" if phase == "mtp" else "decode")
                     original = rows[2 if phase == "prefill" else 3]
-                    for sequence in range(3, 56):
-                        additional = copy.deepcopy(original)
-                        additional["tags"]["sequence"] = str(sequence)
-                        rows.append(additional)
+                    original.update(count=54, value=original["value"] * 54,
+                                    sequence_word_count=108)
+                    original["sequence_maximum_words"][1] = 55
+                    rows[4].update(count=55, value=55, sequence_word_count=110,
+                                   sequence_maximum_words=[2, 55])
                     self.assertIsNone(validate_graph_capture_policy(rows, frozenset({device.split(":")[0], "cpu"})).error)
-                    # Distinct commands cannot recycle a sequence either.
-                    duplicate = copy.deepcopy(rows[-1])
+                    # The collector emits only one aggregate per stable family.
+                    duplicate = copy.deepcopy(original)
                     duplicate["tags"]["command"] = "99"
                     rows.append(duplicate)
                     self.assertIn("Incomplete ExpertOverlay", validate_graph_capture_policy(
                         rows, frozenset({device.split(":")[0], "cpu"})).error or "")
+
+    def test_overlay_retirement_preserves_exact_large_ids_across_measurement_reset(self) -> None:
+        """A reset may start mid-lifetime; uint64 IDs never pass through floats."""
+        rows = self.overlay_boundary_records()
+        offset = (1 << 54) + 3
+        for row in rows[2:5]:
+            for key in ("sequence_minimum_words", "sequence_maximum_words"):
+                row[key] = [word + offset for word in row[key]]
+        self.assertIsNone(validate_graph_capture_policy(rows, frozenset({'cuda', 'cpu'})).error)
+        rows[4]["sequence_maximum_words"][1] += 1
+        self.assertIn("Incomplete ExpertOverlay", validate_graph_capture_policy(
+            rows, frozenset({'cuda', 'cpu'})).error or "")
 
     def test_overlay_boundary_keeps_native_executable_and_topology_obligations(self) -> None:
         """A retired command cannot certify missing GPU execution or eager work."""
@@ -3046,6 +3269,139 @@ class TestRankedPerfArtifacts(unittest.TestCase):
     def test_single_rank_is_the_same_collection_protocol(self) -> None:
         self.write_rank(0, size=1, authority=0)
         self.assertEqual(collect_ranked_perf_stats(self.output)["world_size"], 1)
+
+    def test_terminal_movement_sidecars_keep_exact_ranked_metadata(self) -> None:
+        """Physical receipts are separate from counters and never parsed as rank names."""
+        expected = []
+        for rank in range(2):
+            path = self.write_rank(rank)
+            value = {"schema": 1, "scope": "terminal_model_lifetime", "rank": rank,
+                     "movement": {"edges": [{"transaction": 2**54 + rank}]},
+                     "device_publications": [{"physical_payload_bytes": 2**54 + rank + 1}]}
+            path.with_name(path.name + ".movement.json").write_text(json.dumps(value))
+            expected.append(value)
+        data = collect_and_publish_ranked_perf_stats(self.output)
+        self.assertEqual(data["terminal_movement"], expected)
+        self.assertEqual(len(data["records"]), 2)
+        self.assertEqual(json.loads(self.output.read_text())["terminal_movement"], expected)
+
+    def test_terminal_movement_requires_complete_and_matching_rank_ownership(self) -> None:
+        """Partial, forged and foreign sidecars cannot borrow a valid communicator."""
+        paths = [self.write_rank(rank) for rank in range(2)]
+        valid = {"schema": 1, "scope": "terminal_model_lifetime", "rank": 0,
+                 "movement": {}, "device_publications": []}
+        sidecar = paths[0].with_name(paths[0].name + ".movement.json")
+        sidecar.write_text(json.dumps(valid))
+        with self.assertRaisesRegex(ValueError, "missing or foreign rank"):
+            collect_ranked_perf_stats(self.output)
+        second = paths[1].with_name(paths[1].name + ".movement.json")
+        second.write_text(json.dumps(dict(valid, rank=1)))
+        for field, bad in (("rank", 1), ("rank", True), ("schema", True), ("schema", 2),
+                           ("scope", "request"), ("movement", []), ("device_publications", {})):
+            with self.subTest(field=field, bad=bad):
+                sidecar.write_text(json.dumps(dict(valid, **{field: bad})))
+                with self.assertRaisesRegex(ValueError, "invalid terminal movement"):
+                    collect_ranked_perf_stats(self.output)
+        sidecar.write_text(json.dumps(valid))
+        self.assertEqual(len(collect_ranked_perf_stats(self.output)["terminal_movement"]), 2)
+        foreign = sidecar.with_name("cell.perfstats.rank-9.json.movement.json")
+        foreign.write_text(json.dumps(dict(valid, rank=9)))
+        with self.assertRaisesRegex(ValueError, "missing or foreign rank"):
+            collect_ranked_perf_stats(self.output)
+
+    @staticmethod
+    def pipeline_terminal(rank: int, width: int, backends: tuple[str, str]) -> dict:
+        """Mirror the production stage envelope without inventing movement proofs.
+
+        These intentionally small journals test collection and exact metadata
+        preservation. The movement observer separately validates physical cycles
+        and joins their transport witnesses after rank provenance is attached.
+        """
+        return {"schema": 2, "scope": "terminal_model_lifetime", "rank": rank,
+                "stages": [{
+                    "identity": {"stage_index": stage, "first_layer": stage * 20,
+                                 "main_last_layer": (stage + 1) * 20,
+                                 "routed_last_layer": (stage + 1) * 20 + stage,
+                                 "terminal": stage == 1,
+                                 "participants": [f"localhost:{rank}:{backend}:{device}"
+                                                  for device in range(width)]},
+                    "transport": {"schema": 1, "scope": "terminal_model_lifetime",
+                                  "movement": {"edges": [{"transaction": 2**54 + stage}]},
+                                  "device_publications": [{"physical_payload_bytes": 2**54 + stage + 1}]}}
+                    for stage, backend in enumerate(backends)]}
+
+    def test_pipeline_terminal_movement_preserves_every_rank_and_stage(self) -> None:
+        """Four/eight-device mixed pipelines retain independent large identities."""
+        for width in (2, 4):
+            for backends in (("rocm", "cuda"), ("cuda", "rocm")):
+                with self.subTest(width=width, backends=backends):
+                    expected, originals = [], []
+                    for rank in range(2):
+                        path = self.write_rank(rank)
+                        sidecar = path.with_name(path.name + ".movement.json")
+                        value = self.pipeline_terminal(rank, width, backends)
+                        sidecar.write_text(json.dumps(value))
+                        expected.append(value)
+                        originals.append((sidecar, sidecar.read_bytes()))
+                    data = collect_and_publish_ranked_perf_stats(self.output)
+                    self.assertEqual(data["terminal_movement"], expected)
+                    self.assertEqual(json.loads(self.output.read_text())["terminal_movement"], expected)
+                    self.assertEqual(len(data["records"]), 2)
+                    for sidecar, raw in originals:
+                        self.assertEqual(sidecar.read_bytes(), raw)
+
+    def test_pipeline_terminal_movement_rejects_incomplete_or_foreign_scopes(self) -> None:
+        """Malformed stage metadata cannot publish over an existing aggregate."""
+        path = self.write_rank(0, size=1, authority=0)
+        sidecar = path.with_name(path.name + ".movement.json")
+        valid = self.pipeline_terminal(0, 2, ("rocm", "cuda"))
+        corruptions = [
+            (("rank",), 1), (("rank",), True), (("schema",), True),
+            (("schema",), 1), (("scope",), "request"), (("stages",), []),
+            (("movement",), {}), (("device_publications",), []),
+            (("stages", 0, "identity", "stage_index"), 1),
+            (("stages", 1, "identity", "first_layer"), 19),
+            (("stages", 0, "identity", "routed_last_layer"), 21),
+            (("stages", 0, "identity", "terminal"), True),
+            (("stages", 1, "identity", "terminal"), False),
+            (("stages", 1, "identity", "participants"), []),
+            (("stages", 1, "identity", "participants"), ["foreign"]),
+            (("stages", 1, "identity", "participants"), ["host:cuda:0", "host:cuda:0"]),
+            (("stages", 1, "transport", "rank"), 0),
+            (("stages", 1, "transport", "schema"), 2),
+            (("stages", 1, "transport", "scope"), "request"),
+            (("stages", 1, "transport", "stages"), []),
+            (("stages", 1, "transport", "movement"), []),
+            (("stages", 1, "transport", "device_publications"), {}),
+        ]
+        previous = '{"previous":"complete evidence"}\n'
+        self.output.write_text(previous)
+        for coordinate, bad in corruptions:
+            with self.subTest(coordinate=coordinate, bad=bad):
+                value = copy.deepcopy(valid)
+                parent = value
+                for key in coordinate[:-1]:
+                    parent = parent[key]
+                parent[coordinate[-1]] = bad
+                sidecar.write_text(json.dumps(value))
+                with self.assertRaisesRegex(ValueError, "invalid terminal movement"):
+                    collect_and_publish_ranked_perf_stats(self.output)
+                self.assertEqual(self.output.read_text(), previous)
+
+    def test_pipeline_terminal_movement_requires_complete_rank_membership(self) -> None:
+        """A valid pipeline sidecar cannot stand in for a missing peer rank."""
+        paths = [self.write_rank(rank) for rank in range(2)]
+        sidecar = paths[0].with_name(paths[0].name + ".movement.json")
+        sidecar.write_text(json.dumps(self.pipeline_terminal(0, 2, ("rocm", "cuda"))))
+        with self.assertRaisesRegex(ValueError, "missing or foreign rank"):
+            collect_ranked_perf_stats(self.output)
+        paths[1].with_name(paths[1].name + ".movement.json").write_text(
+            json.dumps(self.pipeline_terminal(1, 2, ("rocm", "cuda"))))
+        self.assertEqual(len(collect_ranked_perf_stats(self.output)["terminal_movement"]), 2)
+        sidecar.with_name("cell.perfstats.rank-9.json.movement.json").write_text(
+            json.dumps(self.pipeline_terminal(9, 2, ("rocm", "cuda"))))
+        with self.assertRaisesRegex(ValueError, "missing or foreign rank"):
+            collect_ranked_perf_stats(self.output)
 
     def test_publication_and_validation_share_one_parse_per_rank(self) -> None:
         """Preserve all rows and raw bytes while returning the published owner."""

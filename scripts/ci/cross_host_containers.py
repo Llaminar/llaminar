@@ -5,6 +5,8 @@ MPI bootstrap runs inside the controller image. Its SSH agent starts each
 remote MPI daemon inside that same image, so the daemon and inference child
 share libraries, process environment, and local rendezvous files. This module
 does not create an MPI job, choose a topology, or replace Llaminar's bootstrap.
+Each host's container owns private shared memory and process identities, so
+unrelated jobs cannot alias the recursive mutexes used by GPU dependencies.
 It also runs as the small copied launcher inside these temporary containers;
 those roles use the standard library only and never import repository code.
 """
@@ -337,7 +339,7 @@ def container_fleet(*, image: str, hosts: list[dict], key: Path, workspace: Path
                          f"llaminar@{peer['public_ip']}:{peer['directory']}/mpi.conf"])
                 mounts = ["--mount", f"type=bind,src={peer['directory']},dst={CASE_ROOT}",
                           "--mount", "type=bind,src=/opt/llaminar-models,dst=/opt/llaminar-models,readonly"]
-                options = ["--user", "0:0", "--network", "host", "--ipc", "host",
+                options = ["--user", "0:0", "--network", "host", *docker_paths.container_namespace_args(),
                            "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_NICE"]
             command(["docker", "create", "--name", name, "--label", f"llaminar.remote-owner={identity}",
                      *options, *mounts, "-e", f"OMPI_MCA_mca_base_param_files={CASE_ROOT}/mpi.conf",

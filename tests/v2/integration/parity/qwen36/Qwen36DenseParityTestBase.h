@@ -3540,6 +3540,8 @@ namespace llaminar2::test::parity::qwen36
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
+        config.mtp_activation_policy = enable_mtp
+            ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled;
         config.mtp.draft_tokens = mtp_draft_tokens;
         config.mtp.depth_policy = depth_policy;
 
@@ -5280,6 +5282,8 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        // This device-level fixture consumes resolved runtime policy; automatic
+        // activation intent belongs only to OrchestrationConfig admission.
         config.mtp.enabled = false;
 
         auto runner = createInferenceRunner(
@@ -6410,6 +6414,8 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        // This device-level fixture consumes resolved runtime policy; automatic
+        // activation intent belongs only to OrchestrationConfig admission.
         config.mtp.enabled = false;
 
         auto runner = createInferenceRunner(
@@ -6553,6 +6559,7 @@ namespace llaminar2::test::parity::qwen36
             config.force_graph = true;
             config.activation_precision = ActivationPrecision::FP32;
             config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+            // The device runner receives the already-resolved MTP choice.
             config.mtp.enabled = enable_mtp;
             config.mtp.draft_tokens = 1;
             return config;

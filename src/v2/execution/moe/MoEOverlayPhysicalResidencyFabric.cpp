@@ -7,6 +7,8 @@
  * down. Every independent operation reserves its own lane before the first
  * poll, so the worker submits the complete wave without software queueing or
  * runtime stream/staging allocation.
+ * Completed lifecycle diagnostics fold epoch identities into bounded evidence;
+ * an indefinitely reused fabric cannot accumulate one statistics key per wave.
  */
 
 #include "MoEOverlayPhysicalResidencyFabric.h"
@@ -21,6 +23,7 @@
 #include "MoEOverlayGpuRemoteProjectionEndpoint.h"
 #include "MoEOverlayMPIRemoteProjectionTransport.h"
 #include "MoEOverlayPreparedWeightSource.h"
+#include "MoEPhysicalResidencyPerfStats.h"
 #include "loaders/ModelLoader.h"
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
@@ -108,10 +111,15 @@ namespace llaminar2
                         participant->device,
                         static_cast<int>(bank.layers.size()),
                         static_cast<int>(
-                            bank.layers.front().resident_mask.size())))
+                            bank.layers.front().resident_mask.size()),
+                        bank.first_model_layer))
                 {
                     return false;
                 }
+                canonical_owner_map.requireLayerGeometry(
+                    static_cast<int>(bank.layers.size()),
+                    static_cast<int>(bank.layers.front().resident_mask.size()),
+                    bank.first_model_layer);
                 for (std::size_t previous = 0;
                      previous < bank_index;
                      ++previous)
@@ -134,7 +142,7 @@ namespace llaminar2
                          ++expert)
                     {
                         const auto *owner = canonical_owner_map.ownerFor(
-                            static_cast<int>(layer),
+                            bank.first_model_layer + static_cast<int>(layer),
                             static_cast<int>(expert));
                         if (!owner ||
                             resident_mask[expert] !=
@@ -159,12 +167,14 @@ namespace llaminar2
     buildMoEOverlayLayerWeightManifestFromGGUF(
         const GGUFModel &model,
         int num_layers,
-        int num_experts)
+        int num_experts,
+        int first_model_layer)
     {
-        if (num_layers <= 0 || num_experts <= 0)
+        if (num_layers <= 0 || num_experts <= 0 || first_model_layer < 0 ||
+            num_layers > std::numeric_limits<int>::max() - first_model_layer)
         {
             throw std::invalid_argument(
-                "ExpertOverlay GGUF weight manifest requires positive model geometry");
+                "ExpertOverlay GGUF weight manifest requires positive model geometry and a valid owned layer interval");
         }
 
         const auto source_format = [](GGUFTensorType type)
@@ -243,7 +253,8 @@ namespace llaminar2
 
         std::vector<MoEOverlayLayerWeightManifest> result;
         result.reserve(static_cast<std::size_t>(num_layers));
-        for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx)
+        for (int layer_idx = first_model_layer;
+             layer_idx < first_model_layer + num_layers; ++layer_idx)
         {
             MoEOverlayLayerWeightManifest layer;
             layer.layer_idx = layer_idx;
@@ -3551,6 +3562,20 @@ namespace llaminar2
             std::vector<MoEOverlayDeviceInitialPhysicalSlot>
                 initial_device_slots;
 
+            const auto &ownership = config.initial_snapshot->layered_ownership;
+            if (!config.layer_weight_manifest.empty())
+            {
+                if (config.layer_weight_manifest.size() !=
+                    static_cast<std::size_t>(ownership.layerCount()))
+                    throw std::invalid_argument(
+                        "ExpertOverlay layer weight manifest does not cover the owned stage");
+                for (std::size_t row = 0; row < config.layer_weight_manifest.size(); ++row)
+                    if (config.layer_weight_manifest[row].layer_idx !=
+                        ownership.firstModelLayer() + static_cast<int>(row))
+                        throw std::invalid_argument(
+                            "ExpertOverlay layer weight manifest belongs to another stage");
+            }
+
             /*
              * Distributed setup may publish the model contract before this
              * process has any local source for a layer.  Install those entries
@@ -3590,19 +3615,25 @@ namespace llaminar2
                                             config.initial_snapshot->epoch)
                                       : MoEOverlayParticipantBankLease{};
                 if (!endpoint || !participant || !bank ||
-                    bank->device != endpoint->device())
+                    bank->device != endpoint->device() ||
+                    endpoint->firstModelLayer() != ownership.firstModelLayer() ||
+                    endpoint->numLayers() != ownership.layerCount() ||
+                    endpoint->numExperts() != ownership.expertCount() ||
+                    !bank->valid(participant_id, endpoint->device(),
+                                 endpoint->numLayers(), endpoint->numExperts(),
+                                 endpoint->firstModelLayer()))
                 {
                     throw std::runtime_error(
-                        "ExpertOverlay physical fabric requires every local initial bank");
+                        "ExpertOverlay physical fabric requires every local initial bank with matching stage geometry");
                 }
                 initial_banks.emplace(participant_id, bank);
 
-                for (int layer_idx = 0;
-                     layer_idx < endpoint->numLayers();
+                for (int layer_idx = endpoint->firstModelLayer();
+                     layer_idx < endpoint->endModelLayer();
                      ++layer_idx)
                 {
                     const auto &layer =
-                        bank->layers[static_cast<std::size_t>(layer_idx)];
+                        bank->layerForModelLayer(layer_idx);
                     for (std::size_t expert = 0;
                          expert < layer.experts.size();
                          ++expert)
@@ -3658,6 +3689,12 @@ namespace llaminar2
                         .initial_epoch = config.initial_snapshot->epoch,
                         .local_participant_ids = local_ids,
                         .initial_slots = std::move(initial_device_slots),
+                        .first_model_layer =
+                            config.initial_snapshot->layered_ownership.firstModelLayer(),
+                        .num_layers = static_cast<std::uint32_t>(
+                            config.initial_snapshot->layered_ownership.layerCount()),
+                        .num_experts = static_cast<std::uint32_t>(
+                            config.initial_snapshot->layered_ownership.expertCount()),
                     });
 
             /*
@@ -3691,7 +3728,8 @@ namespace llaminar2
 
                 std::map<ExpertGeometryKey, std::vector<int>>
                     layers_by_geometry;
-                for (int layer_idx = 0; layer_idx < endpoint->numLayers();
+                for (int layer_idx = endpoint->firstModelLayer();
+                     layer_idx < endpoint->endModelLayer();
                      ++layer_idx)
                 {
                     const auto signatures = requireLayerSignatures(
@@ -3731,8 +3769,7 @@ namespace llaminar2
                     for (const int layer_idx : layer_indices)
                     {
                         const auto &initial_layer =
-                            bank_found->second->layers[
-                                static_cast<std::size_t>(layer_idx)];
+                            bank_found->second->layerForModelLayer(layer_idx);
                         auto layer_slots = makeAdoptedInitialSlots(
                             initial_layer,
                             layer_idx,
@@ -5285,9 +5322,7 @@ namespace llaminar2
                                                 expected_epoch)
                                           : MoEOverlayParticipantBankLease{};
                         if (!source_endpoint || !source_bank ||
-                            migration.layer_idx < 0 ||
-                            migration.layer_idx >=
-                                source_endpoint->numLayers() ||
+                            !source_bank->containsModelLayer(migration.layer_idx) ||
                             migration.expert_id < 0 ||
                             migration.expert_id >=
                                 source_endpoint->numExperts())
@@ -5295,11 +5330,8 @@ namespace llaminar2
                             throw std::runtime_error(
                                 "ExpertOverlay physical fabric cannot acquire the exact local source epoch");
                         }
-                        source_payload = &source_bank
-                                              ->layers[static_cast<std::size_t>(
-                                                  migration.layer_idx)]
-                                              .experts[static_cast<std::size_t>(
-                                                  migration.expert_id)];
+                        source_payload = &source_bank->layerForModelLayer(migration.layer_idx)
+                                              .experts[static_cast<std::size_t>(migration.expert_id)];
                     }
                     if (!source_payload->complete())
                     {
@@ -6403,16 +6435,9 @@ namespace llaminar2
             {
                 return false;
             }
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                "device_physical_destinations_staged",
-                static_cast<double>(batch.migrations.size()),
-                "maintenance",
-                config_.perf_device,
-                {{"transaction", std::to_string(batch.transaction_id)},
-                 {"base_epoch", std::to_string(batch.base_epoch)},
-                 {"candidate_epoch",
-                  std::to_string(batch.candidate_epoch)}});
+            recordMoEPhysicalWave(MoEPhysicalWaveEvent::DestinationsStaged,
+                batch.transaction_id, batch.base_epoch, batch.candidate_epoch,
+                batch.migrations.size(), config_.perf_device);
             return true;
         }
         catch (const std::exception &exception)
@@ -6442,14 +6467,9 @@ namespace llaminar2
                     "ExpertOverlay device physical publication lost its slot ledger";
             return false;
         }
-        PerfStatsCollector::addCounter(
-            "moe_overlay_residency",
-            "device_physical_epoch_published",
-            1.0,
-            "maintenance",
-            config_.perf_device,
-            {{"transaction", std::to_string(batch.transaction_id)},
-             {"candidate_epoch", std::to_string(batch.candidate_epoch)}});
+        recordMoEPhysicalWave(MoEPhysicalWaveEvent::EpochPublished,
+            batch.transaction_id, batch.base_epoch, batch.candidate_epoch,
+            0, config_.perf_device);
         return true;
     }
 
@@ -6475,14 +6495,9 @@ namespace llaminar2
          * method exit. Neither path synchronizes a device or inference stream.
          */
         retirePreviousSources(batch.base_epoch, batch.migrations);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_residency",
-            "device_physical_sources_retired",
-            static_cast<double>(retired.size()),
-            "maintenance",
-            config_.perf_device,
-            {{"transaction", std::to_string(batch.transaction_id)},
-             {"retired_epoch", std::to_string(batch.base_epoch)}});
+        recordMoEPhysicalWave(MoEPhysicalWaveEvent::SourcesRetired,
+            batch.transaction_id, batch.base_epoch, batch.candidate_epoch,
+            retired.size(), config_.perf_device);
         return true;
     }
 
@@ -6498,13 +6513,9 @@ namespace llaminar2
                     "ExpertOverlay device physical abort lost its slot ledger";
             return false;
         }
-        PerfStatsCollector::addCounter(
-            "moe_overlay_residency",
-            "device_physical_wave_aborted",
-            1.0,
-            "maintenance",
-            config_.perf_device,
-            {{"transaction", std::to_string(batch.transaction_id)}});
+        recordMoEPhysicalWave(MoEPhysicalWaveEvent::WaveAborted,
+            batch.transaction_id, batch.base_epoch, batch.candidate_epoch,
+            0, config_.perf_device);
         return true;
     }
 
@@ -6547,13 +6558,7 @@ namespace llaminar2
             return;
         impl_->adopted_initial_slots_recycled.fetch_add(
             recycled, std::memory_order_relaxed);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_residency",
-            "bootstrap_live_slots_recycled",
-            static_cast<double>(recycled),
-            "maintenance",
-            config_.perf_device,
-            {{"retired_epoch", std::to_string(retired_epoch)}});
+        recordMoEBootstrapSlotsRecycled(retired_epoch, recycled, config_.perf_device);
     }
 
     std::shared_ptr<MappedTransferProgressEpoch>
@@ -6689,7 +6694,8 @@ namespace llaminar2
                             participant_id,
                             endpoint->device(),
                             endpoint->numLayers(),
-                            endpoint->numExperts()))
+                            endpoint->numExperts(),
+                            endpoint->firstModelLayer()))
                     {
                         return fail(
                             "ExpertOverlay reusable-context seal cannot acquire participant " +
@@ -6739,6 +6745,7 @@ namespace llaminar2
                         .epoch = published_epoch,
                         .participant_id = participant_id,
                         .device = endpoint->device(),
+                        .first_model_layer = endpoint->firstModelLayer(),
                     };
                     bank.layers.resize(
                         static_cast<std::size_t>(endpoint->numLayers()));
@@ -6765,20 +6772,15 @@ namespace llaminar2
                             "ExpertOverlay device physical inventory contains a non-local participant slot");
                     }
                     auto &bank = result.local_banks.at(bank_index->second);
-                    if (slot.key.layer_idx < 0 ||
+                    if (!bank.containsModelLayer(slot.key.layer_idx) ||
                         slot.key.expert_id < 0 ||
-                        static_cast<std::size_t>(slot.key.layer_idx) >=
-                            bank.layers.size() ||
                         static_cast<std::size_t>(slot.key.expert_id) >=
-                            bank.layers.at(
-                                static_cast<std::size_t>(slot.key.layer_idx))
-                                .experts.size())
+                            bank.layerForModelLayer(slot.key.layer_idx).experts.size())
                     {
                         return fail(
                             "ExpertOverlay device physical inventory contains an out-of-range expert coordinate");
                     }
-                    auto &layer = bank.layers.at(
-                        static_cast<std::size_t>(slot.key.layer_idx));
+                    auto &layer = bank.layerForModelLayer(slot.key.layer_idx);
                     if (layer.resident_mask.at(
                             static_cast<std::size_t>(slot.key.expert_id)))
                     {
@@ -6818,17 +6820,17 @@ namespace llaminar2
                         participant_id,
                         endpoint->device(),
                         endpoint->numLayers(),
-                        endpoint->numExperts()))
+                        endpoint->numExperts(),
+                        endpoint->firstModelLayer()))
                 {
                     return fail(
                         "ExpertOverlay reusable-context seal materialized an incomplete local participant bank");
                 }
-                for (int layer_idx = 0;
-                     layer_idx < endpoint->numLayers();
+                for (int layer_idx = endpoint->firstModelLayer();
+                     layer_idx < endpoint->endModelLayer();
                      ++layer_idx)
                 {
-                    auto &layer = canonical.layers.at(
-                        static_cast<std::size_t>(layer_idx));
+                    auto &layer = canonical.layerForModelLayer(layer_idx);
                     const auto expected_mask =
                         config_.initial_snapshot->owner_map
                             .expertMaskForParticipant(
@@ -7027,12 +7029,11 @@ namespace llaminar2
                         "ExpertOverlay reusable-context seal lost a preflighted participant");
                 }
 
-                for (int layer_idx = 0;
-                     layer_idx < endpoint->numLayers();
+                for (int layer_idx = endpoint->firstModelLayer();
+                     layer_idx < endpoint->endModelLayer();
                      ++layer_idx)
                 {
-                    auto &layer = bank.layers.at(
-                        static_cast<std::size_t>(layer_idx));
+                    auto &layer = bank.layerForModelLayer(layer_idx);
                     auto &pool = requireEndpointPool(
                         *impl_, bank.participant_id, layer_idx);
                     if (!pool.geometry_pool ||
@@ -7268,7 +7269,8 @@ namespace llaminar2
                         bank.participant_id,
                         bank.device,
                         endpoint->numLayers(),
-                        endpoint->numExperts()))
+                        endpoint->numExperts(),
+                        endpoint->firstModelLayer()))
                 {
                     return fail(
                         "ExpertOverlay reusable-context seal produced an invalid canonical bank");
@@ -7282,21 +7284,10 @@ namespace llaminar2
             }
             impl_->cached_reusable_seal = std::move(result);
             impl_->reusable_seal_state = Impl::ReusableSealState::Sealed;
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                "reusable_context_physical_seals",
-                1.0,
-                "model_teardown",
-                config_.perf_device,
-                {{"epoch", std::to_string(published_epoch)},
-                 {"canonical_experts",
-                  std::to_string(
-                      impl_->cached_reusable_seal
-                          ->retained_canonical_experts)},
-                 {"compacted_shadow_experts",
-                  std::to_string(
-                      impl_->cached_reusable_seal
-                          ->compacted_shadow_experts)}});
+            recordMoEReusableContextSeal(published_epoch,
+                impl_->cached_reusable_seal->retained_canonical_experts,
+                impl_->cached_reusable_seal->compacted_shadow_experts,
+                config_.perf_device);
             return impl_->cached_reusable_seal;
         }
         catch (const std::exception &exception)

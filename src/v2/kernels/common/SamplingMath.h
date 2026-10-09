@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "DeviceGenerationInitialization.h"
 #include "execution/config/MTPDepthDefaults.h"
 #include "execution/mtp/MTPDepthLearnedPolicy.h"
 #include "utils/PrefillGraphBucketDefaults.h"
@@ -26,6 +27,51 @@
 
 namespace llaminar2::sampling_math
 {
+    /**
+     * @brief Apply the sign-aware repetition law before additive history penalties.
+     * @param value Original logit of a token present in the live history.
+     * @param repetition Positive finite request factor; one preserves neutral arithmetic.
+     * @param additive Combined presence, frequency and optional DRY adjustment.
+     * @return Adjusted logit; callers leave unseen tokens untouched.
+     */
+    LLAMINAR_SAMPLING_HD float penalizedLogit(float value, float repetition, float additive)
+    {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        // Sampling is a probability law. Keep round-to-nearest division and a
+        // distinct subtraction even when surrounding model kernels use fast math.
+        if (repetition != 1.0f)
+            value = value < 0.0f ? __fmul_rn(value, repetition) : __fdiv_rn(value, repetition);
+        return __fsub_rn(value, additive);
+#else
+        if (repetition != 1.0f)
+            value = value < 0.0f ? value * repetition : value / repetition;
+        return value - additive;
+#endif
+    }
+
+    /**
+     * @brief Packed prompt membership plus generated frequency in one arena word.
+     *
+     * Repetition observes the complete prompt and output; OpenAI presence and
+     * frequency observe output only. A reserved positive bit records immutable
+     * prompt membership without a second vocabulary allocation or live ledger.
+     * Generated counts occupy the lower 30 bits and retain the flag on increment.
+     */
+    struct TokenPenaltyHistory
+    {
+        static constexpr int32_t prompt_bit = int32_t{1} << 30;
+        static constexpr int32_t count_mask = prompt_bit - 1;
+        /** @return Generated frequency, excluding immutable prompt membership. */
+        LLAMINAR_SAMPLING_HD static int generatedCount(int32_t encoded) { return encoded & count_mask; }
+        /** @return Whether this token appeared in the admitted prompt. */
+        LLAMINAR_SAMPLING_HD static bool inPrompt(int32_t encoded) { return (encoded & prompt_bit) != 0; }
+        /** @return Whether increment preserves the count and membership fields. */
+        LLAMINAR_SAMPLING_HD static bool canIncrement(int32_t encoded)
+        { return encoded >= 0 && generatedCount(encoded) != count_mask; }
+        /** @return Encoded history with prompt membership set, preserving frequency. */
+        LLAMINAR_SAMPLING_HD static int32_t withPrompt(int32_t encoded) { return encoded | prompt_bit; }
+    };
+
     constexpr int kMaxTopK = 256;
 
     /**
@@ -715,7 +761,9 @@ namespace llaminar2::sampling_math
         kDeviceGenerationControlLearnedDepthVerifyMode = 49,
         /** Proof that generated rules, including holds, controlled live windows. */
         kDeviceGenerationControlLearnedDepthMatchedWindows = 50,
-        kDeviceGenerationControlCount = 51,
+        /** Immutable initial selector, authenticated across response windows. */
+        kDeviceGenerationControlInitialDraftDepth = 51,
+        kDeviceGenerationControlCount = 52,
     };
 
     /**
@@ -803,6 +851,8 @@ namespace llaminar2::sampling_math
         InvalidVerifierTransactionIdentity = 13,
         InvalidOrdinarySample = 14,
         InvalidOrdinaryTransition = 15,
+        InvalidContinuation = 16,
+        InvalidRequestSeed = 17, ///< A captured verifier consumed an unadmitted zero seed.
     };
 
     /**
@@ -910,6 +960,32 @@ namespace llaminar2::sampling_math
     static_assert(
         sizeof(DeviceGenerationDispatchTicket) ==
         DeviceGenerationDispatchTicket::kWireBytes);
+
+    /**
+     * @brief Compare every immutable depth-policy word with its admitted value.
+     * @param control Resident or terminal controller row; never null.
+     * @param policy Immutable request policy to authenticate.
+     * @return Whether continuation and terminal publication retain that policy.
+     */
+    LLAMINAR_SAMPLING_HD bool device_generation_policy_matches(
+        const int *control, const DeviceGenerationPolicy &policy)
+    {
+        return control[kDeviceGenerationControlDepthPolicyMode] == static_cast<int>(policy.mode) &&
+            control[kDeviceGenerationControlInitialDraftDepth] == policy.initial_depth &&
+            control[kDeviceGenerationControlMinimumDraftDepth] == policy.minimum_depth &&
+            control[kDeviceGenerationControlMaximumDraftDepth] == policy.maximum_depth &&
+            control[kDeviceGenerationControlDepthWindowSize] == policy.window_size &&
+            control[kDeviceGenerationControlDepthMinimumSamples] == policy.minimum_samples &&
+            control[kDeviceGenerationControlDepthCooldownSteps] == policy.cooldown_steps &&
+            control[kDeviceGenerationControlDepthPromoteConsecutiveWindows] == policy.promote_consecutive_windows &&
+            control[kDeviceGenerationControlDepthPromoteFullAcceptRatePPM] == policy.promote_full_accept_rate_ppm &&
+            control[kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM] == policy.demote_zero_accept_rate_ppm &&
+            control[kDeviceGenerationControlDepthDemoteAcceptanceRatePPM] == policy.demote_acceptance_rate_ppm &&
+            control[kDeviceGenerationControlLearnedDepthEnabled] == static_cast<int>(policy.learned.enabled) &&
+            control[kDeviceGenerationControlLearnedDepthBackend] == static_cast<int>(policy.learned.backend) &&
+            control[kDeviceGenerationControlLearnedDepthModelClass] == static_cast<int>(policy.learned.model_class) &&
+            control[kDeviceGenerationControlLearnedDepthVerifyMode] == static_cast<int>(policy.learned.verify_mode);
+    }
 
     /**
      * @brief Initialize the stable identity of a host-scheduling ticket.
@@ -1114,6 +1190,9 @@ namespace llaminar2::sampling_math
      * @param initial_leading_row_disposition Whether verifier row zero is a new
      *        response token or an already-emitted correction carried from the
      *        preceding controller.
+     * @param initialization Request identity and explicit fresh/continuation
+     *        boundary. A continuation preserves only device-owned learner state;
+     *        response and reporting counters restart for the next publication.
      * @return true when the initialized controller is valid.
      */
     LLAMINAR_SAMPLING_HD bool initialize_device_generation_control(
@@ -1123,15 +1202,51 @@ namespace llaminar2::sampling_math
         int *control,
         DeviceGenerationLeadingRowDisposition
             initial_leading_row_disposition =
-                DeviceGenerationLeadingRowDisposition::PendingResponse)
+                DeviceGenerationLeadingRowDisposition::PendingResponse,
+        const DeviceGenerationInitialization &initialization = {})
     {
         if (!control)
             return false;
 
+        const bool continuing = initialization.kind == DeviceGenerationAdmissionKind::ContinueResponse;
+        if (continuing)
+        {
+            if (max_new_tokens <= 0 || response_capacity <= 0 || max_new_tokens > response_capacity ||
+                !valid_device_generation_leading_row_disposition(initial_leading_row_disposition))
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidInitialization);
+            // Neither a new epoch nor an unfinished/EOS/failed controller may
+            // borrow adaptation from a previous response. Check before writes.
+            if (!initialization.valid() ||
+                !initialization.prior_tickets->matchesLifecycle(
+                    initialization.session_epoch, initialization.workspace_generation) ||
+                depth_policy.isForwardOnly() ||
+                control[kDeviceGenerationControlOk] != 1 ||
+                control[kDeviceGenerationControlRequestComplete] != 1 ||
+                control[kDeviceGenerationControlModelStopped] != 0 ||
+                control[kDeviceGenerationControlErrorCode] != static_cast<int>(DeviceGenerationError::None) ||
+                control[kDeviceGenerationControlRemainingTokenCount] != 0 ||
+                control[kDeviceGenerationControlTransactionCommitBudget] != 0 ||
+                control[kDeviceGenerationControlTransactionCount] <= 0)
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidContinuation);
+            if (!depth_policy.valid() || !device_generation_policy_matches(control, depth_policy) ||
+                control[kDeviceGenerationControlCurrentDraftDepth] < depth_policy.minimum_depth ||
+                control[kDeviceGenerationControlCurrentDraftDepth] > depth_policy.maximum_depth)
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+        }
         for (int i = 0; i < kDeviceGenerationControlCount; ++i)
-            control[i] = 0;
+        {
+            // Partial observations, cooldown, hysteresis and the current
+            // selector span response windows. Reporting counters do not: the
+            // terminal consumer adds each window exactly once to PerfStats.
+            const bool learner_word = i == kDeviceGenerationControlCurrentDraftDepth ||
+                i == kDeviceGenerationControlDepthLastRecommendedDepth ||
+                (i >= kDeviceGenerationControlDepthStepsSinceChange &&
+                 i <= kDeviceGenerationControlDepthWindowAcceptedPrefixSum);
+            if (!continuing || !learner_word)
+                control[i] = 0;
+        }
 
-        if (max_new_tokens < 0 ||
+        if (!initialization.valid() || max_new_tokens < 0 ||
             response_capacity <= 0 ||
             max_new_tokens > response_capacity)
         {
@@ -1158,13 +1273,17 @@ namespace llaminar2::sampling_math
 
         control[kDeviceGenerationControlOk] = 1;
         control[kDeviceGenerationControlRemainingTokenCount] = max_new_tokens;
+        // Explicit forced output may advance the logical-sequence mailbox
+        // between publications. Its admitted condition owns this boundary;
+        // the previous response's carry bit is not a second mailbox authority.
         control[kDeviceGenerationControlNextLeadingCommittedOutputCount] =
             initial_leading_committed_output_count;
-        control[kDeviceGenerationControlCurrentDraftDepth] =
-            depth_policy.initial_depth;
+        if (!continuing)
+            control[kDeviceGenerationControlCurrentDraftDepth] = depth_policy.initial_depth;
+        control[kDeviceGenerationControlInitialDraftDepth] = depth_policy.initial_depth;
         control[kDeviceGenerationControlActiveVerifierRowCount] =
             depth_policy.isOrdinary() || depth_policy.isForwardOnly()
-                ? 0 : depth_policy.initial_depth + 1;
+                ? 0 : control[kDeviceGenerationControlCurrentDraftDepth] + 1;
         control[kDeviceGenerationControlMinimumDraftDepth] =
             depth_policy.minimum_depth;
         control[kDeviceGenerationControlMaximumDraftDepth] =
@@ -1185,10 +1304,11 @@ namespace llaminar2::sampling_math
             depth_policy.demote_zero_accept_rate_ppm;
         control[kDeviceGenerationControlDepthDemoteAcceptanceRatePPM] =
             depth_policy.demote_acceptance_rate_ppm;
-        control[kDeviceGenerationControlDepthStepsSinceChange] =
-            depth_policy.cooldown_steps;
-        control[kDeviceGenerationControlDepthLastRecommendedDepth] =
-            depth_policy.initial_depth;
+        if (!continuing)
+        {
+            control[kDeviceGenerationControlDepthStepsSinceChange] = depth_policy.cooldown_steps;
+            control[kDeviceGenerationControlDepthLastRecommendedDepth] = depth_policy.initial_depth;
+        }
         control[kDeviceGenerationControlLearnedDepthEnabled] = depth_policy.learned.enabled ? 1 : 0;
         control[kDeviceGenerationControlLearnedDepthBackend] = static_cast<int>(depth_policy.learned.backend);
         control[kDeviceGenerationControlLearnedDepthModelClass] = static_cast<int>(depth_policy.learned.model_class);
@@ -1528,7 +1648,7 @@ namespace llaminar2::sampling_math
             return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinarySample);
         }
         int32_t *const count = history.counts + request * history.request_stride + sampled;
-        if (*count < 0 || *count == INT32_MAX)
+        if (!TokenPenaltyHistory::canIncrement(*count))
         {
             frontier.publication_ok_flags[request] = 0;
             return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinarySample);
@@ -1897,6 +2017,10 @@ namespace llaminar2::sampling_math
             compact_meta[kSpecBatchMetaAcceptedSpeculativePrefix];
         const int consumed_rows =
             compact_meta[kSpecBatchMetaConsumedVerifierRows];
+        const int live_depth =
+            control[kDeviceGenerationControlCurrentDraftDepth];
+        const int live_verifier_rows =
+            control[kDeviceGenerationControlActiveVerifierRowCount];
 
         if (output_count <= 0 || output_count > output_token_stride ||
             leading_count < 0 || leading_count > 1 ||
@@ -1913,8 +2037,13 @@ namespace llaminar2::sampling_math
                 DeviceGenerationError::LeadingCommittedRowMismatch);
         }
         if (verifier_state_count < 0 || verifier_state_count > output_count ||
-            accepted_prefix < 0 || consumed_rows < 0)
+            verifier_state_count > live_verifier_rows ||
+            accepted_prefix < 0 || accepted_prefix > live_depth ||
+            consumed_rows < 0 || consumed_rows > live_verifier_rows)
         {
+            // Validate before publishing any response bytes. Fixed policies and
+            // budget-limited transactions intentionally skip depth learning;
+            // that cannot make captured inactive capacity valid verifier work.
             return fail_device_generation_control(
                 control,
                 DeviceGenerationError::InvalidVerifierCounts);
@@ -2842,6 +2971,60 @@ namespace llaminar2::sampling_math
             out_meta[kSpecBatchMetaSampledTerminal] = 0;
             out_meta[kSpecBatchMetaCommitBoundaryClipped] = 1;
         }
+    }
+
+    /**
+     * @brief Reduce exactly the live verifier rows of a resident transaction.
+     *
+     * Captured comparison capacity is storage, not a semantic row count. A
+     * carried condition grants an extra response slot at a commit boundary,
+     * but never grants an extra draft beyond the device-selected depth. The
+     * producer places the bonus sample at that live depth in @p row_tokens;
+     * the separate capacity bonus is used only when the full capture is live.
+     *
+     * @param first_token Device-owned condition token for verifier row zero.
+     * @param row_tokens Target decisions followed by the live bonus sample.
+     * @param row_accepted Acceptance decisions, or null for greedy comparison.
+     * @param greedy_draft_tokens Draft row including its leading condition.
+     * @param comparison_capacity Number of retained comparison slots.
+     * @param stop_tokens Request stop-token inventory.
+     * @param stop_token_count Number of entries in the stop inventory.
+     * @param capacity_bonus_token Bonus at the full captured depth.
+     * @param has_bonus_token Whether the producer supplies a bonus sample.
+     * @param control Sole device-owned generation controller.
+     * @param out_tokens Compact output buffer.
+     * @param out_token_capacity Writable compact token extent.
+     * @param out_meta Canonical compact metadata row.
+     */
+    LLAMINAR_SAMPLING_HD void
+    summarize_speculative_verify_batch_device_generation_controls(
+        int first_token, const int *row_tokens, const int *row_accepted,
+        const int *greedy_draft_tokens, int comparison_capacity,
+        const int *stop_tokens, int stop_token_count,
+        const int *capacity_bonus_token, int has_bonus_token,
+        const int *control, int *out_tokens, int out_token_capacity,
+        int *out_meta)
+    {
+        const int depth = control
+            ? control[kDeviceGenerationControlCurrentDraftDepth] : 0;
+        if (!control || control[kDeviceGenerationControlOk] == 0 ||
+            depth <= 0 || depth > comparison_capacity ||
+            control[kDeviceGenerationControlActiveVerifierRowCount] != depth + 1 ||
+            !row_tokens || (has_bonus_token && !capacity_bonus_token))
+        {
+            initialize_invalid_speculative_batch_outcome(
+                out_tokens, out_token_capacity, out_meta);
+            return;
+        }
+        const int ready_token = has_bonus_token
+            ? (depth < comparison_capacity ? row_tokens[depth] : *capacity_bonus_token)
+            : -1;
+        summarize_speculative_verify_batch_at_commit_boundary(
+            first_token, row_tokens, row_accepted, depth,
+            stop_tokens, stop_token_count, ready_token, has_bonus_token,
+            control[kDeviceGenerationControlTransactionCommitBudget],
+            out_tokens, out_token_capacity, out_meta, greedy_draft_tokens,
+            control[kDeviceGenerationControlNextLeadingCommittedOutputCount]);
     }
 
     /**

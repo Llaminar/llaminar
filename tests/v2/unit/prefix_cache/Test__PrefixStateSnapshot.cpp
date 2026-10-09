@@ -6,6 +6,7 @@
  * record. Boundary planning never invents a rewind of recurrent model state.
  */
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -133,12 +134,70 @@ TEST(Test__PrefixStateSnapshot, HarvestScheduleSealsCanonicalFrontiers)
     hit.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
     const auto schedule = PrefixHarvestSchedule::forPrefill(hit, 365, 0, 96);
     EXPECT_EQ(schedule.promptTokens(), 365);
-    EXPECT_EQ(schedule.reusableCheckpoint(), 192);
-    EXPECT_FALSE(PrefixHarvestSchedule::forPrefill(hit, 365, 365).reusableCheckpoint());
-    EXPECT_FALSE(PrefixHarvestSchedule::forPrefill(hit, 365, 320).reusableCheckpoint());
+    EXPECT_EQ(schedule.reusableCheckpoints(), std::vector<int>({192}));
+    EXPECT_TRUE(PrefixHarvestSchedule::forPrefill(hit, 365, 365).reusableCheckpoints().empty());
+    EXPECT_TRUE(PrefixHarvestSchedule::forPrefill(hit, 365, 320).reusableCheckpoints().empty());
     EXPECT_THROW(PrefixHarvestSchedule::forPrefill(hit, 365, -1), std::invalid_argument);
     EXPECT_THROW(PrefixHarvestSchedule::forPrefill(hit, 365, 366), std::invalid_argument);
     EXPECT_THROW(PrefixHarvestSchedule::forPrefill(hit, 365, 0, -1), std::invalid_argument);
+}
+
+/** @test A rewritten history can restore an earlier state without linear snapshot growth. */
+TEST(Test__PrefixStateSnapshot, SparseCheckpointsPreserveLeadingHistoryWithinLogarithmicBound)
+{
+    PrefixLookupResult admission;
+    admission.supported = admission.cache_enabled = true;
+    admission.block_size = 64;
+    admission.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    const auto original = PrefixHarvestSchedule::forPrefill(admission, 234506, 0);
+    EXPECT_EQ(original.reusableCheckpoints(),
+        std::vector<int>({4096, 8192, 16384, 32768, 65536, 131072, 234496}));
+    // Observed history rewrite: the common leading tokens end before either
+    // old terminal archive. A sparse checkpoint is independently restorable.
+    const auto boundary = std::upper_bound(original.reusableCheckpoints().begin(),
+        original.reusableCheckpoints().end(), 6212);
+    ASSERT_NE(boundary, original.reusableCheckpoints().begin());
+    EXPECT_EQ(*std::prev(boundary), 4096);
+    const auto resumed = PrefixHarvestSchedule::forPrefill(admission, 20416, 4096);
+    EXPECT_EQ(resumed.reusableCheckpoints(), std::vector<int>({8192, 16384, 20352}));
+    const auto ordinary = PrefixHarvestSchedule::forPrefill(admission, 234571, 234506);
+    EXPECT_EQ(ordinary.reusableCheckpoints(), std::vector<int>({234560}))
+        << "Growing conversations must not rearchive earlier sparse checkpoints";
+    EXPECT_TRUE(PrefixHarvestSchedule::forPrefill(admission, 234506, 234506)
+                    .reusableCheckpoints().empty());
+    EXPECT_EQ(PrefixHarvestSchedule::forPrefill(admission, 4097, 0)
+                  .reusableCheckpoints(), std::vector<int>({4096}));
+    EXPECT_LE(PrefixHarvestSchedule::forPrefill(admission,
+        std::numeric_limits<int>::max(), 0).reusableCheckpoints().size(), 20u);
+}
+
+/** @test Ragged routing windows, large alignments and restored ranges share one safe schedule. */
+TEST(Test__PrefixStateSnapshot, SparseCheckpointsRespectEveryAlignmentAndRestoreBoundary)
+{
+    PrefixLookupResult admission;
+    admission.supported = admission.cache_enabled = true;
+    admission.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    for (const int block : {1, 3, 64, 257, 4097, 65537, std::numeric_limits<int>::max() - 1})
+        for (const int window : {0, 1, 96, 1024, 4097, std::numeric_limits<int>::max()})
+            for (const int prompt : {1, 64, 4096, 4097, 8192, 20416, 262144, std::numeric_limits<int>::max()})
+                for (const int restored : {0, prompt / 3, prompt - 1, prompt})
+                {
+                    admission.block_size = block;
+                    const auto schedule = PrefixHarvestSchedule::forPrefill(admission, prompt, restored, window);
+                    EXPECT_LE(schedule.reusableCheckpoints().size(), 20u);
+                    int previous = restored;
+                    for (const int frontier : schedule.reusableCheckpoints())
+                    {
+                        EXPECT_GT(frontier, previous);
+                        EXPECT_LT(frontier, prompt);
+                        EXPECT_EQ(frontier % block, 0);
+                        if (window > 0) EXPECT_EQ(frontier % window, 0);
+                        previous = frontier;
+                    }
+                }
+    admission.block_size = 64;
+    admission.checkpoint_policy = PrefixCheckpointPolicy::TerminalOnly;
+    EXPECT_TRUE(PrefixHarvestSchedule::forPrefill(admission, 262144, 0).reusableCheckpoints().empty());
 }
 
 /** @brief Disabled, unsupported, and attention-only caches retain one terminal harvest. */
@@ -173,6 +232,25 @@ TEST(Test__PrefixStateSnapshot, ClampedToRetainsEarlierCheckpointTerminalState)
     EXPECT_TRUE(clamped.has_terminal_hidden);
     EXPECT_TRUE(clamped.has_terminal_logits);
     EXPECT_EQ(clamped.checkpoint_policy, PrefixCheckpointPolicy::ReusableBoundary);
+}
+
+/** @test Terminal-only admission cannot be mistaken for a complete restore chain. */
+TEST(Test__PrefixStateSnapshot, HarvestAdmissionRejectsConsumedChainRestore)
+{
+    PrefixLookupResult lookup;
+    lookup.supported = lookup.cache_enabled = true;
+    lookup.block_size = 4;
+    lookup.cached_tokens = 8;
+    lookup.blocks.push_back(makeBlock(0, 0, 4, false, false, false, false));
+    lookup.blocks.push_back(makeBlock(1, 4, 4, false, false, false, true));
+    EXPECT_EQ(lookup.restoreBlocks().size(), 2u);
+    const auto harvest = lookup.forHarvest(8);
+    ASSERT_EQ(harvest.blocks.size(), 1u);
+    EXPECT_THROW(harvest.restoreBlocks(), std::logic_error);
+    EXPECT_THROW(harvest.clampedTo(8).restoreBlocks(), std::logic_error);
+    EXPECT_THROW(harvest.forHarvest(8).restoreBlocks(), std::logic_error);
+    EXPECT_THROW(lookup.forHarvest(0).restoreBlocks(), std::logic_error);
+    EXPECT_EQ(lookup.clampedTo(4).restoreBlocks().size(), 1u);
 }
 
 TEST(Test__PrefixStateSnapshot, ClampedToKeepsTerminalPartialBlock)

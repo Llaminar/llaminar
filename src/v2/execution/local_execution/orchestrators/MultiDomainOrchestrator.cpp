@@ -330,4 +330,9 @@ namespace llaminar2
         return info;
     }
 
+    PrefixCacheTelemetrySources MultiDomainOrchestrator::prefixCacheTelemetrySources() const
+    {
+        return inner_runner_ ? inner_runner_->prefixCacheTelemetrySources() : PrefixCacheTelemetrySources{};
+    }
+
 } // namespace llaminar2

@@ -965,10 +965,10 @@ namespace llaminar2::test::parity
         bool state_compared = false;
         bool state_equivalent = false;
         std::string state_detail;
-        uint64_t observed_moe_movement_epoch = 0;
-        uint64_t oracle_moe_movement_epoch = 0;
+        PrefixMovementEpochSnapshot observed_moe_movement_epoch;
+        PrefixMovementEpochSnapshot oracle_moe_movement_epoch;
         /// Placement epoch of the immutable seed used for exact prefix proof.
-        std::optional<uint64_t> cached_prefix_moe_movement_epoch;
+        std::optional<PrefixMovementEpochSnapshot> cached_prefix_moe_movement_epoch;
         MTPKVPayloadComparisonPolicy main_kv_policy =
             MTPKVPayloadComparisonPolicy::ExactBytes;
         MTPStateValidationResult::KVNumericalEvidence main_kv_numerical;
@@ -6928,7 +6928,7 @@ namespace llaminar2::test::parity
                         state.prefix_request.mtp_state_restored);
             };
 
-            std::optional<std::uint64_t> seed_movement_epoch;
+            std::optional<PrefixMovementEpochSnapshot> seed_movement_epoch;
             for (int admission = 0; admission < 2; ++admission)
             {
                 activeClearSnapshots();

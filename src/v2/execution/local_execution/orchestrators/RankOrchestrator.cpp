@@ -14,6 +14,12 @@
  * Diagnostic assembly obeys each immutable producer publication, including
  * complete values and explicit output-column partitions, instead of assuming
  * that a semantic checkpoint always retains its schema's historical layout.
+ * The main host logits output holds the terminal row only. Full-context KV
+ * capacity never determines output storage; verifier rows are a separate API.
+ * PP child construction authenticates stage-local expert ownership before
+ * materializing any child, preserving the authored TP-in-PP decomposition.
+ * The outer PP family owns the shared weight lifecycle: nested participants
+ * cannot release sources or publish graph completion for unfinished siblings.
  */
 
 #include "RankOrchestrator.h"
@@ -49,6 +55,7 @@
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../loaders/WeightManager.h"
 #include "../../../planning/CollectiveMemoryEstimator.h"
+#include "../../moe/MoEOverlayPipelineStageBinding.h"
 #include "../graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config access
 #include "../../../tensors/TensorClasses.h"
 #include "../../../tensors/TensorFactory.h"
@@ -677,290 +684,6 @@ namespace llaminar2
     // Config Implementation
     // =========================================================================
 
-    bool RankOrchestrator::PPStageConfig::validate() const
-    {
-        // Layer range must be valid
-        if (last_layer <= first_layer)
-        {
-            LOG_ERROR("PPStageConfig: Invalid layer range [" << first_layer << ", " << last_layer << ")");
-            return false;
-        }
-
-        // Must have at least one device
-        if (stage_devices.empty())
-        {
-            LOG_ERROR("PPStageConfig: No stage devices specified");
-            return false;
-        }
-
-        // If TP weights are provided, must match device count
-        if (!tp_weights.empty() && tp_weights.size() != stage_devices.size())
-        {
-            LOG_ERROR("PPStageConfig: TP weights count (" << tp_weights.size()
-                                                          << ") doesn't match device count (" << stage_devices.size() << ")");
-            return false;
-        }
-
-        // If TP weights are provided, must sum to approximately 1.0
-        if (!tp_weights.empty())
-        {
-            float sum = std::accumulate(tp_weights.begin(), tp_weights.end(), 0.0f);
-            if (std::abs(sum - 1.0f) > 0.01f)
-            {
-                LOG_ERROR("PPStageConfig: TP weights sum to " << sum << ", expected 1.0");
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    RankOrchestrator::ParallelismMode
-    RankOrchestrator::Config::detectMode() const
-    {
-        if (pp_stages.empty())
-        {
-            // No PP stages - pure TP mode
-            return ParallelismMode::TP;
-        }
-
-        // Check if any PP stage is a TP domain
-        bool has_tp_stages = std::any_of(pp_stages.begin(), pp_stages.end(),
-                                         [](const PPStageConfig &stage)
-                                         { return stage.isTPDomain(); });
-
-        return has_tp_stages ? ParallelismMode::TP_PP : ParallelismMode::PP;
-    }
-
-    std::vector<int> RankOrchestrator::Config::buildLayerBoundaries() const
-    {
-        std::vector<int> boundaries;
-        if (pp_stages.empty())
-        {
-            return boundaries;
-        }
-
-        boundaries.push_back(0);
-        for (const auto &stage : pp_stages)
-        {
-            boundaries.push_back(stage.last_layer);
-        }
-        return boundaries;
-    }
-
-    bool RankOrchestrator::Config::validate() const
-    {
-        ParallelismMode effective = effectiveMode();
-
-        if (prepared_weight_admission ==
-                PreparedWeightAdmission::ReuseCertifiedCompleteSet &&
-            !prepared_weight_store)
-        {
-            LOG_ERROR(
-                "RankOrchestrator::Config: certified prepared-weight reuse "
-                "requires the exact model-owned PreparedWeightStore");
-            return false;
-        }
-
-        if (effective == ParallelismMode::TP)
-        {
-            // TP mode validation
-            if (devices.empty())
-            {
-                LOG_ERROR("RankOrchestrator::Config: No devices specified for TP mode");
-                return false;
-            }
-
-            // If weights are provided, must match device count
-            if (!weights.empty() && weights.size() != devices.size())
-            {
-                LOG_ERROR("RankOrchestrator::Config: Weights count (" << weights.size()
-                                                                      << ") doesn't match device count (" << devices.size() << ")");
-                return false;
-            }
-
-            // If weights are provided, must sum to approximately 1.0
-            if (!weights.empty())
-            {
-                float sum = std::accumulate(weights.begin(), weights.end(), 0.0f);
-                if (std::abs(sum - 1.0f) > 0.01f)
-                {
-                    LOG_ERROR("RankOrchestrator::Config: Weights sum to " << sum << ", expected 1.0");
-                    return false;
-                }
-            }
-        }
-        else
-        {
-            // PP or TP_PP mode validation
-            if (pp_stages.empty())
-            {
-                LOG_ERROR("RankOrchestrator::Config: No PP stages specified for PP mode");
-                return false;
-            }
-
-            // Validate each stage
-            for (size_t i = 0; i < pp_stages.size(); ++i)
-            {
-                if (!pp_stages[i].validate())
-                {
-                    LOG_ERROR("RankOrchestrator::Config: PP stage " << i << " validation failed");
-                    return false;
-                }
-            }
-
-            // Check layer continuity (no gaps)
-            int expected_first = 0;
-            for (size_t i = 0; i < pp_stages.size(); ++i)
-            {
-                if (pp_stages[i].first_layer != expected_first)
-                {
-                    LOG_ERROR("RankOrchestrator::Config: PP stage " << i
-                                                                    << " first_layer=" << pp_stages[i].first_layer
-                                                                    << " but expected " << expected_first << " (gap in layers)");
-                    return false;
-                }
-                expected_first = pp_stages[i].last_layer;
-            }
-
-            // First stage should have embedding, last should have LM head
-            if (!pp_stages.front().has_embedding)
-            {
-                LOG_WARN("RankOrchestrator::Config: First PP stage doesn't have embedding flag set");
-            }
-            if (!pp_stages.back().has_lm_head)
-            {
-                LOG_WARN("RankOrchestrator::Config: Last PP stage doesn't have lm_head flag set");
-            }
-        }
-
-        return true;
-    }
-
-    std::vector<float> RankOrchestrator::Config::getNormalizedWeights() const
-    {
-        if (weights.empty() || weights.size() != devices.size())
-        {
-            // Equal distribution
-            float equal_weight = 1.0f / static_cast<float>(devices.size());
-            return std::vector<float>(devices.size(), equal_weight);
-        }
-
-        // Normalize to ensure sum is exactly 1.0
-        float sum = std::accumulate(weights.begin(), weights.end(), 0.0f);
-        if (sum <= 0.0f)
-        {
-            float equal_weight = 1.0f / static_cast<float>(devices.size());
-            return std::vector<float>(devices.size(), equal_weight);
-        }
-
-        std::vector<float> normalized(weights.size());
-        for (size_t i = 0; i < weights.size(); ++i)
-        {
-            normalized[i] = weights[i] / sum;
-        }
-        return normalized;
-    }
-
-    // =========================================================================
-    // Config::fromPlan — Canonical translation from RankExecutionPlan
-    // =========================================================================
-
-    RankOrchestrator::Config
-    RankOrchestrator::Config::fromRuntime(const RuntimeConfig &runtime)
-    {
-        Config config;
-
-        // Runtime fields from pre-parsed RuntimeConfig
-        config.max_seq_len = runtime.max_seq_len;
-        config.resident_graph_rows = runtime.resident_graph_rows;
-        config.batch_size = runtime.batch_size;
-        config.activation_precision = runtime.activation_precision;
-        config.kv_cache_precision = runtime.kv_cache_precision;
-        config.tp_allreduce_precision_override =
-            runtime.tp_allreduce_precision_override;
-        config.prefix_cache = runtime.prefix_cache;
-        config.mtp = runtime.mtp;
-        config.routed_expert_compute_policy = runtime.routed_expert_compute_policy;
-        config.routed_expert_owner_order =
-            runtime.routed_expert_owner_order;
-        config.moe_hot_expert_cache = runtime.moe_hot_expert_cache;
-        config.moe_routed_prefill = runtime.moe_routed_prefill;
-        config.moe_rebalance = runtime.moe_rebalance;
-
-        config.fused_attention_backend = runtime.fused_attention_backend;
-        config.kv_cache_scale_k = runtime.kv_cache_scale_k;
-        config.kv_cache_scale_v = runtime.kv_cache_scale_v;
-        return config;
-    }
-
-    RankOrchestrator::Config
-    RankOrchestrator::Config::fromPlan(const RankExecutionPlan &plan)
-    {
-        Config config = fromRuntime(plan.runtime);
-
-        if (plan.usesLocalPP())
-        {
-            // PP mode: build stage configs from plan boundaries
-            config.mode = ParallelismMode::PP;
-
-            const auto &pp_devices = plan.local_pp_devices;
-            const auto &boundaries = plan.local_pp_layer_boundaries;
-            const auto &stage_tp_info = plan.local_pp_stage_tp_info;
-
-            for (size_t i = 0; i < pp_devices.size(); ++i)
-            {
-                PPStageConfig stage_cfg;
-                stage_cfg.first_layer = boundaries[i];
-                stage_cfg.last_layer = boundaries[i + 1]; // exclusive
-                stage_cfg.has_embedding = (i == 0);
-                stage_cfg.has_lm_head = (i == pp_devices.size() - 1);
-
-                // Use per-stage TP info if available (TP-in-PP composition)
-                if (i < stage_tp_info.size() && stage_tp_info[i].devices.size() > 1)
-                {
-                    stage_cfg.stage_devices = stage_tp_info[i].devices;
-                    stage_cfg.tp_weights = stage_tp_info[i].tp_weights;
-                    stage_cfg.tp_backend = stage_tp_info[i].tp_backend;
-                }
-                else
-                {
-                    stage_cfg.stage_devices = {pp_devices[i]};
-                }
-
-                // Cross-vendor detection for host-staged hidden state transfer
-                // Compare primary devices of adjacent stages
-                auto primaryDeviceType = [&](size_t idx) -> DeviceType
-                {
-                    if (idx < stage_tp_info.size() && !stage_tp_info[idx].devices.empty())
-                        return stage_tp_info[idx].devices[0].device_type;
-                    if (idx < pp_devices.size())
-                        return pp_devices[idx].device_type;
-                    return DeviceType::CPU;
-                };
-                if (i + 1 < pp_devices.size() &&
-                    primaryDeviceType(i) != primaryDeviceType(i + 1))
-                {
-                    // Cross-vendor PP stage boundary detected
-                }
-
-                config.pp_stages.push_back(std::move(stage_cfg));
-            }
-        }
-        else
-        {
-            // TP mode: copy devices, weights, backend
-            config.devices = plan.local_tp_devices;
-            if (!plan.local_tp_weights.empty())
-            {
-                config.weights = plan.local_tp_weights;
-            }
-            config.backend = plan.local_tp_backend;
-        }
-
-        return config;
-    }
-
     // =========================================================================
     // Factory Methods
     // =========================================================================
@@ -1129,11 +852,9 @@ namespace llaminar2
             int vocab = vocab_size();
             if (vocab > 0)
             {
-                size_t max_tokens = static_cast<size_t>(config_.batch_size) *
-                                    static_cast<size_t>(config_.max_seq_len);
                 logits_gatherer_ = std::make_unique<LogitsGatherer>(
                     vocab,
-                    max_tokens,
+                    /*max_tokens=*/1,
                     logits_backend_resolver_);
 
                 if (device_runners_.size() > 1)
@@ -1713,28 +1434,14 @@ namespace llaminar2
             }
         }
 
-        // =====================================================================
-        // PRE-LOAD WEIGHTS FOR ALL DEVICES
-        // =====================================================================
-        // This is critical for multi-device operation:
-        // - Creates device-specific clones of shared tensors (embedding, norms)
-        // - Uploads each clone to its target device BEFORE parallel execution
-        // - Avoids race condition where multiple devices try to upload same tensor
-        //
-        // The WeightManager now handles all device-aware weight management centrally.
-        // =====================================================================
+        // Install one model-owned prepared store before participant graphs are
+        // built concurrently. Each factory materializes and prepares its frozen
+        // WeightPlan, whose main/MTP/overlay bindings are the admitted consumers.
+        // A broad tensor-directory preload would pack unused NextN blocks when
+        // MTP is disabled, and cannot express replicated sidecar/expert ownership.
+        // Per-device cache keys and immutable frozen bindings own tensor identity;
+        // preloading raw tensors is neither a race barrier nor an admission plan.
         {
-            // Collect device IDs for preloading
-            std::vector<DeviceId> device_ids;
-            device_ids.reserve(devices.size());
-            for (const auto &device_addr : devices)
-            {
-                device_ids.push_back(device_addr.toLocalDeviceId());
-            }
-
-            // Finalize weights for all devices: clone, upload, and prepare GEMM
-            // weights. Host data release is deferred until after device runners are
-            // created because graph construction resolves prepared weight bindings.
             auto weight_mgr = model_ctx_->weightManager();
             if (weight_mgr)
             {
@@ -1770,90 +1477,39 @@ namespace llaminar2
                         concrete_weight_mgr->setPreparedWeightStore(config_.prepared_weight_store);
                     }
                 }
-                if (config_.nested_pp_stage_config.has_value())
+                std::vector<DeviceId> device_ids;
+                for (const auto &device_addr : devices)
+                    device_ids.push_back(device_addr.toLocalDeviceId());
+                if (config_.prepared_weight_admission ==
+                    PreparedWeightAdmission::ReuseCertifiedCompleteSet)
                 {
-                    LOG_DEBUG("RankOrchestrator: Preloading weights for "
-                              << device_ids.size() << " nested TP-in-PP devices"
-                              << " (binding-driven preparation deferred to runner materialization)");
-                    if (!weight_mgr->preloadForDevices(device_ids))
+                    auto concrete_weight_mgr =
+                        std::dynamic_pointer_cast<WeightManager>(weight_mgr);
+                    if (!concrete_weight_mgr ||
+                        !config_.prepared_weight_store)
                     {
-                        LOG_WARN("RankOrchestrator: Weight preload failed; runner materialization may fail");
+                        throw std::runtime_error(
+                            "RankOrchestrator certified prepared-weight "
+                            "reuse lacks its concrete model authority");
                     }
-                }
-                else
-                {
-                    const bool include_expert_jobs =
-                        !(config_.moe_routed_expert_plan &&
-                          config_.moe_routed_expert_plan
-                              ->usesExpertOverlayAuthority());
-                    if (config_.prepared_weight_admission ==
-                        PreparedWeightAdmission::ReuseCertifiedCompleteSet)
+                    for (const DeviceId device : device_ids)
                     {
-                        auto concrete_weight_mgr =
-                            std::dynamic_pointer_cast<WeightManager>(weight_mgr);
-                        if (!concrete_weight_mgr ||
-                            !config_.prepared_weight_store)
+                        if (concrete_weight_mgr
+                                ->preparedRecordCountForDevice(device) == 0u)
                         {
                             throw std::runtime_error(
                                 "RankOrchestrator certified prepared-weight "
-                                "reuse lacks its concrete model authority");
-                        }
-                        for (const DeviceId device : device_ids)
-                        {
-                            if (concrete_weight_mgr
-                                    ->preparedRecordCountForDevice(device) == 0u)
-                            {
-                                throw std::runtime_error(
-                                    "RankOrchestrator certified prepared-weight "
-                                    "reuse has no records for " +
-                                    device.toString());
-                            }
-                        }
-
-                        /*
-                         * Non-GEMM device tensors live in WeightManager's
-                         * model-owned device cache rather than PreparedWeightStore.
-                         * Revisit that cache so a missing binding fails here,
-                         * while deliberately avoiding the broad GEMM pipeline
-                         * whose exact handles are already certified resident.
-                         */
-                        if (!weight_mgr->preloadForDevices(device_ids))
-                        {
-                            throw std::runtime_error(
-                                "RankOrchestrator failed to restore non-GEMM "
-                                "device bindings for certified weight reuse");
-                        }
-                        PerfStatsCollector::addCounter(
-                            "weight_loading",
-                            "rank_prepared_weight_materialization_reuses",
-                            1.0,
-                            "load",
-                            {},
-                            {{"devices", std::to_string(device_ids.size())}});
-                    }
-                    else
-                    {
-                        LOG_DEBUG("RankOrchestrator: Finalizing weights for "
-                                  << device_ids.size() << " devices"
-                                  << " (release_host_data=false, deferred until after graph build"
-                                  << ", include_expert_jobs=" << include_expert_jobs << ")");
-                        if (!weight_mgr->finalizeForDevices(
-                                device_ids,
-                                /*release_host_data=*/false,
-                                include_expert_jobs))
-                        {
-                            throw std::runtime_error(
-                                "RankOrchestrator required weight finalization failed");
+                                "reuse has no records for " +
+                                device.toString());
                         }
                     }
-
-                    /**
-                     * Routed-overlay engines are deliberately not prepared here.
-                     * This parent owns only mutable preload caches; it does not own
-                     * the per-runner frozen TP/replication bindings that define the
-                     * graph's actual weight identity. Each device runner prepares
-                     * its overlay from that immutable set during materialization.
-                     */
+                    PerfStatsCollector::addCounter(
+                        "weight_loading",
+                        "rank_prepared_weight_materialization_reuses",
+                        1.0,
+                        "load",
+                        {},
+                        {{"devices", std::to_string(device_ids.size())}});
                 }
             }
         }
@@ -2129,11 +1785,12 @@ namespace llaminar2
             int vocab = vocab_size();
             if (vocab > 0)
             {
-                size_t max_tokens = static_cast<size_t>(config_.batch_size) *
-                                    static_cast<size_t>(config_.max_seq_len);
+                // logits() publishes one terminal row for both decode and
+                // prefill. The explicitly requested all-position verifier has
+                // its own gatherer; the KV horizon is never a host output axis.
                 logits_gatherer_ = std::make_unique<LogitsGatherer>(
                     vocab,
-                    max_tokens,
+                    /*max_tokens=*/1,
                     logits_backend_resolver_);
 
                 // Pin the logits buffer for faster D2H DMA
@@ -2250,6 +1907,34 @@ namespace llaminar2
             }
         }
 
+        // Validate every handoff before the first participant allocates weights.
+        // A foreign terminal-stage binding must not leave an earlier GPU stage
+        // partially constructed while setup unwinds.
+        std::vector<Config> child_configs;
+        child_configs.reserve(num_stages);
+        for (size_t stage_idx = 0; stage_idx < num_stages; ++stage_idx)
+        {
+            const auto &stage_config = config_.pp_stages[stage_idx];
+            Config child_config = config_.forPipelineStage(stage_idx);
+            const auto &factory_pp_config = *child_config.nested_pp_stage_config;
+            factory_pp_config.requireValidForModel(*concrete_model_ctx);
+            const auto routed_metadata = resolveMoERoutedExpertModelMetadataForModel(
+                *concrete_model_ctx, child_config.mtp, factory_pp_config);
+            if (routed_metadata.num_experts > 0 && !stage_config.moe_runtime)
+                throw std::invalid_argument("Pipeline MoE stage has no admitted expert runtime binding");
+            if (stage_config.moe_runtime)
+            {
+                const auto &bound = stage_config.moe_runtime->metadata();
+                if (bound.first_model_layer != routed_metadata.first_model_layer ||
+                    bound.num_layers != routed_metadata.num_layers ||
+                    bound.num_experts != routed_metadata.num_experts ||
+                    bound.main_inference_layer_count != routed_metadata.main_inference_layer_count)
+                    throw std::invalid_argument("Pipeline expert binding differs from the loaded model/MTP geometry");
+            }
+
+            child_configs.push_back(std::move(child_config));
+        }
+
         pp_stage_runners_.reserve(num_stages);
 
         for (size_t stage_idx = 0; stage_idx < num_stages; ++stage_idx)
@@ -2271,57 +1956,51 @@ namespace llaminar2
             // Get primary device for this stage
             DeviceId primary_device = stage_config.stage_devices[0].toLocalDeviceId();
 
+            const auto &child_config = child_configs[stage_idx];
+            const auto &factory_pp_config = *child_config.nested_pp_stage_config;
+
             // =====================================================================
             // Build InferenceRunnerConfig for this stage
             // =====================================================================
             InferenceRunnerConfig runner_config;
-            runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
-            runner_config.activation_seq_len = config_.resident_graph_rows;
-            runner_config.batch_size = config_.batch_size;
-            runner_config.activation_precision = config_.activation_precision;
-            runner_config.fused_attention_backend = config_.fused_attention_backend;
-            runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
-            runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
-            runner_config.kv_cache_precision = config_.kv_cache_precision;
+            runner_config.max_seq_len = static_cast<int>(child_config.max_seq_len);
+            runner_config.activation_seq_len = child_config.resident_graph_rows;
+            runner_config.batch_size = child_config.batch_size;
+            runner_config.activation_precision = child_config.activation_precision;
+            runner_config.fused_attention_backend = child_config.fused_attention_backend;
+            runner_config.kv_cache_scale_k = child_config.kv_cache_scale_k;
+            runner_config.kv_cache_scale_v = child_config.kv_cache_scale_v;
+            runner_config.kv_cache_precision = child_config.kv_cache_precision;
             runner_config.tp_allreduce_precision_override =
-                config_.tp_allreduce_precision_override;
-            runner_config.prefix_cache = config_.prefix_cache;
-            runner_config.mtp = config_.mtp;
-            runner_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
-            runner_config.routed_expert_owner_order = config_.routed_expert_owner_order;
-            runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
-            runner_config.moe_routed_prefill = config_.moe_routed_prefill;
-            runner_config.moe_rebalance = config_.moe_rebalance;
-            runner_config.prepared_weight_store = config_.prepared_weight_store;
+                child_config.tp_allreduce_precision_override;
+            runner_config.prefix_cache = child_config.prefix_cache;
+            runner_config.mtp = child_config.mtp;
+            runner_config.routed_expert_compute_policy = child_config.routed_expert_compute_policy;
+            runner_config.routed_expert_owner_order = child_config.routed_expert_owner_order;
+            runner_config.moe_hot_expert_cache = child_config.moe_hot_expert_cache;
+            runner_config.moe_routed_prefill = child_config.moe_routed_prefill;
+            runner_config.moe_rebalance = child_config.moe_rebalance;
+            runner_config.prepared_weight_store = child_config.prepared_weight_store;
             runner_config.prepared_weight_admission =
-                config_.prepared_weight_admission;
+                child_config.prepared_weight_admission;
             runner_config.reusable_execution_workspaces =
-                config_.reusable_execution_workspaces;
-            runner_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
+                child_config.reusable_execution_workspaces;
+            runner_config.moe_routed_expert_plan = child_config.moe_routed_expert_plan;
             runner_config.moe_expert_overlay_residency_authority =
-                config_.moe_expert_overlay_residency_authority;
+                child_config.moe_expert_overlay_residency_authority;
             runner_config.moe_expert_overlay_participant_residency =
-                config_.moe_expert_overlay_participant_residency;
+                child_config.moe_expert_overlay_participant_residency;
             runner_config.moe_expert_overlay_decode_histogram =
-                config_.moe_expert_overlay_decode_histogram;
-            runner_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
+                child_config.moe_expert_overlay_decode_histogram;
+            runner_config.moe_expert_overlay_mpi_ctx = child_config.moe_expert_overlay_mpi_ctx;
             runner_config.moe_rank_batch_transport_registry =
-                config_.moe_rank_batch_transport_registry;
+                child_config.moe_rank_batch_transport_registry;
             runner_config.moe_device_controller_fabric =
-                config_.moe_device_controller_fabric;
+                child_config.moe_device_controller_fabric;
             runner_config.moe_node_local_route_exchange =
-                config_.moe_node_local_route_exchange;
+                child_config.moe_node_local_route_exchange;
             runner_config.moe_node_local_route_transport_policy =
-                config_.moe_node_local_route_transport_policy;
-            // =====================================================================
-            // Build FactoryPPStageConfig for the createPPStageRunner factory
-            // =====================================================================
-            FactoryPPStageConfig factory_pp_config;
-            factory_pp_config.first_layer = stage_config.first_layer;
-            factory_pp_config.last_layer = stage_config.last_layer;
-            factory_pp_config.has_embedding = stage_config.has_embedding;
-            factory_pp_config.has_lm_head = stage_config.has_lm_head;
-
+                child_config.moe_node_local_route_transport_policy;
             // =====================================================================
             // Handle single-device vs TP-domain stages
             // =====================================================================
@@ -2333,54 +2012,9 @@ namespace llaminar2
                 LOG_DEBUG("RankOrchestrator: PP stage " << stage_idx
                                                         << " is a TP domain with " << stage_config.stage_devices.size() << " devices");
 
-                // Build TP configuration for the nested orchestrator
-                Config nested_config;
-                nested_config.mode = ParallelismMode::TP;
-                nested_config.devices = stage_config.stage_devices;
-                nested_config.weights = stage_config.tp_weights;
-                nested_config.backend = stage_config.tp_backend;
-                nested_config.max_seq_len = config_.max_seq_len;
-                nested_config.resident_graph_rows = config_.resident_graph_rows;
-                nested_config.batch_size = config_.batch_size;
-                nested_config.activation_precision = config_.activation_precision;
-                nested_config.fused_attention_backend = config_.fused_attention_backend;
-                nested_config.kv_cache_scale_k = config_.kv_cache_scale_k;
-                nested_config.kv_cache_scale_v = config_.kv_cache_scale_v;
-                nested_config.kv_cache_precision = config_.kv_cache_precision;
-                nested_config.tp_allreduce_precision_override =
-                    config_.tp_allreduce_precision_override;
-                nested_config.prefix_cache = config_.prefix_cache;
-                nested_config.mtp = config_.mtp;
-                nested_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
-                nested_config.routed_expert_owner_order = config_.routed_expert_owner_order;
-                nested_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
-                nested_config.moe_routed_prefill = config_.moe_routed_prefill;
-                nested_config.moe_rebalance = config_.moe_rebalance;
-                nested_config.prepared_weight_store = config_.prepared_weight_store;
-                nested_config.prepared_weight_admission =
-                    config_.prepared_weight_admission;
-                nested_config.reusable_execution_workspaces =
-                    config_.reusable_execution_workspaces;
-                nested_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
-                nested_config.moe_expert_overlay_residency_authority =
-                    config_.moe_expert_overlay_residency_authority;
-                nested_config.moe_expert_overlay_participant_residency =
-                    config_.moe_expert_overlay_participant_residency;
-                nested_config.moe_expert_overlay_decode_histogram =
-                    config_.moe_expert_overlay_decode_histogram;
-                nested_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
-                nested_config.moe_rank_batch_transport_registry =
-                    config_.moe_rank_batch_transport_registry;
-                nested_config.moe_device_controller_fabric =
-                    config_.moe_device_controller_fabric;
-                nested_config.moe_node_local_route_exchange =
-                    config_.moe_node_local_route_exchange;
-                nested_config.moe_node_local_route_transport_policy =
-                    config_.moe_node_local_route_transport_policy;
-                // CRITICAL: Pass PP stage config to nested TP MDO so its DeviceGraphOrchestrators
-                // build partial graphs instead of full graphs. Without this, the TP devices would
-                // build LM_HEAD stages even though this PP stage doesn't own LM_HEAD.
-                nested_config.nested_pp_stage_config = factory_pp_config;
+                // TP siblings retain one stage authority; the PP parent owns
+                // composition and cannot substitute a model-wide expert map.
+                const Config &nested_config = child_config;
 
                 // Create the nested RankOrchestrator
                 // Note: model_ctx_ is the shared ModelContext — the nested MDO's
@@ -2426,34 +2060,9 @@ namespace llaminar2
 
         LOG_DEBUG("RankOrchestrator: Successfully initialized " << pp_stage_runners_.size() << " PP stage runners");
 
-        // =====================================================================
-        // Release host weight copies now that all PP stages are prepared.
-        // With single-WM architecture, host copies are retained across stages
-        // and only released after ALL stage preparation is complete.
-        //
-        // CPU safety: If any PP stage runs on CPU, retain host weight data —
-        // CPU stages read weights directly from host memory.
-        // =====================================================================
-        bool has_cpu_stage = false;
-        for (const auto &stage_config : config_.pp_stages)
-        {
-            if (!stage_config.stage_devices.empty() &&
-                stage_config.stage_devices[0].toLocalDeviceId().is_cpu())
-            {
-                has_cpu_stage = true;
-                break;
-            }
-        }
-
-        if (has_cpu_stage)
-        {
-            LOG_DEBUG("RankOrchestrator: Retaining host weight data (CPU PP stages present)");
-        }
-        else if (auto *concrete_wm = dynamic_cast<WeightManager *>(model_ctx_->weightManager().get()))
-        {
-            size_t released = concrete_wm->releaseAllHostWeightData();
-            LOG_DEBUG("RankOrchestrator: Released " << released << " host weight copies after PP preparation");
-        }
+        // Source reclamation belongs to the complete serving family transition
+        // below. Prepared children alone do not prove every graph has bound its
+        // operands; nested TP deliberately leaves that shared gate to this PP.
 
         // Build PPActivationContract describing inter-stage data transfers
         if (config_.pp_stages.size() > 1)
@@ -3069,6 +2678,20 @@ namespace llaminar2
                     "RankOrchestrator PP serving graph setup did not cover its frozen native inventory: "
                     << materialization_error);
                 return false;
+            }
+
+            // Publish only after the complete, exact stage inventory succeeds.
+            // WeightManager's typed CPU policy retains any CPU operands while
+            // reclaiming GPU-only sources, even in a heterogeneous pipeline.
+            if (model_ctx_)
+            {
+                if (const auto weights = model_ctx_->weightManager())
+                {
+                    weights->markGraphMaterializationComplete();
+                    const auto released = weights->releaseAllHostWeightData();
+                    LOG_DEBUG("RankOrchestrator: Released " << released
+                        << " host weight copies after PP graph materialization");
+                }
             }
 
             if (pp_graph_execution_plan_->hasHeterogeneousBoundary())
@@ -4111,7 +3734,7 @@ namespace llaminar2
                     logits_gatherer_ = std::make_unique<LogitsGatherer>(0, 0, logits_backend_resolver_);
                     applyLogitsGatherSkipFlags();
                 }
-                logits_gatherer_->copyFromStage(*pp_stage_runners_.back(), 0, config_.batch_size, config_.max_seq_len);
+                logits_gatherer_->copyFromStage(*pp_stage_runners_.back());
             }
             recordCompletedPPGraphTransactions("prefill", num_stages, root_schedule.chunks.size());
             current_position_ += seq_len;
@@ -4274,10 +3897,7 @@ namespace llaminar2
                 applyLogitsGatherSkipFlags();
             }
             logits_gatherer_->copyFromStage(
-                *pp_stage_runners_.back(),
-                0,
-                config_.batch_size,
-                config_.max_seq_len);
+                *pp_stage_runners_.back());
         }
 
         recordCompletedPPGraphTransactions(
@@ -5038,6 +4658,40 @@ namespace llaminar2
             pp_graph_execution_plan_->segmentCount();
         std::size_t completed_segments = 0u;
 
+        if (pp_device_generation_ && seq_len == 1 && dispatch != MainForwardDispatch::Prefill)
+        {
+            // Frozen GPU pipeline edges already own activation movement.
+            // Enter the same concurrent domain authority as prefill/verifiers;
+            // the CPU stage loop cannot drive these captured channels.
+            if (!tokens)
+            {
+                LOG_ERROR("RankOrchestrator::forwardPP scalar input requires its request token");
+                return false;
+            }
+            const bool submitted = restored_prefix_bridge
+                ? pp_device_generation_->restoredPrefixMTPDecodeBridge(
+                      {.token_id = tokens[0], .restored_prefix_tokens = restored_prefix_tokens})
+                : pp_device_generation_->forwardDecodeInput(tokens[0]);
+            if (!submitted)
+                return false;
+            if (!skip_logits_gather_decode_)
+            {
+                if (!logits_gatherer_)
+                {
+                    logits_gatherer_ = std::make_unique<LogitsGatherer>(0, 0, logits_backend_resolver_);
+                    applyLogitsGatherSkipFlags();
+                }
+                logits_gatherer_->copyFromStage(*pp_stage_runners_.back());
+            }
+            recordCompletedPPGraphTransactions("decode", num_stages, 1);
+            ++current_position_;
+            stats_dirty_ = true;
+            PerfStatsCollector::addCounter("forward_graph", "pipeline_scalar_input_transactions", 1.0,
+                "decode", "rank", {{"boundary_authority", "captured_native_pipeline_edges"},
+                    {"state_transition", restored_prefix_bridge ? "main_and_shifted_mtp" : "main_only"}});
+            return true;
+        }
+
         LOG_DEBUG("RankOrchestrator::forwardPP: seq_len=" << seq_len
                                                           << " num_stages=" << num_stages);
 
@@ -5185,8 +4839,7 @@ namespace llaminar2
                         logits_backend_resolver_);
                     applyLogitsGatherSkipFlags();
                 }
-                logits_gatherer_->copyFromStage(*pp_stage_runners_[last_stage],
-                                                0, config_.batch_size, config_.max_seq_len);
+                logits_gatherer_->copyFromStage(*pp_stage_runners_[last_stage]);
             }
         }
 
@@ -5660,6 +5313,11 @@ namespace llaminar2
          * sampling collectives on its behalf.
          */
         return false;
+    }
+
+    size_t RankOrchestrator::mainHostLogitsStorageBytes() const
+    {
+        return logits_gatherer_ ? logits_gatherer_->bufferNumel() * sizeof(float) : 0u;
     }
 
     const float *RankOrchestrator::logits() const
@@ -7325,10 +6983,11 @@ namespace llaminar2
         rank_resident_child_logical_state_handles_.clear();
         ++rank_resident_logical_state_epoch_;
 
-        PerfStatsCollector::addCounter(
+        PerfStatsCollector::addCounterWithSequence(
             "mtp",
             "rank_resident_logical_state_aggregate_invalidations",
             1.0,
+            {static_cast<uint64_t>(rank_resident_logical_state_epoch_)},
             "decode",
             "rank",
             {{"lifecycle", lifecycle && lifecycle[0] != '\0'
@@ -7338,8 +6997,7 @@ namespace llaminar2
                             ? reason
                             : "unspecified"},
              {"participant", std::to_string(participant)},
-             {"had_aggregate", had_aggregate ? "true" : "false"},
-             {"rank_epoch", std::to_string(rank_resident_logical_state_epoch_)}});
+             {"had_aggregate", had_aggregate ? "true" : "false"}});
     }
 
     DeviceResidentLogicalSequenceStateHandle
@@ -9517,6 +9175,16 @@ namespace llaminar2
 
         configure_runners(device_runners_, "device");
         configure_runners(pp_stage_runners_, "pipeline");
+        return true;
+    }
+
+    bool RankOrchestrator::initializePromptRepetitionHistory(
+        std::span<const int32_t> unique_tokens, int request_index)
+    {
+        for (auto *group : {&device_runners_, &pp_stage_runners_})
+            for (const auto &runner : *group)
+                if (!runner || !runner->initializePromptRepetitionHistory(unique_tokens, request_index))
+                    return false;
         return true;
     }
 
@@ -15399,7 +15067,7 @@ namespace llaminar2
     }
 
     bool RankOrchestrator::applyPenaltiesOnDevice(
-        const std::vector<LogitPenalty> &penalties,
+        const LogitPenaltyBatch &penalties,
         int vocab_size)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
@@ -15433,7 +15101,7 @@ namespace llaminar2
     }
 
     bool RankOrchestrator::applyPenaltiesToMTPLogitsOnDevice(
-        const std::vector<LogitPenalty> &penalties,
+        const LogitPenaltyBatch &penalties,
         int vocab_size)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
@@ -15470,7 +15138,7 @@ namespace llaminar2
 
     bool RankOrchestrator::applyPenaltiesToAllPositionLogitsOnDeviceRow(
         int row,
-        const std::vector<LogitPenalty> &penalties,
+        const LogitPenaltyBatch &penalties,
         int vocab_size)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
@@ -16950,37 +16618,6 @@ namespace llaminar2
         return epoch;
     }
 
-    const IInferenceRunner *RankOrchestrator::moeOptimizationOwner() const
-    {
-        const IInferenceRunner *owner = nullptr;
-        auto inspect = [&](const auto &runners)
-        {
-            for (const auto &runner : runners)
-            {
-                if (!runner || runner->moeOptimizationStatus().authority == MoEOptimizationAuthority::None)
-                    continue;
-                if (owner)
-                    throw std::logic_error("Rank MoE movement evidence has multiple publication authorities");
-                owner = runner.get();
-            }
-        };
-        inspect(device_runners_);
-        inspect(pp_stage_runners_);
-        return owner;
-    }
-
-    MoEOptimizationStatus RankOrchestrator::moeOptimizationStatus() const
-    {
-        const auto *owner = moeOptimizationOwner();
-        return owner ? owner->moeOptimizationStatus() : MoEOptimizationStatus{};
-    }
-
-    MoEOptimizationMovementLedger RankOrchestrator::moeOptimizationMovementLedger() const
-    {
-        const auto *owner = moeOptimizationOwner();
-        return owner ? owner->moeOptimizationMovementLedger() : MoEOptimizationMovementLedger{};
-    }
-
     PrefixLookupResult RankOrchestrator::lookupPrefix(const std::vector<int32_t> &tokens)
     {
         PrefixLookupResult aggregate;
@@ -17075,6 +16712,31 @@ namespace llaminar2
         return aggregate;
     }
 
+    PrefixRestoreMetadata RankOrchestrator::prefixRestoreMetadata(const PrefixLookupResult &hit) const
+    {
+        PrefixRestoreMetadata metadata;
+        if (hit.cached_tokens <= 0) return metadata;
+        const auto collect = [&](const auto &runners, const auto &hits)
+        {
+            size_t index = 0;
+            for (const auto &runner : runners)
+            {
+                if (!runner) continue;
+                if (index >= hits.size())
+                    throw std::logic_error("Prefix restore metadata has no retained child admission");
+                const auto selected = hits[index++].clampedTo(hit.cached_tokens);
+                if (selected.cached_tokens != hit.cached_tokens)
+                    throw std::logic_error("Prefix restore metadata disagrees with the common frontier");
+                metadata.merge(runner->prefixRestoreMetadata(selected));
+            }
+            if (index != hits.size())
+                throw std::logic_error("Prefix restore metadata has an unowned child admission");
+        };
+        collect(device_runners_, last_device_prefix_hits_);
+        collect(pp_stage_runners_, last_pp_prefix_hits_);
+        return metadata;
+    }
+
     bool RankOrchestrator::preparePrefixHarvest(
         const PrefixLookupResult &admission,
         const std::vector<int32_t> &tokens,
@@ -17082,15 +16744,18 @@ namespace llaminar2
     {
         if (!admission.supported || !admission.cache_enabled)
             return false;
-        const auto prepare = [&](const auto &runners, const auto &hits)
+        const auto prepare = [&](const auto &runners, auto &hits)
         {
             size_t index = 0u;
             for (const auto &runner : runners)
             {
                 if (!runner)
                     continue;
-                if (index >= hits.size() ||
-                    !runner->preparePrefixHarvest(hits[index++], tokens, schedule))
+                if (index >= hits.size())
+                    return false;
+                auto &child_admission = hits[index++];
+                child_admission = child_admission.forHarvest(admission.cached_tokens);
+                if (!runner->preparePrefixHarvest(child_admission, tokens, schedule))
                     return false;
             }
             return index == hits.size();
@@ -17103,6 +16768,7 @@ namespace llaminar2
 
     bool RankOrchestrator::populatePrefix(const PrefixLookupResult &hit, int seq_idx)
     {
+        (void)hit.restoreBlocks();
         const int common_tokens = std::max(0, hit.cached_tokens);
         if (common_tokens <= 0)
             return true;
@@ -17281,14 +16947,14 @@ namespace llaminar2
                         "refresh CPU TP terminal logits after child restore");
                     return false;
                 }
-                PerfStatsCollector::addCounter(
+                PerfStatsCollector::addCounterWithSequence(
                     "prefix_cache",
                     "cpu_tp_terminal_logits_aggregate_refreshes",
                     1.0,
+                    {static_cast<uint64_t>(common_tokens)},
                     "restore",
                     "rank",
                     {{"participants", std::to_string(device_runners_.size())},
-                     {"cached_tokens", std::to_string(common_tokens)},
                      {"ownership", "cpu_rank_aggregate"}});
             }
         }
@@ -17309,9 +16975,7 @@ namespace llaminar2
                 applyLogitsGatherSkipFlags();
             }
             logits_gatherer_->copyFromStage(*pp_stage_runners_.back(),
-                                            static_cast<size_t>(vocab_size()),
-                                            config_.batch_size,
-                                            static_cast<int>(config_.max_seq_len));
+                                            static_cast<size_t>(vocab_size()));
         }
         current_position_ = common_tokens;
         stats_dirty_ = true;
@@ -17675,9 +17339,6 @@ namespace llaminar2
             snapshot.has_hidden = snapshot.has_hidden || child.has_hidden;
             snapshot.has_logits = snapshot.has_logits || child.has_logits;
             snapshot.session_epoch = std::max(snapshot.session_epoch, child.session_epoch);
-            snapshot.moe_runtime_movement_epoch =
-                std::max(snapshot.moe_runtime_movement_epoch,
-                         child.moe_runtime_movement_epoch);
             snapshot.prefix_cache_config_enabled =
                 snapshot.prefix_cache_config_enabled || child.prefix_cache_config_enabled;
             snapshot.prefix_cache_ready = snapshot.prefix_cache_ready || child.prefix_cache_ready;
@@ -17896,6 +17557,7 @@ namespace llaminar2
         };
 
         bool saw_child = false;
+        uint64_t tp_movement_epoch = 0;
         for (const auto &runner : device_runners_)
         {
             if (runner)
@@ -17903,18 +17565,27 @@ namespace llaminar2
                 const PrefixRuntimeStateSnapshot child =
                     runner->prefixStateProbe(capture_policy);
                 adopt_authoritative_child_logical_state(child);
+                tp_movement_epoch = std::max(tp_movement_epoch, child.moe_runtime_movement_epoch.epoch());
                 merge_child(child);
                 saw_child = true;
             }
         }
+        snapshot.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(tp_movement_epoch);
+        std::vector<PrefixMovementEpochSnapshot> pipeline_epochs;
         for (const auto &runner : pp_stage_runners_)
         {
             if (runner)
             {
-                merge_child(runner->prefixStateProbe(capture_policy));
+                const auto child = runner->prefixStateProbe(capture_policy);
+                pipeline_epochs.push_back(child.moe_runtime_movement_epoch);
+                merge_child(child);
                 saw_child = true;
             }
+            else
+                throw std::logic_error("Pipeline prefix diagnostics lost a declared stage");
         }
+        if (!pipeline_epochs.empty())
+            snapshot.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::pipeline(std::move(pipeline_epochs));
 
         if (!saw_child)
         {
@@ -19570,6 +19241,22 @@ namespace llaminar2
             std::cout << table.to_string() << std::flush;
             tp_decode_stats_.reset();
         }
+    }
+
+    PrefixCacheTelemetrySources RankOrchestrator::prefixCacheTelemetrySources() const
+    {
+        PrefixCacheTelemetrySources result;
+        const auto append = [&](const auto &runners) {
+            for (const auto &runner : runners)
+                if (runner)
+                {
+                    const auto sources = runner->prefixCacheTelemetrySources();
+                    result.insert(result.end(), sources.begin(), sources.end());
+                }
+        };
+        append(device_runners_);
+        append(pp_stage_runners_);
+        return result;
     }
 
 } // namespace llaminar2

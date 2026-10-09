@@ -16,6 +16,8 @@
  * - Top-k expert selections match CPU reference
  * - Captured canonical route publication matches serial expert outputs byte
  *   for byte across codebooks, participant masks, and long-prefill buckets.
+ * - Expert preparation admits its native payload and upload-ring BOM through
+ *   one model-owned PreparedWeightStore before materializing device storage.
  *
  * Target Hardware: AMD MI50 (gfx906 / Vega 20)
  */
@@ -44,6 +46,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/DecodeExpertHistogram.h"
+#include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
@@ -449,6 +452,69 @@ namespace
                 }});
         }
         return formats;
+    }
+
+    /**
+     * @brief Admit the exact native expert payload and upload-ring test BOM.
+     * @param context Extracted expert views, local mask and projection geometry.
+     * @return Model-owned store retaining the sole admission authority and kernels.
+     * @throws std::logic_error for missing views, metadata or an already-bound store.
+     *
+     * Production expert preparation intentionally rejects an unadmitted context.
+     * These low-level fixtures must supply that same lifecycle rather than asking
+     * the service to infer a budget from free device memory. Canonical estimators
+     * own allocation geometry; the fixture contributes only named BOM inputs.
+     */
+    std::unique_ptr<PreparedWeightStore> admitROCmExpertPreparation(MoEWeightContext &context)
+    {
+        if (!context.device_id.is_rocm() || context.prepared_store)
+            throw std::logic_error("ROCm expert fixture has invalid admission state");
+        size_t payload_bytes = 0, maximum_raw_bytes = 0;
+        for (int expert = 0; expert < context.num_experts; ++expert)
+        {
+            const int local_end = context.local_expert_start +
+                (context.local_expert_count < 0 ? context.num_experts : context.local_expert_count);
+            const bool owned = context.expert_mask.empty()
+                ? expert >= context.local_expert_start && expert < local_end
+                : context.expert_mask.at(static_cast<size_t>(expert));
+            if (!owned) continue;
+            for (const auto *views : {&context.expert_gate_views,
+                                     &context.expert_up_views, &context.expert_down_views})
+            {
+                const auto &view = views->at(static_cast<size_t>(expert));
+                auto *unpackable = view ? dynamic_cast<IINT8Unpackable *>(view.get()) : nullptr;
+                const auto *format = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+                if (!format)
+                    throw std::logic_error("ROCm expert fixture lacks native source metadata");
+                payload_bytes = expert_prepared_memory_detail::checkedAdd(payload_bytes,
+                    resolveExpertPreparedProjectionMemoryGeometry(
+                        static_cast<int>(view->rows()), static_cast<int>(view->cols()),
+                        ExpertWeightFormat::nativeVnni(
+                            {format->codebook_id, format->is_superblock, true})).gpu_live_bytes,
+                    "ROCm expert fixture payload");
+                maximum_raw_bytes = std::max(maximum_raw_bytes,
+                    quantizedRawBytesForGpuPreparedTest(*view));
+            }
+        }
+        const auto staging = resolveGPUWeightLoadMemoryGeometry(
+            maximum_raw_bytes, configuredGPUWeightLoadMemoryPolicy());
+        const size_t device_bytes = expert_prepared_memory_detail::checkedAdd(
+            payload_bytes, staging.staging_bytes, "ROCm expert fixture device BOM");
+        const PhysicalMemoryResource device{.world_rank = 0, .device = context.device_id,
+            .total_bytes = device_bytes, .admission_available_bytes = device_bytes};
+        const PhysicalMemoryResource host{.world_rank = 0, .device = DeviceId::cpu(),
+            .total_bytes = staging.host_staging_bytes,
+            .admission_available_bytes = staging.host_staging_bytes};
+        PhysicalMemoryPlanBuilder plan;
+        plan.add(device, PhysicalMemoryOwner::RoutedExpertWeights, payload_bytes)
+            .add(device, PhysicalMemoryOwner::WeightLoadStaging, staging.staging_bytes)
+            .add(host, PhysicalMemoryOwner::WeightLoadStaging, staging.host_staging_bytes);
+        auto store = std::make_unique<PreparedWeightStore>(
+            ModelContextId{static_cast<uint64_t>(720000 + context.layer_idx)});
+        store->installPhysicalMemoryAuthority(std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0));
+        context.prepared_store = store.get();
+        return store;
     }
 
     DeviceNativeVNNIMatrixDesc fakeNativeVNNIDesc(uintptr_t base)
@@ -21082,6 +21148,7 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Q4KGateUp_Q5KDownMatchesSequentialGemm)
         nullptr,
         CPUExpertNUMAPlacement::notApplicable()};
     ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(gpu_ctx));
+    auto prepared_store = admitROCmExpertPreparation(gpu_ctx);
     ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(gpu_ctx));
 
     auto input = TestTensorFactory::createFP32Random(
@@ -21383,6 +21450,7 @@ TEST(Test__ROCmMoEKernel, GroupedPrefillMaskedTopK8MatchesRowDecode)
         nullptr,
         CPUExpertNUMAPlacement::notApplicable()};
     ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(gpu_ctx));
+    auto prepared_store = admitROCmExpertPreparation(gpu_ctx);
     ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(gpu_ctx));
 
     std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
@@ -21637,6 +21705,7 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Qwen35RouteTable_Q4KQ5KMatchesCpuDequan
         nullptr,
         CPUExpertNUMAPlacement::notApplicable()};
     ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(gpu_ctx));
+    auto prepared_store = admitROCmExpertPreparation(gpu_ctx);
     ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(gpu_ctx));
 
     auto *gate0_workspace = dynamic_cast<IWorkspaceConsumer *>(gpu_gate_gemms[0]);
@@ -21917,6 +21986,7 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Qwen36RouteTable_IQ2SGateUp_IQ4XSDownMa
         nullptr,
         CPUExpertNUMAPlacement::notApplicable()};
     ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(gpu_ctx));
+    auto prepared_store = admitROCmExpertPreparation(gpu_ctx);
     ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(gpu_ctx));
 
     auto *gate0_workspace = dynamic_cast<IWorkspaceConsumer *>(gpu_gate_gemms[0]);
@@ -25031,6 +25101,12 @@ void runSharedExpertVerifierPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     auto down_weights = make_down(
         {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)}, 718103);
 
+    // The widest pattern has |hidden| <= 48 * (.011 * 23 + .003 * 8 + .0075).
+    // Preserve all four amplitude ratios while keeping composed native Q8
+    // metadata representable for every synthetic source codebook.
+    const float hidden_multiplier = composedMoEVerifierInputMultiplier(
+        *gate_weights, *up_weights, 48.f * (.011f * 23 + .003f * 8 + .0075f));
+
     auto gate_prepared = llaminar2::test::makeGpuPreparedGemm(
         gate_weights.get(),
         device,
@@ -25161,7 +25237,7 @@ void runSharedExpertVerifierPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
              * parity loads the full checkpoint.
              */
             hidden.mutable_data()[i] =
-                pattern.amplitude * (structured + 0.0075f * random_component);
+                hidden_multiplier * pattern.amplitude * (structured + 0.0075f * random_component);
         }
     };
 
@@ -27728,13 +27804,13 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
         top_k);
 
     /*
-     * Layer 27 retains the exact route captured from the original failure so
-     * the production router itself remains under byte-level regression.  The
-     * `experts` array is then replaced with the current production route and
-     * becomes the authoritative preparation mask for both test layers.
+     * Layer 27 retains the captured input and exact expert IDs from the original
+     * failure. Probability bytes are compared against the real production M=1
+     * router below: historical literals predated binary16 Q8 scale publication
+     * and no longer describe the canonical arithmetic. The current grouped
+     * route becomes the authoritative preparation mask for both test layers.
      */
     std::array<int, seq_len * top_k> experts{};
-    std::array<uint32_t, seq_len * top_k> captured_layer27_weight_bits{};
     if (layer_index == 27)
     {
         /*
@@ -27747,20 +27823,7 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
             54, 250, 121, 210, 177, 87, 135, 110,
             121, 206, 177, 220, 233, 230, 48, 238,
             87, 165, 88, 229, 48, 242, 185, 58};
-        captured_layer27_weight_bits = {
-            /*
-             * These bytes follow the canonical rounded Q8 scale multiplier
-             * shared by serial NativeVNNI and grouped router publication. The
-             * change from independently formed division scales moves a handful
-             * of row-zero and row-two probabilities by one to four FP32 ULPs;
-             * retaining the exact bytes keeps future router drift visible.
-             */
-            0x3e3d5905u, 0x3e29bed4u, 0x3df7b506u, 0x3df7143fu,
-            0x3ddafa53u, 0x3dd6786cu, 0x3dcfff5au, 0x3dc194fbu,
-            0x3e48b871u, 0x3e33dc01u, 0x3e0f49bfu, 0x3ddea924u,
-            0x3dd70439u, 0x3dc90252u, 0x3db5544au, 0x3db43fa8u,
-            0x3e4cdf6du, 0x3e34c6d5u, 0x3e17d0a1u, 0x3dded8d6u,
-            0x3dce15f3u, 0x3dcbf61du, 0x3db203fcu, 0x3da22962u};
+
     }
     else if (layer_index != 3)
     {
@@ -27840,16 +27903,10 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
     {
         const int production_expert =
             static_cast<int>(routing_indices->data()[route]);
-        const uint32_t production_weight_bits =
-            f32BitsForROCmMoEKernelTest(routing_weights->data()[route]);
         if (layer_index == 27)
         {
             EXPECT_EQ(production_expert, experts[route])
                 << "layer-27 captured expert route drift at slot " << route;
-            EXPECT_EQ(
-                production_weight_bits,
-                captured_layer27_weight_bits[route])
-                << "layer-27 captured route-weight drift at slot " << route;
         }
         experts[route] = production_expert;
     }
@@ -27923,6 +27980,7 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
         CPUExpertNUMAPlacement::notApplicable()};
     weight_context.advise_raw_pages_after_prepare = false;
     ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(weight_context));
+    auto prepared_store = admitROCmExpertPreparation(weight_context);
     ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(weight_context));
 
     for (const int expert : used_experts)
@@ -28156,7 +28214,7 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
                 << " slot=" << slot;
         }
         expectBitwiseVerifierRowsEqual(
-            "ROCm Qwen3.6 production router weights must reproduce the captured serial route",
+            "ROCm Qwen3.6 grouped router weights must match the production serial route",
             production_route_weights->data(),
             routing_weights->data() + static_cast<size_t>(row) * top_k,
             static_cast<size_t>(top_k),

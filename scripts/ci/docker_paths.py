@@ -7,6 +7,8 @@ must first be explicitly published as a host bind mount; runc rejects direct
 /proc/PID/root magic-link sources. Publication pins the existing pages without
 copying or clearing them, and remains until manual unmount/reboot. This is
 intentionally not a remote-Docker transport.
+IPC storage and PID identity are selected together: process-shared recursive
+mutexes must never confuse equal namespace-local TIDs from unrelated owners.
 """
 from __future__ import annotations
 
@@ -28,6 +30,73 @@ import uuid
 # explicitly: accepting an arbitrary caller path here would conceal an
 # incomplete mount contract.
 SHARED_DAEMON_ROOTS_ENV = "LLAMINAR_DOCKER_SHARED_ROOTS"
+CODING_DRIVER_ENV = "LLAMINAR_CODING_DRIVER"
+CODING_OWNER_LABEL = "org.llaminar.coding_driver"
+
+
+def require_no_active_coding_owners() -> None:
+    """Block every production lease if a cancelled coding owner still runs.
+
+    A runner or lock file can disappear while Docker retains its processes.
+    The next E2E, benchmark or build gate must observe that native ownership,
+    rather than merely relying on its own clean Python process or CI job slot.
+    """
+    identities = subprocess.check_output(['docker', 'ps', '--quiet', '--no-trunc',
+        '--filter', 'label=' + CODING_OWNER_LABEL], text=True, timeout=30).splitlines()
+    if any(not re.fullmatch(r'[0-9a-f]{64}', identity) for identity in identities):
+        raise ValueError('Invalid active coding owner inventory')
+    if identities:
+        raise RuntimeError('Prior coding owners still hold native resources: ' + ', '.join(identities))
+
+
+def coding_owner_arguments() -> list[str]:
+    """Bind sibling helpers to the exact outer coding driver for terminal cleanup.
+
+    Local diagnostics have no outer driver. CI supplies one unique name before
+    creating children; a forced driver retirement can then find only its own
+    native containers without trusting an unfinished child receipt.
+    """
+    owner = os.environ.get(CODING_DRIVER_ENV)
+    if owner is None:
+        return []
+    if not re.fullmatch(r'llaminar-suite-driver-[0-9a-f]{32}', owner):
+        raise ValueError('Invalid outer coding driver identity')
+    return ['--label', CODING_OWNER_LABEL + '=' + owner]
+
+
+def inspect_owned_container(name: str) -> dict | None:
+    """Inspect an exact claimed name or prove daemon absence without parsing errors.
+
+    Docker clients vary the spelling/capitalization of missing-object errors.
+    A successful exact-name inventory owns absence. An auto-removed container
+    may disappear between inventory and inspection; one fresh inventory then
+    proves that transition. A failed daemon read never becomes an empty result.
+    """
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name):
+        raise ValueError('Owned container requires one literal name')
+
+    def inventory() -> list[str]:
+        """Select the one anchored daemon name, never a substring or caller regex."""
+        identities = subprocess.check_output(['docker', 'ps', '--all', '--quiet', '--no-trunc',
+            '--filter', 'name=^/' + re.escape(name) + '$'], text=True, timeout=30).splitlines()
+        if len(identities) > 1 or any(not re.fullmatch(r'[0-9a-f]{64}', value) for value in identities):
+            raise ValueError('Owned container inventory is ambiguous')
+        return identities
+
+    identities = inventory()
+    if not identities:
+        return None
+    result = subprocess.run(['docker', 'inspect', identities[0]], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    if result.returncode:
+        if not inventory():
+            return None
+        raise subprocess.CalledProcessError(result.returncode, result.args,
+                                            output=result.stdout, stderr=result.stderr)
+    rows = json.loads(result.stdout)
+    if len(rows) != 1 or rows[0]['Id'] != identities[0] or rows[0]['Name'] != '/' + name:
+        raise ValueError('Owned container identity changed')
+    return rows[0]
 
 # Docker accepts a full object ID or an unambiguous hexadecimal prefix.  A
 # runner/pod hostname is otherwise just a hostname: treating a friendly label
@@ -284,7 +353,8 @@ def daemon_device_metadata(image: str, script: str) -> str:
     subprocess.run([
         # Metadata never needs a bridge. Match the host-network inference
         # container so an unrelated network lifecycle cannot block admission.
-        "docker", "create", "--name", name, "--network", "host", "--entrypoint", "/bin/sh",
+        "docker", "create", "--name", name, *coding_owner_arguments(),
+        "--network", "host", "--entrypoint", "/bin/sh",
         "--mount", "type=bind,src=/dev,dst=/host-dev,readonly", image,
         "-c", 'exec /bin/sh -eu -c "$1" > "$2"',
         "llaminar-device-probe", script, result_path],
@@ -339,13 +409,38 @@ def nvidia_device_nodes(image: str) -> tuple[str, ...]:
     return tuple(sorted(set(nodes)))
 
 
+def container_namespace_args(ipc_mode: str = "private", shm_size: str = "16g",
+                             extra_args: tuple[str, ...] = ()) -> list[str]:
+    """Bind shared mutex storage to exactly one process-ID namespace.
+
+    Private storage is the ordinary per-job policy. Explicit host/peer IPC
+    joins the same PID namespace because ROCm SMI's recursive robust mutexes
+    encode their owner as a TID. Sharing storage across private PID namespaces
+    allows unrelated threads with equal TIDs to enter a held mutex as recursion.
+    A joined /dev/shm belongs to its existing owner and cannot be resized here.
+    Extra Docker arguments cannot override this coupled lifecycle contract.
+    """
+    for argument in extra_args:
+        if argument.split("=", 1)[0] in {"--ipc", "--pid", "--shm-size"}:
+            raise ValueError("Docker namespace policy owns --ipc, --pid and --shm-size; "
+                             "use LLAMINAR_E2E_DOCKER_IPC/SHM_SIZE instead of extra arguments")
+    if ipc_mode in ("", "none", "private", "shareable"):
+        mode = "shareable" if ipc_mode == "shareable" else "private"
+        if not re.fullmatch(r"[1-9][0-9]*[bBkKmMgG]?", shm_size):
+            raise ValueError(f"Docker IPC shared-memory size is invalid: {shm_size!r}")
+        return ["--ipc", mode, "--shm-size", shm_size]
+    if ipc_mode == "host" or re.fullmatch(r"container:[a-zA-Z0-9][a-zA-Z0-9_.-]*", ipc_mode):
+        return ["--ipc", ipc_mode, "--pid", ipc_mode]
+    raise ValueError(f"Docker IPC mode is invalid: {ipc_mode!r}")
+
+
 def device_args(image: str, backends: str, *, user: str = "0:0") -> list[str]:
     """Expose drivers/devices only for the explicitly selected backend set.
 
     A full image defers CUDA driver binding until CUDA preparation. CPU-only
     remote ranks and ROCm lanes therefore need no NVIDIA runtime installation.
     """
-    result = ["--user", user, "--network", "host", "--ipc", "host",
+    result = ["--user", user, "--network", "host", *container_namespace_args(),
               "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_NICE",
               "--cap-add", "SYS_PTRACE"]
     if "CUDA" in backends:
@@ -360,7 +455,10 @@ def device_args(image: str, backends: str, *, user: str = "0:0") -> list[str]:
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "--publish-model-cache":
+    if sys.argv[1] == "--container-namespace-args":
+        for argument in container_namespace_args(sys.argv[2], sys.argv[3], tuple(sys.argv[4:])):
+            print(argument)
+    elif sys.argv[1] == "--publish-model-cache":
         publish_model_cache(Path(sys.argv[2]))
     elif sys.argv[1] == "--nvidia-device-nodes":
         for node in nvidia_device_nodes(sys.argv[2]):

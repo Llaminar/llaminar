@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "../../backends/DeviceId.h"
 #include "../../config/OrchestrationConfig.h"
 #include "../prefix_cache/PrefixCacheStateProbe.h"
@@ -31,6 +32,7 @@
 #include "../../transfer/TransferEngine.h"
 #include "../../planning/GraphSnapshotMemoryCapacity.h"
 #include "../../utils/Sampler.h"
+#include "../../utils/ThinkingMode.h"
 #include "../../utils/ToolCallTypes.h"
 #include <algorithm>
 #include <memory>
@@ -48,6 +50,7 @@ namespace llaminar2
     class ModelContext;        // Forward declaration
     class PhysicalMemoryAuthority; // CPU/GPU admission and live-allocation owner
     class ReusableExecutionWorkspaceRegistry; // Model-lifetime workspace owner
+    class MoEPipelinePreparedPlan;
     struct MoEOverlaySealedMigrationMeasurements;
     struct MoEOverlayResolvedCapacityPlan;
     struct GraphExecutorStats; // Forward declaration
@@ -323,6 +326,8 @@ namespace llaminar2
          */
         std::shared_ptr<const MoEOverlayResolvedCapacityPlan>
             expert_overlay_memory_admission;
+        /** Complete PP stage placements and their one admission; exclusive with a model-wide overlay. */
+        std::shared_ptr<const MoEPipelinePreparedPlan> pipeline_prepared_plan;
         /**
          * Canonical, collision-free identity of the requested routed-weight
          * topology that populated @ref context.
@@ -719,12 +724,12 @@ namespace llaminar2
          * @return Expected authority and expressible axes, even in Static mode.
          * @throws std::invalid_argument if overlay setup has not frozen its plan.
          *
-         * This non-virtual projection reuses canonical configuration, not live
+         * The default projection reuses canonical configuration, not live
          * device placement or PerfStats. It performs no device I/O, maintenance,
          * allocation admission or synchronization and belongs only in opt-in
          * diagnostics, outside the inference loop.
          */
-        [[nodiscard]] MoEOptimizationMovementTopology moeOptimizationMovementTopology() const
+        [[nodiscard]] virtual MoEOptimizationMovementTopology moeOptimizationMovementTopology() const
         {
             return describeMoEOptimizationMovementTopology(config().moe_routed_expert_plan.get());
         }
@@ -832,6 +837,16 @@ namespace llaminar2
          * @return True after no reusable prefix record remains addressable.
          */
         virtual bool purgePrefixCache() = 0;
+
+        /**
+         * @brief Freeze rank-local cache publishers during serving setup.
+         * @return Metadata-only sources from every local model-graph participant.
+         * Call before concurrent serving starts. Composite owners enumerate their
+         * local children once; HTTP subsequently reads these retained publishers,
+         * without traversing runners, invoking MPI or polling native devices.
+         * Runners without a reusable prefix tier contribute no sources.
+         */
+        virtual PrefixCacheTelemetrySources prefixCacheTelemetrySources() const { return {}; }
 
         /**
          * @brief Drain completed decode-boundary maintenance diagnostics.
@@ -1133,13 +1148,18 @@ namespace llaminar2
         virtual void setSamplingParams(const SamplingParams & /*params*/) {}
 
         /**
-         * @brief Get model-recommended sampling parameters
+         * @brief Get model-recommended sampling parameters for a reasoning mode.
          *
-         * Returns the model-specific defaults (e.g., Qwen3.5 recommends
-         * temp=0.6, presence_penalty=1.5). Callers should merge these
-         * as defaults when the user hasn't specified explicit values.
+         * Recommendations belong to the loaded model revision, not merely its
+         * weight architecture. Callers merge only fields the user omitted.
+         * @param mode The request's template mode; omission uses the model's default.
+         * @return Model-owned sampling defaults for that request mode.
          */
-        virtual SamplingParams getRecommendedSamplingParams() const { return {}; }
+        virtual SamplingParams getRecommendedSamplingParams(
+            ThinkingMode /*mode*/ = ThinkingMode::ModelDefault) const { return {}; }
+
+        /** @return The loaded model's default reasoning mode, before request overrides. */
+        virtual ThinkingMode getDefaultThinkingMode() const { return ThinkingMode::Enabled; }
 
         /**
          * @brief Get the stop-thinking prompt for thinking budget enforcement

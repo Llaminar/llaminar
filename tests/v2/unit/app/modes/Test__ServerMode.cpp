@@ -5,10 +5,12 @@
  * Real loopback clients exercise the production server configuration without
  * loading a model. An idle keep-alive client must not capture the sole worker,
  * and SSE must retain its connection only until the complete stream is sent.
+ * Model work retains one dedicated thread while control requests remain independent.
  */
 #include <gtest/gtest.h>
 
 #include "app/modes/ServerMode.h"
+#include "app/modes/SerializedInferenceExecutor.h"
 #include "httplib.h"
 
 #include <chrono>
@@ -22,26 +24,13 @@ using namespace llaminar2;
 
 namespace
 {
-    /** @brief Join a test queue before its captured fixture storage is retired. */
-    class ScopedTaskQueueShutdown
-    {
-    public:
-        /** @brief Borrow the queue whose worker must be joined on scope exit. */
-        explicit ScopedTaskQueueShutdown(httplib::TaskQueue &queue) : queue_(queue) {}
-        /** @brief Join queued work, including on a failed test assertion. */
-        ~ScopedTaskQueueShutdown() { queue_.shutdown(); }
-
-    private:
-        httplib::TaskQueue &queue_;
-    };
-
     /** @brief Stop and join a pre-bound HTTP listener on every test exit. */
     class ScopedHttpListener
     {
     public:
         /** @brief Start listening on the server's already-bound loopback socket. */
         explicit ScopedHttpListener(httplib::Server &server)
-            : server_(server), thread_([&server] { server.listen_after_bind(); }) {}
+            : server_(server), thread_([&server] { listenInferenceHttpServer(server); }) {}
 
         /** @brief Stop accepting work and join before route captures are destroyed. */
         ~ScopedHttpListener()
@@ -65,8 +54,9 @@ namespace
      */
     void expectCompletedConnectionReleasesWorker(bool streaming)
     {
+        SerializedInferenceExecutor executor;
         httplib::Server server;
-        configureSerializedInferenceHttpServer(server);
+        configureInferenceHttpServer(server, executor);
         server.Get("/response", [streaming](const httplib::Request &, httplib::Response &response) {
             if (streaming)
             {
@@ -112,44 +102,14 @@ namespace
 
 TEST(Test__ServerMode, SerializedInferenceTaskQueue_RunsJobsOnOneWorkerThread)
 {
-    httplib::Server server;
-    configureSerializedInferenceHttpServer(server);
-    std::unique_ptr<httplib::TaskQueue> queue(server.new_task_queue());
-    ASSERT_NE(queue, nullptr);
-
-    constexpr int task_count = 6;
-    std::mutex mutex;
-    std::condition_variable cv;
+    SerializedInferenceExecutor executor;
     std::vector<std::thread::id> worker_ids;
-    worker_ids.reserve(task_count);
-    // Join before captured synchronization and observation storage is retired,
-    // including on the timeout/assertion path.
-    ScopedTaskQueueShutdown shutdown(*queue);
-
-    for (int i = 0; i < task_count; ++i)
-    {
-        ASSERT_TRUE(queue->enqueue([&]
-                                   {
-                                       {
-                                           std::lock_guard<std::mutex> lock(mutex);
-                                           worker_ids.push_back(std::this_thread::get_id());
-                                       }
-                                       cv.notify_one();
-                                   }));
-    }
-
-    bool completed = false;
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        completed = cv.wait_for(lock, std::chrono::seconds(5), [&]
-                                { return worker_ids.size() == task_count; });
-    }
-
-    ASSERT_TRUE(completed);
-    ASSERT_FALSE(worker_ids.empty());
-    const auto expected_worker = worker_ids.front();
+    for (int i = 0; i < 6; ++i)
+        worker_ids.push_back(executor.tryReserve()->run([] { return std::this_thread::get_id(); }));
+    ASSERT_EQ(worker_ids.size(), 6);
+    EXPECT_NE(worker_ids.front(), std::this_thread::get_id());
     for (const auto &worker_id : worker_ids)
-        EXPECT_EQ(worker_id, expected_worker);
+        EXPECT_EQ(worker_id, worker_ids.front());
 }
 
 /** @brief An idle non-streaming client cannot retain the serialized worker. */

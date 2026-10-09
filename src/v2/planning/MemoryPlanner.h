@@ -27,6 +27,7 @@
 #include "loaders/PreparedWeightAdmission.h"
 
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -469,11 +470,33 @@ struct ResidentGraphMemoryPlan
 class MemoryPlanner
 {
 public:
-    /// Plan memory for a set of devices with the given model profile.
+    /**
+     * @brief Assemble fixed allocations for one ownership group.
+     * @param profile Complete model metadata without loaded tensor payloads.
+     * @param device_configs Actual retained device graph owners.
+     * @return One typed BOM, with process-shared archive storage charged once.
+     */
     static MemoryPlan plan(
         const ModelMemoryProfile& profile,
         const std::vector<DevicePlanConfig>& device_configs
     );
+
+    /**
+     * @brief Assemble several groups while retaining shared physical-owner identity.
+     * @param profile One complete source model shared by the declared groups.
+     * @param device_groups Ordered groups of distinct retained graph owners.
+     * @return Matching contribution plans; shared archive scratch belongs to its
+     *         first declaring group and is absent from subsequent contributions.
+     * @throws std::invalid_argument for an empty group inventory or invalid inputs.
+     *
+     * The result contains contributions, not independently spendable budgets.
+     * The caller must admit their complete aggregate through PMA. RAM tiers and
+     * graph-private allocations remain additive even when their archive is
+     * shared. No ownership state survives this pure setup transaction.
+     */
+    static std::vector<MemoryPlan> planGroups(
+        const ModelMemoryProfile &profile,
+        std::span<const std::vector<DevicePlanConfig>> device_groups);
 
     /**
      * @brief Select the largest configured graph row bucket that fits.
@@ -493,6 +516,17 @@ public:
         const std::vector<DevicePlanConfig>& device_configs,
         const std::vector<int>& candidate_rows
     );
+private:
+    struct SharedOwnerIdentities;
+    /**
+     * @brief Emit one group's fixed BOM using transaction-owned shared identities.
+     * @param profile Complete source metadata.
+     * @param devices This group's retained graph owners.
+     * @param shared Identity-only ownership of common process objects.
+     * @return Sealed contribution, to be aggregated before admission.
+     */
+    static MemoryPlan planOwnerGroup(const ModelMemoryProfile &profile,
+        const std::vector<DevicePlanConfig> &devices, SharedOwnerIdentities &shared);
 };
 
 } // namespace llaminar2

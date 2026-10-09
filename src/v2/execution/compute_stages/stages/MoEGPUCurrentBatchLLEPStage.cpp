@@ -278,6 +278,8 @@ namespace llaminar2
         }
         const DeviceMoERebalanceConfig config = transactionConfig();
         if (!validateDeviceMoERebalanceConfig(config) ||
+            config.num_experts != static_cast<std::uint32_t>(params_.num_experts) ||
+            config.top_k != static_cast<std::uint32_t>(params_.top_k) ||
             params_.tp_ctx->degree() <= 1 ||
             params_.tp_ctx->degree() !=
                 static_cast<int>(config.participant_count) ||
@@ -292,7 +294,8 @@ namespace llaminar2
         if (!table || !table->isMirroredToDevice() ||
             !table->usesOverlayEpochTicket() ||
             table->overlayPlacementSource() == nullptr ||
-            params_.layer_idx >= table->layerCount() ||
+            !table->containsModelLayer(params_.layer_idx) ||
+            table->layerCount() != static_cast<int>(config.num_layers) ||
             table->expertCount() != params_.num_experts ||
             table->topK() != params_.top_k)
         {
@@ -363,7 +366,8 @@ namespace llaminar2
         auto *runtime_layer =
             params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
         auto *runtime_layers =
-            params_.moe_runtime_table->deviceLayerState(0);
+            params_.moe_runtime_table->deviceLayerState(
+                params_.moe_runtime_table->firstModelLayer());
         if (!runtime_layer || !runtime_layers)
             return false;
 
@@ -458,7 +462,8 @@ namespace llaminar2
                 status,
                 config,
                 payload_slots,
-                static_cast<std::uint32_t>(params_.layer_idx)) ||
+                static_cast<std::uint32_t>(
+                    params_.moe_runtime_table->storageIndexForModelLayer(params_.layer_idx))) ||
             !kernel->projectPrefillLeastLoadedDomainCommands(
                 launch,
                 gathered_plan,
@@ -512,7 +517,8 @@ namespace llaminar2
         auto *runtime_layer =
             params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
         auto *runtime_layers =
-            params_.moe_runtime_table->deviceLayerState(0);
+            params_.moe_runtime_table->deviceLayerState(
+                params_.moe_runtime_table->firstModelLayer());
         if (!runtime_layer || !runtime_layers)
             return false;
 
@@ -587,7 +593,8 @@ namespace llaminar2
                 config,
                 apply_status,
                 command_header,
-                params_.layer_idx) ||
+                static_cast<int>(params_.moe_runtime_table->storageIndexForModelLayer(
+                    params_.layer_idx))) ||
             !kernel->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
                 launch,
                 runtime_layer,

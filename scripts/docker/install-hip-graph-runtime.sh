@@ -12,6 +12,8 @@
 # repair preserves independent progress for waits and opaque child/callback
 # work. Packet capture, concurrent builders and the existing queue bound remain
 # enabled; finite compute graphs retain the upstream single-queue optimization.
+# Retained events authenticate a live producer generation under the native
+# stream registry before inspecting capture state, including after retirement.
 #
 # Both development and release builders call this after installing ROCm's
 # compiler/SDK. The release image copies the resulting standard-SONAME DSO
@@ -32,6 +34,7 @@ hip_patches=(
     "${hip_script_dir}/patches/rocm-hip-sdma-stream-sharing.patch"
     "${hip_script_dir}/patches/rocm-hip-sdma-event-publication.patch"
     "${hip_script_dir}/patches/rocm-hip-graph-progress-safe-collapse.patch"
+    "${hip_script_dir}/patches/rocm-hip-event-producer-lifetime.patch"
 )
 hip_library="${hip_prefix}/lib/libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}"
 # ROCm's package uses a zero Git stamp. Preserve its filename as an alias, not

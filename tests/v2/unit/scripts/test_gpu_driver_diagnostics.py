@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Device-free driver-health regressions for the complete HTTP cell lifecycle.
+"""Device-free driver-health and continuous HTTP lifetime regressions.
 
-Replay real warning shapes, log loss, teardown faults and unreadable logs.
-No GPU, kernel-log access, model or elevated privilege is used by this gate.
+Exercise ring rotation, missing records, late teardown warnings, process
+retirement, journal corruption and the actual CLI/shell closure protocol.
+Kernel reads are simulated; no model, GPU or elevated privilege is used.
 """
 from dataclasses import asdict
 import json
 from pathlib import Path
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -26,27 +28,36 @@ def record(message="ordinary boot record", priority="info", timestamp=10.0, faci
 
 
 def snapshot(*records, boot="same-boot", reader=driver.KernelReader.DIRECT):
-    """Expose an immutable simulated kernel log through the real policy API."""
+    """Expose an immutable simulated kernel ring through the real policy API."""
     return driver.KernelSnapshot(boot, reader, tuple(records))
 
 
 def checkpoint(*records):
-    """Create the on-disk begin contract for focused continuity tests."""
+    """Construct the collector's internal predecessor cursor contract."""
     return {"schema": 1, "state": "armed", "boot_id": "same-boot", "reader": "direct",
             "cursor": [asdict(row) for row in records]}
 
 
-def clean_evidence():
-    """Complete synthetic receipt for outer runners' device-free fixtures."""
-    return {"schema": 1, "complete": True, "passed": True,
-            "boot_id": "same-boot", "reader": "direct", "reader_container": None,
-            "checkpoint": "fixture.driver-checkpoint.json", "new_record_count": 0,
-            "records": [], "findings": [], "error": None}
+def clean_evidence(directory: Path):
+    """Write a complete minimal journal for outer-runner device-free fixtures."""
+    directory.mkdir(parents=True, exist_ok=True)
+    window = 'a' * 32
+    cursor = [asdict(record())]
+    rows = [{'schema': 2, 'kind': 'begin', 'window_id': window, 'boot_id': 'same-boot',
+             'reader': 'direct', 'reader_container': None, 'cursor': cursor},
+            {'kind': 'end', 'window_id': window, 'complete': True, 'new_record_count': 0,
+             'snapshot_count': 2, 'cursor': cursor}]
+    journal = directory / 'fixture.driver-records.jsonl'
+    journal.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    return {'schema': 2, 'complete': True, 'passed': True, 'window_id': window,
+            'boot_id': 'same-boot', 'reader': 'direct', 'reader_container': None,
+            'checkpoint': 'fixture.driver-checkpoint.json', 'new_record_count': 0,
+            'snapshot_count': 2, 'journal': journal.name,
+            'findings': [], 'finding_count': 0, 'error': None}
 
 
 class GPUDriverDiagnosticsTests(unittest.TestCase):
-    """Driver warnings must fail otherwise successful production HTTP cells."""
-
+    """Existing warning, scope and public-harness obligations stay mandatory."""
     def setUp(self):
         """Never inherit a real CI observer while testing simulated kernels."""
         self.enterContext(patch.dict(driver.os.environ))
@@ -75,29 +86,6 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
                     self.assertTrue(driver.driver_diagnostic(record(message, priority)))
         self.assertTrue(driver.driver_diagnostic(record("amdgpu: unexpected status 17", "warn")))
         self.assertTrue(driver.driver_diagnostic(record("NVRM: bad status 17", "crit")))
-
-    def test_nvidia_profiling_assertion_is_not_a_clean_interval(self):
-        """Nsight-associated assertions still fail evidence; no profiler allowlist."""
-        warning = record(
-            "NVRM: nvAssertFailedNoLog: Assertion failed: "
-            "pStaticInfo->pSmIssueThrottleCtrl != NULL @ kernel_graphics.c:3411",
-            "warn", timestamp=20.0)
-        self.assertTrue(driver.driver_diagnostic(warning))
-        before = record("nvidia: normal initialization", timestamp=10.0)
-        observed = driver.new_records(checkpoint(before), snapshot(before, warning))
-        self.assertEqual(observed, (warning,))
-        evidence = clean_evidence()
-        evidence.update(passed=False, new_record_count=1,
-                        records=[asdict(warning)], findings=[asdict(warning)])
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for claimed_pass in (False, True):
-                # A stale green summary cannot erase the retained assertion.
-                evidence.update(passed=claimed_pass,
-                                findings=[] if claimed_pass else [asdict(warning)])
-                driver.publish(root / "cell.driver-diagnostics.json", evidence)
-                with self.subTest(claimed_pass=claimed_pass), self.assertRaises(ValueError):
-                    driver.validate_evidence(root)
 
     def test_normal_initialization_and_unrelated_warnings_are_not_gpu_faults(self):
         """Loaded module names alone do not attribute another subsystem's WARN."""
@@ -157,36 +145,6 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     driver.read_snapshot()
 
-    def test_complete_lifecycle_passes_and_teardown_warning_fails(self):
-        """Use the public CLI lifecycle to reject a fault after successful HTTP."""
-        old = record("amdgpu: old overflow", "err")
-        for tail in (
-            (),
-            (record("NVRM: Xid 79, GPU has fallen off the bus", timestamp=20),),
-            (record("workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 259 times",
-                    "warn", timestamp=20),),
-        ):
-            with self.subTest(tail=tail), tempfile.TemporaryDirectory() as directory:
-                state = Path(directory) / "cell.driver-checkpoint.json"
-                report = Path(directory) / "cell.driver-diagnostics.json"
-                with patch.object(driver, "read_snapshot", side_effect=(snapshot(old), snapshot(old, *tail))):
-                    self.assertEqual(driver.main(["begin", "--state", str(state)]), 0)
-                    with self.assertRaises(ValueError):
-                        driver.begin(state)
-                    self.assertEqual(driver.main(["finish", "--state", str(state), "--report", str(report)]),
-                                     1 if tail else 0)
-                evidence = json.loads(report.read_text())
-                self.assertEqual(evidence["findings"], [asdict(row) for row in tail])
-                self.assertTrue(evidence["complete"])
-                self.assertEqual(json.loads(state.read_text())["state"], "closed")
-                if tail:
-                    with self.assertRaises(ValueError):
-                        driver.validate_evidence(Path(directory))
-                else:
-                    driver.validate_evidence(Path(directory))
-                with self.assertRaises(ValueError):
-                    driver.finish(state, report)
-
     def test_ci_reader_is_fixed_read_only_command_on_same_kernel_and_owned_container(self):
         """Non-root cache ownership cannot disable CI's kernel-health gate."""
         name = "llaminar-suite-driver-" + "a" * 32
@@ -209,20 +167,6 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 driver.KernelReader.TOOLS_CONTAINER.command(invalid)
 
-    def test_unreadable_finish_and_lost_history_preserve_failed_evidence(self):
-        """Monitoring failure cannot leave a stale pass for the outer driver."""
-        old = record()
-        for ending in (RuntimeError("permission denied"), snapshot(record("ring wrapped"))):
-            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as directory:
-                state = Path(directory) / "cell.driver-checkpoint.json"
-                report = Path(directory) / "cell.driver-diagnostics.json"
-                with patch.object(driver, "read_snapshot", side_effect=(snapshot(old), ending)):
-                    driver.begin(state)
-                    self.assertFalse(driver.finish(state, report))
-                self.assertFalse(json.loads(report.read_text())["complete"])
-                with self.assertRaises(ValueError):
-                    driver.validate_evidence(Path(directory))
-
     def test_outer_http_admission_requires_driver_evidence(self):
         """A successful shell/needle/tool result cannot omit driver health."""
         sys.path.insert(0, str(ROOT / "scripts/ci"))
@@ -238,57 +182,6 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "driver"):
                 e2e.validate_http_cell_evidence(root, {})
 
-    def test_outer_reader_rejects_a_passing_summary_with_faults_or_missing_records(self):
-        """Retained raw evidence, not only a cached green flag, owns admission."""
-        bad = asdict(record("NVRM: Xid 31, MMU Fault"))
-        invalid = [[], {**clean_evidence(), "new_record_count": 1},
-                   {**clean_evidence(), "new_record_count": 1, "records": [bad]},
-                   {**clean_evidence(), "new_record_count": 1, "records": [{}]}]
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for evidence in invalid:
-                with self.subTest(evidence=evidence):
-                    driver.publish(root / "cell.driver-diagnostics.json", evidence)
-                    with self.assertRaises(ValueError):
-                        driver.validate_evidence(root)
-
-    def test_real_shell_counter_fails_on_driver_warning_after_successful_http(self):
-        """Exercise the shared shell's exit decision without a model or GPU.
-
-        Only log reading is simulated. The real Python CLI, artifact publisher,
-        shell pass/fail counters and final cell exit decision all execute.
-        """
-        shell = (ROOT / "tests/v2/e2e/server/test_server_e2e.sh").read_text()
-        functions = "\n".join(name + "() {" + shell.split(name + "() {", 1)[1].split("\n}\n", 1)[0]
-                              + "\n}" for name in ("pass", "fail", "finish_driver_diagnostics"))
-        for warning in (None, "amdgpu: ih2 ring buffer overflow", "NVRM: Xid 79"):
-            with self.subTest(warning=warning), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                state = root / "cell.driver-checkpoint.json"
-                report = root / "cell.driver-diagnostics.json"
-                driver.publish(state, checkpoint(record()))
-                # Match the admitted direct reader; no sudo or host log access
-                # may occur in this device-free protocol regression.
-                boot = driver._BOOT_ID.read_text().strip()
-                saved = json.loads(state.read_text())
-                driver.publish(state, {**saved, "boot_id": boot})
-                records = [asdict(record())]
-                if warning:
-                    records.append(asdict(record(warning, timestamp=20)))
-                fake = root / "dmesg"
-                fake.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(json.dumps({"dmesg": records})) + "\n")
-                fake.chmod(0o755)
-                env = {**driver.os.environ, "PATH": str(root) + ":" + driver.os.environ["PATH"]}
-                command = (functions + '\nTOTAL_TESTS=0; PASSED_TESTS=0; FAILED_TESTS=0\n'
-                           'SCRIPT_DIR="$1"\npass "HTTP passed"\n'
-                           'finish_driver_diagnostics cell "$2" "$3"\n'
-                           '[ "$FAILED_TESTS" -eq 0 ]\n')
-                result = subprocess.run(["bash", "-c", command, "guard-regression",
-                                         str(ROOT / "tests/v2/e2e/server"), str(state), str(report)],
-                                        env=env, capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 1 if warning else 0, result.stdout + result.stderr)
-                self.assertEqual(json.loads(report.read_text())["passed"], warning is None)
-
     def test_shell_brackets_server_startup_and_teardown_and_has_no_disable_switch(self):
         """Keep this observer in the shared harness, including generation cells."""
         path = ROOT / "tests/v2/e2e/server/test_server_e2e.sh"
@@ -301,5 +194,158 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("LLAMINAR_E2E_SKIP_DRIVER", shell)
 
 
-if __name__ == "__main__":
+class GPUDriverWindowTests(unittest.TestCase):
+    """Long lifetimes rotate the ring without losing collected diagnostics."""
+
+    def run_collector(self, root, before, after, *, controls=None, owners=None):
+        """Drive the real collector and journal through a deterministic ring."""
+        state = root / 'cell.driver-checkpoint.json'
+        window = 'b' * 32
+        driver.publish(state, {'schema': 2, 'state': 'starting', 'window_id': window,
+            'boot_id': before.boot_id, 'reader': before.reader.value, 'reader_container': before.container,
+            'owner': {'pid': 1, 'start_ticks': 1}, 'cursor': [asdict(row) for row in before.records[-8:]]})
+        close = json.dumps({'action': 'close', 'window_id': window}).encode()
+        if controls is None:
+            controls = [socket.timeout()] * max(0, len(after) - 2) + [close]
+        with patch.object(driver, 'read_snapshot', side_effect=after), \
+             patch.object(driver, 'process_is_live', side_effect=owners) as alive, \
+             patch.object(driver.socket, 'socket') as control:
+            alive.return_value = True
+            control.return_value.__enter__.return_value.recv.side_effect = controls
+            passed = driver.collect(state)
+        terminal = json.loads(state.read_text())
+        self.assertEqual(terminal['state'], 'retired')
+        return state, terminal['outcome'], passed
+
+    def test_continuous_collection_survives_repeated_ring_rotation(self):
+        """Reproduce the five-hour bookend defect with 128 immediate rotations."""
+        rows = [record('kernel row ' + str(i), timestamp=i) for i in range(1040)]
+        before = snapshot(*rows[:8])
+        after = [snapshot(*rows[i:i+16]) for i in range(0,1024,8)]
+        with self.assertRaisesRegex(ValueError, 'cursor lost'):
+            driver.new_records(checkpoint(*before.records), after[-1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, evidence, passed = self.run_collector(root, before, after)
+            self.assertTrue(passed)
+            self.assertEqual(evidence['new_record_count'], 1024)
+            self.assertEqual(evidence['snapshot_count'], 128)
+            driver.publish(root / 'cell.driver-diagnostics.json', evidence)
+            driver.validate_evidence(root)
+
+    def test_loss_between_observations_and_reboots_still_fail(self):
+        """A short polling interval never excuses missing kernel history."""
+        before = snapshot(record())
+        for end in (snapshot(record('wrapped clean tail',timestamp=20)),
+                    snapshot(record(),boot='new-boot'), RuntimeError('permission denied')):
+            with self.subTest(end=end), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                _, evidence, passed = self.run_collector(root, before, [before,end])
+                self.assertFalse(passed)
+                self.assertFalse(evidence['complete'])
+                self.assertIsNotNone(evidence['error'])
+                driver.publish(root/'cell.driver-diagnostics.json',evidence)
+                with self.assertRaises(ValueError):driver.validate_evidence(root)
+
+    def test_final_read_captures_teardown_fault_and_preserves_bounded_preview(self):
+        """Keep every warning in the journal while retaining only 32 in memory."""
+        before = snapshot(record())
+        warnings = [record('NVRM: nvAssertFailedNoLog: Assertion failed ' + str(i),
+                           'warn',timestamp=20+i) for i in range(40)]
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            _, evidence, passed=self.run_collector(root,before,[before,snapshot(*before.records,*warnings)])
+            self.assertFalse(passed)
+            self.assertTrue(evidence['complete'])
+            self.assertEqual(evidence['finding_count'],40)
+            self.assertEqual(evidence['findings'],[asdict(row) for row in warnings[:32]])
+            journal=[json.loads(line) for line in (root/evidence['journal']).read_text().splitlines()]
+            self.assertEqual(len([row for row in journal if row['kind']=='record']),40)
+            evidence.update(passed=True,findings=[],finding_count=0)
+            driver.publish(root/'cell.driver-diagnostics.json',evidence)
+            with self.assertRaises(ValueError):driver.validate_evidence(root)
+
+    def test_owner_retirement_and_invalid_close_are_terminal_failures(self):
+        """A detached collector cannot silently certify an abandoned cell."""
+        before=snapshot(record())
+        cases=[{'owners':[False]}, {'controls':[b'{}']},
+               {'controls':[json.dumps({'action':'close','window_id':'c'*32}).encode()]}]
+        for options in cases:
+            with self.subTest(options=options),tempfile.TemporaryDirectory() as directory:
+                _,evidence,passed=self.run_collector(Path(directory),before,[before,before],**options)
+                self.assertFalse(passed)
+                self.assertFalse(evidence['complete'])
+
+    def test_journal_tampering_truncation_and_extra_data_fail(self):
+        """A green summary cannot mask missing records, boundaries or identity."""
+        for mutation in ('truncate','missing_end','extra','wrong_window','count','cursor','reorder'):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); evidence=clean_evidence(root);path=root/evidence['journal']
+                rows=[json.loads(line) for line in path.read_text().splitlines()]
+                if mutation=='truncate':path.write_bytes(path.read_bytes()[:-1])
+                else:
+                    if mutation=='missing_end':rows.pop()
+                    elif mutation=='extra':rows.append(rows[-1])
+                    elif mutation=='wrong_window':rows[0]['window_id']='d'*32
+                    elif mutation=='count':rows[-1]['new_record_count']=1
+                    elif mutation=='cursor':rows[-1]['cursor']=[]
+                    elif mutation=='reorder':rows.insert(1,{'kind':'record','ordinal':2,**asdict(record(timestamp=20))})
+                    path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+                driver.publish(root/'cell.driver-diagnostics.json',evidence)
+                with self.assertRaises(ValueError):driver.validate_evidence(root)
+
+    def test_retired_or_reused_collector_cannot_make_a_fresh_pass(self):
+        """A dead native PID never authorizes a substitute monitoring process."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);state=root/'cell.driver-checkpoint.json';report=root/'cell.driver-diagnostics.json'
+            driver.publish(state,{'schema':2,'state':'armed','window_id':'e'*32,
+                                  'collector':{'pid':99999,'start_ticks':5}})
+            with patch.object(driver,'process_identity',return_value={'pid':99999,'start_ticks':6}):
+                self.assertFalse(driver.finish(state,report))
+            self.assertFalse(json.loads(report.read_text())['complete'])
+            with self.assertRaises(ValueError):driver.finish(state,report)
+
+    def test_real_cli_and_shell_count_teardown_warnings(self):
+        """Run real owned background processes with only dmesg substituted."""
+        shell=(ROOT/'tests/v2/e2e/server/test_server_e2e.sh').read_text()
+        functions='\n'.join(name+'() {'+shell.split(name+'() {',1)[1].split('\n}\n',1)[0]+'\n}'
+                             for name in ('pass','fail','finish_driver_diagnostics'))
+        for warning in (None,'amdgpu: ih2 ring buffer overflow','NVRM: Xid 79'):
+            with self.subTest(warning=warning),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);state=root/'cell.driver-checkpoint.json';report=root/'cell.driver-diagnostics.json'
+                current=root/'current.json';current.write_text(json.dumps({'dmesg':[asdict(record())]}))
+                ending=root/'ending.json';ending.write_text(json.dumps({'dmesg':[asdict(record())]+(
+                    [asdict(record(warning,timestamp=20))] if warning else [])}))
+                fake=root/'dmesg';fake.write_text('#!/bin/sh\nexec cat '+shlex.quote(str(current))+'\n');fake.chmod(0o755)
+                env={**driver.os.environ,'PATH':str(root)+':'+driver.os.environ['PATH']}
+                env.pop(driver.READER_CONTAINER_ENV,None)
+                command=(functions+'\nTOTAL_TESTS=0; PASSED_TESTS=0; FAILED_TESTS=0\n'
+                    'SCRIPT_DIR="$1"\n'
+                    'python3 "$SCRIPT_DIR/gpu_driver_diagnostics.py" begin --state "$2" || exit 3\n'
+                    'pass "HTTP passed"\ncp "$4" "$5"\n'
+                    'finish_driver_diagnostics cell "$2" "$3"\n'
+                    '[ "$FAILED_TESTS" -eq 0 ]\n')
+                result=subprocess.run(['bash','-c',command,'guard-regression',str(ROOT/'tests/v2/e2e/server'),
+                    str(state),str(report),str(ending),str(current)],env=env,capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,1 if warning else 0,result.stdout+result.stderr)
+                evidence=json.loads(report.read_text())
+                self.assertEqual(evidence['passed'],warning is None)
+                self.assertTrue(evidence['complete'])
+                self.assertFalse(driver.process_is_live(evidence['collector']))
+                self.assertEqual(json.loads(state.read_text())['state'],'closed')
+                if warning is None:driver.validate_evidence(root)
+
+    def test_journal_paths_and_line_bound_are_checked(self):
+        """Reports cannot substitute an unrelated file or unbounded JSON row."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ('../outside','/tmp/elsewhere',''):
+                evidence=clean_evidence(root);evidence['journal']=name
+                with self.subTest(name=name),self.assertRaises(ValueError):driver.inspect_journal(root,evidence)
+            evidence=clean_evidence(root)
+            (root/evidence['journal']).write_bytes(b'x'*(driver._MAX_LINE_BYTES+1))
+            with self.assertRaises(ValueError):driver.inspect_journal(root,evidence)
+
+
+if __name__ == '__main__':
     unittest.main()

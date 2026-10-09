@@ -10,6 +10,7 @@
  */
 
 #include "BenchmarkRunner.h"
+#include "app/modes/PrefixMovementJson.h"
 #include "Logger.h"
 #include "DebugEnv.h"
 #include "KernelProfiler.h"
@@ -145,7 +146,7 @@ namespace llaminar2
 
     static nlohmann::json prefixRequestToJson(const PrefixCacheRequestSummary &request)
     {
-        return nlohmann::json{
+        nlohmann::json result{
             {"enabled", request.enabled},
             {"bypassed", request.bypassed},
             {"bypass_reason", request.bypass_reason},
@@ -164,6 +165,14 @@ namespace llaminar2
             {"completion_movement_epoch", request.completion_movement_epoch},
             {"crossed_movement_epoch", request.crossedMovementEpoch()},
         };
+        if (!request.movement_stages.empty())
+        {
+            result["admission_movement_epoch"] = nullptr;
+            result["admission_latest_movement_epoch"] = nullptr;
+            result["completion_movement_epoch"] = nullptr;
+            result["movement_epochs"] = prefixMovementStagesJson(request.movement_stages);
+        }
+        return result;
     }
 
     static nlohmann::json mtpRequestToJson(const MTPRequestSummary &request)

@@ -8,6 +8,8 @@
  * do not hold a contended cache lease. Lookup APIs also understand terminal
  * partial blocks, which are important for multi-turn prompts whose previous
  * request boundary falls inside the next request's full cache block.
+ * Each selected RAM victim receives a fresh archive-authoritative publication;
+ * participant-local disk metadata never authorizes releasing its payload.
  */
 #pragma once
 
@@ -16,6 +18,7 @@
 #include "execution/prefix_cache/PrefixArchivePersistence.h"
 #include "execution/prefix_cache/PrefixStateBlock.h"
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
+#include "execution/prefix_cache/PrefixRestoreSourceRetirement.h"
 
 #include <list>
 #include <deque>
@@ -28,6 +31,7 @@ namespace llaminar2
 {
     class DeviceHotPrefixStorageBackend;
     class DiskPrefixStorageBackend;
+    class PrefixCacheLookupPlan;
 
     /**
      * @brief Total result of attempting to lease one preallocated hot slot.
@@ -99,13 +103,29 @@ namespace llaminar2
      * Required publication joins only its capacity dependencies; native payload
      * processing remains on the archive worker and pending bytes stay charged.
      */
-    class PrefixStateCache
+    class PrefixStateCache : public std::enable_shared_from_this<PrefixStateCache>
     {
+        friend class PrefixCacheLookupPlan;
     public:
+        /**
+         * @brief Start metadata selection without hydrating historical state.
+         * @return A request-owned source cohort; the cache itself remains single-thread-owned.
+         * @throws std::logic_error when the production cache has no shared lifetime.
+         */
+        std::shared_ptr<IPrefixLookupPayloadPlan> beginLookup();
+        /**
+         * @brief Bind admitted storage and its optional asynchronous restore authority.
+         * @param ram_budget_bytes Existing bounded RAM-tier envelope.
+         * @param ram_backend Sole RAM storage and placement authority.
+         * @param disk_backend Optional durable archive worker.
+         * @param device_hot_backend Optional admitted device tier.
+         * @param restore_retirement Borrowed producer authority which outlives this cache.
+         */
         PrefixStateCache(size_t ram_budget_bytes,
                          std::shared_ptr<IPrefixStorageBackend> ram_backend,
                          std::shared_ptr<DiskPrefixStorageBackend> disk_backend = nullptr,
-                         std::shared_ptr<DeviceHotPrefixStorageBackend> device_hot_backend = nullptr);
+                         std::shared_ptr<DeviceHotPrefixStorageBackend> device_hot_backend = nullptr,
+                         const IPrefixRestoreSourceRetirement *restore_retirement = nullptr);
 
         /**
          * @brief Atomically publish durable RAM and optional device-hot handles.
@@ -187,36 +207,10 @@ namespace llaminar2
          * @throws std::runtime_error If required archive persistence fails.
          *
          * A pending victim write is a dependency, not a cache miss. Hydration
-         * retains its verified inode while that dependency retires; an external
+         * retains its retained inode while that dependency retires; an external
          * alias with no progress edge remains charged and cannot be overwritten.
          */
         std::optional<PrefixBlockHandle> find(const PrefixCacheKey &key);
-
-        /**
-         * @brief Find the longest installed token prefix of one logical block.
-         *
-         * A previous request can end partway through a cache block. Its
-         * terminal block then owns the exact recurrent/hybrid state required
-         * to continue a later, longer request, but its key hashes fewer tokens
-         * than the later request's full block. This method probes candidate
-         * widths from longest to shortest without charging every metadata
-         * probe as a cache miss, then performs one ordinary find() so tier
-         * hydration, LRU touch, and request statistics remain canonical.
-         *
-         * @param fingerprint Runtime/model fingerprint shared by all candidates.
-         * @param parent_hash Stable hash of the preceding matched block.
-         * @param block_index Logical block index within the token sequence.
-         * @param token_start Logical token offset of this block.
-         * @param tokens Current request's tokens for this block.
-         * @return The longest installed handle, or std::nullopt when no token
-         *         prefix is installed or the selected tier record cannot load.
-         */
-        std::optional<PrefixBlockHandle> findLongestTokenPrefix(
-            uint64_t fingerprint,
-            uint64_t parent_hash,
-            int block_index,
-            int token_start,
-            const std::vector<int32_t> &tokens);
 
         bool contains(const PrefixCacheKey &key) const;
         bool retain(const PrefixCacheKey &key);
@@ -268,21 +262,24 @@ namespace llaminar2
          *
          * The operation rejects retained resident entries. On success no cache
          * tier contains @p key and both logical and physically leased RAM
-         * capacity are available for @p incoming_bytes. A later allocation or
+         * capacity are available for @p allocation. A later allocation or
          * copy failure leaves the key absent; stale payloads never reappear.
          *
          * @param key Key that the new archive will publish.
-         * @param incoming_bytes Total RAM bytes required by the new archive.
+         * @param allocation Exact independently owned serialized section geometry.
          * @return Prepared, temporary physical-capacity contention, or error.
          */
         PrefixRamInsertPreparation prepareInsert(
             const PrefixCacheKey &key,
-            size_t incoming_bytes);
+            const PrefixPayloadAllocationPlan &allocation);
+        /** @brief Admit one contiguous owner through the same typed section authority. */
+        PrefixRamInsertPreparation prepareInsert(const PrefixCacheKey &key, size_t bytes)
+        { return prepareInsert(key, PrefixPayloadAllocationPlan::contiguous(bytes)); }
 
         /**
          * @brief Complete required RAM publication before allocating its payload.
          * @param key Exact replacement incarnation to publish.
-         * @param incoming_bytes Actual payload size, not allocation capacity.
+         * @param allocation Exact payload sections, including model runtime bytes.
          * @throws std::runtime_error If admission cannot complete or storage fails.
          *
          * Unlike early prepareInsert(), this cannot yield Busy or silently skip
@@ -292,16 +289,22 @@ namespace llaminar2
          */
         void completeInsertPreparation(
             const PrefixCacheKey &key,
-            size_t incoming_bytes);
+            const PrefixPayloadAllocationPlan &allocation);
+        /** @brief Complete publication of one contiguous owner through the same admission boundary. */
+        void completeInsertPreparation(const PrefixCacheKey &key, size_t bytes)
+        { completeInsertPreparation(key, PrefixPayloadAllocationPlan::contiguous(bytes)); }
 
         /**
          * @brief Start only the necessary eviction work before producing a block.
-         * @param incoming_bytes Exact payload capacity needed by the producer.
+         * @param allocation Exact section geometry needed by the archive producer.
          * @return Prepared, pending physical/durable owners, or invalid geometry.
          * Unlike prepareInsert(), this does not retire or replace an existing
          * key. Callers can overlap the archive writer with ordinary inference.
          */
-        PrefixRamInsertPreparation prepareCapacity(size_t incoming_bytes);
+        PrefixRamInsertPreparation prepareCapacity(const PrefixPayloadAllocationPlan &allocation);
+        /** @brief Prepare one contiguous owner without a separate storage or accounting path. */
+        PrefixRamInsertPreparation prepareCapacity(size_t bytes)
+        { return prepareCapacity(PrefixPayloadAllocationPlan::contiguous(bytes)); }
 
         /**
          * @brief Start exact request publication pressure before prefill executes.
@@ -338,6 +341,15 @@ namespace llaminar2
         bool isDiskResident(const PrefixCacheKey &key) const;
 
     private:
+        /**
+         * @brief Admit one selected archive read through existing eviction and physical ownership.
+         * @param source Immutable inode snapshot retained by the lookup cohort.
+         * @param read_set Actual sections required by this selected block.
+         * @return Ready RAM source; partial views are transient read owners, never cache records.
+         * @throws std::runtime_error for failed integrity, capacity, or publication.
+         */
+        PrefixBlockHandle materializeLookupSource(
+            DiskPrefixStorageBackend::HydrationTicket &source, PrefixPayloadReadSet read_set);
         struct Entry
         {
             PrefixStateBlock block;
@@ -354,27 +366,37 @@ namespace llaminar2
         };
 
         bool insertResident(PrefixBlockHandle handle, bool count_store, bool preserve_disk_entry = false);
-        bool evictResident(const PrefixCacheKey &key);
+        /** @brief Distinguish administrative removal from committed capacity churn. */
+        enum class ResidentRetirement { Removal, Eviction, Demotion };
+        /** @brief Remove a resident alias and publish capacity churn only after that removal. */
+        bool evictResident(const PrefixCacheKey &key,
+                           ResidentRetirement reason = ResidentRetirement::Removal);
         /** @brief Reclaim only durable owners; unfinished writes yield Busy. */
         PrefixRamInsertPreparation evictUntilFits(size_t incoming_bytes);
         /** @brief Reclaim cache-owned aliases until PMA can lease RAM bytes. */
         PrefixRamInsertPreparation evictUntilPhysicallyFits(
-            size_t incoming_bytes);
+            const PrefixPayloadAllocationPlan &allocation);
         /**
          * @brief Complete known archive dependencies until capacity is admitted.
-         * @param incoming_bytes Exact new physical owner extent.
+         * @param allocation Exact new independently owned section extents.
          * @return Prepared, invalid geometry, or Busy with no archive dependency.
          *
          * Every wait consumes an immutable FIFO receipt before rechecking the
          * actual RAM authority. This is dependency completion, not an I/O retry
          * or an archive-wide idle wait. Unknown external aliases remain charged.
          */
-        PrefixRamInsertPreparation completePendingCapacity(size_t incoming_bytes);
+        PrefixRamInsertPreparation completePendingCapacity(const PrefixPayloadAllocationPlan &allocation);
         bool removeDeviceHotEntry(
             const PrefixCacheKey &key,
             bool capacity_eviction);
         void touchDeviceHot(const PrefixCacheKey &key);
-        /** @brief Schedule one victim exactly once; never perform native I/O. */
+        /**
+         * @brief Schedule one victim exactly once; never perform native I/O.
+         * @param entry Selected unretained resident with its original source leases.
+         * @return Prepared for RAM-only storage, otherwise Busy until publication.
+         * The completed writer receipt retires the selected cache alias. Existing
+         * durable metadata is a hint, never evidence that a shared record remains.
+         */
         PrefixRamInsertPreparation persistResidentToDisk(Entry &entry);
         /** @brief Queue a tombstone and retire the local lookup incarnation. */
         void retireArchiveKey(const PrefixCacheKey &key);
@@ -391,13 +413,15 @@ namespace llaminar2
         std::shared_ptr<IPrefixStorageBackend> ram_backend_;
         std::shared_ptr<DiskPrefixStorageBackend> disk_backend_;
         std::shared_ptr<DeviceHotPrefixStorageBackend> device_hot_backend_;
+        // A participant owns this cache, so its exact-event authority outlives it.
+        const IPrefixRestoreSourceRetirement *restore_retirement_ = nullptr;
         std::unordered_map<PrefixCacheKey, Entry, PrefixCacheKeyHasher> entries_;
         std::unordered_map<PrefixCacheKey, PrefixBlockHandle, PrefixCacheKeyHasher> device_hot_entries_;
         std::unordered_map<PrefixCacheKey, PrefixBlockHandle, PrefixCacheKeyHasher> disk_entries_;
         std::list<PrefixCacheKey> lru_;
         std::list<PrefixCacheKey> device_hot_lru_;
         std::deque<PendingPersistence> pending_persistence_;
-        // At most one verified pending promotion retains its immutable inode.
+        // At most one selected pending promotion retains its immutable inode.
         // Its logical archive key may be evicted by the required RAM swap.
         std::optional<DiskPrefixStorageBackend::HydrationTicket> pending_hydration_;
     };

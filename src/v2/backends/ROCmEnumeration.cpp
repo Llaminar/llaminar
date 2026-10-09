@@ -20,6 +20,7 @@
 #include "ComputeBackend.h"
 #include "GPUEnumeration.h"
 #include "DeviceUUID.h"
+#include "DevicePCIAddress.h"
 #include "rocm/ROCmRuntimeStartup.h"
 #include "../utils/Logger.h"
 
@@ -88,6 +89,12 @@ namespace llaminar2
                 dev.type = ComputeBackendType::GPU_ROCM;
                 dev.device_id = i;
                 dev.uuid = formatDeviceUUID(prop.uuid.bytes);
+                // Preserve the driver's full endpoint, including PCI function.
+                // Reconstructing from ordinal or link bottleneck loses identity.
+                char pci_address[32]{};
+                if (hipDeviceGetPCIBusId(pci_address, sizeof(pci_address), i) != hipSuccess)
+                    throw std::runtime_error("HIP discovery could not read the native PCI endpoint");
+                dev.pci_bus_address = DevicePCIAddress::parse(pci_address).toString();
                 dev.compute_units = prop.multiProcessorCount;
                 dev.last_level_cache_bytes = prop.l2CacheSize > 0 ? static_cast<size_t>(prop.l2CacheSize) : 0;
                 dev.total_memory_bytes = prop.totalGlobalMem;

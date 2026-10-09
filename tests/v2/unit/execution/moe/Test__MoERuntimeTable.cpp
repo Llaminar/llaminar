@@ -11,15 +11,13 @@
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/DeviceMoERebalanceMovementJournal.h"
+#include "execution/moe/MoEOverlayDeviceControllerRuntimeBinding.h"
 
 #include <gtest/gtest.h>
 
-#ifdef HAVE_ROCM
-#include <hip/hip_runtime.h>
-#endif
-
 #include <cstdint>
 #include <array>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2::test
@@ -350,6 +348,308 @@ namespace llaminar2::test
             histograms[static_cast<size_t>(idx)] += count;
         }
     } // namespace
+
+
+    /**
+     * @brief Build a complete immutable CPU placement for a compact stage.
+     * @param epoch Monotonic placement epoch.
+     * @return Four prepared expert descriptors owned by the sole participant.
+     */
+    static MoEPlacementUpdate stagePlacement(uint32_t epoch)
+    {
+        MoEPlacementUpdate update;
+        update.epoch = epoch;
+        update.expert_count = 4;
+        update.participant_id = 0;
+        update.participant_count = 1;
+        update.local_compute_mask.assign(4, 1);
+        update.replica_role.assign(4, static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+        update.resident_participant_mask.assign(4, 1);
+        for (int expert = 0; expert < 4; ++expert)
+            update.experts.push_back(expertDesc(expert, 0, expert));
+        return update;
+    }
+
+    /** Global identities select compact rows on every backend without using a device. */
+    TEST(Test__MoERuntimeTable, PipelineStageOwnsCompactRowsAcrossBackends)
+    {
+        for (const auto device : {DeviceId::cpu(), DeviceId(DeviceType::CUDA, 0),
+                                  DeviceId(DeviceType::ROCm, 0)})
+            for (const int first : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+            {
+                SCOPED_TRACE(device.toString() + ":" + std::to_string(first));
+                MoERuntimeTable table(MoERuntimeTable::Config{
+                    .device_id = device, .num_layers = 2, .num_experts = 4, .top_k = 2,
+                    .mirror_to_device = false, .first_model_layer = first});
+                EXPECT_EQ(table.firstModelLayer(), first);
+                EXPECT_EQ(table.endModelLayer(), first + 2);
+                EXPECT_EQ(table.layerCount(), 2);
+                auto *base = table.deviceLayerState(first);
+                EXPECT_EQ(table.deviceLayerState(first + 1), base + 1);
+                EXPECT_EQ(&table.hostLayerState(first + 1), base + 1);
+                EXPECT_EQ(table.storageIndexForModelLayer(first + 1), 1u);
+                EXPECT_FALSE(table.containsModelLayer(first - 1));
+                EXPECT_FALSE(table.containsModelLayer(first + 2));
+                EXPECT_THROW(table.deviceLayerState(first - 1), std::out_of_range);
+                EXPECT_THROW(table.hostLayerState(first + 2), std::out_of_range);
+                EXPECT_THROW(table.prepareInactiveBank(first + 2, stagePlacement(1)), std::out_of_range);
+                EXPECT_THROW(table.deviceOverlayServiceTelemetryBinding(first - 1), std::out_of_range);
+                EXPECT_EQ(table.deviceOverlayServiceTelemetrySample(first + 2), nullptr);
+                table.resetDecodeRuntimeState();
+                EXPECT_EQ(table.deviceLayerState(first), base);
+            }
+    }
+
+    /** Controller storage coordinates and model-global publication identities stay distinct. */
+    TEST(Test__MoERuntimeTable, PipelineStageControllerBindingAuthenticatesGlobalInterval)
+    {
+        for (const auto device : {DeviceId(DeviceType::CUDA, 0), DeviceId(DeviceType::ROCm, 0)})
+            for (const int first : {0, 20, 40, std::numeric_limits<int>::max() - 2})
+            {
+                MoERuntimeTable table(MoERuntimeTable::Config{
+                    .device_id = device, .num_layers = 2, .num_experts = 4, .top_k = 2,
+                    .mirror_to_device = false, .first_model_layer = first});
+                const MoEOverlayDeviceControllerRuntimeBinding binding{
+                    .device = device, .runtime_layers_device = table.deviceLayerState(first),
+                    .runtime_table_host = &table, .overlay_participant_id = 0,
+                    .domain_participant_id = 0, .domain_participant_count = 1,
+                    .layer_count = 2, .expert_count = 4, .top_k = 2, .first_model_layer = first};
+                ASSERT_TRUE(binding.valid());
+                EXPECT_TRUE(binding.matchesLayerScope(table.firstModelLayer(), table.layerCount()));
+                EXPECT_FALSE(binding.matchesLayerScope(first + 1, 2));
+                EXPECT_FALSE(binding.matchesLayerScope(first, 1));
+                for (std::uint32_t row = 0; row < 2; ++row)
+                {
+                    const int layer = binding.modelLayerForStorageIndex(row);
+                    EXPECT_EQ(layer, first + row);
+                    EXPECT_EQ(binding.storageIndexForModelLayer(layer), row);
+                    EXPECT_EQ(binding.runtime_layers_device + row, table.deviceLayerState(layer));
+                }
+                EXPECT_THROW(binding.modelLayerForStorageIndex(2), std::out_of_range);
+                EXPECT_THROW(binding.modelLayerForStorageIndex(UINT32_MAX), std::out_of_range);
+                EXPECT_THROW(binding.storageIndexForModelLayer(first - 1), std::out_of_range);
+                EXPECT_THROW(binding.storageIndexForModelLayer(first + 2), std::out_of_range);
+            }
+    }
+
+    /** Malformed controller intervals fail before any pointer or row is interpreted. */
+    TEST(Test__MoERuntimeTable, PipelineStageControllerBindingRejectsInvalidIntervals)
+    {
+        for (const auto [first, count] : std::vector<std::pair<int, std::uint32_t>>{
+                 {-1, 2}, {20, 0}, {std::numeric_limits<int>::max(), 1}, {20, UINT32_MAX}})
+        {
+            const MoEOverlayDeviceControllerRuntimeBinding binding{
+                .layer_count = count, .first_model_layer = first};
+            EXPECT_FALSE(binding.layerScopeValid());
+            EXPECT_FALSE(binding.valid());
+            EXPECT_FALSE(binding.matchesLayerScope(first, count));
+            EXPECT_THROW(binding.modelLayerForStorageIndex(0), std::out_of_range);
+            EXPECT_THROW(binding.storageIndexForModelLayer(first), std::out_of_range);
+        }
+    }
+
+    /** Admission rejects wrapped, negative or empty intervals before allocating rows. */
+    TEST(Test__MoERuntimeTable, PipelineStageRejectsInvalidIntervals)
+    {
+        for (const auto [first, count] : std::array<std::pair<int, int>, 4>{{
+                 {-1, 1}, {32, 0}, {32, -1}, {std::numeric_limits<int>::max(), 1}}})
+        {
+            SCOPED_TRACE(std::to_string(first) + ":" + std::to_string(count));
+            EXPECT_THROW((MoERuntimeTable(MoERuntimeTable::Config{
+                .device_id = DeviceId::cpu(), .num_layers = count,
+                .num_experts = 4, .top_k = 2, .first_model_layer = first})),
+                std::invalid_argument);
+        }
+    }
+
+    /** Request resets retain the exact stage, placement baseline and graph addresses. */
+    TEST(Test__MoERuntimeTable, PipelineStageEpochReplayRetainsInitialBanks)
+    {
+        for (const int first : {32, 40, std::numeric_limits<int>::max() - 2})
+        {
+            SCOPED_TRACE(first);
+            MoERuntimeTable table(MoERuntimeTable::Config{
+                .device_id = DeviceId::cpu(), .num_layers = 2, .num_experts = 4,
+                .top_k = 2, .first_model_layer = first});
+            auto *const base = table.deviceLayerState(first);
+            for (int layer = first; layer < first + 2; ++layer)
+            {
+                ASSERT_TRUE(table.prepareInactiveBank(layer, stagePlacement(1)));
+                ASSERT_TRUE(table.flipActiveBank(layer, 1, nullptr));
+            }
+            ASSERT_TRUE(table.hasCompleteInitialRuntimeState());
+            for (int iteration = 0; iteration < 20; ++iteration)
+            {
+                for (int layer = first; layer < first + 2; ++layer)
+                {
+                    ASSERT_TRUE(table.prepareInactiveBank(layer, stagePlacement(2)));
+                    ASSERT_TRUE(table.flipActiveBank(layer, 2, nullptr));
+                    table.hostLayerState(layer).decode_histogram[0] = 9;
+                }
+                table.resetDecodeRuntimeState();
+                table.restoreInitialRuntimeState();
+                for (int layer = first; layer < first + 2; ++layer)
+                {
+                    EXPECT_EQ(table.hostLayerState(layer).active_epoch, 1u);
+                    EXPECT_EQ(table.hostLayerState(layer).decode_histogram[0], 0u);
+                    EXPECT_FALSE(table.decodeRuntimePublicationRequired(layer));
+                    EXPECT_TRUE(table.hasInitialLayerRuntimeState(layer));
+                }
+                EXPECT_EQ(table.deviceLayerState(first), base);
+                EXPECT_EQ(table.deviceLayerState(first + 1), base + 1);
+            }
+        }
+    }
+
+    /** A same-sized foreign histogram cannot drain or reset this stage's evidence. */
+    TEST(Test__MoERuntimeTable, PipelineStageHistogramRequiresExactInterval)
+    {
+        constexpr int first = 32;
+        MoERuntimeTable table(MoERuntimeTable::Config{
+            .device_id = DeviceId::cpu(), .num_layers = 2, .num_experts = 4,
+            .top_k = 2, .first_model_layer = first});
+        DecodeExpertHistogramConfig config;
+        config.num_layers = 2;
+        config.num_experts = 4;
+        config.top_k = 2;
+        config.window_size = 32;
+        config.sockets = {DeviceId::cpu()};
+        config.ownership = MoELayeredExpertOwnership::uniform(2, 1, {0, 0, 0, 0}, 0);
+        DecodeExpertHistogram foreign(config);
+        config.ownership = MoELayeredExpertOwnership::uniform(2, 1, {0, 0, 0, 0}, first);
+        DecodeExpertHistogram owned(config);
+        for (int layer = first; layer < first + 2; ++layer)
+        {
+            auto &row = table.hostLayerState(layer);
+            row.decode_histogram[0] = 2;
+            row.decode_local_histogram[0] = 1;
+            row.prefill_histogram[1] = 4;
+            row.grouped_verifier_histogram[2] = 6;
+        }
+        EXPECT_FALSE(table.syncDecodeHistogramToHost(foreign));
+        EXPECT_EQ(table.hostLayerState(first + 1).decode_histogram[0], 2u);
+        EXPECT_EQ(foreign.activationCount(0, 0), 0u);
+        std::vector<uint64_t> selected;
+        std::vector<uint64_t> local;
+        ASSERT_TRUE(table.captureDecodeHistogramCounts(selected, local));
+        ASSERT_EQ(selected.size(), 8u);
+        EXPECT_EQ(selected[0], 2u);
+        EXPECT_EQ(selected[4], 2u);
+        std::fill(selected.begin(), selected.end(), 7);
+        EXPECT_FALSE(table.restoreDecodeHistogramCounts(selected.data(), local.data(), 2, 4, 0));
+        EXPECT_EQ(table.hostLayerState(first).prefill_histogram[1], 4u);
+        ASSERT_TRUE(table.syncDecodeHistogramToHost(owned));
+        for (int layer = first; layer < first + 2; ++layer)
+        {
+            EXPECT_EQ(owned.activationCount(ExpertHistogramSource::DecodeToken, layer, 0), 2u);
+            EXPECT_EQ(owned.activationCount(ExpertHistogramSource::PrefillChunk, layer, 1), 4u);
+            EXPECT_EQ(owned.activationCount(ExpertHistogramSource::GroupedVerifier, layer, 2), 6u);
+            EXPECT_EQ(table.hostLayerState(layer).decode_histogram[0], 0u);
+        }
+        ASSERT_TRUE(table.restoreDecodeHistogramCounts(selected.data(), local.data(), 2, 4, first));
+        EXPECT_EQ(table.hostLayerState(first).decode_histogram[3], 7u);
+        EXPECT_EQ(table.hostLayerState(first + 1).decode_histogram[3], 7u);
+        EXPECT_EQ(table.hostLayerState(first + 1).decode_local_histogram[0], 1u);
+    }
+
+    /** Async admission rejects a foreign stage before consuming a count generation. */
+    TEST(Test__MoERuntimeTable, PipelineStageAsyncDrainRejectsBeforeRotation)
+    {
+        MoERuntimeTable table(MoERuntimeTable::Config{
+            .device_id = DeviceId::cpu(), .num_layers = 2, .num_experts = 4,
+            .top_k = 2, .first_model_layer = 32});
+        table.enableAsyncDecodeHistogramDrain({true, true, false});
+        DecodeExpertHistogramConfig config;
+        config.num_layers = 2;
+        config.num_experts = 4;
+        config.top_k = 2;
+        config.sockets = {DeviceId::cpu()};
+        config.ownership = MoELayeredExpertOwnership::uniform(2, 1, {0, 0, 0, 0}, 0);
+        DecodeExpertHistogram foreign(config);
+        config.ownership = MoELayeredExpertOwnership::uniform(2, 1, {0, 0, 0, 0}, 32);
+        DecodeExpertHistogram owned(config);
+        table.hostLayerState(33).decode_histogram[0] = 6;
+        const auto rejected = table.progressAsyncDecodeHistogramDrain(foreign);
+        EXPECT_EQ(rejected.progress, RuntimeExpertHistogramDrainProgress::Failed);
+        EXPECT_NE(rejected.error.find("owned model-layer interval"), std::string::npos);
+        EXPECT_EQ(table.hostLayerState(33).decode_histogram[0], 6u);
+        EXPECT_EQ(table.progressAsyncDecodeHistogramDrain(owned).progress,
+                  RuntimeExpertHistogramDrainProgress::Ready);
+        EXPECT_EQ(owned.activationCount(33, 0), 6u);
+        EXPECT_EQ(table.hostLayerState(33).decode_histogram[0], 0u);
+        EXPECT_EQ(table.progressAsyncDecodeHistogramDrain(owned).progress,
+                  RuntimeExpertHistogramDrainProgress::Ready);
+        EXPECT_EQ(owned.activationCount(33, 0), 6u);
+    }
+
+    /** Every portable row is authenticated before an earlier valid row can change. */
+    TEST(Test__MoERuntimeTable, PipelineStagePortableRestoreRejectsForeignRowsAtomically)
+    {
+        for (const int first : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+        {
+            SCOPED_TRACE(first);
+            MoERuntimeTable table(MoERuntimeTable::Config{
+                .device_id = DeviceId::cpu(), .num_layers = 2, .num_experts = 4,
+                .top_k = 2, .first_model_layer = first});
+            for (int layer = first; layer < first + 2; ++layer)
+            {
+                ASSERT_TRUE(table.prepareInactiveBank(layer, stagePlacement(1)));
+                ASSERT_TRUE(table.flipActiveBank(layer, 1, nullptr));
+                table.hostLayerState(layer).decode_histogram[0] = 11;
+            }
+            std::vector<DeviceMoEPortableLayerRuntimeState> snapshot;
+            ASSERT_TRUE(table.capturePortableRuntimeState(snapshot));
+            ASSERT_EQ(snapshot.size(), 2u);
+            EXPECT_EQ(snapshot[0].model_layer, first);
+            EXPECT_EQ(snapshot[1].model_layer, first + 1);
+            snapshot[0].selected_histogram[0] = 31;
+            snapshot[1].selected_histogram[0] = 41;
+            for (const int foreign : {-1, first, first + 2})
+            {
+                snapshot[1].model_layer = foreign;
+                EXPECT_FALSE(table.restorePortableRuntimeState(snapshot));
+                EXPECT_EQ(table.hostLayerState(first).decode_histogram[0], 11u);
+                EXPECT_EQ(table.hostLayerState(first + 1).decode_histogram[0], 11u);
+            }
+            snapshot[1].model_layer = first + 1;
+            for (int invalid_field = 0; invalid_field < 3; ++invalid_field)
+            {
+                auto malformed = snapshot;
+                if (invalid_field == 0) malformed[1].top_k = 1;
+                if (invalid_field == 1) malformed[1].experts.pop_back();
+                if (invalid_field == 2) malformed[1].grouped_verifier_local_histogram.clear();
+                EXPECT_FALSE(table.restorePortableRuntimeState(malformed));
+                EXPECT_EQ(table.hostLayerState(first).decode_histogram[0], 11u);
+                EXPECT_EQ(table.hostLayerState(first + 1).decode_histogram[0], 11u);
+            }
+            ASSERT_TRUE(table.restorePortableRuntimeState(snapshot));
+            EXPECT_EQ(table.hostLayerState(first).decode_histogram[0], 31u);
+            EXPECT_EQ(table.hostLayerState(first + 1).decode_histogram[0], 41u);
+        }
+    }
+
+    /** Pointer-bearing diagnostic snapshots also require explicit stage identity. */
+    TEST(Test__MoERuntimeTable, PipelineStageRawRestoreRequiresExactInterval)
+    {
+        MoERuntimeTable table(MoERuntimeTable::Config{
+            .device_id = DeviceId::cpu(), .num_layers = 2, .num_experts = 4,
+            .top_k = 2, .first_model_layer = 32});
+        std::vector<DeviceMoELayerRuntime> snapshot;
+        for (int layer = 32; layer < 34; ++layer)
+        {
+            ASSERT_TRUE(table.prepareInactiveBank(layer, stagePlacement(1)));
+            ASSERT_TRUE(table.flipActiveBank(layer, 1, nullptr));
+            snapshot.push_back(table.hostLayerState(layer));
+            ASSERT_TRUE(table.prepareInactiveBank(layer, stagePlacement(2)));
+            ASSERT_TRUE(table.flipActiveBank(layer, 2, nullptr));
+        }
+        EXPECT_THROW(table.restoreRuntimeStateSnapshot(snapshot.data(), 2, 0), std::invalid_argument);
+        EXPECT_EQ(table.hostLayerState(32).active_epoch, 2u);
+        EXPECT_EQ(table.hostLayerState(33).active_epoch, 2u);
+        table.restoreRuntimeStateSnapshot(snapshot.data(), 2, 32);
+        EXPECT_EQ(table.hostLayerState(32).active_epoch, 1u);
+        EXPECT_EQ(table.hostLayerState(33).active_epoch, 1u);
+    }
 
     TEST(Test__MoERuntimeTable, ConstructionCreatesStableLayerPointers)
     {
@@ -2062,7 +2362,7 @@ namespace llaminar2::test
         uninitialized_snapshot.expert_count = 4;
         uninitialized_snapshot.top_k = 2;
 
-        table.restoreRuntimeStateSnapshot(&uninitialized_snapshot, 1, nullptr);
+        table.restoreRuntimeStateSnapshot(&uninitialized_snapshot, 1, 0, nullptr);
 
         const auto *restored = table.deviceLayerState(0);
         ASSERT_EQ(captured_runtime_ptr, restored);
@@ -3551,73 +3851,6 @@ namespace llaminar2::test
             << "Accepted verifier history must have one exact GPU stream authority";
     }
 
-#ifdef HAVE_ROCM
-    TEST(Test__MoERuntimeTable, RocmPrefillRouteScratchAllocationTracksCapacity)
-    {
-        int device_count = 0;
-        if (hipGetDeviceCount(&device_count) != hipSuccess || device_count <= 0)
-            GTEST_SKIP() << "No ROCm GPU available";
 
-        DeviceMoERuntimeTable::Config config;
-        config.device_id = DeviceId::rocm(0);
-        config.num_layers = 2;
-        config.num_experts = 4;
-        config.top_k = 2;
-        config.mirror_to_device = true;
-        config.prefill_token_capacity = 8;
-
-        MoERuntimeTable table(config);
-        EXPECT_TRUE(table.hasPrefillRouteScratchCapacity(0, 8));
-        EXPECT_TRUE(table.hasPrefillRouteScratchCapacity(1, 4));
-        EXPECT_FALSE(table.hasPrefillRouteScratchCapacity(0, 9));
-
-        const auto &state = table.hostLayerState(0);
-        EXPECT_EQ(state.prefill_token_capacity, 8u);
-        EXPECT_EQ(state.prefill_route_capacity, 16u);
-        EXPECT_NE(state.route_expert_ids, nullptr);
-        EXPECT_NE(state.route_weights, nullptr);
-        EXPECT_NE(state.expert_counts, nullptr);
-        EXPECT_NE(state.expert_offsets, nullptr);
-        EXPECT_NE(state.grouped_token_ids, nullptr);
-        EXPECT_NE(state.grouped_route_weights, nullptr);
-        EXPECT_NE(state.reserved_ptrs[0], nullptr)
-            << "prefill LLEP split-table scratch must be a first-class runtime buffer";
-        EXPECT_NE(state.reserved_ptrs[1], nullptr)
-            << "full current-batch LLEP assignment spans must be first-class runtime scratch";
-        EXPECT_NE(state.reserved_ptrs[2], nullptr)
-            << "full current-batch LLEP transfer plans must be first-class runtime scratch";
-        EXPECT_EQ(state.reserved_u64[0], 4u * kDeviceMoEMaxParticipants);
-        EXPECT_EQ(state.reserved_u64[1], 4u * kDeviceMoEMaxParticipants);
-        EXPECT_EQ(state.reserved_u64[2], 0u);
-        EXPECT_EQ(state.reserved_u64[3], 0u);
-        EXPECT_NE(table.deviceLayerState(0), &table.hostLayerState(0));
-
-        void *split_scratch_before_reset = state.reserved_ptrs[0];
-        void *span_scratch_before_reset = state.reserved_ptrs[1];
-        void *transfer_scratch_before_reset = state.reserved_ptrs[2];
-
-        hipStream_t stream = nullptr;
-        ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
-        table.resetDecodeRuntimeState(stream);
-        EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[0], split_scratch_before_reset)
-            << "decode-runtime reset must preserve prefill LLEP scratch bindings";
-        EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[1], span_scratch_before_reset)
-            << "decode-runtime reset must preserve full current-batch LLEP span scratch";
-        EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[2], transfer_scratch_before_reset)
-            << "decode-runtime reset must preserve full current-batch LLEP transfer scratch";
-
-        table.ensurePrefillRouteScratchCapacity(12, stream);
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
-        EXPECT_TRUE(table.hasPrefillRouteScratchCapacity(0, 12));
-        EXPECT_EQ(table.hostLayerState(0).prefill_token_capacity, 12u);
-        EXPECT_EQ(table.hostLayerState(0).prefill_route_capacity, 24u);
-        EXPECT_NE(table.hostLayerState(0).reserved_ptrs[0], nullptr);
-        EXPECT_NE(table.hostLayerState(0).reserved_ptrs[1], nullptr);
-        EXPECT_NE(table.hostLayerState(0).reserved_ptrs[2], nullptr);
-        EXPECT_EQ(table.hostLayerState(0).reserved_u64[0], 4u * kDeviceMoEMaxParticipants);
-        EXPECT_EQ(table.hostLayerState(0).reserved_u64[1], 4u * kDeviceMoEMaxParticipants);
-    }
-#endif
 
 } // namespace llaminar2::test

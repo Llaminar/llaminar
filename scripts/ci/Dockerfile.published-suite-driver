@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.6
-# Control-plane tools only. This image never substitutes for a tested runtime:
-# the canonical HTTP/benchmark drivers launch the separately pinned GHCR IDs.
+# Control-plane tools and the pinned OpenCode client only. This image never
+# substitutes for a tested runtime: HTTP, benchmark and coding workloads launch
+# the separately pinned GHCR IDs.
 # Inheriting the AVX2 runtime supplies both vendors' memory-telemetry libraries
 # on hosts whose ARC pod has neither a GPU SDK nor writable model-cache mounts.
 ARG RUNTIME_IMAGE
@@ -10,5 +11,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       docker.io curl jq pciutils procps util-linux python3-requests python3-yaml \
  && rm -rf /var/lib/apt/lists/*
+COPY install_opencode_client.py /tmp/install_opencode_client.py
+RUN mkdir -p /usr/local/share/llaminar \
+ && python3 /tmp/install_opencode_client.py > /usr/local/share/llaminar/opencode-client.json \
+ && rm /tmp/install_opencode_client.py
 LABEL org.llaminar.image_role="suite-driver"
 ENTRYPOINT []

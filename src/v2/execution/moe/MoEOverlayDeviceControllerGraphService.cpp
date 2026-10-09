@@ -12,10 +12,14 @@
  * stays resident awaiting a later transfer, reader drain, host publication, or
  * graph submission. This distinction is required on heterogeneous schedulers,
  * where an open-ended maintenance wait can starve independent inference.
+ * No-movement decisions retain bounded numeric telemetry so idle placement
+ * checks cannot grow process memory across a long serving lifetime.
  */
 
 #include "MoEOverlayDeviceControllerGraphService.h"
 #include "MoEOverlayWorkerDrainProtocol.h"
+#include "MoEOverlayControllerPerfStats.h"
+#include "MoEControllerMovementPerfStats.h"
 
 #include "MoEOverlayDeviceControllerKernels.h"
 #include "MoEOverlayEconomyCertificationController.h"
@@ -500,6 +504,8 @@ namespace llaminar2
         std::vector<MoEOptimizationMovementEdge> movement_ledger;
         /** Sole leader's immutable admitting economics for completed waves. */
         std::vector<MoEOptimizationMovementEconomy> movement_economy;
+        /** Physical publication survives even on a follower without an economy proof. */
+        std::vector<MoEOptimizationDeviceMovementPublication> movement_device_publications;
         /**
          * Completed decision evidence, including economically correct no-ops.
          *
@@ -570,6 +576,7 @@ namespace llaminar2
                 .discarded_edges = 0u,
                 .economy = movement_economy,
                 .discarded_economy_records = 0u,
+                .device_publications = movement_device_publications,
             };
         }
 
@@ -694,6 +701,7 @@ namespace llaminar2
             if (left.participant_count != right.participant_count ||
                 left.num_layers != right.num_layers ||
                 left.num_experts != right.num_experts ||
+                left.first_model_layer != right.first_model_layer ||
                 std::memcmp(
                     &left.header, &right.header, sizeof(left.header)) != 0 ||
                 left.entries.size() != right.entries.size())
@@ -790,7 +798,8 @@ namespace llaminar2
             if (!runtime.valid() ||
                 !runtime.initialRuntimePublicationValid() ||
                 runtime.overlay_participant_id != local_ids[local_index] ||
-                runtime.layer_count != config_.fabric->layout().header.num_layers ||
+                !runtime.matchesLayerScope(config_.fabric->layout().header.first_model_layer,
+                                           config_.fabric->layout().header.num_layers) ||
                 runtime.expert_count != config_.fabric->layout().header.num_experts)
             {
                 throw std::logic_error(
@@ -3228,21 +3237,9 @@ namespace llaminar2
                 owner->failDynamic(std::move(error));
                 break;
             }
-            PerfStatsCollector::addCounter(
-                "moe_overlay_controller",
-                "background_notification_batches",
-                1.0,
-                "maintenance",
-                owner->config_.perf_device,
-                {{"coalesced_tokens",
-                 std::to_string(window.completed_tokens)},
-                 {"required_tokens",
-                  std::to_string(admitted_window_tokens)},
-                 {"phase",
-                  window.phase == MoEOverlayInferencePhase::Prefill
-                      ? "prefill"
-                      : "decode"},
-                 {"blocking_inference", "false"}});
+            recordMoEMaintenanceNotification(window.completed_tokens, admitted_window_tokens,
+                window.phase == MoEOverlayInferencePhase::Prefill ? "prefill" : "decode",
+                owner->config_.perf_device);
 
             const std::uint64_t next_window_tokens =
                 boundary_gate.advanceAfterReceipt(
@@ -3251,22 +3248,8 @@ namespace llaminar2
                     transaction_result.cadenceReceipt());
             if (next_window_tokens != admitted_window_tokens)
             {
-                PerfStatsCollector::addCounter(
-                    "moe_overlay_controller",
-                    "maintenance_window_growth",
-                    1.0,
-                    "maintenance",
-                    owner->config_.perf_device,
-                    {{"previous_tokens",
-                      std::to_string(admitted_window_tokens)},
-                     {"next_tokens",
-                      std::to_string(next_window_tokens)},
-                     {"maximum_tokens",
-                      std::to_string(maximum_window_tokens)},
-                     {"growth_factor",
-                      std::to_string(window_growth_factor)},
-                     {"policy_owner", "device"},
-                     {"scheduler_role", "retained_graph_submission"}});
+                recordMoEMaintenanceWindowGrowth(admitted_window_tokens, next_window_tokens,
+                    maximum_window_tokens, window_growth_factor, owner->config_.perf_device);
             }
 
             if (drain.shutdownRequested())
@@ -3423,43 +3406,15 @@ namespace llaminar2
                     << (first_observed_layer
                             ? std::string("none")
                             : observed_layers.str()));
-                PerfStatsCollector::addCounter(
-                    "moe_overlay_controller",
-                    "device_service_phase_observed",
-                    1.0,
-                    "maintenance",
-                    owner->config_.perf_device,
-                    {{"participant_id",
-                      std::to_string(endpoint->binding.participant_id)},
-                     {"source", phase_names[phase]},
-                     {"samples", std::to_string(participant_samples[phase])},
-                     {"activations",
-                      std::to_string(participant_activations[phase])},
-                     {"blocking_inference", "false"},
-                     {"evidence_source", "device_local"}});
+                recordMoEServicePhaseObservation(endpoint->binding.participant_id,
+                    phase_names[phase], participant_samples[phase], participant_activations[phase],
+                    owner->config_.perf_device);
             }
-            PerfStatsCollector::addCounter(
-                "moe_overlay_controller",
-                "device_service_snapshot_publications",
-                1.0,
-                "maintenance",
-                owner->config_.perf_device,
-                {{"participant_id",
-                  std::to_string(endpoint->binding.participant_id)},
-                 {"generation", std::to_string(generation)},
-                 {"blocking_inference", "false"},
-                 {"evidence_source", "device_local"}});
+            recordMoEServiceSnapshotPublication(endpoint->binding.participant_id,
+                generation, owner->config_.perf_device);
             ++endpoint_index;
         }
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "device_service_snapshot_rows",
-            static_cast<double>(imported_rows),
-            "maintenance",
-            owner->config_.perf_device,
-            {{"samples", std::to_string(imported_samples)},
-             {"blocking_inference", "false"},
-             {"evidence_source", "device_local"}});
+        recordMoEServiceSnapshotRows(imported_rows, imported_samples, owner->config_.perf_device);
         return true;
     }
 
@@ -4184,81 +4139,7 @@ namespace llaminar2
                 .snapshot_observations =
                     command.header.snapshot_observations,
             };
-            if (prepared_context_restore)
-            {
-                PerfStatsCollector::addCounter(
-                    "moe_overlay_controller",
-                    "prepared_context_restore_certifications",
-                    1.0,
-                    "model_teardown",
-                    owner->config_.perf_device,
-                    {{"transaction", std::to_string(last_transaction)},
-                     {"durable_epoch",
-                      std::to_string(command.header.candidate_epoch)},
-                     {"movement_commands", "0"},
-                     {"policy_owner", "device"},
-                     {"exact_initial_owner_table", "true"}});
-            }
-            else
-            {
-                PerfStatsCollector::addCounter(
-                    "moe_overlay_controller",
-                    "dynamic_zero_movement_transactions",
-                    1.0,
-                    "maintenance",
-                    owner->config_.perf_device,
-                    {{"transaction", std::to_string(last_transaction)},
-                     {"movement_commands", "0"},
-                     {"physical_bytes", "0"},
-                     {"snapshot_observations",
-                      std::to_string(command.header.snapshot_observations)},
-                     {"priority_cost_before",
-                      std::to_string(command.header.priority_cost_before)},
-                     {"priority_cost_after",
-                      std::to_string(command.header.priority_cost_after)},
-                     {"same_priority_makespan_before",
-                      std::to_string(
-                          command.header.same_priority_makespan_before)},
-                     {"same_priority_makespan_after",
-                      std::to_string(
-                          command.header.same_priority_makespan_after)},
-                     {"accepted_cycles",
-                      std::to_string(command.header.accepted_cycles)},
-                     {"rejected_cycles",
-                      std::to_string(command.header.rejected_cycles)},
-                     {"phase_tradeoff_candidates",
-                      std::to_string(
-                          command.header.phase_tradeoff_candidates)},
-                     {"improvement_floor_rejected_cycles",
-                      std::to_string(
-                          command.header.improvement_floor_rejected_cycles)},
-                     {"payoff_rejected_cycles",
-                      std::to_string(
-                          command.header.payoff_rejected_cycles)},
-                     {"residency_rejected_cycles",
-                      std::to_string(
-                          command.header.residency_rejected_cycles)},
-                     {"projected_service_gain_ns",
-                      std::to_string(
-                          command.header.projected_service_gain_ns)},
-                     {"projected_transfer_and_repack_ns",
-                      std::to_string(
-                          command.header.projected_transfer_and_repack_ns)},
-                     {"projected_inference_interference_ns",
-                      std::to_string(
-                          command.header.projected_inference_interference_ns)},
-                     {"projected_net_benefit_ns",
-                      std::to_string(
-                          command.header.projected_net_benefit_ns)},
-                     {"layer_scan_start",
-                      std::to_string(command.header.layer_scan_start)},
-                     {"layer_scan_next",
-                      std::to_string(command.header.layer_scan_next)},
-                     {"bounded_device_phases", "true"},
-                     {"resident_external_waits", "0"},
-                     {"prearmed_cross_device_fanin", "true"},
-                     {"policy_owner", "device"}});
-            }
+            recordMoEZeroMovementCompletion(command.header, owner->config_.perf_device);
             return true;
         }
 
@@ -4470,30 +4351,14 @@ namespace llaminar2
                 "; poll_quanta=" + std::to_string(poll_quanta) +
                 "; operation_polls=" + std::to_string(operation_polls));
         }
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "physical_wave_parallel_operations_started",
-            static_cast<double>(operation_count),
-            "maintenance",
-            owner->config_.perf_device,
-            {{"transaction", std::to_string(batch.transaction_id)},
-             {"migrations", std::to_string(batch.migrations.size())},
-             {"poll_quanta", std::to_string(poll_quanta)},
-             {"maximum_polls_per_quantum",
-              std::to_string(maximum_polls_per_quantum)},
-             {"serialized_submission", "false"}});
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "physical_wave_bounded_progress_polls",
-            static_cast<double>(operation_polls),
-            "maintenance",
-            owner->config_.perf_device,
-            {{"transaction", std::to_string(batch.transaction_id)},
-             {"operations", std::to_string(operation_count)},
-             {"poll_quanta", std::to_string(poll_quanta)},
-             {"maximum_polls_per_quantum",
-              std::to_string(maximum_polls_per_quantum)},
-             {"driver_fair", "true"}});
+        recordMoEPhysicalWaveProgress({
+            .transaction = batch.transaction_id,
+            .migrations = batch.migrations.size(),
+            .operations = operation_count,
+            .polls = operation_polls,
+            .quanta = poll_quanta,
+            .maximum_polls_per_quantum = maximum_polls_per_quantum,
+        }, owner->config_.perf_device);
 
         std::string stage_error;
         if (!owner->config_.physical_fabric->stageDevicePreparedTransfers(
@@ -4878,22 +4743,7 @@ namespace llaminar2
          * newly published epoch and either continue or certify exact equality. */
         if (prepared_context_restore)
         {
-            PerfStatsCollector::addCounter(
-                "moe_overlay_controller",
-                "prepared_context_restore_movement_waves",
-                1.0,
-                "model_teardown",
-                owner->config_.perf_device,
-                {{"transaction", std::to_string(last_transaction)},
-                 {"base_epoch", std::to_string(batch.base_epoch)},
-                 {"candidate_epoch",
-                  std::to_string(batch.candidate_epoch)},
-                 {"movement_commands",
-                  std::to_string(batch.command_count)},
-                 {"physical_bytes",
-                  std::to_string(batch.packed_weight_bytes)},
-                 {"policy_owner", "device"},
-                 {"excluded_from_optimization_ledger", "true"}});
+            recordMoEPreparedContextMovement(command.header, owner->config_.perf_device);
             return true;
         }
 
@@ -5016,15 +4866,80 @@ namespace llaminar2
                     "completed device movement lost its authoritative economy proof");
             }
         }
+        const MoEOptimizationDeviceMovementPublication completed_publication{
+            .transaction = last_transaction,
+            .candidate_epoch = batch.candidate_epoch,
+            .command_count = batch.command_count,
+            .physical_payload_bytes = batch.packed_weight_bytes,
+            .controller = MoEOptimizationControllerMovementReceipt{
+                .base_epoch = batch.base_epoch,
+                .promotions = promotions,
+                .demotions = demotions,
+                .same_priority_moves = same_priority_moves,
+                .cross_domain_moves = cross_domain_moves,
+                .cross_rank_moves = cross_rank_moves,
+                .cross_backend_moves = cross_backend_moves,
+                .snapshot_observations = command.header.snapshot_observations,
+                .priority_cost_before = command.header.priority_cost_before,
+                .priority_cost_after = command.header.priority_cost_after,
+                .same_priority_makespan_before = command.header.same_priority_makespan_before,
+                .same_priority_makespan_after = command.header.same_priority_makespan_after,
+                .accepted_cycles = command.header.accepted_cycles,
+                .physical_cycles = batch.migration_cycles.size(),
+                .rejected_cycles = command.header.rejected_cycles,
+                .phase_tradeoff_candidates = command.header.phase_tradeoff_candidates,
+                .improvement_floor_rejected_cycles = command.header.improvement_floor_rejected_cycles,
+                .payoff_rejected_cycles = command.header.payoff_rejected_cycles,
+                .residency_rejected_cycles = command.header.residency_rejected_cycles,
+                .economy = {
+                    .projected_service_gain_ns = command.header.projected_service_gain_ns,
+                    .projected_transfer_and_repack_ns = command.header.projected_transfer_and_repack_ns,
+                    .projected_inference_interference_ns = command.header.projected_inference_interference_ns,
+                    .projected_net_benefit_ns = command.header.projected_net_benefit_ns,
+                },
+                .changed_layers = command.header.changed_layers,
+                .layer_scan_start = command.header.layer_scan_start,
+                .layer_scan_next = command.header.layer_scan_next,
+                .edges_checked = capacity_evidence.edges_checked,
+                .participant_coordinates_checked = capacity_evidence.participant_coordinates_checked,
+                .tier_coordinates_checked = capacity_evidence.tier_coordinates_checked,
+                .malformed_edges = capacity_evidence.malformed_edges,
+                .participant_flow_violations = capacity_evidence.participant_flow_violations,
+                .tier_flow_violations = capacity_evidence.tier_flow_violations,
+            },
+        };
+        if (!completed_publication.valid() ||
+            completed_publication.command_count != completed_edges.size())
+            return fail(error, "completed device movement lost its physical publication receipt");
+        validateMoEControllerCompletedMovement(completed_publication, completed_edges);
         {
-            /* One lock publishes every edge plus the leader-only policy proof. */
+            /* Reserve every append before publishing any logical history. A
+             * failed allocation may change capacity, never the accepted ledger.
+             * One lock publishes edges, actual bytes and the leader-only proof. */
             std::lock_guard<std::mutex> lock(movement_ledger_mutex);
+            /** Reserve an atomic append with amortized growth, retaining old contents. */
+            const auto reserve_append = [](auto &history, std::size_t count)
+            {
+                if (count > history.max_size() - history.size())
+                    throw std::length_error("Completed device movement history exceeds its container limit");
+                const auto required = history.size() + count;
+                if (required > history.capacity())
+                {
+                    const auto doubled = history.capacity() > history.max_size() / 2
+                        ? history.max_size() : history.capacity() * 2;
+                    history.reserve(std::max(required, doubled));
+                }
+            };
+            reserve_append(movement_ledger, completed_edges.size());
+            reserve_append(movement_economy, completed_economy ? 1u : 0u);
+            reserve_append(movement_device_publications, 1u);
             movement_ledger.insert(
                 movement_ledger.end(),
                 completed_edges.begin(),
                 completed_edges.end());
             if (completed_economy)
                 movement_economy.push_back(*completed_economy);
+            movement_device_publications.push_back(completed_publication);
         }
 
         /*
@@ -5078,231 +4993,8 @@ namespace llaminar2
                 << " blocking_inference=false");
         }
 
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_movement_transactions",
-            1.0,
-            "maintenance",
-            owner->config_.perf_device,
-            {{"transaction", std::to_string(last_transaction)},
-             {"base_epoch", std::to_string(batch.base_epoch)},
-             {"candidate_epoch", std::to_string(batch.candidate_epoch)},
-             {"movement_commands", std::to_string(batch.command_count)},
-             {"physical_bytes", std::to_string(batch.packed_weight_bytes)},
-             {"promotions", std::to_string(promotions)},
-             {"demotions", std::to_string(demotions)},
-             {"same_priority_moves",
-              std::to_string(same_priority_moves)},
-             {"cross_domain_moves",
-              std::to_string(cross_domain_moves)},
-             {"cross_rank_moves",
-              std::to_string(cross_rank_moves)},
-             {"cross_backend_moves",
-              std::to_string(cross_backend_moves)},
-             {"snapshot_observations",
-              std::to_string(command.header.snapshot_observations)},
-             {"priority_cost_before",
-              std::to_string(command.header.priority_cost_before)},
-             {"priority_cost_after",
-              std::to_string(command.header.priority_cost_after)},
-             {"same_priority_makespan_before",
-              std::to_string(
-                  command.header.same_priority_makespan_before)},
-             {"same_priority_makespan_after",
-              std::to_string(
-                  command.header.same_priority_makespan_after)},
-             {"accepted_cycles",
-              std::to_string(command.header.accepted_cycles)},
-             {"rejected_cycles",
-              std::to_string(command.header.rejected_cycles)},
-             {"phase_tradeoff_candidates",
-              std::to_string(
-                  command.header.phase_tradeoff_candidates)},
-             {"improvement_floor_rejected_cycles",
-              std::to_string(
-                  command.header.improvement_floor_rejected_cycles)},
-             {"payoff_rejected_cycles",
-              std::to_string(command.header.payoff_rejected_cycles)},
-             {"residency_rejected_cycles",
-              std::to_string(command.header.residency_rejected_cycles)},
-             {"projected_service_gain_ns",
-              std::to_string(
-                  command.header.projected_service_gain_ns)},
-             {"projected_transfer_and_repack_ns",
-              std::to_string(
-                  command.header.projected_transfer_and_repack_ns)},
-             {"projected_inference_interference_ns",
-              std::to_string(
-                  command.header.projected_inference_interference_ns)},
-             {"projected_net_benefit_ns",
-              std::to_string(command.header.projected_net_benefit_ns)},
-             {"changed_layers",
-              std::to_string(command.header.changed_layers)},
-             {"layer_scan_start",
-              std::to_string(command.header.layer_scan_start)},
-             {"layer_scan_next",
-              std::to_string(command.header.layer_scan_next)},
-             {"parallel_submission", "true"},
-             {"bounded_device_phases", "true"},
-             {"resident_external_waits", "0"},
-             {"prearmed_cross_device_fanin", "true"},
-             {"retirement_attempts", "1"},
-             {"retirement_busy_retries", "0"},
-             {"blocking_inference", "false"},
-             {"policy_owner", "device"}});
-        const PerfStatsCollector::Tags movement_tags{
-            {"transaction", std::to_string(last_transaction)},
-            {"base_epoch", std::to_string(batch.base_epoch)},
-            {"candidate_epoch", std::to_string(batch.candidate_epoch)},
-            {"policy_owner", "device"},
-            {"parallel_submission", "true"},
-            {"bounded_device_phases", "true"},
-            {"resident_external_waits", "0"},
-            {"prearmed_cross_device_fanin", "true"},
-            {"blocking_inference", "false"}};
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_movement_commands",
-            static_cast<double>(batch.command_count),
-            "maintenance",
-            owner->config_.perf_device,
-            movement_tags);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_physical_bytes",
-            static_cast<double>(batch.packed_weight_bytes),
-            "maintenance",
-            owner->config_.perf_device,
-            movement_tags);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_promotions",
-            static_cast<double>(promotions),
-            "maintenance",
-            owner->config_.perf_device,
-            movement_tags);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_demotions",
-            static_cast<double>(demotions),
-            "maintenance",
-            owner->config_.perf_device,
-            movement_tags);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_same_priority_moves",
-            static_cast<double>(same_priority_moves),
-            "maintenance",
-            owner->config_.perf_device,
-            movement_tags);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_cross_domain_moves",
-            static_cast<double>(cross_domain_moves),
-            "maintenance",
-            owner->config_.perf_device,
-            movement_tags);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_cross_rank_moves",
-            static_cast<double>(cross_rank_moves),
-            "maintenance",
-            owner->config_.perf_device,
-            movement_tags);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_cross_backend_moves",
-            static_cast<double>(cross_backend_moves),
-            "maintenance",
-            owner->config_.perf_device,
-            movement_tags);
-        PerfStatsCollector::addCounter(
-            "moe_overlay_controller",
-            "dynamic_capacity_conservation_certifications",
-            1.0,
-            "maintenance",
-            owner->config_.perf_device,
-            {{"transaction", std::to_string(last_transaction)},
-             {"candidate_epoch", std::to_string(batch.candidate_epoch)},
-             {"edges_checked",
-              std::to_string(capacity_evidence.edges_checked)},
-             {"participant_coordinates_checked",
-              std::to_string(
-                  capacity_evidence.participant_coordinates_checked)},
-             {"tier_coordinates_checked",
-              std::to_string(capacity_evidence.tier_coordinates_checked)},
-             {"malformed_edges",
-              std::to_string(capacity_evidence.malformed_edges)},
-             {"participant_flow_violations",
-              std::to_string(
-                  capacity_evidence.participant_flow_violations)},
-             {"tier_flow_violations",
-              std::to_string(capacity_evidence.tier_flow_violations)},
-             {"direction_counts_are_capacity_proof", "false"},
-             {"blocking_inference", "false"},
-             {"policy_owner", "device"}});
-
-        /* Keep one diagnostic row per authenticated physical edge. Aggregate
-         * transaction counters prove economy, while these rows retain the
-         * exact participant, priority, backend, and rank direction needed to
-         * diagnose a parity campaign without reconstructing policy state. */
-        for (const auto &migration : batch.migrations)
-        {
-            const auto *const source_group =
-                owner->config_.topology->groupForParticipant(
-                    migration.source.owner_participant);
-            const auto *const destination_group =
-                owner->config_.topology->groupForParticipant(
-                    migration.destination.owner_participant);
-            if (!source_group || !destination_group)
-            {
-                return fail(
-                    error,
-                    "completed device movement lost its frozen topology group");
-            }
-            const char *direction = "same_priority";
-            if (migration.direction ==
-                MoEOverlayTierMigrationDirection::Promotion)
-            {
-                direction = "promotion";
-            }
-            else if (migration.direction ==
-                     MoEOverlayTierMigrationDirection::Demotion)
-            {
-                direction = "demotion";
-            }
-            PerfStatsCollector::addCounter(
-                "moe_overlay_controller",
-                "dynamic_migration_edges",
-                1.0,
-                "maintenance",
-                owner->config_.perf_device,
-                {{"transaction", std::to_string(last_transaction)},
-                 {"candidate_epoch", std::to_string(batch.candidate_epoch)},
-                 {"layer", std::to_string(migration.layer_idx)},
-                 {"expert", std::to_string(migration.expert_id)},
-                 {"direction", direction},
-                 {"movement_axis", movementAxisName(migration.axis)},
-                 {"source_participant",
-                  std::to_string(migration.source.owner_participant)},
-                 {"destination_participant",
-                  std::to_string(migration.destination.owner_participant)},
-                 {"source_priority",
-                  std::to_string(source_group->tier_priority)},
-                 {"destination_priority",
-                  std::to_string(destination_group->tier_priority)},
-                 {"source_device", migration.source.device.to_string()},
-                 {"destination_device",
-                  migration.destination.device.to_string()},
-                 {"source_world_rank",
-                  std::to_string(migration.source.owner_world_rank)},
-                 {"destination_world_rank",
-                  std::to_string(migration.destination.owner_world_rank)},
-                 {"estimated_weight_bytes",
-                  std::to_string(migration.estimated_weight_bytes)},
-                 {"blocking_inference", "false"},
-                 {"policy_owner", "device"}});
-        }
+        recordMoEControllerCompletedMovement(
+            completed_publication, completed_edges, owner->config_.perf_device);
         return true;
     }
 

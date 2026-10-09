@@ -824,6 +824,22 @@ namespace llaminar2
         return aggregate;
     }
 
+    PrefixRestoreMetadata StageRunnerRegistry::prefixRestoreMetadataAll(const PrefixLookupResult &hit) const
+    {
+        PrefixRestoreMetadata metadata;
+        if (hit.cached_tokens <= 0) return metadata;
+        if (last_prefix_hits_.size() != entries_.size())
+            throw std::logic_error("Prefix restore metadata has no complete stage admission");
+        for (size_t index = 0; index < entries_.size(); ++index)
+        {
+            const auto selected = last_prefix_hits_[index].clampedTo(hit.cached_tokens);
+            if (selected.cached_tokens != hit.cached_tokens)
+                throw std::logic_error("Prefix restore metadata disagrees with the stage frontier");
+            metadata.merge(entries_[index].runner->prefixRestoreMetadata(selected));
+        }
+        return metadata;
+    }
+
     bool StageRunnerRegistry::preparePrefixHarvestAll(
         const PrefixLookupResult &admission,
         const std::vector<int32_t> &tokens,
@@ -834,8 +850,10 @@ namespace llaminar2
             return false;
         for (size_t index = 0u; index < entries_.size(); ++index)
         {
+            auto &child_admission = last_prefix_hits_[index];
+            child_admission = child_admission.forHarvest(admission.cached_tokens);
             if (!entries_[index].runner->preparePrefixHarvest(
-                    last_prefix_hits_[index], tokens, schedule))
+                    child_admission, tokens, schedule))
                 return false;
         }
         return true;
@@ -845,6 +863,7 @@ namespace llaminar2
         const PrefixLookupResult &hit,
         int seq_idx)
     {
+        (void)hit.restoreBlocks();
         const int common_tokens = std::max(0, hit.cached_tokens);
         if (common_tokens <= 0)
             return true;
@@ -931,7 +950,11 @@ namespace llaminar2
         if (children.size() == 1u)
             return std::move(children.front());
 
+        std::vector<PrefixMovementEpochSnapshot> movement_epochs;
+        movement_epochs.reserve(children.size());
+        for (const auto &child : children) movement_epochs.push_back(child.moe_runtime_movement_epoch);
         PrefixRuntimeStateSnapshot aggregate = std::move(children.front());
+        aggregate.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::pipeline(std::move(movement_epochs));
         aggregate.execution_path = "global-stage-registry";
 
         constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ull;
@@ -975,9 +998,6 @@ namespace llaminar2
                 std::max(aggregate.current_position, child.current_position);
             aggregate.session_epoch =
                 std::max(aggregate.session_epoch, child.session_epoch);
-            aggregate.moe_runtime_movement_epoch = std::max(
-                aggregate.moe_runtime_movement_epoch,
-                child.moe_runtime_movement_epoch);
             aggregate.live_state_epoch =
                 std::max(aggregate.live_state_epoch, child.live_state_epoch);
             aggregate.live_state_mutations += child.live_state_mutations;
@@ -2207,6 +2227,11 @@ namespace llaminar2
         return stage_runners_.lookupPrefixAll(tokens);
     }
 
+    PrefixRestoreMetadata GlobalOrchestrator::prefixRestoreMetadata(const PrefixLookupResult &hit) const
+    {
+        return stage_runners_.prefixRestoreMetadataAll(hit);
+    }
+
     bool GlobalOrchestrator::preparePrefixHarvest(
         const PrefixLookupResult &admission,
         const std::vector<int32_t> &tokens,
@@ -2761,6 +2786,22 @@ namespace llaminar2
         if (!owner || *owner < 0 || *owner >= config_.world_size)
             throw std::invalid_argument("GlobalOrchestrator: no valid vocabulary-head request authority");
         return *owner;
+    }
+
+    PrefixCacheTelemetrySources StageRunnerRegistry::prefixCacheTelemetrySourcesAll() const
+    {
+        PrefixCacheTelemetrySources result;
+        for (const auto &entry : entries_)
+        {
+            const auto sources = entry.runner->prefixCacheTelemetrySources();
+            result.insert(result.end(), sources.begin(), sources.end());
+        }
+        return result;
+    }
+
+    PrefixCacheTelemetrySources GlobalOrchestrator::prefixCacheTelemetrySources() const
+    {
+        return stage_runners_.prefixCacheTelemetrySourcesAll();
     }
 
 } // namespace llaminar2

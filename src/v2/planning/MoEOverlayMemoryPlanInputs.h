@@ -10,6 +10,7 @@
 #pragma once
 
 #include "config/OrchestrationConfig.h"
+#include "execution/factory/FactoryPPStageConfig.h"
 #include "execution/moe/MoEOverlayInferenceTransaction.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
 #include <span>
@@ -45,6 +46,8 @@ struct MoEOverlayMemoryPlanInputRequest
     MoEOverlayGPUWeightLoadCapacityInput gpu_weight_load;
     GraphSnapshotMemoryCapacity snapshot_capacity;
     std::size_t model_graph_topology_variant_count = 1;
+    /** Local child boundary; required when pricing a projected pipeline stage. */
+    std::optional<FactoryPPStageConfig> pipeline_stage;
 };
 
 /** @brief Complete local BOM input and the exact schedule/cache identity it prices. */

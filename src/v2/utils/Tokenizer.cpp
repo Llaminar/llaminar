@@ -5,17 +5,19 @@
  * @date 2025
  *
  * Implements Byte Pair Encoding (BPE) tokenization by reading vocabulary
- * directly from GGUF metadata.
+ * directly from GGUF metadata. Unicode pre-tokenization is selected by the
+ * declared policy and bounds every merge; decoded byte equality alone does
+ * not establish that a prompt uses the token IDs seen during training.
  */
 
 #include "Tokenizer.h"
 #include "Logger.h"
 #include "../loaders/ModelContext.h"
 #include "../loaders/ModelLoader.h"
-#include <regex>
 #include <algorithm>
 #include <sstream>
 #include <queue>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -32,11 +34,19 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto tokenizer = std::shared_ptr<BPETokenizer>(new BPETokenizer());
+        return create(model_ctx->model().metadata);
+    }
 
-        if (!tokenizer->initializeFromMetadata(model_ctx))
+    std::shared_ptr<BPETokenizer> BPETokenizer::create(const std::map<std::string, GGUFValue>& metadata)
+    {
+        auto tokenizer = std::shared_ptr<BPETokenizer>(new BPETokenizer());
+        try
         {
-            LOG_ERROR("[BPETokenizer] Failed to initialize from metadata");
+            if (!tokenizer->initializeFromMetadata(metadata)) return nullptr;
+        }
+        catch (const std::exception& error)
+        {
+            LOG_ERROR("[BPETokenizer] Metadata admission failed: " << error.what());
             return nullptr;
         }
 
@@ -44,9 +54,16 @@ namespace llaminar2
         return tokenizer;
     }
 
-    bool BPETokenizer::initializeFromMetadata(std::shared_ptr<ModelContext> model_ctx)
+    bool BPETokenizer::initializeFromMetadata(const std::map<std::string, GGUFValue>& metadata)
     {
-        const auto &metadata = model_ctx->model().metadata;
+        const auto model = metadata.find("tokenizer.ggml.model");
+        if (model == metadata.end() || model->second.type != GGUFValueType::STRING ||
+            model->second.asString() != "gpt2")
+            throw std::invalid_argument("BPETokenizer requires tokenizer.ggml.model='gpt2'");
+        const auto pre = metadata.find("tokenizer.ggml.pre");
+        if (pre == metadata.end() || pre->second.type != GGUFValueType::STRING)
+            throw std::invalid_argument("Missing STRING tokenizer.ggml.pre; token boundaries cannot be inferred");
+        pre_tokenizer_ = std::make_unique<TextPreTokenizer>(parseTextPreTokenizerProfile(pre->second.asString()));
 
         // Extract vocabulary tokens
         auto tokens_it = metadata.find("tokenizer.ggml.tokens");
@@ -135,6 +152,8 @@ namespace llaminar2
             {
                 byte_to_token_id_[i] = it->second;
             }
+            else
+                throw std::invalid_argument("Byte-BPE vocabulary is missing byte " + std::to_string(i));
         }
 
         LOG_DEBUG("[BPETokenizer] Initialized with " << vocab_.size() << " tokens, "
@@ -442,10 +461,10 @@ namespace llaminar2
 
     std::vector<int> BPETokenizer::encodeWithSpecialTokens(const std::string &text) const
     {
-        // If no special tokens, just use regular BPE
+        // Added/control tokens delimit the Unicode pre-tokenizer's subjects.
         if (special_tokens_.empty())
         {
-            return applyBPE(text);
+            return encodeOrdinaryText(text);
         }
 
         std::vector<int> result;
@@ -481,11 +500,12 @@ namespace llaminar2
                     }
                 }
 
-                // Apply BPE to the non-special segment
-                std::string segment = text.substr(pos, next_special - pos);
+                // Pre-tokenize ordinary text before merging any bytes. A whole
+                // segment may round-trip correctly while using untrained IDs.
+                const auto segment = std::string_view(text).substr(pos, next_special - pos);
                 if (!segment.empty())
                 {
-                    auto bpe_tokens = applyBPE(segment);
+                    auto bpe_tokens = encodeOrdinaryText(segment);
                     result.insert(result.end(), bpe_tokens.begin(), bpe_tokens.end());
                 }
                 pos = next_special;
@@ -566,7 +586,19 @@ namespace llaminar2
         return "";
     }
 
-    std::vector<int> BPETokenizer::applyBPE(const std::string &text) const
+    std::vector<int> BPETokenizer::encodeOrdinaryText(std::string_view text) const
+    {
+        std::vector<int> result;
+        const auto normalized = pre_tokenizer_->normalize(text);
+        for (const auto span : pre_tokenizer_->split(normalized))
+        {
+            auto tokens = applyBPE(span);
+            result.insert(result.end(), tokens.begin(), tokens.end());
+        }
+        return result;
+    }
+
+    std::vector<int> BPETokenizer::applyBPE(std::string_view text) const
     {
         // Optimized BPE implementation using priority queue
         // Time complexity: O(n log n) instead of O(n²)
@@ -587,22 +619,8 @@ namespace llaminar2
         tokens.reserve(text.size());
         for (unsigned char c : text)
         {
-            int id = byte_to_token_id_[c];
-            if (id != -1)
-            {
-                tokens.push_back(id);
-            }
-            else
-            {
-                // Unknown byte - try to find it in vocab directly
-                std::string byte_str = byte_encoder_[c];
-                auto it = vocab_map_.find(byte_str);
-                if (it != vocab_map_.end())
-                {
-                    tokens.push_back(it->second);
-                }
-                // else: skip unknown bytes (shouldn't happen with proper vocab)
-            }
+            // Admission proves complete byte coverage; no byte may be dropped.
+            tokens.push_back(byte_to_token_id_[c]);
         }
 
         if (tokens.size() <= 1)

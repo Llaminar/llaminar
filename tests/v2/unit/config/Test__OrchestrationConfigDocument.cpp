@@ -7,6 +7,8 @@
  * Documents retain policy intent and exact topology; they are not certificates.
  * Saved selection preserves the discovery order without redefining physical
  * CPU/GPU identities or allocating an execution communicator in the parser.
+ * Compact routed stage plans preserve their global layer origin through the
+ * same codec, including terminal MTP rows and nonzero pipeline offsets.
  */
 #include "config/OrchestrationConfigDocument.h"
 #include "config/OrchestrationConfigParser.h"
@@ -174,6 +176,44 @@ TEST(OrchestrationConfigDocument, AllBackendsMovementOwnerAndOptionalMtpPolicies
         EXPECT_NE(decoded.moe_routed_expert_plan.get(), config.moe_routed_expert_plan.get());
         decoded.moe_routed_expert_plan->routed_tiers[0].priority = -9;
         EXPECT_EQ(config.moe_routed_expert_plan->routed_tiers[0].priority, -5);
+    }
+}
+
+/** @test Stage documents retain exact compact global layer intervals and expert rows. */
+TEST(OrchestrationConfigDocument, PipelineStageOriginAndMtpRowsRoundTrip)
+{
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    for (const int expert_count : {4, 8})
+    for (const int origin : {0, 32})
+    for (const bool mtp : {false, true})
+    {
+        SCOPED_TRACE(static_cast<int>(backend));
+        SCOPED_TRACE(expert_count);
+        SCOPED_TRACE(origin);
+        SCOPED_TRACE(mtp);
+        auto config = example(backend);
+        auto &plan = *config.moe_routed_expert_plan;
+        plan.first_model_layer = origin;
+        plan.placements.clear();
+        const int rows = 2 + (mtp && origin != 0 ? 1 : 0);
+        for (int row = 0; row < rows; ++row)
+            plan.placements.push_back({.layer = origin + row,
+                .routed_expert_tier = std::vector<int>(expert_count, 0)});
+        plan.initial_layer_order_overrides = {{.layer = origin,
+            .expert_ids = {1, 0}}};
+        config.mtp.enabled = mtp;
+        const auto encoded = serializeOrchestrationConfig(config);
+        EXPECT_EQ(Json::parse(encoded)["configuration"]["moe_routed_expert_plan"]["first_model_layer"], origin);
+        const auto decoded = deserializeOrchestrationConfig(encoded);
+        ASSERT_TRUE(decoded.moe_routed_expert_plan);
+        const auto &restored = *decoded.moe_routed_expert_plan;
+        EXPECT_EQ(restored.first_model_layer, origin);
+        EXPECT_EQ(restored.placementLayerCapacity(2), rows);
+        EXPECT_EQ(restored.initial_layer_order_overrides.front().layer, origin);
+        EXPECT_EQ(restored.placements.front().layer, origin);
+        EXPECT_EQ(restored.placements.back().layer, origin + rows - 1);
+        EXPECT_EQ(restored.placements.front().routed_expert_tier.size(), expert_count);
+        EXPECT_EQ(serializeOrchestrationConfig(decoded), encoded);
     }
 }
 

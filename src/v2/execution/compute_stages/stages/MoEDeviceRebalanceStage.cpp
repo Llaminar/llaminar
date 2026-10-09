@@ -758,6 +758,15 @@ namespace llaminar2
                           << " config_layers=" << params_.config.num_layers);
             return false;
         }
+        if (params_.apply_layer_idx != -1 &&
+            !params_.moe_runtime_table->containsModelLayer(params_.apply_layer_idx))
+        {
+            LOG_ERROR("[" << label << "] Apply selector is outside the runtime table's owned model-layer interval"
+                      << " layer=" << params_.apply_layer_idx
+                      << " first=" << params_.moe_runtime_table->firstModelLayer()
+                      << " end=" << params_.moe_runtime_table->endModelLayer());
+            return false;
+        }
         auto *device_table = dynamic_cast<DeviceMoERuntimeTable *>(params_.moe_runtime_table);
         if (!device_table || !device_table->isMirroredToDevice())
         {
@@ -1113,7 +1122,8 @@ namespace llaminar2
         }
 
         DeviceMoELayerRuntime *runtime_layers =
-            params_.moe_runtime_table->deviceLayerState(0);
+            params_.moe_runtime_table->deviceLayerState(
+                params_.moe_runtime_table->firstModelLayer());
         if (!runtime_layers)
         {
             LOG_ERROR("[MoEDeviceRebalanceStage] Runtime table returned null device state");
@@ -1843,7 +1853,9 @@ namespace llaminar2
             if (!apply_published_transfer_wave(
                     compute_launch,
                     "compute-stream deferred apply",
-                    params_.apply_layer_idx))
+                    params_.apply_layer_idx == -1 ? -1 :
+                        static_cast<int>(params_.moe_runtime_table->storageIndexForModelLayer(
+                            params_.apply_layer_idx))))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Device rebalance ready-wave apply failed");
                 return false;
@@ -1897,19 +1909,8 @@ namespace llaminar2
 
     bool MoEDeviceRebalanceStage::isGraphCapturable() const
     {
-        if (!validateDeviceMoERebalanceConfig(params_.config))
-            return false;
-        if (!params_.device_id.is_gpu() || !params_.tp_ctx || !params_.moe_runtime_table)
-            return false;
-        if (params_.tp_ctx->degree() <= 1 ||
-            params_.tp_ctx->degree() != static_cast<int>(params_.config.participant_count))
-            return false;
-        if (params_.tp_device_idx < 0 ||
-            params_.tp_device_idx >= params_.tp_ctx->degree() ||
-            params_.tp_device_idx != static_cast<int>(params_.config.participant_id))
-            return false;
-        auto *device_table = dynamic_cast<DeviceMoERuntimeTable *>(params_.moe_runtime_table);
-        if (!device_table || !device_table->isMirroredToDevice())
+        if (!validateCommon("MoEDeviceRebalanceStage::isGraphCapturable") ||
+            params_.tp_ctx->degree() <= 1)
             return false;
 
         bool backend_supported = false;
@@ -1932,6 +1933,8 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
+        if (!validateCommon("MoEDeviceRebalanceStage::prepareGraphLaunch"))
+            return false;
         if (!usesTransferSlotApply())
             return true;
         auto *transfer_state = transferState();

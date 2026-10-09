@@ -5,6 +5,8 @@
  * Archive pressure must keep payload leases valid without turning a request
  * thread into a disk writer. A held native archive lock models a slow durable
  * tier deterministically, instead of depending on an unusually busy SSD.
+ * Restored block chains must retire before harvest admission; only the exact
+ * terminal reuse witness remains a request-owned physical lease.
  */
 
 #include <gtest/gtest.h>
@@ -17,9 +19,11 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <fcntl.h>
@@ -191,6 +195,7 @@ namespace
                 });
             PrefixBlockHandle handle;
             handle.key = key;
+            handle.payload_identity = PrefixPayloadIdentity::fresh();
             handle.layout = layoutBytes(bytes);
             handle.total_bytes = bytes;
             handle.kv_payload = storage->data();
@@ -357,12 +362,192 @@ TEST(Test__PrefixStateCacheLRU, AsyncPressurePlansAllAndOnlyNecessaryVictims)
 }
 
 /**
- * @test A short producer cannot skip required terminal state under archive pressure.
+ * @test Consumed request chains stop retaining physical bytes needed by harvest.
  *
+ * Exercise dense, hybrid and MTP archives at the admitted capacity ceiling.
+ * Eviction must remain Busy while the restore lookup owns all three records;
+ * selecting terminal-only harvest admission releases the other physical owners.
+ */
+TEST(Test__PrefixStateCacheLRU, RestoredChainReleasesCapacityForEveryArchiveKind)
+{
+    for (const bool hybrid : {false, true})
+        for (const bool mtp : {false, true})
+            for (int iteration = 0; iteration < 20; ++iteration)
+            {
+                auto layout = layoutBytes(32u);
+                layout.includes_hybrid_state = hybrid;
+                layout.hybrid_state_bytes = hybrid ? 16u : 0u;
+                layout.includes_mtp_state = mtp;
+                layout.mtp_kv_bytes = mtp ? 16u : 0u;
+                const size_t bytes = layout.totalBytes();
+                auto ram = RamPrefixStorageBackend::create(
+                    DeviceId::cpu(), bytes * 3u, prefixAuthority(bytes * 3u));
+                ASSERT_NE(ram, nullptr);
+                PrefixStateCache cache(bytes * 3u, ram);
+                PrefixLookupResult admission;
+                admission.supported = admission.cache_enabled = true;
+                admission.block_size = 1;
+                admission.fingerprint_key = 0xbeef;
+                admission.cached_tokens = 3;
+                admission.requires_terminal_hidden = admission.requires_terminal_logits = false;
+                for (int block = 0; block < 3; ++block)
+                {
+                    auto handle = ram->allocate(keyFor(block), layout);
+                    ASSERT_TRUE(handle.valid());
+                    handle.has_hybrid_state = hybrid;
+                    ASSERT_TRUE(cache.insert(handle));
+                    admission.blocks.push_back(std::move(handle));
+                }
+                // An event-owned restore may retain a temporary alias; here
+                // the synchronous CPU import is complete, so harvest is its
+                // only remaining request owner. Eviction alone cannot help.
+                EXPECT_EQ(cache.prepareCapacity(bytes), PrefixRamInsertPreparation::Busy);
+                EXPECT_EQ(ram->availableAllocationBytes(), 0u);
+                admission = admission.forHarvest(3);
+                ASSERT_EQ(admission.blocks.size(), 1u);
+                EXPECT_EQ(admission.blocks.back().key, keyFor(2));
+                EXPECT_EQ(admission.terminalHarvestDisposition(keyFor(2), 3),
+                    PrefixTerminalHarvestDisposition::ReuseAdmittedArchive);
+                EXPECT_EQ(ram->availableAllocationBytes(), bytes * 2u);
+                EXPECT_NO_THROW(cache.completeInsertPreparation(keyFor(3), bytes));
+                auto next = ram->allocate(keyFor(3), layout);
+                EXPECT_TRUE(next.valid());
+                EXPECT_TRUE(admission.blocks.back().valid());
+            }
+}
+
+/** @test Only consumed sections remain physically charged across a rich-checkpoint row restore. */
+TEST(Test__PrefixStateCacheLRU, RichRestoreRetainsOnlyConsumedPhysicalSections)
+{
+    for (const bool hybrid : {false, true})
+        for (const bool mtp : {false, true})
+            for (int iteration = 0; iteration < 20; ++iteration)
+            {
+                SCOPED_TRACE(hybrid);
+                SCOPED_TRACE(mtp);
+                SCOPED_TRACE(iteration);
+                auto layout = layoutBytes(32u);
+                layout.includes_hybrid_state = hybrid;
+                layout.hybrid_state_bytes = hybrid ? 64u : 0u;
+                layout.includes_mtp_state = mtp;
+                layout.mtp_layers = mtp ? 1 : 0;
+                layout.mtp_kv_bytes = mtp ? 16u : 0u;
+                layout.bytes_per_mtp_layer_k = layout.bytes_per_mtp_layer_v = 8u;
+                layout.includes_terminal_hidden = layout.includes_terminal_logits = true;
+                layout.terminal_hidden_bytes = layout.terminal_logits_bytes = 16u;
+                const size_t runtime_bytes = 13u;
+                const auto allocation = PrefixPayloadAllocationPlan::archive(layout, runtime_bytes);
+                const size_t capacity = 3u * allocation.totalBytes();
+                auto authority = prefixAuthority(capacity);
+                auto ram = RamPrefixStorageBackend::create(DeviceId::cpu(), capacity, authority);
+                ASSERT_NE(ram, nullptr);
+                PrefixStateCache cache(capacity, ram);
+                std::vector<PrefixPayloadReadLease> reads;
+                size_t retained = 0u;
+                for (int block = 0; block < 3; ++block)
+                {
+                    auto archive = ram->allocate(keyFor(block), layout);
+                    ASSERT_TRUE(archive.valid());
+                    ASSERT_TRUE(ram->attachModelRuntimeState(&archive,
+                        std::make_shared<std::vector<uint8_t>>(runtime_bytes, uint8_t{0x7b})));
+                    ASSERT_TRUE(cache.insert(archive));
+                    reads.push_back(block == 2 ? PrefixPayloadReadLease::wholeArchive(std::move(archive))
+                                               : PrefixPayloadReadLease::sequenceRows(std::move(archive)));
+                    retained += reads.back().retainedBytes();
+                }
+                ASSERT_TRUE(cache.clear());
+                const auto claimed = [&] {
+                    return authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier,
+                        PhysicalMemoryMaterializationKind::NewAllocation);
+                };
+                EXPECT_EQ(retained, 2u * (layout.faKVBytes() + layout.mtpKVBytes()) + allocation.totalBytes());
+                EXPECT_EQ(claimed(), retained);
+                EXPECT_NO_THROW(cache.completeInsertPreparation(keyFor(3),
+                    PrefixPayloadAllocationPlan::archive(layout)));
+                auto next = ram->allocate(keyFor(3), layout);
+                ASSERT_TRUE(next.valid());
+                EXPECT_EQ(claimed(), retained + layout.totalBytes());
+                ASSERT_TRUE(ram->release(next));
+                next = {};
+                EXPECT_EQ(claimed(), retained);
+                reads.clear();
+                EXPECT_EQ(claimed(), 0u);
+            }
+}
+
+/** @test Section allocation geometry rejects overflow before storage admission. */
+TEST(Test__PrefixStateCacheLRU, PrefixSectionAllocationPlanAuthenticatesAllSectionExtents)
+{
+    auto layout = layoutBytes(32u);
+    layout.includes_mtp_state = true;
+    layout.mtp_kv_bytes = 17u;
+    EXPECT_EQ(PrefixPayloadAllocationPlan::archive(layout, 13u).totalBytes(), 62u);
+    EXPECT_EQ(PrefixPayloadAllocationPlan::contiguous(23u).totalBytes(), 23u);
+    layout.includes_hybrid_state = true;
+    layout.hybrid_state_bytes = std::numeric_limits<size_t>::max();
+    EXPECT_THROW(PrefixPayloadAllocationPlan::archive(layout), std::overflow_error);
+    layout = layoutBytes(32u);
+    layout.fa_layers = -1;
+    EXPECT_THROW(PrefixPayloadAllocationPlan::archive(layout), std::invalid_argument);
+}
+
+/** @test Capacity admission polls the restore authority for every archive kind. */
+TEST(Test__PrefixStateCacheLRU, AdmissionRetiresCompletedRestoreSourcesBeforePhysicalCapacity)
+{
+    struct Retirement final : IPrefixRestoreSourceRetirement
+    {
+        mutable std::vector<PrefixBlockHandle> sources;
+        bool reads_complete = false;
+        mutable int polls = 0;
+        /** @brief Model a completed asynchronous consumer without a second byte ledger. */
+        void retireCompletedPrefixRestoreSources() const override
+        {
+            ++polls;
+            if (reads_complete)
+                sources.clear();
+        }
+    };
+    for (const bool hybrid : {false, true})
+        for (const bool mtp : {false, true})
+            for (int iteration = 0; iteration < 20; ++iteration)
+            {
+                SCOPED_TRACE(hybrid);
+                SCOPED_TRACE(mtp);
+                SCOPED_TRACE(iteration);
+                auto layout = layoutBytes(32u);
+                layout.includes_hybrid_state = hybrid;
+                layout.hybrid_state_bytes = hybrid ? 16u : 0u;
+                layout.includes_mtp_state = mtp;
+                layout.mtp_kv_bytes = mtp ? 16u : 0u;
+                const size_t bytes = layout.totalBytes();
+                auto ram = RamPrefixStorageBackend::create(
+                    DeviceId::cpu(), bytes * 3u, prefixAuthority(bytes * 3u));
+                ASSERT_NE(ram, nullptr);
+                Retirement retirement;
+                PrefixStateCache cache(bytes * 3u, ram, nullptr, nullptr, &retirement);
+                for (int block = 0; block < 3; ++block)
+                {
+                    auto archive = ram->allocate(keyFor(block), layout);
+                    ASSERT_TRUE(archive.valid());
+                    ASSERT_TRUE(cache.insert(archive));
+                    retirement.sources.push_back(std::move(archive));
+                }
+                EXPECT_EQ(cache.prepareCapacity(bytes), PrefixRamInsertPreparation::Busy);
+                EXPECT_EQ(ram->availableAllocationBytes(), 0u);
+                EXPECT_GT(retirement.polls, 0);
+                const int earlier_polls = retirement.polls;
+                retirement.reads_complete = true;
+                EXPECT_NO_THROW(cache.completeInsertPreparation(keyFor(3), bytes));
+                EXPECT_GT(retirement.polls, earlier_polls);
+                EXPECT_TRUE(retirement.sources.empty());
+                EXPECT_EQ(ram->availableAllocationBytes(), bytes * 3u);
+            }
+}
+
+/**
+ * @test Required durable publication joins its capacity victims, never unrelated work.
  * Force two necessary victims to remain pending beyond the producer's work.
- * Required completion must admit the real KV/GDN/MTP image after their receipts,
- * while a later unrelated write is still held. Global-drain and Busy-to-skip
- * implementations fail this same bounded interleaving without deadlocking it.
+ * A later unrelated payload's held retirement proves the join is receipt-local.
  */
 TEST(Test__PrefixStateCacheLRU, AsyncArchiveRequiredTerminalWaitsOnlyForItsCapacity)
 {
@@ -498,7 +683,7 @@ TEST(Test__PrefixStateCacheLRU, PrefillPublicationPreparesBothRecurrentFrontiers
         admission.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
         const std::vector<int32_t> tokens{20, 21, 22};
         const auto schedule = PrefixHarvestSchedule::forPrefill(admission, 3, 0);
-        ASSERT_EQ(schedule.reusableCheckpoint(), 2);
+        ASSERT_EQ(schedule.reusableCheckpoints(), std::vector<int>({2}));
         auto layout = layoutBytes(4u);
         layout.gdn_layers = 1;
         layout.total_layers = 2;
@@ -522,6 +707,115 @@ TEST(Test__PrefixStateCacheLRU, PrefillPublicationPreparesBothRecurrentFrontiers
         EXPECT_EQ(ram->availableAllocationBytes(), 66u);
     }
     std::filesystem::remove_all(directory);
+}
+
+/**
+ * @test A history rewrite restores its own sparse checkpoint after RAM-to-disk churn.
+ *
+ * Tiny device-free state payloads exercise the real causal keys, PMA admission,
+ * archive worker, metadata selection and selected-section hydration. The state
+ * marker identifies its producing frontier; later terminal state must never be
+ * substituted for the shared leading history. No model execution is simulated.
+ */
+TEST(Test__PrefixStateCacheLRU, SparseCheckpointSurvivesHistoryRewriteAndColdPromptPressure)
+{
+    for (const bool mtp : {false, true})
+    {
+        SCOPED_TRACE(mtp);
+        const auto directory = tempDir();
+        {
+            constexpr size_t ram_bytes = 4096u;
+            constexpr size_t disk_bytes = 65536u;
+            auto ram = RamPrefixStorageBackend::create(DeviceId::cpu(), ram_bytes, prefixAuthority(ram_bytes));
+            ASSERT_TRUE(ram);
+            auto disk = makeDiskBackend(directory, disk_bytes);
+            auto cache = std::make_shared<PrefixStateCache>(ram_bytes, ram, disk);
+            auto layout = layoutBytes(16u);
+            layout.block_size = 64;
+            layout.gdn_layers = 1;
+            layout.total_layers = 2;
+            layout.includes_hybrid_state = true;
+            layout.hybrid_host_state_bytes = layout.hybrid_state_bytes = 256u;
+            layout.includes_mtp_state = mtp;
+            layout.mtp_kv_bytes = mtp ? 8u : 0u;
+            layout.includes_terminal_hidden = layout.includes_terminal_logits = true;
+            layout.terminal_hidden_bytes = layout.terminal_logits_bytes = 8u;
+            PrefixLookupResult admission;
+            admission.supported = admission.cache_enabled = true;
+            admission.fingerprint_key = 0xbeef;
+            admission.block_size = 64;
+            admission.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+            const auto archive = [&](const std::vector<int32_t> &tokens)
+            {
+                const auto schedule = PrefixHarvestSchedule::forPrefill(admission, tokens.size(), 0);
+                ASSERT_NE(cache->prepareHarvest(admission, tokens, schedule, layout, 0u),
+                          PrefixRamInsertPreparation::Error);
+                auto frontiers = schedule.reusableCheckpoints();
+                frontiers.push_back(tokens.size());
+                for (const int frontier : frontiers)
+                {
+                    uint64_t parent = 0;
+                    for (int start = 0; start < frontier; start += 64)
+                    {
+                        const int end = std::min(frontier, start + 64);
+                        const auto key = makePrefixCacheKey(0xbeef, parent, start / 64, start,
+                            {tokens.begin() + start, tokens.begin() + end});
+                        parent = key.stableHash();
+                        const bool terminal = end == frontier;
+                        if (!terminal && cache->contains(key)) continue;
+                        auto block_layout = layout;
+                        block_layout.includes_hybrid_state = terminal;
+                        block_layout.includes_terminal_hidden = block_layout.includes_terminal_logits = terminal;
+                        cache->completeInsertPreparation(key, PrefixPayloadAllocationPlan::archive(block_layout));
+                        auto handle = ram->allocate(key, block_layout);
+                        ASSERT_TRUE(handle.valid());
+                        handle.has_hybrid_state = handle.has_terminal_hidden = handle.has_terminal_logits = terminal;
+                        if (terminal)
+                            std::memcpy(handle.hybrid_storage->data(), &frontier, sizeof(frontier));
+                        ASSERT_TRUE(cache->insert(std::move(handle)));
+                        EXPECT_LE(cache->usedBytes(), ram_bytes);
+                        EXPECT_LE(ram->usedBytes(), ram_bytes);
+                    }
+                }
+                ASSERT_TRUE(disk->waitForPersistence());
+                cache->publishCompletedPersistence();
+                EXPECT_LE(disk->usedBytes(), disk_bytes);
+            };
+            std::vector<int32_t> original(20037, 7);
+            archive(original);
+            ASSERT_FALSE(HasFatalFailure());
+            archive(std::vector<int32_t>(16001, 9));
+            ASSERT_FALSE(HasFatalFailure());
+            EXPECT_GT(disk->usedBytes(), 0u);
+            std::vector<int32_t> rewritten(9001, 11);
+            std::copy_n(original.begin(), 6212, rewritten.begin());
+            auto lookup = admission;
+            lookup.payload_plan = cache->beginLookup();
+            uint64_t parent = 0;
+            for (int start = 0; start < static_cast<int>(rewritten.size()); start += 64)
+            {
+                const int end = std::min(static_cast<int>(rewritten.size()), start + 64);
+                const auto found = lookup.payload_plan->selectLongest(0xbeef, parent, start / 64, start,
+                    {rewritten.begin() + start, rewritten.begin() + end});
+                if (!found) break;
+                lookup.blocks.push_back(*found);
+                lookup.cached_tokens = found->key.token_start + found->key.token_count;
+                parent = found->key.stableHash();
+            }
+            const auto selected = lookup.clampedTo(lookup.payload_plan->boundedTokenCount(lookup.blocks));
+            ASSERT_EQ(selected.cached_tokens, 4096);
+            const auto restored = selected.materializeRestoreBlocks();
+            ASSERT_EQ(restored.size(), 64u);
+            int checkpoint = 0;
+            ASSERT_TRUE(restored.back().has_hybrid_state);
+            std::memcpy(&checkpoint, restored.back().hybrid_payload, sizeof(checkpoint));
+            EXPECT_EQ(checkpoint, 4096);
+            for (size_t index = 0; index + 1 < restored.size(); ++index)
+                EXPECT_FALSE(restored[index].has_hybrid_state);
+            EXPECT_LE(ram->usedBytes(), ram_bytes);
+        }
+        std::filesystem::remove_all(directory);
+    }
 }
 
 /** @test Only publication releases the background writer's original PMA alias. */
@@ -779,7 +1073,7 @@ TEST(Test__PrefixStateCacheLRU, InsertFindAndTouchUpdatesRecency)
 /**
  * A placement-invalidating fingerprint transition must immediately recover
  * volatile capacity. Persisting stale blocks during that request boundary
- * would charge disk checksums, writes, and fsync to the next inference.
+ * would charge disk writes and fsync to the next inference.
  */
 TEST(
     Test__PrefixStateCacheLRU,
@@ -845,6 +1139,128 @@ TEST(
     cleanup();
 }
 
+/**
+ * @brief A peer's archive eviction cannot masquerade as this cache's backing.
+ *
+ * TP participants share one durable budget but keep distinct RAM indexes.
+ * Hydrate A, let a peer evict its old disk copy, then demote the still-valid
+ * RAM owner. That demotion must publish A again before releasing its source;
+ * a stale participant-local disk entry is not a persistence receipt.
+ */
+TEST(Test__PrefixStateCacheLRU, SharedArchiveEvictionRepersistsResidentOwner)
+{
+    for (const bool independent_writer : {false, true})
+    {
+        SCOPED_TRACE(independent_writer ? "independent archive writer" : "shared archive writer");
+        const auto directory = tempDir();
+        constexpr size_t bytes = 32;
+        auto disk = makeDiskBackend(directory, 2 * bytes);
+        ASSERT_TRUE(disk->ready()) << disk->initializationError();
+        auto peer_disk = independent_writer ? makeDiskBackend(directory, 2 * bytes) : disk;
+        ASSERT_TRUE(peer_disk->ready()) << peer_disk->initializationError();
+        auto first_ram = std::make_shared<RamPrefixStorageBackend>(2 * bytes);
+        auto peer_ram = std::make_shared<RamPrefixStorageBackend>(bytes);
+        PrefixStateCache first(2 * bytes, first_ram, disk);
+        PrefixStateCache peer(bytes, peer_ram, peer_disk);
+        const auto layout = layoutBytes(bytes);
+        const auto a = keyForFingerprint(0x1111, 0);
+        const auto b = keyForFingerprint(0x1111, 1);
+        const auto c = keyForFingerprint(0x1111, 2);
+        const auto d = keyForFingerprint(0x1111, 3);
+        const auto peer_a = keyForFingerprint(0x2222, 0);
+        const auto peer_b = keyForFingerprint(0x2222, 1);
+        const auto peer_c = keyForFingerprint(0x2222, 2);
+        const auto insert = [&](PrefixStateCache &cache,
+                                RamPrefixStorageBackend &ram,
+                                const PrefixCacheKey &key)
+        {
+            cache.completeInsertPreparation(key, PrefixPayloadAllocationPlan::archive(layout));
+            auto handle = ram.allocate(key, layout);
+            if (!handle.valid())
+                return false;
+            std::fill_n(static_cast<uint8_t *>(handle.kv_payload), bytes,
+                        static_cast<uint8_t>(key.block_index + 37));
+            return cache.insert(handle);
+        };
+        ASSERT_TRUE(insert(first, *first_ram, a));
+        ASSERT_TRUE(insert(first, *first_ram, b));
+        ASSERT_TRUE(insert(first, *first_ram, c));
+        ASSERT_TRUE(findAfterArchivePublication(first, *disk, a).has_value());
+        ASSERT_TRUE(first.isRamResident(a));
+        ASSERT_TRUE(first.isDiskResident(a));
+
+        ASSERT_TRUE(insert(peer, *peer_ram, peer_a));
+        ASSERT_TRUE(insert(peer, *peer_ram, peer_b));
+        ASSERT_TRUE(insert(peer, *peer_ram, peer_c));
+        ASSERT_TRUE(peer_disk->waitForPersistence());
+        std::string error;
+        ASSERT_FALSE(peer_disk->beginHydration(a, layout, &error).has_value())
+            << "The peer must evict A's durable copy before this test demotes RAM";
+        ASSERT_TRUE(first.find(c).has_value()); // A is now the next RAM victim.
+        ASSERT_TRUE(insert(first, *first_ram, d));
+        ASSERT_TRUE(disk->waitForPersistence());
+
+        auto restored = findAfterArchivePublication(first, *disk, a);
+        ASSERT_TRUE(restored.has_value())
+            << "Participant-local disk metadata must not discard the only A payload";
+        ASSERT_TRUE(restored->kv_payload);
+        const auto *data = static_cast<const uint8_t *>(restored->kv_payload);
+        EXPECT_TRUE(std::all_of(data, data + bytes, [](uint8_t value) { return value == 37; }));
+        restored.reset();
+        ASSERT_TRUE(disk->waitForPersistence());
+        std::filesystem::remove_all(directory);
+    }
+}
+
+/**
+ * @brief A retain acquired during persistence cannot reuse that old receipt later.
+ *
+ * The native file lock holds the selected write while a legacy cache retain
+ * arrives. After publication a separate archive writer removes that backing.
+ * Releasing the retain must start a new demotion and preserve the original bytes.
+ */
+TEST(Test__PrefixStateCacheLRU, SharedArchiveRetainedVictimNeedsFreshPublication)
+{
+    const auto directory = tempDir();
+    {
+        constexpr size_t bytes = 32;
+        const auto layout = layoutBytes(bytes);
+        auto disk = makeDiskBackend(directory, bytes);
+        auto peer = makeDiskBackend(directory, bytes);
+        auto ram = std::make_shared<RamPrefixStorageBackend>(bytes);
+        PrefixStateCache cache(bytes, ram, disk);
+        auto source = ram->allocate(keyFor(0), layout);
+        ASSERT_TRUE(source.valid());
+        std::fill(source.kv_storage->begin(), source.kv_storage->end(), 0x7a);
+        ASSERT_TRUE(cache.insert(source));
+        source = {};
+        HeldArchiveLock held(disk->archivePath());
+        ASSERT_TRUE(held.valid());
+        EXPECT_EQ(cache.prepareCapacity(bytes), PrefixRamInsertPreparation::Busy);
+        ASSERT_TRUE(cache.retain(keyFor(0)));
+        held.release();
+        ASSERT_TRUE(disk->waitForPersistence());
+        cache.publishCompletedPersistence();
+        EXPECT_TRUE(cache.isRamResident(keyFor(0)));
+        EXPECT_EQ(cache.stats().evictions, 0u);
+        RamPrefixStorageBackend peer_ram(bytes);
+        auto competing = peer_ram.allocate(keyForFingerprint(0x2222, 0), layout);
+        ASSERT_TRUE(competing.valid());
+        ASSERT_TRUE(peer->writeBlock(competing, nullptr));
+        ASSERT_TRUE(cache.release(keyFor(0)));
+        cache.completeInsertPreparation(keyFor(1), PrefixPayloadAllocationPlan::archive(layout));
+        EXPECT_FALSE(cache.isRamResident(keyFor(0)));
+        EXPECT_EQ(cache.stats().evictions, 1u);
+        EXPECT_TRUE(ram->canStore(bytes));
+        PrefixBlockHandle restored;
+        ASSERT_TRUE(disk->readBlock(keyFor(0), layout, &restored));
+        ASSERT_TRUE(restored.kv_storage);
+        EXPECT_TRUE(std::all_of(restored.kv_storage->begin(), restored.kv_storage->end(),
+                                [](uint8_t value) { return value == 0x7a; }));
+    }
+    std::filesystem::remove_all(directory);
+}
+
 /** A retained legacy lease rejects the complete rebase before any tier moves. */
 TEST(Test__PrefixStateCacheLRU, BusyFingerprintRebaseIsAtomic)
 {
@@ -895,7 +1311,7 @@ TEST(Test__PrefixStateCacheLRU, LongestTokenPrefixSelectsTerminalPartialBlock)
     constexpr int kBlockIndex = 2;
     constexpr int kTokenStart = 128;
     auto backend = std::make_shared<RamPrefixStorageBackend>(256);
-    PrefixStateCache cache(256, backend);
+    auto cache = std::make_shared<PrefixStateCache>(256, backend);
 
     const std::vector<int32_t> terminal_tokens = {41, 42, 43};
     const PrefixCacheKey terminal_key = makePrefixCacheKey(
@@ -906,10 +1322,10 @@ TEST(Test__PrefixStateCacheLRU, LongestTokenPrefixSelectsTerminalPartialBlock)
         terminal_tokens);
     auto terminal = backend->allocate(terminal_key, layoutBytes(32));
     terminal.has_hybrid_state = true;
-    ASSERT_TRUE(cache.insert(terminal));
+    ASSERT_TRUE(cache->insert(terminal));
 
     const std::vector<int32_t> longer_block = {41, 42, 43, 44, 45};
-    auto match = cache.findLongestTokenPrefix(
+    auto match = cache->beginLookup()->selectLongest(
         kFingerprint,
         kParentHash,
         kBlockIndex,
@@ -918,9 +1334,9 @@ TEST(Test__PrefixStateCacheLRU, LongestTokenPrefixSelectsTerminalPartialBlock)
     ASSERT_TRUE(match.has_value());
     EXPECT_EQ(match->key, terminal_key);
     EXPECT_TRUE(match->has_hybrid_state);
-    EXPECT_EQ(cache.stats().lookups, 1u);
-    EXPECT_EQ(cache.stats().hits, 1u);
-    EXPECT_EQ(cache.stats().misses, 0u);
+    EXPECT_EQ(cache->stats().lookups, 1u);
+    EXPECT_EQ(cache->stats().hits, 1u);
+    EXPECT_EQ(cache->stats().misses, 0u);
 
     const PrefixCacheKey full_key = makePrefixCacheKey(
         kFingerprint,
@@ -929,8 +1345,8 @@ TEST(Test__PrefixStateCacheLRU, LongestTokenPrefixSelectsTerminalPartialBlock)
         kTokenStart,
         longer_block);
     auto full = backend->allocate(full_key, layoutBytes(32));
-    ASSERT_TRUE(cache.insert(full));
-    match = cache.findLongestTokenPrefix(
+    ASSERT_TRUE(cache->insert(full));
+    match = cache->beginLookup()->selectLongest(
         kFingerprint,
         kParentHash,
         kBlockIndex,
@@ -939,6 +1355,189 @@ TEST(Test__PrefixStateCacheLRU, LongestTokenPrefixSelectsTerminalPartialBlock)
     ASSERT_TRUE(match.has_value());
     EXPECT_EQ(match->key, full_key)
         << "An exact block must take precedence over an older terminal prefix";
+}
+
+/** @test Coordinated endpoints own exact bytes across cold/mixed tiers and every archive organization. */
+TEST(Test__PrefixStateCacheLRU, SelectedRestoreOwnsOnlyCoordinatedReadSet)
+{
+    for (const int organization : {0, 1, 2}) // Attention, hybrid, recurrent-only PP.
+        for (const bool mtp : {false, true})
+            for (const bool resident : {false, true})
+                for (const int selected_count : {2, 4})
+                {
+                    SCOPED_TRACE(::testing::Message() << "organization=" << organization
+                        << " mtp=" << mtp << " resident=" << resident << " selected=" << selected_count);
+                    const auto directory = tempDir();
+                    {
+                        auto layout = layoutBytes(16);
+                        if (organization == 2)
+                        {
+                            layout.fa_layers = 0;
+                            layout.bytes_per_fa_layer_k = layout.bytes_per_fa_layer_v = 0;
+                        }
+                        layout.gdn_layers = organization != 0 ? 1 : 0;
+                        layout.total_layers = layout.fa_layers + layout.gdn_layers;
+                        layout.includes_hybrid_state = organization != 0;
+                        layout.hybrid_host_state_bytes = layout.hybrid_state_bytes = organization != 0 ? 32u : 0u;
+                        layout.includes_mtp_state = mtp;
+                        layout.mtp_kv_bytes = mtp ? 16u : 0u;
+                        layout.includes_terminal_hidden = layout.includes_terminal_logits = true;
+                        layout.terminal_hidden_bytes = layout.terminal_logits_bytes = 8u;
+                        constexpr size_t runtime_bytes = 8u;
+                        const size_t rows = layout.faKVBytes() + layout.mtpKVBytes();
+                        const size_t full = layout.totalBytes() + runtime_bytes;
+                        const size_t capacity = rows * 3u + full;
+                        auto ram = RamPrefixStorageBackend::create(DeviceId::cpu(), capacity, prefixAuthority(capacity));
+                        ASSERT_TRUE(ram);
+                        auto disk = makeDiskBackend(directory, full * 4u);
+                        auto cache = std::make_shared<PrefixStateCache>(capacity, ram, disk);
+                        RamPrefixStorageBackend staging(full);
+                        const auto fill = [&](PrefixBlockHandle &block, RamPrefixStorageBackend &backend, int index)
+                        {
+                            if (block.kv_storage) std::fill(block.kv_storage->begin(), block.kv_storage->end(), index + 1);
+                            if (block.mtp_storage) std::fill(block.mtp_storage->begin(), block.mtp_storage->end(), index + 11);
+                            if (block.hybrid_storage) std::fill(block.hybrid_storage->begin(), block.hybrid_storage->end(), index + 21);
+                            std::fill(block.terminal_hidden_storage->begin(), block.terminal_hidden_storage->end(), index + 31);
+                            std::fill(block.terminal_logits_storage->begin(), block.terminal_logits_storage->end(), index + 41);
+                            block.has_hybrid_state = layout.includes_hybrid_state;
+                            block.has_terminal_hidden = block.has_terminal_logits = true;
+                            return backend.attachModelRuntimeState(&block,
+                                std::make_shared<std::vector<uint8_t>>(runtime_bytes, index + 51));
+                        };
+                        for (int index = 0; index < 4; ++index)
+                        {
+                            auto block = staging.allocate(keyFor(index), layout);
+                            ASSERT_TRUE(fill(block, staging, index));
+                            std::string error;
+                            ASSERT_TRUE(disk->writeBlock(block, nullptr, nullptr, &error)) << error;
+                            ASSERT_TRUE(staging.release(block));
+                        }
+                        ASSERT_TRUE(cache->installDiscoveredDiskEntries(0xbeef, layout));
+                        if (resident)
+                        {
+                            const auto block = cache->find(keyFor(1));
+                            ASSERT_TRUE(block);
+                        }
+                        const auto before = cache->stats();
+                        PrefixLookupResult admission;
+                        admission.supported = admission.cache_enabled = true;
+                        admission.fingerprint_key = 0xbeef;
+                        admission.block_size = 1;
+                        admission.cached_tokens = 4;
+                        admission.has_terminal_hidden = admission.has_terminal_logits = true;
+                        admission.payload_plan = cache->beginLookup();
+                        for (int index = 0; index < 4; ++index)
+                        {
+                            const auto block = admission.payload_plan->selectLongest(0xbeef, 0, index, index, {index});
+                            ASSERT_TRUE(block);
+                            EXPECT_EQ(block->kv_payload, nullptr);
+                            admission.blocks.push_back(*block);
+                        }
+                        EXPECT_EQ(cache->stats().lookups - before.lookups, 4u);
+                        EXPECT_EQ(cache->stats().hits - before.hits, 4u);
+                        EXPECT_EQ(cache->stats().disk_hydrations, before.disk_hydrations);
+                        EXPECT_EQ(admission.payload_plan->boundedTokenCount(admission.blocks), 4);
+                        auto selected = admission.clampedTo(selected_count);
+                        const bool recurrent_only = layout.organization() == PrefixPayloadOrganization::RecurrentCheckpoint;
+                        if (recurrent_only)
+                            selected.blocks.erase(selected.blocks.begin(), selected.blocks.end() - 1);
+                        auto copied_metadata = selected;
+                        // Selection may copy metadata through TP/PP coordination.
+                        // Only captured source geometry can authorize omitting rows.
+                        copied_metadata.blocks.back().layout.fa_layers = 0;
+                        copied_metadata.blocks.back().layout.gdn_layers = 1;
+                        copied_metadata.blocks.back().layout.includes_mtp_state = false;
+                        auto payloads = copied_metadata.materializeRestoreBlocks();
+                        ASSERT_EQ(payloads.size(), recurrent_only ? 1u : selected_count);
+                        const int first = recurrent_only ? selected_count - 1 : 0;
+                        for (size_t position = 0; position < payloads.size(); ++position)
+                        {
+                            const auto &block = payloads[position];
+                            const int index = first + static_cast<int>(position);
+                            EXPECT_EQ(block.key, keyFor(index));
+                            if (block.kv_storage) EXPECT_TRUE(std::all_of(block.kv_storage->begin(), block.kv_storage->end(),
+                                [index](uint8_t value) { return value == index + 1; }));
+                            if (block.mtp_storage) EXPECT_TRUE(std::all_of(block.mtp_storage->begin(), block.mtp_storage->end(),
+                                [index](uint8_t value) { return value == index + 11; }));
+                            const bool terminal = position + 1u == payloads.size();
+                            EXPECT_EQ(block.has_hybrid_state, terminal && layout.includes_hybrid_state);
+                            EXPECT_EQ(block.has_terminal_hidden, terminal);
+                            EXPECT_EQ(block.has_terminal_logits, terminal);
+                            EXPECT_EQ(block.has_model_runtime_state, terminal);
+                        }
+                        const auto &terminal = payloads.back();
+                        EXPECT_EQ(terminal.terminal_hidden_storage->front(), selected_count - 1 + 31);
+                        EXPECT_EQ(terminal.terminal_logits_storage->front(), selected_count - 1 + 41);
+                        EXPECT_EQ(terminal.model_runtime_state_storage->front(), selected_count - 1 + 51);
+                        if (terminal.hybrid_storage)
+                            EXPECT_EQ(terminal.hybrid_storage->front(), selected_count - 1 + 21);
+                        EXPECT_LE(ram->budgetBytes() - ram->availableAllocationBytes(), capacity);
+                        EXPECT_THROW(selected.clampedTo(selected_count - 1).materializeRestoreBlocks(), std::logic_error);
+
+                        std::weak_ptr<std::vector<uint8_t>> earlier_rows;
+                        if (payloads.size() > 1u)
+                            earlier_rows = mtp ? payloads.front().mtp_storage : payloads.front().kv_storage;
+                        ASSERT_TRUE(cache->clear());
+                        payloads.clear();
+                        auto witness = selected.forHarvest(selected_count);
+                        ASSERT_EQ(witness.blocks.size(), 1u);
+                        EXPECT_EQ(witness.blocks.front().key, keyFor(selected_count - 1));
+                        EXPECT_FALSE(witness.payload_plan);
+                        EXPECT_TRUE(earlier_rows.expired())
+                            << "The original lookup alias must not pin consumed rows after harvest";
+                        EXPECT_EQ(admission.forHarvest(selected_count).blocks.front().key, witness.blocks.front().key);
+                        EXPECT_THROW(selected.materializeRestoreBlocks(), std::logic_error);
+                    }
+                    std::filesystem::remove_all(directory);
+                }
+}
+
+/** @test A cache window larger than RAM is shortened before any disk read or live-state mutation. */
+TEST(Test__PrefixStateCacheLRU, SelectedRestoreBoundsActualRowsAndEndpointByTierCapacity)
+{
+    const auto directory = tempDir();
+    {
+        auto layout = layoutBytes(16);
+        layout.includes_hybrid_state = true;
+        layout.gdn_layers = 1;
+        layout.total_layers = 2;
+        layout.hybrid_host_state_bytes = layout.hybrid_state_bytes = 32;
+        const size_t capacity = layout.totalBytes() + layout.faKVBytes();
+        auto ram = RamPrefixStorageBackend::create(DeviceId::cpu(), capacity, prefixAuthority(capacity));
+        auto disk = makeDiskBackend(directory, layout.totalBytes() * 4u);
+        auto cache = std::make_shared<PrefixStateCache>(capacity, ram, disk);
+        RamPrefixStorageBackend staging(layout.totalBytes());
+        for (int index = 0; index < 4; ++index)
+        {
+            auto source = staging.allocate(keyFor(index), layout);
+            source.has_hybrid_state = true;
+            ASSERT_TRUE(disk->writeBlock(source, nullptr));
+            ASSERT_TRUE(staging.release(source));
+        }
+        ASSERT_TRUE(cache->installDiscoveredDiskEntries(0xbeef, layout));
+        PrefixLookupResult hit;
+        hit.cached_tokens = 4;
+        hit.block_size = 1;
+        hit.payload_plan = cache->beginLookup();
+        for (int index = 0; index < 4; ++index)
+        {
+            auto block = hit.payload_plan->selectLongest(0xbeef, 0, index, index, {index});
+            ASSERT_TRUE(block);
+            hit.blocks.push_back(*block);
+        }
+        EXPECT_EQ(hit.payload_plan->boundedTokenCount(hit.blocks), 2);
+        EXPECT_EQ(cache->stats().disk_hydrations, 0u);
+        EXPECT_THROW(hit.materializeRestoreBlocks(), std::invalid_argument);
+        EXPECT_EQ(cache->stats().disk_hydrations, 0u);
+        EXPECT_EQ(ram->availableAllocationBytes(), capacity);
+        const auto selected = hit.clampedTo(hit.payload_plan->boundedTokenCount(hit.blocks));
+        const auto payloads = selected.materializeRestoreBlocks();
+        ASSERT_EQ(payloads.size(), 2u);
+        EXPECT_EQ(payloads.front().total_bytes + payloads.back().total_bytes, capacity);
+        EXPECT_EQ(cache->stats().disk_hydrations, 2u);
+        EXPECT_EQ(ram->availableAllocationBytes(), 0u);
+    }
+    std::filesystem::remove_all(directory);
 }
 
 /**
@@ -1395,6 +1994,16 @@ TEST(Test__PrefixStateCacheLRU, RepeatedPromotionDemotionAndBottomTierEvictionAr
     EXPECT_EQ(cache.stats().ram_to_disk_demotions, 4u);
     EXPECT_EQ(cache.stats().disk_evictions, 2u);
     EXPECT_EQ(cache.stats().evictions, 4u);
+    const auto ram_observation = ram->telemetry()->snapshot();
+    const auto disk_observation = disk->telemetry()->snapshot();
+    EXPECT_EQ(ram_observation.used_bytes, ram->usedBytes());
+    EXPECT_EQ(disk_observation.used_bytes, kBlockBytes * 2);
+    EXPECT_EQ(ram_observation.activity.operations[static_cast<size_t>(PrefixTierEvent::Demotion)], 4u);
+    EXPECT_EQ(ram_observation.activity.bytes[static_cast<size_t>(PrefixTierEvent::Demotion)], 4 * kBlockBytes);
+    EXPECT_EQ(ram_observation.activity.operations[static_cast<size_t>(PrefixTierEvent::Eviction)], 4u);
+    EXPECT_EQ(disk_observation.activity.operations[static_cast<size_t>(PrefixTierEvent::Read)], 3u);
+    EXPECT_EQ(disk_observation.activity.bytes[static_cast<size_t>(PrefixTierEvent::Read)], 3 * kBlockBytes);
+    EXPECT_EQ(disk_observation.activity.operations[static_cast<size_t>(PrefixTierEvent::Eviction)], 2u);
 
     ASSERT_TRUE(disk->waitForPersistence());
     cleanup();
@@ -1431,7 +2040,8 @@ TEST(Test__PrefixStateCacheLRU, ClearReleasesDiskEntries)
     cleanup();
 }
 
-TEST(Test__PrefixStateCacheLRU, DiskHydrationFailureRecordsReadFailureAndMiss)
+/** @test Native archive failure is fatal and preserves the known committed key. */
+TEST(Test__PrefixStateCacheLRU, DiskHydrationNativeFailureIsFatal)
 {
     const auto dir = tempDir();
     const auto cleanup = [&]() { std::filesystem::remove_all(dir); };
@@ -1447,23 +2057,17 @@ TEST(Test__PrefixStateCacheLRU, DiskHydrationFailureRecordsReadFailureAndMiss)
     ASSERT_TRUE(cache.insert(b));
     ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, c));
 
-    const auto archive_bytes = std::filesystem::file_size(disk->archivePath());
-    ASSERT_GT(archive_bytes, 17u);
-    std::fstream corrupt(
-        disk->archivePath(),
-        std::ios::binary | std::ios::in | std::ios::out);
-    corrupt.seekg(static_cast<std::streamoff>(archive_bytes - 17));
-    char byte = 0;
-    corrupt.read(&byte, 1);
-    byte ^= 0x33;
-    corrupt.seekp(static_cast<std::streamoff>(archive_bytes - 17));
-    corrupt.write(&byte, 1);
-    corrupt.close();
+    const auto saved_archive = dir / "saved-archive";
+    std::filesystem::rename(disk->archivePath(), saved_archive);
+    std::filesystem::create_directory(disk->archivePath());
 
-    EXPECT_FALSE(cache.find(a.key).has_value());
+    EXPECT_THROW(cache.find(a.key), std::runtime_error);
     EXPECT_EQ(cache.stats().disk_read_failures, 1u);
     EXPECT_EQ(cache.stats().misses, 1u);
-    EXPECT_FALSE(cache.contains(a.key));
+    EXPECT_TRUE(cache.contains(a.key));
+
+    std::filesystem::remove(disk->archivePath());
+    std::filesystem::rename(saved_archive, disk->archivePath());
 
     ASSERT_TRUE(disk->waitForPersistence());
     cleanup();

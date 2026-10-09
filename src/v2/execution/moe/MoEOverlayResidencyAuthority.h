@@ -319,10 +319,13 @@ namespace llaminar2
         MoEExpertOwnerMap owner_map;
         MoELayeredExpertOwnership layered_ownership;
 
+        /** @return Whether the published plan and compact owners name one stage. */
         bool valid() const noexcept
         {
             return epoch > 0 && placement_plan != nullptr &&
-                   !layered_ownership.empty();
+                   !layered_ownership.empty() &&
+                   placement_plan->first_model_layer ==
+                       layered_ownership.firstModelLayer();
         }
     };
 
@@ -432,7 +435,18 @@ namespace llaminar2
         /** @return Whether geometry, evidence, and dense entries are coherent. */
         [[nodiscard]] bool valid() const noexcept;
 
-        /** @return Flattened index for one checked layer/expert coordinate. */
+        /** @return Global stage origin owned by the retained evidence, or -1 if absent. */
+        [[nodiscard]] int firstModelLayer() const noexcept
+        {
+            return histogram_window ? histogram_window->first_model_layer : -1;
+        }
+
+        /**
+         * @param layer_idx Global layer identity within the retained evidence.
+         * @param expert_id Logical routed expert within that layer.
+         * @return Flattened index in the compact stage-owned entries.
+         * @throws std::out_of_range For missing evidence or a foreign coordinate.
+         */
         [[nodiscard]] size_t offset(int layer_idx, int expert_id) const;
     };
 
@@ -1097,6 +1111,14 @@ namespace llaminar2
 
         /** @brief Read the current immutable snapshot outside ticket execution. */
         std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot() const;
+
+        /**
+         * @brief Authenticate the lifetime retained for this authority's histogram.
+         * @param histogram Shared owner's object, or null for a static authority.
+         * @return Whether the setup-owned pointer is exactly the one consumed here.
+         */
+        [[nodiscard]] bool retainsHistogram(const DecodeExpertHistogram *histogram) const noexcept
+        { return config_.histogram == histogram; }
 
         /** @brief Return the unmodified epoch-one placement policy. */
         [[nodiscard]] RoutedExpertResidencyPolicy residencyPolicy() const noexcept;

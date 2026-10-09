@@ -23,7 +23,7 @@
 namespace llaminar2
 {
     /**
-     * @brief Immutable presence/frequency policy admitted once per request.
+     * @brief Immutable repetition/presence/frequency policy admitted once per request.
      *
      * These values originate in the serving request and may therefore cross the
      * host/device boundary at request admission.  They must never be rebuilt or
@@ -38,11 +38,12 @@ namespace llaminar2
     {
         float presence_penalty = 0.0f;
         float frequency_penalty = 0.0f;
+        float repetition_penalty = 1.0f;
 
-        /** @return Whether serial decode applies either history penalty. */
+        /** @return Whether serial decode applies any history penalty. */
         [[nodiscard]] bool enabled() const noexcept
         {
-            return presence_penalty != 0.0f || frequency_penalty != 0.0f;
+            return presence_penalty != 0.0f || frequency_penalty != 0.0f || repetition_penalty != 1.0f;
         }
 
         bool operator==(const MTPRequestPenaltyPolicy &) const = default;
@@ -51,7 +52,7 @@ namespace llaminar2
     /**
      * @brief Request policy consumed by graph-owned grouped greedy sampling.
      *
-     * Presence and frequency penalties are part of the decode algorithm, not a
+     * Repetition, presence and frequency penalties are part of the decode algorithm, not a
      * post-processing step.  Immutable magnitudes are copied from
      * @ref MTPRequestPenaltyPolicy once at request admission.  The
      * `first_token_already_in_history` member is different: accepted-state
@@ -59,15 +60,16 @@ namespace llaminar2
      * proposal and verifier kernels only read this resident structure; no graph
      * node accepts a host-authored transaction bit.
      */
-    struct alignas(16) MTPGreedyPenaltyPolicy
+    struct MTPGreedyPenaltyPolicy
     {
         float presence_penalty = 0.0f;
         float frequency_penalty = 0.0f;
+        float repetition_penalty = 1.0f;
         int32_t first_token_already_in_history = 0;
         int32_t enabled = 0;
     };
 
-    static_assert(sizeof(MTPGreedyPenaltyPolicy) == 4 * sizeof(int32_t));
+    static_assert(sizeof(MTPGreedyPenaltyPolicy) == 5 * sizeof(int32_t));
     constexpr int kMTPGreedyPenaltyPolicyWords =
         static_cast<int>(sizeof(MTPGreedyPenaltyPolicy) / sizeof(int32_t));
 

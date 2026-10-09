@@ -1264,6 +1264,91 @@ namespace
             std::invalid_argument);
     }
 
+    /** @brief Every MTP policy retains sidecar banks exclusively in the terminal stage. */
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PipelineStageMTPStorageBelongsOnlyToTerminalStage)
+    {
+        auto model = makeMoEModelContextWithTrailingMTP();
+        std::vector<MTPRuntimeConfig> policies(5);
+        policies[1].graph_capacity_draft_tokens = 15;
+        policies[2].enabled = true;
+        policies[2].draft_tokens = 1;
+        policies[3].enabled = true;
+        policies[3].draft_tokens = 15;
+        policies[4].enabled = true;
+        policies[4].depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        policies[4].graph_capacity_draft_tokens = 15;
+        for (std::size_t policy = 0; policy < policies.size(); ++policy)
+        for (const FactoryPPStageConfig stage : {
+                 FactoryPPStageConfig{0, 1, true, false},
+                 FactoryPPStageConfig{1, 2, false, false},
+                 FactoryPPStageConfig{2, 3, false, true}})
+        {
+            SCOPED_TRACE(::testing::Message() << policy << '/' << stage.first_layer);
+            InferenceRunnerConfig config;
+            config.mtp = policies[policy];
+            config.pp_stage_config = stage;
+            config.moe_routed_expert_plan = makeRequestedOverlayPlan();
+            config.moe_routed_expert_plan->first_model_layer = stage.first_layer;
+            const auto metadata = resolveMoERoutedExpertModelMetadataForModel(*model, config.mtp, stage);
+            const int owned_count = stage.layerCount() + (stage.has_lm_head && policy != 0 ? 1 : 0);
+            EXPECT_EQ(metadata.first_model_layer, stage.first_layer);
+            EXPECT_EQ(metadata.num_layers, owned_count);
+            EXPECT_EQ(metadata.main_inference_layer_count, stage.last_layer);
+            EXPECT_EQ(metadata.num_experts, kMoEExperts);
+            const auto plan = resolveMoERoutedExpertPlacementPlanForModel(*model, config);
+            ASSERT_NE(plan, nullptr);
+            ASSERT_EQ(plan->placements.size(), static_cast<std::size_t>(owned_count));
+            EXPECT_EQ(plan->first_model_layer, stage.first_layer);
+            for (std::size_t row = 0; row < plan->placements.size(); ++row)
+                EXPECT_EQ(plan->placements[row].layer, stage.first_layer + static_cast<int>(row));
+            EXPECT_TRUE(config.moe_routed_expert_plan->placements.empty());
+        }
+    }
+
+    /** @brief The factory requires an explicitly scoped plan, even for equal row counts. */
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PipelineStageRejectsForeignPlansAndMainLayerScopes)
+    {
+        auto model = makeMoEModelContextWithTrailingMTP();
+        InferenceRunnerConfig full;
+        full.moe_routed_expert_plan = makeRequestedOverlayPlan();
+        full.mtp.enabled = true;
+        const auto all_layers = resolveMoERoutedExpertPlacementPlanForModel(*model, full);
+        InferenceRunnerConfig stage = full;
+        stage.pp_stage_config = FactoryPPStageConfig{1, 2, false, false};
+        EXPECT_THROW((void)resolveMoERoutedExpertPlacementPlanForModel(*model, stage), std::invalid_argument);
+        stage.pp_stage_config = FactoryPPStageConfig{0, 1, true, false};
+        stage.moe_routed_expert_plan = all_layers;
+        EXPECT_THROW((void)resolveMoERoutedExpertPlacementPlanForModel(*model, stage), std::invalid_argument);
+        for (const FactoryPPStageConfig invalid : {
+                 FactoryPPStageConfig{1, 2, true, false},
+                 FactoryPPStageConfig{0, 1, true, true},
+                 FactoryPPStageConfig{2, 4, false, true},
+                 FactoryPPStageConfig{-1, 2, false, false}})
+            EXPECT_THROW((void)resolveMoERoutedExpertModelMetadataForModel(*model, full.mtp, invalid), std::invalid_argument);
+    }
+
+    /** @brief A terminal serial view removes only its authenticated inactive sidecar. */
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PipelineStageSerialViewPreservesGlobalMainLayer)
+    {
+        auto model = makeMoEModelContextWithTrailingMTP();
+        InferenceRunnerConfig active;
+        active.mtp.enabled = true;
+        active.pp_stage_config = FactoryPPStageConfig{2, 3, false, true};
+        active.moe_routed_expert_plan = makeRequestedOverlayPlan();
+        active.moe_routed_expert_plan->first_model_layer = 2;
+        const auto all_features = resolveMoERoutedExpertPlacementPlanForModel(*model, active);
+        ASSERT_EQ(all_features->placements.size(), 2u);
+        auto serial = active;
+        serial.mtp.enabled = false;
+        serial.moe_routed_expert_plan = all_features;
+        const auto main_only = resolveMoERoutedExpertPlacementPlanForModel(*model, serial);
+        ASSERT_EQ(main_only->placements.size(), 1u);
+        EXPECT_EQ(main_only->placements.front().layer, 2);
+        EXPECT_EQ(all_features->placements.size(), 2u);
+        active.moe_routed_expert_plan = main_only;
+        EXPECT_THROW((void)resolveMoERoutedExpertPlacementPlanForModel(*model, active), std::invalid_argument);
+    }
+
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PlanningErrorsSurfaceBeforeGraphExecution)
     {
         auto model_ctx = makeMoEModelContext();

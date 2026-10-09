@@ -125,6 +125,18 @@ namespace llaminar2
         return true;
     }
 
+    bool MPIPrefixCollectiveCoordinator::allRestoreMetadata(
+        PrefixRestoreMetadata local, PrefixRestoreMetadata *global)
+    {
+        if (!global || communicator_ == MPI_COMM_NULL) return false;
+        const uint32_t word = local.wireBits();
+        uint32_t combined = 0;
+        if (MPI_Allreduce(&word, &combined, 1, MPI_UINT32_T, MPI_BOR, communicator_) != MPI_SUCCESS)
+            return false;
+        *global = PrefixRestoreMetadata::fromWireBits(combined);
+        return true;
+    }
+
     PrefixParticipantLookup makePrefixParticipantLookup(
         int participant_id,
         DeviceId device,

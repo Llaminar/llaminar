@@ -45,6 +45,14 @@
 namespace llaminar2
 {
 
+    /** @brief Authoring intent, resolved against the GGUF before physical admission. */
+    enum class MTPActivationPolicy
+    {
+        Automatic, ///< Enable complete learned heads; models without heads use ordinary decode.
+        Enabled,   ///< Require learned heads and fail if they are missing or incomplete.
+        Disabled,  ///< Ordinary decode, retaining capacity only when explicitly requested.
+    };
+
     // =========================================================================
     // Enums
     // =========================================================================
@@ -499,13 +507,16 @@ namespace llaminar2
 
         PrefixCacheRuntimeConfig prefix_cache; ///< Enabled bounded tiered prefix-state cache settings
         /**
-         * @brief Disabled-by-default MTP with topology-selected terminal weights.
+         * @brief GGUF-selected dynamic MTP with an explicit serial opt-out.
          *
          * Authoring preserves automatic versus explicit intent. Rank compilation
-         * replaces Automatic with one concrete policy before physical admission;
+         * seals activation and terminal placement before physical admission;
          * low-level runtime and graph objects must never consume this sentinel.
          */
-        MTPRuntimeConfig mtp{.terminal_head_policy = MTPTerminalHeadPolicy::Automatic};
+        MTPActivationPolicy mtp_activation_policy = MTPActivationPolicy::Automatic;
+        MTPRuntimeConfig mtp{
+            .terminal_head_policy = MTPTerminalHeadPolicy::Automatic,
+            .depth_policy = {.mode = MTPDepthPolicyMode::Dynamic}};
 
         // =========================================================================
         // Weight Sharding

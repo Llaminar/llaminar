@@ -425,23 +425,24 @@ namespace llaminar2
         std::vector<double> entries, terminals;
         for (const auto &cost : local) { entries.push_back(cost.entry); terminals.push_back(cost.terminal); }
         result.compute = planningIndependentSeconds(entries) + planningIndependentSeconds(terminals);
-        std::optional<size_t> overlay_root;
-        if (candidate.overlayCapacity())
-        {
-            const auto &placement = *candidate.config().moe_routed_expert_plan;
-            const auto bindings = MoEOverlayCapacityAdmission::boundParticipants(placement);
-            const auto root = std::find_if(bindings.begin(), bindings.end(), [&](const auto &binding) {
-                return binding.participant_id == placement.continuation_domain_spec.logical_root_participant;
-            });
-            if (root == bindings.end()) throw std::logic_error("Request overlay has no bound logical root");
-            for (size_t index = 0; index < work.size(); ++index)
-                if (work[index].execution_rank == root->world_rank && work[index].device == root->device)
-                    overlay_root = index;
-            if (!overlay_root) throw std::logic_error("Request overlay root is not a compiled participant");
-        }
         std::vector<size_t> previous;
         for (int layer = 0; layer < layers; ++layer)
         {
+            std::optional<size_t> overlay_root;
+            if (const auto overlay = candidate.expertLayer(layer))
+            {
+                const auto &placement = overlay->placement;
+                const auto bindings = MoEOverlayCapacityAdmission::boundParticipants(placement);
+                const auto root = std::find_if(bindings.begin(), bindings.end(), [&](const auto &binding) {
+                    return binding.participant_id == placement.continuation_domain_spec.logical_root_participant;
+                });
+                if (root == bindings.end()) throw std::logic_error("Request overlay has no bound logical root");
+                for (size_t index = 0; index < work.size(); ++index)
+                    if (work[index].execution_rank == root->world_rank && work[index].device == root->device &&
+                        work[index].first_layer <= layer && work[index].last_layer >= layer)
+                        overlay_root = index;
+                if (!overlay_root) throw std::logic_error("Request overlay root is not a compiled participant");
+            }
             std::vector<size_t> continuation, tp;
             std::vector<double> ordinary, experts;
             for (size_t index = 0; index < work.size(); ++index)

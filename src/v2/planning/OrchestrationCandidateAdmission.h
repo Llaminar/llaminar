@@ -12,12 +12,20 @@
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "planning/MemoryPlanner.h"
+#include "planning/MoEPipelineMemoryAdmission.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "loaders/GPUVramPreflight.h"
 
 namespace llaminar2
 {
+    /** @brief Borrowed expert evidence for one exact global layer of an admitted candidate. */
+    struct AdmittedMoELayerView
+    {
+        const MoERoutedExpertPlacementPlan &placement;
+        const MoEOverlayResolvedCapacityPlan &capacity;
+    };
+
     /** @brief Complete setup capture/upload policy, frozen once for a candidate search. */
     struct OrchestrationCandidateMemoryPolicy
     {
@@ -69,15 +77,27 @@ namespace llaminar2
          * @return Exact admitted participant inputs, including TP assignments and PP ranges.
          *
          * These are compiler facts, not a new physical ledger. Overlay inputs
-         * describe the fixed zero-routed-expert BOM; overlayCapacity() remains
-         * the sole owner of final routed residency. Costs must not infer live
+         * describe the fixed zero-routed-expert BOM; expertLayer() names the
+         * final routed residency authority. Costs must not infer live
          * expert counts or invocation traffic from these allocation inputs.
          */
         const std::vector<DevicePlanConfig> &devicePlans() const noexcept { return devices_; }
         /** @return The canonical immutable aggregate behind every resource diagnostic. */
         const PhysicalMemoryPlanAdmissionCertificate &physicalAdmission() const noexcept { return *admission_; }
-        /** @return Optional quota/footprint evidence from the existing overlay resolver. */
+        /** @return Quota evidence for a model-wide overlay; pipelines use stage-local expertLayer() views. */
         const std::shared_ptr<const MoEOverlayResolvedCapacityPlan> &overlayCapacity() const noexcept { return overlay_; }
+        /** @return Complete local PP admission when experts have separate stage authorities. */
+        const std::shared_ptr<const AdmittedMoEPipelineMemory> &pipelineMemory() const noexcept { return pipeline_; }
+        /**
+         * @brief Select the admitted expert authority for a global model layer.
+         * @param model_layer Main or retained predictor layer, in model coordinates.
+         * @return Borrowed evidence, or no value for an ordinary candidate.
+         * @throws std::invalid_argument if an expert candidate does not own that layer.
+         *
+         * The returned references remain valid only while this candidate lives.
+         * Cost consumers must use this scope instead of a parent-wide expert plan.
+         */
+        std::optional<AdmittedMoELayerView> expertLayer(int model_layer) const;
 
     private:
         /** @brief Only successful complete admission may create a selectable candidate. */
@@ -85,11 +105,13 @@ namespace llaminar2
             std::vector<RankExecutionPlan> ranks,
             std::vector<DevicePlanConfig> devices,
             std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> admission,
-            std::shared_ptr<const MoEOverlayResolvedCapacityPlan> overlay);
+            std::shared_ptr<const MoEOverlayResolvedCapacityPlan> overlay,
+            std::shared_ptr<const AdmittedMoEPipelineMemory> pipeline = {});
         AutomaticOrchestrationCandidate candidate_;
         std::vector<RankExecutionPlan> ranks_;
         std::vector<DevicePlanConfig> devices_;
         std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> admission_;
         std::shared_ptr<const MoEOverlayResolvedCapacityPlan> overlay_;
+        std::shared_ptr<const AdmittedMoEPipelineMemory> pipeline_;
     };
 }

@@ -226,6 +226,8 @@ namespace llaminar2
         PCIeLinkInfo pcie;         // PCIe link information (GPU devices only)
         /// Driver UUID, independent of process-local ordinals and PCIe aliases.
         std::string uuid;
+        /// Native endpoint BDF for OS resource observation, independent of the bottleneck bridge.
+        std::string pci_bus_address;
         /// Observed device-wide last-level cache; zero means unavailable, not zero-sized hardware.
         size_t last_level_cache_bytes = 0;
     };

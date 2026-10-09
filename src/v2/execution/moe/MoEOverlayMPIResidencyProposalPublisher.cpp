@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <climits>
 #include <exception>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -62,7 +63,9 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay proposal coordinator is outside the MPI world");
         }
-        if (config_.num_layers <= 0 || config_.num_experts <= 0)
+        if (config_.num_layers <= 0 || config_.num_experts <= 0 ||
+            config_.first_model_layer < 0 ||
+            config_.num_layers > std::numeric_limits<int>::max() - config_.first_model_layer)
         {
             throw std::invalid_argument(
                 "ExpertOverlay proposal publisher requires positive model geometry");
@@ -352,6 +355,7 @@ namespace llaminar2
         }
         if (!proposal.valid() ||
             proposal.plan.num_layers != config_.num_layers ||
+            proposal.plan.firstModelLayer() != config_.first_model_layer ||
             proposal.plan.num_experts != config_.num_experts ||
             static_cast<bool>(proposal.plan.histogram_window->transaction_demand) !=
                 config_.transaction_demand.has_value())
@@ -668,7 +672,8 @@ namespace llaminar2
                 config_.num_experts,
                 proposal.get(),
                 &decode_error,
-                config_.transaction_demand ? &*config_.transaction_demand : nullptr))
+                config_.transaction_demand ? &*config_.transaction_demand : nullptr,
+                config_.first_model_layer))
         {
             ++stats_.validation_failures;
             fail(decode_error, error);

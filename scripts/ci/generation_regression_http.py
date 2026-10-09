@@ -27,7 +27,7 @@ import urllib.request
 from typing import Iterable
 
 from generation_tokens import GenerationWorkload, TokenTrace, compare_tokens, _token_ids
-from generation_movement_ledger import MovementLedgerObserver, MovementRequirement
+from generation_movement_ledger import MovementLedgerObserver, MovementRequirement, _pipeline_entries
 from production_artifacts import write_json
 
 
@@ -237,6 +237,32 @@ def admit_expected_tokens(record: dict, document: dict) -> dict[str, TokenTrace]
     return traces
 
 
+def validate_prefix_movement_epochs(prefix: dict, schema: int) -> None:
+    """Validate each independent authority; a sibling cannot cover a stale epoch."""
+    names = ("admission_epoch_earliest", "admission_epoch_latest", "completion_movement_epoch")
+    if schema == 1:
+        if "movement_epochs" in prefix:
+            raise ValueError("scoped prefix epochs require runtime summary schema 2")
+        leaves = [prefix]
+    elif schema == 2:
+        envelope = prefix.get("movement_epochs")
+        if (any(name not in prefix or prefix[name] is not None for name in names)
+                or not isinstance(envelope, dict) or set(envelope) != {"schema", "stages"}
+                or type(envelope["schema"]) is not int or envelope["schema"] != 1):
+            raise ValueError("pipeline prefix epochs require exact scoped metadata")
+        leaves = [entry["epochs"] for entry in _pipeline_entries(envelope, "epochs")]
+        if any(set(leaf) != set(names) for leaf in leaves):
+            raise ValueError("pipeline prefix epoch fields are incomplete")
+    else:
+        raise ValueError("unsupported terminal runtime summary")
+    for leaf in leaves:
+        for name in names:
+            if type(leaf.get(name)) is not int or not 0 <= leaf[name] < 2**64:
+                raise ValueError("malformed terminal prefix counter: " + name)
+        if not leaf[names[0]] <= leaf[names[1]] <= leaf[names[2]]:
+            raise ValueError("terminal prefix epoch span is reversed")
+
+
 def validate_prefix_outcome(profile: dict, request: dict, response: dict, trace: TokenTrace,
                             previous: Iterable[TokenTrace]) -> None:
     """Prove the requested restore from the runner's completed outcome.
@@ -247,7 +273,7 @@ def validate_prefix_outcome(profile: dict, request: dict, response: dict, trace:
     epoch span is retained for diagnosis, not used to waive the requirement.
     """
     summary = response.get("runtime_summary")
-    if not isinstance(summary, dict) or type(summary.get("schema")) is not int or summary["schema"] != 1:
+    if not isinstance(summary, dict) or type(summary.get("schema")) is not int or summary["schema"] not in (1, 2):
         raise ValueError("missing or unsupported terminal runtime summary")
     prefix = summary.get("prefix_cache")
     if not isinstance(prefix, dict):
@@ -256,12 +282,10 @@ def validate_prefix_outcome(profile: dict, request: dict, response: dict, trace:
                  "terminal_hidden_restored", "mtp_state_restored", "hybrid_state_restored"):
         if type(prefix.get(name)) is not bool:
             raise ValueError("malformed terminal prefix flag: " + name)
-    for name in ("requested_tokens", "matched_tokens", "matched_blocks", "admission_epoch_earliest",
-                 "admission_epoch_latest", "completion_movement_epoch"):
+    for name in ("requested_tokens", "matched_tokens", "matched_blocks"):
         if type(prefix.get(name)) is not int or prefix[name] < 0:
             raise ValueError("malformed terminal prefix counter: " + name)
-    if not prefix["admission_epoch_earliest"] <= prefix["admission_epoch_latest"] <= prefix["completion_movement_epoch"]:
-        raise ValueError("terminal prefix epoch span is reversed")
+    validate_prefix_movement_epochs(prefix, summary["schema"])
     requested, matched = prefix["requested_tokens"], prefix["matched_tokens"]
     if (prefix["enabled"] is not True or prefix["bypassed"] is not False
             or prefix.get("bypass_reason") != "" or requested != len(trace.prompt) or matched > requested):

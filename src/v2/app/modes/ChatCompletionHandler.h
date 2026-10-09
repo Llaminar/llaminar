@@ -10,12 +10,15 @@
  * Non-streaming callers may request exact prompt/completion token IDs. These
  * are observations of ordinary committed runner output, not model snapshots
  * or a separate inference path, and remain independent of text framing.
+ * The lightweight stats view accumulates immutable terminal observations and
+ * never asks the runner to probe live GPU/cache state.
  * Optional runtime JSON also projects the placement owner's completed,
  * model-lifetime movement ledger without polling or joining maintenance.
  */
 
 #pragma once
 
+#include "app/modes/HttpRuntimeStats.h"
 #include "utils/Sampler.h"
 #include "utils/ChatTemplate.h"
 #include "utils/ToolCallTypes.h"
@@ -46,6 +49,7 @@ namespace llaminar2
         bool top_k{false};
         bool presence_penalty{false};
         bool frequency_penalty{false};
+        bool repetition_penalty{false};
         bool seed{false};
         bool dry_multiplier{false};
         bool dry_base{false};
@@ -66,6 +70,13 @@ namespace llaminar2
     {
         Omit,    ///< Standard response; no runtime-summary JSON.
         Include, ///< Non-streaming response includes terminal summary and passive lifetime movement evidence.
+    };
+
+    /** @brief Terminal SSE token-accounting policy, independent of inference. */
+    enum class StreamingUsageOutput
+    {
+        Omit,    ///< Standard SSE chunks with no usage observation.
+        Include, ///< Null usage on deltas, then one usage-only chunk before DONE.
     };
 
     /** @brief Validated OpenAI tool-selection policy for one request. */
@@ -109,11 +120,13 @@ namespace llaminar2
         SamplingParams sampling;
         SamplingOverrides sampling_set;  ///< Per-field "user specified" flags
         bool stream{false};         ///< If true, use SSE streaming response
+        StreamingUsageOutput streaming_usage{StreamingUsageOutput::Omit};
+                                   ///< Exact terminal counts requested by streaming clients.
         CompletionTokenOutput token_output{CompletionTokenOutput::TextOnly};
                                    ///< Requested terminal representation, independent of model state.
         CompletionRuntimeOutput runtime_output{CompletionRuntimeOutput::Omit};
                                    ///< Optional immutable outcome, independent of logging/PerfStats.
-        bool enable_thinking{true}; ///< If true, enable thinking mode for thinking models
+        std::optional<bool> enable_thinking; ///< Omission selects the loaded model's reasoning default.
         std::string model;          ///< Model identifier from request (optional)
 
         /// Thinking budget: maximum tokens to spend in thinking mode.
@@ -226,6 +239,18 @@ namespace llaminar2
         ChatCompletionHandler(IOrchestrationRunner &runner, ITokenizer &tokenizer,
                               const std::string &model_name = "");
 
+        /**
+         * @brief Read completed lifetime counters without touching inference state.
+         * @return A bounded, coherent host snapshot safe during active generation.
+         */
+        [[nodiscard]] nlohmann::json runtimeStats() const { return runtime_stats_.snapshot(); }
+
+        /** @brief Reset passive counters without visiting the runner or changing an active request. */
+        uint64_t resetRuntimeStats() { return runtime_stats_.reset(); }
+
+        /** @brief Observe an actual completed HTTP response independently of inference state. */
+        void recordHttpResponse(int status) { runtime_stats_.recordHttpResponse(status); }
+
         /// Parse a JSON string into a validated ChatCompletionRequest.
         /// On failure, returns an error ChatCompletionResponse.
         static std::optional<ChatCompletionRequest> parseRequest(
@@ -233,14 +258,31 @@ namespace llaminar2
             ChatCompletionResponse &error_out);
 
         /// Execute inference for a validated request (non-streaming).
-        ChatCompletionResponse handleRequest(const ChatCompletionRequest &request);
+        ChatCompletionResponse handleRequest(const ChatCompletionRequest &request,
+                                             HttpRequestArrival arrival = {});
 
         /// Execute inference with SSE streaming. Calls chunk_cb for each SSE line.
         /// Returns a ChatCompletionResponse with ok=true on success (json_body is empty
         /// since data was streamed). On pre-inference errors, returns error response.
         ChatCompletionResponse handleStreamingRequest(
             const ChatCompletionRequest &request,
-            const StreamChunkCallback &chunk_cb);
+            const StreamChunkCallback &chunk_cb,
+            HttpRequestArrival arrival = {});
+
+        /**
+         * @brief Publish one complete HTTP SSE response, including early errors.
+         * @param request Admitted chat request.
+         * @param chunk_cb Transport writer; false retires a disconnected client.
+         * @return Handler outcome, with exactly one terminal sentinel published
+         *         while the client remains connected.
+         *
+         * Tracks publication across handler failures so a transport cannot
+         * append another error after the handler has already closed its stream.
+         */
+        ChatCompletionResponse publishStreamingRequest(
+            const ChatCompletionRequest &request,
+            const StreamChunkCallback &chunk_cb,
+            HttpRequestArrival arrival = {});
 
         /// Convenience: parse + execute in one call (routes to streaming if stream=true).
         ChatCompletionResponse handleRawRequest(const std::string &json_body,
@@ -250,11 +292,20 @@ namespace llaminar2
         static std::string generateRequestId();
 
     private:
+        HttpRuntimeStats runtime_stats_; ///< Passive terminal observations; never a GPU state mirror.
+        /**
+         * @brief Resolve one request's reasoning mode from its override and model default.
+         * @param request Parsed immutable request, before inference state changes.
+         * @return The same reasoning choice used for sampling, rendering and output splitting.
+         */
+        bool thinkingEnabled(const ChatCompletionRequest &request) const;
+
         /// Common setup: clear cache, merge sampling params, encode, prefill.
         /// Returns prompt_tokens on success, or sets error response and returns -1.
         int setupInference(const ChatCompletionRequest &request,
                            ChatCompletionResponse &error_out,
-                           std::vector<int32_t> &input_ids);
+                           std::vector<int32_t> &input_ids,
+                           HttpRuntimeStats::Request &observation);
 
         ChatCompletionResponse handleUnhandledRequestException(
             const char *phase,

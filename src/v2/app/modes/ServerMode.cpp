@@ -7,6 +7,8 @@
  * and handlers before the runner, contexts and outer session are destroyed.
  *
  * Endpoints:
+ *   GET  /stats                   — Passive current-period cache/token/MTP/timing counters
+ *   PUT  /stats                   — Reset observations without interrupting inference
  *   GET  /health                  — Liveness check
  *   GET  /v1/models               — OpenAI-compatible loaded-model discovery
  *   POST /v1/chat/completions     — OpenAI-compatible chat completion (streaming + non-streaming)
@@ -15,14 +17,22 @@
  * Every rank publishes its immutable membership in PerfStats so an external
  * certificate can require complete participant evidence without steering
  * inference or adding a diagnostic collective to the execution lifecycle.
- * A stable worker retains CPU/OpenMP locality; connections end after each
- * complete response so an idle HTTP client cannot retain that worker.
+ * One dedicated inference worker retains CPU/OpenMP locality. Bounded request
+ * admission leaves independent HTTP capacity for passive stats and discovery
+ * while generations are active or queued. Connections end after each complete
+ * response so idle clients cannot retain HTTP workers. The listener and its
+ * children use the rank's admitted CPU partition; they must not inherit the
+ * OpenMP initial thread's single-place mask and compete with model service.
  */
 
 #include "app/modes/ServerMode.h"
 #include "app/modes/ServerRankMembership.h"
 #include "app/modes/ServerExecutionEvidence.h"
 #include "app/modes/ChatCompletionHandler.h"
+#include "app/modes/SerializedInferenceExecutor.h"
+#include "app/modes/HttpServiceThreadAffinity.h"
+#include "app/modes/HttpProcessStats.h"
+#include "app/modes/MoEMovementTransportJson.h"
 #include "app/AppContext.h"
 #include "loaders/ModelContext.h"
 #include "utils/Assertions.h"
@@ -37,6 +47,7 @@
 #include "nlohmann/json.hpp"
 
 #include <iostream>
+#include <unistd.h>
 #include <mutex>
 #include <atomic>
 #include <chrono>
@@ -352,6 +363,25 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Export completed physical history after this rank's clean drain.
+         * @param runner Retired runner retaining its canonical terminal diagnostics.
+         *
+         * Live stats remain bounded counters. The optional final sidecar preserves
+         * exact transaction membership for generation and parity observers; export
+         * failure propagates to the serving lifecycle instead of certifying a
+         * successful run with missing transport evidence.
+         */
+        void exportTerminalMovement(const IOrchestrationRunner &runner)
+        {
+            const auto path = PerfStatsCollector::jsonExportPath();
+            if (path.empty() || (!PerfStatsCollector::isDomainEnabled("moe_overlay_controller") &&
+                !PerfStatsCollector::isDomainEnabled("moe_overlay_residency")))
+                return;
+            writeMoEMovementTransportJson(path, std::max(0, Logger::getInstance().getRank()),
+                runner.moeOptimizationMovementLedger());
+        }
+
         bool shutdownEndpointEnabled()
         {
             return DebugEnv::isTruthyEnvValue(
@@ -404,18 +434,167 @@ namespace llaminar2
         return config.serve_mode;
     }
 
-    void configureSerializedInferenceHttpServer(httplib::Server &server)
+    void configureInferenceHttpServer(httplib::Server &server,
+                                      const SerializedInferenceExecutor &executor)
     {
-        server.new_task_queue = [] {
-            return std::make_unique<httplib::ThreadPool>(1).release();
+        server.new_task_queue = [workers = executor.httpWorkerCount()] {
+            return std::make_unique<httplib::ThreadPool>(workers).release();
         };
-        // httplib schedules sockets, not individual requests. With one stable
-        // worker, HTTP keep-alive would reserve the inference executor for an
-        // idle client until the library's five-second timeout. End ownership at
-        // the response boundary instead: httplib sends Connection: close and
-        // closes only after the entire body/SSE stream has been delivered. This
-        // preserves the stable OpenMP team without another scheduler or pool.
+        // A completed connection releases HTTP ownership. Inference thread
+        // locality belongs solely to the executor, never a rotating web worker.
         server.set_keep_alive_max_count(1);
+    }
+
+    bool listenInferenceHttpServer(httplib::Server &server)
+    {
+        // The inference executor already owns its stable thread. Only the
+        // listener and HTTP children created by listen_after_bind inherit
+        // this rank-local service mask. Restore it before runner shutdown.
+        const HttpServiceThreadAffinity service_affinity;
+        return server.listen_after_bind();
+    }
+
+    void registerRuntimeStatsEndpoint(httplib::Server &server,
+                                      ChatCompletionHandler &handler,
+                                      const SerializedInferenceExecutor &executor,
+                                      std::string model_name, json description,
+                                      HttpResponseObserver response_observer,
+                                      std::shared_ptr<HttpProcessStats> process_stats)
+    {
+        // HTTP closures retain one periodic sampler. Neither GET nor PUT has
+        // an OS refresh entrypoint, including when its cached data is stale.
+        if (!process_stats) process_stats = std::make_shared<HttpProcessStats>();
+        server.set_logger([&handler, observer = std::move(response_observer)](
+                              const httplib::Request &request, const httplib::Response &response) {
+            handler.recordHttpResponse(response.status);
+            if (observer) observer(request, response);
+        });
+        server.Put("/stats", [&handler](const httplib::Request &, httplib::Response &response) {
+            const auto epoch = handler.resetRuntimeStats();
+            response.set_header("Cache-Control", "no-store");
+            response.set_content(json{{"object", "llaminar.stats.reset"}, {"epoch", epoch}}.dump(),
+                                 "application/json");
+        });
+        server.Options("/stats", [](const httplib::Request &, httplib::Response &response) {
+            response.status = 204;
+        });
+        server.Get("/stats", [&handler, &executor, model_name = std::move(model_name),
+                              description = std::move(description), process_stats = std::move(process_stats)](
+                               const httplib::Request &, httplib::Response &response) {
+            auto result = handler.runtimeStats();
+            const auto queue = executor.snapshot();
+            result["model"] = model_name;
+            result["topology"] = description.at("topology");
+            result["configuration"] = description.at("configuration");
+            result["resources"] = process_stats->snapshot();
+            result["inference_queue"] = {{"capacity", queue.capacity}, {"admitted", queue.admitted},
+                                         {"queued", queue.queued}, {"active", queue.active}};
+            response.set_header("Cache-Control", "no-store");
+            response.set_content(result.dump(), "application/json");
+        });
+    }
+
+    nlohmann::json serverRuntimeDescription(const RankExecutionPlan &plan,
+                                            const OrchestrationConfig &config, int world_size)
+    {
+        const auto participants = serverExecutionParticipants(plan, config, world_size);
+        const auto policy = serverExecutionPolicyTags(plan, config);
+        json devices = json::array();
+        for (const auto &[device, role] : participants)
+            devices.push_back({{"id", device.toString()},
+                {"role", role == ServerParticipantRole::ModelGraph ? "model_graph" : "expert_only"}});
+        json domains = json::array();
+        for (const auto &domain : plan.my_domains)
+        {
+            json members = json::array();
+            for (const auto &address : domain.devices) members.push_back(address.toString());
+            domains.push_back({{"id", domain.domain_id}, {"name", domain.domain_name},
+                {"devices", std::move(members)}, {"backend", collectiveBackendTypeToString(domain.backend)}});
+        }
+        const auto &runtime = plan.runtime;
+        return {
+            {"topology", {{"source", "resolved_execution_plan"}, {"scope", "serving_rank"},
+                {"rank", plan.rank}, {"world_size", world_size},
+                {"strategy", policy.at("execution_strategy")}, {"devices", std::move(devices)},
+                {"pipeline_domains", serverPipelineDomainTags(plan)}, {"tp_domains", std::move(domains)},
+                {"global_tp_domain_size", plan.global_tp_domain_size},
+                {"expert_overlay", policy.at("expert_overlay") == "true"}}},
+            {"configuration", {{"context_tokens", config.max_seq_len},
+                {"mtp", {{"enabled", runtime.mtp.enabled},
+                    {"verify_mode", mtpVerifyModeToString(runtime.mtp.verify_mode)},
+                    {"depth_policy", mtpDepthPolicyModeToString(runtime.mtp.depth_policy.mode)},
+                    {"min_depth", runtime.mtp.depth_policy.min_depth},
+                    {"max_depth", resolveMTPMaximumExecutionDraftDepth(runtime.mtp)}}},
+                {"prefix_cache", {{"enabled", runtime.prefix_cache.enabled},
+                    {"ram_budget_bytes_per_participant", runtime.prefix_cache.ram_budget_bytes},
+                    {"disk_budget_bytes", runtime.prefix_cache.disk_budget_bytes}}}}}};
+    }
+
+    void registerChatCompletionEndpoint(httplib::Server &server, ChatCompletionHandler &handler,
+                                        SerializedInferenceExecutor &inference_executor,
+                                        HttpStreamObserver stream_observer)
+    {
+        server.Post("/v1/chat/completions",
+                 [&handler, &inference_executor, stream_observer = std::move(stream_observer)](const httplib::Request &req, httplib::Response &res)
+                 {
+                     const HttpRequestArrival arrival;
+                     // Parse before spending an inference reservation.
+                     ChatCompletionResponse parse_error;
+                     auto parsed_request = ChatCompletionHandler::parseRequest(req.body, parse_error);
+
+                     if (!parsed_request)
+                     {
+                         res.status = parse_error.http_status;
+                         res.set_content(parse_error.json_body, "application/json");
+                         return;
+                     }
+
+                     auto admission = inference_executor.tryReserve();
+                     if (!admission)
+                     {
+                         res.status = 503;
+                         res.set_content(json{{"error", {{"message", "Inference request capacity is full"},
+                             {"type", "server_busy"}, {"code", "inference_queue_full"}}}}.dump(),
+                             "application/json");
+                         return;
+                     }
+
+                     if (parsed_request->stream)
+                     {
+                         auto streamed_response_body = traceAccessLoggingEnabled()
+                                                           ? std::make_shared<std::string>()
+                                                           : nullptr;
+                         if (stream_observer) stream_observer(req, streamed_response_body);
+
+                         // SSE streaming response
+                         res.set_chunked_content_provider(
+                             "text/event-stream",
+                             [&handler,
+                              admission = std::move(admission),
+                              request = std::move(*parsed_request),
+                              streamed_response_body, arrival](size_t /*offset*/, httplib::DataSink &sink) -> bool
+                             {
+                                 auto chunk_cb = [&sink, streamed_response_body](const std::string &sse_line) -> bool
+                                 {
+                                     if (streamed_response_body)
+                                         streamed_response_body->append(sse_line);
+                                     return sink.write(sse_line.c_str(), sse_line.size());
+                                 };
+
+                                 admission->run([&] { return handler.publishStreamingRequest(request, chunk_cb, arrival); });
+
+                                 sink.done();
+                                 return true;
+                             });
+                     }
+                     else
+                     {
+                         // Non-streaming response
+                         auto response = admission->run([&] { return handler.handleRequest(*parsed_request, arrival); });
+                         res.status = response.http_status;
+                         res.set_content(response.json_body, "application/json");
+                     }
+                 });
     }
 
     int ServerMode::execute(AppContext &ctx)
@@ -443,6 +622,9 @@ namespace llaminar2
                 "server", "rank_membership", 1.0, "startup", {},
                 serverRankMembershipTags(*inventory, mpi_ctx->rank(),
                                          runner->coordinatedRootRank()));
+            PerfStatsCollector::addCounter(
+                "server", "process_identity", 1.0, "startup", {},
+                serverProcessIdentityTags(static_cast<int>(::getpid())));
             const auto participants = serverExecutionParticipants(
                 runner->executionPlan(), runner->config(), mpi_ctx->world_size());
             // Reuse loaded metadata; observing attention ownership must not
@@ -480,6 +662,7 @@ namespace llaminar2
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();
             runner->shutdown();
+            exportTerminalMovement(*runner);
             flushPerfStatsFromEnv();
             return 0;
         }
@@ -517,14 +700,15 @@ namespace llaminar2
         // Extract model name from path for response metadata
         std::string model_name = std::filesystem::path(config.model_path).stem().string();
 
+        ChatCompletionHandler handler(*runner, *tokenizer, model_name);
+        SerializedInferenceExecutor inference_executor;
         httplib::Server svr;
         g_server_ptr = &svr;
         RequestLogState request_log_state;
 
-        // Inference is serialized on a single model instance. Keep HTTP handling
-        // on one stable worker so OpenMP does not initialize per-request teams
-        // on a large rotating httplib thread pool.
-        configureSerializedInferenceHttpServer(svr);
+        // The dedicated worker retains model/OpenMP ownership. HTTP waiters
+        // cannot consume the capacity reserved for passive control requests.
+        configureInferenceHttpServer(svr, inference_executor);
 
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);
@@ -542,17 +726,9 @@ namespace llaminar2
                 return httplib::Server::HandlerResponse::Unhandled;
             });
 
-        svr.set_logger(
-            [&request_log_state](const httplib::Request &req, const httplib::Response &res) {
-                logServedRequest(req, res, request_log_state);
-            });
-
-        // Mutex to serialize inference requests (single model instance)
-        std::mutex inference_mutex;
-
         // CORS headers for Open WebUI and other browser-based clients
         svr.set_default_headers({{"Access-Control-Allow-Origin", "*"},
-                                 {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+                                 {"Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS"},
                                  {"Access-Control-Allow-Headers", "Content-Type, Authorization"}});
 
         // Handle CORS preflight
@@ -573,6 +749,16 @@ namespace llaminar2
         // presenting it in their UI.  The response is immutable for this
         // server lifetime because its model was admitted before bind(2).
         registerOpenAIModelDiscoveryEndpoint(svr, model_name);
+        HttpProcessStatsOptions process_options;
+        process_options.filesystems.push_back(std::filesystem::absolute(config.model_path).parent_path());
+        if (runner->executionPlan().runtime.prefix_cache.enabled &&
+            runner->executionPlan().runtime.prefix_cache.disk_budget_bytes != 0)
+            process_options.filesystems.push_back(runner->executionPlan().runtime.prefix_cache.disk_dir);
+        registerRuntimeStatsEndpoint(svr, handler, inference_executor, model_name,
+            serverRuntimeDescription(runner->executionPlan(), runner->config(), mpi_ctx->world_size()),
+            [&request_log_state](const httplib::Request &req, const httplib::Response &res) {
+                logServedRequest(req, res, request_log_state);
+            }, std::make_shared<HttpProcessStats>(std::move(process_options)));
 
         if (shutdownEndpointEnabled())
         {
@@ -593,68 +779,11 @@ namespace llaminar2
         }
 
         // ─── POST /v1/chat/completions ───────────────────────────────
-        ChatCompletionHandler handler(*runner, *tokenizer, model_name);
 
-        svr.Post("/v1/chat/completions",
-                 [&](const httplib::Request &req, httplib::Response &res)
-                 {
-                     std::lock_guard<std::mutex> lock(inference_mutex);
-
-                     // Check if streaming was requested
-                     ChatCompletionResponse parse_error;
-                     auto parsed_request = ChatCompletionHandler::parseRequest(req.body, parse_error);
-
-                     if (!parsed_request)
-                     {
-                         res.status = parse_error.http_status;
-                         res.set_content(parse_error.json_body, "application/json");
-                         return;
-                     }
-
-                     if (parsed_request->stream)
-                     {
-                         auto streamed_response_body = traceAccessLoggingEnabled()
-                                                           ? std::make_shared<std::string>()
-                                                           : nullptr;
-                         request_log_state.attachStreamedResponseBody(req, streamed_response_body);
-
-                         // SSE streaming response
-                         res.set_chunked_content_provider(
-                             "text/event-stream",
-                             [&handler,
-                              request = std::move(*parsed_request),
-                              streamed_response_body](size_t /*offset*/, httplib::DataSink &sink) -> bool
-                             {
-                                 auto chunk_cb = [&sink, streamed_response_body](const std::string &sse_line) -> bool
-                                 {
-                                     if (streamed_response_body)
-                                         streamed_response_body->append(sse_line);
-                                     return sink.write(sse_line.c_str(), sse_line.size());
-                                 };
-
-                                 auto response = handler.handleStreamingRequest(request, chunk_cb);
-
-                                 if (!response.ok && !response.json_body.empty())
-                                 {
-                                     // Error before streaming started — emit error as SSE
-                                     std::string error_sse = "data: " + response.json_body + "\n\ndata: [DONE]\n\n";
-                                     if (streamed_response_body)
-                                         streamed_response_body->append(error_sse);
-                                     sink.write(error_sse.c_str(), error_sse.size());
-                                 }
-
-                                 sink.done();
-                                 return true;
-                             });
-                     }
-                     else
-                     {
-                         // Non-streaming response
-                         auto response = handler.handleRequest(*parsed_request);
-                         res.status = response.http_status;
-                         res.set_content(response.json_body, "application/json");
-                     }
-                 });
+        registerChatCompletionEndpoint(svr, handler, inference_executor,
+            [&request_log_state](const httplib::Request &request, std::shared_ptr<std::string> body) {
+                request_log_state.attachStreamedResponseBody(request, std::move(body));
+            });
 
         // Bind the socket before announcing readiness. cpp-httplib combines
         // bind(2) and listen(2) in bind_to_port(), then listen_after_bind()
@@ -694,7 +823,7 @@ namespace llaminar2
         }
 #endif
 
-        if (!svr.listen_after_bind())
+        if (!listenInferenceHttpServer(svr))
         {
             if (!g_shutdown_requested.load())
             {
@@ -707,6 +836,9 @@ namespace llaminar2
             }
         }
 
+        // All HTTP workers have drained their responses. Join inference before
+        // retiring model/MPI owners; no maintenance or GPU cancellation occurs.
+        inference_executor.shutdown();
         LOG_INFO("Server shut down.");
         g_server_ptr = nullptr;
 
@@ -715,6 +847,7 @@ namespace llaminar2
             runner->shutdownMPIWorkers();
 
         runner->shutdown();
+        exportTerminalMovement(*runner);
         flushPerfStatsFromEnv();
         return 0;
     }

@@ -148,11 +148,15 @@ namespace llaminar2::test
             return metadata;
         }
 
-        /** @brief Create one frozen histogram whose hottest experts start cold. */
-        std::unique_ptr<DecodeExpertHistogram> makeHistogram()
+        /**
+         * @param first_model_layer Global row owned by this one-layer stage.
+         * @return Histogram whose hottest experts start in the cold tier.
+         */
+        std::unique_ptr<DecodeExpertHistogram> makeHistogram(int first_model_layer = 0)
         {
             DecodeExpertHistogramConfig config;
             config.num_layers = 1;
+            config.token_boundary_layer_idx = first_model_layer;
             config.num_experts = 6;
             config.top_k = 2;
             config.window_size = 4;
@@ -163,10 +167,10 @@ namespace llaminar2::test
             };
             /* Random owner ordering is resolved by the authority's owner map. */
             config.ownership = MoELayeredExpertOwnership::uniform(
-                1, 3, {0, 0, 1, 1, 2, 2});
+                1, 3, {0, 0, 1, 1, 2, 2}, first_model_layer);
             auto histogram = std::make_unique<DecodeExpertHistogram>(config);
             const std::vector<std::uint64_t> counts{1, 2, 3, 4, 100, 90};
-            histogram->mergeLayerCounts(0, counts.data(), 6, false);
+            histogram->mergeLayerCounts(first_model_layer, counts.data(), 6, false);
             return histogram;
         }
 
@@ -178,16 +182,23 @@ namespace llaminar2::test
             MoEOverlayResidencyTransaction transaction;
         };
 
-        /** @brief Produce the same deterministic rank-local transaction. */
-        TransactionFixture makeTransaction()
+        /**
+         * @param first_model_layer Global row owned by this one-layer stage.
+         * @return Deterministic transaction with its authority dependencies retained.
+         */
+        TransactionFixture makeTransaction(int first_model_layer = 0)
         {
             TransactionFixture fixture;
-            fixture.histogram = makeHistogram();
+            fixture.histogram = makeHistogram(first_model_layer);
+            auto plan = threeRankPlan();
+            plan.first_model_layer = first_model_layer;
+            auto metadata = modelMetadata();
+            metadata.first_model_layer = first_model_layer;
             fixture.authority =
                 std::make_unique<MoEOverlayResidencyAuthority>(
                     MoEOverlayResidencyAuthority::Config{
-                        .initial_plan = threeRankPlan(),
-                        .model_metadata = modelMetadata(),
+                        .initial_plan = std::move(plan),
+                        .model_metadata = metadata,
                         .maintenance_mode =
                             MoERebalanceRuntimeMode::Dynamic,
                         .histogram = fixture.histogram.get(),
@@ -985,11 +996,11 @@ namespace llaminar2::test
         source.transaction_demand->encodeWire(packet);
         auto envelope = source;
         envelope.transaction_demand.reset();
-        // Descriptor zero starts after the 8-byte model and 16-byte layer headers.
+        // Descriptor zero starts after the 16-byte model and 16-byte layer headers.
         for (uint32_t malformed : {0u, 5u, std::numeric_limits<uint32_t>::max()})
         {
             auto corrupted = packet;
-            size_t offset = 24;
+            size_t offset = 32;
             moe_overlay_wire::writeLittleEndian(corrupted, offset, malformed);
             EXPECT_THROW((void)DecodeExpertTransactionWindow::decodeWire(receiver, envelope, corrupted),
                          std::invalid_argument);
@@ -1248,6 +1259,39 @@ namespace llaminar2::test
             &decoded_proposal,
             &error));
         EXPECT_NE(error.find("size"), std::string::npos);
+    }
+
+    /** @brief Equal-shaped proposals remain bound to the receiver's admitted global stage. */
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, PipelineStageProposalRoundTripAuthenticatesOrigin)
+    {
+        for (int first : {0, 32, 40, std::numeric_limits<int>::max() - 1})
+        {
+            SCOPED_TRACE(first);
+            auto fixture = makeTransaction(first);
+            const auto proposal = makeMoEOverlayDistributedResidencyProposal(
+                fixture.authority->exportAuthoritativeResidencyPlan(fixture.transaction), fixture.transaction);
+            ASSERT_TRUE(proposal.valid());
+            // The nested histogram already owns origin metadata. A later stage
+            // requires neither leading empty rows nor extra payload fields.
+            std::vector<std::uint8_t> packet(moeOverlayDistributedResidencyProposalWireBytes(1, 6));
+            std::string error;
+            ASSERT_TRUE(encodeMoEOverlayDistributedResidencyProposal(proposal, packet, &error)) << error;
+            MoEOverlayDistributedResidencyProposal decoded;
+            ASSERT_TRUE(decodeMoEOverlayDistributedResidencyProposal(
+                packet, 1, 6, &decoded, &error, nullptr, first)) << error;
+            EXPECT_EQ(decoded.plan.firstModelLayer(), first);
+            EXPECT_EQ(decoded.plan.entries, proposal.plan.entries);
+            EXPECT_EQ(decoded.execution_fingerprint, proposal.execution_fingerprint);
+            auto follower = makeTransaction(first);
+            const auto adopted = follower.authority->adoptAuthoritativeResidencyPlan(decoded.plan);
+            EXPECT_EQ(fingerprintMoEOverlayResidencyExecutionPlan(adopted), proposal.execution_fingerprint);
+            for (int invalid : {-1, first == 0 ? 32 : 0, std::numeric_limits<int>::max()})
+            {
+                EXPECT_FALSE(decodeMoEOverlayDistributedResidencyProposal(
+                    packet, 1, 6, &decoded, &error, nullptr, invalid));
+                EXPECT_FALSE(error.empty());
+            }
+        }
     }
 
     TEST(

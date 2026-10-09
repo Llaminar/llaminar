@@ -9,6 +9,8 @@
  * and PerfStats evidence.
  * Request-admission regressions hold the real economy lock explicitly, proving
  * that background planning cannot stall an already-active inference request.
+ * Pipeline tests retain global model-layer identities while exercising compact
+ * ownership, observed phase costs, frozen proposals and epoch publication.
  */
 
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
@@ -181,17 +183,25 @@ namespace llaminar2::test
             return plan;
         }
 
-        /** @brief Histogram authority matching the one-tier participant set. */
-        std::unique_ptr<DecodeExpertHistogram> oneTierHistogram(int top_k = 1)
+        /**
+         * @brief Histogram authority matching the one-tier participant set.
+         * @param top_k Distinct experts in each observed route row.
+         * @param num_layers Compact owned row count.
+         * @param first_model_layer Global origin of the pipeline stage.
+         * @return Device-free histogram retaining exact stage ownership.
+         */
+        std::unique_ptr<DecodeExpertHistogram> oneTierHistogram(
+            int top_k = 1, int num_layers = 1, int first_model_layer = 0)
         {
             DecodeExpertHistogramConfig config;
-            config.num_layers = 1;
+            config.num_layers = num_layers;
+            config.token_boundary_layer_idx = first_model_layer;
             config.num_experts = 6;
             config.top_k = top_k;
             config.window_size = 4;
             config.sockets = {DeviceId::cuda(0), DeviceId::cuda(1)};
             config.ownership = MoELayeredExpertOwnership::uniform(
-                1, 2, {0, 0, 0, 1, 1, 1});
+                num_layers, 2, {0, 0, 0, 1, 1, 1}, first_model_layer);
             return std::make_unique<DecodeExpertHistogram>(config);
         }
 
@@ -546,15 +556,17 @@ namespace llaminar2::test
          * @param num_experts Complete model expert geometry.
          * @param top_k Distinct routes per logical row.
          * @param generation Number of empty generations retired before recording.
-         * @return Immutable observed window with the token boundary at layer zero.
+         * @param first_model_layer Global origin of the owned stage.
+         * @return Immutable observed window with the token boundary at its first layer.
          *
          * Only this fixture constructs synthetic routes. Production receives real
-         * router output. Layer zero owns progress; summing tokens across layers
+         * router output. The first layer owns progress; summing tokens across layers
          * would incorrectly multiply the payoff horizon by the layer count.
          */
         std::shared_ptr<const DecodeExpertHistogramWindow> observedLayerBatches(
             const std::vector<std::vector<ObservedBatch>> &layers,
-            int num_experts, int top_k, uint64_t generation)
+            int num_experts, int top_k, uint64_t generation,
+            int first_model_layer = 0)
         {
             if (top_k <= 0 || num_experts < top_k || layers.empty())
                 throw std::invalid_argument("Observed fixture needs positive batch geometry");
@@ -580,6 +592,9 @@ namespace llaminar2::test
                 static_cast<uint32_t>(rows), static_cast<uint32_t>(maximum_rows),
                 static_cast<uint32_t>(top_k)};
             const int num_layers = static_cast<int>(layers.size());
+            if (first_model_layer < 0 ||
+                num_layers > std::numeric_limits<int>::max() - first_model_layer)
+                throw std::invalid_argument("Observed fixture has an invalid owned stage");
             const auto bytes = 2 * capacity.allocationBytes() * layers.size() +
                 DecodeExpertTransactionWindow::maximumAllocationBytes(capacity, num_layers, num_experts);
             PhysicalMemoryBOMBuilder bom({.world_rank = 0, .device = DeviceId::cpu(),
@@ -593,11 +608,11 @@ namespace llaminar2::test
             config.num_layers = num_layers;
             config.num_experts = num_experts;
             config.top_k = top_k;
-            config.token_boundary_layer_idx = 0;
+            config.token_boundary_layer_idx = first_model_layer;
             config.window_size = static_cast<int>(rows);
             config.sockets = {DeviceId::cpu()};
             config.ownership = MoELayeredExpertOwnership::uniform(
-                num_layers, 1, std::vector<int>(num_experts, 0));
+                num_layers, 1, std::vector<int>(num_experts, 0), first_model_layer);
             config.transaction_demand = ExpertHistogramTransactionConfig{capacity, std::move(memory)};
             DecodeExpertHistogram histogram(config);
             // Editing generation on a frozen window would invalidate its seal.
@@ -609,7 +624,7 @@ namespace llaminar2::test
                 {
                     const int batch_rows = static_cast<int>(batch.routes.size() / top_k);
                     const auto merged = histogram.mergeRoutedExpertRows(batch.routes.data(), {
-                            .source = batch.phase, .layer_idx = layer,
+                            .source = batch.phase, .layer_idx = first_model_layer + layer,
                             .real_token_count = batch_rows, .bucket_token_count = batch_rows,
                             .top_k = top_k, .route_stride = top_k,
                             .count_window_tokens = layer == 0}, scratch);
@@ -5427,6 +5442,253 @@ namespace llaminar2::test
             "committed_expert_migrations");
         ASSERT_NE(movement_record, nullptr);
         EXPECT_DOUBLE_EQ(movement_record->value, 0.0);
+    }
+
+    namespace
+    {
+        /** @brief Two compact rows with deliberately different certified prices. */
+        struct PipelineStageAuthorityFixture
+        {
+            std::unique_ptr<DecodeExpertHistogram> histogram;
+            MoERoutedExpertPlacementPlan plan;
+            MoERoutedExpertModelMetadata metadata;
+            std::shared_ptr<MoERoutedTierServiceProfile> service;
+            std::shared_ptr<MoEOverlayMigrationCostProfile> movement;
+
+            /**
+             * @brief Admit a two-row stage at the specified global origin.
+             * @param first First global layer owned by the fixture.
+             */
+            explicit PipelineStageAuthorityFixture(int first)
+                : histogram(oneTierHistogram(2, 2, first)),
+                  plan(oneTierTwoParticipantPlan(RoutedExpertResidencyPolicy::RoutedTierRebalanced)),
+                  metadata(modelMetadata()),
+                  service(std::make_shared<MoERoutedTierServiceProfile>()),
+                  movement(std::make_shared<MoEOverlayMigrationCostProfile>())
+            {
+                plan.first_model_layer = first;
+                metadata.num_layers = 2;
+                metadata.first_model_layer = first;
+                service->identity = "stage-service";
+                service->production_topology = ExpertHistogramProductionTopology::uniform(
+                    2, kAllExpertHistogramProductionSources, first);
+                movement->identity = "stage-movement";
+                for (int row = 0; row < 2; ++row)
+                {
+                    const int layer = first + row;
+                    const std::uint64_t price = row == 0 ? 10 : 100;
+                    service->costs.push_back({.tier_index = 0, .layer = layer,
+                        .nanoseconds_per_activation = {price, 2 * price, 3 * price}});
+                    for (int participant = 0; participant < 2; ++participant)
+                    {
+                        service->participant_costs.push_back({.participant_id = participant,
+                            .layer = layer,
+                            .nanoseconds_per_activation = {price, 2 * price, 3 * price}});
+                        movement->costs.push_back({.source_participant = participant,
+                            .destination_participant = 1 - participant, .layer = layer,
+                            .transfer_and_repack_ns = 1, .inference_interference_ns = 1});
+                    }
+                }
+            }
+
+            /**
+             * @param economy Whether this authority owns certified cost evidence.
+             * @return Production inputs borrowing this fixture's histogram.
+             */
+            MoEOverlayResidencyAuthority::Config config(bool economy = true) const
+            {
+                MoEOverlayResidencyAuthority::Config result{
+                    .initial_plan = plan, .model_metadata = metadata,
+                    .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+                    .histogram = histogram.get(),
+                    .participant_rebalance_policy = {.enabled = true,
+                        .imbalance_threshold_per_mille = 1300, .minimum_improvement_per_mille = 50,
+                        .maximum_swaps_per_layer = 1, .maximum_plan_entries_per_wave = 4,
+                        .minimum_window_activations = 1},
+                    .shadow_slots_per_endpoint_layer = 1, .max_concurrent_cycles = 2,
+                };
+                if (economy)
+                {
+                    result.phase_service_profile = service;
+                    result.migration_cost_profile = movement;
+                    result.migration_economy_policy = MoEOverlayMigrationEconomyPolicy{
+                        .historical_window_weight = 3, .current_window_weight = 1,
+                        .payoff_horizon_tokens = 2, .minimum_net_benefit_ns = 0,
+                        .minimum_residency_generations = 2};
+                }
+                return result;
+            }
+
+            /**
+             * @param phase Production invocation phase represented by each batch.
+             * @param generation Number of prior histogram rotations.
+             * @return Real phase-local route transactions for both owned rows.
+             */
+            std::shared_ptr<const DecodeExpertHistogramWindow> observed(
+                ExpertHistogramSource phase, std::uint64_t generation = 0) const
+            {
+                return observedLayerBatches({{{phase, {0, 1}}, {phase, {3, 4}}},
+                                            {{phase, {0, 1}}, {phase, {3, 4}}}},
+                    6, 2, generation, metadata.first_model_layer);
+            }
+        };
+    }
+
+    /** @brief Every maintenance mode keeps exact compact ownership and stage identity. */
+    TEST(Test__MoEOverlayResidencyAuthority, PipelineStageSnapshotsAndFrozenEvidence)
+    {
+        for (int first : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+        for (auto mode : {MoERebalanceRuntimeMode::Off, MoERebalanceRuntimeMode::Observe,
+                          MoERebalanceRuntimeMode::Dynamic})
+        {
+            SCOPED_TRACE(first);
+            SCOPED_TRACE(static_cast<int>(mode));
+            PipelineStageAuthorityFixture fixture(first);
+            auto config = fixture.config(false);
+            config.maintenance_mode = mode;
+            MoEOverlayResidencyAuthority authority(config);
+            const auto snapshot = authority.snapshot();
+            ASSERT_TRUE(snapshot->valid());
+            EXPECT_EQ(snapshot->layered_ownership.firstModelLayer(), first);
+            EXPECT_EQ(snapshot->layered_ownership.layerCount(), 2);
+            EXPECT_EQ(snapshot->owner_map.owners().size(), 12u);
+            EXPECT_NE(snapshot->owner_map.ownerFor(first + 1, 5), nullptr);
+            EXPECT_EQ(snapshot->owner_map.ownerFor(first + 2, 0), nullptr);
+            if (mode != MoERebalanceRuntimeMode::Dynamic) continue;
+            const auto frozen = authority.freezeAndRotateHistogramWindow();
+            EXPECT_EQ(frozen->first_model_layer, first);
+            EXPECT_EQ(frozen->expert_counts.size(), 12u);
+            const auto transaction = authority.proposeFromFrozenHistogramWindow(frozen);
+            ASSERT_TRUE(transaction.valid());
+            auto foreign = std::make_shared<DecodeExpertHistogramWindow>(*frozen);
+            foreign->first_model_layer = first == 0 ? 32 : 0;
+            ASSERT_TRUE(foreign->valid());
+            EXPECT_THROW((void)authority.proposeFromFrozenHistogramWindow(foreign), std::invalid_argument);
+            auto invalid = transaction;
+            invalid.histogram_window = foreign;
+            EXPECT_FALSE(invalid.valid());
+            auto candidate = std::make_shared<MoEOverlayResidencySnapshot>(*transaction.candidate);
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>(*candidate->placement_plan);
+            plan->first_model_layer = foreign->first_model_layer;
+            candidate->placement_plan = plan;
+            EXPECT_FALSE(candidate->valid());
+            invalid = transaction;
+            invalid.candidate = candidate;
+            EXPECT_FALSE(invalid.valid());
+        }
+    }
+
+    /** @brief Equal-sized foreign scopes fail before snapshot or cost-table construction. */
+    TEST(Test__MoEOverlayResidencyAuthority, PipelineStageRejectsForeignSetupGeometry)
+    {
+        for (int variant = 0; variant < 8; ++variant)
+        {
+            SCOPED_TRACE(variant);
+            PipelineStageAuthorityFixture fixture(32);
+            auto config = fixture.config(false);
+            auto foreign_histogram = oneTierHistogram(2, 2, 0);
+            switch (variant)
+            {
+            case 0: config.initial_plan.first_model_layer = 0; break;
+            case 1: config.histogram = foreign_histogram.get(); break;
+            case 2: config.model_metadata.num_layers = 1; break;
+            case 3: config.model_metadata.num_experts = 5; break;
+            case 4: config.model_metadata.first_model_layer = -1; break;
+            case 5: config.model_metadata.first_model_layer = std::numeric_limits<int>::max();
+                    config.initial_plan.first_model_layer = config.model_metadata.first_model_layer; break;
+            case 6: config.model_metadata.num_layers = 0; break;
+            case 7: config.model_metadata.num_experts = 0; break;
+            }
+            EXPECT_THROW((void)MoEOverlayResidencyAuthority(config), std::invalid_argument);
+        }
+    }
+
+    /** @brief Prices, proposals and publication use compact rows but global identities. */
+    TEST(Test__MoEOverlayResidencyAuthority, PipelineStageEconomicProposalsAndAdoption)
+    {
+        for (int first : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+        for (auto phase : {ExpertHistogramSource::DecodeToken, ExpertHistogramSource::PrefillChunk,
+                           ExpertHistogramSource::GroupedVerifier})
+        {
+            SCOPED_TRACE(first);
+            SCOPED_TRACE(static_cast<int>(phase));
+            PipelineStageAuthorityFixture fixture(first);
+            MoEOverlayResidencyAuthority authority(fixture.config());
+            const auto observed = fixture.observed(phase);
+            const auto transaction = authority.proposeFromFrozenHistogramWindow(observed);
+            ASSERT_TRUE(transaction.valid());
+            ASSERT_EQ(transaction.migrations.size(), 4u);
+            const std::uint64_t phase_factor = phase == ExpertHistogramSource::DecodeToken ? 1 :
+                phase == ExpertHistogramSource::PrefillChunk ? 2 : 3;
+            EXPECT_EQ(transaction.economy.projected_service_gain_ns, 220u * phase_factor);
+            // The two endpoints overlap. The critical path is each endpoint's
+            // two layer transfers, not the sum of all four movement edges.
+            EXPECT_EQ(transaction.economy.projected_transfer_and_repack_ns, 2u);
+            EXPECT_EQ(transaction.economy.projected_inference_interference_ns, 2u);
+            for (const auto &migration : transaction.migrations)
+            {
+                EXPECT_TRUE(fixture.metadata.containsModelLayer(migration.layer_idx));
+                EXPECT_EQ(migration.activation_count,
+                    observed->activationCount(migration.layer_idx, migration.expert_id));
+            }
+            const auto plan = authority.exportAuthoritativeResidencyPlan(transaction);
+            ASSERT_TRUE(plan.valid());
+            EXPECT_EQ(plan.firstModelLayer(), first);
+            EXPECT_EQ(plan.entries.size(), 12u);
+            EXPECT_EQ(plan.offset(first, 0), 0u);
+            EXPECT_EQ(plan.offset(first + 1, 5), 11u);
+            EXPECT_THROW((void)plan.offset(first - 1, 0), std::out_of_range);
+            EXPECT_THROW((void)plan.offset(first + 2, 0), std::out_of_range);
+            PipelineStageAuthorityFixture follower(first);
+            MoEOverlayResidencyAuthority peer(follower.config(false));
+            const auto adopted = peer.adoptAuthoritativeResidencyPlan(plan);
+            ASSERT_TRUE(adopted.valid());
+            EXPECT_EQ(fingerprintMoEOverlayResidencyExecutionPlan(adopted),
+                      fingerprintMoEOverlayResidencyExecutionPlan(transaction));
+            PipelineStageAuthorityFixture other(first == 0 ? 32 : 0);
+            MoEOverlayResidencyAuthority foreign(other.config(false));
+            EXPECT_THROW((void)foreign.adoptAuthoritativeResidencyPlan(plan), std::invalid_argument);
+            EXPECT_THROW((void)foreign.exportAuthoritativeResidencyPlan(transaction), std::invalid_argument);
+
+            // Advancing and retransmitting observations must not rebase their
+            // global layer identities or apply temporal smoothing twice.
+            const auto next = fixture.observed(phase, 1);
+            const auto next_transaction = authority.proposeFromFrozenHistogramWindow(next);
+            const auto repeated = authority.proposeFromFrozenHistogramWindow(next);
+            EXPECT_TRUE(next_transaction.valid());
+            EXPECT_EQ(fingerprintMoEOverlayResidencyTransaction(next_transaction),
+                      fingerprintMoEOverlayResidencyTransaction(repeated));
+            RecordingTransport transport(&authority);
+            ASSERT_EQ(authority.beginApply(next_transaction, transport).status,
+                      MoEOverlayResidencyApplyStatus::Started);
+            EXPECT_EQ(authority.advanceBackground().status, MoEOverlayResidencyApplyStatus::Preparing);
+            EXPECT_EQ(authority.advanceBackground().status, MoEOverlayResidencyApplyStatus::Publishing);
+            EXPECT_EQ(authority.advanceBackground().status, MoEOverlayResidencyApplyStatus::Published);
+            EXPECT_EQ(authority.snapshot()->layered_ownership, next_transaction.candidate->layered_ownership);
+        }
+    }
+
+    /** @brief Price tables must cover this exact stage before economy scoring starts. */
+    TEST(Test__MoEOverlayResidencyAuthority, PipelineStageRejectsForeignAndRaggedCostEvidence)
+    {
+        for (int variant = 0; variant < 8; ++variant)
+        {
+            SCOPED_TRACE(variant);
+            PipelineStageAuthorityFixture fixture(32);
+            switch (variant)
+            {
+            case 0: fixture.service->production_topology = ExpertHistogramProductionTopology::uniform(
+                        2, kAllExpertHistogramProductionSources, 0); break;
+            case 1: fixture.service->costs[0].layer = 0; break;
+            case 2: fixture.service->participant_costs[0].layer = 0; break;
+            case 3: fixture.movement->costs[0].layer = 0; break;
+            case 4: fixture.service->costs.pop_back(); break;
+            case 5: fixture.service->participant_costs.pop_back(); break;
+            case 6: fixture.movement->costs.pop_back(); break;
+            case 7: fixture.movement->costs.back() = fixture.movement->costs.front(); break;
+            }
+            EXPECT_THROW((void)MoEOverlayResidencyAuthority(fixture.config()), std::invalid_argument);
+        }
     }
 
 } // namespace llaminar2::test

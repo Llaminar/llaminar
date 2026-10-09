@@ -131,11 +131,10 @@ namespace llaminar2
          */
         std::vector<PlanningExpertExecutionShare> executionShares(
             const AdmittedOrchestrationCandidate &candidate, const DevicePlanConfig &device,
-            std::span<const MoEOverlayBoundTierParticipant> participants, int layer,
+            const std::optional<AdmittedMoELayerView> &overlay, std::span<const MoEOverlayBoundTierParticipant> participants, int layer,
             int model_experts, size_t ordinary_experts, PlanningMainForwardPhase phase)
         {
-            const auto &capacity = candidate.overlayCapacity();
-            if (!capacity)
+            if (!overlay)
             {
                 const auto policy = candidate.rankPlans().at(device.world_rank).runtime.routed_expert_compute_policy;
                 if (policy == RoutedExpertComputePolicy::Replicated)
@@ -146,18 +145,19 @@ namespace llaminar2
                     throw std::logic_error("Whole-expert planning work requires replicated or apportioned execution");
                 return {{PlanningExpertExecution::OwnedExperts, static_cast<int>(ordinary_experts)}};
             }
-            const auto &plan = *candidate.config().moe_routed_expert_plan;
-            const auto footprint = std::find_if(capacity->layer_footprints.begin(), capacity->layer_footprints.end(),
+            const auto &plan = overlay->placement;
+            const auto &capacity = overlay->capacity;
+            const auto footprint = std::find_if(capacity.layer_footprints.begin(), capacity.layer_footprints.end(),
                 [&](const auto &entry) { return entry.layer_idx == layer; });
-            if (footprint == capacity->layer_footprints.end() || capacity->num_experts != model_experts)
+            if (footprint == capacity.layer_footprints.end() || capacity.num_experts != model_experts)
                 throw std::logic_error("Expert work has no matching admitted layer/population");
-            const size_t layer_index = static_cast<size_t>(footprint - capacity->layer_footprints.begin());
+            const size_t layer_index = static_cast<size_t>(footprint - capacity.layer_footprints.begin());
             std::vector<PlanningExpertExecutionShare> result;
             for (const auto &participant : participants)
             {
                 if (participant.world_rank != device.world_rank || participant.device != device.device) continue;
                 const auto &tier = plan.routed_tiers.at(participant.tier_index);
-                const auto *quota = capacity->tier(participant.tier_index);
+                const auto *quota = capacity.tier(participant.tier_index);
                 const auto domain = std::find_if(plan.domains.begin(), plan.domains.end(),
                     [&](const auto &entry) { return entry.name == tier.domain; });
                 if (!quota || domain == plan.domains.end())
@@ -239,9 +239,6 @@ namespace llaminar2
         });
         std::vector<PlanningParticipantWeightWork> result;
         result.reserve(candidate.devicePlans().size());
-        const auto participants = candidate.overlayCapacity()
-            ? MoEOverlayCapacityAdmission::boundParticipants(*candidate.config().moe_routed_expert_plan)
-            : std::vector<MoEOverlayBoundTierParticipant>{};
         for (const auto &device : candidate.devicePlans())
         {
             if (device.world_rank < 0 || static_cast<size_t>(device.world_rank) >= ranks.size() ||
@@ -252,8 +249,12 @@ namespace llaminar2
             const int last = std::min(main_layers - 1, device.last_layer < 0 ? main_layers - 1 : device.last_layer);
             if (first > last)
                 throw std::logic_error("Main-forward participant has no main-model layer interval");
+            const auto overlay = candidate.expertLayer(first);
+            const auto participants = overlay
+                ? MoEOverlayCapacityAdmission::boundParticipants(overlay->placement)
+                : std::vector<MoEOverlayBoundTierParticipant>{};
             const bool continuation = device.execution_role == DeviceExecutionMemoryRole::ContinuationGraph;
-            const bool routed = !candidate.overlayCapacity() || device.serial_routed_expert_participant_count > 0;
+            const bool routed = !overlay || device.serial_routed_expert_participant_count > 0;
             const bool head = continuation && rank.has_lm_head && last == main_layers - 1;
             const bool decode = phase == PlanningMainForwardPhase::Decode;
             const bool full_decode = decode && hasSet(device, AdditionalPersistentWeightSet::ReplicatedDenseDecode);
@@ -313,7 +314,7 @@ namespace llaminar2
                     if (entry) throw std::invalid_argument("Duplicate routed projection: " + tensor.name);
                     entry = operand(tensor, role, true, 1);
                     requireMatrix(*entry);
-                    if (!candidate.overlayCapacity())
+                    if (!overlay)
                     {
                         const auto local = sharded.resolve(tensor).matrix();
                         if (!local) throw std::invalid_argument("Routed source has no participant geometry");
@@ -346,8 +347,8 @@ namespace llaminar2
                     throw std::invalid_argument("Incompatible routed FFN projection geometry at layer " + std::to_string(layer));
                 work.routed.push_back({layer, profile.expert_count, profile.expert_used_count,
                     {std::move(*triplet[0]), std::move(*triplet[1]), std::move(*triplet[2])},
-                    executionShares(candidate, device, participants, layer, profile.expert_count,
-                        candidate.overlayCapacity() ? 0 : ordinary_expert_counts.at(layer), phase)});
+                    executionShares(candidate, device, overlay, participants, layer, profile.expert_count,
+                        overlay ? 0 : ordinary_expert_counts.at(layer), phase)});
                 auto &routed_work = work.routed.back();
                 const auto *ownership = device.weight_residency.projectionOwnership();
                 if (device.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
@@ -361,13 +362,13 @@ namespace llaminar2
                     const auto endpoint = std::find_if(participants.begin(), participants.end(), [&](const auto &entry) {
                         return entry.world_rank == device.world_rank && entry.device == device.device;
                     });
-                    if (!device.device.is_gpu() || !candidate.overlayCapacity() || endpoint == participants.end() ||
+                    if (!device.device.is_gpu() || !overlay || endpoint == participants.end() ||
                         std::count_if(participants.begin(), participants.end(), [&](const auto &entry) {
                             return entry.world_rank == device.world_rank && entry.device == device.device;
                         }) != 1 || gate.rows > size_t(std::numeric_limits<int>::max()) ||
                         gate.columns > size_t(std::numeric_limits<int>::max()))
                         throw std::logic_error("Projection work requires one exact admitted GPU domain binding");
-                    const auto &plan = *candidate.config().moe_routed_expert_plan;
+                    const auto &plan = overlay->placement;
                     const auto &tier = plan.routed_tiers.at(endpoint->tier_index);
                     const auto domain = std::find_if(plan.domains.begin(), plan.domains.end(),
                         [&](const auto &entry) { return entry.name == tier.domain; });

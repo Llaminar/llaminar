@@ -669,7 +669,10 @@ namespace llaminar2
         {
             if (key == "enabled" || key == "mtp")
             {
-                config.mtp.enabled = parseBoolValue(value);
+                config.mtp_activation_policy = value == "auto"
+                    ? MTPActivationPolicy::Automatic
+                    : (parseBoolValue(value) ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled);
+                config.mtp.enabled = config.mtp_activation_policy == MTPActivationPolicy::Enabled;
             }
             else if (key == "draft_tokens")
             {
@@ -2629,11 +2632,23 @@ namespace llaminar2
         spec.add({
             .long_name = "--mtp",
             .category = "MTP",
-            .description = "Enable multi-token prediction speculative decoding",
+            .description = "Require learned MTP heads (default: auto-enable complete GGUF heads with dynamic depth)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &)
                 {
                     c.mtp.enabled = true;
+                    c.mtp_activation_policy = MTPActivationPolicy::Enabled;
+                }),
+        });
+        spec.add({
+            .long_name = "--no-mtp",
+            .category = "MTP",
+            .description = "Disable speculative decoding, including on GGUFs with learned MTP heads",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.mtp.enabled = false;
+                    c.mtp_activation_policy = MTPActivationPolicy::Disabled;
                 }),
         });
         spec.add({
@@ -2724,7 +2739,7 @@ namespace llaminar2
             .long_name = "--mtp-depth-policy",
             .category = "MTP",
             .value_label = "<mode>",
-            .description = "MTP draft-depth policy: fixed, observe, dynamic",
+            .description = "MTP draft-depth policy: fixed, observe, dynamic (default: dynamic)",
             .valid_values = {"fixed", "observe", "dynamic"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)

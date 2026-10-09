@@ -43,6 +43,17 @@ namespace llaminar2
 
         /** @return Whether every region is aligned, bounded, and non-overlapping. */
         [[nodiscard]] bool valid() const noexcept;
+
+        /** @return Whether the immutable global interval admits @p layer. */
+        [[nodiscard]] bool containsModelLayer(int layer) const noexcept;
+
+        /**
+         * @brief Convert a global evidence coordinate into a compact controller row.
+         * @param layer Exact model-global layer from placement or service evidence.
+         * @return Row relative to this fabric's immutable interval.
+         * @throws std::out_of_range If the evidence belongs to another stage.
+         */
+        [[nodiscard]] std::uint32_t storageIndexForModelLayer(int layer) const;
     };
 
     /**
@@ -232,10 +243,27 @@ namespace llaminar2
             std::uint32_t dynamic_maximum_commands_per_wave =
                 moe_rebalance_policy::
                     kDefaultDynamicMaxPlanEntriesPerWave;
+            /** Exact global origin shared by residency and graph runtime tables. */
+            std::int32_t first_model_layer = 0;
         };
 
         /**
          * @brief Compute page ownership and all device-relative offsets.
+         * @param topology Frozen participant, group and tier ownership.
+         * @param num_layers Number of compact owned rows.
+         * @param num_experts Experts addressable in each row.
+         * @param command_capacity Maximum device-authored commands in one wave.
+         * @param page_bytes Native alignment and first-touch granularity.
+         * @param payload_bytes_per_layer Exact complete expert bytes per owned row.
+         * @param minimum_window_activations Observation floor for policy admission.
+         * @param maximum_cycles_per_wave Complete-cycle limit for one wave.
+         * @param dynamic_imbalance_threshold_per_mille Local skew threshold.
+         * @param dynamic_minimum_improvement_per_mille Required objective reduction.
+         * @param dynamic_maximum_cycles_per_layer Per-row movement-cycle bound.
+         * @param dynamic_maximum_commands_per_wave Policy command bound.
+         * @param routed_experts_per_token Exact model router fan-out.
+         * @param first_model_layer Global identity of compact row zero.
+         * @return One immutable layout with no allocation for preceding layers.
          * @throws std::invalid_argument for unsupported or overflowing geometry.
          */
         [[nodiscard]] static MoEOverlayDeviceControllerFabricLayout planLayout(
@@ -258,7 +286,8 @@ namespace llaminar2
             std::uint32_t dynamic_maximum_commands_per_wave =
                 moe_rebalance_policy::
                     kDefaultDynamicMaxPlanEntriesPerWave,
-            std::uint32_t routed_experts_per_token = 1u);
+            std::uint32_t routed_experts_per_token = 1u,
+            std::int32_t first_model_layer = 0);
 
         /**
          * @brief Create/attach, first-touch, initialize, and register the fabric.

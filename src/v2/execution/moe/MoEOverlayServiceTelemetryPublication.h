@@ -30,7 +30,8 @@ namespace llaminar2
      *
      * @param publication Stable host alias of the mapped publication record.
      * @param expected_participant_id Immutable global participant identity.
-     * @param expected_layer_count Exact model layer count.
+     * @param expected_first_model_layer Immutable global origin of compact row zero.
+     * @param expected_layer_count Exact owned layer count; no preceding rows exist.
      * @param output Receives one layer-ordered cumulative row per layer.
      * @param generation Optional accepted even publication generation.
      * @return True only for one coherent, identity-matching generation.
@@ -38,6 +39,7 @@ namespace llaminar2
     [[nodiscard]] bool trySnapshotMoEOverlayServiceTelemetryPublication(
         MoEOverlayDeviceServiceTelemetryPublicationHeader *publication,
         int expected_participant_id,
+        int expected_first_model_layer,
         std::uint32_t expected_layer_count,
         std::vector<MoEOverlayParticipantLayerServiceTotals> *output,
         std::uint64_t *generation = nullptr) noexcept;

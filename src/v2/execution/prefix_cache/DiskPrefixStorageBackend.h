@@ -2,15 +2,19 @@
  * @file DiskPrefixStorageBackend.h
  * @brief Durable, loaded-model-artifact-addressed prefix-cache archive.
  *
- * A disk cache is one append-only `<model-artifact-identity>.kvcache` file.
+ * A disk cache has one append-only `<model-artifact-identity>.kvcache` metadata
+ * journal and an adjacent `.blocks` directory of immutable payload inodes.
  * The identity covers the stable filesystem identity of every GGUF shard in
  * the already-loaded model context, without rereading model payload bytes.
- * Each put or delete operation is an independently checksummed record.
+ * Each journal record authenticates its small metadata and committed extents; payload
+ * bytes are opaque and are never checksummed or scanned for equality.
  * Complete records survive process restart; an interrupted tail is ignored
  * and removed before the next append. The archive owns capacity eviction and
- * compaction so the configured disk budget remains a real bounded tier.
- * Payload copying is background work; only an atomic inode publication holds
- * the foreground index lock. Verified readers retain their exact source inode.
+ * metadata compaction. Durable eviction unlinks the retired payload immediately,
+ * independently of compaction progress. Selected readers retain only the exact
+ * payload inodes they selected, never a whole obsolete archive generation.
+ * The ordered writer authenticates backing at each RAM demotion. Local cache
+ * indexes cannot certify residency after another participant or process writes.
  */
 
 #pragma once
@@ -18,6 +22,7 @@
 #include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "execution/prefix_cache/PrefixArchivePersistence.h"
 #include "execution/prefix_cache/PrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "execution/prefix_cache/PrefixArchiveMaintenanceWriter.h"
 
@@ -27,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -35,9 +41,10 @@
 namespace llaminar2
 {
     class RamPrefixStorageBackend;
+    class PrefixArchiveReadInode;
 
     /**
-     * @brief Persistent prefix blocks stored in one model-specific blob file.
+     * @brief Persistent prefix blocks owned by a journal and immutable payload files.
      *
      * Instances opened through openShared() are shared by every local
      * orchestrator targeting the same archive. A separate advisory lock file
@@ -53,7 +60,7 @@ namespace llaminar2
         {
             Idle,       ///< No requested archive rewrite.
             Scheduled,  ///< The worker has an admitted request.
-            Copying,    ///< Immutable records/tail are copied without cache locks.
+            Copying,    ///< Metadata snapshot is copied without cache locks.
             Publishing, ///< The complete replacement is atomically renamed.
             Failed,     ///< Native I/O failed; further archive use is rejected.
             Stopping,   ///< Teardown cancels bounded copying and joins the worker.
@@ -72,10 +79,10 @@ namespace llaminar2
         };
 
         /**
-         * @brief Move-only proof of one verified, physically stable archive record.
+         * @brief Move-only snapshot of one physically stable archive record.
          *
-         * A ticket snapshots immutable put-record offsets after checksum
-         * verification and owns an open descriptor for that exact inode.
+         * A ticket snapshots committed payload-section offsets without any payload
+         * read and shares an open descriptor for that exact inode.
          * Disk capacity eviction may remove the logical record while RAM makes
          * room; hydration can still stream the snapshotted committed bytes
          * into their final owner without retaining a second full block.
@@ -89,47 +96,47 @@ namespace llaminar2
             ~HydrationTicket();
             HydrationTicket(const HydrationTicket &) = delete;
             HydrationTicket &operator=(const HydrationTicket &) = delete;
-            /** @brief Transfer the verified record and its inode exactly once. */
+            /** @brief Transfer the selected record and its inode exactly once. */
             HydrationTicket(HydrationTicket &&other) noexcept;
             /** @brief Release the old record before accepting a moved ticket. */
             HydrationTicket &operator=(HydrationTicket &&other) noexcept;
 
-            /** @return Whether this ticket names one unconsumed verified record. */
+            /** @return Whether this ticket names an unconsumed captured or selected record. */
             [[nodiscard]] bool valid() const noexcept;
-            /** @return Exact RAM capacity required by the verified record. */
+            /** @return Complete archive payload bytes named by this snapshot. */
             [[nodiscard]] size_t totalBytes() const noexcept;
-            /** @return Durable handle metadata captured during verification. */
+            /** @return Durable handle metadata captured without payload reads. */
             [[nodiscard]] const PrefixBlockHandle &diskHandle() const noexcept;
+            /** @return Payload bytes actually read into final RAM sections. */
+            size_t hydratedPayloadBytes() const noexcept { return hydrated_payload_bytes_; }
 
         private:
             friend class DiskPrefixStorageBackend;
 
-            /** @brief Immutable extent and checksum within the retained inode. */
+            /** @brief Immutable section extent within the retained inode. */
             struct SectionSnapshot
             {
                 uint64_t offset = 0;
                 uint64_t bytes = 0;
-                uint64_t checksum = 0;
             };
 
-            /** @brief Bind verified metadata to one owned native descriptor. */
+            /** @brief Bind captured metadata to one owned native descriptor. */
             HydrationTicket(
                 std::shared_ptr<DiskPrefixStorageBackend> backend,
                 PrefixBlockHandle handle,
-                int archive_fd,
-                uint64_t archive_device,
-                uint64_t archive_inode,
+                std::shared_ptr<PrefixArchiveReadInode> inode,
                 std::array<SectionSnapshot, 6> sections);
             /** @brief Close the retained inode before releasing the backend. */
             void release() noexcept;
 
             std::shared_ptr<DiskPrefixStorageBackend> backend_;
             PrefixBlockHandle handle_;
-            int archive_fd_ = -1;
-            uint64_t archive_device_ = 0;
-            uint64_t archive_inode_ = 0;
+            std::shared_ptr<PrefixArchiveReadInode> inode_;
             std::array<SectionSnapshot, 6> sections_{};
-            bool consumed_ = false;
+            enum class Phase { Captured, Selected, Consumed };
+            Phase phase_ = Phase::Captured;
+            PrefixPayloadReadSet read_set_ = PrefixPayloadReadSet::WholeArchive;
+            size_t hydrated_payload_bytes_ = 0u;
         };
 
         /**
@@ -168,11 +175,19 @@ namespace llaminar2
         PrefixBlockHandle allocate(
             const PrefixCacheKey &key,
             const PrefixPayloadLayout &layout) override;
-        /** @brief Append a durable tombstone and schedule stale-byte reclamation. */
+        /** @brief Commit a tombstone, unlink its payload and schedule metadata compaction. */
         bool release(const PrefixBlockHandle &handle) override;
 
         /**
-         * @brief Append one complete block and enforce the active-byte budget.
+         * @brief Publish complete backing and enforce the active-byte budget.
+         * @param handle Immutable, ready source with its original physical leases.
+         * @param disk_handle Receives archive-owned durable record metadata.
+         * @param evicted_keys Receives keys retired by this exact publication.
+         * @param error Receives a native failure diagnostic.
+         * @param disposition Distinguishes appended payload from identical backing reuse.
+         * @return Whether the complete durable publication succeeded.
+         * Matching payload identity, layout and flags permit a payload-free
+         * durable touch; replacement data still follows the ordinary append path.
          *
          * The source may be event-backed pinned RAM. The method waits only at
          * this true host serialization boundary. Any least-recent archive
@@ -183,7 +198,8 @@ namespace llaminar2
             const PrefixBlockHandle &handle,
             PrefixBlockHandle *disk_handle,
             std::vector<PrefixCacheKey> *evicted_keys = nullptr,
-            std::string *error = nullptr);
+            std::string *error = nullptr,
+            PrefixArchiveWriteDisposition *disposition = nullptr);
 
         /**
          * @brief Persist an immutable resident through the archive-owned writer.
@@ -211,32 +227,59 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
-         * @brief Verify every serialized section through the bounded scratch.
+         * @brief Capture a complete restore source using metadata only.
          *
-         * This is the first half of disk-to-RAM hydration.  It proves the
-         * durable record before the cache retires a RAM victim, without
-         * materializing a second full prefix block.  The later direct read
-         * validates each section again while filling its final RAM owner.
-         *
-         * @param key Exact durable record to verify.
-         * @param layout Runtime payload geometry required by the caller.
-         * @param error Optional deterministic corruption/layout diagnostic.
-         * @return true only when all section sizes and checksums match.
+         * Retain the committed inode and select its complete section geometry
+         * before RAM victims retire. Actual payload bytes are read once, directly
+         * into their final owners, by hydrateSelected().
+         * @param key Exact durable record identity.
+         * @param layout Required payload geometry.
+         * @param error Optional native I/O or metadata diagnostic; absent keys leave it empty.
+         * @return One selected immutable source, or no available record.
          */
-        [[nodiscard]] std::optional<HydrationTicket> beginVerifiedHydration(
+        [[nodiscard]] std::optional<HydrationTicket> beginHydration(
             const PrefixCacheKey &key,
             const PrefixPayloadLayout &layout,
             std::string *error = nullptr);
 
         /**
-         * @brief Consume a verified ticket directly into admitted RAM.
+         * @brief Retain committed offsets without reading any payload section.
+         * @param key Exact immutable record identity selected by lookup.
+         * @param layout Expected metadata shape.
+         * @param error Receives native errors; an ordinary absent key leaves it empty.
+         * @return Metadata snapshot retaining its inode across eviction/compaction.
+         */
+        [[nodiscard]] std::optional<HydrationTicket> captureLookupSource(
+            const PrefixCacheKey &key, const PrefixPayloadLayout &layout,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Select and bound the coordinated read set without reading payload bytes.
+         *
+         * Publish the selected version's recency before RAM admission demotes
+         * victims. Retained older versions never touch a replacement's recency.
+         * @param ticket Unconsumed metadata snapshot from this backend.
+         * @param read_set Actual sections selected by the restore endpoint.
+         * @param error Receives native I/O, metadata or lifecycle diagnostics.
+         * @return Whether every selected extent fits the retained inode.
+         */
+        bool selectHydrationSections(HydrationTicket &ticket, PrefixPayloadReadSet read_set,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Consume a selected ticket directly into admitted RAM.
          *
          * The immutable record snapshot remains readable even when making RAM
          * capacity caused its logical disk entry to be evicted.  The method
-         * performs a second checksum while filling final storage and permits
-         * exactly one attempt per ticket.
+         * reads each selected section directly into final storage once and
+         * permits exactly one attempt per ticket.
+         * @param ticket Selected, unconsumed source belonging to this backend.
+         * @param ram_backend Authority-backed destination for the selected sections.
+         * @param ram_handle Receives their owning handle after successful hydration.
+         * @param error Receives corruption, allocation or lifecycle diagnostics.
+         * @return Whether every selected byte reached its final owner with matching extents.
          */
-        bool hydrateVerified(
+        bool hydrateSelected(
             HydrationTicket &ticket,
             RamPrefixStorageBackend &ram_backend,
             PrefixBlockHandle *ram_handle,
@@ -271,6 +314,8 @@ namespace llaminar2
         const std::filesystem::path &archivePath() const { return archive_path_; }
         /** @return Configured active-payload capacity, not an I/O traffic extent. */
         size_t budgetBytes() const { return budget_bytes_; }
+        /** @return Passive metadata publisher, retaining no payload or storage owner. */
+        std::shared_ptr<const PrefixCacheTierTelemetry> telemetry() const { return telemetry_; }
         /** @return Indexed committed payload bytes from the archive authority. */
         size_t usedBytes() const;
 
@@ -309,13 +354,14 @@ namespace llaminar2
         {
             uint64_t offset = 0;
             uint64_t bytes = 0;
-            uint64_t checksum = 0;
         };
 
-        /** @brief Active put extent, immutable section offsets and logical recency. */
+        /** @brief Journal put extent, immutable payload inode identity and logical recency. */
         struct RecordIndex
         {
             PrefixBlockHandle handle;
+            PrefixPayloadIdentity storage_identity;
+            std::weak_ptr<PrefixArchiveReadInode> lookup_inode;
             uint64_t record_offset = 0;
             uint64_t record_bytes = 0;
             uint64_t sequence = 0;
@@ -324,6 +370,44 @@ namespace llaminar2
 
         /** @brief Validate model identity and recover the crash-tolerant archive. */
         bool initialize(std::string *error);
+        /**
+         * @brief Retain a failed native mutation and reject later archive work.
+         * @param message Precise failure at the owned native mutation boundary.
+         * @param error Optional output receiving the retained diagnostic.
+         * @return Always false after making the failure terminal.
+         */
+        bool failMutationLocked(std::string message, std::string *error);
+        /**
+         * @param identity Opaque generation assigned by the archive, never a digest.
+         * @return Exact archive-owned filename without accepting external path text.
+         */
+        std::filesystem::path payloadPath(const PrefixPayloadIdentity &identity) const;
+        /**
+         * @brief Persist payload directory entries before journal references or after unlink.
+         * @param error Optional native directory publication diagnostic.
+         * @return Whether the exact payload directory was durably synchronized.
+         */
+        bool syncPayloadDirectory(std::string *error) const;
+        /**
+         * @brief Unlink only payloads retired by an already-durable journal frontier.
+         * @param identities Storage generations removed by this exact transaction.
+         * @param error Receives native retirement or directory durability failures.
+         * @return Whether every retirement completed; retained readers own open inodes.
+         */
+        bool retirePayloadsLocked(std::span<const PrefixPayloadIdentity> identities, std::string *error);
+        /**
+         * @brief Validate live extents and remove crash-orphaned payloads under the writer lock.
+         * @param error Optional metadata, extent or native retirement diagnostic.
+         * @return Whether every live extent is valid and unreferenced files retired.
+         */
+        bool recoverPayloadFilesLocked(std::string *error);
+        /**
+         * @brief Retain one immutable native descriptor per live record's lookup cohort.
+         * @param record Authoritative live record receiving a weak cohort reference.
+         * @param error Optional native-open or committed-extent diagnostic.
+         * @return Exact retained payload inode, or null after a storage failure.
+         */
+        std::shared_ptr<PrefixArchiveReadInode> openPayloadLocked(RecordIndex &record, std::string *error);
         /** @brief Scan committed metadata after appends or atomic inode replacement. */
         bool refreshIndexLocked(int archive_fd, std::string *error);
         /** @brief Reconstruct the index; return the exact last complete footer. */
@@ -359,18 +443,16 @@ namespace llaminar2
         /** @brief Background outcome distinguishes peer ownership from failure. */
         enum class CompactionOutcome { Published, PeerOwned, Cancelled, Failed };
         /**
-         * @brief Copy a committed snapshot and catch up its append tail online.
+         * @brief Compact journal metadata without reading any payload inode.
          * @param stop Teardown cancellation, observed between bounded I/O chunks.
          * @param error Deterministic native I/O or identity failure diagnostic.
          * @return Exact publication/cancellation/failure outcome.
-         * No payload I/O, fsync, or checksum runs under the cache/index lock.
+         * Snapshot copying runs outside cache locks. A finite metadata-only
+         * tail and durable rename join the writer frontier without chasing new
+         * payload appends; payload lifetime is independent of this maintenance.
          */
         CompactionOutcome rewriteArchive(std::stop_token stop, std::string *error);
-        /** @brief Fold every checksum through the exclusive foreground window. */
-        bool verifyRecordPayloadLocked(
-            int archive_fd,
-            const RecordIndex &record,
-            std::string *error);
+
         /** @brief Replace one key and update active-byte capacity exactly once. */
         void applyPutRecord(RecordIndex record);
         /** @brief Remove the indexed logical owner, not retained reader bytes. */
@@ -382,7 +464,10 @@ namespace llaminar2
 
         std::filesystem::path archive_path_;
         std::filesystem::path lock_path_;
+        std::filesystem::path payload_directory_;
         size_t budget_bytes_ = 0;
+        std::shared_ptr<PrefixCacheTierTelemetry> telemetry_ =
+            std::make_shared<PrefixCacheTierTelemetry>(budget_bytes_);
         std::string model_artifact_identity_;
 
         mutable std::mutex mutex_;
@@ -391,6 +476,7 @@ namespace llaminar2
         uint64_t scan_offset_ = 0;
         uint64_t next_sequence_ = 1;
         uint64_t active_bytes_ = 0;
+        uint64_t active_record_bytes_ = 0; ///< Live journal framing/metadata only, never payload capacity.
         uint64_t archive_device_ = 0;
         uint64_t archive_inode_ = 0;
         std::unordered_map<PrefixCacheKey, RecordIndex, PrefixCacheKeyHasher> records_;
@@ -400,9 +486,9 @@ namespace llaminar2
         /*
          * Declaration order is intentional: reverse destruction frees the
          * scratch allocation before its ledger lease, and the lease before
-         * the authority it retains.  The process-shared archive serializes all
-         * verification uses the first half under mutex_; the sole maintenance
-         * worker exclusively owns the second half. No extra physical claim.
+         * the authority it retains. The sole maintenance worker owns this copy
+         * buffer. Foreground hydration reads directly into final owners and
+         * needs no verification or staging allocation.
          */
         std::shared_ptr<PhysicalMemoryAuthority> memory_authority_;
         PhysicalMemoryAllocationLease archive_scratch_memory_lease_;

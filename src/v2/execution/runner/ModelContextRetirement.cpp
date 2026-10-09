@@ -13,6 +13,7 @@
 #include "ModelContextRetirement.h"
 
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
+#include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "transfer/TransferEngine.h"
 
 #if defined(__GLIBC__)
@@ -26,6 +27,34 @@
 
 namespace llaminar2
 {
+    ModelContextPhysicalSealBoundary modelContextPhysicalSealBoundary(
+        const std::shared_ptr<ModelContextReuseAuthority> &authority,
+        const std::vector<MoEOverlayMigrationStorageKind> &storage)
+    {
+        bool mutable_storage = false;
+        for (const auto kind : storage)
+        {
+            switch (kind)
+            {
+            case MoEOverlayMigrationStorageKind::Disabled:
+            case MoEOverlayMigrationStorageKind::DeviceTransferDirectory:
+                break;
+            case MoEOverlayMigrationStorageKind::PhysicalResidencyFabric:
+                mutable_storage = true;
+                break;
+            default:
+                throw std::logic_error("Prepared context sealing has an invalid storage owner");
+            }
+        }
+        if (!authority)
+            return ModelContextPhysicalSealBoundary::Unretained;
+        if (authority->state() != ModelContextReuseAuthority::State::RunnerExclusive &&
+            authority->state() != ModelContextReuseAuthority::State::Sealing)
+            throw std::logic_error("Prepared context sealing does not own its reuse authority");
+        return mutable_storage ? ModelContextPhysicalSealBoundary::LiveMutableResidency
+                               : ModelContextPhysicalSealBoundary::RetiredImmutableSources;
+    }
+
     MoEOverlayDeviceControllerDrainIntent modelContextOverlayDrainIntent(
         const std::shared_ptr<ModelContextReuseAuthority> &authority,
         MoERebalanceRuntimeMode movement)

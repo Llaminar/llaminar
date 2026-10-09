@@ -28,6 +28,8 @@ namespace llaminar2
     {
         std::uint64_t workspace_generation = 0;
         std::uint32_t layers = 0;
+        /** Global origin of compact device-journal rows; frozen with the arena. */
+        std::uint32_t first_model_layer = 0;
         std::uint32_t experts = 0;
         std::uint32_t wave_capacity = 0;
         std::uint32_t edge_capacity = 0;

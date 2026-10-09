@@ -12,10 +12,112 @@
 #include "backends/BackendManager.h"
 #include "tensors/TensorClasses.h"
 
+#include <limits>
 #include <stdexcept>
+#include <cerrno>
+#include <sys/random.h>
 
 namespace llaminar2
 {
+    PrefixPayloadIdentity PrefixPayloadIdentity::fresh()
+    {
+        // Native entropy supplies only sixteen metadata bytes. This must never
+        // inspect cache contents or share the model's sampling RNG state.
+        std::array<uint64_t, 2> words{};
+        auto *cursor = reinterpret_cast<uint8_t *>(words.data());
+        size_t remaining = sizeof(words);
+        while (remaining > 0u)
+        {
+            const auto count = ::getrandom(cursor, remaining, 0);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) throw std::runtime_error("prefix payload identity generation failed");
+            cursor += count;
+            remaining -= static_cast<size_t>(count);
+        }
+        PrefixPayloadIdentity identity{words[0], words[1]};
+        if (!identity.valid()) throw std::runtime_error("prefix payload identity is empty");
+        return identity;
+    }
+
+    PrefixPayloadLayout prefixReadLayout(PrefixPayloadLayout layout, PrefixPayloadReadSet read_set)
+    {
+        if (read_set == PrefixPayloadReadSet::SequenceRows)
+        {
+            layout.includes_hybrid_state = false;
+            layout.includes_terminal_hidden = false;
+            layout.includes_terminal_logits = false;
+        }
+        return layout;
+    }
+    PrefixPayloadAllocationPlan::PrefixPayloadAllocationPlan(std::array<size_t, 6> sections)
+        : sections_(sections)
+    {
+        for (const size_t bytes : sections_)
+        {
+            if (bytes > std::numeric_limits<size_t>::max() - total_bytes_)
+                throw std::overflow_error("prefix section allocation BOM overflow");
+            total_bytes_ += bytes;
+        }
+    }
+
+    PrefixPayloadAllocationPlan PrefixPayloadAllocationPlan::contiguous(size_t bytes)
+    { return PrefixPayloadAllocationPlan({bytes, 0u, 0u, 0u, 0u, 0u}); }
+
+    PrefixPayloadAllocationPlan PrefixPayloadAllocationPlan::archive(
+        const PrefixPayloadLayout &layout, size_t runtime_bytes)
+    {
+        const size_t limit = std::numeric_limits<size_t>::max();
+        if (layout.fa_layers < 0 || layout.mtp_layers < 0 ||
+            layout.bytes_per_fa_layer_k > limit - layout.bytes_per_fa_layer_v ||
+            layout.bytes_per_mtp_layer_k > limit - layout.bytes_per_mtp_layer_v)
+            throw std::invalid_argument("invalid prefix section allocation geometry");
+        const size_t fa_stride = layout.bytes_per_fa_layer_k + layout.bytes_per_fa_layer_v;
+        const size_t mtp_stride = layout.bytes_per_mtp_layer_k + layout.bytes_per_mtp_layer_v;
+        if ((layout.fa_layers > 0 && fa_stride > limit / static_cast<size_t>(layout.fa_layers)) ||
+            (layout.mtp_layers > 0 && mtp_stride > limit / static_cast<size_t>(layout.mtp_layers)))
+            throw std::overflow_error("prefix section layer allocation overflow");
+        return PrefixPayloadAllocationPlan({static_cast<size_t>(layout.fa_layers) * fa_stride,
+            layout.includes_hybrid_state ? layout.hybrid_state_bytes : 0u,
+            layout.includes_mtp_state ? layout.mtpKVBytes() : 0u,
+            layout.includes_terminal_hidden ? layout.terminal_hidden_bytes : 0u,
+            layout.includes_terminal_logits ? layout.terminal_logits_bytes : 0u,
+            runtime_bytes});
+    }
+
+    PrefixPayloadReadLease PrefixPayloadReadLease::wholeArchive(PrefixBlockHandle source)
+    { return PrefixPayloadReadLease(std::move(source)); }
+
+    PrefixPayloadReadLease PrefixPayloadReadLease::sequenceRows(PrefixBlockHandle source)
+    {
+        // These sections are not read by a nonterminal row import. Drop their
+        // physical owners as well as addresses; a rich archive remains intact
+        // in the cache until ordinary eviction retires that independent owner.
+        source.hybrid_storage.reset();
+        source.terminal_hidden_storage.reset();
+        source.terminal_logits_storage.reset();
+        source.model_runtime_state_storage.reset();
+        source.pinned_hybrid_storage.reset();
+        source.pinned_terminal_hidden_storage.reset();
+        source.pinned_terminal_logits_storage.reset();
+        source.device_hybrid_storage.reset();
+        source.device_terminal_hidden_storage.reset();
+        source.device_terminal_logits_storage.reset();
+        source.device_hybrid_allocation.reset();
+        source.device_terminal_hidden_allocation.reset();
+        source.device_terminal_logits_allocation.reset();
+        source.ram_section_memory_leases[static_cast<size_t>(PrefixPayloadSection::RecurrentState)].reset();
+        source.ram_section_memory_leases[static_cast<size_t>(PrefixPayloadSection::TerminalHidden)].reset();
+        source.ram_section_memory_leases[static_cast<size_t>(PrefixPayloadSection::TerminalLogits)].reset();
+        source.ram_runtime_state_memory_lease.reset();
+        source.hybrid_payload = source.terminal_hidden = source.terminal_logits = nullptr;
+        source.has_hybrid_state = source.has_terminal_hidden = source.has_terminal_logits = false;
+        source.has_model_runtime_state = false;
+        source.layout.includes_hybrid_state = source.layout.includes_terminal_hidden =
+            source.layout.includes_terminal_logits = false;
+        source.total_bytes = PrefixPayloadAllocationPlan::archive(source.layout).totalBytes();
+        return PrefixPayloadReadLease(std::move(source));
+    }
+
     PrefixRuntimeStateStorage::PrefixRuntimeStateStorage(
         std::shared_ptr<std::vector<uint8_t>> storage)
     {

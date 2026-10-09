@@ -6,6 +6,8 @@
  * A cache can then evict its own RAM alias, while PMA remains the sole authority
  * for request-held or DMA-held physical bytes. Failures seal the writer and are
  * published to every outstanding consumer; no mutation is silently retried.
+ * Economy counters distinguish new payload writes from metadata-authenticated
+ * reuse, so metadata refresh cannot masquerade as additional disk traffic.
  */
 #include "execution/prefix_cache/PrefixArchivePersistence.h"
 
@@ -173,14 +175,19 @@ namespace llaminar2
                     {
                         PrefixArchiveWritePublication written;
                         if (!backend_.writeBlock(put->handle, &written.disk_handle,
-                                                 &written.evicted_keys, &error))
+                                                 &written.evicted_keys, &error,
+                                                 &written.disposition))
                             throw std::runtime_error(error.empty() ? "prefix archive put failed" : error);
                         written.executor = std::this_thread::get_id();
                         PerfStatsCollector::addCounter(
-                            "prefix_archive", "background_write_blocks", 1.0,
+                            "prefix_archive",
+                            written.disposition == PrefixArchiveWriteDisposition::Stored
+                                ? "background_write_blocks" : "background_reused_blocks", 1.0,
                             "prefix_persistence", "CPU");
                         PerfStatsCollector::addCounter(
-                            "prefix_archive", "background_write_bytes",
+                            "prefix_archive",
+                            written.disposition == PrefixArchiveWriteDisposition::Stored
+                                ? "background_write_bytes" : "background_reused_bytes",
                             static_cast<double>(put->handle.total_bytes),
                             "prefix_persistence", "CPU");
                         result = std::move(written);

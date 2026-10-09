@@ -12,6 +12,7 @@
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
+#include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
@@ -20,6 +21,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <future>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2::test
@@ -467,6 +469,115 @@ namespace llaminar2::test
             std::invalid_argument);
     }
 
+    /** Stage slicing retains only terminal NextN banks at every admitted depth. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         PipelineStagePartitionsMainAndRetainedSidecars)
+    {
+        for (int depth = 0; depth <= 15; ++depth)
+        {
+            SCOPED_TRACE(depth);
+            const MoEOverlayInferenceGraphFamilyIdentity family{
+                .graph_family_generation = 7, .main_layer_count = 40,
+                .mtp_source_layers = depth == 0 ? std::vector<int>{} : std::vector<int>{40},
+                .max_graph_rows = 128, .max_decode_rows = depth + 1,
+                .max_request_count = 2, .max_mtp_draft_depth = depth};
+            ASSERT_TRUE(family.valid());
+            const auto first = family.forRoutedLayerInterval(0, 20);
+            const auto middle = family.forRoutedLayerInterval(17, 3);
+            const auto terminal = family.forRoutedLayerInterval(20, depth == 0 ? 20 : 21);
+            EXPECT_TRUE(first.mtp_source_layers.empty());
+            EXPECT_TRUE(middle.mtp_source_layers.empty());
+            EXPECT_EQ(middle.first_model_layer, 17);
+            EXPECT_EQ(middle.routedLayerCapacity(), 3);
+            EXPECT_EQ(terminal.first_model_layer, 20);
+            EXPECT_EQ(terminal.main_layer_count, 20);
+            EXPECT_EQ(terminal.mtp_source_layers, family.mtp_source_layers);
+            EXPECT_EQ(terminal.max_mtp_draft_depth, depth);
+            EXPECT_EQ(terminal.max_decode_rows, depth + 1);
+            EXPECT_EQ(terminal.max_request_count, 2);
+            const auto nested = terminal.forRoutedLayerInterval(35, depth == 0 ? 5 : 6);
+            EXPECT_EQ(nested.main_layer_count, 5);
+            EXPECT_EQ(nested.mtp_source_layers, family.mtp_source_layers);
+        }
+    }
+
+    /** Missing sidecars, fabricated rows and stages outside a parent's scope fail. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         PipelineStageRejectsForeignOrIncompleteIntervals)
+    {
+        const MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 7, .main_layer_count = 40,
+            .mtp_source_layers = {42, 44}, .max_graph_rows = 128,
+            .max_decode_rows = 16, .max_request_count = 1, .max_mtp_draft_depth = 15};
+        ASSERT_TRUE(family.valid());
+        const auto tail = family.forRoutedLayerInterval(20, 25);
+        EXPECT_EQ(tail.routedLayerCapacity(), 25);
+        EXPECT_EQ(tail.mtp_source_layers, (std::vector<int>{42, 44}));
+        for (const auto [first, count] : std::vector<std::pair<int, int>>{
+                 {-1, 20}, {0, 0}, {40, 5}, {45, 1}, {20, 20}, {20, 23},
+                 {20, 26}, {20, std::numeric_limits<int>::max()}})
+        {
+            SCOPED_TRACE(std::to_string(first) + ":" + std::to_string(count));
+            EXPECT_THROW((void)family.forRoutedLayerInterval(first, count), std::invalid_argument);
+        }
+        EXPECT_THROW((void)tail.forRoutedLayerInterval(19, 1), std::invalid_argument);
+        EXPECT_THROW((void)family.forRoutedLayerInterval(0, 20).forRoutedLayerInterval(19, 2),
+                     std::invalid_argument);
+    }
+
+    /** Equal-sized pipeline stages cannot alias a transport identity or wire layer. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         PipelineStageTopologyAndManifestsKeepGlobalIdentity)
+    {
+        const MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 7, .main_layer_count = 40,
+            .mtp_source_layers = {40}, .max_graph_rows = 128,
+            .max_decode_rows = 16, .max_request_count = 1, .max_mtp_draft_depth = 15};
+        const auto head = family.forRoutedLayerInterval(0, 10);
+        const auto middle = family.forRoutedLayerInterval(20, 10);
+        const auto tail = family.forRoutedLayerInterval(35, 6);
+        const auto owners = heterogeneousOwnerMap();
+        const auto head_identity = makeMoEOverlayInferenceTopologyIdentity(owners, head, 0, 1);
+        const auto middle_identity = makeMoEOverlayInferenceTopologyIdentity(owners, middle, 0, 1);
+        EXPECT_NE(head_identity.topology_fingerprint_low, middle_identity.topology_fingerprint_low);
+        EXPECT_NE(head_identity.topology_fingerprint_high, middle_identity.topology_fingerprint_high);
+        for (const auto &stage : {head, middle, tail})
+        {
+            const auto manifests = makeMoEOverlayActivationGraphFamilyManifests(stage);
+            ASSERT_EQ(manifests.size(), 1u + stage.mtp_source_layers.size());
+            ASSERT_EQ(manifests.front().model_layer_indices.size(), stage.main_layer_count);
+            for (int row = 0; row < stage.main_layer_count; ++row)
+                EXPECT_EQ(manifests.front().model_layer_indices[row], stage.first_model_layer + row);
+            for (std::size_t depth = 0; depth < stage.mtp_source_layers.size(); ++depth)
+                EXPECT_EQ(manifests[depth + 1].model_layer_indices,
+                          (std::vector<int>{stage.mtp_source_layers[depth]}));
+        }
+    }
+
+    /** The compact row count never relies on signed wrap or unordered NextN IDs. */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         PipelineStageRejectsWrappedOrUnorderedGeometry)
+    {
+        MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 7, .main_layer_count = 2,
+            .max_graph_rows = 16, .max_decode_rows = 1, .max_request_count = 1,
+            .first_model_layer = std::numeric_limits<int>::max() - 2};
+        ASSERT_TRUE(family.valid());
+        EXPECT_EQ(family.routedLayerCapacity(), 2);
+        EXPECT_EQ(family.forRoutedLayerInterval(family.first_model_layer + 1, 1).main_layer_count, 1);
+        ++family.first_model_layer;
+        EXPECT_FALSE(family.valid());
+        EXPECT_EQ(family.routedLayerCapacity(), 0);
+        family.first_model_layer = 32;
+        for (const std::vector<int> sources : {std::vector<int>{33}, {35, 34}, {34, 34},
+                                             {std::numeric_limits<int>::max()}})
+        {
+            family.mtp_source_layers = sources;
+            EXPECT_FALSE(family.valid());
+            EXPECT_THROW((void)family.forRoutedLayerInterval(32, 2), std::invalid_argument);
+        }
+    }
+
     TEST(Test__MoEOverlayInferenceTransaction,
          CoordinatorGraphPlanSealsOneDeterministicRankTransactionPerSegment)
     {
@@ -592,6 +703,86 @@ namespace llaminar2::test
         EXPECT_DOUBLE_EQ(
             value_for("segmented_graph_capture_segments"), 1.0);
         EXPECT_DOUBLE_EQ(value_for("segmented_replay_segments"), 2.0);
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @test Repeated real coordinator lifetimes retain a bounded evidence map.
+     *
+     * Command and sequence identities advance independently. The production
+     * state machine still retires every sparse return, while observability
+     * must aggregate by topology/role instead of retaining each command as a
+     * new map key. No model, MPI runtime or accelerator is used.
+     */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         LongSessionsKeepTransactionEvidenceBounded)
+    {
+        ScopedEnvironmentVariable perf_export("LLAMINAR_PERF_STATS_JSON", "1");
+        ScopedEnvironmentVariable perf_filter("LLAMINAR_PERF_STATS_FILTER", "forward_graph,moe_overlay_transaction");
+        PerfStatsCollector::reset();
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        MoEOverlayInferenceTransactionCoordinator coordinator(
+            MoEOverlayInferenceTransactionCoordinator::Config{
+                .publishers = {publisher},
+                .graph_plan = coordinatorGraphPlan(1),
+                .continuation_participant_count = 1,
+                .ticket_authority_participant_index = 0,
+                .participant_completion_boundaries = {
+                    MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command = 1,
+                .max_mtp_draft_depth = 0,
+            });
+        constexpr std::uint64_t sessions = 256;
+        std::size_t warm_rows = 0;
+        for (std::uint64_t session = 0; session < sessions; ++session)
+        {
+            auto identity = command();
+            identity.command_id += session;
+            identity.request_generation += session;
+            ASSERT_TRUE(coordinator.beginCommand(identity));
+            for (int chunk = 0; chunk < 3; ++chunk)
+            {
+                ASSERT_TRUE(coordinator.beginGraphSequence(0));
+                const auto binding = coordinator.beginParticipantGraph({
+                    .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+                    .placement_epoch = 41,
+                    .request_count = 1,
+                    .logical_rows_per_request = 1,
+                    .physical_rows_per_request = 1,
+                }, 0);
+                ASSERT_TRUE(binding.ok) << binding.error;
+                ASSERT_TRUE(coordinator.armParticipantGraph(binding));
+                ASSERT_TRUE(coordinator.finishParticipantGraph(binding, true));
+                ASSERT_TRUE(coordinator.retireCompletedGraphSequence());
+            }
+            ASSERT_TRUE(coordinator.completeCommand(41));
+            if (session == 0) warm_rows = PerfStatsCollector::snapshot().size();
+        }
+        const auto records = PerfStatsCollector::snapshot();
+        EXPECT_EQ(records.size(), warm_rows)
+            << "Changing commands and sequence IDs must not create new telemetry rows";
+        const auto replay = std::find_if(records.begin(), records.end(), [](const auto &record)
+        {
+            return record.name == "segmented_replay_segments";
+        });
+        ASSERT_NE(replay, records.end());
+        EXPECT_EQ(replay->count, sessions * 3);
+        EXPECT_DOUBLE_EQ(replay->value, sessions * 3 * 2);
+        EXPECT_EQ(replay->sequence_word_count, sessions * 3 * 2);
+        EXPECT_EQ(replay->sequence_minimum_words,
+            (std::vector<std::uint64_t>{command().command_id, 1}));
+        EXPECT_EQ(replay->sequence_maximum_words,
+            (std::vector<std::uint64_t>{command().command_id + sessions - 1, sessions * 3}));
+        const auto lifetime = std::find_if(records.begin(), records.end(), [](const auto &record)
+        {
+            return record.name == "segmented_retirement_sequence";
+        });
+        ASSERT_NE(lifetime, records.end());
+        EXPECT_EQ(lifetime->count, replay->count);
+        EXPECT_EQ(lifetime->sequence_digest_lo, replay->sequence_digest_lo);
+        EXPECT_EQ(lifetime->sequence_digest_hi, replay->sequence_digest_hi);
+        EXPECT_EQ(publisher->retireCount(), sessions * 3);
+        EXPECT_EQ(publisher->completeCount(), sessions);
         PerfStatsCollector::reset();
     }
 
@@ -932,21 +1123,33 @@ namespace llaminar2::test
         EXPECT_EQ(retired_prefill_tokens, 16u)
             << "Each real prefill row must advance cadence exactly once";
 
-        // Both chunks share an outer command. Evidence must retain the actual
-        // admitted sequence identities instead of coalescing distinct returns.
+        // Both chunks share an outer command. Exact ordered identities survive
+        // aggregation; compare them with the independent admission bindings.
         const auto records = PerfStatsCollector::snapshot({"forward_graph"});
-        std::vector<std::uint64_t> retired_sequences;
+        for (const auto sequence : admitted_sequences)
+            PerfStatsCollector::addCounterWithSequence(
+                "forward_graph", "expected_retirement", 2.0,
+                {command().command_id, sequence}, "prefill", "test_oracle");
+        const auto with_oracle = PerfStatsCollector::snapshot({"forward_graph"});
+        const auto oracle = std::find_if(with_oracle.begin(), with_oracle.end(), [](const auto &record)
+        {
+            return record.name == "expected_retirement";
+        });
+        ASSERT_NE(oracle, with_oracle.end());
+        std::size_t replay_records = 0;
         for (const auto &record : records)
         {
             if (record.name != "segmented_replay_segments") continue;
-            EXPECT_EQ(record.count, 1u);
-            EXPECT_DOUBLE_EQ(record.value, 2.0);
-            const auto sequence = record.tags.find("sequence");
-            ASSERT_NE(sequence, record.tags.end());
-            retired_sequences.push_back(std::stoull(sequence->second));
+            ++replay_records;
+            EXPECT_EQ(record.count, admitted_sequences.size());
+            EXPECT_DOUBLE_EQ(record.value, 2.0 * admitted_sequences.size());
+            EXPECT_EQ(record.sequence_word_count, oracle->sequence_word_count);
+            EXPECT_EQ(record.sequence_digest_lo, oracle->sequence_digest_lo);
+            EXPECT_EQ(record.sequence_digest_hi, oracle->sequence_digest_hi);
+            EXPECT_EQ(record.sequence_minimum_words, oracle->sequence_minimum_words);
+            EXPECT_EQ(record.sequence_maximum_words, oracle->sequence_maximum_words);
         }
-        std::sort(retired_sequences.begin(), retired_sequences.end());
-        EXPECT_EQ(retired_sequences, admitted_sequences);
+        EXPECT_EQ(replay_records, 1u);
         PerfStatsCollector::reset();
     }
 

@@ -5,6 +5,7 @@
  * Real cache factories, admission, archive and restore exercise attention and
  * recurrent-only pipeline shards. Keep this fixture separate from the larger
  * generation/composition suite so prefix lifecycle iteration stays inexpensive.
+ * Lookup retains metadata; each restore selects one immutable payload frontier.
  */
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -173,7 +174,10 @@ TEST_P(PipelinePrefixState, FullVocabularyPublicationArchivesEveryTPShard)
                 const auto hit = owner->lookupPrefix(prompt);
                 ASSERT_EQ(hit.cached_tokens, 4);
                 ASSERT_FALSE(hit.blocks.empty());
-                const auto &terminal = hit.blocks.back();
+                EXPECT_EQ(hit.blocks.back().terminal_logits, nullptr);
+                const auto selected = hit.materializeRestoreBlocks();
+                ASSERT_FALSE(selected.empty());
+                const auto &terminal = selected.back();
                 ASSERT_TRUE(terminal.has_terminal_logits);
                 ASSERT_EQ(terminal.layout.terminal_logits_bytes, shard_columns * sizeof(float));
                 // Harvest publishes an asynchronous archive. Raw host inspection
@@ -229,6 +233,8 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                         ":format=" + std::to_string(static_cast<int>(precision)));
                     auto config = stateConfig(device);
                     config.d_model = config.head_dim = 64;
+                    constexpr int context_tokens = 8201;
+                    config.max_seq_len = context_tokens;
                     config.gdn.state_size = config.gdn.inner_size = 64;
                     config.layer_types = {"gdn", "full_attention", "gdn", "full_attention"};
                     config.kv_cache_precision = precision;
@@ -245,7 +251,7 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                     profile.d_model = profile.head_dim = profile.d_ff = 64;
                     profile.vocab_size = 32;
                     profile.n_heads = profile.n_kv_heads = 1;
-                    profile.max_seq_len = 64;
+                    profile.max_seq_len = context_tokens;
                     profile.full_attention_interval = 2;
                     profile.gdn_conv_kernel_size = 4;
                     profile.gdn_state_size = profile.gdn_inner_size = 64;
@@ -263,7 +269,7 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                         .admission_available_bytes = 1ull << 30};
                     input.first_layer = input.last_layer = stage;
                     input.owns_embedding = stage == 0;
-                    input.max_seq_len = input.activation_seq_len = 64;
+                    input.max_seq_len = input.activation_seq_len = context_tokens;
                     input.kv_precision = kvCachePrecisionToString(precision);
                     input.mtp_enabled = true; // Price retained capacity, not request enablement.
                     input.mtp_target_query_rows = 16;
@@ -278,7 +284,7 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                     auto &runner = *owner;
                     runner.setPPStageConfig({.first_layer = stage, .last_layer = stage + 1,
                         .has_embedding = stage == 0, .has_lm_head = stage == 2});
-                    ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, 64, device));
+                    ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, context_tokens, device));
                     const auto lookup = runner.lookupPrefix({});
                     ASSERT_TRUE(lookup.supported) << lookup.bypass_reason;
                     EXPECT_TRUE(lookup.cache_enabled);
@@ -364,13 +370,46 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                     runner.resetInferenceState(InferenceStateResetRequest::requestBoundary("prefix-stage-proof"));
                     ASSERT_TRUE(runner.populatePrefix(clamped));
                     expect_state(0.25F);
-                    ASSERT_TRUE(runner.populatePrefix(long_hit));
+                    // Choosing the shorter frontier retires unread endpoint
+                    // owners. Its metadata alias cannot reselect another
+                    // endpoint; an independent restore needs a fresh lookup.
+                    EXPECT_THROW(runner.populatePrefix(long_hit), std::logic_error);
+                    const auto fresh_long_hit = runner.lookupPrefix(long_prompt);
+                    ASSERT_EQ(fresh_long_hit.cached_tokens, 13);
+                    ASSERT_TRUE(runner.populatePrefix(fresh_long_hit));
                     expect_state(0.5F);
 
                     auto changed_ancestor = long_prompt;
                     changed_ancestor.front() = 20;
                     EXPECT_EQ(runner.lookupPrefix(changed_ancestor).cached_tokens, 0)
                         << "A matching terminal chunk cannot hide a different earlier prompt";
+
+                    // Sparse histories must preserve the actual recurrent
+                    // producer, including an all-GDN pipeline participant
+                    // with no attention ancestors to materialize. The state
+                    // marker is test-only; archive/lookup/restore are native.
+                    runner.resetInferenceState(InferenceStateResetRequest::requestBoundary("sparse-prefix-state-proof"));
+                    const std::vector<int32_t> history(context_tokens, 3);
+                    const auto sparse_admission = runner.lookupPrefix(history);
+                    const auto schedule = PrefixHarvestSchedule::forPrefill(sparse_admission, context_tokens, 0);
+                    ASSERT_EQ(schedule.reusableCheckpoints(), std::vector<int>({4096, 8192, 8200}));
+                    ASSERT_TRUE(runner.preparePrefixHarvest(sparse_admission, history, schedule));
+                    auto frontiers = schedule.reusableCheckpoints();
+                    frontiers.push_back(context_tokens);
+                    for (const int boundary : frontiers)
+                    {
+                        seed(static_cast<float>(boundary));
+                        ASSERT_FALSE(HasFatalFailure());
+                        ASSERT_TRUE(runner.harvestPrefix(sparse_admission,
+                            {history.begin(), history.begin() + boundary}, boundary));
+                    }
+                    auto rewritten = history;
+                    std::fill(rewritten.begin() + 6212, rewritten.end(), 4);
+                    const auto sparse_hit = runner.lookupPrefix(rewritten);
+                    ASSERT_EQ(sparse_hit.cached_tokens, 4096);
+                    ASSERT_EQ(sparse_hit.blocks.size(), 1u);
+                    ASSERT_TRUE(runner.populatePrefix(sparse_hit));
+                    expect_state(4096.0F);
                 }
     };
     if (device.is_cpu())

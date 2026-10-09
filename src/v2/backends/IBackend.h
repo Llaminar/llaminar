@@ -21,6 +21,7 @@
 #include "DeviceType.h"
 #include "GenerationPenaltyHistory.h"
 #include "kernels/common/GenerationLogicalState.h"
+#include "kernels/common/DeviceGenerationInitialization.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -1221,7 +1222,7 @@ namespace llaminar2
             float frequency_penalty,
             bool first_token_already_in_history,
             int device_id,
-            void *stream)
+            void *stream, float repetition_penalty = 1.0f)
         {
             (void)controls_device;
             (void)presence_penalty;
@@ -1229,6 +1230,7 @@ namespace llaminar2
             (void)first_token_already_in_history;
             (void)device_id;
             (void)stream;
+            (void)repetition_penalty;
             return false;
         }
 
@@ -2123,6 +2125,16 @@ namespace llaminar2
          *
          * Implementations must only enqueue work on `stream`; they must not
          * allocate, synchronize, or use a default/null GPU stream.
+         *
+         * @param generation_control_device Optional resident generation controller.
+         *        With this binding, seeded one-hot verification consumes only
+         *        its live draft depth and samples the live bonus target row.
+         *        Target and token output bindings then require row_count + 1
+         *        slots; acceptance outputs require row_count slots. Inactive
+         *        capacity is neither consumed nor written.
+         * @param threshold_seed_device Admitted UINT64 request seed. This and the
+         *        scalar seed are mutually exclusive. Captured generation binds the
+         *        resident bank; zero contents fail the device controller.
          */
         virtual bool enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
             const void *target_token_ids_device,
@@ -2146,7 +2158,9 @@ namespace llaminar2
             int inverse_sample_first_logical_position = 0,
             int inverse_sample_vocab_size = 0,
             const void *threshold_base_position_device = nullptr,
-            int threshold_position_offset = 0)
+            int threshold_position_offset = 0,
+            const int *generation_control_device = nullptr,
+            const uint64_t *threshold_seed_device = nullptr)
         {
             (void)target_token_ids_device;
             (void)target_probs_device;
@@ -2170,6 +2184,8 @@ namespace llaminar2
             (void)inverse_sample_vocab_size;
             (void)threshold_base_position_device;
             (void)threshold_position_offset;
+            (void)generation_control_device;
+            (void)threshold_seed_device;
             return false;
         }
 
@@ -2590,7 +2606,8 @@ namespace llaminar2
          *        logical depth supplies the bonus sample. This distinction lets
          *        one maximum-capacity executable serve every MTP depth without
          *        recapture or a host-authored launch parameter.
-         * @param threshold_seed Immutable request sampling seed.
+         * @param threshold_seed Explicit scalar seed for standalone kernel callers;
+         *        zero when threshold_seed_device owns the request seed.
          * @param threshold_position_device Resident pre-verifier base position.
          * @param threshold_position_offset Logical offset of comparison row zero.
          * @param verifier_input_tokens_device Materialized `[first, drafts...]` row.
@@ -2606,6 +2623,9 @@ namespace llaminar2
          *        `MTPFirstTransactionDiagnosticRecord`. A non-null pointer
          *        selects the diagnostic kernel specialization; production
          *        callers leave it null and pay no row-hash/copy cost.
+         * @param threshold_seed_device Admitted UINT64 request seed. This and the
+         *        scalar seed are mutually exclusive. Captured generation binds the
+         *        resident bank; zero contents fail the device controller.
          */
         virtual bool
         enqueueSampleAndSummarizeSerialEquivalentSpeculativeBatchDeviceGenerationControls(
@@ -2626,7 +2646,8 @@ namespace llaminar2
             void *sampled_target_tokens_device,
             void *out_tokens_device,
             void *out_meta_device,
-            void *first_transaction_diagnostic_device = nullptr)
+            void *first_transaction_diagnostic_device = nullptr,
+            const uint64_t *threshold_seed_device = nullptr)
         {
             (void)target_token_ids_device;
             (void)target_probs_device;
@@ -2646,6 +2667,7 @@ namespace llaminar2
             (void)out_tokens_device;
             (void)out_meta_device;
             (void)first_transaction_diagnostic_device;
+            (void)threshold_seed_device;
             return false;
         }
 
@@ -2966,6 +2988,19 @@ namespace llaminar2
          * later speculative transaction mutates @p control_device and appends to
          * @p response_tokens_device on explicit streams; no per-transaction host
          * mirror participates in the lifecycle.
+         *
+         * @param request_count Live independent request rows.
+         * @param max_new_tokens Response budget for this publication window.
+         * @param depth_policy Immutable request depth policy.
+         * @param initial_leading_row_disposition Whether the condition was already emitted.
+         * @param response_token_stride Physical response row capacity in tokens.
+         * @param response_tokens_device Persistent response storage; inactive bytes are untouched.
+         * @param control_stride Physical controller row capacity in INT32 words.
+         * @param control_device Persistent authoritative controller rows.
+         * @param device_id Device owning every supplied pointer.
+         * @param stream Exact producer stream ordered after the previous terminal event.
+         * @param initialization Explicit fresh/continuation boundary and device ticket identity.
+         * @return Whether initialization was enqueued; device validation failures are fatal.
          */
         virtual bool enqueueInitializeDeviceGeneration(
             int request_count,
@@ -2978,8 +3013,10 @@ namespace llaminar2
             int control_stride,
             void *control_device,
             int device_id,
-            void *stream)
+            void *stream,
+            const sampling_math::DeviceGenerationInitialization &initialization = {})
         {
+            (void)initialization;
             (void)request_count;
             (void)max_new_tokens;
             (void)depth_policy;
@@ -3657,11 +3694,30 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Admit immutable prompt membership into the device-owned token history.
+         * @param counts_device Persistent packed history row, already reset on its producer.
+         * @param unique_tokens Sorted unique host token IDs; only this live extent is transferred.
+         * @param token_count Number of unique prompt tokens.
+         * @param vocab_size Logical vocabulary size and preallocated sparse workspace bound.
+         * @param device_id Owning GPU ordinal.
+         * @param stream Exact non-null admission stream; no capture or synchronization.
+         * @return Whether the complete copy, transform and reuse publication were enqueued.
+         */
+        virtual bool initializePromptRepetitionHistory(
+            void *counts_device, const int32_t *unique_tokens, int token_count,
+            int vocab_size, int device_id, void *stream)
+        {
+            (void)counts_device; (void)unique_tokens; (void)token_count;
+            (void)vocab_size; (void)device_id; (void)stream;
+            return false;
+        }
+
         virtual bool applyLogitPenaltiesF32(void *logits_device,
                                             const int *token_ids_host,
                                             const float *penalties_host,
                                             int num_penalties, int vocab_size,
-                                            int device_id, void *stream)
+                                            int device_id, void *stream, float repetition_penalty = 1.0f)
         {
             (void)logits_device;
             (void)token_ids_host;
@@ -3670,6 +3726,7 @@ namespace llaminar2
             (void)vocab_size;
             (void)device_id;
             (void)stream;
+            (void)repetition_penalty;
             return false; // Not supported by default
         }
 
@@ -3694,7 +3751,7 @@ namespace llaminar2
                                                     const void *token_ids_device,
                                                     const void *penalties_device,
                                                     int num_penalties, int vocab_size,
-                                                    int device_id, void *stream)
+                                                    int device_id, void *stream, float repetition_penalty = 1.0f)
         {
             (void)logits_device;
             (void)token_ids_device;
@@ -3703,6 +3760,7 @@ namespace llaminar2
             (void)vocab_size;
             (void)device_id;
             (void)stream;
+            (void)repetition_penalty;
             return false;
         }
 

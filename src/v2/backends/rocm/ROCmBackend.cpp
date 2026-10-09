@@ -751,7 +751,7 @@ namespace llaminar2
         float frequency_penalty,
         bool first_token_already_in_history,
         int device_idx,
-        void *stream);
+        void *stream, float repetition_penalty);
     extern "C" bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
         const float *data, int rows, int cols, int row_stride,
         const int *verifier_input_tokens,
@@ -1079,8 +1079,10 @@ namespace llaminar2
         float frequency_penalty,
         bool first_token_already_in_history,
         int device_id,
-        void *stream)
+        void *stream, float repetition_penalty)
     {
+        if (!std::isfinite(repetition_penalty) || repetition_penalty <= 0.0f)
+            return false;
         if (device_id >= device_count_ || device_id < 0 ||
             !controls_device || !stream)
         {
@@ -1094,7 +1096,7 @@ namespace llaminar2
             frequency_penalty,
             first_token_already_in_history,
             device_id,
-            stream);
+            stream, repetition_penalty);
     }
 
     bool ROCmBackend::enqueueArgmaxF32RowsWithHistoryDevice(
@@ -1445,11 +1447,12 @@ namespace llaminar2
         int thresholds_from_seed,
         const int *threshold_base_position,
         int threshold_position_offset,
+        const int *generation_control,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
         float *out_accept_threshold,
-        int device_idx, void *stream);
+        int device_idx, void *stream, const uint64_t *threshold_seed_device);
     extern "C" bool rocmOps_speculative_verify_processed_logits_thresholds_batch_device_tokens_f32(
         const float *target_logits,
         const float *draft_logits,
@@ -1592,7 +1595,7 @@ namespace llaminar2
         int *out_meta,
         void *first_transaction_diagnostic,
         int device_idx,
-        void *stream);
+        void *stream, const uint64_t *threshold_seed_device);
     extern "C" bool rocmOps_summarize_greedy_speculative_verify_batch(
         const int *verify_tokens,
         const int *draft_tokens,
@@ -1679,7 +1682,8 @@ namespace llaminar2
         int control_stride,
         int *control,
         int device_idx,
-        void *stream);
+        void *stream,
+        const sampling_math::DeviceGenerationInitialization &initialization);
     extern "C" bool rocmOps_initialize_device_generation_dispatch_tickets(
         uint64_t session_epoch,
         uint64_t workspace_generation,
@@ -2570,7 +2574,9 @@ namespace llaminar2
         int inverse_sample_first_logical_position,
         int inverse_sample_vocab_size,
         const void *threshold_base_position_device,
-        int threshold_position_offset)
+        int threshold_position_offset,
+            const int *generation_control_device,
+        const uint64_t *threshold_seed_device)
     {
         const bool has_draft_distribution =
             draft_token_ids_device != nullptr && draft_probs_device != nullptr;
@@ -2586,7 +2592,7 @@ namespace llaminar2
             accept_thresholds_host == nullptr &&
             residual_thresholds_host == nullptr &&
             has_one_hot_draft_distribution &&
-            inverse_sample_seed != 0 &&
+            ((inverse_sample_seed != 0) + (threshold_seed_device != nullptr) == 1) &&
             threshold_position_source_count == 1;
         if (device_id >= device_count_ || device_id < 0 ||
             !target_token_ids_device || !target_probs_device ||
@@ -2596,7 +2602,13 @@ namespace llaminar2
             distribution_stride < top_k ||
             row_count <= 0 ||
             (!has_host_thresholds && !uses_seeded_device_thresholds) ||
-            !stream || !out_token_device || !out_accepted_device)
+            !stream || !out_token_device || !out_accepted_device ||
+            (threshold_seed_device &&
+             (!uses_seeded_device_thresholds || !generation_control_device ||
+              reinterpret_cast<uintptr_t>(threshold_seed_device) % alignof(uint64_t) != 0)) ||
+            (generation_control_device &&
+             (!uses_seeded_device_thresholds || !threshold_base_position_device ||
+              !has_one_hot_draft_distribution || inverse_sample_vocab_size <= 0)))
         {
             return false;
         }
@@ -2622,12 +2634,13 @@ namespace llaminar2
             uses_seeded_device_thresholds ? 1 : 0,
             static_cast<const int *>(threshold_base_position_device),
             threshold_position_offset,
+            generation_control_device,
             static_cast<int *>(out_token_device),
             static_cast<int *>(out_accepted_device),
             static_cast<float *>(out_accept_probability_device),
             static_cast<float *>(out_accept_threshold_device),
             device_id,
-            stream);
+            stream, threshold_seed_device);
     }
 
     bool ROCmBackend::enqueueSpeculativeVerifyProcessedLogitsF32DeviceThresholdsBatchDeviceTokens(
@@ -3047,7 +3060,8 @@ namespace llaminar2
             void *sampled_target_tokens_device,
             void *out_tokens_device,
             void *out_meta_device,
-            void *first_transaction_diagnostic_device)
+            void *first_transaction_diagnostic_device,
+            const uint64_t *threshold_seed_device)
     {
         if (device_id < 0 || device_id >= device_count_)
             return false;
@@ -3071,7 +3085,7 @@ namespace llaminar2
             static_cast<int *>(out_meta_device),
             first_transaction_diagnostic_device,
             device_id,
-            stream);
+            stream, threshold_seed_device);
     }
 
     bool ROCmBackend::enqueueSummarizeGreedySpeculativeVerifyBatch(
@@ -3325,6 +3339,7 @@ namespace llaminar2
             stream);
     }
 
+    /** @copydoc IBackend::enqueueInitializeDeviceGeneration */
     bool ROCmBackend::enqueueInitializeDeviceGeneration(
         int request_count,
         int max_new_tokens,
@@ -3336,10 +3351,11 @@ namespace llaminar2
         int control_stride,
         void *control_device,
         int device_id,
-        void *stream)
+        void *stream,
+        const sampling_math::DeviceGenerationInitialization &initialization)
     {
         if (device_id < 0 || device_id >= device_count_ ||
-            request_count <= 0 ||
+            request_count <= 0 || !initialization.valid() ||
             !sampling_math::valid_device_generation_admission(
                 depth_policy, max_new_tokens, initial_leading_row_disposition) ||
             response_token_stride <= 0 || response_token_stride < max_new_tokens ||
@@ -3360,7 +3376,7 @@ namespace llaminar2
             control_stride,
             static_cast<int *>(control_device),
             device_id,
-            stream);
+            stream, initialization);
     }
 
     /** @copydoc IBackend::enqueuePublishOrdinaryGenerationSample */
@@ -3918,7 +3934,7 @@ namespace llaminar2
     // Forward declaration for HIP penalty kernel (implemented in ROCmSamplingKernels.hip)
     extern "C" bool rocmOps_apply_logit_penalties_f32(
         float *logits, const int *token_ids, const float *penalties,
-        int num_penalties, int vocab_size, int device_idx, void *stream);
+        int num_penalties, int vocab_size, int device_idx, void *stream, float repetition_penalty);
 
     bool ROCmBackend::prepareLogitPenaltyWorkspace(
         int vocab_size,
@@ -3980,12 +3996,46 @@ namespace llaminar2
         return true;
     }
 
+    extern "C" bool rocmOps_initialize_prompt_repetition_history(
+        int32_t *counts, const int32_t *tokens, int token_count, int vocab_size, void *stream);
+
+    bool ROCmBackend::initializePromptRepetitionHistory(
+        void *counts_device, const int32_t *unique_tokens, int token_count,
+        int vocab_size, int device_id, void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ || !counts_device || !unique_tokens ||
+            token_count <= 0 || token_count > vocab_size || !stream)
+            return false;
+        for (int i = 0; i < token_count; ++i)
+            if (unique_tokens[i] < 0 || unique_tokens[i] >= vocab_size ||
+                (i != 0 && unique_tokens[i - 1] >= unique_tokens[i]))
+                return false;
+        auto &bufs = penalty_buffers_[static_cast<size_t>(device_id)];
+        if (token_count > bufs.allocated_count || !bufs.token_ids_ptr || !bufs.ready_event)
+            return false;
+        HipDeviceGuard::setDevice(device_id);
+        auto s = requireExplicitStream(stream, "ROCmBackend::initializePromptRepetitionHistory");
+        if (bufs.publication_valid && bufs.producer_stream != stream)
+            HIP_CHECK_OR_THROW(hipStreamWaitEvent(s, static_cast<hipEvent_t>(bufs.ready_event), 0));
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(bufs.token_ids_ptr, unique_tokens,
+            static_cast<size_t>(token_count) * sizeof(int32_t), hipMemcpyHostToDevice, s));
+        if (!rocmOps_initialize_prompt_repetition_history(static_cast<int32_t *>(counts_device),
+                static_cast<const int32_t *>(bufs.token_ids_ptr), token_count, vocab_size, s))
+            return false;
+        HIP_CHECK_OR_THROW(hipEventRecord(static_cast<hipEvent_t>(bufs.ready_event), s));
+        bufs.producer_stream = stream;
+        bufs.publication_valid = true;
+        return true;
+    }
+
     bool ROCmBackend::applyLogitPenaltiesF32(void *logits_device,
                                               const int *token_ids_host,
                                               const float *penalties_host,
                                               int num_penalties, int vocab_size,
-                                              int device_id, void *stream)
+                                              int device_id, void *stream, float repetition_penalty)
     {
+        if (!std::isfinite(repetition_penalty) || repetition_penalty <= 0.0f)
+            return false;
         if (device_id >= device_count_ || device_id < 0 || !logits_device ||
             !token_ids_host || !penalties_host || num_penalties <= 0)
             return false;
@@ -4023,7 +4073,7 @@ namespace llaminar2
                 static_cast<float *>(logits_device),
                 static_cast<const int *>(bufs.token_ids_ptr),
                 static_cast<const float *>(bufs.penalties_ptr),
-                num_penalties, vocab_size, device_id, s))
+                num_penalties, vocab_size, device_id, s, repetition_penalty))
         {
             return false;
         }
@@ -4042,8 +4092,10 @@ namespace llaminar2
                                                      int num_penalties,
                                                      int vocab_size,
                                                      int device_id,
-                                                     void *stream)
+                                                     void *stream, float repetition_penalty)
     {
+        if (!std::isfinite(repetition_penalty) || repetition_penalty <= 0.0f)
+            return false;
         if (device_id >= device_count_ || device_id < 0 || !logits_device ||
             !token_ids_device || !penalties_device || num_penalties <= 0 ||
             vocab_size <= 0 || !stream)
@@ -4059,7 +4111,7 @@ namespace llaminar2
             num_penalties,
             vocab_size,
             device_id,
-            stream);
+            stream, repetition_penalty);
     }
 
     bool ROCmBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)

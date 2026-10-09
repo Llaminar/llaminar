@@ -5,6 +5,8 @@
  * Writers publish complete transaction IDs and their marginal counts into one
  * pinned bank. Maintenance redirects new writers before copying retired data;
  * immutable copies carry their own PMA claim and never pin a reusable bank.
+ * Global model identities are translated only at compact storage boundaries;
+ * generation and wire identity also bind the stage origin.
  */
 
 #include "DecodeExpertHistogram.h"
@@ -92,15 +94,22 @@ namespace llaminar2
     ExpertHistogramProductionTopology::forRetainedExecution(
         int retained_layer_count,
         int main_inference_layer_count,
-        ExpertHistogramServingRegime regime)
+        ExpertHistogramServingRegime regime,
+        int first_model_layer)
     {
-        if (retained_layer_count <= 0 ||
-            main_inference_layer_count <= 0 ||
-            main_inference_layer_count > retained_layer_count)
+        if (retained_layer_count <= 0 || first_model_layer < 0 ||
+            retained_layer_count > std::numeric_limits<int>::max() - first_model_layer ||
+            main_inference_layer_count <= first_model_layer ||
+            main_inference_layer_count > first_model_layer + retained_layer_count)
         {
             throw std::invalid_argument(
                 "Expert histogram production topology requires a valid main/retained layer boundary");
         }
+
+        if (regime != ExpertHistogramServingRegime::Serial &&
+            regime != ExpertHistogramServingRegime::PositiveDepthMTP &&
+            regime != ExpertHistogramServingRegime::AdaptiveSerialOrMTP)
+            throw std::invalid_argument("Unknown expert histogram serving regime");
 
         const bool mtp_enabled =
             regime != ExpertHistogramServingRegime::Serial;
@@ -112,7 +121,7 @@ namespace llaminar2
         std::vector<ExpertHistogramProductionSourceMask> economy_layers(
             static_cast<std::size_t>(retained_layer_count));
         for (int layer = 0;
-             layer < main_inference_layer_count;
+             layer < std::min(retained_layer_count, main_inference_layer_count - first_model_layer);
              ++layer)
         {
             /* MTP never removes the serial graph family: it is required for
@@ -128,7 +137,7 @@ namespace llaminar2
                 mtp_enabled,
             };
         }
-        for (int layer = main_inference_layer_count;
+        for (int layer = main_inference_layer_count - first_model_layer;
              layer < retained_layer_count;
              ++layer)
         {
@@ -144,12 +153,13 @@ namespace llaminar2
             };
         }
         return ExpertHistogramProductionTopology(
-            std::move(layers), std::move(economy_layers));
+            std::move(layers), std::move(economy_layers), first_model_layer);
     }
 
     bool DecodeExpertHistogramWindow::valid() const noexcept
     {
-        if (num_layers <= 0 || num_experts <= 0)
+        if (num_layers <= 0 || num_experts <= 0 || first_model_layer < 0 ||
+            num_layers > std::numeric_limits<int>::max() - first_model_layer)
             return false;
         const size_t layers = static_cast<size_t>(num_layers);
         const size_t experts = static_cast<size_t>(num_experts);
@@ -209,6 +219,11 @@ namespace llaminar2
         return window_->num_layers;
     }
 
+    int ValidatedDecodeExpertHistogramWindowView::firstModelLayer() const noexcept
+    {
+        return window_->first_model_layer;
+    }
+
     int ValidatedDecodeExpertHistogramWindowView::numExperts() const noexcept
     {
         return window_->num_experts;
@@ -239,14 +254,14 @@ namespace llaminar2
         int layer_idx,
         int expert_id) const
     {
-        if (layer_idx < 0 || layer_idx >= window_->num_layers ||
+        if (!window_->containsModelLayer(layer_idx) ||
             expert_id < 0 || expert_id >= window_->num_experts)
         {
             throw std::out_of_range(
                 "Validated frozen expert histogram index is outside its geometry");
         }
         return window_->expert_counts[
-            static_cast<std::size_t>(layer_idx) *
+            static_cast<std::size_t>(layer_idx - window_->first_model_layer) *
                 static_cast<std::size_t>(window_->num_experts) +
             static_cast<std::size_t>(expert_id)];
     }
@@ -256,7 +271,7 @@ namespace llaminar2
         int layer_idx,
         int expert_id) const
     {
-        if (layer_idx < 0 || layer_idx >= window_->num_layers ||
+        if (!window_->containsModelLayer(layer_idx) ||
             expert_id < 0 || expert_id >= window_->num_experts)
         {
             throw std::out_of_range(
@@ -264,7 +279,7 @@ namespace llaminar2
         }
         return window_->source_expert_counts[sourceCountOffset(
             querySourceIndex(source),
-            layer_idx,
+            layer_idx - window_->first_model_layer,
             expert_id,
             window_->num_layers,
             window_->num_experts)];
@@ -274,14 +289,14 @@ namespace llaminar2
         int layer_idx,
         int expert_id) const
     {
-        if (!valid() || layer_idx < 0 || layer_idx >= num_layers ||
+        if (!valid() || !containsModelLayer(layer_idx) ||
             expert_id < 0 || expert_id >= num_experts)
         {
             throw std::out_of_range(
                 "Frozen expert histogram index is outside its geometry");
         }
         return expert_counts[
-            static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts) +
+            static_cast<size_t>(layer_idx - first_model_layer) * static_cast<size_t>(num_experts) +
             static_cast<size_t>(expert_id)];
     }
 
@@ -290,7 +305,7 @@ namespace llaminar2
         int layer_idx,
         int expert_id) const
     {
-        if (!valid() || layer_idx < 0 || layer_idx >= num_layers ||
+        if (!valid() || !containsModelLayer(layer_idx) ||
             expert_id < 0 || expert_id >= num_experts)
         {
             throw std::out_of_range(
@@ -298,7 +313,7 @@ namespace llaminar2
         }
         return source_expert_counts[sourceCountOffset(
             querySourceIndex(source),
-            layer_idx,
+            layer_idx - first_model_layer,
             expert_id,
             num_layers,
             num_experts)];
@@ -307,13 +322,13 @@ namespace llaminar2
     std::vector<uint64_t> DecodeExpertHistogramWindow::layerHistogram(
         int layer_idx) const
     {
-        if (!valid() || layer_idx < 0 || layer_idx >= num_layers)
+        if (!valid() || !containsModelLayer(layer_idx))
         {
             throw std::out_of_range(
                 "Frozen expert histogram layer is outside its geometry");
         }
         const auto begin = expert_counts.begin() +
-                           static_cast<ptrdiff_t>(layer_idx) * num_experts;
+                           static_cast<ptrdiff_t>(layer_idx - first_model_layer) * num_experts;
         return {begin, begin + num_experts};
     }
 
@@ -321,14 +336,14 @@ namespace llaminar2
         ExpertHistogramSource source,
         int layer_idx) const
     {
-        if (!valid() || layer_idx < 0 || layer_idx >= num_layers)
+        if (!valid() || !containsModelLayer(layer_idx))
         {
             throw std::out_of_range(
                 "Frozen expert histogram phase layer is outside its geometry");
         }
         const std::size_t begin_offset = sourceCountOffset(
             querySourceIndex(source),
-            layer_idx,
+            layer_idx - first_model_layer,
             0,
             num_layers,
             num_experts);
@@ -349,6 +364,7 @@ namespace llaminar2
         int num_experts = 0;
         std::uint32_t top_k = 0;
         int boundary_layer = -1;
+        int first_model_layer = 0;
         /** @brief A compact, retired layer sample; no mutable publication state. */
         struct Layer
         {
@@ -369,9 +385,10 @@ namespace llaminar2
                           const DecodeExpertHistogramWindow &window)
         {
             if (!capacity.valid() || !window.valid() || layers.size() != static_cast<size_t>(window.num_layers) ||
-                boundary_layer < 0 || boundary_layer >= window.num_layers || top_k != capacity.top_k)
+                !window.containsModelLayer(boundary_layer) || top_k != capacity.top_k)
                 throw std::invalid_argument("Transaction evidence has invalid model or boundary geometry");
             generation = window.generation;
+            first_model_layer = window.first_model_layer;
             num_experts = window.num_experts;
             phase_counts.assign(window.source_expert_counts.size(), 0);
             token_count = 0;
@@ -404,7 +421,7 @@ namespace llaminar2
                     }
                     cursor += slots;
                     rows += record.logical_rows;
-                    if (static_cast<int>(layer) == boundary_layer)
+                    if (static_cast<int>(layer) + first_model_layer == boundary_layer)
                     {
                         token_count += record.logical_rows;
                         source_tokens[phase] += record.logical_rows;
@@ -478,7 +495,7 @@ namespace llaminar2
 
     std::size_t DecodeExpertTransactionWindow::wireBytes() const
     {
-        std::size_t bytes = 8; // Common top-k and token-boundary layer.
+        std::size_t bytes = 16; // Top-k, boundary, model origin and compact layer count.
         for (const auto &layer : data_->layers)
         {
             bytes = demandBytesAdd(bytes, 1, 16); // Compact frontier, without native padding.
@@ -494,7 +511,7 @@ namespace llaminar2
         (void)maximumAllocationBytes(capacity, num_layers, num_experts);
         auto per_layer = demandBytesAdd(16, capacity.target_rows, 8);
         per_layer = demandBytesAdd(per_layer, capacity.routeSlots(), sizeof(int32_t));
-        return demandBytesAdd(8, num_layers, per_layer);
+        return demandBytesAdd(16, num_layers, per_layer);
     }
 
     void DecodeExpertTransactionWindow::encodeWire(std::span<uint8_t> destination) const
@@ -505,6 +522,8 @@ namespace llaminar2
         size_t offset = 0;
         writeLittleEndian(destination, offset, data_->top_k);
         writeLittleEndian(destination, offset, static_cast<int32_t>(data_->boundary_layer));
+        writeLittleEndian(destination, offset, static_cast<int32_t>(data_->first_model_layer));
+        writeLittleEndian(destination, offset, static_cast<int32_t>(data_->layers.size()));
         for (const auto &layer : data_->layers)
         {
             writeLittleEndian(destination, offset, layer.frontier.transactions);
@@ -531,7 +550,10 @@ namespace llaminar2
         size_t offset = 0;
         const auto top_k = readLittleEndian<uint32_t>(packet, offset);
         const auto boundary = readLittleEndian<int32_t>(packet, offset);
-        if (top_k != config.capacity.top_k || boundary < 0 || boundary >= window.num_layers)
+        const auto first_model_layer = readLittleEndian<int32_t>(packet, offset);
+        const auto layer_count = readLittleEndian<int32_t>(packet, offset);
+        if (first_model_layer != window.first_model_layer || layer_count != window.num_layers ||
+            top_k != config.capacity.top_k || !window.containsModelLayer(boundary))
             throw std::invalid_argument("Transaction evidence routing width or token boundary differs from model geometry");
         // Validate sizes before any allocation. The second pass materializes the
         // same payload directly into its final owner; no temporary route mirror.
@@ -559,7 +581,7 @@ namespace llaminar2
         data->top_k = top_k;
         data->boundary_layer = boundary;
         data->layers.resize(window.num_layers);
-        offset = 8;
+        offset = 16;
         for (auto &layer : data->layers)
         {
             layer.frontier.transactions = readLittleEndian<uint32_t>(packet, offset);
@@ -592,15 +614,17 @@ namespace llaminar2
     std::span<const moe_overlay_economy::TransactionDemandRecord>
     DecodeExpertTransactionWindow::layerTransactions(int layer) const
     {
-        if (layer < 0) throw std::out_of_range("Negative expert transaction layer");
-        return data_->layers.at(static_cast<size_t>(layer)).records;
+        if (layer < data_->first_model_layer)
+            throw std::out_of_range("Expert transaction layer precedes its stage");
+        return data_->layers.at(static_cast<size_t>(layer - data_->first_model_layer)).records;
     }
 
     moe_overlay_economy::TransactionRoutes DecodeExpertTransactionWindow::routes(
         int layer, std::size_t transaction) const
     {
-        if (layer < 0) throw std::out_of_range("Negative expert transaction layer");
-        const auto &sample = data_->layers.at(static_cast<size_t>(layer));
+        if (layer < data_->first_model_layer)
+            throw std::out_of_range("Expert transaction layer precedes its stage");
+        const auto &sample = data_->layers.at(static_cast<size_t>(layer - data_->first_model_layer));
         const auto &record = sample.records.at(transaction);
         return {sample.ids.data() + record.first_route_slot,
                 static_cast<uint64_t>(record.logical_rows) * record.top_k,
@@ -611,7 +635,8 @@ namespace llaminar2
 
     bool DecodeExpertTransactionWindow::matches(const DecodeExpertHistogramWindow &window) const noexcept
     {
-        return window.num_layers == static_cast<int>(data_->layers.size()) &&
+        return window.first_model_layer == data_->first_model_layer &&
+            window.num_layers == static_cast<int>(data_->layers.size()) &&
             window.num_experts == data_->num_experts && window.generation == data_->generation &&
             window.token_count == data_->token_count && window.source_token_counts == data_->source_tokens &&
             window.source_expert_counts == data_->phase_counts;
@@ -815,6 +840,7 @@ namespace llaminar2
 
     DecodeExpertHistogram::DecodeExpertHistogram(DecodeExpertHistogramConfig config)
         : config_(std::move(config)),
+          first_model_layer_(config_.ownership.firstModelLayer()),
           active_window_size_(config_.window_size),
           ownership_(config_.ownership)
     {
@@ -830,6 +856,11 @@ namespace llaminar2
             throw std::invalid_argument(
                 "DecodeExpertHistogram ownership geometry does not match its layer, expert, and participant config");
         }
+
+        if (config_.token_boundary_layer_idx < -1 ||
+            (config_.token_boundary_layer_idx >= 0 &&
+             !containsModelLayer(config_.token_boundary_layer_idx)))
+            throw std::invalid_argument("Histogram token boundary belongs outside its owned stage");
 
         if (config_.transaction_demand)
         {
@@ -849,8 +880,8 @@ namespace llaminar2
     bool DecodeExpertHistogram::isTokenBoundaryLayer(int layer_idx) const
     {
         int boundary = config_.token_boundary_layer_idx;
-        if (boundary < 0 || boundary >= config_.num_layers)
-            boundary = config_.num_layers - 1;
+        if (boundary == -1)
+            boundary = endModelLayer() - 1;
         return layer_idx == boundary;
     }
 
@@ -862,7 +893,7 @@ namespace llaminar2
         const float *expert_weights,
         int top_k)
     {
-        if (layer_idx < 0 || layer_idx >= config_.num_layers || !expert_indices || !expert_weights ||
+        if (!containsModelLayer(layer_idx) || !expert_indices || !expert_weights ||
             top_k <= 0 || top_k > config_.top_k || top_k > MAX_TOP_K)
             throw std::invalid_argument("Decode histogram record has invalid layer or routing geometry");
         for (int slot = 0; slot < top_k; ++slot)
@@ -872,7 +903,7 @@ namespace llaminar2
         if (!bank_lease)
             return;
         auto &bank = bank_lease.mutableBank();
-        auto &layer = bank.layers[layer_idx];
+        auto &layer = bank.layers[storageIndexForModelLayer(layer_idx)];
         const int k = std::min(top_k, static_cast<int>(MAX_TOP_K));
         if (layer.transaction_demand)
         {
@@ -926,6 +957,8 @@ namespace llaminar2
     {
         if (token_count == 0)
             return;
+        if (!containsModelLayer(layer_idx))
+            throw std::invalid_argument("Histogram token boundary belongs outside its owned stage");
         if (isTokenBoundaryLayer(layer_idx))
         {
             auto bank_lease = acquireAdmittedBank();
@@ -949,7 +982,9 @@ namespace llaminar2
         bool count_window_tokens,
         ExpertHistogramSource source)
     {
-        if (!expert_counts || layer_idx < 0 || layer_idx >= config_.num_layers || num_experts <= 0)
+        if (!containsModelLayer(layer_idx))
+            throw std::invalid_argument("Histogram count merge belongs outside its owned stage");
+        if (!expert_counts || num_experts <= 0)
             return;
 
         auto bank_lease = acquireAdmittedBank();
@@ -958,7 +993,7 @@ namespace llaminar2
         if (config_.transaction_demand)
             throw std::logic_error("Marginal-only ingress cannot publish transaction-shaped demand");
         auto &bank = bank_lease.mutableBank();
-        auto &layer = bank.layers[layer_idx];
+        auto &layer = bank.layers[storageIndexForModelLayer(layer_idx)];
         const std::size_t source_index = ingestionSourceIndex(source);
         const int count = std::min(num_experts, config_.num_experts);
         uint64_t total_activations = 0;
@@ -999,7 +1034,7 @@ namespace llaminar2
             result.error = "expert_indices must not be null";
             return result;
         }
-        if (merge.layer_idx < 0 || merge.layer_idx >= config_.num_layers)
+        if (!containsModelLayer(merge.layer_idx))
         {
             result.error = "layer_idx is out of range";
             return result;
@@ -1104,7 +1139,7 @@ namespace llaminar2
             }
             auto &bank = bank_lease.mutableBank();
             auto &layer = bank.layers[
-                static_cast<std::size_t>(merge.layer_idx)];
+                storageIndexForModelLayer(merge.layer_idx)];
             if (!retain_transaction(layer)) return result;
             const std::size_t source_index =
                 ingestionSourceIndex(merge.source);
@@ -1174,7 +1209,7 @@ namespace llaminar2
             return result;
         }
         auto &bank = bank_lease.mutableBank();
-        auto &layer = bank.layers[static_cast<size_t>(merge.layer_idx)];
+        auto &layer = bank.layers[storageIndexForModelLayer(merge.layer_idx)];
         if (!retain_transaction(layer)) return result;
         const std::size_t source_index = ingestionSourceIndex(merge.source);
         for (int expert_id = 0; expert_id < config_.num_experts; ++expert_id)
@@ -1399,7 +1434,7 @@ namespace llaminar2
     {
         const auto bank_lease = acquireActiveBank();
         return bank_lease.bank()
-            .layers[static_cast<size_t>(layer_idx)]
+            .layers[storageIndexForModelLayer(layer_idx)]
             .expert_counts[static_cast<size_t>(expert_id)]
             .load(std::memory_order_relaxed);
     }
@@ -1411,7 +1446,7 @@ namespace llaminar2
     {
         const auto bank_lease = acquireActiveBank();
         return bank_lease.bank()
-            .layers[static_cast<size_t>(layer_idx)]
+            .layers[storageIndexForModelLayer(layer_idx)]
             .source_expert_counts[querySourceIndex(source)]
                                  [static_cast<size_t>(expert_id)]
             .load(std::memory_order_relaxed);
@@ -1421,7 +1456,7 @@ namespace llaminar2
     {
         const auto bank_lease = acquireActiveBank();
         const auto &layer =
-            bank_lease.bank().layers[static_cast<size_t>(layer_idx)];
+            bank_lease.bank().layers[storageIndexForModelLayer(layer_idx)];
         std::vector<uint64_t> result(config_.num_experts);
         for (int e = 0; e < config_.num_experts; ++e)
             result[e] = layer.expert_counts[e].load(std::memory_order_relaxed);
@@ -1435,7 +1470,7 @@ namespace llaminar2
         const auto bank_lease = acquireActiveBank();
         const auto &counts =
             bank_lease.bank()
-                .layers[static_cast<size_t>(layer_idx)]
+                .layers[storageIndexForModelLayer(layer_idx)]
                 .source_expert_counts[querySourceIndex(source)];
         std::vector<uint64_t> result(config_.num_experts);
         for (int expert = 0; expert < config_.num_experts; ++expert)
@@ -1451,7 +1486,7 @@ namespace llaminar2
     {
         const auto bank_lease = acquireActiveBank();
         const auto &layer =
-            bank_lease.bank().layers[static_cast<size_t>(layer_idx)];
+            bank_lease.bank().layers[storageIndexForModelLayer(layer_idx)];
         std::lock_guard<std::mutex> lock(ownership_mutex_);
         const int num_sockets = static_cast<int>(config_.sockets.size());
         std::vector<uint64_t> loads(num_sockets, 0);
@@ -1467,7 +1502,7 @@ namespace llaminar2
     {
         const auto bank_lease = acquireActiveBank();
         const auto &layer =
-            bank_lease.bank().layers[static_cast<size_t>(layer_idx)];
+            bank_lease.bank().layers[storageIndexForModelLayer(layer_idx)];
         return layer.weighted_sums[expert_id];
     }
 
@@ -1494,7 +1529,7 @@ namespace llaminar2
 
         float sum = 0.0f;
         int finite_count = 0;
-        for (int l = 0; l < config_.num_layers; ++l)
+        for (int l = firstModelLayer(); l < endModelLayer(); ++l)
         {
             float ratio = socketImbalanceRatio(l);
             if (std::isfinite(ratio))
@@ -1518,6 +1553,7 @@ namespace llaminar2
         if (config_.num_layers <= 0 ||
             config_.num_experts <= 0 ||
             num_sockets <= 0 ||
+            ownership.firstModelLayer() != firstModelLayer() ||
             ownership.layerCount() != config_.num_layers ||
             ownership.expertCount() != config_.num_experts ||
             ownership.participantCount() != num_sockets)
@@ -1527,11 +1563,11 @@ namespace llaminar2
 
         double ratio_sum = 0.0;
         double spread_sum = 0.0;
-        for (int layer_idx = 0; layer_idx < config_.num_layers; ++layer_idx)
+        for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
             std::vector<uint64_t> loads(static_cast<size_t>(num_sockets), 0);
             uint64_t layer_total = 0;
-            const auto &layer = bank.layers[static_cast<size_t>(layer_idx)];
+            const auto &layer = bank.layers[storageIndexForModelLayer(layer_idx)];
             for (int expert_id = 0; expert_id < config_.num_experts; ++expert_id)
             {
                 const int socket = ownership.owner(layer_idx, expert_id);
@@ -1723,6 +1759,7 @@ namespace llaminar2
                 frozen.source_token_counts[source].load(
                     std::memory_order_relaxed);
         }
+        window.first_model_layer = firstModelLayer();
         window.num_layers = config_.num_layers;
         window.num_experts = config_.num_experts;
         const std::size_t entries =
@@ -1771,7 +1808,8 @@ namespace llaminar2
             {
                 auto view = frozen.layers[index].transaction_demand->view();
                 layers.push_back(view);
-                if (isTokenBoundaryLayer(index)) boundary = index;
+                const int model_layer = firstModelLayer() + index;
+                if (isTokenBoundaryLayer(model_layer)) boundary = model_layer;
             }
             // No snapshot pins either bank. A slow planner may retain this copy
             // through arbitrarily many rotations; PMA bounds total live copies.
@@ -1787,7 +1825,8 @@ namespace llaminar2
     void DecodeExpertHistogram::updateOwnership(
         const MoELayeredExpertOwnership &ownership)
     {
-        if (ownership.layerCount() != config_.num_layers ||
+        if (ownership.firstModelLayer() != firstModelLayer() ||
+            ownership.layerCount() != config_.num_layers ||
             ownership.expertCount() != config_.num_experts ||
             ownership.participantCount() != static_cast<int>(config_.sockets.size()))
         {

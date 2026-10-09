@@ -9,6 +9,8 @@
  * - LOCAL TP: Multiple devices owned by one MPI rank (decoupled from MPI world_size)
  * - Proportional TP: Devices can have different capacities (weights)
  * - Backend selection: NCCL, RCCL, or HOST based on device types
+ * - Pipeline stages retain independent, checked expert-runtime bindings;
+ *   only TP siblings within one stage share a residency authority.
  *
  * Design philosophy:
  * - Extends IRankOrchestrator (which extends IInferenceRunner)
@@ -94,6 +96,7 @@ namespace llaminar2
     class MoEOverlayRankBatchTransportRegistry;
     class MoEOverlayNodeLocalDeviceControllerFabric;
     class MoEOverlayInferenceInterferenceProbe;
+    class MoEOverlayPipelineStageBinding;
     struct GraphExecutorStats;
     struct MoERoutedExpertPlacementPlan;
     struct PlacementPlan;
@@ -183,6 +186,9 @@ namespace llaminar2
 
             /// TP backend for this stage (only used when stage_devices.size() > 1)
             CollectiveBackendType tp_backend = CollectiveBackendType::AUTO;
+
+            /** Expert ownership admitted for this exact stage, absent for dense models. */
+            std::shared_ptr<const MoEOverlayPipelineStageBinding> moe_runtime;
 
             /// Get the number of layers in this stage
             int numLayers() const { return last_layer - first_layer; }
@@ -446,6 +452,21 @@ namespace llaminar2
              * @return Policy-only config; the caller must bind exact participants.
              */
             static Config fromRuntime(const RuntimeConfig &runtime);
+
+            /**
+             * @brief Project one PP stage into its child runner configuration.
+             * @param stage_index Exact stage in the authored pipeline order.
+             * @return Child topology, common policy and only that stage's expert owners.
+             * @throws std::invalid_argument for a model-wide PP expert binding,
+             *         incomplete stage installation or a foreign runtime scope.
+             * @throws std::out_of_range if the stage does not exist.
+             *
+             * This setup projection creates no runner or physical allocation.
+             * Both single-device and nested-TP children consume this same
+             * checked handoff, preventing either path from borrowing another
+             * stage's owner epoch, histogram or prepared-bank registry.
+             */
+            [[nodiscard]] Config forPipelineStage(std::size_t stage_index) const;
         };
 
         // =====================================================================
@@ -610,6 +631,15 @@ namespace llaminar2
          * @return Pointer to combined logits [vocab_size], or nullptr if unavailable
          */
         const float *logits() const override;
+
+        /**
+         * @brief Inspect physical capacity of the rank's main host logits output.
+         * @return Allocated bytes, including invalidated retained output storage.
+         *
+         * This observation never materializes data or authorizes allocation.
+         * Verifier and learned-predictor outputs have independent lifetimes.
+         */
+        size_t mainHostLogitsStorageBytes() const;
         bool forwardMTP(int32_t draft_condition_token) override;
         bool forwardMTPForDeviceSampling(int32_t draft_condition_token) override;
         /**
@@ -887,14 +917,14 @@ namespace llaminar2
         bool publishesFullVocabularyMTPLogits() const override;
         bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
         bool applyPenaltiesOnDevice(
-            const std::vector<LogitPenalty> &penalties,
+            const LogitPenaltyBatch &penalties,
             int vocab_size) override;
         bool applyPenaltiesToMTPLogitsOnDevice(
-            const std::vector<LogitPenalty> &penalties,
+            const LogitPenaltyBatch &penalties,
             int vocab_size) override;
         bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
             int row,
-            const std::vector<LogitPenalty> &penalties,
+            const LogitPenaltyBatch &penalties,
             int vocab_size) override;
         bool applyDeviceOwnedMTPPenaltiesToLogitRows(
             DeviceLogitsSource source,
@@ -951,6 +981,15 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle) override;
         bool configureMTPRequestStopTokens(
             const std::vector<int32_t> &stop_tokens) override;
+        /**
+         * @brief Admit complete prompt membership after prefill or prefix restore.
+         * @param unique_tokens Sorted unique prompt tokens, excluding generated output.
+         * @param request_index Request-owned histogram row; zero for scalar generation.
+         * @return Whether every continuation owner published its initialized history.
+         */
+        bool initializePromptRepetitionHistory(
+            std::span<const int32_t> unique_tokens, int request_index = 0) override;
+
         bool configureMTPRequestPenaltyPolicy(
             const MTPRequestPenaltyPolicy &policy) override;
         bool prepareGreedyAllPositionBatchOutcomeGraph(
@@ -1251,6 +1290,8 @@ namespace llaminar2
         void clear_cache() override;
         /** @copydoc IInferenceRunner::purgePrefixCache */
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::prefixCacheTelemetrySources */
+        PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override;
         bool maybeApplyDecodeBoundaryMaintenance(
             uint64_t committed_tokens) override;
 
@@ -1319,6 +1360,10 @@ namespace llaminar2
         const char *architecture() const override;
         uint64_t moePlacementEpoch() const override;
         uint64_t moeRuntimeMovementEpoch() const override;
+
+        /** @copydoc IInferenceRunner::prefixMovementStages */
+        MoEOptimizationStages<PrefixMovementEpochObservation>
+        prefixMovementStages() const override;
         /** @copydoc IInferenceRunner::moeOptimizationStatus */
         MoEOptimizationStatus moeOptimizationStatus() const override;
         /** @copydoc IInferenceRunner::moeOptimizationMovementLedger */
@@ -1333,6 +1378,8 @@ namespace llaminar2
             const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override;
 
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
+        /** @copydoc IInferenceRunner::prefixRestoreMetadata */
+        PrefixRestoreMetadata prefixRestoreMetadata(const PrefixLookupResult &hit) const override;
         /** @copydoc IInferenceRunner::preparePrefixHarvest */
         bool preparePrefixHarvest(
             const PrefixLookupResult &admission,
@@ -1636,7 +1683,7 @@ namespace llaminar2
         void setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas);
 
     private:
-        /** @return The sole child publication root; duplicate authorities are fatal. */
+        /** @return The sole TP publication root; PP stages retain independent namespaces. */
         const IInferenceRunner *moeOptimizationOwner() const;
         // =====================================================================
         // Private Constructor (for createForTest)

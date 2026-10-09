@@ -113,6 +113,7 @@ COPY scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch \
      scripts/docker/patches/rocm-hip-sdma-stream-sharing.patch \
      scripts/docker/patches/rocm-hip-sdma-event-publication.patch \
      scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch \
+     scripts/docker/patches/rocm-hip-event-producer-lifetime.patch \
      /tmp/install-scripts/patches/
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
@@ -159,6 +160,8 @@ COPY scripts/docker/patches/rccl-device-live-rows.patch \
      /tmp/install-scripts/patches/rccl-device-live-rows.patch
 COPY scripts/docker/patches/rccl-native-host-storage.patch \
      /tmp/install-scripts/patches/rccl-native-host-storage.patch
+COPY scripts/docker/patches/rccl-communicator-protocol-defaults.patch \
+     /tmp/install-scripts/patches/rccl-communicator-protocol-defaults.patch
 # ccache hashes the compiler and full command line, so one 50 GB shared cache
 # is correct across both ISA lanes. It lives in the persistent named BuildKit
 # worker hosted by the one host Docker daemon; locked sharing keeps independent
@@ -194,6 +197,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
             echo "==> [rccl] ONLY_FUNCS=${rccl_build_funcs}"; \
             cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
                 -DCMAKE_C_COMPILER="${ROCM_PATH}/bin/amdclang" \
                 -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
                 -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
@@ -205,6 +209,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         else \
             cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
                 -DCMAKE_C_COMPILER="${ROCM_PATH}/bin/amdclang" \
                 -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
                 -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
@@ -225,7 +230,8 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         rccl_capture_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-hip-capture-event-wait.patch | cut -d ' ' -f 1)"; \
         rccl_rows_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-device-live-rows.patch | cut -d ' ' -f 1)"; \
         rccl_storage_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-native-host-storage.patch | cut -d ' ' -f 1)"; \
-        printf '%s\n' "${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}" \
+        rccl_protocol_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-communicator-protocol-defaults.patch | cut -d ' ' -f 1)"; \
+        printf '%s\n' "${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}-protocol-${rccl_protocol_patch_sha}" \
             > /src/external/rccl/build/.llaminar-rccl-commit; \
         echo "==> [rccl] done; elapsed_seconds=$(( $(date +%s) - rccl_started_epoch )); library: $(readlink -f /src/external/rccl/build/librccl.so.1.0)"; \
     elif [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
@@ -474,7 +480,12 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} + \
  && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses /src/runtime-rocblas \
  && cp build_v2_release/llaminar2 /src/runtime-bin/llaminar2 \
+ && cp build_v2_release/llaminar_native_tool_evidence_decoder /src/runtime-bin/ \
  && cp build_v2_release/libllaminar2_core.so /src/runtime-libs/ \
+ && mkdir -p /src/runtime-licenses/pcre2 \
+ && cp build_v2_release/_deps/pcre2-src/LICENCE.md /src/runtime-licenses/pcre2/ \
+ && mkdir -p /src/runtime-licenses/utf8proc \
+ && cp build_v2_release/_deps/utf8proc-src/LICENSE.md /src/runtime-licenses/utf8proc/ \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -P /usr/local/lib/libllaminar_nccl.so* /src/runtime-libs/; fi \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -r /usr/local/share/licenses/llaminar-nccl /src/runtime-licenses/; fi \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \

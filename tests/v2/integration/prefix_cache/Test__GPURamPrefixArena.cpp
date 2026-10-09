@@ -6,6 +6,8 @@
  * producer. Admission must reclaim only the latter, without waiting, allocating
  * another pinned slab, or touching the held destination. The same backing also
  * survives metadata-only aliases, disk hydration and both owner retirement orders.
+ * Harvest sheds its consumed lookup chain while the restore event continues
+ * to protect every source range until the native DMA read has completed.
  */
 #include <gtest/gtest.h>
 
@@ -14,8 +16,10 @@
 #include "backends/IGPUGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixStateCache.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "utils/PerfStatsCollector.h"
+#include "../backends/MTPMainForwardReadRetirementProof.h"
 
 #include <algorithm>
 #include <array>
@@ -70,7 +74,7 @@ namespace
         static constexpr size_t kCapacity = 2u * kPayload;
 
         /** @brief Materialize one admitted tier and two retained producer graphs. */
-        Fixture(DeviceId device, IWorkerGPUContext &gpu) : device(device), backend(getBackendFor(device))
+        Fixture(DeviceId device, IWorkerGPUContext &gpu, size_t capacity = kCapacity) : device(device), backend(getBackendFor(device))
         {
             require(backend != nullptr, "prefix arena fixture has no backend");
             try
@@ -92,7 +96,7 @@ namespace
                     source[lane] = backend->allocate(kPayload, device.ordinal);
                     require(source[lane] != nullptr, "prefix arena fixture source allocation failed");
                     ready[lane] = std::shared_ptr<void>(backend->createEvent(device.ordinal),
-                        [this](void *event) { backend->destroyEvent(event, this->device.ordinal); });
+                        [backend = backend, ordinal = device.ordinal](void *event) { backend->destroyEvent(event, ordinal); });
                     require(ready[lane] != nullptr, "prefix arena fixture readiness admission failed");
                     graphs[lane] = gpu.createGraphCapture(streams[lane]);
                     require(graphs[lane] != nullptr, "prefix arena fixture capture unavailable");
@@ -105,13 +109,13 @@ namespace
                 }
                 PhysicalMemoryPlanBuilder plan;
                 plan.add(PhysicalMemoryResource{.world_rank = 0, .device = DeviceId::cpu(),
-                             .total_bytes = kCapacity, .admission_available_bytes = kCapacity},
-                         PhysicalMemoryOwner::PrefixHostTier, kCapacity);
+                             .total_bytes = capacity, .admission_available_bytes = capacity},
+                         PhysicalMemoryOwner::PrefixHostTier, capacity);
                 authority = std::make_shared<PhysicalMemoryAuthority>(
                     std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
                 std::string error;
                 initial_allocations = pinnedAllocations();
-                ram = RamPrefixStorageBackend::create(device, kCapacity, authority, &error);
+                ram = RamPrefixStorageBackend::create(device, capacity, authority, &error);
                 if (!ram) throw std::runtime_error(error);
             }
             catch (...)
@@ -130,13 +134,21 @@ namespace
             require(handle.payload_readiness->prepare(ready[lane], device, streams[lane]),
                     "prepare exact archive edge");
             if (generation)
-                require(backend->streamWaitTimelineSignal32(streams[lane], signal, generation, device.ordinal),
-                        "enqueue held producer frontier");
+                require(hold(lane, generation), "enqueue held producer frontier");
             require(graphs[lane]->launch(), "replay retained producer");
             require(backend->deviceToHostOnStream(handle.kv_payload, source[lane], kPayload,
                                                   device.ordinal, streams[lane]), "enqueue archive DMA");
             require(backend->recordEvent(ready[lane].get(), device.ordinal, streams[lane]) &&
                     handle.payload_readiness->publishRecorded(), "publish archive readiness");
+        }
+
+        /** @brief Hold an exact fixture stream and retain the generation needed for safe early-exit cleanup. */
+        bool hold(size_t lane, uint32_t generation)
+        {
+            const bool submitted = backend->streamWaitTimelineSignal32(
+                streams.at(lane), signal, generation, device.ordinal);
+            if (submitted) highest_gate_generation = std::max(highest_gate_generation, generation);
+            return submitted;
         }
 
         /** @brief Publish one monotonically increasing gate generation on its independent stream. */
@@ -172,6 +184,7 @@ namespace
         std::shared_ptr<PhysicalMemoryAuthority> authority;
         std::shared_ptr<RamPrefixStorageBackend> ram;
         double initial_allocations = 0.0;
+        uint32_t highest_gate_generation = 0u;
 
     private:
         /** @brief Drain only fixture streams, then retire their bound native resources. */
@@ -179,7 +192,7 @@ namespace
         {
             if (signal && control &&
                 !backend->streamPublishTimelineSignal32(control, signal,
-                    std::numeric_limits<uint32_t>::max(), device.ordinal)) std::terminate();
+                    highest_gate_generation, device.ordinal)) std::terminate();
             if (terminal)
                 for (void *stream : {streams[0], streams[1], control})
                     if (stream && (!backend->recordEvent(terminal, device.ordinal, stream) ||
@@ -271,6 +284,25 @@ namespace
         fixture.expectPersistentBacking();
     }
 
+    /** @brief Assertion-failure cleanup releases the real gate generation on both native backends. */
+    void verifyHeldEarlyExitCleanup(DeviceId device, IWorkerGPUContext &gpu)
+    {
+        for (uint32_t generation = 1u; generation <= 20u; ++generation)
+        {
+            Fixture fixture(device, gpu);
+            auto held = fixture.ram->allocate(keyFor(8200 + generation), layoutFor(device));
+            ASSERT_TRUE(held.valid());
+            fixture.produce(held, 0u, generation);
+            bool ready = true;
+            ASSERT_TRUE(fixture.backend->queryEvent(fixture.ready[0].get(), device.ordinal, &ready));
+            EXPECT_FALSE(ready);
+            ASSERT_TRUE(fixture.ram->release(held));
+            // Intentionally leave the producer held. Fixture teardown must
+            // publish this exact generation, not a wraparound sentinel that
+            // CUDA's signed stream comparison can interpret as still pending.
+        }
+    }
+
     /** @brief A completed producer does not release a range borrowed by pending restore DMA. */
     void verifyRestoreAliases(DeviceId device, IWorkerGPUContext &gpu)
     {
@@ -284,8 +316,7 @@ namespace
             ASSERT_TRUE(archive.waitForPayloadOnHost());
             auto request_alias = archive;
             auto restore_alias = archive;
-            ASSERT_TRUE(fixture.backend->streamWaitTimelineSignal32(
-                fixture.streams[0], fixture.signal, iteration + 1u, device.ordinal));
+            ASSERT_TRUE(fixture.hold(0u, iteration + 1u));
             ASSERT_TRUE(fixture.backend->hostToDeviceOnStream(fixture.source[0], archive.kv_payload,
                 Fixture::kPayload, device.ordinal, fixture.streams[0]));
             ASSERT_TRUE(fixture.backend->recordEvent(fixture.ready[0].get(), device.ordinal, fixture.streams[0]));
@@ -346,10 +377,10 @@ namespace
             auto receipt = publication.waitForPublication();
             ASSERT_NE(receipt, nullptr);
             ASSERT_TRUE(std::holds_alternative<PrefixArchiveWritePublication>(*receipt));
-            auto verified = disk->beginVerifiedHydration(key, layout, &error);
+            auto verified = disk->beginHydration(key, layout, &error);
             ASSERT_TRUE(verified.has_value()) << error;
             PrefixBlockHandle hydrated;
-            ASSERT_TRUE(disk->hydrateVerified(*verified, *fixture.ram, &hydrated, &error)) << error;
+            ASSERT_TRUE(disk->hydrateSelected(*verified, *fixture.ram, &hydrated, &error)) << error;
             expectBytes(hydrated.kv_payload, Fixture::kPayload, 0x5a);
             ASSERT_NE(hydrated.model_runtime_state_storage, nullptr);
             EXPECT_TRUE(std::ranges::equal(hydrated.model_runtime_state_storage->bytes(), *metadata));
@@ -363,6 +394,286 @@ namespace
         }
     }
 
+    /** @brief Harvest ownership and native restore completion independently gate arena reuse. */
+    void verifyHarvestAdmission(DeviceId device, IWorkerGPUContext &gpu)
+    {
+        Fixture fixture(device, gpu);
+        PrefixStateCache cache(Fixture::kCapacity, fixture.ram);
+        for (int iteration = 0; iteration < 20; ++iteration)
+        {
+            PrefixLookupResult admission;
+            admission.supported = admission.cache_enabled = true;
+            admission.block_size = 64;
+            for (int block = 0; block < 2; ++block)
+            {
+                auto archive = fixture.ram->allocate(keyFor(1000 + iteration * 3 + block), layoutFor(device));
+                ASSERT_TRUE(archive.valid());
+                fixture.produce(archive, 1u);
+                ASSERT_TRUE(archive.waitForPayloadOnHost());
+                ASSERT_TRUE(cache.insert(archive));
+                admission.blocks.push_back(std::move(archive));
+            }
+            admission.cached_tokens = admission.blocks.back().key.token_start + admission.blocks.back().key.token_count;
+            const auto *terminal_address = admission.blocks.back().kv_payload;
+            auto restore_sources = admission.blocks;
+            ASSERT_TRUE(fixture.hold(0u, iteration + 1u));
+            for (const auto &archive : restore_sources)
+                ASSERT_TRUE(fixture.backend->hostToDeviceOnStream(fixture.source[0], archive.kv_payload,
+                    Fixture::kPayload, device.ordinal, fixture.streams[0]));
+            ASSERT_TRUE(fixture.backend->recordEvent(fixture.ready[0].get(), device.ordinal, fixture.streams[0]));
+            admission = admission.forHarvest(admission.cached_tokens);
+            ASSERT_EQ(admission.blocks.size(), 1u);
+            EXPECT_EQ(cache.prepareCapacity(Fixture::kPayload), PrefixRamInsertPreparation::Busy);
+            EXPECT_FALSE(fixture.ram->canStore(Fixture::kPayload));
+            fixture.release(iteration + 1u);
+            ASSERT_TRUE(fixture.backend->waitForEvent(fixture.ready[0].get(), device.ordinal));
+            restore_sources.clear();
+            EXPECT_EQ(fixture.ram->availableAllocationBytes(), Fixture::kPayload);
+            EXPECT_NO_THROW(cache.completeInsertPreparation(keyFor(1002 + iteration * 3), Fixture::kPayload));
+            auto next = fixture.ram->allocate(keyFor(1002 + iteration * 3), layoutFor(device));
+            ASSERT_TRUE(next.valid());
+            std::memset(next.kv_payload, 0x3c, Fixture::kPayload);
+            expectBytes(terminal_address, Fixture::kPayload, 0xb6);
+            ASSERT_TRUE(fixture.ram->release(next));
+            next = {};
+            admission = {};
+            EXPECT_EQ(fixture.ram->availableAllocationBytes(), Fixture::kCapacity);
+            fixture.expectPersistentBacking();
+        }
+    }
+
+    /** @brief Completed restore reads release storage before the live-state handoff is consumed. */
+    void verifyUnconsumedRestoreAdmission(DeviceId device, IWorkerGPUContext &gpu)
+    {
+        using Peer = DeviceGraphOrchestratorLiveStateTestAccess;
+        // On assertion failure the fixture drains its exact streams before
+        // the participant releases any still-retained archive read sources.
+        std::unique_ptr<DeviceGraphOrchestrator> runner;
+        Fixture fixture(device, gpu);
+        runner = std::make_unique<DeviceGraphOrchestrator>(
+            std::make_shared<QwenStandardGraph>(GraphConfig{}, nullptr), nullptr);
+        PrefixStateCache cache(Fixture::kCapacity, fixture.ram);
+        for (int iteration = 0; iteration < 20; ++iteration)
+        {
+            SCOPED_TRACE(iteration);
+            PrefixLookupResult admission;
+            admission.supported = admission.cache_enabled = true;
+            admission.block_size = 64;
+            for (int block = 0; block < 2; ++block)
+            {
+                auto archive = fixture.ram->allocate(keyFor(2000 + iteration * 3 + block), layoutFor(device));
+                ASSERT_TRUE(archive.valid());
+                fixture.produce(archive, 1u);
+                ASSERT_TRUE(archive.waitForPayloadOnHost());
+                ASSERT_TRUE(cache.insert(archive));
+                admission.blocks.push_back(std::move(archive));
+            }
+            admission.cached_tokens = admission.blocks.back().key.token_start + admission.blocks.back().key.token_count;
+            const auto *terminal_address = admission.blocks.back().kv_payload;
+            ASSERT_TRUE(fixture.hold(0u, iteration + 1u));
+            for (const auto &archive : admission.blocks)
+                ASSERT_TRUE(fixture.backend->hostToDeviceOnStream(fixture.source[0], archive.kv_payload,
+                    Fixture::kPayload, device.ordinal, fixture.streams[0]));
+            ASSERT_TRUE(Peer::publishPrefixRestore(*runner, device, fixture.streams[0], admission.blocks));
+            void *event = Peer::prefixRestoreEvent(*runner);
+            ASSERT_NE(event, nullptr);
+            admission = admission.forHarvest(admission.cached_tokens);
+            Peer::retirePrefixRestoreSources(*runner);
+            EXPECT_EQ(cache.prepareCapacity(Fixture::kPayload), PrefixRamInsertPreparation::Busy);
+            EXPECT_FALSE(fixture.ram->canStore(Fixture::kPayload));
+            EXPECT_TRUE(Peer::prefixRestoreHandoffRetained(*runner, event));
+            fixture.release(iteration + 1u);
+            ASSERT_TRUE(fixture.backend->waitForEvent(event, device.ordinal));
+            Peer::retirePrefixRestoreSources(*runner);
+            EXPECT_TRUE(Peer::prefixRestoreHandoffRetained(*runner, event));
+            EXPECT_EQ(fixture.ram->availableAllocationBytes(), Fixture::kPayload);
+            // This is the admission boundary that failed during OpenCode's
+            // suffix prefill, before decode consumed the restore handoff.
+            EXPECT_EQ(cache.prepareCapacity(Fixture::kPayload), PrefixRamInsertPreparation::Prepared);
+            expectBytes(terminal_address, Fixture::kPayload, 0xb6);
+            Peer::consumePrefixRestore(*runner);
+            Peer::retirePrefixRestoreSources(*runner);
+            admission = {};
+            EXPECT_EQ(fixture.ram->availableAllocationBytes(), Fixture::kCapacity);
+            fixture.expectPersistentBacking();
+        }
+        runner.reset();
+    }
+
+    /**
+     * @brief Required RAM admission itself retires completed restore sources.
+     *
+     * A harvest can begin before restore completes and finish after several
+     * archives or durable writes. Polling only at harvest entry leaves the
+     * source chain charged at its later required publication. Exercise both
+     * consumed and unconsumed ordering handoffs without a manual retirement
+     * between native completion and the real cache admission boundary.
+     */
+    void verifyRestoreCapacityRetirement(DeviceId device, IWorkerGPUContext &gpu)
+    {
+        using Peer = DeviceGraphOrchestratorLiveStateTestAccess;
+        std::unique_ptr<DeviceGraphOrchestrator> runner;
+        Fixture fixture(device, gpu);
+        runner = std::make_unique<DeviceGraphOrchestrator>(
+            std::make_shared<QwenStandardGraph>(GraphConfig{}, nullptr), nullptr);
+        PrefixStateCache cache(Fixture::kCapacity, fixture.ram, nullptr, nullptr, runner.get());
+        for (const bool consumed : {false, true})
+            for (int iteration = 0; iteration < 20; ++iteration)
+            {
+                SCOPED_TRACE(consumed);
+                SCOPED_TRACE(iteration);
+                const auto generation = static_cast<uint32_t>(iteration + (consumed ? 21 : 1));
+                PrefixLookupResult admission;
+                admission.supported = admission.cache_enabled = true;
+                admission.block_size = 64;
+                for (int block = 0; block < 2; ++block)
+                {
+                    auto archive = fixture.ram->allocate(keyFor(3000 + generation * 3 + block), layoutFor(device));
+                    ASSERT_TRUE(archive.valid());
+                    fixture.produce(archive, 1u);
+                    ASSERT_TRUE(archive.waitForPayloadOnHost());
+                    ASSERT_TRUE(cache.insert(archive));
+                    admission.blocks.push_back(std::move(archive));
+                }
+                admission.cached_tokens = admission.blocks.back().key.token_start + admission.blocks.back().key.token_count;
+                const auto *terminal_address = admission.blocks.back().kv_payload;
+                ASSERT_TRUE(fixture.hold(0u, generation));
+                for (const auto &archive : admission.blocks)
+                    ASSERT_TRUE(fixture.backend->hostToDeviceOnStream(fixture.source[0], archive.kv_payload,
+                        Fixture::kPayload, device.ordinal, fixture.streams[0]));
+                ASSERT_TRUE(Peer::publishPrefixRestore(*runner, device, fixture.streams[0], admission.blocks));
+                void *event = Peer::prefixRestoreEvent(*runner);
+                ASSERT_NE(event, nullptr);
+                admission = admission.forHarvest(admission.cached_tokens);
+                if (consumed)
+                    Peer::consumePrefixRestore(*runner);
+                EXPECT_EQ(cache.prepareCapacity(Fixture::kPayload), PrefixRamInsertPreparation::Busy);
+                EXPECT_FALSE(fixture.ram->canStore(Fixture::kPayload));
+                fixture.release(generation);
+                ASSERT_TRUE(fixture.backend->waitForEvent(event, device.ordinal));
+
+                const auto next_key = keyFor(3000 + generation * 3 + 2);
+                EXPECT_NO_THROW(cache.completeInsertPreparation(next_key, Fixture::kPayload));
+                EXPECT_EQ(fixture.ram->availableAllocationBytes(), Fixture::kPayload);
+                if (!consumed)
+                    EXPECT_TRUE(Peer::prefixRestoreHandoffRetained(*runner, event));
+                expectBytes(terminal_address, Fixture::kPayload, 0xb6);
+
+                // Keep a failing implementation's teardown safe as well. This
+                // explicit fixture cleanup occurs only after the assertions.
+                Peer::retirePrefixRestoreSources(*runner);
+                Peer::consumePrefixRestore(*runner);
+                admission = {};
+                EXPECT_EQ(fixture.ram->availableAllocationBytes(), Fixture::kCapacity);
+                fixture.expectPersistentBacking();
+            }
+        runner.reset();
+    }
+
+    /**
+     * @brief Rich nonterminal checkpoints release unused sections while real row reads stay pending.
+     *
+     * Three checkpoints fill the tier. Their historical recurrent images are
+     * not restore consumers. Required publication must fit its independently
+     * owned sections into the resulting holes without waiting for the held GPU
+     * read, overwriting its KV/MTP sources, or materializing another pinned slab.
+     */
+    void verifyRichRestoreSections(DeviceId device, IWorkerGPUContext &gpu)
+    {
+        using Peer = DeviceGraphOrchestratorLiveStateTestAccess;
+        for (const bool mtp : {false, true})
+        {
+            auto layout = layoutFor(device);
+            layout.includes_hybrid_state = true;
+            layout.hybrid_state_bytes = 2u * Fixture::kPayload;
+            layout.includes_mtp_state = mtp;
+            layout.mtp_kv_bytes = mtp ? Fixture::kPayload : 0u;
+            layout.mtp_layers = mtp ? 1 : 0;
+            layout.bytes_per_mtp_layer_k = layout.bytes_per_mtp_layer_v = Fixture::kPayload / 2u;
+            const auto allocation = PrefixPayloadAllocationPlan::archive(layout);
+            const size_t capacity = 3u * allocation.totalBytes() + Fixture::kPayload;
+            std::unique_ptr<DeviceGraphOrchestrator> runner;
+            Fixture fixture(device, gpu, capacity);
+            runner = std::make_unique<DeviceGraphOrchestrator>(
+                std::make_shared<QwenStandardGraph>(GraphConfig{}, nullptr), nullptr);
+            PrefixStateCache cache(capacity, fixture.ram, nullptr, nullptr, runner.get());
+            for (const bool consumed : {false, true})
+                for (int iteration = 0; iteration < 20; ++iteration)
+                {
+                    SCOPED_TRACE(mtp);
+                    SCOPED_TRACE(consumed);
+                    SCOPED_TRACE(iteration);
+                    const auto generation = static_cast<uint32_t>(1 + iteration + (consumed ? 20 : 0));
+                    std::vector<PrefixBlockHandle> archives;
+                    std::array<const void *, 3> kv_sources{};
+                    for (size_t block = 0; block < 3u; ++block)
+                    {
+                        auto archive = fixture.ram->allocate(keyFor(6000 + generation * 4 + block), layout);
+                        ASSERT_TRUE(archive.valid());
+                        std::memset(archive.hybrid_payload, 0x8b, layout.hybrid_state_bytes);
+                        if (mtp) std::memset(archive.mtp_payload, 0x9c, Fixture::kPayload);
+                        fixture.produce(archive, 1u);
+                        ASSERT_TRUE(archive.waitForPayloadOnHost());
+                        ASSERT_TRUE(cache.insert(archive));
+                        kv_sources[block] = archive.kv_payload;
+                        archives.push_back(std::move(archive));
+                    }
+                    ASSERT_TRUE(fixture.hold(0u, generation));
+                    std::vector<PrefixPayloadReadLease> reads;
+                    for (size_t block = 0; block < archives.size(); ++block)
+                    {
+                        const auto &archive = archives[block];
+                        ASSERT_TRUE(fixture.backend->hostToDeviceOnStream(fixture.source[0], archive.kv_payload,
+                            Fixture::kPayload, device.ordinal, fixture.streams[0]));
+                        if (mtp)
+                            ASSERT_TRUE(fixture.backend->hostToDeviceOnStream(fixture.source[0], archive.mtp_payload,
+                                Fixture::kPayload, device.ordinal, fixture.streams[0]));
+                        const bool terminal = block + 1u == archives.size();
+                        if (terminal)
+                            for (size_t offset = 0; offset < layout.hybrid_state_bytes; offset += Fixture::kPayload)
+                                ASSERT_TRUE(fixture.backend->hostToDeviceOnStream(fixture.source[0],
+                                    static_cast<const uint8_t *>(archive.hybrid_payload) + offset,
+                                    Fixture::kPayload, device.ordinal, fixture.streams[0]));
+                        reads.push_back(terminal ? PrefixPayloadReadLease::wholeArchive(archive)
+                                                 : PrefixPayloadReadLease::sequenceRows(archive));
+                    }
+                    ASSERT_TRUE(Peer::publishPrefixReadSources(*runner, device, fixture.streams[0], std::move(reads)));
+                    void *const event = Peer::prefixRestoreEvent(*runner);
+                    archives.clear();
+                    if (consumed) Peer::consumePrefixRestore(*runner);
+                    bool complete = true;
+                    ASSERT_TRUE(fixture.backend->queryEvent(event, device.ordinal, &complete));
+                    EXPECT_FALSE(complete);
+                    const auto next_key = keyFor(6003 + generation * 4);
+                    EXPECT_NO_THROW(cache.completeInsertPreparation(next_key, allocation));
+                    ASSERT_TRUE(fixture.ram->canStore(allocation));
+                    auto next = fixture.ram->allocate(next_key, layout);
+                    ASSERT_TRUE(next.valid());
+                    std::memset(next.hybrid_payload, 0x3c, layout.hybrid_state_bytes);
+                    for (const auto *source : kv_sources) expectBytes(source, Fixture::kPayload, 0xb6);
+                    ASSERT_TRUE(fixture.backend->queryEvent(event, device.ordinal, &complete));
+                    EXPECT_FALSE(complete);
+                    fixture.release(generation);
+                    ASSERT_TRUE(fixture.backend->waitForEvent(event, device.ordinal));
+                    ASSERT_TRUE(fixture.backend->deviceToHostOnStream(next.kv_payload, fixture.source[0],
+                        Fixture::kPayload, device.ordinal, fixture.streams[0]));
+                    ASSERT_TRUE(fixture.backend->recordEvent(fixture.terminal, device.ordinal, fixture.streams[0]));
+                    ASSERT_TRUE(fixture.backend->waitForEvent(fixture.terminal, device.ordinal));
+                    expectBytes(next.kv_payload, Fixture::kPayload, 0x8b);
+                    expectBytes(next.hybrid_payload, layout.hybrid_state_bytes, 0x3c);
+                    Peer::retirePrefixRestoreSources(*runner);
+                    Peer::consumePrefixRestore(*runner);
+                    cache.clear();
+                    ASSERT_TRUE(fixture.ram->release(next));
+                    next = {};
+                    EXPECT_EQ(fixture.ram->availableAllocationBytes(), capacity);
+                    EXPECT_EQ(fixture.claimed(), capacity);
+                    fixture.expectPersistentBacking();
+                }
+            runner.reset();
+        }
+    }
+
     /** @brief Execute the identical adversarial native lifecycle on each backend. */
     void run(DeviceId device)
     {
@@ -370,6 +681,7 @@ namespace
         gpu.submitAndWait([&] {
             ASSERT_NO_FATAL_FAILURE(verifyOutOfOrderRetirement(device, gpu));
             ASSERT_NO_FATAL_FAILURE(verifyPendingTeardown(device, gpu));
+            ASSERT_NO_FATAL_FAILURE(verifyHeldEarlyExitCleanup(device, gpu));
             ASSERT_NO_FATAL_FAILURE(verifyRestoreAliases(device, gpu));
             ASSERT_NO_FATAL_FAILURE(verifyDiskHydration(device, gpu));
         });
@@ -378,7 +690,47 @@ namespace
 
 #ifdef HAVE_CUDA
 TEST(GPURamPrefixArena, CUDA) { run(DeviceId::cuda(0)); }
+TEST(PrefixRestoredChainOwnership, CUDA)
+{
+    auto &gpu = GPUDeviceContextPool::instance().getContext(DeviceId::cuda(0));
+    gpu.submitAndWait([&] { verifyHarvestAdmission(DeviceId::cuda(0), gpu); });
+}
+TEST(PrefixUnconsumedRestoreOwnership, CUDA)
+{
+    auto &gpu = GPUDeviceContextPool::instance().getContext(DeviceId::cuda(0));
+    gpu.submitAndWait([&] { verifyUnconsumedRestoreAdmission(DeviceId::cuda(0), gpu); });
+}
+TEST(PrefixRichRestoreSectionOwnership, CUDA)
+{
+    auto &gpu = GPUDeviceContextPool::instance().getContext(DeviceId::cuda(0));
+    gpu.submitAndWait([&] { verifyRichRestoreSections(DeviceId::cuda(0), gpu); });
+}
+TEST(PrefixRestoreCapacityRetirement, CUDA)
+{
+    auto &gpu = GPUDeviceContextPool::instance().getContext(DeviceId::cuda(0));
+    gpu.submitAndWait([&] { verifyRestoreCapacityRetirement(DeviceId::cuda(0), gpu); });
+}
 #endif
 #ifdef HAVE_ROCM
 TEST(GPURamPrefixArena, ROCm) { run(DeviceId::rocm(0)); }
+TEST(PrefixRestoredChainOwnership, ROCm)
+{
+    auto &gpu = GPUDeviceContextPool::instance().getContext(DeviceId::rocm(0));
+    gpu.submitAndWait([&] { verifyHarvestAdmission(DeviceId::rocm(0), gpu); });
+}
+TEST(PrefixUnconsumedRestoreOwnership, ROCm)
+{
+    auto &gpu = GPUDeviceContextPool::instance().getContext(DeviceId::rocm(0));
+    gpu.submitAndWait([&] { verifyUnconsumedRestoreAdmission(DeviceId::rocm(0), gpu); });
+}
+TEST(PrefixRichRestoreSectionOwnership, ROCm)
+{
+    auto &gpu = GPUDeviceContextPool::instance().getContext(DeviceId::rocm(0));
+    gpu.submitAndWait([&] { verifyRichRestoreSections(DeviceId::rocm(0), gpu); });
+}
+TEST(PrefixRestoreCapacityRetirement, ROCm)
+{
+    auto &gpu = GPUDeviceContextPool::instance().getContext(DeviceId::rocm(0));
+    gpu.submitAndWait([&] { verifyRestoreCapacityRetirement(DeviceId::rocm(0), gpu); });
+}
 #endif

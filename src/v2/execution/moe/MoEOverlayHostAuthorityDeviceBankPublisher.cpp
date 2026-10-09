@@ -218,8 +218,10 @@ namespace llaminar2
                 if (!binding.hostPublicationValid() ||
                     !endpoint_authority ||
                     endpoint_authority->device() != binding.device ||
-                    endpoint_authority->numLayers() !=
-                        static_cast<int>(binding.layer_count) ||
+                    !binding.matchesLayerScope(endpoint_authority->firstModelLayer(),
+                        static_cast<std::uint32_t>(endpoint_authority->numLayers())) ||
+                    !binding.matchesLayerScope(binding.runtime_table_host->firstModelLayer(),
+                        static_cast<std::uint32_t>(binding.runtime_table_host->layerCount())) ||
                     endpoint_authority->numExperts() !=
                         static_cast<int>(binding.expert_count) ||
                     !participants.insert(
@@ -876,8 +878,7 @@ namespace llaminar2
                     binding.expert_count,
                     -1);
 
-                const auto &local_layer = bank.layers.at(
-                    static_cast<std::size_t>(layer));
+                const auto &local_layer = bank.layerForModelLayer(layer);
                 for (std::uint32_t expert = 0u;
                      expert < binding.expert_count;
                      ++expert)
@@ -1046,7 +1047,7 @@ namespace llaminar2
                         binding.overlay_participant_id,
                         binding.device,
                         static_cast<int>(binding.layer_count),
-                        static_cast<int>(binding.expert_count)))
+                        static_cast<int>(binding.expert_count), binding.first_model_layer))
                 {
                     throw std::logic_error(
                         endpointPrefix(
@@ -1061,16 +1062,17 @@ namespace llaminar2
                      layer < binding.layer_count;
                      ++layer)
                 {
+                    const int model_layer = binding.modelLayerForStorageIndex(layer);
                     auto update = buildPlacementUpdate(
                         endpoint,
                         *participant,
-                        static_cast<int>(layer));
+                        model_layer);
                     binding.runtime_table_host->prepareInactiveBank(
-                        static_cast<int>(layer),
+                        model_layer,
                         update);
                     auto recipe = binding.runtime_table_host
                                       ->preparedInactiveBankPublicationRecipe(
-                                          static_cast<int>(layer),
+                                          model_layer,
                                           update.epoch);
                     if (!recipe.valid())
                     {
@@ -1587,7 +1589,7 @@ namespace llaminar2
                     {
                         endpoint.endpoint->binding.runtime_table_host
                             ->acknowledgeDevicePublishedBank(
-                                static_cast<int>(layer),
+                                endpoint.endpoint->binding.modelLayerForStorageIndex(layer),
                                 static_cast<std::uint32_t>(
                                     candidate_->epoch),
                                 bank);

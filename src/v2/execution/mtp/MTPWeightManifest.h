@@ -16,6 +16,7 @@
 namespace llaminar2
 {
     class IModelLoader;
+    struct ModelMemoryProfile;
 
     /**
      * @enum MTPRoutedExpertWeightAuthority
@@ -110,6 +111,15 @@ namespace llaminar2
         const std::string &architecture,
         int base_layer_count,
         bool explicit_mtp);
+
+    /**
+     * @brief Inspect the published GGUF directory with the same discovery grammar.
+     * @param profile Canonical metadata-only profile, including learned-block count.
+     * @param explicit_mtp Whether a missing predictor was explicitly requested.
+     * @return The same role/availability result as discovery on the source loader.
+     */
+    MTPWeightManifest discoverMTPWeightManifest(
+        const ModelMemoryProfile &profile, bool explicit_mtp);
 
     /**
      * @brief Require real learned MTP weights before admission or graph allocation.

@@ -5,11 +5,15 @@
  * Retirement only changes an existing placement node. A later admission queries
  * each exact producer event once and coalesces completed ranges; it never waits
  * for GPU progress or reclaims bytes still held by a request or disk writer.
+ * Archive sections have independent lifetime tokens. Admission and acquisition
+ * share one placement algorithm, so a restore can retain its KV readers while
+ * unrelated recurrent images are reused across physically separate free holes.
  */
 #include "execution/prefix_cache/PrefixHostArena.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 
 namespace llaminar2
@@ -111,34 +115,135 @@ namespace llaminar2
         return largest;
     }
 
+    size_t PrefixHostArena::availableStorageBytes()
+    {
+        std::lock_guard lock(mutex_);
+        collectRetired();
+        size_t available = 0u;
+        for (const auto &[offset, extent] : extents_)
+        {
+            (void)offset;
+            if (extent.state == State::Free)
+                available += extent.bytes;
+        }
+        return available;
+    }
+
+    std::optional<std::vector<size_t>> PrefixHostArena::planSections(
+        std::span<const size_t> sections) const
+    {
+        // This transient geometry describes existing free nodes, not a second
+        // physical capacity ledger. Only committed extents own placement.
+        std::vector<std::pair<size_t, size_t>> free_ranges;
+        free_ranges.reserve(extents_.size());
+        for (const auto &[offset, extent] : extents_)
+            if (extent.state == State::Free)
+                free_ranges.emplace_back(offset, extent.bytes);
+
+        std::vector<size_t> offsets(sections.size(), 0u);
+        for (size_t section = 0u; section < sections.size(); ++section)
+        {
+            const size_t bytes = sections[section];
+            if (bytes == 0u)
+                continue;
+            auto range = std::find_if(free_ranges.begin(), free_ranges.end(),
+                [bytes](const auto &candidate) { return bytes <= candidate.second; });
+            if (range == free_ranges.end())
+                return std::nullopt;
+            offsets[section] = range->first;
+            range->first += bytes;
+            range->second -= bytes;
+        }
+        return offsets;
+    }
+
+    bool PrefixHostArena::canAcquireSections(std::span<const size_t> sections)
+    {
+        std::lock_guard lock(mutex_);
+        collectRetired();
+        return planSections(sections).has_value();
+    }
+
+    std::vector<std::shared_ptr<void>> PrefixHostArena::acquireSections(
+        std::span<const size_t> sections,
+        std::shared_ptr<PrefixPayloadReadiness> readiness)
+    {
+        std::lock_guard lock(mutex_);
+        collectRetired();
+        const auto offsets = planSections(sections);
+        if (!offsets)
+            return {};
+
+        // Prepare every token and replacement map node before changing live
+        // placement. Metadata allocation failure cannot leave a partial archive
+        // or a Leased node whose final owner was never constructed.
+        std::vector<std::shared_ptr<Lease>> leases(sections.size());
+        std::vector<std::shared_ptr<void>> owners(sections.size());
+        std::map<size_t, Extent> replacements;
+        std::vector<size_t> replaced_offsets;
+        replaced_offsets.reserve(sections.size());
+        const auto self = shared_from_this();
+        for (size_t section = 0u; section < sections.size(); ++section)
+        {
+            if (sections[section] == 0u)
+                continue;
+            leases[section] = std::make_shared<Lease>();
+            leases[section]->offset = (*offsets)[section];
+            owners[section] = std::shared_ptr<void>(leases[section],
+                static_cast<uint8_t *>(backing_.get()) + (*offsets)[section]);
+            if (!replacements.emplace((*offsets)[section], Extent{
+                    .bytes = sections[section], .state = State::Leased,
+                    .readiness = readiness}).second)
+                throw std::logic_error("Prefix section placement overlaps a live section");
+        }
+        for (const auto &[offset, extent] : extents_)
+        {
+            if (extent.state != State::Free)
+                continue;
+            size_t consumed = 0u;
+            for (size_t section = 0u; section < sections.size(); ++section)
+            {
+                const size_t placement = (*offsets)[section];
+                if (sections[section] == 0u || placement < offset ||
+                    placement - offset >= extent.bytes)
+                    continue;
+                if (placement != offset + consumed ||
+                    sections[section] > extent.bytes - consumed)
+                    throw std::logic_error("Prefix section placement violates its free-range plan");
+                consumed += sections[section];
+            }
+            if (consumed == 0u)
+                continue;
+            replaced_offsets.push_back(offset);
+            // Serialized sections are DMA/memcpy bytes, not typed tensor loads.
+            // Exact odd-byte placement adds no unadmitted alignment padding.
+            if (consumed < extent.bytes &&
+                !replacements.emplace(offset + consumed,
+                    Extent{.bytes = extent.bytes - consumed}).second)
+                throw std::logic_error("Prefix section placement overlaps its free suffix");
+        }
+
+        for (const size_t offset : replaced_offsets)
+            extents_.erase(offset);
+        extents_.merge(replacements);
+        if (!replacements.empty())
+        {
+            LOG_ERROR("[PrefixHostArena] atomic section placement conflicts with retained extents");
+            std::terminate();
+        }
+        for (const auto &lease : leases)
+            if (lease)
+                lease->arena = self;
+        return owners;
+    }
+
     std::shared_ptr<void> PrefixHostArena::acquire(
         size_t bytes, std::shared_ptr<PrefixPayloadReadiness> readiness)
     {
         if (bytes == 0u)
             return {};
-        std::lock_guard lock(mutex_);
-        collectRetired();
-        for (auto &[offset, extent] : extents_)
-        {
-            if (extent.state != State::Free || bytes > extent.bytes)
-                continue;
-
-            // Construct the lease before publishing placement. No destructor
-            // can observe a Leased entry whose lifetime token was not created.
-            auto lease = std::make_shared<Lease>();
-            // These are serialized bytes, consumed through DMA/memcpy, never
-            // typed tensor loads. Exact placement admits odd MoE extensions
-            // without unplanned alignment padding or a second byte budget.
-            if (bytes < extent.bytes)
-                extents_.emplace(offset + bytes, Extent{.bytes = extent.bytes - bytes});
-            extent.bytes = bytes;
-            extent.readiness = std::move(readiness);
-            extent.state = State::Leased;
-            lease->offset = offset;
-            lease->arena = shared_from_this();
-            return std::shared_ptr<void>(std::move(lease),
-                static_cast<uint8_t *>(backing_.get()) + offset);
-        }
-        return {};
+        const std::array sections{bytes};
+        auto owners = acquireSections(sections, std::move(readiness));
+        return owners.empty() ? std::shared_ptr<void>{} : std::move(owners.front());
     }
 } // namespace llaminar2

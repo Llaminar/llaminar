@@ -163,6 +163,8 @@ namespace llaminar2
         void clearCacheAll();
         /** @return True after every local stage retires reusable prefix state. */
         bool purgePrefixCacheAll();
+        /** @return Every local stage's metadata publishers, without contacting remote stages. */
+        PrefixCacheTelemetrySources prefixCacheTelemetrySourcesAll() const;
         /**
          * @brief Admit one immutable stop-token policy into every local runner.
          *
@@ -297,6 +299,8 @@ namespace llaminar2
          * @return Common locally restorable prefix and typed terminal requirements.
          */
         PrefixLookupResult lookupPrefixAll(const std::vector<int32_t> &tokens);
+        /** @copydoc IInferenceRunner::prefixRestoreMetadata */
+        PrefixRestoreMetadata prefixRestoreMetadataAll(const PrefixLookupResult &hit) const;
         /** @copydoc IInferenceRunner::preparePrefixHarvest */
         bool preparePrefixHarvestAll(
             const PrefixLookupResult &admission,
@@ -480,6 +484,8 @@ namespace llaminar2
         void clear_cache() override;
         /** @copydoc IInferenceRunner::purgePrefixCache */
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::prefixCacheTelemetrySources */
+        PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override;
         int get_position() const override;
         ExecutionPath executionPath() const override;
         const char *architecture() const override;
@@ -573,6 +579,8 @@ namespace llaminar2
         /** @brief Coordinate prefix lookup across the local stages on this rank. */
         PrefixLookupResult lookupPrefix(
             const std::vector<int32_t> &tokens) override;
+        /** @copydoc IInferenceRunner::prefixRestoreMetadata */
+        PrefixRestoreMetadata prefixRestoreMetadata(const PrefixLookupResult &hit) const override;
         /** @brief Populate every local stage from its retained lookup handles. */
         /** @copydoc IInferenceRunner::preparePrefixHarvest */
         bool preparePrefixHarvest(

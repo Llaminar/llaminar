@@ -1,6 +1,6 @@
 /**
  * @file PlanningGGUFFixture.h
- * @brief Tiny sparse GGUF directory for device-free planning lifecycle tests.
+ * @brief Tiny sparse GGUF source for planning and explicit loading regressions.
  *
  * The real parser reads metadata and tensor extents. Payload holes may be used
  * by explicit source-loading tests, never as real-model numerical evidence.
@@ -24,6 +24,8 @@ namespace llaminar2::test
     class PlanningGGUFFixture final
     {
     public:
+        /** @brief Directory-only geometry or complete all-attention graph metadata. */
+        enum class Geometry { Directory, FullAttentionGraph };
         /** @return Exact GGUF encoding for a source tensor; runtime-only formats are rejected. */
         static GGUFTensorType sourceType(TensorType type)
         {
@@ -88,10 +90,13 @@ namespace llaminar2::test
          * @param gdn_projection Optional alpha/beta source format for canonical runtime-promotion tests.
          * @param attention_heads Integral Q-head count; source KV and norm tensors
          *        use its actual head width, allowing valid high-degree GQA tests.
+         * @param geometry Graph loading additionally needs the gated Q projection
+         *        and nonzero recurrent arena metadata, even for all-FA layers.
          */
         explicit PlanningGGUFFixture(bool moe = false, bool mtp = false,
             GGUFTensorType expert_type = GGUFTensorType::F32, uint32_t expert_width = 256,
-            std::optional<GGUFTensorType> gdn_projection = std::nullopt, uint32_t attention_heads = 8)
+            std::optional<GGUFTensorType> gdn_projection = std::nullopt, uint32_t attention_heads = 8,
+            Geometry geometry = Geometry::Directory)
         {
             if (GGUFTensorInfo{.type = expert_type}.getTypeSize() == 0)
                 throw std::invalid_argument("Planning fixture requires a supported GGUF format");
@@ -100,7 +105,7 @@ namespace llaminar2::test
             if (descriptor < 0) throw std::runtime_error("Cannot create planning GGUF fixture");
             ::close(descriptor);
             path_ = pattern;
-            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads); }
+            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads, geometry); }
             catch (...) { remove(); throw; }
         }
         /** @brief Remove only this fixture's file, including during exception unwinding. */
@@ -132,7 +137,7 @@ namespace llaminar2::test
         }
         /** @brief Publish the directory followed by sparse, unread payload extents. */
         void write(bool moe, bool mtp, GGUFTensorType expert_type, uint32_t expert_width,
-            std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads)
+            std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads, Geometry geometry)
         {
             if (attention_heads < 2 || 256 % attention_heads != 0)
                 throw std::invalid_argument("Planning fixture needs integral attention heads and two KV heads");
@@ -149,8 +154,9 @@ namespace llaminar2::test
                     tensors.push_back({prefix + name, {256}});
                 for (const auto name : {"attn_q_norm.weight", "attn_k_norm.weight"})
                     tensors.push_back({prefix + name, {head_columns}});
-                for (const auto name : {"attn_q.weight", "attn_output.weight"})
-                    tensors.push_back({prefix + name, {256, 256}});
+                tensors.push_back({prefix + "attn_q.weight", {256,
+                    geometry == Geometry::FullAttentionGraph ? 512u : 256u}});
+                tensors.push_back({prefix + "attn_output.weight", {256, 256}});
                 for (const auto name : {"attn_k.weight", "attn_v.weight"})
                     tensors.push_back({prefix + name, {256, 2 * head_columns}});
                 if (gdn_projection)
@@ -162,8 +168,10 @@ namespace llaminar2::test
                         tensors.push_back({prefix + name, {256, expert_width, 8}, expert_type});
                     tensors.push_back({prefix + "ffn_down_exps.weight", {expert_width, 256, 8}, expert_type});
                     tensors.push_back({prefix + "ffn_gate_inp.weight", {256, 8}});
-                    for (const auto name : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
-                        tensors.push_back({prefix + name, {256, 256}});
+                    const uint64_t shared_width = geometry == Geometry::FullAttentionGraph ? expert_width : 256;
+                    for (const auto name : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight"})
+                        tensors.push_back({prefix + name, {256, shared_width}});
+                    tensors.push_back({prefix + "ffn_down_shexp.weight", {shared_width, 256}});
                     tensors.push_back({prefix + "ffn_gate_inp_shexp.weight", {256}});
                 }
                 else
@@ -179,21 +187,31 @@ namespace llaminar2::test
                         tensors.push_back({prefix + name, {256}});
                 }
             }
-            const std::vector<std::pair<std::string, uint32_t>> metadata{
+            std::vector<std::pair<std::string, uint32_t>> metadata{
                 {arch + ".block_count", static_cast<uint32_t>(layers)},
-                {arch + ".embedding_length", 256}, {arch + ".feed_forward_length", 512},
+                {arch + ".embedding_length", 256},
+                {arch + ".feed_forward_length", moe && geometry == Geometry::FullAttentionGraph ? expert_width : 512},
                 {arch + ".attention.head_count", attention_heads}, {arch + ".attention.head_count_kv", 2},
                 {arch + ".context_length", 1024}, {"tokenizer.ggml.token_count", 320},
                 {arch + ".expert_count", moe ? 8u : 0u},
                 {arch + ".expert_used_count", moe ? 2u : 0u},
                 {arch + ".expert_feed_forward_length", moe ? expert_width : 0u},
                 {arch + ".nextn_predict_layers", mtp ? 1u : 0u}};
+            if (geometry == Geometry::FullAttentionGraph)
+                metadata.insert(metadata.end(), {
+                    {arch + ".expert_shared_count", moe ? 1u : 0u},
+                    {arch + ".full_attention_interval", 1},
+                    {arch + ".ssm.conv_kernel", 4},
+                    {arch + ".ssm.state_size", static_cast<uint32_t>(head_columns)},
+                    {arch + ".ssm.inner_size", 256},
+                    {arch + ".ssm.group_count", attention_heads},
+                    {arch + ".ssm.time_step_rank", attention_heads}});
             std::ofstream stream(path_, std::ios::binary | std::ios::trunc);
             stream.exceptions(std::ios::badbit | std::ios::failbit);
             stream.write("GGUF", 4);
             scalar<uint32_t>(stream, 3);
             scalar<uint64_t>(stream, tensors.size());
-            scalar<uint64_t>(stream, metadata.size() + 1);
+            scalar<uint64_t>(stream, metadata.size() + 1 + (geometry == Geometry::FullAttentionGraph ? 3 : 0));
             string(stream, "general.architecture");
             scalar<uint32_t>(stream, 8);
             string(stream, arch);
@@ -202,6 +220,40 @@ namespace llaminar2::test
                 string(stream, key);
                 scalar<uint32_t>(stream, 4);
                 scalar<uint32_t>(stream, value);
+            }
+            if (geometry == Geometry::FullAttentionGraph)
+            {
+                // Initialization consumes a real tokenizer directory even
+                // though this ownership fixture never submits text prompts.
+                for (const auto &[key, value] : std::vector<std::pair<std::string, std::string>>{
+                    {"tokenizer.ggml.model", "gpt2"}, {"tokenizer.ggml.pre", "qwen2"}})
+                {
+                    string(stream, key);
+                    scalar<uint32_t>(stream, 8);
+                    string(stream, value);
+                }
+                string(stream, "tokenizer.ggml.tokens");
+                scalar<uint32_t>(stream, 9);
+                scalar<uint32_t>(stream, 8);
+                scalar<uint64_t>(stream, 320);
+                // GPT-2 byte BPE must cover every byte before extra tokens.
+                // Non-printing bytes map to the consecutive U+0100 range.
+                int escaped = 256;
+                for (int byte = 0; byte < 256; ++byte)
+                {
+                    const int point = (byte >= 33 && byte <= 126) ||
+                        (byte >= 161 && byte <= 172) || byte >= 174 ? byte : escaped++;
+                    std::string encoded;
+                    if (point < 128) encoded.push_back(static_cast<char>(point));
+                    else
+                    {
+                        encoded.push_back(static_cast<char>(0xc0 | (point >> 6)));
+                        encoded.push_back(static_cast<char>(0x80 | (point & 63)));
+                    }
+                    string(stream, encoded);
+                }
+                for (int token = 256; token < 320; ++token)
+                    string(stream, "fixture_token_" + std::to_string(token));
             }
             uint64_t offset = 0;
             for (const auto &tensor : tensors)

@@ -22,7 +22,8 @@ bool DeviceGraphOrchestrator::observeOrdinaryGenerationForwardCompletion(int64_t
 {
     const auto &loop = mtp_device_generation_loop_graph_;
     std::string error;
-    if (loop.ordinary_composition == OrdinaryGenerationComposition::ExpertOverlay &&
+    if ((loop.ordinary_composition == OrdinaryGenerationComposition::ExpertOverlay ||
+         loop.ordinary_composition == OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail) &&
         loop.execution_kind == MTPDeviceGenerationLoopGraphCache::ExecutionKind::HostedDispatchTicketPublisher)
     {
         /*
@@ -117,6 +118,10 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         return false;
     };
     if (error) error->clear();
+    const bool expert_overlay = composition == OrdinaryGenerationComposition::ExpertOverlay ||
+        composition == OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail;
+    const bool pipeline_domain_tail = composition == OrdinaryGenerationComposition::PipelineDomainTail ||
+        composition == OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail;
     // This compiler accepts a complete participant-local graph. A pipeline or
     // sparse boundary needs its explicit transfer/follower composition, not an
     // apparently successful loop around only this participant's model shard.
@@ -128,10 +133,10 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         activeMainLogitsAreColumnParallel() ||
         (pp_stage_config_ && (!pp_stage_config_->has_lm_head ||
             (!pp_stage_config_->has_embedding && composition != OrdinaryGenerationComposition::PipelineTail &&
-             composition != OrdinaryGenerationComposition::PipelineDomainTail))) ||
-        (composition == OrdinaryGenerationComposition::PipelineDomainTail &&
+             !pipeline_domain_tail))) ||
+        (pipeline_domain_tail &&
             (!pipeline_forward_edges_ || !pipeline_forward_edges_->hasHeterogeneousBoundary())) ||
-        (composition == OrdinaryGenerationComposition::ExpertOverlay) !=
+        expert_overlay !=
             static_cast<bool>(moe_overlay_epoch_execution_binding_))
         return fail("Ordinary generation requires an admitted scalar sampler and an exact local, pipeline-tail, or ExpertOverlay composition");
 
@@ -141,7 +146,8 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     if ((greedy ? DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic) != sampling_mode)
         return fail("Ordinary materialization differs from the admitted sampling law");
     if (law.presence_penalty != mtp_request_penalty_policy_.presence_penalty ||
-        law.frequency_penalty != mtp_request_penalty_policy_.frequency_penalty)
+        law.frequency_penalty != mtp_request_penalty_policy_.frequency_penalty ||
+        law.repetition_penalty != mtp_request_penalty_policy_.repetition_penalty)
         return fail("Ordinary sampling penalties differ from the published request policy");
 
     const auto generation = workspaceGeneration(state_.device_id);
@@ -171,7 +177,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         const auto &maintenance = device_moe_rebalance_maintenance_graph_;
         const auto *const controller =
             deviceMoERebalanceControllerStateDevice();
-        if (composition != OrdinaryGenerationComposition::ExpertOverlay ||
+        if (!expert_overlay ||
             !controller || !maintenance.graph ||
             maintenance.workspace_generation != generation)
             return fail("Ordinary ExpertOverlay has no current device maintenance owner");
@@ -301,7 +307,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
                 detail))
             return fail(detail);
     }
-    else if (composition == OrdinaryGenerationComposition::ExpertOverlay)
+    else if (expert_overlay)
     {
         std::string retained_error;
         if (!forward_engine_->retainedDecodeGraph(signature, &retained_error) ||
@@ -397,8 +403,8 @@ bool DeviceGraphOrchestrator::replayHostedOrdinaryExpertOverlayTransaction(
     auto &loop = mtp_device_generation_loop_graph_;
     if (!forward_engine_ || !sampler || !sampler->hasExecutable() ||
         !loop.stream ||
-        loop.ordinary_composition !=
-            OrdinaryGenerationComposition::ExpertOverlay ||
+        (loop.ordinary_composition != OrdinaryGenerationComposition::ExpertOverlay &&
+         loop.ordinary_composition != OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail) ||
         !loop.ordinary_forward_identity ||
         *loop.ordinary_forward_identity != signature)
     {

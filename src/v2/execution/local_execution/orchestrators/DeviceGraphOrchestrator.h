@@ -59,6 +59,7 @@
 #include "../../prefix_cache/PrefixCacheFingerprint.h"
 #include "../../prefix_cache/PrefixCacheStats.h"
 #include "../../prefix_cache/PrefixStorageBackend.h"   // PrefixBlockHandle restore-source ownership
+#include "../../prefix_cache/PrefixRestoreSourceRetirement.h"
 #include "../../prefix_cache/PrefixTerminalLogitsSlice.h"
 #include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../mtp/MTPSidecarCaptureLayout.h"
@@ -655,7 +656,8 @@ namespace llaminar2
                                     public IForwardExecutionHost,
                                     public ICPUCurrentBatchLLEPPhysicalExecutor,
                                     public IMoEOverlayDeviceInferenceBoundary,
-                                    public IMoEOverlayDeviceInitialRuntimePublisher
+                                    public IMoEOverlayDeviceInitialRuntimePublisher,
+                                    public IPrefixRestoreSourceRetirement
     {
         // Pipeline composition borrows participant-local recordings and the
         // existing event handoff; it never owns a second sampler/controller.
@@ -2355,6 +2357,15 @@ namespace llaminar2
             DeviceSpeculativeOutcomeHandle *out_handle) override;
         bool configureMTPRequestStopTokens(
             const std::vector<int32_t> &stop_tokens) override;
+        /**
+         * @brief Admit complete prompt membership after prefill or prefix restore.
+         * @param unique_tokens Sorted unique prompt tokens, excluding generated output.
+         * @param request_index Request-owned histogram row; zero for scalar generation.
+         * @return Whether every continuation owner published its initialized history.
+         */
+        bool initializePromptRepetitionHistory(
+            std::span<const int32_t> unique_tokens, int request_index = 0) override;
+
         bool configureMTPRequestPenaltyPolicy(
             const MTPRequestPenaltyPolicy &policy) override;
         bool prepareGreedyAllPositionBatchOutcomeGraph(
@@ -2697,11 +2708,11 @@ namespace llaminar2
 
         /**
          * @brief Run forward pass (IInferenceRunner override)
+         * @param tokens Immutable host request tokens.
+         * @param seq_len Logical rows to execute.
+         * @return Execution success, including an upstream stage with no logits.
          */
-        bool forward(const int *tokens, int seq_len) override
-        {
-            return forward(tokens, seq_len, 1) != nullptr;
-        }
+        bool forward(const int *tokens, int seq_len) override;
 
         bool waitForLastInferenceCompletionForBenchmark() override;
 
@@ -2795,13 +2806,13 @@ namespace llaminar2
          * @return True on successful CPU or explicitly ordered GPU mutation.
          * @throws std::logic_error if nonempty penalties have no published row.
          */
-        bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
+        bool applyPenaltiesOnDevice(const LogitPenaltyBatch &penalties,
                                     int vocab_size) override;
-        bool applyPenaltiesToMTPLogitsOnDevice(const std::vector<LogitPenalty> &penalties,
+        bool applyPenaltiesToMTPLogitsOnDevice(const LogitPenaltyBatch &penalties,
                                                int vocab_size) override;
         bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
             int row,
-            const std::vector<LogitPenalty> &penalties,
+            const LogitPenaltyBatch &penalties,
             int vocab_size) override;
         bool applyDeviceOwnedMTPPenaltiesToLogitRows(
             DeviceLogitsSource source,
@@ -3967,6 +3978,8 @@ namespace llaminar2
 
         /** @copydoc IInferenceRunner::purgePrefixCache */
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::prefixCacheTelemetrySources */
+        PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override;
 
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
 
@@ -4474,6 +4487,15 @@ namespace llaminar2
         };
 
         /**
+         * @brief Preserve main-forward diagnostic scope for both public return contracts.
+         * @param tokens Host request tokens; resident graph inputs remain device-owned.
+         * @param seq_len Logical token rows per request.
+         * @param batch_size Number of admitted requests.
+         * @return Execution completion containing optional logits, or nullopt on failure.
+         */
+        std::optional<const float *> forwardMainImpl(const int *tokens, int seq_len, int batch_size);
+
+        /**
          * @brief Shared implementation for host-token and device-token forwards.
          *
          * `tokens` is always the host shadow used for request bookkeeping. When
@@ -4494,8 +4516,22 @@ namespace llaminar2
          * `remote_prefill_geometry` is supplied only when an eager CPU graph
          * executes exact rows while its retained remote follower uses the
          * scheduler's larger physical bucket.
+         * @param tokens Immutable request tokens or inert bookkeeping for resident inputs.
+         * @param token_ids_device Canonical resident token input, when supplied.
+         * @param seq_len Physical graph rows per request.
+         * @param batch_size Number of admitted requests.
+         * @param execution_role Mathematical ownership of the graph invocation.
+         * @param invocation Typed phase and persistent-state transaction policy.
+         * @param position_ids_device_override Resident position bank paired with lengths.
+         * @param sequence_lengths_device_override Resident request-length bank.
+         * @param request_real_lengths Immutable logical row extents for this invocation.
+         * @param remote_prefill_geometry Authenticated remote CPU-prefill transport width.
+         * @return nullopt on execution failure; otherwise an engaged result whose
+         *         pointer is null exactly when this participant has no logits.
+         *         A successful PP follower publishes activations and completion,
+         *         so absence of an LM head must never masquerade as failure.
          */
-        const float *forwardImpl(
+        std::optional<const float *> forwardImpl(
             const int *tokens,
             const void *token_ids_device,
             int seq_len,
@@ -5513,7 +5549,7 @@ namespace llaminar2
         bool recordLivePrefixMutationReady(
             void *producer_stream,
             const char *producer_name,
-            std::vector<PrefixBlockHandle> retained_payload_sources = {},
+            std::vector<PrefixPayloadReadLease> retained_payload_sources = {},
             std::vector<std::shared_ptr<void>>
                 retained_device_sources = {});
 
@@ -6579,6 +6615,8 @@ namespace llaminar2
         /// Persistent prefix cache state. This intentionally lives outside
         /// InferenceState so clear_cache() preserves cross-request blocks.
         std::shared_ptr<PrefixStateCache> prefix_cache_;
+        /** Passive model-lifetime publisher; never retains an arena or payload owner. */
+        std::shared_ptr<PrefixCacheTelemetry> prefix_telemetry_ = std::make_shared<PrefixCacheTelemetry>();
         std::shared_ptr<RamPrefixStorageBackend> prefix_ram_backend_;
         std::shared_ptr<DiskPrefixStorageBackend> prefix_disk_backend_;
         std::shared_ptr<DeviceHotPrefixStorageBackend> prefix_device_hot_backend_;
@@ -8117,6 +8155,9 @@ namespace llaminar2
          * accidentally replaying while the forward carries an overlay reader
          * lease.  The boundary stays inside that complete model capture rather
          * than being duplicated around the parent sampler loop.
+         * PipelineDomainExpertOverlayTail retains both contracts: frozen native
+         * activation edges and semantic sparse replay with its request identity.
+         * Pipeline placement never removes the terminal's maintenance owner.
          */
         enum class OrdinaryGenerationComposition : uint8_t
         {
@@ -8124,6 +8165,7 @@ namespace llaminar2
             PipelineTail,
             PipelineDomainTail, ///< Boundary already enclosed in this complete local forward.
             ExpertOverlay,
+            PipelineDomainExpertOverlayTail, ///< Captured PP edges plus sparse semantic replay authority.
         };
 
         /**
@@ -9304,7 +9346,7 @@ namespace llaminar2
             void *producer_stream = nullptr;
             bool valid = false;
             uint64_t live_state_epoch = 0;
-            std::vector<PrefixBlockHandle> retained_payload_sources;
+            std::vector<PrefixPayloadReadLease> retained_payload_sources;
             std::vector<std::shared_ptr<void>> retained_device_sources;
         };
 
@@ -9322,7 +9364,7 @@ namespace llaminar2
         struct PendingPrefixPayloadUse
         {
             std::shared_ptr<void> completion_event;
-            std::vector<PrefixBlockHandle> retained_payload_sources;
+            std::vector<PrefixPayloadReadLease> retained_payload_sources;
             std::vector<std::shared_ptr<void>> retained_device_sources;
 
             /** @return Whether teardown still owns this exact completion edge. */
@@ -9560,13 +9602,22 @@ namespace llaminar2
             mtp_gpu_timing_event_pool_;
 
         /**
-         * @brief Retire cache payload owners whose restore event has completed.
+         * @brief Retire completed source reads independently of live-state handoff consumption.
          *
-         * Runtime calls use nonblocking event queries. Destruction passes
+         * Runtime calls use nonblocking event queries for both the unconsumed
+         * live publication and previously consumed publications. Releasing
+         * completed source aliases preserves the live event, stream and epoch
+         * that later model consumers must still wait on. Destruction passes
          * `wait_for_all=true` so no asynchronous copy can outlive the cache
          * allocation that supplied its source bytes.
+         * @param wait_for_all True only after the exclusive teardown boundary.
+         * @throws std::logic_error for missing publication/device authority.
+         * @throws std::runtime_error when the exact native completion query fails.
          */
         void retirePendingPrefixPayloadUses(bool wait_for_all) const;
+
+        /** @copydoc IPrefixRestoreSourceRetirement::retireCompletedPrefixRestoreSources */
+        void retireCompletedPrefixRestoreSources() const override;
 
         /**
          * @brief Hand runner-owned metadata slots from restore reads to checkpoint writes.

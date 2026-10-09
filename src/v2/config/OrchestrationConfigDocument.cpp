@@ -5,7 +5,9 @@
  * Field visitors use structured bindings as compile-time exhaustiveness checks:
  * adding a member to a configuration aggregate requires updating its document
  * contract. Reads and writes use the same member list, including explicitness
- * and optional policy state. This is setup-only value serialization, not a live
+ * and optional policy state. Routed plans retain their compact stage's global
+ * layer origin, so saved configurations cannot rebase later PP stages to zero.
+ * This is setup-only value serialization, not a live
  * device-state mirror or a competing physical-memory ledger.
  */
 #include "OrchestrationConfigDocument.h"
@@ -59,6 +61,7 @@ namespace
     ENUM(PrefixCacheTerminalStateMode, VALUE(Off), VALUE(Auto), VALUE(Always))
     ENUM(PrefixCacheMoEPolicy, VALUE(Disabled), VALUE(PlacementFingerprint), VALUE(InvalidateOnRebalance))
     ENUM(MTPVerifyMode, VALUE(Greedy), VALUE(SpeculativeSampling))
+    ENUM(MTPActivationPolicy, VALUE(Automatic), VALUE(Enabled), VALUE(Disabled))
     ENUM(MTPDepthPolicyMode, VALUE(Fixed), VALUE(Observe), VALUE(Dynamic))
     ENUM(MTPDepthPolicyBackend, VALUE(Any), VALUE(CPU), VALUE(CUDA), VALUE(ROCm))
     ENUM(MTPDepthPolicyModelClass, VALUE(Any), VALUE(Dense), VALUE(MoE))
@@ -162,7 +165,7 @@ namespace
 #define MEMBERS(X) X(topology) X(continuation_domain) X(base_model_domain) X(shared_expert_domain) \
     X(continuation_domain_spec) X(residency_policy) X(authority_execution) X(replica_cache_capacity) \
     X(owner_order) X(dense_domains) X(domains) X(routed_tiers) X(initial_layer_order_overrides) \
-    X(placements) X(continuation_dense_policy_intent)
+    X(placements) X(continuation_dense_policy_intent) X(first_model_layer)
     RECORD(MoERoutedExpertPlacementPlan, enabled, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(automatic_planning) X(execution_rank_selection) X(dry_run) X(explain_placement) X(show_topology) X(show_numa) \
@@ -181,7 +184,7 @@ namespace
     X(max_cpu_memory_mb) X(moe_shared_experts_gpu) X(moe_sparse_experts_cpu) X(routed_expert_compute_policy) \
     X(routed_expert_owner_order) X(moe_hot_expert_cache) X(moe_routed_prefill) X(moe_rebalance) \
     X(moe_routed_expert_plan) X(activation_precision) X(kv_cache_precision) X(tp_allreduce_precision_override) \
-    X(prefix_cache) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
+    X(prefix_cache) X(mtp_activation_policy) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
     X(cpu_compute_fraction) X(disable_gpu_tp) X(disable_cpu_tp) X(min_layers_per_domain)
     RECORD(OrchestrationConfig, planning_mode, MEMBERS)
 #undef MEMBERS

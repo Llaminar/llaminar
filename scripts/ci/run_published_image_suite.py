@@ -222,6 +222,88 @@ def driver_shared_root_environment(pairs: list[tuple[Path, str, bool]]) -> str |
     return os.pathsep.join(map(str, selected)) or None
 
 
+def retire_coding_driver(owner: str) -> dict:
+    """Prove that the unique control container cannot create another sibling.
+
+    Docker's client exit and an unchecked removal are not native retirement.
+    Auto-removal is accepted only through a successful exact-name daemon
+    inventory; failed daemon reads retain ownership and fail the job.
+    """
+    def inspect() -> dict | None:
+        """Bind any surviving driver to its full ID and explicit owner label."""
+        value = docker_paths.inspect_owned_container(owner)
+        if value is None:
+            return None
+        if value['Config'].get('Labels', {}).get(docker_paths.CODING_OWNER_LABEL) != owner:
+            raise ValueError('Coding driver ownership changed')
+        return value
+
+    data = inspect()
+    if data is None:
+        return {'Running': False, 'Pid': 0, 'Status': 'absent'}
+    identity = data['Id']
+    if data['State']['Running']:
+        subprocess.run(['docker', 'kill', '--signal', 'SIGINT', identity], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        try:
+            subprocess.run(['docker', 'wait', identity], check=False, timeout=30,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            pass
+    # The driver uses --rm. It can disappear between any two daemon calls;
+    # only the subsequent inspection decides whether cleanup is complete.
+    subprocess.run(['docker', 'rm', '--force', identity], check=False, timeout=30,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if inspect() is not None:
+        raise RuntimeError('Coding driver still exists after retirement')
+    return {'Running': False, 'Pid': 0, 'Status': 'absent', 'Id': identity}
+
+
+def retire_coding_children(owner: str, output: Path) -> None:
+    """Close exact-labelled siblings after the driver can no longer create work.
+
+    A cancelled Docker client is not proof that its server stopped. The outer
+    owner observes the daemon directly, preserves unexpected live work as a
+    gate failure and retires every matching sibling before returning its lease.
+    Unrelated containers never enter this inventory.
+    """
+    if not re.fullmatch(r'llaminar-suite-driver-[0-9a-f]{32}', owner):
+        raise ValueError('Invalid coding cleanup owner')
+    report = {'complete': False, 'passed': False, 'owner': owner, 'retired': {},
+              'unexpected_live': [], 'errors': []}
+    try:
+        report['driver_retirement'] = retire_coding_driver(owner)
+        identities = subprocess.check_output(['docker', 'ps', '--all', '--quiet', '--no-trunc',
+            '--filter', 'label=' + docker_paths.CODING_OWNER_LABEL + '=' + owner], text=True, timeout=30).splitlines()
+        if any(not re.fullmatch(r'[0-9a-f]{64}', value) for value in identities):
+            raise ValueError('Invalid child container inventory')
+        for identity in identities:
+            try:
+                data = json.loads(subprocess.check_output(['docker', 'inspect', identity], text=True, timeout=30))[0]
+                if (data['Id'] != identity or
+                        data['Config'].get('Labels', {}).get(docker_paths.CODING_OWNER_LABEL) != owner):
+                    raise ValueError('Child container ownership changed')
+                if data['State']['Running']:
+                    report['unexpected_live'].append(identity)
+                    subprocess.run(['docker', 'stop', '--time', '30', identity], check=True,
+                                   stdout=subprocess.DEVNULL, timeout=40)
+                state = json.loads(subprocess.check_output(['docker', 'inspect', identity], text=True, timeout=30))[0]['State']
+                if state['Running'] or state['Pid'] != 0 or state['Status'] not in {'exited', 'created'}:
+                    raise ValueError('Child native retirement remains unproven')
+                report['retired'][identity] = state
+                subprocess.run(['docker', 'rm', identity], check=True, stdout=subprocess.DEVNULL, timeout=30)
+            except Exception as error:
+                report['errors'].append(identity + ': ' + repr(error))
+        report['complete'] = not report['errors']
+        report['passed'] = report['complete'] and not report['unexpected_live']
+    except Exception as error:
+        report['errors'].append(repr(error))
+    finally:
+        write_json(output, report)
+    if not report['passed']:
+        raise RuntimeError('Coding driver left live or unproven native owners; see ' + str(output))
+
+
 def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -> None:
     """Run canonical harnesses as the existing tmpfs owner, including under ARC.
 
@@ -247,6 +329,9 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     if args.e2e_bundle:
         bundle = args.e2e_bundle.resolve(strict=True)
         pairs.append((bundle, str(bundle), True))
+    if getattr(args, 'benchmark_bundle', None):
+        bundle = args.benchmark_bundle.resolve(strict=True)
+        pairs.append((bundle, str(bundle), True))
     # The nested canonical HTTP harness launches the immutable runtime image
     # through the same host socket.  ARC's source/model/evidence roots are
     # deliberately mounted at identical paths in all three namespaces, but an
@@ -255,6 +340,7 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     # choose the direct, audited mapping rather than inspect the ARC pod name.
     shared_roots = driver_shared_root_environment(pairs)
     name = "llaminar-suite-driver-" + uuid.uuid4().hex
+    coding = getattr(args, 'suite', None) == 'opencode'
     launch = ["docker", "run", "--rm", "--init", "--name", name,
         *docker_paths.device_args(driver, "CPU+CUDA+ROCm", user=f"{cache_uid}:{lane_stat.st_gid}"),
         # The cache-owning non-root driver delegates only kernel-log reads to
@@ -263,6 +349,8 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
         # Neither this device nor SYSLOG is granted to inference images.
         "--cap-add", "SYSLOG", "--device", "/dev/kmsg:/dev/kmsg:r",
         "--env", f"LLAMINAR_E2E_KERNEL_READER_CONTAINER={name}",
+        *(['--env', docker_paths.CODING_DRIVER_ENV + '=' + name,
+           '--label', docker_paths.CODING_OWNER_LABEL + '=' + name] if coding else []),
         "--group-add", str(socket.stat().st_gid), *docker_paths.mounts(pairs),
         "--workdir", str(ROOT), "--env", "DOCKER_HOST=unix:///var/run/docker.sock",
         driver, "python3", *command[1:]]
@@ -274,21 +362,25 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     try:
         pipeline.run(launch, lane / log)
     finally:
-        # Signal the Python driver first so its process-group/finally cleanup
-        # can retire the exact server/MPI container it owns before this parent.
-        subprocess.run(["docker", "kill", "--signal", "SIGINT", name], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        try:
-            subprocess.run(["docker", "wait", name], check=False, timeout=30,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
-            pass
-        subprocess.run(["docker", "rm", "--force", name], check=False, timeout=30,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # The driver shares a cache owner with retained tmpfs pages, while the
         # outer runner owns evidence.  Repair that boundary only after every
         # process that could still write the lane is reaped.
-        restore_lane_ownership(driver, lane, lane_owner_uid, lane_owner_gid)
+        try:
+            if coding:
+                retire_coding_children(name, lane / 'outer-cleanup.json')
+            else:
+                # Preserve the established E2E/benchmark owner lifecycle.
+                subprocess.run(["docker", "kill", "--signal", "SIGINT", name], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                try:
+                    subprocess.run(["docker", "wait", name], check=False, timeout=30,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except subprocess.TimeoutExpired:
+                    pass
+                subprocess.run(["docker", "rm", "--force", name], check=False, timeout=30,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        finally:
+            restore_lane_ownership(driver, lane, lane_owner_uid, lane_owner_gid)
 
 
 def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
@@ -340,6 +432,58 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
         validate_image_e2e(evidence, manifest, pair["images"][isa]["id"])
     receipt["complete"] = True
     write_json(directory / "e2e-receipt.json", receipt)
+
+
+def run_opencode(args, pair: dict, directory: Path) -> dict:
+    """Admit both preceding suites, then own one exact canonical coding job."""
+    from run_model_parity_opencode import admit_bundles, select_cell
+    prior, manifest, correctness, benchmarks = admit_bundles(args.e2e_bundle, args.benchmark_bundle)
+    if prior != pair:
+        raise ValueError('Coding image pair differs from the completed E2E/benchmark pair')
+    row = select_cell(manifest, pair['source']['revision'], args.cell)
+    write_json(directory / 'manifest.json', manifest)
+    driver = build_driver(pair, directory)
+    lane = directory / args.cpu_isa.lower()
+    lane.mkdir()
+    result = {'schema': 1, 'scope': 'canonical_opencode_job', 'complete': False, 'passed': False,
+              'case': row['case'], 'cpu_isa': args.cpu_isa, 'image': pair['images'][args.cpu_isa]['id'],
+              'images_digest': digest(pair), 'manifest_digest': digest(manifest),
+              'source_revision': pair['source']['revision'], 'errors': [],
+              'e2e_report_digest': digest(correctness[args.cpu_isa]),
+              'benchmark_report_digest': digest(benchmarks[args.cpu_isa])}
+    write_json(directory / 'cell-result.json', result)
+    try:
+        run_in_driver(args, driver, [sys.executable, str(ROOT / 'scripts/ci/run_model_parity_opencode.py'),
+            '--e2e-bundle', str(args.e2e_bundle.resolve()),
+            '--benchmark-bundle', str(args.benchmark_bundle.resolve()),
+            '--cpu-isa', args.cpu_isa, '--case', row['case'],
+            '--model-ramdisk-root', str(args.model_ramdisk_root),
+            '--output', str(lane / 'coding')], lane, 'opencode.log')
+    except BaseException as error:
+        result['errors'].append(repr(error))
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+    finally:
+        for key, path in (('cell', lane / 'coding/opencode.json'),
+                          ('outer_cleanup', lane / 'outer-cleanup.json')):
+            try:
+                result[key] = json.loads(path.read_text())
+            except Exception as error:
+                result['errors'].append(key + ': ' + repr(error))
+        result['complete'] = (result.get('cell', {}).get('complete') is True
+                              and result.get('outer_cleanup', {}).get('complete') is True)
+        result['passed'] = (result['complete'] and not result['errors']
+                            and result['cell'].get('passed') is True
+                            and result['outer_cleanup'].get('passed') is True)
+        if result['passed']:
+            try:
+                from opencode_evidence import validate_job
+                validate_job(result, pair, manifest, correctness, benchmarks)
+            except Exception as error:
+                result['errors'].append('Independent job evidence: ' + repr(error))
+                result['passed'] = False
+        write_json(directory / 'cell-result.json', result)
+    return result
 
 
 def admit_e2e(bundle: Path, pair: dict) -> tuple[dict, dict]:
@@ -428,6 +572,45 @@ def validate_benchmark(report: dict, pair: dict, manifest: dict, e2e: dict,
         raise ValueError(f"{isa} benchmark comparison differs from canonical high water")
     if not allow_regressions and report["passed"] is not True:
         raise ValueError(f"{isa} benchmark regressed below canonical high water")
+
+
+def admit_benchmarks(benchmark_directory: Path, pair: dict, manifest: dict,
+                     e2e_reports: dict) -> tuple[dict, dict]:
+    """Authenticate both completed benchmark lanes before dependent workloads.
+
+    The caller first admits the complete E2E bundle. OpenCode certification and
+    release publication share this boundary: neither a green summary, an older
+    image pair, a partial matrix nor one successful ISA can admit the next phase.
+    Counts and high-water comparisons are recomputed from the canonical reports.
+    """
+    if json.loads((benchmark_directory / "images.json").read_text()) != pair:
+        raise ValueError("benchmark pair differs from E2E pair")
+    if json.loads((benchmark_directory / "manifest.json").read_text()) != manifest:
+        raise ValueError("benchmark matrix differs from E2E matrix")
+    result = json.loads((benchmark_directory / "results.json").read_text())
+    baseline = json.loads((ROOT / "benchmarks/production/high_water.json").read_text())
+    if (result.get("source") != pair["source"] or result.get("images") != pair["images"]
+            or result.get("repository", "").lower() != pair["repository"].lower()
+            or result.get("branch") != "develop"
+            or result.get("scope") != "full-http-e2e-and-benchmarks"
+            or result.get("passed") is not True
+            or result.get("regression_threshold_pct") != baseline["regression_threshold_pct"]
+            or result.get("full_image_certification") is not False
+            or set(result.get("variants", {})) != set(ISAS)):
+        raise ValueError("compact benchmark result differs from proven image pair")
+    reports = {}
+    for isa in ISAS:
+        report = json.loads((benchmark_directory / isa.lower() / "benchmarks.json").read_text())
+        validate_benchmark(report, pair, manifest, e2e_reports[isa], isa)
+        variant = result["variants"][isa]
+        if (variant.get("report_digest") != digest(report)
+                or variant.get("e2e_report_digest") != digest(e2e_reports[isa])
+                or variant.get("comparisons") != report["comparisons"]
+                or variant.get("cells") != [{key: value for key, value in row.items()
+                                              if key != "artifacts"} for row in report["cells"]]):
+            raise ValueError(f"{isa} compact benchmark numbers differ from complete report")
+        reports[isa] = report
+    return result, reports
 
 
 def run_benchmarks(args, pair: dict, directory: Path) -> dict:
@@ -538,7 +721,7 @@ def publish_results(args, directory: Path, result: dict) -> None:
 def parse_arguments(argv=None):
     """Keep publication explicit and offer the same entry point locally and in CI."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", choices=("e2e", "benchmarks"))
+    parser.add_argument("suite", choices=("e2e", "benchmarks", "opencode"))
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", "Llaminar/llaminar"))
     parser.add_argument("--branch", default=os.environ.get("GITHUB_REF_NAME") or git("branch", "--show-current"))
     parser.add_argument("--image", help="AVX512 branch tag; AVX2 uses the canonical -avx2 suffix")
@@ -550,14 +733,23 @@ def parse_arguments(argv=None):
     evidence = parser.add_mutually_exclusive_group()
     evidence.add_argument("--e2e-run", help="successful manual E2E Actions run ID; defaults to the latest")
     evidence.add_argument("--e2e-bundle", type=Path, help="local completed E2E output directory")
+    parser.add_argument('--benchmark-bundle', type=Path, help='complete passing benchmark pair; required for coding')
+    parser.add_argument('--cpu-isa', choices=ISAS, help='one canonical coding job ISA')
+    parser.add_argument('--cell', help='one exact blessed coding cell; no regex selection')
     parser.add_argument("--run-url", default="local")
     parser.add_argument("--publish", action="store_true", help="commit only successful complete benchmark results")
     args = parser.parse_args(argv)
     if args.expected_source_revision is not None and not re.fullmatch(
             r"[0-9a-f]{40}", args.expected_source_revision):
         parser.error("--expected-source-revision requires a full Git SHA")
-    if args.suite != "benchmarks" and (args.publish or args.e2e_run or args.e2e_bundle):
+    if args.suite == "e2e" and (args.publish or args.e2e_run or args.e2e_bundle):
         parser.error("E2E evidence inputs and publication apply only to benchmarks")
+    if args.suite == 'opencode':
+        if (not args.e2e_bundle or not args.benchmark_bundle or not args.cpu_isa or not args.cell
+                or not args.expected_source_revision or args.publish or args.e2e_run):
+            parser.error('Coding requires explicit E2E/benchmark bundles, source revision, ISA and exact cell')
+    elif args.benchmark_bundle or args.cpu_isa or args.cell:
+        parser.error('Benchmark admission and exact job selection apply only to coding')
     subprocess.run(["git", "check-ref-format", f"refs/heads/{args.branch}"], check=True)
     return args
 
@@ -582,6 +774,9 @@ def main(argv=None) -> int:
         if args.suite == "e2e":
             manifest = discover_inventory(args, pair, args.output)
             run_e2e(args, pair, manifest, args.output)
+        elif args.suite == 'opencode':
+            if not run_opencode(args, pair, args.output)['passed']:
+                raise ValueError('Canonical coding cell failed; see cell-result.json')
         else:
             result = run_benchmarks(args, pair, args.output)
             if args.publish and result["passed"]:

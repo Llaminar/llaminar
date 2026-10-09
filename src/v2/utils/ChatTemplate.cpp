@@ -196,6 +196,12 @@ namespace llaminar2
                 else
                     jmsg["content"] = msg.content;
 
+                // Preserve the client-supplied channel independently of content
+                // and tool arguments. The native model template owns historical
+                // reasoning retention, including Qwen3.8's preserve-by-default.
+                if (msg.reasoning_content.has_value())
+                    jmsg["reasoning_content"] = *msg.reasoning_content;
+
                 // Include tool_calls for assistant messages (parse from JSON strings)
                 if (!msg.tool_calls.empty())
                 {

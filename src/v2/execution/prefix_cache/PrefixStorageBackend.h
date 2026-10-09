@@ -15,6 +15,7 @@
 #include "execution/prefix_cache/PrefixCacheKey.h"
 #include "execution/prefix_cache/PrefixPayloadLayout.h"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <memory>
@@ -24,6 +25,51 @@
 namespace llaminar2
 {
     class TensorBase;
+
+    /** @brief Exact immutable sections consumed by one prefix read. */
+    enum class PrefixPayloadReadSet { SequenceRows, WholeArchive };
+
+    /**
+     * @brief Project archive geometry onto the consumer's actual read set.
+     * @param layout Complete archived shape, including optional endpoint state.
+     * @param read_set Whether this is an earlier row block or the selected endpoint.
+     * @return Geometry retaining all attention/MTP rows and only required endpoint sections.
+     */
+    PrefixPayloadLayout prefixReadLayout(PrefixPayloadLayout layout, PrefixPayloadReadSet read_set);
+
+    /** @brief Stable serialized section order shared by storage and its allocation BOM. */
+    enum class PrefixPayloadSection : size_t
+    {
+        AttentionRows, RecurrentState, ShiftedMTPRows, TerminalHidden, TerminalLogits, ModelRuntime
+    };
+
+    /** @brief Immutable section geometry supplied to the admitted RAM placement authority. */
+    class PrefixPayloadAllocationPlan final
+    {
+    public:
+        /** @brief Describe one contiguous byte owner, including runtime extensions. */
+        static PrefixPayloadAllocationPlan contiguous(size_t bytes);
+        /**
+         * @brief Describe independently owned KV, recurrent, MTP, terminal and runtime sections.
+         * @param layout Serialized tensor capacities for one immutable archive.
+         * @param runtime_bytes Exact model extension capacity, zero when absent.
+         * @throws std::overflow_error or std::invalid_argument for invalid geometry.
+         */
+        static PrefixPayloadAllocationPlan archive(const PrefixPayloadLayout &layout,
+                                                   size_t runtime_bytes = 0u);
+        /** @return Required section extents in their allocation order, including empty sections. */
+        std::span<const size_t> sections() const noexcept { return sections_; }
+        /** @return Checked sum of the required sections; this is geometry, not a capacity ledger. */
+        size_t totalBytes() const noexcept { return total_bytes_; }
+        /** @return One typed serialized section extent; invalid enum values fail before admission. */
+        size_t sectionBytes(PrefixPayloadSection section) const
+        { return sections_.at(static_cast<size_t>(section)); }
+    private:
+        /** @brief Seal a checked section BOM before any storage admission or allocation. */
+        explicit PrefixPayloadAllocationPlan(std::array<size_t, 6> sections);
+        std::array<size_t, 6> sections_;
+        size_t total_bytes_ = 0u;
+    };
 
     /**
      * @brief Shared completion state for an asynchronously serialized RAM block.
@@ -152,11 +198,32 @@ namespace llaminar2
         size_t size_ = 0u;
     };
 
+    /**
+     * @brief Opaque identity for one immutable published payload generation.
+     *
+     * Identity is assigned when storage is created and survives tier copies,
+     * archive restart and compaction. It is metadata, never a content digest.
+     * A recomputed payload receives a new identity even when its key is equal.
+     */
+    struct PrefixPayloadIdentity
+    {
+        uint64_t high = 0;
+        uint64_t low = 0;
+        /** @return Whether this names a published payload generation. */
+        bool valid() const noexcept { return high != 0 || low != 0; }
+        /** @return Fresh process-independent identity without reading payload bytes.
+         * @throws std::runtime_error if native identity generation fails.
+         */
+        static PrefixPayloadIdentity fresh();
+        bool operator==(const PrefixPayloadIdentity &) const = default;
+    };
+
     struct PrefixBlockHandle
     {
         PrefixCacheKey key;
         PrefixStorageTier tier = PrefixStorageTier::Ram;
         PrefixPayloadLayout layout;
+        PrefixPayloadIdentity payload_identity;
         void *kv_payload = nullptr;
         void *hybrid_payload = nullptr;
         void *mtp_payload = nullptr;
@@ -171,7 +238,8 @@ namespace llaminar2
         /**
          * Rank-local RAM accounting owners for this handle's physical bytes.
          *
-         * CPU payload leases cover serialized vector allocations. GPU archives
+         * Each CPU payload section owns its exact vector claim; unused recurrent
+         * sections can retire while KV/MTP read owners remain live. GPU archives
          * retain the single arena claim through their shared range owners;
          * these per-allocation members remain empty. CPU runtime-state leases
          * cover optional model-specific serialized host bytes. They are
@@ -181,7 +249,7 @@ namespace llaminar2
          * member destruction frees every allocation before returning its bytes
          * to the canonical memory ledger.
          */
-        std::shared_ptr<void> ram_payload_memory_lease;
+        std::array<std::shared_ptr<void>, 5> ram_section_memory_leases;
         std::shared_ptr<void> ram_runtime_state_memory_lease;
 
         /**
@@ -326,6 +394,31 @@ namespace llaminar2
             return !payload_readiness ||
                    payload_readiness->waitOnHost();
         }
+    };
+
+    /**
+     * @brief Storage-only ownership for the sections read by an asynchronous restore.
+     *
+     * A row read of an earlier checkpoint consumes its KV and shifted-MTP rows,
+     * not its recurrent/terminal snapshot. This type cannot be inserted into a
+     * cache or serialized as a complete archive. The final checkpoint and real
+     * whole-archive promotions use an explicit complete read lease instead.
+     */
+    class PrefixPayloadReadLease final
+    {
+    public:
+        /** @brief Retain all sections actually read by a terminal restore or promotion. */
+        static PrefixPayloadReadLease wholeArchive(PrefixBlockHandle source);
+        /** @brief Retain only attention and shifted-MTP rows of an earlier checkpoint. */
+        static PrefixPayloadReadLease sequenceRows(PrefixBlockHandle source);
+        /** @return Section storage protected by this read's exact completion event. */
+        size_t retainedBytes() const noexcept { return source_.total_bytes; }
+        /** @return Borrow the selected immutable payload for a restore consumer. */
+        const PrefixBlockHandle &source() const noexcept { return source_; }
+    private:
+        /** @brief Adopt a source whose read extent was selected by a typed factory. */
+        explicit PrefixPayloadReadLease(PrefixBlockHandle source) : source_(std::move(source)) {}
+        PrefixBlockHandle source_;
     };
 
     class IPrefixStorageBackend

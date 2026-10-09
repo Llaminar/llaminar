@@ -232,6 +232,7 @@ def device_lease():
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("another production pipeline owns this node's device lease") from error
+        docker_paths.require_no_active_coding_owners()
         yield
 
 

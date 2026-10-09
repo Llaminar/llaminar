@@ -12,6 +12,8 @@
  * including prefix admission/restore, MTP, and collective ownership contracts.
  * Snapshot regressions check producer-owned column partitions and complete
  * publications independently of a model schema's default partial-sum layout.
+ * Main host output capacity is checked independently of context length; the
+ * all-position verifier owns a separate, explicitly requested output surface.
  */
 
 #include <gmock/gmock.h>
@@ -181,6 +183,7 @@ public:
         snapshot.architecture = config_.architecture;
         snapshot.execution_path = "mock-device-graph";
         snapshot.primary_device = device_id_;
+        snapshot.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(moe_placement_epoch_);
         snapshot.current_position = *prefix_probe_position_override_;
         snapshot.positions = {*prefix_probe_position_override_};
         snapshot.sequence_lengths = {*prefix_probe_position_override_};
@@ -1198,7 +1201,7 @@ public:
     }
 
     bool applyPenaltiesOnDevice(
-        const std::vector<LogitPenalty> &penalties,
+        const LogitPenaltyBatch &penalties,
         int vocab_size) override
     {
         ++apply_penalties_on_device_calls_;
@@ -1208,7 +1211,7 @@ public:
     }
 
     bool applyPenaltiesToMTPLogitsOnDevice(
-        const std::vector<LogitPenalty> &penalties,
+        const LogitPenaltyBatch &penalties,
         int vocab_size) override
     {
         ++apply_penalties_to_mtp_logits_calls_;
@@ -1219,7 +1222,7 @@ public:
 
     bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
         int row,
-        const std::vector<LogitPenalty> &penalties,
+        const LogitPenaltyBatch &penalties,
         int vocab_size) override
     {
         ++apply_penalties_to_all_position_row_calls_;
@@ -2067,7 +2070,8 @@ public:
     {
         prepared_prefix_fingerprint_ = admission.fingerprint_key;
         prepared_prefix_tokens_ = tokens;
-        prepared_prefix_checkpoint_ = schedule.reusableCheckpoint();
+        prepared_prefix_checkpoints_ = schedule.reusableCheckpoints();
+        prepared_prefix_block_count_ = admission.blocks.size();
         return true;
     }
 
@@ -2387,7 +2391,9 @@ public:
     /** @return Prompt payload received by the prepared child, excluding padding. */
     const std::vector<int32_t> &prepared_prefix_tokens() const { return prepared_prefix_tokens_; }
     /** @return The coordinated recurrent boundary forwarded without recomputation. */
-    std::optional<int> prepared_prefix_checkpoint() const { return prepared_prefix_checkpoint_; }
+    std::vector<int> prepared_prefix_checkpoints() const { return prepared_prefix_checkpoints_; }
+    /** @return Archive owners forwarded after the restoration frontier. */
+    size_t prepared_prefix_block_count() const { return prepared_prefix_block_count_; }
     const std::vector<int32_t> &harvested_prefix_tokens() const { return harvested_prefix_tokens_; }
     int harvested_prompt_token_count() const { return harvested_prompt_token_count_; }
     size_t forward_mtp_call_count() const { return forward_mtp_calls_.load(std::memory_order_relaxed); }
@@ -2772,7 +2778,8 @@ private:
     PrefixLookupResult prefix_lookup_result_;
     uint64_t prepared_prefix_fingerprint_ = 0u;
     std::vector<int32_t> prepared_prefix_tokens_;
-    std::optional<int> prepared_prefix_checkpoint_;
+    std::vector<int> prepared_prefix_checkpoints_;
+    size_t prepared_prefix_block_count_ = 0u;
     DeviceId device_id_ = DeviceId::cpu();
     DeviceMoERebalanceMaintenanceExecutionPolicy device_moe_ticket_policy_ =
         DeviceMoERebalanceMaintenanceExecutionPolicy::Inactive;
@@ -6074,6 +6081,49 @@ TEST_F(Test__RankOrchestrator, OwnershipArrivalSnapshotKeepsTransferMaskSeparate
         << "expert 3 moved from participant 0 to participant 1";
 }
 
+/** @brief TP inside PP retains every leaf publisher; enumeration never collapses to the primary device. */
+TEST_F(Test__RankOrchestrator, PrefixTelemetryEnumeratesNestedTPAndPP)
+{
+    class ObservedParticipant final : public MockDeviceGraphOrchestrator
+    {
+    public:
+        std::shared_ptr<PrefixCacheTelemetry> publisher = std::make_shared<PrefixCacheTelemetry>();
+        /** @return One stable metadata publisher, with no fake device execution. */
+        PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override
+        {
+            return {{.participant = "fixture", .ram_enabled = true, .ram_capacity_bytes = 100,
+                     .publisher = publisher}};
+        }
+    };
+    std::vector<std::shared_ptr<PrefixCacheTelemetry>> expected;
+    const auto participant = [&]() -> std::unique_ptr<IInferenceRunner> {
+        auto runner = std::make_unique<ObservedParticipant>();
+        expected.push_back(runner->publisher);
+        return runner;
+    };
+    std::vector<std::unique_ptr<IInferenceRunner>> children;
+    children.push_back(participant());
+    children.push_back(participant());
+    auto tp = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(), std::move(children),
+        makeTPContextForRunnerCount(2), makeRankConfigForRunnerCount(2));
+    const auto tp_sources = tp->prefixCacheTelemetrySources();
+    ASSERT_EQ(tp_sources.size(), 2u);
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(tp));
+    stages.push_back(participant());
+    auto pp = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(), std::move(stages), makeRankConfigForRunnerCount(2));
+    const auto sources = pp->prefixCacheTelemetrySources();
+    ASSERT_EQ(sources.size(), 3u);
+    for (size_t i = 0; i < expected.size(); ++i)
+        EXPECT_EQ(sources[i].publisher, expected[i]);
+    auto ram = std::make_shared<PrefixCacheTierTelemetry>(100);
+    expected[2]->bind(ram, nullptr);
+    ram->publishUsage(37, 1);
+    EXPECT_EQ(sources[2].publisher->sources().ram->snapshot().used_bytes, 37u);
+}
+
 /**
  * @brief Clamp payload coverage while retaining the epochs actually looked up.
  *
@@ -6121,18 +6171,27 @@ TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
     EXPECT_EQ(runner0_ptr->prefix_lookup_tokens(), prompt);
     EXPECT_EQ(runner1_ptr->prefix_lookup_tokens(), prompt);
 
+    ASSERT_TRUE(orchestrator->populatePrefix(hit));
+    EXPECT_EQ(runner0_ptr->populated_prefix_tokens(), std::vector<int>({2}));
+    EXPECT_EQ(runner1_ptr->populated_prefix_tokens(), std::vector<int>({2}));
     const auto schedule = PrefixHarvestSchedule::forPrefill(hit, 4, 2);
     ASSERT_TRUE(orchestrator->preparePrefixHarvest(hit, prompt, schedule));
     EXPECT_EQ(runner0_ptr->prepared_prefix_fingerprint(), 101u);
     EXPECT_EQ(runner1_ptr->prepared_prefix_fingerprint(), 202u);
     EXPECT_EQ(runner0_ptr->prepared_prefix_tokens(), prompt);
     EXPECT_EQ(runner1_ptr->prepared_prefix_tokens(), prompt);
-    EXPECT_EQ(runner0_ptr->prepared_prefix_checkpoint(), schedule.reusableCheckpoint());
-    EXPECT_EQ(runner1_ptr->prepared_prefix_checkpoint(), schedule.reusableCheckpoint());
+    EXPECT_EQ(runner0_ptr->prepared_prefix_checkpoints(), schedule.reusableCheckpoints());
+    EXPECT_EQ(runner1_ptr->prepared_prefix_checkpoints(), schedule.reusableCheckpoints());
 
-    ASSERT_TRUE(orchestrator->populatePrefix(hit));
-    EXPECT_EQ(runner0_ptr->populated_prefix_tokens(), std::vector<int>({2}));
-    EXPECT_EQ(runner1_ptr->populated_prefix_tokens(), std::vector<int>({2}));
+    auto history = prompt;
+    history.resize(8193, 3);
+    const auto longer_hit = orchestrator->lookupPrefix(history);
+    const auto sparse = PrefixHarvestSchedule::forPrefill(longer_hit, history.size(), 2);
+    ASSERT_EQ(sparse.reusableCheckpoints(), std::vector<int>({4096, 8192}));
+    ASSERT_TRUE(orchestrator->preparePrefixHarvest(longer_hit, history, sparse));
+    EXPECT_EQ(runner0_ptr->prepared_prefix_checkpoints(), sparse.reusableCheckpoints());
+    EXPECT_EQ(runner1_ptr->prepared_prefix_checkpoints(), sparse.reusableCheckpoints());
+
 }
 
 TEST_F(Test__RankOrchestrator, PopulatePrefixPropagatesModelRuntimeRestorePolicyToChildren)
@@ -6407,6 +6466,41 @@ TEST_F(Test__RankOrchestrator, PrefixLookupChildMissClampsAllChildrenToZero)
     EXPECT_FALSE(hit.supported);
     EXPECT_EQ(hit.cached_tokens, 0);
     EXPECT_EQ(runner1_ptr->prefix_lookup_call_count(), 1u);
+}
+
+/** @test Harvest retains only the selected terminal owner after a complete TP or PP restore. */
+TEST_F(Test__RankOrchestrator, PrefixHarvestReleasesRestoredBlockChain)
+{
+    for (const bool pipeline : {false, true})
+        for (const int blocks : {2, 17, 256})
+        {
+            std::vector<std::unique_ptr<IInferenceRunner>> children;
+            std::vector<MockDeviceGraphOrchestrator *> observed;
+            for (int participant = 0; participant < 2; ++participant)
+            {
+                auto child = std::make_unique<MockDeviceGraphOrchestrator>();
+                child->set_prefix_lookup_result(makePrefixHit(blocks * 2, true, true, true));
+                observed.push_back(child.get());
+                children.push_back(std::move(child));
+            }
+            auto model = llaminar2::test::MockModelContext::createMinimal();
+            auto orchestrator = pipeline
+                ? RankOrchestrator::createForTestWithPipelineStages(
+                    std::move(model), std::move(children), makeRankConfigForRunnerCount(2))
+                : RankOrchestrator::createForTest(std::move(model), std::move(children),
+                    makeTPContextForRunnerCount(2), makeRankConfigForRunnerCount(2));
+            const std::vector<int32_t> tokens(blocks * 2, 1);
+            const auto admission = orchestrator->lookupPrefix(tokens);
+            ASSERT_TRUE(orchestrator->populatePrefix(admission));
+            const auto schedule = PrefixHarvestSchedule::forPrefill(admission, blocks * 2, blocks * 2);
+            ASSERT_TRUE(orchestrator->preparePrefixHarvest(admission, tokens, schedule));
+            for (const auto *child : observed)
+            {
+                EXPECT_EQ(child->populated_prefix_tokens(), std::vector<int>({blocks * 2}));
+                EXPECT_EQ(child->prepared_prefix_block_count(), 1u);
+            }
+            EXPECT_TRUE(orchestrator->restorePrefixTerminalState(admission));
+        }
 }
 
 TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreRunsOnAllChildrenAtCommonLength)
@@ -8628,6 +8722,27 @@ TEST_F(Test__RankOrchestrator,
         << "Observation must not mutate the scheduler-owned parent cursor.";
 }
 
+/** @brief The real PP probe must observe movement below another stage's maximum. */
+TEST_F(Test__RankOrchestrator, PipelinePrefixProbeDetectsMovementBelowSiblingMaximum)
+{
+    auto first = std::make_unique<MockDeviceGraphOrchestrator>();
+    first->set_prefix_probe_position_override(7);
+    first->set_moe_placement_epoch(100);
+    auto second = std::make_unique<MockDeviceGraphOrchestrator>();
+    second->set_prefix_probe_position_override(7);
+    second->set_moe_placement_epoch(1);
+    auto *second_observer = second.get();
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(first));
+    stages.push_back(std::move(second));
+    auto pipeline = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(), std::move(stages), makeRankConfigForRunnerCount(2));
+    const auto before = pipeline->prefixStateProbe();
+    second_observer->set_moe_placement_epoch(2);
+    const auto after = pipeline->prefixStateProbe();
+    EXPECT_NE(before.moe_runtime_movement_epoch, after.moe_runtime_movement_epoch);
+}
+
 /**
  * @brief Aggregate the immutable verifier row instead of proposal scratch.
  *
@@ -8815,6 +8930,67 @@ TEST_F(Test__RankOrchestrator, AllPositionLogitToggleRunsOnEveryLocalTPChild)
     EXPECT_FALSE(runner1_ptr->compute_all_position_logits());
     EXPECT_EQ(runner0_ptr->set_all_position_logits_call_count(), 2u);
     EXPECT_EQ(runner1_ptr->set_all_position_logits_call_count(), 2u);
+}
+
+/** @brief Large KV horizons must not allocate a host logit row for every token. */
+TEST_F(Test__RankOrchestrator, TerminalHostLogitsStorageIsIndependentOfContext)
+{
+    for (const DeviceId device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const size_t context : {32u, 32768u, 262144u})
+    for (const bool mtp_enabled : {false, true})
+    for (const bool pipeline : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << device.toString() << " context=" << context
+                     << " mtp=" << mtp_enabled << " pipeline=" << pipeline);
+        MockDeviceGraphOrchestrator::Config child_config;
+        child_config.vocab_size = 4;
+        std::vector<std::unique_ptr<IInferenceRunner>> children;
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            auto child = std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+            child->set_primary_device_id(device);
+            child->set_mock_logits({1.0f, 2.0f, 3.0f, 4.0f});
+            if (!pipeline)
+                child->set_mock_logits_local(2, participant == 0
+                    ? std::vector<float>{1.0f, 2.0f} : std::vector<float>{3.0f, 4.0f});
+            child->set_prefix_lookup_result(makePrefixHit(
+                4, true, true, false, false, true, false));
+            children.push_back(std::move(child));
+        }
+        auto model = llaminar2::test::MockModelContextBuilder()
+            .usePreset(llaminar2::test::ModelPreset::MINIMAL).setVocabSize(4).build();
+        auto config = makeRankConfigForRunnerCount(2);
+        config.max_seq_len = context;
+        config.resident_graph_rows = static_cast<int>(std::min(context, size_t{256}));
+        config.mtp.enabled = mtp_enabled;
+        config.mtp.draft_tokens = 15;
+        auto rank = pipeline
+            ? RankOrchestrator::createForTestWithPipelineStages(
+                std::move(model), std::move(children), config)
+            : RankOrchestrator::createForTest(
+                std::move(model), std::move(children), makeTPContextForRunnerCount(2), config);
+
+        if (pipeline)
+        {
+            EXPECT_EQ(rank->mainHostLogitsStorageBytes(), 0u);
+            const auto hit = rank->lookupPrefix({1, 2, 3, 4});
+            ASSERT_TRUE(hit.has_terminal_logits);
+            ASSERT_TRUE(rank->restorePrefixTerminalState(hit));
+        }
+        else
+        {
+            const int token = 7;
+            ASSERT_TRUE(rank->forwardPrefill(&token, 1));
+            ASSERT_NE(rank->logits(), nullptr);
+            EXPECT_FLOAT_EQ(rank->logits()[3], 4.0f);
+            ASSERT_TRUE(rank->forward(&token, 1));
+            EXPECT_FLOAT_EQ(rank->logits()[0], 1.0f);
+        }
+        EXPECT_EQ(rank->mainHostLogitsStorageBytes(), 4u * sizeof(float));
+        rank->setSkipLogitsGatherPrefill(true);
+        rank->setSkipLogitsGatherDecode(true);
+        EXPECT_EQ(rank->mainHostLogitsStorageBytes(), 4u * sizeof(float));
+    }
 }
 
 TEST_F(Test__RankOrchestrator, LogitsGatherSkipPolicyPropagatesToEveryLocalTPChild)

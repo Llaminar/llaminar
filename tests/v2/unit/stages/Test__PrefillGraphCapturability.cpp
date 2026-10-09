@@ -11,6 +11,7 @@
  * - SharedExpertFFNStage
  * - SharedExpertGateStage
  * - GDNRecurrenceStage
+ * - MTP publication authority and retained capture identity
  */
 
 #include <gtest/gtest.h>
@@ -720,6 +721,97 @@ TEST(MTPSpeculativeStatePublicationGraphCapture,
         Publication bound(params);
         accepted = 15;
         EXPECT_TRUE(bound.hasSameCaptureIdentity(params));
+    }
+}
+
+/**
+ * @test A device response controller cannot also accept a host commit-row limit.
+ *
+ * Streaming windows alternate between pending and already emitted leading
+ * rows. Their host-side compact-outcome limits therefore differ even though
+ * the bounded-generation kernel reads the actual limit from device control.
+ * Admitting that unused scalar creates false graph identities and recaptures.
+ * These bindings are addresses for validation only; no device work is issued.
+ */
+TEST(MTPSpeculativeStatePublicationGraphCapture,
+     BoundedGenerationRejectsHostCommitLimits)
+{
+    using Publication = MTPSpeculativeStatePublicationStage;
+    MockBackend backend;
+    std::array<int32_t, 128> storage{};
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        Publication::Params params;
+        params.device_id = device;
+        params.backend = &backend;
+        params.outcome_tokens_device = storage.data();
+        params.outcome_meta_device = storage.data();
+        params.outcome_token_stride = 16;
+        params.outcome_meta_stride = 32;
+        params.base_cached_tokens_device = storage.data();
+        params.accepted_restore_rows_device = storage.data();
+        params.target_cached_tokens_device = storage.data();
+        params.accepted_state_counts_device = storage.data();
+        params.publication_ok_flags_device = storage.data();
+        params.next_condition_tokens_device = storage.data();
+        params.all_drafts_accepted_flags_device = storage.data();
+        params.stopped_flags_device = storage.data();
+        params.next_verifier_condition_tokens_device = storage.data();
+        params.next_sidecar_condition_tokens_device = storage.data();
+        params.next_sidecar_position_ids_device = storage.data();
+        params.authority = Publication::Authority::BoundedGeneration;
+        params.generation_response_tokens_device = storage.data();
+        params.generation_response_token_stride = 16;
+        params.generation_control_device = storage.data();
+        params.generation_control_stride = 128;
+        params.verifier_input_tokens_device = storage.data();
+        params.verifier_input_token_stride = 16;
+        params.committed_verifier_identity_device =
+            reinterpret_cast<sampling_math::MTPCommittedVerifierIdentityRecord *>(storage.data());
+        params.request_count = 1;
+        params.verifier_rows_per_request = 16;
+        // MainKVBinding::valid compares this opaque identity without calling
+        // the cache. The fixture must never execute these host-only bindings.
+        params.main_kv_bindings = {{.cache = reinterpret_cast<IKVCache *>(storage.data()),
+            .base_checkpoint_device = storage.data(), .base_checkpoint_bytes = sizeof(storage)}};
+        params.penalty_policy_device = storage.data();
+        params.generated_token_counts_device = storage.data();
+        params.vocab_size = 128;
+        ASSERT_TRUE(Publication(params).validate());
+        for (int limit = 1; limit <= params.verifier_rows_per_request; ++limit)
+        {
+            SCOPED_TRACE(::testing::Message() << device.toString() << " host_limit=" << limit);
+            auto dual_authority = params;
+            dual_authority.max_state_commit_rows = limit;
+            EXPECT_FALSE(Publication(dual_authority).validate());
+        }
+    }
+    EXPECT_EQ(backend.getTransferStats().h2d_count, 0u);
+    EXPECT_EQ(backend.getTransferStats().d2h_count, 0u);
+}
+
+/** @test Compact outcomes retain their real host clipping policy in graph identity. */
+TEST(MTPSpeculativeStatePublicationGraphCapture,
+     CompactOutcomeCommitLimitsRemainCaptureIdentity)
+{
+    using Publication = MTPSpeculativeStatePublicationStage;
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (int width = 2; width <= 16; ++width)
+    {
+        Publication::Params params;
+        params.device_id = device;
+        params.authority = Publication::Authority::CompactOutcome;
+        params.request_count = 1;
+        params.verifier_rows_per_request = width;
+        params.max_state_commit_rows = width;
+        Publication stage(params);
+        EXPECT_TRUE(stage.hasSameCaptureIdentity(params));
+        for (int limit = 0; limit < width; ++limit)
+        {
+            auto clipped = params;
+            clipped.max_state_commit_rows = limit;
+            EXPECT_FALSE(stage.hasSameCaptureIdentity(clipped));
+        }
     }
 }
 

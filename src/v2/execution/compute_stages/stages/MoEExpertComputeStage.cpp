@@ -7084,7 +7084,7 @@ namespace llaminar2
             params_.prefill_llep_payload_slot_bytes == 0 ||
             params_.prefill_llep_payload_slot_capacity == 0 ||
             !params_.prefill_llep_transfer_state ||
-            params_.layer_idx < 0)
+            !params_.moe_runtime_table->containsModelLayer(params_.layer_idx))
         {
             return false;
         }
@@ -7094,7 +7094,13 @@ namespace llaminar2
         {
             return false;
         }
-        if (!validateDeviceMoERebalanceConfig(params_.prefill_llep_rebalance_config))
+        if (!validateDeviceMoERebalanceConfig(params_.prefill_llep_rebalance_config) ||
+            params_.prefill_llep_rebalance_config.num_experts !=
+                static_cast<uint32_t>(params_.num_experts) ||
+            params_.prefill_llep_rebalance_config.top_k !=
+                static_cast<uint32_t>(params_.top_k) ||
+            params_.moe_runtime_table->layerCount() !=
+                static_cast<int>(params_.prefill_llep_rebalance_config.num_layers))
             return false;
         if (params_.prefill_llep_tp_ctx->degree() <= 1 ||
             params_.prefill_llep_tp_ctx->degree() !=
@@ -7138,7 +7144,8 @@ namespace llaminar2
             return false;
         }
 
-        auto *runtime_layers = params_.moe_runtime_table->deviceLayerState(0);
+        auto *runtime_layers = params_.moe_runtime_table->deviceLayerState(
+            params_.moe_runtime_table->firstModelLayer());
         if (!runtime_layers || !moe_runtime_layer_)
         {
             LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill requires device runtime layers");
@@ -7305,7 +7312,8 @@ namespace llaminar2
                 status,
                 config,
                 payload_slot_count,
-                static_cast<uint32_t>(params_.layer_idx),
+                static_cast<uint32_t>(
+                    params_.moe_runtime_table->storageIndexForModelLayer(params_.layer_idx)),
                 1))
         {
             LOG_ERROR("[MoEExpertComputeStage] Transfer-backed prefix-runtime rehydration command materialization failed");

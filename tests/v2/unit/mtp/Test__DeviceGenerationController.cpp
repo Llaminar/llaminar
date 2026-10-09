@@ -36,8 +36,8 @@ namespace
      */
     TEST(Test__DeviceGenerationController, FatalTransitionsPreserveFirstFailure)
     {
-        for (int first = 1; first <= static_cast<int>(DeviceGenerationError::InvalidOrdinaryTransition); ++first)
-        for (int later = 1; later <= static_cast<int>(DeviceGenerationError::InvalidOrdinaryTransition); ++later)
+        for (int first = 1; first <= static_cast<int>(DeviceGenerationError::InvalidContinuation); ++first)
+        for (int later = 1; later <= static_cast<int>(DeviceGenerationError::InvalidContinuation); ++later)
         {
             ControlRow control{};
             control[kDeviceGenerationControlOk] = 1;
@@ -798,6 +798,140 @@ TEST(Test__DeviceGenerationController, ObservePolicyCannotMutateActiveGeometry)
     EXPECT_EQ(control[kDeviceGenerationControlDepthEvaluatedWindows], 1);
 }
 
+/**
+ * @brief Streaming publication cannot erase a partially learned depth window.
+ *
+ * Short response windows share one request. Compare their learner with an
+ * uninterrupted request after every observation, including cooldown and
+ * promotion hysteresis. Terminal reporting counters belong to each window;
+ * summing them must equal the uninterrupted controller without double counting.
+ */
+TEST(Test__DeviceGenerationController, StreamingPublicationWindowsPreserveAdaptiveState)
+{
+    for (const auto mode : {DeviceGenerationPolicyMode::Fixed,
+                           DeviceGenerationPolicyMode::Observe,
+                           DeviceGenerationPolicyMode::Dynamic})
+    for (const int observations_per_window : {1, 4, 16})
+    {
+        SCOPED_TRACE(static_cast<int>(mode));
+        SCOPED_TRACE(observations_per_window);
+        auto policy = DeviceGenerationPolicy::fixed(1);
+        policy.mode = mode;
+        if (mode != DeviceGenerationPolicyMode::Fixed)
+            policy.maximum_depth = 15;
+        policy.window_size = 32;
+        policy.minimum_samples = 32;
+        policy.cooldown_steps = 40;
+        policy.promote_consecutive_windows = 2;
+        ControlRow streamed{}, uninterrupted{};
+        DeviceGenerationDispatchTicket ticket{};
+        ASSERT_TRUE(initialize_device_generation_dispatch_ticket(17, 41, &ticket));
+        ASSERT_TRUE(initialize_device_generation_control(4096, 4096, policy, uninterrupted.data()));
+        int evaluated = 0, updates = 0;
+        for (int window = 0; window < 256 / observations_per_window; ++window)
+        {
+            ASSERT_TRUE(initialize_device_generation_control(16, 16, policy, streamed.data(),
+                DeviceGenerationLeadingRowDisposition::PendingResponse,
+                {.kind = window == 0 ? DeviceGenerationAdmissionKind::NewRequest
+                                     : DeviceGenerationAdmissionKind::ContinueResponse,
+                 .session_epoch = 17, .workspace_generation = 41, .prior_tickets = &ticket}));
+            for (int observation = 0; observation < observations_per_window; ++observation)
+            {
+                const bool full_accept = window * observations_per_window + observation < 192;
+                for (auto *control : {&streamed, &uninterrupted})
+                    ASSERT_TRUE(record_device_generation_depth_observation(
+                        full_accept ? (*control)[kDeviceGenerationControlCurrentDraftDepth] : 0,
+                        !full_accept, false, control->data()));
+                EXPECT_EQ(streamed[kDeviceGenerationControlCurrentDraftDepth],
+                          uninterrupted[kDeviceGenerationControlCurrentDraftDepth]);
+                for (int word = kDeviceGenerationControlDepthStepsSinceChange;
+                     word <= kDeviceGenerationControlDepthWindowAcceptedPrefixSum; ++word)
+                    ASSERT_EQ(streamed[word], uninterrupted[word]) << "word=" << word;
+                EXPECT_EQ(streamed[kDeviceGenerationControlDepthLastRecommendedDepth],
+                          uninterrupted[kDeviceGenerationControlDepthLastRecommendedDepth]);
+            }
+            evaluated += streamed[kDeviceGenerationControlDepthEvaluatedWindows];
+            updates += streamed[kDeviceGenerationControlDepthUpdates];
+            // Only the response window closes; the request has not hit EOS.
+            streamed[kDeviceGenerationControlRequestComplete] = 1;
+            streamed[kDeviceGenerationControlRemainingTokenCount] = 0;
+            streamed[kDeviceGenerationControlResponseTokenCount] = 16;
+            streamed[kDeviceGenerationControlTransactionCount] = observations_per_window;
+        }
+        EXPECT_EQ(evaluated, uninterrupted[kDeviceGenerationControlDepthEvaluatedWindows]);
+        EXPECT_EQ(updates, uninterrupted[kDeviceGenerationControlDepthUpdates]);
+        // A true request boundary clears adaptation even at the same addresses.
+        ControlRow fresh{};
+        ASSERT_TRUE(initialize_device_generation_control(16, 16, policy, fresh.data()));
+        ASSERT_TRUE(initialize_device_generation_control(16, 16, policy, streamed.data()));
+        EXPECT_EQ(streamed, fresh);
+    }
+}
+
+/** @brief Stale identity, changed policy and invalid terminal boundaries fail closed. */
+TEST(Test__DeviceGenerationController, StreamingContinuationRejectsInvalidBoundaries)
+{
+    auto policy = DeviceGenerationPolicy::fixed(2);
+    policy.mode = DeviceGenerationPolicyMode::Dynamic;
+    policy.minimum_depth = 1;
+    policy.maximum_depth = 15;
+    ControlRow terminal{};
+    ASSERT_TRUE(initialize_device_generation_control(16, 16, policy, terminal.data()));
+    terminal[kDeviceGenerationControlRequestComplete] = 1;
+    terminal[kDeviceGenerationControlRemainingTokenCount] = 0;
+    terminal[kDeviceGenerationControlResponseTokenCount] = 16;
+    terminal[kDeviceGenerationControlTransactionCount] = 8;
+    terminal[kDeviceGenerationControlNextLeadingCommittedOutputCount] = 1;
+    DeviceGenerationDispatchTicket ticket{};
+    ASSERT_TRUE(initialize_device_generation_dispatch_ticket(17, 41, &ticket));
+    const DeviceGenerationInitialization continuation{
+        .kind = DeviceGenerationAdmissionKind::ContinueResponse,
+        .session_epoch = 17, .workspace_generation = 41, .prior_tickets = &ticket};
+    for (int fault = 0; fault < 27; ++fault)
+    {
+        SCOPED_TRACE(fault);
+        auto control = terminal;
+        auto changed_policy = policy;
+        auto boundary = continuation;
+        auto leading = DeviceGenerationLeadingRowDisposition::AlreadyEmitted;
+        switch (fault)
+        {
+        case 0: boundary.session_epoch = 18; break;
+        case 1: boundary.workspace_generation = 42; break;
+        case 2: boundary.prior_tickets = nullptr; break;
+        case 3: control[kDeviceGenerationControlRequestComplete] = 0; break;
+        case 4: control[kDeviceGenerationControlModelStopped] = 1; break;
+        case 5: control[kDeviceGenerationControlRemainingTokenCount] = 1; break;
+        case 6: control[kDeviceGenerationControlTransactionCommitBudget] = 1; break;
+        case 7: control[kDeviceGenerationControlTransactionCount] = 0; break;
+        case 8: leading = static_cast<DeviceGenerationLeadingRowDisposition>(99); break;
+        case 9: control[kDeviceGenerationControlOk] = 0; break;
+        case 10: changed_policy.initial_depth = 3; break;
+        case 11: changed_policy.minimum_depth = 2; break;
+        case 12: changed_policy.maximum_depth = 14; break;
+        case 13: ++changed_policy.window_size; break;
+        case 14: ++changed_policy.minimum_samples; break;
+        case 15: ++changed_policy.cooldown_steps; break;
+        case 16: ++changed_policy.promote_consecutive_windows; break;
+        case 17: --changed_policy.promote_full_accept_rate_ppm; break;
+        case 18: --changed_policy.demote_zero_accept_rate_ppm; break;
+        case 19: --changed_policy.demote_acceptance_rate_ppm; break;
+        case 20: changed_policy.mode = DeviceGenerationPolicyMode::Observe; break;
+        case 21: control[kDeviceGenerationControlLearnedDepthEnabled] = 1; break;
+        case 22: ++control[kDeviceGenerationControlLearnedDepthBackend]; break;
+        case 23: ++control[kDeviceGenerationControlLearnedDepthModelClass]; break;
+        case 24: ++control[kDeviceGenerationControlLearnedDepthVerifyMode]; break;
+        case 25: control[kDeviceGenerationControlCurrentDraftDepth] = 0; break;
+        case 26: control[kDeviceGenerationControlCurrentDraftDepth] = 16; break;
+        }
+        EXPECT_FALSE(initialize_device_generation_control(16, 16, changed_policy,
+            control.data(), leading, boundary));
+        EXPECT_EQ(control[kDeviceGenerationControlOk], 0);
+        EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 1);
+        EXPECT_NE(control[kDeviceGenerationControlErrorCode], 0);
+    }
+}
+
 TEST(Test__DeviceGenerationController,
      DynamicOutcomeLedgerAccumulatesEverySelectedWidthExactly)
 {
@@ -879,6 +1013,81 @@ TEST(Test__DeviceGenerationController,
     EXPECT_EQ(control[kDeviceGenerationControlDepthUpdates], 2);
     EXPECT_EQ(control[kDeviceGenerationControlDepthPromotions], 2);
     EXPECT_EQ(control[kDeviceGenerationControlDepthDemotions], 0);
+}
+
+/**
+ * @brief Sweep live/capacity separation after carries, stops and rejections.
+ *
+ * Each compact outcome is compared with an independent serial-width reducer,
+ * then admitted to the real response/depth controller. Poisoned inactive rows
+ * must never become accepted drafts or a bonus token, at any retained depth.
+ */
+TEST(Test__DeviceGenerationController,
+     ProbabilityRejectionSummaryNeverConsumesInactiveCapacity)
+{
+    using namespace llaminar2::sampling_math;
+    constexpr int capacity = DeviceGenerationPolicy::kMaximumSupportedDraftDepth;
+    std::array<int32_t, capacity + 1> tokens{};
+    std::array<int32_t, capacity + 1> drafts{};
+    std::array<int, capacity> accepted{};
+    for (int row = 0; row <= capacity; ++row)
+        tokens[row] = drafts[row] = 100 + row;
+    const int first = 99;
+    for (const auto mode : {DeviceGenerationPolicyMode::Fixed,
+                            DeviceGenerationPolicyMode::Observe,
+                            DeviceGenerationPolicyMode::Dynamic})
+    for (int retained = 1; retained <= capacity; ++retained)
+        for (int depth = retained; depth >= 1; --depth)
+            for (int carry : {0, 1})
+                for (int budget = 1; budget <= depth + 1; ++budget)
+                    for (int rejection = -1; rejection < depth; ++rejection)
+                        for (int stop : {-1, 0, depth})
+                        {
+                            SCOPED_TRACE(::testing::Message() << "capacity=" << retained
+                                << " depth=" << depth << " carry=" << carry
+                                << " budget=" << budget << " reject=" << rejection
+                                << " stop=" << stop);
+                            DeviceGenerationPolicy policy;
+                            policy.mode = mode;
+                            policy.initial_depth = depth;
+                            policy.minimum_depth = mode == DeviceGenerationPolicyMode::Fixed ? depth : 1;
+                            policy.maximum_depth = mode == DeviceGenerationPolicyMode::Fixed ? depth : retained;
+                            ControlRow control{};
+                            ASSERT_TRUE(initialize_device_generation_control(
+                                256, 256, policy, control.data(), carry
+                                    ? DeviceGenerationLeadingRowDisposition::AlreadyEmitted
+                                    : DeviceGenerationLeadingRowDisposition::PendingResponse));
+                            control[kDeviceGenerationControlTransactionCommitBudget] = budget;
+                            accepted.fill(1);
+                            if (rejection >= 0) accepted[rejection] = 0;
+                            const int stop_token = stop < 0 ? -1
+                                : (stop == 0 ? first : tokens[stop - 1]);
+                            const int bonus = tokens[retained];
+                            std::array<int, capacity + 1> actual{}, expected{};
+                            MetaRow actual_meta{}, expected_meta{};
+                            summarize_speculative_verify_batch_device_generation_controls(
+                                first, tokens.data(), accepted.data(), nullptr, retained,
+                                &stop_token, 1, &bonus, 1, control.data(),
+                                actual.data(), actual.size(), actual_meta.data());
+                            summarize_speculative_verify_batch_at_commit_boundary(
+                                first, tokens.data(), accepted.data(), depth, &stop_token,
+                                1, tokens[depth], 1, budget, expected.data(),
+                                expected.size(), expected_meta.data(), nullptr, carry);
+                            EXPECT_EQ(actual, expected);
+                            EXPECT_EQ(actual_meta, expected_meta);
+                            EXPECT_LE(actual_meta[kSpecBatchMetaAcceptedSpeculativePrefix], depth);
+                            EXPECT_LE(actual_meta[kSpecBatchMetaConsumedVerifierRows], depth);
+                            // A carried EOS-only row emits no new response and
+                            // is deliberately invalid for a fresh transaction.
+                            if (carry && stop == 0) continue;
+                            std::array<int32_t, 256> response{};
+                            ASSERT_TRUE(append_speculative_outcome_to_device_generation(
+                                actual.data(), actual.size(), actual_meta.data(),
+                                actual_meta.size(), response.data(), response.size(),
+                                control.data()));
+                            EXPECT_EQ(control[kDeviceGenerationControlOk], 1);
+                            EXPECT_EQ(control[kDeviceGenerationControlErrorCode], 0);
+                        }
 }
 
 TEST(Test__DeviceGenerationController, InvalidPolicyAndSelectorFailHard)
@@ -1741,6 +1950,56 @@ TEST(Test__DeviceGenerationController, InvalidTransitionsFailHardWithoutClipping
             tokens.data(), 4, meta.data(), meta.size(), response.data(), 4,
             control.data()));
         expectFatal(control, DeviceGenerationError::EmptyTransaction);
+    }
+}
+
+/**
+ * @brief Inactive verifier capacity can never authorize controller publication.
+ *
+ * Fixed policies and budget-limited transactions skip depth learning, but must
+ * still reject impossible counts before changing response bytes or ledgers.
+ */
+TEST(Test__DeviceGenerationController, InvalidVerifierCountsFailBeforePublicationInEveryMode)
+{
+    using namespace llaminar2::sampling_math;
+    constexpr int slots = 16;
+    std::array<int32_t, slots> tokens{};
+    tokens.fill(42);
+    for (const auto mode : {DeviceGenerationPolicyMode::Fixed,
+                            DeviceGenerationPolicyMode::Observe,
+                            DeviceGenerationPolicyMode::Dynamic})
+    for (int depth = 1; depth <= 15; ++depth)
+    for (const int budget : {2, slots})
+    for (const int invalid_field : {kSpecBatchMetaAcceptedSpeculativePrefix,
+                                    kSpecBatchMetaConsumedVerifierRows,
+                                    kSpecBatchMetaTargetVerifierStateCommitCount})
+    {
+        SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<int>(mode)
+                     << " depth=" << depth << " budget=" << budget
+                     << " field=" << invalid_field);
+        auto policy = fixedDepthPolicy(depth);
+        policy.mode = mode;
+        if (mode != DeviceGenerationPolicyMode::Fixed)
+        {
+            policy.minimum_depth = 1;
+            policy.maximum_depth = 15;
+        }
+        ControlRow control{};
+        ASSERT_TRUE(initialize_device_generation_control(slots, slots, policy, control.data()));
+        control[kDeviceGenerationControlTransactionCommitBudget] = budget;
+        auto meta = makeMeta(2, 0, 1, 0, 1, false);
+        meta[invalid_field] = invalid_field == kSpecBatchMetaAcceptedSpeculativePrefix
+            ? depth + 1 : depth + 2;
+        std::array<int32_t, slots> response{};
+        response.fill(-777);
+        const auto before = response;
+        EXPECT_FALSE(append_speculative_outcome_to_device_generation(
+            tokens.data(), slots, meta.data(), meta.size(), response.data(), slots, control.data()));
+        expectFatal(control, DeviceGenerationError::InvalidVerifierCounts);
+        EXPECT_EQ(response, before);
+        EXPECT_EQ(control[kDeviceGenerationControlResponseTokenCount], 0);
+        EXPECT_EQ(control[kDeviceGenerationControlRemainingTokenCount], slots);
+        EXPECT_EQ(control[kDeviceGenerationControlTransactionCount], 0);
     }
 }
 

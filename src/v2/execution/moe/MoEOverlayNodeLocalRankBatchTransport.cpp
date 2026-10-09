@@ -823,8 +823,8 @@ namespace llaminar2
             role_bit(MoEOverlayInferenceGraphRole::MTPGroupedVerifier);
         main.model_layer_indices.reserve(
             static_cast<size_t>(graph_family.main_layer_count));
-        for (int layer = 0; layer < graph_family.main_layer_count; ++layer)
-            main.model_layer_indices.push_back(layer);
+        for (int row = 0; row < graph_family.main_layer_count; ++row)
+            main.model_layer_indices.push_back(graph_family.first_model_layer + row);
         manifests.push_back(std::move(main));
 
         for (const int source_layer : graph_family.mtp_source_layers)

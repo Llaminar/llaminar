@@ -217,11 +217,14 @@ namespace llaminar2
         {
             std::vector<MoEOverlayParticipantLayerServiceTotals> rows;
             const auto endpoint = registry.endpoint(id);
-            if (!endpoint || !endpoint->trySnapshotServiceMeasurements(&rows))
+            if (!endpoint || endpoint->firstModelLayer() != catalog.firstModelLayer() ||
+                static_cast<std::size_t>(endpoint->numLayers()) != catalog.layerCount())
+                throw std::logic_error("CPU prepared-service registry belongs to another model stage");
+            if (!endpoint->trySnapshotServiceMeasurements(&rows))
                 throw std::logic_error("CPU prepared-service setup raced a service writer");
             live.insert(live.end(), rows.begin(), rows.end());
             for (size_t layer = 0; layer < catalog.layerCount(); ++layer)
-                result.push_back({.participant_id = id, .layer = static_cast<int>(layer)});
+                result.push_back({.participant_id = id, .layer = catalog.firstModelLayer() + static_cast<int>(layer)});
         }
         size_t observations = 0;
         for (const auto &gap : catalog.serviceEvidenceGaps(live, ids, topology))
@@ -234,7 +237,7 @@ namespace llaminar2
             int selected_expert = -1;
             for (int layer : gap.eligible_layers)
             {
-                const auto &entries = bank->layers.at(static_cast<size_t>(layer));
+                const auto &entries = bank->layerForModelLayer(layer);
                 for (size_t expert = 0; expert < entries.experts.size(); ++expert)
                     if (entries.resident_mask.at(expert) && entries.experts[expert].complete())
                     {
@@ -246,10 +249,11 @@ namespace llaminar2
             }
             if (selected_expert < 0)
                 throw std::logic_error("CPU prepared-service class has no exact resident source");
-            const auto duration = measurePrepared(bank->layers[selected_layer].experts[selected_expert],
+            const auto duration = measurePrepared(bank->layerForModelLayer(selected_layer).experts[selected_expert],
                 bank->device, selected_layer, gap.source, geometry, memory);
             const auto participant_index = static_cast<size_t>(std::lower_bound(ids.begin(), ids.end(), gap.participant_id) - ids.begin());
-            auto &row = result.at(participant_index * catalog.layerCount() + selected_layer);
+            auto &row = result.at(participant_index * catalog.layerCount() +
+                static_cast<std::size_t>(selected_layer - catalog.firstModelLayer()));
             const auto phase = expertHistogramProductionSourceIndex(gap.source);
             row.total_nanoseconds[phase] = duration;
             row.activation_count[phase] = static_cast<uint64_t>(phaseGeometry(gap.source).second) * kMeasuredSamples;

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Exercise the real pre-commit script using device-free command recorders.
 
-The hook must run exactly two CTest suites, build only their canonical targets,
-resolve the workspace Ninja, and stop at the first failed phase. Temporary
+The hook runs exactly two CTest suites or authenticates their explicitly
+selected prior receipt. It builds only their canonical targets, resolves the
+workspace Ninja, and stops at the first failed phase. Temporary
 repositories and executable shims keep these tests out of real builds, model
 loading, Git registration, and accelerator execution.
 """
@@ -39,6 +40,8 @@ if name == "cmake":
     phase = "build" if "--build" in args else "configure"
 elif name == "ctest":
     phase = "unit" if "-R" in args else "preflight"
+elif name == "python3":
+    phase = "reuse"
 else:
     sys.exit(99)
 sys.exit(17 if os.environ.get("HOOK_TEST_FAIL") == phase else 0)
@@ -48,7 +51,7 @@ sys.exit(17 if os.environ.get("HOOK_TEST_FAIL") == phase else 0)
 class PreCommitHookTests(unittest.TestCase):
     """Prove selection, ordering, quoting, and fail-fast behavior end to end."""
 
-    def run_hook(self, *, fail: str = "", branch: str = "feature/example"):
+    def run_hook(self, *, fail: str = "", branch: str = "feature/example", reuse: bool = False):
         """Run the checked-in shell script in an isolated path containing spaces."""
         with tempfile.TemporaryDirectory(prefix="llaminar-hook-") as directory:
             root = Path(directory) / "repository with spaces"
@@ -56,12 +59,17 @@ class PreCommitHookTests(unittest.TestCase):
             tools = root / "tool shims"
             nested.mkdir(parents=True)
             tools.mkdir()
-            for tool in ("git", "cmake", "ctest", "ninja"):
+            for tool in ("git", "cmake", "ctest", "ninja", "python3"):
                 shim = tools / tool
                 shim.write_text(f"#!{sys.executable}\n" + RECORDER, encoding="utf-8")
                 shim.chmod(0o755)
             record = root / "commands.jsonl"
             env = dict(os.environ)
+            env.pop("LLAMINAR_PRECOMMIT_BUILD_DIR", None)
+            env.pop("LLAMINAR_PRECOMMIT_PREREQUISITES", None)
+            if reuse:
+                env["LLAMINAR_PRECOMMIT_BUILD_DIR"] = str(root / "selected integration build")
+                env["LLAMINAR_PRECOMMIT_PREREQUISITES"] = str(root / "evidence directory/prerequisites.json")
             env.update({
                 "PATH": str(tools) + os.pathsep + env["PATH"],
                 "HOOK_TEST_ROOT": str(root),
@@ -121,6 +129,24 @@ class PreCommitHookTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
                 self.assertEqual(len(calls), count)
                 self.assertNotIn("Unit and ProductionTestPreflight passed.", result.stdout)
+
+    def test_selected_build_reuses_only_authenticated_complete_evidence(self):
+        """An explicit receipt uses the canonical validator after the ordinary build."""
+        result, calls, root, _ = self.run_hook(reuse=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([c["tool"] for c in calls], ["git", "cmake", "cmake", "python3"])
+        build = str(root / "selected integration build")
+        self.assertEqual(calls[1]["args"][1], build)
+        self.assertEqual(calls[2]["args"][1], build)
+        self.assertEqual(calls[3]["args"], [str(root / "scripts/ci/run_production_prerequisites.py"),
+            "--build-dir", build, "--reuse-report", str(root / "evidence directory/prerequisites.json")])
+
+    def test_rejected_receipt_blocks_commit_without_another_test_path(self):
+        """A stale or invalid explicit receipt cannot succeed or start an alternate gate."""
+        result, calls, _, _ = self.run_hook(reuse=True, fail="reuse")
+        self.assertEqual(result.returncode, 17)
+        self.assertEqual(len(calls), 4)
+        self.assertNotIn("Unit and ProductionTestPreflight passed.", result.stdout)
 
 
 if __name__ == "__main__":

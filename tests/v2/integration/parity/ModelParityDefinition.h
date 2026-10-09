@@ -981,6 +981,8 @@ namespace llaminar2::test::parity
                 PrefixCacheTerminalStateMode::Auto;
 
             config.mtp.enabled = mtpEnabled();
+            config.mtp_activation_policy = mtpEnabled()
+                ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled;
             config.mtp.draft_tokens =
                 std::max(1, requestedMTPDraftDepth());
             config.mtp.graph_capacity_draft_tokens =

@@ -127,6 +127,20 @@ namespace llaminar2
 
                 try
                 {
+                    // Validate both snapshots before preparing any physical
+                    // transfers. Equal row counts do not identify a PP stage.
+                    for (const auto *snapshot :
+                         {transaction.previous.get(), transaction.candidate.get()})
+                    {
+                        snapshot->owner_map.requireLayerGeometry(
+                            endpoint->numLayers(), endpoint->numExperts(),
+                            endpoint->firstModelLayer());
+                        if (snapshot->layered_ownership.firstModelLayer() != endpoint->firstModelLayer() ||
+                            snapshot->layered_ownership.layerCount() != endpoint->numLayers() ||
+                            snapshot->layered_ownership.expertCount() != endpoint->numExperts())
+                            throw std::logic_error(
+                                "ExpertOverlay migration snapshot belongs to another model stage");
+                    }
                     auto bank = endpoint->cloneCandidate(
                         transaction.previous->epoch,
                         transaction.candidate->epoch);
@@ -161,8 +175,7 @@ namespace llaminar2
                     });
                 if (found == candidates.end())
                     continue;
-                if (migration.layer_idx < 0 ||
-                    migration.layer_idx >= found->endpoint->numLayers() ||
+                if (!found->bank.containsModelLayer(migration.layer_idx) ||
                     migration.expert_id < 0 ||
                     migration.expert_id >= found->endpoint->numExperts())
                 {
@@ -171,7 +184,7 @@ namespace llaminar2
                     candidates.clear();
                     return MoEOverlayResidencyStageStartStatus::Failed;
                 }
-                found->bank.layers[static_cast<std::size_t>(migration.layer_idx)]
+                found->bank.layerForModelLayer(migration.layer_idx)
                     .clearExpert(migration.expert_id);
             }
             return MoEOverlayResidencyStageStartStatus::Started;
@@ -309,8 +322,7 @@ namespace llaminar2
                                     : arrival_error);
                         }
                         local_candidate
-                            ->bank.layers[static_cast<std::size_t>(
-                                migration.layer_idx)]
+                            ->bank.layerForModelLayer(migration.layer_idx)
                             .setResidentExpert(
                                 migration.expert_id, std::move(payload));
                     }
@@ -326,13 +338,14 @@ namespace llaminar2
                                 local.participant_id,
                                 local.endpoint->device(),
                                 local.endpoint->numLayers(),
-                                local.endpoint->numExperts()))
+                                local.endpoint->numExperts(),
+                                local.endpoint->firstModelLayer()))
                         {
                             throw std::logic_error(
                                 "ExpertOverlay candidate participant bank is incomplete");
                         }
-                        for (int layer = 0;
-                             layer < local.endpoint->numLayers();
+                        for (int layer = local.endpoint->firstModelLayer();
+                             layer < local.endpoint->endModelLayer();
                              ++layer)
                         {
                             const auto expected =
@@ -340,7 +353,7 @@ namespace llaminar2
                                     layer,
                                     local.participant_id,
                                     local.endpoint->numExperts());
-                            if (local.bank.layers[static_cast<std::size_t>(layer)]
+                            if (local.bank.layerForModelLayer(layer)
                                     .resident_mask != expected)
                             {
                                 throw std::logic_error(

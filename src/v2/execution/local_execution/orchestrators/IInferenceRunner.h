@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "execution/prefix_cache/PrefixCacheTelemetry.h"
+#include "execution/prefix_cache/PrefixRestoreMetadata.h"
 #include <algorithm>
 #include <array>
 #include <optional>
@@ -44,6 +46,7 @@ namespace llaminar2
     struct GraphExecutorStats;
     struct SamplingParams;
     struct LogitPenalty;
+    class LogitPenaltyBatch;
     struct MTPSpecStepPlan;
     struct MTPSpecStepPlanBatch;
     struct MTPSpecDecodeVerifierInputPlan;
@@ -3133,6 +3136,21 @@ namespace llaminar2
          * lifecycle violation.  Implementations must fail rather than patching a
          * captured graph or silently retaining the previous request's policy.
          */
+        /**
+         * @brief Admit complete prompt membership after prefill or prefix restore.
+         * @param unique_tokens Sorted unique prompt tokens, excluding generated output.
+         * @param request_index Request-owned histogram row; zero for scalar generation.
+         * @return Whether every continuation owner published its initialized history.
+         */
+        virtual bool initializePromptRepetitionHistory(
+            std::span<const int32_t> unique_tokens, int request_index = 0)
+        {
+            (void)unique_tokens; (void)request_index;
+            if (primaryDeviceId().is_gpu())
+                throw std::logic_error("GPU runner has no prompt repetition-history admission");
+            return true;
+        }
+
         virtual bool configureMTPRequestPenaltyPolicy(
             const MTPRequestPenaltyPolicy &policy)
         {
@@ -3375,6 +3393,16 @@ namespace llaminar2
          * @return True after no reusable prefix record remains addressable.
          */
         virtual bool purgePrefixCache() { return true; }
+
+        /**
+         * @brief Freeze rank-local cache publishers during serving setup.
+         * @return Metadata-only sources from every local model-graph participant.
+         * Call before concurrent serving starts. Composite owners enumerate their
+         * local children once; HTTP subsequently reads these retained publishers,
+         * without traversing runners, invoking MPI or polling native devices.
+         * Runners without a reusable prefix tier contribute no sources.
+         */
+        virtual PrefixCacheTelemetrySources prefixCacheTelemetrySources() const { return {}; }
 
         /**
          * @brief GPU-side greedy sampling (skip D2H of full logits)
@@ -3716,7 +3744,7 @@ namespace llaminar2
          *         GPU decode callers must treat false as a hard failure rather
          *         than silently falling back to host logits.
          */
-        virtual bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
+        virtual bool applyPenaltiesOnDevice(const LogitPenaltyBatch &penalties,
                                             int vocab_size)
         {
             (void)penalties;
@@ -3727,7 +3755,7 @@ namespace llaminar2
         /**
          * @brief Apply sparse logit penalties to MTP sidecar logits on device.
          */
-        virtual bool applyPenaltiesToMTPLogitsOnDevice(const std::vector<LogitPenalty> &penalties,
+        virtual bool applyPenaltiesToMTPLogitsOnDevice(const LogitPenaltyBatch &penalties,
                                                        int vocab_size)
         {
             (void)penalties;
@@ -3740,7 +3768,7 @@ namespace llaminar2
          */
         virtual bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
             int row,
-            const std::vector<LogitPenalty> &penalties,
+            const LogitPenaltyBatch &penalties,
             int vocab_size)
         {
             (void)row;
@@ -5332,6 +5360,18 @@ namespace llaminar2
         virtual uint64_t moeRuntimeMovementEpoch() const { return moePlacementEpoch(); }
 
         /**
+         * @brief Observe independent pipeline prefix admissions after harvest.
+         * @return Empty for a single authority, otherwise every configured stage.
+         *
+         * Composite implementations pair their retained child lookup with that
+         * same child's completed epoch. This passive request observation never
+         * probes device state, merges independent epoch namespaces or rereads a
+         * cache payload. It is valid only after a complete coordinated lookup.
+         */
+        virtual MoEOptimizationStages<PrefixMovementEpochObservation>
+        prefixMovementStages() const { return {}; }
+
+        /**
          * @brief Observe adaptive MoE lifecycle and completed movement totals.
          *
          * This passive projection comes from the real optimization owner. It
@@ -5447,6 +5487,22 @@ namespace llaminar2
             (void)tokens;
             (void)schedule;
             return false;
+        }
+
+        /**
+         * @brief Describe the selected restore sources without observing live device state.
+         * @param hit Exact clamped admission, before its source chain becomes a harvest witness.
+         * @return Section and tier metadata from every participant's selected records.
+         *
+         * Leaf runners read authenticated archive declarations. TP/PP owners
+         * query their retained child admissions; representative blocks cannot
+         * describe sections owned only by another shard or pipeline stage.
+         */
+        virtual PrefixRestoreMetadata prefixRestoreMetadata(const PrefixLookupResult &hit) const
+        {
+            return hit.cached_tokens > 0
+                ? PrefixRestoreMetadata::fromBlocks(hit.restoreBlocks())
+                : PrefixRestoreMetadata{};
         }
 
         virtual bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0)

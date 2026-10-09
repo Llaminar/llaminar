@@ -12,6 +12,7 @@
 #include "execution/compute_stages/stages/MoEDeviceRebalanceStage.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/moe/NativeMoEMovementRequestIdentity.h"
+#include "execution/moe/NativeMoEMovementPerfStats.h"
 #include "utils/PerfStatsCollector.h"
 
 namespace llaminar2
@@ -82,9 +83,14 @@ namespace llaminar2
                 domain->participants[config.root_participant].toLocalDeviceId() != state_.device_id ||
                 (!domain->world_ranks.empty() && domain->world_ranks.size() != domain->participants.size()))
                 throw std::invalid_argument("Native MoE root/domain participant geometry disagrees with captured policy");
+            if (!params.moe_runtime_table || params.moe_runtime_table->firstModelLayer() < 0 ||
+                params.moe_runtime_table->layerCount() != static_cast<int>(config.num_layers))
+                throw std::invalid_argument("Native MoE journal lost its exact stage layer scope");
             const auto view = stage.movementJournalView();
             NativeMoEMovementArchiveConfig geometry{.workspace_generation = generation,
-                .layers = config.num_layers, .experts = config.num_experts,
+                .layers = config.num_layers,
+                .first_model_layer = static_cast<std::uint32_t>(params.moe_runtime_table->firstModelLayer()),
+                .experts = config.num_experts,
                 .wave_capacity = view.wave_capacity, .edge_capacity = view.edge_capacity};
             for (std::size_t i = 0; i < domain->participants.size(); ++i)
                 geometry.participants.push_back({domain->participants[i].toLocalDeviceId(),
@@ -92,7 +98,7 @@ namespace llaminar2
             native_moe_movement_archive_.emplace(std::move(geometry));
         }
         auto &archive = *native_moe_movement_archive_;
-        const auto first_economy = archive.ledger().economy.size();
+        const auto first_publication = archive.ledger().device_publications.size();
         const auto first_edge = archive.observe(request_epoch, generation,
             controller.movement_journal, waves, edges);
 
@@ -102,38 +108,18 @@ namespace llaminar2
         if (!PerfStatsCollector::isDomainEnabled("moe_overlay_controller"))
             return;
         const auto &ledger = archive.ledger();
-        for (std::size_t i = first_economy; i < ledger.economy.size(); ++i)
+        std::size_t next_edge = first_edge;
+        for (std::size_t i = first_publication; i < ledger.device_publications.size(); ++i)
         {
-            const auto &economy = ledger.economy[i];
-            const auto wave = std::find_if(waves.begin(), waves.end(),
-                [&](const auto &value) { return value.candidate_epoch == economy.candidate_epoch; });
-            if (wave == waves.end())
-                throw std::logic_error("Archived native movement lost its terminal payload receipt");
-            const std::map<std::string, std::string> tags{
-                {"transaction", std::to_string(economy.transaction)},
-                {"candidate_epoch", std::to_string(economy.candidate_epoch)},
-                {"policy_owner", "device"}, {"policy", "native_load_spread"}};
-            PerfStatsCollector::addCounter("moe_overlay_controller", "dynamic_movement_transactions", 1.0,
-                "maintenance", state_.device_id.toString(), tags);
-            PerfStatsCollector::addCounter("moe_overlay_controller", "dynamic_physical_bytes",
-                static_cast<double>(wave->physical_payload_bytes), "maintenance", state_.device_id.toString(), tags);
+            const auto &publication = ledger.device_publications[i];
+            if (next_edge > ledger.edges.size() || publication.command_count > ledger.edges.size() - next_edge)
+                throw std::logic_error("Archived native movement lost its completed edge extent");
+            recordNativeMoECompletedMovement(publication,
+                std::span(ledger.edges).subspan(next_edge, publication.command_count), state_.device_id.toString(),
+                params.moe_runtime_table->firstModelLayer(), config.num_layers);
+            next_edge += publication.command_count;
         }
-        for (std::size_t i = first_edge; i < ledger.edges.size(); ++i)
-        {
-            const auto &edge = ledger.edges[i];
-            PerfStatsCollector::addCounter("moe_overlay_controller", "dynamic_migration_edges", 1.0,
-                "maintenance", state_.device_id.toString(),
-                {{"transaction", std::to_string(edge.transaction)}, {"candidate_epoch", std::to_string(edge.candidate_epoch)},
-                 {"layer", std::to_string(edge.layer)}, {"expert", std::to_string(edge.expert)},
-                 {"source_participant", std::to_string(edge.source_participant)},
-                 {"destination_participant", std::to_string(edge.destination_participant)},
-                 {"source_priority", std::to_string(edge.source_priority)},
-                 {"destination_priority", std::to_string(edge.destination_priority)},
-                 {"source_world_rank", std::to_string(edge.source_world_rank)},
-                 {"destination_world_rank", std::to_string(edge.destination_world_rank)},
-                 {"source_device", edge.source_device.toString()}, {"destination_device", edge.destination_device.toString()},
-                 {"movement_axis", "participant_placement"}, {"direction", "same_priority"},
-                 {"blocking_inference", "false"}, {"policy_owner", "device"}, {"policy", "native_load_spread"}});
-        }
+        if (next_edge != ledger.edges.size())
+            throw std::logic_error("Archived native movement left unmatched completed edges");
     }
 }

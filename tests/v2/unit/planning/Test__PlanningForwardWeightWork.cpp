@@ -11,6 +11,7 @@
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
+#include "../../utils/QuantizedVerifierFormats.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -72,6 +73,7 @@ namespace
         request.model_path = source.path();
         request.max_seq_len = 1024;
         request.mtp.enabled = false;
+        request.mtp_activation_policy = MTPActivationPolicy::Disabled;
         request.mtp.graph_capacity_draft_tokens = source.metadata().memoryProfile().mtp_layer_count > 0 ? 15 : 0;
         request.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
         request.routed_expert_compute_policy = routed_policy;
@@ -93,7 +95,8 @@ namespace
                 result = std::move(value);
             }
         });
-        if (!result) throw std::logic_error("No fixture candidate");
+        if (!result) throw std::logic_error(std::string("No fixture candidate: backend=") + deviceTypeToString(backend) +
+            " strategy=" + std::to_string(static_cast<int>(strategy)) + " model=" + source.path());
         return std::move(*result);
     }
 
@@ -182,6 +185,79 @@ TEST(PlanningForwardWeightWork, NativeFormatsAndCanonicalFP32OverridesRemainDist
             EXPECT_EQ(gate.executionFormat(), "F32");
             EXPECT_EQ(find(work[0], "blk.0.ssm_out.weight", WeightRole::GDNProjection).executionFormat(), format);
             EXPECT_EQ(find(work[0], "blk.0.attn_gate.weight", WeightRole::GDNProjection).executionFormat(), format);
+        }
+    }
+}
+
+/**
+ * @test An MTP GGUF with explicit serial execution admits only its main consumers.
+ *
+ * Sweep every native codebook and CPU/CUDA/ROCm through single-device, TP, PP,
+ * and routed multi-device MoE/CPU-overlay candidates. The real compiler and PMA
+ * admission run without loading payloads. Main-forward operands may never name
+ * the trailing sidecar, including when its retained envelope is requested.
+ */
+TEST(PlanningForwardWeightWork, DisabledMTPGGUFAdmissionAllFormatsBackendsAndTopologies)
+{
+    for (const bool moe : {false, true})
+    {
+        std::vector<TensorType> formats{TensorType::FP32, TensorType::FP16, TensorType::BF16};
+        for (const auto &format : test::quantizedVerifierFormats())
+            formats.push_back(format.tensor_type);
+        for (const auto format : formats)
+        {
+            if (format == TensorType::Q8_1)
+            {
+                // Q8_1 is accepted by runtime preparation but has no supported
+                // GGUF source encoding. Prove that boundary rather than forge one.
+                EXPECT_THROW(test::PlanningGGUFFixture::sourceType(format), std::invalid_argument);
+                continue;
+            }
+            test::PlanningGGUFFixture file(moe, true, test::PlanningGGUFFixture::sourceType(format));
+            PlanningModelSource source(file.path());
+            for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+                for (const auto strategy : {OrchestrationStrategy::SingleDevice,
+                     OrchestrationStrategy::TensorParallel, OrchestrationStrategy::PipelineParallel,
+                     OrchestrationStrategy::ExpertOverlay})
+                {
+                    if (moe && strategy == OrchestrationStrategy::PipelineParallel)
+                        continue; // The canonical candidate inventory admits PP for dense models.
+                    if (strategy == OrchestrationStrategy::ExpertOverlay && (!moe || backend == DeviceType::CPU))
+                        continue; // A routed overlay requires routed experts and distinct tier backends.
+                    SCOPED_TRACE(::testing::Message() << "moe=" << moe << " format=" << static_cast<int>(format)
+                        << " backend=" << deviceTypeToString(backend) << " strategy=" << static_cast<int>(strategy));
+                    for (const int retained_depth : {0, 15})
+                    {
+                        auto request = proposal(source, backend, strategy, 2);
+                        request.config.mtp.graph_capacity_draft_tokens = retained_depth;
+                        const auto admitted = admit(std::move(request), source);
+                        EXPECT_FALSE(admitted.config().mtp.enabled);
+                        EXPECT_EQ(admitted.config().mtp_activation_policy, MTPActivationPolicy::Disabled);
+                        EXPECT_EQ(admitted.config().mtp.graph_capacity_draft_tokens, retained_depth);
+                        EXPECT_GT(admitted.physicalAdmission().plan().totalBytes(), 0u);
+                        for (const auto &rank : admitted.rankPlans())
+                        {
+                            EXPECT_FALSE(rank.runtime.mtp.enabled);
+                            EXPECT_LT(rank.last_layer, 2);
+                        }
+                        for (const auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
+                            for (const auto &participant : compilePlanningForwardWeightWork(source.metadata(), admitted, phase))
+                            {
+                                for (const auto &operation : participant.ordinary)
+                                {
+                                    const auto &weight = operand(operation);
+                                    EXPECT_LT(weight.layer, 2);
+                                    EXPECT_FALSE(weight.source_name.starts_with("blk.2."));
+                                }
+                                for (const auto &routed : participant.routed)
+                                    for (const auto &weight : routed.gate_up_down)
+                                    {
+                                        EXPECT_LT(weight.layer, 2);
+                                        EXPECT_FALSE(weight.source_name.starts_with("blk.2."));
+                                    }
+                            }
+                    }
+                }
         }
     }
 }

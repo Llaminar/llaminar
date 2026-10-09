@@ -899,6 +899,12 @@ namespace llaminar2
                 if (params_.device_rebalance_workspace_name.empty() ||
                     params_.device_rebalance_plan_capacity == 0 ||
                     params_.device_rebalance_command_buffer_count == 0 ||
+                    params_.device_rebalance_config.num_layers !=
+                        static_cast<uint32_t>(params_.moe_runtime_table->layerCount()) ||
+                    params_.device_rebalance_config.num_experts !=
+                        static_cast<uint32_t>(params_.num_experts) ||
+                    params_.device_rebalance_config.top_k !=
+                        static_cast<uint32_t>(params_.top_k) ||
                     !validateDeviceMoERebalanceConfig(params_.device_rebalance_config))
                 {
                     LOG_ERROR("[MoERoutingStage] Device rebalance route-apply has an invalid binding"
@@ -933,7 +939,16 @@ namespace llaminar2
                     return ptr;
                 };
 
-                auto *runtime_layers = params_.moe_runtime_table->deviceLayerState(0);
+                // Kernel command rows address compact stage storage; public
+                // table lookups and graph parameters retain global model IDs.
+                auto *runtime_layers = params_.moe_runtime_table->deviceLayerState(
+                    params_.moe_runtime_table->firstModelLayer());
+                const int requested_model_layer =
+                    params_.device_rebalance_apply_layer_idx == -2
+                        ? params_.layer_idx : params_.device_rebalance_apply_layer_idx;
+                const int apply_storage_row = requested_model_layer == -1 ? -1 :
+                    static_cast<int>(params_.moe_runtime_table->storageIndexForModelLayer(
+                        requested_model_layer));
                 auto *plan_entries = static_cast<DeviceMoERebalancePlanEntry *>(
                     requireWorkspaceBuffer(
                         MoEDeviceRebalanceStage::WS_TRANSFER_PLAN,
@@ -982,9 +997,7 @@ namespace llaminar2
                     params_.device_rebalance_config,
                     apply_status,
                     controller_state,
-                    params_.device_rebalance_apply_layer_idx == -2
-                        ? params_.layer_idx
-                        : params_.device_rebalance_apply_layer_idx,
+                    apply_storage_row,
                     params_.device_rebalance_command_buffer_count,
                     params_.absolute_position_ids_device,
                     params_.routed_row_execution_policy);

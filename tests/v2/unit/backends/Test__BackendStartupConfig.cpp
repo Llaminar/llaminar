@@ -4,13 +4,19 @@
  *
  * These tests are deliberately device-free. They lock down parsing and prove
  * that CPU-only inventory detection returns before any vendor enumeration is
- * reachable. Real-driver primary-context isolation is covered by the matching
+ * reachable, including discovery, refresh and lazy BackendManager access. Native
+ * enumeration entrypoints are trapped by this executable: a regression reports
+ * a test failure before any driver can initialize, even on a machine with GPUs.
+ * Real-driver
+ * primary-context isolation is covered by the matching
  * production-test preflight integration test.
  */
 
 #include <gtest/gtest.h>
 
 #include "backends/HardwareInventory.h"
+#include "backends/DeviceRegistry.h"
+#include "backends/BackendManager.h"
 #include "utils/DebugEnv.h"
 
 #include <array>
@@ -19,6 +25,28 @@
 #include <string>
 
 using namespace llaminar2;
+
+/**
+ * @brief Device-free ABI trap for accidental CUDA initialization by this unit executable.
+ * @param count Receives zero so a defective constructor cannot continue into another native API.
+ * @return CUDA's zero success status; the forbidden call itself fails the active test.
+ * The C enumeration ABI returns an integer status. No vendor headers or driver
+ * calls are needed to prove that the manager returns before this boundary.
+ */
+extern "C" int cudaGetDeviceCount(int *count)
+{
+    ADD_FAILURE() << "CPU-only/excluded backend entered cudaGetDeviceCount";
+    *count = 0;
+    return 0;
+}
+
+/** @copydoc cudaGetDeviceCount */
+extern "C" int hipGetDeviceCount(int *count)
+{
+    ADD_FAILURE() << "CPU-only/excluded backend entered hipGetDeviceCount";
+    *count = 0;
+    return 0;
+}
 
 namespace
 {
@@ -157,4 +185,62 @@ TEST(Test__BackendStartupConfig, CpuOnlyInventoryNeverPublishesGpuDevices)
     EXPECT_TRUE(inventory.rocm_devices.empty());
     EXPECT_FALSE(inventory.cuda_p2p.has_value());
     EXPECT_FALSE(inventory.rocm_p2p.has_value());
+}
+
+TEST(Test__BackendStartupConfig, DeviceRegistryHonorsCpuOnlyDiscoveryAndRefresh)
+{
+    ScopedBackendStartupEnvironment environment;
+    environment.set("LLAMINAR_FORCE_CPU_ONLY_STARTUP", "1");
+    auto &registry = DeviceRegistry::instance();
+
+    registry.discover();
+    for (int refresh = 0; refresh < 2; ++refresh)
+    {
+        EXPECT_GT(registry.deviceCount(DeviceType::CPU), 0u);
+        EXPECT_EQ(registry.deviceCount(DeviceType::CUDA), 0u);
+        EXPECT_EQ(registry.deviceCount(DeviceType::ROCm), 0u);
+        EXPECT_FALSE(registry.defaultDevice(DeviceType::CUDA).has_value());
+        EXPECT_FALSE(registry.defaultDevice(DeviceType::ROCm).has_value());
+        EXPECT_FALSE(registry.canP2P(GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)));
+        EXPECT_FALSE(registry.canP2P(GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)));
+        registry.refresh();
+    }
+}
+
+TEST(Test__BackendStartupConfig, DeviceRegistryHonorsBothSelectiveExclusions)
+{
+    ScopedBackendStartupEnvironment environment;
+    environment.set("LLAMINAR_SKIP_CUDA_STARTUP", "1");
+    environment.set("LLAMINAR_SKIP_ROCM_STARTUP", "1");
+    auto &registry = DeviceRegistry::instance();
+    registry.discover();
+
+    EXPECT_GT(registry.deviceCount(DeviceType::CPU), 0u);
+    EXPECT_EQ(registry.totalDeviceCount(), registry.deviceCount(DeviceType::CPU));
+    EXPECT_FALSE(registry.isValid(GlobalDeviceAddress::cuda(0)));
+    EXPECT_FALSE(registry.isValid(GlobalDeviceAddress::rocm(0)));
+}
+
+/** @test Lazy backend access must honor exclusions before constructing either vendor owner. */
+TEST(Test__BackendStartupConfig, BackendManagerHonorsCpuOnlyAndSelectiveExclusion)
+{
+    ScopedBackendStartupEnvironment environment;
+    environment.set("LLAMINAR_FORCE_CPU_ONLY_STARTUP", "1");
+    EXPECT_EQ(getCUDABackend(), nullptr);
+    EXPECT_EQ(getROCmBackend(), nullptr);
+    EXPECT_EQ(getBackendFor(DeviceId::cuda(0)), nullptr);
+    EXPECT_EQ(getBackendFor(DeviceId::rocm(0)), nullptr);
+    EXPECT_EQ(getBackendForDeviceType(ComputeBackendType::GPU_CUDA), nullptr);
+    EXPECT_EQ(getBackendForDeviceType(ComputeBackendType::GPU_ROCM), nullptr);
+    EXPECT_FALSE(hasCUDABackend());
+    EXPECT_FALSE(hasROCmBackend());
+
+    environment.set("LLAMINAR_FORCE_CPU_ONLY_STARTUP", "0");
+    environment.set("LLAMINAR_SKIP_CUDA_STARTUP", "1");
+    EXPECT_EQ(getCUDABackend(), nullptr);
+    EXPECT_EQ(getBackendFor(DeviceId::cuda(0)), nullptr);
+    environment.set("LLAMINAR_SKIP_CUDA_STARTUP", "0");
+    environment.set("LLAMINAR_SKIP_ROCM_STARTUP", "1");
+    EXPECT_EQ(getROCmBackend(), nullptr);
+    EXPECT_EQ(getBackendFor(DeviceId::rocm(0)), nullptr);
 }

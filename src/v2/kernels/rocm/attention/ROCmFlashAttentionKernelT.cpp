@@ -6,6 +6,8 @@
  * defined in ROCmFlashAttentionKernels.hip. Decode owns one capacity-stable
  * parallel split envelope for ordinary and grouped rows. Deterministic mode
  * uses the same ordered reduction rather than serializing each KV traversal.
+ * Native scalar decode retains the cache format even below a wavefront-wide
+ * head, so grouped verification shares its query rounding and dot arithmetic.
  *
  * Target Architecture: AMD MI50 (gfx906 / Vega 20)
  *
@@ -1319,10 +1321,11 @@ namespace llaminar2
 
                 kv_native_type = K->native_type();
 
-                // For prefill (head_dim >= 64) or decode, dispatch to
-                // native FP16/Q8_1 kernel — eliminates FP32 conversion pipeline entirely
+                // Decode admits sub-wavefront heads in the same native-format
+                // body as grouped verification. Converting narrow FP16 caches
+                // to FP32 here would change query rounding and dot arithmetic.
                 if (!disable_native_kv &&
-                    head_dim >= 64 &&
+                    (seq_len == 1 || head_dim >= 64) &&
                     (kv_native_type == TensorType::FP16 ||
                      kv_native_type == TensorType::BF16 ||
                      (kv_native_type == TensorType::Q8_1 && head_dim % 32 == 0)))
