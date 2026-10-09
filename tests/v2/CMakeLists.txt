@@ -4391,6 +4391,17 @@ set_tests_properties(V2_Integration_PreCommitSelectedBuild PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;Hooks;Build;Regression;DeviceFree"
     TIMEOUT 30
 )
+# Real Git linked worktrees export an absolute GIT_DIR to hooks. Dependency
+# checkout inspection must retain the dependency's own repository authority.
+add_test(NAME V2_Integration_PreCommitGitEnvironment
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_precommit_hook.py
+            PreCommitHookTests.test_real_git_hook_keeps_foreign_repository_identity
+)
+set_tests_properties(V2_Integration_PreCommitGitEnvironment PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;Hooks;Build;Regression;DeviceFree"
+    TIMEOUT 30
+)
 add_test(NAME V2_Integration_ProductionPrerequisiteReuse
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_prerequisite_reuse.py

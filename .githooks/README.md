@@ -19,6 +19,11 @@ canonical CMake test registrations. Script-only tests need no executable build;
 shared fixtures are built once. Build and test parallelism is unrestricted,
 with CTest retaining the registered resource locks and timeouts.
 
+After resolving the source root, the hook clears Git's repository-local
+environment variables before configuring dependencies or running tests. Git
+exports those variables to hooks, and an inherited absolute `GIT_DIR` from a
+linked worktree otherwise redirects dependency checkout queries to Llaminar.
+
 Set `LLAMINAR_PRECOMMIT_BUILD_DIR` to select an existing Integration build
 without losing its pinned compiler and dependency configuration. The default
 remains `build_v2_integration`. After a complete canonical prerequisite run,
@@ -83,4 +88,5 @@ models, accelerators, or modifying Git registration. Compiler-metadata
 regeneration, build selection and receipt freshness are also registered in
 `ProductionTestPreflight` as `V2_Integration_PreCommitCompilerMetadata`,
 `V2_Integration_PreCommitSelectedBuild` and
-`V2_Integration_ProductionPrerequisiteReuse`.
+`V2_Integration_ProductionPrerequisiteReuse`. The real-Git linked-worktree
+regression is `V2_Integration_PreCommitGitEnvironment`.

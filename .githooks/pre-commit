@@ -8,6 +8,13 @@ set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
+# Git exports repository-local variables to hooks. Clear that inherited
+# authority before CMake or tests inspect an independent dependency checkout.
+# Resolve our root first; all subsequent local commands run from this directory.
+LLAMINAR_HOOK_GIT_ENV="$(git rev-parse --local-env-vars)"
+while IFS= read -r LLAMINAR_HOOK_GIT_VARIABLE; do
+    unset "$LLAMINAR_HOOK_GIT_VARIABLE"
+done <<< "$LLAMINAR_HOOK_GIT_ENV"
 BUILD_DIR="${LLAMINAR_PRECOMMIT_BUILD_DIR:-$REPO_ROOT/build_v2_integration}"
 LLAMINAR_NINJA_BIN="$(command -v ninja)"
 
