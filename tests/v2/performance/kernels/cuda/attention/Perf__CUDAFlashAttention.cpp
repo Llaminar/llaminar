@@ -8,8 +8,12 @@
  *   - The production Qwen3.6-35B-A3B FP16-KV attention geometry replayed
  *     through a one-node CUDA graph across every ordinary prefill bucket and
  *     resident contexts through 128K tokens.
+ *     Captured blocks and shared bytes authenticate the selected half-producer
+ *     or cooperative float-value schedule using the production resource policy.
  *   - Dense HD256 attention as a complete captured context-partition pipeline,
  *     with a bounded exact-point profiler selector and byte-equal direct oracle.
+ *   - Automatic fixed-query scaling with complete poisoned-output and retained
+ *     replay validation against the native direct reference outside timing.
  *   - Production tensor-dispatched FP16-KV decode at fixed captured geometry,
  *     with host submission amortized across repeated complete attention nodes.
  *
@@ -34,6 +38,7 @@
 
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
+#include "tensors/GpuTensorView.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -42,6 +47,7 @@
 #include "backends/cuda/CUDAGraphCapture.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
+#include "kernels/cuda/attention/CUDATensorPrefillKernels.h"
 #include "utils/DebugEnv.h"
 #include <cuda_runtime.h>
 
@@ -61,6 +67,7 @@
 #include <cstdlib>
 #include <numeric>
 #include <memory>
+#include <utility>
 #include <sstream>
 #include <string>
 
@@ -874,36 +881,34 @@ namespace
                 static_cast<int>(params.gridDim.x * params.gridDim.y * params.gridDim.z);
             captured_block_threads_ =
                 static_cast<int>(params.blockDim.x * params.blockDim.y * params.blockDim.z);
-            const int pv_warps_per_query_group =
-                geometry_.head_dim > 128
-                    ? mutableDebugEnv().attention.cuda_fa2_hd256_pv_warps
-                    : 1;
-            const int consumer_warps =
-                captured_block_threads_ / 32 - 2;
-            if (pv_warps_per_query_group <= 0 ||
-                consumer_warps <= 0 ||
-                consumer_warps % pv_warps_per_query_group != 0)
+            using namespace llaminar2::cuda::fa2_policy;
+            int matching_layouts = 0;
+            for (int groups = 1; groups <= maximumFA2QueryWarpGroups(geometry_.head_dim); ++groups)
             {
-                fail("CUDA FA2 graph exposed an invalid consumer-warp geometry");
-                return false;
-            }
-            const int query_warp_groups =
-                consumer_warps / pv_warps_per_query_group;
-            for (const int tile_kv : {16, 32, 64})
-            {
-                if (params.sharedMemBytes ==
-                    llaminar2::cuda::fa2_policy::fa2DynamicSharedMemoryBytes(
-                        geometry_.head_dim,
-                        query_warp_groups,
-                        tile_kv))
+                const auto storage = selectFA2TileStoragePolicy(geometry_.head_dim, groups);
+                if (!storage)
+                    continue;
+                const int producers = *storage == FA2TileStoragePolicy::WarpSpecializedHalf
+                    ? FA2TileStorageTraits<FA2TileStoragePolicy::WarpSpecializedHalf>::producer_warps
+                    : FA2TileStorageTraits<FA2TileStoragePolicy::CooperativeFloat>::producer_warps;
+                const int pv_warps = selectFA2PVWarpCount(
+                    geometry_.head_dim, groups, debugEnv().attention.cuda_fa2_hd256_pv_warps);
+                const int rows_per_tile = groups * kFA2QueryRowsPerWarpGroup;
+                if (pv_warps == 0 || captured_block_threads_ != (producers + groups * pv_warps) * 32 ||
+                    params.gridDim.y != (point.query_rows + rows_per_tile - 1) / rows_per_tile)
+                    continue;
+                for (const int tile_kv : {16, 32, 64})
                 {
-                    captured_tile_kv_ = tile_kv;
-                    break;
+                    if (params.sharedMemBytes == fa2DynamicSharedMemoryBytes(geometry_.head_dim, groups, tile_kv))
+                    {
+                        captured_tile_kv_ = tile_kv;
+                        ++matching_layouts;
+                    }
                 }
             }
-            if (captured_tile_kv_ == 0)
+            if (matching_layouts != 1)
             {
-                fail("CUDA FA2 graph shared memory does not identify a compiled K/V tile");
+                fail("CUDA FA2 graph does not identify exactly one compiled K/V layout");
                 return false;
             }
             return true;
@@ -963,13 +968,15 @@ namespace
          * @param context_partition_size Fixed logical K/V partition width.
          * @param include_sequence_reference Whether to capture and time the
          *        many-node arithmetic diagnostic in addition to production.
+         * @param summary_capacity Explicit physical summary stride, or zero for canonical capacity.
          */
         CapturedContextPartitionPrefill(
             AttentionGeometry geometry,
             int maximum_query_rows,
             int maximum_context,
             int context_partition_size,
-            bool include_sequence_reference)
+            bool include_sequence_reference,
+            int summary_capacity = 0)
             : geometry_(geometry),
               maximum_query_rows_(maximum_query_rows),
               maximum_context_(maximum_context),
@@ -981,12 +988,15 @@ namespace
                             context_partition_size
                       : 0)
         {
+            physical_summary_capacity_ = summary_capacity > 0 ? summary_capacity : maximum_context_partitions_;
             initialize();
         }
 
         ~CapturedContextPartitionPrefill()
         {
             destroyGraphs();
+            automatic_kernel_.reset();
+            automatic_workspace_.reset();
             if (start_)
                 (void)cudaEventDestroy(start_);
             if (stop_)
@@ -1074,6 +1084,302 @@ namespace
             measurement.sequence_graph_nodes = sequence_graph_.node_count;
             measurement.context_graph_nodes = context_graph_.node_count;
             return measurement;
+        }
+
+        /** Exact automatic transaction resources and captured replay timing. */
+        struct TensorMeasurement
+        {
+            double latency_us = 0.0; ///< Median complete automatic graph latency.
+            int registers = 0; ///< Selected numerical body's compiled registers.
+            size_t local_bytes = 0; ///< Selected numerical body's compiled local allocation.
+            unsigned blocks = 0; ///< Selected numerical body's launch extent.
+            unsigned threads = 0; ///< Selected numerical body's CTA extent.
+            unsigned shared_bytes = 0; ///< Selected dynamic shared memory.
+            bool tensor_selected = false; ///< Device branch policy evaluated for the published fixture input.
+            int direct_kv_limit = 0; ///< Authenticated immutable branch crossover.
+            size_t root_nodes = 0; ///< Actual retained parent topology.
+        };
+
+        /**
+         * @brief Time actual automatic compute_tensor replay with device-owned counts.
+         * @param point Fixed query bucket and visible keys, including the queries.
+         * @param profiler_mode Execute one timed replay for one profiler shape.
+         * @return Selected body resources and complete automatic transaction latency.
+         *
+         * This uses the public tensor kernel and its normal device-count producer.
+         * Only fixture input publication changes between points; the complete native
+         * conditional graph and workspace remain retained. CUDA exposes the guarded
+         * root after capture, while its IF body is opaque to runtime graph queries.
+         * The reported selected path therefore authenticates the actual captured
+         * branch policy against the known published input. An isolated profiler
+         * launch supplies executed-IF-body evidence without changing this graph.
+         */
+        TensorMeasurement measureTensor(const ProductionPrefillPoint &point, bool profiler_mode)
+        {
+            using namespace llaminar2::cuda;
+            TensorMeasurement result;
+            if (!ready_ || point.query_rows != maximum_query_rows_ ||
+                point.kv_len < point.query_rows || point.kv_len > maximum_context_)
+            {
+                fail("Invalid fixed-query automatic timing point");
+                return result;
+            }
+            const attention::AttentionExecutionPolicy automatic{
+                .prefill_parallel_axis = attention::AttentionPrefillParallelAxis::GeometrySelected};
+            const attention::AttentionPrefillCaptureGeometry capture_geometry{
+                .batch_size = 1, .query_rows = point.query_rows, .local_query_heads = geometry_.n_heads,
+                .head_dim = geometry_.head_dim, .kv_capacity = maximum_context_, .execution_policy = automatic,
+                .native_kv_format = TensorType::FP16,
+                .visibility = attention::AttentionVisibilityPolicy::CausalFullContext,
+                .visible_kv_heads = geometry_.n_kv_heads, .head_start = geometry_.head_start,
+                .replicated_gqa_n_rep = geometry_.launchGqaRep()};
+            const auto native = tensor_prefill::selectHeadGeometry({
+                .batch_size = 1, .query_rows = point.query_rows, .head_dim = geometry_.head_dim,
+                .query_heads = geometry_.n_heads, .kv_heads = geometry_.n_kv_heads,
+                .head_start = geometry_.head_start, .gqa_repetition = geometry_.launchGqaRep(),
+                .kv_format = TensorType::FP16,
+                .visibility = attention::AttentionVisibilityPolicy::CausalFullContext});
+            const auto plan = fa2_policy::selectFA2PrefillParallelPlan({
+                .batch_size = 1, .query_rows = point.query_rows, .local_query_heads = geometry_.n_heads,
+                .head_dim = geometry_.head_dim, .kv_capacity = maximum_context_, .sm_count = sm_count_,
+                .requested_axis = automatic.prefill_parallel_axis,
+                .visible_kv_heads = geometry_.n_kv_heads, .head_start = geometry_.head_start,
+                .replicated_gqa_n_rep = geometry_.launchGqaRep(), .native_kv_format = TensorType::FP16,
+                .visibility = attention::AttentionVisibilityPolicy::CausalFullContext,
+                .query_warp_groups_override = debugEnv().attention.cuda_fa2_q_warp_groups,
+                .pv_warps_override = debugEnv().attention.cuda_fa2_hd256_pv_warps,
+                .tile_kv_override = debugEnv().attention.cuda_fa2_tile_kv});
+            if (!native || !plan.valid || !plan.usesDeviceAdaptiveParallelism() ||
+                plan.summary_layout != fa2_policy::FA2PrefillSummaryLayout::TensorCompactFour ||
+                physical_summary_capacity_ != plan.summary_capacity)
+            {
+                fail("Automatic timing requires the exact native adaptive admission plan");
+                return result;
+            }
+            if (publishDeviceParams(point) != 0)
+            {
+                fail("Automatic timing fixture-count publication failed");
+                return result;
+            }
+            GpuTensorView query(d_q_, point.query_rows, geometry_.n_heads * geometry_.head_dim,
+                TensorType::FP32, DeviceId::cuda(0));
+            GpuTensorView key(d_k_, maximum_context_, geometry_.n_kv_heads * geometry_.head_dim,
+                TensorType::FP16, DeviceId::cuda(0));
+            GpuTensorView value(d_v_, maximum_context_, geometry_.n_kv_heads * geometry_.head_dim,
+                TensorType::FP16, DeviceId::cuda(0));
+            GpuTensorView output(d_context_output_, point.query_rows, geometry_.n_heads * geometry_.head_dim,
+                TensorType::FP32, DeviceId::cuda(0));
+            const auto compute = [&]() {
+                return automatic_kernel_->compute_tensor(&query, &key, &value, &output,
+                    1, point.query_rows, point.kv_len, geometry_.n_heads, geometry_.n_kv_heads,
+                    geometry_.head_dim, true, -1, nullptr, nullptr, automatic_mpi_.get(), 0,
+                    geometry_.head_start, geometry_.n_heads, geometry_.n_kv_heads,
+                    geometry_.launchGqaRep(), automatic);
+            };
+            if (!context_graph_.exec)
+            {
+                automatic_kernel_ = std::make_unique<CUDAFlashAttentionKernelT<ActivationPrecision::FP32>>(0);
+                automatic_kernel_->setGPUStream(stream_);
+                automatic_mpi_ = std::make_unique<MPIContext>(0, 1, MPI_COMM_SELF);
+                auto requirements = automatic_kernel_->getWorkspaceRequirements(1, geometry_.n_heads, geometry_.head_dim);
+                for (const auto [name, bytes] : {
+                    std::pair{AttentionWorkspaceBuffers::PARTIAL_OUTPUT, plan.partial_output_bytes},
+                    std::pair{AttentionWorkspaceBuffers::PARTIAL_M, plan.partial_m_bytes},
+                    std::pair{AttentionWorkspaceBuffers::PARTIAL_L, plan.partial_l_bytes}})
+                    for (auto &buffer : requirements.buffers)
+                        if (buffer.name == name) buffer.size_bytes = bytes;
+                automatic_workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                    DeviceId::cuda(0), requirements.total_bytes_with_alignment() + 4096);
+                if (!automatic_workspace_->allocate(requirements))
+                {
+                    fail("Automatic timing workspace materialization failed");
+                    return result;
+                }
+                automatic_kernel_->bindWorkspace(automatic_workspace_.get());
+                if (!automatic_kernel_->prepareDynamicAttnParams(point.kv_len, point.kv_len - point.query_rows,
+                        1, stream_, maximum_context_) || !compute() ||
+                    cudaStreamSynchronize(stream_) != cudaSuccess ||
+                    !captureGraph(context_graph_, [&]() {
+                        return automatic_kernel_->prepareDynamicAttnParamsFromDeviceSequenceState(
+                            reinterpret_cast<const int *>(d_device_params_), point.query_rows, 1,
+                            stream_, maximum_context_, nullptr, capture_geometry) && compute() ? 0 : -1;
+                    }))
+                {
+                    fail("Automatic tensor timing warmup/capture failed");
+                    return result;
+                }
+            }
+            result.direct_kv_limit = plan.device_direct_partition_limit * context_partition_size_;
+            result.tensor_selected = point.kv_len > result.direct_kv_limit;
+            // The count producer and IF node are real captured native operations.
+            // Inspect the guarded numerical root and retain its exact resources
+            // for short prefixes; long prefixes use the typed native IF contract.
+            size_t count = 0;
+            if (cudaGraphGetNodes(context_graph_.graph, nullptr, &count) != cudaSuccess)
+            {
+                fail("Automatic timing parent inventory failed");
+                return result;
+            }
+            result.root_nodes = count;
+            std::vector<cudaGraphNode_t> nodes(count);
+            if (cudaGraphGetNodes(context_graph_.graph, nodes.data(), &count) != cudaSuccess)
+            {
+                fail("Automatic timing root-node query failed");
+                return result;
+            }
+            int conditionals = 0, numerical_roots = 0;
+            for (const auto node : nodes)
+            {
+                cudaGraphNodeType type{};
+                if (cudaGraphNodeGetType(node, &type) != cudaSuccess)
+                {
+                    fail("Automatic timing node classification failed");
+                    return result;
+                }
+                if (type == cudaGraphNodeTypeConditional) { ++conditionals; continue; }
+                if (type != cudaGraphNodeTypeKernel) continue;
+                cudaKernelNodeParams parameters{};
+                if (cudaGraphKernelNodeGetParams(node, &parameters) != cudaSuccess)
+                {
+                    fail("Automatic timing numerical root query failed");
+                    return result;
+                }
+                const auto threads = parameters.blockDim.x * parameters.blockDim.y * parameters.blockDim.z;
+                if (threads <= 32) continue;
+                ++numerical_roots;
+                if (result.tensor_selected) continue;
+                cudaFuncAttributes resources{};
+                if (cudaFuncGetAttributes(&resources, parameters.func) != cudaSuccess)
+                {
+                    fail("Automatic timing direct resource query failed");
+                    return result;
+                }
+                result.registers = resources.numRegs;
+                result.local_bytes = resources.localSizeBytes;
+                result.blocks = parameters.gridDim.x * parameters.gridDim.y * parameters.gridDim.z;
+                result.threads = threads;
+                result.shared_bytes = parameters.sharedMemBytes;
+            }
+            if (conditionals != 1 || numerical_roots != 1)
+            {
+                fail("Automatic timing requires its retained predicate, guarded root and native IF");
+                return result;
+            }
+            if (result.tensor_selected)
+            {
+                cudaFuncAttributes resources{};
+                if (cudaFuncGetAttributes(&resources,
+                        reinterpret_cast<const void *>(tensor_prefill::kernel(*native))) != cudaSuccess)
+                {
+                    fail("Automatic timing native IF resource query failed");
+                    return result;
+                }
+                result.registers = resources.numRegs;
+                result.local_bytes = resources.localSizeBytes;
+                result.blocks = geometry_.n_heads * std::min(plan.context_partition_slots, tensor_prefill::kSplitLimit) *
+                    ((point.query_rows + tensor_prefill::kRows - 1) / tensor_prefill::kRows);
+                result.threads = tensor_prefill::kThreads;
+                result.shared_bytes = tensor_prefill::kSharedBytes;
+            }
+            if (result.local_bytes != 0)
+            {
+                fail("Automatic timing selected a numerical body with local storage");
+                return result;
+            }
+            result.latency_us = measureGraph(context_graph_, profiler_mode);
+            return result;
+        }
+
+        /**
+         * @brief Validate automatic writes, publication and replay outside timing.
+         * @param point Published fixed query geometry including total visible KV.
+         * @return False on poison, nonfinite data, reference drift or replay drift.
+         *
+         * The direct native entry consumes independently published fixture
+         * parameters. Its original FP32 schedule is compared with the accepted
+         * tensor arithmetic using the existing HALF_ABS_TOL/HALF_REL_TOL policy.
+         * Automatic-to-automatic replay remains byte exact. All output and
+         * summary poison, terminal readbacks and synchronization occur here,
+         * after timing; exact profiler points never call this oracle.
+         */
+        bool validateTensorOutput(const ProductionPrefillPoint &point)
+        {
+            if (!ready_ || !context_graph_.exec || !automatic_workspace_ ||
+                point.query_rows != maximum_query_rows_ || point.kv_len < point.query_rows ||
+                point.kv_len > maximum_context_ || publishDeviceParams(point) != 0)
+            {
+                fail("Automatic output validation requires the retained fixed-query transaction");
+                return false;
+            }
+            const size_t elements = static_cast<size_t>(point.query_rows) *
+                geometry_.n_heads * geometry_.head_dim;
+            const size_t bytes = elements * sizeof(float);
+            std::vector<float> expected(elements), observed(elements), previous;
+            if (cudaMemsetAsync(d_direct_output_, 0xff, bytes, stream_) != cudaSuccess ||
+                launchDirect(point) != 0 ||
+                cudaMemcpyAsync(expected.data(), d_direct_output_, bytes,
+                                cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
+                cudaStreamSynchronize(stream_) != cudaSuccess)
+            {
+                fail("Direct native validation reference failed");
+                return false;
+            }
+            void *parameters = automatic_workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+            for (int replay = 0; replay < 2; ++replay)
+            {
+                attention::AttentionDeviceParams published{};
+                for (const auto name : {AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+                                        AttentionWorkspaceBuffers::PARTIAL_M,
+                                        AttentionWorkspaceBuffers::PARTIAL_L})
+                {
+                    const size_t extent = automatic_workspace_->getBufferSize(name);
+                    if (extent && cudaMemsetAsync(automatic_workspace_->getBuffer(name),
+                                                  0xff, extent, stream_) != cudaSuccess)
+                    {
+                        fail("Automatic validation summary poison failed");
+                        return false;
+                    }
+                }
+                if (cudaMemsetAsync(d_context_output_, 0xff, bytes, stream_) != cudaSuccess ||
+                    cudaMemsetAsync(parameters, 0xff, sizeof(published), stream_) != cudaSuccess ||
+                    cudaGraphLaunch(context_graph_.exec, stream_) != cudaSuccess ||
+                    cudaMemcpyAsync(observed.data(), d_context_output_, bytes,
+                                    cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
+                    cudaMemcpyAsync(&published, parameters, sizeof(published),
+                                    cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
+                    cudaStreamSynchronize(stream_) != cudaSuccess)
+                {
+                    fail("Automatic poisoned validation replay failed");
+                    return false;
+                }
+                if (published.kv_len != point.kv_len || published.kv_stride != maximum_context_ ||
+                    published.position_offset != point.kv_len - point.query_rows ||
+                    published.mask_stride != point.kv_len ||
+                    published.ring_row_origin != 0 || published.ring_row_capacity != 0)
+                {
+                    fail("Automatic retained count producer published the wrong visible geometry");
+                    return false;
+                }
+                for (size_t index = 0; index < elements; ++index)
+                    if (!std::isfinite(expected[index]) || !std::isfinite(observed[index]))
+                    {
+                        fail("Direct or automatic output contains poison/nonfinite data");
+                        return false;
+                    }
+                if (!compareArrays(observed.data(), expected.data(), elements,
+                                   HALF_ABS_TOL, HALF_REL_TOL, 0).passed)
+                {
+                    fail("Automatic FP16 tensor output exceeds the native half comparison policy");
+                    return false;
+                }
+                if (!previous.empty() && std::memcmp(previous.data(), observed.data(), bytes) != 0)
+                {
+                    fail("Automatic retained replay changed output bytes");
+                    return false;
+                }
+                previous = observed;
+            }
+            return true;
         }
 
         /**
@@ -1228,7 +1534,7 @@ namespace
                 geometry_.n_kv_heads * geometry_.head_dim;
             const size_t summary_scalars =
                 static_cast<size_t>(maximum_query_rows_) *
-                geometry_.n_heads * maximum_context_partitions_;
+                geometry_.n_heads * physical_summary_capacity_;
             const size_t summary_elements =
                 summary_scalars * geometry_.head_dim;
 
@@ -1781,6 +2087,9 @@ namespace
         CapturedGraph direct_graph_{};
         CapturedGraph sequence_graph_{};
         CapturedGraph context_graph_{};
+        std::unique_ptr<DeviceWorkspaceManager> automatic_workspace_; ///< Retained admitted tensor scratch.
+        std::unique_ptr<CUDAFlashAttentionKernelT<ActivationPrecision::FP32>> automatic_kernel_; ///< Actual production kernel.
+        std::unique_ptr<MPIContext> automatic_mpi_; ///< One-participant ordinary kernel context.
         float *d_q_ = nullptr;
         void *d_k_ = nullptr;
         void *d_v_ = nullptr;
@@ -1798,6 +2107,7 @@ namespace
         bool include_sequence_reference_ = false;
         int sm_count_ = 0;
         int maximum_context_partitions_ = 0;
+        int physical_summary_capacity_ = 0; ///< Exact admitted per-row summary stride.
         int captured_query_rows_ = 0;
         int captured_live_context_partitions_ = 0;
         int captured_context_partitions_ = 0;
@@ -3617,6 +3927,87 @@ namespace
     // ============================================================================
     // Decode Benchmarks (Latency-focused)
     // ============================================================================
+
+    /**
+     * @brief Canonical fixed-M512 prefill scaling with explicit history semantics.
+     *
+     * Matched TP2 dense12/2 and MoE8/1 reuse a 128K KV allocation and 32 summaries.
+     * Total visible KV is history plus 512 query rows. Additional 8192/8193-key
+     * witnesses expose the compact-summary boundary. The actual compute_tensor
+     * entry and device-count producer capture the automatic direct/IF transaction.
+     * The path column joins its branch policy to known fixture input; conditional
+     * child execution requires the isolated profiler witness described above.
+     * This is attention transaction timing; full-model prefill is a separate gate.
+     */
+    TEST_F(CUDAFlashAttentionPerf, Prefill_FP16TensorFixedM512HistoryScaling)
+    {
+        /** Restore immutable capture settings after this standalone measurement. */
+        struct AutomaticAttentionSettings
+        {
+            int query = mutableDebugEnv().attention.cuda_fa2_q_warp_groups;
+            int values = mutableDebugEnv().attention.cuda_fa2_hd256_pv_warps;
+            int tile = mutableDebugEnv().attention.cuda_fa2_tile_kv;
+            /** Select the same automatic settings used by ordinary inference. */
+            AutomaticAttentionSettings()
+            {
+                auto &settings = mutableDebugEnv().attention;
+                settings.cuda_fa2_q_warp_groups = 0;
+                settings.cuda_fa2_hd256_pv_warps = 0;
+                settings.cuda_fa2_tile_kv = 0;
+            }
+            /** Restore the process settings after every success or assertion exit. */
+            ~AutomaticAttentionSettings()
+            {
+                auto &settings = mutableDebugEnv().attention;
+                settings.cuda_fa2_q_warp_groups = query;
+                settings.cuda_fa2_hd256_pv_warps = values;
+                settings.cuda_fa2_tile_kv = tile;
+            }
+        } automatic;
+        constexpr int rows = 512;
+        constexpr std::array<int, 11> visible_keys{
+            512, 1024, 1536, 2560, 4608, 8192, 8193, 8704, 16896, 33280, 66048};
+        const int selected = positiveEnvironmentValue("LLAMINAR_ATTENTION_TENSOR_PROFILE_KV");
+        const int selected_heads = positiveEnvironmentValue("LLAMINAR_ATTENTION_TENSOR_PROFILE_HEADS");
+        ASSERT_EQ(selected != 0, selected_heads != 0) << "Select one KV and one local head geometry per profiler launch";
+        ASSERT_TRUE(selected_heads == 0 || selected_heads == 8 || selected_heads == 12);
+        ASSERT_TRUE(selected == 0 || std::find(visible_keys.begin(), visible_keys.end(), selected) != visible_keys.end());
+        std::cout << "model,history_rows,query_rows,visible_kv,capacity,summary_capacity,live_summaries,"
+                     "tensor_selected_by_device_policy,direct_kv_limit,root_nodes,blocks,threads,shared_bytes,registers,local_bytes,transaction_us\n";
+        for (const auto &geometry : {
+            AttentionGeometry{"dense-TP2", 12, 2, 256},
+            AttentionGeometry{"MoE-TP2", 8, 1, 256}})
+        {
+            if (selected_heads && geometry.n_heads != selected_heads) continue;
+            CapturedContextPartitionPrefill benchmark(geometry, rows, QWEN36_MAX_CONTEXT, 256,
+                /*include_sequence_reference=*/false,
+                llaminar2::cuda::tensor_attention_policy::summaryCapacity(QWEN36_MAX_CONTEXT));
+            ASSERT_TRUE(benchmark.ready()) << benchmark.error();
+            for (const int visible : visible_keys)
+            {
+                if (selected && visible != selected) continue;
+                const auto measurement = benchmark.measureTensor({rows, visible, "fixed-M512"}, selected != 0);
+                ASSERT_GT(measurement.latency_us, 0.0) << benchmark.error();
+                if (!selected)
+                    ASSERT_TRUE(benchmark.validateTensorOutput({rows, visible, "fixed-M512 validation"}))
+                        << benchmark.error();
+                const auto partitions = llaminar2::cuda::tensor_attention_policy::plan<
+                    llaminar2::cuda::tensor_attention_policy::SplitPolicy::Four>(visible, 32);
+                std::cout << geometry.release_label << ',' << visible - rows << ',' << rows << ',' << visible
+                          << ',' << QWEN36_MAX_CONTEXT << ",32," << (measurement.tensor_selected ? partitions.count : 0) << ','
+                          << (measurement.tensor_selected ? "true" : "false") << ','
+                          << measurement.direct_kv_limit << ',' << measurement.root_nodes << ','
+                          << measurement.blocks << ',' << measurement.threads << ',' << measurement.shared_bytes
+                          << ',' << measurement.registers << ',' << measurement.local_bytes << ','
+                          << std::fixed << std::setprecision(3) << measurement.latency_us << '\n';
+            }
+            // Retain the same graph after 64K history, then poison and replay
+            // the empty-history causal transaction twice outside timing.
+            if (!selected)
+                ASSERT_TRUE(benchmark.validateTensorOutput({rows, visible_keys.front(), "large-to-small validation"}))
+                    << benchmark.error();
+        }
+    }
 
     TEST_F(CUDAFlashAttentionPerf, Decode_DenseHD256_CapturedFP16KV)
     {

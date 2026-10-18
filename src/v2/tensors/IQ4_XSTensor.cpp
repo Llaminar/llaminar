@@ -6,6 +6,7 @@
 
 #include "TensorClasses.h"
 #include "VnniPackContext.h"
+#include "NativeVnniIQ4XSScale.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -489,6 +490,8 @@ namespace llaminar2
 
     void IQ4_XSTensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
+        if (!ctx.mins_array)
+            throw std::invalid_argument("IQ4_XS preparation requires original coefficient storage");
         const size_t linear = vnniLinearIdx(ctx, destination_n, b);
         const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
         const int sb_idx = b / 8;
@@ -499,8 +502,9 @@ namespace llaminar2
 
         const int ls = ((blk->scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf) |
                        (((blk->scales_h >> (2 * sub_idx)) & 3) << 4);
-        const float combined_scale = fp16_to_fp32(blk->d) * static_cast<float>(ls - 32);
-        ctx.scales_array[linear] = fp32_to_fp16(combined_scale);
+        ctx.scales_array[linear] = blk->d;
+        ctx.mins_array[linear] = native_vnni_iq4xs_scale::encodeSourceCoefficient(
+            static_cast<uint8_t>(ls));
     }
 
 } // namespace llaminar2

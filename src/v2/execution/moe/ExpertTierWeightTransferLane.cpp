@@ -22,9 +22,11 @@
 
 #ifdef HAVE_CUDA
 #include "../../kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
+#include "../../kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #endif
 #ifdef HAVE_ROCM
 #include "../../kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
+#include "../../kernels/rocm/gemm/ROCmWeightPacker.h"
 #endif
 
 #include <algorithm>
@@ -127,6 +129,17 @@ namespace llaminar2
             if (!transfer_stream_)
                 throw std::runtime_error("Could not bind the pooled auxiliary transfer stream");
 
+            // First CPU-origin IQ3 source promotion needs the same grid as a
+            // native decode. Cold materialization precedes ticket publication;
+            // the existing synchronous table authority completes all copies.
+#ifdef HAVE_CUDA
+            if (config_.device.is_cuda() && !cuda::prepareNativeIQGridTablesCUDA(device_ordinal_))
+                throw std::runtime_error("CUDA IQ grid setup failed before tier capture");
+#endif
+#ifdef HAVE_ROCM
+            if (config_.device.is_rocm() && !rocm::ensureIQGridTablesInitialized(device_ordinal_))
+                throw std::runtime_error("ROCm IQ grid setup failed before tier capture");
+#endif
             /* All allocations happen before any inference ticket can use this lane. */
             chunk_ready_event_ = backend_->createEvent(device_ordinal_);
             if (config_.collect_timing_measurements)

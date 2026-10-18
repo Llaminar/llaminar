@@ -13,9 +13,14 @@
  * Grouped down publications admit dirty output storage through a checked live
  * overwrite extent. Only a successfully enqueued complete writer can publish
  * that output's exact-stream event; inactive routes still own explicit zeros.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 
+#include "kernels/common/RouterQ8Launch.h"
 #include "CUDAMoEKernel.h"
+#include "CUDARouterQ8Prefill.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
 #include "kernels/common/MoEGroupedIntermediateExchangeKernels.h"
 #include "kernels/common/MoEGroupingInitialization.h"
@@ -77,7 +82,8 @@ namespace
             .word2 = static_cast<std::uint64_t>(
                 static_cast<std::uint32_t>(key.d_model)),
             .word3 = static_cast<std::uint64_t>(
-                static_cast<std::uint32_t>(key.num_experts)),
+                static_cast<std::uint32_t>(key.num_experts)) |
+                (static_cast<std::uint64_t>(key.basis) << 32u),
         };
     }
 
@@ -526,9 +532,16 @@ namespace
         return tile_n >= 64 && tile_n <= 256 && (tile_n % 32) == 0;
     }
 
-    /** Return the sole execution codebook represented by a descriptor mask. */
+    /**
+     * @brief Select the sole execution family without changing descriptor masks.
+     * @param codebook_mask Every actual physical format in the retained table.
+     * @return The single family, or -1 for unrelated mixed formats.
+     */
     int singleCUDAMoECodebook(uint32_t codebook_mask) noexcept
     {
+        // Family24 executes both IQ4 descriptors without changing their mask.
+        if (codebook_mask & (uint32_t{1} << llaminar2::kNativeVnniIQ4XSSourceScaleCodebook))
+            codebook_mask &= ~(uint32_t{1} << 4);
         if (codebook_mask == 0 ||
             (codebook_mask & (codebook_mask - 1U)) != 0U)
         {
@@ -923,6 +936,7 @@ namespace
         {
         case 0:
         case 4:
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
         case 5:
         case 6:
         case 7:
@@ -948,6 +962,8 @@ namespace
     {
         switch (cb)
         {
+        case 11: // Original IQ3_S source nibble; no additive correction.
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
         case 5:
         case 7:
         case 8:
@@ -991,8 +1007,8 @@ namespace
     {
         if (!desc.source_identity_present)
         {
-            return desc.codebook_id !=
-                   llaminar2::kNativeVnniExpandedInt8MinCodebook;
+            return desc.codebook_id != llaminar2::kNativeVnniIQ4XSSourceScaleCodebook &&
+                   desc.codebook_id != llaminar2::kNativeVnniExpandedInt8MinCodebook;
         }
         const auto *source =
             llaminar2::native_vnni_formats::forSourceIdentity(
@@ -1203,27 +1219,21 @@ extern "C"
         int seq_len, int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool cudaMoE_route_logits_fp16(
+        const float *hidden, const void *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts, int device_idx, void *stream,
+        const int *live_rows = nullptr);
+
     bool cudaMoE_route_logits_bf16(
         const float *hidden, const void *gate_weights, float *logits,
         int seq_len, int d_model, int num_experts,
         int device_idx, void *stream);
 
-    bool cudaMoE_quantize_router_gate_q8(
-        const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
-        int d_model, int num_experts,
-        int device_idx, void *stream);
 
-    bool cudaMoE_gate_logits_single_token_q8_weights(
-        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
-        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
-        int d_model, int num_experts,
-        int device_idx, void *stream);
 
-    bool cudaMoE_gate_logits_q8_weights_decode_equivalent_rows(
-        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
-        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
-        int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream);
+
+
+
 
     bool cudaMoE_route_logits_decode_equivalent_rows(
         const float *hidden, const float *gate_weights, float *logits,
@@ -3737,6 +3747,11 @@ namespace llaminar2
         publication.blocks_per_row_capacity =
             (decode_gateup_d_model_cap_ + 31) / 32;
         publication.capture_recorded = recorded_during_capture;
+        if (routerQ8Basis(debugEnv().gemm.moe_router_arithmetic) == RouterQ8Basis::SignedHadamard32)
+            PerfStatsCollector::addCounter("kernel", "cuda_moe_router_hadamard32_calls", 1.0,
+                "router", "cuda:" + std::to_string(device_ordinal_),
+                {{"rows", std::to_string(rows)}, {"expert_hidden_basis", "original"}, {"block", "32"}});
+
     }
 
     bool CUDAMoEKernel::canReuseRouterQ8Hidden(
@@ -3802,7 +3817,8 @@ namespace llaminar2
 
         const DeviceResidentRouterGateCacheKey cache_key =
             DeviceResidentRouterGateCacheKey::make(
-                workspace_->id(), gate_device_ptr, d_model, num_experts);
+                workspace_->id(), gate_device_ptr, d_model, num_experts,
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         for (const auto &entry : router_q8_gate_cache_)
         {
             if (entry.key == cache_key &&
@@ -3926,7 +3942,7 @@ namespace llaminar2
                             d_model,
                             num_experts,
                             device_ordinal_,
-                            stream))
+                            stream, routerQ8Basis(debugEnv().gemm.moe_router_arithmetic)))
                     {
                         LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] "
                                   "FP32->Q8 router gate conversion launch failed");
@@ -4040,7 +4056,7 @@ namespace llaminar2
             d_model,
             num_experts,
             device_ordinal_,
-            stream);
+            stream, routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         if (!ok)
         {
             LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router logits kernel failed");
@@ -4631,9 +4647,9 @@ namespace llaminar2
             return false;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         const bool gate_is_bf16 = (gate_type == TensorType::BF16);
-        if (!gate_is_fp32 && !gate_is_bf16)
+        if (!gate_is_fp32 && !gate_is_bf16 && gate_type != TensorType::FP16)
         {
-            LOG_ERROR("[CUDAMoEKernel] CUDA router supports FP32 or BF16 gate weights, got tensor type "
+            LOG_ERROR("[CUDAMoEKernel] CUDA router supports FP32, FP16 or BF16 gate weights, got tensor type "
                       << static_cast<int>(gate_type));
             return false;
         }
@@ -4670,6 +4686,57 @@ namespace llaminar2
             return false;
         }
 
+        // The explicit Q8 prefill policy uses the same canonical block quantizer
+        // and row-local reduction as decode. Setup has already admitted the gate
+        // cache and hidden bank; capture only consumes their retained addresses.
+        const bool q8_prefill = gate_is_fp32 &&
+            debugEnv().gemm.cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8;
+        if (q8_prefill)
+        {
+            if (!debugEnv().gemm.cuda_moe_router_q8 || d_model % 32 != 0 ||
+                !ensureGroupedGateUpDecodeCapacity(top_k, d_model, seq_len)) return false;
+            const auto *gate = getOrCreateQ8RouterGateCache(
+                static_cast<const float *>(gate_weights), d_model, num_experts);
+            if (!gate) return false;
+            const auto basis = routerQ8Basis(debugEnv().gemm.moe_router_arithmetic);
+            invalidateRouterQ8HiddenPublication();
+            if (owned)
+            {
+                const MoERouterOwnedRowsLaunch launch{
+                    .partition = owned->partition, .capacity = seq_len, .width = d_model,
+                    .experts = num_experts, .top_k = top_k, .normalize = normalize_weights,
+                    .live_rows = device_effective_seq_len, .hidden = hidden,
+                    .format = MoERouterPreparedFormat::BlockQ8, .q8_basis = basis,
+                    .gate = gate->d_gate_weights_q8, .gate_scales = gate->d_gate_scales,
+                    .hidden_q8 = d_decode_hidden_int8_, .hidden_scales = d_decode_hidden_scales_,
+                    .logits = d_route_logits_, .selected = owned->selected,
+                    .selected_bytes = owned->selected_bytes};
+                if (!cuda::routeOwnedRows(launch, stream, router_q8_prefill_hardware_)) return false;
+            }
+            else
+            {
+                if (!cudaMoE_gate_logits_q8_weights_prefill_rows(hidden,
+                        d_decode_hidden_int8_, d_decode_hidden_scales_, gate->d_gate_weights_q8,
+                        gate->d_gate_scales, d_route_logits_, seq_len, d_model, num_experts,
+                        device_ordinal_, stream, device_effective_seq_len, basis, router_q8_prefill_hardware_) ||
+                    !cudaMoE_softmax_topk(d_route_logits_, output_indices, output_weights,
+                        seq_len, num_experts, top_k, normalize_weights, device_ordinal_, stream,
+                        device_effective_seq_len)) return false;
+            }
+            publishRouterQ8Hidden(hidden, seq_len, isCudaMoEDecodeCaptureActive(stream));
+            const auto geometry = cuda::routerQ8PrefillGeometry(
+                owned ? owned->partition.capacityFor(seq_len) : seq_len, d_model, num_experts, router_q8_prefill_hardware_);
+            PerfStatsCollector::addCounter("kernel", "cuda_moe_router_q8_prefill_calls", 1.0,
+                "router", "cuda:" + std::to_string(device_ordinal_),
+                {{"arithmetic", "int8_tensor_core"}, {"tile_rows", std::to_string(geometry.rows)},
+                 {"tile_experts", std::to_string(geometry.experts)}, {"warps", std::to_string(geometry.warps)},
+                 {"k_warps", std::to_string(geometry.k_warps)}, {"constant_width", std::to_string(geometry.constant_width)},
+                 {"sm_count", std::to_string(router_q8_prefill_hardware_.multiprocessors)},
+                 {"rows", std::to_string(seq_len)}, {"basis", basis == RouterQ8Basis::Original ? "original" : "hadamard32"},
+                 {"ownership", owned ? "partitioned" : "complete"}, {"expert_hidden_basis", "original"}});
+            return true;
+        }
+
         // Row distribution changes ownership, not the prepared representation or
         // arithmetic. This same workspace/gate owner serves both destinations.
         if (owned)
@@ -4679,15 +4746,27 @@ namespace llaminar2
                 .capacity = seq_len, .width = d_model, .experts = num_experts,
                 .top_k = top_k, .normalize = normalize_weights,
                 .live_rows = device_effective_seq_len, .hidden = hidden,
-                .format = gate_is_fp32 ? MoERouterPreparedFormat::FP32 : MoERouterPreparedFormat::BF16,
+                .format = gate_is_fp32 ? MoERouterPreparedFormat::FP32 :
+                    (gate_type == TensorType::FP16 ? MoERouterPreparedFormat::FP16 : MoERouterPreparedFormat::BF16),
                 .gate = gate_weights, .logits = d_route_logits_,
                 .selected = owned->selected, .selected_bytes = owned->selected_bytes};
-            return cuda::routeOwnedRows(launch, stream);
+            const bool submitted = cuda::routeOwnedRows(launch, stream, router_q8_prefill_hardware_);
+            if (submitted && gate_type == TensorType::FP16)
+                PerfStatsCollector::addCounter("cuda_moe", "router_fp16_owned_operands", 1.0, {}, {},
+                    {{"m", std::to_string(seq_len)}, {"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"}});
+            return submitted;
         }
+        if (gate_type == TensorType::FP16)
+            PerfStatsCollector::addCounter("cuda_moe", "router_fp16_operands", 1.0, {}, {},
+                {{"m", std::to_string(seq_len)}, {"k", std::to_string(d_model)},
+                 {"weight", "fp16"}, {"activation", "fp16_rne"}, {"accumulation", "fp32"}});
         const bool route_ok = gate_is_fp32
                                   ? cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
                                                          seq_len, d_model, num_experts,
                                                          device_ordinal_, stream)
+                                  : gate_type == TensorType::FP16
+                                  ? cudaMoE_route_logits_fp16(hidden, gate_weights, d_route_logits_,
+                                        seq_len, d_model, num_experts, device_ordinal_, stream, device_effective_seq_len)
                                   : cudaMoE_route_logits_bf16(hidden, gate_weights, d_route_logits_,
                                                               seq_len, d_model, num_experts,
                                                               device_ordinal_, stream);
@@ -4783,7 +4862,7 @@ namespace llaminar2
             return false;
 
         if (!requireTensorType(hidden_base, TensorType::FP32, "hidden", "routeWithTensors") ||
-            !requireTensorTypeOneOf(gate_base, TensorType::FP32, TensorType::BF16, "gate_weights", "routeWithTensors") ||
+            !(gate_base->native_type() == TensorType::FP16 || requireTensorTypeOneOf(gate_base, TensorType::FP32, TensorType::BF16, "gate_weights", "routeWithTensors")) ||
             !requireTensorType(indices_base, TensorType::FP32, "output_indices", "routeWithTensors") ||
             !requireTensorType(weights_base, TensorType::FP32, "output_weights", "routeWithTensors"))
             return false;
@@ -4932,12 +5011,12 @@ namespace llaminar2
         auto *gate_base = requireTensor(
             gate_weights, "prepared route gate_weights");
         if (!gate_base ||
-            !requireTensorTypeOneOf(
+            !(gate_base->native_type() == TensorType::FP16 || requireTensorTypeOneOf(
                 gate_base,
                 TensorType::FP32,
                 TensorType::BF16,
                 "gate_weights",
-                kContext) ||
+                kContext)) ||
             !requireMatrixCapacity(
                 gate_weights,
                 plan.num_experts,
@@ -4945,6 +5024,22 @@ namespace llaminar2
                 "gate_weights",
                 kContext))
         {
+            return false;
+        }
+
+        if (debugEnv().gemm.cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8 &&
+            gate_base->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[" << kContext << "] explicit CUDA Q8 prefill requires an FP32 "
+                      "prepared router gate; a floating operand override cannot replace it");
+            return false;
+        }
+
+        if (debugEnv().gemm.cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8 &&
+            !router_q8_prefill_hardware_.valid() &&
+            !cuda::prepareRouterQ8PrefillHardware(device_ordinal_, stream, router_q8_prefill_hardware_))
+        {
+            LOG_ERROR("[" << kContext << "] Q8 router hardware limits must be prepared on the owning stream before capture");
             return false;
         }
 
@@ -4961,7 +5056,7 @@ namespace llaminar2
             plan.kind == MoERouteLaunchKind::RuntimeDecode ||
             plan.kind == MoERouteLaunchKind::DecodeEquivalentVerifier;
         const bool q8_router_requested =
-            uses_decode_row_math &&
+            (uses_decode_row_math || debugEnv().gemm.cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8) &&
             gate_base->native_type() == TensorType::FP32 &&
             debugEnv().gemm.cuda_moe_router_q8;
         if (!q8_router_requested)
@@ -5030,7 +5125,7 @@ namespace llaminar2
             return false;
 
         if (!requireTensorType(hidden_base, TensorType::FP32, "hidden", kContext) ||
-            !requireTensorTypeOneOf(gate_base, TensorType::FP32, TensorType::BF16, "gate_weights", kContext) ||
+            !(gate_base->native_type() == TensorType::FP16 || requireTensorTypeOneOf(gate_base, TensorType::FP32, TensorType::BF16, "gate_weights", kContext)) ||
             !requireTensorType(indices_base, TensorType::FP32, "output_indices", kContext) ||
             !requireTensorType(weights_base, TensorType::FP32, "output_weights", kContext))
         {
@@ -5116,7 +5211,7 @@ namespace llaminar2
                     d_model,
                     num_experts,
                     device_ordinal_,
-                    stream))
+                    stream, routerQ8Basis(debugEnv().gemm.moe_router_arithmetic)))
             {
                 LOG_ERROR("[" << kContext << "] grouped Q8 decode-equivalent logits failed");
                 return false;
@@ -5142,6 +5237,13 @@ namespace llaminar2
                 LOG_ERROR("[" << kContext << "] grouped FP32 decode-equivalent logits failed");
                 return false;
             }
+        }
+        else if (gate_base->native_type() == TensorType::FP16)
+        {
+            if (!cudaMoE_route_logits_fp16(d_hidden, d_gate, d_route_logits_, seq_len, d_model,
+                    num_experts, device_ordinal_, stream, device_effective_seq_len)) return false;
+            PerfStatsCollector::addCounter("cuda_moe", "router_fp16_grouped_operands", 1.0, {}, {},
+                {{"m", std::to_string(seq_len)}, {"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"}});
         }
         else if (!cudaMoE_route_logits_bf16_decode_equivalent_rows(
                      d_hidden,
@@ -5222,9 +5324,9 @@ namespace llaminar2
         const TensorType gate_type = gate_base->native_type();
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         const bool gate_is_bf16 = (gate_type == TensorType::BF16);
-        if (!gate_is_fp32 && !gate_is_bf16)
+        if (!gate_is_fp32 && !gate_is_bf16 && gate_type != TensorType::FP16)
         {
-            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] CUDA runtime router supports FP32 or BF16 gate weights, got "
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] CUDA runtime router supports FP32, FP16 or BF16 gate weights, got "
                       << tensorTypeName(gate_type));
             return false;
         }
@@ -5274,11 +5376,18 @@ namespace llaminar2
         }
         if (!logits_ready)
         {
+            if (gate_type == TensorType::FP16)
+                PerfStatsCollector::addCounter("cuda_moe", "router_fp16_operands", 1.0, {}, {},
+                    {{"m", "1"}, {"k", std::to_string(d_model)},
+                     {"weight", "fp16"}, {"activation", "fp16_rne"}, {"accumulation", "fp32"}});
             invalidateRouterQ8HiddenPublication();
             const bool route_ok = gate_is_fp32
                                       ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
                                                              /*seq_len=*/1, d_model, num_experts,
                                                              device_ordinal_, stream)
+                                      : gate_type == TensorType::FP16
+                                      ? cudaMoE_route_logits_fp16(d_hidden, d_gate, d_route_logits_,
+                                            1, d_model, num_experts, device_ordinal_, stream)
                                       : cudaMoE_route_logits_bf16(d_hidden, d_gate, d_route_logits_,
                                                                   /*seq_len=*/1, d_model, num_experts,
                                                                   device_ordinal_, stream);
@@ -5388,9 +5497,9 @@ namespace llaminar2
         const TensorType gate_type = gate_base->native_type();
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         const bool gate_is_bf16 = (gate_type == TensorType::BF16);
-        if (!gate_is_fp32 && !gate_is_bf16)
+        if (!gate_is_fp32 && !gate_is_bf16 && gate_type != TensorType::FP16)
         {
-            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] CUDA runtime router supports FP32 or BF16 gate weights, got "
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] CUDA runtime router supports FP32, FP16 or BF16 gate weights, got "
                       << tensorTypeName(gate_type));
             return false;
         }
@@ -5441,11 +5550,18 @@ namespace llaminar2
         }
         if (!logits_ready)
         {
+            if (gate_type == TensorType::FP16)
+                PerfStatsCollector::addCounter("cuda_moe", "router_fp16_operands", 1.0, {}, {},
+                    {{"m", "1"}, {"k", std::to_string(d_model)},
+                     {"weight", "fp16"}, {"activation", "fp16_rne"}, {"accumulation", "fp32"}});
             invalidateRouterQ8HiddenPublication();
             const bool route_ok = gate_is_fp32
                                       ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
                                                              /*seq_len=*/1, d_model, num_experts,
                                                              device_ordinal_, stream)
+                                      : gate_type == TensorType::FP16
+                                      ? cudaMoE_route_logits_fp16(d_hidden, d_gate, d_route_logits_,
+                                            1, d_model, num_experts, device_ordinal_, stream)
                                       : cudaMoE_route_logits_bf16(d_hidden, d_gate, d_route_logits_,
                                                                   /*seq_len=*/1, d_model, num_experts,
                                                                   device_ordinal_, stream);
@@ -7472,7 +7588,7 @@ namespace llaminar2
             }
 
             if (!gate_desc.valid() || !up_desc.valid() ||
-                gate_desc.codebook_id != up_desc.codebook_id ||
+                !areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
                 !validateCudaGroupedDescShape(up_desc, intermediate, d_model))
             {
@@ -7946,7 +8062,7 @@ namespace llaminar2
                 return false;
             }
             if (!gate_desc.valid() || !up_desc.valid() ||
-                gate_desc.codebook_id != up_desc.codebook_id ||
+                !areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
                 !validateCudaGroupedDescShape(up_desc, intermediate, d_model))
             {

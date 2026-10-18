@@ -24,6 +24,7 @@
 #include "kernels/cuda/gemm/CUDAQuantisedGemmWorkspaceContract.h"
 #endif
 #include "loaders/GPUVramPreflight.h"
+#include "loaders/PreparedHalfWeights.h"
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
 #include "tensors/TensorClasses.h"
 #include "transfer/TransferEngine.h"
@@ -58,12 +59,13 @@ namespace llaminar2
             size_t n, k, payload_bytes;
             TensorType type;
             std::string format, name;
+            FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native;
 
             /** @return Canonical model-loader representation without changing the source contract. */
             static ProjectionGeometry model(const PlanningMatrixSamplePlan &plan)
             {
                 return {plan.geometry().n, plan.geometry().k, plan.executionPayloadBytes(),
-                    plan.executionType(), plan.executionFormat(), plan.request().tensor_name};
+                    plan.executionType(), plan.executionFormat(), plan.request().tensor_name, plan.operandPrecision()};
             }
             /** @return Source-free arithmetic geometry; this has no GGUF path or tensor identity. */
             static ProjectionGeometry arithmetic()
@@ -118,18 +120,18 @@ namespace llaminar2
             if (!GPUDeviceContextPool::instance().getContext(device).ownsCurrentThread())
                 throw std::invalid_argument("GPU projection declaration requires its exact owning worker");
             if (device.is_rocm())
-                return floating(plan) ? rocm::floating_gemm_workspace::projectionRequirements() :
+                return floating(plan) ? rocm::floating_gemm_workspace::projectionRequirements(rows, shape.k, plan.operand_precision) :
                     rocm::quantized_gemm_workspace::projectionRequirements(rows, shape.n, shape.k);
 #ifdef HAVE_CUDA
             if (device.is_cuda())
             {
                 if (floating(plan))
-                    return cuda::floating_gemm_workspace::projectionRequirements(rows, shape.n);
+                    return cuda::floating_gemm_workspace::projectionRequirements(rows, shape.n, shape.k, plan.operand_precision);
                 const auto *format = native_vnni_formats::forQuantType(plan.format);
                 if (!format) throw std::invalid_argument("Unsupported CUDA projection source format");
-                const uint8_t codebook = canonicalDeviceVnniCodebookId(format->codebook_id);
+                const uint8_t codebook = canonicalDeviceVnniCodebookId(*format);
                 return cuda::quantized_gemm_workspace::projectionRequirements(rows, shape.n, shape.k,
-                    device.gpu_ordinal(), cuda::quantized_gemm_workspace::NativeCodebooks{codebook, codebook});
+                    device.gpu_ordinal(), cuda::quantized_gemm_workspace::NativeCodebooks{codebook, canonicalDeviceVnniCodebookId(format->codebook_id)});
             }
 #endif
             throw std::invalid_argument("Planning projection backend is not compiled");
@@ -141,7 +143,7 @@ namespace llaminar2
             pool.addDevice(device.gpu_ordinal());
             if (const auto *format = native_vnni_formats::forQuantType(plan.format))
                 pool.planWeightForOwner(device.gpu_ordinal(), plan.name, plan.n, plan.k,
-                    format->payload_bytes, format->is_asymmetric, format->has_emins, plan.payload_bytes, kWeightOwner);
+                    format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric, format->has_emins, plan.payload_bytes, kWeightOwner);
             else if (floating(plan))
                 pool.planRawWeightForOwner(device.gpu_ordinal(), plan.name,
                     plan.n, plan.k, plan.payload_bytes, kWeightOwner);
@@ -293,7 +295,8 @@ namespace llaminar2
                 std::optional<PhysicalMemoryAllocationLease> staging;
                 if (packing.temporary_bytes) staging.emplace(memory->claimNewAllocation(device,
                     PhysicalMemoryOwner::WeightLoadStaging, packing.temporary_bytes));
-                cpu_handle = KernelFactory::prepareGemmHandleLocal(&execution, device);
+                cpu_handle = KernelFactory::prepareGemmHandleLocal(&execution, device,
+                    KernelFactory::GemmPreparationKind::AUTO, plan.operand_precision);
                 engine = KernelFactory::getOrCreateGemmEngine(cpu_handle.get());
                 require(engine && engine->hasWeights() && engine->packedWeightBytes() == prepared_bytes,
                     "CPU prepared payload differs from its admitted native representation");
@@ -312,19 +315,23 @@ namespace llaminar2
                 gpu_pool->addWeightJob(device.gpu_ordinal(), {.name = plan.name,
                     .host_raw_data = execution.raw_data(), .raw_bytes = plan.payload_bytes,
                     .format = *repack, .N = int(plan.n), .K = int(plan.k),
-                    .is_asymmetric = format && format->is_asymmetric});
+                    .is_asymmetric = format && canonicalDeviceVnniFormat(*format).is_asymmetric});
                 gpu_pool->load();
                 gpu_pool->finalize();
-                gpu_engine = KernelFactory::createGemmFromGPUWeightPool(execution, device, gpu_pool, plan.name);
+                gpu_engine = KernelFactory::createGemmFromGPUWeightPool(execution, device, gpu_pool, plan.name, 0,
+                    GPUPreparedWeightPoolLayout::SourceNative, plan.operand_precision);
                 engine = gpu_engine.get();
                 require(engine && engine->hasWeights(), "GPU prepared projection missing");
                 prepared_bytes = gpu_pool->plannedPersistentBytes(device.gpu_ordinal(), kWeightOwner);
             }
 
             PreparedProjectionResult result{device, prepared_bytes, cpu, {}};
+            // The public tensors stay FP32 even when the prepared engine rounds
+            // its operands to half; retain both identities in timing evidence.
             identity += "; execution-format=" + plan.format +
                 "; N=" + std::to_string(plan.n) + "; K=" + std::to_string(plan.k) +
-                "; device=" + device.toString() + "; cache-regime=repeated-same-prepared-matrix; activations=FP32";
+                "; device=" + device.toString() + "; cache-regime=repeated-same-prepared-matrix; activations=FP32; activation-operand-policy=" +
+                std::to_string(static_cast<int>(plan.operand_precision));
             if (cpu) identity += "; workers=" + std::to_string(cpu->workers) + "; ISA=" + isaLevelName(cpu->isa) +
                 "; compiled-ISA=" + isaLevelName(cpu->compiled_isa) + "; numerical-policy=BackendNative";
             const size_t graph_bytes = device.is_gpu() ?
@@ -365,13 +372,19 @@ namespace llaminar2
         // source independently and retire the converted owner after all engine
         // borrowers return; neither conversion nor capture is timed arithmetic.
         std::optional<PhysicalMemoryAllocationLease> converted_claim;
-        std::unique_ptr<FP32Tensor> converted;
+        std::shared_ptr<TensorBase> converted;
         const TensorBase *execution = &sample.tensor();
         if (plan.executionType() != plan.tensorType())
         {
             converted_claim.emplace(memory->claimNewAllocation(DeviceId::cpu(), kWeightOwner, geometry.payload_bytes));
-            converted = std::make_unique<FP32Tensor>(sample.tensor().shape(), DeviceId::cpu());
-            sample.tensor().to_fp32(converted->mutable_typed_data());
+            if (plan.executionType() == TensorType::FP16)
+                converted = materializePreparedHalfWeights(sample.tensor());
+            else
+            {
+                auto fp32 = std::make_shared<FP32Tensor>(sample.tensor().shape(), DeviceId::cpu());
+                sample.tensor().to_fp32(fp32->mutable_typed_data());
+                converted = std::move(fp32);
+            }
             execution = converted.get();
         }
         auto observed = measurePrepared(geometry, *execution, device, memory, prefill_rows,

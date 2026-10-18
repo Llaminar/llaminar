@@ -3978,6 +3978,8 @@ namespace llaminar2
 
         /** @copydoc IInferenceRunner::purgePrefixCache */
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::collectPrefixCacheShutdown */
+        void collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const override;
         /** @copydoc IInferenceRunner::prefixCacheTelemetrySources */
         PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override;
 

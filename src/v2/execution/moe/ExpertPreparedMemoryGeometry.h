@@ -170,8 +170,7 @@ namespace llaminar2
                     "CPU expert projection source codebook is not catalogued");
             }
             const auto encoding =
-                cpu::native_vnni::preparedEncodingForCodebook(
-                    source->codebook_id);
+                cpu::native_vnni::preparedEncodingForSource(*source);
             const std::size_t stride =
                 cpu::native_vnni::preparedInterleavedBlockStride(
                     encoding, source->is_asymmetric);

@@ -6,6 +6,10 @@
  * maps one thread to one (n, b) block position, performing the same payload
  * repack and metadata derivation as the CPU reference path. Computed binary16
  * metadata is published through the shared cross-backend encoding contract.
+ * Q6 instead copies original half d and packed signed subscales losslessly.
+ * IQ2_S copies original half d and unsigned coefficient nibbles unchanged.
+ * IQ4_XS copies original half d and the raw six-bit encoded coefficient; its
+ * secondary word is never interpreted or converted as binary16.
  */
 
 #include <hip/hip_runtime.h>
@@ -15,6 +19,10 @@
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include "kernels/rocm/repack/VnniRepackKernels.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/NativeVnniQ6Scale.h"
+#include "tensors/NativeVnniIQ2SScale.h"
+#include "tensors/NativeVnniIQ4XSScale.h"
+#include "tensors/NativeVnniIQ3SScale.h"
 
 namespace llaminar2 {
 
@@ -393,10 +401,9 @@ __global__ void repack_q8_1_to_vnni(
 // ============================================================================
 
 /**
- * @brief Normalize one 32-value Q8_K slice into raw-INT8 device layout.
- *
- * Q8_K values have an implicit unit scale.  Its `bsums` are reconstructible
- * metadata and need not be retained by the execution representation.
+ * @brief Copy source Q8_K codes and apply the existing prepared FP16-scale ABI.
+ * Source d is FP32; narrowing here is explicit and not source-value lossless.
+ * Original/native embedding storage retains d and never uses this conversion.
  */
 __global__ void repack_q8_k_to_vnni(
     const Q8_KBlock* __restrict__ d_raw,
@@ -416,7 +423,7 @@ __global__ void repack_q8_k_to_vnni(
     uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 32, destination);
     const int8_t* src = blk.qs + subblock * 32;
     hip_repack_copy32(dst, src);
-    d_scales[linear] = 0x3c00u; // IEEE FP16 1.0.
+    d_scales[linear] = canonicalPreparedHalfBits(blk.d); // Existing prepared FP16 metadata ABI.
 }
 
 // ============================================================================
@@ -558,6 +565,17 @@ __global__ void repack_q5k_to_vnni(
 // One thread per (n, b) sub-block. 24-byte payload (16B low4 + 8B high2).
 // Uses signed int8_t scales.
 
+/**
+ * @brief Preserve source Q6 codes and factors in unchanged separated regions.
+ * @param d_raw Original uploaded256-value source superblocks.
+ * @param d_payload Destination24-byte payload per32 values.
+ * @param d_scales Destination original half d word per32 values.
+ * @param d_mins Destination packed signed low/high subscale word per32 values.
+ * @param N Number of complete source rows in this submission.
+ * @param K Logical source row width.
+ * @param sb_per_row Number of source superblocks per row.
+ * @param destination Immutable destination slice/group geometry.
+ */
 __global__ void repack_q6k_to_vnni(
     const Q6_KBlock* __restrict__ d_raw,
     uint8_t*         __restrict__ d_payload,
@@ -614,11 +632,11 @@ __global__ void repack_q6k_to_vnni(
     const int8_t* signed_scales = reinterpret_cast<const int8_t*>(blk.scales);
     const int sc_lo_idx = half * 8 + sub_in_half * 2;
     const int sc_hi_idx = sc_lo_idx + 1;
-    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    d_scales[linear] = canonicalPreparedHalfBits(
-        d_f * static_cast<float>(signed_scales[sc_lo_idx]));
-    d_mins[linear] = canonicalPreparedHalfBits(
-        d_f * static_cast<float>(signed_scales[sc_hi_idx]));
+    // Preserve the original factors in the same two16-bit metadata planes.
+    // The consumer reconstructs each product before applying either integer dot.
+    d_scales[linear] = blk.d;
+    d_mins[linear] = native_vnni_q6_scale::pack(
+        signed_scales[sc_lo_idx], signed_scales[sc_hi_idx]);
 }
 
 // ============================================================================
@@ -788,10 +806,25 @@ __global__ void repack_q2k_to_vnni(
 // Kernel 10: IQ4_XS repack
 // ============================================================================
 
+/**
+ * @brief Transpose IQ4_XS payload and original source factors without narrowing.
+ * @param d_raw Original row-padded source superblocks owned by the load operation.
+ * @param d_payload Persistent16-byte-per32-value nibble payload destination.
+ * @param d_scales Persistent original binary16 d words, indexed by destination.
+ * @param d_coefficients Persistent raw encoded6 words; never binary16 minima.
+ * @param N Number of source rows in this admitted repack window.
+ * @param K Logical columns, divisible by32.
+ * @param sb_per_row Row-padded source superblock stride.
+ * @param destination Existing owner/offset layout for the retained GPU regions.
+ * @details One thread writes one complete logical block on the caller's exact
+ * stream. Source coefficients remain unsigned until the execution resolver
+ * subtracts32 and multiplies in FP32 before the unchanged single-dot contract.
+ */
 __global__ void repack_iq4xs_to_vnni(
     const IQ4_XSBlock* __restrict__ d_raw,
     uint8_t*           __restrict__ d_payload,
     uint16_t*          __restrict__ d_scales,
+    uint16_t*          __restrict__ d_coefficients,
     int N, int K, int sb_per_row,
     PackedVnniDestination destination)
 {
@@ -815,9 +848,10 @@ __global__ void repack_iq4xs_to_vnni(
     // Scale: 6-bit from split hi/lo
     const int ls = ((blk.scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf)
                  | (((blk.scales_h >> (2 * sub_idx)) & 3) << 4);
-    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    d_scales[linear] = canonicalPreparedHalfBits(
-        d_f * static_cast<float>(ls - 32));
+    // Keep original d and encoded6 as raw words. No coefficient half conversion.
+    d_scales[linear] = blk.d;
+    d_coefficients[linear] =
+        llaminar2::native_vnni_iq4xs_scale::encodeSourceCoefficient(static_cast<uint8_t>(ls));
 }
 
 // ============================================================================
@@ -828,6 +862,7 @@ __global__ void repack_iq3s_to_vnni(
     const IQ3_SBlock* __restrict__ d_raw,
     uint8_t*          __restrict__ d_payload,
     uint16_t*         __restrict__ d_scales,
+    uint16_t*         __restrict__ d_source_nibbles,
     int N, int K, int sb_per_row,
     PackedVnniDestination destination)
 {
@@ -852,11 +887,13 @@ __global__ void repack_iq3s_to_vnni(
     *reinterpret_cast<uint32_t*>(dst + 9) = signs_src[0];
 
     // Scale: nibble from scales
-    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     uint8_t sc_byte = blk.scales[sub_idx / 2];
     int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
-    d_scales[linear] = canonicalPreparedHalfBits(
-        d_f * static_cast<float>(1 + 2 * nibble));
+    // Source factors remain two typed words: original half d and raw nibble.
+    // Consumers resolve d*(1+2*nibble) in FP32 before unchanged dot scaling.
+    d_scales[linear] = blk.d;
+    d_source_nibbles[linear] = llaminar2::native_vnni_iq3s_scale::encodeSourceCoefficient(
+        static_cast<uint8_t>(nibble));
 }
 
 // ============================================================================
@@ -912,9 +949,22 @@ __global__ void repack_iq3xxs_to_vnni(
 }
 
 // ============================================================================
-// Kernel 13: IQ2_S repack (asymmetric)
+// Kernel 13: IQ2_S repack (original half base and packed scale nibbles)
 // ============================================================================
 
+/**
+ * @brief Publish compact IQ2_S payload and lossless original scale factors.
+ * @param d_raw Original source superblocks, with ceil(K/256) blocks per row.
+ * @param d_payload Destination nine-byte grid/index/sign payload plane.
+ * @param d_scales Destination original half d words.
+ * @param d_mins Destination original scale-byte words, high8 zero.
+ * @param N Live source rows in this bounded setup transfer.
+ * @param K Logical source row width, divisible by32.
+ * @param sb_per_row Source superblock row stride, including a partial tail.
+ * @param destination Complete block-major destination ownership and strides.
+ * @details Metadata stays raw until the codebook13 execution resolver; each
+ * thread owns one live source row/block and writes no destination padding.
+ */
 __global__ void repack_iq2s_to_vnni(
     const IQ2_SBlock* __restrict__ d_raw,
     uint8_t*          __restrict__ d_payload,
@@ -942,13 +992,11 @@ __global__ void repack_iq2s_to_vnni(
     const uint32_t* src2 = reinterpret_cast<const uint32_t*>(blk.qs + 32 + sub_idx * 4);
     *reinterpret_cast<uint32_t*>(dst + 5) = src2[0];
 
-    // Dual scale from scales[sub_idx]
-    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    uint8_t sc = blk.scales[sub_idx];
-    d_scales[linear] = canonicalPreparedHalfBits(
-        d_f * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
-    d_mins[linear] = canonicalPreparedHalfBits(
-        d_f * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
+    // Preserve the source factors in the same two words. Both nibble scales
+    // are resolved in FP32 by the execution codebook13 loader; no half
+    // narrowing or transformation of the nine payload bytes occurs here.
+    d_scales[linear] = blk.d;
+    d_mins[linear] = llaminar2::native_vnni_iq2s_scale::pack(blk.scales[sub_idx]);
 }
 
 // ============================================================================
@@ -1322,21 +1370,23 @@ bool launchVnniRepack(
         break;
     }
     case RepackFormat::IQ4_XS: {
+        if (!d_mins) return false; // Source coefficient storage is mandatory.
         const int sb_per_row = (K + 255) / 256;
         dim3 block(64, 4);
         dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
         repack_iq4xs_to_vnni<<<grid, block, 0, hip_stream>>>(
             static_cast<const IQ4_XSBlock*>(d_raw_blocks),
-            d_payload, d_scales, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ3_S: {
+        if (!d_mins) return false; // Original raw source nibble is mandatory.
         const int sb_per_row = (K + 255) / 256;
         dim3 block(64, 4);
         dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
         repack_iq3s_to_vnni<<<grid, block, 0, hip_stream>>>(
             static_cast<const IQ3_SBlock*>(d_raw_blocks),
-            d_payload, d_scales, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ3_XXS: {

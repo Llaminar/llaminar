@@ -10,6 +10,11 @@
  * 1. Implements ITensorGemm (includes IMPIContext, etc.)
  * 2. Holds a CuBLASGemmKernel* that does the actual CUDA work
  * 3. Handles tensor type introspection in multiply_tensor()
+ * 4. Explicit GDN operand modes preserve fixed serial/verifier row arithmetic. Half A
+ *    uses exact named M*K storage, one same-stream cast per fused group;
+ *    cuBLAS consumes real half A/B and writes FP32 C with FP32 accumulation.
+ *    M1, live verifier rows and fixed columns use the existing fixed FP32 tree;
+ *    ordinary M>1 retains BLAS. The FP32 control disables fast downconversion.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -31,10 +36,18 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
+#include <limits>
+#ifdef HAVE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 
 // CUDA memory operations (implemented in CUDAQuantisedGemmKernel_CUTLASS.cu)
 extern "C"
 {
+#ifdef HAVE_CUDA
+    cudaError_t cudaCastLiveFP32ToFP16(const float *source, void *destination,
+        llaminar2::DeviceRowRange rows, size_t columns, int ordinal, cudaStream_t stream);
+#endif
     bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream);
     bool cudaFp32_stage_batched_projection_pointers(
         const float **d_A_array,
@@ -60,11 +73,13 @@ namespace llaminar2
         CUDAFloatingPointGemmKernel::CUDAFloatingPointGemmKernel(
             const TensorBase *weights,
             int cuda_device_id,
-            Precision precision)
+            Precision precision,
+            FloatingActivationOperandPrecision operand_precision)
             : weights_(weights),
               d_weights_(nullptr),
               cuda_device_id_(cuda_device_id),
               precision_(precision),
+              operand_precision_(operand_precision),
               N_(0),
               K_(0),
               cublas_kernel_(nullptr)
@@ -93,6 +108,11 @@ namespace llaminar2
                          << static_cast<int>(wt));
             }
 
+            if (operand_precision_ != FloatingActivationOperandPrecision::Native &&
+                ((operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && wt != TensorType::FP16) ||
+                 (operand_precision_ == FloatingActivationOperandPrecision::FP32 && wt != TensorType::FP32)))
+                throw std::invalid_argument("Explicit CUDA operand policy requires matching actual weight tensor encoding");
+
             // Get dimensions
             N_ = weights->rows(); // Output features
             K_ = weights->cols(); // Input features
@@ -107,6 +127,10 @@ namespace llaminar2
                     "[CUDAFloatingPointGemmKernel] Weight tensor must be on GPU (call ensureOnDevice() first)");
             }
 
+            if ((operand_precision_ == FloatingActivationOperandPrecision::FP32 && precision_ != Precision::FP32) ||
+                (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && precision_ != Precision::FP16))
+                throw std::invalid_argument("CUDA floating operand mode disagrees with prepared weight type");
+
             // Create underlying cuBLAS kernel
             CuBLASGemmKernel::Precision cublas_precision;
             switch (precision)
@@ -124,7 +148,7 @@ namespace llaminar2
                 cublas_precision = CuBLASGemmKernel::Precision::FP32;
             }
 
-            cublas_kernel_ = std::make_unique<CuBLASGemmKernel>(cuda_device_id_, cublas_precision);
+            cublas_kernel_ = std::make_unique<CuBLASGemmKernel>(cuda_device_id_, cublas_precision, operand_precision_);
 
             LOG_DEBUG("[CUDAFloatingPointGemmKernel] Created for " << N_ << "x" << K_
                                                                    << " weights on CUDA device " << cuda_device_id_);
@@ -135,20 +159,28 @@ namespace llaminar2
             int N, int K,
             int cuda_device_id,
             Precision precision,
-            std::shared_ptr<void> lifetime_owner)
+            std::shared_ptr<void> lifetime_owner,
+            FloatingActivationOperandPrecision operand_precision)
             : weights_(nullptr),
               d_weights_(d_weights),
               cuda_device_id_(cuda_device_id),
               precision_(precision),
+              operand_precision_(operand_precision),
               N_(static_cast<size_t>(N)),
               K_(static_cast<size_t>(K)),
               cublas_kernel_(nullptr),
               lifetime_owner_(std::move(lifetime_owner))
         {
+            if (operand_precision_ != FloatingActivationOperandPrecision::Native && (N <= 0 || K <= 0))
+                throw std::invalid_argument("Explicit CUDA operands require positive prepared matrix dimensions");
             if (!d_weights)
             {
                 throw std::runtime_error("[CUDAFloatingPointGemmKernel] Null device weight pointer");
             }
+
+            if ((operand_precision_ == FloatingActivationOperandPrecision::FP32 && precision_ != Precision::FP32) ||
+                (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && precision_ != Precision::FP16))
+                throw std::invalid_argument("CUDA floating operand mode disagrees with prepared weight type");
 
             // Create underlying cuBLAS kernel
             CuBLASGemmKernel::Precision cublas_precision;
@@ -167,7 +199,7 @@ namespace llaminar2
                 cublas_precision = CuBLASGemmKernel::Precision::FP32;
             }
 
-            cublas_kernel_ = std::make_unique<CuBLASGemmKernel>(cuda_device_id_, cublas_precision);
+            cublas_kernel_ = std::make_unique<CuBLASGemmKernel>(cuda_device_id_, cublas_precision, operand_precision_);
 
             LOG_TRACE("[CUDAFloatingPointGemmKernel] Created (raw ptr) for " << N_ << "x" << K_
                       << " weights on CUDA device " << cuda_device_id_);
@@ -210,6 +242,7 @@ namespace llaminar2
               d_weights_(other.d_weights_),
               cuda_device_id_(other.cuda_device_id_),
               precision_(other.precision_),
+              operand_precision_(other.operand_precision_),
               N_(other.N_),
               K_(other.K_),
               cublas_kernel_(std::move(other.cublas_kernel_)),
@@ -229,6 +262,7 @@ namespace llaminar2
                 d_weights_ = other.d_weights_;
                 cuda_device_id_ = other.cuda_device_id_;
                 precision_ = other.precision_;
+                operand_precision_ = other.operand_precision_;
                 N_ = other.N_;
                 K_ = other.K_;
                 cublas_kernel_ = std::move(other.cublas_kernel_);
@@ -313,6 +347,15 @@ namespace llaminar2
                 return false;
             }
 
+            if (operand_precision_ != FloatingActivationOperandPrecision::Native &&
+                (m <= 0 || n != static_cast<int>(N_) || k != static_cast<int>(K_) ||
+                 A->current_device() != DeviceId::cuda(cuda_device_id_) || C->current_device() != DeviceId::cuda(cuda_device_id_) ||
+                 activation_row_offset < 0 || !transpose_B || alpha != 1.0f || beta != 0.0f || bias ||
+                 (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && C->isMapped()) ||
+                 A->numel() < (static_cast<size_t>(activation_row_offset) + static_cast<size_t>(m)) * static_cast<size_t>(k) ||
+                 C->numel() < static_cast<size_t>(m) * static_cast<size_t>(n)))
+                throw std::invalid_argument("Explicit CUDA floating operands require exact row geometry and no epilogue");
+
             // Partition scopes cannot silently fall through to a different
             // arithmetic implementation when a caller supplies another epilogue.
             const bool fixed_columns = FloatingOutputPartitionScope::requiresFixedColumns(*this, n);
@@ -388,6 +431,21 @@ namespace llaminar2
                     LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] Bias tensor must be on GPU");
                     return false;
                 }
+            }
+
+            if (operand_precision_ != FloatingActivationOperandPrecision::Native)
+            {
+                auto *effective_workspace = workspace ? workspace : bound_workspace_;
+                const void *operand = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE
+                    ? prepareFP16Operand(d_A, m, k, effective_workspace) : d_A;
+                bool success = ((operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && m == 1) ||
+                    VerifierKernelModeScope::active() || fixed_columns || VerifierKernelModeScope::rowsFor(m))
+                    ? submitFixedOperandProjection(operand, d_C, m, n, k, effective_workspace)
+                    : submitOperandProjection(operand, d_C, m, n, k, effective_workspace);
+                if (success && d_mapped_output)
+                    success = cudaQuantGemm_copyDeviceToDeviceAsync(d_mapped_output, d_C,
+                        static_cast<size_t>(m) * n, cuda_device_id_, gpu_stream_);
+                return success;
             }
 
             /*
@@ -636,14 +694,62 @@ namespace llaminar2
             const TensorBase *input,
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k,
-            const IMPIContext * /*mpi_ctx*/,
+            const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+            // Validate immutable operand identity before seed-based dispatch:
+            // a Native seed must not silently admit a half-A consumer either.
+            for (const auto &projection : projections)
+                if (projection.kernel && projection.kernel->floatingActivationOperandPrecision() != operand_precision_)
+                    throw std::invalid_argument("Fused CUDA projections disagree on immutable operand precision");
             if (!input || projections.empty())
             {
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Null input or empty projections");
                 return false;
             }
+            if (operand_precision_ != FloatingActivationOperandPrecision::Native)
+            {
+                auto *effective_workspace = workspace ? workspace : bound_workspace_;
+                if (m <= 0 || k != static_cast<int>(K_) || !gpu_stream_ || !effective_workspace ||
+                    input->native_type() != TensorType::FP32 || !input->gpu_data_ptr() ||
+                    input->current_device() != DeviceId::cuda(cuda_device_id_) ||
+                    input->numel() < static_cast<size_t>(m) * k)
+                    throw std::invalid_argument("Explicit fused CUDA operands require exact physical input rows");
+                for (const auto &projection : projections)
+                {
+                    auto *kernel = dynamic_cast<CUDAFloatingPointGemmKernel *>(projection.kernel);
+                    if (!kernel || !projection.output || projection.bias || projection.n <= 0 ||
+                        projection.output->native_type() != TensorType::FP32 || projection.output->isMapped() ||
+                        projection.output->current_device() != DeviceId::cuda(cuda_device_id_) ||
+                        !projection.output->gpu_data_ptr() ||
+                        projection.output->numel() < static_cast<size_t>(m) * projection.n ||
+                        kernel->N_ != static_cast<size_t>(projection.n) || kernel->K_ != K_ ||
+                        kernel->floatingActivationOperandPrecision() != operand_precision_ || kernel->precision_ != precision_ ||
+                        kernel->gpu_stream_ != gpu_stream_ || kernel->cuda_device_id_ != cuda_device_id_ || !kernel->d_weights_)
+                        throw std::invalid_argument("Explicit fused CUDA operand descriptor is incompatible");
+                }
+                const bool fixed = (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && m == 1) ||
+                    VerifierKernelModeScope::active() || VerifierKernelModeScope::rowsFor(m) ||
+                    std::any_of(projections.begin(), projections.end(), [](const auto &p) {
+                        return FloatingOutputPartitionScope::requiresFixedColumns(*p.kernel, p.n);
+                    });
+                if (fixed)
+                    return multiply_fused_verifier_rows_decode_equivalent(input, projections, m, k, mpi_ctx, effective_workspace);
+                const auto *source = static_cast<const float *>(input->gpu_data_ptr());
+                const void *operand = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE
+                    ? prepareFP16Operand(source, m, k, effective_workspace) : source;
+                // One named half-A publication, then all consumers on this exact
+                // stream. No side stream can overwrite shared stage scratch.
+                for (const auto &projection : projections)
+                {
+                    auto *kernel = static_cast<CUDAFloatingPointGemmKernel *>(projection.kernel);
+                    if (!kernel->submitOperandProjection(operand,
+                        static_cast<float *>(projection.output->gpu_data_ptr()), m, projection.n, k, effective_workspace))
+                        return false;
+                }
+                return true;
+            }
+
             /*
              * FP16/BF16 weights use the fixed-order grouped projection kernel
              * for ordinary prefill as well as verifier rows. This is the
@@ -978,6 +1084,11 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+            // Validate immutable operand identity before seed-based dispatch:
+            // a Native seed must not silently admit a half-A consumer either.
+            for (const auto &projection : projections)
+                if (projection.kernel && projection.kernel->floatingActivationOperandPrecision() != operand_precision_)
+                    throw std::invalid_argument("Fused CUDA projections disagree on immutable operand precision");
             if (m < 1)
             {
                 LOG_ERROR("[CUDAFloatingPointGemmKernel] grouped verifier projection requires M>=1, got M="
@@ -1019,6 +1130,77 @@ namespace llaminar2
                 LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection input has no CUDA device data");
                 return false;
             }
+
+            // Validate every consumer before publishing the shared half activation bank.
+            for (const auto &projection : projections)
+            {
+                const auto *engine = dynamic_cast<const CUDAFloatingPointGemmKernel *>(projection.kernel);
+                if (!engine || !projection.output || projection.bias || projection.n <= 0 ||
+                    engine->precision_ != precision_ || engine->gpu_stream_ != gpu_stream_ ||
+                    engine->cuda_device_id_ != cuda_device_id_ || engine->K_ != static_cast<size_t>(k) ||
+                    engine->N_ != static_cast<size_t>(projection.n) || !engine->d_weights_ ||
+                    projection.output->native_type() != TensorType::FP32 ||
+                    (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && projection.output->isMapped()) ||
+                    input->current_device() != DeviceId::cuda(cuda_device_id_) ||
+                    projection.output->current_device() != DeviceId::cuda(cuda_device_id_) ||
+                    input->numel() < static_cast<size_t>(m) * k ||
+                    projection.output->numel() < static_cast<size_t>(m) * projection.n)
+                    throw std::invalid_argument("Fixed CUDA floating projection has incompatible consumer geometry/policy");
+            }
+
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && m <= kShortHalfProjectionMaxRows)
+            {
+                // Bind every immutable owner before submitting the one shared
+                // half producer. Capture arguments replace device pointer tables.
+                const auto *half_bank = static_cast<const std::uint16_t *>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::FULL_A_FP16));
+                std::vector<FixedHalfProjectionGroup> groups;
+                groups.reserve((projections.size() + floating_gemm_abi::kMaxBatchedProjections - 1) /
+                    floating_gemm_abi::kMaxBatchedProjections);
+                for (size_t first = 0; first < projections.size(); first += floating_gemm_abi::kMaxBatchedProjections)
+                {
+                    const size_t end = std::min(projections.size(), first + floating_gemm_abi::kMaxBatchedProjections);
+                    const auto bind = [&](size_t index) {
+                        const auto &p = projections[index];
+                        const auto *engine = static_cast<const CUDAFloatingPointGemmKernel *>(p.kernel);
+                        return FixedHalfProjectionGroup::single(half_bank,
+                            static_cast<const std::uint16_t *>(engine->d_weights_),
+                            static_cast<float *>(p.output->gpu_data_ptr()), p.n);
+                    };
+                    auto group = bind(first);
+                    for (size_t index = first + 1; index < end; ++index)
+                    {
+                        const auto next = bind(index);
+                        group.append(next.weight(0), next.output(0), next.columns(0));
+                    }
+                    groups.push_back(group);
+                }
+                (void)prepareFP16Operand(d_input, m, k, effective_workspace);
+                for (const auto &group : groups)
+                {
+                    if (!cudaFp16_short_projection_group(group, m, k, cuda_device_id_,
+                            gpu_stream_, VerifierKernelModeScope::rowsFor(m))) return false;
+                    if (PerfStatsCollector::isDomainEnabled("kernel"))
+                    {
+                        std::string widths;
+                        for (int index = 0; index < group.size(); ++index)
+                        {
+                            if (index) widths += "+";
+                            widths += std::to_string(group.columns(index));
+                        }
+                        PerfStatsCollector::addCounter("kernel", "cuda_fp16_short_projection_group_calls", 1.0,
+                            "gemm", "cuda:" + std::to_string(cuda_device_id_),
+                            {{"m", std::to_string(m)}, {"k", std::to_string(k)}, {"widths", widths},
+                             {"projections", std::to_string(group.size())}, {"columns", std::to_string(group.totalColumns())},
+                             {"physical_launches", "1"}, {"pointer_publications", "0"},
+                             {"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"},
+                             {"output", "fp32"}, {"route", "fixed_order_fp16_short_group"}});
+                    }
+                }
+                return true;
+            }
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                d_input = static_cast<const float *>(prepareFP16Operand(d_input, m, k, effective_workspace));
 
             auto *d_A_array = static_cast<const float **>(
                 effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS));
@@ -1162,7 +1344,10 @@ namespace llaminar2
                     }
 
                     CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
-                    const bool projection_ok = use_fp32_weights
+                    const bool projection_ok = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE
+                        ? cudaFp16_tiny_batched_projection(d_A_array, d_B_array, d_C_array, m, seed.n, k,
+                            static_cast<int>(group_count), cuda_device_id_, gpu_stream_, VerifierKernelModeScope::rowsFor(m))
+                        : use_fp32_weights
                                                    ? cudaFp32_tiny_batched_projection(
                                                          d_A_array,
                                                          d_B_array,
@@ -1223,7 +1408,9 @@ namespace llaminar2
                             "kernel",
                             use_fp32_weights
                                 ? "cuda_fp32_grouped_verifier_projection_calls"
-                                : "cuda_fp32x16_grouped_verifier_projection_calls",
+                                : operand_precision_ == FloatingActivationOperandPrecision::FP16RNE
+                                    ? "cuda_fp16_grouped_verifier_projection_calls"
+                                    : "cuda_fp32x16_grouped_verifier_projection_calls",
                             1.0,
                             "gemm",
                             "cuda:" + std::to_string(cuda_device_id_),
@@ -1235,7 +1422,11 @@ namespace llaminar2
                                 {"projections", std::to_string(group_count)},
                                 {"route", use_fp32_weights
                                               ? "fixed_order_fp32_batched_projection"
-                                              : "fixed_order_fp32x16_batched_projection"}});
+                                              : operand_precision_ == FloatingActivationOperandPrecision::FP16RNE
+                                                  ? "fixed_order_fp16_batched_projection"
+                                                  : "fixed_order_fp32x16_batched_projection"},
+                                {"activation", operand_precision_ == FloatingActivationOperandPrecision::FP16RNE ? "fp16_rne" : "fp32"},
+                                {"accumulation", "fp32"}});
                     }
 
                     group_offset += group_count;
@@ -1487,13 +1678,111 @@ namespace llaminar2
             }
         }
 
+        const void *CUDAFloatingPointGemmKernel::prepareFP16Operand(
+            const float *source, int m, int k, DeviceWorkspaceManager *workspace)
+        {
+            if (operand_precision_ != FloatingActivationOperandPrecision::FP16RNE || precision_ != Precision::FP16 ||
+                !source || !gpu_stream_ || m <= 0 || k != static_cast<int>(K_) ||
+                !workspace || workspace->device() != DeviceId::cuda(cuda_device_id_))
+                throw std::invalid_argument("CUDA half A requires exact row geometry and device workspace");
+            if (static_cast<size_t>(m) > std::numeric_limits<size_t>::max() / sizeof(std::uint16_t) / static_cast<size_t>(k))
+                throw std::overflow_error("CUDA half activation extent overflow");
+            const size_t bytes = static_cast<size_t>(m) * k * sizeof(std::uint16_t);
+            if (!workspace->hasBuffer(GemmWorkspaceBuffers::FULL_A_FP16) ||
+                workspace->getBufferSize(GemmWorkspaceBuffers::FULL_A_FP16) < bytes)
+                throw std::invalid_argument("CUDA half A exceeds admitted FULL_A_FP16 extent");
+            void *destination = workspace->getBuffer(GemmWorkspaceBuffers::FULL_A_FP16);
+            if (!destination) throw std::invalid_argument("CUDA half activation bank is not materialized");
+#ifdef HAVE_CUDA
+            // The producer and fixed-order consumer share the same device-owned live range.
+            const auto *live = VerifierKernelModeScope::rowsFor(m);
+            const auto rows = live ? *live : DeviceRowRange::fullyActive(m);
+            if (cudaCastLiveFP32ToFP16(source, destination, rows,
+                static_cast<size_t>(k), cuda_device_id_, static_cast<cudaStream_t>(gpu_stream_)) != cudaSuccess)
+                throw std::runtime_error("CUDA half activation publication failed on its consumer stream");
+#else
+            throw std::runtime_error("CUDA half operands require compiled CUDA support");
+#endif
+            PerfStatsCollector::addCounter("gemm", "cuda_fp16_operand_cast_calls", 1.0,
+                "gemm", "cuda:" + std::to_string(cuda_device_id_),
+                {{"m", std::to_string(m)}, {"k", std::to_string(k)},
+                 {"activation", "fp16_rne"}, {"rows", VerifierKernelModeScope::rowsFor(m) ? "device_live" : "complete"}});
+            return destination;
+        }
+
+        bool CUDAFloatingPointGemmKernel::submitFixedOperandProjection(
+            const void *input, float *output, int m, int n, int k, DeviceWorkspaceManager *workspace)
+        {
+            if (!workspace || !input || !output || !d_weights_ || !gpu_stream_)
+                throw std::invalid_argument("Fixed CUDA operand projection requires admitted persistent storage");
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE &&
+                m <= kShortHalfProjectionMaxRows)
+            {
+                const auto group = FixedHalfProjectionGroup::single(static_cast<const std::uint16_t *>(input),
+                    static_cast<const std::uint16_t *>(d_weights_), output, n);
+                const bool ok = cudaFp16_short_projection_group(group, m, k, cuda_device_id_, gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m));
+                if (ok) PerfStatsCollector::addCounter("gemm", "cuda_floating_fixed_operand_projection", 1.0, {}, {},
+                    {{"m", std::to_string(m)}, {"n", std::to_string(n)}, {"k", std::to_string(k)},
+                     {"operand", "fp16_rne"}, {"accumulation", "fp32"},
+                     {"route", "fixed_order_fp16_short_group"}, {"pointer_publications", "0"}});
+                return ok;
+            }
+            auto *a = static_cast<const float **>(workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS));
+            auto *b = static_cast<const float **>(workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS));
+            auto *c = static_cast<float **>(workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS));
+            const float *input_address = static_cast<const float *>(input);
+            const float *weight_address = static_cast<const float *>(d_weights_);
+            if (!a || !b || !c ||
+                workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS) < sizeof(float *) ||
+                workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS) < sizeof(float *) ||
+                workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS) < sizeof(float *))
+                throw std::invalid_argument("Fixed CUDA operand projection lacks pointer publication capacity");
+            if (!cudaFp32_stage_batched_projection_pointers(a, b, c, &input_address, &weight_address,
+                    &output, 1, cuda_device_id_, gpu_stream_)) return false;
+            const bool half = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE;
+            const bool ok = half
+                ? cudaFp16_tiny_batched_projection(a, b, c, m, n, k, 1, cuda_device_id_, gpu_stream_, VerifierKernelModeScope::rowsFor(m))
+                : cudaFp32_tiny_batched_projection(a, b, c, m, n, k, 1, cuda_device_id_, gpu_stream_, VerifierKernelModeScope::rowsFor(m));
+            if (ok) PerfStatsCollector::addCounter("gemm", "cuda_floating_fixed_operand_projection", 1.0, {}, {},
+                {{"m", std::to_string(m)}, {"n", std::to_string(n)}, {"k", std::to_string(k)},
+                 {"operand", half ? "fp16_rne" : "fp32"}, {"accumulation", "fp32"}});
+            return ok;
+        }
+
+        bool CUDAFloatingPointGemmKernel::submitOperandProjection(
+            const void *input, float *output, int m, int n, int k, DeviceWorkspaceManager *workspace)
+        {
+            if (!input || !output || !gpu_stream_ || !workspace || workspace->device() != DeviceId::cuda(cuda_device_id_) ||
+                m <= 0 || n != static_cast<int>(N_) || k != static_cast<int>(K_) ||
+                operand_precision_ == FloatingActivationOperandPrecision::Native)
+                throw std::invalid_argument("CUDA explicit operand GEMM geometry/workspace differs");
+            cublas_kernel_->bindWorkspace(workspace);
+            const bool half = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE;
+            const bool success = half
+                ? cublas_kernel_->executeFP16AccumulateFP32(input, d_weights_, output, m, n, k)
+                : cublas_kernel_->execute(static_cast<const float *>(input),
+                    static_cast<const float *>(d_weights_), output, m, n, k, false, true, 1.0f, 0.0f);
+            if (success)
+                PerfStatsCollector::addCounter("gemm", "cuda_floating_operand_projection_calls", 1.0,
+                    "gemm", "cuda:" + std::to_string(cuda_device_id_),
+                    {{"m", std::to_string(m)}, {"n", std::to_string(n)}, {"k", std::to_string(k)},
+                     {"activation", half ? "fp16_rne" : "fp32"}, {"weight", half ? "fp16" : "fp32"},
+                     {"accumulation", "fp32"}, {"output", "fp32"},
+                     {"compute", half ? "CUBLAS_COMPUTE_32F" : "CUBLAS_COMPUTE_32F_PEDANTIC"},
+                     {"route", "cublas_gemm_ex"}});
+            return success;
+        }
+
         WorkspaceRequirements CUDAFloatingPointGemmKernel::getWorkspaceRequirements(int m, int n, int k) const
         {
             if (!cublas_kernel_)
                 return WorkspaceRequirements{};
             if (n == 0)
                 n = static_cast<int>(N_);
-            return floating_gemm_workspace::projectionRequirements(std::max(0, m), std::max(0, n));
+            if (k == 0) k = static_cast<int>(K_);
+            return floating_gemm_workspace::projectionRequirements(std::max(0, m), std::max(0, n),
+                std::max(0, k), operand_precision_);
         }
 
         void CUDAFloatingPointGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
@@ -1547,9 +1836,11 @@ namespace llaminar2
         {
             return KernelSnapshotInfo::gemm()
                 .withInput("A", "input activations [m, k]", KernelBufferDtype::FP32)
-                .withWeight("B", "weight matrix [n, k]", KernelBufferDtype::FP32)
+                .withWeight("B", "prepared weight matrix [n, k]", precision_ == Precision::FP16
+                    ? KernelBufferDtype::FP16 : precision_ == Precision::BF16 ? KernelBufferDtype::BF16 : KernelBufferDtype::FP32)
                 .withOutput("C", "output matrix [m, n]", KernelBufferDtype::FP32)
                 .withScalar("precision", "computation precision (FP32/FP16/BF16)", KernelBufferDtype::INT32)
+                .withScalar("operand_precision", "immutable Native/FP32/FP16RNE activation policy", KernelBufferDtype::INT32)
                 .withScalar("N", "output features", KernelBufferDtype::INT32)
                 .withScalar("K", "input features", KernelBufferDtype::INT32)
                 .withScalar("cuda_device_id", "CUDA device ID", KernelBufferDtype::INT32);

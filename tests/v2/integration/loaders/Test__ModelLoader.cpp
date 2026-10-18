@@ -2316,7 +2316,7 @@ TEST_F(Test__ModelLoader, LoadQ4_KTensor)
  */
 TEST_F(Test__ModelLoader, LoadQ8_KTensor)
 {
-    std::string path = "/tmp/test_q8k.gguf";
+    std::string path = test_dir_ + "source_q8k.gguf";
     std::ofstream file(path, std::ios::binary);
     ASSERT_TRUE(file.is_open());
 
@@ -2339,14 +2339,16 @@ TEST_F(Test__ModelLoader, LoadQ8_KTensor)
     file.write(reinterpret_cast<const char *>(&value_len), 8);
     file.write("test", 4);
 
-    // Q8_K tensor: 256 elements = 1 block × 290 bytes
+    // Q8_K tensor: 256 elements = one original 292-byte block
     key_len = 10;
     file.write(reinterpret_cast<const char *>(&key_len), 8);
     file.write("q8k_tensor", 10);
-    uint32_t n_dims = 1;
+    uint32_t n_dims = 2;
     file.write(reinterpret_cast<const char *>(&n_dims), 4);
     uint64_t dim0 = 256;
     file.write(reinterpret_cast<const char *>(&dim0), 8);
+    uint64_t dim1 = 1; // One complete native weight row in GGUF dimension order.
+    file.write(reinterpret_cast<const char *>(&dim1), 8);
     uint32_t type = 15; // Q8_K
     file.write(reinterpret_cast<const char *>(&type), 4);
     uint64_t offset = 0;
@@ -2362,9 +2364,16 @@ TEST_F(Test__ModelLoader, LoadQ8_KTensor)
         cur++;
     }
 
-    // Q8_K data: 1 block × 288 bytes (per ModelLoader's expectation)
-    std::vector<uint8_t> q8k_data(288, 0xEE);
-    file.write(reinterpret_cast<const char *>(q8k_data.data()), 288);
+    // Serialize the GGUF layout independently of the production block struct.
+    // A non-unit FP32 scale exposes omitted or re-rounded source metadata.
+    std::vector<uint8_t> q8k_data(292, 0);
+    const float source_scale = 0.1f;
+    std::memcpy(q8k_data.data(), &source_scale, sizeof(source_scale));
+    std::memset(q8k_data.data() + 4, 3, 256);
+    const int16_t source_sum = 48;
+    for (size_t block = 0; block < 16; ++block)
+        std::memcpy(q8k_data.data() + 260 + block * 2, &source_sum, 2);
+    file.write(reinterpret_cast<const char *>(q8k_data.data()), q8k_data.size());
     file.close();
 
     ModelLoader loader;
@@ -2373,6 +2382,11 @@ TEST_F(Test__ModelLoader, LoadQ8_KTensor)
     auto tensor = loader.loadTensor("q8k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q8_K);
+    EXPECT_EQ(tensor->size_bytes(), 292u);
+    std::vector<float> values(256);
+    tensor->to_fp32(values.data());
+    for (const float value : values)
+        EXPECT_FLOAT_EQ(value, source_scale * 3.0f);
 }
 
 /**
@@ -2452,7 +2466,7 @@ TEST_F(Test__ModelLoader, LoadQ4_KTensorWithFactory)
  */
 TEST_F(Test__ModelLoader, LoadQ8_KTensorWithFactory)
 {
-    std::string path = "/tmp/test_q8k_factory.gguf";
+    std::string path = test_dir_ + "source_q8k_factory.gguf";
     std::ofstream file(path, std::ios::binary);
     ASSERT_TRUE(file.is_open());
 
@@ -2479,10 +2493,12 @@ TEST_F(Test__ModelLoader, LoadQ8_KTensorWithFactory)
     key_len = 10;
     file.write(reinterpret_cast<const char *>(&key_len), 8);
     file.write("q8k_tensor", 10);
-    uint32_t n_dims = 1;
+    uint32_t n_dims = 2;
     file.write(reinterpret_cast<const char *>(&n_dims), 4);
     uint64_t dim0 = 256;
     file.write(reinterpret_cast<const char *>(&dim0), 8);
+    uint64_t dim1 = 1; // One complete native weight row in GGUF dimension order.
+    file.write(reinterpret_cast<const char *>(&dim1), 8);
     uint32_t type = 15; // Q8_K
     file.write(reinterpret_cast<const char *>(&type), 4);
     uint64_t offset = 0;
@@ -2498,9 +2514,16 @@ TEST_F(Test__ModelLoader, LoadQ8_KTensorWithFactory)
         cur++;
     }
 
-    // Q8_K data: 1 block × 288 bytes
-    std::vector<uint8_t> q8k_data(288, 0xEE);
-    file.write(reinterpret_cast<const char *>(q8k_data.data()), 288);
+    // Serialize the GGUF layout independently of the production block struct.
+    // A non-unit FP32 scale exposes omitted or re-rounded source metadata.
+    std::vector<uint8_t> q8k_data(292, 0);
+    const float source_scale = 0.1f;
+    std::memcpy(q8k_data.data(), &source_scale, sizeof(source_scale));
+    std::memset(q8k_data.data() + 4, 3, 256);
+    const int16_t source_sum = 48;
+    for (size_t block = 0; block < 16; ++block)
+        std::memcpy(q8k_data.data() + 260 + block * 2, &source_sum, 2);
+    file.write(reinterpret_cast<const char *>(q8k_data.data()), q8k_data.size());
     file.close();
 
     MPIContext mpi_ctx(0, 1);
@@ -2512,6 +2535,11 @@ TEST_F(Test__ModelLoader, LoadQ8_KTensorWithFactory)
     auto tensor = loader.loadTensor("q8k_tensor", DeviceId::cpu(), WeightPrecision::NATIVE);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q8_K);
+    EXPECT_EQ(tensor->size_bytes(), 292u);
+    std::vector<float> values(256);
+    tensor->to_fp32(values.data());
+    for (const float value : values)
+        EXPECT_FLOAT_EQ(value, source_scale * 3.0f);
 }
 
 // =============================================================================

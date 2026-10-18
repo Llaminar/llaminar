@@ -228,6 +228,7 @@ TEST(Test__HeterogeneousLayers, AttentionOutputGateStage_SigmoidGating)
     params.gate = gate.get();
     params.output = output.get();
     params.seq_len = 1;
+    params.feature_dim = 4;
 
     auto ctx = makeCPUContext();
     AttentionOutputGateStage stage(params);
@@ -243,6 +244,8 @@ TEST(Test__HeterogeneousLayers, AttentionOutputGateStage_SigmoidGating)
 TEST(Test__HeterogeneousLayers, AttentionOutputGateStage_Type)
 {
     AttentionOutputGateStage::Params params;
+    params.seq_len = 1;
+    params.feature_dim = 1;
     AttentionOutputGateStage stage(params);
     EXPECT_EQ(stage.type(), ComputeStageType::ATTENTION_OUTPUT_GATE);
 }
@@ -265,6 +268,7 @@ TEST(Test__HeterogeneousLayers, AttentionOutputGateStage_InPlace)
     params.gate = gate.get();
     params.output = tensor.get();  // in-place
     params.seq_len = 1;
+    params.feature_dim = 2;
 
     auto ctx = makeCPUContext();
     AttentionOutputGateStage stage(params);
@@ -732,6 +736,7 @@ TEST(Test__HeterogeneousLayers, AttentionOutputGateStage_MultiToken)
     params.gate = gate.get();
     params.output = output.get();
     params.seq_len = seq_len;
+    params.feature_dim = d;
 
     auto ctx = makeCPUContext();
     AttentionOutputGateStage stage(params);

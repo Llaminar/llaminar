@@ -77,8 +77,9 @@ def published_releases(repository: str) -> tuple[list[dict], str | None]:
 
 def download_assets(repository: str, metadata: dict, destination: Path) -> None:
     """Download the publisher's exact named public assets, without wildcards."""
-    names = release.release_asset_sources(Path("e2e"), Path("benchmarks"))
     attached = [asset["name"] for asset in metadata["assets"]]
+    names = release.release_asset_sources(Path("e2e"), Path("benchmarks"),
+        model_kld=any(name in {'kld-avx2.json', 'kld-avx512.json'} for name in attached))
     if any(attached.count(name) != 1 for name in names):
         raise ValueError(f"{metadata['tag_name']}: missing or duplicate certificate assets")
     destination.mkdir(parents=True)
@@ -123,6 +124,18 @@ def load_evidence(repository: str, metadata: dict, assets: Path) -> PublishedEvi
             or receipt.get("manifest_digest") != digest(manifest)
             or set(receipt.get("reports", {})) != set(suite.ISAS)):
         raise ValueError("published E2E receipt is incomplete or mismatched")
+    if receipt.get('model_kld_required'):
+        # Historical displays authenticate the original accepted report; they
+        # must not retroactively apply a newer numerical policy or corpus pin.
+        if set(receipt.get('model_kld_reports', {})) != set(suite.ISAS):
+            raise ValueError('Published KL receipt omits an ISA')
+        for isa in suite.ISAS:
+            numerical = read_json(assets / f'kld-{isa.lower()}.json')
+            if (numerical.get('complete') is not True or numerical.get('passed') is not True
+                    or numerical.get('cpu_isa') != isa or numerical.get('image') != pair['images'][isa]['id']
+                    or numerical.get('source_revision') != pair['source']['revision']
+                    or digest(numerical) != receipt['model_kld_reports'][isa]):
+                raise ValueError('Published KL evidence differs from its completed receipt')
     result = read_json(assets / "benchmark-results.json")
     if (result.get("source") != pair["source"] or result.get("images") != pair["images"]
             or result.get("repository", "").lower() != repository.lower()

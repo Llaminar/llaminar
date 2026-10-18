@@ -9,6 +9,8 @@
  * certification is registered independently from the performance tournament.
  * Every installable timing row measures a retained native graph of complete
  * projection operations and records its amortization count in the raw corpus.
+ * IQ4_XS resource sweeps use physical24 including its secondary plane;
+ * installed tile/staging expectation remains the explicit source4 schedule.
  */
 
 #include <gtest/gtest.h>
@@ -365,10 +367,10 @@ namespace
         for (const auto &source : llaminar2::native_vnni_formats::kAllSourceFormats)
         {
             const auto &format = *source.metadata;
-            codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format.codebook_id));
+            codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format));
             codebooks.insert(llaminar2::migrationStableDeviceVnniFormat(format).codebook_id);
             if (format.payload_bytes == 16 || format.payload_bytes == 20)
-                staged_codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format.codebook_id));
+                staged_codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format));
         }
         const std::string csv_path =
             getEnvString("LLAMINAR_TILE_RESOURCE_CSV");
@@ -1722,7 +1724,8 @@ namespace
                     SCOPED_TRACE(::testing::Message() << "M=" << m << " N=" << n << " K=" << k);
                     llaminar2::cuda::generated::CUDADensePrefillOverlayConfig expected{};
                     ASSERT_TRUE(llaminar2::cuda::generated::selectCUDADensePrefillOverlay(
-                        format.runtimeCodebook(), m, n, k, expected));
+                        format.runtimeCodebook() == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
+                            ? uint8_t{4} : format.runtimeCodebook(), m, n, k, expected));
                     cudaNativeVNNIPrefill_setExactOverlayEnabled(false);
                     auto requirements = consumer->getWorkspaceRequirements(m, n, k);
                     cudaNativeVNNIPrefill_setExactOverlayEnabled(true);

@@ -1,6 +1,10 @@
 /**
  * @file AttentionOutputGateStage.cpp
- * @brief Implementation of sigmoid-gated attention output stage
+ * @brief Apply sigmoid gating to an explicit participant-local packed prefix.
+ *
+ * Retained arenas can be wider than the sharded prefill activation so they can
+ * also hold full decode/GDN outputs. Kernel work, snapshot extents and estimates
+ * share the graph's live geometry; none may interpret allocation width as data.
  */
 
 #include "AttentionOutputGateStage.h"
@@ -9,6 +13,8 @@
 #include "../../../utils/OpenMPUtils.h"
 
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
@@ -135,6 +141,26 @@ namespace llaminar2
     AttentionOutputGateStage::AttentionOutputGateStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        (void)liveElementCount();
+    }
+
+    size_t AttentionOutputGateStage::liveElementCount() const
+    {
+        if (params_.seq_len <= 0 || params_.feature_dim <= 0 ||
+            params_.seq_len > std::numeric_limits<int>::max() / params_.feature_dim)
+        {
+            throw std::invalid_argument(
+                "AttentionOutputGateStage requires positive explicit live rows/columns fitting the native int element-count ABI");
+        }
+        return static_cast<size_t>(params_.seq_len) * static_cast<size_t>(params_.feature_dim);
+    }
+
+    void AttentionOutputGateStage::validateLiveCapacity(
+        const TensorBase &tensor, const char *role) const
+    {
+        if (tensor.numel() < liveElementCount())
+            throw std::invalid_argument(
+                std::string("AttentionOutputGateStage live prefix exceeds ") + role + " capacity");
     }
 
     bool AttentionOutputGateStage::execute(IDeviceContext *ctx)
@@ -158,12 +184,12 @@ namespace llaminar2
             return false;
         }
 
-        const int seq_len = (params_.seq_len > 0)
-                                ? params_.seq_len
-                                : static_cast<int>(input_base->rows());
-
-        const size_t cols = input_base->shape().size() > 1 ? input_base->shape()[1] : input_base->numel();
-        const size_t total = static_cast<size_t>(seq_len) * cols;
+        const int seq_len = params_.seq_len;
+        const size_t cols = static_cast<size_t>(params_.feature_dim);
+        const size_t total = liveElementCount();
+        validateLiveCapacity(*input_base, "input");
+        validateLiveCapacity(*gate_base, "gate");
+        validateLiveCapacity(*output_base, "output");
 
         // GPU dispatch path
         if (params_.device_id.is_gpu())
@@ -240,20 +266,14 @@ namespace llaminar2
 
     size_t AttentionOutputGateStage::estimatedFlops() const
     {
-        auto *input_base = dynamic_cast<TensorBase *>(params_.input);
-        if (!input_base)
-            return 0;
         // sigmoid (4 ops) + multiply (1 op) per element
-        return input_base->numel() * 5;
+        return liveElementCount() * 5;
     }
 
     size_t AttentionOutputGateStage::estimatedMemoryBytes() const
     {
-        auto *input_base = dynamic_cast<TensorBase *>(params_.input);
-        if (!input_base)
-            return 0;
         // Read input + gate, write output (each float)
-        return input_base->numel() * 3 * sizeof(float);
+        return liveElementCount() * 3 * sizeof(float);
     }
 
     bool AttentionOutputGateStage::supportsBackend(ComputeBackendType backend) const
@@ -281,18 +301,25 @@ namespace llaminar2
         auto *input_base = dynamic_cast<TensorBase *>(params_.input);
         auto *gate_base = dynamic_cast<TensorBase *>(params_.gate);
         auto *output_base = dynamic_cast<TensorBase *>(params_.output);
-        const size_t rows = (params_.seq_len > 0) ? static_cast<size_t>(params_.seq_len)
-                                                  : (output_base ? output_base->rows() : 0);
-        const size_t cols = output_base ? output_base->cols()
-                                        : (input_base ? input_base->cols()
-                                                      : (gate_base ? gate_base->cols() : 0));
+        (void)liveElementCount();
+        const size_t rows = static_cast<size_t>(params_.seq_len);
+        const size_t cols = static_cast<size_t>(params_.feature_dim);
 
         if (input_base)
+        {
+            validateLiveCapacity(*input_base, "input");
             info.addInput("input", input_base, rows, cols);
+        }
         if (gate_base)
+        {
+            validateLiveCapacity(*gate_base, "gate");
             info.addInput("gate", gate_base, rows, cols);
+        }
         if (output_base)
+        {
+            validateLiveCapacity(*output_base, "output");
             info.addOutput("output", output_base, rows, cols);
+        }
 
         return info;
     }

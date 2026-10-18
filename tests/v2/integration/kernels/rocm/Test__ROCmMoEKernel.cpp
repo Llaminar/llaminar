@@ -1,6 +1,6 @@
 /**
  * @file Test__ROCmMoEKernel.cpp
- * @brief Integration tests for ROCm MoE kernel vs CPU reference
+ * @brief Integration tests for ROCm MoE arithmetic, typed router operands and retained capture
  *
  * Validates that ROCmMoEKernel produces numerically equivalent results to
  * CPUMoEKernel for all 5 IMoEKernel operations:
@@ -22,10 +22,13 @@
  * Target Hardware: AMD MI50 (gfx906 / Vega 20)
  */
 
+#include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
 
 #include "tensors/Tensors.h"
+#include "kernels/common/DeviceHalfMetadataContract.h"
+#include <bit>
 #include "utils/Assertions.h"
 #include "kernels/common/SamplingMath.h"
 #include "kernels/common/FloatingExpertNumericalContract.h"
@@ -6078,7 +6081,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "0");
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
@@ -6295,7 +6298,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeRecordsHotCacheBalanceImprovem
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "0");
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
@@ -9423,7 +9426,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWithReadyRebalanceApplyTargetAllRolls
         /*top_k=*/2);
     ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
     ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-    ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
     ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
     ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "0");
 
@@ -12922,7 +12925,7 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "1");
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
@@ -13164,7 +13167,7 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "1");
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
@@ -15410,7 +15413,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWaveTopKMatchesDefaultRuntimeTopK)
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "0");
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
@@ -15425,7 +15428,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWaveTopKMatchesDefaultRuntimeTopK)
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "1");
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
@@ -15522,7 +15525,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWaveTopKMatchesDefaultRuntimeTopKQwen
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "0");
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
@@ -15537,7 +15540,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWaveTopKMatchesDefaultRuntimeTopKQwen
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "1");
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
@@ -15594,7 +15597,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWaveTopKMatchesDefaultRuntimeTopKQwen
               << max_weight_diff << "\n";
 }
 
-TEST(Test__ROCmMoEKernel, DecodeRouteSelectFP16RouterMatchesFP32TopK)
+TEST(Test__ROCmMoEKernel, DecodeRouteSelectPreparedHalfOperandsMatchesFP32TopK)
 {
     SKIP_IF_NO_ROCM();
 
@@ -15631,9 +15634,13 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectFP16RouterMatchesFP32TopK)
 
     std::copy(hidden_host.begin(), hidden_host.end(), hidden->mutable_data());
     std::copy(gate_host.begin(), gate_host.end(), gate_weights->mutable_data());
+    std::vector<uint16_t> half_words(gate_host.size());
+    for(size_t i=0;i<gate_host.size();++i)half_words[i]=canonicalPreparedHalfBits(gate_host[i]);
+    auto prepared_half=std::make_shared<FP16Tensor>(std::vector<size_t>{size_t(num_experts),size_t(d_model)},half_words);
 
     TransferEngine::prepareDeviceInput(hidden.get(), device, stream);
     TransferEngine::prepareDeviceInput(gate_weights.get(), device, stream);
+    TransferEngine::prepareDeviceInput(prepared_half.get(), device, stream);
     TransferEngine::prepareDeviceOutput(output_indices_fp32.get(), device, stream);
     TransferEngine::prepareDeviceOutput(output_weights_fp32.get(), device, stream);
     TransferEngine::prepareDeviceOutput(output_indices_fp16.get(), device, stream);
@@ -15647,8 +15654,8 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectFP16RouterMatchesFP32TopK)
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
+        ScopedROCmEnvOverride q8_off("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
         {
-            ScopedROCmEnvOverride router_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
             ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
                 runtime_fp32.get(),
                 hidden.get(), gate_weights.get(),
@@ -15659,10 +15666,9 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectFP16RouterMatchesFP32TopK)
                 RoutedExpertRowExecutionPolicy::ParticipantAssigned));
         }
         {
-            ScopedROCmEnvOverride router_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "1");
             ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
                 runtime_fp16.get(),
-                hidden.get(), gate_weights.get(),
+                hidden.get(), prepared_half.get(),
                 d_model, num_experts, top_k,
                 true,
                 output_indices_fp16.get(), output_weights_fp16.get(),
@@ -15700,7 +15706,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectFP16RouterMatchesFP32TopK)
         EXPECT_NEAR(legacy_weights_fp32[k], after_fp32.topk_weights[k], 1.0e-6f);
     }
 
-    std::cout << "[DecodeRouteSelectFP16RouterMatchesFP32TopK] max_weight_diff="
+    std::cout << "[DecodeRouteSelectPreparedHalfOperandsMatchesFP32TopK] max_weight_diff="
               << std::fixed << std::setprecision(8) << max_weight_diff << std::endl;
 }
 
@@ -15762,7 +15768,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectBF16RouterMatchesFP32TopK)
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "0");
 
@@ -15887,7 +15893,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectKPartRouterMatchesFP32TopK)
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
         ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
             runtime_fp32.get(),
@@ -15928,7 +15934,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectKPartRouterMatchesFP32TopK)
             ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
             ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
             ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-            ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
             ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "1");
             ScopedROCmEnvOverride kparts_env("LLAMINAR_ROCM_MOE_ROUTER_KPARTS", kparts_value.c_str());
             ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
@@ -16033,7 +16039,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectQ8RouterMatchesFP32TopKAcrossSeeds)
             ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
             ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
             ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-            ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
             ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
             ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
                 runtime_fp32.get(),
@@ -16048,7 +16054,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectQ8RouterMatchesFP32TopKAcrossSeeds)
             ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
             ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
             ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "1");
-            ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
             ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
             ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
                 runtime_q8.get(),
@@ -16148,7 +16154,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectFailsOnQ8CacheMissDuringGraphCapture)
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "1");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "1");
         GraphCaptureGuard guard;
         EXPECT_FALSE(gpu_kernel.decodeRouteSelect(
@@ -16200,7 +16206,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectFailsWhenQ8RouterEnabledForUnalignedF
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "1");
-        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "1");
+
         ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "1");
         EXPECT_FALSE(gpu_kernel.decodeRouteSelect(
             runtime.get(),
@@ -16363,8 +16369,6 @@ TEST(Test__ROCmMoEKernel, Route_PrefillLargeFP32MatchesSerialDecodeBytes)
 
     ScopedROCmEnvOverride disable_q8_router(
         "LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
-    ScopedROCmEnvOverride disable_fp16_router(
-        "LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
     runRoutePrefillLargeBatchInvariant("fp32");
 }
 
@@ -28633,3 +28637,234 @@ TEST(Test__ROCmMoEKernel, SkippedNoROCm)
 }
 
 #endif // HAVE_ROCM
+
+/** @test Captured optimized IQ2_S expert roles match original GGUF factors. */
+TEST(Test__ROCmMoEKernel, IQ2SOriginalSourceEquationInCapturedFusedExpert)
+{
+    llaminar2::test::iq2s_fused_source_witness::runGpu(llaminar2::DeviceId::rocm(0));
+}
+
+#ifdef HAVE_ROCM
+extern "C" bool hipMoE_gate_logits_single_token_fp16_weights(
+    const float *,const void *,float *,int,int,int,void *);
+extern "C" bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
+    const float *,const void *,float *,int,int,int,int,void *,const int *);
+#endif
+
+/**
+ * @test Router half operands preserve exact source equations and live-row bytes.
+ * @details Independent integer/dyadic expectations include odd/even K, halfway
+ * RNE inputs and half-subnormal ties. Real retained kernels consume original
+ * FP32 hidden, while a borrowed device count controls inactive suffix ownership.
+ * Serial capture is a test-only byte oracle for the same grouped fixed tree.
+ */
+TEST(Test__ROCmMoEKernel, FP16RouterOperandsExactSourceAndLiveRowsCaptured)
+{
+    SKIP_IF_NO_ROCM();
+    const DeviceId device=DeviceId::rocm(0);
+    const hipStream_t stream=rocmMoETestStream();
+    constexpr int E=17;
+    for (const auto [M, K] : std::vector<std::pair<int, int>>{
+        {1,65}, {8,64}, {15,65}, {16,64}, {17,65}, {512,64}, {512,65},
+        {64,2048}, {1024,64}, {2048,65}})
+    {
+        std::vector<uint16_t> words(E*K);
+        for(int e=0;e<E;++e)for(int k=0;k<K;++k)
+            words[e*K+k]=canonicalPreparedHalfBits(float(((e+k)&1?-1:1)*(32+(e*7+k*3)%17))/64.f);
+        auto gate=std::make_shared<FP16Tensor>(std::vector<size_t>{size_t(E),size_t(K)},words);
+        auto hidden=TestTensorFactory::createFP32Zeros({size_t(M),size_t(K)});
+        auto single=TestTensorFactory::createFP32Zeros({1,size_t(K)});
+        auto logits=TestTensorFactory::createFP32Zeros({size_t(M),size_t(E)});
+        auto serial_logits=TestTensorFactory::createFP32Zeros({1,E});
+        WorkspaceRequirements requirements;
+        requirements.buffers.push_back({"router_half_test_live_count",sizeof(int32_t),256,true});
+        DeviceWorkspaceManager bank(device,requirements.total_bytes_with_alignment());
+        ASSERT_TRUE(bank.allocate(requirements));
+        auto *count=static_cast<int32_t *>(bank.getBuffer("router_half_test_live_count"));
+        ASSERT_NE(count,nullptr);
+        std::vector<float> source(M*K),actual(M*E),reference(E),unchanged(M*K);
+        int32_t live=M;
+        auto graph=std::make_unique<HIPGraphCapture>(stream,device.ordinal);
+        auto serial_graph=std::make_unique<HIPGraphCapture>(stream,device.ordinal);
+        struct Join {
+            hipStream_t stream;
+            ~Join(){(void)hipStreamSynchronize(stream);}
+        } join{stream}; // All borrowed DMA banks and graph owners precede the join.
+        TransferEngine::prepareDeviceInput(gate.get(),device,stream);
+        ASSERT_TRUE(hidden->allocateOnDevice(device,stream));ASSERT_TRUE(single->allocateOnDevice(device,stream));
+        ASSERT_TRUE(logits->allocateOnDevice(device,stream));ASSERT_TRUE(serial_logits->allocateOnDevice(device,stream));
+        ASSERT_EQ(hipMemcpyAsync(count,&live,sizeof(live),hipMemcpyHostToDevice,stream),hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+        {
+            ScopedBackendGraphCapture capture(*graph,"half router live rows");
+            ASSERT_TRUE(capture.begin());
+            ASSERT_TRUE(hipMoE_gate_logits_fp16_decode_equivalent_rows(
+                static_cast<const float *>(hidden->gpu_data_ptr()),gate->gpu_data_ptr(),
+                static_cast<float *>(logits->gpu_data_ptr()),M,K,E,device.ordinal,stream,count));
+            capture.finish();
+        }
+        ASSERT_TRUE(graph->instantiate());
+        {
+            ScopedBackendGraphCapture capture(*serial_graph,"half router serial");
+            ASSERT_TRUE(capture.begin());
+            ASSERT_TRUE(hipMoE_gate_logits_single_token_fp16_weights(
+                static_cast<const float *>(single->gpu_data_ptr()),gate->gpu_data_ptr(),
+                static_cast<float *>(serial_logits->gpu_data_ptr()),K,E,device.ordinal,stream));
+            capture.finish();
+        }
+        ASSERT_TRUE(serial_graph->instantiate());
+        int replay=0;
+        for(const int value : {M,std::min(M,3),0,1,M-1,std::min(M,17),M})
+        {
+            live=value;++replay;
+            std::fill(source.begin(),source.end(),std::bit_cast<float>(UINT32_C(0x7FC00001)));
+            for(int row=0;row<live;++row)for(int k=0;k<K;++k)
+                source[row*K+k]=float(4096+((row*5+k*7+replay*3)%29)*3)/4096.f;
+            if(live>0)
+            {
+                std::fill_n(source.begin(),K,0.f);
+                for(int k=0;k<4;++k)source[k]=std::ldexp(float(2*k+1+2*replay),-25);
+            }
+            ASSERT_EQ(hipMemcpyAsync(hidden->gpu_data_ptr(),source.data(),source.size()*sizeof(float),hipMemcpyHostToDevice,stream),hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(count,&live,sizeof(live),hipMemcpyHostToDevice,stream),hipSuccess);
+            ASSERT_EQ(hipMemsetAsync(logits->gpu_data_ptr(),0xFF,actual.size()*sizeof(float),stream),hipSuccess);
+            ASSERT_TRUE(graph->launch());
+            ASSERT_EQ(hipMemcpyAsync(actual.data(),logits->gpu_data_ptr(),actual.size()*sizeof(float),hipMemcpyDeviceToHost,stream),hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(unchanged.data(),hidden->gpu_data_ptr(),source.size()*sizeof(float),hipMemcpyDeviceToHost,stream),hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+            EXPECT_EQ(std::memcmp(source.data(),unchanged.data(),source.size()*sizeof(float)),0);
+            for(int row=live;row<M;++row)for(int e=0;e<E;++e)
+                EXPECT_EQ(std::bit_cast<uint32_t>(actual[row*E+e]),UINT32_C(0xFFFFFFFF));
+            for(int row=0;row<live;++row)
+            {
+                ASSERT_EQ(hipMemcpyAsync(single->gpu_data_ptr(),source.data()+row*K,K*sizeof(float),hipMemcpyHostToDevice,stream),hipSuccess);
+                ASSERT_TRUE(serial_graph->launch());
+                ASSERT_EQ(hipMemcpyAsync(reference.data(),serial_logits->gpu_data_ptr(),E*sizeof(float),hipMemcpyDeviceToHost,stream),hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+                for(int e=0;e<E;++e)
+                {
+                    int64_t total=0;
+                    for(int k=0;k<K;++k)
+                    {
+                        int rounded;
+                        if(row==0)
+                        {
+                            const int numerator=k<4?2*k+1+2*replay:0;
+                            const int q=numerator/2;rounded=q+((numerator&1)&&(q&1));
+                        }
+                        else
+                        {
+                            const int numerator=4096+((row*5+k*7+replay*3)%29)*3;
+                            const int q=numerator/4,r=numerator%4;rounded=q+(r>2||(r==2&&(q&1)));
+                        }
+                        const int coefficient=((e+k)&1?-1:1)*(32+(e*7+k*3)%17);
+                        total+=int64_t(rounded)*coefficient;
+                    }
+                    const float expected=std::ldexp(float(total),row==0?-30:-16);
+                    EXPECT_EQ(std::bit_cast<uint32_t>(actual[row*E+e]),std::bit_cast<uint32_t>(expected));
+                    EXPECT_EQ(std::bit_cast<uint32_t>(actual[row*E+e]),std::bit_cast<uint32_t>(reference[e]));
+                }
+            }
+        }
+        ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+    }
+}
+
+/**
+ * @test Actual prepared-half router setup must capture cold on every public route kind.
+ *
+ * No eager route or half cache preparation precedes capture. Persistent routing
+ * scratch is declared by the production MoE workspace builder. Public ordinary
+ * and verifier calls must both accept the immutable physical-half gate; changed
+ * retained input replays keep outputs finite and normalized. The companion raw
+ * kernel fixture independently checks every half arithmetic word.
+ */
+TEST(Test__ROCmMoEKernel, PreparedHalfRouterCapturesWithoutEagerWarmup)
+{
+    SKIP_IF_NO_ROCM();
+    constexpr int K=64,E=17,Top=4;
+    const DeviceId device=DeviceId::rocm(0);
+    const hipStream_t stream=rocmMoETestStream();
+    for(const int M : {1,8,512})
+    {
+        auto hidden=TestTensorFactory::createFP32Zeros({size_t(M),K});
+        auto indices=TestTensorFactory::createFP32Zeros({size_t(M),Top});
+        auto weights=TestTensorFactory::createFP32Zeros({size_t(M),Top});
+        std::vector<uint16_t> words(E*K);
+        for(int e=0;e<E;++e)for(int k=0;k<K;++k)
+            words[e*K+k]=canonicalPreparedHalfBits(float((e+1)*(k%7+1))/1024.f);
+        auto gate=std::make_shared<FP16Tensor>(std::vector<size_t>{E,K},words);
+        ROCmMoEKernel kernel(0);kernel.setGPUStream(stream);
+        auto workspace=bindDefaultMoEWorkspace(kernel,M,K,128,E,Top);
+        std::vector<float> source(size_t(M)*K),actual(size_t(M)*Top),selected(actual.size());
+        MoERoutingResult host;
+        auto ordinary=std::make_unique<HIPGraphCapture>(stream,0);
+        auto verifier=std::make_unique<HIPGraphCapture>(stream,0);
+        struct Join{hipStream_t stream;~Join(){(void)hipStreamSynchronize(stream);}} join{stream};
+        // Allocation is not publication: the first capture consumes external
+        // host-initialized inputs. Admit both producer events before recording
+        // either public router so capture never owns an H2D initialization.
+        TransferEngine::prepareDeviceInput(gate.get(),device,stream);
+        TransferEngine::prepareDeviceInput(hidden.get(),device,stream);
+        TransferEngine::requireDeviceInput(gate.get(),device,stream);
+        TransferEngine::requireDeviceInput(hidden.get(),device,stream);
+        TransferEngine::prepareDeviceOutput(indices.get(),device,stream);
+        TransferEngine::prepareDeviceOutput(weights.get(),device,stream);
+        ASSERT_TRUE(kernel.prepareRouteLaunch(gate.get(),MoERouteLaunchPlan{
+            .kind=MoERouteLaunchKind::GroupedPrefill,.physical_rows=M,
+            .d_model=K,.num_experts=E,.top_k=Top}));
+        ASSERT_TRUE(kernel.prepareRouteLaunch(gate.get(),MoERouteLaunchPlan{
+            .kind=MoERouteLaunchKind::DecodeEquivalentVerifier,.physical_rows=M,
+            .d_model=K,.num_experts=E,.top_k=Top}));
+        if(M==1)ASSERT_TRUE(kernel.prepareRouteLaunch(gate.get(),MoERouteLaunchPlan{
+            .kind=MoERouteLaunchKind::RuntimeDecode,.physical_rows=1,
+            .d_model=K,.num_experts=E,.top_k=Top}));
+        ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+        {
+            ScopedBackendGraphCapture capture(*ordinary,"cold actual-half public ordinary router");
+            ASSERT_TRUE(capture.begin());
+            ASSERT_TRUE(kernel.routeWithTensors(hidden.get(),gate.get(),M,K,E,Top,true,
+                indices.get(),weights.get(),host));
+            capture.finish();
+        }
+        ASSERT_TRUE(ordinary->instantiate());
+        {
+            ScopedBackendGraphCapture capture(*verifier,"cold actual-half public verifier router");
+            ASSERT_TRUE(capture.begin());
+            ASSERT_TRUE(kernel.routeVerifierRowsDecodeEquivalent(hidden.get(),gate.get(),M,K,E,Top,true,
+                indices.get(),weights.get()));
+            capture.finish();
+        }
+        ASSERT_TRUE(verifier->instantiate());
+        for(int replay=0;replay<3;++replay)
+        {
+            for(int row=0;row<M;++row)for(int k=0;k<K;++k)
+                source[row*K+k]=float(4099+4*((row+k+replay)%31))/4096.f;
+            ASSERT_EQ(hipMemcpyAsync(hidden->gpu_data_ptr(),source.data(),source.size()*sizeof(float),hipMemcpyHostToDevice,stream),hipSuccess);
+            // This explicit test I/O producer changes retained external bytes;
+            // publish its exact stream before either captured consumer reuses it.
+            TransferEngine::publishCurrentDeviceWrite(hidden.get(),stream);
+            TransferEngine::requireDeviceInput(hidden.get(),device,stream);
+            for(auto *graph : {ordinary.get(),verifier.get()})
+            {
+                ASSERT_EQ(hipMemsetAsync(weights->gpu_data_ptr(),0xFF,actual.size()*sizeof(float),stream),hipSuccess);
+                ASSERT_TRUE(graph->launch());
+                ASSERT_EQ(hipMemcpyAsync(actual.data(),weights->gpu_data_ptr(),actual.size()*sizeof(float),hipMemcpyDeviceToHost,stream),hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(selected.data(),indices->gpu_data_ptr(),selected.size()*sizeof(float),hipMemcpyDeviceToHost,stream),hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+                for(int row=0;row<M;++row)
+                {
+                    float sum=0;
+                    for(int slot=0;slot<Top;++slot)
+                    {
+                        EXPECT_TRUE(std::isfinite(actual[row*Top+slot]));
+                        sum+=actual[row*Top+slot];
+                        EXPECT_EQ(selected[row*Top+slot],float(E-1-slot));
+                    }
+                    EXPECT_NEAR(sum,1.f,1e-6f);
+                }
+            }
+        }
+        kernel.unbindWorkspace();
+    }
+}

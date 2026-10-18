@@ -10,7 +10,13 @@
  * Algorithms implemented:
  * - Flash Attention 2: Tiled attention with online softmax
  *   - Uses v_dot2_f32_f16 for native FP16 dot products with FP32 accumulation
- *   - LDS double-buffering for overlapped load/compute
+ *   - Geometry-owned LDS buffering and aligned cooperative vector copies
+ *   - Three resident context workgroups via nonoverlapping K/V LDS lifetimes
+ *   - Four resident native-half M512 query groups with register-owned scores
+ *   - XOR Q/K tiles preserve every operand and canonical FP32 reduction order
+ *   - Query scans retain concurrent K/V loads; reducer scales are shared by stripes
+ *   - Fully valid context P/V tiles unroll four ordered keys without changing
+ *     FP32 accumulation, masked-tile semantics or three-workgroup residency
  *   - Explicit wavefront reductions via DPP
  *   - NO WMMA/Matrix Cores - pure VALU implementation
  * - Flash Decoding: Split-K parallelism for single-token decode
@@ -367,68 +373,74 @@ namespace
                  head) *
                     static_cast<size_t>(head_dim);
 
-            for (int dimension =
-                     dimension_wavefront * WAVEFRONT_SIZE + lane;
-                 dimension < head_dim;
-                 dimension += DIMENSION_WAVEFRONTS * WAVEFRONT_SIZE)
+            // The ascending (m,l) fold is independent of output dimension.
+            // Retain one accumulator per owned stripe and evaluate each scale
+            // once; every output still consumes the same ordered FP32 FMA.
+            constexpr int dimensions_per_lane =
+                256 / (DIMENSION_WAVEFRONTS * WAVEFRONT_SIZE);
+            const int first_dimension =
+                dimension_wavefront * WAVEFRONT_SIZE + lane;
+            if (first_dimension >= head_dim)
+                continue;
+            float merged_m = -FLT_MAX;
+            float merged_l = 0.0f;
+            float merged_output[dimensions_per_lane] = {};
+
+            for (int partition = 0; partition < live_partitions; ++partition)
             {
-                float merged_m = -FLT_MAX;
-                float merged_l = 0.0f;
-                float merged_output = 0.0f;
-
-                for (int partition = 0;
-                     partition < live_partitions;
-                     ++partition)
+                const size_t summary_index =
+                    scalar_base + static_cast<size_t>(partition);
+                const float partition_l = l_partial[summary_index];
+                if (!(partition_l > 0.0f))
+                    continue;
+                const float partition_m = m_partial[summary_index];
+                const float *partition_output =
+                    O_partial + summary_index * static_cast<size_t>(head_dim);
+                if (!(merged_l > 0.0f))
                 {
-                    const size_t summary_index =
-                        scalar_base + static_cast<size_t>(partition);
-                    const float partition_l = l_partial[summary_index];
-                    if (!(partition_l > 0.0f))
-                        continue;
-
-                    const float partition_m = m_partial[summary_index];
-                    const float partition_output =
-                        O_partial[
-                            summary_index * static_cast<size_t>(head_dim) +
-                            dimension];
-                    if (!(merged_l > 0.0f))
+                    merged_m = partition_m;
+                    merged_l = partition_l;
+                    #pragma unroll
+                    for (int slot = 0; slot < dimensions_per_lane; ++slot)
                     {
-                        merged_m = partition_m;
-                        merged_l = partition_l;
-                        merged_output = partition_output;
-                        continue;
+                        const int dimension = first_dimension +
+                            slot * DIMENSION_WAVEFRONTS * WAVEFRONT_SIZE;
+                        if (dimension < head_dim)
+                            merged_output[slot] = partition_output[dimension];
                     }
-
-                    const float next_m = fmaxf(merged_m, partition_m);
-                    const float previous_scale =
-                        fast_expf(merged_m - next_m);
-                    const float partition_scale =
-                        fast_expf(partition_m - next_m);
-                    merged_output = merge_fa2_scaled_terms(
-                        merged_output,
-                        previous_scale,
-                        partition_output,
-                        partition_scale);
-                    merged_l = merge_fa2_scaled_terms(
-                        merged_l,
-                        previous_scale,
-                        partition_l,
-                        partition_scale);
-                    merged_m = next_m;
+                    continue;
                 }
+                const float next_m = fmaxf(merged_m, partition_m);
+                const float previous_scale = fast_expf(merged_m - next_m);
+                const float partition_scale = fast_expf(partition_m - next_m);
+                #pragma unroll
+                for (int slot = 0; slot < dimensions_per_lane; ++slot)
+                {
+                    const int dimension = first_dimension +
+                        slot * DIMENSION_WAVEFRONTS * WAVEFRONT_SIZE;
+                    if (dimension < head_dim)
+                    {
+                        merged_output[slot] = merge_fa2_scaled_terms(
+                            merged_output[slot], previous_scale,
+                            partition_output[dimension], partition_scale);
+                    }
+                }
+                merged_l = merge_fa2_scaled_terms(
+                    merged_l, previous_scale, partition_l, partition_scale);
+                merged_m = next_m;
+            }
 
-                /*
-                 * Preserve the direct schedule's exact normalization
-                 * expression. A source-level division can select a different
-                 * gfx906 rounding sequence from `reciprocal then multiply`,
-                 * even though both are numerically close.
-                 */
-                const float inverse_l =
-                    merged_l > 0.0f ? 1.0f / merged_l : 0.0f;
-                O_row[dimension] =
-                    merged_l > 0.0f
-                        ? merged_output * inverse_l
-                        : 0.0f;
+            // Match direct FA2's reciprocal-then-multiply rounding, including
+            // empty masked rows. Invalid tail dimensions never touch output.
+            const float inverse_l = merged_l > 0.0f ? 1.0f / merged_l : 0.0f;
+            #pragma unroll
+            for (int slot = 0; slot < dimensions_per_lane; ++slot)
+            {
+                const int dimension = first_dimension +
+                    slot * DIMENSION_WAVEFRONTS * WAVEFRONT_SIZE;
+                if (dimension < head_dim)
+                    O_row[dimension] = merged_l > 0.0f
+                        ? merged_output[slot] * inverse_l : 0.0f;
             }
         }
     }
@@ -455,25 +467,13 @@ namespace
     // Chosen to fit comfortably in 64KB LDS with good occupancy
     constexpr int FA2_TILE_Q = 64;   // Q tile rows
     constexpr int FA2_TILE_KV = 64;  // KV tile rows
-    constexpr int FA2_NUM_STAGES = 2; // Double buffering
 
-    // LDS padding to avoid bank conflicts (32 banks, 4-byte granularity)
-    // The critical access pattern: threads in a wavefront access DIFFERENT ROWS
-    // at the SAME column (e.g., different K rows in the Q@K^T dot product).
-    // Bank index = (row × stride_dwords + col) mod 32.
-    // To avoid conflicts, stride_dwords must be coprime with 32 (i.e., odd).
-    //
-    // For FP16: stride_dwords = (head_dim + pad) / 2
-    //   head_dim=128: (128+2)/2 = 65 → 65 mod 32 = 1 → gcd(1,32) = 1 ✓
-    //   head_dim=64:  (64+2)/2  = 33 → 33 mod 32 = 1 → gcd(1,32) = 1 ✓
-    // For FP32: stride_dwords = tile_kv + pad
-    //   tile_kv=32: 32+1 = 33 → coprime with 32 ✓
-    //   tile_kv=64: 64+1 = 65 → coprime with 32 ✓
-    //
-    // Previous values (8/4) gave stride_dwords ≡ 4 (mod 32) → gcd(4,32)=4
-    // → 8-way bank conflicts on K/V reads in the dot product inner loop!
-    constexpr int FA2_LDS_PAD_FP16 = 2;
-    constexpr int FA2_LDS_PAD_FP32 = 1;
+    // The launch policy owns the LDS layout used by both planning and kernels.
+    // Eight half elements keep compiled rows aligned for wide vector traffic.
+    constexpr int FA2_LDS_PAD_FP16 =
+        llaminar2::rocm::fa2_policy::kROCmFA2QKVLDSPad;
+    constexpr int FA2_LDS_PAD_FP32 =
+        llaminar2::rocm::fa2_policy::kROCmFA2ScoreLDSPad;
 
     // Block configuration
     // We use 256 threads = 4 wavefronts per block for good occupancy
@@ -618,7 +618,7 @@ namespace
     // This implementation uses vectorized FP16 operations since MI50 lacks
     // Matrix Cores. Key optimizations:
     //   1. Vectorized FP16 dot products (2 elements at a time)
-    //   2. LDS double-buffering for K/V tiles
+    //   2. LDS buffering selected jointly with physical workgroup residency
     //   3. Online softmax to avoid materializing full attention matrix
     //   4. FP32 accumulators for numerical stability
     //
@@ -640,7 +640,37 @@ namespace
         int kv_stride;        // K/V leading dimension
         int scores_stride;    // Scores leading dimension
 
-        __host__ __device__ void compute(int head_dim, int tile_q, int tile_kv)
+        /**
+         * @brief Bind the exact register-score XOR Q/K storage lifetime.
+         *
+         * K retires before V overwrites the same 8KB plane. Every score is
+         * consumed by its producing lane, so no score matrix is materialized.
+         * The host bridge validates these bytes against its typed tile plan.
+         */
+        __host__ __device__ void computeRegisterScores()
+        {
+            q_stride=256;
+            kv_stride=256;
+            scores_stride=16;
+            q_tile_size=16*256*sizeof(__half);
+            kv_tile_size=q_tile_size;
+            scores_size=0;
+            total_size=q_tile_size+kv_tile_size;
+        }
+
+
+        /**
+         * @brief Resolve the same LDS layout used by capture-time admission.
+         * @param head_dim Width of a Q/K/V head.
+         * @param tile_q Physical query rows in the compiled tile.
+         * @param tile_kv Physical K/V rows in the compiled tile.
+         * @param schedule Physical query/context reader lifetime.
+         *
+         * Buffer count and padding come from the launch policy. The launcher
+         * compares total_size with its admitted tile before recording a graph.
+         */
+        __host__ __device__ void compute(int head_dim, int tile_q, int tile_kv,
+            llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode schedule)
         {
             // Add padding to avoid bank conflicts
             q_stride = head_dim + FA2_LDS_PAD_FP16;
@@ -651,8 +681,12 @@ namespace
             kv_tile_size = tile_kv * kv_stride * sizeof(__half);
             scores_size = tile_q * scores_stride * sizeof(float);
 
-            // Total: Q + 2*(K+V) for double buffer + scores
-            total_size = q_tile_size + FA2_NUM_STAGES * 2 * kv_tile_size + scores_size;
+            // The schedule owns each plane until its last consumer barrier.
+            const int stages = llaminar2::rocm::fa2_policy::rocmFA2KVStages(
+                head_dim, tile_q, tile_kv);
+            total_size = q_tile_size + stages *
+                llaminar2::rocm::fa2_policy::rocmFA2LiveKVPlanes(head_dim, tile_q, tile_kv, schedule) *
+                kv_tile_size + scores_size;
         }
     };
 
@@ -742,6 +776,213 @@ namespace
     }
 
     /**
+     * @brief Map an admitted logical row into its native physical KV ring.
+     * @param logical_row Live row in [0, ring_capacity), or a linear row.
+     * @param ring_origin Canonical normalized physical origin.
+     * @param ring_capacity Positive ring capacity, or zero for linear storage.
+     * @return Physical row after at most one wrap.
+     *
+     * The cache count bounds every consumed logical row by physical capacity.
+     * Unsigned addition also remains defined when two valid signed extents sum
+     * above INT_MAX. Repeated integer division is unnecessary in each tile copy.
+     */
+    __device__ __forceinline__ unsigned fa2_physical_kv_row(
+        int logical_row, int ring_origin, int ring_capacity)
+    {
+        if (ring_capacity <= 0)
+            return static_cast<unsigned>(logical_row);
+        const unsigned row = static_cast<unsigned>(ring_origin) +
+                             static_cast<unsigned>(logical_row);
+        const unsigned capacity = static_cast<unsigned>(ring_capacity);
+        return row >= capacity ? row - capacity : row;
+    }
+
+    /**
+     * @brief Assign adjacent output pairs to each row lane.
+     * @tparam THREADS_PER_ROW Number of cooperating lanes for one query.
+     * @param lane Lane within that query row.
+     * @param slot Private output-accumulator index.
+     * @return Unique dimension owned by this lane/slot pair.
+     *
+     * Adjacent halves share one LDS word and feed two mixed FP32/FP16 FMAs.
+     * The order of accumulation for each output dimension stays unchanged.
+     * Both partial-summary publication and final output use this same map.
+     */
+    template <int THREADS_PER_ROW>
+    __device__ __forceinline__ int fa2_output_dimension(int lane, int slot)
+    {
+        return (slot / 2) * THREADS_PER_ROW * 2 + lane * 2 + slot % 2;
+    }
+
+    /**
+     * @brief Cooperatively publish one live K/V tile into its owned LDS pair.
+     * @tparam KV_TYPE Native cache encoding consumed by this specialization.
+     * @tparam STATIC_HEAD_DIM Compiled head width, or zero for generic geometry.
+     * @param K Native key allocation.
+     * @param V Native value allocation.
+     * @param K_dst Destination key tile, owned until its consumer barrier.
+     * @param V_dst Destination value tile, owned until its consumer barrier.
+     * @param request_offset Element offset of the batch participant.
+     * @param first_row First logical live row in this tile.
+     * @param live_rows Exact live row count; capacity padding is never fetched.
+     * @param n_kv_heads Native physical head count per row.
+     * @param kv_head Participant-local or replicated GQA head index.
+     * @param head_dim Width of one head.
+     * @param lds_stride Padded LDS row stride in FP16 elements.
+     * @param ring_origin Normalized native ring origin.
+     * @param ring_capacity Ring capacity, or zero for linear storage.
+     * @param tid Physical thread index in the admitted 256-thread block.
+     *
+     * The 256-wide FP16 specialization copies sixteen elements per lane with
+     * aligned global/LDS vectors. Other encodings retain their exact conversion
+     * and rounding operations. The caller owns the producer/consumer barriers;
+     * this helper neither synchronizes nor changes online-softmax arithmetic.
+     */
+    template <KVTypeTag KV_TYPE, int STATIC_HEAD_DIM>
+    __device__ __forceinline__ void load_fa2_kv_tile(
+        const void *K, const void *V, __half *K_dst, __half *V_dst,
+        size_t request_offset, int first_row, int live_rows, int n_kv_heads,
+        int kv_head, int head_dim, int lds_stride,
+        int ring_origin, int ring_capacity, int tid)
+    {
+        constexpr int threads =
+            llaminar2::rocm::fa2_policy::kROCmFA2ThreadsPerBlock;
+        if constexpr (KV_TYPE == KVTypeTag::FP16 && STATIC_HEAD_DIM == 256)
+        {
+            using CopyPack = unsigned int
+                __attribute__((ext_vector_type(8), aligned(16)));
+            using LocalCopyPack = CopyPack __attribute__((address_space(3)));
+            constexpr int packs_per_row = 256 / 16;
+            for (int i = tid; i < live_rows * packs_per_row; i += threads)
+            {
+                const int row = i / packs_per_row;
+                const int dimension = (i % packs_per_row) * 16;
+                const unsigned physical_row = fa2_physical_kv_row(
+                    first_row + row, ring_origin, ring_capacity);
+                const size_t element = request_offset +
+                    (static_cast<size_t>(physical_row) * n_kv_heads + kv_head) *
+                        256 + dimension;
+                const CopyPack keys = *reinterpret_cast<const CopyPack *>(
+                    static_cast<const __half *>(K) + element);
+                const CopyPack values = *reinterpret_cast<const CopyPack *>(
+                    static_cast<const __half *>(V) + element);
+                // This explicit address-space cast names LDS rather than
+                // making generic flat stores rediscover the backing space.
+                *(LocalCopyPack *)(K_dst + row * lds_stride + dimension) = keys;
+                *(LocalCopyPack *)(V_dst + row * lds_stride + dimension) = values;
+            }
+        }
+        else if ((head_dim & 1) == 0)
+        {
+            const int pairs_per_row = head_dim / 2;
+            for (int i = tid; i < live_rows * pairs_per_row; i += threads)
+            {
+                const int row = i / pairs_per_row;
+                const int dimension = (i % pairs_per_row) * 2;
+                const unsigned physical_row = fa2_physical_kv_row(
+                    first_row + row, ring_origin, ring_capacity);
+                const size_t element = request_offset +
+                    (static_cast<size_t>(physical_row) * n_kv_heads + kv_head) *
+                        head_dim + dimension;
+                reinterpret_cast<__half2 *>(
+                    K_dst + row * lds_stride + dimension)[0] =
+                    load_fa2_kv_pair_as_half2<KV_TYPE>(K, element);
+                reinterpret_cast<__half2 *>(
+                    V_dst + row * lds_stride + dimension)[0] =
+                    load_fa2_kv_pair_as_half2<KV_TYPE>(V, element);
+            }
+        }
+        else
+        {
+            for (int i = tid; i < live_rows * head_dim; i += threads)
+            {
+                const int row = i / head_dim;
+                const int dimension = i % head_dim;
+                const unsigned physical_row = fa2_physical_kv_row(
+                    first_row + row, ring_origin, ring_capacity);
+                const size_t element = request_offset +
+                    (static_cast<size_t>(physical_row) * n_kv_heads + kv_head) *
+                        head_dim + dimension;
+                K_dst[row * lds_stride + dimension] =
+                    load_fa2_kv_element_as_half<KV_TYPE>(K, element);
+                V_dst[row * lds_stride + dimension] =
+                    load_fa2_kv_element_as_half<KV_TYPE>(V, element);
+            }
+        }
+    }
+
+    /**
+     * @brief Publish one native 256-wide plane into reusable shared LDS.
+     * @tparam KV_TYPE Cache format with unchanged half-conversion arithmetic.
+     * @param source Native key or value allocation for this phase.
+     * @param destination LDS plane whose previous readers have retired.
+     * @param request_offset Element offset of the batch participant.
+     * @param first_row First logical row in the live tile.
+     * @param live_rows Exact consumed row count; capacity padding is never fetched.
+     * @param n_kv_heads Physical native head count per row.
+     * @param kv_head Participant-local or replicated GQA head index.
+     * @param lds_stride Padded LDS row stride in FP16 elements.
+     * @param ring_origin Normalized ring origin.
+     * @param ring_capacity Ring capacity, or zero for linear storage.
+     * @param tid Thread index in the admitted 256-thread block.
+     *
+     * The caller owns the prior-reader and following publication barriers.
+     * QK consumes K completely before V replaces the same physical LDS region.
+     */
+    template <KVTypeTag KV_TYPE, bool SWIZZLE_KEYS = false>
+    __device__ __forceinline__ void load_fa2_wide_kv_plane(
+        const void *source, __half *destination, size_t request_offset,
+        int first_row, int live_rows, int n_kv_heads, int kv_head,
+        int lds_stride, int ring_origin, int ring_capacity, int tid)
+    {
+        constexpr int threads = llaminar2::rocm::fa2_policy::kROCmFA2ThreadsPerBlock;
+
+        if constexpr (SWIZZLE_KEYS)
+        {
+            static_assert(KV_TYPE == KVTypeTag::FP16);
+            using Pack=unsigned int __attribute__((ext_vector_type(4),aligned(16)));
+            using LocalPack=Pack __attribute__((address_space(3)));
+            for (int chunk=tid; chunk<live_rows*32; chunk+=threads)
+            {
+                const int row=chunk/32;
+                const int dimension=(chunk%32)*8;
+                const unsigned physical=fa2_physical_kv_row(first_row+row,ring_origin,ring_capacity);
+                const size_t element=request_offset+(static_cast<size_t>(physical)*n_kv_heads+kv_head)*256+dimension;
+                const Pack value=*reinterpret_cast<const Pack *>(static_cast<const __half *>(source)+element);
+                *(LocalPack *)(destination+row*256+(dimension^((row&7)<<3)))=value;
+            }
+        }
+        else if constexpr (KV_TYPE == KVTypeTag::FP16)
+        {
+            using Pack = unsigned int __attribute__((ext_vector_type(8), aligned(16)));
+            using LocalPack = Pack __attribute__((address_space(3)));
+            for (int i = tid; i < live_rows * 16; i += threads)
+            {
+                const int row = i / 16;
+                const int dimension = (i % 16) * 16;
+                const unsigned physical_row = fa2_physical_kv_row(first_row + row, ring_origin, ring_capacity);
+                const size_t element = request_offset +
+                    (static_cast<size_t>(physical_row) * n_kv_heads + kv_head) * 256 + dimension;
+                const Pack value = *reinterpret_cast<const Pack *>(static_cast<const __half *>(source) + element);
+                *(LocalPack *)(destination + row * lds_stride + dimension) = value;
+            }
+        }
+        else
+        {
+            for (int i = tid; i < live_rows * 128; i += threads)
+            {
+                const int row = i / 128;
+                const int dimension = (i % 128) * 2;
+                const unsigned physical_row = fa2_physical_kv_row(first_row + row, ring_origin, ring_capacity);
+                const size_t element = request_offset +
+                    (static_cast<size_t>(physical_row) * n_kv_heads + kv_head) * 256 + dimension;
+                reinterpret_cast<__half2 *>(destination + row * lds_stride + dimension)[0] =
+                    load_fa2_kv_pair_as_half2<KV_TYPE>(source, element);
+            }
+        }
+    }
+
+    /**
      * @brief Evaluate a direct attention scan or canonical context summaries.
      *
      * The launch authority admits one 256-thread workgroup geometry. Context
@@ -789,8 +1030,8 @@ namespace
               int STATIC_HEAD_DIM = 0,
               int STATIC_TILE_Q = 0,
               int STATIC_TILE_KV = 0,
-              bool WRITE_CONTEXT_PARTIAL = false>
-    __global__ __launch_bounds__(256, 2) void flash_attention_2_mi50_kernel(
+              bool WRITE_CONTEXT_PARTIAL = false, bool REGISTER_SCORE_TILE = false>
+    __global__ __launch_bounds__(256, REGISTER_SCORE_TILE ? 4 : 2) void flash_attention_2_mi50_kernel(
         const float *__restrict__ Q,
         const void *__restrict__ K,
         const void *__restrict__ V,
@@ -818,6 +1059,18 @@ namespace
         int context_partition_slots = 0,
         int device_direct_partition_limit = 0)
     {
+        constexpr auto schedule = WRITE_CONTEXT_PARTIAL
+            ? llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode::KeyValueContext
+            : llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode::QuerySequence;
+        constexpr int kv_planes = llaminar2::rocm::fa2_policy::rocmFA2LiveKVPlanes(
+            STATIC_HEAD_DIM, STATIC_TILE_Q, STATIC_TILE_KV, schedule,
+            REGISTER_SCORE_TILE
+                ? llaminar2::rocm::fa2_policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile
+                : llaminar2::rocm::fa2_policy::ROCmFA2ScoreStorage::SharedMatrix);
+        constexpr bool shared_kv_storage = kv_planes == 1;
+        constexpr int pipeline_stages =
+            llaminar2::rocm::fa2_policy::rocmFA2KVStages(
+                STATIC_HEAD_DIM, STATIC_TILE_Q, STATIC_TILE_KV);
         const int kernel_head_dim =
             STATIC_HEAD_DIM > 0 ? STATIC_HEAD_DIM : head_dim;
         const int kernel_tile_q =
@@ -905,7 +1158,7 @@ namespace
         const int lane_id = tid % WAVEFRONT_SIZE;
 
         /*
-         * Context graphs expose a CU-sized physical grid. Every workgroup
+         * Context graphs expose an LDS-resident physical grid. Every workgroup
          * deterministically strides the larger logical space of partition
          * slots, batches, query tiles, and heads. All threads in a workgroup
          * execute the same task sequence, so the barriers in the tiled
@@ -985,23 +1238,25 @@ namespace
 
         // Compute LDS layout
         FA2LDSLayout lds_layout;
-        lds_layout.compute(kernel_head_dim, kernel_tile_q, kernel_tile_kv);
+        if constexpr (REGISTER_SCORE_TILE) lds_layout.computeRegisterScores();
+        else lds_layout.compute(kernel_head_dim, kernel_tile_q, kernel_tile_kv, schedule);
 
         // LDS allocation
         extern __shared__ char smem[];
 
         __half *Q_tile = reinterpret_cast<__half *>(smem);
         __half *KV_buffers = Q_tile + kernel_tile_q * lds_layout.q_stride;
-        float *scores = reinterpret_cast<float *>(KV_buffers + FA2_NUM_STAGES * 2 * kernel_tile_kv * lds_layout.kv_stride);
+        float *scores = REGISTER_SCORE_TILE ? nullptr : reinterpret_cast<float *>(
+            KV_buffers + pipeline_stages * kv_planes * kernel_tile_kv * lds_layout.kv_stride);
 
-        // Helper lambdas for double-buffered K/V access
+        // Resolve the buffer pair owned by this compile-time pipeline stage.
         auto get_K_tile = [&](int stage) -> __half *
         {
-            return KV_buffers + stage * 2 * kernel_tile_kv * lds_layout.kv_stride;
+            return KV_buffers + stage * kv_planes * kernel_tile_kv * lds_layout.kv_stride;
         };
         auto get_V_tile = [&](int stage) -> __half *
         {
-            return KV_buffers + (stage * 2 + 1) * kernel_tile_kv * lds_layout.kv_stride;
+            return KV_buffers + (stage * kv_planes + (shared_kv_storage ? 0 : 1)) * kernel_tile_kv * lds_layout.kv_stride;
         };
 
         // =====================================================================
@@ -1066,7 +1321,8 @@ namespace
 
                 const float2 qv = *reinterpret_cast<const float2 *>(
                     Q_batch + global_row * n_heads * kernel_head_dim + head_idx * kernel_head_dim + d);
-                reinterpret_cast<__half2 *>(Q_tile + local_row * lds_layout.q_stride + d)[0] = __float22half2_rn(qv);
+                const int physical_column=REGISTER_SCORE_TILE ? d^((local_row&7)<<3) : d;
+                reinterpret_cast<__half2 *>(Q_tile + local_row * lds_layout.q_stride + physical_column)[0] = __float22half2_rn(qv);
             }
         }
         else
@@ -1134,59 +1390,16 @@ namespace
                 kv_partition_end);
             const int actual_len = kv_end - kv_start;
 
-            __half *K_dst = get_K_tile(0);
-            __half *V_dst = get_V_tile(0);
-
-            if ((kernel_head_dim & 1) == 0)
-            {
-                const int head_dim_vec2 = kernel_head_dim / 2;
-                for (int i = tid; i < actual_len * head_dim_vec2; i += threads_per_block)
-                {
-                    int local_row = i / head_dim_vec2;
-                    int d2 = i % head_dim_vec2;
-                    int d = d2 * 2;
-                    const int logical_row = kv_start + local_row;
-                    const int global_row = ring_row_capacity > 0
-                                               ? (ring_row_origin + logical_row) %
-                                                     ring_row_capacity
-                                               : logical_row;
-                    const size_t element =
-                        request_element_offset +
-                        (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
-                            static_cast<size_t>(kernel_head_dim) +
-                        static_cast<size_t>(d);
-
-                    reinterpret_cast<__half2 *>(
-                        K_dst + local_row * lds_layout.kv_stride + d)[0] =
-                        load_fa2_kv_pair_as_half2<KV_TYPE>(K, element);
-                    reinterpret_cast<__half2 *>(
-                        V_dst + local_row * lds_layout.kv_stride + d)[0] =
-                        load_fa2_kv_pair_as_half2<KV_TYPE>(V, element);
-                }
-            }
+            if constexpr (shared_kv_storage)
+                load_fa2_wide_kv_plane<KV_TYPE,REGISTER_SCORE_TILE>(K, get_K_tile(0), request_element_offset,
+                    kv_start, actual_len, n_kv_heads, kv_head_idx, lds_layout.kv_stride,
+                    ring_row_origin, ring_row_capacity, tid);
             else
-            {
-                for (int i = tid; i < actual_len * kernel_head_dim; i += threads_per_block)
-                {
-                    int local_row = i / kernel_head_dim;
-                    int d = i % kernel_head_dim;
-                    const int logical_row = kv_start + local_row;
-                    const int global_row = ring_row_capacity > 0
-                                               ? (ring_row_origin + logical_row) %
-                                                     ring_row_capacity
-                                               : logical_row;
-                    const size_t element =
-                        request_element_offset +
-                        (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
-                            static_cast<size_t>(kernel_head_dim) +
-                        static_cast<size_t>(d);
-
-                    K_dst[local_row * lds_layout.kv_stride + d] =
-                        load_fa2_kv_element_as_half<KV_TYPE>(K, element);
-                    V_dst[local_row * lds_layout.kv_stride + d] =
-                        load_fa2_kv_element_as_half<KV_TYPE>(V, element);
-                }
-            }
+            load_fa2_kv_tile<KV_TYPE, STATIC_HEAD_DIM>(
+                K, V, get_K_tile(0), get_V_tile(0), request_element_offset,
+                kv_start, actual_len, n_kv_heads, kv_head_idx,
+                kernel_head_dim, lds_layout.kv_stride,
+                ring_row_origin, ring_row_capacity, tid);
         }
         __syncthreads();
 
@@ -1195,8 +1408,8 @@ namespace
         // =====================================================================
         for (int kv_tile_iter = 0; kv_tile_iter < num_kv_tiles; kv_tile_iter++)
         {
-            const int current_stage = kv_tile_iter % FA2_NUM_STAGES;
-            const int next_stage = (kv_tile_iter + 1) % FA2_NUM_STAGES;
+            const int current_stage = kv_tile_iter % pipeline_stages;
+            const int next_stage = (kv_tile_iter + 1) % pipeline_stages;
 
             const int kv_start =
                 kv_partition_begin + kv_tile_iter * kernel_tile_kv;
@@ -1217,80 +1430,70 @@ namespace
             // =================================================================
             // PHASE 1: Start loading next KV tile (if any)
             // =================================================================
-            if (kv_tile_iter + 1 < num_kv_tiles)
+            if constexpr (pipeline_stages > 1)
             {
-                const int next_kv_start =
-                    kv_partition_begin +
-                    (kv_tile_iter + 1) * kernel_tile_kv;
-                const int next_kv_end = min(
-                    next_kv_start + kernel_tile_kv,
-                    kv_partition_end);
-                const int next_len = next_kv_end - next_kv_start;
-
-                __half *K_next = get_K_tile(next_stage);
-                __half *V_next = get_V_tile(next_stage);
-
-                // Cooperative load by all threads
-                if ((kernel_head_dim & 1) == 0)
+                if (kv_tile_iter + 1 < num_kv_tiles)
                 {
-                    const int head_dim_vec2 = kernel_head_dim / 2;
-                    for (int i = tid; i < next_len * head_dim_vec2; i += threads_per_block)
-                    {
-                        int local_row = i / head_dim_vec2;
-                        int d2 = i % head_dim_vec2;
-                        int d = d2 * 2;
-                        const int logical_row = next_kv_start + local_row;
-                        const int global_row = ring_row_capacity > 0
-                                                   ? (ring_row_origin + logical_row) %
-                                                         ring_row_capacity
-                                                   : logical_row;
-                        const size_t element =
-                            request_element_offset +
-                            (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
-                                static_cast<size_t>(kernel_head_dim) +
-                            static_cast<size_t>(d);
-
-                        reinterpret_cast<__half2 *>(
-                            K_next + local_row * lds_layout.kv_stride + d)[0] =
-                            load_fa2_kv_pair_as_half2<KV_TYPE>(K, element);
-                        reinterpret_cast<__half2 *>(
-                            V_next + local_row * lds_layout.kv_stride + d)[0] =
-                            load_fa2_kv_pair_as_half2<KV_TYPE>(V, element);
-                    }
-                }
-                else
-                {
-                    for (int i = tid; i < next_len * kernel_head_dim; i += threads_per_block)
-                    {
-                        int local_row = i / kernel_head_dim;
-                        int d = i % kernel_head_dim;
-                        const int logical_row = next_kv_start + local_row;
-                        const int global_row = ring_row_capacity > 0
-                                                   ? (ring_row_origin + logical_row) %
-                                                         ring_row_capacity
-                                                   : logical_row;
-                        const size_t element =
-                            request_element_offset +
-                            (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
-                                static_cast<size_t>(kernel_head_dim) +
-                            static_cast<size_t>(d);
-
-                        K_next[local_row * lds_layout.kv_stride + d] =
-                            load_fa2_kv_element_as_half<KV_TYPE>(K, element);
-                        V_next[local_row * lds_layout.kv_stride + d] =
-                            load_fa2_kv_element_as_half<KV_TYPE>(V, element);
-                    }
+                    const int next_start = kv_start + kernel_tile_kv;
+                    const int next_rows = min(
+                        kernel_tile_kv, kv_partition_end - next_start);
+                    if constexpr (shared_kv_storage)
+                        load_fa2_wide_kv_plane<KV_TYPE,REGISTER_SCORE_TILE>(K, get_K_tile(next_stage), request_element_offset,
+                            next_start, next_rows, n_kv_heads, kv_head_idx, lds_layout.kv_stride,
+                            ring_row_origin, ring_row_capacity, tid);
+                    else
+                    load_fa2_kv_tile<KV_TYPE, STATIC_HEAD_DIM>(
+                        K, V, get_K_tile(next_stage), get_V_tile(next_stage),
+                        request_element_offset, next_start, next_rows,
+                        n_kv_heads, kv_head_idx, kernel_head_dim,
+                        lds_layout.kv_stride, ring_row_origin,
+                        ring_row_capacity, tid);
                 }
             }
 
             // =================================================================
             // PHASE 2: Compute Q @ K^T (v_dot2_f32_f16 with FP32 accumulator)
             // =================================================================
+
+            // QK and P/V assign the same (query,key) pair to each lane. Keeping
+            // the score here removes its LDS round trip without changing any
+            // QK operand, four-chain FP32 accumulation, or softmax operation.
+            float owned_score = 0.0f;
+            if constexpr (REGISTER_SCORE_TILE)
+            {
+                static_assert(KV_TYPE == KVTypeTag::FP16 && STATIC_HEAD_DIM == 256 &&
+                              STATIC_TILE_Q == 16 && STATIC_TILE_KV == 16 && !WRITE_CONTEXT_PARTIAL);
+                const int row = tid / 16;
+                const int key = tid % 16;
+                if (row < q_tile_rows && key < actual_kv_len)
+                {
+                    const __half2 *q = reinterpret_cast<const __half2 *>(Q_tile+row*256);
+                    const __half2 *k = reinterpret_cast<const __half2 *>(K_tile+key*256);
+                    float a0=0.0f,a1=0.0f,a2=0.0f,a3=0.0f;
+                    using Pairs = unsigned int __attribute__((ext_vector_type(4),aligned(16)));
+                    using LocalPairs = Pairs __attribute__((address_space(3)));
+                    // Two iterations expose independent LDS reads while keeping
+                    // the four original accumulator chains in ascending order.
+                    #pragma unroll 2
+                    for (int dimension=0; dimension<128; dimension+=4)
+                    {
+                        const Pairs x=*(const LocalPairs *)(q+(dimension^((row&7)<<2)));
+                        const Pairs y=*(const LocalPairs *)(k+(dimension^((key&7)<<2)));
+                        a0=__builtin_amdgcn_fdot2(__builtin_bit_cast(_Float16_2,static_cast<unsigned>(x[0])),__builtin_bit_cast(_Float16_2,static_cast<unsigned>(y[0])),a0,false);
+                        a1=__builtin_amdgcn_fdot2(__builtin_bit_cast(_Float16_2,static_cast<unsigned>(x[1])),__builtin_bit_cast(_Float16_2,static_cast<unsigned>(y[1])),a1,false);
+                        a2=__builtin_amdgcn_fdot2(__builtin_bit_cast(_Float16_2,static_cast<unsigned>(x[2])),__builtin_bit_cast(_Float16_2,static_cast<unsigned>(y[2])),a2,false);
+                        a3=__builtin_amdgcn_fdot2(__builtin_bit_cast(_Float16_2,static_cast<unsigned>(x[3])),__builtin_bit_cast(_Float16_2,static_cast<unsigned>(y[3])),a3,false);
+                    }
+                    owned_score=(a0+a1+a2+a3)*softmax_scale;
+                }
+            }
+            else
+            {
             // Each thread computes a subset of score matrix elements
 
             // Score matrix is [q_tile_rows, actual_kv_len]
             // We distribute computation: thread t computes elements at stride
-            const int total_score_elements = q_tile_rows * actual_kv_len;
+            const int total_score_elements = q_tile_rows * kernel_tile_kv;
             int score_copy_tid = tid;
             // In particular, do not hoist the score-row LDS offset over the
             // register-heavy P/V accumulation that follows this phase.
@@ -1299,8 +1502,9 @@ namespace
                  s_idx < total_score_elements;
                  s_idx += threads_per_block)
             {
-                int q_row = s_idx / actual_kv_len;
-                int kv_col = s_idx % actual_kv_len;
+                int q_row = s_idx / kernel_tile_kv;
+                int kv_col = s_idx % kernel_tile_kv;
+                if (kv_col >= actual_kv_len) continue;
 
                 // Compute dot product Q[q_row] @ K[kv_col]
                 float score = 0.0f;
@@ -1324,12 +1528,55 @@ namespace
                     float score0 = 0.0f, score1 = 0.0f, score2 = 0.0f, score3 = 0.0f;
                     int d2 = 0;
                     const int head_dim_vec2_aligned = head_dim_vec2 & ~3; // round down to multiple of 4
-                    for (; d2 < head_dim_vec2_aligned; d2 += 4)
+                    // Bound the context producer's operand live range without
+                    // changing the order of its four FP32 accumulation chains.
+                    constexpr int qk_pack_pairs = WRITE_CONTEXT_PARTIAL && STATIC_HEAD_DIM == 256 ? 8 : 16;
+                    for (; d2 < head_dim_vec2_aligned;
+                         d2 += (STATIC_HEAD_DIM > 0 ? qk_pack_pairs : 4))
                     {
-                        score0 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 0], K_ptr2[d2 + 0], score0, false);
-                        score1 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 1], K_ptr2[d2 + 1], score1, false);
-                        score2 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 2], K_ptr2[d2 + 2], score2, false);
-                        score3 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 3], K_ptr2[d2 + 3], score3, false);
+                        if constexpr (STATIC_HEAD_DIM == 64 ||
+                                      STATIC_HEAD_DIM == 128 ||
+                                      STATIC_HEAD_DIM == 256)
+                        {
+                            // Wide LDS reads expose independent operands before the four
+                            // ordered accumulators consume them. Scalarize vector lanes
+                            // before bit_cast: the lane value, not its vector lvalue,
+                            // must supply the packed half pair. Both barriers protect
+                            // every loaded byte without changing arithmetic order.
+                            using PackedPairs = unsigned int
+                                __attribute__((ext_vector_type(qk_pack_pairs), aligned(16)));
+                            using LocalPairs = PackedPairs
+                                __attribute__((address_space(3)));
+                            const PackedPairs q = *(const LocalPairs *)(Q_ptr2 + d2);
+                            const PackedPairs k = *(const LocalPairs *)(K_ptr2 + d2);
+                            #pragma unroll
+                            for (int group = 0; group < qk_pack_pairs; group += 4)
+                            {
+                                score0 = __builtin_amdgcn_fdot2(
+                                    __builtin_bit_cast(_Float16_2, static_cast<unsigned int>(q[group + 0])),
+                                    __builtin_bit_cast(_Float16_2, static_cast<unsigned int>(k[group + 0])),
+                                    score0, false);
+                                score1 = __builtin_amdgcn_fdot2(
+                                    __builtin_bit_cast(_Float16_2, static_cast<unsigned int>(q[group + 1])),
+                                    __builtin_bit_cast(_Float16_2, static_cast<unsigned int>(k[group + 1])),
+                                    score1, false);
+                                score2 = __builtin_amdgcn_fdot2(
+                                    __builtin_bit_cast(_Float16_2, static_cast<unsigned int>(q[group + 2])),
+                                    __builtin_bit_cast(_Float16_2, static_cast<unsigned int>(k[group + 2])),
+                                    score2, false);
+                                score3 = __builtin_amdgcn_fdot2(
+                                    __builtin_bit_cast(_Float16_2, static_cast<unsigned int>(q[group + 3])),
+                                    __builtin_bit_cast(_Float16_2, static_cast<unsigned int>(k[group + 3])),
+                                    score3, false);
+                            }
+                        }
+                        else
+                        {
+                            score0 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 0], K_ptr2[d2 + 0], score0, false);
+                            score1 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 1], K_ptr2[d2 + 1], score1, false);
+                            score2 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 2], K_ptr2[d2 + 2], score2, false);
+                            score3 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 3], K_ptr2[d2 + 3], score3, false);
+                        }
                     }
                     // Handle remaining pairs (head_dim not multiple of 8)
                     for (; d2 < head_dim_vec2; d2++)
@@ -1348,7 +1595,19 @@ namespace
 
                 scores[q_row * lds_layout.scores_stride + kv_col] = score * softmax_scale;
             }
+            }
             __syncthreads();
+
+            if constexpr (shared_kv_storage)
+            {
+                // The barrier retires every K reader. Scores either remain in
+                // their owning lanes or are published in the canonical matrix.
+                // The next barrier makes the replacement V visible to P/V.
+                load_fa2_wide_kv_plane<KV_TYPE>(V, V_tile, request_element_offset,
+                    kv_start, actual_kv_len, n_kv_heads, kv_head_idx, lds_layout.kv_stride,
+                    ring_row_origin, ring_row_capacity, tid);
+                __syncthreads();
+            }
 
             // =================================================================
             // PHASE 3: Apply softmax and accumulate O = softmax(QK^T) @ V
@@ -1360,113 +1619,220 @@ namespace
             // tiles are fully valid since only the diagonal tiles need masking.
             // This eliminates 3-5 conditional branches per score element.
 
-            if (thread_has_row)
+            if constexpr (STATIC_HEAD_DIM == 256 && STATIC_TILE_Q == 16 &&
+                          STATIC_TILE_KV == 16 && THREADS_PER_ROW == 16)
             {
-                int global_q_row = q_block_start + local_q_row;
-                float *my_scores = scores + local_q_row * lds_layout.scores_stride;
-
-                // Determine if this tile needs per-element masking
-                // Tile is fully unmasked when:
-                //   - No external mask
-                //   - No sliding window (or window covers entire tile)
-                //   - For causal: last KV position <= first Q position in block
-                const bool tile_needs_masking =
-                    mask != nullptr ||
-                    (window_size > 0) ||
-                    (causal && (kv_start + actual_kv_len - 1) > (global_q_row + position_offset_runtime));
-
-                // Find max for this row (with masking)
-                float m_ij = -FLT_MAX;
-
-                if (!tile_needs_masking)
+                // Sixteen adjacent lanes own one row and one score each.
+                // The original FP32 score and exponent are unchanged; the
+                // probability is computed once, then consumed in original key
+                // order by every disjoint P/V output owner. A wave ballot retains
+                // a validity mask so even zero-probability signed-zero behavior
+                // has the same conditional FMA contract as the scalar path.
+                const float *my_scores = REGISTER_SCORE_TILE ? nullptr :
+                    scores + local_q_row * lds_layout.scores_stride;
+                float score = -FLT_MAX;
+                if (thread_has_row && row_lane < actual_kv_len)
                 {
-                    // FAST PATH: no masking needed — scores already pre-scaled
-                    for (int j = 0; j < actual_kv_len; j++)
+                    if constexpr (REGISTER_SCORE_TILE) score=owned_score;
+                    else score=my_scores[row_lane];
+                    const int global_q_row = q_block_start + local_q_row;
+                    const int kv_pos = kv_start + row_lane;
+                    const int q_pos = global_q_row + position_offset_runtime;
+                    bool masked = causal && kv_pos > q_pos;
+                    if (window_size > 0 &&
+                        (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size))
+                        masked = true;
+                    if (mask)
                     {
-                        m_ij = fmaxf(m_ij, my_scores[j]);
+                        const float mask_value = mask[
+                            (batch_idx * seq_len + global_q_row) * mask_stride + kv_pos];
+                        if (mask_value <= -1.0e20f) masked = true;
+                        else score += mask_value;
                     }
+                    if (masked) score = -FLT_MAX;
                 }
-                else
+                float row_maximum = fmaxf(-FLT_MAX, score);
+                #pragma unroll
+                for (int shift = THREADS_PER_ROW / 2; shift > 0; shift >>= 1)
+                    row_maximum = fmaxf(row_maximum, __shfl_xor(row_maximum, shift, THREADS_PER_ROW));
+                const float m_i_new = fmaxf(m_i, row_maximum);
+                const float scale_old = fast_expf(m_i - m_i_new);
+                const bool contributes = thread_has_row && row_lane < actual_kv_len &&
+                                         score > -FLT_MAX / 2;
+                const unsigned long long wave_valid = __ballot(contributes);
+                const int group_origin =
+                    (tid & (WAVEFRONT_SIZE - 1)) & ~(THREADS_PER_ROW - 1);
+                const unsigned int valid =
+                    static_cast<unsigned int>(wave_valid >> group_origin) & 0xffffU;
+                const float probability = contributes ? fast_expf(score - m_i_new) : 0.0f;
+                // Every score owner and P/V consumer for this query belongs to
+                // one fixed 16-lane group. Register shuffles publish the exact
+                // FP32 probability without another block barrier or LDS roundtrip.
+                if (thread_has_row)
                 {
-                    // SLOW PATH: per-element masking
-                    for (int j = 0; j < actual_kv_len; j++)
+                    #pragma unroll
+                    for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
+                        O_acc[d_local] *= scale_old;
+                    l_i *= scale_old;
+                    float l_ij = 0.0f;
+                    if ((WRITE_CONTEXT_PARTIAL || REGISTER_SCORE_TILE) && valid == 0xffffU)
                     {
-                        int kv_pos = kv_start + j;
-                        bool masked = false;
-
-                        // Causal masking
-                        if (causal && kv_pos > global_q_row + position_offset_runtime)
-                            masked = true;
-
-                        // Sliding window
-                        if (window_size > 0)
+                        // A complete validity ballot proves all sixteen keys
+                        // contribute, including each lane of a partial query
+                        // tile that reaches this row-owned scope. Unrolling
+                        // four keys removes repeated mask/loop bookkeeping
+                        // while preserving ascending key and FP32 FMA order.
+                        // Larger unrolls increase instruction cost or lose the
+                        // register budget for three resident context groups.
+                        #pragma unroll 4
+                        for (int j = 0; j < 16; ++j)
                         {
-                            int q_pos = global_q_row + position_offset_runtime;
-                            if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
-                                masked = true;
-                        }
-
-                        if (mask)
-                        {
-                            float mask_val = mask[(batch_idx * seq_len + global_q_row) * mask_stride + kv_pos];
-                            if (mask_val <= -1.0e20f)
+                            const float p = __shfl(probability, j, THREADS_PER_ROW);
+                            l_ij += p;
+                            const __half *V_row = V_tile + j * lds_layout.kv_stride;
+                            #pragma unroll
+                            for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
                             {
-                                masked = true;
-                            }
-                            else
-                            {
-                                my_scores[j] += mask_val;
+                                const int dimension = fa2_output_dimension<THREADS_PER_ROW>(row_lane, d_local);
+                                O_acc[d_local] += p * half_to_float(V_row[dimension]);
                             }
                         }
-
-                        if (masked)
+                    }
+                    else
+                    {
+                        // Masked keys must skip the FMA, rather than multiply
+                        // by zero: signed-zero behavior belongs to the direct
+                        // query oracle's exact arithmetic contract.
+                        for (int j = 0; j < actual_kv_len; ++j)
                         {
-                            my_scores[j] = -FLT_MAX;
+                            if ((valid & (1U << j)) != 0)
+                            {
+                                const float p = __shfl(probability, j, THREADS_PER_ROW);
+                                l_ij += p;
+                                const __half *V_row = V_tile + j * lds_layout.kv_stride;
+                                #pragma unroll
+                                for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
+                                {
+                                    const int dimension = fa2_output_dimension<THREADS_PER_ROW>(row_lane, d_local);
+                                    O_acc[d_local] += p * half_to_float(V_row[dimension]);
+                                }
+                            }
                         }
-                        else
+                    }
+                    l_i += l_ij;
+                    m_i = m_i_new;
+                }
+            }
+            else
+            {
+                if (thread_has_row)
+                {
+                    int global_q_row = q_block_start + local_q_row;
+                    float *my_scores = scores + local_q_row * lds_layout.scores_stride;
+
+                    // Determine if this tile needs per-element masking
+                    // Tile is fully unmasked when:
+                    //   - No external mask
+                    //   - No sliding window (or window covers entire tile)
+                    //   - For causal: last KV position <= first Q position in block
+                    const bool tile_needs_masking =
+                        mask != nullptr ||
+                        (window_size > 0) ||
+                        (causal && (kv_start + actual_kv_len - 1) > (global_q_row + position_offset_runtime));
+
+                    // Find max for this row (with masking)
+                    float m_ij = -FLT_MAX;
+
+                    if (!tile_needs_masking)
+                    {
+                        // FAST PATH: no masking needed — scores already pre-scaled
+                        for (int j = 0; j < actual_kv_len; j++)
                         {
                             m_ij = fmaxf(m_ij, my_scores[j]);
                         }
                     }
-                }
-
-                // Online softmax update
-                float m_i_new = fmaxf(m_i, m_ij);
-                float scale_old = fast_expf(m_i - m_i_new);
-
-                // Rescale previous accumulators
-                #pragma unroll
-                for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
-                {
-                    const int d = row_lane + d_local * THREADS_PER_ROW;
-                    if (d < kernel_head_dim)
-                        O_acc[d_local] *= scale_old;
-                }
-                l_i *= scale_old;
-
-                // Accumulate P @ V for this tile
-                float l_ij = 0.0f;
-                for (int j = 0; j < actual_kv_len; j++)
-                {
-                    float s = my_scores[j];
-                    if (s > -FLT_MAX / 2)
+                    else
                     {
-                        float p = fast_expf(s - m_i_new);
-                        l_ij += p;
-
-                        const __half *V_row = V_tile + j * lds_layout.kv_stride;
-                        #pragma unroll
-                        for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
+                        // SLOW PATH: per-element masking
+                        for (int j = 0; j < actual_kv_len; j++)
                         {
-                            const int d = row_lane + d_local * THREADS_PER_ROW;
-                            if (d < kernel_head_dim)
-                                O_acc[d_local] += p * half_to_float(V_row[d]);
+                            int kv_pos = kv_start + j;
+                            bool masked = false;
+
+                            // Causal masking
+                            if (causal && kv_pos > global_q_row + position_offset_runtime)
+                                masked = true;
+
+                            // Sliding window
+                            if (window_size > 0)
+                            {
+                                int q_pos = global_q_row + position_offset_runtime;
+                                if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
+                                    masked = true;
+                            }
+
+                            if (mask)
+                            {
+                                float mask_val = mask[(batch_idx * seq_len + global_q_row) * mask_stride + kv_pos];
+                                if (mask_val <= -1.0e20f)
+                                {
+                                    masked = true;
+                                }
+                                else
+                                {
+                                    my_scores[j] += mask_val;
+                                }
+                            }
+
+                            if (masked)
+                            {
+                                my_scores[j] = -FLT_MAX;
+                            }
+                            else
+                            {
+                                m_ij = fmaxf(m_ij, my_scores[j]);
+                            }
                         }
                     }
-                }
 
-                l_i += l_ij;
-                m_i = m_i_new;
+                    // Online softmax update
+                    float m_i_new = fmaxf(m_i, m_ij);
+                    float scale_old = fast_expf(m_i - m_i_new);
+
+                    // Rescale previous accumulators
+                    #pragma unroll
+                    for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
+                    {
+                        const int d = fa2_output_dimension<THREADS_PER_ROW>(row_lane, d_local);
+                        if (d < kernel_head_dim)
+                            O_acc[d_local] *= scale_old;
+                    }
+                    l_i *= scale_old;
+
+                    // Accumulate P @ V for this tile
+                    float l_ij = 0.0f;
+                    for (int j = 0; j < actual_kv_len; j++)
+                    {
+                        float s = my_scores[j];
+                        if (s > -FLT_MAX / 2)
+                        {
+                            float p = fast_expf(s - m_i_new);
+                            l_ij += p;
+
+                            const __half *V_row = V_tile + j * lds_layout.kv_stride;
+                            #pragma unroll
+                            for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
+                            {
+                                const int d = fa2_output_dimension<THREADS_PER_ROW>(row_lane, d_local);
+                                if (d < kernel_head_dim)
+                                    O_acc[d_local] += p * half_to_float(V_row[d]);
+                            }
+                        }
+                    }
+
+                    l_i += l_ij;
+                    m_i = m_i_new;
+                }
             }
 
             const int maximum_visible_key =
@@ -1507,8 +1873,7 @@ namespace
                                  ++d_local)
                             {
                                 const int d =
-                                    row_lane +
-                                    d_local * THREADS_PER_ROW;
+                                    fa2_output_dimension<THREADS_PER_ROW>(row_lane, d_local);
                                 if (d < kernel_head_dim)
                                     O_row[d] = O_acc[d_local];
                             }
@@ -1527,8 +1892,7 @@ namespace
                                  ++d_local)
                             {
                                 const int d =
-                                    row_lane +
-                                    d_local * THREADS_PER_ROW;
+                                    fa2_output_dimension<THREADS_PER_ROW>(row_lane, d_local);
                                 if (d < kernel_head_dim)
                                 {
                                     O_row[d] = merge_fa2_scaled_terms(
@@ -1565,6 +1929,29 @@ namespace
             __syncthreads();
             if (next_tile_is_causally_empty)
                 break;
+            if constexpr (pipeline_stages == 1)
+            {
+                if (kv_tile_iter + 1 < num_kv_tiles)
+                {
+                    const int next_start = kv_start + kernel_tile_kv;
+                    const int next_rows = min(
+                        kernel_tile_kv, kv_partition_end - next_start);
+                    if constexpr (shared_kv_storage)
+                        load_fa2_wide_kv_plane<KV_TYPE,REGISTER_SCORE_TILE>(K, get_K_tile(next_stage), request_element_offset,
+                            next_start, next_rows, n_kv_heads, kv_head_idx, lds_layout.kv_stride,
+                            ring_row_origin, ring_row_capacity, tid);
+                    else
+                    load_fa2_kv_tile<KV_TYPE, STATIC_HEAD_DIM>(
+                        K, V, get_K_tile(next_stage), get_V_tile(next_stage),
+                        request_element_offset, next_start, next_rows,
+                        n_kv_heads, kv_head_idx, kernel_head_dim,
+                        lds_layout.kv_stride, ring_row_origin,
+                        ring_row_capacity, tid);
+                }
+                // The prior consumer barrier releases this same LDS pair;
+                // this producer barrier publishes its replacement to all waves.
+                __syncthreads();
+            }
         }
 
         // =====================================================================
@@ -1617,7 +2004,7 @@ namespace
                      ++d_local)
                 {
                     const int d =
-                        summary_lane + d_local * THREADS_PER_ROW;
+                        fa2_output_dimension<THREADS_PER_ROW>(summary_lane, d_local);
                     if (d < kernel_head_dim)
                         O_summary[d] = O_acc[d_local];
                 }
@@ -1637,7 +2024,7 @@ namespace
                      ++d_local)
                 {
                     const int d =
-                        row_lane + d_local * THREADS_PER_ROW;
+                        fa2_output_dimension<THREADS_PER_ROW>(row_lane, d_local);
                     if (d < kernel_head_dim)
                     {
                         O_row[d] = merged_l > 0.0f
@@ -2682,10 +3069,24 @@ static int launch_device_resident_prefill(
         }
     }
 
-    const auto tile_plan =
-        llaminar2::rocm::fa2_policy::selectROCmFA2Tile(
-            head_dim,
-            LDS_SIZE_BYTES);
+    constexpr auto schedule = WRITE_CONTEXT_PARTIAL
+        ? llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode::KeyValueContext
+        : llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode::QuerySequence;
+    namespace policy = llaminar2::rocm::fa2_policy;
+    constexpr auto operand_format = KV_TYPE == KVTypeTag::FP16 ? llaminar2::TensorType::FP16 :
+                                    KV_TYPE == KVTypeTag::BF16 ? llaminar2::TensorType::BF16 :
+                                    KV_TYPE == KVTypeTag::Q8_1 ? llaminar2::TensorType::Q8_1 :
+                                                              llaminar2::TensorType::FP32;
+    const auto score_storage = WRITE_CONTEXT_PARTIAL
+        ? policy::ROCmFA2ScoreStorage::SharedMatrix
+        : policy::selectROCmFA2QueryScoreStorage({
+              .batch_size = batch_size, .query_rows = seq_len, .head_dim = head_dim,
+              .kv_format = operand_format,
+              .visibility = causal && window_size <= 0 && !mask
+                  ? policy::ROCmFA2VisibilityPolicy::CausalFullContext
+                  : policy::ROCmFA2VisibilityPolicy::General});
+    const auto tile_plan = policy::selectROCmFA2Tile(
+        head_dim, LDS_SIZE_BYTES, 0, schedule, score_storage);
     if (!tile_plan.valid)
     {
         printf("[launch_device_resident_prefill] No LDS tile fits head_dim=%d\n", head_dim);
@@ -2694,8 +3095,21 @@ static int launch_device_resident_prefill(
     const int tile_q = tile_plan.query_rows;
     const int tile_kv = tile_plan.kv_rows;
     const int threads_per_row = tile_plan.threads_per_row;
+    if constexpr (KV_TYPE == KVTypeTag::FP16)
+    {
+        if (head_dim == 256 && tile_q == 16 && tile_kv == 16 &&
+            ((reinterpret_cast<std::uintptr_t>(K) |
+              reinterpret_cast<std::uintptr_t>(V)) & 15U) != 0)
+        {
+            printf("[launch_device_resident_prefill] FP16 wide copies require 16-byte-aligned native K/V allocations\n");
+            return -1;
+        }
+    }
     FA2LDSLayout lds_layout{};
-    lds_layout.compute(head_dim, tile_q, tile_kv);
+    if (tile_plan.score_storage == policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile)
+        lds_layout.computeRegisterScores();
+    else
+        lds_layout.compute(head_dim, tile_q, tile_kv, schedule);
     if (static_cast<size_t>(lds_layout.total_size) != tile_plan.lds_bytes)
     {
         printf("[launch_device_resident_prefill] Policy/kernel LDS layout mismatch\n");
@@ -2760,6 +3174,26 @@ static int launch_device_resident_prefill(
     // Discard an error left by an earlier asynchronous operation before the
     // launch, then report only the status produced by this kernel.
     (void)hipGetLastError();
+
+    if constexpr (KV_TYPE == KVTypeTag::FP16 && !WRITE_CONTEXT_PARTIAL)
+    {
+        if (tile_plan.score_storage == policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile)
+        {
+            hipLaunchKernelGGL(
+                (flash_attention_2_mi50_kernel<KVTypeTag::FP16,16,256,16,16,false,true>),
+                grid,block,lds_layout.total_size,hip_stream,
+                Q,K,V,O,batch_size,seq_len,kv_len,n_heads,n_kv_heads,head_dim,softmax_scale,
+                causal,window_size,position_offset,device_params,mask,tile_q,tile_kv,head_start,gqa_n_rep,
+                O_partial,m_partial,l_partial,max_context_partitions,context_partition_slots,device_direct_partition_limit);
+            const hipError_t status=hipGetLastError();
+            if (status!=hipSuccess)
+            {
+                printf("[register_score_prefill] Native launch failed: %s\n",hipGetErrorString(status));
+                return -1;
+            }
+            return 0;
+        }
+    }
     if (head_dim == 64 && tile_q == 64 && tile_kv == 64)
     {
         hipLaunchKernelGGL(

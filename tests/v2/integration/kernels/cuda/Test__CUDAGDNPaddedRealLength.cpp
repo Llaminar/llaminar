@@ -12,6 +12,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../../utils/GDNAdditiveEpsilonFixture.h"
 
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -5047,6 +5048,53 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
                 oracle_state,
                 0,
                 replay_state.size());
+        }
+    }
+}
+
+
+/** @test Captured native Q/K normalization obeys the independent additive-epsilon equation. */
+TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceAdditiveEpsilonNearZeroCaptured)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "set device");
+    for (int dk : {64, 128})
+    {
+        for (int rows : {1, 2, 9, 425, 512})
+        {
+            SCOPED_TRACE("dk=" + std::to_string(dk) + " rows=" + std::to_string(rows));
+            llaminar2::test::GDNAdditiveEpsilonFixture f(rows, dk);
+            CudaFloatBuffer q(f.q), k(f.k), v(f.v), alpha(f.alpha), beta(f.beta),
+                a_log(f.a_log), dt_bias(f.dt_bias), output(rows * f.heads * f.dv, 123.f);
+            CudaStreamHandle stream;
+            CUDAGatedDeltaNet chunk(cuda_ordinal_);
+            CudaGDNStateOwner state_owner(chunk, f.zero_state.size());
+            chunk.setGPUStream(stream.stream);
+            ASSERT_TRUE(chunk.importState(f.zero_state.data(), nullptr, stream.stream));
+            // Materialize retained workspace before capture. Preprocessing may write
+            // raw operands, so every replay restores the original bytes and state.
+            ASSERT_TRUE(chunk.chunk_forward(q.ptr, k.ptr, v.ptr, alpha.ptr, beta.ptr,
+                a_log.ptr, dt_bias.ptr, output.ptr, nullptr, rows, f.heads, dk, f.dv, 64, true));
+            checkCuda(cudaStreamSynchronize(stream.stream), "warmup completion");
+            CudaCapturedGraph graph(stream.stream, [&]() {
+                return chunk.chunk_forward(q.ptr, k.ptr, v.ptr, alpha.ptr, beta.ptr,
+                    a_log.ptr, dt_bias.ptr, output.ptr, nullptr, rows, f.heads, dk, f.dv, 64, true);
+            });
+            for (int replay = 0; replay < 2; ++replay)
+            {
+                q.copyFrom(f.q);
+                k.copyFrom(f.k);
+                v.copyFrom(f.v);
+                alpha.copyFrom(f.alpha);
+                beta.copyFrom(f.beta);
+                output.fill(123.f);
+                ASSERT_TRUE(chunk.importState(f.zero_state.data(), nullptr, stream.stream));
+                graph.launch(stream.stream);
+                checkCuda(cudaStreamSynchronize(stream.stream), "diagnostic completion");
+                std::vector<float> terminal(f.zero_state.size());
+                ASSERT_TRUE(chunk.exportState(terminal.data(), nullptr, stream.stream));
+                f.expect(output.toHost(), terminal);
+            }
         }
     }
 }

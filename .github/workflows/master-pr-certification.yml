@@ -85,14 +85,20 @@ jobs:
           cleanup: false
           keep-state: true
           cache-binary: false
-      - name: Run exact-ref HTTP E2E on both published ISA images
+      - name: Materialize only the reviewed KL reference corpus
+        env:
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git submodule update --init -- corpora
+          git -C corpora lfs pull --include 'model-kld/qwen-gdn-alpha-beta-v1/**' --exclude ''
+      - name: Run exact-ref HTTP E2E and GPU KL canaries on both published ISA images
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          exec python3 scripts/ci/run_published_image_suite.py e2e \
+          exec python3 scripts/ci/run_published_image_suite.py e2e --model-kld-canaries \
             --repository "$REPOSITORY" --branch develop \
             --image "ghcr.io/${REPOSITORY,,}:develop-$HEAD_SHA" \
             --expected-source-revision "$HEAD_SHA" \
@@ -110,6 +116,8 @@ jobs:
             ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/e2e-receipt.json
             ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx512/e2e.json
             ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx2/e2e.json
+            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx512/kld/kld-canaries.json
+            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx2/kld/kld-canaries.json
           if-no-files-found: warn
           retention-days: 90
 

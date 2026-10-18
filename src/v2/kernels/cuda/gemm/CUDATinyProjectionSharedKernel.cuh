@@ -61,6 +61,7 @@ __device__ __forceinline__ float tinyProjectionWeight(Weight value)
  *
  * @tparam Weight Native persistent weight element type, not activation precision.
  * @tparam RowsPerCTA Compiled physical row tile: 2, 4 or 8.
+ * @tparam Activation Physical FP32 or FP16 activation element, widened before arithmetic.
  * @param activations Device pointer array of FP32 activation matrices [M,K].
  * @param weights Device pointer array using the existing floating-projection ABI;
  *                each address owns a native Weight matrix [N,K].
@@ -72,7 +73,7 @@ __device__ __forceinline__ float tinyProjectionWeight(Weight value)
  *      (ceil(N/8),ceil(M/RowsPerCTA),batch_count). Pointer arrays and matrices
  *      must be prepared, admitted, and alive for the complete captured replay.
  */
-template<class Weight, int RowsPerCTA>
+template<class Weight, int RowsPerCTA, class Activation = float>
 __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     const float *const *activations, const float *const *weights,
     float *const *outputs, int m, int n, int k, DeviceRowRange row_range)
@@ -94,7 +95,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     if (first_row >= active_rows)
         return;
     const int first_column = static_cast<int>(blockIdx.x) * columns_per_cta;
-    const float *a = activations[blockIdx.z];
+    const Activation *a = reinterpret_cast<const Activation *>(activations[blockIdx.z]);
     const Weight *b = reinterpret_cast<const Weight *>(weights[blockIdx.z]);
     float *c = outputs[blockIdx.z];
     float partials[RowsPerCTA][parts_per_lane] = {};
@@ -110,7 +111,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
         #pragma unroll
         for (int row = 0; row < RowsPerCTA; ++row)
             activation_tile[row][threadIdx.x] = first_row + row < active_rows && load_k < static_cast<unsigned int>(k)
-                ? a[static_cast<size_t>(first_row + row) * k + load_k] : 0.0f;
+                ? tinyProjectionWeight(a[static_cast<size_t>(first_row + row) * k + load_k]) : 0.0f;
         #pragma unroll
         for (int col = 0; col < columns_per_cta; ++col)
             weight_tile[col][threadIdx.x] = first_column + col < n && load_k < static_cast<unsigned int>(k)

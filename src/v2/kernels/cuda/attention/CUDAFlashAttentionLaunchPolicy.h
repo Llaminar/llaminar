@@ -14,25 +14,58 @@
  * query-head count, head dimension, and device SM count.  Consequently new
  * model sizes and tensor-parallel head shards receive a total decision without
  * adding a model-name branch or a runtime host callback.
+ *
+ * Shared-tile storage is also an immutable geometry policy. Small HD256 query
+ * tiles retain dedicated half-operand producers; larger tiles and narrower
+ * heads reuse cooperative FP32 value tiles. Both execute the same FP32 sums.
+ * The typed storage traits own the exact shared-memory and producer-warp BOM.
+ * Native tensor prefills retain their architecture at every larger M. Their
+ * compact summary stride is distinct from the controller's logical KV count;
+ * admission and capture share the same operand, mapping and override facts.
  */
 
 #pragma once
 
 #include "../../attention/AttentionExecutionPolicy.h"
+#include "CUDATensorPrefillGeometry.h"
+#include "CUDATensorContextPartition.cuh"
 
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 
 namespace llaminar2::cuda::fa2_policy
 {
     /** Number of query rows owned by one WMMA score group. */
     inline constexpr int kFA2QueryRowsPerWarpGroup = 16;
 
-    /** Number of K/V shared-memory buffers in the producer pipeline. */
-    inline constexpr int kFA2KVSharedMemoryStages = 2;
+    /** Physical ownership of the shared K/V operand tiles, fixed at capture. */
+    enum class FA2TileStoragePolicy : std::uint8_t
+    {
+        WarpSpecializedHalf, ///< Dedicated producers and two half-value stages.
+        CooperativeFloat,   ///< Consumers publish one exact FP32 value stage.
+    };
 
-    /** Half elements appended to each Q/K/V shared-memory row. */
+    /**
+     * @brief Compile-time resource authority for one physical operand schedule.
+     * @tparam Policy Explicit shared-tile ownership embedded in the kernel type.
+     */
+    template <FA2TileStoragePolicy Policy>
+    struct FA2TileStorageTraits
+    {
+        static_assert(Policy == FA2TileStoragePolicy::WarpSpecializedHalf ||
+                      Policy == FA2TileStoragePolicy::CooperativeFloat);
+        static constexpr int producer_warps =
+            Policy == FA2TileStoragePolicy::WarpSpecializedHalf ? 2 : 0; ///< Dedicated loader warps.
+        static constexpr int kv_stages =
+            Policy == FA2TileStoragePolicy::WarpSpecializedHalf ? 2 : 1; ///< Disjoint shared K/V stages.
+        static constexpr std::size_t value_element_bytes =
+            Policy == FA2TileStoragePolicy::WarpSpecializedHalf
+                ? sizeof(std::uint16_t) : sizeof(float); ///< On-chip V storage; native KV is unchanged.
+    };
+
+    /** Elements appended to each Q/K/V shared-memory row, in its own dtype. */
     inline constexpr int kFA2QKVSharedMemoryPad = 8;
 
     /** FP32 elements appended to each score shared-memory row. */
@@ -204,14 +237,61 @@ namespace llaminar2::cuda::fa2_policy
     }
 
     /**
+     * @brief Select an economical shared-tile schedule from admitted geometry.
+     *
+     * A single HD256 query group benefits from the dedicated half-value
+     * pipeline at small M. Cooperative float values amortize conversion across
+     * two groups, while HD64/128 and partial widths also gain from retiring idle
+     * producer warps. This selects an implementation before capture, never in
+     * response to a failed launch or from a host read of live device state.
+     *
+     * @param head_dim Live elements in one attention head.
+     * @param query_warp_groups Independent sixteen-row query groups.
+     * @return Complete physical policy, or no policy for invalid geometry.
+     */
+    [[nodiscard]] inline constexpr std::optional<FA2TileStoragePolicy>
+    selectFA2TileStoragePolicy(int head_dim, int query_warp_groups)
+    {
+        const int maximum_groups = maximumFA2QueryWarpGroups(head_dim);
+        if (maximum_groups == 0 || query_warp_groups <= 0 ||
+            query_warp_groups > maximum_groups)
+            return std::nullopt;
+        return head_dim == 256 && query_warp_groups == 1
+                   ? FA2TileStoragePolicy::WarpSpecializedHalf
+                   : FA2TileStoragePolicy::CooperativeFloat;
+    }
+
+    /**
+     * @brief Resolve the P/V lane ownership for the selected physical schedule.
+     * @param head_dim Live elements in one attention head.
+     * @param query_warp_groups Independent sixteen-row query groups.
+     * @param configured_warps HD256-family override; zero requests the measured default.
+     * @return Compiled warp count, or zero for invalid geometry/override.
+     */
+    [[nodiscard]] inline constexpr int selectFA2PVWarpCount(
+        int head_dim, int query_warp_groups, int configured_warps = 0)
+    {
+        const auto storage = selectFA2TileStoragePolicy(head_dim, query_warp_groups);
+        if (!storage)
+            return 0;
+        if (head_dim <= 128)
+            return 1;
+        const int selected = configured_warps == 0
+            ? (head_dim == 256 && *storage == FA2TileStoragePolicy::CooperativeFloat ? 2 : 4)
+            : configured_warps;
+        return isCompiledFA2PVWarpGeometry(head_dim, selected) ? selected : 0;
+    }
+
+    /**
      * @brief Calculate exact dynamic shared memory for one compiled FA2 tile.
      *
      * Production launch selection, captured-graph inspection, and performance
      * tournaments must use one byte calculation. Duplicating this formula made
      * it possible for a benchmark to label one physical TILE_KV while the graph
-     * actually contained another. The layout is one Q tile, two pipelined K/V
-     * buffer pairs, and one FP32 score tile with the bank-conflict padding used
-     * by the kernel.
+     * actually contained another. The layout is one Q tile, the selected
+     * policy's exact K/V stages, and one FP32 score tile with the bank-conflict
+     * padding used by the kernel. Native cache storage is independent of this
+     * on-chip operand representation.
      *
      * @param head_dim Elements in one query/key/value head.
      * @param query_warp_groups Independent 16-row query groups in one block.
@@ -241,10 +321,17 @@ namespace llaminar2::cuda::fa2_policy
             static_cast<std::size_t>(tile_kv) +
             kFA2ScoreSharedMemoryPad;
         const std::size_t q_bytes = tile_q * qkv_stride * sizeof(std::uint16_t);
+        const auto storage = selectFA2TileStoragePolicy(head_dim, query_warp_groups);
+        if (!storage)
+            return 0;
+        using HalfTiles = FA2TileStorageTraits<FA2TileStoragePolicy::WarpSpecializedHalf>;
+        using FloatTiles = FA2TileStorageTraits<FA2TileStoragePolicy::CooperativeFloat>;
+        const std::size_t stage_operand_bytes =
+            *storage == FA2TileStoragePolicy::WarpSpecializedHalf
+                ? HalfTiles::kv_stages * (sizeof(std::uint16_t) + HalfTiles::value_element_bytes)
+                : FloatTiles::kv_stages * (sizeof(std::uint16_t) + FloatTiles::value_element_bytes);
         const std::size_t kv_bytes =
-            kFA2KVSharedMemoryStages * 2u *
-            static_cast<std::size_t>(tile_kv) * qkv_stride *
-            sizeof(std::uint16_t);
+            static_cast<std::size_t>(tile_kv) * qkv_stride * stage_operand_bytes;
         const std::size_t score_bytes =
             tile_q * score_stride * sizeof(float);
         return q_bytes + kv_bytes + score_bytes;
@@ -316,10 +403,11 @@ namespace llaminar2::cuda::fa2_policy
      * HD128 query groups use compact blocks whose measured occupancy sustains
      * two productive grid waves on GA102.  Restricting them to one wave chooses
      * an unnecessarily wide block for geometries such as 28 local heads at
-     * M=128.  HD256 uses four waves because its 256-wide P@V stripe geometry
-     * loses more to the wider two-group block than it gains by collapsing
-     * small-M grids: the complete Qwen 0.8B-through-397B, TP1/2/4/8 tournament
-     * selected one group at M=64 and M=128.  HD64 retains one wave because its
+     * M=128. HD256 now uses two waves: cooperative two-group value tiles lower
+     * long-context latency while the single-group schedule retains its smaller
+     * half-value pipeline. Small query grids therefore preserve their measured
+     * schedule, and large grids share conversion work across more rows.
+     * HD64 retains one wave because its
      * wider group inventory amortizes K/V scans without HD256's register and
      * consumer-warp cost.  The return value is dimension-derived and therefore
      * remains total for unseen model names, TP degrees, and SM counts.
@@ -330,7 +418,7 @@ namespace llaminar2::cuda::fa2_policy
     [[nodiscard]] inline constexpr int preferredFA2QueryGridWaves(int head_dim)
     {
         return head_dim > 128 && head_dim <= 256
-                   ? 4
+                   ? 2
                : head_dim > 64 && head_dim <= 128
                    ? 2
                    : maximumFA2QueryWarpGroups(head_dim) > 0 ? 1 : 0;
@@ -457,7 +545,43 @@ namespace llaminar2::cuda::fa2_policy
         int sm_count = 0;          ///< SM count on the selected device.
         attention::AttentionPrefillParallelAxis requested_axis =
             attention::AttentionPrefillParallelAxis::QuerySequence;
+        int visible_kv_heads = 0; ///< Addressable native KV heads; zero cannot qualify tensor execution.
+        int head_start = 0; ///< Global query offset for replicated KV.
+        int replicated_gqa_n_rep = 0; ///< Zero for local KV shards.
+        TensorType native_kv_format = TensorType::FP32; ///< Actual native operand storage.
+        attention::AttentionVisibilityPolicy visibility = attention::AttentionVisibilityPolicy::General;
+        int query_warp_groups_override = 0; ///< Authored capture-time query grouping.
+        int pv_warps_override = 0; ///< Authored capture-time PV ownership.
+        int tile_kv_override = 0; ///< Authored capture-time staged key width.
     };
+
+    /** Physical summary layout selected before admission and capture. */
+    enum class FA2PrefillSummaryLayout : std::uint8_t
+    {
+        Canonical256, ///< One slot for every admitted 256-key interval.
+        TensorCompactFour, ///< At most 32 short-context slots and four long-context summaries.
+    };
+
+    /**
+     * @brief Authenticate the exact compiled tensor body from immutable facts.
+     * @param geometry Native operands, mapping, visibility and explicit overrides.
+     * @param query_warp_groups Resolved query grouping, also used by the launcher.
+     * @return Compiled native head entry, or absence for a different first-class body.
+     */
+    [[nodiscard]] inline constexpr std::optional<tensor_prefill::HeadGeometry>
+    selectFA2TensorPrefillGeometry(const FA2PrefillParallelGeometry &geometry, int query_warp_groups)
+    {
+        if (query_warp_groups != 2 ||
+            selectFA2PVWarpCount(geometry.head_dim, query_warp_groups, geometry.pv_warps_override) != 2 ||
+            (geometry.tile_kv_override != 0 && geometry.tile_kv_override != 16))
+            return std::nullopt;
+        return tensor_prefill::selectHeadGeometry({
+            .batch_size = geometry.batch_size, .query_rows = geometry.query_rows,
+            .head_dim = geometry.head_dim, .query_heads = geometry.local_query_heads,
+            .kv_heads = geometry.visible_kv_heads, .head_start = geometry.head_start,
+            .gqa_repetition = geometry.replicated_gqa_n_rep,
+            .kv_format = geometry.native_kv_format, .visibility = geometry.visibility});
+    }
 
     /**
      * @brief One fully resolved, capture-stable CUDA prefill plan.
@@ -477,6 +601,8 @@ namespace llaminar2::cuda::fa2_policy
         int context_partition_slots = 0;
         int device_direct_partition_limit = 0;
         int max_context_partitions = 0;
+        int summary_capacity = 0; ///< Physical per-row stride, independent of logical KV partitions.
+        FA2PrefillSummaryLayout summary_layout = FA2PrefillSummaryLayout::Canonical256;
         std::int64_t query_grid_blocks = 0;
         std::size_t partial_output_bytes = 0;
         std::size_t partial_m_bytes = 0;
@@ -540,12 +666,14 @@ namespace llaminar2::cuda::fa2_policy
      * @param max_context_partitions Capacity-sized canonical partition count.
      * @param explicit_slots Zero for generic policy, otherwise an exact slot
      *        count used by isolated parity and performance tournaments.
+     * @param configured_query_groups Resolved capture grouping, or zero for automatic selection.
      * @return Slots per query-tile/head pair, or zero for invalid geometry.
      */
     [[nodiscard]] inline constexpr int selectFA2ContextPartitionSlots(
         const FA2QueryPartitionGeometry &geometry,
         int max_context_partitions,
-        int explicit_slots = 0)
+        int explicit_slots = 0,
+        int configured_query_groups = 0)
     {
         if (max_context_partitions <= 0 || explicit_slots < 0)
             return 0;
@@ -555,7 +683,7 @@ namespace llaminar2::cuda::fa2_policy
                        : 0;
 
         const int query_warp_groups =
-            selectFA2QueryWarpGroups(geometry);
+            selectFA2QueryWarpGroups(geometry, configured_query_groups);
         const std::int64_t base_blocks =
             fa2QueryGridBlocks(geometry, query_warp_groups);
         if (base_blocks <= 0 || geometry.sm_count <= 0)
@@ -688,11 +816,14 @@ namespace llaminar2::cuda::fa2_policy
             .sm_count = geometry.sm_count,
         };
         const int query_warp_groups =
-            selectFA2QueryWarpGroups(query_geometry);
+            selectFA2QueryWarpGroups(query_geometry, geometry.query_warp_groups_override);
         const std::int64_t query_grid_blocks =
             fa2QueryGridBlocks(query_geometry, query_warp_groups);
         if (geometry.kv_capacity <= 0 || query_warp_groups <= 0 ||
-            query_grid_blocks <= 0)
+            query_grid_blocks <= 0 ||
+            selectFA2PVWarpCount(geometry.head_dim, query_warp_groups, geometry.pv_warps_override) <= 0 ||
+            (geometry.tile_kv_override != 0 && geometry.tile_kv_override != 16 &&
+             geometry.tile_kv_override != 32 && geometry.tile_kv_override != 64))
         {
             return {};
         }
@@ -712,9 +843,10 @@ namespace llaminar2::cuda::fa2_policy
         const int context_partition_slots =
             selectFA2ContextPartitionSlots(
                 query_geometry,
-                max_context_partitions);
+                max_context_partitions, 0, query_warp_groups);
         if (context_partition_slots <= 0)
             return {};
+        const bool tensor_prefill = selectFA2TensorPrefillGeometry(geometry, query_warp_groups).has_value();
 
         FA2PrefillPhysicalMode mode = FA2PrefillPhysicalMode::QuerySequence;
         int device_direct_partition_limit = 0;
@@ -729,7 +861,7 @@ namespace llaminar2::cuda::fa2_policy
         {
             if (geometry.query_rows < kFA2ContextPrefillMinimumQueryRows ||
                 max_context_partitions <= 1 ||
-                context_partition_slots <= 1)
+                (!tensor_prefill && context_partition_slots <= 1))
             {
                 break;
             }
@@ -758,6 +890,8 @@ namespace llaminar2::cuda::fa2_policy
             .context_partition_slots = 0,
             .device_direct_partition_limit = device_direct_partition_limit,
             .max_context_partitions = 0,
+            .summary_capacity = 0,
+            .summary_layout = FA2PrefillSummaryLayout::Canonical256,
             .query_grid_blocks = query_grid_blocks,
             .partial_output_bytes = 0,
             .partial_m_bytes = 0,
@@ -770,6 +904,10 @@ namespace llaminar2::cuda::fa2_policy
         plan.reducer_dimension_warps =
             selectFA2ReducerDimensionWarps(query_geometry);
         plan.max_context_partitions = max_context_partitions;
+        plan.summary_layout = tensor_prefill ? FA2PrefillSummaryLayout::TensorCompactFour
+                                             : FA2PrefillSummaryLayout::Canonical256;
+        plan.summary_capacity = tensor_prefill
+            ? tensor_attention_policy::summaryCapacity(geometry.kv_capacity) : max_context_partitions;
         plan.context_partition_slots = context_partition_slots;
         if (plan.reducer_dimension_warps <= 0 ||
             plan.context_partition_slots <= 0)
@@ -783,7 +921,7 @@ namespace llaminar2::cuda::fa2_policy
             static_cast<std::size_t>(geometry.local_query_heads));
         scalar_count = checkedFA2WorkspaceProduct(
             scalar_count,
-            static_cast<std::size_t>(plan.max_context_partitions));
+            static_cast<std::size_t>(plan.summary_capacity));
         const std::size_t output_elements = checkedFA2WorkspaceProduct(
             scalar_count,
             static_cast<std::size_t>(geometry.head_dim));

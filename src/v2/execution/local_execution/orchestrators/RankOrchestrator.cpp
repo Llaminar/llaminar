@@ -3304,6 +3304,10 @@ namespace llaminar2
         for (int &length : current_sequence_lengths_)
             ++length;
         current_padded_seq_len_ = 1;
+        // This public condition transaction completed one main decode row on
+        // every participant. Token/mailbox publication alone does not own this
+        // phase edge, and a failed fan-out must retain the preceding phase.
+        last_logits_forward_phase_ = LogitsForwardPhase::Decode;
         stats_dirty_ = true;
         return true;
     }
@@ -3369,6 +3373,10 @@ namespace llaminar2
         for (int &length : current_sequence_lengths_)
             ++length;
         current_padded_seq_len_ = 1;
+        // This public condition transaction completed one main decode row on
+        // every participant. Token/mailbox publication alone does not own this
+        // phase edge, and a failed fan-out must retain the preceding phase.
+        last_logits_forward_phase_ = LogitsForwardPhase::Decode;
         stats_dirty_ = true;
         return true;
     }
@@ -3432,6 +3440,10 @@ namespace llaminar2
         for (int &length : current_sequence_lengths_)
             ++length;
         current_padded_seq_len_ = 1;
+        // This public condition transaction completed one main decode row on
+        // every participant. Token/mailbox publication alone does not own this
+        // phase edge, and a failed fan-out must retain the preceding phase.
+        last_logits_forward_phase_ = LogitsForwardPhase::Decode;
         stats_dirty_ = true;
         return true;
     }
@@ -17807,6 +17819,10 @@ namespace llaminar2
 
     bool RankOrchestrator::phaseSplitReplicatedDecodeSnapshotsActive() const
     {
+        // The started transaction owns the phase. In particular, an explicit
+        // one-token prefill still uses sharded prefill weights and snapshots.
+        if (last_logits_forward_phase_ != LogitsForwardPhase::Decode)
+            return false;
         const int max_decode_like_rows = config_.mtp.enabled
                                              ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
                                              : 1;
@@ -17824,6 +17840,31 @@ namespace llaminar2
         return dense.dense_tp_enabled && dense.dense_decode_replicated;
     }
 
+    /** @copydoc RankOrchestrator::phaseSplitReplicatedDecodeEmbeddingSnapshotsActive */
+    bool RankOrchestrator::phaseSplitReplicatedDecodeEmbeddingSnapshotsActive() const
+    {
+        // A full-vocabulary decode table is independently looked up on every
+        // participant. It has no embedding allreduce whose CompleteValue
+        // publication could supersede the schema's vocabulary-shard partials.
+        // The declared embedding placement and actual transaction phase own
+        // this distinction; a one-row tensor alone is never sufficient.
+        if (last_logits_forward_phase_ != LogitsForwardPhase::Decode)
+            return false;
+        const int max_decode_like_rows = config_.mtp.enabled
+                                             ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
+                                             : 1;
+        if (current_padded_seq_len_ <= 0 ||
+            current_padded_seq_len_ > max_decode_like_rows)
+            return false;
+        const auto &plan = config_.moe_routed_expert_plan;
+        if (!plan || !plan->usesExpertOverlayAuthority())
+            return false;
+        const auto &dense = plan->continuation_domain_spec;
+        return dense.dense_tp_enabled &&
+               (dense.dense_decode_replicated ||
+                dense.dense_decode_mirrored_embedding);
+    }
+
     bool RankOrchestrator::isPhaseSplitReplicatedDecodeSnapshotKey(const std::string &key)
     {
         const std::string stage_type = extractStageType(key);
@@ -17833,6 +17874,22 @@ namespace llaminar2
                stage_type == "GDN_OUTPUT" ||
                stage_type == "MOE_SHARED_EXPERT_OUTPUT" ||
                stage_type == "MOE_SHARED_GATE_OUTPUT";
+    }
+
+    bool RankOrchestrator::isPhaseSplitReplicatedAttentionSnapshotKey(const std::string &key)
+    {
+        // These exact semantics belong to the complete dense attention block.
+        // Vocabulary and routed-expert publications retain independent owners.
+        static constexpr std::array<std::string_view, 19> kAttentionStages = {
+            "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION", "Q_NORM", "K_NORM",
+            "Q_ROPE", "K_ROPE", "FA_GATE", "ATTENTION_CONTEXT", "ATTENTION_CONTEXT_GATED",
+            "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_ALPHA", "GDN_BETA",
+            "GDN_CONV1D_OUTPUT", "GDN_RECURRENCE", "GDN_DELTA_RULE_OUTPUT",
+            "GATED_RMSNORM", "GDN_NORM_GATE_OUTPUT",
+        };
+        const std::string stage_type = extractStageType(key);
+        return std::find(kAttentionStages.begin(), kAttentionStages.end(), stage_type) !=
+               kAttentionStages.end();
     }
 
     bool RankOrchestrator::replicatedMTPSidecarSnapshotsActive() const noexcept
@@ -17931,6 +17988,17 @@ namespace llaminar2
             return SnapshotShardingMode::REPLICATED;
         }
 
+        // Only the ordinary main embedding uses this placement rule. MTP
+        // depths and condition scopes retain their own vocabulary authority;
+        // generic layer-qualified names are not global embedding checkpoints.
+        if (!condition_snapshot && !mtp_model_snapshot &&
+            semantic_key == "EMBEDDING" &&
+            mode == SnapshotShardingMode::ROW_PARALLEL &&
+            phaseSplitReplicatedDecodeEmbeddingSnapshotsActive())
+        {
+            return SnapshotShardingMode::REPLICATED;
+        }
+
         /*
          * Phase-split MoE overlay uses DenseTP for prefill but switches dense and
          * always-on shared decode work to full replicated weights. The schema still
@@ -17941,6 +18009,22 @@ namespace llaminar2
         if (mode == SnapshotShardingMode::ROW_PARALLEL &&
             phaseSplitReplicatedDecodeSnapshotsActive() &&
             isPhaseSplitReplicatedDecodeSnapshotKey(semantic_key))
+        {
+            return SnapshotShardingMode::REPLICATED;
+        }
+
+        // Ordinary main decode binds the complete FA/GDN dense block on each
+        // participant. It therefore publishes full column/packed intermediates,
+        // just as the existing row-output rule above publishes full Wo output.
+        // The typed phase and declared placement establish replication; the
+        // one-row restriction excludes grouped verifier transactions. Their
+        // depth/condition scopes keep the existing independent MTP contracts.
+        if (!condition_snapshot && !mtp_model_snapshot &&
+            current_padded_seq_len_ == 1 &&
+            (mode == SnapshotShardingMode::COLUMN_PARALLEL ||
+             mode == SnapshotShardingMode::PACKED_COLUMN_PARALLEL) &&
+            phaseSplitReplicatedDecodeSnapshotsActive() &&
+            isPhaseSplitReplicatedAttentionSnapshotKey(semantic_key))
         {
             return SnapshotShardingMode::REPLICATED;
         }
@@ -19257,6 +19341,15 @@ namespace llaminar2
         append(device_runners_);
         append(pp_stage_runners_);
         return result;
+    }
+
+    /** @copydoc RankOrchestrator::collectPrefixCacheShutdown */
+    void RankOrchestrator::collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const
+    {
+        for (const auto &runner : device_runners_)
+            if (runner) runner->collectPrefixCacheShutdown(shutdown);
+        for (const auto &runner : pp_stage_runners_)
+            if (runner) runner->collectPrefixCacheShutdown(shutdown);
     }
 
 } // namespace llaminar2

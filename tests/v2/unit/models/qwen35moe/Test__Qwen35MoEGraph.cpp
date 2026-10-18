@@ -2514,6 +2514,30 @@ TEST(Test__Qwen35MoEGraph, DecodeMirroredEmbeddingSuppressesOnlyDecodeEmbeddingA
 
     EXPECT_NE(prefill_graph.getNode("embedding_allreduce"), nullptr)
         << "Prefill still uses the sharded base embedding table and must keep the embedding allreduce";
+
+    // Explicit Prefill1 has the same row count as Decode but keeps vocabulary
+    // sharding. This proves the graph-side placement premise of snapshot policy.
+    prefill_input.seq_len = 1;
+    ForwardOutput one_row_prefill_output;
+    auto one_row_prefill_graph = graph_builder.buildFullForwardGraph(prefill_input, one_row_prefill_output);
+    EXPECT_NE(one_row_prefill_graph.getNode("embedding_allreduce"), nullptr)
+        << "Mirrored embedding placement follows typed Decode, never a one-row heuristic";
+    const auto *prefill_embedding_node = one_row_prefill_graph.getNode("embedding");
+    ASSERT_NE(prefill_embedding_node, nullptr);
+    const auto &prefill_embedding_dump = prefill_embedding_node->stage->getDumpInfo();
+    ASSERT_EQ(prefill_embedding_dump.weights.size(), 1u);
+    EXPECT_EQ(prefill_embedding_dump.weights.front().tensor, base_embedding)
+        << "Prefill1 must bind the actual sharded base table, not merely insert a collective";
+    ForwardOutput decode_after_prefill_output;
+    auto decode_after_prefill_graph = graph_builder.buildFullForwardGraph(decode_input, decode_after_prefill_output);
+    EXPECT_EQ(decode_after_prefill_graph.getNode("embedding_allreduce"), nullptr)
+        << "Returning from Prefill1 must restore the full-vocabulary Decode lookup";
+    const auto *decode_embedding_node = decode_after_prefill_graph.getNode("embedding");
+    ASSERT_NE(decode_embedding_node, nullptr);
+    const auto &decode_embedding_dump = decode_embedding_node->stage->getDumpInfo();
+    ASSERT_EQ(decode_embedding_dump.weights.size(), 1u);
+    EXPECT_EQ(decode_embedding_dump.weights.front().tensor, decode_embedding)
+        << "Mirror-only Decode must bind the full-vocabulary weight authority";
 }
 
 TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedPrefillKeepsShardedAttentionState)

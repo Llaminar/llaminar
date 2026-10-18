@@ -13,6 +13,9 @@
  * because source reads can finish during a harvest or its durable capacity join.
  * A local durable index is only a lookup hint. Every selected RAM victim joins
  * the archive writer's fresh publication before releasing its cache alias.
+ * The first lookup miss reconciles peer-evicted hints in one metadata batch,
+ * so the following harvest can rebuild the complete missing chain without
+ * acquiring archive locks in its ordinary presence/admission checks.
  */
 
 #include "execution/prefix_cache/PrefixStateCache.h"
@@ -83,6 +86,7 @@ namespace llaminar2
                     {
                         if (!error.empty()) throw std::runtime_error("prefix lookup snapshot failed: " + error);
                         cache->forgetDiskEntry(key);
+                        reconcileDiskHints(*cache);
                         continue;
                     }
                 }
@@ -102,6 +106,7 @@ namespace llaminar2
                 ++cache->stats_.hits;
                 return metadata;
             }
+            reconcileDiskHints(*cache);
             ++cache->stats_.misses;
             return std::nullopt;
         }
@@ -290,15 +295,61 @@ namespace llaminar2
             if (!owner) throw std::logic_error("prefix lookup cache owner has retired");
             return owner;
         }
+        /**
+         * @brief Bound peer-eviction reconciliation to one batch in this lookup.
+         * @param cache Original participant-local owner whose hints require reconciliation.
+         * @throws std::exception If the archive metadata snapshot cannot be authenticated.
+         */
+        void reconcileDiskHints(PrefixStateCache &cache)
+        {
+            if (reconciled_disk_hints_) return;
+            cache.discardMissingDiskHints();
+            reconciled_disk_hints_ = true;
+        }
         std::weak_ptr<PrefixStateCache> cache_;
+        bool reconciled_disk_hints_ = false; ///< Selected source leases survive metadata cleanup.
         Phase phase_ = Phase::Selecting;
         std::vector<Source> sources_;
         std::vector<PrefixCacheKey> selected_keys_;
         std::vector<PrefixBlockHandle> materialized_;
     };
 
+    /** @copydoc PrefixStateCache::requireActive */
+    void PrefixStateCache::requireActive() const
+    {
+        if (lifecycle_ != Lifecycle::Active)
+            throw std::logic_error("prefix cache request admission is closed for shutdown");
+    }
+
+    /** @copydoc PrefixStateCache::sealForShutdown */
+    PrefixCacheShutdownSource PrefixStateCache::sealForShutdown()
+    {
+        requireActive();
+        if (std::any_of(entries_.begin(), entries_.end(), [](const auto &entry) {
+                return entry.second.block.ref_count != 0;
+            }))
+            throw std::logic_error("prefix shutdown requires every explicit cache lease to retire");
+        if (disk_backend_)
+        {
+            std::string error;
+            if (!disk_backend_->waitForPersistence(&error))
+                throw std::runtime_error("prefix shutdown could not drain archive persistence: " + error);
+            publishCompletedPersistence();
+        }
+        lifecycle_ = Lifecycle::ShutdownSealed;
+        PrefixCacheShutdownSource result{.archive = disk_backend_};
+        if (disk_backend_)
+        {
+            result.most_recent_first.reserve(entries_.size());
+            for (const auto &key : lru_)
+                result.most_recent_first.push_back(entries_.at(key).block.handle);
+        }
+        return result;
+    }
+
     std::shared_ptr<IPrefixLookupPayloadPlan> PrefixStateCache::beginLookup()
     {
+        requireActive();
         if (weak_from_this().expired())
             throw std::logic_error("prefix lookup requires its cache's shared lifetime");
         return std::make_shared<PrefixCacheLookupPlan>(weak_from_this());
@@ -307,6 +358,7 @@ namespace llaminar2
     PrefixBlockHandle PrefixStateCache::materializeLookupSource(
         DiskPrefixStorageBackend::HydrationTicket &source, PrefixPayloadReadSet read_set)
     {
+        requireActive();
         std::string error;
         if (!disk_backend_ || !disk_backend_->selectHydrationSections(source, read_set, &error))
         {
@@ -368,6 +420,7 @@ namespace llaminar2
         PrefixBlockHandle handle,
         PrefixBlockHandle device_hot_handle)
     {
+        requireActive();
         const bool install_device_hot = device_hot_handle.valid();
         if (install_device_hot &&
             (device_hot_handle.tier != PrefixStorageTier::DeviceHot ||
@@ -461,6 +514,7 @@ namespace llaminar2
         const PrefixPayloadLayout &layout,
         std::string *error)
     {
+        requireActive();
         if (!disk_backend_)
             return true;
 
@@ -490,6 +544,7 @@ namespace llaminar2
         PrefixBlockHandle device_hot_handle,
         bool repromotion)
     {
+        requireActive();
         if (!device_hot_backend_ ||
             !device_hot_handle.valid() ||
             device_hot_handle.tier != PrefixStorageTier::DeviceHot)
@@ -520,6 +575,7 @@ namespace llaminar2
 
     std::optional<PrefixBlockHandle> PrefixStateCache::find(const PrefixCacheKey &key)
     {
+        requireActive();
         publishCompletedPersistence();
         if (pending_hydration_ && pending_hydration_->diskHandle().key != key)
             pending_hydration_.reset();
@@ -633,6 +689,23 @@ namespace llaminar2
         return it->second.block.handle;
     }
 
+    /** @copydoc PrefixStateCache::discardMissingDiskHints */
+    void PrefixStateCache::discardMissingDiskHints()
+    {
+        if (disk_entries_.empty()) return;
+        std::vector<PrefixCacheKey> keys;
+        keys.reserve(disk_entries_.size());
+        for (const auto &[key, handle] : disk_entries_) keys.push_back(key);
+        const auto missing = disk_backend_->missingKeys(keys);
+        for (const auto &key : missing) forgetDiskEntry(key);
+        // The archive already counted actual capacity evictions. These are
+        // additional stale local hints, not another payload-churn event.
+        PerfStatsCollector::addCounter("prefix_cache", "disk_hint_reconciliations",
+            1.0, "lookup", "CPU");
+        PerfStatsCollector::addCounter("prefix_cache", "stale_disk_presence_discards",
+            static_cast<double>(missing.size()), "lookup", "CPU");
+    }
+
     bool PrefixStateCache::contains(const PrefixCacheKey &key) const
     {
         return entries_.find(key) != entries_.end() ||
@@ -643,6 +716,7 @@ namespace llaminar2
 
     bool PrefixStateCache::retain(const PrefixCacheKey &key)
     {
+        requireActive();
         auto it = entries_.find(key);
         if (it == entries_.end())
         {
@@ -655,6 +729,7 @@ namespace llaminar2
 
     bool PrefixStateCache::release(const PrefixCacheKey &key)
     {
+        requireActive();
         auto it = entries_.find(key);
         if (it == entries_.end() || it->second.block.ref_count == 0)
         {
@@ -666,6 +741,7 @@ namespace llaminar2
 
     bool PrefixStateCache::erase(const PrefixCacheKey &key)
     {
+        requireActive();
         publishCompletedPersistence();
         const bool retired_promotion =
             pending_hydration_ && pending_hydration_->diskHandle().key == key;
@@ -694,6 +770,7 @@ namespace llaminar2
 
     bool PrefixStateCache::clear()
     {
+        requireActive();
         publishCompletedPersistence();
         for (const auto &[key, entry] : entries_)
         {
@@ -761,6 +838,7 @@ namespace llaminar2
         uint64_t previous_fingerprint,
         uint64_t active_fingerprint)
     {
+        requireActive();
         publishCompletedPersistence();
         if (previous_fingerprint == 0 || active_fingerprint == 0 ||
             previous_fingerprint == active_fingerprint)
@@ -859,6 +937,7 @@ namespace llaminar2
         const PrefixCacheKey &key,
         const PrefixPayloadAllocationPlan &allocation)
     {
+        requireActive();
         const size_t incoming_bytes = allocation.totalBytes();
         publishCompletedPersistence();
         if (!key.valid() || incoming_bytes == 0 ||
@@ -885,6 +964,7 @@ namespace llaminar2
         const PrefixCacheKey &key,
         const PrefixPayloadAllocationPlan &allocation)
     {
+        requireActive();
         const size_t incoming_bytes = allocation.totalBytes();
         auto preparation = prepareInsert(key, allocation);
         if (preparation == PrefixRamInsertPreparation::Busy)
@@ -929,6 +1009,7 @@ namespace llaminar2
 
     PrefixRamInsertPreparation PrefixStateCache::prepareCapacity(const PrefixPayloadAllocationPlan &allocation)
     {
+        requireActive();
         const size_t incoming_bytes = allocation.totalBytes();
         // Completion can advance during a harvest loop or while joining a
         // necessary archive receipt. Reap exact restore readers at every
@@ -952,6 +1033,7 @@ namespace llaminar2
         const PrefixPayloadLayout &layout,
         size_t runtime_capacity)
     {
+        requireActive();
         publishCompletedPersistence();
         if (!admission.supported || !admission.cache_enabled ||
             admission.fingerprint_key == 0u || layout.block_size <= 0 ||
@@ -1077,6 +1159,7 @@ namespace llaminar2
         void *producer_stream,
         PrefixBlockHandle *device_hot_handle)
     {
+        requireActive();
         if (!device_hot_handle || !producer_stream || !device_hot_backend_ ||
             !ram_archive.valid())
         {
@@ -1141,6 +1224,7 @@ namespace llaminar2
                                                int matched_tokens,
                                                int matched_blocks)
     {
+        requireActive();
         const int clamped_requested = std::max(0, requested_tokens);
         const int clamped_matched = std::max(0, std::min(matched_tokens, clamped_requested));
         if (clamped_matched > 0 && clamped_matched < clamped_requested)
@@ -1153,6 +1237,7 @@ namespace llaminar2
 
     void PrefixStateCache::recordTerminalStateHit()
     {
+        requireActive();
         ++stats_.terminal_state_hits;
     }
 
@@ -1249,6 +1334,7 @@ namespace llaminar2
 
     void PrefixStateCache::touchDeviceHot(const PrefixCacheKey &key)
     {
+        requireActive();
         for (auto it = device_hot_lru_.begin(); it != device_hot_lru_.end(); ++it)
         {
             if (*it == key)
@@ -1311,6 +1397,7 @@ namespace llaminar2
 
     void PrefixStateCache::publishCompletedPersistence()
     {
+        requireActive();
         while (!pending_persistence_.empty())
         {
             const auto &pending = pending_persistence_.front();
@@ -1398,6 +1485,7 @@ namespace llaminar2
 
     void PrefixStateCache::touch(Entry &entry)
     {
+        requireActive();
         lru_.erase(entry.lru_it);
         lru_.push_front(entry.block.handle.key);
         entry.lru_it = lru_.begin();

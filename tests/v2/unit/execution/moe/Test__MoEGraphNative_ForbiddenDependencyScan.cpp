@@ -8859,6 +8859,26 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
 
         const std::string contents = readFile(rocm_path);
+        // Retired weight-only policy cannot reappear as a second ownership or
+        // arithmetic authority beside model-owned prepared half gate tensors.
+        for (const char *retired : {"getOrCreateFP16RouterGateCache", "moe_router_fp16",
+                                    "ROCM_ROUTER_FP16_GATE_WEIGHTS"})
+            EXPECT_EQ(contents.find(retired), std::string::npos) << retired;
+        const size_t typed_begin = contents.find("bool launchDecodeGateLogitsForGateType(");
+        ASSERT_NE(typed_begin, std::string::npos);
+        const size_t typed_end = contents.find("\n}\n\nnamespace llaminar2", typed_begin);
+        ASSERT_NE(typed_end, std::string::npos);
+        const std::string typed = contents.substr(typed_begin, typed_end - typed_begin);
+        const size_t half_begin = typed.find("case llaminar2::TensorType::FP16:");
+        const size_t half_end = typed.find("case llaminar2::TensorType::BF16:", half_begin);
+        ASSERT_NE(half_begin, std::string::npos);
+        ASSERT_NE(half_end, std::string::npos);
+        const std::string half = typed.substr(half_begin, half_end - half_begin);
+        EXPECT_NE(half.find("!hipMoE_gate_logits_single_token_fp16_weights("), std::string::npos);
+        EXPECT_NE(half.find("FP16 gate logits kernel failed"), std::string::npos);
+        EXPECT_NE(half.find("return false;"), std::string::npos);
+        EXPECT_EQ(half.find("launchDecodeGateLogits("), std::string::npos)
+            << "A physical half gate may not enter the FP32 router after failure";
         auto require_strict_router_body =
             [&](const std::string &begin_marker,
                 const std::string &end_marker,
@@ -8881,12 +8901,20 @@ namespace llaminar2::test
             EXPECT_NE(body.find("fused K-part router runtime kernel failed"),
                       std::string::npos)
                 << label << " must fail hard when explicit K-part top-k/rebalance routing fails";
-            EXPECT_NE(body.find("FP16 router was requested but gate cache is unavailable"),
-                      std::string::npos)
-                << label << " must fail hard when explicit FP16 routing cannot build its cache";
-            EXPECT_NE(body.find("FP16 router logits kernel failed"),
-                      std::string::npos)
-                << label << " must fail hard when explicit FP16 logits fail";
+            // Physical gate identity now selects the sole typed dispatcher;
+            // there is no workspace-derived half cache to recover or replace.
+            const size_t typed_call = body.find("!launchDecodeGateLogitsForGateType(");
+            ASSERT_NE(typed_call, std::string::npos)
+                << label << " must use the typed gate dispatcher as a checked condition";
+            const size_t fail_begin = body.find('{', typed_call);
+            const size_t fail_end = body.find('}', fail_begin);
+            ASSERT_NE(fail_begin, std::string::npos);
+            ASSERT_NE(fail_end, std::string::npos);
+            const std::string failure = body.substr(fail_begin, fail_end - fail_begin);
+            EXPECT_NE(failure.find("return false;"), std::string::npos)
+                << label << " must propagate typed FP16/FP32/BF16 launch failure";
+            EXPECT_EQ(failure.find("hipMoE_"), std::string::npos)
+                << label << " may not submit an alternate kernel after typed failure";
             EXPECT_NE(body.find("wave64 decode softmax/top-k runtime kernel failed"),
                       std::string::npos)
                 << label << " must fail hard when the enabled wave top-k runtime path fails";

@@ -270,7 +270,8 @@ if(HAVE_CUDA)
     
     # CUDA optimization flags for Release builds
     # --use_fast_math: Enable fast math intrinsics (~10-30% speedup, slight precision loss)
-    # --ftz=true: Flush denormals to zero (faster, no denormals in LLM inference anyway)
+    # --ftz=true: Flush ordinary CUDA arithmetic; shared explicit cross-backend
+    # FP32 primitives opt out where their byte contract preserves subnormals.
     # --prec-div=false: Fast division (slightly less accurate, negligible for inference)
     # --prec-sqrt=false: Fast sqrt (slightly less accurate)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math --ftz=true --prec-div=false --prec-sqrt=false")
@@ -413,6 +414,7 @@ if(HAVE_CUDA)
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
         # MoE (Mixture of Experts) kernels
         kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
+        kernels/cuda/moe/CUDARouterQ8Prefill.cu       # Exact block32 INT8 tensor-core router prefill
         kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.cu # Device-owned node-local sparse activation packets
         kernels/cuda/moe/CUDAMoEOverlayDeviceControllerKernels.cu # Node-local sole-controller lifecycle
         kernels/cuda/moe/CUDAMoEOverlayEpochKernels.cu # Captured ExpertOverlay placement-epoch RCU
@@ -432,6 +434,14 @@ if(HAVE_CUDA)
         set_source_files_properties(
             kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu
             PROPERTIES COMPILE_OPTIONS "--split-compile=8"
+        )
+        # Attention owns one arithmetic body specialized across native formats,
+        # exact/partial widths, tile ownership and direct/context execution.
+        # Parallelize optimization of that complete family instead of making a
+        # single serial compiler worker dominate every local tuning rebuild.
+        set_source_files_properties(
+            kernels/cuda/attention/CUDAFlashAttentionKernels.cu
+            PROPERTIES COMPILE_OPTIONS "--split-compile=0"
         )
     endif()
     
@@ -468,6 +478,25 @@ if(HAVE_CUDA)
         kernels/cuda/kvcache/CUDARingKVCacheBase.cpp
         ${CUDA_KERNEL_SOURCES}
     )
+    # Pure tensor prefill exports only host native-function handles. It has
+    # no cross-TU device calls, so compile its complete numerical code object.
+    # Graph/conditional controllers still use cuda_backend's device link. The
+    # directory-wide fatal spill guard and shipped architecture set apply to
+    # this target exactly as to every other project-owned CUDA kernel.
+    add_library(cuda_tensor_prefill OBJECT
+        kernels/cuda/attention/CUDATensorPrefillKernels.cu)
+    set_target_properties(cuda_tensor_prefill PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_EXTENSIONS ON
+        POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(cuda_tensor_prefill PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(cuda_tensor_prefill PRIVATE CUDA::cudart)
+    target_sources(cuda_backend PRIVATE $<TARGET_OBJECTS:cuda_tensor_prefill>)
+
     # Resolve CUDA device symbols at library build time so downstream executables
     # (500+ test binaries) don't each need their own nvcc device-link step.
     set_target_properties(cuda_backend PROPERTIES
@@ -1600,6 +1629,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/prefix_cache/PrefixCacheStateProbe.cpp
     execution/prefix_cache/PrefixStateSnapshot.cpp
     execution/prefix_cache/PrefixStateCache.cpp
+    execution/prefix_cache/PrefixCacheShutdown.cpp
     execution/prefix_cache/PrefixStorageBackend.cpp
     execution/prefix_cache/PrefixHostArena.cpp
     execution/prefix_cache/RamPrefixStorageBackend.cpp
@@ -2276,7 +2306,11 @@ target_link_libraries(llaminar2 llaminar2_core)
 # independently linked parser implementation.
 add_executable(llaminar_native_tool_evidence_decoder tools/NativeToolEvidenceDecoder.cpp)
 target_link_libraries(llaminar_native_tool_evidence_decoder PRIVATE llaminar2_core)
-add_dependencies(llaminar2 llaminar_native_tool_evidence_decoder)
+add_executable(llaminar_model_kld_canary tools/ModelKLDCanary.cpp)
+target_link_libraries(llaminar_model_kld_canary PRIVATE llaminar2_core)
+# The numerical observer must use the same shipped core as serving; no SDK or
+# local rebuild is needed in the master PR model gate.
+add_dependencies(llaminar2 llaminar_native_tool_evidence_decoder llaminar_model_kld_canary)
 
 # GEMM tile-config sweep benchmark (CUDA only, optional)
 if(HAVE_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../benchmarks/v2/gemm_sweep_main.cu")
@@ -2310,7 +2344,7 @@ endif()
 # TODO: Intel MKL backend - not yet implemented
 
 # Install targets
-install(TARGETS llaminar2 llaminar2_core llaminar_native_tool_evidence_decoder
+install(TARGETS llaminar2 llaminar2_core llaminar_native_tool_evidence_decoder llaminar_model_kld_canary
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib

@@ -11,6 +11,7 @@
  *
  * Tests cover:
  * - Every native source format and nested borrowed views in TensorClasses.h
+ * - Independent row-block strides for ragged K without decoding or GPU storage
  * - Verification that size_bytes() doesn't throw
  * - Verification that size_bytes() matches expected calculations
  * - For block-quantized tensors: size_bytes matches num_blocks * sizeof(BlockType)
@@ -24,6 +25,7 @@
 #include "tensors/TensorFactory.h"
 #include "../../utils/QuantizedVerifierFormats.h"
 #include <array>
+#include <type_traits>
 #include <cstring>
 
 using namespace llaminar2;
@@ -68,6 +70,156 @@ TEST(NativeTensorExtent, CheckedGeometryRejectsOverflowWithoutAllocation)
     const std::array too_many_bytes{std::numeric_limits<size_t>::max()};
     EXPECT_THROW(nativeTensorExtent(too_many_bytes, 1, 2), std::overflow_error);
     EXPECT_THROW(nativeTensorExtent(shape, 0, 1), std::invalid_argument);
+}
+
+namespace
+{
+/**
+ * @brief Prove raw source row strides without consulting the extent implementation.
+ * @tparam Tensor Original block-quantized tensor class.
+ * @tparam Block Original source ABI whose tail belongs to each row independently.
+ * @param label Stable source-format name used in failure diagnostics.
+ */
+template<class Tensor, class Block>
+void proveNativeRowViewExtent(const char *label)
+{
+    constexpr size_t rows = 12;
+    for (const size_t columns : {1u, 31u, 32u, 33u, 255u, 256u, 257u, 288u})
+    {
+        SCOPED_TRACE(::testing::Message() << label << " K=" << columns);
+        const auto prove_case = [&]()
+        {
+            // Independent small source-ABI arithmetic, never parent->size_bytes()
+            // or the new production helper. Every row owns its own final block.
+            const size_t blocks_per_row = columns / Block::BLOCK_SIZE +
+                (columns % Block::BLOCK_SIZE != 0);
+            const size_t row_bytes = blocks_per_row * sizeof(Block);
+            std::vector<uint8_t> raw(rows * row_bytes);
+            for (size_t i = 0; i < raw.size(); ++i)
+                raw[i] = static_cast<uint8_t>((i * 37u + i / row_bytes * 11u) & 255u);
+            std::shared_ptr<std::vector<uint8_t>> mapped_bytes;
+            std::shared_ptr<Tensor> parent;
+            if constexpr (std::is_same_v<Tensor, Q5_0Tensor> ||
+                          std::is_same_v<Tensor, Q5_1Tensor>)
+            {
+                // These two owning constructors require exactly a flattened block
+                // count. Their existing explicit mapped-source API admits complete
+                // row-padded storage. Keep its owner visibly alive through every
+                // descendant read: current mapped-root views do not retain it.
+                mapped_bytes = std::make_shared<std::vector<uint8_t>>(raw);
+                parent = std::make_shared<Tensor>(std::vector<size_t>{rows, columns},
+                    mapped_bytes->data(), mapped_bytes->size(), mapped_bytes);
+            }
+            else
+            {
+                // All other source constructors admit these independent row bytes;
+                // IQ4_NL and Q8_1 explicitly require the per-row padded count.
+                parent = std::make_shared<Tensor>(
+                    std::vector<size_t>{rows, columns}, raw);
+            }
+            const auto *root = static_cast<const uint8_t *>(parent->raw_data());
+            ASSERT_NE(root, nullptr);
+            auto view = parent->create_view({8, columns}, 2 * columns);
+            auto nested = view->create_view({5, columns}, columns);
+            EXPECT_EQ(view->size_bytes(), 8 * row_bytes);
+            EXPECT_EQ(nested->size_bytes(), 5 * row_bytes);
+            EXPECT_EQ(static_cast<const uint8_t *>(view->raw_data()), root + 2 * row_bytes);
+            EXPECT_EQ(static_cast<const uint8_t *>(nested->raw_data()), root + 3 * row_bytes);
+            const std::vector<uint8_t> expected(raw.begin() + 3 * row_bytes,
+                                                raw.begin() + 8 * row_bytes);
+            if constexpr (std::is_same_v<Tensor, Q3_KTensor>)
+            {
+                // Q3_K's declared view API requires positive N. Preserve that
+                // rejection instead of broadening production merely for this test.
+                EXPECT_THROW(parent->create_view({0, columns}, rows * columns),
+                             std::invalid_argument);
+            }
+            else
+            {
+                auto empty = parent->create_view({0, columns}, rows * columns);
+                EXPECT_EQ(empty->size_bytes(), 0u);
+            }
+            parent.reset();
+            view.reset();
+            EXPECT_EQ(nested->size_bytes(), expected.size());
+            EXPECT_EQ(std::memcmp(nested->raw_data(), expected.data(), expected.size()), 0);
+        };
+        // A format-specific rejection must not hide the rest of this sweep.
+        EXPECT_NO_THROW(prove_case());
+    }
+}
+} // namespace
+
+/** @test Every source format retains each row's padded block through nested views. */
+TEST(NativeTensorExtent, RowPaddedAllFormatsNestedViewsKeepIndependentSourceStrides)
+{
+    ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
+    proveNativeRowViewExtent<Q4_0Tensor, Q4_0Block>("Q4_0");
+    proveNativeRowViewExtent<IQ4_NLTensor, IQ4_NLBlock>("IQ4_NL");
+    proveNativeRowViewExtent<IQ4_XSTensor, IQ4_XSBlock>("IQ4_XS");
+    proveNativeRowViewExtent<Q4_1Tensor, Q4_1Block>("Q4_1");
+    proveNativeRowViewExtent<Q4_KTensor, Q4_KBlock>("Q4_K");
+    proveNativeRowViewExtent<Q5_0Tensor, Q5_0Block>("Q5_0");
+    proveNativeRowViewExtent<Q5_1Tensor, Q5_1Block>("Q5_1");
+    proveNativeRowViewExtent<Q5_KTensor, Q5_KBlock>("Q5_K");
+    proveNativeRowViewExtent<Q6_KTensor, Q6_KBlock>("Q6_K");
+    proveNativeRowViewExtent<Q3_KTensor, Q3_KBlock>("Q3_K");
+    proveNativeRowViewExtent<Q2_KTensor, Q2_KBlock>("Q2_K");
+    proveNativeRowViewExtent<IQ3_STensor, IQ3_SBlock>("IQ3_S");
+    proveNativeRowViewExtent<IQ3_XXSTensor, IQ3_XXSBlock>("IQ3_XXS");
+    proveNativeRowViewExtent<IQ2_STensor, IQ2_SBlock>("IQ2_S");
+    proveNativeRowViewExtent<IQ2_XSTensor, IQ2_XSBlock>("IQ2_XS");
+    proveNativeRowViewExtent<IQ2_XXSTensor, IQ2_XXSBlock>("IQ2_XXS");
+    proveNativeRowViewExtent<IQ1_STensor, IQ1_SBlock>("IQ1_S");
+    proveNativeRowViewExtent<IQ1_MTensor, IQ1_MBlock>("IQ1_M");
+    proveNativeRowViewExtent<Q8_0Tensor, Q8_0Block>("Q8_0");
+    proveNativeRowViewExtent<Q8_1Tensor, Q8_1Block>("Q8_1");
+    proveNativeRowViewExtent<Q8_KTensor, Q8_KBlock>("Q8_K");
+}
+
+/** @test Q4_0 reports authoritative owned/mmap bytes and complete borrowed rows. */
+TEST(NativeTensorExtent, Q4OwnedAndMappedRowStorageRetainsAuthoritativeBytes)
+{
+    constexpr size_t rows = 4, columns = 33;
+    const size_t expected_bytes = rows * 2 * sizeof(Q4_0Block);
+    std::vector<uint8_t> raw(expected_bytes, 0);
+    auto owner = std::make_shared<Q4_0Tensor>(std::vector<size_t>{rows, columns}, raw);
+    EXPECT_EQ(owner->size_bytes(), expected_bytes);
+    auto view = owner->create_view({2, columns}, columns);
+    EXPECT_EQ(view->size_bytes(), 2 * 2 * sizeof(Q4_0Block));
+    // The public zero-copy constructor's explicit source extent is its
+    // authority, independent of an empty owning vector. No actual mapping or
+    // GPU allocation is needed to test that tensor storage interface.
+    auto storage = std::make_shared<std::vector<uint8_t>>(raw);
+    Q4_0Tensor mapped(std::vector<size_t>{rows, columns}, storage->data(),
+                     storage->size(), storage);
+    EXPECT_EQ(mapped.size_bytes(), expected_bytes);
+    EXPECT_EQ(std::memcmp(mapped.raw_data(), raw.data(), expected_bytes), 0);
+}
+
+
+/** @test Explicit row geometry rejects overflow and leaves non-matrix rules alone. */
+TEST(NativeTensorExtent, ExplicitMatrixExtentIsCheckedAndDoesNotInferOtherAxes)
+{
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    EXPECT_EQ(nativeMatrixExtent<IQ2_SBlock>(2561, 288), 420004u);
+    EXPECT_EQ(nativeMatrixExtent<Q4_0Block>(4, 33), 8u * sizeof(Q4_0Block));
+    EXPECT_EQ(nativeMatrixExtent<IQ2_SBlock>(0, maximum), 0u);
+    EXPECT_EQ(nativeMatrixExtent<IQ2_SBlock>(maximum, 0), 0u);
+    EXPECT_EQ(nativeMatrixExtent(1, maximum, maximum, 1), 1u);
+    EXPECT_EQ(nativeMatrixExtent(maximum, 1, 1, 1), maximum);
+    EXPECT_THROW(nativeMatrixExtent(0, 0, 0, 1), std::invalid_argument);
+    EXPECT_THROW(nativeMatrixExtent(0, 0, 1, 0), std::invalid_argument);
+    EXPECT_THROW(nativeMatrixExtent(maximum, 2, maximum, 1), std::overflow_error);
+    EXPECT_THROW(nativeMatrixExtent(1, maximum, 1, 2), std::overflow_error);
+    EXPECT_THROW(nativeMatrixExtent(maximum / 2 + 1, 1, 32, 2), std::overflow_error);
+    const std::array expert_shape{size_t{288}, size_t{5}, size_t{3}};
+    // No axis inference is added to the existing flattened helper or its
+    // callers for 1-D/3-D storage. Explicit matrix rows are a separate API.
+    const size_t flat_blocks = (288u * 5u * 3u + 255u) / 256u;
+    EXPECT_EQ(nativeTensorExtent<IQ2_SBlock>(expert_shape), flat_blocks * sizeof(IQ2_SBlock));
+    const std::span<const size_t> empty_shape;
+    EXPECT_EQ(nativeTensorExtent<IQ2_SBlock>(empty_shape), 0u);
 }
 
 // ============================================================================
@@ -545,7 +697,7 @@ TEST_F(Test__TensorByteSize, Q4_KTensor_HasCorrectByteSize)
 }
 
 /**
- * @brief Q8_KTensor: 256 elements per super-block, 288 bytes per block
+ * @brief Q8_KTensor: 256 elements per super-block, 292 bytes per source block
  * byte_size() returns raw_data_.size()
  */
 TEST_F(Test__TensorByteSize, Q8_KTensor_HasCorrectByteSize)
@@ -562,9 +714,9 @@ TEST_F(Test__TensorByteSize, Q8_KTensor_HasCorrectByteSize)
     size_t byte_size = 0;
     ASSERT_NO_THROW(byte_size = tensor.size_bytes());
 
-    // 4 blocks * 288 bytes = 1152 bytes
+    // 4 blocks * 292 bytes = 1168 bytes
     EXPECT_EQ(byte_size, expected_bytes);
-    EXPECT_EQ(byte_size, 4 * 288);
+    EXPECT_EQ(byte_size, 4 * 292);
     EXPECT_GT(byte_size, 0);
 }
 
@@ -919,7 +1071,7 @@ TEST_F(Test__TensorByteSize, BlockSizeofAssertions)
     EXPECT_EQ(sizeof(Q3_KBlock), 110);
     EXPECT_EQ(sizeof(Q4_KBlock), 144);
     EXPECT_EQ(sizeof(Q5_KBlock), 176);
-    EXPECT_EQ(sizeof(Q8_KBlock), 288);
+    EXPECT_EQ(sizeof(Q8_KBlock), 292);
 
     // IQ formats
     EXPECT_EQ(sizeof(IQ4_XSBlock), 136);

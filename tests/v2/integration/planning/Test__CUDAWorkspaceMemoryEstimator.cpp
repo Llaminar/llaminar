@@ -7,6 +7,8 @@
  * Unit test.  These focused tests use only synthetic tensor metadata: they do
  * not load a model or allocate model weights, but they query the same CUDA
  * workspace authority used immediately before production weight admission.
+ * Native quantized controls and the model-scoped floating-control default are
+ * separate admitted cases; neither may multiply scratch across serial layers.
  */
 
 #include "backends/BackendManager.h"
@@ -15,6 +17,7 @@
 #include "kernels/cuda/gemm/CUDAQuantisedGemmWorkspaceContract.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "tensors/TensorType.h"
+#include "../../utils/ScopedGDNProjectionArithmetic.h"
 
 #include <gtest/gtest.h>
 
@@ -67,27 +70,30 @@ WorkspaceMemoryGeometry geometry()
 }
 
 /**
- * @brief Add one fused GDN projection bundle with production Q8 source format.
+ * @brief Add native wide projections and explicitly typed alpha/beta controls.
  * @param value Profile receiving the layer-local tensor metadata.
  * @param layer Layer index encoded in every tensor name and ownership record.
+ * @param control_format Original control source format admitted by the policy.
  */
-void addFusedBundle(ModelMemoryProfile& value, int layer)
+void addFusedBundle(ModelMemoryProfile& value, int layer,
+                    const std::string& control_format)
 {
     const auto add_matrix = [&](std::string suffix,
-                                std::size_t output_columns)
+                                std::size_t output_columns,
+                                const std::string& source_format)
     {
         TensorSizeInfo tensor;
         tensor.name = "blk." + std::to_string(layer) + suffix;
-        tensor.quant_type = "Q8_0";
+        tensor.quant_type = source_format;
         tensor.elements = output_columns * std::size_t{2048};
         tensor.K = 2048;
         tensor.layer_index = layer;
         value.tensors.push_back(std::move(tensor));
     };
-    add_matrix(".attn_qkv.weight", 8192);
-    add_matrix(".attn_gate.weight", 4096);
-    add_matrix(".ssm_alpha.weight", 32);
-    add_matrix(".ssm_beta.weight", 32);
+    add_matrix(".attn_qkv.weight", 8192, "Q8_0");
+    add_matrix(".attn_gate.weight", 4096, "Q8_0");
+    add_matrix(".ssm_alpha.weight", 32, control_format);
+    add_matrix(".ssm_beta.weight", 32, control_format);
 }
 
 } // namespace
@@ -103,21 +109,31 @@ void addFusedBundle(ModelMemoryProfile& value, int layer)
 TEST(Test__CUDAWorkspaceMemoryEstimator,
      FusedProjectionWorkspaceCanonicalizesAcrossSerialLayers)
 {
-    if (!getCUDABackend())
-        GTEST_SKIP() << "CUDA backend is unavailable";
+    ASSERT_NE(getCUDABackend(), nullptr);
+    for (const auto policy : {GDNProjectionArithmetic::Native,
+                              GDNProjectionArithmetic::FP16MoEAlphaBeta})
+    {
+        SCOPED_TRACE(gdnProjectionArithmeticName(policy));
+        const test::ScopedGDNProjectionArithmetic arithmetic(policy);
+        // The original all-quantized fixture remains a native-policy witness.
+        // The production MoE default requires original floating controls and
+        // adds its half-operand bank to the same shared workspace authority.
+        const std::string control_format =
+            policy == GDNProjectionArithmetic::Native ? "Q8_0" : "F32";
+        auto value = profile();
+        addFusedBundle(value, 0, control_format);
+        const std::size_t one_layer =
+            WorkspaceMemoryEstimator::estimate(value, geometry());
 
-    auto value = profile();
-    addFusedBundle(value, 0);
-    const std::size_t one_layer =
-        WorkspaceMemoryEstimator::estimate(value, geometry());
+        addFusedBundle(value, 1, control_format);
+        const std::size_t two_layers =
+            WorkspaceMemoryEstimator::estimate(value, geometry());
 
-    addFusedBundle(value, 1);
-    const std::size_t two_layers =
-        WorkspaceMemoryEstimator::estimate(value, geometry());
-
-    EXPECT_EQ(two_layers, one_layer)
-        << "Serial CUDA layers must merge their stable fused workspace names "
-           "instead of multiplying physical admission bytes.";
+        EXPECT_GT(one_layer, 0u);
+        EXPECT_EQ(two_layers, one_layer)
+            << "Serial CUDA layers must merge their stable fused workspace names "
+               "instead of multiplying physical admission bytes.";
+    }
 }
 
 /** @test The real CUDA launch policy admits every compact expert projection codebook and row capacity. */

@@ -8,6 +8,8 @@
  * determinism mode; determinism does not serialize a whole attention head.
  * Native FP16, BF16 and FP32 cache storage shares that grouped decode contract.
  * Native prefill converts only on-chip WMMA operands, never the stored cache.
+ * Capture publication, physical summary admission and concrete compute use the
+ * same native head/visibility facts; large M cannot select an older body.
  *
  * @author David Sanftenberg
  */
@@ -258,6 +260,9 @@ namespace llaminar2
 
         /**
          * @brief Resolve one CUDA prefill graph plan from immutable geometry.
+         * @param geometry Complete captured dimensions, native operands and head mapping.
+         * @param device_idx Device whose immutable SM count owns this plan.
+         * @return The exact physical plan, or an invalid plan for rejected geometry.
          *
          * CUDA device properties are setup-time inputs. The returned mode is
          * embedded in graph capture and never re-evaluated from a live sequence
@@ -266,13 +271,8 @@ namespace llaminar2
          * invalid context request.
          */
         static fa2_policy::FA2PrefillParallelPlan resolvePrefillPlanForDevice(
-            int batch_size,
-            int query_rows,
-            int local_query_heads,
-            int head_dim,
-            int kv_capacity,
-            int device_idx,
-            const attention::AttentionExecutionPolicy &execution_policy)
+            const attention::AttentionPrefillCaptureGeometry &geometry,
+            int device_idx)
         {
             cudaDeviceProp properties{};
             const cudaError_t status =
@@ -285,14 +285,22 @@ namespace llaminar2
             }
 
             return fa2_policy::selectFA2PrefillParallelPlan({
-                .batch_size = batch_size,
-                .query_rows = query_rows,
-                .local_query_heads = local_query_heads,
-                .head_dim = head_dim,
-                .kv_capacity = kv_capacity,
+                .batch_size = geometry.batch_size,
+                .query_rows = geometry.query_rows,
+                .local_query_heads = geometry.local_query_heads,
+                .head_dim = geometry.head_dim,
+                .kv_capacity = geometry.kv_capacity,
                 .sm_count = properties.multiProcessorCount,
                 .requested_axis =
-                    execution_policy.prefill_parallel_axis,
+                    geometry.execution_policy.prefill_parallel_axis,
+                .visible_kv_heads = geometry.visible_kv_heads,
+                .head_start = geometry.head_start,
+                .replicated_gqa_n_rep = geometry.replicated_gqa_n_rep,
+                .native_kv_format = geometry.native_kv_format,
+                .visibility = geometry.visibility,
+                .query_warp_groups_override = debugEnv().attention.cuda_fa2_q_warp_groups,
+                .pv_warps_override = debugEnv().attention.cuda_fa2_hd256_pv_warps,
+                .tile_kv_override = debugEnv().attention.cuda_fa2_tile_kv,
             });
         }
 
@@ -342,6 +350,9 @@ namespace llaminar2
                      std::to_string(plan.query_grid_blocks)},
                     {"context_partitions",
                      std::to_string(plan.max_context_partitions)},
+                    {"summary_capacity", std::to_string(plan.summary_capacity)},
+                    {"summary_layout", plan.summary_layout == fa2_policy::FA2PrefillSummaryLayout::TensorCompactFour
+                        ? "tensor_compact_four" : "canonical_256"},
                     {"context_partition_slots",
                      std::to_string(plan.context_partition_slots)},
                     {"device_direct_partition_limit",
@@ -1098,13 +1109,13 @@ namespace llaminar2
                     : kv_len;
             const fa2_policy::FA2PrefillParallelPlan prefill_plan =
                 resolvePrefillPlanForDevice(
-                    batch_size,
-                    seq_len,
-                    n_heads,
-                    head_dim,
-                    launch_kv_capacity,
-                    dev,
-                    execution_policy);
+                    {.batch_size = batch_size, .query_rows = seq_len,
+                     .local_query_heads = n_heads, .head_dim = head_dim,
+                     .kv_capacity = launch_kv_capacity, .execution_policy = execution_policy,
+                     .native_kv_format = use_nativekv_direct ? K->native_type() : TensorType::FP32,
+                     .visibility = attention::attentionVisibilityPolicy(causal, window_size, mask_ptr != nullptr),
+                     .visible_kv_heads = n_kv_heads, .head_start = head_start,
+                     .replicated_gqa_n_rep = gqa_n_rep}, dev);
             if (!prefill_plan.valid)
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Invalid declared CUDA prefill capture plan"
@@ -2237,13 +2248,7 @@ namespace llaminar2
             {
                 const fa2_policy::FA2PrefillParallelPlan capture_plan =
                     resolvePrefillPlanForDevice(
-                        prefill_capture.batch_size,
-                        prefill_capture.query_rows,
-                        prefill_capture.local_query_heads,
-                        prefill_capture.head_dim,
-                        prefill_capture.kv_capacity,
-                        device_idx_,
-                        prefill_capture.execution_policy);
+                        prefill_capture, device_idx_);
                 if (!capture_plan.valid)
                 {
                     LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Invalid prefill plan before device attention-param publication");

@@ -17,6 +17,9 @@ Auto observations authenticate the executed physical family, not just the
 subset of cooperative geometries exposed as forced tournament candidates.
 Q8 aliases independently measure the INT8 blockwise producer and its own
 controls; low-bit NativeVNNI override names cannot label those launches.
+ROCm aggregate and timing rows explicitly bind physical execution identity next
+to original source codebook. Current schema rejects old or relabeled IQ4_XS
+rows; source4 and physical24 are never collapsed into a synthetic measurement.
 """
 
 from __future__ import annotations
@@ -73,7 +76,7 @@ CUDA_AGGREGATE_COLUMNS = (
 )
 
 ROCM_AGGREGATE_COLUMNS = (
-    "backend", "phase", "format", "codebook", "shape", "category", "m",
+    "backend", "phase", "format", "codebook", "execution_codebook", "shape", "category", "m",
     "n", "k", "variant", "min_us", "mean_us", "stddev_us", "gflops",
     "cosine", "correctness_pass", "byte_mismatches_vs_auto",
     "first_byte_mismatch_vs_auto", "is_best", "observed_n_tile",
@@ -92,7 +95,7 @@ CUDA_TIMING_COLUMNS = (
 )
 
 ROCM_TIMING_COLUMNS = (
-    "backend", "phase", "format", "codebook", "shape", "m", "n", "k",
+    "backend", "phase", "format", "codebook", "execution_codebook", "shape", "m", "n", "k",
     "variant", "sample_index", "timed_replays", "latency_us",
     "latency_us_hex", "captured_operations",
 )
@@ -552,10 +555,18 @@ def _validate_common_identity(
     cell: DensePrefillCell,
     context: str,
 ) -> None:
+    """Bind original format, physical GPU decoder and complete live geometry.
+
+    The source-only codebook is insufficient for IQ4_XS: physical24 owns its
+    original-factor representation, independently of source-policy4 schedules.
+    """
+
     if row["format"] != cell.source_format.label:
         raise ValueError(f"{context}: source format disagrees with plan")
     if int(row["codebook"]) != cell.source_format.source_codebook_id:
         raise ValueError(f"{context}: source codebook disagrees with registry")
+    if cell.backend == "rocm" and int(row["execution_codebook"]) != cell.source_format.runtime_codebook("rocm"):
+        raise ValueError(f"{context}: physical execution codebook disagrees with registry")
     if row["shape"] != cell.shape.name:
         raise ValueError(f"{context}: shape disagrees with plan")
     if (int(row["m"]), int(row["n"]), int(row["k"])) != (

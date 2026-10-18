@@ -10,6 +10,9 @@
 #pragma once
 #include "PlanningModelMetadata.h"
 #include "backends/DeviceId.h"
+#include "kernels/FloatingActivationOperandPrecision.h"
+#include "config/GDNProjectionArithmeticPolicy.h"
+#include "config/MoERouterArithmeticPolicy.h"
 #include <functional>
 
 namespace llaminar2
@@ -37,6 +40,8 @@ namespace llaminar2
         TensorType tensorType() const;
         /** @return Runtime type from the canonical model preparation policy, not a sampling override. */
         TensorType executionType() const;
+        /** @return Exact original-source scoped arithmetic of the observed prepared engine. */
+        FloatingActivationOperandPrecision operandPrecision() const;
         /** @return Runtime format whose production projection implementation is measured. */
         std::string executionFormat() const;
         /** @return Checked logical runtime extent; source publication retains its native extent. */
@@ -60,6 +65,8 @@ namespace llaminar2
         PlanningModelSampleRequest request_;
         PlanningModelSampleGeometry geometry_{};
         uint32_t gguf_type_ = 0;
+        GDNProjectionArithmetic arithmetic_ = GDNProjectionArithmetic::Native; ///< Sealed original-source scoped setup mode.
+        MoERouterArithmetic router_arithmetic_ = MoERouterArithmetic::Native; ///< Router-only source preparation identity.
     };
 
     /** @brief A complete native payload and its sealed selection cannot separate in transit. */

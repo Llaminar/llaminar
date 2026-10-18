@@ -7,7 +7,9 @@
  * its permanent VNNI byte stream.  These tests independently reconstruct that
  * stream from the public IINT8Unpackable contract and require exact equality for
  * every Expanded-INT8 codebook. Single-scale integer grids use the native
- * prepared payload and exact FP16 metadata, not the older lossy INT8 export.
+ * prepared payload and exact metadata, not the older lossy INT8 export.
+ * IQ3_S independently reads original GGUF blocks: primary is source half d,
+ * secondary is its raw nibble, and encoding5 stays arithmetically symmetric.
  * Multi-scale sources retain every native payload/metadata bit and are checked
  * against independently addressed whole-row GPU preparation. The complete
  * 21-format catalog additionally
@@ -167,18 +169,22 @@ namespace llaminar2::cpu::native_vnni::test
          * Read it with whole-row addressing (not the packer's bounded tile),
          * then expand one value at a time without calling decode_native_block.
          * This checks both the optimized decoder and its windowed destination
-         * addressing, while leaving the source's FP16 scale/minimum untouched.
+         * addressing, while leaving the source's metadata untouched. IQ3_S
+         * takes a separate original-block oracle: neither its scale/coefficient
+         * nor signed-grid payload is obtained from production preparation.
          *
-         * @param source Quantized source implementation.
+         * @param original Original quantized tensor and source-byte authority.
+         * @param source Quantized source implementation for the other IQ grids.
          * @param packed Destination geometry and source codebook identity.
          * @param source_row Original source row, including the TP slice offset.
          * @param kb Logical 32-value block within that row.
          * @param values Output signed grid values, before scale or minimum.
-         * @param scale Output original FP16 scale bits.
-         * @param minimum Output original FP16 minimum bits.
+         * @param scale Output original FP16 scale/base bits.
+         * @param minimum Output raw IQ3 nibble or other original FP16 minimum bits.
          * @return Whether this source belongs to the lossless single-scale grid family.
          */
         bool decodeSingleScaleGridOracle(
+            const TensorBase &original,
             const IINT8Unpackable &source,
             const CPUNativeVNNIPackedWeights &packed,
             int source_row,
@@ -191,6 +197,35 @@ namespace llaminar2::cpu::native_vnni::test
             if (codebook != 11 && codebook != 12 &&
                 codebook != 15 && codebook != 16)
                 return false;
+
+            if (codebook == 11)
+            {
+                // Decode the original GGUF row/superblock directly, independently
+                // of packVnniBlock, native metadata helpers and optimized decoders.
+                if (original.native_type() != TensorType::IQ3_S || source_row < 0 ||
+                    kb < 0 || kb >= packed.blocks_per_row || packed.K <= 0)
+                    throw std::invalid_argument("IQ3 scalar oracle requires exact original source geometry");
+                const size_t superblocks_per_row=(static_cast<size_t>(packed.K)+255u)/256u;
+                const size_t offset=(static_cast<size_t>(source_row)*superblocks_per_row+
+                    static_cast<size_t>(kb/8))*sizeof(IQ3_SBlock);
+                const auto *raw=static_cast<const uint8_t*>(original.raw_data());
+                if (!raw || offset>original.size_bytes() || sizeof(IQ3_SBlock)>original.size_bytes()-offset)
+                    throw std::invalid_argument("IQ3 scalar oracle source block exceeds original bytes");
+                IQ3_SBlock block{};std::memcpy(&block,raw+offset,sizeof(block));
+                const int sub=kb%8;
+                scale=block.d;
+                minimum=static_cast<uint16_t>((block.scales[sub/2]>>(4*(sub%2)))&15u);
+                for(int element=0;element<32;++element)
+                {
+                    const int group=element/4;
+                    const unsigned index=block.qs[sub*8+group] |
+                        (((unsigned(block.qh[sub])>>group)&1u)<<8);
+                    const int magnitude=int((iq3s_grid[index]>>(8*(element%4)))&255u);
+                    const unsigned signs=unsigned(block.signs[sub*4+group/2])>>(4*(group%2));
+                    values[element]=static_cast<int8_t>((signs&(1u<<(element%4)))?-magnitude:magnitude);
+                }
+                return true;
+            }
 
             // Full-row storage deliberately has no destination origin override.
             // Only one block is populated, at its absolute source K index.
@@ -278,6 +313,11 @@ namespace llaminar2::cpu::native_vnni::test
                 throw std::invalid_argument(
                     "Expanded-INT8 oracle received another physical encoding");
 
+            const bool iq3_source_tuple=packed.codebook_id==11;
+            if (iq3_source_tuple &&
+                (packed.encoding!=CPUNativeVNNIEncoding::IQ3SExpandedSourceScale ||
+                 packed.is_asymmetric || packed.data_stride!=2048 || packed.interleaved_block_stride!=2432))
+                throw std::invalid_argument("IQ3 scalar oracle requires source-tuple encoding5 geometry");
             const int chunks = packed.N_padded / 64;
             std::vector<uint8_t> expected(
                 static_cast<size_t>(chunks) * packed.blocks_per_row *
@@ -299,7 +339,9 @@ namespace llaminar2::cpu::native_vnni::test
                             block + packed.data_stride);
                     auto *const scales = reinterpret_cast<uint16_t *>(
                         block + packed.data_stride + 128);
-                    auto *const mins = packed.is_asymmetric
+                    // Raw secondary presence is a physical encoding fact, not
+                    // additive-minimum arithmetic. Keep all padded words zero.
+                    auto *const mins = (packed.is_asymmetric || iq3_source_tuple)
                         ? reinterpret_cast<uint16_t *>(
                               block + packed.data_stride + 256)
                         : nullptr;
@@ -312,7 +354,7 @@ namespace llaminar2::cpu::native_vnni::test
                         uint16_t scale = 0;
                         uint16_t minimum = 0;
                         if (!decodeSingleScaleGridOracle(
-                                *unpackable, packed, static_cast<int>(source_row),
+                                source, *unpackable, packed, static_cast<int>(source_row),
                                 kb, values, scale, minimum))
                         {
                             unpackable->unpack_block_to_int8(

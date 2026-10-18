@@ -22,7 +22,8 @@
  * ```
  *
  * The payload/scales/mins/emins sections are laid out identically to the
- * GPU VRAM representation (N-interleaved, linear index = b * N + n), so
+ * GPU VRAM representation (N-interleaved, linear index = b * N + n). IQ2_S
+ * retains original d and an opaque coefficient byte rather than two half scales, so
  * a receiver with a GPU can upload the sections directly and point kernels
  * at them with zero conversion.
  */
@@ -38,8 +39,10 @@ namespace llaminar2 {
 /// Magic bytes identifying a GPU packed weights blob: "GPWT"
 static constexpr uint32_t GPU_PACKED_WEIGHTS_MAGIC = 0x54575047; // "GPWT" little-endian
 
-/// Wire format version for GPU packed weights.
-static constexpr uint32_t GPU_PACKED_WEIGHTS_VERSION = 1;
+/// Version4 adds mandatory IQ3_S original-base/raw-nibble tuples; older wires reject.
+/// Version2 retains IQ2_S original d/coefficient metadata. Version1's same-sized
+/// derived-half words must be rejected before any packed payload is adopted.
+static constexpr uint32_t GPU_PACKED_WEIGHTS_VERSION = 4;
 
 #pragma pack(push, 1)
 
@@ -56,7 +59,7 @@ struct GpuPackedWeightsHeader
     uint8_t  format;             //  1B  RepackFormat enum value
     uint8_t  codebook_id;        //  1B  NativeVnniFormatInfo codebook_id
     uint8_t  payload_bytes;      //  1B  bytes per payload block (16, 20, 24, 32, ...)
-    uint8_t  is_asymmetric;      //  1B  has min-value offsets
+    uint8_t  is_asymmetric;      //  1B  secondary plane present (raw IQ4_XS coefficients for24)
     uint8_t  is_superblock;      //  1B  256-element super-blocks
     uint8_t  has_emins;          //  1B  Q2_K effective mins
     uint8_t  reserved_flags[2];  //  2B  zero-padded
@@ -133,6 +136,32 @@ inline bool validateGpuPackedHeader(const GpuPackedWeightsHeader& hdr, size_t bu
     if (hdr.magic != GPU_PACKED_WEIGHTS_MAGIC) return false;
     if (hdr.version != GPU_PACKED_WEIGHTS_VERSION) return false;
     if (hdr.N <= 0 || hdr.K <= 0 || hdr.blocks_per_row <= 0) return false;
+    // IQ3_S physical11 owns original half base and mandatory raw nibble.
+    if (hdr.codebook_id == 11 || hdr.format == static_cast<uint8_t>(RepackFormat::IQ3_S))
+    {
+        const uint64_t blocks = uint64_t(hdr.N) * uint64_t(hdr.blocks_per_row);
+        if (hdr.codebook_id != 11 || hdr.format != static_cast<uint8_t>(RepackFormat::IQ3_S) ||
+            hdr.payload_bytes != 13 || hdr.is_asymmetric != 1 || hdr.is_superblock != 1 || hdr.has_emins != 0 ||
+            hdr.K % 32 != 0 || hdr.blocks_per_row != hdr.K / 32 || blocks > UINT64_MAX / 17u ||
+            hdr.payload_size != blocks * 13u || hdr.scales_size != blocks * 2u ||
+            hdr.mins_size != blocks * 2u || hdr.emins_size != 0u) return false;
+    }
+    // Source4+superblock is distinct from IQ4_NL despite sharing the LUT.
+    // This is metadata-only rejection before a wire payload can be adopted.
+    if (hdr.format == static_cast<uint8_t>(RepackFormat::IQ4_XS) &&
+        (hdr.codebook_id != kNativeVnniIQ4XSSourceScaleCodebook ||
+         hdr.payload_bytes != 16 || hdr.is_asymmetric != 1 ||
+         hdr.is_superblock != 1 || hdr.has_emins != 0)) return false;
+    if (hdr.codebook_id == kNativeVnniIQ4XSSourceScaleCodebook &&
+        hdr.format != static_cast<uint8_t>(RepackFormat::IQ4_XS)) return false;
+    if (hdr.codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
+    {
+        const uint64_t blocks = uint64_t(hdr.N) * uint64_t(hdr.blocks_per_row);
+        if (hdr.K % 32 != 0 || hdr.blocks_per_row != hdr.K / 32 ||
+            blocks > UINT64_MAX / 20u ||
+            hdr.payload_size != blocks * 16u || hdr.scales_size != blocks * 2u ||
+            hdr.mins_size != blocks * 2u || hdr.emins_size != 0u) return false;
+    }
     if (buffer_size < gpuPackedTotalSize(hdr)) return false;
     return true;
 }

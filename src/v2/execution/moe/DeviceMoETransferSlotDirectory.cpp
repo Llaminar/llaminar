@@ -463,8 +463,7 @@ namespace llaminar2
                     .is_asymmetric = reusable.has_mins,
                     .has_emins = reusable.has_emins,
                     .codebook_id =
-                        canonicalDeviceVnniCodebookId(
-                            source->codebook_id),
+                        canonicalDeviceVnniCodebookId(*source),
                     .format = projection.format,
                 });
             }

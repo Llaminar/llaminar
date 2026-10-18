@@ -145,13 +145,14 @@ namespace llaminar2
         /**
          * @brief L2-normalize src into dst with optional combined scale.
          *
-         * dst[i] = src[i] * (combined_scale / ||src||)
+         * dst[i] = src[i] * combined_scale / sqrt(sum(src*src) + eps).
+         * Epsilon belongs to squared norm, matching Qwen/FLA Q/K normalization.
          */
         static inline void l2norm_scale(const float *src, float *dst, int n,
                                         float combined_scale, float eps)
         {
             float nsq = norm_sq(src, n);
-            const float inv = combined_scale / std::max(std::sqrt(nsq), eps);
+            const float inv = combined_scale / std::sqrt(nsq + eps);
             const __m256 vinv = _mm256_set1_ps(inv);
             int i = 0;
             const int n8 = n & ~7;

@@ -1826,6 +1826,9 @@ namespace llaminar2
                               .gate = fa_gate,
                               .output = buffers.attn_output,
                               .seq_len = total_tokens,
+                              // Retained decode/GDN capacity can exceed this
+                              // graph's actual participant-local FA width.
+                              .feature_dim = local_n_heads * config_.head_dim,
                               .input_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT),
                               .gate_buffer_id = buffers.idFor(BufferId::FA_GATE),
                               .output_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT),

@@ -2072,3 +2072,200 @@ TEST(Test__PrefixStateCacheLRU, DiskHydrationNativeFailureIsFatal)
     ASSERT_TRUE(disk->waitForPersistence());
     cleanup();
 }
+
+/** @brief Retire only the uniquely owned synthetic archive on every assertion path. */
+class ScopedPresenceArchive final
+{
+public:
+    /** @brief Reserve a fresh test-owned directory name. */
+    ScopedPresenceArchive() : path(tempDir())
+    {
+        if (std::filesystem::exists(path)) throw std::runtime_error("Prefix fixture already exists");
+    }
+    /** @brief Run after all cache/archive owners have retired. */
+    ~ScopedPresenceArchive()
+    {
+        std::error_code error;
+        std::filesystem::remove_all(path, error);
+    }
+    std::filesystem::path path; ///< Sole synthetic artifact root owned by this scope.
+};
+
+/** @test A peer-evicted chain is fully republished in one harvest, not one gap per request. */
+TEST(Test__PrefixStateCacheLRU, SharedArchiveEvictionCannotSuppressPromptReharvest)
+{
+    for (const bool independent_writer : {false, true})
+    for (const int block_count : {4, 16})
+    {
+        SCOPED_TRACE(independent_writer ? "independent writer" : "shared writer");
+        SCOPED_TRACE(block_count);
+        ScopedPresenceArchive directory;
+        constexpr size_t bytes = 32;
+        const auto budget = static_cast<size_t>(block_count) * bytes;
+        auto disk = makeDiskBackend(directory.path, budget);
+        auto peer = independent_writer ? makeDiskBackend(directory.path, budget) : disk;
+        ASSERT_TRUE(disk->ready());
+        ASSERT_TRUE(peer->ready());
+        auto ram = std::make_shared<RamPrefixStorageBackend>(2 * budget);
+        auto cache = std::make_shared<PrefixStateCache>(budget, ram, disk);
+        const auto layout = layoutBytes(bytes);
+        std::vector<PrefixCacheKey> keys;
+        uint64_t parent = 0;
+        for (int block = 0; block < block_count; ++block)
+        {
+            keys.push_back(makePrefixCacheKey(0xbeef, parent, block, block, {block}));
+            parent = keys.back().stableHash();
+            ASSERT_TRUE(cache->insert(ram->allocate(keys.back(), layout)));
+        }
+        const auto preparation = cache->prepareCapacity(budget);
+        ASSERT_TRUE(preparation == PrefixRamInsertPreparation::Busy ||
+                    preparation == PrefixRamInsertPreparation::Prepared);
+        ASSERT_TRUE(disk->waitForPersistence());
+        cache->publishCompletedPersistence();
+        ASSERT_EQ(cache->prepareCapacity(budget), PrefixRamInsertPreparation::Prepared);
+        ASSERT_EQ(cache->usedBytes(), 0u);
+        for (const auto &key : keys) ASSERT_TRUE(cache->isDiskResident(key));
+        for (int block = 0; block < block_count; ++block)
+        {
+            auto handle = ram->allocate(keyForFingerprint(0xcafe, block), layout);
+            ASSERT_TRUE(handle.valid());
+            ASSERT_TRUE(peer->writeBlock(handle, nullptr));
+            ASSERT_TRUE(ram->release(handle));
+        }
+        // A real contiguous lookup stops at the first absent ancestor. It
+        // cannot clean the remaining stale hints as a side effect of lookup.
+        {
+            auto lookup = cache->beginLookup();
+            ASSERT_FALSE(lookup->selectLongest(0xbeef, 0, 0, 0, {0}));
+        }
+        for (const auto &key : keys)
+        {
+            if (cache->contains(key)) continue;
+            cache->completeInsertPreparation(key, bytes);
+            ASSERT_TRUE(cache->insert(ram->allocate(key, layout)));
+        }
+        auto lookup = cache->beginLookup();
+        parent = 0;
+        for (int block = 0; block < block_count; ++block)
+        {
+            auto selected = lookup->selectLongest(0xbeef, parent, block, block, {block});
+            ASSERT_TRUE(selected) << "One completed harvest must repair every missing ancestor";
+            EXPECT_EQ(selected->key, keys[static_cast<size_t>(block)]);
+            parent = selected->key.stableHash();
+        }
+    }
+}
+
+/** @test Reconciliation preserves healthy disk owners without payload or recency traffic. */
+TEST(Test__PrefixStateCacheLRU, DiskHintReconciliationReadsMetadataOnly)
+{
+    ScopedPresenceArchive directory;
+    auto disk = makeDiskBackend(directory.path, 128);
+    auto ram = std::make_shared<RamPrefixStorageBackend>(64);
+    auto cache = std::make_shared<PrefixStateCache>(32, ram, disk);
+    const auto layout = layoutBytes(32);
+    ASSERT_TRUE(cache->insert(ram->allocate(keyFor(0), layout)));
+    cache->completeInsertPreparation(keyFor(1), 32);
+    ASSERT_TRUE(cache->insert(ram->allocate(keyFor(1), layout)));
+    const auto before = disk->telemetry()->snapshot().activity;
+    const auto file_bytes = std::filesystem::file_size(disk->archivePath());
+    for (int repeat = 0; repeat < 20; ++repeat)
+    {
+        auto lookup = cache->beginLookup();
+        EXPECT_FALSE(lookup->selectLongest(0xcafe, 0, 0, 0, {999}));
+        EXPECT_TRUE(cache->contains(keyFor(0)));
+    }
+    const auto after = disk->telemetry()->snapshot().activity;
+    EXPECT_EQ(after.operations, before.operations);
+    EXPECT_EQ(after.bytes, before.bytes);
+    EXPECT_EQ(std::filesystem::file_size(disk->archivePath()), file_bytes);
+    EXPECT_EQ(cache->stats().disk_hydrations, 0u);
+    EXPECT_FALSE(cache->isRamResident(keyFor(0)));
+}
+
+/** @test Only one miss in a lookup may join the archive metadata boundary. */
+TEST(Test__PrefixStateCacheLRU, DiskHintReconciliationIsOncePerLookupAndHarvestStaysNonblocking)
+{
+    ScopedPresenceArchive directory;
+    auto disk = makeDiskBackend(directory.path, 128);
+    auto ram = std::make_shared<RamPrefixStorageBackend>(64);
+    auto cache = std::make_shared<PrefixStateCache>(32, ram, disk);
+    const auto layout = layoutBytes(32);
+    ASSERT_TRUE(cache->insert(ram->allocate(keyFor(0), layout)));
+    cache->completeInsertPreparation(keyFor(1), 32);
+    ASSERT_TRUE(cache->insert(ram->allocate(keyFor(1), layout)));
+    auto lookup = cache->beginLookup();
+    EXPECT_FALSE(lookup->selectLongest(0xcafe, 0, 0, 0, {999}));
+    HeldArchiveLock held(disk->archivePath());
+    ASSERT_TRUE(held.valid());
+    std::promise<void> started;
+    auto running = started.get_future();
+    auto checked = std::async(std::launch::async, [&] {
+        started.set_value();
+        return cache->contains(keyFor(0)) &&
+            !lookup->selectLongest(0xcafe, 0, 1, 1, {1000}) &&
+            cache->beginLookup()->selectLongest(0xbeef, 0, 1, 1, {1}).has_value();
+    });
+    running.wait();
+    const auto progress = checked.wait_for(std::chrono::seconds(1));
+    // Release on both outcomes: a regression must fail, never strand its worker.
+    held.release();
+    EXPECT_EQ(progress, std::future_status::ready)
+        << "Harvest checks, RAM hits and later misses must not wait for unrelated I/O";
+    EXPECT_TRUE(checked.get());
+}
+
+/** @test A failed miss-boundary metadata read does not turn stale hints into false absence. */
+TEST(Test__PrefixStateCacheLRU, DiskHintReconciliationFailureIsFatalAndPreservesHints)
+{
+    ScopedPresenceArchive directory;
+    auto disk = makeDiskBackend(directory.path, 128);
+    auto ram = std::make_shared<RamPrefixStorageBackend>(64);
+    auto cache = std::make_shared<PrefixStateCache>(32, ram, disk);
+    const auto layout = layoutBytes(32);
+    ASSERT_TRUE(cache->insert(ram->allocate(keyFor(0), layout)));
+    cache->completeInsertPreparation(keyFor(1), 32);
+    ASSERT_TRUE(cache->insert(ram->allocate(keyFor(1), layout)));
+    const auto saved = directory.path / "saved-archive";
+    std::filesystem::rename(disk->archivePath(), saved);
+    std::filesystem::create_directory(disk->archivePath());
+    auto lookup = cache->beginLookup();
+    EXPECT_THROW(lookup->selectLongest(0xcafe, 0, 0, 0, {999}), std::runtime_error);
+    EXPECT_TRUE(cache->isDiskResident(keyFor(0)));
+    EXPECT_TRUE(cache->contains(keyFor(0))) << "A presence hint is an in-memory observation";
+    EXPECT_TRUE(cache->beginLookup()->selectLongest(0xbeef, 0, 1, 1, {1}));
+    std::filesystem::remove(disk->archivePath());
+    std::filesystem::rename(saved, disk->archivePath());
+}
+
+/** @test Reconciliation retires lookup hints without invalidating a selected inode lease. */
+TEST(Test__PrefixStateCacheLRU, DiskHintReconciliationPreservesSelectedSourceAfterPeerEviction)
+{
+    ScopedPresenceArchive directory;
+    auto disk = makeDiskBackend(directory.path, 32);
+    auto peer = makeDiskBackend(directory.path, 32);
+    auto ram = std::make_shared<RamPrefixStorageBackend>(64);
+    auto cache = std::make_shared<PrefixStateCache>(64, ram, disk);
+    RamPrefixStorageBackend staging(32);
+    const auto layout = layoutBytes(32);
+    auto original = staging.allocate(keyFor(0), layout);
+    ASSERT_TRUE(original.valid());
+    std::fill(original.kv_storage->begin(), original.kv_storage->end(), 0x5a);
+    ASSERT_TRUE(disk->writeBlock(original, nullptr));
+    ASSERT_TRUE(staging.release(original));
+    ASSERT_TRUE(cache->installDiscoveredDiskEntries(0xbeef, layout));
+    auto lookup = cache->beginLookup();
+    const auto selected = lookup->selectLongest(0xbeef, 0, 0, 0, {0});
+    ASSERT_TRUE(selected);
+    auto replacement = staging.allocate(keyForFingerprint(0xcafe, 0), layout);
+    ASSERT_TRUE(replacement.valid());
+    ASSERT_TRUE(peer->writeBlock(replacement, nullptr));
+    ASSERT_TRUE(staging.release(replacement));
+    EXPECT_FALSE(lookup->selectLongest(0xcafe, 0, 1, 1, {1}));
+    EXPECT_FALSE(cache->isDiskResident(keyFor(0)));
+    const auto restored = lookup->materialize({*selected});
+    ASSERT_EQ(restored.size(), 1u);
+    ASSERT_TRUE(restored.front().kv_storage);
+    EXPECT_TRUE(std::all_of(restored.front().kv_storage->begin(),
+        restored.front().kv_storage->end(), [](uint8_t byte) { return byte == 0x5a; }));
+}

@@ -1222,6 +1222,52 @@ scripts/docker/build-runtime-image.sh --cpu-isa AVX512 --tag llaminar:local
 Use `--cpu-isa AVX2` for an AVX2 image. A local image is not CI-certified merely
 because it built successfully.
 
+### Projection arithmetic diagnostics
+
+Qwen GDN MoE alpha/beta projections use FP16 weights and activations with FP32
+accumulation by default. Dense models retain native arithmetic because matched
+canaries found higher decode KL with half alpha/beta operands. CUDA and ROCm
+use the same model scope. The default policy is
+`LLAMINAR_GDN_PROJECTION_ARITHMETIC=fp16_moe_alpha_beta`.
+QKV, Z and output projections retain their native weights and arithmetic.
+The explicit `fp16_alpha_beta` policy selects half controls for both dense and
+MoE experiments. Both selective half policies require original floating
+alpha/beta weights and reject quantized sources where half operands are selected.
+Select `native` explicitly for the original arithmetic; `fp16` applies half
+operands to all GDN projections and `fp32` selects full floating operands.
+Router precision and Q8 expert GEMM stay unchanged. Planning, prepared engines
+and prefix-cache identity include the selected policy.
+
+### Router arithmetic diagnostics
+
+For FP32 router source weights, the native CUDA policy uses FP32 routing in
+ordinary prefill and Q8 routing in decode and serial-equivalent verification.
+The native ROCm policy uses Q8 in both phases. These router choices are separate
+from the Q8 activation arithmetic used by quantized expert GEMM.
+
+`LLAMINAR_MOE_ROUTER_ARITHMETIC=native_hadamard32` rotates floating source
+router weights and activations together before their first Q8 conversion.
+It leaves floating router paths unchanged and restores the original activation
+basis for expert GEMM. Already quantized source weights are not requantized.
+
+CUDA Q8 prefill uses INT8 tensor cores with exact INT32 block products and
+the serial router's FP32 reduction tree. Tiles depend on the complete M/N/K
+geometry and GPU block capacity. Sparse output grids cooperate across K with
+an exact shared-memory tree; dense grids group output tiles and minimize tails.
+Power-of-two K specialization is independent of model, expert count and batch
+size. Larger batches retain tensor cores. Decode and MTP verification retain
+their serial-equivalent Q8 kernel.
+
+For an explicit CUDA comparison using Q8 in both phases, select
+`LLAMINAR_CUDA_MOE_ROUTER_PREFILL=q8`; its default is `fp32`.
+The Q8 prefill option requires enabled Q8 routing and an FP32 prepared router
+gate. An incompatible floating operand override is rejected. Pair this option
+with `native_hadamard32` to rotate both CUDA phases. Prefix-cache identity
+includes both choices. Compare full-model accuracy and phase throughput before
+choosing an arithmetic policy; lower router error alone does not guarantee
+lower final-logit divergence. `src/v2/utils/DebugEnv.h` owns these diagnostic
+settings.
+
 ### Optional corpora
 
 Ordinary checkouts, builds, Docker images, and Unit/preflight tests do not

@@ -1,3 +1,11 @@
+/**
+ * @file CUDAWeightPacker.cpp
+ * @brief CUDA native format execution and original-source tuple preservation.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
+ */
+
 #include "CUDAWeightPacker.h"
 
 #include "CUDAQuantisedGemmKernel.h"
@@ -70,12 +78,13 @@ namespace llaminar2::cuda
                 return false;
             }
 
+            const auto physical = canonicalDeviceVnniFormat(*info);
             const int blocks_per_row = K / 32;
             out.native_vnni.assign(static_cast<size_t>(blocks_per_row) * N * info->payload_bytes, uint8_t{0});
             out.native_scales.assign(static_cast<size_t>(blocks_per_row) * N, uint16_t{0});
             out.native_mins.clear();
             out.native_emins.clear();
-            if (info->is_asymmetric)
+            if (physical.is_asymmetric)
             {
                 out.native_mins.assign(static_cast<size_t>(blocks_per_row) * N, uint16_t{0});
             }
@@ -83,7 +92,7 @@ namespace llaminar2::cuda
             {
                 out.native_emins.assign(static_cast<size_t>(blocks_per_row) * N, uint32_t{0});
             }
-            out.native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
+            out.native_codebook_id = physical.codebook_id;
             out.native_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
             out.native_source_identity = {
                 .codebook_id = info->codebook_id,
@@ -99,7 +108,7 @@ namespace llaminar2::cuda
             ctx.payload_bytes = info->payload_bytes;
             ctx.payload_array = out.native_vnni.data();
             ctx.scales_array = out.native_scales.data();
-            ctx.mins_array = info->is_asymmetric ? out.native_mins.data() : nullptr;
+            ctx.mins_array = physical.is_asymmetric ? out.native_mins.data() : nullptr;
             ctx.emins_array = info->has_emins ? out.native_emins.data() : nullptr;
 
 #pragma omp parallel for schedule(static)
@@ -339,23 +348,24 @@ namespace llaminar2::cuda
 
         const int blocks_per_row = K / 32;
 
+        const auto physical = canonicalDeviceVnniFormat(*info);
         auto batch = std::make_shared<MoEBatchPackedWeightsCUDA>();
         batch->num_experts = num_experts;
         batch->rows_per_expert = rows_per_expert;
         batch->K = K;
         batch->blocks_per_row = blocks_per_row;
-        batch->codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
+        batch->codebook_id = physical.codebook_id;
 
         // Per-expert sizes
         batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;
         batch->scales_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
-        batch->mins_per_expert = info->is_asymmetric ? batch->scales_per_expert : 0;
+        batch->mins_per_expert = physical.is_asymmetric ? batch->scales_per_expert : 0;
         batch->emins_per_expert = info->has_emins ? batch->scales_per_expert : 0;
 
         // Allocate contiguous slabs
         batch->all_vnni.assign(static_cast<size_t>(num_experts) * batch->vnni_bytes_per_expert, uint8_t{0});
         batch->all_scales.assign(static_cast<size_t>(num_experts) * batch->scales_per_expert, uint16_t{0});
-        if (info->is_asymmetric)
+        if (physical.is_asymmetric)
             batch->all_mins.assign(static_cast<size_t>(num_experts) * batch->mins_per_expert, uint16_t{0});
         if (info->has_emins)
             batch->all_emins.assign(static_cast<size_t>(num_experts) * batch->emins_per_expert, uint32_t{0});
@@ -378,7 +388,7 @@ namespace llaminar2::cuda
             ctx.payload_bytes = info->payload_bytes;
             ctx.payload_array = batch->all_vnni.data() + e * batch->vnni_bytes_per_expert;
             ctx.scales_array = batch->all_scales.data() + e * batch->scales_per_expert;
-            ctx.mins_array = info->is_asymmetric
+            ctx.mins_array = physical.is_asymmetric
                                  ? batch->all_mins.data() + e * batch->mins_per_expert
                                  : nullptr;
             ctx.emins_array = info->has_emins

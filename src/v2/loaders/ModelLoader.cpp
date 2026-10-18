@@ -378,7 +378,7 @@ namespace llaminar2
         case GGUFTensorType::Q6_K:
             return 210;
         case GGUFTensorType::Q8_K:
-            return 288;
+            return sizeof(Q8_KBlock);
         case GGUFTensorType::IQ2_XXS:
             return 66;
         case GGUFTensorType::IQ2_XS:

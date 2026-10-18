@@ -7,7 +7,8 @@
  * - BF16/FP16 output: Lookup FP32 embeddings, then convert
  * - Q8_1 output: Lookup FP32 embeddings, then quantize to Q8_1 format
  *
- * The embedding table is always FP32 (stored in model weights).
+ * Native quantized weights retain their original codebook and scale metadata.
+ * Only consumed rows are decoded; no derived whole-table quantization is cached.
  * Output format is determined by activation precision configuration.
  *
  * @author David Sanftenberg
@@ -18,7 +19,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../CPUKernelBase.h"
-#include "../../common/EmbedQ8Repack.h"
+#include "../../common/NativeEmbeddingLayout.h"
 #include <memory>
 
 namespace llaminar2
@@ -90,7 +91,16 @@ namespace llaminar2
             int device_idx = -1);
 
         /**
-         * @brief Apply embedding lookup using tensor objects with automatic type dispatch
+         * @brief Decode requested native weight rows and publish the declared activation type.
+         * @param embed_table Live native source table; quantized weights are never requantized.
+         * @param token_ids Host-owned global vocabulary IDs for this CPU transaction.
+         * @param num_tokens Number of live requested rows.
+         * @param d_model Logical values per source and output row.
+         * @param output Caller-owned FP32/BF16/FP16/Q8_1 activation storage.
+         * @param mpi_ctx Optional declared vocabulary-shard context.
+         * @param device_idx CPU execution identity, retained by the common interface.
+         * @return True after every live output row has been written, false for invalid input.
+         * @throws std::runtime_error If a released or malformed source cannot decode its row.
          */
         bool apply_tensor(
             const TensorBase *embed_table,
@@ -119,10 +129,6 @@ namespace llaminar2
         }
 
     private:
-        /// Cached EmbedQ8 repack of quantized embedding table (avoids full FP32 dequant)
-        mutable const TensorBase *cached_embed_table_ = nullptr;
-        mutable std::shared_ptr<const EmbedQ8RepackResult> cached_repack_;
-
         /// Vocab-parallel sharding state (set by apply_tensor, used by inner apply* functions)
         /// When embedding table is sharded across TP ranks, each rank holds a slice of the
         /// vocabulary. vocab_offset_ is the first global vocab index in this shard.

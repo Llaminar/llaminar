@@ -13,6 +13,8 @@
 #include "planning/WorkspaceMemoryEstimator.h"
 
 #include "config/GDNHeadAssignment.h"
+#include "loaders/PreparedWeightRepresentationContract.h"
+#include "utils/DebugEnv.h"
 #include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
@@ -1104,10 +1106,10 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
                 tensor.quant_type + " tensor " + tensor.name);
         }
         const std::uint8_t codebook =
-            canonicalDeviceVnniCodebookId(format->codebook_id);
+            canonicalDeviceVnniCodebookId(*format);
         return cuda::quantized_gemm_workspace::NativeCodebooks{
             .execution = codebook,
-            .arithmetic = codebook,
+            .arithmetic = canonicalDeviceVnniCodebookId(format->codebook_id),
         };
     };
 
@@ -1432,7 +1434,10 @@ size_t maximumFloatingProjectionColumns(
         const bool routed = isRoutedExpertWeight(tensor.name);
         if (tensor.layer_index < geometry.first_layer ||
             tensor.layer_index > geometry.last_layer ||
-            (routed_only && !routed) || !isFloatingWeight(tensor) ||
+            (routed_only && !routed) ||
+            (!isFloatingWeight(tensor) && PreparedWeightRepresentationContract::resolve(
+                inferWeightRole(tensor.name), tensor.quant_type, tensor.name, profile.architecture,
+                debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic) == ModelPreparedWeightRepresentation::SourceNative) ||
             tensor.K == 0 || tensor.elements < tensor.K)
         {
             continue;
@@ -1489,17 +1494,42 @@ size_t gpuFloatingPointWorkspaceBytes(
     if (columns == 0)
         return 0;
 
+    WorkspaceRequirements scoped_gdn;
+    if (!routed_only && debugEnv().gemm.gdn_projection_arithmetic != GDNProjectionArithmetic::Native)
+    {
+        const auto sharding = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
+        for (const auto &tensor : profile.tensors)
+        {
+            if (!workspaceOwnsTensor(tensor, profile, geometry) ||
+                PreparedWeightRepresentationContract::effectiveGDNArithmetic(
+                    inferWeightRole(tensor.name), tensor.name, profile.architecture,
+                    debugEnv().gemm.gdn_projection_arithmetic) != GDNProjectionArithmetic::FP16) continue;
+            const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding, false);
+            if (!shape.valid()) throw std::invalid_argument("GDN half workspace has no source matrix geometry: " + tensor.name);
+            if (geometry.device.is_rocm())
+                scoped_gdn.merge(rocm::floating_gemm_workspace::projectionRequirements(
+                    execution_rows, shape.input_columns, FloatingActivationOperandPrecision::FP16RNE));
+            else
+                scoped_gdn.merge(cuda::floating_gemm_workspace::projectionRequirements(
+                    execution_rows, shape.output_columns, shape.input_columns, FloatingActivationOperandPrecision::FP16RNE));
+        }
+    }
+
     // The routed-only ROCm caller already composes the descriptor-based
     // direct/compact GEMM contract. Dense/continuation graphs need its same
     // BLAS region and pointer ABI here, without a second live ledger.
     if (geometry.device.is_rocm())
-        return routed_only ? 0u : rocm::floating_gemm_workspace::projectionRequirements()
-            .total_bytes_with_alignment();
+    {
+        if (routed_only) return 0;
+        scoped_gdn.merge(rocm::floating_gemm_workspace::projectionRequirements());
+        return scoped_gdn.total_bytes_with_alignment();
+    }
 
     // Count both physical pointer triplets: the wrapper and its cuBLAS
     // adapter use distinct captured addresses. Runtime and admission now
     // compose the same names instead of separately reconstructing their sum.
     auto requirements = cuda::floating_gemm_workspace::projectionRequirements(execution_rows, columns);
+    requirements.merge(scoped_gdn);
     if (!routed_only && geometry.compact_routed_expert_token_rows)
     {
         const auto routed_columns = maximumFloatingProjectionColumns(profile, geometry, true);
@@ -1578,6 +1608,8 @@ std::optional<WorkspaceMemoryGeometry> retainedMTPAttentionGeometry(
         .first_layer = profile.n_layers - profile.mtp_layer_count,
         .last_layer = profile.n_layers - 1,
         .total_shards = 1,
+        .attention_kv_format = geometry.attention_kv_format,
+        .attention_visibility = geometry.attention_visibility,
     };
 }
 
@@ -1644,6 +1676,14 @@ WorkspaceRequirements exactAttentionMemberRequirements(
     size_t partial_m = 0;
     size_t partial_l = 0;
 
+    const int local_kv_heads =
+        geometry.local_kv_heads > 0
+            ? geometry.local_kv_heads
+            : std::max(
+                  1,
+                  (profile.n_kv_heads + geometry.total_shards - 1) /
+                      geometry.total_shards);
+
     if (geometry.device.is_cuda())
     {
         const cuda::fa2_policy::FA2PrefillParallelGeometry current{
@@ -1655,6 +1695,15 @@ WorkspaceRequirements exactAttentionMemberRequirements(
             .sm_count = geometry.device_compute_units,
             .requested_axis =
                 attention::AttentionPrefillParallelAxis::GeometrySelected,
+            .visible_kv_heads = local_kv_heads,
+            .head_start = geometry.local_query_head_start,
+            .replicated_gqa_n_rep = local_query_heads < profile.n_heads && local_kv_heads == profile.n_kv_heads
+                ? profile.n_heads / profile.n_kv_heads : 0,
+            .native_kv_format = geometry.attention_kv_format,
+            .visibility = geometry.attention_visibility,
+            .query_warp_groups_override = debugEnv().attention.cuda_fa2_q_warp_groups,
+            .pv_warps_override = debugEnv().attention.cuda_fa2_hd256_pv_warps,
+            .tile_kv_override = debugEnv().attention.cuda_fa2_tile_kv,
         };
         const auto plan = cuda::fa2_policy::selectFA2PrefillParallelPlan(current);
         if (!plan.valid)
@@ -1692,6 +1741,8 @@ WorkspaceRequirements exactAttentionMemberRequirements(
                 rocm::fa2_policy::kROCmFA2LDSCapacityBytes,
             .requested_axis =
                 attention::AttentionPrefillParallelAxis::GeometrySelected,
+            .kv_format = geometry.attention_kv_format,
+            .visibility = geometry.attention_visibility,
         };
         const auto plan =
             rocm::fa2_policy::selectROCmFA2PrefillParallelPlan(current);
@@ -1716,13 +1767,6 @@ WorkspaceRequirements exactAttentionMemberRequirements(
         }
     }
 
-    const int local_kv_heads =
-        geometry.local_kv_heads > 0
-            ? geometry.local_kv_heads
-            : std::max(
-                  1,
-                  (profile.n_kv_heads + geometry.total_shards - 1) /
-                      geometry.total_shards);
     const attention::AttentionWorkspaceCardinality cardinality =
         attention::planAttentionWorkspaceCardinality(
             geometry.resident_graph_rows,

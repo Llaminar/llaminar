@@ -166,6 +166,12 @@ namespace llaminar2
         /** @return Every local stage's metadata publishers, without contacting remote stages. */
         PrefixCacheTelemetrySources prefixCacheTelemetrySourcesAll() const;
         /**
+         * @brief Collect terminal prefix owners from every local stage.
+         * @param shutdown Cohort retaining original cache owners until terminal persistence.
+         * @throws std::exception If retaining source metadata fails.
+         */
+        void collectPrefixCacheShutdownAll(PrefixCacheShutdown &shutdown) const;
+        /**
          * @brief Admit one immutable stop-token policy into every local runner.
          *
          * Global orchestration is a transparent ownership boundary: request
@@ -484,6 +490,8 @@ namespace llaminar2
         void clear_cache() override;
         /** @copydoc IInferenceRunner::purgePrefixCache */
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::collectPrefixCacheShutdown */
+        void collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const override;
         /** @copydoc IInferenceRunner::prefixCacheTelemetrySources */
         PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override;
         int get_position() const override;

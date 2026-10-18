@@ -7,6 +7,9 @@
  * the former public ABI while allowing Ninja to compile all eight template
  * groups concurrently.  Trainer controls fan out to every shard because they
  * are semantic execution state, not per-format preferences.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 
 #include "CUDANativeVNNIGemvShard.h"
@@ -29,6 +32,7 @@ constexpr int shardIndexForCodebook(uint8_t codebook_id)
     {
     case 0:
     case 4:
+    case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
         return 0;
     case 5:
     case 6:

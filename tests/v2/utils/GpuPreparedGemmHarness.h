@@ -240,7 +240,7 @@ namespace llaminar2::test
         orchestrator->addDevice(device.ordinal);
         orchestrator->planWeight(
             device.ordinal, canonical_name, N, K,
-            vnni->payload_bytes, vnni->is_asymmetric, vnni->has_emins, raw_bytes);
+            vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric, vnni->has_emins, raw_bytes);
 
         constexpr int kNumStreams = 3;
         orchestrator->allocate(raw_bytes, kNumStreams);
@@ -252,7 +252,7 @@ namespace llaminar2::test
         job.format = *repack_fmt;
         job.N = N;
         job.K = K;
-        job.is_asymmetric = vnni->is_asymmetric;
+        job.is_asymmetric = canonicalDeviceVnniFormat(*vnni).is_asymmetric;
         orchestrator->addWeightJob(device.ordinal, job);
         orchestrator->load();
 
@@ -457,7 +457,7 @@ namespace llaminar2::test
         out.orchestrator->addDevice(device.ordinal);
         out.orchestrator->planWeight(
             device.ordinal, canonical_name, N, K,
-            vnni->payload_bytes, vnni->is_asymmetric, vnni->has_emins, raw_bytes);
+            vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric, vnni->has_emins, raw_bytes);
 
         // Allocate pool + staging. Pinned slot size must cover the largest raw weight.
         constexpr int kNumStreams = 3;
@@ -471,7 +471,7 @@ namespace llaminar2::test
         job.format = *repack_fmt;
         job.N = N;
         job.K = K;
-        job.is_asymmetric = vnni->is_asymmetric;
+        job.is_asymmetric = canonicalDeviceVnniFormat(*vnni).is_asymmetric;
         out.orchestrator->addWeightJob(device.ordinal, job);
         out.orchestrator->load();
 
@@ -520,12 +520,19 @@ namespace llaminar2::test
      * CUDA/ROCm floating-point GEMM kernel is bound to that persistent device
      * pointer and registered in a PreparedWeightStore. Keep the returned object
      * alive while using the borrowed kernel pointer.
+     * @param weights Host source owning the immutable floating words.
+     * @param device Physical GPU owning the prepared pool and engine.
+     * @param canonical_name Unique source identity within the test model.
+     * @param model_id Prepared-store lifetime identity.
+     * @param operand_precision Immutable activation rounding for the engine and binding.
+     * @return Owner retaining the loader, pool and prepared engine.
      */
     inline GpuPreparedGemm makeGpuPreparedFloatingPointGemm(
         TensorBase *weights,
         DeviceId device,
         const std::string &canonical_name = "test.gpu_prepared_fp_gemm.weight",
-        ModelContextId model_id = ModelContextId{9900})
+        ModelContextId model_id = ModelContextId{9900},
+        FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native)
     {
         namespace kf = llaminar::v2::kernels;
 
@@ -569,7 +576,8 @@ namespace llaminar2::test
         out.orchestrator->load();
 
         auto kernel = kf::KernelFactory::createGemmFromGPUWeightPool(
-            *weights, device, out.orchestrator, canonical_name);
+            *weights, device, out.orchestrator, canonical_name, 0,
+            GPUPreparedWeightPoolLayout::SourceNative, operand_precision);
 
         auto owned_kernel = std::shared_ptr<ITensorGemm>(std::move(kernel));
         auto prepared_weights = std::make_shared<kf::KernelFactory::PreparedGemmWeights>();
@@ -586,6 +594,7 @@ namespace llaminar2::test
 
         out.store = std::make_unique<PreparedWeightStore>(model_id);
         out.binding = makePreparedWeightTestBinding(weights, device, canonical_name, model_id);
+        out.binding.floating_operand_precision = operand_precision;
         out.ref = out.store->registerPreparedGemmHandle(
             out.binding,
             preparedKindForDevice(device),

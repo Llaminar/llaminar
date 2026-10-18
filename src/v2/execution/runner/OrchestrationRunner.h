@@ -515,6 +515,19 @@ namespace llaminar2
         void broadcastCommand(MPICommand cmd);
 
     private:
+        /**
+         * @brief Seal and persist participant RAM prefixes once, before native teardown.
+         * @throws std::logic_error If an incomplete terminal publication is reentered.
+         * @throws std::exception For invalid metadata, active leases or durable I/O failure.
+         * Multi-rank publication failure aborts the live communicator before propagation.
+         *
+         * Every coordinated rank enters from SHUTDOWN after maintenance drains;
+         * local and non-coordinated runners enter from ordinary shutdown. Fatal
+         * persistence errors must not masquerade as successful server retirement.
+         */
+        void flushPrefixCacheOnShutdown();
+        enum class PrefixShutdownLifecycle { Pending, Flushing, Complete };
+        PrefixShutdownLifecycle prefix_shutdown_lifecycle_ = PrefixShutdownLifecycle::Pending;
         // =====================================================================
         // Initialization Helpers
         // =====================================================================

@@ -1,5 +1,7 @@
 /**
  * @file CPUNativeVNNIWeightPacker.h
+ * IQ3_S keeps original half/nibble factors beside unchanged decoded grid bytes;
+ * all effective-scale loads reconstruct in FP32 before existing contributions.
  * @brief Repacks tensor weights from native quantized formats into a CPU-cache-friendly
  *        layout for NativeVNNI GEMV/GEMM with inline decode + vpdpbusd accumulation.
  *
@@ -22,11 +24,11 @@
  *   - blocks_per_row = ceil(K/32)
  *   - payload_bytes = format-specific (Q4_0=16, IQ4_NL=16, Q6_K=24, etc.)
  *
- * scales: [N_chunks][blocks_per_row][64] × FP32
- *   - One scale per 32-element block per column
+ * scales: [N_chunks][blocks_per_row][64] × uint16_t
+ *   - FP16 scale, or original FP16 superblock base for Q6_K/IQ2_S/IQ4_XS
  *
- * mins: [N_chunks][blocks_per_row][64] × FP32  (only for asymmetric formats)
- *   - One min offset per block per column
+ * mins: [N_chunks][blocks_per_row][64] × uint16_t (asymmetric/dual-scale)
+ *   - FP16 minimum/second scale; Q6_K packs signed coefficients, IQ2_S/IQ4_XS raw source coefficients
  * ```
  *
  * This layout ensures:
@@ -57,6 +59,11 @@
 #include "tensors/FP16Utils.h"
 #include "tensors/TensorClasses.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeVnniQ6Scale.h"
+#include "tensors/NativeVnniIQ2SScale.h"
+#include "tensors/NativeVnniIQ4XSScale.h"
+#include "tensors/NativeVnniIQ3SScale.h"
+#include "kernels/common/DeviceFP32NumericalContract.h"
 #include "utils/Logger.h"
 
 namespace llaminar2::cpu::native_vnni
@@ -75,6 +82,8 @@ namespace llaminar2::cpu::native_vnni
     {
         if (rotation_enabled)
             return CPUNativeVNNIEncoding::ExpandedInt8;
+        if (codebook_id == 11)
+            return CPUNativeVNNIEncoding::IQ3SExpandedSourceScale;
         if (is_nibble_lut_format(codebook_id))
             return CPUNativeVNNIEncoding::NibbleLUT;
         if (codebook_id == 8)
@@ -82,6 +91,19 @@ namespace llaminar2::cpu::native_vnni
         if (hasCompactMultiScaleVnniPayload(codebook_id))
             return CPUNativeVNNIEncoding::CompactMultiScale;
         return CPUNativeVNNIEncoding::ExpandedInt8;
+    }
+
+    /** @brief Select CPU encoding using the original source tuple.
+     * @param source Original GGUF descriptor, including superblock identity.
+     * @param rotation_enabled Explicit separately selected rotated INT8 policy.
+     * @return Lossless ordinary encoding or the unchanged explicit rotation encoding.
+     */
+    [[nodiscard]] inline CPUNativeVNNIEncoding preparedEncodingForSource(
+        const NativeVnniFormatInfo &source, bool rotation_enabled = false) noexcept
+    {
+        if (!rotation_enabled && source.codebook_id == 4 && source.is_superblock)
+            return CPUNativeVNNIEncoding::NibbleLUTSourceScale;
+        return preparedEncodingForCodebook(source.codebook_id, rotation_enabled);
     }
 
     /**
@@ -108,6 +130,20 @@ namespace llaminar2::cpu::native_vnni
             .activation_bytes_per_row_k_block = sizeof(Q8_1Block),
             .output_bytes_per_row_n_chunk = 64u * sizeof(float),
         };
+    }
+
+    /** @brief Compute source-aware footprint without materializing weight data.
+     * @param source Exact original source descriptor.
+     * @param rotation_enabled Explicit CPU rotation policy.
+     * @return Authoritative physical per-unit weight and activation byte counts.
+     */
+    [[nodiscard]] inline NativeVNNIPreparedFootprint preparedFootprintForFormat(
+        const NativeVnniFormatInfo &source, bool rotation_enabled = false) noexcept
+    {
+        auto result = preparedFootprintForFormat(source.codebook_id, source.is_asymmetric, rotation_enabled);
+        result.encoding = preparedEncodingForSource(source, rotation_enabled);
+        result.weight_bytes_per_n_chunk_k_block = preparedInterleavedBlockStride(result.encoding, result.is_asymmetric);
+        return result;
     }
 
     /**
@@ -159,7 +195,7 @@ namespace llaminar2::cpu::native_vnni
         case 17: return 56;  // IQ1_MBlock
         case 19: return 34;  // Q8_0Block
         case 20: return 36;  // Q8_1Block
-        case 21: return 288; // Q8_KBlock
+        case 21: return sizeof(Q8_KBlock); // Original FP32-scale Q8_K source block
         default: return 0;
         }
     }
@@ -233,13 +269,25 @@ namespace llaminar2::cpu::native_vnni
         /** @brief Return whether this matrix uses native four-bit interleaving. */
         [[nodiscard]] bool usesNibbleLUT() const noexcept
         {
-            return encoding == CPUNativeVNNIEncoding::NibbleLUT;
+            return encoding == CPUNativeVNNIEncoding::NibbleLUT || usesNibbleLUTSourceScale();
+        }
+
+        /** @brief Whether raw IQ4_XS source factors accompany the nibble payload. */
+        [[nodiscard]] bool usesNibbleLUTSourceScale() const noexcept
+        {
+            return encoding == CPUNativeVNNIEncoding::NibbleLUTSourceScale;
         }
 
         /** @brief Return whether this matrix was expanded to signed INT8. */
         [[nodiscard]] bool usesExpandedInt8() const noexcept
         {
-            return encoding == CPUNativeVNNIEncoding::ExpandedInt8;
+            return encoding == CPUNativeVNNIEncoding::ExpandedInt8 || usesIQ3SExpandedSourceScale();
+        }
+
+        /** @brief Whether decoded IQ3_S grid bytes retain original source factors. */
+        [[nodiscard]] bool usesIQ3SExpandedSourceScale() const noexcept
+        {
+            return encoding == CPUNativeVNNIEncoding::IQ3SExpandedSourceScale;
         }
 
         /** @brief Return whether this matrix retains native dual-scale Q6_K. */
@@ -325,15 +373,104 @@ namespace llaminar2::cpu::native_vnni
             return payload.data() + offset;
         }
 
-        /// Scale for N-chunk c, K-block kb, column n_local (returns FP32, converts from FP16)
+#if defined(__AVX512F__)
+        /** @brief Load sixteen effective scales without rounding source products to half.
+         * @param primary Aligned inline primary words, within one64-column unit.
+         * @return Widened ordinary scale or exact IQ4_XS base times signed coefficient.
+         */
+        [[nodiscard]] inline __m512 loadScales512(const uint16_t *primary) const
+        {
+            const __m512 base = _mm512_cvtph_ps(_mm256_load_si256(
+                reinterpret_cast<const __m256i *>(primary)));
+            if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
+            const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
+                reinterpret_cast<const __m256i *>(primary + 64)));
+            if (usesIQ3SExpandedSourceScale())
+            {
+                if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~15)) != 0)
+                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
+                return _mm512_mul_ps(base, _mm512_cvtepi32_ps(_mm512_add_epi32(
+                    _mm512_slli_epi32(raw, 1), _mm512_set1_epi32(1))));
+            }
+            return _mm512_mul_ps(base, _mm512_cvtepi32_ps(
+                _mm512_sub_epi32(_mm512_and_si512(raw, _mm512_set1_epi32(63)), _mm512_set1_epi32(32))));
+        }
+#endif
+#if defined(__AVX2__)
+        /** @brief Load eight effective scales using the same original source equation.
+         * @param primary Aligned inline primary words, within one64-column unit.
+         * @return Separately rounded FP32 scale vector, shared across grouped rows.
+         */
+        [[nodiscard]] inline __m256 loadScales256(const uint16_t *primary) const
+        {
+            const __m256 base = _mm256_cvtph_ps(_mm_load_si128(
+                reinterpret_cast<const __m128i *>(primary)));
+            if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
+            const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
+                reinterpret_cast<const __m128i *>(primary + 64)));
+            if (usesIQ3SExpandedSourceScale())
+            {
+                if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~15)))
+                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
+                return _mm256_mul_ps(base, _mm256_cvtepi32_ps(_mm256_add_epi32(
+                    _mm256_slli_epi32(raw, 1), _mm256_set1_epi32(1))));
+            }
+            return _mm256_mul_ps(base, _mm256_cvtepi32_ps(
+                _mm256_sub_epi32(_mm256_and_si256(raw, _mm256_set1_epi32(63)), _mm256_set1_epi32(32))));
+        }
+#endif
+
+        /**
+         * @brief Resolve the first source factor without narrowing its product.
+         * @param c Physical64-column chunk index.
+         * @param kb Logical32-value K-block index.
+         * @param n_local Column0..63 within the chunk.
+         * @return Q6_K/IQ2_S/IQ4_XS original-source factor or the existing widened scale.
+         */
         inline float blockScale(int c, int kb, int n_local) const
         {
-            return fp16_to_fp32(chunkScales(c, kb)[n_local]);
+            const float base = fp16_to_fp32(chunkScales(c, kb)[n_local]);
+            if (usesIQ3SExpandedSourceScale())
+            {
+                const auto word = chunkMins(c, kb)[n_local];
+                if (!native_vnni_iq3s_scale::valid(word))
+                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
+                return device_fp32_contract::multiply(base, static_cast<float>(
+                    native_vnni_iq3s_scale::coefficient(word)));
+            }
+            if (usesNibbleLUTSourceScale())
+                return device_fp32_contract::multiply(base, static_cast<float>(
+                    native_vnni_iq4xs_scale::coefficient(chunkMins(c, kb)[n_local])));
+            if (usesQ6KNativeDualScale())
+                return device_fp32_contract::multiply(base, static_cast<float>(
+                    native_vnni_q6_scale::low(chunkMins(c, kb)[n_local])));
+            if (codebook_id == 13 && usesCompactMultiScale())
+                return device_fp32_contract::multiply(device_fp32_contract::multiply(
+                    base, 0.5f + static_cast<float>(native_vnni_iq2s_scale::low(
+                        chunkMins(c, kb)[n_local]))), 0.25f);
+            return base;
         }
 
-        /// Min for N-chunk c, K-block kb, column n_local (returns FP32, converts from FP16)
+        /**
+         * @brief Resolve a second source factor or the existing minimum scale.
+         * @param c Physical64-column chunk index.
+         * @param kb Logical32-value K-block index.
+         * @param n_local Column0..63 within the chunk.
+         * @return Q6_K/IQ2_S second source factor or the existing widened minimum.
+         */
         inline float blockMin(int c, int kb, int n_local) const
         {
+            if (usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale())
+                return 0.0f;
+            if (usesQ6KNativeDualScale())
+                return device_fp32_contract::multiply(
+                    fp16_to_fp32(chunkScales(c, kb)[n_local]), static_cast<float>(
+                        native_vnni_q6_scale::high(chunkMins(c, kb)[n_local])));
+            if (codebook_id == 13 && usesCompactMultiScale())
+                return device_fp32_contract::multiply(device_fp32_contract::multiply(
+                    fp16_to_fp32(chunkScales(c, kb)[n_local]),
+                    0.5f + static_cast<float>(native_vnni_iq2s_scale::high(
+                        chunkMins(c, kb)[n_local]))), 0.25f);
             return fp16_to_fp32(chunkMins(c, kb)[n_local]);
         }
 
@@ -346,7 +483,7 @@ namespace llaminar2::cpu::native_vnni
                 interleavedBase() + block_offset + data_stride + compensation_bytes);
         }
 
-        /// Mins pointer for N-chunk c, K-block kb (contiguous 64 FP16 values, inline in native_interleaved)
+        /// Secondary words for one chunk: FP16 minimum/scale, or Q6_K/IQ2_S/IQ3_S/IQ4_XS raw coefficients.
         inline const uint16_t *chunkMins(int c, int kb) const
         {
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
@@ -499,7 +636,8 @@ namespace llaminar2::cpu::native_vnni
         const CPUNativeVNNIPackedWeights &meta,
         uint8_t *workspace)
     {
-        if (meta.usesQ6KNativeDualScale() || meta.usesCompactMultiScale())
+        if (meta.usesQ6KNativeDualScale() || meta.usesCompactMultiScale() ||
+            meta.usesNibbleLUTSourceScale() || meta.usesIQ3SExpandedSourceScale())
         {
             throw std::invalid_argument(
                 "Deferred native-block repacking does not own the source "
@@ -832,6 +970,8 @@ namespace llaminar2::cpu::native_vnni
                     kBlocksPerTile * kValuesPerBlock]{};
                 alignas(64) float scales[kBlocksPerTile]{};
                 alignas(64) float mins[kBlocksPerTile]{};
+                uint16_t source_bases[kBlocksPerTile]{};
+                uint16_t source_coefficients[kBlocksPerTile]{};
 
                 for (int column = 0; column < kColumnsPerChunk; ++column)
                 {
@@ -871,8 +1011,18 @@ namespace llaminar2::cpu::native_vnni
                                     out.codebook_id,
                                     native_payload + local_kb * out.payload_bytes,
                                     decoded + local_kb * kValuesPerBlock);
-                                scales[local_kb] = fp16_to_fp32(native_scales[local_kb]);
-                                mins[local_kb] = fp16_to_fp32(native_mins[local_kb]);
+                                if (out.usesIQ3SExpandedSourceScale())
+                                {
+                                    source_bases[local_kb] = native_scales[local_kb];
+                                    source_coefficients[local_kb] = native_mins[local_kb];
+                                    if (!native_vnni_iq3s_scale::valid(source_coefficients[local_kb]))
+                                        throw std::invalid_argument("IQ3_S source nibble is invalid");
+                                }
+                                else
+                                {
+                                    scales[local_kb] = fp16_to_fp32(native_scales[local_kb]);
+                                    mins[local_kb] = fp16_to_fp32(native_mins[local_kb]);
+                                }
                             }
                         }
                         else if (use_superblock &&
@@ -967,8 +1117,8 @@ namespace llaminar2::cpu::native_vnni
                             }
                             compensation[column] =
                                 static_cast<int16_t>(sum);
-                            inline_scales[column] =
-                                fp32_to_fp16(scales[local_kb]);
+                            inline_scales[column] = out.usesIQ3SExpandedSourceScale()
+                                ? source_bases[local_kb] : fp32_to_fp16(scales[local_kb]);
                         }
                         else
                         {
@@ -976,15 +1126,14 @@ namespace llaminar2::cpu::native_vnni
                             inline_scales[column] = 0;
                         }
 
-                        if (out.is_asymmetric)
+                        if (out.is_asymmetric || out.usesIQ3SExpandedSourceScale())
                         {
                             auto *const inline_mins =
                                 reinterpret_cast<uint16_t *>(
                                     destination + out.data_stride + 256);
                             inline_mins[column] = source_column_valid
-                                                      ? fp32_to_fp16(
-                                                            mins[local_kb])
-                                                      : 0;
+                                ? (out.usesIQ3SExpandedSourceScale()
+                                    ? source_coefficients[local_kb] : fp32_to_fp16(mins[local_kb])) : 0;
                         }
                     }
                 }
@@ -1065,8 +1214,8 @@ namespace llaminar2::cpu::native_vnni
         const bool use_rotated_path = (rotation != nullptr);
         if (use_rotated_path)
             out.is_asymmetric = false;
-        out.encoding = preparedEncodingForCodebook(
-            fmt->codebook_id, use_rotated_path);
+        out.encoding = preparedEncodingForSource(
+            *fmt, use_rotated_path);
 
         out.data_stride = preparedDataStride(out.encoding);
         out.interleaved_block_stride = preparedInterleavedBlockStride(
@@ -1263,14 +1412,15 @@ namespace llaminar2::cpu::native_vnni
             // Preserve the exact 24-byte payload emitted for each logical
             // 32-value block.  The first sixteen bytes carry paired low
             // nibbles and the final eight bytes carry four two-bit high parts
-            // each.  The two FP16 metadata arrays are independent scales for
-            // values [0,16) and [16,32); they are not scale/min correction.
+            // each. The primary metadata retains the original FP16 base; the
+            // secondary word packs both signed source coefficients. Neither
+            // derived factor is rounded to half during preparation.
             //
             // Prepared bytes per 64-column/K block:
             //   1024 B low-nibble transpose
             //    512 B high-two-bit transpose
-            //    128 B low-half scales
-            //    128 B high-half scales
+            //    128 B original half bases
+            //    128 B signed coefficient pairs
             // = 1792 B, versus 2304 B for the previous requantized INT8 path.
             // =================================================================
             std::vector<uint8_t> temp_payload(
@@ -1446,6 +1596,7 @@ namespace llaminar2::cpu::native_vnni
 #pragma omp parallel for schedule(static)
             for (int n = 0; n < N; ++n)
             {
+                if (out.usesNibbleLUTSourceScale()) continue; // Original words come from the native source packer below.
                 int src_row = row_start + n;
                 int chunk = n / 64;
                 int n_local = n % 64;
@@ -1491,7 +1642,7 @@ namespace llaminar2::cpu::native_vnni
             gpu_ctx.payload_bytes = fmt->payload_bytes;
             gpu_ctx.payload_array = temp_payload.data();
             gpu_ctx.scales_array = temp_scales2.data();
-            gpu_ctx.mins_array = fmt->is_asymmetric ? temp_mins2.data() : nullptr;
+            gpu_ctx.mins_array = (fmt->is_asymmetric || out.usesNibbleLUTSourceScale()) ? temp_mins2.data() : nullptr;
             gpu_ctx.emins_array = nullptr;
 
 #pragma omp parallel for schedule(static)
@@ -1516,6 +1667,11 @@ namespace llaminar2::cpu::native_vnni
                         if (n >= N) continue;
                         size_t gpu_idx = (size_t)kb * N_padded + n;
                         size_t cpu_idx = (size_t)chunk * blocks_per_row * 64 + (size_t)kb * 64 + n_local;
+                        if (out.usesNibbleLUTSourceScale())
+                        {
+                            temp_scales[cpu_idx] = temp_scales2[gpu_idx];
+                            temp_mins[cpu_idx] = temp_mins2[gpu_idx];
+                        }
                         std::memcpy(out.payload.data() + cpu_idx * fmt->payload_bytes,
                                     temp_payload.data() + gpu_idx * fmt->payload_bytes,
                                     fmt->payload_bytes);
@@ -1595,7 +1751,7 @@ namespace llaminar2::cpu::native_vnni
                     std::memcpy(inline_scales, &temp_scales[meta_idx], 64 * sizeof(uint16_t));
 
                     // Write mins inline after scales (if asymmetric)
-                    if (out.is_asymmetric)
+                    if (out.is_asymmetric || out.usesNibbleLUTSourceScale())
                     {
                         uint16_t *inline_mins = reinterpret_cast<uint16_t *>(interleaved_dst + 1024 + 256);
                         std::memcpy(inline_mins, &temp_mins[meta_idx], 64 * sizeof(uint16_t));
@@ -1706,7 +1862,7 @@ namespace llaminar2::cpu::native_vnni
                     std::memcpy(inline_scales, &temp_scales[meta_idx], 64 * sizeof(uint16_t));
 
                     // Write mins inline after scales (if asymmetric)
-                    if (out.is_asymmetric)
+                    if (out.is_asymmetric || out.usesNibbleLUTSourceScale())
                     {
                         uint16_t *inline_mins = reinterpret_cast<uint16_t *>(interleaved_dst + 2048 + 256);
                         std::memcpy(inline_mins, &temp_mins[meta_idx], 64 * sizeof(uint16_t));

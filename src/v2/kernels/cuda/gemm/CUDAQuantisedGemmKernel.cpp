@@ -25,8 +25,13 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 
+#include "kernels/common/NativeEmbeddingIQTables.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "CUDAQuantisedGemmKernel.h"
 #include "CUDAQuantisedGemmWorkspaceContract.h"
 #include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
@@ -43,7 +48,6 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/AlignedWorkspaceSlices.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
-#include "execution/local_execution/graph/GraphCaptureGuard.h" // isGraphCaptureActive()
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "utils/Logger.h"
 #include "utils/CUDAKernelProfiler.h"
@@ -847,6 +851,7 @@ namespace llaminar2
                 {
                 case 0:
                 case 4:
+                case kNativeVnniIQ4XSSourceScaleCodebook:
                 case 5:
                 case 6:
                 case 7:
@@ -1228,7 +1233,8 @@ namespace llaminar2
             if (!source_format ||
                 !deviceVnniExecutionCompatibleWithSource(
                     *source_format, codebook_id) ||
-                (codebook_id == kNativeVnniExpandedInt8MinCodebook &&
+                ((codebook_id == 11 || codebook_id == kNativeVnniExpandedInt8MinCodebook ||
+                  codebook_id == kNativeVnniIQ4XSSourceScaleCodebook) &&
                  d_mins == nullptr))
             {
                 throw std::invalid_argument(
@@ -1238,16 +1244,10 @@ namespace llaminar2
             impl_->native_source_identity = source_identity;
             if (allocation_format.payload_bytes_per_block != 0)
             {
+                const auto canonical_format = canonicalDeviceVnniFormat(*source_format);
                 const auto execution_format =
-                    codebook_id == canonicalDeviceVnniCodebookId(
-                                       source_format->codebook_id)
-                        ? NativeVnniMigrationStableDeviceFormat{
-                              .codebook_id = codebook_id,
-                              .payload_bytes_per_block = static_cast<uint8_t>(
-                                  source_format->payload_bytes),
-                              .is_asymmetric = source_format->is_asymmetric,
-                              .has_emins = source_format->has_emins,
-                          }
+                    codebook_id == canonical_format.codebook_id
+                        ? canonical_format
                         : migrationStableDeviceVnniFormat(*source_format);
                 if (allocation_format.payload_bytes_per_block <
                         execution_format.payload_bytes_per_block ||
@@ -1340,6 +1340,12 @@ namespace llaminar2
                 return *it->second;
             }
         } // namespace
+
+        bool prepareNativeIQGridTablesCUDA(int device_ordinal)
+        {
+            return ensureNativeVNNIIQGridTablesInitialized(11, device_ordinal,
+                "Expert tier cold setup");
+        }
 
         void CUDAQuantisedGemmKernel::clearSharedPrefillPools()
         {
@@ -3978,10 +3984,13 @@ namespace llaminar2
                  * grouped verifier must make the same dispatch decision for
                  * every row. It remains one economical runtime-M launch; only
                  * the incompatible ROWPAR promotion is suppressed while the
-                 * explicit decode-equivalent scope is active.
+                 * explicit decode-equivalent scope is active. An explicit
+                 * trainer sweep may consume its setup-prepared ROWPAR view;
+                 * dispatch still rejects a missing view and never creates one.
                  */
                 CUDARowMajorWeights **rowmajor_slot =
-                    explicitSmallMVerifierScopeActive()
+                    explicitSmallMVerifierScopeActive() &&
+                            !cudaNativeVNNIGemvSweep_isActive()
                         ? nullptr
                         : (impl_ ? &impl_->rowmajor : nullptr);
                 return cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
@@ -4086,13 +4095,14 @@ namespace llaminar2
              * route avoids the padded small-M scratch/copy transaction that
              * produced one-ULP repeat drift in Q4_0 focused tests.
              *
-             * Pass a null row-major slot for the canonical verifier oracle.  The
-             * optional ROWPAR auxiliary view is materialized lazily, so comparing
-             * a first decode token against a later token can otherwise compare two
-             * different dispatch families.  Once ROWPAR preparation becomes an
-             * explicit graph warmup step, it can earn its way back through the
-             * same first-call repeat tests.
+             * The canonical verifier oracle keeps its null row-major slot, so
+             * merely preparing an auxiliary view cannot change its dispatch.
+             * Explicit trainer sweeps may consume a setup-prepared ROWPAR view,
+             * matching grouped diagnostics. A missing view remains a hard miss:
+             * the dispatcher never allocates or transposes weights here.
              */
+            CUDARowMajorWeights **rowmajor_slot =
+                cudaNativeVNNIGemvSweep_isActive() ? &impl_->rowmajor : nullptr;
             ScopedNativeVNNIGemvDecodeEquivalentM1Config decode_equivalent_m1_scope;
             const bool ok = cudaNativeVNNIGemvTuned_fp32_withPolicy(
                 d_A_int8,
@@ -4113,7 +4123,7 @@ namespace llaminar2
                 cuda_device_id_,
                 stream_handle,
                 impl_->gemv_ctx,
-                nullptr);
+                rowmajor_slot);
             if (!ok)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv] "
@@ -4504,7 +4514,7 @@ namespace llaminar2
                 {
                     if (const auto *info = unpackable->vnniFormatInfo())
                     {
-                        native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
+                        native_codebook_id = canonicalDeviceVnniCodebookId(*info);
                         native_arithmetic_policy_codebook_id =
                             canonicalDeviceVnniCodebookId(info->codebook_id);
                         has_native_codebook = true;
@@ -4780,3 +4790,35 @@ namespace llaminar2
 
     } // namespace cuda
 } // namespace llaminar2
+
+extern "C" bool cudaNativeEmbeddingIQTableView(int, llaminar2::NativeEmbeddingIQTables *);
+
+namespace llaminar2
+{
+    /**
+     * @brief Prepare a source-embedding view through the existing IQ table authority.
+     * @param ordinal Device whose backend runtime generation owns the grids.
+     * @param source_type Original source codebook; table-free formats return an empty view.
+     * @param tables Output non-owning immutable addresses used by retained lookup graphs.
+     * @return False for capture-time preparation or a failed existing-owner publication.
+     */
+    bool prepareNativeEmbeddingTablesCUDA(
+        int ordinal, TensorType source_type, NativeEmbeddingIQTables &tables)
+    {
+        tables = {};
+        if (ordinal < 0 || isGraphCaptureActive()) return false;
+        switch (source_type)
+        {
+        case TensorType::IQ1_S: case TensorType::IQ1_M:
+        case TensorType::IQ2_XXS: case TensorType::IQ2_XS: case TensorType::IQ2_S:
+        case TensorType::IQ3_XXS: case TensorType::IQ3_S:
+            break;
+        default:
+            return true;
+        }
+        // This function belongs to setup. Even warm symbol lookup is not a
+        // replay operation, and a late factory must never initialize codebooks.
+        if (!cuda::ensureNativeVNNIIQGridTablesInitialized(11, ordinal, "prepareNativeEmbeddingTablesCUDA")) return false;
+        return cudaNativeEmbeddingIQTableView(ordinal, &tables);
+    }
+}

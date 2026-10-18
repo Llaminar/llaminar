@@ -120,7 +120,8 @@ namespace llaminar2
         if (found == source_bytes_per_element_.end())
             throw std::invalid_argument("Request operand does not belong to its measured model");
         return weight.geometry.elements() * (weight.representation == ModelPreparedWeightRepresentation::FP32
-            ? sizeof(float) : found->second);
+            ? sizeof(float) : weight.representation == ModelPreparedWeightRepresentation::FP16
+                ? sizeof(uint16_t) : found->second);
     }
 
     double PlanningRequestCostModel::scalarSeconds(int rank, DeviceId device, int rows,

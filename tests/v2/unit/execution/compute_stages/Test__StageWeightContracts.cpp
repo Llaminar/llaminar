@@ -325,6 +325,14 @@ TEST_F(Test__StageWeightContracts, QuantizedGpuEmbedding_DeclaresExactPreparedBi
     handle.device_id = DeviceId::cuda(1);
     handle.weights = std::make_shared<PreparedEmbeddingWeights>();
     handle.weights->device_id = DeviceId::cuda(1);
+    // This contract fixture registers metadata only; no device allocation or
+    // kernel execution is needed to prove the exact store-owned binding.
+    handle.weights->layout = NativeEmbeddingLayout::forSource(
+        embed->native_type(), embed->rows(), D_MODEL);
+    handle.weights->vocab_size = embed->rows();
+    handle.weights->vocab_offset = 0;
+    handle.weights->total_vocab = embed->rows();
+    handle.weights->d_model = D_MODEL;
     const auto ref = store.registerPreparedEmbeddingFromPipeline(
         binding, DeviceId::cuda(1), &handle);
 
@@ -349,6 +357,14 @@ TEST_F(Test__StageWeightContracts, QuantizedGpuEmbedding_DeclaresExactPreparedBi
     EXPECT_EQ(contract.prepared_weights[0].store, &store);
     EXPECT_EQ(contract.prepared_weights[0].ref.binding_id, ref.binding_id);
     EXPECT_EQ(contract.prepared_weights[0].ref.device, DeviceId::cuda(1));
+    const auto *registered = store.embeddingHandle(ref);
+    ASSERT_NE(registered, nullptr);
+    ASSERT_NE(registered->weights, nullptr);
+    EXPECT_EQ(registered->weights.get(), handle.weights.get());
+    EXPECT_EQ(registered->weights->layout,
+              NativeEmbeddingLayout::forSource(embed->native_type(), embed->rows(), D_MODEL));
+    EXPECT_EQ(registered->weights->vocab_size, embed->rows());
+    EXPECT_EQ(registered->weights->total_vocab, embed->rows());
 }
 
 TEST_F(Test__StageWeightContracts, EmbeddingStage_NoOutputBufferId_EmptyContract)

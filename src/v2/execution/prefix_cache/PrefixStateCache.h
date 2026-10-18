@@ -10,6 +10,8 @@
  * request boundary falls inside the next request's full cache block.
  * Each selected RAM victim receives a fresh archive-authoritative publication;
  * participant-local disk metadata never authorizes releasing its payload.
+ * Lookup reconciles stale disk hints before harvest, while presence checks
+ * remain in-memory and selected restore sources retain independent leases.
  */
 #pragma once
 
@@ -228,6 +230,15 @@ namespace llaminar2
         void publishCompletedPersistence();
 
         /**
+         * @brief Close lookup/mutation admission and snapshot terminal RAM owners.
+         * @return Disk target and original immutable RAM leases in current LRU order.
+         * @throws std::exception For an outstanding explicit lease, repeated seal or failed writer.
+         * Pending demotions publish before selection; disabled disk tiers produce
+         * no source. Sealing reads metadata only and never hydrates a disk entry.
+         */
+        PrefixCacheShutdownSource sealForShutdown();
+
+        /**
          * @brief Retire volatile records outside one active fingerprint.
          *
          * This is the typed publication boundary for
@@ -342,6 +353,11 @@ namespace llaminar2
 
     private:
         /**
+         * @brief Reject new work after the terminal cache lifetime has been sealed.
+         * @throws std::logic_error If terminal persistence closed cache admission.
+         */
+        void requireActive() const;
+        /**
          * @brief Admit one selected archive read through existing eviction and physical ownership.
          * @param source Immutable inode snapshot retained by the lookup cohort.
          * @param read_set Actual sections required by this selected block.
@@ -402,6 +418,13 @@ namespace llaminar2
         void retireArchiveKey(const PrefixCacheKey &key);
         bool removeDiskEntry(const PrefixCacheKey &key);
         void forgetDiskEntry(const PrefixCacheKey &key);
+        /**
+         * @brief Remove peer-evicted hints at one explicit lookup-miss boundary.
+         * @throws std::runtime_error for native archive metadata failure.
+         * Never call during harvest/admission: their presence checks stay
+         * in-memory while the archive writer makes independent progress.
+         */
+        void discardMissingDiskHints();
         void touch(Entry &entry);
         void addResidentStats(const PrefixBlockHandle &handle);
         void subtractResidentStats(const PrefixBlockHandle &handle);
@@ -409,6 +432,8 @@ namespace llaminar2
         size_t ram_budget_bytes_ = 0;
         size_t used_bytes_ = 0;
         uint64_t tick_ = 0;
+        enum class Lifecycle { Active, ShutdownSealed };
+        Lifecycle lifecycle_ = Lifecycle::Active;
         PrefixCacheStats stats_;
         std::shared_ptr<IPrefixStorageBackend> ram_backend_;
         std::shared_ptr<DiskPrefixStorageBackend> disk_backend_;

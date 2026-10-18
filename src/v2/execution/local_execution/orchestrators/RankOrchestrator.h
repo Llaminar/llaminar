@@ -1290,6 +1290,8 @@ namespace llaminar2
         void clear_cache() override;
         /** @copydoc IInferenceRunner::purgePrefixCache */
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::collectPrefixCacheShutdown */
+        void collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const override;
         /** @copydoc IInferenceRunner::prefixCacheTelemetrySources */
         PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override;
         bool maybeApplyDecodeBoundaryMaintenance(
@@ -1942,8 +1944,31 @@ namespace llaminar2
             const std::string &stage_type);
 
         SnapshotShardingMode resolveSnapshotShardingMode(const std::string &key) const;
+        /**
+         * @brief Check the typed main Decode phase and declared replicated dense placement.
+         * @return True only within the existing admitted decode-row envelope.
+         */
         bool phaseSplitReplicatedDecodeSnapshotsActive() const;
+        /**
+         * @brief Check whether ordinary Decode binds a complete embedding per participant.
+         *
+         * Fully replicated dense decode and the embedding-only mirrored policy
+         * both use full-vocabulary lookup weights. Their complete rows must be
+         * checked as replicas instead of summed as vocabulary-shard partials.
+         * The caller separately excludes MTP depths and condition namespaces.
+         *
+         * @return True only for the actual Decode phase, admitted row envelope,
+         *         and an explicit dense TP full-vocabulary embedding placement.
+         */
+        bool phaseSplitReplicatedDecodeEmbeddingSnapshotsActive() const;
+        /** @brief Identify existing dense/shared row-output semantics replicated in decode. */
         static bool isPhaseSplitReplicatedDecodeSnapshotKey(const std::string &key);
+        /**
+         * @brief Identify exact FA/GDN dense-intermediate semantics replicated by ordinary decode.
+         * @param key Main semantic snapshot key; callers exclude depth and condition scopes.
+         * @return True for the declared attention block, excluding vocabulary/routed experts.
+         */
+        static bool isPhaseSplitReplicatedAttentionSnapshotKey(const std::string &key);
 
         /**
          * @brief Replay rank-level logits gather policy into gatherers/children.
@@ -2100,9 +2125,11 @@ namespace llaminar2
         /**
          * @brief Typed phase for the most recently started main forward.
          *
-         * This is optional until the first forward begins. It is never inferred
-         * by logits() from tensor shape, so a one-token prefill cannot silently
-         * inherit decode's host-observation policy.
+         * This is optional until the first forward begins. Resident and target
+         * main-condition advances publish Decode only after every participant
+         * completes; staging a pending token does not advance it. It is never
+         * inferred by logits() from tensor shape, so a one-token prefill cannot
+         * silently inherit decode's host-observation policy.
          */
         std::optional<LogitsForwardPhase> last_logits_forward_phase_;
 

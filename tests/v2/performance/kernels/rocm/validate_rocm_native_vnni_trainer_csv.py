@@ -12,7 +12,7 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1]
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from native_vnni_codebooks import FORMAT_TO_CODEBOOK  # noqa: E402
+from native_vnni_codebooks import FORMAT_TO_CODEBOOK, GPU_FORMAT_TO_EXECUTION_CODEBOOK  # noqa: E402
 from native_vnni_prefill_policy import load_native_vnni_m_policy  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -137,6 +137,12 @@ def validate_file(
                     f"{path}:{row_index}: codebook mismatch for {fmt}: "
                     f"expected {expected}, found {actual}"
                 )
+
+            execution = (row.get("execution_codebook") or "").strip()
+            if fmt.upper() == "IQ4_XS" and not execution:
+                raise SystemExit(f"{path}:{row_index}: IQ4_XS requires explicit execution_codebook=24")
+            if execution and _parse_int(path, row_index, "execution_codebook", execution) != GPU_FORMAT_TO_EXECUTION_CODEBOOK[fmt.upper()]:
+                raise SystemExit(f"{path}:{row_index}: execution codebook disagrees with registry for {fmt}")
 
             correctness = _parse_int(
                 path,

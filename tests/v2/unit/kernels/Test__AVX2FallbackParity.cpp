@@ -16,6 +16,8 @@
  *   - Q16_1 attention VNNI dot products over native separate cache rows
  *
  * All tests run on AVX512 hardware, calling both paths explicitly and comparing.
+ * GDN Q/K reference normalization adds epsilon to the squared norm, matching
+ * Qwen/FLA even when testing the combined query-scale helper independently.
  */
 
 #include <gtest/gtest.h>
@@ -219,7 +221,7 @@ TEST(AVX2HelperParityTest, L2NormScale)
     float nsq = 0.0f;
     for (int i = 0; i < 128; ++i)
         nsq += src[i] * src[i];
-    float inv = 2.0f / std::max(std::sqrt(nsq), 1e-6f);
+    float inv = 2.0f / std::sqrt(nsq + 1e-6f);
     for (int i = 0; i < 128; ++i)
         dst_ref[i] = src[i] * inv;
 
@@ -503,12 +505,12 @@ TEST(AVX2GDNParity, RecurrentStep_MatchesReference)
         float nq = 0.0f;
         for (int d = 0; d < d_k; ++d)
             nq += q[h * d_k + d] * q[h * d_k + d];
-        float inv_q = scale_val / std::max(std::sqrt(nq), 1e-6f);
+        float inv_q = scale_val / std::sqrt(nq + 1e-6f);
 
         float nk = 0.0f;
         for (int d = 0; d < d_k; ++d)
             nk += k[h * d_k + d] * k[h * d_k + d];
-        float inv_k = 1.0f / std::max(std::sqrt(nk), 1e-6f);
+        float inv_k = 1.0f / std::sqrt(nk + 1e-6f);
 
         float q_local[64], k_local[64];
         for (int d = 0; d < d_k; ++d)

@@ -24,6 +24,11 @@
  * auto kernel = std::make_unique<CuBLASGemmKernel>(context, Precision::FP32);
  * ```
  *
+ * Explicit operand modes borrow the same handle under its submission lock.
+ * FP32 uses CUBLAS_COMPUTE_32F_PEDANTIC; FP16RNE uses real half A/B with
+ * CUBLAS_COMPUTE_32F and FP32 C. Scoped math configuration is restored before
+ * the submission view releases its lock; no context-wide default is changed.
+ *
  * **Note**: For quantized tensors (Q4_0, Q8_0, IQ4_NL), use CudaQuantizedGemmKernel
  * with INT8 Tensor Cores instead of cuBLAS.
  *
@@ -34,6 +39,7 @@
 #pragma once
 
 #include "kernels/cuda/CUDAKernelBase.h"
+#include "kernels/FloatingActivationOperandPrecision.h"
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -85,11 +91,13 @@ namespace llaminar2
              * @brief Resolve the persistent context and borrow its BLAS handles.
              *
              * @param device_id CUDA device ID (from cudaGetDevice)
-             * @param precision Floating-point precision to use
+             * @param precision Floating-point weight precision.
+             * @param operand_precision Immutable explicit GDN operand policy, Native otherwise.
              *
              * @throws std::runtime_error if device context initialization fails
              */
-            explicit CuBLASGemmKernel(int device_id, Precision precision = Precision::FP32);
+            explicit CuBLASGemmKernel(int device_id, Precision precision = Precision::FP32,
+                FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native);
 
             /**
              * @brief Create cuBLAS GEMM kernel using device context's handle
@@ -99,11 +107,13 @@ namespace llaminar2
              * own the handle and will not destroy it.
              *
              * @param ctx Device context providing cuBLAS handle (must outlive this kernel)
-             * @param precision Floating-point precision to use
+             * @param precision Floating-point weight precision.
+             * @param operand_precision Immutable explicit GDN operand policy, Native otherwise.
              *
              * @throws std::runtime_error if ctx is null or not initialized
              */
-            explicit CuBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision = Precision::FP32);
+            explicit CuBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision = Precision::FP32,
+                FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native);
 
             /**
              * @brief Release only the projection view; the context retains its library.
@@ -160,6 +170,20 @@ namespace llaminar2
                 int M, int N, int K,
                 bool transA = false, bool transB = false,
                 float alpha = 1.0f, float beta = 0.0f);
+
+            /**
+             * @brief Real half A/B GEMM with FP32 accumulation and FP32 output.
+             * @param d_A Half row-major [M,K], already rounded into persistent workspace.
+             * @param d_B Original prepared half row-major [N,K].
+             * @param d_C FP32 row-major [M,N]; never half output or a widened half bank.
+             * @param M Complete ordinary rows.
+             * @param N Output features.
+             * @param K Reduction width.
+             * @return Exact-stream enqueue success; unsupported immutable mode rejects.
+             * @throws std::logic_error Missing prepared library workspace or stream.
+             */
+            bool executeFP16AccumulateFP32(const void *d_A, const void *d_B, float *d_C,
+                int M, int N, int K);
 
             /**
              * @brief GPU GEMM with fused bias: C = alpha * A @ B + beta * C + bias
@@ -240,6 +264,7 @@ namespace llaminar2
         private:
             int device_id_ = 0;
             Precision precision_ = Precision::FP32;
+            FloatingActivationOperandPrecision operand_precision_ = FloatingActivationOperandPrecision::Native;
         };
 
         /**

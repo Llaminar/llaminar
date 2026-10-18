@@ -3865,9 +3865,7 @@ namespace llaminar2
                                 spec.is_asymmetric = true;
                                 spec.has_emins = true;
                                 spec.codebook_id =
-                                    canonicalDeviceVnniCodebookId(
-                                        signature.format.native_vnni
-                                            .codebook_id);
+                                    canonicalDeviceVnniCodebookId(signature.format.native_vnni);
                             }
                             specs.push_back(std::move(spec));
                         }

@@ -28,6 +28,8 @@
  * is no separate submit/join lifecycle or filesystem-dependent alternate path.
  * RAM demotion authenticates its backing under the existing archive lock.
  * Unchanged payload identity, layout and flags reuse durable bytes with a small touch.
+ * Lookup can reconcile a batch of participant hints against one committed
+ * metadata snapshot without opening payloads or changing archive recency.
  */
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
@@ -850,6 +852,43 @@ namespace llaminar2
             return false;
         }
 
+        // The lock inode is stable across journal compaction and pathname
+        // aliases. A small opaque identity lets shutdown planning distinguish
+        // independent disks on different hosts while recognizing a shared
+        // filesystem. Existing empty lock files receive metadata once; no
+        // archive payload or model bytes participate in this identity.
+        FileDescriptor identity_file(::open(lock_path_.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW));
+        if (!identity_file)
+        {
+            if (error) *error = errnoMessage("failed to open prefix archive identity");
+            return false;
+        }
+        std::array<uint8_t, 16> identity_bytes{};
+        if (fileSize(identity_file.get()) == 0)
+        {
+            const auto identity = PrefixPayloadIdentity::fresh();
+            storeU64(identity_bytes.data(), identity.high);
+            storeU64(identity_bytes.data() + 8, identity.low);
+            if (!writeAll(identity_file.get(), identity_bytes.data(), identity_bytes.size()) ||
+                ::fsync(identity_file.get()) != 0)
+            {
+                if (error) *error = errnoMessage("failed to publish prefix archive identity");
+                return false;
+            }
+        }
+        else if (fileSize(identity_file.get()) != identity_bytes.size() ||
+                 !preadAll(identity_file.get(), identity_bytes.data(), identity_bytes.size(), 0))
+        {
+            if (error) *error = "invalid prefix archive lock identity metadata";
+            return false;
+        }
+        archive_identity_ = {loadU64(identity_bytes.data()), loadU64(identity_bytes.data() + 8)};
+        if (!archive_identity_.valid())
+        {
+            if (error) *error = "empty prefix archive identity";
+            return false;
+        }
+
         FileDescriptor archive(::open(
             archive_path_.c_str(),
             O_RDWR | O_CREAT | O_CLOEXEC,
@@ -1398,12 +1437,76 @@ namespace llaminar2
         return true;
     }
 
+    /** @copydoc DiskPrefixStorageBackend::flushShutdown */
+    PrefixCacheShutdownResult DiskPrefixStorageBackend::flushShutdown(
+        std::span<const PrefixBlockHandle> handles,
+        const PrefixShutdownArchivePlan &plan)
+    {
+        if (plan.archive != archive_identity_ || !plan.archive.valid() || plan.budget_bytes != budget_bytes_)
+            throw std::invalid_argument("prefix shutdown selection belongs to another archive or budget");
+        std::unordered_set<PrefixCacheKey, PrefixCacheKeyHasher> keys;
+        uint64_t selected_bytes = 0;
+        for (const auto &block : plan.retained)
+        {
+            if (!block.key.valid() || !block.payload_identity.valid() || block.bytes == 0 ||
+                !keys.insert(block.key).second ||
+                block.bytes > std::numeric_limits<uint64_t>::max() - selected_bytes)
+                throw std::invalid_argument("invalid prefix shutdown retained-block metadata");
+            selected_bytes += block.bytes;
+        }
+        if (budget_bytes_ != 0 && selected_bytes > budget_bytes_)
+            throw std::invalid_argument("prefix shutdown selection exceeds the shared archive budget");
+        keys.clear();
+        for (const auto &handle : handles)
+        {
+            const auto selected = std::find_if(plan.retained.begin(), plan.retained.end(), [&](const auto &block) {
+                return block.key == handle.key && block.payload_identity == handle.payload_identity &&
+                    block.bytes == handle.total_bytes;
+            });
+            if (selected == plan.retained.end() || !keys.insert(handle.key).second)
+                throw std::invalid_argument("prefix shutdown writer received an unselected or repeated owner");
+        }
+        std::string drain_error;
+        if (!waitForPersistence(&drain_error))
+            throw std::runtime_error("prefix shutdown could not complete its writer frontier: " + drain_error);
+        PrefixCacheShutdownResult result;
+        result.selected = handles.size();
+        // Publish oldest selected owners first so a single writer preserves
+        // its RAM retention order in the ordinary persistent LRU as well.
+        for (auto iterator = handles.rbegin(); iterator != handles.rend(); ++iterator)
+        {
+            std::string error;
+            PrefixArchiveWriteDisposition disposition;
+            if (!writeBlockImpl(*iterator, nullptr, nullptr, &error, &disposition, plan.retained))
+                throw std::runtime_error("prefix shutdown persistence failed: " + error);
+            if (disposition == PrefixArchiveWriteDisposition::Stored)
+            {
+                ++result.written;
+                result.payload_bytes_written += iterator->total_bytes;
+            }
+            else ++result.reused;
+        }
+        return result;
+    }
+
     bool DiskPrefixStorageBackend::writeBlock(
         const PrefixBlockHandle &handle,
         PrefixBlockHandle *disk_handle,
         std::vector<PrefixCacheKey> *evicted_keys,
         std::string *error,
         PrefixArchiveWriteDisposition *disposition)
+    {
+        return writeBlockImpl(handle, disk_handle, evicted_keys, error, disposition, {});
+    }
+
+    /** @copydoc DiskPrefixStorageBackend::writeBlockImpl */
+    bool DiskPrefixStorageBackend::writeBlockImpl(
+        const PrefixBlockHandle &handle,
+        PrefixBlockHandle *disk_handle,
+        std::vector<PrefixCacheKey> *evicted_keys,
+        std::string *error,
+        PrefixArchiveWriteDisposition *disposition,
+        std::span<const PrefixShutdownBlock> protected_blocks)
     {
         if (!handle.valid() || !handle.payload_identity.valid() || !canStore(handle.total_bytes))
         {
@@ -1464,6 +1567,14 @@ namespace llaminar2
 
         std::vector<PrefixCacheKey> evicted;
         std::vector<uint64_t> evicted_payload_bytes;
+        std::unordered_map<PrefixCacheKey, const PrefixShutdownBlock *, PrefixCacheKeyHasher> protection;
+        for (const auto &block : protected_blocks) protection.emplace(block.key, &block);
+        const auto protected_record = [&](const auto &entry) {
+            const auto selected = protection.find(entry.first);
+            return selected != protection.end() &&
+                entry.second.handle.payload_identity == selected->second->payload_identity &&
+                entry.second.handle.total_bytes == selected->second->bytes;
+        };
         auto same_key = records_.find(handle.key);
         if (same_key != records_.end())
         {
@@ -1514,13 +1625,13 @@ namespace llaminar2
                 records_.end(),
                 [&](const auto &lhs, const auto &rhs)
                 {
-                    if (lhs.first == handle.key)
+                    if (lhs.first == handle.key || protected_record(lhs))
                         return false;
-                    if (rhs.first == handle.key)
+                    if (rhs.first == handle.key || protected_record(rhs))
                         return true;
                     return lhs.second.sequence < rhs.second.sequence;
                 });
-            if (victim == records_.end() || victim->first == handle.key)
+            if (victim == records_.end() || victim->first == handle.key || protected_record(*victim))
             {
                 if (error)
                     *error = "disk budget cannot admit prefix block";
@@ -2115,6 +2226,33 @@ namespace llaminar2
         }
         *ram_handle = std::move(out);
         return compactIfNeededLocked(archive.get(), error);
+    }
+
+    /** @copydoc DiskPrefixStorageBackend::missingKeys */
+    std::vector<PrefixCacheKey> DiskPrefixStorageBackend::missingKeys(
+        std::span<const PrefixCacheKey> keys)
+    {
+        if (keys.empty()) return {};
+        std::lock_guard<std::mutex> process_lock(mutex_);
+        if (!ready_)
+            throw std::runtime_error("prefix index reconciliation failed: " + initialization_error_);
+        AdvisoryLock file_lock(lock_path_);
+        if (!file_lock.locked())
+            throw std::runtime_error(errnoMessage("failed to lock prefix index reconciliation"));
+        FileDescriptor archive(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
+        if (!archive)
+            throw std::runtime_error(errnoMessage("failed to open prefix index reconciliation"));
+        std::string error;
+        if (!refreshIndexLocked(archive.get(), &error))
+            throw std::runtime_error("prefix index reconciliation failed: " + error);
+        std::vector<PrefixCacheKey> missing;
+        for (const auto &key : keys)
+        {
+            if (!key.valid())
+                throw std::invalid_argument("prefix index reconciliation requires valid keys");
+            if (!records_.contains(key)) missing.push_back(key);
+        }
+        return missing;
     }
 
     std::vector<PrefixBlockHandle> DiskPrefixStorageBackend::compatibleEntries(

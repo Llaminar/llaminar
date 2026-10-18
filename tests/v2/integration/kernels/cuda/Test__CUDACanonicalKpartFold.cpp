@@ -7,6 +7,9 @@
  * empty partitions, the full CTA limit, epilogues, and replay with poisoned
  * outputs. Serial-row replay is only the diagnostic oracle in this fixture.
  * No performance threshold belongs in this model-free functional gate.
+ * IQ2_S prepared fixtures retain source half bases and opaque coefficient bytes.
+ * IQ4_XS physical24 uses independently authored original half bases/raw6
+ * coefficients and retains source4 arithmetic policy in captured comparisons.
  */
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
@@ -163,6 +166,28 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
     {
         scales[i] = static_cast<uint16_t>(0x1000U + (mixed(i + 31) & 0x1fffU));
         secondary[i] = static_cast<uint16_t>(0x1000U + (mixed(i + 41) & 0x1fffU));
+        if (codebook == 11)
+        {
+            // Original source half d repeats across eight blocks; raw nibble
+            // is independently authored, never an FP16-derived scale.
+            const size_t source_index=i%n+size_t(n)*((i/n)/8);
+            scales[i]=uint16_t(0x1000U+(mixed(source_index)&0x1fffU));
+            secondary[i]=uint16_t(mixed(i+77)&15u);
+        }
+        if (codebook == 13)
+        {
+            // Source-compatible IQ2_S words; high8 of the coefficient is zero.
+            const size_t source_index = i % n + static_cast<size_t>(n) * ((i / n) / 8);
+            scales[i] = static_cast<uint16_t>(0x1000U + (mixed(source_index + 31) & 0x1fffU));
+            secondary[i] = static_cast<uint8_t>(mixed(i + 77));
+        }
+        if (codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
+        {
+            // Independently valid original half base + encoded6 source word.
+            const size_t source_index = i % n + static_cast<size_t>(n) * ((i / n) / 8);
+            scales[i] = static_cast<uint16_t>(0x1000U + (mixed(source_index) & 0x1fffU));
+            secondary[i] = static_cast<uint16_t>(mixed(i + 77) & 63u);
+        }
         minima[i] = scales[i] | (static_cast<uint32_t>(secondary[i]) << 16);
     }
     for (size_t i = 0; i < activations.size(); ++i) activations[i] = int(mixed(i + 71) % 255) - 127;
@@ -266,7 +291,7 @@ std::map<int, int> formats()
     for (const auto &source : llaminar2::native_vnni_formats::kAllSourceFormats)
     {
         const auto &f = *source.metadata;
-        result.emplace(llaminar2::canonicalDeviceVnniCodebookId(f.codebook_id), f.payload_bytes);
+        result.emplace(llaminar2::canonicalDeviceVnniCodebookId(f), f.payload_bytes);
         const auto promoted = llaminar2::migrationStableDeviceVnniFormat(f);
         result.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
     }

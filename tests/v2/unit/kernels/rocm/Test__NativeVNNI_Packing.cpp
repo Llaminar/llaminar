@@ -4,14 +4,17 @@
  *
  * Validates that packWeightsToROCm() correctly produces native-VNNI payload,
  * scales, and mins containers for all 16 supported formats (Tier 1/2/3).
+ * IQ2_S metadata preserves original d and packed source scale nibbles.
+ * IQ4_XS uses physical24/source4 and exact original half/raw6 tuple words;
+ * physical secondary-plane presence is independent of additive-minimum math.
  *
  * Tests verify:
  * - Packing succeeds (non-empty payload/scales)
  * - Correct codebook_id assignment
  * - Correct blocks_per_row calculation
  * - Payload, scales, and mins sizes match expected layout
- * - FP16 scale values are finite (not NaN/Inf/zero)
- * - Asymmetric formats populate mins, symmetric do not
+ * - Scale values are finite; Q6 secondary words match original signed subscales
+ * - Physical auxiliary formats populate the secondary plane, including raw IQ4_XS coefficients
  * - Various N/K dimensions work
  *
  * GPU-requiring native-VNNI tests (GEMV accuracy comparison) are in:
@@ -22,6 +25,7 @@
 
 #include <gtest/gtest.h>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -48,7 +52,7 @@ namespace
         std::string name;
         uint8_t expected_codebook_id;
         int payload_bytes; ///< Per 32-element block
-        bool is_asymmetric;
+        bool has_secondary_metadata; ///< Physical plane, not additive-minimum arithmetic.
         bool is_superblock; ///< 256-element blocks (K must be multiple of 256)
 
         /// Factory function that creates a random tensor of this type
@@ -74,8 +78,8 @@ namespace
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ5_1Random({N, K}); }},
 
-        // Tier 1 super-block (reuses IQ4_NL kernel)
-        {"IQ4_XS", 4, 16, false, true,
+        // Same IQ4 LUT; distinct source-tuple execution and raw coefficient plane.
+        {"IQ4_XS", 24, 16, true, true,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_XSRandom({N, K}); }},
 
@@ -97,7 +101,7 @@ namespace
          { return TestTensorFactory::createQ2_KRandom({N, K}); }},
 
         // Tier 3: IQ grid-index super-blocks
-        {"IQ3_S", 11, 13, false, true,
+        {"IQ3_S", 11, 13, true, true,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ3_SRandom({N, K}); }},
         {"IQ3_XXS", 12, 12, false, true,
@@ -185,6 +189,11 @@ namespace
         EXPECT_EQ(packed.native_vnni_codebook_id, fmt.expected_codebook_id)
             << fmt.name << ": wrong codebook_id";
 
+        EXPECT_TRUE(packed.native_source_identity.present);
+        EXPECT_EQ(packed.native_source_identity.codebook_id,
+            fmt.expected_codebook_id == 24 ? uint8_t{4} : fmt.expected_codebook_id);
+        EXPECT_EQ(packed.native_source_identity.is_superblock, fmt.is_superblock);
+
         // Verify blocks_per_row
         EXPECT_EQ(packed.native_vnni_blocks_per_row, static_cast<uint32_t>(blocks_per_row))
             << fmt.name << ": wrong blocks_per_row";
@@ -201,16 +210,16 @@ namespace
         EXPECT_EQ(packed.native_vnni_scales.size(), blocks_per_row * N)
             << fmt.name << ": scales size mismatch";
 
-        // Verify asymmetric formats have mins, symmetric do not
-        if (fmt.is_asymmetric)
+        // Verify physical secondary-plane presence using independent fixture literals.
+        if (fmt.has_secondary_metadata)
         {
             EXPECT_EQ(packed.native_vnni_mins.size(), blocks_per_row * N)
-                << fmt.name << ": asymmetric format should have mins";
+                << fmt.name << ": auxiliary format should retain secondary words";
         }
         else
         {
             EXPECT_TRUE(packed.native_vnni_mins.empty())
-                << fmt.name << ": symmetric format should NOT have mins";
+                << fmt.name << ": plane-free format should not allocate secondary words";
         }
 
         // N/K dimensions preserved
@@ -238,12 +247,107 @@ namespace
                 << std::hex << packed.native_vnni_scales[i] << std::dec << ")";
         }
 
-        // If asymmetric, mins must also be finite
-        for (size_t i = 0; i < packed.native_vnni_mins.size(); ++i)
+        if (packed.native_vnni_codebook_id == 8)
         {
-            EXPECT_TRUE(isFP16ValidScale(packed.native_vnni_mins[i]))
-                << fmt.name << ": min[" << i << "] is NaN/Inf (bits=0x"
-                << std::hex << packed.native_vnni_mins[i] << std::dec << ")";
+            // Q6 secondary metadata is two original signed bytes, never a half.
+            const auto *q6 = dynamic_cast<const Q6_KTensor *>(tensor.get());
+            ASSERT_NE(q6, nullptr);
+            const auto *source = q6->typed_data();
+            ASSERT_NE(source, nullptr);
+            const size_t blocks_per_row = K / 32;
+            const size_t superblocks_per_row = K / 256;
+            for (size_t block = 0; block < blocks_per_row; ++block)
+                for (size_t row = 0; row < N; ++row)
+                {
+                    const auto &original = source[row * superblocks_per_row + block / 8];
+                    const uint16_t expected =
+                        static_cast<uint16_t>(static_cast<uint8_t>(original.scales[2 * (block % 8)])) |
+                        (static_cast<uint16_t>(static_cast<uint8_t>(original.scales[2 * (block % 8) + 1])) << 8);
+                    const size_t at = block * N + row;
+                    EXPECT_EQ(packed.native_vnni_scales[at], original.d);
+                    EXPECT_EQ(packed.native_vnni_mins[at], expected);
+                }
+        }
+        else if (packed.native_vnni_codebook_id == 11)
+        {
+            // Independent source words: original half d plus one raw nibble.
+            // No scale resolver or candidate repacker supplies these expected bytes.
+            const auto *original_tensor = dynamic_cast<const IQ3_STensor *>(tensor.get());
+            ASSERT_NE(original_tensor, nullptr);
+            const auto *source = original_tensor->typed_data();
+            const size_t superblocks_per_row = (K + 255) / 256;
+            for (size_t block = 0; block < K / 32; ++block)
+                for (size_t row = 0; row < N; ++row)
+                {
+                    const auto &original = source[row * superblocks_per_row + block / 8];
+                    const unsigned sub = static_cast<unsigned>(block % 8);
+                    const uint16_t nibble = static_cast<uint16_t>((original.scales[sub / 2] >> (4 * (sub % 2))) & 15u);
+                    const size_t at = block * N + row;
+                    EXPECT_EQ(packed.native_vnni_scales[at], original.d);
+                    EXPECT_EQ(packed.native_vnni_mins[at], nibble);
+                    EXPECT_EQ(packed.native_vnni_mins[at] & 0xfff0u, 0u);
+                    const auto *payload = packed.native_vnni_payload.data() + at * 13;
+                    EXPECT_EQ(std::memcmp(payload, original.qs + sub * 8, 8), 0);
+                    EXPECT_EQ(payload[8], original.qh[sub]);
+                    EXPECT_EQ(std::memcmp(payload + 9, original.signs + sub * 4, 4), 0);
+                }
+        }
+        else if (packed.native_vnni_codebook_id == 13)
+        {
+            // IQ2_S secondary is the original coefficient byte, with high8 zero.
+            // Literal source access keeps this check independent of the packer.
+            const auto *iq2 = dynamic_cast<const IQ2_STensor *>(tensor.get());
+            ASSERT_NE(iq2, nullptr);
+            const auto *source = iq2->typed_data();
+            ASSERT_NE(source, nullptr);
+            const size_t blocks_per_row = K / 32;
+            const size_t superblocks_per_row = (K + 255) / 256;
+            for (size_t block = 0; block < blocks_per_row; ++block)
+                for (size_t row = 0; row < N; ++row)
+                {
+                    const auto &original = source[row * superblocks_per_row + block / 8];
+                    const size_t at = block * N + row;
+                    EXPECT_EQ(packed.native_vnni_scales[at], original.d);
+                    EXPECT_EQ(packed.native_vnni_mins[at],
+                        static_cast<uint16_t>(original.scales[block % 8]));
+                }
+        }
+        else if (packed.native_vnni_codebook_id == 24)
+        {
+            // Derive words from the literal original GGUF fields, never from a
+            // prepared resolver or scale reconstruction function under test.
+            const auto *iq4 = dynamic_cast<const IQ4_XSTensor *>(tensor.get());
+            ASSERT_NE(iq4, nullptr);
+            const auto *source = iq4->typed_data();
+            ASSERT_NE(source, nullptr);
+            const size_t blocks_per_row = K / 32;
+            const size_t superblocks_per_row = (K + 255) / 256;
+            ASSERT_EQ(packed.native_vnni_mins.size(), blocks_per_row * N);
+            for (size_t block = 0; block < blocks_per_row; ++block)
+                for (size_t row = 0; row < N; ++row)
+                {
+                    const auto &original = source[row * superblocks_per_row + block / 8];
+                    const unsigned sub = static_cast<unsigned>(block % 8);
+                    const uint16_t encoded = static_cast<uint16_t>(
+                        ((original.scales_l[sub / 2] >> (4 * (sub % 2))) & 15u) |
+                        (((original.scales_h >> (2 * sub)) & 3u) << 4));
+                    const size_t at = block * N + row;
+                    EXPECT_EQ(packed.native_vnni_scales[at], original.d);
+                    EXPECT_EQ(packed.native_vnni_mins[at], encoded);
+                    EXPECT_EQ(packed.native_vnni_mins[at] & 0xffc0u, 0u);
+                    EXPECT_EQ(std::memcmp(packed.native_vnni_payload.data() + at * 16,
+                        original.qs + sub * 16, 16), 0);
+                }
+        }
+        else
+        {
+            // Other codebooks retain their existing finite half auxiliaries.
+            for (size_t i = 0; i < packed.native_vnni_mins.size(); ++i)
+            {
+                EXPECT_TRUE(isFP16ValidScale(packed.native_vnni_mins[i]))
+                    << fmt.name << ": min[" << i << "] is NaN/Inf (bits=0x"
+                    << std::hex << packed.native_vnni_mins[i] << std::dec << ")";
+            }
         }
     }
 

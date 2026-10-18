@@ -69,6 +69,13 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
+        /**
+         * @brief Authenticate native source/device/layout before graph execution.
+         * @param error Optional precise diagnostic written when prepared state is invalid.
+         * @return True for a valid native prepared handle or existing direct floating/CPU source.
+         * @throws std::invalid_argument For unsupported source or malformed native row geometry.
+         * @throws std::overflow_error For a native backing extent that cannot be represented.
+         */
         bool validatePreparedWeights(std::string *error) const override;
         bool isGraphCapturable() const override { return true; }
         bool hasDynamicParams() const override { return true; }

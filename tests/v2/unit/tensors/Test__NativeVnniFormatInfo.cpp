@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "tensors/Tensors.h"
+#include "tensors/NativeVnniIQ4XSScale.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #include "../../utils/TestTensorFactory.h"
 
@@ -154,8 +155,8 @@ TEST(Test__NativeVnniFormatInfo, ExpandedSingleScaleGridsRetainNativeScaleAndInt
     for (const auto &format : kExpectations)
     {
         if (!is_payload_decodable(format.codebook_id) ||
-            preparedEncodingForCodebook(format.codebook_id) !=
-                CPUNativeVNNIEncoding::ExpandedInt8)
+            (preparedEncodingForCodebook(format.codebook_id) != CPUNativeVNNIEncoding::ExpandedInt8 &&
+             preparedEncodingForCodebook(format.codebook_id) != CPUNativeVNNIEncoding::IQ3SExpandedSourceScale))
             continue;
         SCOPED_TRACE(format.name);
         auto tensor = format.create();
@@ -180,7 +181,7 @@ TEST(Test__NativeVnniFormatInfo, ExpandedSingleScaleGridsRetainNativeScaleAndInt
                 std::array<int8_t, 32> values{};
                 decode_native_block(format.codebook_id, payload.data(), values.data());
                 EXPECT_EQ(cpu.chunkScales(0, block)[row], scale);
-                if (format.is_asymmetric)
+                if (format.is_asymmetric || format.codebook_id == 11)
                     EXPECT_EQ(cpu.chunkMins(0, block)[row], minimum);
                 const auto *unit = cpu.interleavedBase() +
                     block * cpu.interleaved_block_stride;
@@ -342,7 +343,7 @@ TEST(Test__NativeVnniFormatInfo, PackedRegionSizingMatchesCanonicalMetadata)
         EXPECT_EQ(regions.scales_bytes, blocks * sizeof(uint16_t));
         EXPECT_EQ(
             regions.mins_bytes,
-            expected.is_asymmetric
+            (expected.is_asymmetric || expected.name == "IQ4_XS" || expected.name == "IQ3_S")
                 ? blocks * sizeof(uint16_t)
                 : 0);
         EXPECT_EQ(
@@ -364,7 +365,7 @@ TEST(Test__NativeVnniFormatInfo, MigrationStableAndReusableFormatsCoverEveryCode
 
         const auto migrated = migrationStableDeviceVnniFormat(*source);
         const int expected_migrated_payload =
-            source->codebook_id == 8 || hasCompactMultiScaleVnniPayload(source->codebook_id)
+            source->codebook_id == 8 || source->codebook_id == 11 || hasCompactMultiScaleVnniPayload(source->codebook_id)
                 ? source->payload_bytes
                 : (source->codebook_id == 0 ||
                            source->codebook_id == 4 ||
@@ -373,7 +374,7 @@ TEST(Test__NativeVnniFormatInfo, MigrationStableAndReusableFormatsCoverEveryCode
                        : 32);
         const uint8_t expected_migrated_codebook =
             expected_migrated_payload < 32
-                ? canonicalDeviceVnniCodebookId(source->codebook_id)
+                ? canonicalDeviceVnniCodebookId(*source)
                 : (source->is_asymmetric
                        ? kNativeVnniExpandedInt8MinCodebook
                        : static_cast<uint8_t>(19));
@@ -381,7 +382,7 @@ TEST(Test__NativeVnniFormatInfo, MigrationStableAndReusableFormatsCoverEveryCode
             migrated.payload_bytes_per_block,
             expected_migrated_payload);
         EXPECT_EQ(migrated.codebook_id, expected_migrated_codebook);
-        EXPECT_EQ(migrated.is_asymmetric, source->is_asymmetric);
+        EXPECT_EQ(migrated.is_asymmetric, source->is_asymmetric || expected.name == "IQ4_XS" || expected.name == "IQ3_S");
         EXPECT_EQ(migrated.has_emins, source->has_emins);
         EXPECT_TRUE(deviceVnniExecutionCompatibleWithSource(
             *source, migrated.codebook_id));
@@ -394,7 +395,7 @@ TEST(Test__NativeVnniFormatInfo, MigrationStableAndReusableFormatsCoverEveryCode
         EXPECT_EQ(
             allocation.payload_bytes_per_block,
             std::max(source->payload_bytes, expected_migrated_payload));
-        EXPECT_EQ(allocation.has_mins, source->is_asymmetric);
+        EXPECT_EQ(allocation.has_mins, source->is_asymmetric || expected.name == "IQ4_XS" || expected.name == "IQ3_S");
         EXPECT_EQ(allocation.has_emins, source->has_emins);
         EXPECT_GE(
             allocation.payload_bytes_per_block,
@@ -415,7 +416,7 @@ TEST(Test__NativeVnniFormatInfo, RuntimeCaptureEnvelopeCoversEveryTierRepresenta
 
         const NativeVnniFormatInfo &source = *entry.metadata;
         const uint8_t canonical_codebook =
-            canonicalDeviceVnniCodebookId(source.codebook_id);
+            canonicalDeviceVnniCodebookId(source);
         const uint8_t migration_codebook =
             migrationStableDeviceVnniFormat(source).codebook_id;
         const NativeVnniSourceIdentity source_identity{
@@ -424,9 +425,9 @@ TEST(Test__NativeVnniFormatInfo, RuntimeCaptureEnvelopeCoversEveryTierRepresenta
             .present = true,
         };
         const uint32_t expected_policy_mask =
-            nativeVnniCodebookMaskBit(canonical_codebook);
+            nativeVnniCodebookMaskBit(canonicalDeviceVnniCodebookId(source.codebook_id));
         const uint32_t expected_runtime_mask =
-            expected_policy_mask |
+            nativeVnniCodebookMaskBit(canonical_codebook) |
             nativeVnniCodebookMaskBit(migration_codebook);
 
         NativeVnniExecutionFormatEnvelope immutable_envelope;
@@ -437,7 +438,7 @@ TEST(Test__NativeVnniFormatInfo, RuntimeCaptureEnvelopeCoversEveryTierRepresenta
             false));
         EXPECT_EQ(
             immutable_envelope.execution_codebook_mask,
-            expected_policy_mask);
+            nativeVnniCodebookMaskBit(canonical_codebook));
         EXPECT_EQ(
             immutable_envelope.policy_codebook_mask,
             expected_policy_mask);
@@ -495,4 +496,45 @@ TEST(Test__NativeVnniFormatInfo, MutableEnvelopeRequiresAuthenticatedSourceIdent
         NativeVnniSourceIdentity{},
         false));
     EXPECT_TRUE(envelope.valid());
+}
+
+/** @brief Tuple source, physical decoder and arithmetic policy are three explicit identities. */
+TEST(Test__NativeVnniFormatInfo, IQ4XSSourceTupleMappingAndCapacityAreExact)
+{
+    using namespace cpu::native_vnni;
+    using namespace native_vnni_iq4xs_scale;
+    const auto &xs = native_vnni_formats::IQ4_XS;
+    const auto &nl = native_vnni_formats::IQ4_NL;
+    EXPECT_EQ(xs.codebook_id, 4); EXPECT_FALSE(xs.is_asymmetric);
+    EXPECT_EQ(canonicalDeviceVnniCodebookId(xs), 24);
+    EXPECT_EQ(canonicalDeviceVnniCodebookId(nl), 4);
+    EXPECT_EQ(canonicalDeviceVnniCodebookId(xs.codebook_id), 4);
+    EXPECT_TRUE(canonicalDeviceVnniFormat(xs).is_asymmetric);
+    EXPECT_FALSE(canonicalDeviceVnniFormat(nl).is_asymmetric);
+    EXPECT_FALSE(deviceVnniExecutionCompatibleWithSource(xs, 4));
+    EXPECT_TRUE(deviceVnniExecutionCompatibleWithSource(xs, 19)); // Explicit normalized metadata, not native preparation.
+    EXPECT_FALSE(deviceVnniExecutionCompatibleWithSource(nl, 24));
+    EXPECT_TRUE(deviceVnniExecutionCompatibleWithSource(xs, 24));
+    EXPECT_TRUE(areNativeVnniGateUpCodebooksCompatible(4, 24));
+    EXPECT_TRUE(areNativeVnniGateUpCodebooksCompatible(24, 4));
+    EXPECT_FALSE(areNativeVnniGateUpCodebooksCompatible(24, 5));
+    EXPECT_EQ(preparedEncodingForSource(xs), CPUNativeVNNIEncoding::NibbleLUTSourceScale);
+    EXPECT_EQ(preparedEncodingForSource(nl), CPUNativeVNNIEncoding::NibbleLUT);
+    EXPECT_EQ(preparedFootprintForFormat(xs).weight_bytes_per_n_chunk_k_block, 1408);
+    EXPECT_EQ(preparedFootprintForFormat(nl).weight_bytes_per_n_chunk_k_block, 1280);
+    EXPECT_EQ(nativeVnniPackedRegionSizes(17, 288, xs).logicalBytes(), 17u * 9u * 20u);
+    EXPECT_EQ(nativeVnniPackedRegionSizes(17, 288, nl).logicalBytes(), 17u * 9u * 18u);
+    for (unsigned value = 0; value < 64; ++value)
+    {
+        const auto raw = encodeSourceCoefficient(static_cast<uint8_t>(value));
+        EXPECT_EQ(raw, value); EXPECT_TRUE(valid(raw));
+        EXPECT_EQ(coefficient(raw), static_cast<int>(value) - 32);
+        EXPECT_FALSE(valid(raw | 0x40u)); EXPECT_FALSE(valid(raw | 0x8000u));
+    }
+    NativeVnniExecutionFormatEnvelope envelope;
+    EXPECT_FALSE(addNativeVnniExecutionFormat(envelope, 24, {}, false));
+    EXPECT_FALSE(addNativeVnniExecutionFormat(envelope, 4, {4, true, true}, true));
+    ASSERT_TRUE(addNativeVnniExecutionFormat(envelope, 24, {4, true, true}, true));
+    EXPECT_EQ(envelope.execution_codebook_mask, uint32_t{1} << 24);
+    EXPECT_EQ(envelope.policy_codebook_mask, uint32_t{1} << 4);
 }

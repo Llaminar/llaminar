@@ -8,6 +8,7 @@
 #include "PlacementStrategy.h"
 #include "placement/HeterogeneousMultiDomainStrategy.h"
 #include "../../utils/Logger.h"
+#include "../../tensors/BlockStructures.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -122,9 +123,9 @@ namespace llaminar2
         if (quant_type == "Q6_K")
             return 210.0f / 256.0f; // 0.820
 
-        // Q8_K: 288 bytes per 256 elements
+        // Include the original FP32 super-block scale in source storage.
         if (quant_type == "Q8_K")
-            return 288.0f / 256.0f; // 1.125
+            return static_cast<float>(sizeof(Q8_KBlock)) / Q8_KBlock::BLOCK_SIZE;
 
         // =================================================================
         // IQ (importance quantization) formats (256-element super-blocks)

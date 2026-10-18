@@ -7,6 +7,8 @@
  * It can therefore diagnose a kernel change without rebuilding unrelated GPU
  * subsystems. Serial row replay is an oracle only; the candidate is one grouped
  * production launch. Every retained replay poisons its output and guard tail.
+ * IQ2_S/IQ4_XS prepared fixtures retain source half bases and raw coefficient
+ * words. Physical24 uses source-policy4 without reinterpreting either word.
  */
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
@@ -135,6 +137,7 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
     const size_t weight_blocks = static_cast<size_t>(blocks) * n;
     int partitions = 0, waves = 0;
     const auto policy = static_cast<uint8_t>(
+        codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? 4 :
         codebook == llaminar2::kNativeVnniExpandedInt8MinCodebook ? 19 : codebook);
     ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config_with_policy(
         policy, n, k, &partitions, &waves));
@@ -149,6 +152,27 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
     {
         scales[i] = static_cast<uint16_t>(0x1000U + (mixed(i) & 0x1fffU));
         secondary[i] = static_cast<uint16_t>(0x1000U + (mixed(i + 77) & 0x1fffU));
+        if (codebook == 11)
+        {
+            // Original IQ3_S d is shared by eight blocks; secondary is raw low4.
+            const size_t source_index = i % n + static_cast<size_t>(n) * ((i / n) / 8);
+            scales[i] = static_cast<uint16_t>(0x1000U + (mixed(source_index) & 0x1fffU));
+            secondary[i] = static_cast<uint16_t>(mixed(i + 77) & 15u);
+        }
+        if (codebook == 13)
+        {
+            // Source-compatible IQ2_S words; high8 of the coefficient is zero.
+            const size_t source_index = i % n + static_cast<size_t>(n) * ((i / n) / 8);
+            scales[i] = static_cast<uint16_t>(0x1000U + (mixed(source_index) & 0x1fffU));
+            secondary[i] = static_cast<uint8_t>(mixed(i + 77));
+        }
+        if (codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
+        {
+            // Each original IQ4_XS superblock owns one base and eight raw ls.
+            const size_t source_index = i % n + static_cast<size_t>(n) * ((i / n) / 8);
+            scales[i] = static_cast<uint16_t>(0x1000U + (mixed(source_index) & 0x1fffU));
+            secondary[i] = static_cast<uint16_t>(mixed(i + 77) & 63u);
+        }
         minima[i] = scales[i] | (static_cast<uint32_t>(secondary[i]) << 16);
     }
     for (size_t i = 0; i < activation.size(); ++i)
@@ -234,7 +258,7 @@ TEST(ROCmNativeVNNIRegisterLifetime, WholeRowSignedZeroKeepsSerialReducerOrigin)
     for (const auto& source : native_vnni_formats::kAllSourceFormats)
     {
         const auto& format = *source.metadata;
-        formats.emplace(canonicalDeviceVnniCodebookId(format.codebook_id), format.payload_bytes);
+        formats.emplace(canonicalDeviceVnniCodebookId(format), format.payload_bytes);
         const auto promoted = migrationStableDeviceVnniFormat(format);
         formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
     }
@@ -267,7 +291,7 @@ TEST(ROCmNativeVNNIRegisterLifetime, CapturedAllFormatsMatchSerialRows)
     for (const auto& source : native_vnni_formats::kAllSourceFormats)
     {
         const auto& format = *source.metadata;
-        formats.emplace(canonicalDeviceVnniCodebookId(format.codebook_id), format.payload_bytes);
+        formats.emplace(canonicalDeviceVnniCodebookId(format), format.payload_bytes);
         const auto promoted = migrationStableDeviceVnniFormat(format);
         formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
     }

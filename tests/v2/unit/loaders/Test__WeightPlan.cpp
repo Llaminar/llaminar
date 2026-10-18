@@ -8,6 +8,11 @@
 #include "loaders/WeightPlan.h"
 #include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
+#include "loaders/PreparedWeightRepresentationContract.h"
+#include "loaders/PreparedHalfWeights.h"
+#include <array>
+#include <bit>
+#include "utils/DebugEnv.h"
 #include "backends/ComputeBackend.h"
 #include "config/TensorParallelConfig.h"
 #include "models/GraphTypes.h"
@@ -1207,4 +1212,477 @@ TEST(Test__WeightPlan, FrozenSetRetainsItsExactPhysicalMemoryOwner)
             {},
             PhysicalMemoryOwner::KVCache),
         std::invalid_argument);
+}
+
+/** @brief Reject aliases/unknown arithmetic modes instead of selecting another route. */
+TEST(Test__GDNProjectionArithmetic, ExplicitPolicyRejectsUnknownValues)
+{
+    EXPECT_EQ(parseGDNProjectionArithmetic("native"), GDNProjectionArithmetic::Native);
+    EXPECT_EQ(parseGDNProjectionArithmetic("fp32"), GDNProjectionArithmetic::FP32);
+    EXPECT_EQ(parseGDNProjectionArithmetic("fp16"), GDNProjectionArithmetic::FP16);
+    EXPECT_EQ(parseGDNProjectionArithmetic("fp16_alpha_beta"), GDNProjectionArithmetic::FP16AlphaBeta);
+    for (const auto mode : {GDNProjectionArithmetic::Native, GDNProjectionArithmetic::FP32,
+                           GDNProjectionArithmetic::FP16, GDNProjectionArithmetic::FP16AlphaBeta, GDNProjectionArithmetic::FP16MoEAlphaBeta})
+        EXPECT_EQ(parseGDNProjectionArithmetic(gdnProjectionArithmeticName(mode)), mode);
+    EXPECT_THROW(gdnProjectionArithmeticName(static_cast<GDNProjectionArithmetic>(255)), std::invalid_argument);
+    for (const auto value : {"", "FP32", "FP16", "auto", "native32"})
+        EXPECT_THROW(parseGDNProjectionArithmetic(value), std::invalid_argument);
+}
+
+/** @brief Both planning and materialization convert exactly the same GDN sources. */
+TEST(Test__GDNProjectionArithmetic, SourceAwareSelectionPreservesOtherOperators)
+{
+    using Contract = PreparedWeightRepresentationContract;
+    for (const auto architecture : {"qwen35", "qwen35moe"})
+    {
+        for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight",
+                                "blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight", "blk.0.ssm_out.weight"})
+        {
+            const auto role = inferWeightRole(name);
+            EXPECT_TRUE(Contract::isGDNProjectionSource(role, name, architecture));
+            EXPECT_EQ(Contract::resolve(role, TensorType::Q6_K, name, architecture, GDNProjectionArithmetic::FP32),
+                      ModelPreparedWeightRepresentation::FP32);
+            EXPECT_EQ(Contract::resolve(role, "Q6_K", name, architecture, GDNProjectionArithmetic::FP32),
+                      ModelPreparedWeightRepresentation::FP32);
+            EXPECT_EQ(Contract::resolve(role, TensorType::FP32, name, architecture, GDNProjectionArithmetic::FP32),
+                      ModelPreparedWeightRepresentation::SourceNative);
+            EXPECT_EQ(Contract::resolve(role, "F32", name, architecture, GDNProjectionArithmetic::FP32),
+                      ModelPreparedWeightRepresentation::SourceNative);
+            EXPECT_EQ(Contract::resolve(role, TensorType::Q6_K, name, architecture, GDNProjectionArithmetic::Native),
+                      Contract::resolve(role, TensorType::Q6_K));
+        }
+    }
+    for (const auto name : {"blk.3.attn_q.weight", "blk.3.attn_k.weight", "blk.3.attn_v.weight",
+                            "blk.3.attn_output.weight", "blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate_exps.weight",
+                            "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight", "output.weight", "token_embd.weight"})
+    {
+        const auto role = inferWeightRole(name);
+        EXPECT_FALSE(Contract::isGDNProjectionSource(role, name, "qwen35moe"));
+        EXPECT_EQ(Contract::resolve(role, TensorType::Q6_K, name, "qwen35moe", GDNProjectionArithmetic::FP32),
+                  Contract::resolve(role, TensorType::Q6_K));
+    }
+    for (const auto name : {"blk.x.attn_qkv.weight", "blk..attn_qkv.weight", "blk.-1.attn_qkv.weight",
+                            "blk.0.attn_qkv.weight.extra", "other.blk.0.attn_qkv.weight"})
+        EXPECT_FALSE(Contract::isGDNProjectionSource(WeightRole::FusedQKV, name, "qwen35moe"));
+    EXPECT_FALSE(Contract::isGDNProjectionSource(WeightRole::MoERouter, "blk.0.attn_qkv.weight", "qwen35moe"));
+    EXPECT_FALSE(Contract::isGDNProjectionSource(WeightRole::FusedQKV, "blk.0.attn_qkv.weight", "llama"));
+}
+
+/**
+ * @brief The real materializer copies original Q6 values and preserves unrelated sources.
+ *
+ * Setup mode is restored even on a fatal assertion. No device or GEMM kernel is
+ * created; the test exercises the canonical source decoder and model-owned FP32
+ * override lifetime with small complete blocks and an existing FP32 gate.
+ */
+TEST(Test__GDNProjectionArithmetic, ActualMaterializerPreservesOriginalValuesAndNativeExperts)
+{
+    struct Restore
+    {
+        GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
+        ~Restore() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
+    } restore;
+    mutableDebugEnv().gemm.gdn_projection_arithmetic = GDNProjectionArithmetic::FP32;
+    std::shared_ptr<TensorBase> source(TestTensorFactory::createQ6_KRandom({2, 256}, 817));
+    ASSERT_TRUE(source);
+    std::vector<float> expected(source->numel());
+    source->to_fp32(expected.data());
+    std::vector<uint8_t> original(source->size_bytes());
+    std::memcpy(original.data(), source->raw_data(), original.size());
+    auto loader = MockModelLoaderBuilder().setArchitecture("qwen35moe")
+        .addTensor("blk.0.attn_qkv.weight", std::make_shared<Q6_KTensor>(source->shape(), original))
+        .addTensor("blk.0.attn_gate.weight", std::make_shared<Q6_KTensor>(source->shape(), original))
+        .addTensor("blk.0.ssm_out.weight", std::make_shared<Q6_KTensor>(source->shape(), original))
+        .addTensor("blk.0.ffn_up.weight", source)
+        .addFP32RandomTensor("blk.0.ssm_alpha.weight", {2, 256})
+        .build();
+    WeightManager manager(*loader);
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{18721};
+    strategy.devices = {DeviceId::cpu()};
+    WeightPlan plan(strategy);
+    for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight",
+                            "blk.0.ffn_up.weight", "blk.0.ssm_alpha.weight"})
+    {
+        WeightRequirement requirement;
+        requirement.canonical_name = name;
+        requirement.target_device = DeviceId::cpu();
+        requirement.lookup_device = DeviceId::cpu();
+        requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
+        plan.add(requirement);
+    }
+    auto frozen = manager.materialize(plan);
+    for (const auto suffix : {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"})
+    {
+        const auto &binding = frozen.layer(0, suffix);
+        ASSERT_TRUE(binding.tensor_owner);
+        ASSERT_EQ(binding.tensor->native_type(), TensorType::FP32);
+        EXPECT_EQ(std::memcmp(binding.tensor->data(), expected.data(), expected.size() * sizeof(float)), 0);
+    }
+    EXPECT_EQ(frozen.layer(0, "ffn_up.weight").tensor->native_type(), TensorType::Q6_K);
+    EXPECT_EQ(frozen.layer(0, "ssm_alpha.weight").tensor,
+              loader->loadTensor("blk.0.ssm_alpha.weight").get());
+    EXPECT_EQ(source->native_type(), TensorType::Q6_K);
+    EXPECT_EQ(std::memcmp(source->raw_data(), original.data(), original.size()), 0);
+}
+
+/** @brief Source scope, physical representation and immutable engine mode agree. */
+TEST(Test__GDNProjectionArithmetic, HalfSourceAndOperandPolicyStayScoped)
+{
+    using Contract = PreparedWeightRepresentationContract;
+    for (const auto architecture : {"qwen35", "qwen35moe"})
+        for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_alpha.weight",
+                               "blk.0.ssm_beta.weight", "blk.0.ssm_out.weight"})
+        {
+            const auto role = inferWeightRole(name);
+            for (const auto type : {TensorType::Q6_K, TensorType::FP32, TensorType::BF16})
+                EXPECT_EQ(Contract::resolve(role, type, name, architecture, GDNProjectionArithmetic::FP16),
+                    ModelPreparedWeightRepresentation::FP16);
+            for (const auto format : {"Q6_K", "F32", "FP32", "BF16"})
+                EXPECT_EQ(Contract::resolve(role, format, name, architecture, GDNProjectionArithmetic::FP16),
+                    ModelPreparedWeightRepresentation::FP16);
+            EXPECT_EQ(Contract::resolve(role, TensorType::FP16, name, architecture, GDNProjectionArithmetic::FP16),
+                ModelPreparedWeightRepresentation::SourceNative);
+            EXPECT_EQ(Contract::resolve(role, "F16", name, architecture, GDNProjectionArithmetic::FP16),
+                ModelPreparedWeightRepresentation::SourceNative);
+            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, GDNProjectionArithmetic::Native),
+                FloatingActivationOperandPrecision::Native);
+            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, GDNProjectionArithmetic::FP32),
+                FloatingActivationOperandPrecision::FP32);
+            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, GDNProjectionArithmetic::FP16),
+                FloatingActivationOperandPrecision::FP16RNE);
+        }
+    for (const auto name : {"blk.3.attn_q.weight", "blk.3.attn_output.weight", "blk.0.ffn_gate_inp.weight",
+                           "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up.weight", "output.weight", "token_embd.weight"})
+    {
+        const auto role = inferWeightRole(name);
+        EXPECT_EQ(Contract::resolve(role, TensorType::Q6_K, name, "qwen35moe", GDNProjectionArithmetic::FP16),
+            Contract::resolve(role, TensorType::Q6_K));
+        EXPECT_EQ(Contract::operandPrecision(role, name, "qwen35moe", GDNProjectionArithmetic::FP16),
+            FloatingActivationOperandPrecision::Native);
+    }
+    EXPECT_EQ(Contract::operandPrecision(WeightRole::FusedQKV, "blk.0.attn_qkv.weight", "llama",
+        GDNProjectionArithmetic::FP16), FloatingActivationOperandPrecision::Native);
+}
+
+/**
+ * @brief Real source tiles retain Q6 factors while literal ties prove half RNE.
+ *
+ * This tests preparation only, with no CPU half-activation execution claim. The
+ * source tensor and its words survive; the independently checked half words own
+ * a separate model-prepared tensor. Nonmultiple K covers the live source tail.
+ */
+TEST(Test__GDNProjectionArithmetic, HalfMaterializationPreservesSourceFactorsAndTies)
+{
+    constexpr std::array<uint32_t, 13> inputs{
+        0x00000000u, 0x80000000u, 0x33000000u, 0xb3000000u, 0x33800000u, 0xb3800000u,
+        0x33c00000u, 0xb3c00000u, 0x3f801000u, 0x3f803000u, 0xbf803000u, 0x477fe000u, 0xc77fe000u};
+    constexpr std::array<uint16_t, 13> expected{
+        0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0001u, 0x8001u,
+        0x0002u, 0x8002u, 0x3c00u, 0x3c02u, 0xbc02u, 0x7bffu, 0xfbffu};
+    FP32Tensor original({2, inputs.size()}, DeviceId::cpu());
+    for (size_t row = 0; row < 2; ++row)
+        for (size_t column = 0; column < inputs.size(); ++column)
+            original.mutable_typed_data()[row * inputs.size() + column] = std::bit_cast<float>(inputs[column]);
+    const auto half = materializePreparedHalfWeights(original);
+    ASSERT_EQ(half->shape(), original.shape());
+    for (size_t row = 0; row < 2; ++row)
+        for (size_t column = 0; column < inputs.size(); ++column)
+        {
+            EXPECT_EQ(half->typed_data()[row * inputs.size() + column], expected[column]);
+            EXPECT_EQ(std::bit_cast<uint32_t>(original.data()[row * inputs.size() + column]), inputs[column]);
+        }
+    std::shared_ptr<TensorBase> q6(TestTensorFactory::createQ6_KRandom({2, 256}, 918));
+    std::vector<uint8_t> source_bytes(q6->size_bytes());
+    std::memcpy(source_bytes.data(), q6->raw_data(), source_bytes.size());
+    std::vector<float> decoded(q6->numel());
+    q6->to_fp32(decoded.data());
+    const auto prepared = materializePreparedHalfWeights(*q6);
+    for (size_t i = 0; i < decoded.size(); ++i)
+        EXPECT_EQ(prepared->typed_data()[i], canonicalPreparedHalfBits(decoded[i]));
+    EXPECT_EQ(std::memcmp(source_bytes.data(), q6->raw_data(), source_bytes.size()), 0);
+    // Existing source half words need no conversion by the representation policy.
+    FP16Tensor native_half({1, 1});
+    native_half.mutable_typed_data()[0] = 0x8000;
+    EXPECT_EQ(PreparedWeightRepresentationContract::resolve(WeightRole::GDNProjection,
+        TensorType::FP16, "blk.0.ssm_out.weight", "qwen35moe", GDNProjectionArithmetic::FP16),
+        ModelPreparedWeightRepresentation::SourceNative);
+    EXPECT_EQ(native_half.typed_data()[0], 0x8000u);
+}
+
+/** @brief Invalid half operands fail during setup rather than publishing infinity. */
+TEST(Test__GDNProjectionArithmetic, HalfMaterializationRejectsOverflowAndAdmitsCPUExecution)
+{
+    FP32Tensor source({1, 1}, DeviceId::cpu());
+    for (const uint32_t word : {0x477ff000u, 0xc77ff000u, 0x7f800000u, 0x7fc00000u})
+    {
+        source.mutable_typed_data()[0] = std::bit_cast<float>(word);
+        EXPECT_THROW(materializePreparedHalfWeights(source), std::invalid_argument);
+    }
+    struct Restore
+    {
+        GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
+        ~Restore() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
+    } restore;
+    mutableDebugEnv().gemm.gdn_projection_arithmetic = GDNProjectionArithmetic::FP16;
+    auto loader = MockModelLoaderBuilder().setArchitecture("qwen35moe")
+        .addFP32RandomTensor("blk.0.ssm_alpha.weight", {1, 32}).build();
+    WeightManager manager(*loader);
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{18722};
+    strategy.devices = {DeviceId::cpu()};
+    WeightPlan plan(strategy);
+    WeightRequirement requirement;
+    requirement.canonical_name = "blk.0.ssm_alpha.weight";
+    requirement.target_device = DeviceId::cpu();
+    requirement.lookup_device = DeviceId::cpu();
+    plan.add(requirement);
+    const auto frozen = manager.materialize(plan);
+    const auto &binding = frozen.layer(0, "ssm_alpha.weight");
+    EXPECT_EQ(binding.tensor->native_type(), TensorType::FP16);
+    EXPECT_EQ(binding.floating_operand_precision, FloatingActivationOperandPrecision::FP16RNE);
+}
+
+/** @brief Router policy changes only its operands and leaves expert activation math native. */
+TEST(Test__MoERouterArithmetic, OriginalSourceAndOperandPolicyAreScoped)
+{
+    using Contract = PreparedWeightRepresentationContract;
+    const char *name = "blk.0.ffn_gate_inp.weight";
+    ASSERT_EQ(inferWeightRole(name), WeightRole::MoERouter);
+    for (const auto type : {TensorType::Q6_K, TensorType::Q8_0, TensorType::FP32, TensorType::BF16})
+    {
+        EXPECT_EQ(Contract::resolve(WeightRole::MoERouter, type, name, "qwen35moe",
+            GDNProjectionArithmetic::Native, MoERouterArithmetic::FP16), ModelPreparedWeightRepresentation::FP16);
+        EXPECT_EQ(Contract::resolve(WeightRole::MoERouter, type, name, "qwen35moe",
+            GDNProjectionArithmetic::Native, MoERouterArithmetic::Native),
+            Contract::resolve(WeightRole::MoERouter, type));
+    }
+    EXPECT_EQ(Contract::resolve(WeightRole::MoERouter, TensorType::FP16, name, "qwen35moe",
+        GDNProjectionArithmetic::Native, MoERouterArithmetic::FP16), ModelPreparedWeightRepresentation::SourceNative);
+    for (const auto source_name : {"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                  "blk.0.ffn_down_exps.weight", "blk.3.attn_output.weight",
+                                  "output.weight", "token_embd.weight"})
+    {
+        const auto role = inferWeightRole(source_name);
+        EXPECT_EQ(Contract::resolve(role, TensorType::Q6_K, source_name, "qwen35moe",
+            GDNProjectionArithmetic::Native, MoERouterArithmetic::FP16), Contract::resolve(role, TensorType::Q6_K));
+        EXPECT_EQ(Contract::operandPrecision(role, source_name, "qwen35moe",
+            GDNProjectionArithmetic::Native, MoERouterArithmetic::FP16), FloatingActivationOperandPrecision::Native);
+    }
+}
+
+/** @brief Frozen model bindings own original-source half routers once and preserve source bytes. */
+TEST(Test__MoERouterArithmetic, MaterializationSealsHalfOperandsAndPreservesNativeExperts)
+{
+    struct Restore {
+        MoERouterArithmetic previous = debugEnv().gemm.moe_router_arithmetic;
+        ~Restore() { mutableDebugEnv().gemm.moe_router_arithmetic = previous; }
+    } restore;
+    mutableDebugEnv().gemm.moe_router_arithmetic = MoERouterArithmetic::FP16;
+    auto source = std::make_shared<FP32Tensor>(std::vector<size_t>{3, 32});
+    for (size_t i = 0; i < source->numel(); ++i)
+        source->mutable_typed_data()[i] = static_cast<float>(i + 1) / 129.0f;
+    const std::vector<float> original(source->data(), source->data() + source->numel());
+    auto loader = MockModelLoaderBuilder().setArchitecture("qwen35moe")
+        .addTensor("blk.0.ffn_gate_inp.weight", source)
+        .addFP32RandomTensor("blk.0.ffn_up.weight", {3, 32}).build();
+    WeightManager manager(*loader);
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{18723};
+    strategy.devices = {DeviceId::cpu()};
+    WeightPlan plan(strategy);
+    for (const auto name : {"blk.0.ffn_gate_inp.weight", "blk.0.ffn_up.weight"})
+    {
+        WeightRequirement requirement;
+        requirement.canonical_name = name;
+        requirement.target_device = DeviceId::cpu();
+        requirement.lookup_device = DeviceId::cpu();
+        plan.add(requirement);
+    }
+    const auto frozen = manager.materialize(plan);
+    const auto &router = frozen.layer(0, "ffn_gate_inp.weight");
+    ASSERT_TRUE(router.tensor_owner);
+    ASSERT_EQ(router.tensor->native_type(), TensorType::FP16);
+    EXPECT_EQ(router.floating_operand_precision, FloatingActivationOperandPrecision::FP16RNE);
+    const auto *half = static_cast<const uint16_t *>(router.tensor->raw_data());
+    for (size_t i = 0; i < original.size(); ++i)
+        EXPECT_EQ(half[i], canonicalPreparedHalfBits(original[i]));
+    EXPECT_EQ(std::memcmp(source->data(), original.data(), original.size() * sizeof(float)), 0);
+    EXPECT_EQ(frozen.layer(0, "ffn_up.weight").floating_operand_precision,
+        FloatingActivationOperandPrecision::Native);
+    EXPECT_EQ(frozen.layer(0, "ffn_up.weight").tensor->native_type(), TensorType::FP32);
+}
+
+/** @brief Hadamard is a first quantization of floating router sources only. */
+TEST(Test__MoERouterArithmetic, HadamardRejectsEveryQuantizedSourceAndPreservesOtherRoles)
+{
+    using C = PreparedWeightRepresentationContract;
+    constexpr auto mode = MoERouterArithmetic::NativeHadamard32;
+    for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
+    {
+        const auto type = static_cast<TensorType>(raw);
+        if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16) continue;
+        EXPECT_THROW(C::resolve(WeightRole::MoERouter, type, "blk.0.ffn_gate_inp.weight", "qwen35moe",
+            GDNProjectionArithmetic::Native, mode), std::invalid_argument);
+    }
+    for (const auto format : {"Q8_0", "Q6_K", "IQ3_S", "Q4_K", "unknown"})
+        EXPECT_THROW(C::resolve(WeightRole::MoERouter, format, "blk.0.ffn_gate_inp.weight", "qwen35moe",
+            GDNProjectionArithmetic::Native, mode), std::invalid_argument);
+    for (const auto type : {TensorType::FP32, TensorType::FP16, TensorType::BF16})
+        EXPECT_EQ(C::resolve(WeightRole::MoERouter, type, "blk.0.ffn_gate_inp.weight", "qwen35moe",
+            GDNProjectionArithmetic::Native, mode), type == TensorType::FP32 ?
+                ModelPreparedWeightRepresentation::SourceNative : ModelPreparedWeightRepresentation::FP32);
+    for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight",
+                            "blk.0.attn_gate.weight", "blk.0.ssm_out.weight", "blk.0.ffn_gate_exps.weight",
+                            "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight", "token_embd.weight"})
+    {
+        const auto role = inferWeightRole(name);
+        EXPECT_EQ(C::resolve(role, TensorType::Q6_K, name, "qwen35moe", GDNProjectionArithmetic::Native, mode),
+                  C::resolve(role, TensorType::Q6_K));
+        EXPECT_EQ(C::operandPrecision(role, name, "qwen35moe", GDNProjectionArithmetic::Native, mode),
+                  FloatingActivationOperandPrecision::Native);
+    }
+}
+
+/** @brief Selective half controls preserve every wide source and reject codebook conversion. */
+TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaSelectsOnlyOriginalFloatingControls)
+{
+    using Contract = PreparedWeightRepresentationContract;
+    constexpr auto mode = GDNProjectionArithmetic::FP16AlphaBeta;
+    for (const auto architecture : {"qwen35", "qwen35moe"})
+        for (const auto name : {"blk.0.ssm_alpha.weight", "blk.12.ssm_beta.weight"})
+        {
+            const auto role = inferWeightRole(name);
+            EXPECT_EQ(Contract::effectiveGDNArithmetic(role, name, architecture, mode), GDNProjectionArithmetic::FP16);
+            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, mode), FloatingActivationOperandPrecision::FP16RNE);
+            for (const auto type : {TensorType::FP32, TensorType::BF16})
+                EXPECT_EQ(Contract::resolve(role, type, name, architecture, mode), ModelPreparedWeightRepresentation::FP16);
+            for (const auto format : {"F32", "FP32", "BF16"})
+                EXPECT_EQ(Contract::resolve(role, format, name, architecture, mode), ModelPreparedWeightRepresentation::FP16);
+            EXPECT_EQ(Contract::resolve(role, TensorType::FP16, name, architecture, mode), ModelPreparedWeightRepresentation::SourceNative);
+            for (const auto format : {"F16", "FP16"})
+                EXPECT_EQ(Contract::resolve(role, format, name, architecture, mode), ModelPreparedWeightRepresentation::SourceNative);
+            for (const auto type : {TensorType::Q6_K, TensorType::Q8_0, TensorType::IQ3_S})
+                EXPECT_THROW(Contract::resolve(role, type, name, architecture, mode), std::invalid_argument);
+            for (const auto format : {"Q6_K", "Q8_0", "IQ3_S", "unknown"})
+                EXPECT_THROW(Contract::resolve(role, format, name, architecture, mode), std::invalid_argument);
+        }
+    for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight",
+                           "blk.0.gdn_qkv.weight", "blk.3.attn_q.weight", "blk.3.attn_output.weight",
+                           "blk.0.ffn_gate_inp.weight", "blk.0.ffn_up_exps.weight", "output.weight", "token_embd.weight",
+                           "blk.x.ssm_alpha.weight", "blk.0.ssm_beta.weight.extra"})
+    {
+        const auto role = inferWeightRole(name);
+        EXPECT_EQ(Contract::effectiveGDNArithmetic(role, name, "qwen35moe", mode), GDNProjectionArithmetic::Native);
+        EXPECT_EQ(Contract::operandPrecision(role, name, "qwen35moe", mode), FloatingActivationOperandPrecision::Native);
+        for (const auto type : {TensorType::FP32, TensorType::FP16, TensorType::Q6_K, TensorType::IQ3_S})
+            EXPECT_EQ(Contract::resolve(role, type, name, "qwen35moe", mode), Contract::resolve(role, type));
+        for (const auto format : {"F32", "F16", "Q6_K", "IQ3_S"})
+            EXPECT_EQ(Contract::resolve(role, format, name, "qwen35moe", mode), Contract::resolve(role, format));
+    }
+    EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::GDNAlphaBetaProjection,
+        "blk.0.ssm_alpha.weight", "llama", mode), GDNProjectionArithmetic::Native);
+    EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::MoERouter,
+        "blk.0.ssm_alpha.weight", "qwen35moe", mode), GDNProjectionArithmetic::Native);
+}
+
+/** @brief The default is explicitly MoE-scoped and retains original-source conversion guards. */
+TEST(Test__GDNProjectionArithmetic, DefaultHalfMoEAlphaBetaPreservesDenseNative)
+{
+    using Contract = PreparedWeightRepresentationContract;
+    constexpr auto mode = GDNProjectionArithmetic::FP16MoEAlphaBeta;
+    EXPECT_EQ(kDefaultGDNProjectionArithmetic, mode);
+    EXPECT_EQ(parseGDNProjectionArithmetic("fp16_moe_alpha_beta"), mode);
+    EXPECT_EQ(gdnProjectionArithmeticName(mode), "fp16_moe_alpha_beta");
+    EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::MoERouter,
+        "blk.0.ssm_alpha.weight", "qwen35moe", mode), GDNProjectionArithmetic::Native);
+    for (const auto architecture : {"qwen35", "qwen35moe", "llama"})
+        for (const auto name : {"blk.0.ssm_alpha.weight", "blk.12.ssm_beta.weight",
+                               "blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight",
+                               "blk.0.ffn_gate_inp.weight", "blk.0.ffn_up_exps.weight", "output.weight",
+                               "blk.x.ssm_alpha.weight", "blk.0.ssm_beta.weight.extra"})
+        {
+            const auto role = inferWeightRole(name);
+            const bool selected = std::string_view(architecture) == "qwen35moe" &&
+                Contract::isGDNProjectionSource(role, name, architecture) &&
+                role == WeightRole::GDNAlphaBetaProjection;
+            EXPECT_EQ(Contract::effectiveGDNArithmetic(role, name, architecture, mode),
+                selected ? GDNProjectionArithmetic::FP16 : GDNProjectionArithmetic::Native);
+            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, mode), selected ?
+                FloatingActivationOperandPrecision::FP16RNE : FloatingActivationOperandPrecision::Native);
+            for (const auto type : {TensorType::FP32, TensorType::FP16, TensorType::BF16})
+                EXPECT_EQ(Contract::resolve(role, type, name, architecture, mode), selected ?
+                    (type == TensorType::FP16 ? ModelPreparedWeightRepresentation::SourceNative :
+                        ModelPreparedWeightRepresentation::FP16) : Contract::resolve(role, type));
+            for (const auto format : {"F32", "FP32", "F16", "FP16", "BF16"})
+                EXPECT_EQ(Contract::resolve(role, format, name, architecture, mode), selected ?
+                    (std::string_view(format) == "F16" || std::string_view(format) == "FP16" ?
+                        ModelPreparedWeightRepresentation::SourceNative : ModelPreparedWeightRepresentation::FP16) :
+                    Contract::resolve(role, format));
+            for (const auto type : {TensorType::Q6_K, TensorType::Q8_0, TensorType::IQ3_S})
+                if (selected) { EXPECT_THROW(Contract::resolve(role, type, name, architecture, mode), std::invalid_argument); }
+                else { EXPECT_EQ(Contract::resolve(role, type, name, architecture, mode), Contract::resolve(role, type)); }
+            for (const auto format : {"Q6_K", "Q8_0", "IQ3_S"})
+                if (selected) { EXPECT_THROW(Contract::resolve(role, format, name, architecture, mode), std::invalid_argument); }
+                else { EXPECT_EQ(Contract::resolve(role, format, name, architecture, mode), Contract::resolve(role, format)); }
+        }
+}
+
+/** @brief The real loader prepares only alpha/beta and preserves source ownership and bytes. */
+TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaMaterializationLeavesWideQuantizationUntouched)
+{
+    struct Restore {
+        GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
+        ~Restore() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
+    } restore;
+    mutableDebugEnv().gemm.gdn_projection_arithmetic = GDNProjectionArithmetic::FP16MoEAlphaBeta;
+    std::shared_ptr<TensorBase> wide(TestTensorFactory::createQ6_KRandom({2, 256}, 9817));
+    std::vector<uint8_t> original(wide->size_bytes());
+    std::memcpy(original.data(), wide->raw_data(), original.size());
+    auto loader = MockModelLoaderBuilder().setArchitecture("qwen35moe")
+        .addTensor("blk.0.attn_qkv.weight", wide).addTensor("blk.0.attn_gate.weight", wide)
+        .addTensor("blk.0.ssm_out.weight", wide).addTensor("blk.0.ffn_up.weight", wide)
+        .addFP32RandomTensor("blk.0.ssm_alpha.weight", {2, 256})
+        .addFP32RandomTensor("blk.0.ssm_beta.weight", {2, 256}).build();
+    WeightManager manager(*loader);
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{18729};
+    strategy.devices = {DeviceId::cpu()};
+    WeightPlan plan(strategy);
+    for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight",
+                           "blk.0.ffn_up.weight", "blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight"})
+    {
+        WeightRequirement requirement;
+        requirement.canonical_name = name;
+        requirement.target_device = DeviceId::cpu();
+        requirement.lookup_device = DeviceId::cpu();
+        requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
+        plan.add(requirement);
+    }
+    const auto frozen = manager.materialize(plan);
+    for (const auto suffix : {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ffn_up.weight"})
+    {
+        const auto &binding = frozen.layer(0, suffix);
+        EXPECT_EQ(binding.tensor->native_type(), TensorType::Q6_K);
+        EXPECT_EQ(binding.floating_operand_precision, FloatingActivationOperandPrecision::Native);
+        EXPECT_EQ(std::memcmp(binding.tensor->raw_data(), original.data(), original.size()), 0);
+    }
+    for (const auto suffix : {"ssm_alpha.weight", "ssm_beta.weight"})
+    {
+        const auto &binding = frozen.layer(0, suffix);
+        const auto source = loader->loadTensor(std::string("blk.0.") + suffix);
+        ASSERT_EQ(binding.tensor->native_type(), TensorType::FP16);
+        ASSERT_EQ(source->native_type(), TensorType::FP32);
+        EXPECT_EQ(binding.floating_operand_precision, FloatingActivationOperandPrecision::FP16RNE);
+        EXPECT_NE(binding.tensor, source.get());
+        EXPECT_EQ(binding.tensor->size_bytes() * 2, source->size_bytes());
+        const auto *words = static_cast<const uint16_t *>(binding.tensor->raw_data());
+        for (size_t i = 0; i < source->numel(); ++i)
+            EXPECT_EQ(words[i], canonicalPreparedHalfBits(source->data()[i]));
+    }
+    EXPECT_EQ(std::memcmp(wide->raw_data(), original.data(), original.size()), 0);
 }

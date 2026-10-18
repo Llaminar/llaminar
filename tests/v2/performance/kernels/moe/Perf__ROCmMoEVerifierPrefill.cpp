@@ -243,19 +243,19 @@ namespace
      * Shared-expert verifier performance is meaningful only when its input is
      * the exact Q8 row publication produced by the routed router stage.  This
      * scope keeps that production contract independent of test order while
-     * restoring every mutable debug-policy field when a case finishes.
+     * restoring the Q8 publication and reuse controls when a case finishes.
+     * Floating router operands are now immutable prepared-tensor identity,
+     * so this Q8 benchmark never rewrites a half-weight cache policy.
      */
     class ScopedROCmBatchInvariantRouterPolicy
     {
     public:
         ScopedROCmBatchInvariantRouterPolicy()
             : old_q8_(llaminar2::mutableDebugEnv().rocm.moe_router_q8),
-              old_fp16_(llaminar2::mutableDebugEnv().rocm.moe_router_fp16),
               old_reuse_(llaminar2::mutableDebugEnv().rocm.moe_reuse_router_q8_hidden)
         {
             auto &config = llaminar2::mutableDebugEnv().rocm;
             config.moe_router_q8 = true;
-            config.moe_router_fp16 = false;
             config.moe_reuse_router_q8_hidden = true;
         }
 
@@ -263,7 +263,6 @@ namespace
         {
             auto &config = llaminar2::mutableDebugEnv().rocm;
             config.moe_router_q8 = old_q8_;
-            config.moe_router_fp16 = old_fp16_;
             config.moe_reuse_router_q8_hidden = old_reuse_;
         }
 
@@ -274,7 +273,6 @@ namespace
 
     private:
         bool old_q8_ = true;
-        bool old_fp16_ = false;
         bool old_reuse_ = true;
     };
 

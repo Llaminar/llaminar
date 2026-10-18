@@ -1,9 +1,11 @@
 /**
  * @file ROCmEmbeddingKernels.hip
- * @brief ROCm/HIP kernels for embedding lookup operations
+ * @brief Resident floating and original-source quantized embedding lookup.
  *
- * Implements FP32, native FP16/BF16 source, typed output, and EmbedQ8
- * (universal quantized) embedding lookups.
+ * Quantized rows preserve their source codes, scales and minima. A launch-time
+ * format specialization decodes only requested values through the common
+ * source decoder; IQ tables are borrowed from the backend's existing immutable
+ * generation owner. Replay performs no initialization, allocation or transfer.
  */
 
 #include <hip/hip_runtime.h>
@@ -12,9 +14,9 @@
 #include <cstdio>
 #include <cstring>
 
-#include "../../common/EmbedQ8Block.h"
-
-using llaminar2::EmbedQ8Block;
+#include "../../common/NativeEmbeddingDecode.h"
+#include "../../common/NativeEmbeddingLayout.h"
+#include <limits>
 
 // BF16 type support
 #if defined(__HIP_PLATFORM_AMD__)
@@ -298,72 +300,6 @@ __global__ void rocm_embedding_q8_1_kernel(
 }
 
 // ============================================================================
-// EmbedQ8 Universal Quantized Embedding Lookup Kernel
-// ============================================================================
-
-/**
- * @brief EmbedQ8 quantized embedding lookup kernel (universal format)
- *
- * Handles ALL quantized embedding formats (Q4_0, Q8_0, Q6_K, IQ4_NL, etc.)
- * after CPU-side repacking via IINT8Unpackable → EmbedQ8Block.
- *
- * Dequant: value = qs[i] * half_to_float(d) + half_to_float(m)
- *
- * @param embed_q8       EmbedQ8 blocks [vocab_size * blocks_per_row]
- * @param token_ids      Token IDs [num_tokens]
- * @param output         FP32 output [num_tokens, d_model]
- * @param num_tokens     Number of tokens
- * @param d_model        Embedding dimension
- * @param blocks_per_row Number of EmbedQ8 blocks per row (= ceil(d_model/32))
- */
-__global__ void rocm_embedding_q8_kernel(
-    const EmbedQ8Block *__restrict__ embed_q8,
-    const int *__restrict__ token_ids,
-    float *__restrict__ output,
-    int num_tokens,
-    int d_model,
-    int blocks_per_row,
-    int vocab_size,
-    int vocab_offset,
-    int debug_probe)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = num_tokens * d_model;
-
-    if (idx < total_elements)
-    {
-        int token_idx = idx / d_model;
-        int dim_idx = idx % d_model;
-        int token_id = token_ids[token_idx];
-
-        // Vocab-parallel: offset token ID by this shard's base
-        int local_id = token_id - vocab_offset;
-
-        (void)debug_probe;
-
-        // Out-of-range tokens produce zeros (summed via AllReduce across shards)
-        if (local_id < 0 || local_id >= vocab_size)
-        {
-            output[idx] = 0.0f;
-            return;
-        }
-
-        // Locate the EmbedQ8Block containing this element
-        int block_idx = dim_idx / 32;
-        int elem_in_block = dim_idx % 32;
-
-        const EmbedQ8Block &block = embed_q8[local_id * blocks_per_row + block_idx];
-
-        // Dequantize: value = qs[i] * scale + min
-        float scale = __half2float(*reinterpret_cast<const __half *>(&block.d));
-        float min_val = __half2float(*reinterpret_cast<const __half *>(&block.m));
-        float q_val = static_cast<float>(block.qs[elem_in_block]);
-
-        output[idx] = q_val * scale + min_val;
-    }
-}
-
-// ============================================================================
 // Host Launch Wrappers (extern "C" for linking from C++ code)
 // ============================================================================
 
@@ -520,43 +456,138 @@ extern "C"
         return hipGetLastError();
     }
 
-    /**
-     * @brief Launch EmbedQ8 universal quantized embedding lookup kernel
-     *
-     * @param embed_q8       EmbedQ8 blocks on GPU [vocab_size * blocks_per_row]
-     * @param token_ids      Token IDs on GPU [num_tokens]
-     * @param output         FP32 output on GPU [num_tokens, d_model]
-     * @param num_tokens     Number of tokens
-     * @param d_model        Embedding dimension
-     * @param blocks_per_row Number of EmbedQ8 blocks per row (ceil(d_model / 32))
-     * @param vocab_size     Number of vocab entries in this shard
-     * @param vocab_offset   Global vocab index of this shard's first row
-     * @param stream         HIP stream (0 for default)
-     * @return hipError_t
-     */
-    hipError_t hipOps_embedding_q8(
-        const void *embed_q8,
-        const int *token_ids,
-        float *output,
-        int num_tokens,
-        int d_model,
-        int blocks_per_row,
-        int vocab_size,
-        int vocab_offset,
-        int debug_probe,
-        hipStream_t stream)
-    {
-        (void)hipGetLastError();
-
-        int total_elements = num_tokens * d_model;
-        int block_size = 256;
-        int grid_size = (total_elements + block_size - 1) / block_size;
-
-        rocm_embedding_q8_kernel<<<grid_size, block_size, 0, stream>>>(
-            reinterpret_cast<const EmbedQ8Block *>(embed_q8),
-            token_ids, output, num_tokens, d_model, blocks_per_row, vocab_size, vocab_offset, debug_probe);
-
-        return hipGetLastError();
-    }
 
 } // extern "C"
+
+namespace {
+/**
+ * @brief Decode one exact original source value with a unique output writer.
+ * @tparam Format Immutable source codebook selected before launch.
+ * @param source Original packed table; no EmbedQ8 intermediate is present.
+ * @param ids Live device token rows on the exact producer stream.
+ * @param output Full-width FP32 activation rows.
+ * @param total Number of live output elements.
+ * @param width Logical row width, including partial final source blocks.
+ * @param vocab Number of locally owned original vocabulary rows.
+ * @param offset Global first vocabulary row of this shard.
+ * @param row_bytes Exact source row stride from prepared layout.
+ * @param tables Borrowed immutable backend IQ grid addresses.
+ */
+template<llaminar2::TensorType Format>
+__global__ void rocm_embedding_native_source_kernel(
+    const unsigned char *__restrict__ source, const int *__restrict__ ids,
+    float *__restrict__ output, size_t total, int width, int vocab, int offset,
+    size_t row_bytes, llaminar2::NativeEmbeddingIQTables tables)
+{
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= total) return;
+    const size_t row = index / size_t(width);
+    const size_t column = index % size_t(width);
+    // Widen subtraction before range checking to avoid invalid-token overflow.
+    const int64_t local = int64_t(ids[row]) - int64_t(offset);
+    output[index] = local < 0 || local >= vocab ? 0.0f
+        : llaminar2::native_embedding::decode<Format>(
+            source + size_t(local) * row_bytes, column, tables);
+}
+
+/**
+ * @brief Validate the complete source layout and submit its specialized lookup.
+ * @tparam Format Original table format; never selected from an output dtype.
+ * @param source Immutable prepared bytes.
+ * @param ids Ordered device token source.
+ * @param output Full-width FP32 output.
+ * @param rows Live row count for this captured executable.
+ * @param width Logical embedding width.
+ * @param vocab Locally owned original source rows.
+ * @param offset Global start of the local vocabulary shard.
+ * @param layout Sole physical byte/stride authority from preparation.
+ * @param tables Setup-bound codebook view.
+ * @param stream Exact non-null launch stream.
+ * @return Backend launch status; incompatible geometry is an error.
+ */
+template<llaminar2::TensorType Format>
+hipError_t launchNativeSource(const void *source, const int *ids, float *output,
+    int rows, int width, int vocab, int offset, llaminar2::NativeEmbeddingLayout layout,
+    llaminar2::NativeEmbeddingIQTables tables, hipStream_t stream)
+{
+    using Block = typename llaminar2::native_embedding::SourceBlock<Format>::type;
+    const size_t blocks = size_t(width) / Block::BLOCK_SIZE + (size_t(width) % Block::BLOCK_SIZE != 0);
+    if (layout.block_elements != Block::BLOCK_SIZE || layout.block_bytes != sizeof(Block) ||
+        layout.blocks_per_row != blocks || layout.row_stride_bytes != blocks * sizeof(Block) ||
+        size_t(vocab) > std::numeric_limits<size_t>::max() / layout.row_stride_bytes ||
+        layout.byte_size != size_t(vocab) * layout.row_stride_bytes)
+        return hipErrorInvalidValue;
+    if constexpr (Format == llaminar2::TensorType::IQ1_S || Format == llaminar2::TensorType::IQ1_M)
+        { if (!tables.iq1s) return hipErrorInvalidValue; }
+    if constexpr (Format == llaminar2::TensorType::IQ2_XXS)
+        { if (!tables.iq2xxs) return hipErrorInvalidValue; }
+    if constexpr (Format == llaminar2::TensorType::IQ2_XS)
+        { if (!tables.iq2xs) return hipErrorInvalidValue; }
+    if constexpr (Format == llaminar2::TensorType::IQ2_S)
+        { if (!tables.iq2s) return hipErrorInvalidValue; }
+    if constexpr (Format == llaminar2::TensorType::IQ3_XXS)
+        { if (!tables.iq3xxs) return hipErrorInvalidValue; }
+    if constexpr (Format == llaminar2::TensorType::IQ3_S)
+        { if (!tables.iq3s) return hipErrorInvalidValue; }
+    const size_t total = size_t(rows) * size_t(width);
+    constexpr unsigned threads = 256;
+    const size_t blocks_in_grid = total / threads + (total % threads != 0);
+    if (blocks_in_grid > std::numeric_limits<unsigned>::max()) return hipErrorInvalidValue;
+    rocm_embedding_native_source_kernel<Format><<<unsigned(blocks_in_grid), threads, 0, stream>>>(
+        static_cast<const unsigned char *>(source), ids, output, total, width, vocab, offset,
+        layout.row_stride_bytes, tables);
+    return hipGetLastError();
+}
+} // namespace
+
+/**
+ * @brief Launch original-source quantized lookup without a replay-time converter.
+ * @param source Original immutable table storage.
+ * @param ids Device token source.
+ * @param output Full-width FP32 destination.
+ * @param rows Number of live rows represented by this captured executable.
+ * @param width Original embedding width.
+ * @param vocab Local original table row count.
+ * @param offset Global first row of this vocabulary shard.
+ * @param layout Exact source format/block/stride/extent identity.
+ * @param tables Borrowed source IQ codebooks prepared before capture.
+ * @param stream Exact non-null producer stream.
+ * @return Backend status, rejecting null bindings and unsupported formats.
+ */
+extern "C" hipError_t hipOps_embedding_native(
+    const void *source, const int *ids, float *output, int rows, int width,
+    int vocab, int offset, llaminar2::NativeEmbeddingLayout layout,
+    llaminar2::NativeEmbeddingIQTables tables, hipStream_t stream)
+{
+    if (!stream || !source || !ids || !output || rows <= 0 || width <= 0 || vocab <= 0 || offset < 0)
+        return hipErrorInvalidValue;
+#define LLAMINAR_EMBED_SOURCE(TYPE) \
+    case llaminar2::TensorType::TYPE: return launchNativeSource<llaminar2::TensorType::TYPE>( \
+        source, ids, output, rows, width, vocab, offset, layout, tables, stream)
+    switch (layout.source_type)
+    {
+        LLAMINAR_EMBED_SOURCE(Q4_0);
+        LLAMINAR_EMBED_SOURCE(Q4_1);
+        LLAMINAR_EMBED_SOURCE(Q5_0);
+        LLAMINAR_EMBED_SOURCE(Q5_1);
+        LLAMINAR_EMBED_SOURCE(Q8_0);
+        LLAMINAR_EMBED_SOURCE(Q8_1);
+        LLAMINAR_EMBED_SOURCE(Q2_K);
+        LLAMINAR_EMBED_SOURCE(Q3_K);
+        LLAMINAR_EMBED_SOURCE(Q4_K);
+        LLAMINAR_EMBED_SOURCE(Q5_K);
+        LLAMINAR_EMBED_SOURCE(Q6_K);
+        LLAMINAR_EMBED_SOURCE(Q8_K);
+        LLAMINAR_EMBED_SOURCE(IQ1_S);
+        LLAMINAR_EMBED_SOURCE(IQ1_M);
+        LLAMINAR_EMBED_SOURCE(IQ2_XXS);
+        LLAMINAR_EMBED_SOURCE(IQ2_XS);
+        LLAMINAR_EMBED_SOURCE(IQ2_S);
+        LLAMINAR_EMBED_SOURCE(IQ3_XXS);
+        LLAMINAR_EMBED_SOURCE(IQ3_S);
+        LLAMINAR_EMBED_SOURCE(IQ4_NL);
+        LLAMINAR_EMBED_SOURCE(IQ4_XS);
+    default: return hipErrorInvalidValue;
+    }
+#undef LLAMINAR_EMBED_SOURCE
+}

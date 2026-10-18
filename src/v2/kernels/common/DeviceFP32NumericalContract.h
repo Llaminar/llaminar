@@ -6,7 +6,9 @@
  * optimizer may still reassociate a completed result with its consumer. CPU
  * experts must execute the same program when ExpertOverlay moves a logical
  * expert between host and device tiers. These primitives therefore make every
- * published binary32 dependency edge explicit on all three backends.
+ * published binary32 dependency edge explicit on all three backends. CUDA
+ * primitives also retain IEEE subnormal operands and results explicitly: the
+ * translation unit's fast-math FTZ policy cannot override this byte contract.
  */
 
 #pragma once
@@ -90,6 +92,8 @@ namespace llaminar2::device_fp32_contract
 
     /**
      * @brief Multiply two values with one retained round-to-nearest boundary.
+     * @details CUDA explicitly retains subnormal inputs and results under the
+     * translation unit fast-math policy; HIP and CPU keep their existing RNE paths.
      * @param lhs Left operand.
      * @param rhs Right operand.
      * @return Explicitly rounded binary32 product.
@@ -98,7 +102,15 @@ namespace llaminar2::device_fp32_contract
         float lhs,
         float rhs) noexcept
     {
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#if defined(__CUDA_ARCH__)
+        // CUDA's --ftz=true also changes the rounded intrinsic to a flushing
+        // instruction. The explicit RNE PTX form deliberately omits .ftz,
+        // retaining subnormal inputs/results and forbidding contraction.
+        float value;
+        asm("mul.rn.f32 %0, %1, %2;"
+            : "=f"(value) : "f"(lhs), "f"(rhs));
+        return persistRounded(value);
+#elif defined(__HIP_DEVICE_COMPILE__)
         return persistRounded(__fmul_rn(lhs, rhs));
 #else
         return persistRounded(lhs * rhs);
@@ -107,6 +119,8 @@ namespace llaminar2::device_fp32_contract
 
     /**
      * @brief Add two values with one retained round-to-nearest boundary.
+     * @details CUDA explicitly retains subnormal inputs and results under the
+     * translation unit fast-math policy; HIP and CPU keep their existing RNE paths.
      * @param lhs Left operand.
      * @param rhs Right operand.
      * @return Explicitly rounded binary32 sum.
@@ -115,7 +129,15 @@ namespace llaminar2::device_fp32_contract
         float lhs,
         float rhs) noexcept
     {
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#if defined(__CUDA_ARCH__)
+        // CUDA's --ftz=true also changes the rounded intrinsic to a flushing
+        // instruction. The explicit RNE PTX form deliberately omits .ftz,
+        // retaining subnormal inputs/results and forbidding contraction.
+        float value;
+        asm("add.rn.f32 %0, %1, %2;"
+            : "=f"(value) : "f"(lhs), "f"(rhs));
+        return persistRounded(value);
+#elif defined(__HIP_DEVICE_COMPILE__)
         return persistRounded(__fadd_rn(lhs, rhs));
 #else
         return persistRounded(lhs + rhs);
@@ -124,6 +146,8 @@ namespace llaminar2::device_fp32_contract
 
     /**
      * @brief Fused multiply-add with one retained round-to-nearest boundary.
+     * @details CUDA explicitly retains subnormal inputs and results under the
+     * translation unit fast-math policy; HIP and CPU keep their existing RNE paths.
      * @param lhs Multiplicand.
      * @param rhs Multiplier.
      * @param accumulator Addend.
@@ -134,7 +158,15 @@ namespace llaminar2::device_fp32_contract
         float rhs,
         float accumulator) noexcept
     {
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#if defined(__CUDA_ARCH__)
+        // CUDA's --ftz=true also changes the rounded intrinsic to a flushing
+        // instruction. The explicit RNE PTX form deliberately omits .ftz,
+        // retaining subnormal inputs/results and forbidding contraction.
+        float value;
+        asm("fma.rn.f32 %0, %1, %2, %3;"
+            : "=f"(value) : "f"(lhs), "f"(rhs), "f"(accumulator));
+        return persistRounded(value);
+#elif defined(__HIP_DEVICE_COMPILE__)
         return persistRounded(__fmaf_rn(lhs, rhs, accumulator));
 #else
         return persistRounded(std::fma(lhs, rhs, accumulator));

@@ -13,9 +13,15 @@
  * Lifecycle: Instances are created and cached by `KernelFactory` per CUDA
  * device. Scratch allocations are retained across calls and released when the
  * cached kernel is destroyed.
+ *
+ * Model-prepared FP16 router weights select true half operands: original hidden
+ * loads round RNE to half inside the fixed per-row dot, then widen for FP32
+ * accumulation. Serial, grouped, prefill and owned rows share that same tree.
+ * Router rounding never replaces the original expert hidden publication.
  */
 
 #include "../../IMoEKernel.h"
+#include "CUDARouterQ8Prefill.h"
 #include "../../common/DeviceResidentRouterGateCache.h"
 #include "../CUDAKernelBase.h"
 #include "../gemm/CUDADeviceWorkspace.h"
@@ -1439,6 +1445,7 @@ namespace llaminar2
         };
 
         int device_ordinal_ = 0;
+        cuda::RouterQ8PrefillHardware router_q8_prefill_hardware_; ///< Immutable setup limits; never queried in capture.
         int *d_staging_indices_ = nullptr;
         float *d_staging_weights_ = nullptr;
         int staging_capacity_ = 0;

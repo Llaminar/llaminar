@@ -115,6 +115,7 @@ void fill_q8_1_blocks(Q8_1Block* blocks, int count) {
 
 void fill_q8_k_blocks(Q8_KBlock* blocks, int count) {
     for (int i = 0; i < count; ++i) {
+        blocks[i].d = (i % 2 ? -1.0f : 1.0f) * (1 + i % 4) * 0.03125f;
         for (int partial = 0; partial < 16; ++partial) {
             int sum = 0;
             for (int lane = 0; lane < 16; ++lane) {
@@ -1189,7 +1190,7 @@ TEST_P(VnniUnpackTest, RawBlockSizeBytes) {
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q5_1),   24u);
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q8_0),   34u);
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q8_1),   36u);
-    EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q8_K),  288u);
+    EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q8_K),  292u);
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q4_K),   0u);
     EXPECT_EQ(rawBlockSizeBytes(RepackFormat::Q6_K),   0u);
 }
@@ -1201,8 +1202,8 @@ TEST_P(VnniUnpackTest, RawBlockBufferSize) {
     EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q8_0, 64, 128), 8704u);
     // Q8_1: N=64, K=128 -> 64 * 4 * 36 = 9216
     EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q8_1, 64, 128), 9216u);
-    // Q8_K: N=64, K=512 -> 64 * 2 * 288 = 36864
-    EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q8_K, 64, 512), 36864u);
+    // Q8_K: N=64, K=512 -> 64 * 2 * 292 = 37376
+    EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q8_K, 64, 512), 37376u);
     // Non-reversible → 0
     EXPECT_EQ(rawBlockBufferSize(RepackFormat::Q4_K, 64, 128), 0u);
 }

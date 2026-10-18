@@ -2,6 +2,10 @@
  * @file TensorClasses.h
  * @brief Tensor interfaces, storage ownership, and coherence contracts.
  *
+ * Borrowed rank-two source-weight views report whole block-padded rows, matching
+ * their row-slice pointer arithmetic. Other ranks retain their existing extent
+ * authority; no GGUF parent-axis or packed-activation layout is inferred here.
+ *
  * ============================================================================
  * INTERFACE HIERARCHY AND USAGE
  * ============================================================================
@@ -1290,8 +1294,10 @@ namespace llaminar2
          *
          * Host-resident tensors live exclusively on the host. Device upload
          * requests (ensureOnDevice, TransferEngine::uploadFull) are no-ops.
-         * Use this for weights that are consumed on CPU and repacked into a
-         * device workspace by the kernel (e.g., embedding tables → EmbedQ8).
+         * Use this for immutable host source weights whose prepared device
+         * representation has a separate model-owned lifetime. Quantized
+         * embedding preparation preserves the original source blocks and owns
+         * their device allocation; lookup never repacks into graph workspace.
          */
         bool isHostResident() const
         {
@@ -3701,11 +3707,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<IQ4_NLBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<IQ4_NLBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<IQ4_NLBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -3958,11 +3966,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q8_0Block>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q8_0Block>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q8_0Block>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -5202,10 +5212,15 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
-            return nativeTensorExtent<Q4_0Block>(shape_);
+            // Explicit mmap bytes and owned source bytes retain their actual
+            // storage authority, matching the other source-weight tensors.
+            return data_byte_size_ > 0 ? data_byte_size_ :
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q4_0Block>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q4_0Block>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -5431,11 +5446,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q4_1Block>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q4_1Block>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q4_1Block>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -5652,11 +5669,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q5_0Block>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q5_0Block>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q5_0Block>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -5873,11 +5892,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q5_1Block>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q5_1Block>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q5_1Block>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -6055,11 +6076,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q6_KBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q6_KBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q6_KBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -6234,11 +6257,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q2_KBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q2_KBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q2_KBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -6418,11 +6443,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q5_KBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q5_KBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q5_KBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -6600,11 +6627,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q3_KBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q3_KBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q3_KBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -6782,11 +6811,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q4_KBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q4_KBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q4_KBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -6903,7 +6934,7 @@ namespace llaminar2
         // IQ8_0Decodable interface - per-block decode to Q8_0 (used by Q8_0WeightAccessor)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
 
-        // IINT8Unpackable interface — Q8_K has no per-block scale (scale = 1.0f)
+        // IINT8Unpackable preserves source signed codes and the full FP32 super-block scale.
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
             // k_block_offset is in 32-element units; Q8_K uses 256-element super-blocks
@@ -6915,23 +6946,20 @@ namespace llaminar2
 
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
-            (void)row_idx;
-            (void)k_block_offset;
-            return 1.0f; // Q8_K has no per-block scale
+            const auto *block = static_cast<const Q8_KBlock *>(
+                get_raw_block_at(row_idx, k_block_offset / 8));
+            return block->d;
         }
 
         size_t superblock_size() const override { return 256; }
 
         /**
-         * @brief Describe Q8_K as a lossless pre-decoded INT8 VNNI source.
+         * @brief Describe Q8_K for the existing FP16-scale INT8 VNNI execution ABI.
          *
-         * Q8_K already stores signed INT8 values.  Its 16-element block sums are
-         * an auxiliary dot-product acceleration and do not participate in the
-         * represented weight values, so CPU and GPU preparation can copy the
-         * values into the common 32-byte INT8 payload and publish a unit FP16
-         * scale for every 32-element execution block.  Codebook 21 identifies
-         * the source layout during preparation; GPU execution canonicalizes the
-         * prepared payload to the tuned raw-INT8 codebook 19.
+         * Source codes are copied unchanged, while the source FP32 scale is
+         * narrowed to FP16. This ABI does not preserve arbitrary source d;
+         * exact tensor/embedding consumers retain original Q8_K blocks.
+         * Codebook21 identifies the source and canonicalizes to execution19.
          */
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
@@ -6939,9 +6967,7 @@ namespace llaminar2
         }
         void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
 
-        /// Efficient override: reads Q8_K superblocks directly via typed_data().
-        /// Q8_K has no per-block scale so values are already int8; only needs
-        /// rescaling to maximize [-127,127] dynamic range.
+        /// Explicit legacy row-INT8 conversion applies each original source scale.
         float requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const override;
 
         void unpack_superblock_to_int8(
@@ -6953,7 +6979,7 @@ namespace llaminar2
             if (scales)
             {
                 for (int i = 0; i < 8; ++i)
-                    scales[i] = 1.0f;
+                    scales[i] = block->d;
             }
             if (mins)
             {
@@ -7013,11 +7039,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<Q8_KBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<Q8_KBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<Q8_KBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -7229,11 +7257,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<IQ4_XSBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<IQ4_XSBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<IQ4_XSBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -7428,11 +7458,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<IQ2_XXSBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<IQ2_XXSBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<IQ2_XXSBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -7627,11 +7659,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<IQ2_XSBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<IQ2_XSBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<IQ2_XSBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -7830,11 +7864,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<IQ3_XXSBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<IQ3_XXSBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<IQ3_XXSBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -8029,11 +8065,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<IQ2_SBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<IQ2_SBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<IQ2_SBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -8232,11 +8270,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<IQ3_SBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<IQ3_SBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<IQ3_SBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -8431,11 +8471,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<IQ1_SBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<IQ1_SBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<IQ1_SBlock>(shape_)) : raw_data_.size());
         }
 
     private:
@@ -8630,11 +8672,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        /** @return Exact native view extent; an empty owner vector is not an empty borrowed tensor. */
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
         size_t byte_size() const override
         {
             return data_byte_size_ > 0 ? data_byte_size_ :
-                (is_view_ ? nativeTensorExtent<IQ1_MBlock>(shape_) : raw_data_.size());
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<IQ1_MBlock>(shape_[0], shape_[1])
+                    : nativeTensorExtent<IQ1_MBlock>(shape_)) : raw_data_.size());
         }
 
     private:

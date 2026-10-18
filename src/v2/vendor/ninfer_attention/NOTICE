@@ -1,0 +1,5 @@
+Llaminar CUDA tensor-tile attention adapts the Apache-2.0 NInfer 3090 attention execution structure.
+Modified by Llaminar: native FP16 KV, FP32 running softmax state, binary probability/value scaling,
+device-owned ring geometry, captured conditional dispatch and deterministic compact-summary merging.
+Upstream: https://github.com/ashalliants/ninfer-3090
+Revision: 409fdc55ece9acf1c57d6cce6ca05427c8901692

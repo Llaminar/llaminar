@@ -9,6 +9,9 @@
  * - Flash Attention 2 (prefill) vs CPU attention
  * - Flash Decoding (decode) vs CPU attention
  * - Various head dimensions (64, 128, 256)
+ * - Independent probability references, ring replay and native LDS residency
+ * - Register-owned query scores preserve canonical FP32 bytes through poisoned
+ *   long/short captures, larger buckets, GQA mappings and extreme native-half V
  * - GQA configurations (n_heads != n_kv_heads)
  * - Deterministic captured decode retains KV parallelism and grouped/serial bytes
  *
@@ -1324,6 +1327,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_GQA)
  * workgroups publish unnormalized summaries and one deterministic reducer
  * consumes them in ascending partition order. This matrix crosses every native
  * K/V format, every compiled head dimension, sharded and replicated GQA,
+ * partial dimension stripes, poisoned summary capacity, output sentinels,
  * causal tails, a sliding window, an additive mask, and live lengths on both
  * sides of both the one-partition and medium-context device-only mode shifts.
  *
@@ -1357,7 +1361,17 @@ TEST_F(
         bool sweep_physical_candidates = true;
     };
 
-    constexpr std::array<ContextCase, 11> cases{{
+    constexpr std::array<ContextCase, 17> cases{{
+        {"generic HD32 partition tail", 7, 513, 8, 1, 32,
+         0, 0, -1, false},
+        {"generic HD96 mask and query tail", 31, 769, 12, 2, 96,
+         0, 0, -1, true},
+        {"generic HD192 multiple query tiles", 65, 513, 8, 1, 192,
+         0, 0, -1, false},
+        {"generic HD160 partial third reducer stripe", 17, 769, 8, 1, 160,
+         0, 0, -1, true},
+        {"generic HD224 partial fourth reducer stripe", 17, 769, 8, 1, 224,
+         0, 0, -1, true},
         {"M1 grouped verifier", 1, 513, 2, 2, 256,
          0, 8, -1, false},
         {"M2 grouped verifier", 2, 513, 2, 2, 256,
@@ -1374,6 +1388,11 @@ TEST_F(
          9, 6, 191, false},
         {"HD256 sharded additive mask", 17, 1025, 16, 2, 256,
          0, 0, -1, true},
+        // The 19-key window crosses full 16-key tiles, partial tiles and empty
+        // tiles as device-live positions advance, then shrink on the same
+        // retained graph. The additive holes also exclude individual keys.
+        {"HD256 full and partial window tile transitions", 33, 1025, 4, 1, 256,
+         0, 0, 19, true},
         {"HD256 replicated TP8 rank7", 17, 1025, 2, 2, 256,
          14, 8, -1, false},
         {"packed single-wave device-direct boundary", 1, 8449, 56, 1, 128,
@@ -1489,8 +1508,9 @@ TEST_F(
             ASSERT_TRUE(d_v.allocate(v_native.size()));
             ASSERT_TRUE(
                 d_direct_output.allocate(output_elements * sizeof(float)));
-            ASSERT_TRUE(
-                d_context_output.allocate(output_elements * sizeof(float)));
+            constexpr size_t output_guard_words = 16;
+            ASSERT_TRUE(d_context_output.allocate(
+                (output_elements + output_guard_words) * sizeof(float)));
             ASSERT_TRUE(d_partial_output.allocate(plan.partial_output_bytes));
             ASSERT_TRUE(d_partial_m.allocate(plan.partial_m_bytes));
             ASSERT_TRUE(d_partial_l.allocate(plan.partial_l_bytes));
@@ -1679,12 +1699,60 @@ TEST_F(
             ASSERT_EQ(graph_node_count, 3u)
                 << "ROCm context FA2 must remain one guarded direct kernel, "
                    "one guarded phase, and one guarded reducer";
+            // Certify the actual compiled producer, including native formats
+            // whose scalar-to-vector register moves can change occupancy.
+            // A source-level LDS estimate alone cannot prove three resident CTAs.
+            if (test_case.head_dim == 256)
+            {
+                std::vector<hipGraphNode_t> nodes(graph_node_count);
+                ASSERT_EQ(hipGraphGetNodes(graph, nodes.data(), &graph_node_count), hipSuccess);
+                int phase_nodes = 0;
+                int query_nodes = 0;
+                for (const auto node : nodes)
+                {
+                    hipKernelNodeParams native{};
+                    ASSERT_EQ(hipGraphKernelNodeGetParams(node, &native), hipSuccess);
+                    if (native.sharedMemBytes && native.gridDim.y == 1 &&
+                        native.gridDim.x == static_cast<unsigned>(plan.context_phase_block_slots))
+                    {
+                        ++phase_nodes;
+                        EXPECT_EQ(native.sharedMemBytes, plan.tile.lds_bytes);
+                        EXPECT_EQ(native.blockDim.x * native.blockDim.y * native.blockDim.z, 256U);
+                        int resident_blocks = 0;
+                        ASSERT_EQ(hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &resident_blocks, native.func, 256, native.sharedMemBytes), hipSuccess);
+                        EXPECT_GE(resident_blocks, 3);
+                        hipFuncAttributes attributes{};
+                        ASSERT_EQ(hipFuncGetAttributes(&attributes, native.func), hipSuccess);
+                        EXPECT_EQ(attributes.localSizeBytes, 0U);
+                        std::cout << "native_fa2_residency format=" << rocmFA2KVFormatName(format)
+                                  << " query_rows=" << test_case.seq_len
+                                  << " groups_per_cu=" << resident_blocks
+                                  << " dynamic_lds_bytes=" << native.sharedMemBytes
+                                  << " private_bytes=" << attributes.localSizeBytes
+                                  << " registers=" << attributes.numRegs
+                                  << " grid_x=" << native.gridDim.x
+                                  << " kernel=" << hipKernelNameRefByPtr(native.func, test_stream_)
+                                  << std::endl;
+                    }
+                    else if (native.sharedMemBytes)
+                    {
+                        ++query_nodes;
+                        // The guarded query scan has less parallel work and
+                        // retains concurrent K/V loads without the overwrite barrier.
+                        EXPECT_EQ(native.sharedMemBytes, 26432U);
+                    }
+                }
+                ASSERT_EQ(phase_nodes, 1);
+                ASSERT_EQ(query_nodes, 1);
+            }
+
             ASSERT_EQ(
                 hipGraphInstantiate(
                     &graph_exec, graph, nullptr, nullptr, 0),
                 hipSuccess);
 
-            const std::array<int, 8> live_lengths{{
+            const std::array<int, 10> live_lengths{{
                 test_case.seq_len,
                 255,
                 256,
@@ -1693,9 +1761,21 @@ TEST_F(
                 8192,
                 8193,
                 test_case.kv_capacity,
+                257,
+                test_case.seq_len,
             }};
             std::vector<float> direct_output(output_elements);
             std::vector<float> context_output(output_elements);
+            std::array<uint32_t, output_guard_words> output_guard{};
+            const auto verify_output_guard = [&]()
+            {
+                ASSERT_EQ(hipMemcpyAsync(
+                    output_guard.data(), d_context_output.as<float>() + output_elements,
+                    sizeof(output_guard), hipMemcpyDeviceToHost, test_stream_), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+                for (const uint32_t word : output_guard)
+                    EXPECT_EQ(word, 0xa5a5a5a5U);
+            };
             for (int live_kv_len : live_lengths)
             {
                 if (live_kv_len > test_case.kv_capacity ||
@@ -1716,6 +1796,17 @@ TEST_F(
                         d_params.get(), &params, sizeof(params),
                         hipMemcpyHostToDevice, test_stream_),
                     hipSuccess);
+                // Each retained replay starts with dirty summary capacity.
+                // Shortening after the maximum must never consume stale tuples;
+                // output stripes must stop before the allocation-end sentinel.
+                ASSERT_EQ(hipMemsetAsync(d_partial_output.get(), 0xff,
+                    plan.partial_output_bytes, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(d_partial_m.get(), 0xff,
+                    plan.partial_m_bytes, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(d_partial_l.get(), 0xff,
+                    plan.partial_l_bytes, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(d_context_output.get(), 0xa5,
+                    (output_elements + output_guard_words) * sizeof(float), test_stream_), hipSuccess);
                 ASSERT_EQ(launch_direct(), 0);
                 ASSERT_EQ(
                     hipGraphLaunch(graph_exec, test_stream_),
@@ -1743,6 +1834,7 @@ TEST_F(
                     std::string(test_case.label) + " " +
                         rocmFA2KVFormatName(format) +
                         " captured context/direct"));
+                verify_output_guard();
             }
 
             /*
@@ -1967,6 +2059,7 @@ TEST_F(
                         " persistent phase grid"));
             }
 
+            verify_output_guard();
             ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
             ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
         }
@@ -2329,7 +2422,7 @@ TEST_F(
     const std::vector<PerfStatRecord> records =
         PerfStatsCollector::snapshot({"gpu_graph_inventory"});
     const auto recorded =
-        [&records](const char *selected_axis, const char *storage)
+        [&records](const char *selected_axis, const char *schedule)
     {
         return std::any_of(
             records.begin(), records.end(),
@@ -2344,13 +2437,13 @@ TEST_F(
                        selected != record.tags.end() &&
                        selected->second == selected_axis &&
                        kv_storage != record.tags.end() &&
-                       kv_storage->second == storage;
+                       kv_storage->second == schedule;
             });
     };
-    for (const char *storage : {"fp32", "FP16", "BF16", "Q8_1"})
+    for (const char *schedule : {"fp32", "FP16", "BF16", "Q8_1"})
     {
-        EXPECT_TRUE(recorded("query_sequence", storage));
-        EXPECT_TRUE(recorded("key_value_context", storage));
+        EXPECT_TRUE(recorded("query_sequence", schedule));
+        EXPECT_TRUE(recorded("key_value_context", schedule));
     }
     PerfStatsCollector::reset();
 }
@@ -6808,4 +6901,564 @@ TEST_F(Test__ROCmFlashAttentionParity, NoROCm_SkipsGracefully)
     {
         SUCCEED() << "ROCm available - tests will run";
     }
+}
+
+/**
+ * @brief Prove generic/wide prefill arithmetic, LDS residency and ring replay.
+ *
+ * Dyadic Q/K values are exactly representable in FP16. Sparse one-hot V rows
+ * expose attention probabilities directly, allowing an independent CPU softmax
+ * oracle to detect duplicated packed lanes even when both GPU schedules share
+ * the same arithmetic defect. Dense/MoE participant geometries replay large,
+ * small and boundary contexts through one graph while physical ring origins
+ * wrap. Generic widths and an odd-dimensional tail cover the shared loaders
+ * and P/V mapping outside the wide fast path. Poisoned summary storage detects
+ * stale-capacity consumption. Finite additive biases, fully masked rows and
+ * valid scores whose probabilities underflow exercise the cooperative softmax
+ * publication without changing the original ascending-key P/V arithmetic.
+ */
+TEST_F(Test__ROCmFlashAttentionParity,
+       FA2WideNativeRingMatchesIndependentProbabilityReference)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support is disabled";
+#else
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+    namespace policy = llaminar2::rocm::fa2_policy;
+    constexpr int rows = 17;
+    constexpr int capacity = 8193;
+    const auto properties =
+        llaminar2::rocm::queryROCmFlashAttentionDeviceProperties(0);
+    for (const int width : {32, 64, 96, 128, 160, 192, 224, 255, 256})
+    for (const auto [heads, kv_heads] :
+         {std::pair{8, 1}, std::pair{12, 2}})
+    for (const bool external_mask : {false, true})
+    {
+        SCOPED_TRACE("width=" + std::to_string(width));
+        SCOPED_TRACE("heads=" + std::to_string(heads));
+        SCOPED_TRACE("external_mask=" + std::to_string(external_mask));
+        const auto plan = policy::selectROCmFA2PrefillParallelPlan({
+            .batch_size = 1, .query_rows = rows,
+            .local_query_heads = heads, .head_dim = width,
+            .kv_capacity = capacity,
+            .compute_unit_count = properties.compute_unit_count,
+            .lds_capacity_bytes = properties.lds_capacity_bytes,
+            .requested_axis = attention::AttentionPrefillParallelAxis::KeyValueContext,
+        });
+        ASSERT_TRUE(plan.valid);
+        if (width == 256)
+            ASSERT_LE(plan.tile.lds_bytes * 3, properties.lds_capacity_bytes);
+        const size_t output_elements = static_cast<size_t>(rows) * heads * width;
+        const size_t kv_elements = static_cast<size_t>(capacity) * kv_heads * width;
+        std::vector<float> query(output_elements), keys(kv_elements), values(kv_elements, 0.0f);
+        const auto dyadic = [](uint32_t index)
+        {
+            index ^= index >> 16;
+            index *= 0x7feb352du;
+            index ^= index >> 15;
+            index *= 0x846ca68bu;
+            index ^= index >> 16;
+            return (static_cast<int>(index & 31U) - 15) / 16.0f;
+        };
+        for (size_t i = 0; i < query.size(); ++i)
+            query[i] = dyadic(static_cast<uint32_t>(i) ^ 123U);
+        for (size_t i = 0; i < keys.size(); ++i)
+            keys[i] = dyadic(static_cast<uint32_t>(i) ^ 456U);
+        std::vector<float> mask(static_cast<size_t>(rows) * capacity);
+        for (int row = 0; row < rows; ++row)
+        for (int key = 0; key < capacity; ++key)
+        {
+            mask[static_cast<size_t>(row) * capacity + key] =
+                row == 5 || key % 23 == 11 ? -std::numeric_limits<float>::infinity() :
+                key % 17 == 3 ? -200.0f : dyadic(static_cast<uint32_t>(row * capacity + key));
+        }
+        for (int key = 0; key < capacity; ++key)
+            for (int head = 0; head < kv_heads; ++head)
+                values[(static_cast<size_t>(key) * kv_heads + head) * width +
+                       (key + head * 7) % width] = 1.0f;
+        const auto native_keys = encodeROCmFA2KV(keys, ROCmFA2KVFormat::FP16, width);
+        const auto native_values = encodeROCmFA2KV(values, ROCmFA2KVFormat::FP16, width);
+        std::vector<uint8_t> physical_keys(native_keys.size()), physical_values(native_values.size());
+        ScopedHIPAllocation dq, dk, dv, output, partial, partial_m, partial_l, parameters, dmask;
+        ASSERT_TRUE(dq.allocate(query.size() * sizeof(float)));
+        ASSERT_TRUE(dk.allocate(native_keys.size()));
+        ASSERT_TRUE(dv.allocate(native_values.size()));
+        ASSERT_TRUE(output.allocate(output_elements * sizeof(float)));
+        ASSERT_TRUE(partial.allocate(plan.partial_output_bytes));
+        ASSERT_TRUE(partial_m.allocate(plan.partial_m_bytes));
+        ASSERT_TRUE(partial_l.allocate(plan.partial_l_bytes));
+        ASSERT_TRUE(parameters.allocate(sizeof(attention::AttentionDeviceParams)));
+        ASSERT_EQ(hipMemcpyAsync(dq.get(), query.data(), query.size() * sizeof(float),
+                                hipMemcpyHostToDevice, test_stream_), hipSuccess);
+        if (external_mask)
+        {
+            ASSERT_TRUE(dmask.allocate(mask.size() * sizeof(float)));
+            ASSERT_EQ(hipMemcpyAsync(dmask.get(), mask.data(), mask.size() * sizeof(float),
+                                    hipMemcpyHostToDevice, test_stream_), hipSuccess);
+        }
+
+        /**
+         * @brief Record the admitted tile with exact native K/V addresses.
+         * @param keys Native key base whose vector alignment is checked at admission.
+         * @param values Native value base with the same independent alignment contract.
+         * @return The native bridge status; invalid addresses must launch no work.
+         */
+        const auto launch = [&](const void *keys, const void *values)
+        {
+            return hipFlashAttn_prefill_fa2_fp16_context_parallel(
+                static_cast<const float *>(dq.get()), keys, values,
+                static_cast<float *>(output.get()),
+                static_cast<float *>(partial.get()), static_cast<float *>(partial_m.get()),
+                static_cast<float *>(partial_l.get()), 1, rows, capacity,
+                heads, kv_heads, width, true, -1, 0,
+                static_cast<const attention::AttentionDeviceParams *>(parameters.get()),
+                static_cast<const float *>(dmask.get()),
+                policy::kROCmFA2CanonicalContextPartitionKeys, plan.max_context_partitions,
+                plan.context_partition_slots, plan.context_phase_block_slots,
+                plan.device_direct_partition_limit, plan.reducer_dimension_wavefronts,
+                plan.reducer_block_slots, static_cast<void *>(test_stream_), 0, 0);
+        };
+        if (width == 256)
+        {
+            for (const size_t offset : {2U, 4U, 8U})
+            {
+                SCOPED_TRACE("misaligned byte offset=" + std::to_string(offset));
+                EXPECT_EQ(launch(static_cast<const uint8_t *>(dk.get()) + offset, dv.get()), -1);
+                EXPECT_EQ(launch(dk.get(), static_cast<const uint8_t *>(dv.get()) + offset), -1);
+            }
+        }
+
+        /** Retire the executable before the native graph, including assertion exits. */
+        struct GraphOwner
+        {
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t exec = nullptr;
+            /** Release capture resources after the test's terminal readback. */
+            ~GraphOwner()
+            {
+                if (exec) (void)hipGraphExecDestroy(exec);
+                if (graph) (void)hipGraphDestroy(graph);
+            }
+        } captured;
+        ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+        {
+            GraphCaptureGuard capture_guard;
+            ASSERT_EQ(hipStreamBeginCapture(test_stream_, hipStreamCaptureModeGlobal), hipSuccess);
+            const int status = launch(dk.get(), dv.get());
+            const auto capture_status = hipStreamEndCapture(test_stream_, &captured.graph);
+            ASSERT_EQ(status, 0);
+            ASSERT_EQ(capture_status, hipSuccess);
+        }
+        size_t count = 0;
+        ASSERT_EQ(hipGraphGetNodes(captured.graph, nullptr, &count), hipSuccess);
+        ASSERT_EQ(count, 3U);
+        std::vector<hipGraphNode_t> nodes(count);
+        ASSERT_EQ(hipGraphGetNodes(captured.graph, nodes.data(), &count), hipSuccess);
+        int phase_nodes = 0;
+        for (const auto node : nodes)
+        {
+            hipKernelNodeParams native{};
+            ASSERT_EQ(hipGraphKernelNodeGetParams(node, &native), hipSuccess);
+            if (native.sharedMemBytes && native.gridDim.y == 1 &&
+                native.gridDim.x == static_cast<unsigned>(plan.context_phase_block_slots))
+            {
+                ++phase_nodes;
+                EXPECT_EQ(native.blockDim.x, 256U);
+                if (width == 256)
+                    EXPECT_LE(native.sharedMemBytes * 3, properties.lds_capacity_bytes);
+                EXPECT_EQ(native.sharedMemBytes, plan.tile.lds_bytes);
+            }
+        }
+        ASSERT_EQ(phase_nodes, 1);
+        ASSERT_EQ(hipGraphInstantiate(&captured.exec, captured.graph, nullptr, nullptr, 0), hipSuccess);
+
+        for (const int live : {513, 17, 257, 513})
+        {
+            SCOPED_TRACE("live=" + std::to_string(live));
+            std::vector<double> expected(output_elements, 0.0);
+            for (int row = 0; row < rows; ++row)
+            for (int head = 0; head < heads; ++head)
+            {
+                const int kv_head = head / (heads / kv_heads);
+                const int visible = live - rows + row + 1;
+                const size_t q_offset = (static_cast<size_t>(row) * heads + head) * width;
+                std::vector<double> scores(visible);
+                double maximum = -std::numeric_limits<double>::infinity();
+                for (int key = 0; key < visible; ++key)
+                {
+                    const size_t k_offset = (static_cast<size_t>(key) * kv_heads + kv_head) * width;
+                    double dot = 0.0;
+                    for (int d = 0; d < width; ++d)
+                        dot += static_cast<double>(query[q_offset + d]) * keys[k_offset + d];
+                    scores[key] = dot / std::sqrt(static_cast<double>(width));
+                    if (external_mask)
+                        scores[key] += mask[static_cast<size_t>(row) * capacity + key];
+                    maximum = std::max(maximum, scores[key]);
+                }
+                if (!std::isfinite(maximum))
+                    continue; // A fully masked row publishes the initialized zero output.
+                double denominator = 0.0;
+                for (double &score : scores)
+                {
+                    score = std::exp(score - maximum);
+                    denominator += score;
+                }
+                for (int key = 0; key < visible; ++key)
+                    expected[q_offset + (key + kv_head * 7) % width] += scores[key] / denominator;
+            }
+            std::vector<float> linear_output;
+            for (const int origin : {0, capacity - 7, capacity - 1})
+            {
+                SCOPED_TRACE("origin=" + std::to_string(origin));
+                const size_t row_bytes = static_cast<size_t>(kv_heads) * width * sizeof(uint16_t);
+                for (int row = 0; row < capacity; ++row)
+                {
+                    const int physical = (origin + row) % capacity;
+                    std::memcpy(physical_keys.data() + physical * row_bytes,
+                                native_keys.data() + row * row_bytes, row_bytes);
+                    std::memcpy(physical_values.data() + physical * row_bytes,
+                                native_values.data() + row * row_bytes, row_bytes);
+                }
+                const attention::AttentionDeviceParams params{
+                    .kv_len = live, .kv_stride = capacity,
+                    .position_offset = live - rows, .mask_stride = capacity,
+                    .ring_row_origin = origin, .ring_row_capacity = capacity,
+                };
+                ASSERT_EQ(hipMemcpyAsync(dk.get(), physical_keys.data(), physical_keys.size(), hipMemcpyHostToDevice, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(dv.get(), physical_values.data(), physical_values.size(), hipMemcpyHostToDevice, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(parameters.get(), &params, sizeof(params), hipMemcpyHostToDevice, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(partial.get(), 0x7f, plan.partial_output_bytes, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(partial_m.get(), 0x7f, plan.partial_m_bytes, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(partial_l.get(), 0x7f, plan.partial_l_bytes, test_stream_), hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(captured.exec, test_stream_), hipSuccess);
+                std::vector<float> observed(output_elements);
+                ASSERT_EQ(hipMemcpyAsync(observed.data(), output.get(), observed.size() * sizeof(float), hipMemcpyDeviceToHost, test_stream_), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+                double maximum_error = 0.0;
+                for (size_t i = 0; i < observed.size(); ++i)
+                {
+                    ASSERT_TRUE(std::isfinite(observed[i]));
+                    maximum_error = std::max(maximum_error, std::abs(observed[i] - expected[i]));
+                }
+                ASSERT_LT(maximum_error, 2.0e-6);
+                if (origin == 0)
+                    linear_output = observed;
+                else
+                    ASSERT_EQ(std::memcmp(linear_output.data(), observed.data(), observed.size() * sizeof(float)), 0);
+            }
+        }
+    }
+#endif
+}
+
+
+/**
+ * @brief Prove the installed exact register-score body with native graph resources.
+ *
+ * All six dense/MoE sharded and replicated head mappings retain one query
+ * graph and one canonical context graph through boundary tails and long/short
+ * replays. A one-partition device-direct limit forces the independent canonical
+ * producer/reducer for every tested length; both observers cannot accidentally
+ * execute the new query body. Normal and largest finite native-half V certify
+ * score ownership, K-to-V publication and unchanged FP32 accumulation together.
+ */
+TEST_F(Test__ROCmFlashAttentionParity, RegisterScoreCapturedLifecycleIsCanonicalByteExact)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support is disabled";
+#else
+    if (!hasROCm()) GTEST_SKIP() << "ROCm not available";
+    namespace policy = llaminar2::rocm::fa2_policy;
+    constexpr int width = 256;
+    struct Heads
+    {
+        int query; ///< Participant-local query heads.
+        int kv; ///< Sharded or replicated native K/V heads.
+        int start; ///< Global query offset for replicated K/V.
+        int repetition; ///< Explicit global GQA grouping, or zero for local grouping.
+    };
+    constexpr std::array<Heads, 6> geometries{{
+        {8, 1, 0, 0}, {12, 2, 0, 0}, {16, 2, 0, 0},
+        {24, 4, 0, 0}, {8, 2, 8, 8}, {12, 4, 12, 6}}};
+    const auto physical = llaminar2::rocm::queryROCmFlashAttentionDeviceProperties(0);
+    for (const int rows : {512, 513, 1024, 2048, 4096})
+    for (const auto geometry : geometries)
+    {
+        const int capacity = rows == 512 ? 65536 : 16384;
+        SCOPED_TRACE("physical_queries=" + std::to_string(rows));
+        SCOPED_TRACE("query_heads=" + std::to_string(geometry.query));
+        const auto plan = policy::selectROCmFA2PrefillParallelPlan({
+            .batch_size = 1, .query_rows = rows, .local_query_heads = geometry.query,
+            .head_dim = width, .kv_capacity = capacity,
+            .compute_unit_count = physical.compute_unit_count,
+            .lds_capacity_bytes = physical.lds_capacity_bytes,
+            .requested_axis = attention::AttentionPrefillParallelAxis::KeyValueContext,
+            .kv_format = TensorType::FP16,
+            .visibility = policy::ROCmFA2VisibilityPolicy::CausalFullContext});
+        ASSERT_TRUE(plan.valid);
+        ASSERT_TRUE(plan.usesContextParallelism());
+        const size_t output_elements = static_cast<size_t>(rows) * geometry.query * width;
+        const size_t kv_elements = static_cast<size_t>(capacity) * geometry.kv * width;
+        const auto query = randomFP32Scaled(output_elements, 0.25f);
+        const auto keys = encodeROCmFA2KV(randomFP32Scaled(kv_elements, 0.25f), ROCmFA2KVFormat::FP16, width);
+        const auto normal_values = randomFP32Scaled(kv_elements, 0.25f);
+        ScopedHIPAllocation dq, dk, dv, direct, canonical, partial, partial_m, partial_l, params;
+        ASSERT_TRUE(dq.allocate(output_elements * sizeof(float)));
+        ASSERT_TRUE(dk.allocate(keys.size()));
+        ASSERT_TRUE(dv.allocate(keys.size()));
+        ASSERT_TRUE(direct.allocate(output_elements * sizeof(float)));
+        ASSERT_TRUE(canonical.allocate(output_elements * sizeof(float)));
+        ASSERT_TRUE(partial.allocate(plan.partial_output_bytes));
+        ASSERT_TRUE(partial_m.allocate(plan.partial_m_bytes));
+        ASSERT_TRUE(partial_l.allocate(plan.partial_l_bytes));
+        ASSERT_TRUE(params.allocate(sizeof(attention::AttentionDeviceParams)));
+        ASSERT_EQ(hipMemcpyAsync(dq.get(), query.data(), query.size() * sizeof(float),
+            hipMemcpyHostToDevice, test_stream_), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(dk.get(), keys.data(), keys.size(),
+            hipMemcpyHostToDevice, test_stream_), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+        /** Retain native topology until all stream-ordered witnesses have completed. */
+        struct GraphOwner
+        {
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t exec = nullptr;
+            /** Retire the executable before the underlying captured graph. */
+            ~GraphOwner()
+            {
+                if (exec) (void)hipGraphExecDestroy(exec);
+                if (graph) (void)hipGraphDestroy(graph);
+            }
+        } query_graph, context_graph;
+        /**
+         * @brief Record one preallocated stream-owned transaction.
+         * @param owner RAII native graph authority.
+         * @param launch Native launcher with immutable addresses/geometry.
+         * @return True only when capture and executable admission both succeed.
+         */
+        const auto capture = [&](GraphOwner &owner, auto &&launch)
+        {
+            int submitted = -1;
+            hipError_t status = hipSuccess;
+            {
+                GraphCaptureGuard guard;
+                if (hipStreamBeginCapture(test_stream_, hipStreamCaptureModeGlobal) != hipSuccess)
+                    return false;
+                submitted = launch();
+                status = hipStreamEndCapture(test_stream_, &owner.graph);
+            }
+            return submitted == 0 && status == hipSuccess && owner.graph &&
+                hipGraphInstantiate(&owner.exec, owner.graph, nullptr, nullptr, 0) == hipSuccess;
+        };
+        ASSERT_TRUE(capture(query_graph, [&]
+        {
+            return hipFlashAttn_prefill_fa2_fp16(dq.as<float>(), dk.get(), dv.get(), direct.as<float>(),
+                1, rows, capacity, geometry.query, geometry.kv, width, true, -1, 0,
+                params.as<attention::AttentionDeviceParams>(), nullptr,
+                static_cast<void *>(test_stream_), geometry.start, geometry.repetition);
+        }));
+        ASSERT_TRUE(capture(context_graph, [&]
+        {
+            return hipFlashAttn_prefill_fa2_fp16_context_parallel(
+                dq.as<float>(), dk.get(), dv.get(), canonical.as<float>(),
+                partial.as<float>(), partial_m.as<float>(), partial_l.as<float>(),
+                1, rows, capacity, geometry.query, geometry.kv, width, true, -1, 0,
+                params.as<attention::AttentionDeviceParams>(), nullptr,
+                policy::kROCmFA2CanonicalContextPartitionKeys, plan.max_context_partitions,
+                plan.context_partition_slots, plan.context_phase_block_slots, 1,
+                plan.reducer_dimension_wavefronts, plan.reducer_block_slots,
+                static_cast<void *>(test_stream_), geometry.start, geometry.repetition);
+        }));
+        size_t node_count = 0;
+        ASSERT_EQ(hipGraphGetNodes(query_graph.graph, nullptr, &node_count), hipSuccess);
+        ASSERT_EQ(node_count, 1U);
+        hipGraphNode_t node = nullptr;
+        ASSERT_EQ(hipGraphGetNodes(query_graph.graph, &node, &node_count), hipSuccess);
+        hipKernelNodeParams native{};
+        ASSERT_EQ(hipGraphKernelNodeGetParams(node, &native), hipSuccess);
+        EXPECT_EQ(native.sharedMemBytes, 16384U);
+        EXPECT_EQ(native.blockDim.x, 256U);
+        hipFuncAttributes attributes{};
+        ASSERT_EQ(hipFuncGetAttributes(&attributes, native.func), hipSuccess);
+        EXPECT_EQ(attributes.localSizeBytes, 0U);
+        EXPECT_LE(attributes.numRegs, 64);
+        int resident = 0;
+        ASSERT_EQ(hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &resident, native.func, 256, native.sharedMemBytes), hipSuccess);
+        EXPECT_GE(resident, 4);
+        ASSERT_EQ(hipGraphGetNodes(context_graph.graph, nullptr, &node_count), hipSuccess);
+        ASSERT_EQ(node_count, 3U);
+        std::vector<float> actual(output_elements), expected(output_elements), replay(output_elements);
+        for (const int pattern : {0, 1, -1})
+        {
+            if (rows != 512 && pattern != 0) continue;
+            SCOPED_TRACE("native_V_pattern=" + std::to_string(pattern));
+            const auto values = encodeROCmFA2KV(pattern == 0 ? normal_values :
+                std::vector<float>(kv_elements, pattern * 65504.0f), ROCmFA2KVFormat::FP16, width);
+            ASSERT_EQ(hipMemcpyAsync(dv.get(), values.data(), values.size(),
+                hipMemcpyHostToDevice, test_stream_), hipSuccess);
+            ASSERT_EQ(hipMemsetAsync(partial.get(), 0x7f, plan.partial_output_bytes, test_stream_), hipSuccess);
+            // A retained M512 bucket also serves a partial final prompt chunk.
+            // Its device-published position offset uses the actual query count;
+            // changing that count must not change topology or score ownership.
+            const std::vector<std::pair<int, int>> lifecycle = rows == 512
+                ? std::vector<std::pair<int, int>>{{512, 512}, {8192, 512}, {8193, 512}, {16384, 512},
+                    {16793, 512}, {32768, 512}, {65536, 512}, {512, 1},
+                    {8193, 2}, {8193, 3}, {8193, 15}, {8193, 16}, {65536, 17},
+                    {8193, 255}, {512, 511}, {512, 512}}
+                : std::vector<std::pair<int, int>>{{8192, rows}, {8193, rows}, {16384, rows},
+                    {8193, 1}, {8193, rows - 1}, {8193, rows}};
+            for (const auto [length, logical_rows] : lifecycle)
+            {
+                SCOPED_TRACE("live_KV=" + std::to_string(length));
+                SCOPED_TRACE("logical_queries=" + std::to_string(logical_rows));
+                attention::AttentionDeviceParams live{
+                    .kv_len = length, .kv_stride = capacity, .position_offset = length - logical_rows,
+                    .mask_stride = capacity};
+                ASSERT_EQ(hipMemcpyAsync(params.get(), &live, sizeof(live),
+                    hipMemcpyHostToDevice, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(partial_m.get(), 0x7f, plan.partial_m_bytes, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(partial_l.get(), 0x7f, plan.partial_l_bytes, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(direct.get(), 0x7f, actual.size() * sizeof(float), test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(canonical.get(), 0x7f, expected.size() * sizeof(float), test_stream_), hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(query_graph.exec, test_stream_), hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(context_graph.exec, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(actual.data(), direct.get(), actual.size() * sizeof(float),
+                    hipMemcpyDeviceToHost, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(expected.data(), canonical.get(), expected.size() * sizeof(float),
+                    hipMemcpyDeviceToHost, test_stream_), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+                ASSERT_FALSE(hasNaNOrInf(actual.data(), actual.size()));
+                ASSERT_EQ(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)), 0);
+                ASSERT_EQ(hipMemsetAsync(direct.get(), 0x7f, actual.size() * sizeof(float), test_stream_), hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(query_graph.exec, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(replay.data(), direct.get(), replay.size() * sizeof(float),
+                    hipMemcpyDeviceToHost, test_stream_), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+                ASSERT_EQ(std::memcmp(actual.data(), replay.data(), actual.size() * sizeof(float)), 0);
+            }
+        }
+    }
+#endif
+}
+
+
+/**
+ * @brief Compare short prefixes to a first-class native-half unoptimized batch.
+ *
+ * The B2 reference has identical operands in two request banks and cannot select
+ * the B1 register-score specialization. Its retained one-node graph therefore
+ * provides an independent canonical implementation even for a one-partition
+ * prefix. Both bank outputs must equal the optimized output byte for byte.
+ */
+TEST_F(Test__ROCmFlashAttentionParity, RegisterScoreShortPrefixesMatchUnoptimizedNativeBatch)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support is disabled";
+#else
+    if (!hasROCm()) GTEST_SKIP() << "ROCm not available";
+    constexpr int rows = 512, width = 256, capacity = 512;
+    struct Heads { int query; int kv; int start; int repetition; };
+    for (const auto geometry : std::array<Heads, 6>{{
+        {8, 1, 0, 0}, {12, 2, 0, 0}, {16, 2, 0, 0},
+        {24, 4, 0, 0}, {8, 2, 8, 8}, {12, 4, 12, 6}}})
+    {
+        SCOPED_TRACE("short_prefix_query_heads=" + std::to_string(geometry.query));
+        const size_t output_elements = static_cast<size_t>(rows) * geometry.query * width;
+        const size_t kv_elements = static_cast<size_t>(capacity) * geometry.kv * width;
+        const auto query = randomFP32Scaled(output_elements, 0.25f);
+        const auto keys = encodeROCmFA2KV(randomFP32Scaled(kv_elements, 0.25f), ROCmFA2KVFormat::FP16, width);
+        const auto normal = randomFP32Scaled(kv_elements, 0.25f);
+        ScopedHIPAllocation dq, dk, dv, optimized, reference, params;
+        ASSERT_TRUE(dq.allocate(2 * output_elements * sizeof(float)));
+        ASSERT_TRUE(dk.allocate(2 * keys.size()));
+        ASSERT_TRUE(dv.allocate(2 * keys.size()));
+        ASSERT_TRUE(optimized.allocate(output_elements * sizeof(float)));
+        ASSERT_TRUE(reference.allocate(2 * output_elements * sizeof(float)));
+        ASSERT_TRUE(params.allocate(sizeof(attention::AttentionDeviceParams)));
+        for (const int bank : {0, 1})
+        {
+            ASSERT_EQ(hipMemcpyAsync(dq.as<float>() + bank * output_elements, query.data(),
+                output_elements * sizeof(float), hipMemcpyHostToDevice, test_stream_), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(dk.as<uint8_t>() + bank * keys.size(), keys.data(),
+                keys.size(), hipMemcpyHostToDevice, test_stream_), hipSuccess);
+        }
+        ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+        /** Retain both graph resources through terminal test observations. */
+        struct GraphOwner
+        {
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t exec = nullptr;
+            /** Retire executable references before the underlying graph. */
+            ~GraphOwner()
+            {
+                if (exec) (void)hipGraphExecDestroy(exec);
+                if (graph) (void)hipGraphDestroy(graph);
+            }
+        } candidate_graph, reference_graph;
+        for (const int batch : {1, 2})
+        {
+            auto &owner = batch == 1 ? candidate_graph : reference_graph;
+            int submitted = -1;
+            hipError_t end_status = hipSuccess;
+            {
+                GraphCaptureGuard guard;
+                ASSERT_EQ(hipStreamBeginCapture(test_stream_, hipStreamCaptureModeGlobal), hipSuccess);
+                submitted = hipFlashAttn_prefill_fa2_fp16(dq.as<float>(), dk.get(), dv.get(),
+                    batch == 1 ? optimized.as<float>() : reference.as<float>(), batch,
+                    rows, capacity, geometry.query, geometry.kv, width, true, -1, 0,
+                    params.as<attention::AttentionDeviceParams>(), nullptr,
+                    static_cast<void *>(test_stream_), geometry.start, geometry.repetition);
+                end_status = hipStreamEndCapture(test_stream_, &owner.graph);
+            }
+            ASSERT_EQ(submitted, 0);
+            ASSERT_EQ(end_status, hipSuccess);
+            ASSERT_EQ(hipGraphInstantiate(&owner.exec, owner.graph, nullptr, nullptr, 0), hipSuccess);
+            size_t count = 0;
+            ASSERT_EQ(hipGraphGetNodes(owner.graph, nullptr, &count), hipSuccess);
+            ASSERT_EQ(count, 1U);
+            hipGraphNode_t node = nullptr;
+            ASSERT_EQ(hipGraphGetNodes(owner.graph, &node, &count), hipSuccess);
+            hipKernelNodeParams native{};
+            ASSERT_EQ(hipGraphKernelNodeGetParams(node, &native), hipSuccess);
+            EXPECT_EQ(native.sharedMemBytes, batch == 1 ? 16384U : 26432U);
+            EXPECT_EQ(native.gridDim.z, static_cast<unsigned>(batch));
+            hipFuncAttributes attributes{};
+            ASSERT_EQ(hipFuncGetAttributes(&attributes, native.func), hipSuccess);
+            EXPECT_EQ(attributes.localSizeBytes, 0U);
+        }
+        std::vector<float> actual(output_elements), expected(2 * output_elements);
+        for (const int pattern : {0, 1, -1})
+        {
+            SCOPED_TRACE("short_prefix_V_pattern=" + std::to_string(pattern));
+            const auto values = encodeROCmFA2KV(pattern == 0 ? normal :
+                std::vector<float>(kv_elements, pattern * 65504.0f), ROCmFA2KVFormat::FP16, width);
+            for (const int bank : {0, 1})
+                ASSERT_EQ(hipMemcpyAsync(dv.as<uint8_t>() + bank * values.size(), values.data(),
+                    values.size(), hipMemcpyHostToDevice, test_stream_), hipSuccess);
+            for (const int length : {1, 2, 3, 15, 16, 17, 31, 127, 255, 256, 257, 511, 512, 17, 1})
+            {
+                SCOPED_TRACE("short_live_KV=" + std::to_string(length));
+                attention::AttentionDeviceParams live{
+                    .kv_len = length, .kv_stride = capacity,
+                    .position_offset = length - std::min(length, 17), .mask_stride = capacity};
+                ASSERT_EQ(hipMemcpyAsync(params.get(), &live, sizeof(live),
+                    hipMemcpyHostToDevice, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(optimized.get(), 0x7f, actual.size() * sizeof(float), test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(reference.get(), 0x7f, expected.size() * sizeof(float), test_stream_), hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(candidate_graph.exec, test_stream_), hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(reference_graph.exec, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(actual.data(), optimized.get(), actual.size() * sizeof(float),
+                    hipMemcpyDeviceToHost, test_stream_), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(expected.data(), reference.get(), expected.size() * sizeof(float),
+                    hipMemcpyDeviceToHost, test_stream_), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(test_stream_), hipSuccess);
+                ASSERT_FALSE(hasNaNOrInf(actual.data(), actual.size()));
+                for (const int bank : {0, 1})
+                    ASSERT_EQ(std::memcmp(actual.data(), expected.data() + bank * output_elements,
+                        actual.size() * sizeof(float)), 0);
+            }
+        }
+    }
+#endif
 }

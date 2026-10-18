@@ -455,4 +455,11 @@ namespace llaminar2
         return result;
     }
 
+    /** @copydoc PipelineRunner::collectPrefixCacheShutdown */
+    void PipelineRunner::collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const
+    {
+        for (const auto &stage : stages_)
+            if (stage.runner) stage.runner->collectPrefixCacheShutdown(shutdown);
+    }
+
 } // namespace llaminar2

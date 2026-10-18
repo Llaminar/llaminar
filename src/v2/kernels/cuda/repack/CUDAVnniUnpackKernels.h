@@ -2,6 +2,9 @@
 
 /**
  * @file CUDAVnniUnpackKernels.h
+ * @note Q8_K source d is FP32. Existing prepared arrays store FP16 scales,
+ * so reverse conversion preserves only that prepared scale, not arbitrary
+ * original d bits. Original source/native embedding storage remains exact.
  * @brief CUDA kernels for reverse repack: GPU separated VNNI → raw GGUF blocks.
  *
  * These are the exact inverse of CUDAVnniRepackKernels.  They reconstruct
@@ -12,8 +15,8 @@
  *
  * Formats are reversible when every source field is either retained directly or
  * derivable from the retained payload.  Most scale-compressed superblock formats
- * are lossy after decomposition.  Q8_K is the exception: its payload is already
- * raw INT8 and its block sums can be reconstructed exactly.
+ * are lossy after decomposition.  Q8_K retains exact INT8 codes and reconstructible sums, but its original
+ * FP32 scale has already been narrowed by the prepared FP16 metadata ABI.
  *
  * | Format  | Reversible | Notes                                    |
  * |---------|------------|------------------------------------------|
@@ -24,10 +27,10 @@
  * | Q5_1    | ✅         | 20 B payload + FP16 scale + FP16 min     |
  * | Q8_0    | ✅         | 32 B payload + FP16 scale                |
  * | Q8_1    | ✅         | Sum reconstructed from payload           |
- * | Q8_K    | ✅         | Partial sums reconstructed from payload   |
+ * | Q8_K    | FP16 scale | Codes/sums exact; source FP32 d is narrowed |
  * | Q4_K    | ❌         | Superblock scale decomposition is lossy  |
  * | Q5_K    | ❌         | Superblock scale decomposition is lossy  |
- * | Q6_K    | ❌         | Superblock scale decomposition is lossy  |
+ * | Q6_K    | ❌         | Source-tuple reverse unpack not implemented |
  * | Q3_K    | ❌         | Superblock scale decomposition is lossy  |
  * | Q2_K    | ❌         | Superblock scale decomposition is lossy  |
  * | IQ*     | ❌         | Scale nibble expressions are lossy        |
@@ -40,7 +43,8 @@
 namespace llaminar2 {
 
 /**
- * @brief Check whether a format supports lossless GPU→raw-GGUF reverse repack.
+ * @brief Check whether the existing prepared layout supports GPU→raw reconstruction.
+ * @note Q8_K reconstruction retains prepared FP16 scale precision only.
  */
 inline bool isReversibleFormat(RepackFormat format)
 {
@@ -62,7 +66,7 @@ inline bool isReversibleFormat(RepackFormat format)
 /**
  * @brief Launch CUDA kernel to reverse-repack GPU separated VNNI → raw GGUF blocks.
  *
- * Supports every losslessly reversible source format listed above.  Returns
+ * Supports the reconstruction formats above, including FP16-scale Q8_K. Returns
  * false for scale-compressed superblock formats whose original metadata cannot
  * be reconstructed from the prepared representation.
  *

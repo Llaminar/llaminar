@@ -1,5 +1,7 @@
 #include "PreparedWeightStore.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "GPUVramPreflight.h"
+#include "transfer/TransferEngine.h"
 #include "../tensors/TensorClasses.h"
 #include "../tensors/TensorKernels.h"
 
@@ -15,7 +17,8 @@
  * The store owns prepared handles for model-weight kernels and provides lookup
  * APIs used by graph stages during execution. It also participates in session
  * cleanup by resetting dynamic kernel state while preserving long-lived packed
- * weights.
+ * weights. Real kernel registration also authenticates the sealed floating
+ * operand policy before publishing tensor state or an adoptable prepared ref.
  */
 
 namespace llaminar2
@@ -43,6 +46,14 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Authenticate the complete native source representation before adoption.
+         * @param binding Frozen source identity and exact device/slice binding.
+         * @param device Physical allocation endpoint being adopted.
+         * @param handle Existing model-owned native embedding state.
+         * @throws std::runtime_error For stale source/device/geometry/extent ownership.
+         * @throws std::invalid_argument For a source without native quantized geometry.
+         */
         void validatePreparedEmbeddingHandle(
             const WeightBinding &binding,
             DeviceId device,
@@ -66,6 +77,18 @@ namespace llaminar2
             if (handle->weights->device_id != device)
                 throw std::runtime_error(
                     "PreparedWeightStore prepared embedding allocation device mismatch");
+
+            const auto expected_layout = NativeEmbeddingLayout::forSource(
+                binding.tensor->native_type(), binding.tensor->rows(),
+                static_cast<int>(binding.tensor->cols()));
+            if (handle->weights->layout != expected_layout ||
+                handle->weights->vocab_size != binding.tensor->rows() ||
+                handle->weights->d_model != static_cast<int>(binding.tensor->cols()) ||
+                handle->weights->vocab_offset > handle->weights->total_vocab ||
+                handle->weights->vocab_size >
+                    handle->weights->total_vocab - handle->weights->vocab_offset)
+                throw std::runtime_error(
+                    "PreparedWeightStore native embedding source layout or vocabulary extent mismatch");
 
             const DeviceId binding_device =
                 binding.residency.resident_device.value_or(binding.residency.home_device);
@@ -157,6 +180,9 @@ namespace llaminar2
             if (!stored.tensor || !requested.tensor)
                 return false;
             if (stored.tensor->shape() != requested.tensor->shape())
+                return false;
+            if (stored.tensor->native_type() != requested.tensor->native_type() ||
+                stored.floating_operand_precision != requested.floating_operand_precision)
                 return false;
             return sameWeightSliceForAdoption(
                 stored.slice,
@@ -259,7 +285,8 @@ namespace llaminar2
         validateBindingForStore(binding, model_id_, kind);
 
         auto owned = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(
-            binding.tensor, device);
+            binding.tensor, device, llaminar::v2::kernels::KernelFactory::GemmPreparationKind::AUTO,
+            binding.floating_operand_precision);
         if (!owned)
             throw std::runtime_error("PreparedWeightStore::prepareGemm failed for: " + binding.identity.canonical_name);
 
@@ -308,6 +335,15 @@ namespace llaminar2
         std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle)
     {
         validateBindingForStore(binding, model_id_, kind);
+        // A real engine is the arithmetic authority. Reject a contradictory
+        // advertised binding before publishing either tensor state or a ref.
+        // Metadata-only fixture handles intentionally have no executable kernel.
+        if (handle && handle->prepared_weights && handle->prepared_weights->kernel &&
+            handle->prepared_weights->kernel->floatingActivationOperandPrecision() !=
+                binding.floating_operand_precision)
+            throw std::invalid_argument(
+                "PreparedWeightStore real GEMM arithmetic differs from its sealed binding: " +
+                binding.identity.canonical_name);
         auto ref = makeRef(binding.binding_id, kind, device);
         WeightBinding stored = binding;
         stored.prepared = ref;
@@ -662,9 +698,8 @@ namespace llaminar2
         if (const auto authority = physicalMemoryAuthority())
         {
             const size_t allocation_bytes =
-                PreparedEmbeddingWeights::allocationBytes(
-                    binding.tensor->rows(),
-                    d_model);
+                NativeEmbeddingLayout::forSource(
+                    binding.tensor->native_type(), binding.tensor->rows(), d_model).byte_size;
             allocation_lease.emplace(
                 authority->claimNewAllocation(
                     device,
@@ -677,8 +712,26 @@ namespace llaminar2
                 "PreparedWeightStore GPU embedding preparation requires the admitted physical-memory authority");
         }
 
+        // The existing weight-load policy owns stream division, alignment and
+        // unlimited semantics. One sequential pinned slot fits that admitted ring;
+        // no second budget or device staging allocation is introduced here.
+        // Declaration order frees host storage before its exact ledger lease.
+        std::optional<PhysicalMemoryAllocationLease> host_staging_lease;
+        std::shared_ptr<PinnedHostTransferBuffer> upload_staging;
+        if (device.is_gpu())
+        {
+            const auto layout = NativeEmbeddingLayout::forSource(
+                binding.tensor->native_type(), binding.tensor->rows(), d_model);
+            const auto geometry = resolveGPUWeightLoadMemoryGeometry(
+                layout.byte_size, configuredGPUWeightLoadMemoryPolicy());
+            host_staging_lease.emplace(physicalMemoryAuthority()->claimNewAllocation(
+                DeviceId::cpu(), PhysicalMemoryOwner::WeightLoadStaging,
+                geometry.staging_slot_bytes));
+            upload_staging = TransferEngine::instance().allocatePinnedHostBuffer(
+                geometry.staging_slot_bytes, device);
+        }
         auto owned = llaminar::v2::kernels::KernelFactory::prepareEmbeddingHandleLocal(
-            binding.tensor, d_model, device, vocab_offset, total_vocab);
+            binding.tensor, d_model, device, upload_staging.get(), vocab_offset, total_vocab);
         if (!owned)
             throw std::runtime_error("PreparedWeightStore::prepareEmbedding failed for: " + binding.identity.canonical_name);
 
@@ -854,18 +907,18 @@ namespace llaminar2
             const auto *handle = entry.activeHandle();
             if (!handle || handle->device_id != device || !handle->weights ||
                 handle->weights->device_id != device ||
-                handle->weights->byte_size == 0u ||
+                handle->weights->layout.byte_size == 0u ||
                 !owners.insert(handle->weights.get()).second)
             {
                 continue;
             }
-            if (handle->weights->byte_size >
+            if (handle->weights->layout.byte_size >
                 std::numeric_limits<size_t>::max() - bytes)
             {
                 throw std::overflow_error(
                     "Prepared embedding allocation BOM overflows size_t");
             }
-            bytes += handle->weights->byte_size;
+            bytes += handle->weights->layout.byte_size;
         }
         return bytes;
     }

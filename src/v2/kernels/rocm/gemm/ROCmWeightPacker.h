@@ -67,8 +67,9 @@ namespace llaminar2
          *
          * Converts any supported ≤6-bit quantized tensor to native-VNNI format:
          * - Interleaved payload bytes for coalesced GPU access
-         * - Separate FP16 scale/min arrays
-         * - Pre-computed sub-block scales for super-block formats
+         * - Separate uint16 metadata planes: binary16 scales/minima for ordinary
+         *   formats; original half bases and raw Q6/IQ2/IQ4 coefficients for
+         *   source-preserving formats. No raw coefficient is half-converted.
          *
          * @param tensor Source quantized tensor
          * @param out Output packed weights structure
@@ -85,7 +86,7 @@ namespace llaminar2
         {
             std::vector<uint8_t> all_native_vnni;
             std::vector<uint16_t> all_native_scales;
-            std::vector<uint16_t> all_native_mins;
+            std::vector<uint16_t> all_native_mins; ///< Raw source coefficients or format-specific half auxiliary.
             std::vector<uint32_t> all_native_emins;
 
             int num_experts = 0;
@@ -103,7 +104,7 @@ namespace llaminar2
             {
                 uint8_t *d_native_vnni = nullptr;
                 void *d_native_scales = nullptr;  // __half* on device
-                void *d_native_mins = nullptr;
+                void *d_native_mins = nullptr; ///< uint16 raw source coefficients or half auxiliary.
                 void *d_native_emins = nullptr;
             };
 

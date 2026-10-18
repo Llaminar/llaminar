@@ -1770,7 +1770,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEWorkspaceOwnsLiveRoutingStateAnd
     EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES), nullptr);
     EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_WEIGHTS), nullptr);
     EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_SCALES), nullptr);
-    EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_ROUTER_FP16_GATE_WEIGHTS), nullptr);
+    // FP16 router weights are immutable prepared model weights, never a second
+    // workspace cache with an independent allocation/eviction lifetime.
+    EXPECT_EQ(reqs.find("rocm_moe_router_fp16_gate_weights"), nullptr);
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDAKernelProfilingScopesUseExplicitStreams)
@@ -4177,15 +4179,33 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCaptu
               std::string::npos)
         << "Canonical decode must derive its reduction schedule from the source "
            "codebook, not the normalized physical decoder.";
+    // The default oracle still hides optional ROWPAR state. Only an explicit
+    // trainer sweep may consume an already prepared view; neither route may
+    // materialize that view during a launch or captured replay.
+    EXPECT_NE(m1_compact.find(
+                  "CUDARowMajorWeights**rowmajor_slot="
+                  "cudaNativeVNNIGemvSweep_isActive()?&impl_->rowmajor:nullptr;"),
+              std::string::npos);
+    EXPECT_NE(small_m_compact.find(
+                  "CUDARowMajorWeights**rowmajor_slot="
+                  "explicitSmallMVerifierScopeActive()&&!cudaNativeVNNIGemvSweep_isActive()"
+                  "?nullptr:(impl_?&impl_->rowmajor:nullptr);"),
+              std::string::npos);
+    for (const auto &body : {m1_compact, small_m_compact})
+    {
+        EXPECT_EQ(body.find("cudaRowMajorWeights_create"), std::string::npos);
+        EXPECT_EQ(body.find("prepareRowMajorWeightsOutsideCapture("), std::string::npos);
+    }
     EXPECT_NE(m1_compact.find("cudaNativeVNNIGemvTuned_fp32_withPolicy("
                               "d_A_int8,impl_->d_weights_native_vnni,impl_->d_weights_native_scales,"
                               "impl_->d_weights_native_mins,impl_->d_weights_native_emins,d_C,"
                               "d_scales_A_blockwise,n,k,alpha,beta,nullptr,d_bias,"
                               "impl_->native_codebook_id,arithmetic_policy_codebook_id,"
-                              "cuda_device_id_,stream_handle,impl_->gemv_ctx,nullptr)"),
+                              "cuda_device_id_,stream_handle,impl_->gemv_ctx,rowmajor_slot)"),
               std::string::npos)
         << "The M=1 canonical path must launch the source-policy serial decode "
-           "GEMV on the captured stream without lazy ROWPAR state.";
+           "GEMV on the captured stream with only an explicitly selected, "
+           "setup-prepared ROWPAR diagnostic view.";
     EXPECT_EQ(m1_compact.find("cudaMemsetAsync("), std::string::npos)
         << "Canonical M=1 decode must not pad into a synthetic small-M transaction.";
     EXPECT_EQ(m1_compact.find("cudaMemcpyAsync("), std::string::npos)
@@ -13034,7 +13054,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEGraphMetadataUsesExplicitWorkspaceOw
                 : "const ROCmMoEKernel::RouterQ8GateCacheEntry *ROCmMoEKernel::getOrCreateQ8RouterGateCache(",
             backend == std::string("CUDA")
                 ? "bool CUDAMoEKernel::tryRouteDecodeLogitsQ8("
-                : "const void *ROCmMoEKernel::getOrCreateFP16RouterGateCache(");
+                : "bool ROCmMoEKernel::routeCore(");
         const auto executable_router_publication =
             stripCommentsAndStringLiterals(router_publication);
         EXPECT_NE(
@@ -13121,30 +13141,34 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEGraphMetadataUsesExplicitWorkspaceOw
         rocm_header.find("next_router_fp16_gate_workspace_slot_"),
         std::string::npos);
 
-    const auto rocm_fp16_publication = sliceBetween(
-        rocm_source,
-        "const void *ROCmMoEKernel::getOrCreateFP16RouterGateCache(",
-        "bool ROCmMoEKernel::routeCore(");
-    const auto executable_rocm_fp16_publication =
-        stripCommentsAndStringLiterals(rocm_fp16_publication);
-    EXPECT_NE(
-        executable_rocm_fp16_publication.find(
-            "getOrCreatePersistentPublication("),
-        std::string::npos)
-        << "The ROCm FP16 router preparation path has the same immutable "
-           "workspace ownership contract as Q8";
-    EXPECT_EQ(
-        executable_rocm_fp16_publication.find("acquirePersistentSlot("),
-        std::string::npos);
-    EXPECT_NE(
-        executable_rocm_fp16_publication.find("hipStreamWaitEvent("),
-        std::string::npos);
-    EXPECT_EQ(
-        executable_rocm_fp16_publication.find("synchronize"),
-        std::string::npos);
-    EXPECT_NE(
-        executable_rocm_fp16_publication.find("std::terminate();"),
-        std::string::npos);
+    // FP16 router storage is now a model-prepared weight, not a second
+    // backend conversion cache. Keep the ownership check at its real authority
+    // and forbid restoring the retired graph-local half-cache machinery.
+    for (const auto *file : {&rocm_source, &rocm_header, &cuda_source, &cuda_header})
+        for (const char *retired : {"getOrCreateFP16RouterGateCache(", "RouterFP16GateCacheEntry",
+                                   "router_fp16_gate_cache_", "RouterFP16GatePublicationDomain"})
+            EXPECT_EQ(file->find(retired), std::string::npos)
+                << "Half router weights must retain model ownership; retired symbol=" << retired;
+
+    const auto weight_manager = readFile(root / "src/v2/loaders/WeightManager.cpp");
+    const auto prepared_floating = stripCommentsAndStringLiterals(sliceBetween(
+        weight_manager,
+        "std::shared_ptr<TensorBase> WeightManager::createModelPreparedFloatingOverride(",
+        "const char *WeightManager::weightPrepStateName("));
+    EXPECT_NE(prepared_floating.find("PreparedWeightRepresentationContract::resolve("), std::string::npos);
+    EXPECT_NE(prepared_floating.find("ModelPreparedWeightRepresentation::FP16"), std::string::npos);
+    EXPECT_NE(prepared_floating.find("materializePreparedHalfWeights(*source)"), std::string::npos);
+    EXPECT_NE(prepared_floating.find("std::lock_guard<std::mutex> lock(cache_mutex_)"), std::string::npos)
+        << "Source release and prepared-cache publication must share the model-owned lock";
+    for (const char *identity : {".canonical_name = name", ".role = role", ".target_device = target_device",
+                                 ".slice = logical_slice", ".representation = representation"})
+        EXPECT_NE(prepared_floating.find(identity), std::string::npos)
+            << "Model-prepared half identity must include " << identity;
+    expectNeedleBefore(prepared_floating, "registerDerivedMetadata(",
+        "model_prepared_floating_overrides_.emplace(",
+        "Publish the exact prepared ownership/slice identity before making the half weight adoptable");
+    EXPECT_EQ(prepared_floating.find("acquirePersistentSlot("), std::string::npos)
+        << "Model-prepared weights must not reserve one backend slot per captured graph";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MoERuntimePointerArraysUseLeasedDescriptorIdentity)
@@ -15108,10 +15132,39 @@ TEST(Test__GpuWorkspaceAllocationPolicy, QuantizedEmbeddingHasOnePlannedGPURepre
     EXPECT_LT(embedding_branch, prepared_call);
     EXPECT_LT(prepared_call, raw_upload)
         << "Quantized embeddings must exit through preparation before the generic raw upload.";
-    EXPECT_NE(
-        frozen_non_gemm_body.find(
-            "quantized embedding prepared without raw device upload"),
-        std::string::npos);
+    const auto branch_end = frozen_non_gemm_body.find(
+        "TensorBase *tensor = binding.tensor;", embedding_branch);
+    ASSERT_NE(branch_end, std::string::npos);
+    const auto native_embedding_body = stripCommentsAndStringLiterals(
+        frozen_non_gemm_body.substr(embedding_branch, branch_end - embedding_branch));
+    const auto adopt = native_embedding_body.find("store->adoptPreparedEmbeddingForBinding(");
+    const auto prepare = native_embedding_body.find("store->prepareEmbedding(");
+    const auto publish = native_embedding_body.find("markPrepState(");
+    ASSERT_NE(adopt, std::string::npos);
+    ASSERT_NE(prepare, std::string::npos);
+    ASSERT_NE(publish, std::string::npos);
+    EXPECT_LT(adopt, prepare);
+    EXPECT_LT(prepare, publish);
+    EXPECT_TRUE(std::regex_search(
+        native_embedding_body,
+        std::regex(R"(if\s*\(\s*!store->adoptPreparedEmbeddingForBinding\s*\()")))
+        << "Prepare native backing only when exact store adoption did not succeed.";
+    EXPECT_NE(native_embedding_body.find("prepared_binding.slice.row_start"), std::string::npos);
+    EXPECT_NE(native_embedding_body.find("prepared_binding.slice.source_rows"), std::string::npos);
+    EXPECT_TRUE(std::regex_search(
+        native_embedding_body,
+        std::regex(R"(store->prepareEmbedding\s*\([\s\S]*vocab_offset\s*,\s*total_vocab\s*,\s*persistent_owner\s*\))")))
+        << "The prepared store must retain the exact vocabulary slice and canonical owner.";
+    EXPECT_TRUE(std::regex_search(
+        native_embedding_body,
+        std::regex(R"(markPrepState\s*\(\s*name\s*,\s*target_device\s*,\s*WeightPrepState::READY\s*,)")))
+        << "Native embedding preparation must publish READY before leaving its branch.";
+    EXPECT_TRUE(std::regex_search(
+        native_embedding_body,
+        std::regex(R"(\+\+uploaded_count;\s*continue;\s*\}\s*$)")))
+        << "A prepared embedding must leave before raw tensor upload or pointer deduplication.";
+    EXPECT_EQ(native_embedding_body.find("TransferEngine::instance().upload("), std::string::npos)
+        << "The prepared embedding branch must not create a duplicate raw GPU allocation.";
 
     const auto orchestrator_source =
         readFile(

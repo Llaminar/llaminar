@@ -60,7 +60,8 @@ namespace llaminar2
             const std::optional<uint8_t> &lhs_codebook,
             const std::optional<uint8_t> &rhs_codebook)
         {
-            if (!sameKernelType(lhs, rhs))
+            if (!sameKernelType(lhs, rhs) ||
+                lhs->floatingActivationOperandPrecision() != rhs->floatingActivationOperandPrecision())
                 return false;
 
             /*

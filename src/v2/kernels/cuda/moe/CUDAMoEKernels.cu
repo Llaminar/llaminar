@@ -8,8 +8,17 @@
  * projection. Launch wrappers are C ABI functions consumed by CUDAMoEKernel.
  * Quantized gate/up borrows original token rows through the grouping map; it
  * never expands identical hidden activations into one copy per expert route.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
+ *
+ * Physical-half router loads round the original FP32 hidden to half RNE in
+ * registers; all row modes reuse the same per-row FP32 accumulation/tree.
+ * Four-expert tiles share hidden loads for prefill, while small row capacities
+ * retain the measured lower-latency single-expert launch without new storage.
  */
 
+#include "CUDARouterQ8Prefill.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -19,6 +28,7 @@
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
+#include "kernels/common/DeviceRouterHadamardQ8.h"
 #include "kernels/common/DeviceOrderedRouteFold.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingWarp.h"
@@ -7339,6 +7349,10 @@ namespace
         case 4:
             payload_bytes = 16u;
             return true;
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+            payload_bytes = 16u;
+            is_asymmetric = 1u; // Physical secondary presence, not additive arithmetic.
+            return true;
         case 5:
             payload_bytes = 16u;
             is_asymmetric = 1u;
@@ -7365,6 +7379,7 @@ namespace
             return true;
         case 11:
             payload_bytes = 13u;
+            is_asymmetric = 1u; // Physical raw source nibble; no additive minimum.
             return true;
         case 12:
             payload_bytes = 12u;
@@ -13004,6 +13019,7 @@ namespace
         {
         case 0:
         case 4:
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
         case 5:
         case 6:
         case 7:
@@ -13029,6 +13045,8 @@ namespace
     {
         switch (codebook_id)
         {
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        case 11: // Mandatory original IQ3_S source nibble.
         case 5:
         case 7:
         case 8:
@@ -13082,13 +13100,36 @@ namespace
                    desc.n == N &&
                    desc.k == K &&
                    desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
-                   desc.codebook_id == CodebookId &&
-                   (!(llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_asymmetric ||
-                      llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale) ||
-                    desc.mins) &&
+                   llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
+                   (!(llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::requires_secondary_metadata) ||
+                    (CodebookId == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook && desc.codebook_id == 4) || desc.mins) &&
                    (!llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale_asym ||
                     desc.emins);
         }
+    }
+
+    /**
+     * @brief Admit independent IQ4 LUT factor programs in one selected family.
+     * @tparam CodebookId Selected physical family;24 accepts both IQ4 payload members.
+     * @param gate Original gate descriptor with explicit physical format identity.
+     * @param up Original up descriptor, either the same format or IQ4 peer.
+     * @param n Logical output columns.
+     * @param k Logical input columns.
+     * @return True only for complete descriptors with the declared payload family.
+     */
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ bool native_vnni_pair_shape_ok(
+        const DeviceNativeVNNIMatrixDesc &gate,
+        const DeviceNativeVNNIMatrixDesc &up, int n, int k)
+    {
+        if (!native_vnni_desc_shape_ok<CodebookId>(gate, n, k))
+            return false;
+        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut)
+            return up.codebook_id == 4
+                ? native_vnni_desc_shape_ok<4>(up, n, k)
+                : up.codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook &&
+                  native_vnni_desc_shape_ok<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(up, n, k);
+        return native_vnni_desc_shape_ok<CodebookId>(up, n, k);
     }
 
     __device__ __forceinline__ float silu(float x)
@@ -13404,6 +13445,201 @@ namespace
                 }
             }
         }
+    }
+
+    /**
+     * @brief Actual-half router, one identical per-row dot/tree for all launch modes.
+     * @tparam Partitioned Resolve device-owned row intervals before any operand load.
+     * @param hidden Original FP32 hidden; register loads round RNE through half.
+     * @param gate_weights Model-owned physical FP16 gate rows.
+     * @param logits FP32 route logits, local to the resolved owner.
+     * @param seq_len Physical row capacity. @param d_model Router reduction width.
+     * @param num_experts Expert columns. @param live_rows Optional device live count.
+     * @param partition Immutable participant row ownership.
+     */
+    template<bool Partitioned = false>
+    __global__ void route_logits_fp16_grouped_kernel(
+        const float *__restrict__ hidden,
+        const __half *__restrict__ gate_weights,
+        float *__restrict__ logits,
+        int seq_len, int d_model, int num_experts,
+        const int *live_rows = nullptr, llaminar2::DeviceRowPartition partition = {})
+    {
+        if constexpr (Partitioned)
+        {
+            const auto rows = partition.resolve(seq_len, live_rows);
+            hidden += static_cast<size_t>(rows.first) * d_model;
+            seq_len = rows.count;
+        }
+        else if (live_rows)
+        {
+            const int count = *live_rows;
+            if (count < 0 || count > seq_len) __trap();
+            seq_len = count;
+        }
+        constexpr int kRowsPerBlock = 4;
+        const int expert = blockIdx.x;
+        const int first_row = blockIdx.y * kRowsPerBlock;
+        if (expert >= num_experts)
+            return;
+        const int tile_rows = min(kRowsPerBlock, seq_len - first_row);
+        if (tile_rows <= 0)
+            return;
+
+        const __half *g = gate_weights + static_cast<size_t>(expert) * d_model;
+        float sums[kRowsPerBlock] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int j = threadIdx.x; j < d_model; j += blockDim.x)
+        {
+            const float gv = __half2float(g[j]);
+            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
+            {
+                const int row = first_row + tile_row;
+                sums[tile_row] += __half2float(__float2half_rn(hidden[static_cast<size_t>(row) * d_model + j])) * gv;
+            }
+        }
+
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int num_warps = blockDim.x >> 5;
+        __shared__ float warp_sums[kRowsPerBlock][32];
+        for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
+        {
+            float v = sums[tile_row];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                v += __shfl_down_sync(0xffffffffu, v, offset);
+            if (lane == 0)
+                warp_sums[tile_row][warp] = v;
+        }
+        __syncthreads();
+
+        if (warp == 0)
+        {
+            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
+            {
+                float v = (lane < num_warps) ? warp_sums[tile_row][lane] : 0.0f;
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    v += __shfl_down_sync(0xffffffffu, v, offset);
+                if (lane == 0)
+                {
+                    const int row = first_row + tile_row;
+                    logits[static_cast<size_t>(row) * num_experts + expert] = v;
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief Reuse half operands across four rows and four independent experts.
+     *
+     * Each output retains the small-row kernel's stride-256 FMA sequence and
+     * descending warp/block reduction tree. Tiling shares register loads only;
+     * it never combines experts, changes the hidden owner, or allocates scratch.
+     * @tparam Partitioned Resolve the participant's live interval on device.
+     * @param hidden Original FP32 input, rounded to half RNE in registers.
+     * @param gate_weights Model-owned physical half expert rows.
+     * @param logits Local FP32 output; inactive rows and columns are untouched.
+     * @param seq_len Global admitted row capacity. @param d_model Reduction width.
+     * @param num_experts Expert count. @param live_rows Optional device live count.
+     * @param partition Immutable participant ownership, resolved before loads.
+     */
+    template<bool Partitioned>
+    __global__ __launch_bounds__(256)
+    void route_logits_fp16_expert_tile_kernel(
+        const float *__restrict__ hidden, const __half *__restrict__ gate_weights,
+        float *__restrict__ logits, int seq_len, int d_model, int num_experts,
+        const int *live_rows, llaminar2::DeviceRowPartition partition)
+    {
+        if constexpr (Partitioned)
+        {
+            const auto rows = partition.resolve(seq_len, live_rows);
+            hidden += static_cast<size_t>(rows.first) * d_model;
+            seq_len = rows.count;
+        }
+        else if (live_rows)
+        {
+            const int count = *live_rows;
+            if (count < 0 || count > seq_len) __trap();
+            seq_len = count;
+        }
+        constexpr int Rows = 4, Experts = 4;
+        const int first_row = blockIdx.y * Rows, first_expert = blockIdx.x * Experts;
+        if (first_row >= seq_len || first_expert >= num_experts) return;
+        float sums[Rows][Experts] = {};
+        for (int j = threadIdx.x; j < d_model; j += 256)
+        {
+            float weights[Experts];
+            #pragma unroll
+            for (int e = 0; e < Experts; ++e)
+                weights[e] = first_expert + e < num_experts
+                    ? __half2float(gate_weights[static_cast<size_t>(first_expert + e) * d_model + j]) : 0.0f;
+            #pragma unroll
+            for (int r = 0; r < Rows; ++r)
+                if (first_row + r < seq_len)
+                {
+                    const float h = __half2float(__float2half_rn(hidden[static_cast<size_t>(first_row + r) * d_model + j]));
+                    #pragma unroll
+                    for (int e = 0; e < Experts; ++e) sums[r][e] += h * weights[e];
+                }
+        }
+        __shared__ float partial[Rows][Experts][8];
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        #pragma unroll
+        for (int r = 0; r < Rows; ++r)
+        {
+            #pragma unroll
+            for (int e = 0; e < Experts; ++e)
+            {
+                float value = sums[r][e];
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    value += __shfl_down_sync(0xffffffffu, value, offset);
+                if (lane == 0) partial[r][e][warp] = value;
+            }
+        }
+        __syncthreads();
+        if (warp == 0)
+        {
+            #pragma unroll
+            for (int r = 0; r < Rows; ++r)
+            {
+                #pragma unroll
+                for (int e = 0; e < Experts; ++e)
+                {
+                    float value = lane < 8 ? partial[r][e][lane] : 0.0f;
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                        value += __shfl_down_sync(0xffffffffu, value, offset);
+                    if (lane == 0 && first_row + r < seq_len && first_expert + e < num_experts)
+                        logits[static_cast<size_t>(first_row + r) * num_experts + first_expert + e] = value;
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief Select measured small-row or shared-expert geometry before capture.
+     * @tparam Partitioned Kernel resolves device-owned participant rows.
+     * @param hidden Original FP32 rows. @param gate Model-owned physical half gate.
+     * @param logits Participant-local FP32 destination.
+     * @param capacity Whole-input capacity. @param local_capacity Admitted owner capacity.
+     * @param width Reduction width. @param experts Expert count.
+     * @param live_rows Optional device-owned live count. @param partition Row owner.
+     * @param stream Exact non-null stream authenticated by the public launch bridge.
+     *
+     * Capacity fixes graph geometry; live counts remain device-owned. M1 prefers
+     * the smaller tile, while M8 through M2048 benefit from four-expert reuse.
+     */
+    template<bool Partitioned>
+    void launch_fp16_router_rows(const float *hidden, const __half *gate, float *logits,
+        int capacity, int local_capacity, int width, int experts, const int *live_rows,
+        llaminar2::DeviceRowPartition partition, cudaStream_t stream)
+    {
+        if (local_capacity >= 8 && experts >= 4)
+            route_logits_fp16_expert_tile_kernel<Partitioned><<<
+                dim3((experts + 3) / 4, (local_capacity + 3) / 4), 256, 0, stream>>>(
+                hidden, gate, logits, capacity, width, experts, live_rows, partition);
+        else
+            route_logits_fp16_grouped_kernel<Partitioned><<<
+                dim3(experts, (local_capacity + 3) / 4), 256, 0, stream>>>(
+                hidden, gate, logits, capacity, width, experts, live_rows, partition);
     }
 
     // Tiled SGEMM for the PREFILL router logits: logits[S, E] = hidden[S, D] · gateᵀ[D, E].
@@ -14783,26 +15019,29 @@ namespace
             for (int i = threadIdx.x; i < n4; i += blockDim.x)
             {
                 float4 v = out4[i];
-                v.x *= gate;
-                v.y *= gate;
-                v.z *= gate;
-                v.w *= gate;
+                v.x = llaminar2::device_fp32_contract::multiply(gate, v.x);
+                v.y = llaminar2::device_fp32_contract::multiply(gate, v.y);
+                v.z = llaminar2::device_fp32_contract::multiply(gate, v.z);
+                v.w = llaminar2::device_fp32_contract::multiply(gate, v.w);
                 out4[i] = v;
             }
         }
         else
         {
             for (int i = threadIdx.x; i < d_model; i += blockDim.x)
-                shared_output[row_offset + i] *= gate;
+                shared_output[row_offset + i] =
+                    llaminar2::device_fp32_contract::multiply(gate, shared_output[row_offset + i]);
         }
     }
 
     /**
      * @brief Gate a full row or its disjoint output-column slice with the identical full-width dot.
-     * @tparam ColumnSlice False preserves the established full-row generated kernel.
+     * @tparam ColumnSlice Select disjoint output columns without changing arithmetic.
      *
      * Input stride and sigmoid reduction always use the full model width. Only
      * output addressing narrows; inactive rows overwrite both outputs with zero.
+     * Standalone/full/column paths retain separate RNE product and sum boundaries,
+     * including subnormals despite the translation unit fast-math FTZ policy.
      */
     template<bool ColumnSlice = false>
     __global__ void shared_expert_gate_add_kernel(
@@ -14894,35 +15133,31 @@ namespace
             {
                 const float4 s = shared4[i];
                 const float4 r = residual4[i];
-                const float4 gated = ColumnSlice ? make_float4(
+                const float4 gated = make_float4(
                     llaminar2::device_fp32_contract::multiply(gate, s.x),
                     llaminar2::device_fp32_contract::multiply(gate, s.y),
                     llaminar2::device_fp32_contract::multiply(gate, s.z),
-                    llaminar2::device_fp32_contract::multiply(gate, s.w))
-                    : make_float4(gate * s.x, gate * s.y, gate * s.z, gate * s.w);
+                    llaminar2::device_fp32_contract::multiply(gate, s.w));
                 shared4[i] = gated;
                 // Column completion replaces a standalone shared gate followed
                 // by ResidualAdd. Preserve that intervening FP32 rounding;
                 // an FMA here would change the prefill arithmetic contract.
-                if constexpr (ColumnSlice)
-                    out4[i] = make_float4(__fadd_rn(r.x, gated.x), __fadd_rn(r.y, gated.y),
-                        __fadd_rn(r.z, gated.z), __fadd_rn(r.w, gated.w));
-                else
-                    out4[i] = make_float4(r.x + gated.x, r.y + gated.y, r.z + gated.z, r.w + gated.w);
+                out4[i] = make_float4(
+                    llaminar2::device_fp32_contract::add(r.x, gated.x),
+                    llaminar2::device_fp32_contract::add(r.y, gated.y),
+                    llaminar2::device_fp32_contract::add(r.z, gated.z),
+                    llaminar2::device_fp32_contract::add(r.w, gated.w));
             }
         }
         else
         {
             for (int i = threadIdx.x; i < columns; i += blockDim.x)
             {
-                const float gated = ColumnSlice
-                    ? llaminar2::device_fp32_contract::multiply(gate, shared_output[row_offset + i])
-                    : gate * shared_output[row_offset + i];
+                const float gated = llaminar2::device_fp32_contract::multiply(
+                    gate, shared_output[row_offset + i]);
                 shared_output[row_offset + i] = gated;
-                if constexpr (ColumnSlice)
-                    combined_output[row_offset + i] = __fadd_rn(routed_residual[row_offset + i], gated);
-                else
-                    combined_output[row_offset + i] = routed_residual[row_offset + i] + gated;
+                combined_output[row_offset + i] = llaminar2::device_fp32_contract::add(
+                    routed_residual[row_offset + i], gated);
             }
         }
     }
@@ -17767,10 +18002,16 @@ namespace
         if (lane >= kBlockSize || col >= K)
             return;
 
-        float abs_value = fabsf(hidden[col]);
+        float abs_value =
+
+            llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+
+                hidden[col], 0.0f);
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
-            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+            abs_value =
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                    abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
         const float scale =
             llaminar2::device_q8_activation_contract::scale(abs_value);
@@ -17803,10 +18044,16 @@ namespace
                                 ? gate_weights[static_cast<size_t>(expert) * K + col]
                                 : 0.0f;
 
-        float abs_value = fabsf(value);
+        float abs_value =
+
+            llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+
+                value, 0.0f);
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
-            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+            abs_value =
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                    abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
         const float scale =
             llaminar2::device_q8_activation_contract::scale(abs_value);
@@ -17883,23 +18130,29 @@ namespace
         int8_t *__restrict__ A_int8,
         float *__restrict__ scales_A_blockwise,
         int seq_len,
-        int K)
+        int K, const int *live_rows = nullptr)
     {
         constexpr int kBlockSize = 32;
         const int block_idx = blockIdx.x;
         const int row = blockIdx.y;
         const int lane = threadIdx.x;
         const int col = block_idx * kBlockSize + lane;
-        if (row >= seq_len || lane >= kBlockSize || col >= K)
+        const int live = live_rows ? *live_rows : seq_len;
+        if (live < 0 || live > seq_len) { __trap(); return; }
+        if (row >= live || lane >= kBlockSize || col >= K)
             return;
 
         const size_t row_offset = static_cast<size_t>(row) * static_cast<size_t>(K);
         const int blocks_per_row = K / kBlockSize;
         const float value = hidden[row_offset + col];
-        float abs_value = fabsf(value);
+        float abs_value =
+            llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                value, 0.0f);
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
-            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+            abs_value =
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                    abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
         const float scale =
             llaminar2::device_q8_activation_contract::scale(abs_value);
@@ -18036,10 +18289,16 @@ namespace
             const float value =
                 llaminar2::device_swiglu_contract::swigluValue(g, up[col]);
 
-            float abs_value = fabsf(value);
+            float abs_value =
+
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+
+                    value, 0.0f);
 #pragma unroll
             for (int mask = 16; mask > 0; mask >>= 1)
-                abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+                abs_value =
+                    llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                        abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
             const float scale =
                 llaminar2::device_q8_activation_contract::scale(abs_value);
@@ -18089,10 +18348,14 @@ namespace
         const float value = hidden[static_cast<size_t>(slot) * K + col];
 
         // Warp-local absmax reduction (each warp owns its own 32-element block).
-        float abs_value = fabsf(value);
+        float abs_value =
+            llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                value, 0.0f);
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
-            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+            abs_value =
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                    abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
         const float scale =
             llaminar2::device_q8_activation_contract::scale(abs_value);
@@ -18127,6 +18390,7 @@ namespace
      * @param emin_base Optional Q2_K paired-minimum plane.
      * @param linear Block-major prepared-metadata index.
      * @param scale_a FP32 scale for the quantized activation block.
+     * @param physical_codebook Actual operand identity within the IQ4 payload family.
      * @return Canonically rounded contribution, not yet row-accumulated.
      */
     template <uint8_t CodebookId>
@@ -18138,8 +18402,22 @@ namespace
         const uint16_t *__restrict__ min_base,
         const uint32_t *__restrict__ emin_base,
         size_t linear,
-        float scale_a)
+        float scale_a,
+        uint8_t physical_codebook = CodebookId)
     {
+        // IQ4 pairs share exact LUT integers, but retain independent factors.
+        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut)
+        {
+            int dot = 0;
+#pragma unroll
+            for (int group = 0; group < 8; ++group)
+                dot = __dp4a(a_vals[group], packed_groups[group], dot);
+            const float scale = physical_codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
+                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(
+                      scale_base[linear], min_base[linear])
+                : llaminar2::cuda_native_vnni::fp16_bits_to_float(scale_base[linear]);
+            return llaminar2::device_native_vnni_contract::singleScaleBlock(dot, scale, scale_a);
+        }
         if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale)
         {
             int dot_lo = 0;
@@ -18240,7 +18518,8 @@ namespace
         const float *__restrict__ scale_a_base,
         int scale_a_stride,
         int tokens_in_group,
-        float (&acc)[TileM])
+        float (&acc)[TileM],
+        uint8_t physical_codebook = CodebookId)
     {
 #pragma unroll
         for (int m = 0; m < TileM; ++m)
@@ -18267,7 +18546,7 @@ namespace
                     min_base,
                     emin_base,
                     linear,
-                    scale_a);
+                    scale_a, physical_codebook);
             acc[m] = __fadd_rn(acc[m], contribution);
         }
     }
@@ -18315,8 +18594,7 @@ namespace
 
         const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        if (!native_vnni_desc_shape_ok<CodebookId>(gate_desc, N, K) ||
-            !native_vnni_desc_shape_ok<CodebookId>(up_desc, N, K))
+        if (!native_vnni_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
             return;
 
         const uint8_t *gate_payload_base = gate_desc.payload;
@@ -18390,11 +18668,11 @@ namespace
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
                     gate_groups, gate_scale_base, gate_min_base, gate_emin_base, gate_payload,
                     linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
-                    tokens_in_group, gate_acc);
+                    tokens_in_group, gate_acc, gate_desc.codebook_id);
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
                     up_groups, up_scale_base, up_min_base, up_emin_base, up_payload,
                     linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
-                    tokens_in_group, up_acc);
+                    tokens_in_group, up_acc, up_desc.codebook_id);
             }
 
             // Barrier before the next iteration overwrites the staged tile.
@@ -18464,8 +18742,7 @@ namespace
 
         const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        if (!native_vnni_desc_shape_ok<CodebookId>(gate_desc, N, K) ||
-            !native_vnni_desc_shape_ok<CodebookId>(up_desc, N, K))
+        if (!native_vnni_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
             return;
 
         const uint8_t *gate_payload_base = gate_desc.payload;
@@ -18527,11 +18804,11 @@ namespace
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
                     gate_groups, gate_scale_base, gate_min_base, gate_emin_base, gate_payload,
                     linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
-                    tokens_in_group, gate_acc);
+                    tokens_in_group, gate_acc, gate_desc.codebook_id);
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
                     up_groups, up_scale_base, up_min_base, up_emin_base, up_payload,
                     linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
-                    tokens_in_group, up_acc);
+                    tokens_in_group, up_acc, up_desc.codebook_id);
             }
 
             __syncthreads();
@@ -18551,10 +18828,16 @@ namespace
             // Inactive lanes (n >= N) contribute 0 to the warp absmax and skip the write.
             const float value = active ? (silu(gate_acc[m]) * up_acc[m]) : 0.0f;
 
-            float abs_value = fabsf(value);
+            float abs_value =
+
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+
+                    value, 0.0f);
 #pragma unroll
             for (int mask = 16; mask > 0; mask >>= 1)
-                abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+                abs_value =
+                    llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                        abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
             const float scale =
                 llaminar2::device_q8_activation_contract::scale(abs_value);
@@ -18589,10 +18872,16 @@ namespace
         const float g = gate[idx];
         const float value = silu(g) * up[idx];
 
-        float abs_value = fabsf(value);
+        float abs_value =
+
+            llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+
+                value, 0.0f);
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
-            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+            abs_value =
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                    abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
         const float scale =
             llaminar2::device_q8_activation_contract::scale(abs_value);
@@ -18686,7 +18975,7 @@ namespace
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
                     packed_groups, scale_base, min_base, emin_base, payload,
                     linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
-                    tokens_in_group, acc);
+                    tokens_in_group, acc, desc.codebook_id);
             }
 
             __syncthreads();
@@ -18914,7 +19203,7 @@ namespace
                     min_base,
                     emin_base,
                     linear,
-                    scale_a);
+                    scale_a, desc.codebook_id);
             acc = __fadd_rn(acc, contribution);
         }
 
@@ -18956,8 +19245,7 @@ namespace
         up_acc = 0.0f;
         if (!A_int8 || !scales_A_blockwise || n < 0 || n >= N ||
             blocks_per_row <= 0 ||
-            !native_vnni_desc_shape_ok<CodebookId>(gate_desc, N, K) ||
-            !native_vnni_desc_shape_ok<CodebookId>(up_desc, N, K))
+            !native_vnni_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
         {
             return;
         }
@@ -19004,7 +19292,7 @@ namespace
                     gate_mins,
                     gate_emins,
                     linear,
-                    scale_a));
+                    scale_a, gate_desc.codebook_id));
 
             const uint8_t *up_payload =
                 up_desc.payload + linear * payload_bytes;
@@ -19020,7 +19308,7 @@ namespace
                     up_mins,
                     up_emins,
                     linear,
-                    scale_a));
+                    scale_a, up_desc.codebook_id));
         }
     }
 
@@ -19057,6 +19345,8 @@ namespace
             return native_vnni_dot_desc_range<0>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 4:
             return native_vnni_dot_desc_range<4>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+            return native_vnni_dot_desc_range<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 5:
             return native_vnni_dot_desc_range<5>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 6:
@@ -19305,8 +19595,7 @@ namespace
 
         const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        if (!native_vnni_desc_shape_ok<CodebookId>(gate_desc, N, K) ||
-            !native_vnni_desc_shape_ok<CodebookId>(up_desc, N, K))
+        if (!native_vnni_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
             return;
 
         const size_t partial_index =
@@ -19395,10 +19684,14 @@ namespace
         }
 
         const float value = active ? (silu(gate_sum) * up_sum) : 0.0f;
-        float abs_value = fabsf(value);
+        float abs_value =
+            llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                value, 0.0f);
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
-            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+            abs_value =
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                    abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
         const float scale =
             llaminar2::device_q8_activation_contract::scale(abs_value);
@@ -20861,6 +21154,7 @@ extern "C"
             {
                 QUERY_GROUPED_PREFILL_CODEBOOK(0);
                 QUERY_GROUPED_PREFILL_CODEBOOK(4);
+                QUERY_GROUPED_PREFILL_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
                 QUERY_GROUPED_PREFILL_CODEBOOK(5);
                 QUERY_GROUPED_PREFILL_CODEBOOK(6);
                 QUERY_GROUPED_PREFILL_CODEBOOK(7);
@@ -20949,9 +21243,11 @@ extern "C"
     bool cudaMoE_quantize_router_gate_q8(
         const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
         int d_model, int num_experts,
-        int device_idx, void *stream)
+        int device_idx, void *stream, llaminar2::RouterQ8Basis basis)
     {
         if (!gate_weights || !gate_weights_q8 || !gate_scales || !stream ||
+            !stream || (basis != llaminar2::RouterQ8Basis::Original &&
+            basis != llaminar2::RouterQ8Basis::SignedHadamard32) ||
             d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
         {
             std::fprintf(stderr, "[cudaMoE_quantize_router_gate_q8] invalid arguments\n");
@@ -20959,6 +21255,9 @@ extern "C"
         }
 
         cudaSetDevice(device_idx);
+        if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+            return llaminar2::router_hadamard_q8::launch(
+                gate_weights, gate_weights_q8, gate_scales, num_experts, d_model, stream);
         const int blocks_per_row = d_model / 32;
         router_gate_quantize_q8_kernel<<<dim3(num_experts, blocks_per_row), dim3(32), 0,
                                           static_cast<cudaStream_t>(stream)>>>(
@@ -20970,10 +21269,12 @@ extern "C"
         const float *hidden, int8_t *hidden_q8, float *hidden_scales,
         const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
         int d_model, int num_experts,
-        int device_idx, void *stream)
+        int device_idx, void *stream, llaminar2::RouterQ8Basis basis)
     {
         if (!hidden || !hidden_q8 || !hidden_scales ||
             !gate_weights_q8 || !gate_scales || !logits || !stream ||
+            !stream || (basis != llaminar2::RouterQ8Basis::Original &&
+            basis != llaminar2::RouterQ8Basis::SignedHadamard32) ||
             d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
         {
             std::fprintf(stderr, "[cudaMoE_gate_logits_single_token_q8_weights] invalid arguments\n");
@@ -20983,33 +21284,67 @@ extern "C"
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         const int blocks_per_row = d_model / 32;
-        grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
+        if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+        {
+            if (!llaminar2::router_hadamard_q8::launch(
+                    hidden, hidden_q8, hidden_scales, 1, d_model, stream)) return false;
+        }
+        else
+        {
+            grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
             hidden, hidden_q8, hidden_scales, d_model);
+        }
         if (!finishLaunch("cudaMoE_router_hidden_quantize_q8"))
             return false;
 
         constexpr int kRouterThreads = 128;
         router_gate_logits_single_token_q8_kernel<<<num_experts, kRouterThreads, 0, cuda_stream>>>(
             hidden_q8, hidden_scales, gate_weights_q8, gate_scales, logits, d_model, num_experts);
-        return finishLaunch("cudaMoE_gate_logits_single_token_q8_weights");
+        if (!finishLaunch("cudaMoE_gate_logits_single_token_q8_weights")) return false;
+        // The last router read precedes this overwrite on the SAME stream.
+        // Expert projections borrow original coordinates, never the rotation.
+        if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+        {
+            grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
+            hidden, hidden_q8, hidden_scales, d_model);
+            if (!finishLaunch("cudaMoE_router_original_hidden_publication")) return false;
+        }
+        return true;
     }
 
+    /** @brief Explicit execution policy; both implementations retain serial Q8 arithmetic. */
+    enum class RouterQ8RowsExecution { SerialEquivalent, TensorCorePrefill };
+
     /**
-     * @brief Graph-capturable grouped Q8 router logits for verifier rows.
-     *
-     * This bridge is deliberately not a generic prefill GEMM.  It batches the
-     * launches needed for MTP verifier rows while each row still follows the
-     * same quantize-and-DP4A accumulation contract as the serial decode router.
+     * @brief Share quantization and expert-bank publication across exact Q8 implementations.
+     * @param hidden Original FP32 rows before any router-only rotation.
+     * @param hidden_q8 Admitted signed-byte scratch and original expert publication.
+     * @param hidden_scales Admitted block32 scales for that bank.
+     * @param gate_weights_q8 Immutable prepared router codes in the declared basis.
+     * @param gate_scales Their block32 scales. @param logits Admitted FP32 output.
+     * @param seq_len Captured row capacity. @param d_model Positive block32 width.
+     * @param num_experts Output width. @param device_idx Owning CUDA ordinal.
+     * @param stream Exact non-null producer stream. @param basis Paired gate/input basis.
+     * @param execution Explicit verifier or tensor-core prefill implementation.
+     * @param live_rows Optional device-owned live extent for retained prefill replay.
+     * @param hardware Prepared immutable device limits, consumed only by tensor-core prefill.
+     * @return Whether every ordered launch succeeded.
      */
-    bool cudaMoE_gate_logits_q8_weights_decode_equivalent_rows(
+    static bool launchRouterQ8Rows(
         const float *hidden, int8_t *hidden_q8, float *hidden_scales,
         const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
         int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream)
+        int device_idx, void *stream, llaminar2::RouterQ8Basis basis,
+        RouterQ8RowsExecution execution, const int *live_rows,
+        const llaminar2::cuda::RouterQ8PrefillHardware &hardware)
     {
         if (!hidden || !hidden_q8 || !hidden_scales ||
             !gate_weights_q8 || !gate_scales || !logits || !stream ||
             seq_len <= 0 ||
+            (execution == RouterQ8RowsExecution::TensorCorePrefill &&
+                (!hardware.valid() || hardware.device != device_idx)) ||
+            (basis != llaminar2::RouterQ8Basis::Original &&
+            basis != llaminar2::RouterQ8Basis::SignedHadamard32) ||
             d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
         {
             std::fprintf(stderr, "[cudaMoE_gate_logits_q8_weights_decode_equivalent_rows] invalid arguments\n");
@@ -21019,18 +21354,71 @@ extern "C"
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         const int blocks_per_row = d_model / 32;
-        grouped_hidden_quantize_blockwise_rows_kernel<<<dim3(blocks_per_row, seq_len), 32, 0, cuda_stream>>>(
-            hidden, hidden_q8, hidden_scales, seq_len, d_model);
+        if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+        {
+            if (!llaminar2::router_hadamard_q8::launch(
+                    hidden, hidden_q8, hidden_scales, seq_len, d_model, stream, live_rows)) return false;
+        }
+        else
+        {
+            grouped_hidden_quantize_blockwise_rows_kernel<<<dim3(blocks_per_row, seq_len), 32, 0, cuda_stream>>>(
+            hidden, hidden_q8, hidden_scales, seq_len, d_model, live_rows);
+        }
         if (!finishLaunch("cudaMoE_router_hidden_quantize_q8_rows"))
             return false;
 
-        constexpr int kRouterThreads = 128;
-        constexpr int kRowsPerBlock = 4;
-        const dim3 grid(num_experts, (seq_len + kRowsPerBlock - 1) / kRowsPerBlock);
-        router_gate_logits_q8_grouped_verifier_kernel<<<grid, kRouterThreads, 0, cuda_stream>>>(
-            hidden_q8, hidden_scales, gate_weights_q8, gate_scales, logits,
-            seq_len, d_model, num_experts);
-        return finishLaunch("cudaMoE_gate_logits_q8_weights_decode_equivalent_rows");
+        if (execution == RouterQ8RowsExecution::TensorCorePrefill)
+        {
+            if (!llaminar2::cuda::routerQ8Prefill({
+                    .hidden_codes = hidden_q8, .hidden_scales = hidden_scales,
+                    .gate_codes = gate_weights_q8, .gate_scales = gate_scales,
+                    .logits = logits, .capacity = seq_len, .width = d_model,
+                    .experts = num_experts, .live_rows = live_rows,
+                    .hardware = hardware}, stream)) return false;
+        }
+        else
+        {
+            constexpr int kRouterThreads = 128, kRowsPerBlock = 4;
+            const dim3 grid(num_experts, (seq_len + kRowsPerBlock - 1) / kRowsPerBlock);
+            router_gate_logits_q8_grouped_verifier_kernel<<<grid, kRouterThreads, 0, cuda_stream>>>(
+                hidden_q8, hidden_scales, gate_weights_q8, gate_scales, logits,
+                seq_len, d_model, num_experts);
+            if (!finishLaunch("cudaMoE_gate_logits_q8_weights_decode_equivalent_rows")) return false;
+        }
+        // The last router read precedes this overwrite on the SAME stream.
+        // Expert projections borrow original coordinates, never the rotation.
+        if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+        {
+            grouped_hidden_quantize_blockwise_rows_kernel<<<dim3(blocks_per_row, seq_len), 32, 0, cuda_stream>>>(
+            hidden, hidden_q8, hidden_scales, seq_len, d_model, live_rows);
+            if (!finishLaunch("cudaMoE_router_original_hidden_publication")) return false;
+        }
+        return true;
+    }
+
+    /** @copydoc cudaMoE_gate_logits_q8_weights_decode_equivalent_rows */
+    bool cudaMoE_gate_logits_q8_weights_decode_equivalent_rows(
+        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
+        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
+        int seq_len, int d_model, int num_experts, int device_idx, void *stream,
+        llaminar2::RouterQ8Basis basis)
+    {
+        return launchRouterQ8Rows(hidden, hidden_q8, hidden_scales, gate_weights_q8,
+            gate_scales, logits, seq_len, d_model, num_experts, device_idx, stream,
+            basis, RouterQ8RowsExecution::SerialEquivalent, nullptr, {});
+    }
+
+    /** @copydoc cudaMoE_gate_logits_q8_weights_prefill_rows */
+    bool cudaMoE_gate_logits_q8_weights_prefill_rows(
+        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
+        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
+        int seq_len, int d_model, int num_experts, int device_idx, void *stream,
+        const int *live_rows, llaminar2::RouterQ8Basis basis,
+        const llaminar2::cuda::RouterQ8PrefillHardware &hardware)
+    {
+        return launchRouterQ8Rows(hidden, hidden_q8, hidden_scales, gate_weights_q8,
+            gate_scales, logits, seq_len, d_model, num_experts, device_idx, stream,
+            basis, RouterQ8RowsExecution::TensorCorePrefill, live_rows, hardware);
     }
 
     /**
@@ -21229,6 +21617,23 @@ extern "C"
         route_logits_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             hidden, gate_weights, logits, seq_len, d_model, num_experts);
         return finishLaunch("cudaMoE_route_logits");
+    }
+
+    /** @brief Submit actual-half row-invariant routing without changing expert hidden storage.
+     * @param hidden Original FP32 [M,K]. @param gate_weights Physical FP16 [E,K].
+     * @param logits FP32 [M,E]. @param seq_len Physical rows. @param d_model K.
+     * @param num_experts E. @param device_idx Device ordinal. @param stream Exact stream.
+     * @param live_rows Optional device-owned active row count. @return Submission success.
+     */
+    bool cudaMoE_route_logits_fp16(const float *hidden, const void *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts, int device_idx, void *stream,
+        const int *live_rows)
+    {
+        if (!hidden || !gate_weights || !logits || !stream || seq_len <= 0 ||
+            d_model <= 0 || num_experts <= 0 || cudaSetDevice(device_idx) != cudaSuccess) return false;
+        launch_fp16_router_rows<false>(hidden, static_cast<const __half *>(gate_weights), logits,
+            seq_len, seq_len, d_model, num_experts, live_rows, {}, static_cast<cudaStream_t>(stream));
+        return finishLaunch("cudaMoE_route_logits_fp16");
     }
 
     bool cudaMoE_route_logits_bf16(const float *hidden, const void *gate_weights, float *logits,
@@ -23650,6 +24055,7 @@ extern "C"
         {
         case 0:  LAUNCH_GROUPED_GATE_UP_KPART(0); break;
         case 4:  LAUNCH_GROUPED_GATE_UP_KPART(4); break;
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_GATE_UP_KPART(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook); break;
         case 5:  LAUNCH_GROUPED_GATE_UP_KPART(5); break;
         case 6:  LAUNCH_GROUPED_GATE_UP_KPART(6); break;
         case 7:  LAUNCH_GROUPED_GATE_UP_KPART(7); break;
@@ -23744,6 +24150,7 @@ extern "C"
         {
         case 0:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(0); break;
         case 4:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(4); break;
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook); break;
         case 5:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(5); break;
         case 6:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(6); break;
         case 7:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(7); break;
@@ -23848,6 +24255,7 @@ extern "C"
         {
         case 0:  LAUNCH_GROUPED_DOWN_KPART(0); break;
         case 4:  LAUNCH_GROUPED_DOWN_KPART(4); break;
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_DOWN_KPART(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook); break;
         case 5:  LAUNCH_GROUPED_DOWN_KPART(5); break;
         case 6:  LAUNCH_GROUPED_DOWN_KPART(6); break;
         case 7:  LAUNCH_GROUPED_DOWN_KPART(7); break;
@@ -23956,6 +24364,7 @@ extern "C"
         {
         case 0:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(0); break;
         case 4:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(4); break;
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook); break;
         case 5:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(5); break;
         case 6:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(6); break;
         case 7:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(7); break;
@@ -24105,6 +24514,10 @@ extern "C"
         void *stream,
         const llaminar2::MoEPrefillProjectionExecution &execution)
     {
+        // One LUT family producer handles both factor programs; each actual
+        // descriptor remains untouched and selects its own source scale.
+        gateup_codebook_mask = llaminar2::cuda_native_vnni::native_vnni_iq4_launch_mask(gateup_codebook_mask);
+        down_codebook_mask = llaminar2::cuda_native_vnni::native_vnni_iq4_launch_mask(down_codebook_mask);
         const bool executes_gateup = execution.executesGateUp();
         const bool executes_down = execution.executesDown();
         const int down_columns = execution.columnCount();
@@ -24329,6 +24742,7 @@ extern "C"
 
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(0);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(4);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(5);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(6);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(7);
@@ -24430,6 +24844,7 @@ extern "C"
 
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(0);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(4);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(5);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(6);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(7);
@@ -24597,6 +25012,7 @@ extern "C"
                 {
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(0);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(4);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(5);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(6);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(7);
@@ -24698,6 +25114,7 @@ extern "C"
 
             LAUNCH_GROUPED_DOWN_IF_PRESENT(0);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(4);
+            LAUNCH_GROUPED_DOWN_IF_PRESENT(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(5);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(6);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(7);
@@ -24931,16 +25348,53 @@ extern "C"
 namespace llaminar2::cuda
 {
     /** @brief Reuse canonical prefill arithmetic; distribute rows, never K reductions. */
-    bool routeOwnedRows(const MoERouterOwnedRowsLaunch &launch, void *stream)
+    bool routeOwnedRows(const MoERouterOwnedRowsLaunch &launch, void *stream,
+                        const RouterQ8PrefillHardware &hardware)
     {
         if (!stream || !launch.valid() || launch.experts > kMaxExperts ||
+            (launch.format == MoERouterPreparedFormat::BlockQ8 && !hardware.valid()) ||
             launch.top_k > kMaxTopK ||
             (launch.format != MoERouterPreparedFormat::FP32 &&
-             launch.format != MoERouterPreparedFormat::BF16))
+             launch.format != MoERouterPreparedFormat::BF16 &&
+             launch.format != MoERouterPreparedFormat::FP16 &&
+             launch.format != MoERouterPreparedFormat::BlockQ8))
             return false;
         const int rows = launch.partition.capacityFor(launch.capacity);
         const auto native_stream = static_cast<cudaStream_t>(stream);
-        if (rows > 0 && launch.format == MoERouterPreparedFormat::FP32)
+        if (launch.format == MoERouterPreparedFormat::BlockQ8)
+        {
+            // Publish every local expert input in its original basis, including
+            // empty owners. Only this participant's logits/top-k are computed.
+            const dim3 quant_grid(launch.width / 32, launch.capacity);
+            if (rows > 0 && launch.q8_basis == RouterQ8Basis::SignedHadamard32)
+            {
+                if (!router_hadamard_q8::launch(launch.hidden, launch.hidden_q8, launch.hidden_scales,
+                        launch.capacity, launch.width, stream, launch.live_rows)) return false;
+            }
+            else
+            {
+                grouped_hidden_quantize_blockwise_rows_kernel<<<quant_grid, 32, 0, native_stream>>>(
+                    launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity, launch.width);
+                if (!finishLaunch("cudaMoE_owned_q8_hidden")) return false;
+            }
+            if (rows > 0)
+            {
+                if (!routerQ8Prefill({.hidden_codes = launch.hidden_q8,
+                        .hidden_scales = launch.hidden_scales,
+                        .gate_codes = static_cast<const int8_t *>(launch.gate),
+                        .gate_scales = launch.gate_scales, .logits = launch.logits,
+                        .capacity = launch.capacity, .width = launch.width,
+                        .experts = launch.experts, .live_rows = launch.live_rows,
+                        .partition = launch.partition, .hardware = hardware}, stream)) return false;
+                if (launch.q8_basis == RouterQ8Basis::SignedHadamard32)
+                {
+                    grouped_hidden_quantize_blockwise_rows_kernel<<<quant_grid, 32, 0, native_stream>>>(
+                        launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity, launch.width);
+                    if (!finishLaunch("cudaMoE_owned_q8_original_publication")) return false;
+                }
+            }
+        }
+        else if (rows > 0 && launch.format == MoERouterPreparedFormat::FP32)
         {
             // Keep the established prefill family even when an owner currently
             // has one row. Scalar decode is a different numerical contract.
@@ -24951,6 +25405,12 @@ namespace llaminar2::cuda
                         launch.capacity, launch.width, launch.experts),
                     launch.live_rows, launch.partition))
                 return false;
+        }
+        else if (rows > 0 && launch.format == MoERouterPreparedFormat::FP16)
+        {
+            launch_fp16_router_rows<true>(launch.hidden, static_cast<const __half *>(launch.gate), launch.logits,
+                launch.capacity, rows, launch.width, launch.experts, launch.live_rows, launch.partition, native_stream);
+            if (!finishLaunch("cudaMoE_owned_fp16_logits")) return false;
         }
         else if (rows > 0)
         {

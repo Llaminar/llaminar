@@ -2788,6 +2788,13 @@ namespace llaminar2
         return *owner;
     }
 
+    /** @copydoc StageRunnerRegistry::collectPrefixCacheShutdownAll */
+    void StageRunnerRegistry::collectPrefixCacheShutdownAll(PrefixCacheShutdown &shutdown) const
+    {
+        for (const auto &entry : entries_)
+            if (entry.runner) entry.runner->collectPrefixCacheShutdown(shutdown);
+    }
+
     PrefixCacheTelemetrySources StageRunnerRegistry::prefixCacheTelemetrySourcesAll() const
     {
         PrefixCacheTelemetrySources result;
@@ -2802,6 +2809,12 @@ namespace llaminar2
     PrefixCacheTelemetrySources GlobalOrchestrator::prefixCacheTelemetrySources() const
     {
         return stage_runners_.prefixCacheTelemetrySourcesAll();
+    }
+
+    /** @copydoc GlobalOrchestrator::collectPrefixCacheShutdown */
+    void GlobalOrchestrator::collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const
+    {
+        stage_runners_.collectPrefixCacheShutdownAll(shutdown);
     }
 
 } // namespace llaminar2

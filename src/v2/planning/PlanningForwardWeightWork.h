@@ -42,12 +42,14 @@ namespace llaminar2
         std::string source_format;
         ModelPreparedWeightRepresentation representation;
         WeightShardGeometry geometry;
+        FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native; ///< Immutable observed arithmetic family.
 
         /** @return Actual runtime scalar/codebook label, not an assumed source format. */
         std::string_view executionFormat() const noexcept
         {
             return representation == ModelPreparedWeightRepresentation::FP32
-                ? std::string_view{"F32"} : std::string_view{source_format};
+                ? std::string_view{"F32"} : representation == ModelPreparedWeightRepresentation::FP16
+                    ? std::string_view{"F16"} : std::string_view{source_format};
         }
     };
 

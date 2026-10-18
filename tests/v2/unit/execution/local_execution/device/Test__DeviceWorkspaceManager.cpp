@@ -1343,6 +1343,9 @@ TEST_F(Test__DeviceWorkspaceManager, RouterGateIdentityIgnoresRequestLocalTensor
         /*model_width=*/2048,
         /*expert_count=*/256);
 
+    EXPECT_NE(expected, DeviceResidentRouterGateCacheKey::make(
+        kWorkspaceGeneration, device_weight, 2048, 256, RouterQ8Basis::SignedHadamard32));
+
     /*
      * Rebuilt graph views may have arbitrary host addresses. Simulate many
      * requests and prove none of those wrapper identities can alter the

@@ -295,7 +295,26 @@ A same-repository PR from `develop` to `master` triggers
 successful develop push or manual image gate at the PR's **exact head SHA**.
 It never substitutes the mutable `develop` tag. The required E2E check pulls that
 source-pinned AVX512/AVX2 pair, verifies image labels and source tree, and runs
-the full canonical HTTP suite. The required benchmark check then consumes the
+the full canonical HTTP suite and the frozen dense/MoE KL canaries on one CUDA
+and one ROCm device per ISA. The native observer ships in the runtime image and
+links that image's serving core. MoE uses the FP16 alpha/beta default; dense
+retains native arithmetic because the same half conversion regresses its decode
+KL on this frozen trajectory. Both backends follow this identical model policy.
+Each frozen history gates its prompt-end prefill
+row and all 128 forced decode rows independently against a same-GGUF FP32
+reference, using the full vocabulary. A short identical request before and after
+the long request must replay byte-identically. These are numerical gates, not
+throughput measurements or MTP certification.
+
+Only this master PR job materializes the source-pinned `model-kld/` family from
+the optional corpus submodule. Unit and `ProductionTestPreflight` exercise the
+model-free policy, evidence, freshness, cleanup and CLI contracts without fetching
+models or corpus payloads. Raw candidate logits are removed after each cell;
+compact phase scores and all row metrics accompany the E2E receipt. Missing
+phases, altered histories, stale evidence and cleanup failures fail the gate.
+Complete numerical failures are collected across both ISA lanes.
+
+The required benchmark check then consumes the
 completed E2E pair receipt and runs every tagged benchmark cell on those same
 image digests. Both jobs retain compact per-ISA JSON evidence; benchmarks do
 not run after an E2E failure. A complete red benchmark report still lets the

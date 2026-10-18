@@ -221,6 +221,8 @@ namespace llaminar2
      */
     class DeviceGraphExecutor : public IGraphExecutor
     {
+        // Device-free regression access to immutable capture/publication boundaries.
+        friend struct GraphSnapshotRowLayoutTestAccess;
     public:
         /**
          * @brief One immutable, graph-owned GPU snapshot output descriptor.
@@ -242,6 +244,8 @@ namespace llaminar2
             size_t storage_bytes = 0;
             DeviceId device = DeviceId::invalid();
             const void *source_ptr = nullptr;
+            /** Frozen ownership must survive replay before logical-row projection. */
+            SnapshotRowLayout row_layout;
             /**
              * True after launch preparation froze the complete source and
              * destination descriptor. The producer has not executed at that

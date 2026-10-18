@@ -85,7 +85,7 @@ namespace llaminar2
                 const auto *format = native_vnni_formats::forQuantType(description.formats[i]);
                 if (format)
                     pool.planWeightForOwner(device.gpu_ordinal(), inputs[i]->tensor_name,
-                        matrix.n, matrix.k, format->payload_bytes, format->is_asymmetric,
+                        matrix.n, matrix.k, format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric,
                         format->has_emins, matrix.source_bytes, kWeightOwner);
                 else if (description.formats[i] == "F32" || description.formats[i] == "F16" ||
                          description.formats[i] == "BF16")
@@ -119,10 +119,10 @@ namespace llaminar2
                     const auto &format = description.formats[index];
                     if (const auto *native = native_vnni_formats::forQuantType(format))
                     {
-                        const uint8_t codebook = canonicalDeviceVnniCodebookId(native->codebook_id);
+                        const uint8_t codebook = canonicalDeviceVnniCodebookId(*native);
                         return cuda::quantized_gemm_workspace::projectionRequirements(
                             rows, matrix.n, matrix.k, device.gpu_ordinal(),
-                            cuda::quantized_gemm_workspace::NativeCodebooks{codebook, codebook});
+                            cuda::quantized_gemm_workspace::NativeCodebooks{codebook, canonicalDeviceVnniCodebookId(native->codebook_id)});
                     }
                     if (format == "F32" || format == "F16" || format == "BF16")
                         return cuda::floating_gemm_workspace::projectionRequirements(rows, matrix.n);
@@ -297,8 +297,8 @@ namespace llaminar2
             {
                 projection.format = ExpertWeightFormat::nativeVnni({native->codebook_id, native->is_superblock, true});
                 projection.payload_bytes_per_block = native->payload_bytes;
-                projection.codebook_id = canonicalDeviceVnniCodebookId(native->codebook_id);
-                projection.is_asymmetric = native->is_asymmetric;
+                projection.codebook_id = canonicalDeviceVnniCodebookId(*native);
+                projection.is_asymmetric = canonicalDeviceVnniFormat(*native).is_asymmetric;
                 projection.has_emins = native->has_emins;
             }
             else if (format == "F32") projection.format = ExpertWeightFormat::floating(TensorType::FP32);
@@ -385,7 +385,7 @@ namespace llaminar2
             pool->addWeightJob(device.gpu_ordinal(), {.name = inputs[i]->tensor_name,
                 .host_raw_data = sample.tensor(i).raw_data(), .raw_bytes = description.matrices[i].source_bytes,
                 .format = *repack, .N = int(description.matrices[i].n), .K = int(description.matrices[i].k),
-                .is_asymmetric = format && format->is_asymmetric});
+                .is_asymmetric = format && canonicalDeviceVnniFormat(*format).is_asymmetric});
         }
         pool->load();
         pool->finalize();

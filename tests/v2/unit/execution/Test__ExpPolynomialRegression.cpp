@@ -244,6 +244,7 @@ TEST(Test__ExpPolynomialRegression, AttentionOutputGate_Sigmoid_AVX512Path)
     params.gate = gate.get();
     params.output = output.get();
     params.seq_len = 1;
+    params.feature_dim = static_cast<int>(dim);
 
     auto ctx = makeCPUContext();
     AttentionOutputGateStage stage(params);
@@ -294,6 +295,7 @@ TEST(Test__ExpPolynomialRegression, AttentionOutputGate_Sigmoid_ScalesInput)
     params.gate = gate.get();
     params.output = output.get();
     params.seq_len = 1;
+    params.feature_dim = static_cast<int>(dim);
 
     auto ctx = makeCPUContext();
     AttentionOutputGateStage stage(params);

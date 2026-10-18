@@ -23,6 +23,7 @@
 #include "MoEExpertSourceView.h"
 #include "MmapRegion.h"
 #include "PreparedWeightRepresentationContract.h"
+#include "PreparedHalfWeights.h"
 #include "PreparedWeightStore.h"
 #include "PreparedOverlaySourceRetirement.h"
 #include "GPUHostLoadPreflight.h"
@@ -393,7 +394,7 @@ namespace llaminar2
 
     }
 
-    std::shared_ptr<TensorBase> WeightManager::createModelPreparedFp32Override(
+    std::shared_ptr<TensorBase> WeightManager::createModelPreparedFloatingOverride(
         const std::string &name,
         WeightRole role,
         const TensorBase *source,
@@ -406,33 +407,36 @@ namespace llaminar2
 
         const auto representation =
             PreparedWeightRepresentationContract::resolve(
-                role, source->native_type());
-        if (representation != ModelPreparedWeightRepresentation::FP32)
-            return nullptr;
+                role, source->native_type(), name, loader_.architecture(),
+                debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
+        if (representation == ModelPreparedWeightRepresentation::SourceNative) return nullptr;
+        const auto runtime_type = representation == ModelPreparedWeightRepresentation::FP16 ?
+            TensorType::FP16 : TensorType::FP32;
 
-        const ModelPreparedFp32OverrideKey key{
+        const ModelPreparedFloatingOverrideKey key{
             .canonical_name = name,
             .role = role,
             .target_device = target_device,
             .slice = logical_slice,
+            .representation = representation,
         };
 
         /*
          * The same mutex serializes raw-source release.  Holding it across this
-         * tiny one-row conversion makes the cache-miss transition atomic: a
+         * setup-only source conversion makes the cache-miss transition atomic: a
          * release sweep cannot reclaim source bytes between validation and
          * conversion, and every concurrent runner observes one authority.
          */
         std::lock_guard<std::mutex> lock(cache_mutex_);
-        if (const auto cached = model_prepared_fp32_overrides_.find(key);
-            cached != model_prepared_fp32_overrides_.end())
+        if (const auto cached = model_prepared_floating_overrides_.find(key);
+            cached != model_prepared_floating_overrides_.end())
         {
             if (!cached->second ||
-                cached->second->native_type() != TensorType::FP32 ||
+                cached->second->native_type() != runtime_type ||
                 cached->second->shape() != source->shape())
             {
                 throw std::runtime_error(
-                    "[WeightManager] Invalid cached FP32 override for " + name +
+                    "[WeightManager] Invalid cached floating override for " + name +
                     " role=" + toString(role) +
                     " device=" + target_device.to_string());
             }
@@ -440,7 +444,7 @@ namespace llaminar2
                 cached->second->raw_data() == nullptr)
             {
                 throw std::runtime_error(
-                    "[WeightManager] Model-owned FP32 override lost its host "
+                    "[WeightManager] Model-owned floating override lost its host "
                     "source lifetime for " +
                     name + " role=" + toString(role) +
                     " device=" + target_device.to_string());
@@ -449,7 +453,7 @@ namespace llaminar2
             {
                 PerfStatsCollector::addCounter(
                     "weight_loading",
-                    "model_prepared_fp32_override_cache_hits",
+                    "model_prepared_floating_override_cache_hits",
                     1.0,
                     "materialize",
                     target_device.to_string(),
@@ -461,18 +465,25 @@ namespace llaminar2
         if (source->is_raw_data_released() || source->raw_data() == nullptr)
         {
             throw std::runtime_error(
-                "[WeightManager] Cannot create model-owned FP32 override for " +
+                "[WeightManager] Cannot create model-owned floating override for " +
                 name + " role=" + toString(role) +
                 " device=" + target_device.to_string() +
                 ": raw source bytes were released before the override was materialized");
         }
 
-        auto fp32 = std::make_shared<FP32Tensor>(source->shape(), DeviceId::cpu());
-        source->to_fp32(fp32->mutable_data());
+        std::shared_ptr<TensorBase> prepared;
+        if (representation == ModelPreparedWeightRepresentation::FP16)
+            prepared = materializePreparedHalfWeights(*source);
+        else
+        {
+            auto fp32 = std::make_shared<FP32Tensor>(source->shape(), DeviceId::cpu());
+            source->to_fp32(fp32->mutable_data());
+            prepared = std::move(fp32);
+        }
         const char *purpose = role == WeightRole::SharedExpertInputGate
                                   ? "shared-expert-input-gate"
-                                  : "ssm-projection";
-        fp32->setDebugName(name + "@fp32-" + purpose);
+                                  : role == WeightRole::MoERouter ? "moe-router" : "ssm-projection";
+        prepared->setDebugName(name + (runtime_type == TensorType::FP16 ? "@fp16-" : "@fp32-") + purpose);
 
         /*
          * PreparedWeightStore adoption compares logical slices as well as
@@ -481,17 +492,17 @@ namespace llaminar2
          */
         registerDerivedMetadata(
             name,
-            fp32,
+            prepared,
             logical_derivation,
             logical_slice,
             target_device);
-        model_prepared_fp32_overrides_.emplace(key, fp32);
+        model_prepared_floating_overrides_.emplace(key, prepared);
 
         if (PerfStatsCollector::isDomainEnabled("weight_loading"))
         {
             PerfStatsCollector::addCounter(
                 "weight_loading",
-                "model_prepared_fp32_override_creations",
+                "model_prepared_floating_override_creations",
                 1.0,
                 "materialize",
                 target_device.to_string(),
@@ -499,10 +510,10 @@ namespace llaminar2
         }
         LOG_DEBUG("[WeightManager] Dequantized " << name
                                                   << " from " << source->dtype_name()
-                                                  << " to FP32 for "
+                                                  << " to " << prepared->dtype_name() << " for "
                                                   << target_device.to_string()
                                                   << " " << purpose << " path");
-        return fp32;
+        return prepared;
     }
 
     const char *WeightManager::weightPrepStateName(WeightPrepState state)
@@ -2391,7 +2402,10 @@ namespace llaminar2
             if (!hasExplicitSlice(binding.slice) && tensor)
                 binding.slice = fullSliceSpec(*tensor);
 
-            if (auto fp32_override = createModelPreparedFp32Override(
+            // Original source format is captured before the store-owned override.
+            const TensorType gdn_source_type = tensor->native_type();
+            const size_t gdn_source_bytes = tensor->size_bytes();
+            if (auto prepared_override = createModelPreparedFloatingOverride(
                     requirement.canonical_name,
                     binding.identity.role,
                     tensor.get(),
@@ -2399,11 +2413,49 @@ namespace llaminar2
                     binding.slice,
                     binding.identity.derivation))
             {
-                tensor = fp32_override;
-                binding.tensor_owner = fp32_override;
-                binding.tensor = fp32_override.get();
+                tensor = prepared_override;
+                binding.tensor_owner = prepared_override;
+                binding.tensor = prepared_override.get();
             }
 
+            const auto gdn_arithmetic = PreparedWeightRepresentationContract::effectiveGDNArithmetic(
+                binding.identity.role, requirement.canonical_name, loader_.architecture(),
+                debugEnv().gemm.gdn_projection_arithmetic);
+            if (gdn_arithmetic != GDNProjectionArithmetic::Native)
+            {
+                const bool half = gdn_arithmetic == GDNProjectionArithmetic::FP16;
+                if (tensor->native_type() != (half ? TensorType::FP16 : TensorType::FP32))
+                    throw std::runtime_error("GDN floating setup failed to materialize " + requirement.canonical_name);
+                PerfStatsCollector::addCounter("weight_loading", "gdn_projection_arithmetic_prepared_weight", 1.0,
+                    "materialize", requirement.target_device.to_string(),
+                    {{"canonical_name", requirement.canonical_name},
+                     {"weight_role", toString(binding.identity.role)},
+                     {"policy", std::string(gdnProjectionArithmeticName(debugEnv().gemm.gdn_projection_arithmetic))},
+                     {"source_format", std::string(tensorTypeName(gdn_source_type))},
+                     {"prepared_format", half ? "FP16" : "FP32"},
+                     {"source_path", half ? "source_decoded_half_rne" :
+                         (gdn_source_type == TensorType::FP32 ? "original_fp32" : "source_dequantized_fp32")},
+                     {"source_bytes", std::to_string(gdn_source_bytes)},
+                     {"prepared_bytes", std::to_string(tensor->size_bytes())}});
+            }
+            if (binding.identity.role == WeightRole::MoERouter &&
+                debugEnv().gemm.moe_router_arithmetic == MoERouterArithmetic::FP16)
+            {
+                if (tensor->native_type() != TensorType::FP16)
+                    throw std::runtime_error("Router half setup failed to materialize " + requirement.canonical_name);
+                PerfStatsCollector::addCounter("weight_loading", "moe_router_arithmetic_prepared_weight", 1.0,
+                    "materialize", requirement.target_device.to_string(),
+                    {{"canonical_name", requirement.canonical_name},
+                     {"weight_role", toString(binding.identity.role)}, {"policy", "fp16"},
+                     {"source_format", std::string(tensorTypeName(gdn_source_type))},
+                     {"prepared_format", "FP16"}, {"activation_operand", "half_rne"},
+                     {"accumulation", "fp32"},
+                     {"source_bytes", std::to_string(gdn_source_bytes)},
+                     {"prepared_bytes", std::to_string(tensor->size_bytes())}});
+            }
+            binding.floating_operand_precision = PreparedWeightRepresentationContract::operandPrecision(
+                binding.identity.role, requirement.canonical_name, loader_.architecture(),
+                debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
             binding.identity.instance_id = binding.binding_id;
 
             if (requirement.expected_prepared_kind != PreparedWeightKind::None)
@@ -3484,7 +3536,7 @@ namespace llaminar2
                 // On GPU, mark tensors HOST_RESIDENT when the TransferEngine
                 // upload would produce a dead copy:
                 //
-                // - Quantized token_embd.weight: preparation owns EmbedQ8.
+                // - Quantized token_embd.weight: preparation owns unchanged native blocks.
                 //   Native FP32/FP16/BF16 tables instead remain raw device reads.
                 //
                 // - GEMM weights (attn_q/k/v/output, ffn_gate/up/down, etc.):
@@ -3663,9 +3715,10 @@ namespace llaminar2
         const bool is_gpu = device.is_gpu();
         const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
 
-        // Step 1: Pack GEMM weights (async on GPU for overlap with step 2)
-        // GPU devices use the GPU-native pipeline (LoadOrchestrator) which does
-        // single VRAM alloc + pipelined H2D + GPU repack kernels.
+        // Step 1: Pack GEMM weights through the participant-local pipeline.
+        // GPU devices retain pipelined H2D and repack stream concurrency; sibling
+        // participants also prepare independently. Non-GEMM upload must wait for
+        // this pipeline to release its admitted staging ring before reusing it.
         // CPU devices use the CPU-side VNNI packing path.
         std::future<bool> gemm_future;
         if (is_gpu)
@@ -3687,7 +3740,20 @@ namespace llaminar2
                 });
         }
 
-        // Step 2: Upload non-GEMM weights (norms, embeddings) to device
+        bool gemm_ok = true;
+        if (is_gpu)
+        {
+            gemm_ok = gemm_future.get();
+            if (!gemm_ok)
+            {
+                LOG_ERROR("[WeightManager] GEMM weight packing failed for " << device_name);
+                return false;
+            }
+        }
+
+        // Step 2: Reuse the finalized pipeline's staging allowance for non-GEMM
+        // upload. GPU packing retains raw source views: tied head/embedding
+        // bytes stay live until the later, lifecycle-gated host release sweep.
         bool non_gemm_ok = true;
         if (is_gpu)
         {
@@ -3705,13 +3771,8 @@ namespace llaminar2
             }
         }
 
-        // Step 3: Wait for GEMM pack (or do sync pack for CPU)
-        bool gemm_ok = true;
-        if (is_gpu)
-        {
-            gemm_ok = gemm_future.get();
-        }
-        else
+        // Step 3: CPU GEMM packing has no GPU upload staging to share.
+        if (!is_gpu)
         {
             // Wire progress tracker for CPU weight packing (count-based progress).
             // We use weight count as the progress unit since CPU packing is compute-bound.
@@ -5789,28 +5850,28 @@ namespace llaminar2
             if (!hasExplicitSlice(logical_slice))
                 logical_slice = fullSliceSpec(*dense_job.tensor);
 
-            auto fp32_override = createModelPreparedFp32Override(
+            auto prepared_override = createModelPreparedFloatingOverride(
                 dense_job.name,
                 role,
                 dense_job.tensor,
                 target_device,
                 logical_slice,
                 logical_derivation);
-            if (!fp32_override)
+            if (!prepared_override)
                 continue;
 
-            dense_job.owner = fp32_override;
-            dense_job.tensor = fp32_override.get();
+            dense_job.owner = prepared_override;
+            dense_job.tensor = prepared_override.get();
             if (dense_job.binding.has_value())
             {
-                dense_job.binding->tensor_owner = fp32_override;
-                dense_job.binding->tensor = fp32_override.get();
+                dense_job.binding->tensor_owner = prepared_override;
+                dense_job.binding->tensor = prepared_override.get();
                 if (dense_job.binding->slice.source_rows == 0 &&
                     dense_job.binding->slice.source_cols == 0 &&
                     dense_job.binding->slice.row_count == 0 &&
                     dense_job.binding->slice.col_count == 0)
                 {
-                    dense_job.binding->slice = fullSliceSpec(*fp32_override);
+                    dense_job.binding->slice = fullSliceSpec(*prepared_override);
                 }
             }
         }
@@ -5960,7 +6021,7 @@ namespace llaminar2
             const size_t raw_bytes = tensor->size_bytes();
 
             orchestrator->planWeight(target_device.ordinal, name, N, K,
-                                     vnni->payload_bytes, vnni->is_asymmetric,
+                                     vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                                      vnni->has_emins, raw_bytes);
             max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
             ++planned_storage_count;
@@ -6051,7 +6112,7 @@ namespace llaminar2
                 logical_job.format = *repack_format;
                 logical_job.N = static_cast<int>(mj.view->rows());
                 logical_job.K = static_cast<int>(mj.view->cols());
-                logical_job.is_asymmetric = vnni->is_asymmetric;
+                logical_job.is_asymmetric = canonicalDeviceVnniFormat(*vnni).is_asymmetric;
                 const auto allocation = overlay_preparation_plan
                                             ? reusableDeviceVnniAllocationFormat(
                                                   *vnni)
@@ -6060,7 +6121,7 @@ namespace llaminar2
                                                       static_cast<uint8_t>(
                                                           vnni->payload_bytes),
                                                   .has_mins =
-                                                      vnni->is_asymmetric,
+                                                      canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                                                   .has_emins =
                                                       vnni->has_emins,
                                               };
@@ -6139,7 +6200,7 @@ namespace llaminar2
                                                           static_cast<uint8_t>(
                                                               vnni->payload_bytes),
                                                       .has_mins =
-                                                          vnni->is_asymmetric,
+                                                          canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                                                       .has_emins =
                                                           vnni->has_emins,
                                                   };
@@ -6335,7 +6396,7 @@ namespace llaminar2
         /*
          * LoadOrchestrator owns the only live free-memory observation and
          * performs it immediately before allocation. A second check here was
-         * both redundant and racy with concurrently prepared embedding views.
+         * both redundant and racy with allocations by other TP participants.
          * This BOM call resolves only the shared staging policy; automatic
          * ExpertOverlay capacity and the allocator-adjacent preflight consume
          * the same arithmetic authority.
@@ -6401,7 +6462,7 @@ namespace llaminar2
             job.format = *repack_fmt;
             job.N = static_cast<int>(tensor->rows());
             job.K = static_cast<int>(tensor->cols());
-            job.is_asymmetric = vnni->is_asymmetric;
+            job.is_asymmetric = canonicalDeviceVnniFormat(*vnni).is_asymmetric;
 
             orchestrator->addWeightJob(target_device.ordinal, job);
         }
@@ -6546,7 +6607,12 @@ namespace llaminar2
 
             // One backend/format binding path is shared with bounded startup samples.
             auto kernel = llaminar::v2::kernels::KernelFactory::createGemmFromGPUWeightPool(
-                *tensor, target_device, orchestrator, name);
+                *tensor, target_device, orchestrator, name, 0,
+                GPUPreparedWeightPoolLayout::SourceNative,
+                dense_job.binding ? dense_job.binding->floating_operand_precision :
+                    PreparedWeightRepresentationContract::operandPrecision(
+                        inferWeightRole(name), name, loader_.architecture(),
+                        debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic));
 
             if (kernel)
             {
@@ -6810,9 +6876,9 @@ namespace llaminar2
 
             /*
              * Quantized embeddings have one production representation on a
-             * GPU: PreparedEmbeddingWeights. Preparing that representation
-             * here keeps it inside the device-preparation lifecycle and avoids
-             * uploading a raw quantized tensor that no execution stage reads.
+             * GPU: source-native PreparedEmbeddingWeights. Preparing that view
+             * here keeps its exact native block bytes inside the device lifecycle
+             * without a second raw upload or another quantization operation.
              *
              * Do this before pointer de-duplication. A tied embedding/LM-head
              * tensor may legitimately need both an embedding representation
@@ -6850,7 +6916,7 @@ namespace llaminar2
                     target_device,
                     WeightPrepState::READY,
                     false,
-                    "quantized embedding prepared without raw device upload");
+                    "native quantized embedding prepared without duplicate raw upload");
                 ++uploaded_count;
                 continue;
             }

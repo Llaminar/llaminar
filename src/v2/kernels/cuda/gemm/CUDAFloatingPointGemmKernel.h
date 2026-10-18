@@ -10,6 +10,9 @@
  * - Wraps CuBLASGemmKernel for actual computation
  * - Handles tensor type dispatch (FP32, FP16, BF16)
  * - All tensor data must be on GPU before calling
+ * - Explicit GDN operand modes retain FP32 C: FP32 uses pedantic GemmEx;
+ *   FP16RNE casts exactly complete ordinary M*K rows once into named workspace.
+ *   Verifier, live-count and fixed-column modes reject before any enqueue.
  *
  * **Usage**:
  * ```cpp
@@ -24,6 +27,7 @@
 #pragma once
 
 #include "kernels/common/FloatingOutputPartitionScope.h"
+#include "kernels/FloatingActivationOperandPrecision.h"
 
 #include "tensors/TensorKernels.h"
 #include <memory>
@@ -60,7 +64,7 @@ namespace llaminar2
          *
          * **Thread Safety**:
          * - Single kernel instance should be used from one thread
-         * - cuBLAS handle is per-kernel (not shared)
+         * - Context-owned cuBLAS submissions serialize handle configuration
          */
         class CUDAFloatingPointGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
@@ -80,14 +84,16 @@ namespace llaminar2
              *
              * @param weights FP32/FP16/BF16 tensor (must be on GPU)
              * @param cuda_device_id CUDA device ID (from cudaGetDevice, NOT global index)
-             * @param precision Precision mode (default: auto-detect from tensor)
+             * @param precision Prepared weight encoding.
+             * @param operand_precision Immutable activation/compute policy; Native preserves existing dispatch.
              *
              * @throws std::runtime_error if weight type not supported or not on GPU
              */
             CUDAFloatingPointGemmKernel(
                 const TensorBase *weights,
                 int cuda_device_id,
-                Precision precision = Precision::FP32);
+                Precision precision = Precision::FP32,
+                FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native);
 
             /**
              * @brief Construct kernel from raw device pointer (GPU pipeline path)
@@ -101,13 +107,15 @@ namespace llaminar2
              * @param cuda_device_id CUDA device ID
              * @param precision Precision mode
              * @param lifetime_owner Shared pointer that keeps the VRAM pool alive
+             * @param operand_precision Immutable policy; FP16RNE requires FP16 weights and FP32 C.
              */
             CUDAFloatingPointGemmKernel(
                 const void *d_weights,
                 int N, int K,
                 int cuda_device_id,
                 Precision precision,
-                std::shared_ptr<void> lifetime_owner);
+                std::shared_ptr<void> lifetime_owner,
+                FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native);
 
             ~CUDAFloatingPointGemmKernel() override;
 
@@ -163,6 +171,21 @@ namespace llaminar2
             beginOutputPartitionEquivalenceScope(int actual_columns, int serial_columns) override
             {
                 return FloatingOutputPartitionScope::begin(*this, actual_columns, serial_columns);
+            }
+
+            /** @return Immutable operand arithmetic used by preparation/fusion identity. */
+            FloatingActivationOperandPrecision floatingActivationOperandPrecision() const noexcept override
+            { return operand_precision_; }
+
+            /**
+             * @brief Select the same fixed-order arithmetic for serial and live verifier rows.
+             * @param rows Optional controller-owned verifier geometry.
+             * @return Scope carrying device-owned active rows to cast and projection.
+             */
+            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope(
+                std::optional<DeviceRowRange> rows = std::nullopt) override
+            {
+                return ITensorGemm::beginVerifierDecodeEquivalentScope(rows);
             }
 
             /** @return Prepared physical output width used by admission and equivalence checks. */
@@ -283,6 +306,7 @@ namespace llaminar2
             const void *d_weights_;     // Device pointer to weight data
             int cuda_device_id_;
             Precision precision_;
+            FloatingActivationOperandPrecision operand_precision_; ///< Immutable prepared arithmetic identity.
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)
 
@@ -292,10 +316,47 @@ namespace llaminar2
             // Lifetime owner: keeps VRAM pool alive when constructed from raw pointer
             std::shared_ptr<void> lifetime_owner_;
 
-            // GPU stream for graph capture (nullptr = default stream)
+            // Exact borrowed stream for capture; null means unbound and is rejected.
             void *gpu_stream_ = nullptr;
 
             DeviceWorkspaceManager *bound_workspace_ = nullptr;
+
+
+            /**
+             * @brief Publish live FP32 rows as FP16RNE on the consumer stream.
+             * @param source Stable FP32 [m,k] source with all physical rows defined.
+             * @param m Physical capacity; the verifier scope supplies the device-owned live range.
+             * @param k Prepared reduction width.
+             * @param workspace PMA-owned FULL_A_FP16 bank, retained through replay.
+             * @return Borrowed half operand; no allocation or synchronization.
+             * @throws std::invalid_argument Missing/mismatched complete-row storage.
+             * @throws std::runtime_error The exact-stream cast cannot enqueue.
+             */
+            const void *prepareFP16Operand(const float *source, int m, int k,
+                DeviceWorkspaceManager *workspace);
+
+            /**
+             * @brief Submit actual typed A/B through the fixed 256-part FP32 reduction.
+             * @param input FP32 or FP16RNE [m,k], according to immutable operand mode.
+             * @param output FP32 [m,n], with no hidden half result bank.
+             * @param m Physical capacity with an optional device-owned live range.
+             * @param n Prepared output width.
+             * @param k Prepared reduction width.
+             * @param workspace Persistent library scratch on the exact stream.
+             * @return Enqueue success; emits source-owned arithmetic evidence.
+             */
+            bool submitFixedOperandProjection(const void *input, float *output, int m, int n, int k,
+                DeviceWorkspaceManager *workspace);
+
+            /**
+             * @brief Submit ordinary fully-active multi-row BLAS using actual typed operands.
+             * @param input FP32/half A [m,k], selected by immutable policy.
+             * @param output FP32 C [m,n]. @param m Fully-active rows.
+             * @param n Prepared output width. @param k Prepared reduction width.
+             * @param workspace Retained library scratch. @return Submission success.
+             */
+            bool submitOperandProjection(const void *input, float *output, int m, int n, int k,
+                DeviceWorkspaceManager *workspace);
 
             bool run_fixed_order_swiglu_down(
                 const TensorBase *gate,

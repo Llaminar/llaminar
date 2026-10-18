@@ -7,9 +7,16 @@
  * without host inspection, dynamic allocation, synchronization, or replay-time
  * topology changes. Every launch uses the public serial-M1 K-partition tree so
  * tensor-core integer dot products remain byte-equivalent to decode.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
+ * Both physical IQ4 formats retain the measured source4 launch regime; the
+ * descriptor still owns each format's distinct scale reconstruction.
  */
 
 #pragma once
+
+#include "tensors/NativeVnniFormatInfo.h"
 
 #include "../../common/DeviceNativeVNNIMatrixDesc.h"
 #include "../../common/MoEGroupedSourceRows.h"
@@ -71,7 +78,8 @@ namespace llaminar2::cuda::moe
     };
 
     /** NativeVNNI execution codebook used by IQ4_XS routed projections. */
-    inline constexpr int kQwenIQ4ExecutionCodebook = 4;
+    inline constexpr int kQwenIQ4ExecutionCodebook =
+        kNativeVnniIQ4XSSourceScaleCodebook;
 
     /** NativeVNNI execution codebook used by Q6_K routed projections. */
     inline constexpr int kQwenQ6KExecutionCodebook = 8;
@@ -172,8 +180,15 @@ namespace llaminar2::cuda::moe
 
         for (const auto &regime : kQwen35BGroupedImmaCodebookRegimes)
         {
+            // Physical4 (IQ4_NL) and physical24 (IQ4_XS source tuple) share
+            // the measured source4 schedule, not their factor representation.
+            // Preserve the previously admitted physical4 regime when adding24.
+            const bool measured_down_regime =
+                down_codebook == regime.down_codebook ||
+                (regime.down_codebook == kQwenIQ4ExecutionCodebook &&
+                 down_codebook == 4);
             if (gateup_codebook == regime.gate_up_codebook &&
-                down_codebook == regime.down_codebook)
+                measured_down_regime)
             {
                 policy.gate_up_columns =
                     seq_len <= regime.columns32_max_rows

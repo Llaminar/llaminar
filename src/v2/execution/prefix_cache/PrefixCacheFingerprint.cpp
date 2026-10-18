@@ -5,6 +5,8 @@
  * Fields are sorted before hashing so construction order cannot change a key.
  * The movement epoch enters through one typed argument and is returned with
  * the key; independently sampled epochs must never relabel cached state.
+ * Arithmetic generations reject incompatible retained KV, recurrent state and
+ * terminal logits using metadata before any payload is accessed.
  */
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "execution/moe/MoERuntimeTable.h"
@@ -47,6 +49,29 @@ namespace llaminar2
             return hash;
         }
     } // namespace
+
+    void appendProjectionArithmeticFingerprintFields(
+        std::vector<PrefixFingerprintField> &fields,
+        GDNProjectionArithmetic gdn,
+        MoERouterArithmetic router,
+        CUDARouterPrefillArithmetic cuda_prefill)
+    {
+        const std::string gdn_name(gdnProjectionArithmeticName(gdn));
+        const std::string router_name(moeRouterArithmeticName(router));
+        const std::string prefill_name(cudaRouterPrefillArithmeticName(cuda_prefill));
+        for (const auto &field : fields)
+            if (field.name == "projection_arithmetic_revision" ||
+                field.name == "gdn_projection_arithmetic" ||
+                field.name == "moe_router_arithmetic" ||
+                field.name == "cuda_router_prefill_arithmetic")
+                throw std::invalid_argument("Duplicate projection prefix arithmetic authority");
+        // This revision also distinguishes historical diagnostic FP16 decode,
+        // whose accumulator order did not certify grouped verifier equivalence.
+        fields.push_back({"projection_arithmetic_revision", "half-operands-v1"});
+        fields.push_back({"gdn_projection_arithmetic", gdn_name});
+        fields.push_back({"moe_router_arithmetic", router_name});
+        fields.push_back({"cuda_router_prefill_arithmetic", prefill_name});
+    }
 
     uint64_t hashPrefixFingerprintFields(
         const std::string &part_name,
@@ -93,8 +118,40 @@ namespace llaminar2
         // cannot certify the request-partition-invariant first-input contract.
         // V2 could also persist rank-zero terminal logits in every TP shard
         // after a full-vocabulary publication. V3 archives the owned vocabulary
-        // interval. Retain old files, but never admit their corrupted rows.
-        hash = fnvUpdateString(hash, "prefix-cache-v3");
+        // interval. V9 authenticates the safeguarded CUDA FP16 prefill
+        // arithmetic across partial/larger query buckets and saturated grids.
+        // This fresh generation also fences the unvalidated V8 checkpoint,
+        // whose unrelated MTP/admission changes are not installed here.
+        // Earlier V6/V7 tensor dispatch covered fewer geometries, so the same
+        // model/topology key could retain FP32-produced GDN state or logits.
+        // ROCm register-score scheduling preserves its original FP32 bytes.
+        // Retain old files, but reject old arithmetic before reading payloads.
+        // V10 preserves original embedding source values instead of the lossy
+        // secondary EmbedQ8 representation. Even identical model metadata can
+        // now produce different KV/recurrent/terminal state on every backend;
+        // reject V9 archives before examining any persisted payload.
+        // V11 corrects GDN Q/K normalization to sqrt(sum(x*x) + epsilon)
+        // on CPU, CUDA and ROCm. V10's denominator clamp produced different
+        // recurrent state; metadata alone must reject those persisted entries.
+        // V12 bounds Q8 activation scales to the positive finite half range
+        // and saturates rounded values before integer conversion. Earlier
+        // zero/infinite scales could produce different downstream state. It
+        // also preserves subnormal values in the explicit FP32 byte contract;
+        // CUDA's ordinary fast-math policy must not erase those dependencies.
+        // V13 gives standalone/full/column shared gating the same separately
+        // rounded FP32 product and residual sum, preserving subnormal values.
+        // It also includes every ROCm residual tail element. Either correction
+        // can change recurrent/KV state; reject V12 metadata before payload I/O.
+        // V14 preserves original Q6_K scale factors in prepared GEMM weights.
+        // Earlier half-rounded factors can produce different recurrent/KV state;
+        // reject that arithmetic using metadata before accessing cached payloads.
+        // V15 preserves original IQ2_S base/coefficient words instead of
+        // narrowing derived factors. Identical model metadata may produce
+        // different recurrent/KV state; reject V14 before payload access.
+        // V16 preserves IQ4_XS source base/coefficient products instead of
+        // narrowing the derived factor. Fence V15 state before payload access.
+        // V17 preserves IQ3_S original factors and rejects V16 state before payload I/O.
+        hash = fnvUpdateString(hash, "prefix-cache-v17");
 
         const std::array<std::pair<const char *, uint64_t>, 7> ordered_parts{{
             {"model", parts.model},

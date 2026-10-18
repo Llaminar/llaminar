@@ -5,7 +5,8 @@
  * These tests independently reproduce the CPU and GPU allocation arithmetic,
  * sweep every catalogued source codebook, and exercise multi-tier admission
  * against exact physical budgets.  No backend is initialized: the suite is a
- * fast protocol/BOM gate suitable for ordinary unit-test execution.
+ * fast protocol/BOM gate suitable for ordinary unit-test execution. IQ4_XS
+ * expectations independently count its1408-byte CPU unit and20-byte GPU block.
  */
 
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
@@ -184,6 +185,11 @@ namespace llaminar2
                 return 64 * (16 + 2 * sizeof(uint16_t) + 2 * sizeof(uint16_t));
             if (format.codebook_id == 8)
                 return 1792;
+            if (format.codebook_id == 11)
+                return 2048 + 128 + 128 + 128; // Signed grid + compensation + original d + raw4.
+            if (format.codebook_id == 4 && format.is_superblock)
+                return 1024 + 128 + 128 + 128; // Nibbles + compensation + original d + raw6.
+
             if (format.codebook_id == 0 ||
                 format.codebook_id == 4 ||
                 format.codebook_id == 5)
@@ -245,6 +251,8 @@ namespace llaminar2
                 return format.payload_bytes;
             if (format.codebook_id == 8)
                 return 24;
+            if (format.codebook_id == 11)
+                return 13; // Exact inverse preserves original signed-grid payload.
             if (format.codebook_id == 0 ||
                 format.codebook_id == 4 ||
                 format.codebook_id == 5)
@@ -272,7 +280,7 @@ namespace llaminar2
                     std::max(
                         format.payload_bytes,
                         expectedMigrationPayload(format)),
-                    format.is_asymmetric,
+                    format.is_asymmetric || format.codebook_id == 11 || (format.codebook_id == 4 && format.is_superblock),
                     format.has_emins);
                 expected.gpu_shadow_bytes += expectedGpuProjectionBytes(
                     spec,
@@ -586,6 +594,15 @@ namespace llaminar2
             const auto expected =
                 expectedFootprint(model_manifest.front(), *source.metadata);
 
+            if (source.quant_type == "IQ4_XS")
+            {
+                // N/K are gate96x64, up80x96, down64x128. Independent64-row
+                // CPU padding/page rounding gives8192+12288+8192 bytes.
+                // Independent256-byte GPU region alignment gives4096+4864+5120.
+                EXPECT_EQ(expected.cpu_live_bytes, 28672u);
+                EXPECT_EQ(expected.cpu_shadow_bytes, 28672u);
+                EXPECT_EQ(expected.gpu_live_bytes, 14080u);
+            }
             EXPECT_EQ(actual[0].layer_idx, 0);
             EXPECT_EQ(actual[0].cpu_live_bytes, expected.cpu_live_bytes);
             EXPECT_EQ(actual[0].cpu_shadow_bytes, expected.cpu_shadow_bytes);
@@ -623,8 +640,9 @@ namespace llaminar2
                     reusable.has_emins);
                 EXPECT_EQ(
                     allocation.codebook_id,
-                    canonicalDeviceVnniCodebookId(
-                        source.metadata->codebook_id));
+                    source.quant_type == "IQ4_XS" ? 24 :
+                        (source.metadata->codebook_id == 20 || source.metadata->codebook_id == 21
+                            ? 19 : source.metadata->codebook_id));
                 const auto &projection =
                     model_manifest.front()
                         .projections[projection_index];

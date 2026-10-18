@@ -4,7 +4,8 @@
  *
  * NativeVNNI kernels consume a prepared representation, not the source GGUF
  * payload.  Cache policy therefore must be expressed in bytes of the prepared
- * interleaved stream and its live activation/output panels.  Keeping those
+ * interleaved stream and its live activation/output panels. IQ3_S source-scale
+ * encoding retains decoded grid bytes and adds one raw coefficient vector.  Keeping those
  * quantities in a typed value prevents a compact source block size from being
  * mistaken for the substantially different execution layout.
  */
@@ -29,8 +30,10 @@ namespace llaminar2::cpu::native_vnni
     {
         NibbleLUT = 0,          ///< Four-bit payload decoded in the hot loop.
         ExpandedInt8 = 1,       ///< One prepared signed byte per logical weight.
-        Q6KNativeDualScale = 2, ///< Native six-bit payload with two FP16 scales.
+        Q6KNativeDualScale = 2, ///< Six-bit payload, original half base, two int8 coefficients.
         CompactMultiScale = 3, ///< Native payload, two scales, optional two minima.
+        NibbleLUTSourceScale = 4, ///< IQ4_XS nibble payload, original half base, raw coefficient.
+        IQ3SExpandedSourceScale = 5, ///< Original IQ3_S signed grid, base and raw nibble.
     };
 
     /**
@@ -46,6 +49,8 @@ namespace llaminar2::cpu::native_vnni
         switch (encoding)
         {
         case CPUNativeVNNIEncoding::NibbleLUT:
+        case CPUNativeVNNIEncoding::NibbleLUTSourceScale:
+        case CPUNativeVNNIEncoding::IQ3SExpandedSourceScale:
         case CPUNativeVNNIEncoding::ExpandedInt8:
         case CPUNativeVNNIEncoding::Q6KNativeDualScale:
         case CPUNativeVNNIEncoding::CompactMultiScale:
@@ -67,9 +72,11 @@ namespace llaminar2::cpu::native_vnni
         switch (encoding)
         {
         case CPUNativeVNNIEncoding::NibbleLUT:
+        case CPUNativeVNNIEncoding::NibbleLUTSourceScale:
         case CPUNativeVNNIEncoding::CompactMultiScale:
             return 1024;
         case CPUNativeVNNIEncoding::ExpandedInt8:
+        case CPUNativeVNNIEncoding::IQ3SExpandedSourceScale:
             return 2048;
         case CPUNativeVNNIEncoding::Q6KNativeDualScale:
             return 1536;
@@ -89,6 +96,10 @@ namespace llaminar2::cpu::native_vnni
         const std::uint32_t data_stride = preparedDataStride(encoding);
         if (data_stride == 0)
             return 0;
+        if (encoding == CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+            return 1408;
+        if (encoding == CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+            return 2432;
         if (encoding == CPUNativeVNNIEncoding::Q6KNativeDualScale)
             return 1792;
         // A fixed padded native payload plus two scale vectors and one optional

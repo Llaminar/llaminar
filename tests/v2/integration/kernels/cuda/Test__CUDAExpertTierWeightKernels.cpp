@@ -7,10 +7,16 @@
  * chunks on a non-default CUDA stream. It covers every reversible physical CPU
  * encoding, non-64-aligned N padding, non-zero chunk origins, both directions,
  * and strict launcher rejection before the performance harness is allowed to
- * measure these kernels.
+ * measure these kernels. Q6_K synthetic projections retain original half
+ * bases plus signed source coefficients in their unchanged metadata planes.
+ * IQ2_S synthetic tier metadata preserves original bases and coefficient bytes.
+ * IQ4_XS uses physical24/source4 and raw encoded6 coefficient words; IQ4_NL
+ * remains the independent physical4 control with no secondary plane.
  */
 
 #include "execution/moe/ExpertTierWeightStream.h"
+#include "backends/cuda/CUDAGraphCapture.h"
+#include "tensors/IQQuantTables.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
 #include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
@@ -27,6 +33,7 @@
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/VnniPackContext.h"
+#include "tensors/BlockStructures.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -411,7 +418,8 @@ namespace llaminar2
             projection.N = N;
             projection.K = K;
             projection.blocks_per_row = static_cast<std::uint32_t>(K / 32);
-            projection.source_codebook_id = format.codebook;
+            projection.source_codebook_id = format.codebook == kNativeVnniIQ4XSSourceScaleCodebook
+                ? uint8_t{4} : format.codebook;
             projection.codebook_id = format.codebook;
             projection.payload_bytes_per_block = format.payload_bytes;
             projection.is_asymmetric = format.asymmetric;
@@ -451,6 +459,43 @@ namespace llaminar2
                 {
                     projection.mins[block] = static_cast<std::uint16_t>(
                         0xa000u + (block % 0x0800u));
+                    if (format.codebook == 8)
+                    {
+                        // Author source metadata independently of packVnniBlock.
+                        // The secondary word contains signed bytes, not a half.
+                        const std::size_t source_index = block % N +
+                            static_cast<std::size_t>(N) * ((block / N) / 8);
+                        Q6_KBlock source{};
+                        source.d = static_cast<std::uint16_t>(
+                            0x2400u + (source_index % 0x0800u));
+                        source.scales[0] = static_cast<std::int8_t>(
+                            static_cast<int>((block * 37u + 11u) % 256u) - 128);
+                        source.scales[1] = static_cast<std::int8_t>(
+                            static_cast<int>((block * 19u + 71u) % 256u) - 128);
+                        projection.scales[block] = source.d;
+                        projection.mins[block] = static_cast<std::uint16_t>(
+                            static_cast<std::uint8_t>(source.scales[0])) |
+                            (static_cast<std::uint16_t>(
+                                 static_cast<std::uint8_t>(source.scales[1])) << 8);
+                    }
+                    if (format.codebook == kNativeVnniIQ4XSSourceScaleCodebook)
+                    {
+                        // Independent original half base repeated across its
+                        // eight32-value subblocks; encoded6 is raw, never half.
+                        const size_t source_index = block % N + size_t(N) * ((block / N) / 8);
+                        projection.scales[block] = uint16_t(0x2400u + source_index % 0x0800u);
+                        projection.mins[block] = uint16_t((block * 37u + 11u) & 63u);
+                    }
+                    if (format.codebook == 13)
+                    {
+                        // Exact original source half base and coefficient byte.
+                        const std::size_t source_index = block % N +
+                            static_cast<std::size_t>(N) * ((block / N) / 8);
+                        projection.scales[block] = static_cast<std::uint16_t>(
+                            0x2400u + (source_index % 0x0800u));
+                        projection.mins[block] = static_cast<std::uint8_t>(
+                            (block * 37u + 11u) & 0xffu);
+                    }
                 }
             }
             return projection;
@@ -487,10 +532,10 @@ namespace llaminar2
             projection.blocks_per_row = static_cast<std::uint32_t>(K / 32);
             projection.source_codebook_id = format.codebook_id;
             projection.codebook_id =
-                canonicalDeviceVnniCodebookId(format.codebook_id);
+                canonicalDeviceVnniCodebookId(format);
             projection.payload_bytes_per_block =
                 static_cast<std::uint8_t>(format.payload_bytes);
-            projection.is_asymmetric = format.is_asymmetric;
+            projection.is_asymmetric = canonicalDeviceVnniFormat(format).is_asymmetric;
             projection.is_superblock = format.is_superblock;
             projection.has_emins = format.has_emins;
 
@@ -498,7 +543,7 @@ namespace llaminar2
                 static_cast<std::size_t>(N) * projection.blocks_per_row;
             projection.payload.resize(blocks * format.payload_bytes);
             projection.scales.resize(blocks);
-            if (format.is_asymmetric)
+            if (canonicalDeviceVnniFormat(format).is_asymmetric)
                 projection.mins.resize(blocks);
             if (format.has_emins)
                 projection.emins.resize(blocks);
@@ -511,7 +556,7 @@ namespace llaminar2
             context.payload_array = projection.payload.data();
             context.scales_array = projection.scales.data();
             context.mins_array =
-                format.is_asymmetric ? projection.mins.data() : nullptr;
+                canonicalDeviceVnniFormat(format).is_asymmetric ? projection.mins.data() : nullptr;
             context.emins_array =
                 format.has_emins ? projection.emins.data() : nullptr;
             // `packVnniBlock` is the same production source-format authority
@@ -1176,7 +1221,8 @@ namespace llaminar2
             CUDAExpertTierWeightKernelsTest,
             ::testing::Values(
                 FormatCase{0, 16, false, false, "Q4_0"},
-                FormatCase{4, 16, false, true, "IQ4"},
+                FormatCase{4, 16, false, false, "IQ4NL"},
+                FormatCase{kNativeVnniIQ4XSSourceScaleCodebook, 16, true, true, "IQ4XS"},
                 FormatCase{5, 16, true, true, "Q4K"},
                 FormatCase{8, 24, true, true, "Q6K"},
                 FormatCase{19, 32, false, false, "ExpandedInt8"}),
@@ -3058,7 +3104,7 @@ namespace llaminar2
                 };
                 auto serving = std::make_shared<cuda::CUDAQuantisedGemmKernel>(
                     n, k, 0, payload, scales, mins, emins,
-                    canonicalDeviceVnniCodebookId(identity.codebook_id), k / 32,
+                    canonicalDeviceVnniCodebookId(identity), k / 32,
                     storage, identity,
                     NativeVnniReusableDeviceAllocationFormat{32, true, true});
                 serving->setGPUStream(serving_stream.opaque());
@@ -3158,6 +3204,203 @@ namespace llaminar2
                 probe.reset();
                 EXPECT_TRUE(original_lifetime.expired());
                 EXPECT_TRUE(weight_lifetime.expired());
+            }
+        }
+        /**
+         * @test Actual captured IQ3_S tier movement preserves every source grid/sign.
+         *
+         * All512 source indices and16 sign nibbles occur at every quartet lane,
+         * with odd source coefficients, signed-zero/subnormal/max-finite bases,
+         * nonzero CPU-unit origins and partial N/K source tails. Both directions
+         * execute the production kernels in one retained transaction. The exact
+         * original payload/metadata and CPU source pack remain separate oracles.
+         */
+        TEST_F(CUDAExpertTierWeightKernelsTest,
+               IQ3SSourceTupleAllGridsAndSignsRoundTripCaptured)
+        {
+            constexpr int N = 512 * 16 + 1, K = 288, source_blocks = 2;
+            constexpr std::uint32_t capacity_units = ((N + 63) / 64) * (K / 32);
+            constexpr std::array<std::uint16_t,10> bases{
+                0x3c01,0xbc01,0x0000,0x8000,0x0001,0x8001,0x03ff,0x0401,0x7bff,0xfbff};
+            std::vector<std::uint8_t> raw(static_cast<std::size_t>(N) * source_blocks * sizeof(IQ3_SBlock));
+            auto *original = reinterpret_cast<IQ3_SBlock *>(raw.data());
+            for (int row = 0; row < N; ++row)
+                for (int sb = 0; sb < source_blocks; ++sb)
+                {
+                    auto &block = original[row * source_blocks + sb];
+                    block.d = bases[(row / 16 + sb) % bases.size()];
+                    for (unsigned sub = 0; sub < 8; ++sub)
+                    {
+                        const unsigned nibble = (row + sub + sb) & 15u;
+                        block.scales[sub / 2] |= static_cast<std::uint8_t>(nibble << (4 * (sub % 2)));
+                        for (unsigned group = 0; group < 8; ++group)
+                        {
+                            const unsigned index = (row / 16 + group + sb) % 512;
+                            const unsigned sign = (row + group) & 15u;
+                            block.qs[sub * 8 + group] = static_cast<std::uint8_t>(index);
+                            block.qh[sub] |= static_cast<std::uint8_t>((index >> 8) << group);
+                            block.signs[sub * 4 + group / 2] |= static_cast<std::uint8_t>(sign << (4 * (group % 2)));
+                        }
+                    }
+                }
+            auto tensor = std::make_shared<IQ3_STensor>(std::vector<std::size_t>{N,K},raw);
+            const auto source = packProductionGpuProjection(*tensor);
+            ASSERT_EQ(source.codebook_id,11);ASSERT_EQ(source.source_codebook_id,11);
+            ASSERT_EQ(source.payload_bytes_per_block,13);ASSERT_TRUE(source.is_asymmetric);
+            // Literal source fields authenticate the preparation boundary too.
+            for (int kb = 0; kb < K / 32; ++kb) for (int row = 0; row < N; ++row)
+            {
+                const auto &block = original[row * source_blocks + kb / 8];
+                const unsigned sub = kb % 8;const auto at = static_cast<std::size_t>(kb) * N + row;
+                ASSERT_EQ(source.scales[at],block.d);
+                ASSERT_EQ(source.mins[at],(block.scales[sub / 2] >> (4 * (sub % 2))) & 15u);
+                ASSERT_EQ(std::memcmp(source.payload.data() + at * 13,block.qs + sub * 8,8),0);
+                ASSERT_EQ(source.payload[at * 13 + 8],block.qh[sub]);
+                ASSERT_EQ(std::memcmp(source.payload.data() + at * 13 + 9,block.signs + sub * 4,4),0);
+            }
+            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
+            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(tensor.get(),cpu));
+            ASSERT_EQ(cpu.encoding,cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale);
+            constexpr std::uint32_t first_unit = 1;
+            const auto *format = native_vnni_formats::forSourceIdentity(11,true);
+            ASSERT_NE(format,nullptr);
+            const auto probe = makeGpuToCpuExpertTierWeightStreamManifest(*format,N,K,405,3,7,ExpertTierWeightProjection::Down,capacity_units);
+            const auto demotion = probe.deviceLayout();
+            const auto promotion = makeCpuToGpuExpertTierWeightStreamManifest(cpu,406,3,7,ExpertTierWeightProjection::Down,capacity_units).deviceLayout();
+            ASSERT_TRUE(demotion.valid());ASSERT_TRUE(promotion.valid());
+            ASSERT_EQ(demotion.cpu_block_stride,2432u);ASSERT_EQ(promotion.gpu_codebook_id,11);
+            const std::uint32_t units = demotion.unit_count - first_unit;
+            TestCUDAStream stream;
+            TestCUDABuffer<std::uint8_t> input_payload(source.payload.size()),destination_payload(source.payload.size());
+            TestCUDABuffer<std::uint16_t> input_scales(source.scales.size()),input_coeff(source.mins.size());
+            TestCUDABuffer<std::uint16_t> destination_scales(source.scales.size()),destination_coeff(source.mins.size());
+            TestCUDABuffer<std::uint8_t> chunk(demotion.chunkBytes(units));
+            ASSERT_EQ(input_payload.upload(source.payload),cudaSuccess);
+            ASSERT_EQ(input_scales.upload(source.scales),cudaSuccess);ASSERT_EQ(input_coeff.upload(source.mins),cudaSuccess);
+            ExpertTierGpuConstProjectionView in{.payload=input_payload.data(),.scales=input_scales.data(),.mins=input_coeff.data(),
+                .payload_bytes=input_payload.bytes(),.scales_bytes=input_scales.bytes(),.mins_bytes=input_coeff.bytes()};
+            ExpertTierGpuMutableProjectionView out{.payload=destination_payload.data(),.scales=destination_scales.data(),.mins=destination_coeff.data(),
+                .payload_bytes=destination_payload.bytes(),.scales_bytes=destination_scales.bytes(),.mins_bytes=destination_coeff.bytes()};
+            ASSERT_TRUE(in.validFor(demotion));ASSERT_TRUE(out.validFor(promotion));
+            std::vector<std::uint8_t> observed_cpu(chunk.bytes()),observed_payload(source.payload.size());
+            std::vector<std::uint16_t> observed_scales(source.scales.size()),observed_coeff(source.mins.size());
+            CUDAGraphCapture graph(stream.native(),0);
+            struct Pending
+            {
+                cudaStream_t stream;
+                /** @brief Join before graph, host vectors and device owners retire. */
+                ~Pending() { EXPECT_EQ(cudaStreamSynchronize(stream),cudaSuccess); }
+            } pending{stream.native()};
+            {
+                ScopedBackendGraphCapture capture(graph,"IQ3_S exact source tuple tier roundtrip");
+                ASSERT_TRUE(capture.begin());
+                ASSERT_TRUE(launchGpuToCpuExpertTierChunkCUDA(in,demotion,first_unit,units,chunk.data(),chunk.bytes(),stream.opaque()));
+                ASSERT_TRUE(launchCpuToGpuExpertTierChunkCUDA(chunk.data(),chunk.bytes(),promotion,first_unit,units,out,stream.opaque()));
+                capture.finish();
+            }
+            ASSERT_TRUE(graph.instantiate());
+            for (int replay = 0; replay < 3; ++replay)
+            {
+                ASSERT_EQ(cudaMemsetAsync(chunk.data(),0xa5,chunk.bytes(),stream.native()),cudaSuccess);
+                ASSERT_EQ(cudaMemsetAsync(destination_payload.data(),0xa5,destination_payload.bytes(),stream.native()),cudaSuccess);
+                ASSERT_EQ(cudaMemsetAsync(destination_scales.data(),0xa5,destination_scales.bytes(),stream.native()),cudaSuccess);
+                ASSERT_EQ(cudaMemsetAsync(destination_coeff.data(),0xa5,destination_coeff.bytes(),stream.native()),cudaSuccess);
+                ASSERT_TRUE(graph.launch());
+                ASSERT_EQ(cudaMemcpyAsync(observed_cpu.data(),chunk.data(),chunk.bytes(),cudaMemcpyDeviceToHost,stream.native()),cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(observed_payload.data(),destination_payload.data(),destination_payload.bytes(),cudaMemcpyDeviceToHost,stream.native()),cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(observed_scales.data(),destination_scales.data(),destination_scales.bytes(),cudaMemcpyDeviceToHost,stream.native()),cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(observed_coeff.data(),destination_coeff.data(),destination_coeff.bytes(),cudaMemcpyDeviceToHost,stream.native()),cudaSuccess);
+                ASSERT_EQ(stream.synchronize(),cudaSuccess);
+                EXPECT_EQ(std::memcmp(observed_cpu.data(),cpu.native_interleaved.data()+demotion.chunkBytes(first_unit),chunk.bytes()),0) << "first_unit=" << first_unit;
+                for (int kb = 0; kb < K / 32; ++kb) for (int row = 0; row < N; ++row)
+                {
+                    const auto linear = static_cast<std::size_t>(kb) * N + row;
+                    const bool selected = static_cast<std::uint32_t>((row / 64) * (K / 32) + kb) >= first_unit;
+                    EXPECT_EQ(observed_scales[linear],selected ? source.scales[linear] : 0xa5a5u);
+                    EXPECT_EQ(observed_coeff[linear],selected ? source.mins[linear] : 0xa5a5u);
+                    for (unsigned byte = 0; byte < 13; ++byte)
+                        EXPECT_EQ(observed_payload[linear * 13 + byte],selected ? source.payload[linear * 13 + byte] : 0xa5u);
+                }
+            }
+        }
+
+        /**
+         * @test First CPU-origin IQ3 promotion initializes the existing resident grid.
+         *
+         * This is a standalone test, not the warmed IQ-table fixture. Its focused
+         * CTest starts a fresh process and performs no GPU source packing/GEMV or
+         * explicit table warmup. The real lane materialize method owns cold setup.
+         * Expected payload words come directly from the original source block.
+         */
+        TEST(CUDAIQ3SColdTierSetup, CPUOriginPromotionPreservesSourceWithoutWarmup)
+        {
+            int devices=0;
+            if(cudaGetDeviceCount(&devices)!=cudaSuccess||devices==0)GTEST_SKIP();
+            ASSERT_EQ(cudaSetDevice(0),cudaSuccess);
+            constexpr int N=1,K=256;
+            IQ3_SBlock original{};original.d=0x3c01u;
+            for(unsigned sub=0;sub<8;++sub)
+            {
+                original.scales[sub/2]|=std::uint8_t(((sub*3+1)&15u)<<(4*(sub%2)));
+                for(unsigned group=0;group<8;++group)
+                {
+                    const unsigned index=(sub*67+group*31+511)%512;
+                    original.qs[sub*8+group]=static_cast<std::uint8_t>(index);
+                    original.qh[sub]|=static_cast<std::uint8_t>((index>>8)<<group);
+                    original.signs[sub*4+group/2]|=static_cast<std::uint8_t>(((sub+group*3)&15u)<<(4*(group%2)));
+                }
+            }
+            std::vector<std::uint8_t> bytes(sizeof(original));std::memcpy(bytes.data(),&original,sizeof(original));
+            auto tensor=std::make_shared<IQ3_STensor>(std::vector<std::size_t>{N,K},bytes);
+            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
+            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(tensor.get(),cpu));
+            ASSERT_EQ(cpu.encoding,cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale);
+            const auto layout=makeCpuToGpuExpertTierWeightStreamManifest(cpu,407,3,7,ExpertTierWeightProjection::Down,2).deviceLayout();
+            ASSERT_TRUE(layout.valid());ASSERT_EQ(layout.gpu_codebook_id,11);
+            TestCUDABuffer<std::uint8_t> payload(8*13);
+            TestCUDABuffer<std::uint16_t> scales(8),coefficients(8);
+            ExpertTierGpuMutableProjectionView destination{
+                .payload=payload.data(),.scales=scales.data(),.mins=coefficients.data(),
+                .payload_bytes=payload.bytes(),.scales_bytes=scales.bytes(),.mins_bytes=coefficients.bytes()};
+            ASSERT_TRUE(destination.validFor(layout));
+            const auto execution=TransferEngine::instance().allocatePersistentTransferExecutionLanes(
+                1u,DeviceId::cuda(0),"cuda_iq3_source_cold_promotion").front();
+            ExpertTierWeightTransferLane lane({
+                .device=DeviceId::cuda(0),
+                .staging=TransferEngine::instance().allocatePersistentTransferStagingSlices(
+                    layout.chunkBytes(2),1u,DeviceId::cuda(0)).front(),
+                .execution=execution,.progress=BackgroundTransferProgressBinding::nativeStream(),
+                .lane_name="cuda_iq3_source_cold_promotion",.perf_device="cuda:0"});
+            std::string error;
+            ASSERT_TRUE(lane.materialize(&error))<<error;
+            /** @brief Drain pending test work before lane/source/destination owners retire. */
+            struct Retire
+            {
+                ExpertTierWeightTransferLane &lane;cudaStream_t stream;
+                ~Retire()
+                {
+                    if(!lane.quiescent())
+                    {
+                        EXPECT_EQ(cudaStreamSynchronize(stream),cudaSuccess);
+                        (void)pollLaneToCompletion(lane);
+                    }
+                }
+            } retire{lane,reinterpret_cast<cudaStream_t>(execution.stream())};
+            ASSERT_TRUE(lane.startCpuToGpu(layout,cpu.native_interleaved,destination,&error))<<error;
+            ASSERT_EQ(pollLaneToCompletion(lane),ExpertTierWeightTransferProgress::Ready);
+            ASSERT_TRUE(lane.quiescent());
+            std::vector<std::uint8_t> actual_payload;
+            std::vector<std::uint16_t> actual_scales,actual_coefficients;
+            ASSERT_EQ(payload.download(actual_payload),cudaSuccess);
+            ASSERT_EQ(scales.download(actual_scales),cudaSuccess);
+            ASSERT_EQ(coefficients.download(actual_coefficients),cudaSuccess);
+            for(unsigned sub=0;sub<8;++sub)
+            {
+                EXPECT_EQ(actual_scales[sub],original.d);
+                EXPECT_EQ(actual_coefficients[sub],(original.scales[sub/2]>>(4*(sub%2)))&15u);
+                EXPECT_EQ(std::memcmp(actual_payload.data()+sub*13,original.qs+sub*8,8),0);
+                EXPECT_EQ(actual_payload[sub*13+8],original.qh[sub]);
+                EXPECT_EQ(std::memcmp(actual_payload.data()+sub*13+9,original.signs+sub*4,4),0);
             }
         }
     } // namespace

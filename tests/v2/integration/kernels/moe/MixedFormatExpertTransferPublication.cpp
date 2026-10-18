@@ -7,6 +7,8 @@
  * and immutable capacity while its occupant changes. Stale lease replays must
  * leave the previous publication untouched. Arithmetic parity is certified by
  * the separate grouped-expert sweeps; this test isolates the transfer contract.
+ * Original IQ3_S/IQ4_XS coefficient planes have independently fixed byte
+ * extents so a production metadata omission cannot also shrink the oracle.
  */
 #include "NativeVNNIExpertTransferParityTest.h"
 
@@ -163,6 +165,15 @@ namespace llaminar2::test
                         *raw[projection] = {base, n, k};
                         continue;
                     }
+                    // Source tuples own two distinct words per block even though
+                    // neither format performs an additive minimum correction.
+                    // Fix these extents independently of the production metadata.
+                    if (spec.codebook_id == 11u || spec.codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
+                    {
+                        EXPECT_EQ(spec.payload_bytes_per_block, spec.codebook_id == 11u ? 13u : 16u);
+                        ASSERT_TRUE(spec.is_asymmetric) << "Original source coefficient plane is mandatory";
+                        EXPECT_FALSE(spec.has_emins);
+                    }
                     auto &matrix = *matrices[projection];
                     matrix.payload = base;
                     matrix.scales = base + plane_bytes;
@@ -264,10 +275,27 @@ namespace llaminar2::test
                     {
                         const auto &src = *matrices[projection];
                         const auto &dst = native_dst[projection];
-                        ASSERT_NO_FATAL_FAILURE(verify(dst.payload, deviceMoEMatrixPayloadBytes(src, source), 0));
-                        ASSERT_NO_FATAL_FAILURE(verify(dst.scales, deviceMoEMatrixScalesBytes(src), 1));
-                        ASSERT_NO_FATAL_FAILURE(verify(dst.mins, deviceMoEMatrixMinsBytes(src, source), 2));
-                        ASSERT_NO_FATAL_FAILURE(verify(dst.emins, deviceMoEMatrixEminsBytes(src, source), 3));
+                        if (src.codebook_id == 11u || src.codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
+                        {
+                            const size_t blocks = size_t(n) * size_t(k / 32);
+                            const size_t payload = blocks * (src.codebook_id == 11u ? 13u : 16u);
+                            const size_t coefficient = blocks * sizeof(uint16_t);
+                            EXPECT_EQ(deviceMoEMatrixPayloadBytes(src, source), payload);
+                            EXPECT_EQ(deviceMoEMatrixScalesBytes(src), coefficient);
+                            EXPECT_EQ(deviceMoEMatrixMinsBytes(src, source), coefficient);
+                            EXPECT_EQ(deviceMoEMatrixEminsBytes(src, source), 0u);
+                            ASSERT_NE(dst.mins, nullptr);
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.payload, payload, 0));
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.scales, coefficient, 1));
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.mins, coefficient, 2));
+                        }
+                        else
+                        {
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.payload, deviceMoEMatrixPayloadBytes(src, source), 0));
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.scales, deviceMoEMatrixScalesBytes(src), 1));
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.mins, deviceMoEMatrixMinsBytes(src, source), 2));
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.emins, deviceMoEMatrixEminsBytes(src, source), 3));
+                        }
                     }
                 }
                 // Same captured graph and stale lease: reject without changing the

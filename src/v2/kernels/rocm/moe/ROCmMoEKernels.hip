@@ -16,6 +16,12 @@
  * omitting lanes that provably own no input blocks; this changes scheduling,
  * not the prepared-weight format, quantizer, or floating-point reduction.
  *
+ * FP16 router gates consume hidden values rounded once to half RNE at load;
+ * products, accumulation, logits and routing probabilities remain FP32. The
+ * original hidden allocation is never modified or reused as a rotated basis.
+ * Four-row/eight-expert tiles reuse both operands without changing each output
+ * lane partition or wave tree; small-row launches retain their measured economy.
+ *
  * Compiled by hipcc. Only includes HIP headers + HipDeviceGuard.
  * Linkage to host C++ is via extern "C" wrapper functions.
  */
@@ -27,6 +33,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cfloat>
+#include <string>
+#include "utils/PerfStatsCollector.h"
 
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
@@ -39,6 +47,7 @@
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
+#include "kernels/common/DeviceRouterHadamardQ8.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingWarp.h"
 #include "kernels/common/DeviceRowRange.h"
@@ -7622,6 +7631,10 @@ namespace
         case 4:
             payload_bytes = 16u;
             return true;
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+            payload_bytes = 16u;
+            is_asymmetric = 1u; // Physical raw source coefficient; no additive minimum.
+            return true;
         case 5:
             payload_bytes = 16u;
             is_asymmetric = 1u;
@@ -7648,6 +7661,7 @@ namespace
             return true;
         case 11:
             payload_bytes = 13u;
+            is_asymmetric = 1u; // Physical raw source nibble; no additive minimum.
             return true;
         case 12:
             payload_bytes = 12u;
@@ -13747,15 +13761,6 @@ __global__ void rocm_moe_gate_logits_kpart_reduce_kernel(
     }
 }
 
-__global__ void rocm_moe_fp32_to_fp16_kernel(
-    const float *__restrict__ input,
-    __half *__restrict__ output,
-    int count)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-    output[idx] = __float2half(input[idx]);
-}
 
 /**
  * @brief Quantize one FP32 value with the canonical serial-decode Q8 arithmetic.
@@ -14080,6 +14085,16 @@ void rocm_moe_gate_logits_q8_grouped_verifier_kernel(
     }
 }
 
+/**
+ * @brief Round original router hidden to a physical half register, then widen.
+ * @param value Original FP32 hidden; expert consumers retain these source bits.
+ * @return Half-RNE operand widened exactly for FP32 products and accumulation.
+ */
+__device__ __forceinline__ float router_fp16_operand(float value)
+{
+    return __half2float(__float2half_rn(value));
+}
+
 __global__ void rocm_moe_gate_logits_single_token_fp16_weights_kernel(
     const float *__restrict__ hidden,          // [d_model]
     const __half *__restrict__ gate_weights,   // [num_experts, d_model]
@@ -14100,14 +14115,14 @@ __global__ void rocm_moe_gate_logits_single_token_fp16_weights_kernel(
         {
             const float2 ww = __half22float2(w2[i]);
             const int h = i << 1;
-            sum += hidden[h] * ww.x + hidden[h + 1] * ww.y;
+            sum += router_fp16_operand(hidden[h]) * ww.x + router_fp16_operand(hidden[h + 1]) * ww.y;
         }
     }
     else
     {
         for (int i = threadIdx.x; i < d_model; i += blockDim.x)
         {
-            sum += hidden[i] * __half2float(w[i]);
+            sum += router_fp16_operand(hidden[i]) * __half2float(w[i]);
         }
     }
 
@@ -14261,7 +14276,7 @@ void rocm_moe_gate_logits_fp32_grouped_verifier_kernel(
 }
 
 /**
- * @brief Decode-equivalent grouped FP16-router logits for prefill rows.
+ * @brief Decode-equivalent half-A/half-B router logits for live prefill/verifier rows.
  *
  * Mirrors rocm_moe_gate_logits_single_token_fp16_weights_kernel() per row,
  * including the half2 loop for even K, while sharing each gate load across the
@@ -14290,9 +14305,8 @@ void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
     const int expert = blockIdx.x;
     if (expert >= num_experts) return;
 
-    const int active_rows = device_effective_seq_len
-                                ? max(0, min(seq_len, *device_effective_seq_len))
-                                : seq_len;
+    const int active_rows = device_effective_seq_len ? *device_effective_seq_len : seq_len;
+    if (active_rows < 0 || active_rows > seq_len) __builtin_trap();
     const int row_base = static_cast<int>(blockIdx.y) * ROWS_PER_BLOCK;
     const int rows_in_block = min(ROWS_PER_BLOCK, active_rows - row_base);
     if (rows_in_block <= 0) return;
@@ -14312,7 +14326,7 @@ void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
             {
                 const int row = row_base + local_row;
                 const float *row_hidden = hidden + static_cast<size_t>(row) * d_model;
-                sums[local_row] += row_hidden[h] * ww.x + row_hidden[h + 1] * ww.y;
+                sums[local_row] += router_fp16_operand(row_hidden[h]) * ww.x + router_fp16_operand(row_hidden[h + 1]) * ww.y;
             }
         }
     }
@@ -14324,7 +14338,7 @@ void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
             for (int local_row = 0; local_row < rows_in_block; ++local_row)
             {
                 const int row = row_base + local_row;
-                sums[local_row] += hidden[static_cast<size_t>(row) * d_model + i] * ww;
+                sums[local_row] += router_fp16_operand(hidden[static_cast<size_t>(row) * d_model + i]) * ww;
             }
         }
     }
@@ -14353,6 +14367,145 @@ void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
             }
         }
     }
+}
+
+/**
+ * @brief Share half operands across four rows and eight independent experts.
+ *
+ * Even K retains the serial half2 pair expression; odd K retains scalar order.
+ * Every output keeps the original 128-lane partition and the backend's exact
+ * wave/block tree. The original hidden allocation is never modified.
+ * @tparam Partitioned Resolve participant live intervals before operand loads.
+ * @param hidden Original FP32 input, rounded to half RNE in registers.
+ * @param gate_weights Model-owned physical half gate rows.
+ * @param logits Participant-local FP32 output; inactive suffix stays untouched.
+ * @param seq_len Global admitted capacity. @param d_model Reduction width.
+ * @param num_experts Expert count. @param live_rows Optional device live count.
+ * @param partition Immutable row ownership, resolved entirely on device.
+ */
+template<bool Partitioned>
+__global__ __launch_bounds__(128, 2)
+void rocm_moe_gate_logits_fp16_expert_tile_kernel(
+    const float *__restrict__ hidden, const __half *__restrict__ gate_weights,
+    float *__restrict__ logits, int seq_len, int d_model, int num_experts,
+    const int *live_rows, llaminar2::DeviceRowPartition partition)
+{
+    if constexpr (Partitioned)
+    {
+        const auto rows = partition.resolve(seq_len, live_rows);
+        hidden += static_cast<size_t>(rows.first) * d_model;
+        seq_len = rows.count;
+    }
+    else if (live_rows)
+    {
+        const int count = *live_rows;
+        if (count < 0 || count > seq_len) __builtin_trap();
+        seq_len = count;
+    }
+    constexpr int Rows = 4, Experts = 8;
+    const int first_row = blockIdx.y * Rows, first_expert = blockIdx.x * Experts;
+    if (first_row >= seq_len || first_expert >= num_experts) return;
+    float sums[Rows][Experts] = {};
+    if ((d_model & 1) == 0)
+    {
+        for (int pair = threadIdx.x; pair < d_model / 2; pair += 128)
+        {
+            float2 weights[Experts];
+            #pragma unroll
+            for (int e = 0; e < Experts; ++e)
+            {
+                weights[e] = {0, 0};
+                if (first_expert + e < num_experts)
+                    weights[e] = __half22float2(reinterpret_cast<const __half2 *>(
+                        gate_weights + static_cast<size_t>(first_expert + e) * d_model)[pair]);
+            }
+            #pragma unroll
+            for (int r = 0; r < Rows; ++r)
+                if (first_row + r < seq_len)
+                {
+                    const float *h = hidden + static_cast<size_t>(first_row + r) * d_model + pair * 2;
+                    const float a = router_fp16_operand(h[0]), b = router_fp16_operand(h[1]);
+                    #pragma unroll
+                    for (int e = 0; e < Experts; ++e) sums[r][e] += a * weights[e].x + b * weights[e].y;
+                }
+        }
+    }
+    else
+    {
+        for (int j = threadIdx.x; j < d_model; j += 128)
+        {
+            float weights[Experts];
+            #pragma unroll
+            for (int e = 0; e < Experts; ++e)
+                weights[e] = first_expert + e < num_experts
+                    ? __half2float(gate_weights[static_cast<size_t>(first_expert + e) * d_model + j]) : 0.0f;
+            #pragma unroll
+            for (int r = 0; r < Rows; ++r)
+                if (first_row + r < seq_len)
+                {
+                    const float h = router_fp16_operand(hidden[static_cast<size_t>(first_row + r) * d_model + j]);
+                    #pragma unroll
+                    for (int e = 0; e < Experts; ++e) sums[r][e] += h * weights[e];
+                }
+        }
+    }
+    // Four slots also represent wave32 targets; gfx906 consumes exactly two.
+    __shared__ float partial[Rows][Experts][4];
+    const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize;
+    #pragma unroll
+    for (int r = 0; r < Rows; ++r)
+    {
+        #pragma unroll
+        for (int e = 0; e < Experts; ++e)
+        {
+            const float value = rocm_moe_wave_reduce_sum_f32(sums[r][e]);
+            if (lane == 0) partial[r][e][wave] = value;
+        }
+    }
+    __syncthreads();
+    if (wave == 0)
+    {
+        #pragma unroll
+        for (int r = 0; r < Rows; ++r)
+        {
+            #pragma unroll
+            for (int e = 0; e < Experts; ++e)
+            {
+                float value = lane < 128 / warpSize ? partial[r][e][lane] : 0.0f;
+                value = rocm_moe_wave_reduce_sum_f32(value);
+                if (lane == 0 && first_row + r < seq_len && first_expert + e < num_experts)
+                    logits[static_cast<size_t>(first_row + r) * num_experts + first_expert + e] = value;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Select measured small-row or shared-expert geometry before capture.
+ * @tparam Partitioned Resolve participant rows inside the retained kernel.
+ * @param hidden Original FP32 rows. @param gate Model-owned physical half gate.
+ * @param logits Participant-local FP32 output. @param capacity Whole-input capacity.
+ * @param local_capacity Admitted owner rows. @param width Reduction width.
+ * @param experts Expert count. @param live_rows Optional device-owned live count.
+ * @param partition Immutable row ownership.
+ * @param stream Exact non-null stream authenticated by the public launch bridge.
+ *
+ * M1/M8 prefer the existing single-expert tile. M16 through M2048 benefit from
+ * eight-expert reuse; selection never downloads a device-owned live count.
+ */
+template<bool Partitioned>
+void launch_fp16_router_rows(const float *hidden, const __half *gate, float *logits,
+    int capacity, int local_capacity, int width, int experts, const int *live_rows,
+    llaminar2::DeviceRowPartition partition, hipStream_t stream)
+{
+    if (local_capacity >= 16 && experts >= 8)
+        hipLaunchKernelGGL((rocm_moe_gate_logits_fp16_expert_tile_kernel<Partitioned>),
+            dim3((experts + 7) / 8, (local_capacity + 3) / 4), dim3(128), 0, stream,
+            hidden, gate, logits, capacity, width, experts, live_rows, partition);
+    else
+        hipLaunchKernelGGL((rocm_moe_gate_logits_fp16_grouped_verifier_kernel<Partitioned>),
+            dim3(experts, (local_capacity + 15) / 16), dim3(128), 0, stream,
+            hidden, gate, logits, capacity, width, experts, live_rows, partition);
 }
 
 /**
@@ -15548,7 +15701,8 @@ __global__ void rocm_moe_shared_expert_gate_scale_kernel(
         shared_output[idx] = 0.0f;
         return;
     }
-    shared_output[idx] *= gate_values[token];
+    shared_output[idx] = llaminar2::device_fp32_contract::multiply(
+        gate_values[token], shared_output[idx]);
 }
 
 __global__ void rocm_moe_shared_expert_gate_decode_fused_kernel(
@@ -15604,24 +15758,29 @@ __global__ void rocm_moe_shared_expert_gate_decode_fused_kernel(
         for (int i = threadIdx.x; i < d4; i += blockDim.x)
         {
             const float4 s = shared4[i];
-            shared4[i] = make_float4(gate * s.x, gate * s.y, gate * s.z, gate * s.w);
+            shared4[i] = make_float4(
+                llaminar2::device_fp32_contract::multiply(gate, s.x),
+                llaminar2::device_fp32_contract::multiply(gate, s.y),
+                llaminar2::device_fp32_contract::multiply(gate, s.z),
+                llaminar2::device_fp32_contract::multiply(gate, s.w));
         }
     }
     else
     {
         for (int i = threadIdx.x; i < d_model; i += blockDim.x)
         {
-            shared_output[i] *= gate;
+            shared_output[i] = llaminar2::device_fp32_contract::multiply(gate, shared_output[i]);
         }
     }
 }
 
 /**
  * @brief Gate a full row or its disjoint output-column slice with the identical full-width dot.
- * @tparam ColumnSlice False preserves the established full-row generated kernel.
+ * @tparam ColumnSlice Select disjoint output columns without changing arithmetic.
  *
  * Input stride and sigmoid reduction always use the full model width. Only
  * output addressing narrows; inactive rows overwrite both outputs with zero.
+ * Standalone/full/column paths share explicit RNE product and sum boundaries.
  */
 template<bool ColumnSlice = false>
 __global__ void rocm_moe_shared_expert_gate_add_kernel(
@@ -15720,37 +15879,33 @@ __global__ void rocm_moe_shared_expert_gate_add_kernel(
         {
             const float4 s = shared4[i];
             const float4 r = routed4[i];
-            const float4 gated = ColumnSlice ? make_float4(
+            const float4 gated = make_float4(
                 llaminar2::device_fp32_contract::multiply(gate, s.x),
                 llaminar2::device_fp32_contract::multiply(gate, s.y),
                 llaminar2::device_fp32_contract::multiply(gate, s.z),
-                llaminar2::device_fp32_contract::multiply(gate, s.w))
-                : make_float4(gate * s.x, gate * s.y, gate * s.z, gate * s.w);
+                llaminar2::device_fp32_contract::multiply(gate, s.w));
             shared4[i] = gated;
             // This specialization replaces two previously separate launches.
             // Persist the product with the shared numerical contract: HIP's
             // __fadd_rn alone is plain C++ addition in this toolchain and cannot
             // prevent LLVM contracting the producer into an FMA. The retained
             // register dependency adds no memory access or device barrier.
-            if constexpr (ColumnSlice)
-                combined4[i] = make_float4(__fadd_rn(r.x, gated.x), __fadd_rn(r.y, gated.y),
-                    __fadd_rn(r.z, gated.z), __fadd_rn(r.w, gated.w));
-            else
-                combined4[i] = make_float4(r.x + gated.x, r.y + gated.y, r.z + gated.z, r.w + gated.w);
+            combined4[i] = make_float4(
+                llaminar2::device_fp32_contract::add(r.x, gated.x),
+                llaminar2::device_fp32_contract::add(r.y, gated.y),
+                llaminar2::device_fp32_contract::add(r.z, gated.z),
+                llaminar2::device_fp32_contract::add(r.w, gated.w));
         }
     }
     else
     {
         for (int i = threadIdx.x; i < columns; i += blockDim.x)
         {
-            const float gated_shared = ColumnSlice
-                ? llaminar2::device_fp32_contract::multiply(gate, shared_output[row_offset + i])
-                : gate * shared_output[row_offset + i];
+            const float gated_shared = llaminar2::device_fp32_contract::multiply(
+                gate, shared_output[row_offset + i]);
             shared_output[row_offset + i] = gated_shared;
-            if constexpr (ColumnSlice)
-                combined_output[row_offset + i] = __fadd_rn(routed_residual[row_offset + i], gated_shared);
-            else
-                combined_output[row_offset + i] = routed_residual[row_offset + i] + gated_shared;
+            combined_output[row_offset + i] = llaminar2::device_fp32_contract::add(
+                routed_residual[row_offset + i], gated_shared);
         }
     }
 }
@@ -16270,48 +16425,19 @@ bool hipMoE_gate_logits_single_token_kpart_partials(
     return true;
 }
 
-bool hipMoE_fp32_to_fp16(
-    const float *input, void *output_fp16, int count,
-    int device_idx, void *stream)
-{
-    if (!input || !output_fp16 || count < 0)
-    {
-        fprintf(stderr, "HIP MoE fp32_to_fp16 invalid args\n");
-        return false;
-    }
-    if (count == 0)
-        return true;
-
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
-    (void)hipGetLastError();
-
-    const int threads = 256;
-    const int blocks = (count + threads - 1) / threads;
-    hipLaunchKernelGGL(rocm_moe_fp32_to_fp16_kernel,
-        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        input, static_cast<__half *>(output_fp16), count);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "HIP MoE fp32_to_fp16 kernel launch failed: %s\n", hipGetErrorString(err));
-        return false;
-    }
-    return true;
-}
-
 bool hipMoE_gate_logits_single_token_fp16_weights(
     const float *hidden, const void *gate_weights_fp16, float *logits,
     int d_model, int num_experts,
     int device_idx, void *stream)
 {
-    if (!hidden || !gate_weights_fp16 || !logits || d_model <= 0 || num_experts <= 0)
+    if (!hidden || !gate_weights_fp16 || !logits || d_model <= 0 || num_experts <= 0 || !stream)
     {
         fprintf(stderr, "HIP MoE fp16 gate logits invalid args\n");
         return false;
     }
 
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    if (static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_idx)) != hipSuccess)
+        return false;
     (void)hipGetLastError();
 
     const int threads = 128;
@@ -16325,6 +16451,10 @@ bool hipMoE_gate_logits_single_token_fp16_weights(
         fprintf(stderr, "HIP MoE gate_logits_single_token_fp16_weights kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
+    llaminar2::PerfStatsCollector::addCounter("kernel", "rocm_moe_router_fp16_operand_calls", 1.0,
+        "router", "rocm:" + std::to_string(device_idx),
+        {{"m", "1"}, {"d_model", std::to_string(d_model)}, {"num_experts", std::to_string(num_experts)},
+         {"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"}, {"output", "fp32"}, {"route", "serial_fixed"}});
     return true;
 }
 
@@ -16403,16 +16533,12 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
         return false;
     }
 
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    if (static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_idx)) != hipSuccess)
+        return false;
     (void)hipGetLastError();
 
-    constexpr int rows_per_block = 16;
-    const int threads = 128;
-    hipLaunchKernelGGL(rocm_moe_gate_logits_fp16_grouped_verifier_kernel,
-        dim3(num_experts, (seq_len + rows_per_block - 1) / rows_per_block),
-        dim3(threads), 0, static_cast<hipStream_t>(stream),
-        hidden, static_cast<const __half *>(gate_weights_fp16), logits,
-        seq_len, d_model, num_experts, device_effective_seq_len);
+    launch_fp16_router_rows<false>(hidden, static_cast<const __half *>(gate_weights_fp16), logits,
+        seq_len, seq_len, d_model, num_experts, device_effective_seq_len, {}, static_cast<hipStream_t>(stream));
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -16421,6 +16547,10 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
                 hipGetErrorString(err));
         return false;
     }
+    llaminar2::PerfStatsCollector::addCounter("kernel", "rocm_moe_router_fp16_operand_calls", 1.0,
+        "router", "rocm:" + std::to_string(device_idx),
+        {{"m", std::to_string(seq_len)}, {"d_model", std::to_string(d_model)}, {"num_experts", std::to_string(num_experts)},
+         {"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"}, {"output", "fp32"}, {"route", "grouped_fixed"}});
     return true;
 }
 
@@ -16461,10 +16591,12 @@ bool hipMoE_gate_logits_bf16_decode_equivalent_rows(
 bool hipMoE_quantize_router_gate_q8(
     const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
     int d_model, int num_experts,
-    int device_idx, void *stream)
+    int device_idx, void *stream, llaminar2::RouterQ8Basis basis)
 {
     if (!gate_weights || !gate_weights_q8 || !gate_scales ||
-        d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        !stream || (basis != llaminar2::RouterQ8Basis::Original &&
+            basis != llaminar2::RouterQ8Basis::SignedHadamard32) ||
+            d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
     {
         fprintf(stderr, "HIP MoE Q8 router gate quantize invalid args\n");
         return false;
@@ -16473,6 +16605,9 @@ bool hipMoE_quantize_router_gate_q8(
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
+        if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+            return llaminar2::router_hadamard_q8::launch(
+                gate_weights, gate_weights_q8, gate_scales, num_experts, d_model, stream);
     const int blocks_per_row = d_model / 32;
     hipLaunchKernelGGL(rocm_moe_router_gate_quantize_q8_kernel,
         dim3(num_experts, blocks_per_row), dim3(32), 0, static_cast<hipStream_t>(stream),
@@ -16491,10 +16626,12 @@ bool hipMoE_gate_logits_single_token_q8_weights(
     const float *hidden, int8_t *hidden_q8, float *hidden_scales,
     const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
     int d_model, int num_experts,
-    int device_idx, void *stream)
+    int device_idx, void *stream, llaminar2::RouterQ8Basis basis)
 {
     if (!hidden || !hidden_q8 || !hidden_scales || !gate_weights_q8 || !gate_scales || !logits ||
-        d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        !stream || (basis != llaminar2::RouterQ8Basis::Original &&
+            basis != llaminar2::RouterQ8Basis::SignedHadamard32) ||
+            d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
     {
         fprintf(stderr, "HIP MoE Q8 gate logits invalid args\n");
         return false;
@@ -16505,9 +16642,17 @@ bool hipMoE_gate_logits_single_token_q8_weights(
     (void)hipGetLastError();
 
     const int blocks_per_row = d_model / 32;
-    hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_kernel,
+    if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+        {
+            if (!llaminar2::router_hadamard_q8::launch(
+                    hidden, hidden_q8, hidden_scales, 1, d_model, stream)) return false;
+        }
+        else
+        {
+            hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_kernel,
         dim3(blocks_per_row), dim3(32), 0, hip_stream,
         hidden, hidden_q8, hidden_scales, d_model);
+        }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -16527,6 +16672,14 @@ bool hipMoE_gate_logits_single_token_q8_weights(
     {
         fprintf(stderr, "HIP MoE Q8 gate logits kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
+    }
+    // Reuse the bank after the final router reader, retaining original expert input.
+    if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+    {
+        hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_kernel,
+        dim3(blocks_per_row), dim3(32), 0, hip_stream,
+        hidden, hidden_q8, hidden_scales, d_model);
+        if (hipGetLastError() != hipSuccess) return false;
     }
     return true;
 }
@@ -16560,11 +16713,13 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
     const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
     int seq_len, int d_model, int num_experts,
     int device_idx, void *stream,
-    const int *device_effective_seq_len)
+    const int *device_effective_seq_len, llaminar2::RouterQ8Basis basis)
 {
     if (!hidden || !hidden_q8 || !hidden_scales || !gate_weights_q8 || !gate_scales || !logits ||
         !stream || seq_len <= 0 ||
-        d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        !stream || (basis != llaminar2::RouterQ8Basis::Original &&
+            basis != llaminar2::RouterQ8Basis::SignedHadamard32) ||
+            d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
     {
         fprintf(stderr, "HIP MoE Q8 batch-invariant grouped gate logits invalid args\n");
         return false;
@@ -16579,11 +16734,19 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
     // launch geometry, not a different quantizer or a changed router K tree.
     const int quantize_threads = seq_len > 16 ? 256 : 32;
     const int quantize_groups = quantize_threads / 32;
-    hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_kernel,
+    if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+        {
+            if (!llaminar2::router_hadamard_q8::launch(
+                    hidden, hidden_q8, hidden_scales, seq_len, d_model, stream, device_effective_seq_len)) return false;
+        }
+        else
+        {
+            hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_kernel,
         dim3((blocks_per_row + quantize_groups - 1) / quantize_groups, seq_len),
         dim3(quantize_threads), 0, hip_stream,
         hidden, hidden_q8, hidden_scales, seq_len, d_model,
         device_effective_seq_len);
+        }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -16614,6 +16777,16 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
         fprintf(stderr, "HIP MoE Q8 grouped gate logits kernel launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
+    }
+    // Reuse the bank after the final router reader, retaining original expert input.
+    if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
+    {
+        hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_kernel,
+        dim3((blocks_per_row + quantize_groups - 1) / quantize_groups, seq_len),
+        dim3(quantize_threads), 0, hip_stream,
+        hidden, hidden_q8, hidden_scales, seq_len, d_model,
+        device_effective_seq_len);
+        if (hipGetLastError() != hipSuccess) return false;
     }
     return true;
 }
@@ -23528,11 +23701,19 @@ namespace llaminar2::rocm
             // Expert consumers still borrow ALL local hidden-Q8 rows. Row
             // ownership removes only logits/top-k duplication, not that input.
             const int groups = launch.capacity > 16 ? 8 : 1;
-            hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_kernel,
+            if (launch.q8_basis == RouterQ8Basis::SignedHadamard32 && rows > 0)
+            {
+                if (!router_hadamard_q8::launch(launch.hidden, launch.hidden_q8, launch.hidden_scales,
+                        launch.capacity, launch.width, stream, launch.live_rows)) return false;
+            }
+            else
+            {
+                hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_kernel,
                 dim3((launch.width / 32 + groups - 1) / groups, launch.capacity),
                 dim3(groups * 32), 0, native_stream,
                 launch.hidden, launch.hidden_q8, launch.hidden_scales,
                 launch.capacity, launch.width, launch.live_rows);
+            }
             if (hipGetLastError() != hipSuccess) return false;
             if (rows == 0) break;
             if (launch.width / 32 <= 64)
@@ -23545,6 +23726,17 @@ namespace llaminar2::rocm
                     grid, dim3(128), 0, native_stream, launch.hidden_q8, launch.hidden_scales,
                     static_cast<const int8_t *>(launch.gate), launch.gate_scales, launch.logits,
                     launch.capacity, launch.width, launch.experts, launch.live_rows, launch.partition);
+            if (hipGetLastError() != hipSuccess) return false;
+            if (launch.q8_basis == RouterQ8Basis::SignedHadamard32)
+            {
+                // Publish ALL live original rows for experts, including non-owned rows.
+                hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_kernel,
+                dim3((launch.width / 32 + groups - 1) / groups, launch.capacity),
+                dim3(groups * 32), 0, native_stream,
+                launch.hidden, launch.hidden_q8, launch.hidden_scales,
+                launch.capacity, launch.width, launch.live_rows);
+                if (hipGetLastError() != hipSuccess) return false;
+            }
             break;
         }
         case MoERouterPreparedFormat::FP32:
@@ -23556,10 +23748,8 @@ namespace llaminar2::rocm
             break;
         case MoERouterPreparedFormat::FP16:
             if (rows == 0) break;
-            hipLaunchKernelGGL((rocm_moe_gate_logits_fp16_grouped_verifier_kernel<true>),
-                grid, dim3(128), 0, native_stream, launch.hidden,
-                static_cast<const __half *>(launch.gate), launch.logits,
-                launch.capacity, launch.width, launch.experts, launch.live_rows, launch.partition);
+            launch_fp16_router_rows<true>(launch.hidden, static_cast<const __half *>(launch.gate), launch.logits,
+                launch.capacity, rows, launch.width, launch.experts, launch.live_rows, launch.partition, native_stream);
             break;
         case MoERouterPreparedFormat::BF16:
             if (rows == 0) break;
@@ -23576,7 +23766,18 @@ namespace llaminar2::rocm
             dim3(std::max(1, rows)), dim3(256), 0, native_stream, launch.logits, nullptr, nullptr,
             launch.capacity, launch.experts, launch.top_k, launch.normalize,
             launch.live_rows, nullptr, launch.partition, launch.selected, launch.selected_bytes);
-        return hipGetLastError() == hipSuccess;
+        if (hipGetLastError() != hipSuccess) return false;
+        if (launch.format == MoERouterPreparedFormat::FP16)
+        {
+            int ordinal = -1;
+            if (hipGetDevice(&ordinal) != hipSuccess) return false;
+            PerfStatsCollector::addCounter("kernel", "rocm_moe_router_fp16_operand_calls", 1.0,
+                "router", "rocm:" + std::to_string(ordinal),
+                {{"m", std::to_string(launch.capacity)}, {"d_model", std::to_string(launch.width)},
+                 {"num_experts", std::to_string(launch.experts)}, {"activation", "fp16_rne"},
+                 {"weight", "fp16"}, {"accumulation", "fp32"}, {"output", "fp32"}, {"route", "owned_fixed"}});
+        }
+        return true;
     }
 
     bool publishRouterOwnedRows(const MoERouterRowPublication &publication, void *stream)

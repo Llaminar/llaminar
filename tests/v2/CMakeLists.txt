@@ -2721,7 +2721,10 @@ add_v2_test(V2_Unit_CollectiveContext
 )
 
 # Test: GraphExecutorCollective - CollectiveContext integration with DeviceGraphExecutor
-add_executable(v2_unit_graph_executor_collective unit/execution/local_execution/graph/Test__GraphExecutorCollective.cpp)
+add_executable(v2_unit_graph_executor_collective
+    unit/execution/local_execution/graph/Test__GraphExecutorCollective.cpp
+    unit/execution/local_execution/graph/Test__GraphSnapshotRowLayout.cpp)
+
 target_include_directories(v2_unit_graph_executor_collective PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -2735,6 +2738,14 @@ add_v2_test(V2_Unit_GraphExecutorCollective
     LABELS "V2;Unit;Collective;DeviceGraphExecutor;Execution"
     MPI_PROCS 1
 )
+
+# Captured diagnostic ownership is part of immutable graph descriptor identity.
+# This device-free gate enters the real preparation/publication boundaries.
+add_v2_test(V2_Integration_GraphSnapshotRowLayout
+    COMMAND $<TARGET_FILE:v2_unit_graph_executor_collective>
+        --gtest_filter=GraphSnapshotRowLayout.*
+    LABELS "V2;Integration;ProductionTestPreflight;Snapshot;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 # Test: StageRunPolicy - Unified execution policy tests
 add_executable(v2_unit_stage_run_policy unit/execution/local_execution/graph/Test__StageRunPolicy.cpp)
@@ -3420,6 +3431,15 @@ add_test(NAME V2_Integration_OpenCodeCellRuntime
 set_tests_properties(V2_Integration_OpenCodeCellRuntime PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;HTTP;OpenCode;CI;Lifecycle;Regression;DeviceFree" TIMEOUT 30)
 
+# Graceful RAM-to-disk shutdown is unbounded; cancellation still retires every owner.
+add_test(NAME V2_Integration_OpenCodeShutdownFlush
+    COMMAND ${Python3_EXECUTABLE} -m unittest
+        test_opencode_cell_runtime.CellLifetimeTests.test_shutdown_flush_can_outlive_administrative_command_timeout
+        test_opencode_cell_runtime.CellLifetimeTests.test_cancelled_shutdown_retires_writers_before_reraising)
+set_tests_properties(V2_Integration_OpenCodeShutdownFlush PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts"
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;OpenCode;CI;Lifecycle;Regression;DeviceFree" TIMEOUT 30)
+
 add_test(NAME V2_Unit_OpenCodeCanonicalJobs
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_opencode_canonical_jobs.py)
 set_tests_properties(V2_Unit_OpenCodeCanonicalJobs PROPERTIES
@@ -3988,6 +4008,21 @@ set_tests_properties(V2_Integration_DevelopPRGateContract PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;PullRequest;Regression"
     TIMEOUT 15
 )
+
+# Model-free admission, phase thresholds and lifecycle failures are fast gates.
+# Full vocabulary/model work belongs only to the published master GPU gate.
+add_test(NAME V2_Unit_ModelKLDCanary
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_model_kld_canary.py)
+set_tests_properties(V2_Unit_ModelKLDCanary PROPERTIES
+    LABELS "V2;Unit;DeviceFree;Numerics;Regression" TIMEOUT 30)
+add_test(NAME V2_Integration_ModelKLDCanary
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_model_kld_canary.py)
+set_tests_properties(V2_Integration_ModelKLDCanary PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Numerics;Regression" TIMEOUT 30)
+add_v2_test(V2_Integration_ModelKLDCanaryCLI
+    COMMAND $<TARGET_FILE:llaminar_model_kld_canary> --help
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Numerics;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15)
 
 add_test(NAME V2_Unit_PublishedImageSuites
     COMMAND ${Python3_EXECUTABLE}
@@ -6305,6 +6340,15 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_ResidualAdd
     COMMAND $<TARGET_FILE:v2_integration_cpu_residual_add_grouped_verifier>
     LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;ResidualAdd;FP32;BF16;FP16;AllFormats;BatchInvariant;Regression"
     MPI_PROCS 1
+    NO_MODELS
+)
+# Independent normal-FP32 vector/tail ownership and exact live-extent proof.
+add_v2_test(V2_Integration_CPUResidualAddTailExtents
+    COMMAND $<TARGET_FILE:v2_integration_cpu_residual_add_grouped_verifier>
+        --gtest_filter=Test__CPUResidualAddGroupedVerifier.FP32TailExtentsMatchIndependentAdd
+    LABELS "V2;Integration;CPU;ResidualAdd;FP32;GroupedVerifierRows;ByteExact;Regression;ThreadTotality"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Canonical CPU grouped proof for the graph's fused residual-plus-normalization
@@ -7882,6 +7926,19 @@ add_v2_test(V2_Unit_Q5_1_SIMD_Unpack
     MPI_PROCS 1
 )
 
+# Original Q6 source factors remain exact without changing Q8 GEMM inputs.
+add_executable(v2_test_q6_source_scale unit/kernels/Test__Q6SourceScale.cpp)
+target_link_libraries(v2_test_q6_source_scale
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_Q6SourceScale
+    COMMAND $<TARGET_FILE:v2_test_q6_source_scale>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeVNNI;Q6_K;Regression"
+    MPI_PROCS 1 NO_MODELS)
+add_v2_test(V2_Integration_CPUQ6SourceScalePreservation
+    COMMAND $<TARGET_FILE:v2_test_q6_source_scale>
+    LABELS "V2;Integration;CPU;DeviceFree;NativeVNNI;Q6_K;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
 # Test: Q6_K SIMD Equivalency
 add_executable(v2_test_q6_k_simd unit/tensors/Test__Q6_KTensor.cpp)
 target_link_libraries(v2_test_q6_k_simd 
@@ -7981,7 +8038,7 @@ add_v2_test(V2_Unit_Q5_K_SIMD
 # Test: Q8_K SIMD equivalency (scalar vs AVX2 vs AVX512)
 # Purpose: Validate Q8_K int8→float conversion across SIMD implementations
 # Expected: 9 tests total (3 equivalency + 6 edge cases)
-# Q8_K: Simplest quantization - just direct int8→float type conversion, no scale/lookup
+# Q8_K: Original FP32 scale multiplied by each signed source code.
 add_executable(v2_test_q8_k_simd unit/tensors/Test__Q8_KTensor.cpp)
 target_link_libraries(v2_test_q8_k_simd 
     llaminar2_core 
@@ -7992,6 +8049,15 @@ add_v2_test(V2_Unit_Q8_K_SIMD
     COMMAND $<TARGET_FILE:v2_test_q8_k_simd>
     MPI_PROCS 1
     LABELS "V2;Unit;TensorOperations;Q8_K;Quantization;SIMD;AVX2;AVX512;Equivalency;KQuant;SuperBlock;Int8Conversion"
+)
+
+# Source Q8_K292-byte/FP32-scale regression; no device initialization.
+add_v2_test(V2_Integration_Q8KSourceScale
+    COMMAND $<TARGET_FILE:v2_test_q8_k_simd> --gtest_filter=Q8KSourceScale.*
+    NO_MODELS
+    MPI_PROCS 1
+    NO_MPI
+    LABELS "V2;Integration;ProductionTestPreflight;Q8_K;SourceScale;DeviceFree"
 )
 
 # Test: requantizeRowToInt8() accuracy for Q8_0, Q8_1, Q8_K
@@ -8209,6 +8275,16 @@ add_v2_test(V2_Unit_WeightPlan
     LABELS "V2;Unit;Loaders;Weights;Lifecycle;Planning"
     MPI_PROCS 1
     NO_MODELS
+)
+# Explicit diagnostic representation policy; fast device-free materialization and scope proof.
+add_v2_test(V2_Integration_GDNProjectionArithmeticPolicy
+    COMMAND $<TARGET_FILE:v2_unit_weight_plan>
+        --gtest_filter=Test__GDNProjectionArithmetic.*
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Loaders;GDN;FP32;FP16;PreparedWeights;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
 )
 add_v2_test(V2_Integration_ReplicatedDenseWeightBindingOwnership
     COMMAND $<TARGET_FILE:v2_unit_weight_plan>
@@ -8492,6 +8568,26 @@ add_v2_test(V2_Unit_CUDAFlashAttentionLaunchPolicy
     MPI_PROCS 1
 )
 
+add_v2_test(V2_Integration_CUDATensorPrefillPartitionGeometry
+    COMMAND $<TARGET_FILE:v2_unit_cuda_flash_attention_launch_policy>
+        --gtest_filter=CUDAFlashAttentionLaunchPolicy.TensorPrefill*
+        --gtest_brief=1
+    LABELS "V2;Integration;CUDA;Attention;Prefill;Geometry;LiveExtent;Regression;ProductionTestPreflight"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+
+
+add_v2_test(V2_Integration_CUDAFlashAttentionStoragePolicy
+    COMMAND $<TARGET_FILE:v2_unit_cuda_flash_attention_launch_policy>
+            --gtest_filter=CUDAFlashAttentionLaunchPolicy.TileStoragePolicyIsTotalAndClosed:CUDAFlashAttentionLaunchPolicy.TileStorageOwnsExactSharedMemoryBOM:CUDAFlashAttentionLaunchPolicy.AutomaticPVWarpsFollowTileOwnership:CUDAFlashAttentionLaunchPolicy.PVWarpEnvironmentRejectsMalformedOverrides:CUDAFlashAttentionLaunchPolicy.HD256GridPolicySelectsMeasuredStorage
+    LABELS "V2;Integration;ProductionTestPreflight;Attention;LaunchPolicy;GraphCapture;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+
 # Device-free ROCm FA2 capture-policy coverage over every released Qwen
 # attention geometry, TP1/2/4/8, and short-to-256K K/V capacity envelopes.
 add_executable(v2_unit_rocm_flash_attention_launch_policy
@@ -8504,6 +8600,22 @@ add_v2_test(V2_Unit_ROCmFlashAttentionLaunchPolicy
     COMMAND $<TARGET_FILE:v2_unit_rocm_flash_attention_launch_policy>
     LABELS "V2;Unit;ROCm;Attention;FlashAttention;GraphCapture;LaunchPolicy;Totality;Qwen"
     MPI_PROCS 1
+)
+
+add_v2_test(V2_Integration_ROCmFlashAttentionPrefillResidency
+    COMMAND $<TARGET_FILE:v2_unit_rocm_flash_attention_launch_policy>
+            --gtest_filter=ROCmFlashAttentionLaunchPolicy.PersistentContextPhaseGridMatchesLDSResidency:ROCmFlashAttentionLaunchPolicy.WideHeadResidencyAllQueryBucketsAndTP
+    LABELS "V2;Integration;ROCm;Attention;Prefill;LaunchPolicy;LDS;Totality;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+add_v2_test(V2_Integration_ROCmRegisterScoreAdmission
+    COMMAND $<TARGET_FILE:v2_unit_rocm_flash_attention_launch_policy>
+            --gtest_filter=ROCmFlashAttentionLaunchPolicy.RegisterScore*
+    LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;LaunchPolicy;LDS;NativeFormat;Visibility;Regression"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: CUDA Quantized GEMM workspace declarations
@@ -9253,6 +9365,14 @@ add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillWorkspaceEnvelope
 if(HAVE_CUDA)
 add_executable(v2_integration_cuda_moe_kernel integration/kernels/cuda/Test__CUDAMoEKernel.cpp)
 target_link_libraries(v2_integration_cuda_moe_kernel v2_expert_transfer_parity_support GTest::gtest_main CUDA::cudart)
+# Original GGUF factors, actual fused expert transaction and fixed Q8 publications.
+add_v2_test(V2_Integration_CUDAIQ2SFusedMoEOriginalEquation
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.IQ2SOriginalSourceEquationInCapturedFusedExpert
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;IQ2_S;OriginalEquation;GraphCapture;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    ENVIRONMENT "LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel")
 add_v2_test(V2_Integration_CUDAMoEKernel
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
     LABELS "V2;Integration;CUDA;MoE;Routing;Gather;Scatter;SwiGLU;KernelFactory"
@@ -9480,6 +9600,12 @@ add_v2_test(V2_Integration_CUDAEmbeddingGroupedVerifier
     LABELS "V2;Integration;CUDA;Embedding;MTP;PreparedWeights;DeviceResident;AllFormats;BatchInvariant"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CUDAEmbeddingNativeSourcePreservation
+    COMMAND $<TARGET_FILE:v2_integration_cuda_embedding_grouped_verifier>
+        --gtest_filter=Test__CUDAEmbeddingGroupedVerifier.SourceQuantizationMetadataIsNotRoundedAgain
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;Embedding;AllFormats;DeviceResident;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_Embedding
     COMMAND $<TARGET_FILE:v2_integration_cuda_embedding_grouped_verifier>
             --gtest_filter=Test__CUDAEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensRuntimeMMatchSerialDecodeBytes:Test__CUDAEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights:Test__CUDAEmbeddingGroupedVerifier.NestedVocabularySlicesPreserveCapturedRepresentation
@@ -9581,6 +9707,15 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_ResidualAdd
     COMMAND $<TARGET_FILE:v2_integration_cuda_residual_add_grouped_verifier>
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;ResidualAdd;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression"
     MPI_PROCS 1
+    NO_MODELS
+)
+# Independent normal-FP32 vector/tail ownership and exact live-extent proof.
+add_v2_test(V2_Integration_CUDAResidualAddTailExtents
+    COMMAND $<TARGET_FILE:v2_integration_cuda_residual_add_grouped_verifier>
+        --gtest_filter=Test__CUDAResidualAddGroupedVerifier.FP32TailExtentsMatchIndependentCapturedAdd
+    LABELS "V2;Integration;CUDA;ResidualAdd;FP32;GroupedVerifierRows;ByteExact;Regression;GraphCapture"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: CUDA HiddenStateRowSelectStage graph capture/replay
@@ -9661,15 +9796,44 @@ add_v2_test(V2_Integration_CUDAFlashAttentionQ81Qwen2Prefill
     MPI_PROCS 1
     TIMEOUT 30
 )
-add_v2_test(V2_Integration_CUDAFlashAttentionContextParallelByteExact
+add_v2_test(V2_Integration_CUDAFlashAttentionContextParallelArithmetic
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
-            --gtest_filter=Test__CUDAFlashAttentionParity.FA2FixedContextSequenceAndParallelCapturedTransactionsAreByteExact:Test__CUDAFlashAttentionParity.ComputeTensor_DeviceAdaptiveCapturedReplayCrossesRegimesByteExact:Test__CUDAFlashAttentionParity.FA2QueryPartitions_AllHeadDimsAndTPMappingsAreByteExact:Test__CUDAFlashAttentionParity.FA2VectorKVAlignmentFailsBeforeSubmission
+            --gtest_filter=Test__CUDAFlashAttentionParity.FA2CapturedContextTransactionsPreserveDeclaredArithmetic:Test__CUDAFlashAttentionParity.ComputeTensor_DeviceAdaptiveCapturedReplayCrossesRegimesByteExact:Test__CUDAFlashAttentionParity.FA2QueryPartitions_AllHeadDimsAndTPMappingsAreByteExact:Test__CUDAFlashAttentionParity.FA2VectorKVAlignmentFailsBeforeSubmission
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;Attention;FlashAttention;ContextParallel;GraphCapture;BatchInvariant;ByteExact;AllNativeFormats;FP16;FP32;256K;Regression"
     MPI_PROCS 1
     NO_MODELS
     RESOURCE_LOCK cuda_gpu_0
 )
+add_v2_test(V2_Integration_CUDAFlashAttentionFiniteMask
+    COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
+            --gtest_filter=Test__CUDAFlashAttentionParity.FA2FiniteMaskIndependentProbabilityOracle
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;Attention;FlashAttention;ContextParallel;GraphCapture;FP16;BF16;FP32;AdditiveMask;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    RESOURCE_LOCK cuda_gpu_0
+    TIMEOUT 30
+)
+
+add_v2_test(V2_Integration_CUDASafeguardedFP16TensorPrefill
+    COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
+        --gtest_filter=Test__CUDAFlashAttentionParity.SafeguardedFP16TensorPrefillExtremeValuesAndPoisonedCapturedReplay:Test__CUDAFlashAttentionParity.SafeguardedFP16TensorPrefillLargerBucketsMatchM512
+        --gtest_brief=1
+    LABELS "V2;Integration;CUDA;Attention;Prefill;FP16;Range;GraphCapture;LiveExtent;ByteExact;Regression;ProductionTestPreflight"
+    MPI_PROCS 1
+    NO_MODELS
+    RESOURCE_LOCK cuda_gpu_0
+    TIMEOUT 120
+)
+
+add_v2_test(V2_Integration_CUDATensorPrefillAutomaticLargeBucket
+    COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
+        --gtest_filter=Test__CUDAFlashAttentionParity.SafeguardedFP16TensorPrefillAutomaticLargeGridUsesCompactArena
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;Attention;Prefill;GraphCapture;Workspace;LiveExtent;Regression"
+    MPI_PROCS 1 NO_MODELS RESOURCE_LOCK cuda_gpu_0 TIMEOUT 120)
+
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_Attention
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
             --gtest_filter=Test__CUDAFlashAttentionParity.CapturedAppendThenAttention_*
@@ -9719,6 +9883,12 @@ add_v2_test(V2_Integration_GDNLinkedStateReassembly_CUDA
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_GDNAdditiveEpsilon_CUDA
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
+            --gtest_filter=Test__CUDAGDNPaddedRealLength.RecurrenceAdditiveEpsilonNearZeroCaptured
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;GatedDeltaNet;MathCorrectness;NearZero;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
 add_v2_test(V2_Integration_GDNPrefillDecodeEquivalence_CUDA
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
             --gtest_filter=Test__CUDAGDNPaddedRealLength.RecurrenceLongPrefillQwen36MoEChunkMTotalityMatchesSerialDecodeByteExact:Test__CUDAGDNPaddedRealLength.RecurrenceLongPrefillDk64MTotalityMatchesSerialDecodeByteExact
@@ -12140,6 +12310,49 @@ add_v2_test(V2_Unit_PrefixCacheFingerprint
     MPI_PROCS 1
 )
 
+add_v2_test(V2_Integration_PrefixCacheAttentionArithmeticGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.ScopedAttentionRecoveryArithmeticIsRepeatable:Test__PrefixCacheFingerprint.LegacyUnvalidatedCheckpointArithmeticCannotRestore:Test__PrefixCacheFingerprint.LegacyRestoredFP32ArithmeticCannotRestore:Test__PrefixCacheFingerprint.LegacyFP32PrefillArithmeticCannotRestore:Test__PrefixCacheFingerprint.LegacyM512OnlyTensorArithmeticCannotRestore:Test__PrefixCacheFingerprint.LegacyLargeGridFP32ArithmeticCannotRestore
+        --gtest_brief=1
+    LABELS "V2;Integration;PrefixCache;Fingerprint;Attention;Regression;ProductionTestPreflight"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+
+
+# Original embedding source arithmetic must reject persisted lossy lookup state.
+add_v2_test(V2_Integration_PrefixCacheNativeEmbeddingArithmeticGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.NativeEmbeddingRejectsV9AndRestartsStably
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Embedding;CPU;CUDA;ROCm;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+
+add_v2_test(V2_Integration_PrefixCacheGDNArithmeticGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.GDNAdditiveEpsilonRejectsV10AndRestartsStably
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;GatedDeltaNet;CPU;CUDA;ROCm;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_PrefixCacheQ8ScaleArithmeticGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.FiniteQ8ScaleRejectsV11AndRestartsStably
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Q8;CPU;CUDA;ROCm;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_PrefixCacheResidualArithmeticGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.ResidualArithmeticRejectsV12AndRestartsStably
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;MoE;Residual;CPU;CUDA;ROCm;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
 # Old persisted unsliced-vocabulary rows must not survive the compatibility boundary.
 add_v2_test(V2_Integration_PrefixTerminalArchiveCompatibility
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
@@ -12364,6 +12577,28 @@ if(HAVE_CUDA OR HAVE_ROCM)
     endforeach()
 endif()
 
+# Test: Terminal RAM persistence uses metadata-only selection and one shared disk budget.
+add_executable(v2_test_prefix_cache_shutdown unit/prefix_cache/Test__PrefixCacheShutdown.cpp)
+target_link_libraries(v2_test_prefix_cache_shutdown llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixCacheShutdown
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_shutdown>
+    LABELS "V2;Unit;PrefixCache;Lifecycle;RAM;Disk;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_PrefixCacheShutdown
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_shutdown>
+    LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;Lifecycle;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_executable(v2_integration_prefix_cache_shutdown_mpi
+    integration/prefix_cache/Test__PrefixCacheShutdownMPI.cpp integration/mpi_gtest_main.cpp)
+target_link_libraries(v2_integration_prefix_cache_shutdown_mpi llaminar2_core GTest::gtest)
+foreach(participants IN ITEMS 2 4 8)
+    add_v2_test(V2_Integration_PrefixCacheShutdownMPI_${participants}
+        COMMAND $<TARGET_FILE:v2_integration_prefix_cache_shutdown_mpi>
+        LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;Lifecycle;MPI;Regression;DeviceFree"
+        MPI_PROCS ${participants} NO_MODELS TIMEOUT 30)
+endforeach()
+
 # Test: Prefix state cache LRU accounting
 add_executable(v2_test_prefix_state_cache_lru unit/prefix_cache/Test__PrefixStateCacheLRU.cpp)
 target_link_libraries(v2_test_prefix_state_cache_lru llaminar2_core GTest::gtest GTest::gtest_main)
@@ -12448,6 +12683,13 @@ add_v2_test(V2_Integration_PrefixSharedArchiveEviction
     COMMAND $<TARGET_FILE:v2_test_prefix_state_cache_lru>
         --gtest_filter=Test__PrefixStateCacheLRU.SharedArchiveEvictionRepersistsResidentOwner:Test__PrefixStateCacheLRU.SharedArchiveRetainedVictimNeedsFreshPublication
     LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;Disk;TensorParallel;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+# Peer archive eviction must not leave a prompt chain permanently absent.
+# Reconcile stale hints at lookup, preserving nonblocking harvest and leases.
+add_v2_test(V2_Integration_PrefixArchiveReharvestPresence
+    COMMAND $<TARGET_FILE:v2_test_prefix_state_cache_lru>
+        --gtest_filter=Test__PrefixStateCacheLRU.SharedArchiveEvictionCannotSuppressPromptReharvest:Test__PrefixStateCacheLRU.DiskHintReconciliation*
+    LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;Disk;TensorParallel;Lifecycle;Economy;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_PrefixArchiveIdempotentPublication
     COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
@@ -13440,6 +13682,30 @@ add_v2_test(V2_Integration_TPSnapshotProjectionColumnPublication
         --gtest_filter=Test__RankOrchestrator.TPSnapshot_ExplicitColumnPartitionsOwnAssembly
     LABELS "V2;Integration;ProductionTestPreflight;Snapshot;LocalTP;MoE;Regression"
     MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_PhaseSplitAttentionSnapshotGeometry
+    COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
+        --gtest_filter=Test__RankOrchestrator.TPSnapshot_PhaseSplitAttentionUsesTypedMainPhase
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Snapshot;LocalTP;Attention;GDN;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+)
+# Decode embedding placement is independently mirrored or fully replicated.
+add_v2_test(V2_Integration_PhaseSplitEmbeddingSnapshotGeometry
+    COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
+        --gtest_filter=Test__RankOrchestrator.TPSnapshot_PhaseSplitEmbeddingUsesTypedMainNamespace
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Snapshot;LocalTP;Embedding;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+)
+add_v2_test(V2_Integration_ResidentMainConditionSnapshotPhase
+    COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
+        --gtest_filter=Test__RankOrchestrator.TPSnapshot_ResidentMainConditionPublishesDecodePhase
+    LABELS "V2;Integration;ProductionTestPreflight;Snapshot;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_TPSnapshotReplicatedFiniteValues
+    COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
+        --gtest_filter=Test__RankOrchestrator.TPSnapshot_ReplicatedRejectsEveryNonfiniteParticipant
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Snapshot;LocalTP;FiniteValues;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
 )
 
 # Ordinary GPU generation is a distinct zero-draft captured-parent policy.
@@ -15548,6 +15814,8 @@ add_executable(v2_integration_embedding_weight_residency
 target_link_libraries(v2_integration_embedding_weight_residency PRIVATE
     llaminar2_core GTest::gtest_main)
 target_include_directories(v2_integration_embedding_weight_residency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set(V2_EMBEDDING_READONLY_UPLOAD_PREFLIGHT_TESTS)
+set(V2_EMBEDDING_STAGING_ORDER_PREFLIGHT_TESTS)
 foreach(V2_EMBEDDING_RESIDENCY_BACKEND CUDA ROCm)
     if((V2_EMBEDDING_RESIDENCY_BACKEND STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
        (V2_EMBEDDING_RESIDENCY_BACKEND STREQUAL "ROCm" AND NOT HAVE_ROCM))
@@ -15560,6 +15828,20 @@ foreach(V2_EMBEDDING_RESIDENCY_BACKEND CUDA ROCm)
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 120)
+    add_v2_test(V2_Integration_EmbeddingReadOnlyUpload_${V2_EMBEDDING_RESIDENCY_BACKEND}
+        COMMAND $<TARGET_FILE:v2_integration_embedding_weight_residency>
+            --gtest_filter=EmbeddingReadOnlyUpload.${V2_EMBEDDING_RESIDENCY_BACKEND}
+        LABELS "V2;Integration;${V2_EMBEDDING_RESIDENCY_BACKEND};Embedding;ReadOnlyMmap;PinnedStaging;PhysicalMemoryAuthority;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_EMBEDDING_READONLY_UPLOAD_PREFLIGHT_TESTS
+        V2_Integration_EmbeddingReadOnlyUpload_${V2_EMBEDDING_RESIDENCY_BACKEND})
+    add_v2_test(V2_Integration_EmbeddingLoadStagingOrder_${V2_EMBEDDING_RESIDENCY_BACKEND}
+        COMMAND $<TARGET_FILE:v2_integration_embedding_weight_residency>
+            --gtest_filter=EmbeddingLoadStagingOrder.${V2_EMBEDDING_RESIDENCY_BACKEND}
+        LABELS "V2;Integration;${V2_EMBEDDING_RESIDENCY_BACKEND};Embedding;PreparedWeights;PinnedStaging;PhysicalMemoryAuthority;ConcurrentSetup;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_EMBEDDING_STAGING_ORDER_PREFLIGHT_TESTS
+        V2_Integration_EmbeddingLoadStagingOrder_${V2_EMBEDDING_RESIDENCY_BACKEND})
 endforeach()
 
 add_executable(v2_integration_cpu_projection_workspace
@@ -15621,6 +15903,21 @@ foreach(V2_VERIFIER_WORKER_ISA AVX2 AVX512)
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=moe")
+endforeach()
+
+# Same defining equation through real runtime-selected AVX expert workers.
+foreach(V2_IQ2S_FUSED_ISA AVX2 AVX512)
+    if(V2_IQ2S_FUSED_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${V2_IQ2S_FUSED_ISA}" V2_IQ2S_FUSED_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPUIQ2SFusedMoEOriginalEquation_${V2_IQ2S_FUSED_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
+                --gtest_filter=CPUNativeVNNIVerifierWorkers.IQ2SOriginalSourceEquationInFusedExpertTransaction
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;${V2_IQ2S_FUSED_ISA};MoE;IQ2_S;OriginalEquation;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_IQ2S_FUSED_RUNTIME_ISA}")
 endforeach()
 
 add_executable(v2_integration_cpu_native_vnni_fused_completion
@@ -16176,6 +16473,55 @@ add_v2_test(V2_Unit_CPUExplicitRoundingContract
     COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
     LABELS "V2;Unit;CPU;Numerics;ByteExact"
     NO_MODELS NO_MPI MPI_PROCS 1)
+set(V2_Q8_FINITE_SCALE_CPU_PREFLIGHT_TESTS)
+set(V2_Q8_FINITE_SCALE_CPU_ISAS SCALAR AVX2)
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    list(APPEND V2_Q8_FINITE_SCALE_CPU_ISAS AVX512)
+endif()
+foreach(V2_Q8_SCALE_ISA IN LISTS V2_Q8_FINITE_SCALE_CPU_ISAS)
+    string(TOLOWER "${V2_Q8_SCALE_ISA}" V2_Q8_SCALE_TARGET_ISA)
+    set(V2_Q8_SCALE_TARGET v2_test_q8_finite_scale_contract_${V2_Q8_SCALE_TARGET_ISA})
+    # The production header selects SIMD with compiled feature guards and real
+    # CPUID, not LLAMINAR_ISA_LEVEL. Compile true ceilings; never stub detection.
+    add_executable(${V2_Q8_SCALE_TARGET}
+        unit/kernels/cpu/Test__CPUExplicitRoundingContract.cpp)
+    target_include_directories(${V2_Q8_SCALE_TARGET} PRIVATE
+        ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(${V2_Q8_SCALE_TARGET} PRIVATE cxx_std_20)
+    target_link_libraries(${V2_Q8_SCALE_TARGET} PRIVATE GTest::gtest GTest::gtest_main)
+    target_compile_definitions(${V2_Q8_SCALE_TARGET} PRIVATE
+        LLAMINAR_Q8_SCALE_TEST_${V2_Q8_SCALE_ISA}=1)
+    if(V2_Q8_SCALE_ISA STREQUAL "SCALAR")
+        target_compile_options(${V2_Q8_SCALE_TARGET} PRIVATE
+            -mno-avx -mno-avx2 -mno-avx512f -mno-fma)
+    elseif(V2_Q8_SCALE_ISA STREQUAL "AVX2")
+        target_compile_options(${V2_Q8_SCALE_TARGET} PRIVATE
+            -mavx2 -mfma -mno-avx512f)
+    else()
+        target_compile_options(${V2_Q8_SCALE_TARGET} PRIVATE
+            -mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma)
+    endif()
+    add_v2_test(V2_Integration_Q8FiniteScaleContract_CPU_${V2_Q8_SCALE_ISA}
+        COMMAND $<TARGET_FILE:${V2_Q8_SCALE_TARGET}>
+            --gtest_filter=CPUExplicitRoundingContract.Q8FiniteScale*
+        LABELS "V2;Integration;CPU;${V2_Q8_SCALE_ISA};Quantization;Numerics;ScaleRange;Regression"
+        NO_MODELS NO_MPI MPI_PROCS 1)
+    list(APPEND V2_Q8_FINITE_SCALE_CPU_PREFLIGHT_TESTS
+        V2_Integration_Q8FiniteScaleContract_CPU_${V2_Q8_SCALE_ISA})
+endforeach()
+foreach(_fp32_subnormal_isa IN ITEMS SCALAR AVX2 AVX512)
+    string(TOLOWER "${_fp32_subnormal_isa}" _fp32_subnormal_isa_lower)
+    if(TARGET v2_test_q8_finite_scale_contract_${_fp32_subnormal_isa_lower})
+        add_v2_test(V2_Integration_FP32SubnormalContract_CPU_${_fp32_subnormal_isa}
+            COMMAND $<TARGET_FILE:v2_test_q8_finite_scale_contract_${_fp32_subnormal_isa_lower}>
+                --gtest_filter=CPUExplicitRoundingContract.Q8FiniteScaleCompiledISAPath:CPUExplicitRoundingContract.DeviceFP32SubnormalFixedWords
+            LABELS "V2;Integration;CPU;${_fp32_subnormal_isa};NumericalContract;ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
+        list(APPEND V2_FP32_SUBNORMAL_PREFLIGHT_TESTS
+            V2_Integration_FP32SubnormalContract_CPU_${_fp32_subnormal_isa})
+    endif()
+endforeach()
+
 add_v2_test(V2_Integration_CPUExplicitRoundingContract
     COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
     LABELS "V2;Integration;ProductionTestPreflight;CPU;Numerics;MoE;AllFormats;ByteExact;Regression"
@@ -17140,6 +17486,11 @@ if(HAVE_ROCM)
         integration/kernels/rocm/Test__ROCmActivationQuantization.cpp)
     target_link_libraries(v2_integration_rocm_activation_quantization
         llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_Q8FiniteScaleContract_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_rocm_activation_quantization>
+            --gtest_filter=ROCmActivationQuantization.CapturedFiniteScaleRange
+        LABELS "V2;Integration;ROCm;Quantization;ScaleRange;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     add_v2_test(V2_Integration_ROCmActivationQuantization
         COMMAND $<TARGET_FILE:v2_integration_rocm_activation_quantization>
                 --gtest_brief=1
@@ -17423,6 +17774,14 @@ if(HAVE_ROCM)
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmFlashAttentionDefaultPrefixScaling
+        COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
+                --gtest_filter=ROCmFlashAttentionContextParallelPerf.DefaultFixedQueryPrefixScaling
+        LABELS "V2;Performance;ROCm;Attention;Prefill;GraphCapture;PrefixScaling;FP16;gfx906"
+        MPI_PROCS 1
+        NO_MODELS
+        RESOURCE_LOCK rocm_gpu_0
     )
     add_v2_test(V2_Perf_ROCmFlashAttentionPrefill
         COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
@@ -17954,6 +18313,12 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
     )
+    add_v2_test(V2_Integration_GDNAdditiveEpsilon_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+                --gtest_filter=Test__ROCmGDNPaddedRealLength.RecurrenceAdditiveEpsilonNearZeroCaptured
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;GatedDeltaNet;MathCorrectness;NearZero;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     add_v2_test(V2_Integration_GDNPrefillDecodeEquivalence_ROCm
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
                 --gtest_filter=Test__ROCmGDNPaddedRealLength.RecurrenceLongPrefillQwen36MoEStaticChunkMTotalityMatchesSerialDecodeByteExact:Test__ROCmGDNPaddedRealLength.RecurrenceLongPrefillDk64MTotalityMatchesSerialDecodeByteExact:Test__ROCmGDNPaddedRealLength.CapturedLongPrefillHeadShardsMatchSerialDecodeByteExact
@@ -18264,6 +18629,12 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;Embedding;MTP;PreparedWeights;DeviceResident;AllFormats;BatchInvariant;gfx906"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_ROCmEmbeddingNativeSourcePreservation
+        COMMAND $<TARGET_FILE:v2_integration_rocm_embedding_grouped_verifier>
+            --gtest_filter=Test__ROCmEmbeddingGroupedVerifier.SourceQuantizationMetadataIsNotRoundedAgain
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Embedding;AllFormats;DeviceResident;Regression"
+        MPI_PROCS 1 NO_MODELS
+    )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_Embedding
         COMMAND $<TARGET_FILE:v2_integration_rocm_embedding_grouped_verifier>
                 --gtest_filter=Test__ROCmEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensRuntimeMMatchSerialDecodeBytes:Test__ROCmEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights:Test__ROCmEmbeddingGroupedVerifier.NestedVocabularySlicesPreserveCapturedRepresentation
@@ -18297,6 +18668,24 @@ if(HAVE_ROCM)
                 --gtest_filter=Test__ROCmFlashAttentionParity.FA2ContextParallelCapturedTransactionAllNativeFormatsIsDirectByteExact:Test__ROCmFlashAttentionParity.ComputeTensorGeometrySelectedContextGraphAllNativeFormatsIsQueryByteExact
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;Attention;FlashAttention;ContextParallel;GraphCapture;DeviceResident;BatchInvariant;ByteExact;AllFormats;FP32;FP16;BF16;Q8_1;GQA;TP;256K;Regression;gfx906"
+        MPI_PROCS 1
+        NO_MODELS
+        RESOURCE_LOCK rocm_gpu_0
+    )
+    add_v2_test(V2_Integration_ROCmFlashAttentionWideNativeRing
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
+                --gtest_filter=Test__ROCmFlashAttentionParity.FA2WideNativeRingMatchesIndependentProbabilityReference
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;Attention;Prefill;GraphCapture;NativeRing;ByteExact;LDS;Regression;gfx906"
+        MPI_PROCS 1
+        NO_MODELS
+        RESOURCE_LOCK rocm_gpu_0
+    )
+    add_v2_test(V2_Integration_ROCmRegisterScoreNativeLifecycle
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
+                --gtest_filter=Test__ROCmFlashAttentionParity.RegisterScoreCapturedLifecycleIsCanonicalByteExact:Test__ROCmFlashAttentionParity.RegisterScoreShortPrefixesMatchUnoptimizedNativeBatch
+                --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;GraphCapture;ByteExact;FP16;LDS;GQA;TP;ExtremeValues;Regression;gfx906"
         MPI_PROCS 1
         NO_MODELS
         RESOURCE_LOCK rocm_gpu_0
@@ -18421,6 +18810,15 @@ if(HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_integration_rocm_residual_add_grouped_verifier>
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;ResidualAdd;FP32;BF16;FP16;AllFormats;DeviceResident;ExplicitStream;BatchInvariant;Regression;gfx906"
         MPI_PROCS 1
+        NO_MODELS
+    )
+    # Independent normal-FP32 vector/tail ownership and exact live-extent proof.
+    add_v2_test(V2_Integration_ROCmResidualAddTailExtents
+        COMMAND $<TARGET_FILE:v2_integration_rocm_residual_add_grouped_verifier>
+            --gtest_filter=Test__ROCmResidualAddGroupedVerifier.FP32TailExtentsMatchIndependentCapturedAdd
+        LABELS "V2;Integration;ROCm;ResidualAdd;FP32;GroupedVerifierRows;ByteExact;Regression;GraphCapture"
+        MPI_PROCS 1
+        NO_MODELS
     )
     message(STATUS "V2 Tests: Added ROCm ResidualAdd parity tests")
 
@@ -18685,6 +19083,14 @@ if(HAVE_ROCM)
         v2_expert_transfer_parity_support
         GTest::gtest_main
     )
+# Original GGUF factors, actual fused expert transaction and fixed Q8 publications.
+add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
+    COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.IQ2SOriginalSourceEquationInCapturedFusedExpert
+    LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;IQ2_S;OriginalEquation;GraphCapture;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    ENVIRONMENT "LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel")
     add_v2_test(V2_Integration_ROCmMoEKernel
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
         LABELS "V2;Integration;ROCm;MoE;Routing;Gather;Scatter;gfx906"
@@ -19471,6 +19877,11 @@ if(HAVE_CUDA OR HAVE_ROCM)
         integration/mpi_gtest_main.cpp)
     target_include_directories(v2_integration_shared_expert_column_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(v2_integration_shared_expert_column_gate PRIVATE llaminar2_core GTest::gtest)
+    add_v2_test(V2_Integration_SharedExpertSubnormalPublication_CPU
+        COMMAND $<TARGET_FILE:v2_integration_shared_expert_column_gate>
+            --gtest_filter=SharedExpertColumnGate.SubnormalPublicationCPU
+        LABELS "V2;Integration;ProductionTestPreflight;MoE;ByteExact;CPU"
+        MPI_PROCS 1 TIMEOUT 120 NO_MODELS)
     add_executable(v2_perf_shared_expert_column_gate
         performance/kernels/moe/Perf__SharedExpertColumnGate.cpp
         integration/mpi_gtest_main.cpp)
@@ -19482,6 +19893,11 @@ if(HAVE_CUDA OR HAVE_ROCM)
             add_v2_test(V2_Integration_SharedExpertColumnGate_${projection_backend}
                 COMMAND $<TARGET_FILE:v2_integration_shared_expert_column_gate>
                     --gtest_filter=SharedExpertColumnGate.${projection_backend}
+                LABELS "V2;Integration;ProductionTestPreflight;MoE;GraphCapture;ByteExact;${projection_backend}"
+                MPI_PROCS 1 TIMEOUT 120 NO_MODELS)
+            add_v2_test(V2_Integration_SharedExpertSubnormalPublication_${projection_backend}
+                COMMAND $<TARGET_FILE:v2_integration_shared_expert_column_gate>
+                    --gtest_filter=SharedExpertColumnGate.SubnormalPublication${projection_backend}
                 LABELS "V2;Integration;ProductionTestPreflight;MoE;GraphCapture;ByteExact;${projection_backend}"
                 MPI_PROCS 1 TIMEOUT 120 NO_MODELS)
             add_v2_test(V2_Integration_MoEProjectionPipeline_${projection_backend}
@@ -21206,6 +21622,8 @@ endif()
 add_executable(v2_test_snapshot_capture
     unit/snapshots/Test__SnapshotCapture.cpp
     unit/snapshots/Test__SnapshotRowPartition.cpp
+    unit/snapshots/Test__FusedNormSnapshotPublication.cpp
+    unit/snapshots/Test__MoERoutingSnapshotSelection.cpp
     unit/snapshots/Test__ParityGDNHeadPermutation.cpp
     unit/snapshots/Test__ParityNumericalAggregation.cpp
     unit/snapshots/Test__ParitySnapshotSelection.cpp
@@ -21219,6 +21637,20 @@ add_v2_test(V2_Unit_SnapshotCapture
     LABELS "V2;Unit;Snapshot;SnapshotCapture;DGORefactor"
     MPI_PROCS 1
 )
+# Canonical residual checkpoints follow named outputs of the real fused producer,
+# including the next-layer producer outside a selected layer cohort.
+add_v2_test(V2_Integration_FusedNormSnapshotPublication
+    COMMAND $<TARGET_FILE:v2_test_snapshot_capture>
+        --gtest_filter=FusedNormSnapshotPublication.*
+    LABELS "V2;Integration;ProductionTestPreflight;Snapshot;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+# Router output descriptors select only their named publication, so unrelated
+# score buffers cannot outgrow shared snapshot arenas at smaller prefill buckets.
+add_v2_test(V2_Integration_MoERoutingSnapshotSelection
+    COMMAND $<TARGET_FILE:v2_test_snapshot_capture>
+        --gtest_filter=MoERoutingSnapshotSelection.*
+    LABELS "V2;Integration;ProductionTestPreflight;Snapshot;MoE;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 # Fixed down-column assembly already returns the complete routed row on every
 # participant. Preserve its semantic publication and pinned epoch diagnostics
 # instead of applying the whole-expert partial-sum snapshot interpretation.
@@ -21314,6 +21746,20 @@ add_v2_gpu_backend_test(
     V2_Integration_GPUGraphCaptureExecution
     V2 Integration Execution GraphCapture
 )
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDARoutingSnapshotOutputFilter
+        COMMAND $<TARGET_FILE:v2_test_gpu_graph_capture_execution_cuda>
+            --gtest_filter=GPUGraphCaptureExecutionTest.RoutingOutputFilterRetainsOnlySelectedSharedPayloads
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;Snapshot;MoE;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+endif()
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmRoutingSnapshotOutputFilter
+        COMMAND $<TARGET_FILE:v2_test_gpu_graph_capture_execution_rocm>
+            --gtest_filter=GPUGraphCaptureExecutionTest.RoutingOutputFilterRetainsOnlySelectedSharedPayloads
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Snapshot;MoE;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+endif()
 message(STATUS "V2 Tests: Added GPUGraphCaptureExecution integration tests")
 
 if(HAVE_CUDA)
@@ -21566,8 +22012,23 @@ if(HAVE_CUDA OR HAVE_ROCM)
         integration/backends/Test__MoELiveRows.cpp
         integration/backends/Test__MoERuntimeGrouping.cpp
         integration/backends/Test__MoERouterHiddenQ8.cpp
+        integration/backends/Test__MoEExpertQ8ScaleRange.cpp
         integration/backends/Test__MoERouterOwnedRows.cpp
+        integration/backends/Test__RouterHadamardQ8.cpp
+        integration/backends/Test__FixedHalfProjectionGroup.cpp
         integration/backends/Test__MoEProjectionPhases.cpp)
+    # Release owns performance executables only; attach device fixture sources
+    # only in configurations where the integration executable is admitted.
+    if(HAVE_CUDA AND NOT V2_PERF_TESTS_ONLY)
+        target_sources(v2_integration_moe_live_rows PRIVATE
+            integration/backends/Test__DeviceFP32Subnormal.cu)
+    endif()
+    if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
+        set_source_files_properties(integration/backends/Test__DeviceFP32Subnormal.hip
+            PROPERTIES LANGUAGE HIP)
+        target_sources(v2_integration_moe_live_rows PRIVATE
+            integration/backends/Test__DeviceFP32Subnormal.hip)
+    endif()
     # Event-timed all-format expert economy is intentionally outside preflight.
     add_executable(v2_perf_gpu_expert_pipeline
         performance/kernels/moe/Perf__GPUExpertPipeline.cpp)
@@ -21614,6 +22075,21 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 MPI_PROCS 1
                 NO_MODELS
                 TIMEOUT 120)
+            add_v2_test(V2_Integration_FP32SubnormalContract_${_live_rows_backend}
+                COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                    --gtest_filter=DeviceFP32SubnormalContract.${_live_rows_backend}
+                LABELS "V2;Integration;${_live_rows_backend};NumericalContract;GraphCapture;ByteExact;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+            add_v2_test(V2_Integration_Q8ExpertFiniteScaleContract_${_live_rows_backend}
+                COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                    --gtest_filter=MoEExpertQ8ScaleRange.${_live_rows_backend}
+                LABELS "V2;Integration;${_live_rows_backend};MoE;Quantization;ScaleRange;GraphCapture;ByteExact;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            add_v2_test(V2_Integration_Q8RouterFiniteScaleContract_${_live_rows_backend}
+                COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                    --gtest_filter=MoERouterHiddenQ8ScaleRange.${_live_rows_backend}
+                LABELS "V2;Integration;${_live_rows_backend};MoE;Quantization;ScaleRange;GraphCapture;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 60)
             add_v2_test(V2_Integration_MoERouterHiddenQ8_${_live_rows_backend}
                 COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                     --gtest_filter=Backends/MoERouterHiddenQ8.*/${_live_rows_backend}:MoERouterHiddenQ8Prefill.${_live_rows_backend}*
@@ -22407,6 +22883,22 @@ add_v2_test(V2_Unit_HeterogeneousLayers
     MPI_PROCS 1
 )
 
+# Full decode/GDN reservation must not become sharded-prefill gate work or
+# snapshot capacity. The focused gate is device-free and explicitly in preflight.
+add_executable(v2_test_attention_output_gate_live_geometry
+    unit/execution/Test__AttentionOutputGateLiveGeometry.cpp)
+target_link_libraries(v2_test_attention_output_gate_live_geometry
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_AttentionOutputGateLiveGeometry
+    COMMAND $<TARGET_FILE:v2_test_attention_output_gate_live_geometry>
+    LABELS "V2;Unit;Attention;LiveGeometry;Snapshot;Regression"
+    MPI_PROCS 1)
+add_v2_test(V2_Integration_AttentionOutputGateLiveGeometry
+    COMMAND $<TARGET_FILE:v2_test_attention_output_gate_live_geometry>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Attention;LiveGeometry;Snapshot;Regression"
+    MPI_PROCS 1
+    NO_MODELS)
+
 # Regression: AVX512 exp() polynomial bug in GatedRMSNormStage and AttentionOutputGateStage
 # The polynomial used 2^f Taylor coefficients but was fed f=x-n*ln2 instead of f=x*log2e-n,
 # causing 3-11% SiLU/sigmoid error that compounded across 24 GDN layers.
@@ -22601,6 +23093,23 @@ add_v2_test(V2_Unit_GDNMathematicalCorrectness
     LABELS "V2;Unit;GDNKernels;GDN;MathCorrectness"
     MPI_PROCS 1
 )
+set(V2_GDN_ADDITIVE_EPSILON_CPU_PREFLIGHT_TESTS)
+set(V2_GDN_ADDITIVE_EPSILON_ISAS SCALAR AVX2)
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    list(APPEND V2_GDN_ADDITIVE_EPSILON_ISAS AVX512)
+endif()
+foreach(V2_GDN_EPSILON_ISA IN LISTS V2_GDN_ADDITIVE_EPSILON_ISAS)
+    string(TOLOWER "${V2_GDN_EPSILON_ISA}" V2_GDN_EPSILON_RUNTIME_ISA)
+    add_v2_test(V2_Integration_GDNAdditiveEpsilon_CPU_${V2_GDN_EPSILON_ISA}
+        COMMAND $<TARGET_FILE:v2_test_gdn_mathematical_correctness>
+                --gtest_filter=Test__GDNMathematicalCorrectness.Recurrence_AdditiveEpsilonNearZero
+                --gtest_brief=1
+        LABELS "V2;Integration;CPU;${V2_GDN_EPSILON_ISA};GatedDeltaNet;MathCorrectness;NearZero;Regression"
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_GDN_EPSILON_RUNTIME_ISA}"
+        MPI_PROCS 1 NO_MODELS)
+    list(APPEND V2_GDN_ADDITIVE_EPSILON_CPU_PREFLIGHT_TESTS
+        V2_Integration_GDNAdditiveEpsilon_CPU_${V2_GDN_EPSILON_ISA})
+endforeach()
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_ShortConv
     COMMAND $<TARGET_FILE:v2_test_gdn_mathematical_correctness>
             --gtest_filter=Test__GDNMathematicalCorrectness.ShortConv_GroupedVerifierRowsMatchSerialDecodeAtQwen36ShapeRuntimeM
@@ -22638,6 +23147,13 @@ add_v2_test(V2_Integration_PhaseSplitDenseGDNResolverGeometry
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_PhaseSplitFAGateLiveGeometry
+    COMMAND $<TARGET_FILE:v2_test_qwen35_schema>
+        --gtest_filter=Qwen35GraphBuildTest.PhaseSplitFAGateUsesActualHeadsInsteadOfRetainedCapacity
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen35;Attention;LocalTP;LiveGeometry;Snapshot;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 
 # Test: Qwen35MoEGraph — MoE graph construction regressions
 add_executable(v2_test_qwen35moe_graph unit/models/qwen35moe/Test__Qwen35MoEGraph.cpp)
@@ -22657,6 +23173,12 @@ add_v2_test(V2_Unit_Qwen35MoEGraph
         --gtest_filter=-Test__Qwen35MoEGraph.ROCmPhaseSplitDecodeUsesCanonicalRouteSlotAllreduce
     LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;TensorParallel"
     MPI_PROCS 1
+)
+add_v2_test(V2_Integration_MirroredEmbeddingGraphPhase
+    COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
+        --gtest_filter=Test__Qwen35MoEGraph.DecodeMirroredEmbeddingSuppressesOnlyDecodeEmbeddingAllreduce
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Embedding;Graph;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
 )
 add_v2_test(V2_Integration_MoEPipelineStageRuntimeConstruction
     COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
@@ -22937,6 +23459,36 @@ add_v2_test(V2_Unit_CPUEmbeddingGroupedVerifier
     LABELS "V2;Unit;CPU;Kernels;Embedding;MTP;AllFormats;BatchInvariant"
     MPI_PROCS 1
 )
+# Original source values are independent of the optimized lookup implementation.
+add_v2_test(V2_Integration_EmbeddingSourceRepresentation
+    COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
+        --gtest_filter=Test__CPUEmbeddingGroupedVerifier.NativeLayoutRetainsEverySourceFormatAndRejectsInvalidGeometry
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Embedding;AllFormats;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_NativeEmbeddingSource_CPU
+    COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
+        --gtest_filter=Test__CPUEmbeddingGroupedVerifier.NativeQuantizedSourceValuesMatchIndependentRows:Test__CPUEmbeddingGroupedVerifier.NativeQ6KAndQ4KAdversarialScalesPreserveSourceValues
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Embedding;AllFormats;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_EmbeddingUploadStagingContract
+    COMMAND $<TARGET_FILE:v2_test_prepared_embedding_lifecycle>
+        --gtest_filter=PreparedEmbeddingUploadContract.RejectsMissingUnboundAndWrongDeviceBeforeAllocation
+    LABELS "V2;Integration;DeviceFree;Embedding;PinnedStaging;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_NativeEmbeddingPreparedBindings
+    COMMAND $<TARGET_FILE:v2_unit_prepared_weight_store>
+        --gtest_filter=Test__PreparedWeightStore.NativeEmbeddingRejectsForeignLayoutMetadata:Test__PreparedWeightStore.CountsUniquePreparedEmbeddingAllocationBytes
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Embedding;PreparedWeights;Ownership;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_NativeEmbeddingPreparedOwnership
+    COMMAND $<TARGET_FILE:v2_test_prepared_embedding_lifecycle>
+        --gtest_filter=Test__PreparedEmbeddingWeightsLifecycle.AllNativePreparedBytesPreserveOriginalSourceMetadata:Test__PreparedEmbeddingWeightsLifecycle.CPUEmbeddingSourceBytesIgnoreGPUStagingPolicy:Test__PreparedEmbeddingWeightsLifecycle.AdditionalEmbeddingClaimsAndReleasesItsExactOwnerLine
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Embedding;PreparedWeights;Ownership;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Embedding
     COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
             --gtest_filter=Test__CPUEmbeddingGroupedVerifier.AllWeightAndOutputFormatsM234MatchSerialDecodeBytes:Test__CPUEmbeddingGroupedVerifier.CanonicalQuantizedRegistryMatchesTensorAndDevicePackingContracts:Test__CPUEmbeddingGroupedVerifier.Q6KHighVocabularyRowIsByteIdenticalAtM1AndM2:Test__CPUEmbeddingGroupedVerifier.NestedSlicesMatchUnwrappedSourceBytes
@@ -22947,8 +23499,8 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Embedding
 
 # Test: VocabParallelEmbeddingSharding — Non-GPU logic for Megatron-style
 # vocab-parallel embedding sharding: WeightShardingConfig for token_embd.weight,
-# TensorParallelConfig vocab splits, WeightSlicer boundaries, EmbedQ8Repack
-# vocab-range overload, PreparedEmbeddingWeights metadata, schema TPMode.
+# TensorParallelConfig vocab splits, native source row geometry, prepared
+# embedding ownership metadata, and schema TPMode.
 add_executable(v2_test_vocab_parallel_embedding_sharding unit/loaders/Test__VocabParallelEmbeddingSharding.cpp)
 target_link_libraries(v2_test_vocab_parallel_embedding_sharding llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_vocab_parallel_embedding_sharding PRIVATE
@@ -23071,6 +23623,11 @@ add_v2_test(V2_Unit_WorkspaceMemoryEstimator
     LABELS "V2;Unit;Planning;WorkspaceMemoryEstimator;Workspace"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_FP16PrefillWorkspaceGeometryAdmission
+    COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
+        --gtest_filter=Test__WorkspaceMemoryEstimator.FP16PrefillAdmissionCoversEnumeratedCaptureGeometry
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Attention;Workspace;NativeFormat;Visibility;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_RetainedMTPAttentionWorkspaceAdmission
     COMMAND v2_test_workspace_memory_estimator
         --gtest_filter=Test__WorkspaceMemoryEstimator.RetainedMTPAttentionUsesReplicatedHeadGeometry
@@ -23112,6 +23669,11 @@ add_v2_test(V2_Unit_MemoryPlanner
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_FP16PrefillSchemaCodecAdmission
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.FP16PrefillSchemaAndCodecReachWorkspaceAdmission:Test__MemoryPlanner.AttentionOperandCodecClassificationIsStrict
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Attention;Workspace;NativeFormat;Visibility;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_MTPPlanningWeightAdmission
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=AutomaticOrchestrationPlanner.MissingMTPWeightsFailBeforeEvidencePreparation:OrchestrationCandidateAdmission.MissingMTPWeightsAreNotCapacityExhaustion
@@ -23856,6 +24418,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
     endif()
     if(HAVE_CUDA)
+        add_v2_test(V2_Integration_CUDA_Q8KSourceScaleRepack
+            COMMAND $<TARGET_FILE:v2_integration_vnni_unpack_kernels>
+                    --gtest_filter=*RoundTrip_Q8_K/CUDA
+            NO_MODELS
+            MPI_PROCS 1
+            LABELS "V2;Integration;GPU;CUDA;Q8_K;SourceScale;Repack"
+        )
         add_v2_test(V2_Integration_CUDAVnniUnpackKernels
             COMMAND $<TARGET_FILE:v2_integration_vnni_unpack_kernels>
                     --gtest_filter=*CUDA
@@ -23864,6 +24433,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
     endif()
     if(HAVE_ROCM)
+        add_v2_test(V2_Integration_ROCm_Q8KSourceScaleRepack
+            COMMAND $<TARGET_FILE:v2_integration_vnni_unpack_kernels>
+                    --gtest_filter=*RoundTrip_Q8_K/ROCm
+            NO_MODELS
+            MPI_PROCS 1
+            LABELS "V2;Integration;GPU;ROCm;Q8_K;SourceScale;Repack"
+        )
         add_v2_test(V2_Integration_ROCmVnniUnpackKernels
             COMMAND $<TARGET_FILE:v2_integration_vnni_unpack_kernels>
                     --gtest_filter=*ROCm
@@ -23948,6 +24524,17 @@ add_v2_test(V2_Integration_FPWeightPipeline
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    ${V2_Q8_FINITE_SCALE_CPU_PREFLIGHT_TESTS}
+    ${V2_GDN_ADDITIVE_EPSILON_CPU_PREFLIGHT_TESTS}
+    V2_Integration_EmbeddingUploadStagingContract
+    ${V2_EMBEDDING_READONLY_UPLOAD_PREFLIGHT_TESTS}
+    ${V2_EMBEDDING_STAGING_ORDER_PREFLIGHT_TESTS}
+    V2_Integration_Q8KSourceScale
+    V2_Integration_CPUResidualAddTailExtents
+    V2_Integration_CUDAResidualAddTailExtents
+    V2_Integration_ROCmResidualAddTailExtents
+    V2_Integration_FP16PrefillWorkspaceGeometryAdmission
+    V2_Integration_FP16PrefillSchemaCodecAdmission
     V2_Integration_MTPBoundedPrefixLifecycleEvidence
     V2_Integration_MTPBoundedSamplingPositionEvidence
     V2_Integration_NativeToolDecoderPublicDependency
@@ -23957,8 +24544,14 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixSparseCheckpointTierReuse
     V2_Integration_HTTPDriverLogContinuity
     V2_Integration_OpenCodeContextAdmission
+    V2_Integration_OpenCodeShutdownFlush
     V2_Integration_ServerResourcePhysicalIdentity
     V2_Integration_PrefixSharedArchiveEviction
+    V2_Integration_PrefixArchiveReharvestPresence
+    V2_Integration_PrefixCacheShutdown
+    V2_Integration_PrefixCacheShutdownMPI_2
+    V2_Integration_PrefixCacheShutdownMPI_4
+    V2_Integration_PrefixCacheShutdownMPI_8
     V2_Integration_PrefixArchiveIdempotentPublication
     V2_Integration_NativeVocabularyPrefixAdmission
     V2_Integration_ROCmDensePrefillOverlayAdmission
@@ -23976,7 +24569,14 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoECompactProductionPackets_CUDA
     V2_Integration_MoECompactProductionPackets_ROCm
     V2_Integration_MoERouterHiddenQ8_CUDA
+    ${V2_FP32_SUBNORMAL_PREFLIGHT_TESTS}
+    V2_Integration_FP32SubnormalContract_CUDA
+    V2_Integration_FP32SubnormalContract_ROCm
+    V2_Integration_Q8ExpertFiniteScaleContract_CUDA
+    V2_Integration_Q8ExpertFiniteScaleContract_ROCm
+    V2_Integration_Q8RouterFiniteScaleContract_CUDA
     V2_Integration_MoERouterHiddenQ8_ROCm
+    V2_Integration_Q8RouterFiniteScaleContract_ROCm
     V2_Integration_MoERouterLogits_ROCm
     V2_Integration_MoERouterOwnedRows_CUDA
     V2_Integration_MoERouterOwnedRows_ROCm
@@ -24002,6 +24602,20 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ExpertOverlayRetirementProgress_MPI
     V2_Integration_PhaseSplitDenseMemoryAdmission
     V2_Integration_PhaseSplitDenseGDNResolverGeometry
+    V2_Integration_PhaseSplitAttentionSnapshotGeometry
+    V2_Integration_PhaseSplitEmbeddingSnapshotGeometry
+    V2_Integration_EmbeddingSourceRepresentation
+    V2_Integration_NativeEmbeddingSource_CPU
+    V2_Integration_NativeEmbeddingPreparedOwnership
+    V2_Integration_NativeEmbeddingPreparedBindings
+    V2_Integration_MirroredEmbeddingGraphPhase
+    V2_Integration_ResidentMainConditionSnapshotPhase
+    V2_Integration_TPSnapshotReplicatedFiniteValues
+    V2_Integration_GraphSnapshotRowLayout
+    V2_Integration_FusedNormSnapshotPublication
+    V2_Integration_MoERoutingSnapshotSelection
+    V2_Integration_AttentionOutputGateLiveGeometry
+    V2_Integration_PhaseSplitFAGateLiveGeometry
     V2_Integration_ROCmCanonicalRouteSlotAllreduce
     V2_Integration_PlanningExecutionMeasurement_CPU
     V2_Integration_RankOrdinaryDeviceGeneration
@@ -24144,18 +24758,21 @@ if(HAVE_CUDA OR HAVE_ROCM)
 endif()
 if(HAVE_CUDA)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CUDA_Q8KSourceScaleRepack
     ${V2_CUDA_DENSE_PREFILL_INSTALLED_TESTS}
     V2_Integration_CUDAWorkspaceMemoryEstimator
     V2_Integration_PlanningExecutionMeasurement_CUDA
     V2_Integration_PlanningMPIExpertSample_CUDA
     V2_Integration_GPUPreparedWeightBinding_CUDA
     V2_Integration_GroupedVerifierRows_CUDA_Embedding
+    V2_Integration_CUDAEmbeddingNativeSourcePreservation
     V2_Integration_CUDA_NCCLRetainedParentFragmentReentry
     V2_Integration_CUDA_NCCLNativeWhileRequestReplay
     V2_Integration_CUDA_PipelineGenerationCommandArrival
     V2_Integration_CUDA_TPCanonicalRankOrderGraphCapture
     V2_Integration_GDNLinkedStateReassembly_CUDA
     V2_Integration_GDNPrefillDecodeEquivalence_CUDA
+    V2_Integration_GDNAdditiveEpsilon_CUDA
     V2_Integration_GDNInputTileLifecycle_CUDA
     V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
     V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
@@ -24177,7 +24794,12 @@ if(HAVE_CUDA)
     V2_Integration_CUDACanonicalKpartFoldAllCodebooks
     V2_Integration_CUDAIQ4PackedLookup
     V2_Integration_CUDAActivationBlockSums
-    V2_Integration_CUDAFlashAttentionContextParallelByteExact
+    V2_Integration_CUDAFlashAttentionContextParallelArithmetic
+    V2_Integration_CUDATensorPrefillPartitionGeometry
+    V2_Integration_CUDAFlashAttentionStoragePolicy
+    V2_Integration_CUDAFlashAttentionFiniteMask
+    V2_Integration_CUDASafeguardedFP16TensorPrefill
+    V2_Integration_CUDATensorPrefillAutomaticLargeBucket
     V2_Integration_CUDAFlashDecodeEmptyPrefix
     V2_Integration_GroupedVerifierRows_CUDA_Attention
     V2_Integration_CUDARequestBatchResidentKVAttention
@@ -24200,6 +24822,7 @@ if(HAVE_CUDA)
     V2_Integration_DeviceGenerationSelector_CUDA
     V2_Integration_MTPVerifierPreparation_CUDA
     V2_Integration_GPUGraphCaptureExecution_CUDA
+    V2_Integration_CUDARoutingSnapshotOutputFilter
     V2_Integration_CUDARequestBatchUnequalKVContinuation
     V2_Integration_CUDAAttentionKeyCachePartitions
     V2_Integration_PrefillGraphCacheExecution_CUDA
@@ -24208,14 +24831,17 @@ if(HAVE_CUDA)
 endif()
 if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_ROCm_Q8KSourceScaleRepack
     ${V2_ROCM_DENSE_PREFILL_INSTALLED_TESTS}
     V2_Integration_PlanningExecutionMeasurement_ROCm
     V2_Integration_PlanningMPIExpertSample_ROCm
     V2_Integration_GPUPreparedWeightBinding_ROCm
     V2_Integration_GroupedVerifierRows_ROCm_Embedding
+    V2_Integration_ROCmEmbeddingNativeSourcePreservation
     V2_Integration_ROCm_DeviceCountedVerifierRows
     V2_Integration_GroupedVerifierRows_ROCm_AllFormats
     V2_Integration_ROCmActivationQuantization
+    V2_Integration_Q8FiniteScaleContract_ROCm
     # Ordinary cooperative/streaming prefill must retain serial-M1 arithmetic
     # across tile edges, ragged K partitions, and every source codebook too.
     V2_Integration_ROCm_NativeVNNI_PrefillBucketMInvariantAllFormats
@@ -24224,11 +24850,14 @@ if(HAVE_ROCM)
     V2_Integration_ROCm_TPCapturedEpochTransactionGraphCapture
     V2_Integration_ROCm_MappedLinearMemcpyParentGraphCapture
     V2_Integration_ROCmFlashAttentionContextParallelByteExact
+    V2_Integration_ROCmFlashAttentionWideNativeRing
+    V2_Integration_ROCmRegisterScoreNativeLifecycle
     V2_Integration_GroupedVerifierRows_ROCm_Attention
     V2_Integration_ROCmRequestBatchResidentKVAttention
     V2_Integration_ROCmFlashDecodeDimensionAndRingCursor
     V2_Integration_GDNLinkedStateReassembly_ROCm
     V2_Integration_GDNPrefillDecodeEquivalence_ROCm
+    V2_Integration_GDNAdditiveEpsilon_ROCm
     V2_Integration_GPUDeviceContext_ROCm
     V2_Integration_RCCLRuntimeGenerationRetirement
     ${V2_ROCM_EXPERT_TIER_WEIGHT_PREFLIGHT_TESTS}
@@ -24253,6 +24882,7 @@ if(HAVE_ROCM)
     V2_Integration_HIPMultiStreamGraphReplayLifetime
     V2_Integration_MTPVerifierPreparation_ROCm
     V2_Integration_GPUGraphCaptureExecution_ROCm
+    V2_Integration_ROCmRoutingSnapshotOutputFilter
     V2_Integration_ROCmRequestBatchUnequalKVContinuation
     V2_Integration_ROCmAttentionKeyCachePartitions
     V2_Integration_PrefillGraphCacheExecution_ROCm
@@ -24275,6 +24905,630 @@ if(HAVE_CUDA AND HAVE_ROCM)
         V2_Integration_HardwareInventory_CPUNamedDomain
         ${V2_DEVICE_CONTROLLER_FABRIC_PREFLIGHT_TEST})
 endif()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_ROCmFlashAttentionPrefillResidency
+    V2_Integration_ROCmRegisterScoreAdmission
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PrefixCacheAttentionArithmeticGeneration
+    V2_Integration_PrefixCacheNativeEmbeddingArithmeticGeneration
+    V2_Integration_PrefixCacheGDNArithmeticGeneration
+    V2_Integration_PrefixCacheQ8ScaleArithmeticGeneration)
+# Original Q8_K geometry and source scales must survive loading and planning.
+add_v2_test(V2_Integration_Q8KSourceLoaderValues
+    COMMAND $<TARGET_FILE:v2_test_model_loader>
+        --gtest_filter=Test__ModelLoader.LoadQ8_KTensor:Test__ModelLoader.LoadQ8_KTensorWithFactory
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Loaders;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_Q8KSourceByteGeometry
+    COMMAND $<TARGET_FILE:v2_test_weight_memory_estimator>
+        --gtest_filter=Test__WeightMemoryEstimator.NativeBytesPerWeight_AllSupportedFormats:Test__WeightMemoryEstimator.QuantizedEmbeddingUsesOriginalNativeBytes
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Planning;Embedding;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_Q8KSourceLoaderValues
+    V2_Integration_Q8KSourceByteGeometry)
+# Q6 metadata changed meaning while retaining its exact physical footprint.
+add_v2_test(V2_Integration_Q6PackedArchiveGeneration
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.Q6SourceFactorsRoundTripAndRejectVersion3
+    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;Serialization;Regression"
+    MPI_PROCS 1 NO_MODELS)
+add_v2_test(V2_Integration_PrefixCacheQ6ScaleArithmeticGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.OriginalQ6ScaleRejectsV13AndRestartsStably
+    LABELS "V2;Integration;DeviceFree;CPU;PrefixCache;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CPUQ6SourceScalePreservation
+    V2_Integration_Q6PackedArchiveGeneration
+    V2_Integration_PrefixCacheQ6ScaleArithmeticGeneration)
+if(TARGET v2_integration_cuda_gemm_parity)
+    add_v2_test(V2_Integration_CUDAQ6SourceScalePreservation
+        COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+            --gtest_filter=Test__CUDAGemmParity.Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExact
+        LABELS "V2;Integration;CUDA;NativeVNNI;Q6_K;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAQ6SourceScalePreservation)
+endif()
+if(TARGET v2_integration_rocm_vnni_repack_kernels)
+    add_v2_test(V2_Integration_ROCmQ6SourceScaleRepack
+        COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
+            --gtest_filter=Test__VnniRepackKernels.Q6_K_SourceScaleFactorsPreserveOriginalWords
+        LABELS "V2;Integration;ROCm;NativeVNNI;Q6_K;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS)
+    add_v2_test(V2_Integration_ROCmQ6SourceScaleGEMV
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
+            --gtest_filter=NativeVNNIGEMVTest.Q6_K_SourceScaleFactorsMatchOriginalSourceEquation
+        LABELS "V2;Integration;ROCm;NativeVNNI;Q6_K;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmQ6SourceScaleRepack V2_Integration_ROCmQ6SourceScaleGEMV)
+endif()
+
+# Explicit setup/engine identity proof: a physical format is not an arithmetic mode.
+add_v2_test(V2_Integration_GDNFloatingOperandPlanningIdentity
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningModelSample.GDNOperandArithmeticIsSealedInSampleIdentity:PlanningWeightServiceModel.GDNHalfOperandsKeepSeparateServiceFamilies:Test__WorkspaceMemoryEstimator.HalfAlphaBetaAdmitsOnlyScopedOperandWorkspace
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GDN;FP16;Planning;PreparedWeights;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GDNFloatingOperandPlanningIdentity)
+
+if(TARGET v2_integration_cuda_gemm_parity)
+    add_v2_test(V2_Integration_CUDAGDNPhysicalHalfOperands
+        COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+            --gtest_filter=Test__CUDAGemmParity.FP16OperandsAccumulateFP32Captured
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GDN;FP16;GemmEx;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    add_v2_test(V2_Integration_CUDAGDNFP32Pedantic
+        COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+            --gtest_filter=Test__CUDAGemmParity.FP32OperandsPedanticCaptured
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GDN;FP32;GemmEx;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CUDAGDNPhysicalHalfOperands V2_Integration_CUDAGDNFP32Pedantic)
+endif()
+if(TARGET v2_integration_rocm_quantised_gemm_small_m)
+    add_v2_test(V2_Integration_ROCmGDNPhysicalHalfOperands
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+            --gtest_filter=Test__ROCmQuantisedGemmSmallM.GDNPhysicalHalfOperandsAccumulateIntoFP32Captured
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GDN;FP16;GemmEx;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGDNPhysicalHalfOperands)
+    add_v2_test(V2_Integration_HIPGraphHostAndModuleKernelInventory
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+            --gtest_filter=Test__ROCmQuantisedGemmSmallM.GraphInventoryAcceptsCapturedHostAndModuleKernels
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;HIP;GraphCapture;KernelInventory;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPGraphHostAndModuleKernelInventory)
+
+endif()
+
+# Independent IQ4_XS source equations and unchanged IQ4_NL compatibility.
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_iq4xs_source_equations integration/kernels/Test__IQ4XSSourceEquations.cpp)
+    target_link_libraries(v2_integration_iq4xs_source_equations llaminar2_core GTest::gtest_main)
+    target_include_directories(v2_integration_iq4xs_source_equations PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+add_executable(v2_unit_iq4xs_original_equation unit/kernels/Test__IQ4XSOriginalEquation.cpp)
+target_link_libraries(v2_unit_iq4xs_original_equation llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_IQ4XSOriginalEquation
+    COMMAND $<TARGET_FILE:v2_unit_iq4xs_original_equation>
+    LABELS "V2;Unit;DeviceFree;CPU;NativeVNNI;IQ4_XS;OriginalEquation;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_IQ4XSOriginalEquation
+    COMMAND $<TARGET_FILE:v2_unit_iq4xs_original_equation>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ4_XS;OriginalEquation;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_IQ4XSOriginalEquation)
+foreach(V2_IQ4XS_ISA AVX2 AVX512)
+    if(V2_IQ4XS_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${V2_IQ4XS_ISA}" V2_IQ4XS_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPUIQ4XSFusedMoEOriginalEquation_${V2_IQ4XS_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
+            --gtest_filter=CPUNativeVNNIVerifierWorkers.IQ4XSOriginalSourceEquationInFusedExpertTransaction
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;${V2_IQ4XS_ISA};NativeVNNI;MoE;IQ4_XS;OriginalEquation;Regression"
+        MPI_PROCS 1 NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_IQ4XS_RUNTIME_ISA}")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUIQ4XSFusedMoEOriginalEquation_${V2_IQ4XS_ISA})
+endforeach()
+if(TARGET v2_integration_cuda_gemm_parity)
+    add_v2_test(V2_Integration_CUDAIQ4XSOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
+            --gtest_filter=IQ4XSSourceCUDA.DenseOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ4_XS;OriginalEquation;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ4XSOriginalEquation)
+endif()
+if(TARGET v2_integration_rocm_native_vnni_gemv)
+    add_v2_test(V2_Integration_ROCmIQ4XSOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
+            --gtest_filter=IQ4XSSourceROCm.DenseOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ4_XS;OriginalEquation;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ4XSOriginalEquation)
+endif()
+if(TARGET v2_integration_cuda_moe_kernel)
+    add_v2_test(V2_Integration_CUDAIQ4XSFusedMoEOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
+            --gtest_filter=IQ4XSSourceCUDA.FusedOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;IQ4_XS;OriginalEquation;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ4XSFusedMoEOriginalEquation)
+    add_v2_test(V2_Integration_CUDAMixedIQ4SourceEquations
+        COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
+            --gtest_filter=IQ4XSSourceCUDA.MixedSourcesCaptured
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;IQ4_XS;IQ4_NL;OriginalEquation;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAMixedIQ4SourceEquations)
+endif()
+if(TARGET v2_integration_rocm_moe_kernel)
+    add_v2_test(V2_Integration_ROCmIQ4XSFusedMoEOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
+            --gtest_filter=IQ4XSSourceROCm.FusedOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;IQ4_XS;OriginalEquation;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ4XSFusedMoEOriginalEquation)
+    add_v2_test(V2_Integration_ROCmMixedIQ4SourceEquations
+        COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
+            --gtest_filter=IQ4XSSourceROCm.MixedSourcesCaptured
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;IQ4_XS;IQ4_NL;OriginalEquation;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMixedIQ4SourceEquations)
+endif()
+
+# Original IQ2_S source equations across scalar, SIMD and captured GPU arithmetic.
+add_executable(v2_unit_iq2s_original_equation unit/kernels/Test__IQ2SOriginalEquation.cpp)
+target_link_libraries(v2_unit_iq2s_original_equation llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_IQ2SOriginalEquation
+    COMMAND $<TARGET_FILE:v2_unit_iq2s_original_equation>
+    LABELS "V2;Unit;DeviceFree;CPU;NativeVNNI;IQ2_S;SourceFactors;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_IQ2SOriginalEquation
+    COMMAND $<TARGET_FILE:v2_unit_iq2s_original_equation> --gtest_filter=IQ2SOriginalEquation.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ2_S;SourceFactors;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_IQ2SOriginalEquation)
+if(TARGET v2_integration_cuda_gemm_parity)
+    add_v2_test(V2_Integration_CUDAIQ2SOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+            --gtest_filter=Test__CUDAGemmParity.IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreExact
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ2_S;SourceFactors;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ2SOriginalEquation)
+endif()
+if(TARGET v2_integration_rocm_native_vnni_gemv)
+    add_v2_test(V2_Integration_ROCmIQ2SOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
+            --gtest_filter=NativeVNNIGEMVTest.IQ2_S_SourceFactorsMatchCapturedOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ2_S;SourceFactors;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ2SOriginalEquation)
+endif()
+if(TARGET v2_integration_rocm_vnni_repack_kernels)
+    add_v2_test(V2_Integration_ROCmIQ2SOriginalMetadata
+        COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
+            --gtest_filter=Test__VnniRepackKernels.IQ2_S_SourceFactorsAndPayloadPreserveOffsetsAndTails
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ2_S;SourceFactors;Repack;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ2SOriginalMetadata)
+endif()
+
+# Existing repack parity must retain original IQ4_XS source words exactly.
+if(TARGET v2_integration_rocm_vnni_repack_kernels)
+    add_v2_test(V2_Integration_ROCmIQ4XSSourceTupleRepack
+        COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
+            --gtest_filter=Test__VnniRepackKernels.IQ4_XS_Parity
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ4_XS;SourceFactors;Repack;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ4XSSourceTupleRepack)
+endif()
+
+# Explicit focused inventory membership, in addition to registration labels.
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CPUIQ2SFusedMoEOriginalEquation_AVX2)
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CPUIQ2SFusedMoEOriginalEquation_AVX512)
+endif()
+if(TARGET v2_integration_cuda_moe_kernel)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CUDAIQ2SFusedMoEOriginalEquation)
+endif()
+if(TARGET v2_integration_rocm_moe_kernel)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmIQ2SFusedMoEOriginalEquation)
+endif()
+
+# IQ2_S metadata retains source factors while preserving the physical layout.
+add_v2_test(V2_Integration_IQ2SPackedArchiveGeneration
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.IQ2SRawCoefficientWordsPreserveAllBytes:Test__PackedWeightsSerialization.IQ2SSourceFactorsRoundTripAndRejectVersion4:Test__PackedWeightsSerialization.IQ2SGpuWireSourceFactorsRoundTripAndRejectVersion1
+    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;IQ2_S;Serialization;Regression"
+    MPI_PROCS 1 NO_MODELS)
+add_v2_test(V2_Integration_PrefixCacheIQ2SScaleArithmeticGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.OriginalIQ2SScaleRejectsV14AndRestartsStably
+    LABELS "V2;Integration;DeviceFree;CPU;IQ2_S;PrefixCache;Regression"
+    MPI_PROCS 1 NO_MODELS)
+add_v2_test(V2_Integration_IQ2SMetadataProtocol
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_grouped_oracle_extent.py
+        NativeVNNISecondaryMetadataTypeTest
+    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ2_S;Metadata;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_IQ2SPackedArchiveGeneration
+    V2_Integration_PrefixCacheIQ2SScaleArithmeticGeneration
+    V2_Integration_IQ2SMetadataProtocol)
+
+# Borrowed source matrices retain each row's final block during GPU upload.
+add_v2_test(V2_Integration_NativeQuantizedRowViewExtent
+    COMMAND $<TARGET_FILE:v2_test_tensor_byte_size>
+        --gtest_filter=NativeTensorExtent.RowPaddedAllFormatsNestedViewsKeepIndependentSourceStrides:NativeTensorExtent.Q4OwnedAndMappedRowStorageRetainsAuthoritativeBytes:NativeTensorExtent.ExplicitMatrixExtentIsCheckedAndDoesNotInferOtherAxes
+    LABELS "V2;Integration;DeviceFree;CPU;TensorOperations;ByteSize;AllFormats;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantizedRowViewExtent)
+
+# IQ4_XS source-tuple mapping, movement, serialization and arithmetic-generation fences.
+add_v2_test(V2_Integration_IQ4XSTupleFormatContract
+    COMMAND $<TARGET_FILE:v2_test_native_vnni_format_info>
+        --gtest_filter=Test__NativeVnniFormatInfo.IQ4XSSourceTupleMappingAndCapacityAreExact:Test__NativeVnniFormatInfo.PackedRegionSizingMatchesCanonicalMetadata:Test__NativeVnniFormatInfo.MigrationStableAndReusableFormatsCoverEveryCodebook:Test__NativeVnniFormatInfo.RuntimeCaptureEnvelopeCoversEveryTierRepresentation
+    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;IQ4_XS;Metadata;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+add_v2_test(V2_Integration_IQ4XSTupleTierRoundTrip
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.IQ4XSTupleRoundTripAndPhysicalLayoutAreExact:ExpertTierWeightStream.IQ4XSExplicitExpandedMetadataRemainsAccepted
+    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;IQ4_XS;Movement;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+add_v2_test(V2_Integration_IQ4XSTupleArchiveGeneration
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.IQ4XSSourceTupleRoundTripsAndRejectsVersion5:Test__PackedWeightsSerialization.IQ4XSGpuWireTupleRejectsVersion2AndSourceSubstitution
+    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;IQ4_XS;Serialization;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+add_v2_test(V2_Integration_PrefixCacheIQ4XSScaleArithmeticGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.OriginalIQ4XSScaleRejectsV15AndRestartsStably
+    LABELS "V2;Integration;DeviceFree;CPU;IQ4_XS;PrefixCache;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_IQ4XSTupleFormatContract
+    V2_Integration_IQ4XSTupleTierRoundTrip
+    V2_Integration_IQ4XSTupleArchiveGeneration
+    V2_Integration_PrefixCacheIQ4XSScaleArithmeticGeneration)
+
+add_v2_test(V2_Integration_IQ4XSTupleMetadataProtocol
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_grouped_oracle_extent.py
+        NativeVNNISecondaryMetadataTypeTest
+    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ4_XS;Metadata;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+add_v2_test(V2_Integration_IQ4XSTupleDispatchIdentity
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_common_dispatch_policy.py
+        NativeVNNICommonDispatchPolicyTest.test_iq4xs_tuple_physical_identity_is_not_iq4nl_alias
+    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ4_XS;Dispatch;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_IQ4XSTupleMetadataProtocol
+    V2_Integration_IQ4XSTupleDispatchIdentity)
+if(TARGET v2_integration_iq4xs_source_equations AND HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDA_IQ4XSSourceTupleDirectRowpar
+        COMMAND $<TARGET_FILE:v2_integration_iq4xs_source_equations>
+            --gtest_filter=IQ4XSSourceCUDA.DirectAndRowparVerifierCaptured
+        LABELS "V2;Integration;CUDA;NativeVNNI;IQ4_XS;SourceEquation;Capture;Regression"
+        TIMEOUT 120 NO_MODELS MPI_PROCS 1)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_IQ4XSSourceTupleDirectRowpar)
+endif()
+
+# IQ4_XS physical24 must participate in real transfer descriptor sizing.
+add_v2_test(V2_Integration_IQ4XSTupleTransferDescriptorCapacity
+    COMMAND $<TARGET_FILE:v2_test_moe_rebalance_controller>
+        --gtest_filter=DeviceMoETransferFormats.IQ4XSSourceTupleRetainsSecondaryCapacityAndIdentity
+    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;MoE;IQ4_XS;Movement;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_IQ4XSTupleTransferDescriptorCapacity)
+
+# Source coefficient planes are physical capacity even for symmetric arithmetic.
+add_v2_test(V2_Integration_IQ3STupleTransferDescriptorCapacity
+    COMMAND $<TARGET_FILE:v2_test_moe_rebalance_controller>
+        --gtest_filter=DeviceMoETransferFormats.IQ3SSourceTupleRetainsSecondaryCapacityAndIdentity
+    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;MoE;IQ3_S;Movement;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+add_v2_test(V2_Integration_GPUPreparedWeightCoefficientPlaneAdmission
+    COMMAND $<TARGET_FILE:v2_test_kernel_factory>
+        --gtest_filter=GPUPreparedWeightBinding.RejectsMissingSourceCoefficientPlane
+    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;Kernels;NativeVNNI;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_IQ3STupleTransferDescriptorCapacity
+    V2_Integration_GPUPreparedWeightCoefficientPlaneAdmission)
+
+# Public FP32 storage and internal operand precision are independent facts.
+add_v2_test(V2_Integration_PlanningProjectionOperandPolicyProvenance_CPU
+    COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
+        --gtest_filter=PlanningExecutionMeasurementIntegration.CPU_ProjectionOperandPolicyProvenance
+    LABELS "V2;Integration;CPU;Planning;GDN;FloatingPoint;Regression"
+    TIMEOUT 120 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PlanningProjectionOperandPolicyProvenance_CPU)
+
+# Source4 schedules remain measured for both physical IQ4 representations.
+add_v2_test(V2_Integration_CUDAIQ4GroupedImmaSourcePolicyTotality
+    COMMAND $<TARGET_FILE:v2_test_deterministic_mode>
+        --gtest_filter=Test__DeterministicMode.CudaMoEGroupedImmaPolicyIsMTotal
+    LABELS "V2;Integration;DeviceFree;CUDA;MoE;IQ4_XS;Dispatch;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CUDAIQ4GroupedImmaSourcePolicyTotality)
+
+# Original-source CPU witnesses also compile before the representation patch.
+add_executable(v2_unit_iq3s_original_equation unit/kernels/Test__IQ3SOriginalEquation.cpp)
+target_link_libraries(v2_unit_iq3s_original_equation llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_IQ3SOriginalEquation COMMAND $<TARGET_FILE:v2_unit_iq3s_original_equation>
+    LABELS "V2;Unit;DeviceFree;CPU;NativeVNNI;IQ3_S;OriginalEquation;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_CPUIQ3SOriginalEquation COMMAND $<TARGET_FILE:v2_unit_iq3s_original_equation>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ3_S;OriginalEquation;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUIQ3SOriginalEquation)
+foreach(V2_IQ3S_ISA AVX2 AVX512)
+    if(V2_IQ3S_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${V2_IQ3S_ISA}" V2_IQ3S_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPUIQ3SFusedMoEOriginalEquation_${V2_IQ3S_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
+            --gtest_filter=CPUNativeVNNIVerifierWorkers.IQ3SOriginalSourceEquationInFusedExpertTransaction
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;${V2_IQ3S_ISA};NativeVNNI;MoE;IQ3_S;OriginalEquation;Regression"
+        MPI_PROCS 1 NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_IQ3S_RUNTIME_ISA}")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUIQ3SFusedMoEOriginalEquation_${V2_IQ3S_ISA})
+endforeach()
+# IQ3_S original factor preservation: metadata/ISA plus actual captured consumers.
+add_executable(v2_unit_iq3s_source_scale unit/kernels/Test__IQ3SSourceScale.cpp)
+target_link_libraries(v2_unit_iq3s_source_scale llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_IQ3SSourceScale COMMAND $<TARGET_FILE:v2_unit_iq3s_source_scale>
+    LABELS "V2;Unit;DeviceFree;CPU;NativeVNNI;IQ3_S;SourceFactors;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_CPUIQ3SSourceScale COMMAND $<TARGET_FILE:v2_unit_iq3s_source_scale>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ3_S;SourceFactors;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUIQ3SSourceScale)
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_iq3s_source_equations integration/kernels/Test__IQ3SSourceEquations.cpp)
+    target_link_libraries(v2_integration_iq3s_source_equations llaminar2_core GTest::gtest_main)
+    target_include_directories(v2_integration_iq3s_source_equations PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDAIQ3SOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceCUDA.DenseOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SOriginalEquation)
+    add_v2_test(V2_Integration_CUDAIQ3SFusedMoEOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceCUDA.FusedOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SFusedMoEOriginalEquation)
+    add_v2_test(V2_Integration_CUDAIQ3SGroupedPrefillOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceCUDA.GroupedPrefillOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SGroupedPrefillOriginalEquation)
+    add_v2_test(V2_Integration_CUDAIQ3SSourceScaleTierRoundTrip
+        COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels> --gtest_filter=CUDAExpertTierWeightKernelsTest.IQ3SSourceTupleAllGridsAndSignsRoundTripCaptured
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Tier;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SSourceScaleTierRoundTrip)
+    add_v2_test(V2_Integration_CUDAIQ3SSourceScaleColdTierSetup
+        COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels> --gtest_filter=CUDAIQ3SColdTierSetup.CPUOriginPromotionPreservesSourceWithoutWarmup
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;IQ3_S;SourceFactors;Tier;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAIQ3SSourceScaleColdTierSetup)
+endif()
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmIQ3SOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceROCm.DenseOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SOriginalEquation)
+    add_v2_test(V2_Integration_ROCmIQ3SFusedMoEOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceROCm.FusedOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SFusedMoEOriginalEquation)
+    add_v2_test(V2_Integration_ROCmIQ3SGroupedPrefillOriginalEquation
+        COMMAND $<TARGET_FILE:v2_integration_iq3s_source_equations> --gtest_filter=IQ3SSourceROCm.GroupedPrefillOriginalEquation
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SGroupedPrefillOriginalEquation)
+    add_v2_test(V2_Integration_ROCmIQ3SSourceScaleTierRoundTrip
+        COMMAND $<TARGET_FILE:v2_integration_rocm_expert_tier_weight_kernels> --gtest_filter=ROCmExpertTierWeightKernelsTest.IQ3SSourceTupleAllGridsAndSignsRoundTripCaptured
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Tier;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SSourceScaleTierRoundTrip)
+    add_v2_test(V2_Integration_ROCmIQ3SSourceScaleColdTierSetup
+        COMMAND $<TARGET_FILE:v2_integration_rocm_expert_tier_weight_kernels> --gtest_filter=ROCmIQ3SColdTierSetup.CPUOriginPromotionPreservesSourceWithoutWarmup
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Tier;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SSourceScaleColdTierSetup)
+endif()
+if(TARGET v2_integration_rocm_vnni_repack_kernels)
+    add_v2_test(V2_Integration_ROCmIQ3SSourceScaleRepack
+        COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
+            --gtest_filter=Test__VnniRepackKernels.IQ3_S_SourceFactorsAndPayloadPreserveOffsetsAndTails
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ3_S;SourceFactors;Repack;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ3SSourceScaleRepack)
+endif()
+
+# The IQ3 arithmetic generation has its own explicit focused production gate.
+add_v2_test(V2_Integration_PrefixCacheIQ3SScaleArithmeticGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.OriginalIQ3SScaleRejectsV16AndRestartsStably
+    LABELS "V2;Integration;DeviceFree;CPU;IQ3_S;PrefixCache;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PrefixCacheIQ3SScaleArithmeticGeneration)
+
+# Explicit CUDA Q8-prefill regression: preparation, publication and compact ownership.
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDARouterQ8Prefill
+        COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+            --gtest_filter=MoERouterHiddenQ8Prefill.CUDA*:MoERouterOwnedRows.CUDA:MoERouterOwnedRows.CUDAHadamard:RouterHadamardQ8.CUDATensorCorePrefill
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Q8;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK cuda_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDARouterQ8Prefill)
+endif()
+
+# Explicit half-operand policy, identity, and verifier lifecycle regressions.
+add_v2_test(V2_Integration_MoERouterPrecisionPolicy
+    COMMAND $<TARGET_FILE:v2_unit_weight_plan> --gtest_filter=Test__MoERouterArithmetic.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;FP16;PreparedWeights;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ProjectionPrecisionPreparedIdentity
+    COMMAND $<TARGET_FILE:v2_unit_prepared_weight_store>
+        --gtest_filter=Test__PreparedWeightStore.AdoptionRejectsDifferentProjectionPrecision:Test__PreparedWeightStore.RegistrationRejectsRealKernelPrecisionMismatchBeforePublication
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;FP16;PreparedWeights;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_RouterPrecisionPlanningIdentity
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningModelSample.RouterOperandArithmeticIsSealedInSampleIdentity
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;FP16;Planning;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_PrefixCacheProjectionPrecisionIdentity
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.ProjectionArithmetic*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;FP16;PrefixCache;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_VerifierArithmeticScope
+    COMMAND $<TARGET_FILE:v2_test_mtp_verifier_policy>
+        --gtest_filter=Test__MTPVerifierPolicy.VerifierArithmeticScope*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;FP16;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ProjectionPrecisionExplicitSelection
+    COMMAND $<TARGET_FILE:v2_test_deterministic_mode>
+        --gtest_filter=Test__DeterministicMode.ProjectionArithmeticDefaultsAndExplicitOverrides
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;FP16;Configuration;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+# ROOT merge after the canonical preflight list definition and before its final validation loop.
+if(TARGET v2_integration_cuda_gemm_parity)
+    add_v2_test(V2_Integration_CUDAGDNHalfVerifierRows
+        COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+            --gtest_filter=Test__CUDAGemmParity.FP16OperandsVerifierLiveRowsAndFixedColumnsCaptured
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GDN;FP16;MTP;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAGDNHalfVerifierRows)
+endif()
+if(TARGET v2_integration_cuda_moe_kernel)
+    add_v2_test(V2_Integration_CUDARouterPhysicalHalf
+        COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.FP16RouterOperandsSerialGroupedAndLiveCaptured
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;FP16;Router;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDARouterPhysicalHalf)
+endif()
+# Existing explicit V2_Integration_MoERouterOwnedRows_CUDA/ROCm registrations
+# on v2_integration_moe_live_rows now include actual-half and immutable-source proof.
+
+
+if(TARGET v2_integration_rocm_quantised_gemm_small_m)
+    add_v2_test(V2_Integration_ROCmGDNHalfVerifierRows
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+            --gtest_filter=Test__ROCmQuantisedGemmSmallM.GDNHalfVerifierLiveRowsAndFixedColumnsMatchSerialCaptured --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;FP16;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGDNHalfVerifierRows)
+endif()
+
+if(TARGET v2_integration_rocm_moe_kernel)
+    add_v2_test(V2_Integration_ROCmRouterHalfOperands
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.FP16RouterOperandsExactSourceAndLiveRowsCaptured:Test__ROCmMoEKernel.DecodeRouteSelectPreparedHalfOperandsMatchesFP32TopK:Test__ROCmMoEKernel.PreparedHalfRouterCapturesWithoutEagerWarmup --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;FP16;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRouterHalfOperands)
+endif()
+
+# Compact physical-half projection preserves the original FP32 tree.
+if(TARGET v2_integration_rocm_quantised_gemm_small_m)
+    add_v2_test(V2_Integration_ROCmHalfProjectionPackedReduction
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+            --gtest_filter=Test__ROCmQuantisedGemmSmallM.GDNHalfPackedProjectionFixedTreeCaptured:Test__ROCmQuantisedGemmSmallM.FloatingProjectionAllFormatsRuntimeMMatchSerialDecodeStrict:Test__ROCmQuantisedGemmSmallM.FloatingSwiGLUDownAllFormatsRuntimeMMatchSerialDecodeStrict
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;FP16;BF16;FP32;MTP;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmHalfProjectionPackedReduction)
+endif()
+
+
+# Short half projections certify ragged launch economy independently of model timing.
+add_v2_test(V2_Integration_ShortHalfProjectionBindings
+    COMMAND $<TARGET_FILE:v2_test_mtp_verifier_policy> --gtest_filter=Test__MTPVerifierPolicy.ShortHalfProjection*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GDN;FP16;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ShortHalfProjectionBindings)
+foreach(V2_HALF_BACKEND CUDA ROCm)
+    if((V2_HALF_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR (V2_HALF_BACKEND STREQUAL "ROCm" AND HAVE_ROCM))
+        add_v2_test(V2_Integration_ShortHalfProjectionGroup_${V2_HALF_BACKEND}
+            COMMAND $<TARGET_FILE:v2_integration_moe_live_rows> --gtest_filter=FixedHalfProjectionGroup.${V2_HALF_BACKEND} --gtest_brief=1
+            LABELS "V2;Integration;ProductionTestPreflight;${V2_HALF_BACKEND};GDN;FP16;MTP;Capture;ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ShortHalfProjectionGroup_${V2_HALF_BACKEND})
+    endif()
+endforeach()
+
+# First-quantization router rotation keeps the expert publication in original coordinates.
+foreach(V2_ROUTER_BACKEND CUDA ROCm)
+    if((V2_ROUTER_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR (V2_ROUTER_BACKEND STREQUAL "ROCm" AND HAVE_ROCM))
+        add_v2_test(V2_Integration_RouterHadamard32_${V2_ROUTER_BACKEND}
+            COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                --gtest_filter=RouterHadamardQ8.${V2_ROUTER_BACKEND}:Backends/MoERouterHiddenQ8.HadamardPublishesOriginalExpertBasis/${V2_ROUTER_BACKEND}:MoERouterOwnedRows.${V2_ROUTER_BACKEND}Hadamard
+                --gtest_brief=1
+            LABELS "V2;Integration;ProductionTestPreflight;${V2_ROUTER_BACKEND};MoE;Router;Capture;ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RouterHadamard32_${V2_ROUTER_BACKEND})
+    endif()
+endforeach()
+
+# Explicit half CPU correctness; Native defaults remain unchanged.
+add_executable(v2_test_cpu_half_operands unit/kernels/Test__CPUHalfOperands.cpp)
+target_link_libraries(v2_test_cpu_half_operands PRIVATE llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUHalfOperands
+    COMMAND $<TARGET_FILE:v2_test_cpu_half_operands> --gtest_filter=-CPUHalfOperands.EveryPositiveWorkerBudget
+    LABELS "V2;Unit;CPU;GDN;MoE;FloatingPoint;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+foreach(V2_HALF_ISA AVX2 AVX512)
+    if(V2_HALF_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${V2_HALF_ISA}" V2_HALF_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPUHalfOperands_${V2_HALF_ISA}
+        COMMAND $<TARGET_FILE:v2_test_cpu_half_operands> --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;GDN;MoE;MTP;${V2_HALF_ISA};ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_HALF_RUNTIME_ISA}")
+endforeach()
+# Append these names AFTER the canonical preflight list is set and BEFORE its
+# final registration/validation loop; labels alone are not inventory admission.
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHalfOperands_AVX2)
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUHalfOperands_AVX512)
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR
@@ -24370,3 +25624,10 @@ if(NOT V2_PERF_TESTS_ONLY)
     add_custom_target(v2_production_test_preflight_gate
         DEPENDS ${V2_PREFLIGHT_GATE_TARGETS})
 endif()
+
+# Prepared half router gates are model weights; graph workspace owns no copy.
+add_v2_test(V2_Integration_ROCmModelOwnedRouterAdmission
+    COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
+        --gtest_filter=Test__WorkspaceMemoryEstimator.ROCmRoutedParticipantQuantizedWorkspaceIsCodebookIndependent:Test__WorkspaceMemoryEstimator.Qwen122ROCmTP4Depth15CoversExactQuantizedGemmFamily
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;FP16;Workspace;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)

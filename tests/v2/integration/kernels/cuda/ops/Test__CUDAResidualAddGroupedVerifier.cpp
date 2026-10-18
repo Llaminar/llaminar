@@ -5,12 +5,17 @@
  * The suite enters CUDAResidualAddKernelT through its production tensor API on
  * a non-default stream. FP32, BF16, and FP16 grouped rows must match CUDA M=1
  * decode bytes exactly while publishing one flat device launch.
+ *
+ * The focused FP32 tail case additionally checks independent exact sums, every
+ * mod4 remainder, unused-capacity guards and changing-input reuse. GPU builds
+ * retain real grouped, aligned-M1 and in-place graphs; CPU runs actual 1/2 teams.
  */
 
 #include <gtest/gtest.h>
 
 #include "kernels/cuda/ops/CUDAResidualAddKernelT.h"
 #include "utils/GpuResidualAddGroupedVerifierHarness.h"
+#include "utils/GpuResidualAddTailHarness.h"
 
 #include <cuda_runtime.h>
 
@@ -88,4 +93,15 @@ TEST(Test__CUDAResidualAddGroupedVerifier, AllNativeFormatsMatchSerialDecodeByte
         static_cast<void *>(stream.get()),
         "CUDA",
         "cuda_residual_add_grouped_verifier_rows_calls");
+}
+
+/** @test Every normal-FP32 vector/tail value survives changed captured replays. */
+TEST(Test__CUDAResidualAddGroupedVerifier, FP32TailExtentsMatchIndependentCapturedAdd)
+{
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0)
+        GTEST_SKIP() << "No CUDA device available";
+    llaminar2::test::residual_tail::runGPU<
+        llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP32>>(
+            DeviceId::cuda(0));
 }

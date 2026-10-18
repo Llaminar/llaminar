@@ -3,7 +3,12 @@
  * @brief Captured ROCm FA2 query/context policy and launch-geometry tournament.
  *
  * This benchmark measures the two byte-equivalent ROCm FlashAttention prefill
- * schedules through the same native wrappers used by production. Query-sequence
+ * schedules through the same native wrappers used by production. Fixed-query
+ * scaling records the actual default score owner and native graph resources
+ * as retained history grows and shrinks without recapture. The FP16 fixtures
+ * share CUDA's deterministic input bytes and verify every automatic output
+ * outside timing against canonical bytes after poisoned retained replay.
+ * Query-sequence
  * execution gives one workgroup a complete K/V scan. K/V-context execution
  * gives a bounded persistent grid canonical 256-key partitions and then merges
  * those summaries in ascending key order on device.
@@ -32,6 +37,10 @@
 
 #include "kernels/attention/AttentionDeviceParams.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
+#include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "tensors/GpuTensorView.h"
 
 #include <algorithm>
 #include <array>
@@ -39,9 +48,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -390,6 +401,10 @@ namespace
 
         ~CapturedROCmFA2Benchmark()
         {
+            default_graph_.reset();
+            default_kernel_.reset();
+            default_workspace_.reset();
+            if (d_default_live_length_) (void)hipFree(d_default_live_length_);
             context_graph_.reset();
             direct_graph_.reset();
             if (start_)
@@ -512,6 +527,220 @@ namespace
             return context_plan_;
         }
 
+
+        /**
+         * @brief Capture the production automatic bridge with device-owned KV count.
+         * @return False when exact native geometry or workspace is rejected.
+         *
+         * Native tournament controls remain separate. The focused query plan
+         * owns parameter workspace and a retained device-count producer before
+         * compute_tensor's selected attention node on every replay.
+         */
+        bool captureDefaultGraph()
+        {
+            const auto plan = policyPlan();
+            if (!ready_ || !plan.valid || plan.usesContextParallelism() ||
+                format_ != NativeKVFormat::FP16)
+            {
+                setError("default fixed-query capture requires an admitted FP16 query plan");
+                return false;
+            }
+            using namespace llaminar2;
+            const DeviceId device = DeviceId::rocm(0);
+            WorkspaceRequirements requirements;
+            requirements.buffers.push_back({rocm::AttentionWorkspaceBuffers::DEVICE_PARAMS,
+                sizeof(attention::AttentionDeviceParams), 256, true});
+            default_workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                device, requirements.total_bytes_with_alignment());
+            if (!default_workspace_->allocate(requirements))
+            {
+                setError("default attention parameter workspace allocation failed");
+                return false;
+            }
+            default_kernel_ = std::make_unique<
+                rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>>(0);
+            default_kernel_->setGPUStream(stream_);
+            default_kernel_->bindWorkspace(default_workspace_.get());
+            if (!allocate(reinterpret_cast<void **>(&d_default_live_length_),
+                          sizeof(int), "default device KV count") ||
+                !publishLiveLength(current_query_rows_) ||
+                !check(hipStreamSynchronize(stream_), "default capture preparation"))
+                return false;
+            GpuTensorView query(d_q_, current_query_rows_, geometry_.n_heads * geometry_.head_dim,
+                                TensorType::FP32, device);
+            GpuTensorView keys(d_k_, kv_capacity_, geometry_.n_kv_heads * geometry_.head_dim,
+                               TensorType::FP16, device);
+            GpuTensorView values(d_v_, kv_capacity_, geometry_.n_kv_heads * geometry_.head_dim,
+                                 TensorType::FP16, device);
+            GpuTensorView output(d_direct_output_, current_query_rows_,
+                                 geometry_.n_heads * geometry_.head_dim, TensorType::FP32, device);
+            const attention::AttentionExecutionPolicy automatic{
+                .prefill_parallel_axis = attention::AttentionPrefillParallelAxis::GeometrySelected};
+            const attention::AttentionPrefillCaptureGeometry capture{
+                .batch_size = 1, .query_rows = current_query_rows_,
+                .local_query_heads = geometry_.n_heads, .head_dim = geometry_.head_dim,
+                .kv_capacity = kv_capacity_, .execution_policy = automatic,
+                .native_kv_format = TensorType::FP16,
+                .visibility = attention::AttentionVisibilityPolicy::CausalFullContext};
+            bool submitted = false;
+            hipError_t end_status = hipSuccess;
+            {
+                GraphCaptureGuard guard;
+                if (!check(hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal),
+                           "default begin capture")) return false;
+                submitted = default_kernel_->prepareDynamicAttnParamsFromDeviceSequenceState(
+                    d_default_live_length_, current_query_rows_, 1, stream_, kv_capacity_, nullptr, capture) &&
+                    default_kernel_->compute_tensor(&query, &keys, &values, &output,
+                        1, current_query_rows_, kv_capacity_, geometry_.n_heads,
+                        geometry_.n_kv_heads, geometry_.head_dim, true, -1, nullptr, nullptr,
+                        nullptr, 0, geometry_.head_start, geometry_.n_heads, geometry_.n_kv_heads,
+                        geometry_.replicated_gqa_n_rep, automatic);
+                end_status = hipStreamEndCapture(stream_, &default_graph_.graph);
+            }
+            if (!submitted || !check(end_status, "default end capture") ||
+                !check(hipGraphGetNodes(default_graph_.graph, nullptr, &default_graph_.node_count),
+                       "default graph inventory") || default_graph_.node_count != 2 ||
+                !check(hipGraphInstantiate(&default_graph_.exec, default_graph_.graph,
+                                          nullptr, nullptr, 0), "default graph instantiate"))
+            {
+                setError("default attention must capture one device producer and one query body");
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Inspect the actual automatic attention node outside timed replay.
+         * @param native Receives its launch function, grid and LDS allocation.
+         * @return False unless precisely one retained kernel owns attention LDS.
+         */
+        bool defaultKernelInventory(hipKernelNodeParams &native)
+        {
+            std::array<hipGraphNode_t, 2> nodes{};
+            std::size_t count = default_graph_.node_count;
+            if (!default_graph_.graph || count != nodes.size() ||
+                !check(hipGraphGetNodes(default_graph_.graph, nodes.data(), &count),
+                       "default inventory nodes")) return false;
+            int attention_nodes = 0;
+            for (const auto node : nodes)
+            {
+                hipKernelNodeParams parameters{};
+                if (!check(hipGraphKernelNodeGetParams(node, &parameters),
+                           "default inventory kernel")) return false;
+                if (parameters.sharedMemBytes)
+                {
+                    native = parameters;
+                    ++attention_nodes;
+                }
+            }
+            if (attention_nodes != 1)
+            {
+                setError("default inventory must contain one attention LDS owner");
+                return false;
+            }
+            return true;
+        }
+
+        /** @return Native symbol attached to the observed node on its exact stream. */
+        [[nodiscard]] const char *defaultKernelName(const hipKernelNodeParams &native) const
+        {
+            return hipKernelNameRefByPtr(native.func, stream_);
+        }
+
+        /** Time the retained automatic producer/attention transaction. */
+        [[nodiscard]] TransactionTiming measureDefault(int live_kv_len)
+        {
+            return measureGraph(default_graph_, live_kv_len);
+        }
+
+        /**
+         * @brief Submit one complete automatic graph for isolated profiling.
+         * @param live_kv_len Published device input before the measured submission.
+         * @return False when capture, submission or terminal observation fails.
+         */
+        bool replayDefaultOnceForProfiler(int live_kv_len)
+        {
+            if (!publishLiveLength(live_kv_len) || !default_graph_.exec)
+                return false;
+            return check(hipGraphLaunch(default_graph_.exec, stream_), "default profiler replay") &&
+                   check(hipEventRecord(stop_, stream_), "default profiler terminal event") &&
+                   check(hipEventSynchronize(stop_), "default profiler terminal completion");
+        }
+
+        /**
+         * @brief Prove complete automatic writes and canonical bytes outside timing.
+         * @param live_kv_len Visible keys including the current physical query rows.
+         * @return False on incomplete publication, nonfinite output or changed bytes.
+         *
+         * The independent forced-context transaction uses the fixture-owned
+         * parameter record, not the automatic producer's workspace record. Its
+         * one-partition direct limit forces the canonical summary/reducer at
+         * every M512 point. Both outputs and canonical scratch start as NaNs.
+         * Each automatic replay poisons its own parameter record as well, so
+         * retained producer publication and full-output overwrite are observed.
+         * The profiler entry never calls this untimed oracle.
+         */
+        bool validateDefaultOutput(int live_kv_len)
+        {
+            if (!ready_ || !default_graph_.exec || !context_graph_.exec ||
+                context_plan_.device_direct_partition_limit != 1 ||
+                !publishLiveLength(live_kv_len))
+            {
+                setError("default output validation requires independent retained canonical context");
+                return false;
+            }
+            const size_t elements = static_cast<size_t>(current_query_rows_) *
+                geometry_.n_heads * geometry_.head_dim;
+            const size_t bytes = elements * sizeof(float);
+            std::vector<float> expected(elements), observed(elements), previous;
+            if (!check(hipMemsetAsync(d_context_output_, 0xff, bytes, stream_), "poison canonical output") ||
+                !check(hipMemsetAsync(d_partial_output_, 0xff, partial_output_bytes_, stream_), "poison canonical numerator") ||
+                !check(hipMemsetAsync(d_partial_m_, 0xff, partial_m_bytes_, stream_), "poison canonical maxima") ||
+                !check(hipMemsetAsync(d_partial_l_, 0xff, partial_l_bytes_, stream_), "poison canonical denominator") ||
+                !check(hipGraphLaunch(context_graph_.exec, stream_), "canonical validation replay") ||
+                !check(hipMemcpyAsync(expected.data(), d_context_output_, bytes,
+                                      hipMemcpyDeviceToHost, stream_), "read canonical validation output") ||
+                !check(hipStreamSynchronize(stream_), "canonical validation terminal completion"))
+                return false;
+            void *parameters = default_workspace_->getBuffer(
+                llaminar2::rocm::AttentionWorkspaceBuffers::DEVICE_PARAMS);
+            for (int replay = 0; replay < 2; ++replay)
+            {
+                AttentionDeviceParams published{};
+                if (!check(hipMemsetAsync(d_direct_output_, 0xff, bytes, stream_), "poison automatic output") ||
+                    !check(hipMemsetAsync(parameters, 0xff, sizeof(published), stream_), "poison automatic parameters") ||
+                    !check(hipGraphLaunch(default_graph_.exec, stream_), "automatic validation replay") ||
+                    !check(hipMemcpyAsync(observed.data(), d_direct_output_, bytes,
+                                          hipMemcpyDeviceToHost, stream_), "read automatic validation output") ||
+                    !check(hipMemcpyAsync(&published, parameters, sizeof(published),
+                                          hipMemcpyDeviceToHost, stream_), "read automatic publication") ||
+                    !check(hipStreamSynchronize(stream_), "automatic validation terminal completion"))
+                    return false;
+                if (published.kv_len != live_kv_len || published.kv_stride != kv_capacity_ ||
+                    published.position_offset != live_kv_len - current_query_rows_ ||
+                    published.mask_stride != live_kv_len ||
+                    published.ring_row_origin != 0 || published.ring_row_capacity != 0)
+                {
+                    setError("automatic retained count producer published the wrong visible geometry");
+                    return false;
+                }
+                for (size_t index = 0; index < elements; ++index)
+                    if (!std::isfinite(expected[index]) || !std::isfinite(observed[index]))
+                    {
+                        setError("canonical or automatic validation output contains poison/nonfinite data");
+                        return false;
+                    }
+                if (std::memcmp(expected.data(), observed.data(), bytes) != 0 ||
+                    (!previous.empty() && std::memcmp(previous.data(), observed.data(), bytes) != 0))
+                {
+                    setError("automatic FP32 arithmetic changed canonical or retained replay bytes");
+                    return false;
+                }
+                previous = observed;
+            }
+            return true;
+        }
+
         /** Time the already captured direct transaction at one live K/V length. */
         [[nodiscard]] TransactionTiming measureDirect(int live_kv_len)
         {
@@ -598,7 +827,68 @@ namespace
                 .compute_unit_count = compute_unit_count_,
                 .lds_capacity_bytes = lds_capacity_bytes_,
                 .requested_axis = axis,
+                .kv_format = format_ == NativeKVFormat::FP16 ? llaminar2::TensorType::FP16
+                           : format_ == NativeKVFormat::BF16 ? llaminar2::TensorType::BF16
+                           : format_ == NativeKVFormat::Q8_1 ? llaminar2::TensorType::Q8_1
+                                                          : llaminar2::TensorType::FP32,
+                .visibility = rocm_policy::ROCmFA2VisibilityPolicy::CausalFullContext,
             };
+        }
+
+        /**
+         * @brief Fill Q/K/V with cheap, deterministic, non-uniform bit patterns.
+         *
+         * A zero-filled performance arena makes every value row identical and
+         * lets broken attention arithmetic accidentally pass a byte comparison.
+         * The performance harness does not need expensive random generation,
+         * but it does need different K/V regions to affect online-softmax state.
+         * Thirty-two stream-ordered memsets provide that signal once during
+         * setup without adding a benchmark-only CUDA kernel to production.
+         *
+         * @param q_elements Number of FP32 query elements in the arena.
+         * @param kv_elements Number of FP16 elements in each K/V arena.
+         * @return True when every asynchronous initialization was submitted.
+         */
+        bool initializeDeterministicTensorPatterns(
+            size_t q_elements,
+            size_t kv_elements)
+        {
+            if (hipMemsetAsync(
+                    d_q_, 0x3c,
+                    q_elements * sizeof(float), stream_) != hipSuccess)
+            {
+                return false;
+            }
+
+            constexpr size_t kPatternRegions = 32;
+            const size_t region_elements =
+                (kv_elements + kPatternRegions - 1) / kPatternRegions;
+            for (size_t region = 0; region < kPatternRegions; ++region)
+            {
+                const size_t begin = region * region_elements;
+                if (begin >= kv_elements)
+                    break;
+                const size_t count =
+                    std::min(region_elements, kv_elements - begin);
+                const int k_pattern = 0x28 + static_cast<int>(region % 12);
+                const int v_pattern = 0x30 + static_cast<int>((region * 5) % 12);
+                if (hipMemsetAsync(
+                        static_cast<unsigned char *>(d_k_) +
+                            begin * sizeof(uint16_t),
+                        k_pattern,
+                        count * sizeof(uint16_t),
+                        stream_) != hipSuccess ||
+                    hipMemsetAsync(
+                        static_cast<unsigned char *>(d_v_) +
+                            begin * sizeof(uint16_t),
+                        v_pattern,
+                        count * sizeof(uint16_t),
+                        stream_) != hipSuccess)
+                {
+                    return false;
+                }
+            }
+            return true;
         }
 
         /** Create stream/events and all maximum-capacity device buffers. */
@@ -666,9 +956,19 @@ namespace
                 return;
             }
 
-            if (!check(hipMemsetAsync(d_q_, 0, q_bytes, stream_), "memset Q") ||
-                !check(hipMemsetAsync(d_k_, 0, kv_bytes, stream_), "memset K") ||
-                !check(hipMemsetAsync(d_v_, 0, kv_bytes, stream_), "memset V") ||
+            // The automatic FP16 scaling fixture uses exactly CUDA's bytes.
+            // Other native-format tournaments retain their original zero recipe.
+            const bool inputs_initialized = format_ == NativeKVFormat::FP16
+                ? initializeDeterministicTensorPatterns(output_elements, kv_bytes / sizeof(uint16_t))
+                : check(hipMemsetAsync(d_q_, 0, q_bytes, stream_), "memset Q") &&
+                  check(hipMemsetAsync(d_k_, 0, kv_bytes, stream_), "memset K") &&
+                  check(hipMemsetAsync(d_v_, 0, kv_bytes, stream_), "memset V");
+            if (!inputs_initialized)
+            {
+                setError("Deterministic attention input initialization failed");
+                return;
+            }
+            if (
                 !check(
                     hipMemsetAsync(d_direct_output_, 0, q_bytes, stream_),
                     "memset direct output") ||
@@ -691,6 +991,10 @@ namespace
                 setError("live K/V length is outside captured capacity");
                 return false;
             }
+            if (d_default_live_length_ &&
+                !check(hipMemcpyAsync(d_default_live_length_, &live_kv_len, sizeof(live_kv_len),
+                                      hipMemcpyHostToDevice, stream_), "publish default KV count"))
+                return false;
             const AttentionDeviceParams params{
                 .kv_len = live_kv_len,
                 .kv_stride = kv_capacity_,
@@ -963,6 +1267,11 @@ namespace
             return result;
         }
 
+        CapturedHIPGraph default_graph_; ///< Complete production producer/attention transaction.
+        std::unique_ptr<llaminar2::DeviceWorkspaceManager> default_workspace_; ///< Exact parameter owner.
+        std::unique_ptr<llaminar2::rocm::ROCmFlashAttentionKernelT<
+            llaminar2::ActivationPrecision::FP32>> default_kernel_; ///< Automatic production dispatch.
+        int *d_default_live_length_ = nullptr; ///< Device-owned live KV input.
         ParticipantAttentionGeometry geometry_;
         NativeKVFormat format_ = NativeKVFormat::FP16;
         int maximum_query_rows_ = 0;
@@ -1855,6 +2164,90 @@ namespace
 #endif
     }
 
+    /**
+     * @brief Record fixed-M512 default attention scaling from empty through 64K history.
+     *
+     * Dense and MoE use their measured participant mappings and FP16 KV in a
+     * persistent 131072-row arena. The capture-time selector receives actual
+     * native format and visibility. Native LDS/register/occupancy observations
+     * authenticate the selected graph before timing; each CSV row retains the
+     * three unprofiled event samples. History is existing KV, so total visible
+     * capacity is history plus the fixed 512-row query. The explicit 8192/8193
+     * total-KV points expose the short/long arithmetic boundary, and the final
+     * empty-history replay proves reuse after the largest span.
+     */
+    TEST_F(ROCmFlashAttentionContextParallelPerf, DefaultFixedQueryPrefixScaling)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "ROCm support is disabled";
+#else
+        if (!has_device_) GTEST_SKIP() << "No ROCm device is available";
+        constexpr int rows = 512;
+        constexpr int capacity = 131072;
+        const std::array<ParticipantAttentionGeometry, 2> geometries{{
+            {"dense", 12, 2, 256, 0, 0}, {"moe", 8, 1, 256, 0, 0}}};
+        // 7680/7681 history means exactly 8192/8193 total visible KV rows.
+        constexpr std::array<int, 12> histories{{
+            0, 512, 1024, 2048, 4096, 7680, 7681, 8192, 16384, 32768, 65536, 0}};
+        std::cout << "case,format,M,history,live_kv,capacity,heads,kv_heads,policy_mode,"
+                     "score_storage,tile_lds_bytes,native_lds_bytes,native_registers,"
+                     "native_private_bytes,resident_blocks_per_cu,grid_x,grid_y,grid_z,"
+                     "graph_nodes,replays_per_sample,sample_index,latency_us,kernel_symbol\n";
+        for (const auto &geometry : geometries)
+        {
+            CapturedROCmFA2Benchmark benchmark(geometry, NativeKVFormat::FP16,
+                rows, capacity, properties_.multiProcessorCount,
+                std::max<std::size_t>(properties_.sharedMemPerBlock,
+                                     rocm_policy::kROCmFA2LDSCapacityBytes));
+            ASSERT_TRUE(benchmark.ready()) << benchmark.error();
+            ASSERT_TRUE(benchmark.prepareQueryRows(rows)) << benchmark.error();
+            const auto plan = benchmark.policyPlan();
+            ASSERT_TRUE(plan.valid);
+            // These exact mappings fill the measured retained phase grid.
+            // A context result here is a production-dispatch regression.
+            ASSERT_FALSE(plan.usesContextParallelism());
+            ASSERT_EQ(plan.tile.score_storage,
+                      rocm_policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile);
+            ASSERT_TRUE(benchmark.captureDefaultGraph()) << benchmark.error();
+            ASSERT_TRUE(benchmark.captureContextCandidate(0, 0)) << benchmark.error();
+            ASSERT_EQ(benchmark.contextPlan().device_direct_partition_limit, 1);
+            hipKernelNodeParams native{};
+            ASSERT_TRUE(benchmark.defaultKernelInventory(native)) << benchmark.error();
+            const char *kernel_name = benchmark.defaultKernelName(native);
+            ASSERT_NE(kernel_name, nullptr);
+            ASSERT_EQ(native.sharedMemBytes, plan.tile.lds_bytes);
+            ASSERT_EQ(native.sharedMemBytes, 16384U);
+            hipFuncAttributes attributes{};
+            ASSERT_EQ(hipFuncGetAttributes(&attributes, native.func), hipSuccess);
+            ASSERT_EQ(attributes.localSizeBytes, 0U);
+            ASSERT_LE(attributes.numRegs, 64);
+            int resident = 0;
+            ASSERT_EQ(hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                &resident, native.func, 256, native.sharedMemBytes), hipSuccess);
+            ASSERT_GE(resident, 4);
+            for (const int history : histories)
+            {
+                const auto timing = benchmark.measureDefault(history + rows);
+                ASSERT_GT(timing.median_us, 0.0) << benchmark.error();
+                ASSERT_EQ(timing.graph_nodes, 2U);
+                ASSERT_TRUE(benchmark.validateDefaultOutput(history + rows)) << benchmark.error();
+                for (std::size_t sample = 0; sample < timing.samples_us.size(); ++sample)
+                    std::cout << geometry.sources << ",FP16," << rows << ',' << history
+                              << ',' << history + rows << ',' << capacity << ','
+                              << geometry.n_heads << ',' << geometry.n_kv_heads << ','
+                              << rocm_policy::rocmFA2PrefillPhysicalModeName(plan.mode) << ','
+                              << rocm_policy::rocmFA2ScoreStorageName(plan.tile.score_storage) << ','
+                              << plan.tile.lds_bytes << ',' << native.sharedMemBytes << ','
+                              << attributes.numRegs << ',' << attributes.localSizeBytes << ','
+                              << resident << ',' << native.gridDim.x << ',' << native.gridDim.y
+                              << ',' << native.gridDim.z << ',' << timing.graph_nodes << ','
+                              << timing.replays_per_sample << ',' << sample << ','
+                              << std::setprecision(12) << timing.samples_us[sample] << ',' << kernel_name << '\n';
+            }
+        }
+#endif
+    }
+
     /** @brief Certify generic captured attention policy across the complete Qwen catalog. */
     TEST_F(
         ROCmFlashAttentionContextParallelPerf,
@@ -2100,7 +2493,9 @@ namespace
      * This test is skipped unless `LLAMINAR_ROCM_FA2_PROFILE_M` is positive.
      * Optional selectors are `..._KV`, `..._CAPACITY`, `..._SLOTS`,
      * `..._PHASE_BLOCKS`, `..._REDUCER_WAVEFRONTS`, `..._REDUCER_BLOCKS`,
-     * `..._FORMAT`, `..._MODE`, and `..._GEOMETRY`. Named geometries are
+     * `..._FORMAT`, `..._MODE`, and `..._GEOMETRY`. Mode `default` resolves
+     * the installed geometry policy; `direct` and `context` isolate a schedule.
+     * Named geometries are
      * `qwen35_tp1`, `qwen35_tp2`, `qwen35_tp4`, `qwen35_tp8` (the default),
      * `qwen7_tp1`, and `qwen27_tp4`. The Qwen35 degrees reproduce the exact
      * shard-scaling probe geometries, including replicated GQA after TP2;
@@ -2151,10 +2546,9 @@ namespace
                 << "Unknown LLAMINAR_ROCM_FA2_PROFILE_FORMAT="
                 << requested_format;
 
-        const bool context = requested_mode != "direct";
         ASSERT_TRUE(
             requested_mode.empty() || requested_mode == "direct" ||
-            requested_mode == "context")
+            requested_mode == "context" || requested_mode == "default")
             << "Unknown LLAMINAR_ROCM_FA2_PROFILE_MODE=" << requested_mode;
         ParticipantAttentionGeometry geometry{};
         if (requested_geometry.empty() ||
@@ -2177,10 +2571,11 @@ namespace
             geometry = {
                 "Qwen2.5-7B@TP1", 28, 4, 128, 0, 0};
         }
-        else if (requested_geometry == "qwen27_tp4")
+        else if (requested_geometry == "qwen27_tp2" || requested_geometry == "qwen27_tp4")
         {
-            geometry = {
-                "Qwen3.5/3.6-27B@TP4", 6, 1, 256, 0, 0};
+            const int degree = requested_geometry == "qwen27_tp2" ? 2 : 4;
+            geometry = {degree == 2 ? "Qwen3.5/3.6-27B@TP2" : "Qwen3.5/3.6-27B@TP4",
+                        24 / degree, 4 / degree, 256, 0, 0};
         }
         else
         {
@@ -2198,6 +2593,13 @@ namespace
                 rocm_policy::kROCmFA2LDSCapacityBytes));
         ASSERT_TRUE(benchmark.ready()) << benchmark.error();
         ASSERT_TRUE(benchmark.prepareQueryRows(m)) << benchmark.error();
+        if (requested_mode == "default")
+        {
+            ASSERT_TRUE(benchmark.captureDefaultGraph()) << benchmark.error();
+            ASSERT_TRUE(benchmark.replayDefaultOnceForProfiler(live_kv)) << benchmark.error();
+            return;
+        }
+        const bool context = requested_mode != "direct";
         if (context)
         {
             ASSERT_TRUE(benchmark.captureContextCandidate(

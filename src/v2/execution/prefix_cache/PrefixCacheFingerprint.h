@@ -9,6 +9,8 @@
 #pragma once
 
 #include "execution/config/RuntimeConfig.h"
+#include "config/GDNProjectionArithmeticPolicy.h"
+#include "config/MoERouterArithmeticPolicy.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -47,6 +49,24 @@ namespace llaminar2
         std::vector<PrefixFingerprintField> moe;
         std::vector<PrefixFingerprintField> mtp;
     };
+
+    /**
+     * @brief Bind persisted state to the immutable projection arithmetic choices.
+     * @param fields Runtime compatibility fields receiving the owned policy keys.
+     * @param gdn Selected GDN projection arithmetic.
+     * @param router Selected MoE router operand arithmetic.
+     * @param cuda_prefill Independent CUDA prefill arithmetic, sealed at startup.
+     * @throws std::invalid_argument If policy keys already exist or an enum is invalid.
+     *
+     * Arithmetic changes can alter every later KV/recurrent value. Metadata
+     * distinguishes policies before RAM/disk payload access, with no payload
+     * hashing, conversion, or model-weight inspection.
+     */
+    void appendProjectionArithmeticFingerprintFields(
+        std::vector<PrefixFingerprintField> &fields,
+        GDNProjectionArithmetic gdn,
+        MoERouterArithmetic router,
+        CUDARouterPrefillArithmetic cuda_prefill = CUDARouterPrefillArithmetic::FP32);
 
     /** @brief One fingerprint and the exact placement observation it describes. */
     struct PrefixCacheFingerprintResult

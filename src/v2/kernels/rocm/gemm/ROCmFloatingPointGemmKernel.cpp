@@ -1,6 +1,6 @@
 /**
  * @file ROCmFloatingPointGemmKernel.cpp
- * @brief ITensorGemm adapter implementation for hipBLAS FP32/FP16/BF16 GEMM
+ * @brief Captured floating projections with typed half operands and fixed verifier arithmetic
  *
  * This is the C++ adapter that wraps HipBLASGemmKernel. It implements the full
  * ITensorGemm interface and can be compiled with the regular C++ compiler
@@ -36,6 +36,11 @@
 #include <atomic>
 #include <hip/hip_runtime.h>
 
+
+// Established cast bridge also used by LocalTPContext; its complete row
+// descriptor is copied into the captured HIP arguments, never read on the host.
+extern "C" hipError_t rocmCastLiveFP32ToFP16(const float *, void *,
+    llaminar2::DeviceRowRange, size_t, int, hipStream_t);
 
 extern "C" bool rocmFp32_stage_batched_projection_pointers(
     const float **d_A_array,
@@ -125,11 +130,13 @@ namespace llaminar2
             int N, int K,
             int rocm_device_id,
             Precision precision,
-            std::shared_ptr<void> lifetime_owner)
+            std::shared_ptr<void> lifetime_owner,
+            FloatingActivationOperandPrecision operand_precision)
             : weights_(nullptr),
               d_weights_(d_weights),
               rocm_device_id_(rocm_device_id),
               precision_(precision),
+              operand_precision_(operand_precision),
               N_(static_cast<size_t>(N)),
               K_(static_cast<size_t>(K)),
               hipblas_kernel_(nullptr),
@@ -140,6 +147,17 @@ namespace llaminar2
             {
                 throw std::runtime_error("[ROCmFloatingPointGemmKernel] Null device weight pointer");
             }
+
+            if (operand_precision_ != FloatingActivationOperandPrecision::Native &&
+                operand_precision_ != FloatingActivationOperandPrecision::FP32 &&
+                operand_precision_ != FloatingActivationOperandPrecision::FP16RNE)
+                throw std::invalid_argument("Unknown floating activation operand policy");
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP32 &&
+                (precision_ != Precision::FP32 || N <= 0 || K <= 0))
+                throw std::invalid_argument("Strict FP32 activation policy requires positive physical FP32 weight geometry");
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE &&
+                (precision_ != Precision::FP16 || N <= 0 || K <= 0))
+                throw std::invalid_argument("Half activation operands require positive physical FP16 weight geometry");
 
             // Moving this view later must not move or destroy the library.
             DeviceId device = DeviceId::rocm(rocm_device_id_);
@@ -190,6 +208,7 @@ namespace llaminar2
               d_weights_(other.d_weights_),
               rocm_device_id_(other.rocm_device_id_),
               precision_(other.precision_),
+              operand_precision_(other.operand_precision_),
               N_(other.N_),
               K_(other.K_),
               hipblas_kernel_(std::move(other.hipblas_kernel_)),
@@ -216,6 +235,7 @@ namespace llaminar2
                 d_weights_ = other.d_weights_;
                 rocm_device_id_ = other.rocm_device_id_;
                 precision_ = other.precision_;
+                operand_precision_ = other.operand_precision_;
                 N_ = other.N_;
                 K_ = other.K_;
                 hipblas_kernel_ = std::move(other.hipblas_kernel_);
@@ -294,8 +314,8 @@ namespace llaminar2
                 ROCmKernelType::GEMM_ROCBLAS,
                 static_cast<hipStream_t>(gpu_stream_));
 
-            // For now, only support FP32 I/O
-            // TODO: Add BF16/FP16 activation support
+            // Public graph banks remain FP32. The explicit half operand mode
+            // publishes a separate arena-owned A bank immediately before GEMM.
             if (A->native_type() != TensorType::FP32)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Only FP32 activations supported, got: "
@@ -324,6 +344,26 @@ namespace llaminar2
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] A and C must be on GPU");
                 return false;
+            }
+
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+            {
+                if (!transpose_B || bias || C->isMapped() ||
+                    m <= 0 || n != static_cast<int>(N_) || k != static_cast<int>(K_) ||
+                    activation_row_offset < 0 ||
+                    A->numel() < (static_cast<size_t>(activation_row_offset) + static_cast<size_t>(m)) * static_cast<size_t>(k) ||
+                    C->numel() < static_cast<size_t>(m) * static_cast<size_t>(n))
+                    throw std::invalid_argument("Half operands require declared GDN projection geometry");
+                auto *bank = workspace ? workspace : workspace_;
+                const float *source = d_A + static_cast<size_t>(activation_row_offset) * k;
+                if (m == 1 || VerifierKernelModeScope::active() || fixed_columns || VerifierKernelModeScope::rowsFor(m))
+                {
+                    if (alpha != 1.0f || beta != 0.0f)
+                        throw std::invalid_argument("Fixed half projections require the declared unit epilogue");
+                    return runFixedHalfProjection(source, d_C, m, n, k, bank);
+                }
+                const auto *half_input = prepareFP16Operand(source, m, k, bank);
+                return runFP16OperandProjection(half_input, d_C, m, n, k, alpha, beta, bank);
             }
 
             // =================================================================
@@ -711,6 +751,55 @@ namespace llaminar2
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Null input or empty projections");
                 return false;
             }
+            // The seed cannot reinterpret another engine's immutable operand
+            // policy in either direction, including Native-seed direct calls.
+            for (const auto &projection : projections)
+                if (projection.kernel &&
+                    projection.kernel->floatingActivationOperandPrecision() != operand_precision_)
+                    throw std::invalid_argument("Floating projection group mixes activation operand policies");
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+            {
+                const bool fixed = std::any_of(projections.begin(), projections.end(),
+                    [](const auto &p) { return p.kernel &&
+                        FloatingOutputPartitionScope::requiresFixedColumns(*p.kernel, p.n); });
+                if (m == 1 || VerifierKernelModeScope::active() || fixed || VerifierKernelModeScope::rowsFor(m))
+                    return multiply_fused_verifier_rows_decode_equivalent(input, projections, m, k, mpi_ctx, workspace);
+                if (input->native_type() != TensorType::FP32 || m <= 0 || k != static_cast<int>(K_) ||
+                    input->numel() < static_cast<size_t>(m) * static_cast<size_t>(k))
+                    throw std::invalid_argument("Half-operand GDN group requires complete FP32 source rows");
+                // Validate every consumer before submitting the shared producer.
+                // The one stream orders all GemmEx reads before the next cast
+                // reuses this stage-owned half-A publication.
+                for (const auto &projection : projections)
+                {
+                    const auto *engine = dynamic_cast<ROCmFloatingPointGemmKernel *>(projection.kernel);
+                    if (!engine || engine->operand_precision_ != operand_precision_ ||
+                        engine->precision_ != Precision::FP16 || engine->gpu_stream_ != gpu_stream_ ||
+                        engine->rocm_device_id_ != rocm_device_id_ ||
+                        static_cast<int>(engine->K_) != k || projection.n != static_cast<int>(engine->N_) ||
+                        !projection.output || projection.output->native_type() != TensorType::FP32 ||
+                        projection.output->isMapped() || !projection.output->gpu_data_ptr() || projection.bias ||
+                        input->current_device() != DeviceId::rocm(rocm_device_id_) ||
+                        projection.output->current_device() != DeviceId::rocm(rocm_device_id_) ||
+                        projection.output->numel() < static_cast<size_t>(m) * projection.n ||
+                        FloatingOutputPartitionScope::requiresFixedColumns(*engine, projection.n))
+                        throw std::invalid_argument("Half-operand GDN subgroup has incompatible policy, output or stream");
+                }
+                const auto *half_input = prepareFP16Operand(
+                    static_cast<const float *>(input->gpu_data_ptr()), m, k,
+                    workspace ? workspace : workspace_);
+                for (const auto &projection : projections)
+                {
+                    auto *engine = static_cast<ROCmFloatingPointGemmKernel *>(projection.kernel);
+                    // Each view retains its own persistent library workspace
+                    // binding; all views borrow the same context-owned handle.
+                    if (!engine->runFP16OperandProjection(half_input,
+                        static_cast<float *>(projection.output->gpu_data_ptr()),
+                        m, projection.n, k, 1.0f, 0.0f, workspace ? workspace : workspace_))
+                        return false;
+                }
+                return true;
+            }
             /*
              * FP16/BF16 weights use the fixed-order grouped projection kernel
              * for ordinary prefill as well as verifier rows. That kernel keeps
@@ -956,6 +1045,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+            for (const auto &projection : projections)
+                if (projection.kernel && projection.kernel->floatingActivationOperandPrecision() != operand_precision_)
+                    throw std::invalid_argument("Floating verifier group mixes activation operand policies");
             if (m < 1)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel] grouped verifier projection requires M>=1, got M="
@@ -992,6 +1084,78 @@ namespace llaminar2
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection input has no ROCm device data");
                 return false;
+            }
+
+            const bool half_operands = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE;
+            if (half_operands)
+            {
+                if (input->numel() < static_cast<size_t>(m) * static_cast<size_t>(k))
+                    throw std::invalid_argument("Half verifier input exceeds declared source extent");
+                for (const auto &projection : projections)
+                {
+                    const auto *engine = dynamic_cast<const ROCmFloatingPointGemmKernel *>(projection.kernel);
+                    if (!engine || engine->precision_ != Precision::FP16 ||
+                        engine->operand_precision_ != operand_precision_ || engine->gpu_stream_ != gpu_stream_ ||
+                        engine->rocm_device_id_ != rocm_device_id_ || int(engine->K_) != k ||
+                        int(engine->N_) != projection.n || !engine->d_weights_ || projection.bias ||
+                        !projection.output || projection.output->native_type() != TensorType::FP32 ||
+                        projection.output->numel() < static_cast<size_t>(m) * static_cast<size_t>(projection.n) ||
+                        projection.output->isMapped() || !projection.output->gpu_data_ptr())
+                        throw std::invalid_argument("Half verifier group has incompatible policy, output or stream");
+                }
+
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && m <= kShortHalfProjectionMaxRows && projections.size() > 1)
+                {
+                    // Bind every immutable owner before submitting the one shared
+                    // half producer. Capture arguments replace device pointer tables.
+                    const auto *half_bank = static_cast<const std::uint16_t *>(
+                        effective_workspace->getBuffer(GemmWorkspaceBuffers::FULL_A_FP16));
+                    std::vector<FixedHalfProjectionGroup> groups;
+                    groups.reserve((projections.size() + floating_gemm_abi::kMaxBatchedProjections - 1) /
+                        floating_gemm_abi::kMaxBatchedProjections);
+                    for (size_t first = 0; first < projections.size(); first += floating_gemm_abi::kMaxBatchedProjections)
+                    {
+                        const size_t end = std::min(projections.size(), first + floating_gemm_abi::kMaxBatchedProjections);
+                        const auto bind = [&](size_t index) {
+                            const auto &p = projections[index];
+                            const auto *engine = static_cast<const ROCmFloatingPointGemmKernel *>(p.kernel);
+                            return FixedHalfProjectionGroup::single(half_bank,
+                                static_cast<const std::uint16_t *>(engine->d_weights_),
+                                static_cast<float *>(p.output->gpu_data_ptr()), p.n);
+                        };
+                        auto group = bind(first);
+                        for (size_t index = first + 1; index < end; ++index)
+                        {
+                            const auto next = bind(index);
+                            group.append(next.weight(0), next.output(0), next.columns(0));
+                        }
+                        groups.push_back(group);
+                    }
+                    (void)prepareFP16Operand(d_input, m, k, effective_workspace);
+                    for (const auto &group : groups)
+                    {
+                        if (!rocmFp16_short_projection_group(group, m, k, rocm_device_id_,
+                                gpu_stream_, VerifierKernelModeScope::rowsFor(m))) return false;
+                        if (PerfStatsCollector::isDomainEnabled("kernel"))
+                        {
+                            std::string widths;
+                            for (int index = 0; index < group.size(); ++index)
+                            {
+                                if (index) widths += "+";
+                                widths += std::to_string(group.columns(index));
+                            }
+                            PerfStatsCollector::addCounter("kernel", "rocm_fp16_short_projection_group_calls", 1.0,
+                                "gemm", "rocm:" + std::to_string(rocm_device_id_),
+                                {{"m", std::to_string(m)}, {"k", std::to_string(k)}, {"widths", widths},
+                                 {"projections", std::to_string(group.size())}, {"columns", std::to_string(group.totalColumns())},
+                                 {"physical_launches", "1"}, {"pointer_publications", "0"},
+                                 {"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"},
+                                 {"output", "fp32"}, {"route", "fixed_order_fp16_short_group"}});
+                        }
+                    }
+                    return true;
+                }
+                d_input = reinterpret_cast<const float *>(prepareFP16Operand(d_input, m, k, effective_workspace));
             }
 
             const int weight_dtype = (precision_ == Precision::BF16) ? 1 : 0;
@@ -1075,7 +1239,11 @@ namespace llaminar2
 
                     // Both storage families share serial decode's fixed tree.
                     // Wide FP32 verifier rows must not re-enter generic BLAS.
-                    const bool launched = precision_ == Precision::FP32
+                    const bool launched = half_operands
+                        ? rocmFp16_batched_projection(d_batch_A_ptrs_, d_batch_B_ptrs_, d_batch_C_ptrs_,
+                            m, seed.n, k, static_cast<int>(group_count), rocm_device_id_, gpu_stream_,
+                            VerifierKernelModeScope::rowsFor(m))
+                        : precision_ == Precision::FP32
                         ? rocmFp32_small_n_batched_projection(
                             d_batch_A_ptrs_, d_batch_B_ptrs_, d_batch_C_ptrs_,
                             m, seed.n, k, static_cast<int>(group_count),
@@ -1110,6 +1278,7 @@ namespace llaminar2
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
+                            half_operands ? "rocm_fp16_fixed_grouped_projection_calls" :
                             precision_ == Precision::FP32 ? "rocm_fp32_small_n_batched_projection_calls"
                                                         : "rocm_fp32x16_grouped_verifier_projection_calls",
                             1.0,
@@ -1122,8 +1291,11 @@ namespace llaminar2
                                 {"k", std::to_string(k)},
                                 {"projections", std::to_string(group_count)},
                                 {"batch", std::to_string(group_count)},
-                                {"route", precision_ == Precision::FP32 ? "fixed_order_fp32_batched_projection"
-                                                                        : "fixed_order_fp32x16_batched_projection"}});
+                                {"activation", half_operands ? "fp16_rne" : "fp32"},
+                                {"accumulation", "fp32"}, {"output", "fp32"},
+                                {"route", half_operands ? "fixed_order_fp16_batched_projection" :
+                                    precision_ == Precision::FP32 ? "fixed_order_fp32_batched_projection"
+                                                                : "fixed_order_fp32x16_batched_projection"}});
                     }
 
                     group_offset += group_count;
@@ -1189,6 +1361,9 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace,
             bool verifier_grouped_call)
         {
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                throw std::invalid_argument("GDN-only half activation operands cannot execute an expert SwiGLU boundary");
+
             if (!gate || !up || !output || !d_weights_)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::run_fixed_order_swiglu_down] Null tensor or weights"
@@ -1378,14 +1553,86 @@ namespace llaminar2
             gpu_stream_ = nullptr;
         }
 
+        std::unique_ptr<ITensorGemm::VerifierKernelModeScope>
+        ROCmFloatingPointGemmKernel::beginVerifierDecodeEquivalentScope(std::optional<DeviceRowRange> rows)
+        {
+            return ITensorGemm::beginVerifierDecodeEquivalentScope(rows);
+        }
+
+        bool ROCmFloatingPointGemmKernel::runFixedHalfProjection(
+            const float *source, float *output, int m, int n, int k, DeviceWorkspaceManager *workspace)
+        {
+            const auto *half = prepareFP16Operand(source, m, k, workspace);
+            std::vector<const float *> a{reinterpret_cast<const float *>(half)};
+            std::vector<const float *> b{reinterpret_cast<const float *>(d_weights_)};
+            std::vector<float *> c{output};
+            if (!stageBatchedPointers(a, b, c, workspace)) return false;
+            const bool ok = rocmFp16_batched_projection(d_batch_A_ptrs_, d_batch_B_ptrs_, d_batch_C_ptrs_,
+                m, n, k, 1, rocm_device_id_, gpu_stream_, VerifierKernelModeScope::rowsFor(m));
+            if (ok) PerfStatsCollector::addCounter("gemm", "rocm_fp16_fixed_projection_calls", 1.0,
+                "gemm", "rocm:" + std::to_string(rocm_device_id_),
+                PerfStatsCollector::Tags{{"m", std::to_string(m)}, {"n", std::to_string(n)},
+                    {"k", std::to_string(k)}, {"activation", "fp16_rne"}, {"weight", "fp16"},
+                    {"accumulation", "fp32"}, {"output", "fp32"}, {"route", "fixed_order_fp16_projection"}});
+            return ok;
+        }
+
+        const void *ROCmFloatingPointGemmKernel::prepareFP16Operand(
+            const float *source, int m, int k, DeviceWorkspaceManager *workspace)
+        {
+            if (operand_precision_ != FloatingActivationOperandPrecision::FP16RNE ||
+                precision_ != Precision::FP16 || !source || !gpu_stream_ ||
+                m <= 0 || k != static_cast<int>(K_))
+                throw std::invalid_argument("Half operands require declared rows on an explicit stream");
+            if (!validateROCmWorkspaceBinding(workspace, rocm_device_id_, "GDN half activation publication"))
+                throw std::invalid_argument("Half activation publication has no canonical workspace");
+            const size_t bytes = static_cast<size_t>(m) * static_cast<size_t>(k) * sizeof(std::uint16_t);
+            if (!workspace->hasBuffer(GemmWorkspaceBuffers::FULL_A_FP16) ||
+                workspace->getBufferSize(GemmWorkspaceBuffers::FULL_A_FP16) < bytes)
+                throw std::invalid_argument("Half activation publication exceeds admitted FULL_A_FP16 extent");
+            void *destination = workspace->getBuffer(GemmWorkspaceBuffers::FULL_A_FP16);
+            if (!destination)
+                throw std::invalid_argument("Half activation publication resolved an unbound bank");
+            const auto *live = VerifierKernelModeScope::rowsFor(m);
+            const auto rows = live ? *live : DeviceRowRange::fullyActive(m);
+            if (rocmCastLiveFP32ToFP16(source, destination, rows,
+                static_cast<size_t>(k), rocm_device_id_, static_cast<hipStream_t>(gpu_stream_)) != hipSuccess)
+                throw std::runtime_error("Half activation publication failed on its exact consumer stream");
+            PerfStatsCollector::addCounter("gemm", "rocm_fp16_operand_cast_calls", 1.0,
+                "gemm", "rocm:" + std::to_string(rocm_device_id_),
+                PerfStatsCollector::Tags{{"m", std::to_string(m)}, {"k", std::to_string(k)},
+                    {"activation", "fp16_rne"}, {"route", live ? "device_live_rows" : "complete_rows"}});
+            return destination;
+        }
+
+        bool ROCmFloatingPointGemmKernel::runFP16OperandProjection(
+            const void *half_input, float *output, int m, int n, int k, float alpha, float beta,
+            DeviceWorkspaceManager *workspace)
+        {
+            if (!half_input || !output || !gpu_stream_ || !d_weights_ ||
+                precision_ != Precision::FP16 || operand_precision_ != FloatingActivationOperandPrecision::FP16RNE ||
+                n != static_cast<int>(N_) || k != static_cast<int>(K_))
+                throw std::invalid_argument("Half-operand GEMM has incompatible prepared geometry");
+            hipblas_kernel_->bindWorkspace(workspace);
+            const bool success = hipblas_kernel_->executeFP16AccumulateFP32OnStream(
+                ExplicitGPUStream{gpu_stream_}, half_input, d_weights_, output, m, n, k, alpha, beta);
+            if (success)
+                PerfStatsCollector::addCounter("gemm", "rocm_fp16_operand_compute32_calls", 1.0,
+                    "gemm", "rocm:" + std::to_string(rocm_device_id_),
+                    PerfStatsCollector::Tags{{"m", std::to_string(m)}, {"n", std::to_string(n)},
+                        {"k", std::to_string(k)}, {"activation", "fp16_rne"}, {"weight", "fp16"},
+                        {"accumulation", "fp32"}, {"output", "fp32"}, {"route", "hipblas_gemm_ex"}});
+            return success;
+        }
+
         // =====================================================================
         // IWorkspaceConsumer interface
         // =====================================================================
 
         WorkspaceRequirements ROCmFloatingPointGemmKernel::getWorkspaceRequirements(
-            int, int, int) const
+            int m, int, int k) const
         {
-            return floating_gemm_workspace::projectionRequirements();
+            return floating_gemm_workspace::projectionRequirements(m, k, operand_precision_);
         }
 
         void ROCmFloatingPointGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)

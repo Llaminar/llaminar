@@ -142,8 +142,7 @@ namespace llaminar2
             packed.is_asymmetric = source->is_asymmetric;
             /* Preserve provenance even when execution expands source blocks. */
             packed.is_superblock = source->is_superblock;
-            packed.encoding = cpu::native_vnni::preparedEncodingForCodebook(
-                source->codebook_id);
+            packed.encoding = cpu::native_vnni::preparedEncodingForSource(*source);
             packed.data_stride = static_cast<int>(
                 cpu::native_vnni::preparedDataStride(packed.encoding));
             packed.interleaved_block_stride =
@@ -153,8 +152,12 @@ namespace llaminar2
 
             switch (packed.encoding)
             {
+            case CpuEncoding::NibbleLUTSourceScale:
             case CpuEncoding::NibbleLUT:
                 packed.payload_bytes = 16;
+                break;
+            case CpuEncoding::IQ3SExpandedSourceScale:
+                packed.payload_bytes = 13;
                 break;
             case CpuEncoding::ExpandedInt8:
                 packed.payload_bytes = 32;

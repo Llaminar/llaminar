@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstdint>
+#include "config/MoERouterArithmeticPolicy.h"
 
 namespace llaminar2
 {
@@ -35,6 +36,7 @@ namespace llaminar2
         std::uintptr_t source_device_ptr = 0;
         int d_model = 0;
         int num_experts = 0;
+        RouterQ8Basis basis = RouterQ8Basis::Original; ///< Immutable prepared coordinates.
 
         /**
          * @brief Construct a key from graph-owned device state.
@@ -43,7 +45,8 @@ namespace llaminar2
             std::uint64_t workspace_generation,
             const void *device_ptr,
             int model_width,
-            int expert_count) noexcept
+            int expert_count,
+            RouterQ8Basis prepared_basis = RouterQ8Basis::Original) noexcept
         {
             return {
                 .workspace_id = workspace_generation,
@@ -51,6 +54,7 @@ namespace llaminar2
                     reinterpret_cast<std::uintptr_t>(device_ptr),
                 .d_model = model_width,
                 .num_experts = expert_count,
+                .basis = prepared_basis,
             };
         }
 

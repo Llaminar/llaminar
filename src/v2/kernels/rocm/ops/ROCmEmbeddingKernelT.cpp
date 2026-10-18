@@ -7,6 +7,8 @@
  * graph replay consumes persistent device token IDs and never repacks weights.
  */
 
+#include "kernels/common/NativeEmbeddingLayout.h"
+#include "kernels/common/NativeEmbeddingIQTables.h"
 #include "ROCmEmbeddingKernelT.h"
 #include "../../../tensors/Tensors.h"
 #include "utils/Logger.h"
@@ -85,17 +87,12 @@ extern "C"
         int d_model,
         hipStream_t stream);
 
-    hipError_t hipOps_embedding_q8(
-        const void *embed_q8,
-        const int *token_ids,
-        float *output,
-        int num_tokens,
-        int d_model,
-        int blocks_per_row,
-        int vocab_size,
-        int vocab_offset,
-        int debug_probe,
-        hipStream_t stream);
+    /** @brief Launch original native source blocks with setup-bound immutable grids. */
+    hipError_t hipOps_embedding_native(
+        const void *source, const int *token_ids, float *output,
+        int num_tokens, int d_model, int vocab_size, int vocab_offset,
+        llaminar2::NativeEmbeddingLayout layout,
+        llaminar2::NativeEmbeddingIQTables tables, hipStream_t stream);
 }
 
 namespace llaminar2
@@ -799,132 +796,44 @@ namespace llaminar2
             return true;
         }
 
-        // --- Quantized path: consume model-owned prepared EmbedQ8 weights ---
-        if (IINT8Unpackable::fromTensor(embed_table))
+        // Prepared storage is the exact original source representation. The
+        // model owner prepared source codebooks and bytes before graph capture.
+        if (NativeEmbeddingLayout::supports(embed_table->native_type()))
         {
             const DeviceId dev_id = DeviceId::rocm(dev);
             const PreparedEmbeddingHandle *prepared = prepared_embedding_handle_;
-            const bool prepared_matches =
-                prepared &&
-                prepared->tensor == embed_table &&
-                prepared->device_id == dev_id &&
-                prepared->weights &&
-                prepared->weights->device_id == dev_id &&
-                prepared->weights->device_data &&
+            const bool prepared_matches = prepared && prepared->tensor == embed_table &&
+                prepared->device_id == dev_id && prepared->weights &&
+                prepared->weights->device_id == dev_id && prepared->weights->device_data &&
                 prepared->weights->d_model == d_model &&
-                prepared->weights->blocks_per_row > 0 &&
-                prepared->weights->vocab_size > 0;
+                prepared->weights->layout.source_type == embed_table->native_type() &&
+                prepared->weights->layout.blocks_per_row > 0 &&
+                prepared->weights->layout.row_stride_bytes > 0 &&
+                prepared->weights->vocab_size > 0 &&
+                prepared->weights->vocab_size <= size_t(INT_MAX) &&
+                prepared->weights->vocab_offset <= size_t(INT_MAX);
             if (!prepared_matches)
             {
-                LOG_ERROR("[ROCmEmbeddingKernelT] Quantized GPU embedding requires matching prepared device weights: "
-                          << "tensor=" << static_cast<const void *>(embed_table)
-                          << " format=" << tensorTypeName(embed_table->native_type())
-                          << " device=" << dev_id.to_string()
-                          << " d_model=" << d_model);
+                LOG_ERROR("[ROCmEmbeddingKernelT] Quantized lookup requires matching original-source device weights"
+                    << " tensor=" << static_cast<const void *>(embed_table)
+                    << " format=" << tensorTypeName(embed_table->native_type())
+                    << " device=" << dev_id.to_string() << " width=" << d_model);
                 return false;
             }
-
-            void *d_embed_q8 = prepared->weights->device_data;
-            const size_t blocks_per_row = prepared->weights->blocks_per_row;
-            const int vocab_offset = static_cast<int>(prepared->weights->vocab_offset);
-            const int local_vocab_size = static_cast<int>(prepared->weights->vocab_size);
-            // Validation readbacks require D2H plus stream synchronization, both
-            // illegal inside HIP graph capture. The launch itself still consumes
-            // the device token IDs and remains graph-capturable.
-            if (use_device_token_ids &&
-                debugEnv().validation.validate_buffers &&
-                num_tokens > 0 &&
-                !capture_active)
-            {
-                std::vector<int> sampled_tokens(static_cast<size_t>(num_tokens), -1);
-                hipError_t token_copy_err = hipMemcpyAsync(
-                    sampled_tokens.data(),
-                    d_token_ids,
-                    static_cast<size_t>(num_tokens) * sizeof(int),
-                    hipMemcpyDeviceToHost,
-                    stream);
-                if (token_copy_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to read device token IDs for validation: "
-                              << hipGetErrorString(token_copy_err));
-                    return false;
-                }
-                token_copy_err = hipStreamSynchronize(stream);
-                if (token_copy_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to synchronize device token validation: "
-                              << hipGetErrorString(token_copy_err));
-                    return false;
-                }
-                const bool zero_token_rows_allowed =
-                    allow_out_of_range_token_ids_ ||
-                    (mpi_ctx && mpi_ctx->world_size() > 1);
-                for (int i = 0; i < num_tokens; ++i)
-                {
-                    const int token_id = sampled_tokens[static_cast<size_t>(i)];
-                    const bool in_local_range =
-                        token_id >= vocab_offset &&
-                        token_id < vocab_offset + local_vocab_size;
-                    if (!in_local_range && !zero_token_rows_allowed)
-                    {
-                        LOG_ERROR("[ROCmEmbeddingKernelT] Device-token embedding would zero single-device token="
-                                  << token_id << " local_vocab_size=" << local_vocab_size
-                                  << " vocab_offset=" << vocab_offset
-                                  << " num_tokens=" << num_tokens);
-                        return false;
-                    }
-                    LOG_DEBUG("[ROCmEmbeddingKernelT] Device-token embedding validation token="
-                              << token_id << " local_vocab_size=" << local_vocab_size
-                              << " vocab_offset=" << vocab_offset
-                              << " in_local_range=" << (in_local_range ? 1 : 0));
-                }
-            }
-            err = hipOps_embedding_q8(d_embed_q8, d_token_ids, d_output,
-                                      num_tokens, d_model,
-                                      static_cast<int>(blocks_per_row),
-                                      local_vocab_size,
-                                      vocab_offset,
-                                      (validate_gpu_ptrs && dev == 0 && !capture_active) ? 1 : 0,
-                                      stream);
-            if (validate_gpu_ptrs)
-            {
-                hipError_t launch_err = hipPeekAtLastError();
-                if (launch_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 post-launch error: " << hipGetErrorString(launch_err)
-                                                                                   << " dev=" << dev
-                                                                                   << " stream=" << static_cast<void *>(stream)
-                                                                                   << " d_embed_q8=" << d_embed_q8
-                                                                                   << " d_token_ids=" << static_cast<void *>(d_token_ids)
-                                                                                   << " d_output=" << static_cast<void *>(d_output));
-                    ROCmBackend::dumpRecentPointerEvents(64);
-                    return false;
-                }
-            }
+            const auto &weights = *prepared->weights;
+            err = hipOps_embedding_native(weights.device_data, d_token_ids, d_output,
+                num_tokens, d_model, static_cast<int>(weights.vocab_size),
+                static_cast<int>(weights.vocab_offset), weights.layout,
+                weights.iq_tables, stream);
             if (err != hipSuccess)
             {
-                LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 kernel failed: " << hipGetErrorString(err));
+                LOG_ERROR("[ROCmEmbeddingKernelT] Original-source embedding launch failed: "
+                    << hipGetErrorString(err) << " format=" << tensorTypeName(weights.layout.source_type));
                 return false;
             }
-
-            if (allow_sync_embedding_stage)
-            {
-                hipError_t sync_err = hipStreamSynchronize(stream);
-                if (sync_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 stream sync failed: "
-                              << hipGetErrorString(sync_err));
-                    ROCmBackend::dumpRecentPointerEvents(64);
-                    return false;
-                }
-            }
             recordROCmGroupedEmbeddingCall(
-                embed_table,
-                num_tokens,
-                d_model,
-                dev,
-                use_device_token_ids,
-                "prepared_device_embed_q8");
+                embed_table, num_tokens, d_model, dev, use_device_token_ids,
+                "prepared_device_native_quantized");
             return true;
         }
 

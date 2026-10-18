@@ -97,6 +97,13 @@ def write_e2e_bundle(root, pair=None):
             "cells": [{**row, "outcome": "passed", "return_code": 0} for row in manifest["cells"]]}
         write_json(root / isa.lower() / "e2e.json", report)
         receipt["reports"][isa] = digest(report)
+    from test_model_kld_canary import canary_report
+    approval = json.loads((ROOT / 'scripts/ci/approved_model_kld_corpus.json').read_text())
+    receipt.update(model_kld_required=True, model_kld_reports={})
+    for isa in suite.ISAS:
+        numerical = canary_report(pair['source']['revision'], pair['images'][isa]['id'], isa, approval['manifest_digest'])
+        write_json(root / isa.lower() / 'kld/kld-canaries.json', numerical)
+        receipt['model_kld_reports'][isa] = digest(numerical)
     write_json(root / "e2e-receipt.json", receipt)
     return manifest
 
@@ -159,7 +166,7 @@ def public_release_bundle(root, tag="2026-09-24.1"):
     # uses the publisher's common asset inventory without minting new proof.
     assets = root / 'assets'
     assets.mkdir()
-    for name, source in master_release.release_asset_sources(e2e_root, benchmark_root).items():
+    for name, source in master_release.release_asset_sources(e2e_root, benchmark_root, model_kld=True).items():
         (assets / name).write_bytes(source.read_bytes())
     paths = list(assets.iterdir())
     metadata = {"id": int(tag.split(".")[1]), "tag_name": tag,

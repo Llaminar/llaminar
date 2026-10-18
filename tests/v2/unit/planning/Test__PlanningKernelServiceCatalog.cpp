@@ -6,6 +6,7 @@
  * aliases, reversed receipt order, missing results and malformed work/graph/ISA
  * fields must not become a usable catalog. No test here opens a device.
  */
+#include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include "planning/PlanningKernelServiceCatalog.h"
 #include "planning/PlanningWeightServiceModel.h"
 #include "planning/PlanningCommunicationService.h"
@@ -13,6 +14,7 @@
 #include "planning/PlanningRequestCostModel.h"
 #include "config/OrchestrationConfigParser.h"
 #include "utils/CPUFeatures.h"
+#include "utils/DebugEnv.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
@@ -626,6 +628,7 @@ TEST(PlanningWeightServiceModel, SamplingIsBoundedByFamiliesAndIndependentOfDire
 
 TEST(PlanningWeightServiceModel, PromotedSourcesMeasureAndPriceTheirExecutedFamily)
 {
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
     PlanningGGUFFixture file(false, false, GGUFTensorType::Q8_0, 256, GGUFTensorType::Q8_0);
     PlanningModelSource source(file.path());
     auto profile = source.metadata().memoryProfile();
@@ -1506,5 +1509,33 @@ TEST(PlanningCommunicationService, MalformedHostDeviceReceiptsCannotEscapeTheSha
         const auto text = wire.dump();
         broken[0] = {text.begin(), text.end()};
         EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(broken)), std::exception);
+    }
+}
+
+/** @brief Equal half storage does not merge Native FP32-A and GDN half-A evidence. */
+TEST(PlanningWeightServiceModel, GDNHalfOperandsKeepSeparateServiceFamilies)
+{
+    PlanningGGUFFixture file(false, false, GGUFTensorType::F16, 256, GGUFTensorType::F16);
+    PlanningModelSource source(file.path());
+    auto profile = source.metadata().memoryProfile();
+    profile.architecture = "qwen35moe";
+    struct Restore {
+        GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
+        ~Restore() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
+    } restore;
+    for (const auto mode : {GDNProjectionArithmetic::FP16, GDNProjectionArithmetic::FP16AlphaBeta, GDNProjectionArithmetic::FP16MoEAlphaBeta})
+    {
+        mutableDebugEnv().gemm.gdn_projection_arithmetic = mode;
+        const auto selected = PlanningWeightServiceModel::samples(PlanningModelMetadata(profile, 2));
+        bool native_half = false, gdn_half = false;
+        for (const auto &sample : selected)
+            if (const auto *request = std::get_if<PlanningModelSampleRequest>(&sample))
+            {
+                native_half |= request->tensor_name == "blk.0.ffn_gate.weight" ||
+                    request->tensor_name == "blk.0.ffn_down.weight" || request->tensor_name == "blk.0.ffn_up.weight";
+                gdn_half |= request->tensor_name == "blk.0.ssm_alpha.weight" || request->tensor_name == "blk.0.ssm_beta.weight";
+            }
+        EXPECT_TRUE(native_half);
+        EXPECT_TRUE(gdn_half);
     }
 }

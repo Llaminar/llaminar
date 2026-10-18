@@ -60,6 +60,7 @@
 #include "../mtp/MTPVerifierPolicy.h"
 #include "../mtp/MTPWeightManifest.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
+#include "../prefix_cache/PrefixCacheShutdown.h"
 #include "../local_execution/engine/PrefillBucketUtils.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../moe/MoEExpertOverlayAuthorityPlan.h"
@@ -2520,6 +2521,7 @@ namespace llaminar2
         {
             return setError("Admission-only initialization cannot serve inference; shut down this runner before full initialization");
         }
+        prefix_shutdown_lifecycle_ = PrefixShutdownLifecycle::Pending;
 
         std::uint32_t phase_ordinal = 0;
         const auto run_phase =
@@ -3120,7 +3122,8 @@ namespace llaminar2
             shutdownMoEExpertOverlayResidencyMaintenance(
                 MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
         }
-        PerfStatsCollector::flushFromEnv();
+        if (was_inference_ready)
+            flushPrefixCacheOnShutdown();
 
         if (runner_)
         {
@@ -3166,6 +3169,8 @@ namespace llaminar2
          * runtime generation to destroy the event during member teardown.
          */
         retireMTPRequestContinuationState();
+        // Include terminal durable-cache publication in the saved native proof.
+        PerfStatsCollector::flushFromEnv();
 
         /*
          * Release participant-local runners directly. Every GPU runner's RAII
@@ -24727,6 +24732,42 @@ namespace llaminar2
         return true;
     }
 
+    /** @copydoc OrchestrationRunner::flushPrefixCacheOnShutdown */
+    void OrchestrationRunner::flushPrefixCacheOnShutdown()
+    {
+        if (prefix_shutdown_lifecycle_ == PrefixShutdownLifecycle::Complete)
+            return;
+        if (prefix_shutdown_lifecycle_ != PrefixShutdownLifecycle::Pending)
+            throw std::logic_error("prefix shutdown persistence was re-entered after incomplete publication");
+        prefix_shutdown_lifecycle_ = PrefixShutdownLifecycle::Flushing;
+        try
+        {
+            const auto uses_disk = [](const auto &prefix) {
+                return prefix.enabled && prefix.storage_mode == PrefixCacheStorageMode::Tiered &&
+                    prefix.disk_budget_bytes > 0;
+            };
+            // Configuration is topology-wide. An expert-only or idle rank must
+            // still join metadata selection even when it owns no cache entries.
+            if (uses_disk(config_.prefix_cache) || uses_disk(plan_.runtime.prefix_cache))
+            {
+                PrefixCacheShutdown shutdown;
+                if (runner_) runner_->collectPrefixCacheShutdown(shutdown);
+                LOG_INFO("[PrefixCache] Selecting RAM entries for shutdown persistence");
+                const auto result = shutdown.flush(mpi_ctx_.get());
+                LOG_INFO("[PrefixCache] Shutdown persisted " << result.selected << "/" << result.candidates
+                    << " RAM entries: " << result.written << " payload writes ("
+                    << result.payload_bytes_written << " bytes), " << result.reused << " existing backing reuses");
+            }
+            prefix_shutdown_lifecycle_ = PrefixShutdownLifecycle::Complete;
+        }
+        catch (const std::exception &error)
+        {
+            if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+                terminateFailedMPIWorkerCommand("SHUTDOWN prefix persistence", error.what());
+            throw;
+        }
+    }
+
     void OrchestrationRunner::shutdownMPIWorkers()
     {
         /*
@@ -24743,12 +24784,14 @@ namespace llaminar2
             if (mpi_worker_command_lifecycle_ ==
                 MPIWorkerCommandLifecycle::ShutdownPublished)
             {
+                flushPrefixCacheOnShutdown();
                 return;
             }
             mpi_worker_command_lifecycle_ =
                 MPIWorkerCommandLifecycle::ShutdownPublished;
             shutdownMoEExpertOverlayResidencyMaintenance(
                 MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
+            flushPrefixCacheOnShutdown();
             return;
         }
 
@@ -24764,7 +24807,10 @@ namespace llaminar2
         // boundary rather than relying on each caller to remember cleanup.
         if (mpi_worker_command_lifecycle_ ==
             MPIWorkerCommandLifecycle::ShutdownPublished)
+        {
+            flushPrefixCacheOnShutdown();
             return;
+        }
 
         /*
          * SHUTDOWN closes new inference admission; it does not destroy
@@ -24782,6 +24828,7 @@ namespace llaminar2
             MPIWorkerCommandLifecycle::ShutdownPublished;
         shutdownMoEExpertOverlayResidencyMaintenance(
             MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
+        flushPrefixCacheOnShutdown();
     }
 
     [[noreturn]] void OrchestrationRunner::terminateFailedMPIWorkerCommand(
@@ -25322,6 +25369,7 @@ namespace llaminar2
                     MPIWorkerCommandLifecycle::ShutdownPublished;
                 shutdownMoEExpertOverlayResidencyMaintenance(
                     MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
+                flushPrefixCacheOnShutdown();
                 return;
             }
 

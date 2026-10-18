@@ -73,6 +73,8 @@ namespace llaminar2
         void clear_cache() override;
         /** @copydoc IInferenceRunner::purgePrefixCache */
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::collectPrefixCacheShutdown */
+        void collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const override;
         int get_position() const override;
         ExecutionPath executionPath() const override;
         const char *architecture() const override;

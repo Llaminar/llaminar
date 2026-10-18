@@ -16,22 +16,126 @@
  * the down producer and complete folded rows at the assembly producer; their
  * typed publication contracts prevent the ordinary expert-sum interpretation.
  *
+ * Named router outputs drive both semantic publication and singleton descriptor
+ * selection, keeping unrequested probability buffers out of retained arenas.
+ *
  * Extracted from DeviceGraphOrchestrator.h (Phase 2 of DGO refactor).
  */
 
 #include "SnapshotCapture.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string_view>
 
 namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Resolve the one semantic value owned by a named router output.
+         * @param name Unqualified routing producer or selected-route publisher.
+         * @param output Actual output descriptor name, including singleton views.
+         * @return Its canonical key, or an empty string for an unrelated output.
+         *
+         * Graph capture asks about each output separately before arena binding.
+         * Advertising all router values for one descriptor would retain unused
+         * probability storage whose TP row ownership changes below M512, making
+         * smaller alternatives exceed the already-captured shared arena.
+         */
+        std::string routingSnapshotOutputKey(
+            const std::string &name, const std::string_view output)
+        {
+            const auto position = name.find("_moe_routing");
+            if (position == std::string::npos)
+                return {};
+            const std::string prefix = name.substr(0, position);
+            if (output == "router_logits" || output == "logits")
+                return prefix + "_MOE_ROUTER_OUTPUT";
+            if (output == "routing_indices" || output == "indices" ||
+                output == "output_indices_tensor")
+                return prefix + "_MOE_ROUTING_INDICES";
+            if (output == "routing_weights" || output == "weights" ||
+                output == "output_weights_tensor")
+                return prefix + "_MOE_ROUTING_WEIGHTS";
+            return {};
+        }
+
+        /** @brief Exact graph grammar for the two residual-normalization producers. */
+        enum class NormSnapshotKind { Attention, FeedForward };
+
+        /** @brief Parsed stage identity; a model-layer index never means MTP depth. */
+        struct NormSnapshotProducer
+        {
+            NormSnapshotKind kind;
+            std::string prefix;
+            std::optional<int> layer;
+        };
+
+        /** @brief Parse an exact norm suffix and its optional main-layer index.
+         * @param name Unqualified node; transaction contexts are handled by callers.
+         * @return Producer identity, or no value for an unrelated graph node.
+         *
+         * MTP prefixes such as MTP2 name a predictor depth. Preserve that
+         * namespace, but never decrement its depth to invent another predictor.
+         */
+        std::optional<NormSnapshotProducer> normSnapshotProducer(const std::string &name)
+        {
+            constexpr std::string_view attention = "_attn_norm";
+            constexpr std::string_view ffn = "_ffn_norm";
+            const auto kind = name.ends_with(ffn) ? NormSnapshotKind::FeedForward
+                                                 : NormSnapshotKind::Attention;
+            const auto suffix = kind == NormSnapshotKind::FeedForward ? ffn : attention;
+            if (!name.ends_with(suffix)) return std::nullopt;
+            NormSnapshotProducer producer{kind, name.substr(0, name.size() - suffix.size()), {}};
+            if (producer.prefix.starts_with("layer"))
+            {
+                const auto digits = std::string_view(producer.prefix).substr(5);
+                int layer = -1;
+                const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), layer);
+                const bool decimal = !digits.empty() && std::all_of(
+                    digits.begin(), digits.end(), [](char digit) { return digit >= '0' && digit <= '9'; });
+                if (decimal && (digits.size() == 1 || digits.front() != '0') &&
+                    parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size() && layer >= 0)
+                    producer.layer = layer;
+            }
+            return producer;
+        }
+
+        /** @brief Resolve semantic keys from one actual named normalization output.
+         * @param name Unqualified graph producer name.
+         * @param output Actual name, including singleton descriptor-filtered views.
+         * @return Only keys owned by this output; no positional or shape inference.
+         */
+        std::vector<std::string> normSnapshotOutputKeys(
+            const std::string &name, const std::string_view output)
+        {
+            const auto producer = normSnapshotProducer(name);
+            if (!producer) return {};
+            const auto normalized = SnapshotCapture::convertStageNameToSnapshotKey(name);
+            if (output == "norm_output" || output == "output") return {normalized};
+            if (output != "residual_out") return {};
+            std::vector<std::string> keys{normalized + "_RESIDUAL_OUT"};
+            if (producer->kind == NormSnapshotKind::FeedForward)
+            {
+                // The same producer just performed this layer's attention add.
+                if (producer->layer)
+                    keys.push_back(producer->prefix + "_ATTENTION_RESIDUAL");
+            }
+            else if (producer->layer && *producer->layer > 0)
+            {
+                // The next main layer's fused attention norm materializes the
+                // preceding layer's complete FFN residual without new arithmetic.
+                keys.push_back("layer" + std::to_string(*producer->layer - 1) + "_FFN_RESIDUAL");
+            }
+            return keys;
+        }
+
         /**
          * @brief Row ownership used when rebuilding a segmented prefill snapshot.
          *
@@ -555,42 +659,21 @@ namespace llaminar2
             return;
         }
 
-        // Handle FusedResidualNormStage. The normalized output keeps the long-standing
-        // semantic key, while residual_out exposes the hidden-state handoff that
-        // happens inside this fused stage. That handoff is essential for grouped
-        // verifier diagnostics because non-terminal FFN residual adds are often
-        // represented by the next layer's fused attention norm rather than by a
-        // standalone ResidualAddStage node.
-        if ((name.find("_attn_norm") != std::string::npos ||
-             name.find("_ffn_norm") != std::string::npos) &&
-            dump.outputs.size() >= 2)
+        // Each named output survives singleton descriptor filtering. Retain
+        // the legacy norm-residual key and canonical alias as one immutable
+        // publication, including explicit row ownership when present.
+        if (normSnapshotProducer(name))
         {
-            std::string key = convertStageNameToSnapshotKey(name);
-
-            if (dump.outputs[0].data)
+            for (const auto &output : dump.outputs)
             {
-                auto data = extractFp32FromOutput(dump.outputs[0]);
-                LOG_DEBUG("[Snapshot] FusedResidualNorm: storing residual_out as key="
-                          << key << "_RESIDUAL_OUT count=" << data.size());
-                if (!data.empty())
-                    storeSnapshot(
-                        key + "_RESIDUAL_OUT",
-                        std::move(data),
-                        dump.outputs[0].rows,
-                        dump.outputs[0].cols);
-            }
-
-            if (dump.outputs[1].data)
-            {
-                auto data = extractFp32FromOutput(dump.outputs[1]);
-                LOG_DEBUG("[Snapshot] FusedResidualNorm: storing norm_output as key="
-                          << key << " count=" << data.size());
-                if (!data.empty())
-                    storeSnapshot(
-                        key,
-                        std::move(data),
-                        dump.outputs[1].rows,
-                        dump.outputs[1].cols);
+                const auto keys = normSnapshotOutputKeys(name, output.name ? output.name : "");
+                if (keys.empty() || !output.data || !output.rows || !output.cols) continue;
+                storeOutput(keys.front(), output);
+                const auto stored = snapshots_.find(keys.front());
+                if (stored == snapshots_.end()) continue;
+                const auto payload = stored->second;
+                for (size_t index = 1; index < keys.size(); ++index)
+                    snapshots_[keys[index]] = payload;
             }
             return;
         }
@@ -776,70 +859,19 @@ namespace llaminar2
             return;
         }
 
-        // Handle standalone MoE routing stage. Eager snapshot builds may
-        // provide host-stashed router logits plus routing vectors, while
-        // graph-captured runs publish only the tensor-backed routing outputs
-        // after replay. Route by output name so both contracts preserve the
-        // same parity keys without forcing host mirrors into graph capture.
+        // Routing producers and selected-route publishers expose named outputs.
+        // Use the same descriptor authority as filtering: an unknown output must
+        // neither capture an unrelated value nor infer semantics from position.
         if (name.find("_moe_routing") != std::string::npos)
         {
-            size_t pos = name.find("_moe_routing");
-            std::string prefix = name.substr(0, pos);
-
-            const StageDumpInfo::OutputBuffer *router_logits = nullptr;
-            const StageDumpInfo::OutputBuffer *routing_indices = nullptr;
-            const StageDumpInfo::OutputBuffer *routing_weights = nullptr;
-
             for (const auto &output : dump.outputs)
             {
-                const std::string output_name = output.name ? output.name : "";
-                if (output_name == "router_logits" || output_name == "logits")
-                    router_logits = &output;
-                else if (output_name == "routing_indices" ||
-                         output_name == "indices" ||
-                         output_name == "output_indices_tensor")
-                    routing_indices = &output;
-                else if (output_name == "routing_weights" ||
-                         output_name == "weights" ||
-                         output_name == "output_weights_tensor")
-                    routing_weights = &output;
+                const auto key = routingSnapshotOutputKey(
+                    name, output.name ? output.name : "");
+                if (!key.empty() && output.data)
+                    storeOutput(key, output);
             }
-
-            if (!router_logits && !routing_indices && !routing_weights &&
-                dump.outputs.size() >= 3)
-            {
-                router_logits = &dump.outputs[0];
-                routing_indices = &dump.outputs[1];
-                routing_weights = &dump.outputs[2];
-            }
-
-            if (router_logits && router_logits->data)
-                storeOutput(prefix + "_MOE_ROUTER_OUTPUT", *router_logits);
-            if (routing_indices && routing_indices->data)
-            {
-                LOG_DEBUG("[Snapshot] MoE routing indices stage=" << name
-                                                                     << " shape=["
-                                                                     << routing_indices->rows
-                                                                     << ','
-                                                                     << routing_indices->cols
-                                                                     << "] bytes="
-                                                                     << routing_indices->byte_size);
-                storeOutput(prefix + "_MOE_ROUTING_INDICES", *routing_indices);
-            }
-            if (routing_weights && routing_weights->data)
-            {
-                LOG_DEBUG("[Snapshot] MoE routing weights stage=" << name
-                                                                     << " shape=["
-                                                                     << routing_weights->rows
-                                                                     << ','
-                                                                     << routing_weights->cols
-                                                                     << "] bytes="
-                                                                     << routing_weights->byte_size);
-                storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", *routing_weights);
-            }
-
-            if (router_logits || routing_indices || routing_weights)
-                return;
+            return;
         }
 
         /*
@@ -1525,11 +1557,12 @@ namespace llaminar2
         {
             return {"LM_HEAD"};
         }
-        if ((stage_name.find("_attn_norm") != std::string::npos ||
-             stage_name.find("_ffn_norm") != std::string::npos))
+        if (normSnapshotProducer(stage_name))
         {
-            const std::string key = convertStageNameToSnapshotKey(stage_name);
-            return {key, key + "_RESIDUAL_OUT"};
+            auto keys = normSnapshotOutputKeys(stage_name, "norm_output");
+            const auto residual = normSnapshotOutputKeys(stage_name, "residual_out");
+            keys.insert(keys.end(), residual.begin(), residual.end());
+            return keys;
         }
         if (stage_name.find("_moe_ffn") != std::string::npos)
         {
@@ -1601,6 +1634,35 @@ namespace llaminar2
         if (const auto separator = stage_name.find("::"); separator != std::string::npos)
             return qualifySnapshotKeys(stage_name.substr(0, separator),
                 possibleKeysForStage(stage_name.substr(separator + 2), dump_info));
+
+        if (stage_name.find("_moe_routing") != std::string::npos)
+        {
+            std::vector<std::string> keys;
+            keys.reserve(dump_info.outputs.size());
+            for (const auto &output : dump_info.outputs)
+            {
+                const auto key = routingSnapshotOutputKey(
+                    stage_name, output.name ? output.name : "");
+                if (!key.empty() &&
+                    std::find(keys.begin(), keys.end(), key) == keys.end())
+                    keys.push_back(key);
+            }
+            return keys;
+        }
+
+        if (normSnapshotProducer(stage_name))
+        {
+            std::vector<std::string> keys;
+            for (const auto &output : dump_info.outputs)
+            {
+                const auto actual = normSnapshotOutputKeys(
+                    stage_name, output.name ? output.name : "");
+                for (const auto &key : actual)
+                    if (std::find(keys.begin(), keys.end(), key) == keys.end())
+                        keys.push_back(key);
+            }
+            return keys;
+        }
 
         auto prefixBefore = [&](const std::string &needle) -> std::string
         {

@@ -174,9 +174,7 @@ namespace llaminar2::cpu::native_vnni
             const __m256i corrected = _mm256_sub_epi32(
                 _mm256_add_epi32(dot_low, dot_high),
                 _mm256_mullo_epi32(bias_128_i32, compensation));
-            const __m256 weight_scale = _mm256_cvtph_ps(
-                _mm_load_si128(reinterpret_cast<const __m128i *>(
-                    packed.chunkScales(chunk, kb) + segment * 8)));
+            const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
             const float activation_scale =
                 nativeVNNIFP16ScaleToFP32(activation.d);
             if (packed.is_asymmetric)
@@ -328,9 +326,7 @@ namespace llaminar2::cpu::native_vnni
                 const __m256i corrected = _mm256_sub_epi32(
                     _mm256_add_epi32(dot_even, dot_odd),
                     _mm256_mullo_epi32(bias_128_i32, compensation));
-                const __m256 weight_scale = _mm256_cvtph_ps(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(
-                        packed.chunkScales(chunk, kb) + segment * 8)));
+                const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
                 const float activation_scale =
                     nativeVNNIFP16ScaleToFP32(activation.d);
                 if (packed.is_asymmetric)
@@ -500,9 +496,7 @@ namespace llaminar2::cpu::native_vnni
                     _mm256_add_epi32(dot0_low, dot0_high), bias);
                 const __m256i corrected1 = _mm256_sub_epi32(
                     _mm256_add_epi32(dot1_low, dot1_high), bias);
-                const __m256 weight_scale = _mm256_cvtph_ps(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(
-                        packed.chunkScales(chunk, kb) + segment * 8)));
+                const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
                 const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
                 if (packed.is_asymmetric)
@@ -678,9 +672,7 @@ namespace llaminar2::cpu::native_vnni
                     _mm256_add_epi32(dot0_even, dot0_odd), bias);
                 const __m256i corrected1 = _mm256_sub_epi32(
                     _mm256_add_epi32(dot1_even, dot1_odd), bias);
-                const __m256 weight_scale = _mm256_cvtph_ps(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(
-                        packed.chunkScales(chunk, kb) + segment * 8)));
+                const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
                 const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
                 if (packed.is_asymmetric)

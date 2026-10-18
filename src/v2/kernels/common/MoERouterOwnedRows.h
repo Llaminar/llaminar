@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "MoERouterRowPacket.h"
+#include "config/MoERouterArithmeticPolicy.h"
 
 namespace llaminar2
 {
@@ -37,6 +38,7 @@ namespace llaminar2
         const std::int32_t *live_rows = nullptr; ///< Existing canonical device authority.
         const float *hidden = nullptr; ///< All original rows retained for local consumers.
         MoERouterPreparedFormat format = MoERouterPreparedFormat::FP32;
+        RouterQ8Basis q8_basis = RouterQ8Basis::Original; ///< Only BlockQ8 consumes a rotated basis.
         const void *gate = nullptr;
         const float *gate_scales = nullptr; ///< Required only by prepared BlockQ8.
         std::int8_t *hidden_q8 = nullptr; ///< Full-row side product, never a partial publication.
@@ -55,17 +57,22 @@ namespace llaminar2
             return capacity >= 2 && width > 0 && experts > 0 && top_k > 0 && top_k <= experts &&
                 live_rows && hidden && gate && logits && selected && selected_bytes &&
                 partition.participants() > 1 &&
+                (q8_basis == RouterQ8Basis::Original ||
+                    (q8_basis == RouterQ8Basis::SignedHadamard32 && format == MoERouterPreparedFormat::BlockQ8)) &&
                 (format != MoERouterPreparedFormat::BlockQ8 ||
                     (width % 32 == 0 && gate_scales && hidden_q8 && hidden_scales));
         }
     };
     namespace cuda
     {
+        struct RouterQ8PrefillHardware;
         /** @brief Enqueue supported native prefill routing on the exact CUDA stream.
          * @param launch Frozen ownership, prepared weights and persistent local banks.
          * @param stream Non-null explicit execution stream on the calling device.
+         * @param hardware Immutable native limits prepared before Q8 capture.
          * @return False for invalid bindings, unsupported format or native launch error. */
-        bool routeOwnedRows(const MoERouterOwnedRowsLaunch &launch, void *stream);
+        bool routeOwnedRows(const MoERouterOwnedRowsLaunch &launch, void *stream,
+                            const RouterQ8PrefillHardware &hardware);
     }
     namespace rocm
     {

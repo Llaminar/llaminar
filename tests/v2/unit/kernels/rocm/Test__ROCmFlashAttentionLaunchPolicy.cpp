@@ -4,7 +4,8 @@
  *
  * The suite covers released Qwen dense and MoE attention geometries, equal TP
  * shards through TP8, unseen positive M values, and K/V capacities through the
- * 256K context regime. It performs no HIP runtime call or accelerator work.
+ * 256K context regime. Register-score admission also proves exact native-format,
+ * visibility, LDS and workspace identity. No HIP runtime or accelerator is used.
  */
 
 #include <gtest/gtest.h>
@@ -19,6 +20,7 @@
 
 namespace
 {
+    namespace policy = llaminar2::rocm::fa2_policy;
     using llaminar2::attention::AttentionPrefillParallelAxis;
     using llaminar2::rocm::fa2_policy::ROCmFA2PrefillParallelGeometry;
     using llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode;
@@ -31,6 +33,130 @@ namespace
     using llaminar2::rocm::fa2_policy::selectROCmFA2PrefillParallelPlan;
     using llaminar2::rocm::fa2_policy::selectROCmFA2ReducerWavefronts;
     using llaminar2::rocm::fa2_policy::selectROCmFA2Tile;
+
+    /** Exact score ownership depends on admitted geometry, never live KV length. */
+    TEST(ROCmFlashAttentionLaunchPolicy, RegisterScoreNativeFormatAndVisibilityTotality)
+    {
+        for (const int batch : {-1, 0, 1, 2, 4})
+        for (const int rows : {0, 1, 2, 4, 8, 16, 31, 128, 255, 511, 512, 513, 1024, 2048, 4096, 65536, 2147483647})
+        for (const int width : {0, 64, 128, 192, 255, 256, 257})
+        for (const auto format : {llaminar2::TensorType::FP32, llaminar2::TensorType::FP16,
+                                 llaminar2::TensorType::BF16, llaminar2::TensorType::Q8_1,
+                                 llaminar2::TensorType::TQ8})
+        for (const auto visibility : {policy::ROCmFA2VisibilityPolicy::General,
+                                     policy::ROCmFA2VisibilityPolicy::CausalFullContext})
+        {
+            const auto selected = policy::selectROCmFA2QueryScoreStorage({
+                .batch_size = batch, .query_rows = rows, .head_dim = width,
+                .kv_format = format, .visibility = visibility});
+            const bool eligible = batch == 1 && rows >= 512 && width == 256 &&
+                format == llaminar2::TensorType::FP16 &&
+                visibility == policy::ROCmFA2VisibilityPolicy::CausalFullContext;
+            EXPECT_EQ(selected, eligible ? policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile
+                                        : policy::ROCmFA2ScoreStorage::SharedMatrix);
+        }
+    }
+
+    /** A selected layout owns exact storage; invalid requests cannot substitute a tile. */
+    TEST(ROCmFlashAttentionLaunchPolicy, RegisterScoreExactLDSRejectsInvalidLayouts)
+    {
+        constexpr auto storage = policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile;
+        constexpr auto query = ROCmFA2PrefillPhysicalMode::QuerySequence;
+        const auto tile = selectROCmFA2Tile(256, 16384, 0, query, storage);
+        ASSERT_TRUE(tile.valid);
+        EXPECT_EQ(tile.lds_bytes, 16384U);
+        EXPECT_EQ(tile.query_rows, 16);
+        EXPECT_EQ(tile.kv_rows, 16);
+        EXPECT_EQ(tile.threads_per_row, 16);
+        EXPECT_EQ(tile.score_storage, storage);
+        EXPECT_EQ(rocmFA2LDSBytes(256, 16, 16, query, storage), tile.lds_bytes);
+        EXPECT_FALSE(selectROCmFA2Tile(256, 16383, 0, query, storage).valid);
+        EXPECT_FALSE(selectROCmFA2Tile(128, 65536, 0, query, storage).valid);
+        EXPECT_FALSE(selectROCmFA2Tile(256, 65536, 32, query, storage).valid);
+        EXPECT_FALSE(selectROCmFA2Tile(256, 65536, 0,
+            ROCmFA2PrefillPhysicalMode::KeyValueContext, storage).valid);
+        EXPECT_EQ(rocmFA2LDSBytes(256, 16, 32, query, storage), 0U);
+        const auto invalid = static_cast<policy::ROCmFA2ScoreStorage>(255);
+        EXPECT_EQ(rocmFA2LDSBytes(256, 16, 16, query, invalid), 0U);
+        EXPECT_FALSE(selectROCmFA2Tile(256, 65536, 0, query, invalid).valid);
+    }
+
+    /** Explicit axes retain ownership; automatic selection uses the measured score layout. */
+    TEST(ROCmFlashAttentionLaunchPolicy, RegisterScorePlanPreservesExplicitAxisAndSelectsEconomicalAutomaticAxis)
+    {
+        for (const int heads : {1, 2, 3, 6, 8, 12, 16, 24})
+        for (const int capacity : {512, 8192, 8193, 16384, 65536, 131072, 262144})
+        for (const auto axis : {AttentionPrefillParallelAxis::QuerySequence,
+                               AttentionPrefillParallelAxis::KeyValueContext,
+                               AttentionPrefillParallelAxis::GeometrySelected})
+        {
+            ROCmFA2PrefillParallelGeometry geometry{
+                .batch_size = 1, .query_rows = 512, .local_query_heads = heads,
+                .head_dim = 256, .kv_capacity = capacity, .compute_unit_count = 60,
+                .lds_capacity_bytes = 65536, .requested_axis = axis};
+            const auto canonical = selectROCmFA2PrefillParallelPlan(geometry);
+            geometry.kv_format = llaminar2::TensorType::FP16;
+            geometry.visibility = policy::ROCmFA2VisibilityPolicy::CausalFullContext;
+            const auto selected = selectROCmFA2PrefillParallelPlan(geometry);
+            ASSERT_TRUE(canonical.valid);
+            ASSERT_TRUE(selected.valid);
+            if (axis != AttentionPrefillParallelAxis::GeometrySelected)
+                EXPECT_EQ(selected.mode, canonical.mode);
+            EXPECT_EQ(selected.query_grid_blocks, canonical.query_grid_blocks);
+            EXPECT_LE(selected.partial_output_bytes, canonical.partial_output_bytes);
+            EXPECT_LE(selected.partial_m_bytes, canonical.partial_m_bytes);
+            EXPECT_LE(selected.partial_l_bytes, canonical.partial_l_bytes);
+            if (axis == AttentionPrefillParallelAxis::GeometrySelected && heads >= 6)
+                EXPECT_FALSE(selected.usesContextParallelism());
+            if (selected.usesContextParallelism())
+            {
+                EXPECT_EQ(selected.tile.score_storage, policy::ROCmFA2ScoreStorage::SharedMatrix);
+                EXPECT_EQ(selected.tile.lds_bytes, canonical.tile.lds_bytes);
+            }
+            else
+            {
+                EXPECT_EQ(selected.tile.score_storage, policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile);
+                EXPECT_EQ(selected.tile.lds_bytes, 16384U);
+                EXPECT_EQ(selected.partial_output_bytes, 0U);
+            }
+        }
+    }
+
+    /** Larger buckets cannot lose the register-score path or escape their exact family BOM. */
+    TEST(ROCmFlashAttentionLaunchPolicy, RegisterScoreLargerBucketsAndFamilyEnvelopeAreTotal)
+    {
+        for (const int heads : {1, 2, 3, 4, 6, 8, 12, 16, 24})
+        {
+            ROCmFA2PrefillParallelGeometry geometry{
+                .batch_size = 1, .query_rows = 4096, .local_query_heads = heads,
+                .head_dim = 256, .kv_capacity = 131072, .compute_unit_count = 60,
+                .requested_axis = AttentionPrefillParallelAxis::GeometrySelected,
+                .kv_format = llaminar2::TensorType::FP16,
+                .visibility = policy::ROCmFA2VisibilityPolicy::CausalFullContext};
+            const auto family = selectROCmFA2GeometrySelectedWorkspaceEnvelope(geometry);
+            ASSERT_TRUE(family.valid);
+            std::size_t maximum = 0;
+            bool query_selected = false;
+            for (int rows = 1; rows <= 4096; ++rows)
+            {
+                geometry.query_rows = rows;
+                const auto plan = selectROCmFA2PrefillParallelPlan(geometry);
+                ASSERT_TRUE(plan.valid) << rows << '/' << heads;
+                maximum = std::max(maximum, plan.partial_output_bytes);
+                EXPECT_LE(plan.partial_output_bytes, family.partial_output_bytes) << rows << '/' << heads;
+                if (rows < 512) continue;
+                if (query_selected) EXPECT_FALSE(plan.usesContextParallelism()) << rows << '/' << heads;
+                if (!plan.usesContextParallelism())
+                {
+                    query_selected = true;
+                    EXPECT_EQ(plan.tile.score_storage, policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile);
+                    EXPECT_EQ(plan.tile.lds_bytes, 16384U);
+                }
+                if (heads >= 6) EXPECT_FALSE(plan.usesContextParallelism());
+            }
+            EXPECT_EQ(family.partial_output_bytes, maximum) << heads;
+        }
+    }
 
     /** One model-visible attention geometry used by the policy sweep. */
     struct QwenAttentionGeometry
@@ -77,6 +203,12 @@ namespace
             EXPECT_LE(tile.lds_bytes, kROCmFA2LDSCapacityBytes);
         }
 
+        const auto invalid_schedule = static_cast<
+            llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode>(255);
+        EXPECT_EQ(rocmFA2LDSBytes(256, 16, 16, invalid_schedule), 0U);
+        EXPECT_FALSE(selectROCmFA2Tile(
+            256, kROCmFA2LDSCapacityBytes, 0, invalid_schedule).valid);
+
         EXPECT_FALSE(selectROCmFA2Tile(0).valid);
         EXPECT_FALSE(selectROCmFA2Tile(257).valid);
         EXPECT_FALSE(selectROCmFA2Tile(128, 1).valid);
@@ -122,6 +254,7 @@ namespace
                             selectROCmFA2PrefillParallelPlan(geometry);
                         ASSERT_TRUE(plan.valid);
                         ASSERT_TRUE(plan.tile.valid);
+                        EXPECT_EQ(plan.tile.schedule, plan.mode);
                         EXPECT_GT(
                             rocmFA2QueryGridBlocks(geometry, plan.tile),
                             0);
@@ -318,7 +451,7 @@ namespace
         ASSERT_TRUE(plan.valid);
         ASSERT_TRUE(plan.usesContextParallelism());
         ASSERT_EQ(plan.max_context_partitions, 512);
-        EXPECT_EQ(plan.context_phase_block_slots, 60);
+        EXPECT_EQ(plan.context_phase_block_slots, 180);
 
         constexpr std::size_t scalar_count = 64ULL * 2ULL * 512ULL;
         EXPECT_EQ(
@@ -633,9 +766,35 @@ namespace
             .requested_axis =
                 AttentionPrefillParallelAxis::KeyValueContext,
         };
-        const auto tile = selectROCmFA2Tile(geometry.head_dim);
+        const auto tile = selectROCmFA2Tile(geometry.head_dim, kROCmFA2LDSCapacityBytes, 0,
+            llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode::KeyValueContext);
         ASSERT_TRUE(tile.valid);
-        ASSERT_GT(tile.lds_bytes, kROCmFA2LDSCapacityBytes / 2);
+        ASSERT_EQ(tile.lds_bytes, 17984U);
+        const auto query_tile = selectROCmFA2Tile(geometry.head_dim);
+        ASSERT_TRUE(query_tile.valid);
+        EXPECT_EQ(query_tile.lds_bytes, 26432U);
+        EXPECT_EQ(query_tile.query_rows, tile.query_rows);
+        EXPECT_EQ(query_tile.kv_rows, tile.kv_rows);
+        ASSERT_LE(tile.lds_bytes, kROCmFA2LDSCapacityBytes / 3);
+        ASSERT_GT(tile.lds_bytes, kROCmFA2LDSCapacityBytes / 4);
+
+        // Storage and compiled register envelopes independently cap residency.
+        // A smaller LDS budget must bound the physical grid without padding the
+        // logical task inventory, and extra LDS cannot admit a fourth group.
+        for (const int compute_units : {1, 4, 60, 120})
+        for (const int storage_groups : {1, 2, 3, 4})
+        {
+            auto constrained = geometry;
+            constrained.compute_unit_count = compute_units;
+            constrained.lds_capacity_bytes = tile.lds_bytes * storage_groups;
+            const int hardware = compute_units * (storage_groups < 3 ? storage_groups : 3);
+            for (const int slots : {1, 10, 512})
+            {
+                const auto logical = rocmFA2ContextPhaseLogicalBlocks(constrained, tile, slots);
+                EXPECT_EQ(selectROCmFA2ContextPhaseBlockSlots(constrained, tile, slots),
+                          logical < hardware ? logical : hardware);
+            }
+        }
 
         constexpr int partition_slots = 10;
         EXPECT_EQ(
@@ -649,7 +808,7 @@ namespace
                 geometry,
                 tile,
                 partition_slots),
-            60);
+            180);
         EXPECT_EQ(
             selectROCmFA2ContextPhaseBlockSlots(
                 geometry,
@@ -667,12 +826,49 @@ namespace
 
         for (const int head_dim : {64, 128, 256})
         {
-            const auto selected = selectROCmFA2Tile(head_dim);
+            const auto selected = selectROCmFA2Tile(head_dim, kROCmFA2LDSCapacityBytes, 0,
+                llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode::KeyValueContext);
             ASSERT_TRUE(selected.valid);
-            EXPECT_GT(
-                selected.lds_bytes,
-                kROCmFA2LDSCapacityBytes / 2)
-                << "head_dim=" << head_dim;
+            if (head_dim == 256)
+                EXPECT_LE(selected.lds_bytes * 3, kROCmFA2LDSCapacityBytes);
+            else
+                EXPECT_GT(selected.lds_bytes * 2, kROCmFA2LDSCapacityBytes);
+        }
+    }
+
+    /**
+     * @brief Keep every positive production query bucket within real residency.
+     *
+     * This proves the three-workgroup storage envelope while keeping small
+     * arithmetic grids never grow to a padded hardware-capacity grid. The
+     * unchanged tile width preserves the canonical softmax arithmetic order.
+     */
+    TEST(ROCmFlashAttentionLaunchPolicy, WideHeadResidencyAllQueryBucketsAndTP)
+    {
+        for (const int heads : {16, 24, 32})
+        for (const int tp : {1, 2, 4, 8})
+        for (int rows = 1; rows <= 512; ++rows)
+        for (const int capacity : {256, 257, 4096, 262144})
+        {
+            const ROCmFA2PrefillParallelGeometry geometry{
+                .batch_size = 1,
+                .query_rows = rows,
+                .local_query_heads = heads / tp,
+                .head_dim = 256,
+                .kv_capacity = capacity,
+                .compute_unit_count = 60,
+                .lds_capacity_bytes = kROCmFA2LDSCapacityBytes,
+                .requested_axis = AttentionPrefillParallelAxis::KeyValueContext,
+            };
+            const auto plan = selectROCmFA2PrefillParallelPlan(geometry);
+            ASSERT_TRUE(plan.valid);
+            ASSERT_EQ(plan.tile.query_rows, 16);
+            ASSERT_EQ(plan.tile.kv_rows, 16);
+            ASSERT_LE(plan.tile.lds_bytes * 3, kROCmFA2LDSCapacityBytes);
+            const auto logical = rocmFA2ContextPhaseLogicalBlocks(
+                geometry, plan.tile, plan.context_partition_slots);
+            ASSERT_EQ(plan.context_phase_block_slots, logical < 180 ? logical : 180);
+            ASSERT_LE(plan.context_phase_block_slots, logical);
         }
     }
 

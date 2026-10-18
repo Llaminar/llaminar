@@ -1,11 +1,16 @@
 /**
  * @file IQ2_STensor.cpp
  * @brief IQ2_S quantized tensor implementation (2-bit small IQ with high bits and scales)
+ *
+ * NativeVNNI preparation preserves the original half base and coefficient byte
+ * verbatim; derived scales are reconstructed by consumers in FP32. This keeps
+ * the original source equation and the existing physical footprint.
  * @author David Sanftenberg
  */
 
 #include "TensorClasses.h"
 #include "VnniPackContext.h"
+#include "NativeVnniIQ2SScale.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
@@ -463,12 +468,11 @@ namespace llaminar2
         payload_buf[4] = blk->qh[sub_idx];
         std::memcpy(payload_buf + 5, blk->qs + 32 + sub_idx * 4, 4);
 
-        const float d_val = fp16_to_fp32(blk->d);
         const uint8_t sc = blk->scales[sub_idx];
 
         std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 9);
-        ctx.scales_array[linear] = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
-        ctx.mins_array[linear] = fp32_to_fp16(d_val * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
+        ctx.scales_array[linear] = blk->d;
+        ctx.mins_array[linear] = native_vnni_iq2s_scale::pack(sc);
     }
 
 } // namespace llaminar2

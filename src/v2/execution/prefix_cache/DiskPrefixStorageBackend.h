@@ -25,6 +25,7 @@
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "execution/prefix_cache/PrefixArchiveMaintenanceWriter.h"
+#include "execution/prefix_cache/PrefixCacheShutdown.h"
 
 #include <array>
 #include <condition_variable>
@@ -219,6 +220,25 @@ namespace llaminar2
          */
         bool waitForPersistence(std::string *error = nullptr);
 
+        /** @return Shared identity independent of pathname aliases and journal compaction. */
+        PrefixArchiveIdentity shutdownIdentity() const noexcept { return archive_identity_; }
+
+        /**
+         * @brief Persist selected terminal RAM owners without evicting selected peers.
+         * @param handles Local original leases, ordered most-recent-first.
+         * @param plan Complete metadata-only selection for this shared archive.
+         * @return Actual payload writes and metadata-only backing reuse.
+         * @throws std::exception For a mismatched plan or any native write failure.
+         *
+         * All ordinary writer work must have completed before selection. Existing
+         * disk records remain ordinary LRU victims unless their exact incarnation
+         * is selected. The method writes only selected handles, once each, and
+         * leaves the RAM owners intact until the surrounding runner retires.
+         */
+        PrefixCacheShutdownResult flushShutdown(
+            std::span<const PrefixBlockHandle> handles,
+            const PrefixShutdownArchivePlan &plan);
+
         /** @brief Unit oracle; production hydration uses admitted RAM directly. */
         bool readBlock(
             const PrefixCacheKey &key,
@@ -299,6 +319,17 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Reconcile participant lookup hints against one current archive snapshot.
+         * @param keys Exact local disk identities; no payload pointers are followed.
+         * @return Keys absent from the committed journal at this observation.
+         * @throws std::runtime_error If archive metadata cannot be authenticated.
+         * @throws std::invalid_argument If a supplied key has invalid geometry or identity.
+         * This explicit lookup boundary takes one metadata lock/refresh for the
+         * complete batch. It neither opens payloads nor mutates durable recency.
+         */
+        std::vector<PrefixCacheKey> missingKeys(std::span<const PrefixCacheKey> keys);
+
+        /**
          * @brief Discover restart-persistent records for one runtime layout.
          */
         std::vector<PrefixBlockHandle> compatibleEntries(
@@ -370,6 +401,21 @@ namespace llaminar2
 
         /** @brief Validate model identity and recover the crash-tolerant archive. */
         bool initialize(std::string *error);
+        /**
+         * @brief Publish through the durable writer with optional terminal protection.
+         * @param handle Original immutable RAM payload and exact producer readiness.
+         * @param disk_handle Optional committed backing metadata destination.
+         * @param evicted_keys Optional identities retired by this publication.
+         * @param error Optional native failure diagnostic destination.
+         * @param disposition Optional distinction between payload storage and backing reuse.
+         * @param protected_blocks Exact terminal incarnations no writer may evict.
+         * @return True after durable publication, false for invalid owners or native failure.
+         * @throws std::exception If metadata allocation fails.
+         */
+        bool writeBlockImpl(const PrefixBlockHandle &handle, PrefixBlockHandle *disk_handle,
+            std::vector<PrefixCacheKey> *evicted_keys, std::string *error,
+            PrefixArchiveWriteDisposition *disposition,
+            std::span<const PrefixShutdownBlock> protected_blocks);
         /**
          * @brief Retain a failed native mutation and reject later archive work.
          * @param message Precise failure at the owned native mutation boundary.
@@ -469,6 +515,7 @@ namespace llaminar2
         std::shared_ptr<PrefixCacheTierTelemetry> telemetry_ =
             std::make_shared<PrefixCacheTierTelemetry>(budget_bytes_);
         std::string model_artifact_identity_;
+        PrefixArchiveIdentity archive_identity_;
 
         mutable std::mutex mutex_;
         bool ready_ = false;

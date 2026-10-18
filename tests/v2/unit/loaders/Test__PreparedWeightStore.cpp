@@ -51,6 +51,14 @@ namespace
         return std::make_unique<Q8_0Tensor>(std::vector<size_t>{rows, cols}, std::move(raw_data));
     }
 
+    /**
+     * @brief Construct valid native-layout metadata without allocating device storage.
+     * @param tensor Synthetic native source retained by the calling test.
+     * @param device Exact device used for store identity and metadata validation.
+     * @return Metadata-only handle for registration and ownership-ledger tests.
+     * @throws std::invalid_argument If the fixture source has unsupported geometry.
+     * @throws std::overflow_error If its source backing extent overflows size_t.
+     */
     PreparedEmbeddingHandle makeEmbeddingHandle(TensorBase *tensor, DeviceId device)
     {
         PreparedEmbeddingHandle handle;
@@ -58,6 +66,11 @@ namespace
         handle.device_id = device;
         handle.weights = std::make_shared<PreparedEmbeddingWeights>();
         handle.weights->device_id = device;
+        handle.weights->layout = NativeEmbeddingLayout::forSource(
+            tensor->native_type(), tensor->rows(), static_cast<int>(tensor->cols()));
+        handle.weights->vocab_size = tensor->rows();
+        handle.weights->total_vocab = tensor->rows();
+        handle.weights->d_model = static_cast<int>(tensor->cols());
         return handle;
     }
 }
@@ -287,6 +300,49 @@ TEST(Test__PreparedWeightStore, AdoptsPreparedGemmByCanonicalNameAfterHostPayloa
     EXPECT_TRUE(later_tensor->hasPreparedDeviceState());
 }
 
+/** @brief Same-name and same-shape prepared weights cannot alias different operand arithmetic. */
+TEST(Test__PreparedWeightStore, AdoptionRejectsDifferentProjectionPrecision)
+{
+    using Factory = llaminar::v2::kernels::KernelFactory;
+    PreparedWeightStore store(ModelContextId{99});
+    FP16Tensor prepared(std::vector<size_t>{8, 32});
+    auto original = makeStoreBinding(934, "blk.0.ssm_alpha.weight", DeviceId::cpu());
+    original.tensor = &prepared;
+    original.floating_operand_precision = FloatingActivationOperandPrecision::FP16RNE;
+    auto handle = std::make_shared<Factory::PreparedGemmHandle>();
+    handle->tensor = &prepared;
+    handle->device_id = DeviceId::cpu();
+    handle->kind = Factory::GemmPreparationKind::FLOATING_POINT;
+    handle->prepared_weights = std::make_shared<Factory::PreparedGemmWeights>();
+    handle->prepared_weights->kind = handle->kind;
+    store.registerPreparedGemmHandle(original, PreparedWeightKind::CpuPackedGemm,
+        DeviceId::cpu(), std::move(handle));
+    FP16Tensor same_storage(std::vector<size_t>{8, 32});
+    FP32Tensor other_storage(std::vector<size_t>{8, 32});
+    for (const auto precision : {FloatingActivationOperandPrecision::Native,
+                                FloatingActivationOperandPrecision::FP32})
+    {
+        auto requested = makeStoreBinding(935, original.identity.canonical_name, DeviceId::cpu());
+        requested.tensor = &same_storage;
+        requested.floating_operand_precision = precision;
+        requested.prepared = PreparedWeightRef{ModelContextId{99}, requested.binding_id,
+            PreparedWeightKind::CpuPackedGemm, DeviceId::cpu()};
+        EXPECT_FALSE(store.adoptPreparedGemmForBinding(requested, DeviceId::cpu()));
+    }
+    auto wrong_format = makeStoreBinding(936, original.identity.canonical_name, DeviceId::cpu());
+    wrong_format.tensor = &other_storage;
+    wrong_format.floating_operand_precision = FloatingActivationOperandPrecision::FP16RNE;
+    wrong_format.prepared = PreparedWeightRef{ModelContextId{99}, wrong_format.binding_id,
+        PreparedWeightKind::CpuPackedGemm, DeviceId::cpu()};
+    EXPECT_FALSE(store.adoptPreparedGemmForBinding(wrong_format, DeviceId::cpu()));
+    auto matching = makeStoreBinding(937, original.identity.canonical_name, DeviceId::cpu());
+    matching.tensor = &same_storage;
+    matching.floating_operand_precision = FloatingActivationOperandPrecision::FP16RNE;
+    matching.prepared = PreparedWeightRef{ModelContextId{99}, matching.binding_id,
+        PreparedWeightKind::CpuPackedGemm, DeviceId::cpu()};
+    EXPECT_TRUE(store.adoptPreparedGemmForBinding(matching, DeviceId::cpu()));
+}
+
 TEST(Test__PreparedWeightStore, ExactBindingReuseRestoresStoreOwnedTensorAuthority)
 {
     PreparedWeightStore store(ModelContextId{99});
@@ -476,7 +532,7 @@ TEST(Test__PreparedWeightStore, CountsUniquePreparedEmbeddingAllocationBytes)
     first_binding.tensor = tensor.get();
 
     auto handle = makeEmbeddingHandle(tensor.get(), DeviceId::rocm(0));
-    handle.weights->byte_size = 4096u;
+    const size_t native_bytes = handle.weights->layout.byte_size;
     store.registerPreparedEmbeddingFromPipeline(
         first_binding, DeviceId::rocm(0), &handle);
 
@@ -489,7 +545,7 @@ TEST(Test__PreparedWeightStore, CountsUniquePreparedEmbeddingAllocationBytes)
 
     EXPECT_EQ(
         store.preparedEmbeddingAllocationBytesForDevice(DeviceId::rocm(0)),
-        4096u);
+        native_bytes);
     EXPECT_EQ(
         store.preparedEmbeddingAllocationBytesForDevice(DeviceId::rocm(1)),
         0u);
@@ -715,4 +771,55 @@ TEST(Test__PreparedWeightStore, RejectsEmptyPreparedKind)
     EXPECT_THROW(store.registerPreparedForTest(
                      binding, PreparedWeightKind::None, DeviceId::cpu()),
                  std::runtime_error);
+}
+
+/** @test Pipeline registration rejects altered native source geometry before adoption. */
+TEST(Test__PreparedWeightStore, NativeEmbeddingRejectsForeignLayoutMetadata)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto tensor = makeQ8_0Tensor(64, 96);
+    auto binding = makeStoreBinding(901, "token_embd.weight", DeviceId::cuda(0));
+    binding.identity.role = WeightRole::Embedding;
+    binding.tensor = tensor.get();
+    auto handle = makeEmbeddingHandle(tensor.get(), DeviceId::cuda(0));
+    handle.weights->layout.row_stride_bytes += 1;
+    EXPECT_THROW(store.registerPreparedEmbeddingFromPipeline(binding, DeviceId::cuda(0), &handle), std::runtime_error);
+    handle.weights->layout = NativeEmbeddingLayout::forSource(TensorType::Q8_1, 64, 96);
+    EXPECT_THROW(store.registerPreparedEmbeddingFromPipeline(binding, DeviceId::cuda(0), &handle), std::runtime_error);
+}
+
+/**
+ * @brief A real prepared engine cannot publish a contradictory operand identity.
+ *
+ * Both directions use the actual public CPU preparation factory and physical
+ * half weights without executing GEMM. A rejected registration leaves neither
+ * tensor prepared-state publication nor a store entry; a matching retry succeeds.
+ */
+TEST(Test__PreparedWeightStore, RegistrationRejectsRealKernelPrecisionMismatchBeforePublication)
+{
+    using Factory = llaminar::v2::kernels::KernelFactory;
+    for (const auto actual : {FloatingActivationOperandPrecision::Native,
+                             FloatingActivationOperandPrecision::FP16RNE})
+    {
+        FP16Tensor tensor(std::vector<size_t>{8, 32});
+        PreparedWeightStore store(ModelContextId{99});
+        auto handle = Factory::prepareGemmHandleLocal(&tensor, DeviceId::cpu(),
+            Factory::GemmPreparationKind::AUTO, actual);
+        ASSERT_TRUE(handle);
+        ASSERT_TRUE(handle->prepared_weights);
+        ASSERT_NE(handle->prepared_weights->kernel, nullptr);
+        auto binding = makeStoreBinding(938, "blk.0.ssm_alpha.weight", DeviceId::cpu());
+        binding.tensor = &tensor;
+        binding.floating_operand_precision = actual == FloatingActivationOperandPrecision::Native
+            ? FloatingActivationOperandPrecision::FP16RNE : FloatingActivationOperandPrecision::Native;
+        EXPECT_THROW(store.registerPreparedGemmHandle(binding, PreparedWeightKind::CpuPackedGemm,
+            DeviceId::cpu(), handle), std::invalid_argument);
+        EXPECT_FALSE(store.preparedRefForBinding(binding.binding_id, DeviceId::cpu()).has_value());
+        EXPECT_FALSE(tensor.hasPreparedDeviceState());
+        binding.floating_operand_precision = actual;
+        const auto ref = store.registerPreparedGemmHandle(binding, PreparedWeightKind::CpuPackedGemm,
+            DeviceId::cpu(), handle);
+        EXPECT_TRUE(store.contains(ref));
+        EXPECT_TRUE(tensor.hasPreparedDeviceState());
+    }
 }

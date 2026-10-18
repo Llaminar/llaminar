@@ -111,7 +111,7 @@ def validate_proof(e2e_directory: Path, benchmark_directory: Path,
             or pair["source"]["tree"] != master_tree
             or pair.get("workflow_revision") != develop_sha):
         raise ValueError("master tree or merged PR head differs from certified image source")
-    manifest, e2e_reports = suite.admit_e2e(e2e_directory, pair)
+    manifest, e2e_reports = suite.admit_e2e(e2e_directory, pair, require_model_kld=True)
     result, reports = suite.admit_benchmarks(benchmark_directory, pair, manifest, e2e_reports)
     coding = validate_coding_matrix(json.loads((coding_directory / 'opencode.json').read_text()),
                                     pair, manifest, e2e_reports, reports)
@@ -200,7 +200,7 @@ def release_notes(tag: str, previous_tag: str | None, changes: list[str],
     return "\n".join(lines)
 
 
-def release_asset_sources(e2e: Path, benchmarks: Path) -> dict[str, Path]:
+def release_asset_sources(e2e: Path, benchmarks: Path, *, model_kld: bool = False) -> dict[str, Path]:
     """Name the public evidence once for release upload and documentation."""
     sources = {
         "image-pair.json": e2e / "images.json",
@@ -212,6 +212,10 @@ def release_asset_sources(e2e: Path, benchmarks: Path) -> dict[str, Path]:
     for isa in suite.ISAS:
         sources[f"e2e-{isa.lower()}.json"] = e2e / isa.lower() / "e2e.json"
         sources[f"benchmark-{isa.lower()}.json"] = benchmarks / isa.lower() / "benchmarks.json"
+        # Historical display-only bundles need no invented numerical evidence.
+        # New releases require this pair through validate_proof before copying.
+        if model_kld:
+            sources[f"kld-{isa.lower()}.json"] = e2e / isa.lower() / 'kld/kld-canaries.json'
     return sources
 
 
@@ -219,7 +223,7 @@ def release_assets(e2e: Path, benchmarks: Path, coding: Path, output: Path) -> l
     """Copy only compact authenticated receipts, reports and numbers."""
     assets = output / "assets"
     assets.mkdir()
-    sources = release_asset_sources(e2e, benchmarks)
+    sources = release_asset_sources(e2e, benchmarks, model_kld=True)
     sources['opencode.json'] = coding / 'opencode.json'
     for name, source in sources.items():
         shutil.copyfile(source, assets / name)

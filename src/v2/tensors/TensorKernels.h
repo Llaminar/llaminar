@@ -9,6 +9,7 @@
  */
 
 #pragma once
+#include "kernels/FloatingActivationOperandPrecision.h"
 
 #include "../backends/ExplicitGPUStream.h"
 #include "../utils/MPIContext.h"
@@ -406,6 +407,12 @@ namespace llaminar2
     class ITensorGemm : public ITensorKernel
     {
     public:
+        /** @return Immutable operand arithmetic included in floating fusion identity. */
+        [[nodiscard]] virtual FloatingActivationOperandPrecision floatingActivationOperandPrecision() const noexcept
+        {
+            return FloatingActivationOperandPrecision::Native;
+        }
+
         /**
          * @brief RAII token for verifier-only kernel dispatch modes.
          *
@@ -427,17 +434,32 @@ namespace llaminar2
             /** @brief Bind optional physical/live geometry for this recording scope. */
             explicit VerifierKernelModeScope(
                 std::optional<DeviceRowRange> rows = std::nullopt)
-                : previous_rows_(current_rows_)
+                : previous_rows_(current_rows_), previous_active_(current_active_)
             {
+                current_active_ = true;
                 if (rows)
                     current_rows_ = rows;
             }
 
             /** @brief Restore metadata even when a nested launch throws. */
-            virtual ~VerifierKernelModeScope() { current_rows_ = previous_rows_; }
+            virtual ~VerifierKernelModeScope()
+            {
+                current_rows_ = previous_rows_;
+                current_active_ = previous_active_;
+            }
 
             VerifierKernelModeScope(const VerifierKernelModeScope &) = delete;
             VerifierKernelModeScope &operator=(const VerifierKernelModeScope &) = delete;
+
+            /**
+             * @brief Whether recording requires serial-decode-equivalent arithmetic.
+             * @return True within any verifier scope, including fully active rows.
+             *
+             * Optional row geometry describes launch extent, not the numerical
+             * contract. A verifier with no device count still requires the
+             * fixed reduction tree; nested scopes restore both independently.
+             */
+            [[nodiscard]] static bool active() noexcept { return current_active_; }
 
             /**
              * @brief Resolve borrowed launch metadata without reading device state.
@@ -457,7 +479,9 @@ namespace llaminar2
 
         private:
             std::optional<DeviceRowRange> previous_rows_; ///< Enclosing recording metadata.
+            bool previous_active_; ///< Enclosing arithmetic contract on this recorder.
             inline static thread_local std::optional<DeviceRowRange> current_rows_;
+            inline static thread_local bool current_active_ = false;
         };
 
         /**

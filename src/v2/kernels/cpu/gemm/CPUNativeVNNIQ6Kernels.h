@@ -5,7 +5,8 @@
  * Q6_K stores each logical 32-value block as two independently scaled groups
  * of sixteen six-bit values.  Expanding those values to a requantized INT8
  * stream makes decode bandwidth-bound at one byte per weight and also discards
- * the original dual-scale arithmetic.  These kernels consume the packed
+ * the original dual-scale arithmetic. Metadata retains the original half base
+ * and signed coefficients without narrowing their products. These kernels consume the packed
  * six-bit representation directly for AVX-512 VNNI and AVX2-emulated VNNI.
  *
  * Serial M=1 and grouped MTP verification call the same templated primitive.
@@ -52,6 +53,63 @@ namespace llaminar2::cpu::native_vnni
 
     namespace q6k_detail
     {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        /** @brief Exact original Q6_K factors for sixteen output columns. */
+        struct SourceScalesAVX512
+        {
+            __m512 low;  ///< First sixteen source weights' factor.
+            __m512 high; ///< Last sixteen source weights' factor.
+        };
+
+        /**
+         * @brief Widen sixteen original bases and signed coefficient pairs.
+         * @param bases Aligned source FP16 bases, one per output column.
+         * @param coefficients Aligned opaque signed coefficient pairs.
+         * @return Exact FP32 products; finite half times int8 fits FP32 exactly.
+         */
+        LLAMINAR_Q6K_EXACT_FP inline SourceScalesAVX512 sourceScalesAVX512(
+            const uint16_t *bases, const uint16_t *coefficients) noexcept
+        {
+            const __m512 base = _mm512_cvtph_ps(_mm256_load_si256(
+                reinterpret_cast<const __m256i *>(bases)));
+            const __m512i words = _mm512_cvtepu16_epi32(_mm256_load_si256(
+                reinterpret_cast<const __m256i *>(coefficients)));
+            const __m512 low = _mm512_cvtepi32_ps(_mm512_srai_epi32(
+                _mm512_slli_epi32(words, 24), 24));
+            const __m512 high = _mm512_cvtepi32_ps(_mm512_srai_epi32(
+                _mm512_slli_epi32(words, 16), 24));
+            return {_mm512_mul_ps(base, low), _mm512_mul_ps(base, high)};
+        }
+#endif
+#if defined(__AVX2__)
+        /** @brief Exact original Q6_K factors for eight output columns. */
+        struct SourceScalesAVX256
+        {
+            __m256 low;  ///< First sixteen source weights' factor.
+            __m256 high; ///< Last sixteen source weights' factor.
+        };
+
+        /**
+         * @brief Widen eight original bases and signed coefficient pairs.
+         * @param bases Aligned source FP16 bases, one per output column.
+         * @param coefficients Aligned opaque signed coefficient pairs.
+         * @return Exact FP32 products; finite half times int8 fits FP32 exactly.
+         */
+        LLAMINAR_Q6K_EXACT_FP inline SourceScalesAVX256 sourceScalesAVX256(
+            const uint16_t *bases, const uint16_t *coefficients) noexcept
+        {
+            const __m256 base = _mm256_cvtph_ps(_mm_load_si128(
+                reinterpret_cast<const __m128i *>(bases)));
+            const __m256i words = _mm256_cvtepu16_epi32(_mm_load_si128(
+                reinterpret_cast<const __m128i *>(coefficients)));
+            const __m256 low = _mm256_cvtepi32_ps(_mm256_srai_epi32(
+                _mm256_slli_epi32(words, 24), 24));
+            const __m256 high = _mm256_cvtepi32_ps(_mm256_srai_epi32(
+                _mm256_slli_epi32(words, 16), 24));
+            return {_mm256_mul_ps(base, low), _mm256_mul_ps(base, high)};
+        }
+#endif
+
         /** @brief Pack four signed activation bytes without changing their bits. */
         inline int32_t packSignedActivationWord(
             const Q8_1Block &block, int base_index) noexcept
@@ -337,16 +395,11 @@ namespace llaminar2::cpu::native_vnni
                             const __m512 corrected_high = _mm512_cvtepi32_ps(
                                 _mm512_sub_epi32(
                                     dot_high[row][zi], high_center));
-                            const __m512 scale_low = _mm512_cvtph_ps(
-                                _mm256_load_si256(
-                                    reinterpret_cast<const __m256i *>(
-                                        packed.chunkScales(chunk, kb) +
-                                        z * 16)));
-                            const __m512 scale_high = _mm512_cvtph_ps(
-                                _mm256_load_si256(
-                                    reinterpret_cast<const __m256i *>(
-                                        packed.chunkMins(chunk, kb) +
-                                        z * 16)));
+                            const auto source_scales = sourceScalesAVX512(
+                                packed.chunkScales(chunk, kb) + z * 16,
+                                packed.chunkMins(chunk, kb) + z * 16);
+                            const __m512 scale_low = source_scales.low;
+                            const __m512 scale_high = source_scales.high;
 
                             // Keep these operations separate and ordered.  The
                             // disassembly gate verifies vmulps/vaddps rather
@@ -551,26 +604,16 @@ namespace llaminar2::cpu::native_vnni
                             _mm512_set1_epi32(activation1_high));
                     }
 
-                    const __m512 scale_low0 = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(
-                                packed.chunkScales(chunk, kb) +
-                                z_base * 16)));
-                    const __m512 scale_high0 = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(
-                                packed.chunkMins(chunk, kb) +
-                                z_base * 16)));
-                    const __m512 scale_low1 = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(
-                                packed.chunkScales(chunk, kb) +
-                                (z_base + 1) * 16)));
-                    const __m512 scale_high1 = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(
-                                packed.chunkMins(chunk, kb) +
-                                (z_base + 1) * 16)));
+                    const auto source_scales0 = sourceScalesAVX512(
+                        packed.chunkScales(chunk, kb) + z_base * 16,
+                        packed.chunkMins(chunk, kb) + z_base * 16);
+                    const __m512 scale_low0 = source_scales0.low;
+                    const __m512 scale_high0 = source_scales0.high;
+                    const auto source_scales1 = sourceScalesAVX512(
+                        packed.chunkScales(chunk, kb) + (z_base + 1) * 16,
+                        packed.chunkMins(chunk, kb) + (z_base + 1) * 16);
+                    const __m512 scale_low1 = source_scales1.low;
+                    const __m512 scale_high1 = source_scales1.high;
 
                     fp00 = addScaledDotsAVX512(
                         fp00, dot_low00, dot_high00, activation0[kb],
@@ -752,14 +795,11 @@ namespace llaminar2::cpu::native_vnni
                         }
                     }
 
-                    const __m512 scale_low = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(
-                                packed.chunkScales(chunk, kb) + z * 16)));
-                    const __m512 scale_high = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(
-                                packed.chunkMins(chunk, kb) + z * 16)));
+                    const auto source_scales = sourceScalesAVX512(
+                        packed.chunkScales(chunk, kb) + z * 16,
+                        packed.chunkMins(chunk, kb) + z * 16);
+                    const __m512 scale_low = source_scales.low;
+                    const __m512 scale_high = source_scales.high;
                     fp0 = addScaledDotsAVX512(
                         fp0, dot_low0, dot_high0, activation0[kb],
                         scale_low, scale_high);
@@ -946,16 +986,11 @@ namespace llaminar2::cpu::native_vnni
                                 dot_high[row],
                                 _mm256_mullo_epi32(
                                     center, _mm256_set1_epi32(high_sum))));
-                        const __m256 scale_low = _mm256_cvtph_ps(
-                            _mm_load_si128(
-                                reinterpret_cast<const __m128i *>(
-                                    packed.chunkScales(chunk, kb) +
-                                    segment * 8)));
-                        const __m256 scale_high = _mm256_cvtph_ps(
-                            _mm_load_si128(
-                                reinterpret_cast<const __m128i *>(
-                                    packed.chunkMins(chunk, kb) +
-                                    segment * 8)));
+                        const auto source_scales = sourceScalesAVX256(
+                            packed.chunkScales(chunk, kb) + segment * 8,
+                            packed.chunkMins(chunk, kb) + segment * 8);
+                        const __m256 scale_low = source_scales.low;
+                        const __m256 scale_high = source_scales.high;
                         const __m256 low_term =
                             _mm256_mul_ps(scale_low, corrected_low);
                         const __m256 high_term =

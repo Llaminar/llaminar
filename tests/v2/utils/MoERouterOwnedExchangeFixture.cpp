@@ -7,7 +7,9 @@
  * acquired count and every unused receive byte are observed too: numerically
  * correct output alone cannot certify that only live routes crossed the wire.
  * Test-only uploads/readbacks and final joins occur outside captured execution.
+ * Each participant retains hardware metadata prepared before graph recording.
  */
+#include "kernels/common/RouterQ8Launch.h"
 #include "MoERouterOwnedExchangeFixture.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -15,6 +17,7 @@
 #include "collective/LocalTPCollectiveInventory.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/MoERouterOwnedRows.h"
+#include "kernels/cuda/moe/CUDARouterQ8Prefill.h"
 #include "planning/PlanningObservedResource.h"
 #include "utils/MPIContext.h"
 #include "utils/TestTensorFactory.h"
@@ -32,8 +35,7 @@
 
 extern "C" bool cudaMoE_route_logits(const float *, const float *, float *, int, int, int, int, void *);
 extern "C" bool cudaMoE_softmax_topk(float *, float *, float *, int, int, int, bool, int, void *, const int *, void *);
-extern "C" bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(const float *, int8_t *, float *,
-    const int8_t *, const float *, float *, int, int, int, int, void *, const int *);
+
 extern "C" bool hipMoE_softmax_topk_decode_equivalent_rows(float *, float *, float *, int, int, int,
     bool, int, void *, const int *, void *);
 
@@ -45,11 +47,20 @@ namespace
     void require(bool ok, const char *message)
     { if (!ok) throw std::runtime_error(message); }
 
-    /** @brief Select the declared backend only, never another implementation on failure. */
-    bool route(DeviceId device, const MoERouterOwnedRowsLaunch &p, void *stream)
+    /**
+     * @brief Launch the declared backend using immutable participant setup.
+     * @param device Exact owning GPU participant.
+     * @param p Retained routing buffers and device-owned live row count.
+     * @param stream Exact participant stream used for recording or execution.
+     * @param hardware CUDA launch geometry prepared before capture; unused by ROCm.
+     * @return True when the selected backend accepts the routing launch.
+     * @throws std::invalid_argument If the requested backend is not compiled.
+     */
+    bool route(DeviceId device, const MoERouterOwnedRowsLaunch &p, void *stream,
+               const cuda::RouterQ8PrefillHardware &hardware)
     {
 #ifdef HAVE_CUDA
-        if (device.is_cuda()) return cuda::routeOwnedRows(p, stream);
+        if (device.is_cuda()) return cuda::routeOwnedRows(p, stream, hardware);
 #endif
 #ifdef HAVE_ROCM
         if (device.is_rocm()) return rocm::routeOwnedRows(p, stream);
@@ -100,6 +111,7 @@ namespace
         void *stream = nullptr;
         std::vector<std::shared_ptr<TensorBase>> tensors;
         std::shared_ptr<TensorBase> packet, peers;
+        cuda::RouterQ8PrefillHardware router_hardware; ///< Prepared on the owning worker before capture.
         MoERouterOwnedRowsLaunch routing;
         MoERouterRowPublication publication;
         float *oracle_logits = nullptr, *oracle_indices = nullptr, *oracle_weights = nullptr;
@@ -182,6 +194,11 @@ void proveMoERouterOwnedExchange(DeviceId first, int participants, int capacity,
         owner->worker->submitAndWait([&] {
             owner->stream = owner->worker->getOrCreateAuxiliaryStream("owned_router_exchange");
             require(owner->stream, "Router fixture exact stream");
+#ifdef HAVE_CUDA
+            if (device.is_cuda())
+                require(cuda::prepareRouterQ8PrefillHardware(device.ordinal, owner->stream, owner->router_hardware),
+                    "Router fixture hardware preparation");
+#endif
         });
         streams.push_back(owner->stream);
         owners.push_back(std::move(owner));
@@ -260,7 +277,7 @@ void proveMoERouterOwnedExchange(DeviceId first, int participants, int capacity,
                         require(reference(p.device, r, p.oracle_logits, p.oracle_indices, p.oracle_weights, p.stream), "Complete router oracle");
                     else
                     {
-                        require(route(p.device, r, p.stream), "Owned router producer");
+                        require(route(p.device, r, p.stream, p.router_hardware), "Owned router producer");
                         TransferEngine::publishDeviceWrite(p.packet.get(), p.device, p.stream);
                         p.exchange.enqueue(p.stream);
                         require(publish(p.device, p.publication, p.stream), "Owned router publication");

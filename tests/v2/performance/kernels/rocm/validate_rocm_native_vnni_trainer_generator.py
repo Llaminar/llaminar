@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,7 @@ def main() -> int:
             "M=600",
             "qwen36_ffn_down_bucket",
         ]
+        required_fragments.extend(["CB=24", "IQ4_XS", "CB=4"])
         for fragment in required_fragments:
             if fragment not in text and fragment not in summary_text:
                 raise SystemExit(f"missing expected generated fragment: {fragment}")
@@ -64,6 +66,63 @@ def main() -> int:
             [sys.executable, str(args.dispatch_validator), str(output)],
             check=True,
         )
+
+        # Negative fixture retains source4 while claiming retired execution4.
+        # The generator must reject it; old measured corpora are never upgraded.
+        with args.input.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            fields = list(reader.fieldnames or [])
+            stale_rows = list(reader)
+        xs_rows = [row for row in stale_rows if row["format"] == "IQ4_XS"]
+        if not xs_rows:
+            raise SystemExit("synthetic fixture lacks IQ4_XS source identity")
+        for row in xs_rows:
+            if row["codebook"] != "4" or row["execution_codebook"] != "24":
+                raise SystemExit("IQ4_XS synthetic fixture must retain source4/physical24")
+            row["execution_codebook"] = "4"
+        stale = tmp / "retired-iq4xs.csv"
+        with stale.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(stale_rows)
+        rejected = subprocess.run(
+            [sys.executable, str(args.generator), "--input", str(stale),
+             "--output", str(tmp / "must-not-generate.inc")],
+            text=True, capture_output=True, check=False,
+        )
+        if rejected.returncode == 0 or "execution codebook disagrees with registry" not in rejected.stderr:
+            raise SystemExit("retired IQ4_XS execution4 was not rejected precisely")
+
+        # A legacy source-only row must also fail, rather than acquire24 merely
+        # because today's registry knows the original source label.
+        for row in xs_rows:
+            row["execution_codebook"] = ""
+        with stale.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(stale_rows)
+        rejected = subprocess.run(
+            [sys.executable, str(args.generator), "--input", str(stale),
+             "--output", str(tmp / "must-not-infer.inc")],
+            text=True, capture_output=True, check=False,
+        )
+        if rejected.returncode == 0 or "IQ4_XS requires explicit execution_codebook=24" not in rejected.stderr:
+            raise SystemExit("legacy source-only IQ4_XS row was silently relabeled")
+
+        # The dispatch validator independently rejects unknown or mislabeled
+        # physical identities, while the actual generated24 branch must pass.
+        for filename, branch in (
+            ("unknown.inc", "if (CB == 25) { // IQ4_XS\n}\n"),
+            ("wrong-label.inc", "if (CB == 24) { // IQ4_NL\n}\n"),
+        ):
+            invalid = tmp / filename
+            invalid.write_text(branch)
+            rejected = subprocess.run(
+                [sys.executable, str(args.dispatch_validator), str(invalid)],
+                text=True, capture_output=True, check=False,
+            )
+            if rejected.returncode == 0:
+                raise SystemExit(f"invalid generated physical identity accepted: {filename}")
 
     print("ROCm NativeVNNI trainer generator smoke passed")
     return 0

@@ -7,6 +7,7 @@
  * native bytes for every format, and load revalidates the sealed plan against
  * the same retained directory before allocating or reading anything.
  */
+#include "utils/DebugEnv.h"
 #include "PlanningMatrixSample.h"
 #include "PlanningSampleWire.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
@@ -28,6 +29,11 @@ namespace llaminar2
         const auto *tensor = source.loader().getModel().findTensor(request.tensor_name);
         plan.gguf_type_ = static_cast<uint32_t>(tensor->type);
         plan.format_ = planning_sample_wire::sourceFormat(plan.tensorType());
+        if (PreparedWeightRepresentationContract::isGDNProjectionSource(
+                inferWeightRole(request.tensor_name), request.tensor_name, plan.architecture_))
+            plan.arithmetic_ = debugEnv().gemm.gdn_projection_arithmetic;
+        if (inferWeightRole(request.tensor_name) == WeightRole::MoERouter)
+            plan.router_arithmetic_ = debugEnv().gemm.moe_router_arithmetic;
         return deserialize(plan.serialize());
     }
 
@@ -38,8 +44,17 @@ namespace llaminar2
 
     TensorType PlanningMatrixSamplePlan::executionType() const
     {
-        return PreparedWeightRepresentationContract::resolve(inferWeightRole(request_.tensor_name), tensorType()) ==
-            ModelPreparedWeightRepresentation::FP32 ? TensorType::FP32 : tensorType();
+        const auto representation = PreparedWeightRepresentationContract::resolve(
+            inferWeightRole(request_.tensor_name), tensorType(), request_.tensor_name, architecture_,
+            arithmetic_, router_arithmetic_);
+        return representation == ModelPreparedWeightRepresentation::FP32 ? TensorType::FP32 :
+            representation == ModelPreparedWeightRepresentation::FP16 ? TensorType::FP16 : tensorType();
+    }
+
+    FloatingActivationOperandPrecision PlanningMatrixSamplePlan::operandPrecision() const
+    {
+        return PreparedWeightRepresentationContract::operandPrecision(inferWeightRole(request_.tensor_name),
+            request_.tensor_name, architecture_, arithmetic_, router_arithmetic_);
     }
 
     std::string PlanningMatrixSamplePlan::executionFormat() const
@@ -50,7 +65,7 @@ namespace llaminar2
     size_t PlanningMatrixSamplePlan::executionPayloadBytes() const
     {
         if (executionType() == tensorType()) return geometry_.source_bytes;
-        return nativeTensorExtent(std::array{geometry_.n, geometry_.k}, 1, sizeof(float));
+        return nativeTensorExtent(std::array{geometry_.n, geometry_.k}, 1, executionType() == TensorType::FP16 ? sizeof(uint16_t) : sizeof(float));
     }
 
     std::vector<uint8_t> PlanningMatrixSamplePlan::serialize() const
@@ -63,8 +78,10 @@ namespace llaminar2
             else return {{"kind", std::is_same_v<Selection, PlanningMatrixRows> ? "rows" : "columns"},
                 {"first", value.first}, {"last", value.last}};
         }, request_.selection);
-        const auto text = Json{{"schema", "llaminar.planning-matrix-sample.v1"}, {"model", model_path_},
+        const auto text = Json{{"schema", "llaminar.planning-matrix-sample.v3"}, {"model", model_path_},
             {"architecture", architecture_}, {"selection", selection},
+            {"gdn_arithmetic", gdnProjectionArithmeticName(arithmetic_)},
+            {"router_arithmetic", moeRouterArithmeticName(router_arithmetic_)},
             {"matrix", planning_sample_wire::encode({request_.tensor_name, gguf_type_, geometry_, format_})}}.dump();
         return {text.begin(), text.end()};
     }
@@ -73,7 +90,7 @@ namespace llaminar2
     {
         using planning_sample_wire::unsignedField;
         const auto wire = nlohmann::json::parse(bytes.begin(), bytes.end());
-        if (!wire.is_object() || wire.size() != 5 || wire.at("schema") != "llaminar.planning-matrix-sample.v1")
+        if (!wire.is_object() || wire.size() != 7 || wire.at("schema") != "llaminar.planning-matrix-sample.v3")
             throw std::invalid_argument("Invalid planning matrix sample envelope");
         PlanningMatrixSamplePlan plan;
         plan.model_path_ = wire.at("model").get<std::string>();
@@ -85,6 +102,15 @@ namespace llaminar2
         plan.gguf_type_ = matrix.gguf_type;
         plan.geometry_ = matrix.geometry;
         plan.format_ = matrix.format;
+        plan.arithmetic_ = parseGDNProjectionArithmetic(wire.at("gdn_arithmetic").get<std::string>());
+        plan.router_arithmetic_ = parseMoERouterArithmetic(wire.at("router_arithmetic").get<std::string>());
+        if (plan.router_arithmetic_ != MoERouterArithmetic::Native &&
+            inferWeightRole(plan.request_.tensor_name) != WeightRole::MoERouter)
+            throw std::invalid_argument("Planning router arithmetic is not authenticated by its source role");
+        if (plan.arithmetic_ != GDNProjectionArithmetic::Native &&
+            !PreparedWeightRepresentationContract::isGDNProjectionSource(
+                inferWeightRole(plan.request_.tensor_name), plan.request_.tensor_name, plan.architecture_))
+            throw std::invalid_argument("Planning projection arithmetic is not authenticated by its GDN source");
         const auto &selection = wire.at("selection");
         const auto kind = selection.at("kind").get<std::string>();
         if (kind == "whole" && selection.size() == 1) plan.request_.selection = PlanningWholeMatrix{};
@@ -109,6 +135,7 @@ namespace llaminar2
             }
         }
         else throw std::invalid_argument("Unknown or malformed planning matrix source selection");
+        (void)plan.executionType(); // Reject forbidden source conversion before any payload admission.
         return plan;
     }
 

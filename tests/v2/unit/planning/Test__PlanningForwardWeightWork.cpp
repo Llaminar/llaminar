@@ -7,6 +7,7 @@
  * rank namespaces, and continuation operands from routed-only service. No
  * synthetic inventory or work count is claimed as measured performance.
  */
+#include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include "planning/PlanningForwardWeightWork.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "../../utils/PlanningGGUFFixture.h"
@@ -157,6 +158,7 @@ TEST(PlanningForwardWeightWork, MainInvocationExcludesRetainedDepthFifteenAndPre
 
 TEST(PlanningForwardWeightWork, NativeFormatsAndCanonicalFP32OverridesRemainDistinct)
 {
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
     test::PlanningGGUFFixture file(false, true);
     PlanningModelSource source(file.path());
     std::vector<std::string> formats{"F32", "F16", "BF16"};

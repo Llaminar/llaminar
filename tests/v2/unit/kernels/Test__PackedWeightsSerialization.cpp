@@ -4,8 +4,12 @@
  *
  * Tests round-trip integrity for CPUPackedWeights and CPUPackedWeightsWithNativeBlocks,
  * plus validation of error paths (bad magic, truncated buffers, etc.).
+ * IQ2_S source-factor archives preserve raw words and reject derived-half V4.
  */
 
+#include "tensors/NativeVnniIQ2SScale.h"
+#include "tensors/NativeVnniIQ4XSScale.h"
+#include "loaders/gpu_pipeline/GpuPackedWeightsFormat.h"
 #include <gtest/gtest.h>
 
 #include "kernels/PackedWeightsSerialization.h"
@@ -461,4 +465,162 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_SuperblockFormat)
     EXPECT_TRUE(p.is_superblock);
     EXPECT_EQ(p.N, 256);
     EXPECT_EQ(p.K, 512);
+}
+
+/** @brief Same-sized old Q6 metadata must not be adopted as source coefficients. */
+TEST(Test__PackedWeightsSerialization, Q6SourceFactorsRoundTripAndRejectVersion3)
+{
+    auto packed = buildTestPacked(67, 288, 8, 9, 24, false, true, true,
+        1536, 1792, 2 * 9 * 1792, 0, 0);
+    packed.encoding = CPUNativeVNNIEncoding::Q6KNativeDualScale;
+    CPUPackedWeights owner(std::move(packed));
+    auto blob = serialize(owner);
+    auto restored = deserialize(blob.data(), blob.size());
+    ASSERT_NE(restored, nullptr);
+    const auto *native = dynamic_cast<const CPUPackedWeights *>(restored.get());
+    ASSERT_NE(native, nullptr);
+    ASSERT_TRUE(native->packed().usesQ6KNativeDualScale());
+    ASSERT_EQ(native->packed().native_interleaved.size(), owner.packed().native_interleaved.size());
+    EXPECT_EQ(std::memcmp(native->packed().native_interleaved.data(),
+        owner.packed().native_interleaved.data(), owner.packed().native_interleaved.size()), 0);
+    const uint32_t legacy_version = 3;
+    std::memcpy(blob.data() + offsetof(PackedWeightsHeader, version), &legacy_version, sizeof(legacy_version));
+    EXPECT_EQ(deserialize(blob.data(), blob.size()), nullptr);
+}
+
+/** @brief The canonical IQ2_S raw secondary word preserves all256 source bytes. */
+TEST(Test__PackedWeightsSerialization, IQ2SRawCoefficientWordsPreserveAllBytes)
+{
+    for(unsigned value=0;value<256;++value)
+    {
+        const auto word=llaminar2::native_vnni_iq2s_scale::pack(static_cast<uint8_t>(value));
+        EXPECT_EQ(word,value);
+        EXPECT_TRUE(llaminar2::native_vnni_iq2s_scale::valid(word));
+        EXPECT_EQ(llaminar2::native_vnni_iq2s_scale::low(word),int(value&15u));
+        EXPECT_EQ(llaminar2::native_vnni_iq2s_scale::high(word),int(value>>4));
+        EXPECT_FALSE(llaminar2::native_vnni_iq2s_scale::valid(word|0x0100u));
+    }
+}
+
+/** @brief Source-word archives roundtrip exactly and reject derived-half V4 first. */
+TEST(Test__PackedWeightsSerialization, IQ2SSourceFactorsRoundTripAndRejectVersion4)
+{
+    auto packed=buildTestPacked(67,288,13,9,9,false,true,true,
+        1024,1536,2*9*1536,0,0);
+    packed.encoding=CPUNativeVNNIEncoding::CompactMultiScale;
+    for(int c=0;c<2;++c) for(int kb=0;kb<9;++kb) for(int n=0;n<64;++n)
+    {
+        const unsigned ordinal=unsigned(c*9*64+kb*64+n);
+        const_cast<uint16_t*>(packed.chunkScales(c,kb))[n]=
+            static_cast<uint16_t>((ordinal&1u)?0x8001u:0x3c01u);
+        const_cast<uint16_t*>(packed.chunkMins(c,kb))[n]=static_cast<uint8_t>(ordinal);
+    }
+    CPUPackedWeights owner(std::move(packed));
+    auto blob=serialize(owner);
+    ASSERT_FALSE(blob.empty());
+    auto restored=deserialize(blob.data(),blob.size());
+    ASSERT_NE(restored,nullptr);
+    const auto *native=dynamic_cast<const CPUPackedWeights*>(restored.get());
+    ASSERT_NE(native,nullptr);
+    ASSERT_TRUE(native->packed().usesCompactMultiScale());
+    ASSERT_EQ(native->packed().native_interleaved.size(),owner.packed().native_interleaved.size());
+    EXPECT_EQ(std::memcmp(native->packed().native_interleaved.data(),
+        owner.packed().native_interleaved.data(),owner.packed().native_interleaved.size()),0);
+    const uint32_t legacy_version=4;
+    std::memcpy(blob.data()+offsetof(PackedWeightsHeader,version),&legacy_version,sizeof(legacy_version));
+    EXPECT_EQ(deserialize(blob.data(),blob.size()),nullptr);
+}
+
+/** @brief GPU wire records preserve source words and reject derived-half V1. */
+TEST(Test__PackedWeightsSerialization, IQ2SGpuWireSourceFactorsRoundTripAndRejectVersion1)
+{
+    using namespace llaminar2;
+    const auto header=buildGpuPackedHeader(RepackFormat::IQ2_S,13,9,true,true,false,67,288);
+    std::vector<uint8_t> blob(gpuPackedTotalSize(header),0u);
+    std::memcpy(blob.data(),&header,sizeof(header));
+    const size_t words=static_cast<size_t>(header.N)*header.blocks_per_row;
+    const size_t primary=sizeof(header)+header.payload_size;
+    const size_t secondary=primary+header.scales_size;
+    for(size_t index=0;index<words;++index)
+    {
+        const uint16_t d=(index&1u)?0x8001u:0x3c01u;
+        const uint16_t coefficient=static_cast<uint8_t>(index);
+        std::memcpy(blob.data()+primary+index*sizeof(uint16_t),&d,sizeof(d));
+        std::memcpy(blob.data()+secondary+index*sizeof(uint16_t),&coefficient,sizeof(coefficient));
+    }
+    GpuPackedWeightsView view{};
+    ASSERT_TRUE(parseGpuPackedBuffer(blob.data(),blob.size(),view));
+    ASSERT_NE(view.scales,nullptr); ASSERT_NE(view.mins,nullptr);
+    for(size_t index=0;index<words;++index)
+    {
+        // The compact wire layout has no alignment padding for an odd N.
+        // Inspect its raw words with memcpy rather than an unaligned host load.
+        uint16_t d=0,coefficient=0;
+        std::memcpy(&d,reinterpret_cast<const uint8_t*>(view.scales)+index*sizeof(uint16_t),sizeof(d));
+        std::memcpy(&coefficient,reinterpret_cast<const uint8_t*>(view.mins)+index*sizeof(uint16_t),sizeof(coefficient));
+        EXPECT_EQ(d,(index&1u)?0x8001u:0x3c01u);
+        EXPECT_EQ(coefficient,static_cast<uint8_t>(index));
+    }
+    const uint32_t old_version=1;
+    std::memcpy(blob.data()+offsetof(GpuPackedWeightsHeader,version),&old_version,sizeof(old_version));
+    GpuPackedWeightsView rejected{};
+    EXPECT_FALSE(parseGpuPackedBuffer(blob.data(),blob.size(),rejected));
+    EXPECT_EQ(rejected.payload,nullptr);
+    EXPECT_EQ(rejected.scales,nullptr);
+    EXPECT_EQ(rejected.mins,nullptr);
+}
+
+/** @brief Raw IQ4_XS tuples survive CPU serialization and reject derived-half V5. */
+TEST(Test__PackedWeightsSerialization, IQ4XSSourceTupleRoundTripsAndRejectsVersion5)
+{
+    auto packed = buildTestPacked(67, 288, 4, 9, 16, false, false, true,
+        1024, 1408, 2 * 9 * 1408, 0, 0);
+    packed.encoding = CPUNativeVNNIEncoding::NibbleLUTSourceScale;
+    for (int c = 0; c < 2; ++c) for (int kb = 0; kb < 9; ++kb) for (int n = 0; n < 64; ++n)
+    {
+        const unsigned ordinal = unsigned(c * 9 * 64 + kb * 64 + n);
+        const_cast<uint16_t *>(packed.chunkScales(c, kb))[n] = ordinal & 1u ? 0x8001u : 0x3c01u;
+        const_cast<uint16_t *>(packed.chunkMins(c, kb))[n] = ordinal % 64;
+    }
+    CPUPackedWeights owner(std::move(packed));
+    auto blob = serialize(owner);
+    auto restored = deserialize(blob.data(), blob.size());
+    ASSERT_NE(restored, nullptr);
+    const auto *native = dynamic_cast<const CPUPackedWeights *>(restored.get());
+    ASSERT_NE(native, nullptr); ASSERT_TRUE(native->packed().usesNibbleLUTSourceScale());
+    ASSERT_EQ(native->packed().native_interleaved.size(), owner.packed().native_interleaved.size());
+    EXPECT_EQ(std::memcmp(native->packed().native_interleaved.data(),
+        owner.packed().native_interleaved.data(), owner.packed().native_interleaved.size()), 0);
+    const uint32_t old_version = 5;
+    std::memcpy(blob.data() + offsetof(PackedWeightsHeader, version), &old_version, sizeof(old_version));
+    EXPECT_EQ(deserialize(blob.data(), blob.size()), nullptr);
+    PackedWeightsTransferDescriptor descriptor{};
+    std::memcpy(&descriptor.header, blob.data(), sizeof(descriptor.header));
+    std::memcpy(&descriptor.sections, blob.data() + sizeof(descriptor.header), sizeof(descriptor.sections));
+    EXPECT_THROW((void)allocateTransferTarget(descriptor), std::invalid_argument);
+}
+
+/** @brief GPU tuple wire has20 bytes/block, authentic source4 and a distinct physical ID. */
+TEST(Test__PackedWeightsSerialization, IQ4XSGpuWireTupleRejectsVersion2AndSourceSubstitution)
+{
+    using namespace llaminar2;
+    const auto header = buildGpuPackedHeader(RepackFormat::IQ4_XS, 24, 16, true, true, false, 17, 288);
+    EXPECT_EQ(header.payload_size + header.scales_size + header.mins_size, 17u * 9u * 20u);
+    std::vector<uint8_t> blob(gpuPackedTotalSize(header), 0);
+    std::memcpy(blob.data(), &header, sizeof(header));
+    GpuPackedWeightsView view{};
+    ASSERT_TRUE(parseGpuPackedBuffer(blob.data(), blob.size(), view));
+    ASSERT_NE(view.mins, nullptr);
+    auto wrong = header; wrong.version = 2;
+    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    wrong = header; wrong.codebook_id = 4;
+    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    wrong = header; wrong.format = static_cast<uint8_t>(RepackFormat::IQ4_NL);
+    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    wrong = header; wrong.is_asymmetric = 0;
+    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    wrong = header; wrong.mins_size = 0;
+    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    const auto nl = buildGpuPackedHeader(RepackFormat::IQ4_NL, 4, 16, false, false, false, 17, 288);
+    EXPECT_TRUE(validateGpuPackedHeader(nl, gpuPackedTotalSize(nl)));
 }

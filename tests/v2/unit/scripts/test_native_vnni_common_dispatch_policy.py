@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Regression tests for the common NativeVNNI dispatch policy compiler."""
+"""Regression tests for the common NativeVNNI dispatch policy compiler.
+
+Parallel corpus algorithm fixtures declare their visible physical-core count.
+This keeps their worker-pool and ordering coverage independent of the runner's
+CPU affinity or OpenMP binding; separate policy fixtures verify the core cap.
+"""
 
 from __future__ import annotations
 
@@ -616,9 +621,12 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         ).encode()
         expected = "sha256:" + hashlib.sha256(historical_bytes).hexdigest()
 
-        with mock.patch.dict(
-            os.environ,
-            {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+        with (
+            mock.patch.object(corpus_module, "_physical_core_count", return_value=2),
+            mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+            ),
         ):
             first = corpus.digest()
         self.assertEqual(first, expected)
@@ -659,6 +667,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         corpus = ObservationCorpus((observation(),) * 8192)
         real_executor = corpus_module.ProcessPoolExecutor
         with (
+            mock.patch.object(corpus_module, "_physical_core_count", return_value=2),
             mock.patch.dict(
                 os.environ,
                 {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
@@ -696,9 +705,12 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         ).encode()
         expected = "sha256:" + hashlib.sha256(historical_bytes).hexdigest()
 
-        with mock.patch.dict(
-            os.environ,
-            {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+        with (
+            mock.patch.object(corpus_module, "_physical_core_count", return_value=2),
+            mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+            ),
         ):
             self.assertEqual(corpus.digest(), expected)
 
@@ -722,9 +734,12 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             ).encode()
         ).hexdigest()
 
-        with mock.patch.dict(
-            os.environ,
-            {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+        with (
+            mock.patch.object(corpus_module, "_physical_core_count", return_value=2),
+            mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_CORPUS_DIGEST_WORKERS": "2"},
+            ),
         ):
             self.assertEqual(corpus.digest(), expected)
 
@@ -1938,6 +1953,20 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(format_spec("Q8_1").runtime_codebook("cpu"), 20)
         self.assertEqual(runtime_aliases("rocm", 19), ("Q8_0", "Q8_1", "Q8_K"))
         self.assertEqual(registry_digest(), registry_digest())
+
+    def test_iq4xs_tuple_physical_identity_is_not_iq4nl_alias(self) -> None:
+        """Source arithmetic stays4 while GPU tuple24 has distinct prepared bytes."""
+        source = format_spec("IQ4_XS")
+        self.assertEqual(source.source_codebook_id, 4)
+        self.assertTrue(source.source_is_superblock)
+        self.assertFalse(source.is_asymmetric)
+        self.assertEqual(source.runtime_codebook("cpu"), 4)
+        self.assertEqual(source.runtime_codebook("cuda"), 24)
+        self.assertEqual(source.runtime_codebook("rocm"), 24)
+        self.assertEqual(runtime_aliases("cuda", 4), ("IQ4_NL",))
+        self.assertEqual(runtime_aliases("cuda", 24), ("IQ4_XS",))
+        self.assertEqual(runtime_aliases("rocm", 4), ("IQ4_NL",))
+        self.assertNotEqual(source.packing_abi("rocm"), format_spec("IQ4_NL").packing_abi("rocm"))
 
     def test_candidate_registries_are_explicit_complete_and_digestible(self) -> None:
         rocm_moe = rocm_moe_grouped_prefill_registry()

@@ -12,9 +12,11 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "utils/CPUFeatures.h"
+#include "utils/DebugEnv.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/QuantizedVerifierFormats.h"
 #include <gtest/gtest.h>
+#include <memory>
 #include <omp.h>
 
 using namespace llaminar2;
@@ -155,6 +157,8 @@ namespace
                             EXPECT_EQ(phase.graph_nodes != 0, device.is_gpu());
                             EXPECT_NE(phase.service.provenance().find("repeated-same-prepared-matrix"), std::string::npos);
                             EXPECT_NE(phase.service.provenance().find("activations=FP32"), std::string::npos);
+                            EXPECT_NE(phase.service.provenance().find("; activation-operand-policy=" +
+                                std::to_string(static_cast<int>(plan.operandPrecision())) + ";"), std::string::npos);
                             if (device.is_gpu()) EXPECT_NE(phase.service.provenance().find("retained graph native events"), std::string::npos);
                         }
                         EXPECT_EQ(memory->claimedBytes(device, PhysicalMemoryOwner::PrimaryModelWeights,
@@ -166,6 +170,70 @@ namespace
                     }
                 }
                 expectRetired(*memory, device);
+            }
+        }
+    }
+
+    /**
+     * @brief Public FP32 tensors retain independent native, half and FP32 operand provenance.
+     *
+     * Original FP32 and BF16 controls exercise both half preparation and FP32
+     * promotion. Each policy is resolved before admission and stays fixed until
+     * the source, prepared engine and all phase work have retired.
+     */
+    void proveOperandPolicyProvenance()
+    {
+        struct RestorePolicy final
+        {
+            GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
+            /** @brief Restore setup selection only after every sample owner retires. */
+            ~RestorePolicy() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
+        } restore;
+        FixedWorkers workers(1);
+        if (!hasCPUBackend()) initCPUBackend(-1);
+        for (const auto source_type : {TensorType::FP32, TensorType::BF16})
+        {
+            PlanningGGUFFixture fixture(false, false, GGUFTensorType::F32, 256,
+                PlanningGGUFFixture::sourceType(source_type));
+            for (const auto &name : {"blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight"})
+            {
+                std::unique_ptr<TensorBase> tensor;
+                if (source_type == TensorType::FP32)
+                    tensor = TestTensorFactory::createFP32Random({256, 256}, 713);
+                else
+                    tensor = TestTensorFactory::createBF16Random({256, 256}, 713);
+                fixture.writePayload(name, 0,
+                    {static_cast<const uint8_t *>(tensor->raw_data()), tensor->size_bytes()});
+            }
+            PlanningModelSource source(fixture.path());
+            for (const auto mode : {GDNProjectionArithmetic::Native,
+                GDNProjectionArithmetic::FP16AlphaBeta, GDNProjectionArithmetic::FP32})
+            {
+                mutableDebugEnv().gemm.gdn_projection_arithmetic = mode;
+                const auto expected = mode == GDNProjectionArithmetic::Native ?
+                    FloatingActivationOperandPrecision::Native : mode == GDNProjectionArithmetic::FP32 ?
+                    FloatingActivationOperandPrecision::FP32 : FloatingActivationOperandPrecision::FP16RNE;
+                for (const auto &request : std::array<PlanningModelSampleRequest, 2>{{
+                    {"blk.0.ssm_alpha.weight", PlanningWholeMatrix{}},
+                    {"blk.0.ssm_beta.weight", PlanningMatrixRows{3, 8}}}})
+                {
+                    const auto plan = PlanningMatrixSamplePlan::resolve(source, request);
+                    ASSERT_EQ(plan.operandPrecision(), expected);
+                    auto memory = memoryFor(plan, DeviceId::cpu());
+                    {
+                        const auto sample = plan.load(source, memory, DeviceId::cpu());
+                        const auto observed = PlanningProjectionMeasurement::measure(sample, DeviceId::cpu(), memory, 7);
+                        EXPECT_EQ(observed.source.serialize(), plan.serialize());
+                        ASSERT_EQ(observed.phases.size(), 2u);
+                        for (const auto &phase : observed.phases)
+                        {
+                            EXPECT_NE(phase.service.provenance().find("; activations=FP32;"), std::string::npos);
+                            EXPECT_NE(phase.service.provenance().find("; activation-operand-policy=" +
+                                std::to_string(static_cast<int>(expected)) + ";"), std::string::npos);
+                        }
+                    }
+                    expectRetired(*memory, DeviceId::cpu());
+                }
             }
         }
     }
@@ -296,6 +364,11 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_ProjectionSamples)
     for (int count : {1, 3}) { FixedWorkers workers(count); proveSamples(DeviceId::cpu()); }
 }
 TEST(PlanningExecutionMeasurementIntegration, CPU_ProjectionFailures) { proveFailures(DeviceId::cpu()); }
+/** @brief Measurement metadata separates public activation storage from prepared operand arithmetic. */
+TEST(PlanningExecutionMeasurementIntegration, CPU_ProjectionOperandPolicyProvenance)
+{
+    proveOperandPolicyProvenance();
+}
 TEST(PlanningExecutionMeasurementIntegration, CPU_ProjectionArithmetic)
 {
     for (int count : {1, 3}) { FixedWorkers workers(count); proveArithmetic(DeviceId::cpu()); }

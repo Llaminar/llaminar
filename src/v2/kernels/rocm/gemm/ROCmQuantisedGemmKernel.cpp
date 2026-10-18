@@ -12,6 +12,8 @@
  * Workspace sizing and launch identity share the producer's typed contract;
  * captured execution neither allocates scratch nor stages activations through
  * host storage. TransferEngine owns setup weight publication and event edges.
+ * Raw resident IQ descriptors publish their runtime-generation-owned lookup
+ * tables during construction, before a retained graph can consume them.
  *
  * @see ROCmQuantisedGemmWorkspaceContract.h
  * @see ROCmDenseProductionPrefillOverlay.h
@@ -283,7 +285,7 @@ namespace llaminar2
             // Supports all ≤6-bit quantized formats via codebook_id:
             //   Q-quants: Q4_0, Q4_1, Q5_0, Q5_1
             //   K-quants: Q2_K, Q3_K, Q4_K (via Q4_1 codebook), Q5_K (via Q5_1 codebook), Q6_K
-            //   IQ-quants: IQ4_NL, IQ4_XS (via IQ4_NL codebook), IQ3_S, IQ3_XXS,
+            //   IQ-quants: IQ4_NL, IQ4_XS (physical24, source4), IQ3_S, IQ3_XXS,
             //              IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M
             // Q8_0/Q8_1/Q8_K use the INT8-VNNI path instead (already 1 byte/element).
             // Output is FP32 with scale_A applied inline — no epilogue kernel needed.
@@ -1206,7 +1208,8 @@ namespace llaminar2
                     : nullptr;
             if (!source_format ||
                 !deviceVnniExecutionCompatibleWithSource(*source_format, codebook_id) ||
-                (codebook_id == kNativeVnniExpandedInt8MinCodebook && !d_native_mins))
+                ((codebook_id == 11 || codebook_id == kNativeVnniExpandedInt8MinCodebook ||
+                  codebook_id == kNativeVnniIQ4XSSourceScaleCodebook) && !d_native_mins))
             {
                 throw std::invalid_argument(
                     "[ROCmQuantisedGemmKernel] Direct device weights require an exact, "
@@ -1216,15 +1219,8 @@ namespace llaminar2
             if (allocation_format.payload_bytes_per_block != 0)
             {
                 const auto execution_format =
-                    codebook_id == canonicalDeviceVnniCodebookId(
-                                       source_format->codebook_id)
-                        ? NativeVnniMigrationStableDeviceFormat{
-                              .codebook_id = codebook_id,
-                              .payload_bytes_per_block = static_cast<uint8_t>(
-                                  source_format->payload_bytes),
-                              .is_asymmetric = source_format->is_asymmetric,
-                              .has_emins = source_format->has_emins,
-                          }
+                    codebook_id == canonicalDeviceVnniCodebookId(*source_format)
+                        ? canonicalDeviceVnniFormat(*source_format)
                         : migrationStableDeviceVnniFormat(*source_format);
                 if (allocation_format.payload_bytes_per_block <
                         execution_format.payload_bytes_per_block ||
@@ -1236,6 +1232,20 @@ namespace llaminar2
                     throw std::invalid_argument(
                         "[ROCmQuantisedGemmKernel] Reusable allocation cannot represent its live execution format");
                 }
+            }
+            // Resident payloads do not imply resident IQ constants. This public
+            // constructor bypasses ensureWeightsConverted(), so finish the same
+            // existing generation-owned publication before exposing the engine.
+            // The owner initializes every GEMV/GEMM/MoE translation-unit table
+            // atomically; no table state or setup operation belongs to replay.
+            if (source_identity.codebook_id >= 11 &&
+                source_identity.codebook_id <= 17 &&
+                (isGraphCaptureActive() ||
+                 !ensureIQGridTablesInitialized(rocm_device_id_)))
+            {
+                throw std::runtime_error(
+                    "ROCm resident weight preparation could not publish "
+                    "destination IQ tables before capture");
             }
             impl_->native_allocation_format = allocation_format;
             impl_->has_native_vnni = true;
@@ -2858,7 +2868,7 @@ namespace llaminar2
                     }
 
                     // =====================================================================
-                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline.
+                    // Native-VNNI path: lossless Q4/IQ4 decode, typed block metadata, scale_A inline.
                     // Native GEMV produces FP32, then applies alpha/beta/bias with the shared epilogue when needed.
                     // =====================================================================
                     if (impl_->has_native_vnni)
@@ -4737,7 +4747,7 @@ namespace llaminar2
                         break;
                     }
 
-                    // Native-VNNI path: lossless Q4/IQ4 decode with FP16 block scales
+                    // Native-VNNI path: lossless Q4/IQ4 decode with typed block metadata
                     if (rocm_kernel->impl_->has_native_vnni)
                     {
                         const bool output_is_mapped = fp32_output->isMapped();
@@ -5248,8 +5258,8 @@ namespace llaminar2
 
         /**
          * @brief Materialize host/prepacked weights and their destination resources.
-         * @details Already-resident descriptors were prepared by the weight loader.
-         * Host-backed weights publish IQ constants here, once, before uploading
+         * @details Resident constructors publish their IQ constants before exposing
+         * the engine. Host-backed weights publish IQ constants here before uploading
          * weights. Pure CPU packing therefore needs no live GPU and replay retains
          * the existing immediate weights_converted_ fast path.
          * @throws std::runtime_error If destination IQ table publication fails.
@@ -6368,7 +6378,7 @@ namespace llaminar2
 
                     validateWorkspace();
 
-                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, then optional alpha/beta/bias epilogue.
+                    // Native-VNNI path: lossless Q4/IQ4 decode, typed block metadata, then optional alpha/beta/bias epilogue.
                     if (impl_->has_native_vnni)
                     {
                         if (!rocmQuantGemm_quantizeActivationsBlockwise(

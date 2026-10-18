@@ -72,7 +72,6 @@ namespace llaminar2
         constexpr const char *ROCM_ROUTER_Q8_SCALES = "rocm_moe_router_q8_scales";
         constexpr const char *ROCM_ROUTER_Q8_GATE_WEIGHTS = "rocm_moe_router_q8_gate_weights";
         constexpr const char *ROCM_ROUTER_Q8_GATE_SCALES = "rocm_moe_router_q8_gate_scales";
-        constexpr const char *ROCM_ROUTER_FP16_GATE_WEIGHTS = "rocm_moe_router_fp16_gate_weights";
         constexpr const char *ROCM_GROUP_MAX_TOKENS = "rocm_moe_group_max_tokens";
         constexpr const char *ROCM_DECODE_GATE_PTRS = "rocm_moe_decode_gate_ptrs";
         constexpr const char *ROCM_DECODE_UP_PTRS = "rocm_moe_decode_up_ptrs";
@@ -413,10 +412,6 @@ namespace llaminar2
                 static_cast<std::size_t>(kRouterGateCacheSlots) *
                     static_cast<std::size_t>(num_experts) *
                     static_cast<std::size_t>(d_model_blocks) * sizeof(float));
-            add(reqs, ROCM_ROUTER_FP16_GATE_WEIGHTS,
-                static_cast<std::size_t>(kRouterGateCacheSlots) *
-                    static_cast<std::size_t>(num_experts) *
-                    static_cast<std::size_t>(d_model) * sizeof(uint16_t));
             return reqs;
         }
 

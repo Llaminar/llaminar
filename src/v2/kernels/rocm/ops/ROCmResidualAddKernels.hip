@@ -7,6 +7,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include "../../common/DeviceFP32NumericalContract.h"
 #include <hip/hip_fp16.h>
 #include <cstdint>
 #include <cstdio>
@@ -74,19 +75,20 @@ __global__ void rocm_residual_add_fp32_kernel(
         float4 a = in4[vec_idx];
         float4 b = res4[vec_idx];
         float4 r;
-        r.x = a.x + b.x;
-        r.y = a.y + b.y;
-        r.z = a.z + b.z;
-        r.w = a.w + b.w;
+        r.x = llaminar2::device_fp32_contract::add(a.x, b.x);
+        r.y = llaminar2::device_fp32_contract::add(a.y, b.y);
+        r.z = llaminar2::device_fp32_contract::add(a.z, b.z);
+        r.w = llaminar2::device_fp32_contract::add(a.w, b.w);
         out4[vec_idx] = r;
     }
 
-    // Scalar tail
+    // The first remainder lanes own scalar tail values independently of
+    // whether those same lanes also produced a disjoint float4 above.
     const int tail_start = size4 << 2;
     const int tail_idx = tail_start + (blockIdx.x * blockDim.x + threadIdx.x);
-    if (tail_idx >= tail_start && tail_idx < size && vec_idx >= size4)
+    if (tail_idx >= tail_start && tail_idx < size)
     {
-        output[tail_idx] = input[tail_idx] + residual[tail_idx];
+        output[tail_idx] = llaminar2::device_fp32_contract::add(input[tail_idx], residual[tail_idx]);
     }
 }
 

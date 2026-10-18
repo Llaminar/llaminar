@@ -9,6 +9,7 @@
  *   4. Record a production child graph without launching it
  *   5. Test backend-specific executable publication after re-capture
  *   6. Prove invalid capture ownership fails closed
+ *   7. Retain only selected named routing outputs across shared bucket replay
  *
  * IMPORTANT: No <hip/hip_runtime.h> or <cuda_runtime.h> includes.
  * All GPU interaction goes through the backend interfaces.
@@ -26,6 +27,8 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <stdexcept>
+#include <utility>
 
 // Core execution
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
@@ -37,8 +40,12 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
+#include "backends/BackendManager.h"
+#include "backends/IBackend.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "snapshots/SnapshotCapture.h"
+#include "transfer/TransferEngine.h"
 
 // Tensors and utilities
 #include "tensors/Tensors.h"
@@ -81,6 +88,85 @@ using namespace llaminar2::test;
         if (!HAS_LINKED_GPU_SUPPORT())                        \
             GTEST_SKIP() << LINKED_GPU_SKIP_MESSAGE;          \
     } while (false)
+
+namespace
+{
+    /**
+     * @brief Named routing publications produced by captured native D2D nodes.
+     *
+     * This fixture isolates the production snapshot selection/retention path,
+     * without duplicating routing arithmetic or adding a test device kernel.
+     * All three co-outputs are computed; only the requested evidence is copied
+     * into the immutable snapshot arena by DeviceGraphExecutor.
+     */
+    class RoutingSnapshotCopyStage final : public IComputeStage
+    {
+    public:
+        /**
+         * @brief Bind immutable source packets and independently owned outputs.
+         * @param device Exact backend endpoint.
+         * @param sources Prepared score, ID and weight source tensors.
+         * @param outputs Prepared score, ID and weight destination tensors.
+         */
+        RoutingSnapshotCopyStage(DeviceId device,
+                                 std::array<FP32Tensor *, 3> sources,
+                                 std::array<FP32Tensor *, 3> outputs)
+            : IComputeStage(device), sources_(sources), outputs_(outputs) {}
+
+        /**
+         * @brief Record all producer copies on the stage's exact native stream.
+         * @param context Current backend context; storage is already prepared.
+         * @return True only when every native copy was submitted successfully.
+         * @throws std::logic_error If the explicit GPU stream is absent.
+         */
+        bool execute(IDeviceContext *context) override
+        {
+            auto *backend = getBackendFor(device());
+            if (!context || !backend) return false;
+            for (size_t i = 0; i < outputs_.size(); ++i)
+                if (!backend->deviceCopyAsync(outputs_[i]->gpu_data_ptr(),
+                        sources_[i]->gpu_data_ptr(), outputs_[i]->numel() * sizeof(float),
+                        device().ordinal, gpuStream())) return false;
+            return true;
+        }
+
+        /** @return A concrete classification for this diagnostic producer. */
+        ComputeStageType type() const override { return ComputeStageType::GEMM; }
+        /** @param backend Requested backend. @return True only for CUDA/HIP. */
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            return backend == ComputeBackendType::GPU_CUDA ||
+                   backend == ComputeBackendType::GPU_ROCM;
+        }
+        /** @return Prepared read owners and the three actual arena outputs. */
+        StageBufferContract bufferContract() const override
+        {
+            auto contract = StageBufferContract::build();
+            for (auto *source : sources_) contract.addWeight(source);
+            contract.addOutput(BufferId::MOE_ROUTER_LOGITS);
+            contract.addOutput(BufferId::MOE_EXPERT_INDICES);
+            contract.addOutput(BufferId::MOE_EXPERT_WEIGHTS);
+            return contract;
+        }
+
+    protected:
+        /** @return Actual named descriptors, including the unrelated scores. */
+        StageDumpInfo buildDumpInfoImpl() const override
+        {
+            StageDumpInfo dump;
+            const std::array<const char *, 3> names = {
+                "router_logits", "output_indices_tensor", "output_weights_tensor"};
+            for (size_t i = 0; i < outputs_.size(); ++i)
+                dump.addOutput(names[i], outputs_[i], outputs_[i]->shape()[0],
+                               outputs_[i]->shape()[1]);
+            return dump;
+        }
+
+    private:
+        std::array<FP32Tensor *, 3> sources_;
+        std::array<FP32Tensor *, 3> outputs_;
+    };
+}
 
 // ===========================================================================
 // Test Fixture
@@ -1072,6 +1158,217 @@ TEST_F(GPUGraphCaptureExecutionTest, CanonicalEmbeddingFilterPublishesOneCapture
     EXPECT_EQ(value.get(), published.getShared(canonical + "_ALLREDUCED").get());
     ASSERT_EQ(value->data.size(), rows * columns);
     EXPECT_EQ(std::memcmp(value->data.data(), result->data(), value->data.size() * sizeof(float)), 0);
+}
+
+/**
+ * @brief Selected routing values retain one arena across changing score shapes.
+ *
+ * The production M512 routing scores may occupy 256 physical rows, whereas an
+ * M448 graph publishes 448 score rows. Selecting IDs/weights must not retain
+ * either unrelated score descriptor or grow a frozen shared snapshot owner.
+ * Real captured native copies produce all co-outputs and the executor records
+ * the selected point-in-time copies. Two request passes change source data,
+ * poison destinations and replay the same retained graphs without recapture.
+ * A separately owned score-only graph proves score capture remains supported.
+ */
+TEST_F(GPUGraphCaptureExecutionTest, RoutingOutputFilterRetainsOnlySelectedSharedPayloads)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    gpu_ctx_->submitAndWait([&]
+    {
+        const DeviceId device = device_ctx_->deviceId();
+        auto *backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+        void *const stream = gpu_ctx_->getOrCreateAuxiliaryStream("routing_snapshot_selection");
+        ASSERT_NE(stream, nullptr);
+        const std::string producer = "layer0_moe_routing";
+        const std::string indices_key = "layer0_MOE_ROUTING_INDICES";
+        const std::string weights_key = "layer0_MOE_ROUTING_WEIGHTS";
+        const std::string score_key = "layer0_MOE_ROUTER_OUTPUT";
+        using Manifest = DeviceGraphExecutor::GraphSnapshotManifest;
+        using ReuseClass = DeviceGraphExecutor::GraphSnapshotArenaReuseClass;
+        using ReusePolicy = DeviceGraphExecutor::GraphSnapshotArenaReusePolicy;
+
+        /** @brief Join submitted copies before any retained graph/slot is retired. */
+        struct Packet
+        {
+            IWorkerGPUContext *gpu = nullptr;
+            void *stream = nullptr;
+            size_t rows = 0;
+            std::array<FP32Tensor *, 3> sources{}, outputs{};
+            ComputeGraph graph;
+            Manifest manifest;
+            std::unique_ptr<IGPUGraphCapture> capture;
+            /** @brief Cleanup joins precede graph and immutable-slot destruction. */
+            ~Packet() { if (gpu && stream) (void)gpu->synchronizeStreamChecked(stream); }
+        };
+        /** @brief Reject setup failures before proceeding with capture.
+         * @param ok Completed native/setup result.
+         * @param message Specific failed fixture boundary.
+         * @throws std::runtime_error If the required boundary failed. */
+        const auto require = [](bool ok, const char *message)
+        { if (!ok) throw std::runtime_error(message); };
+        SnapshotCapture published;
+        GraphExecutorConfig config;
+        config.snapshot_callback = [&](const std::string &name, const StageDumpInfo &dump)
+        { published.captureStage(name, dump); };
+        DeviceGraphExecutor executor(config);
+        executor.setArena(&arena_);
+        executor.setSnapshotStageFilter([&](const std::string &name, const StageDumpInfo &dump)
+        {
+            const auto keys = SnapshotCapture::possibleKeysForStage(name, dump);
+            return std::find(keys.begin(), keys.end(), indices_key) != keys.end() ||
+                   std::find(keys.begin(), keys.end(), weights_key) != keys.end();
+        });
+
+        /** @brief Prepare and record one graph with frozen output addresses.
+         * @param owner Executor whose filter and shared pool own the snapshots.
+         * @param rows Logical routing rows.
+         * @param score_rows Actual physical score rows for this bucket.
+         * @param shared Whether this graph belongs to the shared Prefill lane.
+         * @return Retained packet whose graph and manifest outlive every replay.
+         * @throws std::runtime_error For failed storage/capture preparation. */
+        const auto make_packet = [&](DeviceGraphExecutor &owner, size_t rows,
+                                     size_t score_rows, bool shared)
+        {
+            auto packet = std::make_unique<Packet>();
+            packet->gpu = gpu_ctx_; packet->stream = stream; packet->rows = rows;
+            const std::array<std::vector<size_t>, 3> shapes = {
+                std::vector<size_t>{score_rows, 256}, {rows, 8}, {rows, 8}};
+            for (size_t field = 0; field < shapes.size(); ++field)
+            {
+                packet->sources[field] = createFP32Tensor(shapes[field]);
+                packet->outputs[field] = createFP32Tensor(shapes[field]);
+                std::fill_n(packet->sources[field]->mutable_data(),
+                            packet->sources[field]->numel(), field == 0 ? 1.0f / 256.0f : 0.125f);
+                if (field == 1)
+                    for (size_t element = 0; element < packet->sources[field]->numel(); ++element)
+                        packet->sources[field]->mutable_data()[element] = float(element % 256);
+                std::fill_n(packet->outputs[field]->mutable_data(), packet->outputs[field]->numel(), 0.0f);
+                TransferEngine::prepareDeviceInput(packet->sources[field], device, stream);
+                TransferEngine::requireDeviceInput(packet->sources[field], device, stream);
+                TransferEngine::prepareDeviceInput(packet->outputs[field], device, stream);
+            }
+            require(arena_.bindExternalBuffer(BufferId::MOE_ROUTER_LOGITS, packet->outputs[0]), "bind score output");
+            require(arena_.bindExternalBuffer(BufferId::MOE_EXPERT_INDICES, packet->outputs[1]), "bind ID output");
+            require(arena_.bindExternalBuffer(BufferId::MOE_EXPERT_WEIGHTS, packet->outputs[2]), "bind weight output");
+            auto stage = std::make_unique<RoutingSnapshotCopyStage>(device, packet->sources, packet->outputs);
+            stage->setGPUStream(stream);
+            packet->graph.addNode(producer, std::move(stage), device);
+            if (shared) packet->manifest.bindStorageReusePolicy(ReusePolicy{
+                .reuse_class = ReuseClass::PrefillOrMTPVerifierAlternative,
+                .configuration_identity = UINT64_C(193)});
+            require(owner.prepareSnapshotsForGraphCapture(packet->graph, device_ctx_.get(),
+                        stream, "routing output filter", &packet->manifest), "prepare selected routing snapshots");
+            require(gpu_ctx_->synchronizeStreamChecked(stream), "join prepared routing sources");
+            packet->capture = gpu_ctx_->createGraphCapture(stream);
+            require(bool(packet->capture), "create routing capture");
+            {
+                ScopedBackendGraphCapture recording(*gpu_ctx_, *packet->capture, "routing output selection");
+                require(recording.begin(), "begin routing capture");
+                require(owner.recordSetupGraphMaterialization(packet->graph, device_ctx_.get(),
+                            nullptr, &packet->manifest), "record routing producer and selected snapshots");
+                recording.finish();
+            }
+            require(packet->capture->instantiate(), "instantiate retained routing graph");
+            require(packet->capture->nodeCount() > 0, "native routing graph has no nodes");
+            return packet;
+        };
+
+        std::vector<std::unique_ptr<Packet>> packets;
+        packets.push_back(make_packet(executor, 512, 256, true));
+        packets.push_back(make_packet(executor, 448, 448, true));
+        packets.push_back(make_packet(executor, 3, 3, true));
+        void *const shared_address = packets[0]->manifest.storage_arena->gpu_data_ptr();
+        const size_t shared_capacity = packets[0]->manifest.storage_capacity_bytes;
+        ASSERT_EQ(shared_capacity, 2u * 512u * 8u * sizeof(float));
+        for (size_t i = 0; i < packets.size(); ++i)
+        {
+            const auto &manifest = packets[i]->manifest;
+            ASSERT_EQ(manifest.stage_copies.size(), 1u);
+            ASSERT_EQ(manifest.bound_slot_count, 2u);
+            const auto &copies = manifest.stage_copies.at(producer).outputs;
+            ASSERT_EQ(copies.size(), 2u);
+            EXPECT_EQ(copies[0].name, "output_indices_tensor");
+            EXPECT_EQ(copies[1].name, "output_weights_tensor");
+            for (const auto &copy : copies)
+            {
+                EXPECT_EQ(copy.rows, packets[i]->rows);
+                EXPECT_EQ(copy.cols, 8u);
+                EXPECT_EQ(copy.byte_size, packets[i]->rows * 8u * sizeof(float));
+            }
+            EXPECT_EQ(manifest.storage_arena->gpu_data_ptr(), shared_address);
+            EXPECT_EQ(manifest.storage_capacity_bytes, shared_capacity);
+            EXPECT_EQ(manifest.storage_allocation_count, i == 0 ? 1u : 0u);
+        }
+        for (int request = 0; request < 2; ++request)
+        for (const size_t index : {0u, 1u, 2u, 0u})
+        {
+            SCOPED_TRACE(::testing::Message() << "request=" << request << " rows=" << packets[index]->rows);
+            auto &packet = *packets[index];
+            published.clear();
+            float *ids = packet.sources[1]->mutable_data();
+            float *weights = packet.sources[2]->mutable_data();
+            for (size_t row = 0; row < packet.rows; ++row)
+            for (size_t slot = 0; slot < 8; ++slot)
+            {
+                ids[row * 8 + slot] = float((row + slot + 17 * request) % 256);
+                weights[row * 8 + slot] = request == 0 ? 0.125f :
+                    (slot < 2 ? 0.25f : (slot < 4 ? 0.125f : 0.0625f));
+            }
+            for (size_t field : {1u, 2u})
+                TransferEngine::prepareDeviceInput(packet.sources[field], device, stream);
+            for (auto *output : packet.outputs)
+                ASSERT_TRUE(backend->memset(output->gpu_data_ptr(), 0xff, output->numel() * sizeof(float), device.ordinal, stream));
+            ASSERT_TRUE(backend->memset(shared_address, 0xff, shared_capacity, device.ordinal, stream));
+            ASSERT_TRUE(packet.capture->launch());
+            ASSERT_TRUE(gpu_ctx_->synchronizeStreamChecked(stream));
+            ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(packet.graph, stream,
+                "routing filtered replay", &packet.manifest));
+            EXPECT_FALSE(published.getShared(score_key));
+            for (const auto &[key, field] : std::array<std::pair<std::string, size_t>, 2>{
+                     std::pair{indices_key, 1u}, std::pair{weights_key, 2u}})
+            {
+                const auto value = published.getShared(key);
+                ASSERT_TRUE(value);
+                EXPECT_EQ(value->rows, packet.rows); EXPECT_EQ(value->cols, 8u);
+                ASSERT_EQ(value->data.size(), packet.rows * 8u);
+                EXPECT_EQ(std::memcmp(value->data.data(), packet.sources[field]->data(),
+                                      value->data.size() * sizeof(float)), 0);
+            }
+            EXPECT_EQ(packet.manifest.storage_arena->gpu_data_ptr(), shared_address);
+            EXPECT_EQ(packet.manifest.storage_capacity_bytes, shared_capacity);
+        }
+
+        // Score-only evidence owns a different executor/arena; it cannot grow
+        // the retained IDs/weights lane or mask the original admission defect.
+        DeviceGraphExecutor scores(config);
+        scores.setArena(&arena_);
+        scores.setSnapshotStageFilter([&](const std::string &name, const StageDumpInfo &dump)
+        {
+            const auto keys = SnapshotCapture::possibleKeysForStage(name, dump);
+            return std::find(keys.begin(), keys.end(), score_key) != keys.end();
+        });
+        auto positive = make_packet(scores, 448, 448, false);
+        ASSERT_EQ(positive->manifest.bound_slot_count, 1u);
+        ASSERT_EQ(positive->manifest.stage_copies.at(producer).outputs.size(), 1u);
+        EXPECT_EQ(positive->manifest.stage_copies.at(producer).outputs[0].name, "router_logits");
+        EXPECT_NE(positive->manifest.storage_arena->gpu_data_ptr(), shared_address);
+        EXPECT_EQ(positive->manifest.storage_capacity_bytes, 448u * 256u * sizeof(float));
+        published.clear();
+        ASSERT_TRUE(positive->capture->launch());
+        ASSERT_TRUE(gpu_ctx_->synchronizeStreamChecked(stream));
+        ASSERT_TRUE(scores.publishSnapshotsAfterGraphExecution(positive->graph, stream,
+            "score-only positive", &positive->manifest));
+        const auto value = published.getShared(score_key);
+        ASSERT_TRUE(value); ASSERT_EQ(value->data.size(), 448u * 256u);
+        EXPECT_EQ(std::memcmp(value->data.data(), positive->sources[0]->data(),
+                              value->data.size() * sizeof(float)), 0);
+        EXPECT_FALSE(published.getShared(indices_key));
+        EXPECT_FALSE(published.getShared(weights_key));
+        EXPECT_EQ(packets[0]->manifest.storage_arena->gpu_data_ptr(), shared_address);
+    });
 }
 
 /**

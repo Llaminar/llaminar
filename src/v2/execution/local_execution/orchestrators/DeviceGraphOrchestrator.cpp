@@ -45738,6 +45738,9 @@ namespace llaminar2
             {"block_size", std::to_string(prefix_layout_.block_size)},
             {"terminal_state", prefixCacheTerminalStateModeToString(prefix_config.terminal_state)},
         };
+        appendProjectionArithmeticFingerprintFields(
+            material.runtime, debugEnv().gemm.gdn_projection_arithmetic,
+            debugEnv().gemm.moe_router_arithmetic, debugEnv().gemm.cuda_moe_router_prefill);
         material.topology = {
             {"first_layer_index", std::to_string(prefix_layout_.first_layer_index)},
             {"total_layers", std::to_string(prefix_layout_.total_layers)},
@@ -64190,6 +64193,12 @@ namespace llaminar2
             .disk_namespace = disk ? (std::filesystem::path(config.disk_dir).lexically_normal().string() +
                 "|" + (injected_model_ctx_ ? injected_model_ctx_->path() : std::string{})) : std::string{},
             .publisher = prefix_telemetry_}};
+    }
+
+    /** @copydoc DeviceGraphOrchestrator::collectPrefixCacheShutdown */
+    void DeviceGraphOrchestrator::collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const
+    {
+        shutdown.add(prefix_cache_);
     }
 
 } // namespace llaminar2

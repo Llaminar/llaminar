@@ -7,7 +7,8 @@
  * stronger nonzero fixture, but they must preserve the complete entry set.
  * Keeping source and device codebook metadata beside the creator also catches
  * preparation bugs where a source layout is accepted but published under an
- * incompatible execution descriptor.
+ * incompatible execution descriptor. IQ4_XS retains source4 but publishes
+ * physical24 with a raw coefficient secondary plane.
  */
 
 #pragma once
@@ -64,7 +65,7 @@ namespace llaminar2::test
              { return TestTensorFactory::createQ4_0Random(shape, seed); }},
             {"IQ4_NL", TensorType::IQ4_NL, 4, false, 4, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }},
-            {"IQ4_XS", TensorType::IQ4_XS, 4, true, 4, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+            {"IQ4_XS", TensorType::IQ4_XS, 4, true, kNativeVnniIQ4XSSourceScaleCodebook, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }},
             {"Q4_1", TensorType::Q4_1, 5, false, 5, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createQ4_1Random(shape, seed); }},
@@ -113,7 +114,7 @@ namespace llaminar2::test
      * random factory is useful for tensor-decoder coverage, but its synthetic
      * scales can make a gate/up/down composition overflow or collapse to zero.
      * Keeping `ls` close to 32 produces finite, nonzero routed-expert rows while
-     * preserving the real IQ4_XS source layout and codebook-4 preparation path.
+     * preserving source/arithmetic4 and physical24 original-factor preparation.
      * Independent PRNG draws for each payload and scale avoid short row periods:
      * correlated two-row patterns previously saturated every gate negative and
      * underflowed the composed SwiGLU Q8 scale, making replica parity vacuous.

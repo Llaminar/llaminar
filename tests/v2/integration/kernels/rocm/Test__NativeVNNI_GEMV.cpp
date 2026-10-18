@@ -11,9 +11,10 @@
  *   6. Compare GPU vs CPU via cosine similarity and max absolute error
  *
  * Accuracy expectations:
- * - Native-VNNI is lossless within each block's quantization (FP16 per-block scales
- *   are preserved). The only numerical error comes from the INT8 activation
- *   quantization step (FP32 input → INT8 → FP32 scale_A).
+ * - Q6_K and IQ2_S preserve original half d and their signed subscales or raw
+ *   scale byte in the existing four metadata bytes. The focused source-factor
+ *   regressions hold activation Q8 exactly representable so an
+ *   independent original-source equation exposes extra weight-scale rounding.
  * - Expected cosine similarity > 0.99 for all formats.
  * - Lower BPW formats (Q2_K, IQ2) inherently have more quantization noise, so
  *   the comparison is against their own dequantized reference (not FP32 weights).
@@ -23,6 +24,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "tensors/IQQuantTables.h"
 #include "transfer/TransferEngine.h"
 #include <algorithm>
 #include <array>
@@ -51,6 +53,8 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include "backends/rocm/HIPGraphCapture.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 
 extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
 extern "C" void rocmGemv_native_vnni_reset_tuning_overrides();
@@ -892,6 +896,85 @@ namespace
         EXPECT_LT(max_abs_diff, 2e-3f);
 
         cleanupWorkspace(kernel);
+    }
+
+    /**
+     * @test Optimized Q6 GEMV consumes original factors with unchanged Q8 inputs.
+     * @details Two nonzero activation values127 in one32-value block quantize
+     * exactly with scale1. Each raw Q6 code is1, so low/high integer dots are
+     * independently127 or-127. Original d*(3,5) products are reconstructed in
+     * double solely to round the independent two FP32 dot terms and their sum.
+     * Halfway-derived, half-subnormal, negative, and above-half-range source
+     * scales distinguish old preparation. Both M1 and grouped M2 use the real
+     * production quantizer/GEMV interfaces, not a test-only projection kernel.
+     */
+    TEST_F(NativeVNNIGEMVTest, Q6_K_SourceScaleFactorsMatchOriginalSourceEquation)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_rocm_device_) GTEST_SKIP() << "No ROCm device available";
+        constexpr int N = 64;
+        constexpr int K = 256;
+        constexpr uint16_t words[] = {0x3c01, 0x0401, 0x0001, 0x7bff, 0xbc01, 0x8401, 0x8001, 0xfbff};
+        std::vector<uint8_t> raw(static_cast<size_t>(N) * sizeof(Q6_KBlock));
+        auto *blocks = reinterpret_cast<Q6_KBlock *>(raw.data());
+        for (int row = 0; row < N; ++row)
+        {
+            auto &block = blocks[row];
+            std::memset(&block, 0, sizeof(block));
+            block.d = words[row % 8];
+            std::memset(block.ql, 0x11, sizeof(block.ql));
+            std::memset(block.qh, 0xaa, sizeof(block.qh));
+            for (int pair = 0; pair < 8; ++pair)
+            {
+                block.scales[2 * pair] = 3;
+                block.scales[2 * pair + 1] = 5;
+            }
+        }
+        Q6_KTensor source({static_cast<size_t>(N), static_cast<size_t>(K)}, raw);
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packNativeVNNI(&source, packed));
+        ASSERT_EQ(packed.native_vnni_codebook_id, 8);
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        NativeVNNIDecodeEquivalentM1PolicyGuard serial_policy;
+        for (const int M : {1, 2})
+        {
+            ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+            auto input = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(K)});
+            auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+            std::fill_n(input->mutable_data(), static_cast<size_t>(M) * K, 0.0f);
+            std::vector<float> expected(static_cast<size_t>(M) * N);
+            for (int row = 0; row < M; ++row)
+            {
+                const int sign = row == 0 ? 1 : -1;
+                input->mutable_data()[static_cast<size_t>(row) * K] = static_cast<float>(127 * sign);
+                input->mutable_data()[static_cast<size_t>(row) * K + 16] = static_cast<float>(127 * sign);
+                for (int column = 0; column < N; ++column)
+                {
+                    const double d = static_cast<double>(fp16_to_fp32(words[column % 8]));
+                    const float low = static_cast<float>(d * static_cast<double>(3 * 127 * sign));
+                    const float high = static_cast<float>(d * static_cast<double>(5 * 127 * sign));
+                    expected[static_cast<size_t>(row) * N + column] =
+                        static_cast<float>(static_cast<double>(low) + static_cast<double>(high));
+                }
+            }
+            // Declared after every tensor/host vector so failure joins first.
+            struct ObservationJoin
+            {
+                hipStream_t stream;
+                /** @brief Complete exact-stream work before all borrowed buffers retire. */
+                ~ObservationJoin() { EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess); }
+            } observation{stream_};
+            ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output.get(), M, N, K));
+            ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+            const float *actual = output->data();
+            ASSERT_NE(actual, nullptr);
+            expectBitwiseEqualFloatRows("Q6 source-scale original equation M=" + std::to_string(M),
+                actual, expected.data(), expected.size(), N);
+            cleanupWorkspace(kernel);
+        }
+#endif
     }
 
     /**
@@ -1746,6 +1829,138 @@ namespace
 
             cleanupWorkspace(kernel);
         }
+    }
+
+/** @brief Original IQ2_S factors and unchanged Q8 must survive actual optimized capture. */
+TEST_F(NativeVNNIGEMVTest, IQ2_S_SourceFactorsMatchCapturedOriginalEquation)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_rocm_device_) GTEST_SKIP() << "No ROCm device available";
+        constexpr int N = 67, K = 288, source_first = 3;
+        constexpr int superblocks = (K + 255) / 256;
+        constexpr uint16_t words[] = {
+            0x3c01, 0x0001, 0x8001, 0x03ff, 0x0401, 0x7bff,
+            0xfbff, 0xbc01, 0x8000, 0x0000};
+        std::vector<uint8_t> raw(static_cast<size_t>(N + source_first) * superblocks * sizeof(IQ2_SBlock));
+        auto *blocks = reinterpret_cast<IQ2_SBlock *>(raw.data());
+        for (int row = 0; row < N + source_first; ++row)
+            for (int sb = 0; sb < superblocks; ++sb)
+            {
+                auto &block = blocks[row * superblocks + sb];
+                std::memset(&block, 0, sizeof(block));
+                block.d = words[(row + sb) % 10];
+                for (int subblock = 0; subblock < 8; ++subblock)
+                {
+                    block.scales[subblock] = static_cast<uint8_t>(row * 37 + sb * 53 + subblock * 17);
+                    block.qh[subblock] = static_cast<uint8_t>(row * 11 + subblock * 7);
+                    for (int group = 0; group < 4; ++group)
+                    {
+                        block.qs[subblock * 4 + group] = static_cast<uint8_t>(row * 19 + subblock * 13 + group * 23);
+                        block.qs[32 + subblock * 4 + group] = static_cast<uint8_t>((row + group + sb) & 1 ? 0xff : 0);
+                    }
+                }
+            }
+        auto parent = std::make_shared<IQ2_STensor>(
+            std::vector<size_t>{static_cast<size_t>(N + source_first), K}, raw);
+        auto source = parent->create_view({N, K}, static_cast<size_t>(source_first) * K);
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packNativeVNNI(source.get(), packed));
+        ASSERT_EQ(packed.native_vnni_codebook_id, 13);
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        NativeVNNIDecodeEquivalentM1PolicyGuard serial_policy;
+        for (const int M : {1, 2, 3, 17, 512})
+        {
+            ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+            auto input = TestTensorFactory::createFP32({static_cast<size_t>(M), K});
+            auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), N});
+            std::fill_n(input->mutable_data(), static_cast<size_t>(M) * K, 0.0f);
+            std::vector<float> published(static_cast<size_t>(M) * K);
+            std::vector<float> expected(static_cast<size_t>(M) * N);
+            std::vector<int8_t> observed_q8(static_cast<size_t>(M) * K);
+            std::vector<float> observed_q8_scales(static_cast<size_t>(M) * (K / 32));
+            HIPGraphCapture graph(stream_, 0);
+            struct ObservationJoin
+            {
+                hipStream_t stream;
+                /** @brief Join before graph, tensors and borrowed DMA vectors retire. */
+                ~ObservationJoin() { EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess); }
+            } observation{stream_};
+            // Bind all production pointer/launch state before recording. The
+            // observation guard already protects failure-edge tensor/DMA life.
+            ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output.get(), M, N, K));
+            ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+            {
+                ScopedBackendGraphCapture recording(graph, "IQ2_S_original_source_projection");
+                ASSERT_TRUE(recording.begin());
+                const bool captured = kernel.multiply_tensor(input.get(), output.get(), M, N, K);
+                recording.finish();
+                ASSERT_TRUE(captured);
+            }
+            ASSERT_TRUE(graph.instantiate());
+            for (const int active_block : {0, 1, 7, 8, 0})
+            {
+                std::fill(published.begin(), published.end(), 0.0f);
+                for (int row = 0; row < M; ++row)
+                {
+                    const int sign = ((row + active_block) & 1) ? -1 : 1;
+                    published[static_cast<size_t>(row) * K + active_block * 32] = static_cast<float>(127 * sign);
+                    published[static_cast<size_t>(row) * K + active_block * 32 + 16] = static_cast<float>(127 * sign);
+                    for (int column = 0; column < N; ++column)
+                    {
+                        const auto &original = blocks[(source_first + column) * superblocks + active_block / 8];
+                        const int subblock = active_block % 8;
+                        const uint8_t coefficients = original.scales[subblock];
+                        const double base = static_cast<double>(fp16_to_fp32(original.d));
+                        int dots[2]{};
+                        for (int half = 0; half < 2; ++half)
+                        {
+                            const int group = half * 2;
+                            const int index = original.qs[subblock * 4 + group] |
+                                (((original.qh[subblock] >> (2 * group)) & 3) << 8);
+                            const int magnitude = static_cast<int>(iq2s_grid[index] & 0xffu);
+                            const int weight_sign = (original.qs[32 + subblock * 4 + group] & 1) ? -1 : 1;
+                            dots[half] = magnitude * weight_sign * 127 * sign;
+                        }
+                        const double low_scale = (base * (0.5 + (coefficients & 15))) * 0.25;
+                        const double high_scale = (base * (0.5 + (coefficients >> 4))) * 0.25;
+                        // Independent double evaluation with explicit FP32
+                        // publication at each dot product and pair/add edge.
+                        volatile float low = static_cast<float>(low_scale * dots[0]);
+                        volatile float high = static_cast<float>(high_scale * dots[1]);
+                        volatile float pair = static_cast<float>(static_cast<double>(low) + high);
+                        expected[static_cast<size_t>(row) * N + column] =
+                            static_cast<float>(0.0 + static_cast<double>(pair));
+                    }
+                }
+                ASSERT_EQ(hipMemcpyAsync(input->gpu_data_ptr(), published.data(), published.size() * sizeof(float),
+                    hipMemcpyHostToDevice, stream_), hipSuccess);
+                TransferEngine::publishCurrentDeviceWrite(input.get(), stream_);
+                ASSERT_EQ(hipMemsetAsync(output->gpu_data_ptr(), 0xff, expected.size() * sizeof(float), stream_), hipSuccess);
+                ASSERT_TRUE(graph.launch());
+                TransferEngine::publishCurrentDeviceWrite(output.get(), stream_);
+                const void *q8 = workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A);
+                const void *q8_scales = workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE);
+                ASSERT_NE(q8, nullptr);
+                ASSERT_NE(q8_scales, nullptr);
+                ASSERT_EQ(hipMemcpyAsync(observed_q8.data(), q8, observed_q8.size(),
+                    hipMemcpyDeviceToHost, stream_), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(observed_q8_scales.data(), q8_scales,
+                    observed_q8_scales.size() * sizeof(float), hipMemcpyDeviceToHost, stream_), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+                for (size_t index = 0; index < observed_q8.size(); ++index)
+                    ASSERT_EQ(observed_q8[index], static_cast<int8_t>(published[index])) << "Q8 index=" << index;
+                for (size_t index = 0; index < observed_q8_scales.size(); ++index)
+                    ASSERT_EQ(observed_q8_scales[index], 1.0f) << "Q8 scale index=" << index;
+                const float *actual = output->data();
+                ASSERT_NE(actual, nullptr);
+                expectBitwiseEqualFloatRows("IQ2_S captured original equation M=" + std::to_string(M) +
+                    " block=" + std::to_string(active_block), actual, expected.data(), expected.size(), N);
+            }
+            cleanupWorkspace(kernel);
+        }
+#endif
     }
 
 #endif // HAVE_ROCM

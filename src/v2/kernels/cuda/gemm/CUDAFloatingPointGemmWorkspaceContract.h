@@ -6,12 +6,16 @@
  * triplets. Both coexist in a captured graph; counting only the outer triplet
  * understates physical storage. This device-free contract composes their names
  * before alignment, along with the shared library scratch and mapped redirect.
+ * Explicit FP16RNE operands additionally own exactly rows*k half elements;
+ * a sequential fused group casts once and shares that bank on its exact stream.
  */
 #pragma once
 #include "interfaces/IWorkspaceConsumer.h"
+#include "kernels/FloatingActivationOperandPrecision.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include <limits>
+#include <cstdint>
 #include <stdexcept>
 
 namespace llaminar2::cuda::floating_gemm_workspace
@@ -50,6 +54,32 @@ namespace llaminar2::cuda::floating_gemm_workspace
                 throw std::overflow_error("CUDA floating projection redirect extent overflow");
             result.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT,
                 rows * columns * bytes_per_column, 256, true});
+        }
+        return result;
+    }
+
+    /**
+     * @brief Add one physical half-A bank for explicit ordinary half operands.
+     * @param rows Complete retained row envelope, not the allocation capacity.
+     * @param columns Output width used by the existing redirect declaration.
+     * @param k Prepared activation reduction width.
+     * @param operand Immutable arithmetic; only FP16RNE needs a half bank.
+     * @return Existing requirements plus exact rows*k*sizeof(uint16_t) when needed.
+     * @throws std::invalid_argument Half operand geometry is not positive.
+     * @throws std::overflow_error Named half bank bytes cannot be represented.
+     */
+    inline WorkspaceRequirements projectionRequirements(size_t rows, size_t columns,
+        size_t k, FloatingActivationOperandPrecision operand)
+    {
+        auto result = projectionRequirements(rows, columns);
+        if (operand == FloatingActivationOperandPrecision::FP16RNE)
+        {
+            if (!rows || !k)
+                throw std::invalid_argument("CUDA FP16 operand workspace requires rows and k");
+            if (rows > std::numeric_limits<size_t>::max() / sizeof(std::uint16_t) / k)
+                throw std::overflow_error("CUDA FP16 activation operand extent overflow");
+            result.buffers.push_back({GemmWorkspaceBuffers::FULL_A_FP16,
+                rows * k * sizeof(std::uint16_t), 256, true});
         }
         return result;
     }

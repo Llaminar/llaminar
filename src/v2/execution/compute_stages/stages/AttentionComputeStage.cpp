@@ -691,6 +691,15 @@ namespace llaminar2
                 .kv_capacity = workspace_kv_capacity,
                 .sm_count = properties.multiProcessorCount,
                 .requested_axis = params_.execution_policy.prefill_parallel_axis,
+                .visible_kv_heads = params_.n_kv_heads,
+                .head_start = params_.head_start,
+                .replicated_gqa_n_rep = params_.gqa_n_rep,
+                .native_kv_format = nativePrefillKVFormat(),
+                .visibility = attention::attentionVisibilityPolicy(
+                    params_.causal, params_.window_size, params_.workspace_mask != nullptr),
+                .query_warp_groups_override = debugEnv().attention.cuda_fa2_q_warp_groups,
+                .pv_warps_override = debugEnv().attention.cuda_fa2_hd256_pv_warps,
+                .tile_kv_override = debugEnv().attention.cuda_fa2_tile_kv,
             };
             const auto prefill_plan =
                 cuda::fa2_policy::selectFA2PrefillParallelPlan(prefill_geometry);
@@ -785,6 +794,9 @@ namespace llaminar2
                     .lds_capacity_bytes = properties.lds_capacity_bytes,
                     .requested_axis =
                         params_.execution_policy.prefill_parallel_axis,
+                    .kv_format = nativePrefillKVFormat(),
+                    .visibility = attention::attentionVisibilityPolicy(
+                        params_.causal, params_.window_size, params_.workspace_mask != nullptr),
                 });
             if (!prefill_plan.valid)
             {
@@ -846,6 +858,9 @@ namespace llaminar2
                                 properties.lds_capacity_bytes,
                             .requested_axis = params_.execution_policy
                                                   .prefill_parallel_axis,
+                            .kv_format = nativePrefillKVFormat(),
+                            .visibility = attention::attentionVisibilityPolicy(
+                                params_.causal, params_.window_size, params_.workspace_mask != nullptr),
                         });
             if (family_workspace_plan.valid &&
                 family_workspace_plan.usesContextParallelism())
@@ -1378,6 +1393,12 @@ namespace llaminar2
             .head_dim = params_.head_dim,
             .kv_capacity = effective_kv_stride,
             .execution_policy = params_.execution_policy,
+            .native_kv_format = nativePrefillKVFormat(),
+            .visibility = attention::attentionVisibilityPolicy(
+                params_.causal, params_.window_size, params_.workspace_mask != nullptr),
+            .visible_kv_heads = params_.n_kv_heads,
+            .head_start = params_.head_start,
+            .replicated_gqa_n_rep = params_.gqa_n_rep,
         };
 
         if (gpu_stage && params_.kv_cache && params_.layer_idx >= 0)
@@ -1969,6 +1990,21 @@ namespace llaminar2
         default:
             return false;
         }
+    }
+
+    TensorType AttentionComputeStage::nativePrefillKVFormat() const
+    {
+        if (params_.execution_policy.key_cache.transformsOnRead()) return TensorType::FP32;
+        if (params_.kv_cache)
+        {
+            return params_.kv_cache->k_precision() == ActivationPrecision::FP16 &&
+                   params_.kv_cache->v_precision() == ActivationPrecision::FP16
+                ? TensorType::FP16 : TensorType::FP32;
+        }
+        return params_.K && params_.V &&
+               params_.K->native_type() == TensorType::FP16 &&
+               params_.V->native_type() == TensorType::FP16
+            ? TensorType::FP16 : TensorType::FP32;
     }
 
     IKVCache::DeviceReadStorageKind AttentionComputeStage::deviceCacheReadKind() const

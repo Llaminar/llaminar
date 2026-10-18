@@ -14,6 +14,9 @@
  * host transfer, or stream/device synchronization occurs inside the kernel.
  * RegisterDecode remains the default until a complete resource/byte/economy
  * tournament authorizes another explicitly represented launch configuration.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 #pragma once
 
@@ -306,7 +309,7 @@ namespace llaminar2::cuda::prefill
         constexpr bool IS_DUAL_SCALE = Traits::is_dual_scale;
         constexpr bool IS_DUAL_SCALE_ASYM = Traits::is_dual_scale_asym;
         constexpr bool IS_IQ1_M = Traits::is_iq1_m;
-        constexpr bool NEEDS_MINS = IS_ASYMMETRIC || IS_DUAL_SCALE;
+        constexpr bool NEEDS_MINS = Traits::requires_secondary_metadata;
 
         // Shared memory: no smem_B_raw staging buffer needed.
         // STAGES_=1 (single-buffered) halves smem → potential 3 blocks/SM.
@@ -585,7 +588,7 @@ namespace llaminar2::cuda::prefill
                                 static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                 static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
                         }
-                        else if constexpr (CODEBOOK_ID == 4)
+                        else if constexpr (Traits::is_iq4_lut)
                         {
                             using llaminar2::cuda_native_vnni::iq4nl_decode_word;
                             uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
@@ -722,7 +725,7 @@ namespace llaminar2::cuda::prefill
                                     static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                     static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
                             }
-                            else if constexpr (CODEBOOK_ID == 4)
+                            else if constexpr (Traits::is_iq4_lut)
                             {
                                 using llaminar2::cuda_native_vnni::iq4nl_decode_word;
                                 uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
@@ -782,7 +785,7 @@ namespace llaminar2::cuda::prefill
                                         static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                         static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
                                 }
-                                else if constexpr (CODEBOOK_ID == 4)
+                                else if constexpr (Traits::is_iq4_lut)
                                 {
                                     using llaminar2::cuda_native_vnni::iq4nl_decode_word;
                                     uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;

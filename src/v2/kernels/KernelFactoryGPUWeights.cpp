@@ -65,7 +65,8 @@ namespace llaminar::v2::kernels
     std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemmFromGPUWeightPool(
         const llaminar2::TensorBase &tensor, llaminar2::DeviceId device,
         std::shared_ptr<llaminar2::LoadOrchestrator> owner, const std::string &slot_name,
-        size_t row_offset, llaminar2::GPUPreparedWeightPoolLayout layout)
+        size_t row_offset, llaminar2::GPUPreparedWeightPoolLayout layout,
+        llaminar2::FloatingActivationOperandPrecision operand_precision)
     {
         using namespace llaminar2;
         if (!device.is_gpu() || !owner || owner->managedDevice(device.ordinal) != device ||
@@ -84,6 +85,12 @@ namespace llaminar::v2::kernels
         const int n = static_cast<int>(tensor.rows()), k = static_cast<int>(tensor.cols());
         const auto type = tensor.native_type();
         const bool floating = type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16;
+        if ((operand_precision == FloatingActivationOperandPrecision::FP32 && type != TensorType::FP32) ||
+            (operand_precision == FloatingActivationOperandPrecision::FP16RNE && type != TensorType::FP16) ||
+            (operand_precision != FloatingActivationOperandPrecision::Native &&
+             operand_precision != FloatingActivationOperandPrecision::FP32 &&
+             operand_precision != FloatingActivationOperandPrecision::FP16RNE))
+            throw std::invalid_argument("Explicit floating operand precision disagrees with prepared storage");
         if (floating)
         {
             const size_t row_bytes = product(static_cast<size_t>(k), type == TensorType::FP32 ? 4 : 2);
@@ -95,7 +102,7 @@ namespace llaminar::v2::kernels
                 using Kernel = cuda::CUDAFloatingPointGemmKernel;
                 const auto precision = type == TensorType::FP32 ? Kernel::Precision::FP32 :
                     type == TensorType::FP16 ? Kernel::Precision::FP16 : Kernel::Precision::BF16;
-                return std::make_unique<Kernel>(payload, n, k, device.ordinal, precision, std::move(owner));
+                return std::make_unique<Kernel>(payload, n, k, device.ordinal, precision, std::move(owner), operand_precision);
             }
 #endif
 #ifdef HAVE_ROCM
@@ -104,7 +111,7 @@ namespace llaminar::v2::kernels
                 using Kernel = rocm::ROCmFloatingPointGemmKernel;
                 const auto precision = type == TensorType::FP32 ? Kernel::Precision::FP32 :
                     type == TensorType::FP16 ? Kernel::Precision::FP16 : Kernel::Precision::BF16;
-                return std::make_unique<Kernel>(payload, n, k, device.ordinal, precision, std::move(owner));
+                return std::make_unique<Kernel>(payload, n, k, device.ordinal, precision, std::move(owner), operand_precision);
             }
 #endif
         }
@@ -118,7 +125,7 @@ namespace llaminar::v2::kernels
                 ? reusableDeviceVnniAllocationFormat(*source) : NativeVnniReusableDeviceAllocationFormat{};
             const auto allocation = layout == GPUPreparedWeightPoolLayout::MigrationReusable
                 ? reusable : NativeVnniReusableDeviceAllocationFormat{
-                    static_cast<uint8_t>(source->payload_bytes), source->is_asymmetric, source->has_emins};
+                    static_cast<uint8_t>(source->payload_bytes), canonicalDeviceVnniFormat(*source).is_asymmetric, source->has_emins};
             const auto blocks_per_row = static_cast<size_t>(k / 32);
             const auto offset_blocks = product(row_offset, blocks_per_row);
             const auto length_blocks = product(static_cast<size_t>(n), blocks_per_row);
@@ -137,7 +144,7 @@ namespace llaminar::v2::kernels
                 allocation.has_emins ? product(offset_blocks, sizeof(uint32_t)) : 0,
                 allocation.has_emins ? product(length_blocks, sizeof(uint32_t)) : 0, slot_name, "embedded minima"));
             const NativeVnniSourceIdentity identity{source->codebook_id, source->is_superblock, true};
-            const auto codebook = canonicalDeviceVnniCodebookId(source->codebook_id);
+            const auto codebook = canonicalDeviceVnniCodebookId(*source);
 #ifdef HAVE_CUDA
             if (device.is_cuda())
                 return std::make_unique<cuda::CUDAQuantisedGemmKernel>(n, k, device.ordinal,

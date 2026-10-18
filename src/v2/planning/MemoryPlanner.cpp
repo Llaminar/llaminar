@@ -20,6 +20,7 @@
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
+#include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "utils/Logger.h"
 
@@ -38,6 +39,40 @@ namespace llaminar2
 
 namespace
 {
+
+/**
+ * @brief Read immutable attention visibility from the declarative model schema.
+ * @param architecture Registered model architecture being admitted.
+ * @return Full causal visibility only when every declared attention reader has it.
+ *
+ * Admission must not infer visibility from a model name or assume the runtime
+ * stage's default. Named recurrent templates may contain no attention reader;
+ * every real attention reader contributes its explicit causal/window policy.
+ * Additional input operands exclude the unmasked Q/K/V specialization.
+ */
+attention::AttentionVisibilityPolicy modelAttentionVisibility(const std::string &architecture)
+{
+    const auto schema = SchemaFactoryRegistry::getFactory(architecture)->createSchema();
+    bool seen_attention = false;
+    bool full_context = true;
+    const auto inspect = [&](const LayerTemplate &layer)
+    {
+        for (const auto &stage : layer.attention_stages)
+        {
+            if (stage.type != StageType::AttentionCompute) continue;
+            seen_attention = true;
+            full_context = full_context &&
+                stage.causal.has_value() && stage.window_size.has_value() &&
+                attention::attentionVisibilityPolicy(*stage.causal, *stage.window_size,
+                    stage.inputs.size() != 3) == attention::AttentionVisibilityPolicy::CausalFullContext;
+        }
+    };
+    inspect(schema.layer_template);
+    for (const auto &[name, layer] : schema.named_templates) inspect(layer);
+    return seen_attention && full_context
+        ? attention::AttentionVisibilityPolicy::CausalFullContext
+        : attention::AttentionVisibilityPolicy::General;
+}
 
 std::string formatMB(size_t bytes)
 {
@@ -1247,6 +1282,11 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     .mtp_terminal_logits_collective =
                         terminal_logits_collective,
                     .compact_routed_expert_token_rows = compact_routed_expert_token_rows,
+                    .attention_kv_format = KVCacheMemoryEstimator::attentionExecutionFormat(cfg.kv_precision),
+                    .attention_visibility = cfg.device.is_gpu() &&
+                            KVCacheMemoryEstimator::attentionExecutionFormat(cfg.kv_precision) == TensorType::FP16
+                        ? modelAttentionVisibility(profile.architecture)
+                        : attention::AttentionVisibilityPolicy::General,
                 });
         }
         else

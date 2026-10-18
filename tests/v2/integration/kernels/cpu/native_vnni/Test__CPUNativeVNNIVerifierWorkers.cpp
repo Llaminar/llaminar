@@ -15,6 +15,9 @@
  */
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "utils/NativeVNNITestPartialStorage.h"
+#include "utils/IQ2SFusedMoESourceWitness.h"
+#include "utils/IQ4XSFusedMoESourceWitness.h"
+#include "utils/IQ3SFusedMoESourceWitness.h"
 #include "utils/QuantizedVerifierFormats.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -409,4 +412,221 @@ TEST(CPUNativeVNNIVerifierWorkers, DisabledDiagnosticsDoNotAllocate)
     proveExpertTransaction();
 }
 } // namespace
+
+/**
+ * @test Actual grouped MoE transaction retains original IQ2_S factors in each role.
+ *
+ * This is a source-equation oracle, not grouped-versus-serial self-comparison.
+ * The actual middle publication is separately checked and then used as down's
+ * input oracle so gate/up and down factor loss remain independent failures.
+ */
+TEST(CPUNativeVNNIVerifierWorkers, IQ2SOriginalSourceEquationInFusedExpertTransaction)
+{
+    using namespace iq2s_fused_source_witness;
+    using namespace cpu::native_vnni;
+    VerifierWorkerScope restore;
+    constexpr auto policy=CPUProjectionNumericalPolicy::GPUAlignedExpert;
+    using Kernel=CPUNativeVNNIGemmKernel;
+    using Desc=Kernel::BatchedPrequantizedProjectionDesc;
+    const auto input=hidden();
+    for(const Role role : {Role::Gate,Role::Up,Role::Down})
+    {
+        SCOPED_TRACE(int(role));
+        auto weights=sources(role);
+        Kernel gate_kernel(weights.gate.get(),0,-1,policy);
+        Kernel up_kernel(weights.up.get(),0,-1,policy);
+        Kernel down_kernel(weights.down.get(),0,-1,policy);
+        ASSERT_TRUE(gate_kernel.isValid()&&up_kernel.isValid()&&down_kernel.isValid());
+        std::array<float,width> expected_gate{},expected_up{};
+        expectedGateUp(role,expected_gate,expected_up);
+        const auto expected_middle=expectedMiddle(role);
+        // These ordinary witnesses fix Q8 scale/codes independent of any model.
+        const float literal_scale=role==Role::Gate ? 3.12109375f :
+            role==Role::Up ? 399.5f : 128.0f;
+        ASSERT_EQ(fp16_to_fp32(expected_middle[0].d),literal_scale);
+        for(const int workers : {1,3,7}) for(const int rows : {1,3,15,31})
+        {
+            SCOPED_TRACE("workers="+std::to_string(workers)+" rows="+std::to_string(rows));
+            omp_set_num_threads(workers);
+            std::vector<float> inputs(rows*width),gate(rows*width),up(rows*width),down(rows*width);
+            std::vector<Q8_1Block> input_q8(rows*blocks),middle(rows*blocks);
+            for(int r=0;r<rows;++r) std::copy(input.begin(),input.end(),inputs.begin()+r*width);
+            quantize_activations_to_q8_1(inputs.data(),input_q8.data(),rows,width,blocks,policy);
+            for(int r=0;r<rows;++r)
+            {
+                ASSERT_EQ(input_q8[r*blocks].d,0x3c00u);
+                for(int i=0;i<width;++i) ASSERT_EQ(input_q8[r*blocks+i/32].qs[i%32],int(input[i]));
+            }
+            const auto preserved_input=input_q8;
+            const std::array<Desc,2> gate_up{{
+                {.kernel=&gate_kernel,.input_q8=input_q8.data(),.output=gate.data(),.rows=rows,.n=width,.ldc=width},
+                {.kernel=&up_kernel,.input_q8=input_q8.data(),.output=up.data(),.rows=rows,.n=width,.ldc=width}}};
+            const std::array<Desc,1> down_desc{{
+                {.kernel=&down_kernel,.input_q8=middle.data(),.output=down.data(),.rows=rows,.n=width,.ldc=width}}};
+            NativeVNNITestPartialStorage partials(std::max(
+                NativeVNNITestPartialStorage::bundleFloats(gate_up.data(),gate_up.size(),1),
+                NativeVNNITestPartialStorage::bundleFloats(down_desc.data(),down_desc.size(),1)));
+            for(int replay=0;replay<20;++replay)
+            {
+                std::fill(gate.begin(),gate.end(),-12345.0f);
+                std::fill(up.begin(),up.end(),-23456.0f);
+                std::fill(down.begin(),down.end(),-34567.0f);
+                std::memset(middle.data(),replay&1 ? 0x5a : 0xa5,middle.size()*sizeof(Q8_1Block));
+                ASSERT_TRUE(Kernel::execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
+                    gate_up.data(),gate_up.size(),width,gate.data(),up.data(),middle.data(),
+                    rows,width,blocks,down_desc.data(),down_desc.size(),partials.span()));
+                EXPECT_EQ(std::memcmp(input_q8.data(),preserved_input.data(),input_q8.size()*sizeof(Q8_1Block)),0);
+                for(int r=0;r<rows;++r)
+                {
+                    EXPECT_EQ(std::memcmp(gate.data()+r*width,expected_gate.data(),width*sizeof(float)),0);
+                    EXPECT_EQ(std::memcmp(up.data()+r*width,expected_up.data(),width*sizeof(float)),0);
+                    EXPECT_EQ(std::memcmp(middle.data()+r*blocks,expected_middle.data(),blocks*sizeof(Q8_1Block)),0);
+                    const float expected=expectedDown(role,*weights.down,middle.data()+r*blocks);
+                    for(int n=0;n<width;++n) EXPECT_EQ(down[r*width+n],expected);
+                }
+            }
+        }
+    }
+}
+
+/** @brief Original IQ4_XS factors and unchanged IQ4_NL through actual fused SIMD workers. */
+TEST(CPUNativeVNNIVerifierWorkers, IQ4XSOriginalSourceEquationInFusedExpertTransaction)
+{
+    using namespace iq4xs_fused_source_witness;
+    using namespace cpu::native_vnni;
+    VerifierWorkerScope restore;
+    constexpr auto policy=CPUProjectionNumericalPolicy::GPUAlignedExpert;
+    using Kernel=CPUNativeVNNIGemmKernel;
+    using Desc=Kernel::BatchedPrequantizedProjectionDesc;
+    const auto input=hidden();
+    for(const Role role : {Role::Gate,Role::Up,Role::Down,Role::IQ4NLDown,Role::MixedGate,Role::MixedUp})
+    {
+        SCOPED_TRACE(int(role));
+        auto weights=sources(role);
+        Kernel gate_kernel(weights.gate.get(),0,-1,policy);
+        Kernel up_kernel(weights.up.get(),0,-1,policy);
+        Kernel down_kernel(weights.down.get(),0,-1,policy);
+        ASSERT_TRUE(gate_kernel.isValid()&&up_kernel.isValid()&&down_kernel.isValid());
+        std::array<float,width> expected_gate{},expected_up{};
+        expectedGateUp(role,expected_gate,expected_up);
+        const auto expected_middle=expectedMiddle(role);
+        // These ordinary witnesses fix Q8 scale/codes independent of any model.
+        const float literal_scale=gateTarget(role) ? 3.12109375f :
+            upTarget(role) ? 399.5f : 128.0f;
+        ASSERT_EQ(fp16_to_fp32(expected_middle[0].d),literal_scale);
+        for(const int workers : {1,3}) for(const int rows : {1,3,15})
+        {
+            SCOPED_TRACE("workers="+std::to_string(workers)+" rows="+std::to_string(rows));
+            omp_set_num_threads(workers);
+            std::vector<float> inputs(rows*width),gate(rows*width),up(rows*width),down(rows*width);
+            std::vector<Q8_1Block> input_q8(rows*blocks),middle(rows*blocks);
+            for(int r=0;r<rows;++r) std::copy(input.begin(),input.end(),inputs.begin()+r*width);
+            quantize_activations_to_q8_1(inputs.data(),input_q8.data(),rows,width,blocks,policy);
+            for(int r=0;r<rows;++r)
+            {
+                ASSERT_EQ(input_q8[r*blocks].d,0x3c00u);
+                for(int i=0;i<width;++i) ASSERT_EQ(input_q8[r*blocks+i/32].qs[i%32],int(input[i]));
+            }
+            const auto preserved_input=input_q8;
+            const std::array<Desc,2> gate_up{{
+                {.kernel=&gate_kernel,.input_q8=input_q8.data(),.output=gate.data(),.rows=rows,.n=width,.ldc=width},
+                {.kernel=&up_kernel,.input_q8=input_q8.data(),.output=up.data(),.rows=rows,.n=width,.ldc=width}}};
+            const std::array<Desc,1> down_desc{{
+                {.kernel=&down_kernel,.input_q8=middle.data(),.output=down.data(),.rows=rows,.n=width,.ldc=width}}};
+            NativeVNNITestPartialStorage partials(std::max(
+                NativeVNNITestPartialStorage::bundleFloats(gate_up.data(),gate_up.size(),1),
+                NativeVNNITestPartialStorage::bundleFloats(down_desc.data(),down_desc.size(),1)));
+            for(int replay=0;replay<20;++replay)
+            {
+                std::fill(gate.begin(),gate.end(),-12345.0f);
+                std::fill(up.begin(),up.end(),-23456.0f);
+                std::fill(down.begin(),down.end(),-34567.0f);
+                std::memset(middle.data(),replay&1 ? 0x5a : 0xa5,middle.size()*sizeof(Q8_1Block));
+                ASSERT_TRUE(Kernel::execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
+                    gate_up.data(),gate_up.size(),width,gate.data(),up.data(),middle.data(),
+                    rows,width,blocks,down_desc.data(),down_desc.size(),partials.span()));
+                EXPECT_EQ(std::memcmp(input_q8.data(),preserved_input.data(),input_q8.size()*sizeof(Q8_1Block)),0);
+                for(int r=0;r<rows;++r)
+                {
+                    EXPECT_EQ(std::memcmp(gate.data()+r*width,expected_gate.data(),width*sizeof(float)),0);
+                    EXPECT_EQ(std::memcmp(up.data()+r*width,expected_up.data(),width*sizeof(float)),0);
+                    EXPECT_EQ(std::memcmp(middle.data()+r*blocks,expected_middle.data(),blocks*sizeof(Q8_1Block)),0);
+                    const float expected=expectedDown(role,*weights.down,middle.data()+r*blocks);
+                    for(int n=0;n<width;++n) EXPECT_EQ(down[r*width+n],expected);
+                }
+            }
+        }
+    }
+}
+
+/** @brief Original IQ3_S source factors through actual fused SIMD workers. */
+TEST(CPUNativeVNNIVerifierWorkers, IQ3SOriginalSourceEquationInFusedExpertTransaction)
+{
+    using namespace iq3s_source_witness;
+    using namespace cpu::native_vnni;
+    VerifierWorkerScope restore;
+    constexpr auto policy=CPUProjectionNumericalPolicy::GPUAlignedExpert;
+    using Kernel=CPUNativeVNNIGemmKernel;
+    using Desc=Kernel::BatchedPrequantizedProjectionDesc;
+    const auto input=hidden();
+    for(const Role role : ordinaryRoles)
+    {
+        SCOPED_TRACE(int(role));
+        auto weights=sources(role);
+        Kernel gate_kernel(weights.gate.get(),0,-1,policy);
+        Kernel up_kernel(weights.up.get(),0,-1,policy);
+        Kernel down_kernel(weights.down.get(),0,-1,policy);
+        ASSERT_TRUE(gate_kernel.isValid()&&up_kernel.isValid()&&down_kernel.isValid());
+        std::array<float,width> expected_gate{},expected_up{};
+        expectedGateUp(role,expected_gate,expected_up);
+        const auto expected_middle=expectedMiddle(role);
+        // These ordinary witnesses fix Q8 scale/codes independent of any model.
+        const float literal_scale=gateTarget(role) ? 3.12109375f :
+            upTarget(role) ? 399.5f : 128.0f;
+        ASSERT_EQ(fp16_to_fp32(expected_middle[0].d),literal_scale);
+        for(const int workers : {1,3}) for(const int rows : {1,3,15})
+        {
+            SCOPED_TRACE("workers="+std::to_string(workers)+" rows="+std::to_string(rows));
+            omp_set_num_threads(workers);
+            std::vector<float> inputs(rows*width),gate(rows*width),up(rows*width),down(rows*width);
+            std::vector<Q8_1Block> input_q8(rows*blocks),middle(rows*blocks);
+            for(int r=0;r<rows;++r) std::copy(input.begin(),input.end(),inputs.begin()+r*width);
+            quantize_activations_to_q8_1(inputs.data(),input_q8.data(),rows,width,blocks,policy);
+            for(int r=0;r<rows;++r)
+            {
+                ASSERT_EQ(input_q8[r*blocks].d,0x3c00u);
+                for(int i=0;i<width;++i) ASSERT_EQ(input_q8[r*blocks+i/32].qs[i%32],int(input[i]));
+            }
+            const auto preserved_input=input_q8;
+            const std::array<Desc,2> gate_up{{
+                {.kernel=&gate_kernel,.input_q8=input_q8.data(),.output=gate.data(),.rows=rows,.n=width,.ldc=width},
+                {.kernel=&up_kernel,.input_q8=input_q8.data(),.output=up.data(),.rows=rows,.n=width,.ldc=width}}};
+            const std::array<Desc,1> down_desc{{
+                {.kernel=&down_kernel,.input_q8=middle.data(),.output=down.data(),.rows=rows,.n=width,.ldc=width}}};
+            NativeVNNITestPartialStorage partials(std::max(
+                NativeVNNITestPartialStorage::bundleFloats(gate_up.data(),gate_up.size(),1),
+                NativeVNNITestPartialStorage::bundleFloats(down_desc.data(),down_desc.size(),1)));
+            for(int replay=0;replay<20;++replay)
+            {
+                std::fill(gate.begin(),gate.end(),-12345.0f);
+                std::fill(up.begin(),up.end(),-23456.0f);
+                std::fill(down.begin(),down.end(),-34567.0f);
+                std::memset(middle.data(),replay&1 ? 0x5a : 0xa5,middle.size()*sizeof(Q8_1Block));
+                ASSERT_TRUE(Kernel::execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
+                    gate_up.data(),gate_up.size(),width,gate.data(),up.data(),middle.data(),
+                    rows,width,blocks,down_desc.data(),down_desc.size(),partials.span()));
+                EXPECT_EQ(std::memcmp(input_q8.data(),preserved_input.data(),input_q8.size()*sizeof(Q8_1Block)),0);
+                for(int r=0;r<rows;++r)
+                {
+                    EXPECT_EQ(std::memcmp(gate.data()+r*width,expected_gate.data(),width*sizeof(float)),0);
+                    EXPECT_EQ(std::memcmp(up.data()+r*width,expected_up.data(),width*sizeof(float)),0);
+                    EXPECT_EQ(std::memcmp(middle.data()+r*blocks,expected_middle.data(),blocks*sizeof(Q8_1Block)),0);
+                    const float expected=expectedDown(role,*weights.down,middle.data()+r*blocks);
+                    for(int n=0;n<width;++n) EXPECT_EQ(down[r*width+n],expected);
+                }
+            }
+        }
+    }
+}
+
 } // namespace llaminar2::test

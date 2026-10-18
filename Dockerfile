@@ -481,6 +481,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses /src/runtime-rocblas \
  && cp build_v2_release/llaminar2 /src/runtime-bin/llaminar2 \
  && cp build_v2_release/llaminar_native_tool_evidence_decoder /src/runtime-bin/ \
+ && cp build_v2_release/llaminar_model_kld_canary /src/runtime-bin/ \
  && cp build_v2_release/libllaminar2_core.so /src/runtime-libs/ \
  && mkdir -p /src/runtime-licenses/pcre2 \
  && cp build_v2_release/_deps/pcre2-src/LICENCE.md /src/runtime-licenses/pcre2/ \

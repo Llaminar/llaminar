@@ -341,6 +341,9 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     shared_roots = driver_shared_root_environment(pairs)
     name = "llaminar-suite-driver-" + uuid.uuid4().hex
     coding = getattr(args, 'suite', None) == 'opencode'
+    # Numerical observers also create sibling runtime containers. Reuse the
+    # existing exact-owner retirement protocol, including driver cancellation.
+    owned = coding or (getattr(args, 'suite', None) == 'e2e' and getattr(args, 'model_kld_canaries', False))
     launch = ["docker", "run", "--rm", "--init", "--name", name,
         *docker_paths.device_args(driver, "CPU+CUDA+ROCm", user=f"{cache_uid}:{lane_stat.st_gid}"),
         # The cache-owning non-root driver delegates only kernel-log reads to
@@ -350,7 +353,7 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
         "--cap-add", "SYSLOG", "--device", "/dev/kmsg:/dev/kmsg:r",
         "--env", f"LLAMINAR_E2E_KERNEL_READER_CONTAINER={name}",
         *(['--env', docker_paths.CODING_DRIVER_ENV + '=' + name,
-           '--label', docker_paths.CODING_OWNER_LABEL + '=' + name] if coding else []),
+           '--label', docker_paths.CODING_OWNER_LABEL + '=' + name] if owned else []),
         "--group-add", str(socket.stat().st_gid), *docker_paths.mounts(pairs),
         "--workdir", str(ROOT), "--env", "DOCKER_HOST=unix:///var/run/docker.sock",
         driver, "python3", *command[1:]]
@@ -366,7 +369,7 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
         # outer runner owns evidence.  Repair that boundary only after every
         # process that could still write the lane is reaped.
         try:
-            if coding:
+            if owned:
                 retire_coding_children(name, lane / 'outer-cleanup.json')
             else:
                 # Preserve the established E2E/benchmark owner lifecycle.
@@ -392,6 +395,9 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
     """
     receipt = {"schema": 1, "complete": False, "images_digest": digest(pair),
                "manifest_digest": digest(manifest), "reports": {}, "failed_cells": {}}
+    receipt['model_kld_required'] = getattr(args, 'model_kld_canaries', False)
+    receipt['model_kld_reports'] = {}
+    receipt['failed_model_kld_cells'] = {}
     write_json(directory / "e2e-receipt.json", receipt)
     driver = build_driver(pair, directory)
     for isa in ISAS:
@@ -416,6 +422,27 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
         validate_image_e2e_coverage(evidence, manifest, pair["images"][isa]["id"])
         if (cell_failure is None) != evidence["correctness_passed"]:
             raise ValueError(f"E2E {isa} exit status disagrees with complete cell evidence")
+        if receipt['model_kld_required']:
+            numerical = lane / 'kld'
+            numerical.mkdir()
+            numerical_failure = None
+            try:
+                run_in_driver(args, driver, [sys.executable, str(ROOT / 'scripts/ci/run_model_kld_canaries.py'),
+                    '--container-image', pair['images'][isa]['id'],
+                    '--source-revision', pair['source']['revision'], '--models', str(args.models),
+                    '--report', str(numerical / 'kld-canaries.json')], numerical, 'kld.log')
+            except subprocess.CalledProcessError as error:
+                numerical_failure = error
+            from model_kld_canary import validate_report as validate_kld
+            from model_kld_corpus import CATALOG
+            approval = json.loads(CATALOG.read_text())
+            numerical_report = json.loads((numerical / 'kld-canaries.json').read_text())
+            validate_kld(numerical_report, source_revision=pair['source']['revision'], cpu_isa=isa,
+                         image=pair['images'][isa]['id'], corpus_manifest_digest=approval['manifest_digest'], require_passed=False)
+            if (numerical_failure is None) != numerical_report['passed']:
+                raise ValueError('KL process status disagrees with complete numerical evidence')
+            receipt['model_kld_reports'][isa] = digest(numerical_report)
+            receipt['failed_model_kld_cells'][isa] = [c['model']+'-'+c['backend'] for c in numerical_report['cells'] if not c['passed']]
         receipt["reports"][isa] = digest(evidence)
         receipt["failed_cells"][isa] = [row["case"] for row in evidence["cells"]
                                         if row["outcome"] != "passed"]
@@ -424,6 +451,9 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
               f"{len(evidence['cells']) - len(receipt['failed_cells'][isa])} "
               f"failed={len(receipt['failed_cells'][isa])}", flush=True)
     failed = {isa: cells for isa, cells in receipt["failed_cells"].items() if cells}
+    numerical_failed = {isa: cells for isa, cells in receipt['failed_model_kld_cells'].items() if cells}
+    if numerical_failed:
+        raise ValueError(f'Published-image KL phase failures remain: {numerical_failed}')
     if failed:
         print(f"[published-images] E2E complete failure map: {failed}", flush=True)
         raise ValueError("published image E2E cell failures remain on one or both ISAs")
@@ -486,7 +516,7 @@ def run_opencode(args, pair: dict, directory: Path) -> dict:
     return result
 
 
-def admit_e2e(bundle: Path, pair: dict) -> tuple[dict, dict]:
+def admit_e2e(bundle: Path, pair: dict, *, require_model_kld: bool = False) -> tuple[dict, dict]:
     """Authenticate both image-bound suites before any benchmark is started."""
     previous = json.loads((bundle / "images.json").read_text())
     validate_pair(previous)
@@ -510,6 +540,20 @@ def admit_e2e(bundle: Path, pair: dict) -> tuple[dict, dict]:
         if digest(report) != receipt["reports"][isa]:
             raise ValueError("E2E report differs from its completed receipt")
         reports[isa] = report
+    if require_model_kld and receipt.get('model_kld_required') is not True:
+        raise ValueError('Master release requires GPU KL canaries')
+    if receipt.get('model_kld_required'):
+        from model_kld_canary import validate_report as validate_kld
+        from model_kld_corpus import CATALOG
+        approval = json.loads(CATALOG.read_text())
+        if set(receipt.get('model_kld_reports', {})) != set(ISAS):
+            raise ValueError('Incomplete KL canary ISA pair')
+        for isa in ISAS:
+            numerical = json.loads((bundle / isa.lower() / 'kld/kld-canaries.json').read_text())
+            validate_kld(numerical, source_revision=pair['source']['revision'], cpu_isa=isa,
+                         image=pair['images'][isa]['id'], corpus_manifest_digest=approval['manifest_digest'])
+            if digest(numerical) != receipt['model_kld_reports'][isa]:
+                raise ValueError('KL canary report changed after E2E')
     return manifest, reports
 
 
@@ -736,12 +780,15 @@ def parse_arguments(argv=None):
     parser.add_argument('--benchmark-bundle', type=Path, help='complete passing benchmark pair; required for coding')
     parser.add_argument('--cpu-isa', choices=ISAS, help='one canonical coding job ISA')
     parser.add_argument('--cell', help='one exact blessed coding cell; no regex selection')
+    parser.add_argument("--model-kld-canaries", action="store_true", help="master PR GPU numerical gate; requires the pinned corpus")
     parser.add_argument("--run-url", default="local")
     parser.add_argument("--publish", action="store_true", help="commit only successful complete benchmark results")
     args = parser.parse_args(argv)
     if args.expected_source_revision is not None and not re.fullmatch(
             r"[0-9a-f]{40}", args.expected_source_revision):
         parser.error("--expected-source-revision requires a full Git SHA")
+    if args.model_kld_canaries and args.suite != "e2e":
+        parser.error("KL canaries belong to the model/E2E gate")
     if args.suite == "e2e" and (args.publish or args.e2e_run or args.e2e_bundle):
         parser.error("E2E evidence inputs and publication apply only to benchmarks")
     if args.suite == 'opencode':

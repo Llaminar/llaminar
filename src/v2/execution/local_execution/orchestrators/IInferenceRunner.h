@@ -40,6 +40,8 @@
 
 namespace llaminar2
 {
+    class PrefixCacheShutdown;
+
     // Forward declarations
     class TensorBase;
     struct PlacementPlan;
@@ -3393,6 +3395,15 @@ namespace llaminar2
          * @return True after no reusable prefix record remains addressable.
          */
         virtual bool purgePrefixCache() { return true; }
+
+        /**
+         * @brief Collect all local RAM prefix owners for one coordinated shutdown.
+         * @param shutdown Terminal cohort; only its flush operation seals caches.
+         * Composite runners forward every local child. Cache-free runners add
+         * nothing. Call only after inference admission and producers retire.
+         */
+        virtual void collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const {}
+
 
         /**
          * @brief Freeze rank-local cache publishers during serving setup.

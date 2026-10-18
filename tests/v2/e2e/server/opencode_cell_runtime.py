@@ -3,7 +3,8 @@
 The typed inventory supplies production placement, precision and MTP intent.
 PhysicalMemoryAuthority admits context; this driver adds only app/cache budgets.
 Continuous observers bracket inference and native retirement. Request duration
-is unbounded, while administrative operations retain finite control deadlines.
+and graceful cache persistence are unbounded; administrative calls retain finite
+control deadlines, and cancellation still retires all owned processes.
 No model or cache payload is inspected to manufacture qualification evidence.
 """
 from __future__ import annotations
@@ -388,14 +389,17 @@ def run_app(cell: CodingCell) -> dict:
         write_json(cell.output / 'resource-controller.json', observer_state)
 
     def audit(label: str, action):
-        """Preserve a failed audit while allowing independent evidence to finish."""
+        """Preserve failures and defer cancellation until independent owners retire."""
+        nonlocal interrupted
         try:
             value = action()
             if isinstance(value, dict) and value.get('passed') is False:
                 raise ValueError(label + ' reported failure')
             return value
-        except Exception as error:
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
             state['errors'].append(label + ': ' + repr(error))
+            if isinstance(error, (KeyboardInterrupt, SystemExit)) and interrupted is None:
+                interrupted = error
             return None
 
     publish()
@@ -490,7 +494,10 @@ def run_app(cell: CodingCell) -> dict:
                 with urlopen(Request(url + '/admin/shutdown', data=b'', method='POST'), timeout=10) as response:
                     if response.status != 202 or json.load(response).get('status') != 'shutting_down':
                         raise ValueError('Administrative shutdown was not accepted')
-                code = int(command(['docker', 'wait', name]))
+                # Normal exit includes RAM-cache persistence, whose duration
+                # depends on selected bytes and disk speed. Cancellation still
+                # reaches exceptional native/observer retirement below.
+                code = int(command(['docker', 'wait', name], timeout=None))
                 retired = require_retired(name)
                 if code or retired['ExitCode'] != 0 or retired['OOMKilled'] or retired['Error']:
                     raise ValueError('Native retirement failed')

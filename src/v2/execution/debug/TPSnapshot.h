@@ -870,6 +870,12 @@ namespace llaminar2
                 const size_t element_count = first.data.size();
                 constexpr float kReplicatedAbsTolerance = 1.0e-5f;
                 constexpr float kReplicatedRelTolerance = 1.0e-6f;
+                // Tolerance comparisons do not reject NaN: every ordered
+                // comparison with NaN is false. Authenticate the primary even
+                // for singleton publications before selecting its full value.
+                if (!std::all_of(first.data.begin(), first.data.end(),
+                        [](float value) { return std::isfinite(value); }))
+                    return fail();
                 for (size_t device_index = 1; device_index < device_data.size(); ++device_index)
                 {
                     const auto &dev = device_data[device_index];
@@ -887,6 +893,8 @@ namespace llaminar2
                     {
                         const float a = first.data[i];
                         const float b = dev.data[i];
+                        if (!std::isfinite(a) || !std::isfinite(b))
+                            return fail();
                         const float diff = std::fabs(a - b);
                         const float scale = std::max(std::fabs(a), std::fabs(b));
                         if (diff > kReplicatedAbsTolerance &&

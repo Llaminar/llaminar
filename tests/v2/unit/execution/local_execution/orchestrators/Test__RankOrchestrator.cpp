@@ -41,6 +41,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -10575,6 +10576,391 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeTreatsDenseOutputsAsRe
 }
 
 /**
+ * @brief Main decode publishes full FA/GDN replicas; explicit prefill remains TP.
+ *
+ * Every participant and every dense intermediate is observed through production
+ * getTPSnapshot/computeCombined. Device identities are inert mock placements:
+ * these tests never create CUDA/HIP contexts or execute device work. Identical
+ * one-row prefill/decode shapes deliberately require the typed forward phase.
+ */
+TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitAttentionUsesTypedMainPhase)
+{
+    struct StageCase
+    {
+        const char *name;
+        size_t columns;
+        size_t packed_groups;
+    };
+    const std::vector<StageCase> stages = {
+        {"Q_PROJECTION", 16, 0}, {"K_PROJECTION", 8, 0}, {"V_PROJECTION", 8, 0},
+        {"Q_NORM", 8, 0}, {"K_NORM", 8, 0}, {"Q_ROPE", 8, 0}, {"K_ROPE", 8, 0},
+        {"FA_GATE", 8, 0}, {"ATTENTION_CONTEXT", 8, 0}, {"ATTENTION_CONTEXT_GATED", 8, 0},
+        {"QKV_PROJECTION", 32, 4}, {"GDN_Z_PROJECTION", 16, 2},
+        {"GDN_ALPHA", 8, 2}, {"GDN_BETA", 8, 2}, {"GDN_CONV1D_OUTPUT", 32, 4},
+        {"GDN_RECURRENCE", 16, 2}, {"GDN_DELTA_RULE_OUTPUT", 16, 2},
+        {"GATED_RMSNORM", 16, 2}, {"GDN_NORM_GATE_OUTPUT", 16, 2},
+    };
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    for (const int degree : {2, 4})
+    for (const bool declared_replication : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << static_cast<int>(backend) << "/TP" << degree
+                                         << "/replicated=" << declared_replication);
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
+        std::vector<MockDeviceGraphOrchestrator *> participants;
+        RankOrchestrator::Config config;
+        for (int participant = 0; participant < degree; ++participant)
+        {
+            auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+            participants.push_back(runner.get());
+            runners.push_back(std::move(runner));
+            config.devices.push_back(backend == DeviceType::CUDA ? GlobalDeviceAddress::cuda(participant) :
+                backend == DeviceType::ROCm ? GlobalDeviceAddress::rocm(participant) : GlobalDeviceAddress::cpu(participant));
+            config.weights.push_back(1.0f / degree);
+        }
+        auto model = llaminar2::test::MockModelContext::createMinimal();
+        model->setArchitecture("qwen35moe");
+        model->setHeadCountKV(4); // No independent replicated-GQA override at TP2/4.
+        model->mockLoader().setIntParam("qwen35moe.ssm.group_count", 4);
+        model->mockLoader().setIntParam("qwen35moe.ssm.time_step_rank", 8);
+        model->mockLoader().setIntParam("qwen35moe.ssm.state_size", 2);
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+        plan->enabled = true;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->continuation_domain_spec.dense_tp_enabled = true;
+        plan->continuation_domain_spec.dense_decode_replicated = declared_replication;
+        plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+        config.moe_routed_expert_plan = plan;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 3;
+        config.mtp.sidecar_dense_policy = MTPSidecarDensePolicy::TensorParallel;
+        MockLocalTPContext::Config tp_config;
+        tp_config.devices = config.devices;
+        tp_config.weights = config.weights;
+        auto rank = RankOrchestrator::createForTest(model, std::move(runners),
+            std::make_unique<MockLocalTPContext>(tp_config), config);
+
+        const auto expectedValues = [](const StageCase &stage, size_t rows)
+        {
+            std::vector<float> expected(rows * stage.columns);
+            for (size_t row = 0; row < rows; ++row)
+            for (size_t column = 0; column < stage.columns; ++column)
+                expected[row * stage.columns + column] = static_cast<float>(1000 * row + column + 1);
+            return expected;
+        };
+        const auto publish = [&](const std::string &prefix, size_t rows, bool replicas)
+        {
+            for (const auto &stage : stages)
+            for (int participant = 0; participant < degree; ++participant)
+            {
+                const size_t columns = replicas ? stage.columns : stage.columns / degree;
+                std::vector<float> values(rows * columns);
+                for (size_t row = 0; row < rows; ++row)
+                for (size_t column = 0; column < columns; ++column)
+                {
+                    size_t global_column = column;
+                    if (!replicas && stage.packed_groups)
+                    {
+                        const size_t local_group = columns / stage.packed_groups;
+                        global_column = (column / local_group) * (stage.columns / stage.packed_groups) +
+                                        participant * local_group + column % local_group;
+                    }
+                    else if (!replicas)
+                        global_column += participant * columns;
+                    values[row * columns + column] = static_cast<float>(1000 * row + global_column + 1);
+                }
+                participants[participant]->set_mock_snapshot(prefix + stage.name, rows, columns, std::move(values));
+            }
+        };
+        const auto verify = [&](const std::string &prefix, size_t rows, bool replicas)
+        {
+            for (const auto &stage : stages)
+            {
+                const std::string key = prefix + stage.name;
+                SCOPED_TRACE(key);
+                auto snapshot = rank->getTPSnapshot(key);
+                EXPECT_EQ(snapshot.mode, replicas ? SnapshotShardingMode::REPLICATED :
+                    stage.packed_groups ? SnapshotShardingMode::PACKED_COLUMN_PARALLEL : SnapshotShardingMode::COLUMN_PARALLEL);
+                EXPECT_EQ(snapshot.device_data.size(), static_cast<size_t>(degree));
+                EXPECT_EQ(snapshot.column_groups.empty(), replicas || !stage.packed_groups);
+                ASSERT_TRUE(snapshot.computeCombined());
+                EXPECT_EQ(snapshot.combined_rows, rows);
+                EXPECT_EQ(snapshot.combined_cols, stage.columns);
+                EXPECT_EQ(snapshot.combined_data, expectedValues(stage, rows));
+            }
+        };
+        // Same one-row shape first means explicit Prefill, then ordinary Decode.
+        // Returning through a multirow prefill also proves no stale decode mode.
+        const int tokens[] = {42, 43, 44};
+        for (const int transaction : {0, 1, 2, 0, 1})
+        {
+            const bool decode = transaction == 1;
+            const size_t rows = transaction == 2 ? 3 : 1;
+            const bool replicas = decode && declared_replication;
+            publish("layer0_", rows, replicas);
+            if (decode)
+                ASSERT_TRUE(rank->forward(tokens, 1));
+            else
+                ASSERT_TRUE(rank->forwardPrefill(tokens, static_cast<int>(rows)));
+            verify("layer0_", rows, replicas);
+        }
+        // A grouped TensorParallel MTP depth retains packed/column assembly.
+        publish("MTP0_", 3, false);
+        verify("MTP0_", 3, false);
+        // Condition scopes retain their schema classifications independently of
+        // the latest main phase. Their separate grouped capture/publication
+        // plumbing is outside this ordinary-decode assembly regression.
+        for (const std::string prefix : {"MTP_SCALAR_CONDITION_layer0_",
+                                         "MTP_REQUEST_BATCH_CONDITION_layer0_"})
+        {
+            publish(prefix, 3, false);
+            const auto classified = rank->getSnapshotKeysWithSharding();
+            for (const auto &stage : stages)
+            {
+                const std::string key = prefix + stage.name;
+                const auto found = std::find_if(classified.begin(), classified.end(),
+                    [&](const auto &entry) { return entry.first == key; });
+                ASSERT_NE(found, classified.end());
+                EXPECT_EQ(found->second, stage.packed_groups ?
+                    SnapshotShardingMode::PACKED_COLUMN_PARALLEL : SnapshotShardingMode::COLUMN_PARALLEL);
+            }
+        }
+        if (declared_replication)
+        {
+            auto divergent = expectedValues(stages[9], 1);
+            divergent.front() += 1.0f;
+            participants.back()->set_mock_snapshot("layer0_ATTENTION_CONTEXT_GATED", 1, 8, std::move(divergent));
+            auto snapshot = rank->getTPSnapshot("layer0_ATTENTION_CONTEXT_GATED");
+            EXPECT_EQ(snapshot.mode, SnapshotShardingMode::REPLICATED);
+            EXPECT_FALSE(snapshot.computeCombined())
+                << "Every full participant must be compared before selecting the replicated result";
+        }
+    }
+}
+
+/**
+ * @brief Actual resident/target transactions publish Decode only on completion.
+ *
+ * The mocked children expose stable typed device mailbox handles and execute
+ * the real rank fan-out, adoption and retirement paths without native work.
+ * Pending publication, rejected input, failed fan-out and one-token Prefill
+ * cannot masquerade as a completed Decode. Full FA/GDN and row-output replicas
+ * are checked through production getTPSnapshot and computeCombined.
+ */
+TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePhase)
+{
+    struct StageCase { const char *name; size_t columns; size_t groups; bool row; };
+    const std::vector<StageCase> stages={
+        {"Q_PROJECTION",16,0,false},{"K_PROJECTION",8,0,false},{"V_PROJECTION",8,0,false},
+        {"Q_NORM",8,0,false},{"K_NORM",8,0,false},{"Q_ROPE",8,0,false},{"K_ROPE",8,0,false},
+        {"FA_GATE",8,0,false},{"ATTENTION_CONTEXT",8,0,false},{"ATTENTION_CONTEXT_GATED",8,0,false},
+        {"QKV_PROJECTION",32,4,false},{"GDN_Z_PROJECTION",16,2,false},
+        {"GDN_ALPHA",8,2,false},{"GDN_BETA",8,2,false},{"GDN_CONV1D_OUTPUT",32,4,false},
+        {"GDN_RECURRENCE",16,2,false},{"GDN_DELTA_RULE_OUTPUT",16,2,false},
+        {"GATED_RMSNORM",16,2,false},{"GDN_NORM_GATE_OUTPUT",16,2,false},
+        {"ATTENTION_OUTPUT",8,0,true},{"FFN_DOWN",8,0,true},{"GDN_OUTPUT",8,0,true},
+        {"MOE_SHARED_EXPERT_OUTPUT",8,0,true},{"MOE_SHARED_GATE_OUTPUT",8,0,true}};
+    /** @brief Inert mailbox owner whose public advances publish the actual stage values. */
+    class Participant final : public MockDeviceGraphOrchestrator
+    {
+    public:
+        /** @brief Bind checked geometry without creating a backend context. */
+        Participant(const std::vector<StageCase> &stages,int participant,int degree,bool replicated)
+            : stages_(stages),participant_(participant),degree_(degree),replicated_(replicated) {}
+        /** @brief Publish the declared sharded or replicated producer bytes. */
+        void publishSnapshots(bool decode)
+        {
+            const bool replicas=decode&&replicated_;
+            for (const auto &stage:stages_)
+            {
+                const size_t columns=stage.row||replicas?stage.columns:stage.columns/degree_;
+                std::vector<float> values(columns);
+                for (size_t column=0;column<columns;++column)
+                {
+                    size_t global=column;
+                    if (!stage.row&&!replicas)
+                    {
+                        if (stage.groups)
+                        {
+                            const size_t local_group=columns/stage.groups;
+                            global=(column/local_group)*(stage.columns/stage.groups)+
+                                participant_*local_group+column%local_group;
+                        }
+                        else global+=participant_*columns;
+                    }
+                    values[column]=float(global+1)/(stage.row&&!replicas?degree_:1);
+                }
+                set_mock_snapshot(std::string("layer0_")+stage.name,1,columns,std::move(values));
+            }
+        }
+        /** @brief Token publication owns a mailbox, but does not forward a row. */
+        bool publishForcedDeviceResidentConditionToken(int32_t token,int slot) override
+        {
+            if (slot<0) return false;
+            words_[0]=token;ready_=true;++generation_;return true;
+        }
+        /** @brief Expose stable typed mock storage; native code never dereferences it. */
+        DeviceResidentLogicalSequenceStateHandle deviceResidentLogicalSequenceState() const override
+        {
+            if (!ready_) return {};
+            DeviceResidentLogicalSequenceStateHandle state;
+            state.target_positions_device=words_.data();
+            state.target_sequence_lengths_device=words_.data()+1;
+            state.accepted_state_counts_device=words_.data()+2;
+            state.next_condition_tokens_device=words_.data()+3;
+            state.all_drafts_accepted_flags_device=words_.data()+4;
+            state.stopped_flags_device=words_.data()+5;
+            state.publication_ok_flags_device=words_.data()+6;
+            state.request_count=1;state.device=primaryDeviceId();
+            state.stream=const_cast<int *>(&stream_);state.ready_event=const_cast<int *>(&event_);
+            state.live_state_epoch=1;state.publication_generation=generation_;
+            return state;
+        }
+        /** @brief Complete the ordinary main condition using its exact current mailbox. */
+        bool advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
+            int32_t,const DeviceResidentLogicalSequenceStateHandle &state,int request_index) override
+        { return complete(state.sameMailboxAs(deviceResidentLogicalSequenceState())&&request_index==0); }
+        /** @brief Complete either explicitly declared MTP main-condition purpose. */
+        bool advanceMTPMainConditionFromDeviceResidentLogicalState(
+            int32_t,const DeviceResidentLogicalSequenceStateHandle &state,
+            MTPConditionForwardPurpose,int request_index) override
+        { return complete(state.sameMailboxAs(deviceResidentLogicalSequenceState())&&request_index==0); }
+        /** @brief Complete a main condition from an already published target slot. */
+        bool advanceMTPMainConditionFromDeviceTargetSample(
+            int32_t,int slot,MTPConditionForwardPurpose) override
+        { return complete(ready_&&slot==0); }
+        bool advance_ok=true;
+        int advances=0;
+    private:
+        /** @brief Publish snapshots only when this real child transaction succeeds. */
+        bool complete(bool valid)
+        {
+            ++advances;
+            if (!valid||!advance_ok) return false;
+            publishSnapshots(true);ready_=false;return true;
+        }
+        const std::vector<StageCase> &stages_;
+        int participant_,degree_;
+        bool replicated_,ready_=false;
+        std::array<int32_t,7> words_{};
+        int stream_=1,event_=2;
+        uint64_t generation_=0;
+    };
+    for (const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
+    for (const int degree:{2,4})
+    for (const bool replicated:{false,true})
+    for (const int route:{0,1,2,3,4})
+    {
+        SCOPED_TRACE(::testing::Message()<<static_cast<int>(backend)<<"/TP"<<degree
+                     <<"/replicated="<<replicated<<"/route="<<route);
+        RankOrchestrator::Config config;
+        std::vector<std::unique_ptr<IInferenceRunner>> children;
+        std::vector<Participant *> participants;
+        for (int index=0;index<degree;++index)
+        {
+            auto child=std::make_unique<Participant>(stages,index,degree,replicated);
+            child->set_primary_device_id(backend==DeviceType::CUDA?DeviceId::cuda(index):DeviceId::rocm(index));
+            participants.push_back(child.get());children.push_back(std::move(child));
+            config.devices.push_back(backend==DeviceType::CUDA?GlobalDeviceAddress::cuda(index):GlobalDeviceAddress::rocm(index));
+            config.weights.push_back(1.f/degree);
+        }
+        auto model=llaminar2::test::MockModelContext::createMinimal();
+        model->setArchitecture("qwen35moe");model->setHeadCountKV(4);
+        model->mockLoader().setIntParam("qwen35moe.ssm.group_count",4);
+        model->mockLoader().setIntParam("qwen35moe.ssm.time_step_rank",8);
+        model->mockLoader().setIntParam("qwen35moe.ssm.state_size",2);
+        auto plan=std::make_shared<MoERoutedExpertPlacementPlan>();
+        plan->enabled=true;plan->topology=RoutedExpertPlacementTopology::TieredOverlay;
+        plan->continuation_domain_spec.dense_tp_enabled=true;
+        plan->continuation_domain_spec.dense_decode_replicated=replicated;
+        plan->continuation_domain_spec.refreshDensePolicyFromFlags();config.moe_routed_expert_plan=plan;
+        MockLocalTPContext::Config tp;tp.devices=config.devices;tp.weights=config.weights;
+        auto rank=RankOrchestrator::createForTest(model,std::move(children),
+            std::make_unique<MockLocalTPContext>(tp),config);
+        rank->setSkipLogitsGatherPrefill(true);rank->setSkipLogitsGatherDecode(true);
+        const auto verify=[&](bool decode)
+        {
+            for (const auto &stage:stages)
+            {
+                auto snap=rank->getTPSnapshot(std::string("layer0_")+stage.name);
+                const auto mode=decode&&replicated?SnapshotShardingMode::REPLICATED:
+                    stage.row?SnapshotShardingMode::ROW_PARALLEL:
+                    stage.groups?SnapshotShardingMode::PACKED_COLUMN_PARALLEL:SnapshotShardingMode::COLUMN_PARALLEL;
+                EXPECT_EQ(snap.mode,mode)<<stage.name;
+                ASSERT_TRUE(snap.computeCombined())<<stage.name;
+                ASSERT_EQ(snap.combined_rows,1u);ASSERT_EQ(snap.combined_cols,stage.columns);
+                for (size_t column=0;column<stage.columns;++column)
+                    EXPECT_FLOAT_EQ(snap.combined_data[column],float(column+1))<<stage.name;
+            }
+        };
+        const auto advance=[&](int argument)
+        {
+            const auto state=rank->deviceResidentLogicalSequenceState();
+            const auto purpose=route==1||route==3?MTPConditionForwardPurpose::SpeculativeContinuation:
+                MTPConditionForwardPurpose::CommittedSerialToken;
+            if (route==0) return rank->advanceOrdinaryMainConditionFromDeviceResidentLogicalState(42,state,argument);
+            if (route<=2) return rank->advanceMTPMainConditionFromDeviceResidentLogicalState(42,state,purpose,argument);
+            return rank->advanceMTPMainConditionFromDeviceTargetSample(42,argument,purpose);
+        };
+        const int token=42;
+        for (auto *child:participants) child->publishSnapshots(false);
+        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));
+        verify(false); // First forced token is pending; no main row was forwarded.
+        ASSERT_FALSE(advance(-1));verify(false);
+        for (auto *child:participants) EXPECT_EQ(child->advances,0);
+        ASSERT_TRUE(advance(0));verify(true);
+        for (auto *child:participants) EXPECT_EQ(child->advances,1);
+        if (replicated)
+        {
+            // A correct phase never permits silently selecting one full replica.
+            participants.back()->set_mock_snapshot("layer0_MOE_SHARED_EXPERT_OUTPUT",1,8,
+                std::vector<float>(8,99.f));
+            auto bad=rank->getTPSnapshot("layer0_MOE_SHARED_EXPERT_OUTPUT");
+            EXPECT_EQ(bad.mode,SnapshotShardingMode::REPLICATED);EXPECT_FALSE(bad.computeCombined());
+        }
+        // Reset into explicit one-token prefill, then fail every actual child
+        // advance: no successful completion means no new phase publication.
+        for (auto *child:participants) child->publishSnapshots(false);
+        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));verify(false);
+        for (auto *child:participants) child->advance_ok=false;
+        EXPECT_FALSE(advance(0));verify(false);
+    }
+}
+
+/** @brief Every full replica, including a sole primary, must contain finite values. */
+TEST_F(Test__RankOrchestrator, TPSnapshot_ReplicatedRejectsEveryNonfiniteParticipant)
+{
+    for (const int degree : {1, 2, 4})
+    for (int invalid_participant = 0; invalid_participant < degree; ++invalid_participant)
+    for (const float invalid : {std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::infinity(),
+                               -std::numeric_limits<float>::infinity()})
+    {
+        SCOPED_TRACE(::testing::Message() << "TP" << degree << "/participant=" << invalid_participant
+                                         << "/invalid=" << invalid);
+        TPSnapshot snapshot;
+        snapshot.mode = SnapshotShardingMode::REPLICATED;
+        snapshot.tp_degree = degree;
+        for (int participant = 0; participant < degree; ++participant)
+        {
+            DeviceSnapshotData data;
+            data.device_index = participant;
+            data.rows = 1;
+            data.cols = 4;
+            data.data = {1.0f, -2.0f, 3.0f, 4.0f};
+            snapshot.device_data.push_back(std::move(data));
+        }
+        ASSERT_TRUE(snapshot.computeCombined());
+        snapshot.device_data[static_cast<size_t>(invalid_participant)].data[2] = invalid;
+        EXPECT_FALSE(snapshot.computeCombined());
+        EXPECT_FALSE(snapshot.combined_valid);
+        EXPECT_TRUE(snapshot.combined_data.empty());
+    }
+}
+
+/**
  * @brief Replicated GQA owns one complete K/V checkpoint, not one per TP device.
  *
  * The Qwen3.5 122B topology has two KV heads and may use four TP participants.
@@ -11247,4 +11633,139 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_Replicated_RejectsDivergentReplicaPayl
     EXPECT_TRUE(snapshot.combined_data.empty());
     EXPECT_EQ(snapshot.combined_rows, 0);
     EXPECT_EQ(snapshot.combined_cols, 0);
+}
+
+/**
+ * @brief Main decode full-vocabulary embedding snapshots retain one complete row.
+ *
+ * Full dense replication and embedding-only mirroring are independent declared
+ * policies. Same-shaped one-token Prefill and ordinary sharded TP stay additive.
+ * Backend tags are inert mock identities; this regression never opens a GPU.
+ */
+TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitEmbeddingUsesTypedMainNamespace)
+{
+    enum class Placement { Sharded, ReplicatedDense, MirroredEmbeddingOnly, TPDisabled };
+    const std::vector<float> expected{1.25f, -2.5f, 3.75f, -4.0f};
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int degree : {2, 4})
+    for (const bool mtp_enabled : {false, true})
+    for (const auto placement : {Placement::Sharded, Placement::ReplicatedDense,
+                                Placement::MirroredEmbeddingOnly, Placement::TPDisabled})
+    {
+        const bool dense_tp = placement != Placement::TPDisabled;
+        const bool replicated_dense = placement == Placement::ReplicatedDense || placement == Placement::TPDisabled;
+        const bool mirrored_embedding_only = placement == Placement::MirroredEmbeddingOnly;
+        const bool full_embedding = dense_tp && (replicated_dense || mirrored_embedding_only);
+        SCOPED_TRACE(::testing::Message() << "backend=" << static_cast<int>(backend)
+            << " degree=" << degree << " mtp_enabled=" << mtp_enabled
+            << " placement=" << static_cast<int>(placement));
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
+        std::vector<MockDeviceGraphOrchestrator *> participants;
+        RankOrchestrator::Config config;
+        for (int participant = 0; participant < degree; ++participant)
+        {
+            auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+            participants.push_back(runner.get());
+            runners.push_back(std::move(runner));
+            config.devices.push_back(backend == DeviceType::CUDA
+                ? GlobalDeviceAddress::cuda(participant) : GlobalDeviceAddress::rocm(participant));
+            config.weights.push_back(1.0f / degree);
+        }
+        auto model = llaminar2::test::MockModelContext::createMinimal();
+        model->setArchitecture("qwen35moe");
+        model->setHeadCountKV(4);
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+        plan->enabled = true;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->continuation_domain_spec.dense_tp_enabled = dense_tp;
+        plan->continuation_domain_spec.dense_decode_replicated = replicated_dense;
+        plan->continuation_domain_spec.dense_decode_mirrored_embedding = mirrored_embedding_only;
+        plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+        config.moe_routed_expert_plan = plan;
+        // Disabled uses the actual campaign default; enabled additionally covers
+        // the admitted MTP envelope without changing ordinary-main semantics.
+        config.mtp.enabled = mtp_enabled;
+        if (mtp_enabled)
+        {
+            config.mtp.draft_tokens = 3;
+            config.mtp.sidecar_dense_policy = MTPSidecarDensePolicy::ReplicatedPerParticipant;
+        }
+        MockLocalTPContext::Config tp_config;
+        tp_config.devices = config.devices;
+        tp_config.weights = config.weights;
+        auto rank = RankOrchestrator::createForTest(model, std::move(runners),
+            std::make_unique<MockLocalTPContext>(tp_config), config);
+        /**
+         * @brief Publish actual replica or vocabulary-partial mock bytes.
+         * @param key Exact semantic namespace under test.
+         * @param replicas Whether every participant owns the full value.
+         * @param publication Explicit finalizer authority, if one exists.
+         */
+        const auto publish = [&](const std::string &key, bool replicas,
+            SnapshotPublication publication = SnapshotPublication::SchemaPartition)
+        {
+            for (auto *participant : participants)
+            {
+                auto values = expected;
+                if (!replicas)
+                    for (auto &value : values) value /= degree;
+                participant->set_mock_snapshot(key, 1, expected.size(), std::move(values), publication);
+            }
+        };
+        /**
+         * @brief Exercise real typed assembly and require each element exactly once.
+         * @param key Published checkpoint whose producer authority is under test.
+         * @param replicas Expected typed assembly mode.
+         */
+        const auto verify = [&](const std::string &key, bool replicas)
+        {
+            auto snapshot = rank->getTPSnapshot(key);
+            EXPECT_EQ(snapshot.mode, replicas ? SnapshotShardingMode::REPLICATED
+                                             : SnapshotShardingMode::ROW_PARALLEL);
+            EXPECT_EQ(snapshot.device_data.size(), static_cast<size_t>(degree));
+            ASSERT_TRUE(snapshot.computeCombined());
+            EXPECT_EQ(snapshot.combined_rows, 1u);
+            EXPECT_EQ(snapshot.combined_cols, expected.size());
+            EXPECT_EQ(snapshot.combined_data, expected);
+        };
+        const int token = 42;
+        // Same shape, alternating actual phases: stale Decode must not change Prefill1.
+        for (const bool decode : {false, true, false, true})
+        {
+            publish("EMBEDDING", decode && full_embedding);
+            if (decode) ASSERT_TRUE(rank->forward(&token, 1));
+            else ASSERT_TRUE(rank->forwardPrefill(&token, 1));
+            verify("EMBEDDING", decode && full_embedding);
+        }
+        if (full_embedding)
+        {
+            // Compare every nonprimary replica; selecting rank0 would hide these errors.
+            for (int peer = 1; peer < degree; ++peer)
+            {
+                publish("EMBEDDING", true);
+                auto divergent = expected;
+                divergent.front() += 1.0f;
+                participants[peer]->set_mock_snapshot("EMBEDDING", 1, expected.size(), std::move(divergent));
+                auto snapshot = rank->getTPSnapshot("EMBEDDING");
+                EXPECT_EQ(snapshot.mode, SnapshotShardingMode::REPLICATED);
+                EXPECT_FALSE(snapshot.computeCombined());
+            }
+        }
+        // A mirrored embedding alone must not reclassify dense attention partials.
+        publish("layer0_ATTENTION_OUTPUT", replicated_dense && dense_tp);
+        verify("layer0_ATTENTION_OUTPUT", replicated_dense && dense_tp);
+        // The exact ordinary main global namespace is the only new policy target.
+        // MTP vocabulary and request/scalar condition snapshots keep their schema.
+        for (const std::string key : {"MTP0_EMBEDDING", "MTP2_EMBEDDING",
+                "MTP_SCALAR_CONDITION_EMBEDDING", "MTP_REQUEST_BATCH_CONDITION_EMBEDDING",
+                "MTP_SCALAR_CONDITION_MTP0_EMBEDDING", "layer0_EMBEDDING"})
+        {
+            publish(key, false);
+            verify(key, false);
+        }
+        // A real prefill allreduce finalizer remains complete in either placement.
+        ASSERT_TRUE(rank->forwardPrefill(&token, 1));
+        publish("EMBEDDING", true, SnapshotPublication::CompleteValue);
+        verify("EMBEDDING", true);
+    }
 }

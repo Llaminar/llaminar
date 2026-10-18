@@ -10,7 +10,7 @@
  *   o = S^T * q
  *
  * Kernel owns ALL preprocessing (same as CPU):
- * - L2 normalization of Q and K
+ * - Q/K L2 normalization with epsilon added to squared norm
  * - Query scaling by 1/sqrt(d_k)
  * - Gate computation: g = A_log * softplus(alpha + dt_bias)
  * - Beta sigmoid: beta_sig = sigmoid(beta_raw)
@@ -363,7 +363,7 @@ namespace
                 }
                 __syncthreads();
                 const float q_inv =
-                    scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+                    scale / sqrtf(warp_sums[0] + 1e-6f);
                 for (int i = tid; i < D_K; i += blockDim.x)
                     q_local[i] *= q_inv;
                 __syncthreads();
@@ -383,7 +383,7 @@ namespace
                 }
                 __syncthreads();
                 const float k_inv =
-                    1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+                    1.0f / sqrtf(warp_sums[0] + 1e-6f);
                 for (int i = tid; i < D_K; i += blockDim.x)
                     k_local[i] *= k_inv;
                 __syncthreads();
@@ -933,7 +933,7 @@ namespace
             }
             __syncthreads();
             const float q_inv =
-                scale / fmaxf(sqrtf(norm_sum), 1e-6f);
+                scale / sqrtf(norm_sum + 1e-6f);
             for (int i = tid; i < d_k; i += block_size)
                 q_head[i] *= q_inv;
             __syncthreads();
@@ -954,7 +954,7 @@ namespace
             }
             __syncthreads();
             const float k_inv =
-                1.0f / fmaxf(sqrtf(norm_sum), 1e-6f);
+                1.0f / sqrtf(norm_sum + 1e-6f);
             for (int i = tid; i < d_k; i += block_size)
                 k_head[i] *= k_inv;
         }

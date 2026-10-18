@@ -12,6 +12,8 @@
  * 6. Setup service views preserve immutable CPU expert storage for every
  *    quantized source and floating format without a second allocation/repack.
  * 7. GPU pool ownership and bounds reject invalid bindings without GPU access.
+ *    Original-factor IQ formats require a coefficient plane even though their
+ *    source arithmetic has no additive minimum.
  */
 
 #include <gtest/gtest.h>
@@ -90,7 +92,7 @@ TEST(GPUPreparedWeightBinding, AllFormatsRejectTruncatedPoolRegions)
                     const auto allocation = layout == GPUPreparedWeightPoolLayout::MigrationReusable
                         ? reusableDeviceVnniAllocationFormat(source)
                         : NativeVnniReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
-                            source.is_asymmetric, source.has_emins};
+                            canonicalDeviceVnniFormat(source).is_asymmetric, source.has_emins};
                     owner->planWeight(0, "short", 16, 256, allocation.payload_bytes_per_block,
                         allocation.has_mins, allocation.has_emins, tensor->size_bytes());
                 }
@@ -98,6 +100,54 @@ TEST(GPUPreparedWeightBinding, AllFormatsRejectTruncatedPoolRegions)
                 ASSERT_TRUE(owner->getPool(0)->allocate(&backend, 0, 0));
                 EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(*tensor, device, owner, "short", 0, layout),
                     std::out_of_range);
+            }
+}
+
+/** @brief Missing raw source coefficients fail before any native GPU engine is constructed. */
+TEST(GPUPreparedWeightBinding, RejectsMissingSourceCoefficientPlane)
+{
+    for (DeviceType type : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const char *label : {"IQ3_S", "IQ4_XS"})
+            for (auto layout : {GPUPreparedWeightPoolLayout::SourceNative,
+                                GPUPreparedWeightPoolLayout::MigrationReusable})
+            {
+                SCOPED_TRACE(label);
+                SCOPED_TRACE(static_cast<int>(type));
+                SCOPED_TRACE(static_cast<int>(layout));
+                auto tensor = test::quantizedVerifierFormat(label).create({32, 256}, 42);
+                // Hard-coded source widths make missing-plane rejection
+                // independent of the physical-format helper under test.
+                const int payload_bytes = tensor->native_type() == TensorType::IQ3_S ? 13 : 16;
+                constexpr size_t blocks = 32 * (256 / 32);
+                test::MockBackend backend(type);
+                const DeviceId device{type, 0};
+                auto owner = std::make_shared<LoadOrchestrator>(&backend, kTestOnlyUnadmittedGPUAllocation);
+                owner->addDevice(0);
+                owner->planWeight(0, "missing.coefficients", 32, 256,
+                    payload_bytes, false, false, tensor->size_bytes());
+                // MockBackend supplies host backing only. Correct payload and
+                // scale bounds leave the absent secondary as the sole defect.
+                auto *pool = owner->getPool(0);
+                ASSERT_TRUE(pool->allocate(&backend, 0, 0));
+                const auto slot = pool->getSlot("missing.coefficients");
+                ASSERT_TRUE(slot.has_value());
+                ASSERT_NE(slot->d_native_vnni_payload, nullptr);
+                ASSERT_NE(slot->d_native_vnni_scales, nullptr);
+                ASSERT_EQ(slot->payload_bytes, blocks * static_cast<size_t>(payload_bytes));
+                ASSERT_EQ(slot->scales_bytes, blocks * sizeof(uint16_t));
+                ASSERT_EQ(slot->d_native_vnni_mins, nullptr);
+                ASSERT_EQ(slot->mins_bytes, 0u);
+                try
+                {
+                    auto kernel = KernelFactory::createGemmFromGPUWeightPool(
+                        *tensor, device, owner, "missing.coefficients", 0, layout);
+                    FAIL() << "Missing original source coefficients were accepted";
+                }
+                catch (const std::out_of_range &error)
+                {
+                    EXPECT_NE(std::string(error.what()).find("minima region"), std::string::npos)
+                        << error.what();
+                }
             }
 }
 

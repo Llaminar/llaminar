@@ -9,7 +9,7 @@ FROM ${RUNTIME_IMAGE}
 USER root
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      docker.io curl jq pciutils procps util-linux python3-requests python3-yaml \
+      docker.io curl jq pciutils procps util-linux python3-requests python3-yaml python3-numpy \
  && rm -rf /var/lib/apt/lists/*
 COPY install_opencode_client.py /tmp/install_opencode_client.py
 RUN mkdir -p /usr/local/share/llaminar \

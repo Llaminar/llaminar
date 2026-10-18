@@ -161,7 +161,7 @@ namespace llaminar2
         }
 
         // Calculate byte offset for view
-        // Q8_K: 256 elements per block, 288 bytes per block
+        // Q8_K: 256 elements per source block, including its original FP32 scale.
         const size_t blocks_per_row = (K + Q8_KBlock::BLOCK_SIZE - 1) / Q8_KBlock::BLOCK_SIZE;
         const size_t bytes_per_row = blocks_per_row * sizeof(Q8_KBlock);
         size_t byte_offset = start_row * bytes_per_row;
@@ -175,7 +175,9 @@ namespace llaminar2
             // Chain views: add offsets
             byte_offset += view_byte_offset_;
             base_ptr = raw_data_ptr_;
-            root_parent = parent_; // Use root parent, not intermediate view
+            // An mmap-backed root is also marked as a view but has no tensor
+            // parent. Retain that root itself so nested slices keep its mapping.
+            root_parent = parent_ ? parent_ : shared_from_this();
         }
         else
         {
@@ -208,14 +210,12 @@ namespace llaminar2
 
     void Q8_KTensor::decodeBlockScalar(const Q8_KBlock &block, float *output)
     {
-        // Q8_K: 256 int8_t quantized values
-        // bsums[16]: Block sums for optimized dot products
-        // NOTE: Q8_K has NO scale factor in the block! Scale is stored elsewhere.
-        // For now, just convert int8 to float directly (scale will be applied externally)
+        // The source scale is FP32. Never pass it through a binary16 prepared
+        // metadata conversion when decoding original tensor/embedding values.
 
         for (size_t i = 0; i < Q8_KBlock::BLOCK_SIZE; ++i)
         {
-            output[i] = static_cast<float>(block.qs[i]);
+            output[i] = block.d * static_cast<float>(block.qs[i]);
         }
     }
 
@@ -237,7 +237,7 @@ namespace llaminar2
             __m256 float_vals = _mm256_cvtepi32_ps(int32_vals);
 
             // Store result
-            _mm256_storeu_ps(&output[i], float_vals);
+            _mm256_storeu_ps(&output[i], _mm256_mul_ps(_mm256_set1_ps(block.d), float_vals));
         }
     }
 #endif
@@ -260,7 +260,7 @@ namespace llaminar2
             __m512 float_vals = _mm512_cvtepi32_ps(int32_vals);
 
             // Store result
-            _mm512_storeu_ps(&output[i], float_vals);
+            _mm512_storeu_ps(&output[i], _mm512_mul_ps(_mm512_set1_ps(block.d), float_vals));
         }
     }
 #endif
@@ -469,56 +469,26 @@ namespace llaminar2
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
     }
 
-    // ===== Efficient requantizeRowToInt8 for Q8_K =====
-    // Q8_K has no per-block scale (scale = 1.0), so dequantized values are the raw
-    // int8 qs values. We copy them directly and rescale to maximize [-127,127] range.
+    /**
+     * @brief Explicitly convert a scaled native row to the legacy single-scale INT8 API.
+     * @param row_idx Source row. @param K Complete logical row width.
+     * @param output Caller-owned signed INT8 output.
+     * @return The single row scale computed from original d*qs source values.
+     * @note This conversion is lossy by its declared API; source-preserving
+     *       embedding consumers use original blocks and never this conversion.
+     */
     float Q8_KTensor::requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const
     {
-        const size_t superblocks_per_row = K / Q8_KBlock::BLOCK_SIZE;
-        const Q8_KBlock *all_blocks = typed_data();
-        const Q8_KBlock *row_blocks = all_blocks + row_idx * superblocks_per_row;
-
-        // Phase 1: Copy all qs values and find max absolute value
-        int max_abs_qs = 0;
-        for (size_t sb = 0; sb < superblocks_per_row; ++sb)
-        {
-            std::memcpy(output + sb * 256, row_blocks[sb].qs, 256);
-            for (int i = 0; i < 256; ++i)
-            {
-                int a = row_blocks[sb].qs[i] < 0
-                            ? -static_cast<int>(row_blocks[sb].qs[i])
-                            : static_cast<int>(row_blocks[sb].qs[i]);
-                if (a > max_abs_qs)
-                    max_abs_qs = a;
-            }
-        }
-
-        // Common case: values already fit in [-127, 127]
-        if (max_abs_qs <= 127)
-        {
-            return (max_abs_qs > 0) ? (static_cast<float>(max_abs_qs) / 127.0f) : 1.0f;
-        }
-
-        // Rare: have -128 values. Rescale everything by 128/127.
-        const float row_scale = static_cast<float>(max_abs_qs) / 127.0f;
-        const float inv_row_scale = 127.0f / static_cast<float>(max_abs_qs);
-        for (size_t i = 0; i < K; ++i)
-        {
-            float val = static_cast<float>(output[i]) * inv_row_scale;
-            int32_t q = static_cast<int32_t>(val + (val >= 0.0f ? 0.5f : -0.5f));
-            q = q < -127 ? -127 : (q > 127 ? 127 : q);
-            output[i] = static_cast<int8_t>(q);
-        }
-
-        return row_scale;
+        return IINT8Unpackable::requantizeRowToInt8(row_idx, K, output);
     }
 
     /**
-     * @brief Pack one logical 32-value Q8_K slice as raw INT8 plus unit scale.
+     * @brief Pack one logical Q8_K slice into the existing FP16-scale execution layout.
      *
      * Eight logical execution blocks share one 256-value Q8_K source block.
-     * `bsums` are derived acceleration metadata, so preserving `qs` exactly is
-     * sufficient for both execution and lossless reverse repack.
+     * `qs` are copied exactly. The execution ABI narrows the original FP32 d
+     * to FP16; this is a separate known precision boundary, not a lossless
+     * representation of arbitrary source scales. Source embeddings retain d.
      */
     void Q8_KTensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
@@ -530,7 +500,7 @@ namespace llaminar2
             static_cast<size_t>(superblock)];
         const size_t linear = vnniLinearIdx(ctx, destination_n, b);
         std::memcpy(vnniPayloadDst(ctx, linear), block->qs + subblock * 32, 32);
-        ctx.scales_array[linear] = fp32_to_fp16(1.0f);
+        ctx.scales_array[linear] = fp32_to_fp16(block->d);
     }
 
 } // namespace llaminar2

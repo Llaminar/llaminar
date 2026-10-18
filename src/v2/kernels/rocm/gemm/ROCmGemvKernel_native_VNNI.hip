@@ -3,12 +3,13 @@
  * @brief Native-VNNI GEMV kernels for lossless sub-8-bit decode on AMD MI50/MI60 (gfx906)
  *
  * This file contains native-VNNI kernels that decode quantized weights
- * losslessly and compute GEMV using v_dot4_i32_i8 with per-block FP16 scales.
+ * losslessly and compute GEMV using v_dot4_i32_i8. Q6 keeps original half d
+ * plus signed subscales; other formats retain their prepared FP16 metadata.
  *
  * Supported formats:
  *   Q4_0:   w_int8 = q - 8          (exact, symmetric)
  *   IQ4_NL: w_int8 = lut[q]         (exact, LUT-based symmetric)
- *   IQ4_XS: w_int8 = lut[q]         (reuses IQ4_NL kernel, sub-block scales precomputed)
+ *   IQ4_XS: w_int8 = lut[q]         (physical24, original d/raw coefficient)
  *   Q4_1:   w_int8 = q, min corr.   (asymmetric, scale + min)
  *   Q4_K:   w_int8 = q, min corr.   (reuses Q4_1 kernel, sub-block scales precomputed)
  *   Q5_0:   w_int8 = 5bit - 16      (exact, symmetric with high-bit array)
@@ -17,15 +18,16 @@
  *   Q6_K:   w_int8 = 6bit - 32      (symmetric, dual-scale per 32-element block)
  *   Q3_K:   w_int8 = 3bit - 4       (symmetric, dual-scale per 32-element block)
  *   Q2_K:   w_int8 = 2bit (unsigned)(asymmetric, dual-scale + embedded mins)
- *   IQ3_S:  grid LUT → signed INT8  (9-bit grid index + direct sign bytes)
+ *   IQ3_S:  grid LUT → signed INT8; original half base/raw nibble resolve
+ *           one FP32 factor before the unchanged single-dot contribution
  *   IQ3_XXS:grid LUT → signed INT8  (8-bit grid index + pre-resolved signs)
  *   IQ2_S:  grid LUT → signed INT8  (10-bit grid index + direct signs, dual-scale)
  *   IQ2_XS: grid LUT → signed INT8  (9-bit grid index + pre-resolved signs, dual-scale)
  *   IQ2_XXS:grid LUT → signed INT8  (8-bit grid index + pre-resolved signs)
  *
  * Unlike ratio-VNNI (which bakes scales into INT8 weights with truncation),
- * native-VNNI keeps per-block FP16 scales separate and decodes nibbles
- * directly to INT8.
+ * native-VNNI keeps per-block metadata separate and decodes nibbles directly
+ * to INT8. Q6 reconstructs exact FP32 d*subscale before the unchanged dot tree.
  *
  * Captured verifier launches separate physical scratch capacity from the
  * device controller's live row count. Fused bundles use bounded row workers,
@@ -44,6 +46,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include "kernels/common/NativeEmbeddingIQTables.h"
 #include <cstdio>
 #include <cmath>
 #include <chrono>
@@ -104,7 +107,9 @@ struct NativeVNNIDecodeGeneratedRuntimeConfig
 static constexpr uint8_t defaultNativeVNNIArithmeticPolicyCodebook(
     uint8_t execution_codebook_id)
 {
-    return execution_codebook_id ==
+    return execution_codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
+               ? static_cast<uint8_t>(4)
+               : execution_codebook_id ==
                    llaminar2::kNativeVnniExpandedInt8MinCodebook
                ? static_cast<uint8_t>(19)
                : execution_codebook_id;
@@ -348,7 +353,8 @@ __device__ __constant__ uint64_t d_iq1s_grid[2048];   // IQ1_S/M: 2048 × 8B = 1
 // ============================================================================
 enum NativeVNNIFormat : uint8_t {
     NVNNI_Q4_0   = 0,   // 4-bit symmetric, linear decode (q - 8)
-    NVNNI_IQ4_NL = 4,   // 4-bit symmetric, LUT decode
+    NVNNI_IQ4_NL = 4,   // IQ4_NL original half scale
+    NVNNI_IQ4_XS_SOURCE = llaminar2::kNativeVnniIQ4XSSourceScaleCodebook, // Original IQ4_XS tuple
     NVNNI_Q4_1   = 5,   // 4-bit asymmetric (q as-is, has min)
     NVNNI_Q5_0   = 6,   // 5-bit symmetric, linear decode (q - 16)
     NVNNI_Q5_1   = 7,   // 5-bit asymmetric (q as-is, has min)
@@ -384,7 +390,7 @@ struct NVNNITraits {
         (FMT == NVNNI_IQ2_S) ? 2 : (FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ2_XS) ? 1 : 0;
     static constexpr bool has_qh = (qh_bits_per_lookup > 0);
     // Dual-scale: two FP16 scales per 32-element block (stored in scales + mins arrays)
-    // Elements 0-15 use scale_lo (scales[]), elements 16-31 use scale_hi (mins[])
+    // Dual halves use resolved FP32 scales; Q6 stores d and packed coefficients.
     static constexpr bool is_dual_scale = (FMT == NVNNI_Q6_K || FMT == NVNNI_Q3_K || FMT == NVNNI_Q2_K
                                         || FMT == NVNNI_IQ2_S || FMT == NVNNI_IQ2_XS
                                         || FMT == NVNNI_IQ1_M);
@@ -403,7 +409,9 @@ struct NVNNITraits {
     static constexpr bool is_2bit       = (FMT == NVNNI_Q2_K);
     static constexpr bool is_8bit =
         FMT == NVNNI_Q8_0 || FMT == NVNNI_EXPANDED_INT8_MIN;
-    static constexpr bool uses_lut      = (FMT == NVNNI_IQ4_NL);
+    static constexpr bool requires_secondary_metadata =
+        is_asymmetric || is_dual_scale || FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ4_XS_SOURCE;
+    static constexpr bool uses_lut      = (FMT == NVNNI_IQ4_NL || FMT == NVNNI_IQ4_XS_SOURCE);
     static constexpr int  payload_bytes =
         is_8bit ? 32 :                                // Q8_0: 32 raw INT8 values
         is_iq1_grid ? 6 :                            // IQ1_S(6), IQ1_M(6): qs[4]+qh[2] only
@@ -503,7 +511,7 @@ __device__ __forceinline__ uint32_t rocm_native_vnni_expand_q6_high_fields(
 template <NativeVNNIFormat FMT>
 struct NVNNIGroupedMoESupported {
     static constexpr bool value =
-        FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_Q4_1 ||
+        FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_IQ4_XS_SOURCE || FMT == NVNNI_Q4_1 ||
         FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1 || FMT == NVNNI_Q6_K ||
         FMT == NVNNI_Q3_K || FMT == NVNNI_Q2_K || FMT == NVNNI_IQ3_S ||
         FMT == NVNNI_IQ3_XXS || FMT == NVNNI_IQ2_S || FMT == NVNNI_IQ2_XS ||
@@ -1275,9 +1283,10 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 for (int g = 4; g < 8; ++g)
                     acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
 
-                const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                const uint16_t hi_bits = d_block_mins[linear];
-                const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
+                const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
+                    scale_bits, d_block_mins[linear]);
+                const float scale_lo = weight_scales.low;
+                const float scale_hi = weight_scales.high;
                 if constexpr (Traits::is_dual_scale_asym)
                 {
                     constexpr int32_t ones = 0x01010101;
@@ -1367,7 +1376,8 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 for (int g = 0; g < 8; ++g)
                     block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
 
-                const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+                const float block_d = rocm_native_vnni_load_single_weight_scale<FMT>(
+                    scale_bits, (FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ4_XS_SOURCE) ? d_block_mins[linear] : uint16_t{0});
                 if constexpr (Traits::is_asymmetric)
                 {
                     const uint16_t min_bits = d_block_mins[linear];
@@ -1963,7 +1973,7 @@ __global__ void gemv_native_vnni_kernel_t(
                     if constexpr (Traits::is_dual_scale)
                     {
                         // Dual-scale (Q6_K): elements 0-15 use scale_lo, 16-31 use scale_hi
-                        // scale_lo is in d_block_scales[], scale_hi is in d_block_mins[]
+                        // Q6 stores original d and packed coefficients in these two words.
                         int32_t acc_lo = 0, acc_hi = 0;
                         #pragma unroll
                         for (int g = 0; g < 4; ++g)
@@ -1972,9 +1982,10 @@ __global__ void gemv_native_vnni_kernel_t(
                         for (int g = 4; g < 8; ++g)
                             acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
 
-                        const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                        const uint16_t hi_bits = d_block_mins[linear];
-                        const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
+                        const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
+                            scale_bits, d_block_mins[linear]);
+                        const float scale_lo = weight_scales.low;
+                        const float scale_hi = weight_scales.high;
                         // Q2_K/IQ1_M: dual-scale + emin/delta correction
                         // Q2_K: emins from separate d_block_emins array
                         // IQ1_M: has ±IQ1S_DELTA per-group correction (handled below)
@@ -2073,7 +2084,9 @@ __global__ void gemv_native_vnni_kernel_t(
                         for (int g = 0; g < 8; ++g)
                             block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
 
-                        const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+                        const float block_d = rocm_native_vnni_load_single_weight_scale<FMT>(
+                            scale_bits, (FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ4_XS_SOURCE) ?
+                                d_block_mins[linear] : uint16_t{0});
                         // Asymmetric min correction: f_acc += sum_a * block_m
                         // Derives from: value = d*q + m  →  Σ a_i*value_i = d*Σ(a_i*q_i) + m*Σ(a_i)
                         if constexpr (Traits::is_asymmetric)
@@ -2388,8 +2401,9 @@ __device__ __forceinline__ bool native_vnni_desc_shape_ok(
            desc.n == N &&
            desc.k == K &&
            desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
-           desc.codebook_id == static_cast<uint8_t>(FMT) &&
-           (!(Traits::is_asymmetric || Traits::is_dual_scale) || desc.mins) &&
+           (desc.codebook_id == static_cast<uint8_t>(FMT) ||
+            (FMT == NVNNI_IQ4_XS_SOURCE && desc.codebook_id == NVNNI_IQ4_NL)) &&
+           (!(Traits::requires_secondary_metadata && desc.codebook_id != NVNNI_IQ4_NL) || desc.mins) &&
            (!Traits::is_dual_scale_asym || desc.emins);
 }
 
@@ -2928,17 +2942,25 @@ __device__ __forceinline__ float moe_native_vnni_dot_desc_range(
 
         const float scale_ab = scales_A_blockwise[b];
         const int32_t sum_a = native_vnni_activation_sum_a<FMT>(a4);
-        native_vnni_small_m_accumulate_decoded_block<FMT>(
-            acc,
-            a4,
-            packed_groups,
-            payload,
-            scale_base,
-            min_base,
-            emin_base,
-            linear,
-            scale_ab,
-            sum_a);
+        // Mixed IQ4_NL/IQ4_XS pairs share only integer decode. Each actual
+        // descriptor retains its own scale program and optional raw word.
+        if constexpr (FMT == NVNNI_IQ4_XS_SOURCE)
+        {
+            if (desc.codebook_id == NVNNI_IQ4_NL)
+                native_vnni_small_m_accumulate_decoded_block<NVNNI_IQ4_NL>(
+                    acc, a4, packed_groups, payload, scale_base, min_base,
+                    emin_base, linear, scale_ab, sum_a);
+            else
+                native_vnni_small_m_accumulate_decoded_block<FMT>(
+                    acc, a4, packed_groups, payload, scale_base, min_base,
+                    emin_base, linear, scale_ab, sum_a);
+        }
+        else
+        {
+            native_vnni_small_m_accumulate_decoded_block<FMT>(
+                acc, a4, packed_groups, payload, scale_base, min_base,
+                emin_base, linear, scale_ab, sum_a);
+        }
     }
 
     return acc;
@@ -3560,6 +3582,9 @@ __device__ __forceinline__ float moe_native_vnni_dot_desc_range_dynamic(
             *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
     case NVNNI_IQ4_NL:
         return moe_native_vnni_dot_desc_range<NVNNI_IQ4_NL>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_IQ4_XS_SOURCE:
+        return moe_native_vnni_dot_desc_range<NVNNI_IQ4_XS_SOURCE>(
             *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
     case NVNNI_Q4_1:
         return moe_native_vnni_dot_desc_range<NVNNI_Q4_1>(
@@ -4429,10 +4454,10 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
         for (int g = 4; g < 8; ++g)
             acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
 
-        const uint16_t scale_lo_bits = scale_base[linear];
-        const uint16_t scale_hi_bits = min_base[linear];
-        const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
-        const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
+        const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
+            scale_base[linear], min_base[linear]);
+        const float scale_lo = weight_scales.low;
+        const float scale_hi = weight_scales.high;
         // Corrected formats form one complete block contribution before the
         // row update. This is the same publication boundary used by CUDA and
         // prevents a backend-specific extra rounding against the running row.
@@ -4532,7 +4557,8 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
             block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
 
         const uint16_t scale_bits = scale_base[linear];
-        const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+        const float block_d = rocm_native_vnni_load_single_weight_scale<FMT>(
+            scale_bits, (FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ4_XS_SOURCE) ? min_base[linear] : uint16_t{0});
         if constexpr (Traits::is_asymmetric)
         {
             const uint16_t min_bits = min_base[linear];
@@ -4816,6 +4842,10 @@ __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched
         return;
     case NVNNI_IQ4_NL:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ4_NL, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
+        return;
+    case NVNNI_IQ4_XS_SOURCE:
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ4_XS_SOURCE, Publication>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_Q4_1:
@@ -5606,6 +5636,7 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
     {
     case NVNNI_Q4_0:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q4_0);     break;
     case NVNNI_IQ4_NL:   LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ4_NL);   break;
+    case NVNNI_IQ4_XS_SOURCE:   LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ4_XS_SOURCE);   break;
     case NVNNI_Q4_1:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q4_1);     break;
     case NVNNI_Q5_0:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q5_0);     break;
     case NVNNI_Q5_1:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q5_1);     break;
@@ -6441,6 +6472,8 @@ static bool nativeVNNICodebookRequiresAux(uint8_t codebook_id)
 {
     switch (static_cast<NativeVNNIFormat>(codebook_id))
     {
+    case NVNNI_IQ3_S:
+    case NVNNI_IQ4_XS_SOURCE:
     case NVNNI_Q4_1:
     case NVNNI_Q5_1:
     case NVNNI_Q6_K:
@@ -6468,6 +6501,7 @@ static bool nativeVNNICodebookSupported(uint8_t codebook_id)
     {
     case NVNNI_Q4_0:
     case NVNNI_IQ4_NL:
+    case NVNNI_IQ4_XS_SOURCE:
     case NVNNI_Q4_1:
     case NVNNI_Q5_0:
     case NVNNI_Q5_1:
@@ -6804,7 +6838,7 @@ bool rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
     #define LAUNCH_SMALL_M(FMT_TAG)                                                              \
         do {                                                                                      \
             using Traits = NVNNITraits<FMT_TAG>;                                                  \
-            if constexpr (Traits::is_dual_scale || Traits::is_asymmetric)                         \
+            if constexpr (Traits::requires_secondary_metadata)                         \
             {                                                                                     \
                 if (!d_mins_u16)                                                                  \
                 {                                                                                 \
@@ -6832,6 +6866,7 @@ bool rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
     {
     case NVNNI_Q4_0:     LAUNCH_SMALL_M(NVNNI_Q4_0);
     case NVNNI_IQ4_NL:   LAUNCH_SMALL_M(NVNNI_IQ4_NL);
+    case NVNNI_IQ4_XS_SOURCE:   LAUNCH_SMALL_M(NVNNI_IQ4_XS_SOURCE);
     case NVNNI_Q4_1:     LAUNCH_SMALL_M(NVNNI_Q4_1);
     case NVNNI_Q5_0:     LAUNCH_SMALL_M(NVNNI_Q5_0);
     case NVNNI_Q5_1:     LAUNCH_SMALL_M(NVNNI_Q5_1);
@@ -7016,7 +7051,7 @@ static bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
 #define DISPATCH_BATCHED_FMT(FMT_TAG)                                                                   \
     do {                                                                                                \
         using Traits = NVNNITraits<FMT_TAG>;                                                            \
-        if constexpr (Traits::is_dual_scale || Traits::is_asymmetric) {                                 \
+        if constexpr (Traits::requires_secondary_metadata) {                                 \
             if (!d_block_mins) {                                                                        \
                 fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_fp32] codebook_id=%u requires mins/aux array (M=%d K=%d projections=%d)\n", \
                         codebook_id, M, K, num_projections);                                            \
@@ -7054,6 +7089,7 @@ static bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
     {
     case NVNNI_Q4_0:     DISPATCH_BATCHED_FMT(NVNNI_Q4_0);
     case NVNNI_IQ4_NL:   DISPATCH_BATCHED_FMT(NVNNI_IQ4_NL);
+    case NVNNI_IQ4_XS_SOURCE:   DISPATCH_BATCHED_FMT(NVNNI_IQ4_XS_SOURCE);
     case NVNNI_Q4_1:     DISPATCH_BATCHED_FMT(NVNNI_Q4_1);
     case NVNNI_Q5_0:     DISPATCH_BATCHED_FMT(NVNNI_Q5_0);
     case NVNNI_Q5_1:     DISPATCH_BATCHED_FMT(NVNNI_Q5_1);
@@ -7644,6 +7680,7 @@ bool rocmGemv_native_vnni_fp32_with_policy(
         {
         case NVNNI_Q4_0:     LAUNCH_NATIVE_VNNI(NVNNI_Q4_0);     break;
         case NVNNI_IQ4_NL:   LAUNCH_NATIVE_VNNI(NVNNI_IQ4_NL);   break;
+        case NVNNI_IQ4_XS_SOURCE:   LAUNCH_NATIVE_VNNI(NVNNI_IQ4_XS_SOURCE);   break;
         case NVNNI_Q4_1:     LAUNCH_NATIVE_VNNI(NVNNI_Q4_1);     break;
         case NVNNI_Q5_0:     LAUNCH_NATIVE_VNNI(NVNNI_Q5_0);     break;
         case NVNNI_Q5_1:     LAUNCH_NATIVE_VNNI(NVNNI_Q5_1);     break;
@@ -7746,3 +7783,31 @@ bool rocmInitIQGridTables(
 }
 
 } // extern "C"
+
+/**
+ * @brief Borrow existing backend grid addresses after their generation owner published them.
+ * @param ordinal Exact device selected during source-weight preparation.
+ * @param tables Destination non-owning immutable view; no cache or allocation is created.
+ * @return True when all six existing source codebooks have valid device addresses.
+ */
+extern "C" bool rocmNativeEmbeddingIQTableView(
+    int ordinal, llaminar2::NativeEmbeddingIQTables *tables)
+{
+    if (!tables || ordinal < 0) return false;
+    *tables = {};
+    if (hipSetDevice(ordinal) != hipSuccess) return false;
+    void *address = nullptr;
+    if (hipGetSymbolAddress(&address, HIP_SYMBOL(d_iq3s_grid)) != hipSuccess) return false;
+    tables->iq3s = static_cast<const uint32_t *>(address);
+    if (hipGetSymbolAddress(&address, HIP_SYMBOL(d_iq3xxs_grid)) != hipSuccess) return false;
+    tables->iq3xxs = static_cast<const uint32_t *>(address);
+    if (hipGetSymbolAddress(&address, HIP_SYMBOL(d_iq2s_grid)) != hipSuccess) return false;
+    tables->iq2s = static_cast<const uint64_t *>(address);
+    if (hipGetSymbolAddress(&address, HIP_SYMBOL(d_iq2xs_grid)) != hipSuccess) return false;
+    tables->iq2xs = static_cast<const uint64_t *>(address);
+    if (hipGetSymbolAddress(&address, HIP_SYMBOL(d_iq2xxs_grid)) != hipSuccess) return false;
+    tables->iq2xxs = static_cast<const uint64_t *>(address);
+    if (hipGetSymbolAddress(&address, HIP_SYMBOL(d_iq1s_grid)) != hipSuccess) return false;
+    tables->iq1s = static_cast<const uint64_t *>(address);
+    return true;
+}

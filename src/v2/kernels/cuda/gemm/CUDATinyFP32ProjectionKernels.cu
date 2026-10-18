@@ -30,7 +30,7 @@ namespace
     constexpr int TINY_PROJECTION_WARPS = TINY_FP32_BLOCK / TINY_PROJECTION_WARP_SIZE;
     // Measured crossover between the latency and throughput schedules. This is
     // launch geometry, never a different precision or a different reduction.
-    constexpr int TINY_PROJECTION_PREFILL_MIN_ROWS = 32;
+    constexpr int TINY_PROJECTION_PREFILL_MIN_ROWS = llaminar2::kShortHalfProjectionMaxRows + 1;
     // Captured floating-format tournaments place the shared-operand crossover
     // at large batches. Narrow columns and sub-tile K retain the warp schedule
     // because their unused lanes cannot amortize both CTA publication barriers.
@@ -133,6 +133,20 @@ namespace
             return __half2float(reinterpret_cast<const __half *>(weights)[index]);
     }
 
+    /** @brief Widen an admitted activation; HalfActivation selects physical half storage.
+     * @tparam HalfActivation True only for actual FP16 A with FP32 accumulation.
+     * @param values Opaque existing pointer-array ABI address.
+     * @param index Logical element index. @return Exact FP32 operand expansion.
+     */
+    template<bool HalfActivation>
+    __device__ __forceinline__ float projection_activation(const float *values, size_t index)
+    {
+        if constexpr (HalfActivation)
+            return __half2float(reinterpret_cast<const __half *>(values)[index]);
+        else
+            return values[index];
+    }
+
     /**
      * @brief Latency schedule for short batches, preserving the original tree.
      *
@@ -140,6 +154,7 @@ namespace
      * Short decode/verifier batches need that parallelism to occupy the device;
      * the register-tiled prefill schedule becomes economical with more rows.
      * @tparam WeightDtype Native FP32, FP16 or BF16 weight encoding.
+     * @tparam HalfActivation Select actual half A without changing arithmetic ownership.
      * @param d_A_array Device array of persistent FP32 activation matrices [M,K].
      * @param d_B_array Device array of persistent native weight matrices [N,K].
      * @param d_C_array Device array of disjoint FP32 output matrices [M,N].
@@ -147,7 +162,7 @@ namespace
      * @param N Number of output columns.
      * @param K Reduction width; each original thread visits stride-256 positions.
      */
-    template <int WeightDtype>
+    template <int WeightDtype, bool HalfActivation = false>
     __global__ __launch_bounds__(TINY_FP32_BLOCK)
     void floating_tiny_block_projection_kernel(
         const float *const *d_A_array, const float *const *d_B_array,
@@ -160,7 +175,7 @@ namespace
         if (!a || !b || !c || m >= row_range.activeRows() || n >= N) return;
         float sum = 0.0f;
         for (int k = threadIdx.x; k < K; k += TINY_FP32_BLOCK)
-            sum += a[static_cast<size_t>(m) * K + k] *
+            sum += projection_activation<HalfActivation>(a, static_cast<size_t>(m) * K + k) *
                    projection_weight<WeightDtype>(b, static_cast<size_t>(n) * K + k);
         __shared__ float parts[TINY_FP32_BLOCK];
         parts[threadIdx.x] = sum;
@@ -257,7 +272,7 @@ namespace
      * @param N Number of output columns per projection.
      * @param K Reduction width; positive unaligned tails are supported.
      */
-    template <int WeightDtype>
+    template <int WeightDtype, bool HalfActivation = false>
     __global__ __launch_bounds__(TINY_FP32_BLOCK)
         void floating_tiny_warp_projection_kernel(
             const float *const *__restrict__ d_A_array,
@@ -296,7 +311,7 @@ namespace
                 if (k < K)
                 {
                     const float weight = projection_weight<WeightDtype>(B, weight_base + k);
-                    sums[part] += A[activation_base + k] * weight;
+                    sums[part] += projection_activation<HalfActivation>(A, activation_base + k) * weight;
                 }
             }
         }
@@ -325,6 +340,7 @@ namespace
      * and needs no persistent workspace. FP16 uses a smaller row tile because
      * its compiled conversion/load schedule favors four rows over eight.
      * @tparam WeightDtype Native weight encoding.
+     * @tparam HalfActivation Select actual half A; default retains FP32 A.
      * @param a Device activation-pointer array.
      * @param b Device weight-pointer array.
      * @param c Device output-pointer array with disjoint matrix destinations.
@@ -334,14 +350,14 @@ namespace
      * @param batches Number of independent projections.
      * @param stream Exact non-null stream validated by the public launch bridge.
      */
-    template <int WeightDtype>
+    template <int WeightDtype, bool HalfActivation = false>
     void launch_tiny_projection(const float *const *a, const float *const *b,
                                 float *const *c, int m, int n, int k,
                                 int batches, cudaStream_t stream,
                                 llaminar2::DeviceRowRange row_range)
     {
         if (m < TINY_PROJECTION_PREFILL_MIN_ROWS)
-            floating_tiny_block_projection_kernel<WeightDtype>
+            floating_tiny_block_projection_kernel<WeightDtype, HalfActivation>
                 <<<dim3(n, m, batches), TINY_FP32_BLOCK, 0, stream>>>(a, b, c, m, n, k, row_range);
         else if (m >= TINY_PROJECTION_SHARED_MIN_ROWS &&
                  n >= TINY_PROJECTION_SHARED_MIN_COLUMNS &&
@@ -351,14 +367,63 @@ namespace
                 float, std::conditional_t<WeightDtype == TINY_PROJECTION_WEIGHT_FP16,
                                          __half, __nv_bfloat16>>;
             constexpr int rows = WeightDtype == TINY_PROJECTION_WEIGHT_FP16 ? 4 : 8;
-            llaminar2::cuda::detail::sharedTinyProjectionKernel<Weight, rows>
+            llaminar2::cuda::detail::sharedTinyProjectionKernel<Weight, rows, std::conditional_t<HalfActivation, __half, float>>
                 <<<dim3((n-1)/TINY_PROJECTION_WARPS+1, (m-1)/rows+1, batches),
                    TINY_FP32_BLOCK, 0, stream>>>(a, b, c, m, n, k, row_range);
         }
         else
-            floating_tiny_warp_projection_kernel<WeightDtype>
+            floating_tiny_warp_projection_kernel<WeightDtype, HalfActivation>
                 <<<dim3((n + TINY_PROJECTION_WARPS - 1) / TINY_PROJECTION_WARPS, m, batches),
                    TINY_FP32_BLOCK, 0, stream>>>(a, b, c, m, n, k, row_range);
+    }
+
+    /**
+     * @brief Fuse ragged half projections while retaining each original FP32 operation.
+     *
+     * The compact column grid selects immutable bindings directly from kernel
+     * arguments. There is no device pointer publication, padding, new workspace,
+     * or changed reduction partition. Inactive rows retire before operand loads.
+     * @tparam FixedK Measured width specialization; zero admits arbitrary K.
+     * @tparam Single Elide ragged lookup for the measured one-projection CUDA path.
+     * @param g Validated borrowed input/weight/output owners and column ends.
+     * @param runtime_k Positive reduction width. @param rows Device-live row authority.
+     */
+    template<int FixedK = 0, bool Single = false>
+    __global__ __launch_bounds__(256)
+    void short_half_projection_group_kernel(
+        const __grid_constant__ llaminar2::FixedHalfProjectionGroup g,
+        int runtime_k, llaminar2::DeviceRowRange rows)
+    {
+        const int k = FixedK ? FixedK : runtime_k;
+        const int row = blockIdx.y, flat = blockIdx.x, lane = threadIdx.x;
+        if (row >= rows.activeRows()) return;
+        int p = 0;
+        if constexpr (!Single)
+            while (flat >= g.columnEnd(p)) ++p;
+        const int first = p ? g.columnEnd(p - 1) : 0;
+        const int col = flat - first, n = g.columnEnd(p) - first;
+        const auto *a = reinterpret_cast<const __half *>(g.input()) + size_t(row) * k;
+        const auto *b = reinterpret_cast<const __half *>(g.weight(p)) + size_t(col) * k;
+        float sum = 0.0f;
+        for (int j = lane; j < k; j += 256)
+            sum += __half2float(a[j]) * __half2float(b[j]);
+        __shared__ float parts[256];
+        parts[lane] = sum;
+        __syncthreads();
+        if (lane < 32)
+        {
+            // Preserve the original cross-warp 128/64/32 tree before the
+            // final warp reduction. Fusion changes ownership lookup only.
+            const float low = (parts[lane] + parts[lane + 128]) +
+                              (parts[lane + 64] + parts[lane + 192]);
+            const float high = (parts[lane + 32] + parts[lane + 160]) +
+                               (parts[lane + 96] + parts[lane + 224]);
+            float result = low + high;
+            #pragma unroll
+            for (int stride = 16; stride > 0; stride >>= 1)
+                result += __shfl_down_sync(0xffffffffu, result, stride);
+            if (lane == 0) g.output(p)[size_t(row) * n + col] = result;
+        }
     }
 
     /**
@@ -661,6 +726,32 @@ extern "C" bool cudaFp32x16_tiny_batched_projection(
 }
 
 /**
+ * @brief Project actual half A/B with the existing fixed 256-part FP32 tree.
+ * @param d_A_array Persistent pointer array containing physical half matrices [M,K].
+ * @param d_B_array Persistent pointer array containing physical half matrices [N,K].
+ * @param d_C_array Disjoint FP32 outputs [M,N].
+ * @param M Physical row capacity. @param N Output width. @param K Reduction width.
+ * @param batch_count Independent projections, at most eight.
+ * @param device_id Owning CUDA ordinal. @param stream Exact non-null stream.
+ * @param row_range Optional device-owned live-row range, capacity M.
+ * @return True when validation and submission succeeded; no allocation or transfer.
+ */
+extern "C" bool cudaFp16_tiny_batched_projection(
+    const float *const *d_A_array, const float *const *d_B_array, float *const *d_C_array,
+    int M, int N, int K, int batch_count, int device_id, void *stream,
+    const llaminar2::DeviceRowRange *row_range)
+{
+    if (!stream || !d_A_array || !d_B_array || !d_C_array || M <= 0 || N <= 0 || K <= 0 ||
+        batch_count <= 0 || batch_count > TINY_FP32_MAX_BATCH ||
+        (row_range && row_range->physicalRows() != M)) return false;
+    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
+    if (cudaSetDevice(device_id) != cudaSuccess) return false;
+    launch_tiny_projection<TINY_PROJECTION_WEIGHT_FP16, true>(
+        d_A_array, d_B_array, d_C_array, M, N, K, batch_count, static_cast<cudaStream_t>(stream), rows);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+/**
  * @brief Enqueue the fixed-order floating SwiGLU/down verifier kernel.
  * @param d_gate Persistent FP32 gate matrix [M,K].
  * @param d_up Persistent FP32 up matrix [M,K].
@@ -747,4 +838,27 @@ extern "C" bool cudaFloating_swiglu_down_projection(
         return false;
     }
     return true;
+}
+
+/** @brief Submit validated short-row bindings; see the shared launch ABI contract. */
+extern "C" bool cudaFp16_short_projection_group(
+    const llaminar2::FixedHalfProjectionGroup &group, int m, int k,
+    int device_id, void *stream, const llaminar2::DeviceRowRange *row_range)
+{
+    if (!stream || m <= 0 || m > llaminar2::kShortHalfProjectionMaxRows || k <= 0 ||
+        (row_range && row_range->physicalRows() != m)) return false;
+    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(m);
+    if (cudaSetDevice(device_id) != cudaSuccess) return false;
+    const auto native = static_cast<cudaStream_t>(stream);
+    const auto launch = [&]<int K, bool Single>() {
+        short_half_projection_group_kernel<K, Single><<<dim3(group.totalColumns(), m), 256, 0, native>>>(group, k, rows);
+    };
+    const auto width = [&]<bool Single>() {
+        if (k == 2048) launch.template operator()<2048, Single>();
+        else if (k == 4096) launch.template operator()<4096, Single>();
+        else launch.template operator()<0, Single>();
+    };
+    if (group.size() == 1) width.template operator()<true>();
+    else width.template operator()<false>();
+    return cudaGetLastError() == cudaSuccess;
 }

@@ -8,6 +8,7 @@
  * Collective fixtures admit their maximum live payload and conversion scratch
  * through the same physical-memory BOM used by production graph setup.
  */
+#include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
 #include <gtest/gtest.h>
 
 #ifdef HAVE_CUDA
@@ -169,6 +170,8 @@ extern "C" bool cudaMoE_group_tokens_small_float_with_shared_gate(
     int device_idx,
     void *stream);
 
+extern "C" bool cudaMoE_route_logits_fp16(const float *, const void *, float *,
+    int, int, int, int, void *, const int * = nullptr);
 extern "C" bool cudaMoE_route_logits(
     const float *hidden,
     const float *gate_weights,
@@ -27279,5 +27282,144 @@ TEST_F(
         "CUDA",
         llaminar2::DeviceId::cuda(0),
         stream_);
+#endif
+}
+
+/** @test Captured optimized IQ2_S expert roles match original GGUF factors. */
+TEST_F(Test__CUDAMoEKernel, IQ2SOriginalSourceEquationInCapturedFusedExpert)
+{
+    llaminar2::test::iq2s_fused_source_witness::runGpu(llaminar2::DeviceId::cuda(0));
+}
+
+/**
+ * @brief Actual half router retains exact raw dots, grouped/serial rows and live capture replay.
+ *
+ * Integer numerator RNE is independent of the production half conversion.
+ * All represented products/sums are dyadic and exactly FP32, so the source
+ * oracle does not depend on a CPU reduction or a second production router.
+ * Prefill and verifier public calls must publish identical selected bytes.
+ */
+TEST_F(Test__CUDAMoEKernel, FP16RouterOperandsSerialGroupedAndLiveCaptured)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice()) GTEST_SKIP() << "No CUDA device available";
+    using namespace llaminar2;
+    constexpr int experts = 17, topk = 8;
+    const auto device = DeviceId::cuda(0);
+    for (const int width : {65, 2048})
+    {
+        const int capacity = width == 65 ? 2048 : 512;
+        std::vector<float> values(static_cast<size_t>(capacity) * width);
+        std::vector<uint16_t> gate_words(static_cast<size_t>(experts) * width);
+        for (int e = 0; e < experts; ++e)
+            for (int k = 0; k < width; ++k)
+            {
+                const int c = (3 * e + k) % 15 - 7;
+                gate_words[static_cast<size_t>(e) * width + k] = fp32_to_fp16(static_cast<float>(c) / 64.0f);
+            }
+        auto hidden = makeTensor({static_cast<size_t>(capacity), static_cast<size_t>(width)}, values);
+        auto gate = std::make_shared<FP16Tensor>(std::vector<size_t>{experts, static_cast<size_t>(width)}, gate_words);
+        auto pre_ids = makeZeros({static_cast<size_t>(capacity), topk}), pre_weights = makeZeros({static_cast<size_t>(capacity), topk});
+        auto ver_ids = makeZeros({static_cast<size_t>(capacity), topk}), ver_weights = makeZeros({static_cast<size_t>(capacity), topk});
+        std::vector<float> raw(static_cast<size_t>(capacity) * experts);
+        std::vector<float> ids(raw.size()), weights(raw.size());
+        std::vector<float> grouped_ids(raw.size()), grouped_weights(raw.size());
+        std::vector<float> serial(experts);
+        CudaAllocation raw_device(raw.size() * sizeof(float)), serial_device(experts * sizeof(float));
+        CudaAllocation count_device(sizeof(int));
+        int live = 0;
+        /** @brief All DMA destinations and sources precede this join-on-failure owner. */
+        struct Join { cudaStream_t stream; ~Join() { (void)cudaStreamSynchronize(stream); } } join{stream_};
+        prepareRouteTensorStorage(hidden.get(), gate.get(), pre_ids.get(), pre_weights.get());
+        // All public setup kinds must admit actual half before any routing math
+        // or graph construction; a raw-kernel-only positive is insufficient.
+        for (const auto kind : {MoERouteLaunchKind::RuntimeDecode, MoERouteLaunchKind::GroupedPrefill,
+                                MoERouteLaunchKind::DecodeEquivalentVerifier})
+        {
+            const MoERouteLaunchPlan plan{.kind = kind,
+                .physical_rows = kind == MoERouteLaunchKind::RuntimeDecode ? 1 : capacity,
+                .d_model = width, .num_experts = experts, .top_k = topk};
+            ASSERT_TRUE(cuda_kernel_->prepareRouteLaunch(gate.get(), plan));
+        }
+        TransferEngine::prepareDeviceOutput(ver_ids.get(), device, stream_);
+        TransferEngine::prepareDeviceOutput(ver_weights.get(), device, stream_);
+        for (const int m : {1, 3, 7, 8, 15, 16, 17, 63, 64, 65, 448, 512, 1024, 2048})
+        {
+            if (m > capacity) continue;
+            SCOPED_TRACE("K=" + std::to_string(width) + " M=" + std::to_string(m));
+            TransferEngine::requireDeviceInput(hidden.get(), device, stream_);
+            TransferEngine::requireDeviceInput(gate.get(), device, stream_);
+            ScopedCudaTestGraph graph(stream_, "actual half router live rows");
+            Join replay_join{stream_};
+            ASSERT_TRUE(cudaMoE_route_logits_fp16(static_cast<const float *>(hidden->gpu_data_ptr()),
+                gate->gpu_data_ptr(), static_cast<float *>(raw_device.get()), m, width, experts, 0, stream_,
+                static_cast<const int *>(count_device.get())));
+            MoERoutingResult unused;
+            ASSERT_TRUE(cuda_kernel_->routeWithTensorsEffectiveSeqLen(hidden.get(), gate.get(), m, width, experts,
+                topk, true, pre_ids.get(), pre_weights.get(), unused, static_cast<const int *>(count_device.get())));
+            ASSERT_TRUE(cuda_kernel_->routeVerifierRowsDecodeEquivalent(hidden.get(), gate.get(), m, width, experts,
+                topk, true, ver_ids.get(), ver_weights.get(), static_cast<const int *>(count_device.get())));
+            ASSERT_TRUE(graph.finishAndInstantiate());
+            for (int replay = 0; replay < 5; ++replay)
+            {
+                live = replay == 1 ? 0 : replay == 2 ? 1 : replay == 3 ? m / 2 : m;
+                std::fill(values.begin(), values.end(), std::numeric_limits<float>::quiet_NaN());
+                for (int row = 0; row < live; ++row)
+                    for (int k = 0; k < width; ++k)
+                        values[static_cast<size_t>(row) * width + k] = static_cast<float>(4096 + 3 * ((row + k + replay) % 37)) / 4096.0f;
+                ASSERT_EQ(cudaMemcpyAsync(hidden->gpu_data_ptr(), values.data(), values.size() * sizeof(float), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(count_device.get(), &live, sizeof(int), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+                TransferEngine::publishCurrentDeviceWrite(hidden.get(), stream_);
+                TransferEngine::requireDeviceInput(hidden.get(), device, stream_);
+                ASSERT_EQ(cudaMemsetAsync(raw_device.get(), 0xff, raw.size() * sizeof(float), stream_), cudaSuccess);
+                for (auto *tensor : {pre_ids.get(), pre_weights.get(), ver_ids.get(), ver_weights.get()})
+                    ASSERT_EQ(cudaMemsetAsync(tensor->gpu_data_ptr(), 0xff, tensor->numel() * sizeof(float), stream_), cudaSuccess);
+                ASSERT_TRUE(graph.launch());
+                ASSERT_EQ(cudaMemcpyAsync(raw.data(), raw_device.get(), raw.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+                const size_t selected_bytes = static_cast<size_t>(capacity) * topk * sizeof(float);
+                ASSERT_EQ(cudaMemcpyAsync(ids.data(), pre_ids->gpu_data_ptr(), selected_bytes, cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(weights.data(), pre_weights->gpu_data_ptr(), selected_bytes, cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(grouped_ids.data(), ver_ids->gpu_data_ptr(), selected_bytes, cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(grouped_weights.data(), ver_weights->gpu_data_ptr(), selected_bytes, cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+                size_t raw_mismatches = 0, inactive_mismatches = 0, first_bad = raw.size();
+                for (int row = 0; row < capacity; ++row)
+                    for (int e = 0; e < experts; ++e)
+                    {
+                        const float got = raw[static_cast<size_t>(row) * experts + e];
+                        if (row >= live) { inactive_mismatches += !std::isnan(got); continue; }
+                        int sum = 0;
+                        for (int k = 0; k < width; ++k)
+                        {
+                            const int numerator = 4096 + 3 * ((row + k + replay) % 37);
+                            const int q = numerator / 4, r = numerator % 4;
+                            const int rounded = q + (r > 2 || (r == 2 && (q & 1)));
+                            sum += rounded * ((3 * e + k) % 15 - 7);
+                        }
+                        const float expected = static_cast<float>(sum) / 65536.0f;
+                        if (std::memcmp(&got, &expected, sizeof(float)) != 0)
+                        {
+                            ++raw_mismatches;
+                            if (first_bad == raw.size()) first_bad = static_cast<size_t>(row) * experts + e;
+                        }
+                    }
+                EXPECT_EQ(raw_mismatches, 0u) << "first raw mismatch=" << first_bad;
+                EXPECT_EQ(inactive_mismatches, 0u);
+                EXPECT_EQ(std::memcmp(ids.data(), grouped_ids.data(), static_cast<size_t>(live) * topk * sizeof(float)), 0);
+                EXPECT_EQ(std::memcmp(weights.data(), grouped_weights.data(), static_cast<size_t>(live) * topk * sizeof(float)), 0);
+                // Serial calls are solely a diagnostic oracle, never production replay.
+                for (int row = 0; row < std::min(live, 8); ++row)
+                {
+                    ASSERT_TRUE(cudaMoE_route_logits_fp16(static_cast<const float *>(hidden->gpu_data_ptr()) + static_cast<size_t>(row) * width,
+                        gate->gpu_data_ptr(), static_cast<float *>(serial_device.get()), 1, width, experts, 0, stream_));
+                    ASSERT_EQ(cudaMemcpyAsync(serial.data(), serial_device.get(), serial.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+                    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+                    EXPECT_EQ(std::memcmp(serial.data(), raw.data() + static_cast<size_t>(row) * experts, serial.size() * sizeof(float)), 0);
+                }
+            }
+        }
+    }
 #endif
 }

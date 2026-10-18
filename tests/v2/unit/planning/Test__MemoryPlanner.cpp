@@ -6,10 +6,16 @@
  * the bytes that its real graph allocates.  In particular, mixed ExpertOverlay
  * continuation endpoints must reserve both dense graph state and their own
  * stable sparse-route buffers before captured graph construction begins.
+ * Native FP16 admission also authenticates the configured codec and declared
+ * schema visibility against exact local and replicated attention geometry.
  */
 
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
+#include "planning/WorkspaceMemoryEstimator.h"
+#include "utils/DebugEnv.h"
+#include "execution/local_execution/graph/SchemaFactoryRegistry.h"
+#include "models/qwen35/Qwen35Schema.h"
 #include "collective/DeviceCountedAllGather.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
@@ -28,6 +34,7 @@
 #include "kernels/HybridGDNStateGeometry.h"
 #include "backends/DeviceId.h"
 
+#include <memory>
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -3390,4 +3397,115 @@ TEST(Test__MemoryPlanner, NativeVocabularyPrefixAdmissionUsesPublishedRows)
                 << "The archived gathered surface must match the physical-memory certificate.";
         }
     }
+}
+
+/**
+ * @test The real schema and configured codec reach the estimator before admission.
+ *
+ * Existing dense/MoE fixtures exercise the public planner without models, runtime
+ * discovery or allocations. The independent geometry names native FP16 causal
+ * operands explicitly; a default FP32/General record must produce a different
+ * M4096 workspace, preventing an omitted producer field from passing unnoticed.
+ * Sharded KV and full replicated KV also require different native head mappings.
+ */
+TEST(Test__MemoryPlanner, FP16PrefillSchemaAndCodecReachWorkspaceAdmission)
+{
+    /** Keep fixture capture settings automatic and restore every authored override. */
+    struct AutomaticPolicy
+    {
+        AttentionConfig original = mutableDebugEnv().attention;
+        /** Select ordinary production geometry for this device-free admission proof. */
+        AutomaticPolicy()
+        {
+            auto &policy = mutableDebugEnv().attention;
+            policy.cuda_fa2_q_warp_groups = policy.cuda_fa2_hd256_pv_warps = policy.cuda_fa2_tile_kv = 0;
+        }
+        /** Restore the immutable process snapshot after the fixture. */
+        ~AutomaticPolicy() { mutableDebugEnv().attention = original; }
+    } automatic;
+    /** A schema fixture whose declared visibility must exclude the native full-context body. */
+    class WindowAttentionSchema final : public Qwen35SchemaFactory
+    {
+    public:
+        /** @return The same real schema with every attention reader explicitly windowed. */
+        GraphSchema createSchema() const override
+        {
+            auto schema = Qwen35SchemaFactory::createSchema();
+            const auto window = [](LayerTemplate &layer) {
+                for (auto &stage : layer.attention_stages)
+                    if (stage.type == StageType::AttentionCompute) stage.window_size = 96;
+            };
+            window(schema.layer_template);
+            for (auto &[name, layer] : schema.named_templates) window(layer);
+            return schema;
+        }
+        /** @return Fixture-local registry identity, never a production model claim. */
+        std::string architectureName() const override { return "unit_attention_admission_window"; }
+    };
+    SchemaFactoryRegistry::registerFactory("unit_attention_admission_window",
+        [] { return std::make_unique<WindowAttentionSchema>(); });
+
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const bool moe : {false, true})
+    for (const bool replicated : {false, true})
+    for (const bool windowed_schema : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << device.toString() << " MoE=" << moe
+            << " replicated=" << replicated << " windowed_schema=" << windowed_schema);
+        auto profile = moe ? createMoEOverlayProfile() : createTestProfile();
+        profile.architecture = windowed_schema ? "unit_attention_admission_window" : (moe ? "qwen35moe" : "qwen35");
+        profile.n_layers = 2;
+        profile.n_heads = moe ? 16 : 24;
+        profile.n_kv_heads = moe ? 2 : 4;
+        profile.head_dim = 256;
+        profile.max_seq_len = 8193;
+        // The fixture prices metadata declarations, not prepared projection weights.
+        profile.tensors.clear();
+        profile.total_native_bytes = 0;
+        auto config = overlayDeviceConfig(device);
+        config.owns_embedding = false;
+        config.activation_seq_len = 4096;
+        config.max_seq_len = profile.max_seq_len;
+        config.total_shards = 2;
+        config.shard_index = 1;
+        config.local_kv_heads = replicated ? profile.n_kv_heads : profile.n_kv_heads / 2;
+        const WorkspaceMemoryGeometry native{
+            .device = device, .device_compute_units = config.device_compute_units,
+            .batch_size = 1, .resident_graph_rows = 4096, .max_context_rows = profile.max_seq_len,
+            .shard_index = 1, .local_d_ff = profile.d_ff / 2,
+            .local_query_head_start = profile.n_heads / 2, .local_query_heads = profile.n_heads / 2,
+            .local_kv_head_start = config.local_kv_heads, .local_kv_heads = config.local_kv_heads,
+            .first_layer = 0, .last_layer = 1, .total_shards = 2,
+            .attention_kv_format = TensorType::FP16,
+            .attention_visibility = windowed_schema ? attention::AttentionVisibilityPolicy::General
+                : attention::AttentionVisibilityPolicy::CausalFullContext};
+        const auto planned = MemoryPlanner::plan(profile, {config});
+        ASSERT_EQ(planned.devices.size(), 1u);
+        const size_t expected = WorkspaceMemoryEstimator::estimate(profile, native);
+        EXPECT_EQ(planned.devices.front().workspace_bytes(), expected);
+        auto missing_format = native;
+        missing_format.attention_kv_format = TensorType::FP32;
+        auto missing_visibility = native;
+        missing_visibility.attention_visibility = attention::AttentionVisibilityPolicy::General;
+        if (!windowed_schema)
+        {
+            EXPECT_NE(expected, WorkspaceMemoryEstimator::estimate(profile, missing_format));
+            EXPECT_NE(expected, WorkspaceMemoryEstimator::estimate(profile, missing_visibility));
+        }
+        else
+        {
+            auto invented_causal = native;
+            invented_causal.attention_visibility = attention::AttentionVisibilityPolicy::CausalFullContext;
+            EXPECT_NE(expected, WorkspaceMemoryEstimator::estimate(profile, invented_causal));
+        }
+    }
+}
+
+/** @test FP16 codec spelling is strict before it can select native prefill admission. */
+TEST(Test__MemoryPlanner, AttentionOperandCodecClassificationIsStrict)
+{
+    for (const auto *name : {"FP16", "fp16", "fP16"})
+        EXPECT_EQ(KVCacheMemoryEstimator::attentionExecutionFormat(name), TensorType::FP16) << name;
+    EXPECT_THROW(KVCacheMemoryEstimator::attentionExecutionFormat("fp16-extra"), std::invalid_argument);
+    EXPECT_THROW(KVCacheMemoryEstimator::attentionExecutionFormat(""), std::invalid_argument);
 }

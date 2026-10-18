@@ -14,7 +14,8 @@
  *
  *   1. Reuse router-owned Q8 rows, or quantize each original hidden row once.
  *   2. Build a packed expert/tile directory entirely on the device.
- *   3. Decode each gate/up weight block once for a trained 4/8/12/16-row tile
+ *   3. Decode each gate/up weight block once, resolving exact Q6 source factors
+ *      (other formats retain prepared metadata), for a trained 4/8/12/16-row tile
  *      while retaining serial M=1 partition boundaries and reduction order.
  *   4. Quantize exact SwiGLU rows for the down projection.
  *   5. Decode each down weight block once per independently trained row tile
@@ -87,6 +88,7 @@ __device__ __forceinline__ void moe_prefill_fail_fast_invalid_grouped_index()
 // NativeVNNIFormat enum (must match ROCmGemvKernel_native_VNNI.hip)
 enum NativeVNNIFormatPrefill : uint8_t {
     NVNNI_PF_Q4_0    = 0,
+    NVNNI_PF_IQ4_XS_SOURCE = llaminar2::kNativeVnniIQ4XSSourceScaleCodebook,
     NVNNI_PF_IQ4_NL  = 4,
     NVNNI_PF_Q4_1    = 5,
     NVNNI_PF_Q5_0    = 6,
@@ -177,7 +179,9 @@ struct PrefillNVNNITraits {
     static constexpr bool is_2bit = (FMT == NVNNI_PF_Q2_K);
     static constexpr bool is_8bit =
         FMT == NVNNI_PF_Q8_0 || FMT == NVNNI_PF_EXPANDED_INT8_MIN;
-    static constexpr bool uses_lut = (FMT == NVNNI_PF_IQ4_NL);
+    static constexpr bool requires_secondary_metadata =
+        is_asymmetric || is_dual_scale || FMT == NVNNI_PF_IQ3_S || FMT == NVNNI_PF_IQ4_XS_SOURCE;
+    static constexpr bool uses_lut = (FMT == NVNNI_PF_IQ4_NL || FMT == NVNNI_PF_IQ4_XS_SOURCE);
     static constexpr int payload_bytes =
         is_8bit ? 32 :
         is_iq1_grid ? 6 :
@@ -200,8 +204,9 @@ __device__ __forceinline__ bool prefill_native_vnni_desc_shape_ok(
            desc.n == N &&
            desc.k == K &&
            desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
-           desc.codebook_id == static_cast<uint8_t>(FMT) &&
-           (!(Traits::is_asymmetric || Traits::is_dual_scale) || desc.mins) &&
+           (desc.codebook_id == static_cast<uint8_t>(FMT) ||
+            (FMT == NVNNI_PF_IQ4_XS_SOURCE && desc.codebook_id == NVNNI_PF_IQ4_NL)) &&
+           (!(Traits::requires_secondary_metadata && desc.codebook_id != NVNNI_PF_IQ4_NL) || desc.mins) &&
            (!Traits::is_dual_scale_asym || desc.emins);
 }
 
@@ -565,7 +570,7 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
             packed_groups[g + 4] = static_cast<int32_t>(val_hi);
         }
     }
-    else if constexpr (FMT == NVNNI_PF_IQ4_NL) {
+    else if constexpr (FMT == NVNNI_PF_IQ4_NL || FMT == NVNNI_PF_IQ4_XS_SOURCE) {
         /*
          * IQ4_NL / IQ4_XS verifier prefill must follow the same v_perm decode
          * expression as the M=1 MoE row-decode helper.  The removed pair-LUT
@@ -670,12 +675,10 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         for (int g = 4; g < 8; ++g)
             acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
 
-        const uint16_t scale_lo_bits = scale_base[linear];
-        const uint16_t scale_hi_bits = min_base[linear];
-        const float scale_lo =
-            __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
-        const float scale_hi =
-            __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
+        const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
+            scale_base[linear], min_base[linear]);
+        const float scale_lo = weight_scales.low;
+        const float scale_hi = weight_scales.high;
         if constexpr (Traits::is_dual_scale_asym)
         {
             constexpr int32_t ones = 0x01010101;
@@ -776,8 +779,18 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             dot = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], dot, false);
 
         const uint16_t scale_bits = scale_base[linear];
-        const float block_d =
-            __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+        // Physical24 also admits an IQ4_NL gate/up partner. Resolve the
+        // actual descriptor word meaning independently for each projection.
+        float block_d;
+        if constexpr (FMT == NVNNI_PF_IQ4_XS_SOURCE)
+            block_d = desc.codebook_id == NVNNI_PF_IQ4_XS_SOURCE
+                ? rocm_native_vnni_load_single_weight_scale<NVNNI_PF_IQ4_XS_SOURCE>(
+                      scale_bits, min_base[linear])
+                : rocm_native_vnni_load_single_weight_scale<NVNNI_PF_IQ4_NL>(
+                      scale_bits, uint16_t{0});
+        else
+            block_d = rocm_native_vnni_load_single_weight_scale<FMT>(scale_bits,
+                FMT == NVNNI_PF_IQ3_S ? min_base[linear] : uint16_t{0});
         if constexpr (Traits::is_asymmetric)
         {
             constexpr int32_t ones = 0x01010101;
@@ -952,8 +965,8 @@ struct MoEPrefillDualScaleBlockTerms
 {
     int32_t low_dot = 0;       ///< INT32 dot for K elements 0..15.
     int32_t high_dot = 0;      ///< INT32 dot for K elements 16..31.
-    float low_scale = 0.0f;    ///< FP16-derived low-half weight scale.
-    float high_scale = 0.0f;   ///< FP16-derived high-half weight scale.
+    float low_scale = 0.0f;    ///< Source-resolved low-half FP32 weight scale.
+    float high_scale = 0.0f;   ///< Source-resolved high-half FP32 weight scale.
     float activation_scale = 0.0f; ///< Blockwise activation scale.
 };
 
@@ -1024,12 +1037,10 @@ moe_prefill_prepare_dual_scale_block_terms(
         static_cast<const uint16_t*>(desc.scales);
     const uint16_t* high_scales =
         static_cast<const uint16_t*>(desc.mins);
-    const uint16_t low_bits = low_scales[linear];
-    const uint16_t high_bits = high_scales[linear];
-    terms.low_scale =
-        __half2float(*reinterpret_cast<const __half*>(&low_bits));
-    terms.high_scale =
-        __half2float(*reinterpret_cast<const __half*>(&high_bits));
+    const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
+        low_scales[linear], high_scales[linear]);
+    terms.low_scale = weight_scales.low;
+    terms.high_scale = weight_scales.high;
     terms.activation_scale = slot_scales[block_index];
     return terms;
 }
@@ -2415,6 +2426,9 @@ __device__ __forceinline__ float moe_prefill_dot_desc_serial_m1_dispatch(
     case NVNNI_PF_IQ4_NL:
         return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ4_NL>(
             desc, n, slot_A, slot_scales, N, k_partitions);
+    case NVNNI_PF_IQ4_XS_SOURCE:
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ4_XS_SOURCE>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_Q4_1:
         return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q4_1>(
             desc, n, slot_A, slot_scales, N, k_partitions);
@@ -2790,9 +2804,23 @@ namespace
         return columns == 64 || columns == 128 || columns == 256;
     }
 
+    /**
+     * @brief Select one LUT-family producer while preserving descriptor identities.
+     * @param mask Actual physical formats present in a descriptor table.
+     * @return The same mask except that24 owns both IQ4 LUT members when present.
+     * @details Each24 specialization resolves scale words using the actual
+     * descriptor, so mixed4/24 and24/4 use the same integer projection family.
+     */
+    uint32_t moe_prefill_launch_mask(uint32_t mask)
+    {
+        const uint32_t tuple = uint32_t{1} << NVNNI_PF_IQ4_XS_SOURCE;
+        return mask & tuple ? mask & ~(uint32_t{1} << NVNNI_PF_IQ4_NL) : mask;
+    }
+
     /** Return the sole execution codebook in a descriptor mask, if any. */
     int moe_prefill_single_codebook(uint32_t codebook_mask)
     {
+        codebook_mask = moe_prefill_launch_mask(codebook_mask);
         if (codebook_mask == 0 ||
             (codebook_mask & (codebook_mask - 1u)) != 0u)
         {
@@ -2902,6 +2930,7 @@ namespace
         // 19 policy until a dedicated synthetic-format corpus is certified;
         // execution and telemetry retain codebook 23.
         const uint8_t policy_codebook =
+            format == NVNNI_PF_IQ4_XS_SOURCE ? static_cast<uint8_t>(NVNNI_PF_IQ4_NL) :
             format == NVNNI_PF_EXPANDED_INT8_MIN
                 ? static_cast<uint8_t>(NVNNI_PF_Q8_0)
                 : static_cast<uint8_t>(format);
@@ -2959,7 +2988,8 @@ namespace
             exact{};
         const auto policy_codebook = [](int codebook)
         {
-            return codebook == NVNNI_PF_EXPANDED_INT8_MIN
+            return codebook == NVNNI_PF_IQ4_XS_SOURCE ? static_cast<uint8_t>(NVNNI_PF_IQ4_NL) :
+                   codebook == NVNNI_PF_EXPANDED_INT8_MIN
                        ? static_cast<uint8_t>(NVNNI_PF_Q8_0)
                        : static_cast<uint8_t>(codebook);
         };
@@ -3405,6 +3435,7 @@ bool rocmMoE_grouped_prefill_query_kernel_resources(
     {
     case NVNNI_PF_Q4_0: QUERY_TILE_M(NVNNI_PF_Q4_0);
     case NVNNI_PF_IQ4_NL: QUERY_TILE_M(NVNNI_PF_IQ4_NL);
+    case NVNNI_PF_IQ4_XS_SOURCE: QUERY_TILE_M(NVNNI_PF_IQ4_XS_SOURCE);
     case NVNNI_PF_Q4_1: QUERY_TILE_M(NVNNI_PF_Q4_1);
     case NVNNI_PF_Q5_0: QUERY_TILE_M(NVNNI_PF_Q5_0);
     case NVNNI_PF_Q5_1: QUERY_TILE_M(NVNNI_PF_Q5_1);
@@ -3869,7 +3900,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         bool launched_gateup = false;
         #define LAUNCH_GATEUP_IF_PRESENT(FMT) \
             do { \
-                if (gateup_codebook_mask & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
+                if (moe_prefill_launch_mask(gateup_codebook_mask) & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
                     if (use_route_owned) { \
                         LAUNCH_GATEUP_ROUTE_OWNED(FMT); \
                     } \
@@ -3889,6 +3920,7 @@ bool rocmMoE_grouped_prefill_pipeline(
 
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q4_0);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ4_NL);
+        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ4_XS_SOURCE);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q4_1);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q5_0);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q5_1);
@@ -3983,10 +4015,11 @@ bool rocmMoE_grouped_prefill_pipeline(
                     LAUNCH_ROUTE_OWNED_DOWN(static_cast<int>(FMT)); \
                     break
 
-            switch (down_codebook_mask)
+            switch (moe_prefill_launch_mask(down_codebook_mask))
             {
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q4_0);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ4_NL);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ4_XS_SOURCE);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q4_1);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q5_0);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q5_1);
@@ -4101,7 +4134,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                 } while (0)
             #define LAUNCH_DOWN_IF_PRESENT(FMT) \
                 do { \
-                    if (down_codebook_mask & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
+                    if (moe_prefill_launch_mask(down_codebook_mask) & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
                         const MoEPrefillTileConfig candidate = has_uniform_codebook_pair \
                             ? pair_config.down \
                             : moe_prefill_select_tile_config( \
@@ -4116,6 +4149,7 @@ bool rocmMoE_grouped_prefill_pipeline(
 
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_0);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ4_NL);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ4_XS_SOURCE);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_1);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_0);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_1);

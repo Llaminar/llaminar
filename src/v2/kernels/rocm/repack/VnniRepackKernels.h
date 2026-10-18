@@ -10,8 +10,9 @@
  *
  * The VNNI layout interleaves blocks by output feature (N dimension):
  *   payload[b * N + n]  — 16 bytes of repacked nibbles
- *   scales[b * N + n]   — FP16 scale per block
- *   mins[b * N + n]     — FP16 min per block (asymmetric only)
+ *   scales[b * N + n]   — Q6/IQ2_S/IQ4_XS original half d, otherwise FP16 scale
+ *   mins[b * N + n]     — Q6 signed pair, IQ2_S raw nibble byte, IQ4_XS encoded6;
+ *                        otherwise format-specific auxiliary metadata
  *
  * Where b = block index within a row, n = output feature index.
  */
@@ -33,8 +34,11 @@ namespace llaminar2 {
  * @param format       Quantization format of the raw blocks
  * @param d_raw_blocks Raw GGUF block data on device (uploaded as-is from host)
  * @param d_payload    Output VNNI payload [blocks_per_row * N * payload_bytes]
- * @param d_scales     Output VNNI scales [blocks_per_row * N] (FP16 as uint16_t)
- * @param d_mins       Output VNNI mins [blocks_per_row * N] (FP16), nullptr for symmetric
+ * @param d_scales     Output metadata [blocks_per_row * N]: original half d for
+ *                     Q6/IQ2_S/IQ4_XS, otherwise ordinary binary16 scales
+ * @param d_mins       Raw Q6 signed pair, IQ2_S nibble byte, IQ4_XS encoded6, or
+ *                     format-specific half auxiliary; never half-convert source words;
+ *                     nullptr only when the selected format has no secondary metadata
  * @param N            Number of output features (rows in weight matrix)
  * @param K            Number of input features (columns in weight matrix)
  * @param output_N     Row stride of the complete packed destination

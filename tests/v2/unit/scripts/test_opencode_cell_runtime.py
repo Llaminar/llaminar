@@ -305,6 +305,57 @@ class CellLifetimeTests(unittest.TestCase):
         self.assertTrue(result['owned_containers']['passed'])
         self.assertTrue(all(not state['Running'] for state in self.containers.values()))
 
+    def test_shutdown_flush_can_outlive_administrative_command_timeout(self):
+        """A successful RAM-to-disk flush may take longer than daemon administration."""
+        waits = []
+
+        def wait_for_flush(args, **kwargs):
+            """Model a 45-second flush without sleeping or starting a native server."""
+            if args[:2] == ['docker', 'wait'] and not args[-1].endswith('-resources'):
+                timeout = kwargs.get('timeout', 30)
+                waits.append(timeout)
+                if timeout is not None and timeout < 45:
+                    raise subprocess.TimeoutExpired(args, timeout)
+            return self.command(args, **kwargs)
+
+        with patch.object(runtime, 'command', side_effect=wait_for_flush):
+            result = runtime.run_app(self.cell)
+        self.assertTrue(result['passed'], result['errors'])
+        self.assertEqual(waits, [None])
+        self.assertTrue(result['normal_shutdown'])
+        self.assertTrue(result['native_retired'] and result['observer_retired'])
+
+    def test_cancelled_shutdown_retires_writers_before_reraising(self):
+        """Cancellation during a long flush still closes every native owner and observer."""
+        interrupted = KeyboardInterrupt('cancel during shutdown flush')
+
+        def acknowledge_flush(request, **kwargs):
+            """Acknowledge shutdown while the native writer remains live."""
+            response = self.shutdown(request, **kwargs)
+            for name, state in self.containers.items():
+                if not name.endswith('-resources'):
+                    state.update(Running=True, Pid=123, Status='running')
+            return response
+
+        def cancel_wait(args, **kwargs):
+            """Interrupt only the serving process's first normal retirement wait."""
+            if args[:2] == ['docker', 'wait'] and not args[-1].endswith('-resources'):
+                raise interrupted
+            return self.command(args, **kwargs)
+
+        with patch.object(runtime, 'urlopen', side_effect=acknowledge_flush), \
+             patch.object(runtime, 'command', side_effect=cancel_wait), \
+             self.assertRaises(KeyboardInterrupt) as caught:
+            runtime.run_app(self.cell)
+        self.assertIs(caught.exception, interrupted)
+        result = json.loads((self.output / 'controller.json').read_text())
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['passed'])
+        self.assertTrue(result['owned_containers']['passed'])
+        self.assertTrue(result['native_retired'] and result['observer_retired'])
+        self.assertTrue(all(not state['Running'] for state in self.containers.values()))
+        self.assertTrue(any('finish' in event for event in self.events))
+
     def test_failed_admission_owner_prevents_any_successor(self):
         self.admission_error = ValueError('admission failed')
         self.stop_error = OSError('daemon did not retire probe')

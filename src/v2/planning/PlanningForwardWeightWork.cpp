@@ -8,6 +8,7 @@
  * residency: the routing/capacity authority determines whether work is issued.
  * No inferred transfer path, physical allocation or execution timing lives here.
  */
+#include "utils/DebugEnv.h"
 #include "planning/PlanningForwardWeightWork.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
@@ -290,8 +291,10 @@ namespace llaminar2
                     return resolver.resolve(tensor, expert_instances);
                 }();
                 return PlanningWeightOperand{tensor.name, role, tensor.layer_index, tensor.quant_type,
-                    PreparedWeightRepresentationContract::resolve(role, tensor.quant_type),
-                    std::move(geometry)};
+                    PreparedWeightRepresentationContract::resolve(role, tensor.quant_type, tensor.name, profile.architecture,
+                        debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic),
+                    std::move(geometry), PreparedWeightRepresentationContract::operandPrecision(
+                        role, tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic)};
             };
             for (const auto &tensor : profile.tensors)
             {

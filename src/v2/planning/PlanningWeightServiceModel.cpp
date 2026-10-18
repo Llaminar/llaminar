@@ -8,6 +8,7 @@
  * shape explicitly; no vendor peak table, inferred topology, synthetic speed
  * bonus, live placement state or parallel physical-memory ledger is introduced.
  */
+#include "utils/DebugEnv.h"
 #include "PlanningWeightServiceModel.h"
 #include "AutomaticPlanningStartup.h"
 #include "tensors/NativeVnniFormatInfo.h"
@@ -65,7 +66,7 @@ namespace llaminar2
     {
         const auto &profile = model.memoryProfile();
         using Shape = std::pair<size_t, size_t>;
-        std::map<std::string, std::map<Shape, Representative>> ordinary;
+        std::map<std::pair<std::string, FloatingActivationOperandPrecision>, std::map<Shape, Representative>> ordinary;
         std::map<int, std::array<const TensorSizeInfo *, 3>> layers;
         for (const auto &tensor : profile.tensors)
         {
@@ -87,9 +88,13 @@ namespace llaminar2
             {
                 if (!tensor.K || !tensor.elements || tensor.elements % tensor.K)
                     throw std::invalid_argument("Planning projection source has no matrix geometry");
-                const auto execution_format = PreparedWeightRepresentationContract::resolve(role, tensor.quant_type) ==
-                    ModelPreparedWeightRepresentation::FP32 ? std::string("F32") : tensor.quant_type;
-                auto &entry = ordinary[execution_format][{tensor.elements / tensor.K, tensor.K}];
+                const auto representation = PreparedWeightRepresentationContract::resolve(role, tensor.quant_type,
+                    tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
+                const auto execution_format = representation == ModelPreparedWeightRepresentation::FP32 ? std::string("F32") :
+                    representation == ModelPreparedWeightRepresentation::FP16 ? std::string("F16") : tensor.quant_type;
+                const auto operand = PreparedWeightRepresentationContract::operandPrecision(role, tensor.name,
+                    profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
+                auto &entry = ordinary[{execution_format, operand}][{tensor.elements / tensor.K, tensor.K}];
                 ++entry.count;
                 if (!entry.source || tensor.name < entry.source->name) entry.source = &tensor;
             }
@@ -197,13 +202,13 @@ namespace llaminar2
     {
         if (!std::holds_alternative<PlanningStreamingServicePlan>(memory_.source()) || kernels_.empty())
             throw std::invalid_argument("Weight service needs independent streaming and kernel catalogs");
-        std::set<std::string> ordinary;
+        std::set<std::pair<std::string, FloatingActivationOperandPrecision>> ordinary;
         std::set<std::array<std::string, 3>> experts;
         for (const auto &kernel : kernels_)
         {
             if (const auto *plan = std::get_if<PlanningProjectionServicePlan>(&kernel.source()))
             {
-                if (plan->prefillRows() <= 1 || !ordinary.insert(plan->matrix().executionFormat()).second)
+                if (plan->prefillRows() <= 1 || !ordinary.insert({plan->matrix().executionFormat(), plan->matrix().operandPrecision()}).second)
                     throw std::invalid_argument("Missing grouped rows or duplicate projection format evidence");
             }
             else if (const auto *plan = std::get_if<PlanningExpertSamplePlan>(&kernel.source()))
@@ -243,11 +248,13 @@ namespace llaminar2
         }
     }
 
-    const PlanningKernelServiceCatalog &PlanningWeightServiceModel::projection(std::string_view format) const
+    const PlanningKernelServiceCatalog &PlanningWeightServiceModel::projection(std::string_view format,
+        FloatingActivationOperandPrecision operand_precision) const
     {
         for (const auto &kernel : kernels_)
             if (const auto *plan = std::get_if<PlanningProjectionServicePlan>(&kernel.source());
-                plan && plan->matrix().executionFormat() == format) return kernel;
+                plan && plan->matrix().executionFormat() == format &&
+                plan->matrix().operandPrecision() == operand_precision) return kernel;
         throw std::invalid_argument("No observed ordinary projection service for execution format " + std::string(format));
     }
 
@@ -271,7 +278,7 @@ namespace llaminar2
         const auto &shape = weight.geometry.matrix();
         if (!rows || !shape || shape->instances != 1 || !shape->rows || !shape->columns)
             throw std::invalid_argument("Projection service requires a positive single-matrix invocation");
-        const auto &catalog = projection(weight.executionFormat());
+        const auto &catalog = projection(weight.executionFormat(), weight.operand_precision);
         const auto &plan = std::get<PlanningProjectionServicePlan>(catalog.source());
         const auto &observed = std::get<PlanningProjectionObservations>(catalog.serviceFor(rank, device).observation);
         const auto &decode = observed.phases.at(0);

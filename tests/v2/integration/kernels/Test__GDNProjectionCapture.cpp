@@ -27,8 +27,10 @@ namespace
      * @brief Run one backend's complete retained-family regression.
      * @param device Physical device owning every prepared engine and stream.
      * @param all_formats Select the shared registry or full/sharded model shapes.
+     * @param control_precision Immutable alpha/beta operand policy.
      */
-    void exercise(DeviceId device, bool all_formats)
+    void exercise(DeviceId device, bool all_formats,
+        FloatingActivationOperandPrecision control_precision = FloatingActivationOperandPrecision::Native)
     {
         DeviceManager::instance().initialize(-1);
         ScopedGPUStream selection(device);
@@ -76,7 +78,7 @@ namespace
                 const auto &other = format.device_execution_codebook_id ==
                     q5.device_execution_codebook_id ? iq4 : q5;
                 ASSERT_NO_FATAL_FAILURE(runGDNProjectionCaptureCase(device,
-                    *context, factory, format, other, 512, {384, 256, 12, 12}, rows));
+                    *context, factory, format, other, 512, {384, 256, 12, 12}, rows, control_precision));
             }
         }
         else
@@ -88,7 +90,16 @@ namespace
             for (int degree : {1, 2})
                 ASSERT_NO_FATAL_FAILURE(runGDNProjectionCaptureCase(device,
                     *context, factory, q5, iq4, 5120,
-                    {10240 / degree, 6144 / degree, 48 / degree, 48 / degree}, rows));
+                    {10240 / degree, 6144 / degree, 48 / degree, 48 / degree}, rows, control_precision));
+            if (control_precision == FloatingActivationOperandPrecision::FP16RNE)
+            {
+                const auto &q6 = *std::find_if(formats.begin(), formats.end(),
+                    [](const auto &format) { return format.tensor_type == TensorType::Q6_K; });
+                for (int degree : {1, 2, 4, 8})
+                    ASSERT_NO_FATAL_FAILURE(runGDNProjectionCaptureCase(device,
+                        *context, factory, q6, q6, 2048,
+                        {8192 / degree, 4096 / degree, 32 / degree, 32 / degree}, rows, control_precision));
+            }
         }
     }
 }
@@ -96,9 +107,17 @@ namespace
 #ifdef LLAMINAR_GDN_CAPTURE_CUDA
 TEST(GDNMixedProjectionCapture, CUDAProductionShapes) { exercise(DeviceId::cuda(0), false); }
 TEST(GDNMixedProjectionCapture, CUDAAllFormats) { exercise(DeviceId::cuda(0), true); }
+TEST(GDNMixedProjectionCapture, CUDAHalfAlphaBetaProductionShapes)
+{ exercise(DeviceId::cuda(0), false, FloatingActivationOperandPrecision::FP16RNE); }
+TEST(GDNMixedProjectionCapture, CUDAHalfAlphaBetaAllFormats)
+{ exercise(DeviceId::cuda(0), true, FloatingActivationOperandPrecision::FP16RNE); }
 #else
 TEST(GDNMixedProjectionCapture, ROCmProductionShapes) { exercise(DeviceId::rocm(0), false); }
 TEST(GDNMixedProjectionCapture, ROCmAllFormats) { exercise(DeviceId::rocm(0), true); }
+TEST(GDNMixedProjectionCapture, ROCmHalfAlphaBetaProductionShapes)
+{ exercise(DeviceId::rocm(0), false, FloatingActivationOperandPrecision::FP16RNE); }
+TEST(GDNMixedProjectionCapture, ROCmHalfAlphaBetaAllFormats)
+{ exercise(DeviceId::rocm(0), true, FloatingActivationOperandPrecision::FP16RNE); }
 #endif
 
 /** @brief Initialize the process and route counters before native graph tests. */

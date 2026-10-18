@@ -260,6 +260,43 @@ namespace llaminar2
             return true;
         }
 
+        bool HipBLASGemmKernel::executeFP16AccumulateFP32OnStream(
+            ExplicitGPUStream stream,
+            const void *d_A, const void *d_B, float *d_C,
+            int M, int N, int K,
+            float alpha, float beta)
+        {
+            if (!d_A || !d_B || !d_C || M <= 0 || N <= 0 || K <= 0)
+                throw std::invalid_argument("Half-operand compute32 GEMM requires positive device geometry");
+            const auto submission = device_ctx_->acquireBlasSubmission();
+            const auto handle = static_cast<hipblasHandle_t>(submission.handle());
+            if (!handle)
+                throw std::runtime_error("Half-operand compute32 GEMM has no context-owned handle");
+            if (static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.ordinal)) != hipSuccess)
+                return false;
+            HIPBLAS_CHECK(hipblasSetStream(handle, static_cast<hipStream_t>(stream.get())));
+            if (!bindMatmulWorkspace(handle, workspace_))
+                return false;
+
+            // Context initialization requests non-atomic algorithms. Validate
+            // the actual borrowed handle under the same submission lock rather
+            // than accepting the legacy initialization warning as proof.
+            hipblasAtomicsMode_t atomics_mode = HIPBLAS_ATOMICS_ALLOWED;
+            HIPBLAS_CHECK(hipblasGetAtomicsMode(handle, &atomics_mode));
+            if (atomics_mode != HIPBLAS_ATOMICS_NOT_ALLOWED)
+                throw std::runtime_error("Half-operand compute32 requires a non-atomic context handle");
+
+            // Row-major C=A*B^T is column-major C^T=B*A^T. Both physical
+            // operands are half; alpha/beta, accumulation and output stay FP32.
+            HIPBLAS_CHECK(hipblasGemmEx(handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                N, M, K, &alpha,
+                d_B, HIP_R_16F, K,
+                d_A, HIP_R_16F, K,
+                &beta, d_C, HIP_R_32F, N,
+                HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+            return true;
+        }
+
         bool HipBLASGemmKernel::execute_batched(
             const float *const *d_A_array,
             const float *const *d_B_array,

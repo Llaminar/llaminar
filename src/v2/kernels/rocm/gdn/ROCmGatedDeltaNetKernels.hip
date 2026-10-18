@@ -3,7 +3,7 @@
  * @brief HIP kernels for Gated Delta Net (GDN) recurrence and short convolution
  *
  * ROCm/HIP port of the CUDA GDN kernels. Implements:
- * - Delta rule recurrence (decode + prefill)
+ * - Delta rule recurrence (decode + prefill), with Q/K epsilon inside squared norm
  * - Short causal conv1d + SiLU
  * - Gated RMSNorm
  * - Attention output gate (sigmoid)
@@ -269,7 +269,7 @@ void rocm_gdn_recurrent_step_kernel(
             }
             __syncthreads();
             const float q_inv =
-                scale / fmaxf(sqrtf(wave_sums[0]), 1e-6f);
+                scale / sqrtf(wave_sums[0] + 1e-6f);
             for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
                 q_local[i] *= q_inv;
             __syncthreads();
@@ -291,7 +291,7 @@ void rocm_gdn_recurrent_step_kernel(
             }
             __syncthreads();
             const float k_inv =
-                1.0f / fmaxf(sqrtf(wave_sums[0]), 1e-6f);
+                1.0f / sqrtf(wave_sums[0] + 1e-6f);
             for (int i = tid; i < D_K; i += kGdnRecurrentThreads)
                 k_local[i] *= k_inv;
             __syncthreads();
@@ -765,9 +765,9 @@ void rocm_gdn_chunk_forward_kernel(
                     k_total += 0.0f;
                     k_total += 0.0f;
                     gate_beta[request_seq_len + t] =
-                        scale / fmaxf(sqrtf(q_total), 1e-6f);
+                        scale / sqrtf(q_total + 1e-6f);
                     gate_beta[2 * request_seq_len + t] =
-                        1.0f / fmaxf(sqrtf(k_total), 1e-6f);
+                        1.0f / sqrtf(k_total + 1e-6f);
                 }
             }
         }
@@ -986,9 +986,9 @@ void rocm_gdn_chunk_forward_kernel(
                 __syncthreads();
 
                 const float q_inv =
-                    scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+                    scale / sqrtf(warp_sums[0] + 1e-6f);
                 const float k_inv =
-                    1.0f / fmaxf(sqrtf(warp_sums[8]), 1e-6f);
+                    1.0f / sqrtf(warp_sums[8] + 1e-6f);
                 for (int i = tid; i < kernel_d_k; i += kernel_block_size)
                 {
                     q_local[i] *= q_inv;
