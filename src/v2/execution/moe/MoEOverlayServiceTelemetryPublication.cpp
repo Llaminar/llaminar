@@ -1,12 +1,17 @@
 /**
  * @file MoEOverlayServiceTelemetryPublication.cpp
  * @brief Seqlock acquisition for mapped GPU service telemetry.
+ *
+ * Every publication binds one immutable model-global interval. Compact rows
+ * are decoded only after that identity and the complete seqlock are validated;
+ * equal-sized stages cannot import each other's economy measurements.
  */
 
 #include "MoEOverlayServiceTelemetryPublication.h"
 
 #include <atomic>
 #include <cstddef>
+#include <limits>
 
 namespace llaminar2
 {
@@ -24,6 +29,7 @@ namespace llaminar2
     bool trySnapshotMoEOverlayServiceTelemetryPublication(
         MoEOverlayDeviceServiceTelemetryPublicationHeader *publication,
         int expected_participant_id,
+        int expected_first_model_layer,
         std::uint32_t expected_layer_count,
         std::vector<MoEOverlayParticipantLayerServiceTotals> *output,
         std::uint64_t *generation) noexcept
@@ -42,7 +48,9 @@ namespace llaminar2
         try
         {
             if (!publication || expected_participant_id < 0 ||
-                expected_layer_count == 0u)
+                expected_first_model_layer < 0 || expected_layer_count == 0u ||
+                expected_layer_count > static_cast<std::uint32_t>(
+                    std::numeric_limits<int>::max() - expected_first_model_layer))
             {
                 return false;
             }
@@ -55,6 +63,7 @@ namespace llaminar2
                 publication->version !=
                     kDeviceMoEOverlayServiceTelemetryVersion ||
                 publication->participant_id != expected_participant_id ||
+                publication->first_model_layer != expected_first_model_layer ||
                 publication->layer_count != expected_layer_count ||
                 publication->phase_count !=
                     kDeviceMoEOverlayServicePhaseCount ||
@@ -74,7 +83,7 @@ namespace llaminar2
             {
                 auto &row = (*output)[layer];
                 row.participant_id = expected_participant_id;
-                row.layer = static_cast<int>(layer);
+                row.layer = expected_first_model_layer + static_cast<int>(layer);
                 for (std::size_t phase = 0u;
                      phase < kDeviceMoEOverlayServicePhaseCount;
                      ++phase)

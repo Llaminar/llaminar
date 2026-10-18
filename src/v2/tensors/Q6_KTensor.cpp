@@ -8,6 +8,7 @@
 #include "FP16Utils.h"
 
 #include "VnniPackContext.h"
+#include "NativeVnniQ6Scale.h"
 #include "../kernels/KernelFactory.h"
 #include "SIMDHelpers.h"
 #include "../utils/DebugEnv.h"
@@ -666,12 +667,14 @@ namespace llaminar2
 
         std::memcpy(vnniPayloadDst(ctx, linear), payload, 24);
 
-        const float d = fp16_to_fp32(blk->d);
         const int8_t *sc = blk->scales;
         const int sc_lo_idx = half * 8 + sub_in_half * 2;
         const int sc_hi_idx = sc_lo_idx + 1;
-        ctx.scales_array[linear] = fp32_to_fp16(d * static_cast<float>(sc[sc_lo_idx]));
-        ctx.mins_array[linear] = fp32_to_fp16(d * static_cast<float>(sc[sc_hi_idx]));
+        // Keep the original factors, not rounded half products. Both metadata
+        // planes retain their existing byte extent across CPU/GPU migration.
+        ctx.scales_array[linear] = blk->d;
+        ctx.mins_array[linear] = native_vnni_q6_scale::pack(
+            sc[sc_lo_idx], sc[sc_hi_idx]);
     }
 
 } // namespace llaminar2

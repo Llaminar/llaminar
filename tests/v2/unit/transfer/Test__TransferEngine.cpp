@@ -1048,10 +1048,22 @@ TEST_F(Test__TransferEngine_Execute, TransferActivation_HostResident_SkipsTransf
     auto tensor = TestTensorFactory::createFP32Random({2, 2});
     tensor->setHostResident();
 
-    // transferActivation should NOOP for HOST_RESIDENT
-    auto result = engine.transferActivation(tensor.get(), DeviceId::cuda(1));
-    EXPECT_TRUE(result.success);
-    EXPECT_EQ(result.method_used, TransferMethod::NOOP);
+    // Every destination must preserve the original host owner. A backend
+    // resolver cannot authorize storage creation for a no-transfer policy.
+    const auto *host = tensor->data();
+    const auto original_device = tensor->current_device();
+    for (const auto target : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::cuda(1),
+                              DeviceId::rocm(0), DeviceId::rocm(1)})
+    {
+        SCOPED_TRACE(target.toString());
+        auto result = engine.transferActivation(tensor.get(), target);
+        EXPECT_TRUE(result.success) << result.error;
+        EXPECT_EQ(result.method_used, TransferMethod::NOOP);
+        EXPECT_EQ(tensor->data(), host);
+        EXPECT_EQ(tensor->current_device(), original_device);
+        EXPECT_EQ(tensor->gpu_data_ptr(), nullptr);
+        EXPECT_TRUE(tensor->hostValid());
+    }
 
     // Zero backend interaction
     auto stats = mock_backend_->getTransferStats();

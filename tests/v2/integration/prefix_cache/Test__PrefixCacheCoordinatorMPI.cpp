@@ -84,6 +84,28 @@ TEST(Test__PrefixCacheCoordinatorMPI, ReducesCommonPrefixAndTerminalStateAcrossR
     EXPECT_EQ(result.placement_epochs, PrefixPlacementEpochSpan::at(11));
 }
 
+/** @test A non-primary rank's metadata-only MTP/disk section survives one-word reduction. */
+TEST(Test__PrefixCacheCoordinatorMPI, RestoredSectionsAndTiersIncludeEveryRank)
+{
+    ASSERT_GE(mpiWorldSize(), 2);
+    MPIPrefixCollectiveCoordinator coordinator(MPI_COMM_WORLD);
+    for (int owner = 0; owner < mpiWorldSize(); ++owner)
+    {
+        std::vector<PrefixBlockHandle> blocks(1);
+        blocks[0].layout.includes_mtp_state = mpiWorldRank() == owner;
+        blocks[0].has_hybrid_state = mpiWorldRank() != owner;
+        blocks[0].tier = mpiWorldRank() == owner ? PrefixStorageTier::Disk : PrefixStorageTier::Ram;
+        PrefixRestoreMetadata global;
+        ASSERT_TRUE(coordinator.allRestoreMetadata(PrefixRestoreMetadata::fromBlocks(blocks), &global));
+        EXPECT_TRUE(global.hasMTPState());
+        EXPECT_TRUE(global.hasHybridState());
+        EXPECT_STREQ(global.storageTierName(), "mixed");
+        // A later all-rank miss must clear the old observation completely.
+        ASSERT_TRUE(coordinator.allRestoreMetadata({}, &global));
+        EXPECT_EQ(global.wireBits(), 0u);
+    }
+}
+
 TEST(Test__PrefixCacheCoordinatorMPI, ReducesPlacementEpochAcrossRanks)
 {
     if (mpiWorldSize() < 2)
@@ -122,6 +144,8 @@ TEST(Test__PrefixCacheCoordinatorMPI, ReusableCheckpointPolicySurvivesColdNested
         EXPECT_EQ(global.cached_tokens, 0);
         EXPECT_EQ(global.checkpoint_policy, PrefixCheckpointPolicy::ReusableBoundary);
         EXPECT_EQ(global.reusablePrefillCheckpoint(365, 0), 320);
+        EXPECT_EQ(PrefixHarvestSchedule::forPrefill(global, 20416, 0).reusableCheckpoints(),
+                  std::vector<int>({4096, 8192, 16384, 20352}));
     }
 }
 

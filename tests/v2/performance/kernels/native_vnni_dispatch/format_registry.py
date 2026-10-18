@@ -2,7 +2,7 @@
 
 The old ``native_vnni_codebooks.py`` table represented one integer as both the
 source tensor codebook and the runtime dispatch codebook. That is false for the
-raw INT8 family: GPU preparation normalizes Q8_0, Q8_1, and Q8_K to execution
+IQ4_XS family (source4, physical24) and raw INT8 family: GPU preparation normalizes Q8_0, Q8_1, and Q8_K to execution
 codebook 19, while CPU retains source codebooks 19, 20, and 21. Keeping both
 identities here prevents trainer rows from silently selecting a policy the
 production runtime cannot distinguish.
@@ -59,7 +59,7 @@ class NativeVNNIFormatSpec:
 FORMAT_SPECS: tuple[NativeVNNIFormatSpec, ...] = (
     NativeVNNIFormatSpec("Q4_0", 0, 16, False, 0, 0),
     NativeVNNIFormatSpec("IQ4_NL", 4, 16, False, 4, 4),
-    NativeVNNIFormatSpec("IQ4_XS", 4, 16, True, 4, 4),
+    NativeVNNIFormatSpec("IQ4_XS", 4, 16, True, 24, 4),
     NativeVNNIFormatSpec("Q4_1", 5, 16, False, 5, 5, True),
     NativeVNNIFormatSpec("Q4_K", 5, 16, True, 5, 5, True),
     NativeVNNIFormatSpec("Q5_0", 6, 20, False, 6, 6),

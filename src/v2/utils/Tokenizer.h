@@ -5,12 +5,14 @@
  * @date 2025
  *
  * Native tokenizer implementation that reads vocabulary directly from
- * GGUF metadata, avoiding duplicate model loading.
+ * GGUF metadata, avoiding duplicate model loading. The declared Unicode
+ * pre-tokenizer bounds every byte-BPE merge, including whitespace in code.
  */
 
 #pragma once
 
 #include "ChatTemplate.h"
+#include "TextPreTokenizer.h"
 #include <vector>
 #include <string>
 #include <memory>
@@ -218,6 +220,13 @@ namespace llaminar2
         static std::shared_ptr<BPETokenizer> create(std::shared_ptr<ModelContext> model_ctx);
 
         /**
+         * @brief Admit a tokenizer from metadata without loading model tensors.
+         * @param metadata Complete GGUF tokenizer metadata; copied during admission.
+         * @return An initialized tokenizer, or nullptr with an admission diagnostic.
+         */
+        static std::shared_ptr<BPETokenizer> create(const std::map<std::string, GGUFValue>& metadata);
+
+        /**
          * @brief Destructor
          */
         ~BPETokenizer() override = default;
@@ -270,9 +279,11 @@ namespace llaminar2
         BPETokenizer() = default;
 
         /**
-         * @brief Initialize tokenizer from GGUF metadata
+         * @brief Admit the declared byte-BPE policy, vocabulary and control tokens.
+         * @param metadata Model-owned GGUF metadata; no views survive initialization.
+         * @return True if the complete tokenizer contract is supported.
          */
-        bool initializeFromMetadata(std::shared_ptr<ModelContext> model_ctx);
+        bool initializeFromMetadata(const std::map<std::string, GGUFValue>& metadata);
 
         /**
          * @brief Initialize byte encoder/decoder
@@ -280,9 +291,18 @@ namespace llaminar2
         void initializeByteEncoder();
 
         /**
-         * @brief Apply BPE merges to text
+         * @brief Apply BPE merges within one admitted pre-tokenization span.
+         * @param text One UTF-8 span whose bytes may be merged together.
+         * @return Byte-BPE vocabulary IDs in text order.
          */
-        std::vector<int> applyBPE(const std::string &text) const;
+        std::vector<int> applyBPE(std::string_view text) const;
+
+        /**
+         * @brief Split ordinary text at model boundaries before running BPE.
+         * @param text UTF-8 without added/control tokens.
+         * @return Model-exact byte-BPE IDs without crossing any declared boundary.
+         */
+        std::vector<int> encodeOrdinaryText(std::string_view text) const;
 
         /**
          * @brief Byte-level encoding (for handling any UTF-8)
@@ -298,6 +318,7 @@ namespace llaminar2
         std::map<std::pair<int, int>, int> merge_ranks_int_;
         std::vector<int> merge_result_ids_;
         std::vector<int> byte_to_token_id_;
+        std::unique_ptr<TextPreTokenizer> pre_tokenizer_;
 
         std::vector<std::string> byte_encoder_;
         std::unordered_map<std::string, int> byte_decoder_;

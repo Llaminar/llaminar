@@ -5,6 +5,8 @@
  * The factory constructs participant-local full-model or PP-shard graphs.
  * Rank/global orchestrators own multi-device composition and inject contexts;
  * a DeviceGraphOrchestrator cannot own an embedded multi-stage pipeline.
+ * PP expert sources and prepared banks use the same participant-local overlay
+ * plan as the graph. Generic primary-weight preparation never owns those banks.
  * @author David Sanftenberg
  * @date December 2025
  */
@@ -1391,7 +1393,11 @@ namespace llaminar2
         const auto metadata =
             resolveMoERoutedExpertModelMetadataForModel(
                 model_ctx,
-                config.mtp);
+                config.mtp,
+                config.pp_stage_config);
+        if (plan->first_model_layer != metadata.first_model_layer)
+            throw std::invalid_argument(
+                "ExpertOverlay placement plan does not own this runner's pipeline stage");
 
         if (plan->placements.empty())
         {
@@ -1411,16 +1417,19 @@ namespace llaminar2
 
         const int raw_layer_count =
             std::max(model_ctx.totalBlockCount(), model_ctx.blockCount());
+        const int end_model_layer = metadata.first_model_layer + metadata.num_layers;
         const bool has_inactive_trailing_sidecar =
             !retainsMTPGraphCapacity(config.mtp) &&
-            metadata.num_layers < raw_layer_count;
+            (!config.pp_stage_config || config.pp_stage_config->has_lm_head) &&
+            end_model_layer < raw_layer_count;
         bool needs_runtime_view = false;
         for (const auto &placement : plan->placements)
         {
-            if (placement.layer < metadata.num_layers)
+            if (metadata.containsModelLayer(placement.layer))
                 continue;
 
             if (!has_inactive_trailing_sidecar ||
+                placement.layer < end_model_layer ||
                 placement.layer >= raw_layer_count)
             {
                 /*
@@ -1462,7 +1471,7 @@ namespace llaminar2
             runtime_plan->placements,
             [&](const RoutedExpertLayerPlacement &placement)
             {
-                return placement.layer >= metadata.num_layers;
+                return placement.layer >= end_model_layer;
             });
         validateMoERoutedExpertPlacementPlanOrThrow(
             *runtime_plan,
@@ -1475,8 +1484,11 @@ namespace llaminar2
 
     MoERoutedExpertModelMetadata resolveMoERoutedExpertModelMetadataForModel(
         IModelContext &model_ctx,
-        const MTPRuntimeConfig &mtp)
+        const MTPRuntimeConfig &mtp,
+        const std::optional<FactoryPPStageConfig> &pp_stage)
     {
+        if (pp_stage)
+            pp_stage->requireValidForModel(model_ctx);
         auto loader = model_ctx.loader();
         const std::string &arch = model_ctx.architecture();
 
@@ -1494,7 +1506,8 @@ namespace llaminar2
             metadata.num_layers = main_layer_count;
             metadata.main_inference_layer_count = main_layer_count;
 
-            if (retainsMTPGraphCapacity(mtp))
+            if (retainsMTPGraphCapacity(mtp) &&
+                (!pp_stage || pp_stage->has_lm_head))
             {
                 const MTPWeightManifest manifest = discoverMTPWeightManifest(
                     *loader,
@@ -1526,6 +1539,17 @@ namespace llaminar2
                 }
                 metadata.num_layers = next_routed_layer;
             }
+        }
+        if (pp_stage)
+        {
+            // A stage owns compact storage for its main interval. Only the
+            // terminal stage builds routed NextN graphs and retains their
+            // banks, including when an MTP-off control retains graph capacity.
+            const int retained_sidecar_count =
+                metadata.num_layers - metadata.main_inference_layer_count;
+            metadata.first_model_layer = pp_stage->first_layer;
+            metadata.num_layers = pp_stage->layerCount() + retained_sidecar_count;
+            metadata.main_inference_layer_count = pp_stage->last_layer;
         }
         metadata.num_experts =
             loader ? loader->getInt(arch + ".expert_count", 0) : 0;
@@ -4312,6 +4336,12 @@ namespace llaminar2
                     .replicate_routed_experts =
                         needsReplicatedRoutedExpertWeights(graph_config),
                 });
+            weight_plan = includeGraphLocalOverlayParticipantWeights(
+                std::move(weight_plan),
+                *concrete_model_ctx,
+                graph_config,
+                device,
+                config.prepared_weight_admission);
             if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] PP stage"))
                 return nullptr;
             auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
@@ -4334,13 +4364,32 @@ namespace llaminar2
             // bindings. Re-run the stage-filtered preparation here, after
             // materialization, so GPU pipeline handles are registered under the
             // graph binding ids instead of pipeline-local ids.
-            bool prepare_ok = concrete_weight_mgr->prepareWeightsForDevice(
+            // Routed banks belong to this stage's overlay admission, with
+            // exact expert/projection ownership on each TP participant. The
+            // generic path would pack full parents into PrimaryModelWeights
+            // and duplicate both sibling experts and their physical ownership.
+            const auto &overlay_runtime = graph_config.moe.expert_overlay_runtime_plan;
+            const bool prepare_ok = concrete_weight_mgr->prepareWeightsForDevice(
                 frozen_weights,
-                device);
+                device,
+                /*include_expert_jobs=*/!overlay_runtime);
 
             if (!prepare_ok)
             {
                 LOG_ERROR("[InferenceRunner] PP stage weight preparation failed for device "
+                          << device.to_string() << " layers [" << pp_cfg.first_layer << ", " << pp_cfg.last_layer << ")");
+                return nullptr;
+            }
+
+            if (overlay_runtime &&
+                !concrete_weight_mgr->prepareMoEExpertOverlayWeights(
+                    *overlay_runtime,
+                    device,
+                    &frozen_weights,
+                    graph_config.moe.expert_overlay_execution_plan.get(),
+                    config.prepared_weight_admission))
+            {
+                LOG_ERROR("[InferenceRunner] PP stage expert overlay preparation failed for device "
                           << device.to_string() << " layers [" << pp_cfg.first_layer << ", " << pp_cfg.last_layer << ")");
                 return nullptr;
             }

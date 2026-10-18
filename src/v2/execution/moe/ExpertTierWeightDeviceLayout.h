@@ -3,6 +3,8 @@
  * @brief Allocation-free device contract for streamed expert-weight repacking.
  *
  * The structures in this file deliberately contain only scalar geometry and
+ * IQ3_S expanded source grids retain original factors and promote exactly to
+ * physical11; inverse-grid membership is checked before publication.
  * already-owned pointers. CUDA and HIP conversion launchers consume them
  * directly, allowing isolated correctness, timing, and compiler-resource
  * tests without coupling a kernel translation unit to model orchestration.
@@ -111,6 +113,8 @@ namespace llaminar2
             if (source_format == nullptr ||
                 cpu_codebook_id != gpu_source_codebook_id ||
                 cpu_is_superblock != gpu_source_is_superblock ||
+                ((cpu_codebook_id == 4 && cpu_is_superblock != 0) &&
+                 cpu_encoding == Encoding::NibbleLUT) ||
                 ((cpu_codebook_id == 8 ||
                   hasCompactMultiScaleVnniPayload(cpu_codebook_id)) &&
                  cpu_encoding == Encoding::ExpandedInt8))
@@ -126,13 +130,12 @@ namespace llaminar2
                 // ExpandedInt8 source to physical codebook 19/23. That is a
                 // first-class live representation, not a provenance change.
                 const bool canonical_source =
-                    gpu_codebook_id == canonicalDeviceVnniCodebookId(
-                                           source_format->codebook_id) &&
+                    gpu_codebook_id == canonicalDeviceVnniCodebookId(*source_format) &&
                     gpu_payload_bytes_per_block ==
                         source_format->payload_bytes &&
                     gpu_is_asymmetric ==
                         static_cast<std::uint8_t>(
-                            source_format->is_asymmetric) &&
+                            canonicalDeviceVnniFormat(*source_format).is_asymmetric) &&
                     gpu_has_emins ==
                         static_cast<std::uint8_t>(source_format->has_emins);
                 const bool normalized_source =
@@ -153,7 +156,10 @@ namespace llaminar2
                 }
 
                 const Encoding expected_encoding =
-                    gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
+                    gpu_codebook_id == kNativeVnniIQ4XSSourceScaleCodebook
+                        ? Encoding::NibbleLUTSourceScale
+                        : gpu_codebook_id == 11 ? Encoding::IQ3SExpandedSourceScale
+                        : gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
                             gpu_codebook_id == 5
                         ? Encoding::NibbleLUT
                         : (gpu_codebook_id == 8
@@ -171,6 +177,15 @@ namespace llaminar2
                 return false;
             switch (cpu_encoding)
             {
+            case Encoding::IQ3SExpandedSourceScale:
+                return cpu_codebook_id == 11 && cpu_is_superblock == 1 &&
+                       gpu_codebook_id == 11 && gpu_payload_bytes_per_block == 13 &&
+                       cpu_is_asymmetric == 0 && gpu_is_asymmetric == 1;
+            case Encoding::NibbleLUTSourceScale:
+                return cpu_codebook_id == 4 && cpu_is_superblock != 0 &&
+                       gpu_codebook_id == kNativeVnniIQ4XSSourceScaleCodebook &&
+                       gpu_payload_bytes_per_block == 16 &&
+                       cpu_is_asymmetric == 0 && gpu_is_asymmetric == 1;
             case Encoding::NibbleLUT:
                 return gpu_payload_bytes_per_block == 16 &&
                        gpu_is_asymmetric == cpu_is_asymmetric &&

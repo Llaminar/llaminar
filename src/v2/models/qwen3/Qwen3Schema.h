@@ -48,16 +48,6 @@ namespace llaminar2
 
         std::string architectureName() const override { return "qwen3"; }
 
-        SamplingParams getRecommendedSamplingParams() const override
-        {
-            SamplingParams params;
-            params.temperature = 0.6f;
-            params.top_p = 0.95f;
-            params.top_k = 20;
-            params.presence_penalty = 1.5f;
-            return params;
-        }
-
         /** @brief Return the shared Qwen continuation with its paragraph boundary. */
         std::string getStopThinkingPrompt() const override
         {

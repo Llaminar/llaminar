@@ -253,7 +253,8 @@ head's push CI, run `gh workflow run ci.yml --ref develop --repo Llaminar/llamin
 and wait for the published pair before opening the PR.
 The master workflow admits the exact develop source and published
 image pair, runs the full canonical E2E suite on both ISAs, then the published
-benchmark gates. Merge only after all required checks pass. The merge cuts a
+benchmark gates and then complete OpenCode app sessions on every blessed E2E
+cell and both ISAs. Merge only after all required checks pass. The merge cuts a
 release through the canonical release workflow, promoting the same tested
 images and publishing their evidence. Never start a master release merely
 because a feature PR or develop image gate succeeded.
@@ -359,6 +360,17 @@ handles, and `TransferEngine` is the public movement/coherence authority. See
 the architecture document above before changing orchestration or graph
 ownership.
 
+HTTP serving uses one stable inference worker and bounded generation admission,
+with independent HTTP capacity for discovery and passive `GET /stats` reads.
+Stats project immutable terminal observations and host wall clocks; they must
+never call live probes or synchronize devices. `PUT /stats` resets a typed
+measurement epoch without canceling inference or clearing caches; an old active
+request cannot repopulate new counters. Publication follows request cleanup.
+`V2_Integration_HTTPRuntimeStatsAccounting`,
+`V2_Integration_HTTPRuntimeStatsResponsiveness` and
+`V2_Integration_HTTPRuntimeStatsHandlerLifecycle` explicitly guard these
+ownership, reset, freshness and arithmetic contracts in production preflight.
+
 ## Build
 
 Optimized `Release` and `Integration` builds reject memory spills in all
@@ -454,7 +466,22 @@ graft another release's kernel pack into a newer DSO or ship only the host
 library. `V2_Integration_ROCmBLASKernelPackaging` belongs to preflight, alongside
 the functional floating-format BLAS/expert tests.
 
+RCCL protocol defaults are communicator-local values. Do not cache thread limits
+or publish partially initialized protocol arrays across communicator lifetimes.
+`V2_Integration_RCCLProtocolDefaults` verifies the real native consumers and an
+original-code negative control for both architecture orders and concurrent first
+use. Its source/DSO-bound proof is produced in the compiler builder; installed
+preflight needs neither the vendor source nor an accelerator. An external local
+RCCL build must export its compile database and be supplied through
+`RCCL_PROTOCOL_BUILD_DIR` alongside the exact `RCCL_LIBRARY` selection.
+
 RCCL bootstrap proves host/process identity before selecting transport storage.
+Container launchers pair IPC storage with PID identity: private IPC is the
+ordinary policy; explicit host/peer IPC must also join the matching PID namespace.
+ROCm SMI's shared recursive mutexes use namespace-local thread IDs, so sharing
+their storage across independent PID namespaces can admit two owners and crash.
+`V2_Integration_DockerIPCIdentity` in preflight proves the launch contract and
+container-scoped retirement even when a shared PID namespace exposes other jobs.
 Same-process SHM connections use native mapped pinned backing; cross-process
 connections retain real IPC, never an exported raw process pointer. The required
 passive storage ABI observes endpoint mappings, not unique physical bytes, and
@@ -508,6 +535,13 @@ admit a client with large initial ELF TLS. Native pthread stack admission owns
 that layout; never cap worker stacks below valid client TLS or add retries and
 environment overrides to hide a rejected thread. The installer backports the
 upstream stack repair when absent from its pinned release.
+`V2_Integration_HIPEventProducerLifetime` proves a retained completion remains
+usable after its producer stream retires, including concurrent queries,
+rerecording and actual native stream-address reuse. Capture metadata borrows
+the original monotonic stream identity under the native device registry; an
+event must never dereference an unowned producer pointer or retain an otherwise
+retired queue merely to inspect capture state. The event retains its own
+completion independently of that metadata lifetime.
 `V2_Integration_HIPSDMAStreamSharing` proves that mapped round trips and captured
 NoCU copies remain byte-exact when independent stream owners outnumber physical
 DMA engines. Engine scarcity requires native queue sharing, never silent copy
@@ -860,8 +894,12 @@ domain/tier types; they must not acquire a second capacity or role authority.
 Production model activations support FP32 only; other activation precision
 requests fail as unimplemented. KV precision, allreduce wire precision and expert
 weight formats are separate settings. Leave their defaults intact for the
-initial auto baseline. Prefix caching is enabled by default; MTP is independently
-enabled with `--mtp`, and `--mtp-depth-policy dynamic` selects adaptive depth.
+initial auto baseline. Prefix caching is enabled by default. Complete GGUF MTP
+heads automatically enable MTP with dynamic depth; `--mtp` requires those heads
+and `--no-mtp` explicitly disables prediction while retaining supported
+single-device, TP, PP, and multi-device MoE admission. YAML `mtp.enabled: auto`
+preserves automatic intent; explicit booleans select the corresponding mode.
+`--mtp-depth-policy fixed` requests fixed depth.
 MTP verification defaults to `speculative-sampling`, which also specializes
 greedy requests without changing their depth economics. Non-greedy requests
 must not silently disable MTP. Explicit `--mtp-verify-mode greedy` is a

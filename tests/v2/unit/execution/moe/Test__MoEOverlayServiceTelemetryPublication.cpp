@@ -1,6 +1,9 @@
 /**
  * @file Test__MoEOverlayServiceTelemetryPublication.cpp
  * @brief CPU-only protocol tests for mapped GPU service snapshots.
+ *
+ * Adversarial publication headers prove that stage identity and bounded row
+ * geometry are checked before any cumulative service data is imported.
  */
 
 #include <gtest/gtest.h>
@@ -10,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace llaminar2::test
@@ -68,6 +72,7 @@ namespace llaminar2::test
         ASSERT_TRUE(trySnapshotMoEOverlayServiceTelemetryPublication(
             fixture.publication(),
             kParticipant,
+            0,
             kLayers,
             &rows,
             &generation));
@@ -105,6 +110,7 @@ namespace llaminar2::test
         EXPECT_FALSE(trySnapshotMoEOverlayServiceTelemetryPublication(
             fixture.publication(),
             kParticipant,
+            0,
             kLayers,
             &rows,
             &generation));
@@ -121,8 +127,70 @@ namespace llaminar2::test
         EXPECT_FALSE(trySnapshotMoEOverlayServiceTelemetryPublication(
             fixture.publication(),
             kParticipant + 1,
+            0,
             kLayers,
             &rows));
         EXPECT_TRUE(rows.empty());
+    }
+
+    /** Compact mapped rows retain exact global IDs, including the namespace boundary. */
+    TEST(MoEOverlayServiceTelemetryPublication, PipelineStageDecodesGlobalRows)
+    {
+        for (const int first : {20, 40, std::numeric_limits<int>::max() - 2})
+        {
+            PublicationFixture fixture;
+            fixture.publication()->first_model_layer = first;
+            std::vector<MoEOverlayParticipantLayerServiceTotals> rows;
+            std::uint64_t generation = 0;
+            ASSERT_TRUE(trySnapshotMoEOverlayServiceTelemetryPublication(
+                fixture.publication(), kParticipant, first, kLayers, &rows, &generation));
+            ASSERT_EQ(rows.size(), kLayers);
+            EXPECT_EQ(generation, 2u);
+            for (std::size_t row = 0; row < rows.size(); ++row)
+            {
+                EXPECT_EQ(rows[row].layer, first + row);
+                for (std::size_t phase = 0; phase < kDeviceMoEOverlayServicePhaseCount; ++phase)
+                    EXPECT_EQ(rows[row].total_nanoseconds[phase],
+                              100 + row * kDeviceMoEOverlayServicePhaseCount + phase);
+            }
+            EXPECT_EQ(fixture.bytes.size(), kPublicationBytes)
+                << "Global origin must not introduce preceding padding rows";
+        }
+    }
+
+    /** An equal-shaped foreign publication cannot poison another stage's service costs. */
+    TEST(MoEOverlayServiceTelemetryPublication, PipelineStageRejectsForeignOriginAndOldABI)
+    {
+        PublicationFixture fixture;
+        fixture.publication()->first_model_layer = 20;
+        std::vector<MoEOverlayParticipantLayerServiceTotals> rows(2);
+        std::uint64_t generation = 100;
+        EXPECT_FALSE(trySnapshotMoEOverlayServiceTelemetryPublication(
+            fixture.publication(), kParticipant, 0, kLayers, &rows, &generation));
+        EXPECT_TRUE(rows.empty());
+        EXPECT_EQ(generation, 0u);
+        fixture.publication()->version = kDeviceMoEOverlayServiceTelemetryVersion - 1;
+        EXPECT_FALSE(trySnapshotMoEOverlayServiceTelemetryPublication(
+            fixture.publication(), kParticipant, 20, kLayers, &rows, &generation));
+        EXPECT_TRUE(rows.empty());
+        EXPECT_EQ(generation, 0u);
+    }
+
+    /** Reject malformed intervals before resizing or interpreting mapped cells. */
+    TEST(MoEOverlayServiceTelemetryPublication, PipelineStageRejectsInvalidIntervals)
+    {
+        for (const auto [first, count] : std::vector<std::pair<int, std::uint32_t>>{
+                 {-1, 2}, {20, 0}, {std::numeric_limits<int>::max(), 2}, {20, UINT32_MAX}})
+        {
+            PublicationFixture fixture;
+            fixture.publication()->first_model_layer = first;
+            fixture.publication()->layer_count = count;
+            std::vector<MoEOverlayParticipantLayerServiceTotals> rows(2);
+            std::uint64_t generation = 100;
+            EXPECT_FALSE(trySnapshotMoEOverlayServiceTelemetryPublication(
+                fixture.publication(), kParticipant, first, count, &rows, &generation));
+            EXPECT_TRUE(rows.empty());
+            EXPECT_EQ(generation, 0u);
+        }
     }
 } // namespace llaminar2::test

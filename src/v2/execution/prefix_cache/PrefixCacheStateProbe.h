@@ -14,6 +14,7 @@
 #include "backends/DeviceId.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/prefix_cache/PrefixCacheStats.h"
+#include "execution/prefix_cache/PrefixMovementEpochSnapshot.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -346,7 +347,8 @@ namespace llaminar2
         DeviceId primary_device = DeviceId::cpu();
         int current_position = 0;
         uint64_t session_epoch = 0;
-        uint64_t moe_runtime_movement_epoch = 0;
+        /** Every movement authority, preserving declared pipeline stage order. */
+        PrefixMovementEpochSnapshot moe_runtime_movement_epoch;
         uint64_t live_state_epoch = 0;
         uint64_t live_state_mutations = 0;
         std::string last_live_state_mutation_reason;

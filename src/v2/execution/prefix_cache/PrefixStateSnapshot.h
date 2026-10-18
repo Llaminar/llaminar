@@ -22,6 +22,63 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief One immutable lookup cohort, resolved only after participant coordination.
+     *
+     * Selection owns RAM sources or immutable archive offsets, without hydrating
+     * every historical recurrent image. A single chosen frontier seals the read
+     * set; a second, different frontier is rejected instead of reusing a partial
+     * materialization. Concrete tier ownership remains with PrefixStateCache.
+     */
+    class IPrefixLookupPayloadPlan
+    {
+    public:
+        virtual ~IPrefixLookupPayloadPlan() = default;
+        /**
+         * @brief Select and retain the longest available authenticated block prefix.
+         * @param fingerprint Model, geometry and policy namespace of the lookup.
+         * @param parent_hash Stable identity of the preceding authenticated block.
+         * @param block_index Logical block ordinal in the requested sequence.
+         * @param token_start First token position covered by this block.
+         * @param tokens Candidate block tokens, including a possible short tail.
+         * @return Metadata without payload ownership, or no match.
+         * @throws std::logic_error if selection has already been sealed.
+         * @throws std::runtime_error if retained storage cannot be authenticated.
+         */
+        virtual std::optional<PrefixBlockHandle> selectLongest(
+            uint64_t fingerprint, uint64_t parent_hash, int block_index,
+            int token_start, const std::vector<int32_t> &tokens) = 0;
+        /**
+         * @brief Select the longest endpoint whose consumed RAM sections fit the tier.
+         * @param selected Candidate chain in lookup order, possibly already shortened.
+         * @return End token of the largest bounded restore window, or zero.
+         */
+        virtual int boundedTokenCount(const std::vector<PrefixBlockHandle> &selected) const = 0;
+        /**
+         * @brief Seal the coordinated block chain and materialize only its consumed sections.
+         * @param selected Authenticated identities after every participant agrees on the frontier.
+         * @return Owners for historical sequence rows and the complete final checkpoint.
+         * @throws std::logic_error if identities or lifecycle differ from this cohort.
+         * @throws std::invalid_argument if the selected working set exceeds the tier window.
+         * @throws std::runtime_error if actual storage admission or a selected read fails.
+         */
+        virtual std::vector<PrefixBlockHandle> materialize(
+            const std::vector<PrefixBlockHandle> &selected) = 0;
+        /**
+         * @brief Borrow the complete endpoint after that same frontier was materialized.
+         * @param key Exact identity of the materialized endpoint.
+         * @return Shared ownership of the complete terminal payload.
+         * @throws std::logic_error for another frontier or an unmaterialized cohort.
+         */
+        virtual PrefixBlockHandle terminal(const PrefixCacheKey &key) const = 0;
+        /**
+         * @brief Retire row ownership across every lookup alias after restoration.
+         * @param endpoint Selected terminal identity, or no identity for a cache miss.
+         * @return Complete endpoint owner for harvest; an empty handle for a miss.
+         * @throws std::logic_error if a nonempty frontier was never materialized or changed.
+         */
+        virtual PrefixBlockHandle retireForHarvest(std::optional<PrefixCacheKey> endpoint) = 0;
+    };
 
     enum class PrefixStateProvenance
     {
@@ -127,6 +184,8 @@ namespace llaminar2
         bool restore_hybrid_state_for_suffix_prefill = false;
         std::string bypass_reason;
         std::vector<PrefixBlockHandle> blocks;
+        /** Immutable tier-source cohort shared across coordinated clamps. */
+        std::shared_ptr<IPrefixLookupPayloadPlan> payload_plan;
 
         bool hit() const { return supported && cached_tokens > 0 && !blocks.empty(); }
 
@@ -177,6 +236,38 @@ namespace llaminar2
          * @return Owned lookup with complete restorable blocks and terminal metadata.
          */
         PrefixLookupResult clampedTo(int token_count) const;
+
+        /**
+         * @brief Select archive admission after the coordinated restore consumed its block chain.
+         *
+         * Restoration owns its asynchronous source leases through the exact
+         * completion event. Harvest needs only the selected terminal archive
+         * to authenticate full-hit reuse; retaining every restored block here
+         * would prevent physical eviction during a long conversation.
+         *
+         * @param restored_tokens Actual common boundary consumed by restoration, or zero on a miss.
+         * @return Participant identity and terminal owner for harvest, without the restore chain.
+         */
+        PrefixLookupResult forHarvest(int restored_tokens) const;
+
+        /**
+         * @brief Borrow the complete chain for restoration, rejecting terminal-only harvest admission.
+         * @return Original admitted restore sources, including all attention blocks.
+         * @throws std::logic_error when this lookup has already become a harvest witness.
+         */
+        const std::vector<PrefixBlockHandle> &restoreBlocks() const;
+
+        /**
+         * @brief Resolve this selected restore chain through its immutable source cohort.
+         * @return Owned payloads for this exact frontier; preceding blocks own rows only.
+         * @throws std::logic_error for consumed harvest witnesses or a conflicting frontier.
+         */
+        std::vector<PrefixBlockHandle> materializeRestoreBlocks() const;
+
+    private:
+        /** @brief Payload ownership phase; harvest witnesses cannot reenter block restoration. */
+        enum class PayloadPurpose { RestoreSources, HarvestWitness };
+        PayloadPurpose payload_purpose_ = PayloadPurpose::RestoreSources;
     };
 
     /**
@@ -185,6 +276,9 @@ namespace llaminar2
      * The request coordinator selects the common restored boundary once. Both
      * early storage preparation and later execution consume this same schedule,
      * so a participant cannot invent a different recurrent checkpoint.
+     * Sparse checkpoints retain earlier causal prefixes when a client rewrites
+     * history. Their geometric spacing bounds archive traffic logarithmically;
+     * they are actual live states, never reconstructed from a later snapshot.
      */
     class PrefixHarvestSchedule final
     {
@@ -203,15 +297,15 @@ namespace llaminar2
             int restored_tokens, int stable_segment_tokens = 0);
         /** @return Exact final prompt frontier, never graph bucket capacity. */
         int promptTokens() const noexcept { return prompt_tokens_; }
-        /** @return Optional recurrent frontier strictly before the prompt tail. */
-        std::optional<int> reusableCheckpoint() const noexcept { return checkpoint_; }
+        /** @return Strictly increasing live frontiers after restore and before the tail. */
+        const std::vector<int> &reusableCheckpoints() const noexcept { return checkpoints_; }
 
     private:
-        /** @brief Construct only after the factory authenticates both frontiers. */
-        PrefixHarvestSchedule(int prompt_tokens, std::optional<int> checkpoint)
-            : prompt_tokens_(prompt_tokens), checkpoint_(checkpoint) {}
+        /** @brief Construct only after the factory authenticates every frontier. */
+        PrefixHarvestSchedule(int prompt_tokens, std::vector<int> checkpoints)
+            : prompt_tokens_(prompt_tokens), checkpoints_(std::move(checkpoints)) {}
         int prompt_tokens_;
-        std::optional<int> checkpoint_;
+        std::vector<int> checkpoints_;
     };
 
     /**

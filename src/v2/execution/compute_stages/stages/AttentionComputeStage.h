@@ -246,6 +246,13 @@ namespace llaminar2
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
 
     private:
+        /**
+         * @brief Resolve immutable native operands for admission/capture agreement.
+         * @return FP16 only for native half K and V without a read-time transform.
+         * Converted cache views and all other formats retain their ordinary policy.
+         */
+        TensorType nativePrefillKVFormat() const;
+
         Params params_;
 
         /** @return The one physical read policy used by execution and diagnostics. */

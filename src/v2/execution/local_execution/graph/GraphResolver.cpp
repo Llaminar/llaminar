@@ -962,6 +962,9 @@ namespace llaminar2
             params.gate = stage.inputs.size() > 1 ? stage.inputs[1] : nullptr;
             params.output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
             params.seq_len = seq_len;
+            // Declarative gate templates operate on the post-Wo model-width
+            // activation. The FA builder supplies its pre-Wo head width itself.
+            params.feature_dim = d_model;
             params.device_id = stage.device;
             return ComputeStageFactory::createAttentionOutputGate(params);
         }

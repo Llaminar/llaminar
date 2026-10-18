@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -412,18 +413,19 @@ namespace llaminar2
         std::vector<MoEExpertOwner> explicit_owners;
         for (const auto &placement : plan.placements)
         {
-            if (placement.layer < 0 ||
-                placement.layer >= ownership.layerCount())
+            if (!ownership.containsModelLayer(placement.layer))
             {
                 throw std::invalid_argument(
                     "Explicit MoE ownership does not contain a planned layer");
             }
-            if (represented_layers[static_cast<std::size_t>(placement.layer)])
+            const auto storage_index =
+                ownership.storageIndexForModelLayer(placement.layer);
+            if (represented_layers[storage_index])
             {
                 throw std::invalid_argument(
                     "Explicit MoE ownership plan repeats a routed layer");
             }
-            represented_layers[static_cast<std::size_t>(placement.layer)] = true;
+            represented_layers[storage_index] = true;
             if (placement.routed_expert_tier.size() !=
                 static_cast<std::size_t>(ownership.expertCount()))
             {
@@ -650,57 +652,63 @@ namespace llaminar2
         return ownerFor(layer_idx, expert_id) ? 1u : 0u;
     }
 
-    MoELayeredExpertOwnership MoEExpertOwnerMap::layeredOwnership(
+    void MoEExpertOwnerMap::requireLayerGeometry(
         int num_layers,
-        int num_experts) const
+        int num_experts,
+        int first_model_layer) const
     {
-        const int participant_count = static_cast<int>(participants_.size());
-        if (num_layers <= 0 || num_experts <= 0 || participant_count <= 0)
+        if (num_layers <= 0 || num_experts <= 0 || participants_.empty() ||
+            participants_.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         {
             throw std::invalid_argument(
                 "MoE expert owner map requires positive model geometry and at least one participant");
         }
-
-        std::vector<std::vector<int>> owners(
-            static_cast<size_t>(num_layers),
-            std::vector<int>(static_cast<size_t>(num_experts), -1));
-        for (const auto &owner : owners_)
+        if (first_model_layer < 0 ||
+            num_layers > std::numeric_limits<int>::max() - first_model_layer)
         {
-            if (owner.layer_idx < 0 || owner.layer_idx >= num_layers ||
-                owner.expert_id < 0 || owner.expert_id >= num_experts ||
+            throw std::invalid_argument(
+                "MoE expert owner map requires a valid model-layer interval");
+        }
+        if (static_cast<std::size_t>(num_layers) >
+                std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(num_experts))
+            throw std::invalid_argument("MoE expert ownership geometry overflows addressable rows");
+        if (owners_.size() != static_cast<std::size_t>(num_layers) * static_cast<std::size_t>(num_experts))
+            throw std::logic_error("MoE expert owner map is incomplete for the requested model geometry");
+
+        // Construction seals a unique relation in canonical coordinate order.
+        // Authenticate that relation directly; validation needs no second live
+        // ownership table and cannot accept a same-sized foreign-stage map.
+        for (std::size_t index = 0; index < owners_.size(); ++index)
+        {
+            const auto &owner = owners_[index];
+            if (owner.layer_idx != first_model_layer + static_cast<int>(index / num_experts) ||
+                owner.expert_id != static_cast<int>(index % num_experts) ||
                 owner.owner_participant < 0 ||
-                owner.owner_participant >= participant_count)
+                static_cast<std::size_t>(owner.owner_participant) >= participants_.size())
             {
                 throw std::logic_error(
                     "MoE expert owner map exceeds the requested model or participant geometry");
             }
-
-            int &slot = owners[static_cast<size_t>(owner.layer_idx)]
-                              [static_cast<size_t>(owner.expert_id)];
-            if (slot >= 0)
-            {
-                throw std::logic_error(
-                    "MoE expert owner map contains duplicate layered ownership");
-            }
-            slot = owner.owner_participant;
         }
+    }
 
-        for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx)
-        {
-            for (int expert_id = 0; expert_id < num_experts; ++expert_id)
-            {
-                if (owners[static_cast<size_t>(layer_idx)]
-                          [static_cast<size_t>(expert_id)] < 0)
-                {
-                    throw std::logic_error(
-                        "MoE expert owner map is incomplete for the requested model geometry");
-                }
-            }
-        }
+    MoELayeredExpertOwnership MoEExpertOwnerMap::layeredOwnership(
+        int num_layers,
+        int num_experts,
+        int first_model_layer) const
+    {
+        requireLayerGeometry(num_layers, num_experts, first_model_layer);
+        std::vector<std::vector<int>> owners(
+            static_cast<std::size_t>(num_layers),
+            std::vector<int>(static_cast<std::size_t>(num_experts)));
+        for (const auto &owner : owners_)
+            owners[static_cast<std::size_t>(owner.layer_idx - first_model_layer)]
+                  [static_cast<std::size_t>(owner.expert_id)] = owner.owner_participant;
 
         return MoELayeredExpertOwnership(
-            participant_count,
-            std::move(owners));
+            static_cast<int>(participants_.size()),
+            std::move(owners),
+            first_model_layer);
     }
 
 } // namespace llaminar2

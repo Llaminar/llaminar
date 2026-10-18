@@ -100,7 +100,7 @@
         "--device=/dev/dri",
         "--group-add=video",
         "--group-add=render",
-        "--ipc=host",
+        "--ipc=private",
         "--shm-size=32g",
         "--gpus=all"
     ],

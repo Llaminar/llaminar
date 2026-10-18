@@ -29,11 +29,14 @@
 #pragma once
 
 #include "kernels/common/FloatingOutputPartitionScope.h"
+#include "kernels/FloatingActivationOperandPrecision.h"
 
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/TensorKernels.h"
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -58,7 +61,8 @@ namespace llaminar2
          *
          * **Supported Weight Types**:
          * - FP32Tensor → hipblasSgemm
-         * - FP16Tensor → hipblasHgemm (good performance on MI50)
+         * - FP16 weights ordinarily retain fixed-order FP32 activation consumption.
+         * - Explicit FP16RNE operands use half A/B, compute32 and FP32 output.
          * - BF16Tensor → emulated via FP32 (no native MI50 support)
          *
          * **Memory Requirements**:
@@ -83,7 +87,7 @@ namespace llaminar2
             enum class Precision
             {
                 FP32, ///< 32-bit float (hipblasSgemm)
-                FP16, ///< 16-bit float (hipblasHgemm)
+                FP16, ///< Persistent half weights; activation policy is explicit and separate.
                 BF16  ///< BFloat16 (emulated - no native MI50 support)
             };
 
@@ -113,13 +117,16 @@ namespace llaminar2
              * @param rocm_device_id ROCm device ID
              * @param precision Precision mode
              * @param lifetime_owner Shared pointer that keeps the VRAM pool alive
+             * @param operand_precision Immutable typed activation policy; FP16RNE requires half weights.
+             * @throws std::invalid_argument If half operands are requested with another weight type.
              */
             ROCmFloatingPointGemmKernel(
                 const void *d_weights,
                 int N, int K,
                 int rocm_device_id,
                 Precision precision,
-                std::shared_ptr<void> lifetime_owner);
+                std::shared_ptr<void> lifetime_owner,
+                FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native);
 
             ~ROCmFloatingPointGemmKernel() override;
 
@@ -164,6 +171,14 @@ namespace llaminar2
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
+
+            /**
+             * @brief Bind fixed-order serial/grouped floating arithmetic during capture.
+             * @param rows Optional borrowed device-owned live-prefix geometry.
+             * @return Typed scope retaining dispatch and row metadata until recording ends.
+             */
+            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope(
+                std::optional<DeviceRowRange> rows = std::nullopt) override;
 
             /**
              * @brief Keep mirrored outputs on the same fixed column reduction as serial TP.
@@ -292,12 +307,18 @@ namespace llaminar2
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
             Precision precision() const { return precision_; }
+            /** @return Immutable activation operand policy included in dispatch compatibility. */
+            FloatingActivationOperandPrecision operand_precision() const { return operand_precision_; }
+            /** @return Typed fusion authority; weight format alone is insufficient. */
+            FloatingActivationOperandPrecision floatingActivationOperandPrecision() const noexcept override
+            { return operand_precision_; }
 
         private:
             const TensorBase *weights_; // Weight tensor (stored for metadata, may be null for pool path)
             const void *d_weights_;     // Device pointer to weight data
             int rocm_device_id_;
             Precision precision_;
+            FloatingActivationOperandPrecision operand_precision_ = FloatingActivationOperandPrecision::Native;
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)
 
@@ -328,6 +349,45 @@ namespace llaminar2
                 const std::vector<const float *> &b_ptrs,
                 const std::vector<float *> &c_ptrs,
                 DeviceWorkspaceManager *workspace);
+            /**
+             * @brief Cast only declared live rows into the admitted physical half-A bank.
+             * @param source Stable FP32 input on this engine's exact stream.
+             * @param m Positive physical rows; verifier metadata owns the live prefix.
+             * @param k Positive reduction width matching the prepared weights.
+             * @param workspace Canonical graph-owned workspace on this device.
+             * @return Half bank after enqueuing its producer; no synchronization.
+             * @throws std::invalid_argument For incompatible geometry or missing capacity.
+             * @throws std::runtime_error If the established live cast cannot enqueue.
+             */
+            const void *prepareFP16Operand(const float *source, int m, int k,
+                DeviceWorkspaceManager *workspace);
+
+            /**
+             * @brief Publish half A once and submit the fixed serial/verifier tree.
+             * @param source Borrowed FP32 original rows on the exact stream.
+             * @param output Stable unmapped FP32 destination.
+             * @param m Physical rows. @param n Prepared output width. @param k Reduction width.
+             * @param workspace Declared persistent pointer arrays and half-A bank.
+             * @return Whether typed fixed-order submission succeeded.
+             */
+            bool runFixedHalfProjection(const float *source, float *output,
+                int m, int n, int k, DeviceWorkspaceManager *workspace);
+
+            /**
+             * @brief Consume the preceding same-stream half publication via GemmEx.
+             * @param half_input Complete admitted half-A matrix [m,k].
+             * @param output Stable FP32 destination [m,n].
+             * @param m Positive row count.
+             * @param n Output width matching this engine.
+             * @param k Reduction width matching this engine.
+             * @param alpha FP32 product multiplier.
+             * @param beta FP32 existing-output multiplier.
+             * @param workspace Canonical stage scratch retained through every consumer.
+             * @return Whether library enqueue succeeded; records actual operand types.
+             */
+            bool runFP16OperandProjection(const void *half_input, float *output,
+                int m, int n, int k, float alpha, float beta, DeviceWorkspaceManager *workspace);
+
             bool run_fixed_order_swiglu_down(
                 const TensorBase *gate,
                 const TensorBase *up,

@@ -470,7 +470,8 @@ TEST_F(Q8_0_SIMD_Accuracy_Test, Q8_K_Scalar_vs_AVX2)
 {
 #ifdef __AVX2__
     // Create a Q8_K block with random data
-    Q8_KBlock q8k_block;
+    Q8_KBlock q8k_block{};
+    q8k_block.d = 1.0f;
 
     // Initialize with random quantized data (256 int8 values)
     for (int i = 0; i < Q8_KBlock::BLOCK_SIZE; ++i)
@@ -509,7 +510,8 @@ TEST_F(Q8_0_SIMD_Accuracy_Test, Q8_K_Scalar_vs_AVX512)
 {
 #ifdef __AVX512F__
     // Create a Q8_K block with random data
-    Q8_KBlock q8k_block;
+    Q8_KBlock q8k_block{};
+    q8k_block.d = 1.0f;
 
     // Initialize with random quantized data (256 int8 values)
     for (int i = 0; i < Q8_KBlock::BLOCK_SIZE; ++i)
@@ -554,7 +556,8 @@ TEST_F(Q8_0_SIMD_Accuracy_Test, Q8_K_MultipleSuperblocks)
 
     for (int block_idx = 0; block_idx < NUM_BLOCKS; ++block_idx)
     {
-        Q8_KBlock q8k_block;
+        Q8_KBlock q8k_block{};
+    q8k_block.d = 1.0f;
 
         // Random quantized values (256 int8 values)
         for (int i = 0; i < Q8_KBlock::BLOCK_SIZE; ++i)

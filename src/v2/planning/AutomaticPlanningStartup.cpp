@@ -14,6 +14,7 @@
 #include "execution/mtp/MTPWeightManifest.h"
 #include "loaders/ModelLoader.h"
 #include "config/OrchestrationConfigDocument.h"
+#include "config/OrchestrationStartupPolicy.h"
 #include "interfaces/IMPIContext.h"
 #include <exception>
 #include <stdexcept>
@@ -73,6 +74,7 @@ namespace llaminar2
                     static_cast<int>(source->loader().blockCount()));
             return source->metadata();
         });
+        resolveMTPStartupPolicy(shared, metadata.memoryProfile());
         const AutomaticPlanningPreparation context(shared, inventory, mpi, metadata,
             *workload, source ? &*source : nullptr);
         std::optional<AutomaticOrchestrationPlanner::Evaluate> evaluate;

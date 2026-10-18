@@ -2,7 +2,9 @@
 """Device-free adversarial checks of authority-owned HTTP movement evidence.
 
 Synthetic journals exercise schema, closed-cycle, economic and immutable-history
-contracts only. They do not certify physical transfers or any model topology.
+contracts, including different HTTP and terminal publication cutoffs. Exact
+interior identities cannot be replaced by equal totals or endpoint ranges.
+They do not certify physical transfers or any model topology.
 The canonical generation runner additionally retains real server path evidence.
 """
 from __future__ import annotations
@@ -14,7 +16,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
-from generation_movement_ledger import MovementLedgerObserver, MovementRequirement, validate_movement_transport_mirrors
+sys.path.insert(0, str(ROOT / "tests/v2/e2e/server"))
+from generation_movement_ledger import (MovementLedgerObserver, MovementRequirement,
+    validate_movement_transport_mirrors, native_movement_sequence, native_movement_edge_words,
+    validate_controller_movement_transport, controller_movement_words, controller_movement_edge_words,
+    CONTROLLER_MOVEMENT_TAGS, _CONTROLLER_FIELDS, _CONTROLLER_COUNTER_FIELDS)
+from runtime_feature_perf_policy import MovementEvidence, validate_runtime_feature_policy
+from server_execution_contract import RuntimeFeaturePolicy
 
 
 def ledger(authority="device", transaction=1, epoch=2, axis="combined"):
@@ -68,6 +76,45 @@ def response(value, expected_topology=None):
     """Wrap only the terminal boundary consumed by this focused interpreter."""
     return {"runtime_summary": {"schema": 1, "expert_movement": value,
                                "expert_movement_topology": topology() if expected_topology is None else expected_topology}}
+
+
+def controller_transport(journal, ranks=2):
+    """Completed topology-wide history with exactly one policy-owning rank."""
+    publications = []
+    for economy in journal["economy"]:
+        edges = [edge for edge in journal["edges"] if edge["transaction"] == economy["transaction"]]
+        receipt = dict.fromkeys(_CONTROLLER_FIELDS, 0)
+        receipt.update(base_epoch=economy["candidate_epoch"] - 1,
+            promotions=sum(e["direction"] == "promotion" for e in edges),
+            demotions=sum(e["direction"] == "demotion" for e in edges),
+            same_priority_moves=sum(e["direction"] == "same_priority" for e in edges),
+            cross_domain_moves=sum(e["source_priority"] != e["destination_priority"] for e in edges),
+            cross_rank_moves=sum(e["source_world_rank"] is not None and e["destination_world_rank"] is not None
+                                 and e["source_world_rank"] != e["destination_world_rank"] for e in edges),
+            cross_backend_moves=sum(e["source_device"].split(":")[0] != e["destination_device"].split(":")[0] for e in edges),
+            snapshot_observations=64, accepted_cycles=economy["cycle_count"], physical_cycles=economy["cycle_count"], changed_layers=1,
+            edges_checked=len(edges), participant_coordinates_checked=2, tier_coordinates_checked=2)
+        receipt.update({key: value for key, value in economy.items() if key.endswith("_ns")})
+        publications.append({"transaction": economy["transaction"], "candidate_epoch": economy["candidate_epoch"],
+            "command_count": economy["command_count"], "physical_payload_bytes": 10007, "controller": receipt})
+    wave = native_movement_sequence(controller_movement_words(p) for p in publications)
+    edge = native_movement_sequence(controller_movement_edge_words(e) for e in journal["edges"])
+    records, terminals = [], []
+    for rank in range(ranks):
+        terminal = {"schema": 1, "scope": "terminal_model_lifetime", "rank": rank,
+                    "movement": copy.deepcopy(journal), "device_publications": copy.deepcopy(publications)}
+        if rank:
+            terminal["movement"]["economy"] = []
+        terminals.append(terminal)
+        for name, field in _CONTROLLER_COUNTER_FIELDS.items():
+            value = float(len(journal["edges"])) if field == "edges" else 0.0
+            if field != "edges":
+                for p in publications:
+                    value += float(1 if field is None else p.get(field, p["controller"].get(field)))
+            records.append({"kind": "counter", "domain": "moe_overlay_controller", "name": name, "rank": rank,
+                "device": "overlay", "phase": "maintenance", "tags": dict(CONTROLLER_MOVEMENT_TAGS),
+                "value": value, **(edge if field == "edges" else wave)})
+    return records, terminals
 
 
 class MovementLedgerTests(unittest.TestCase):
@@ -133,7 +180,7 @@ class MovementLedgerTests(unittest.TestCase):
                 for edge in journal["edges"]]
 
     def test_http_journal_is_bound_to_the_completed_transport_edge_identities(self):
-        for owner in ("host", "device"):
+        for owner in ("host",):
             journal = ledger(owner)
             mirrors = self.transport_mirrors(journal)
             validate_movement_transport_mirrors(journal, mirrors)
@@ -164,18 +211,261 @@ class MovementLedgerTests(unittest.TestCase):
             validate_movement_transport_mirrors(journal, [{"domain": "moe_overlay_residency",
                 "name": "placement_published_payload_bytes", "value": 999999999}])
 
-    def test_native_completed_receipts_use_the_same_identity_join(self):
-        """Native load units require no alternate transport-evidence protocol."""
-        journal = self.native_load_ledger()
-        mirrors = self.transport_mirrors(journal)
-        for record in mirrors:
-            record["tags"]["policy"] = "native_load_spread"
-        validate_movement_transport_mirrors(journal, mirrors)
-        with self.assertRaisesRegex(ValueError, "matching completed transport"):
-            validate_movement_transport_mirrors(journal, mirrors[:1])
-        mirrors[0]["tags"]["transaction"] = "999"
-        with self.assertRaisesRegex(ValueError, "matching completed transport"):
+    @staticmethod
+    def movement_history(authority, transactions):
+        """Repeat real closed-cycle fixture geometry with distinct exact epochs."""
+        history = empty_ledger()
+        for transaction in transactions:
+            wave = ledger(authority, transaction=transaction, epoch=transaction + 1)
+            for name in ("edges", "economy", "host_admissions"):
+                history[name].extend(wave[name])
+        return history
+
+    def test_transport_history_rejects_missing_interior_wave_with_equal_bounds_and_totals(self):
+        """First/last IDs, cardinality and bytes cannot certify missing history."""
+        for authority in ("host",):
+            first = 2**54 + 1
+            journal = self.movement_history(authority, (first, first + 2, first + 4))
+            unrelated = self.movement_history(authority, (first, first + 3, first + 4))
+            expected = self.transport_mirrors(journal)
+            changed = self.transport_mirrors(unrelated)
+            for field in ("transaction", "candidate_epoch"):
+                expected_ids = [int(row["tags"][field]) for row in expected]
+                changed_ids = [int(row["tags"][field]) for row in changed]
+                self.assertEqual((min(expected_ids), max(expected_ids), len(expected_ids)),
+                                 (min(changed_ids), max(changed_ids), len(changed_ids)))
+            self.assertEqual(sum(row["value"] for row in expected), sum(row["value"] for row in changed))
+            self.assertEqual(sum(edge["estimated_weight_bytes"] for edge in journal["edges"]),
+                             sum(edge["estimated_weight_bytes"] for edge in unrelated["edges"]))
+            with self.subTest(authority=authority), self.assertRaisesRegex(ValueError, "matching completed transport"):
+                validate_movement_transport_mirrors(journal, changed)
+
+    def test_transport_history_accepts_later_terminal_waves_without_losing_http_cutoff(self):
+        """Maintenance may drain after the last HTTP observation; that is valid."""
+        for authority in ("host",):
+            first = 2**54 + 1
+            journal = self.movement_history(authority, (first, first + 1, first + 2))
+            terminal = self.movement_history(authority, (first, first + 1, first + 2, first + 3, first + 4))
+            mirrors = self.transport_mirrors(terminal)
             validate_movement_transport_mirrors(journal, mirrors)
+            # Every rank can mirror the later history, but none of those rows
+            # supplies the missing earlier command required by the HTTP reply.
+            missing = [row for row in mirrors if row["tags"]["transaction"] != str(first + 1)]
+            mirrored = missing + [row | {"rank": 1} for row in missing]
+            with self.subTest(authority=authority), self.assertRaisesRegex(ValueError, "matching completed transport"):
+                validate_movement_transport_mirrors(journal, mirrored)
+
+    def test_transport_history_keeps_adjacent_uint64_publications_distinct(self):
+        """Above double precision, neighboring integer identities must not alias."""
+        for authority in ("host",):
+            first = 2**54
+            journal = self.movement_history(authority, (first, first + 1))
+            mirrors = self.transport_mirrors(journal)
+            self.assertEqual(float(first), float(first + 1))
+            validate_movement_transport_mirrors(journal, mirrors)
+            # The host protocol's candidate epoch is its transaction identity;
+            # an optional diagnostic transaction tag is not an authority.
+            for field in (("candidate_epoch",) if authority == "host" else ("transaction", "candidate_epoch")):
+                changed = copy.deepcopy(mirrors)
+                for row in changed:
+                    row["tags"][field] = str(int(float(row["tags"][field])))
+                with self.subTest(authority=authority, field=field), self.assertRaisesRegex(ValueError, "matching completed transport"):
+                    validate_movement_transport_mirrors(journal, changed)
+
+    def test_controller_bounded_transport_covers_every_rank_and_http_prefix(self):
+        first = 2**54
+        earlier = self.movement_history("device", (first, first + 1))
+        complete = self.movement_history("device", (first, first + 1, first + 2, first + 3))
+        records, terminal = controller_transport(complete)
+        validate_movement_transport_mirrors(earlier, records, terminal)
+        for rank in (0, 1):
+            for name in _CONTROLLER_COUNTER_FIELDS:
+                partial = [r for r in records if (r["rank"], r["name"]) != (rank, name)]
+                with self.subTest(rank=rank, name=name), self.assertRaises(ValueError):
+                    validate_controller_movement_transport(partial, terminal)
+        for evidence in (MovementEvidence.NOT_APPLICABLE, MovementEvidence.REQUIRED):
+            self.assertIsNone(validate_runtime_feature_policy(records, RuntimeFeaturePolicy(), evidence,
+                terminal_movement=terminal))
+            self.assertIsNotNone(validate_runtime_feature_policy([], RuntimeFeaturePolicy(), evidence,
+                terminal_movement=terminal))
+        for changed in (terminal[1:], terminal[:1], terminal * 2):
+            with self.assertRaises(ValueError):
+                validate_controller_movement_transport(records, changed)
+        no_leader = copy.deepcopy(terminal)
+        no_leader[0]["movement"]["economy"] = []
+        with self.assertRaisesRegex(ValueError, "exactly one policy leader"):
+            validate_controller_movement_transport(records, no_leader)
+        duplicate_leader = copy.deepcopy(terminal)
+        duplicate_leader[1]["movement"]["economy"] = duplicate_leader[0]["movement"]["economy"]
+        with self.assertRaisesRegex(ValueError, "exactly one policy leader"):
+            validate_controller_movement_transport(records, duplicate_leader)
+
+    def test_controller_history_rejects_equal_bounds_and_totals_with_missing_interior_wave(self):
+        first = 2**54
+        expected = self.movement_history("device", (first, first + 2, first + 4))
+        unrelated = self.movement_history("device", (first, first + 3, first + 4))
+        records, terminal = controller_transport(expected)
+        changed, wrong_terminal = controller_transport(unrelated)
+        self.assertEqual(records[0]["sequence_minimum_words"], changed[0]["sequence_minimum_words"])
+        self.assertEqual(records[0]["sequence_maximum_words"], changed[0]["sequence_maximum_words"])
+        self.assertEqual([r["value"] for r in records], [r["value"] for r in changed])
+        with self.assertRaisesRegex(ValueError, "exact completed transport sequence"):
+            validate_controller_movement_transport(records, wrong_terminal)
+        with self.assertRaisesRegex(ValueError, "matching completed transport prefix"):
+            validate_movement_transport_mirrors(expected, changed, wrong_terminal)
+        for field in ("transaction", "candidate_epoch"):
+            changed = copy.deepcopy(terminal)
+            for t in changed:
+                t["device_publications"][1][field] += 1
+            with self.assertRaises(ValueError):
+                validate_controller_movement_transport(records, changed)
+        with self.assertRaises(ValueError):
+            validate_movement_transport_mirrors(expected, self.transport_mirrors(expected), terminal)
+
+    def test_controller_receipts_preserve_capacity_economy_edges_and_actual_bytes(self):
+        records, terminal = controller_transport(ledger())
+        for key in ("physical_payload_bytes", "command_count", "transaction", "candidate_epoch"):
+            for value in (True, float(terminal[0]["device_publications"][0][key]), 0, 2**64):
+                changed = copy.deepcopy(terminal)
+                changed[0]["device_publications"][0][key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    validate_controller_movement_transport(records, changed)
+        for key in _CONTROLLER_FIELDS:
+            changed = copy.deepcopy(terminal)
+            changed[0]["device_publications"][0]["controller"][key] += 1
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_controller_movement_transport(records, changed)
+        for key in ("cycle_index", "cycle_size", "source_device", "destination_device", "activation_count",
+                    "source_world_rank", "destination_world_rank", "expert", "estimated_weight_bytes", "movement_axis"):
+            changed = copy.deepcopy(terminal)
+            value = changed[0]["movement"]["edges"][0][key]
+            changed[0]["movement"]["edges"][0][key] = value + 1 if isinstance(value, int) else "wrong"
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_controller_movement_transport(records, changed)
+        for key, value in (("count", True), ("sequence_word_count", 34), ("sequence_digest_lo", -1),
+                           ("sequence_digest_hi", 0), ("value", float("nan")), ("value", True)):
+            changed = copy.deepcopy(records)
+            changed[0][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_controller_movement_transport(changed, terminal)
+        changed = copy.deepcopy(records)
+        changed[0]["sequence_minimum_words"][0] = True
+        with self.assertRaises(ValueError):
+            validate_controller_movement_transport(changed, terminal)
+
+    @classmethod
+    def native_history(cls, transactions):
+        """Keep native equations and edge geometry fixed while exact identities advance."""
+        value = empty_ledger()
+        for transaction in transactions:
+            wave = cls.native_load_ledger()
+            for name in ("edges", "economy"):
+                for row in wave[name]:
+                    row.update(transaction=transaction, candidate_epoch=transaction)
+                value[name].extend(wave[name])
+        return value
+
+    @staticmethod
+    def native_transport(journal):
+        """Build bounded metadata fixtures; C++/Python encoding also has a native probe."""
+        publications = [{"transaction": wave["transaction"], "candidate_epoch": wave["candidate_epoch"],
+                         "command_count": wave["command_count"], "physical_payload_bytes": 6000}
+                        for wave in journal["economy"]]
+        words = [(p["transaction"], p["candidate_epoch"], p["command_count"], p["physical_payload_bytes"])
+                 for p in publications]
+        wave = native_movement_sequence(words)
+        edges = native_movement_sequence(native_movement_edge_words(edge) for edge in journal["edges"])
+        tags = {"policy_owner": "device", "policy": "native_load_spread", "encoding": "completed_wave_v1",
+                "first_model_layer": "0", "layer_count": "8"}
+        values = {"dynamic_movement_transactions": len(publications),
+                  "dynamic_physical_bytes": sum(p["physical_payload_bytes"] for p in publications),
+                  "dynamic_migration_edges": len(journal["edges"]),
+                  "dynamic_migration_edge_identities": len(journal["edges"])}
+        records = [{"domain": "moe_overlay_controller", "name": name, "kind": "counter", "value": value,
+                    "rank": 0, "device": "CUDA:0", "phase": "maintenance", "tags": tags.copy(),
+                    **(edges if name.endswith("identities") else wave)} for name, value in values.items()]
+        terminal = [{"schema": 1, "scope": "terminal_model_lifetime", "rank": 0,
+                     "movement": copy.deepcopy(journal), "device_publications": publications}]
+        return records, terminal
+
+    def test_native_completed_receipts_bind_bounded_counters_to_exact_terminal_history(self):
+        """The same physical identity join survives removal of per-transaction keys."""
+        journal = self.native_load_ledger()
+        records, terminal = self.native_transport(journal)
+        validate_movement_transport_mirrors(journal, records, terminal)
+        for omitted in range(len(records)):
+            with self.subTest(omitted=omitted), self.assertRaises(ValueError):
+                validate_movement_transport_mirrors(journal, records[:omitted] + records[omitted + 1:], terminal)
+        with self.assertRaises(ValueError):
+            validate_movement_transport_mirrors(journal, records)
+        with self.assertRaises(ValueError):
+            validate_movement_transport_mirrors(journal, records, terminal * 2)
+        for name in ("transaction", "candidate_epoch", "command_count", "physical_payload_bytes"):
+            for bad in (0, True, 2**64, float(2**54)):
+                changed = copy.deepcopy(terminal)
+                changed[0]["device_publications"][0][name] = bad
+                with self.subTest(name=name, bad=bad), self.assertRaises(ValueError):
+                    validate_movement_transport_mirrors(journal, records, changed)
+
+    def test_native_terminal_history_accepts_later_waves_but_rejects_missing_interior_identity(self):
+        """Equal extrema, byte totals and row counts cannot replace one missing wave."""
+        first = 2**54 + 1
+        earlier = self.native_history((first, first + 2, first + 4))
+        complete = self.native_history((first, first + 2, first + 4, first + 5))
+        records, terminal = self.native_transport(complete)
+        validate_movement_transport_mirrors(earlier, records, terminal)
+        changed_records, changed_terminal = self.native_transport(self.native_history((first, first + 3, first + 4, first + 5)))
+        for a, b in zip(records, changed_records):
+            self.assertEqual(a["count"], b["count"])
+            self.assertEqual(a["value"], b["value"])
+            self.assertEqual(a["sequence_minimum_words"], b["sequence_minimum_words"])
+            self.assertEqual(a["sequence_maximum_words"], b["sequence_maximum_words"])
+        with self.assertRaisesRegex(ValueError, "matching completed transport sequence"):
+            validate_movement_transport_mirrors(earlier, records, changed_terminal)
+        with self.assertRaisesRegex(ValueError, "matching completed transport prefix"):
+            validate_movement_transport_mirrors(earlier, changed_records, changed_terminal)
+
+    def test_native_transport_preserves_adjacent_uint64_fields_and_actual_bytes(self):
+        """Real copies cannot be reconstructed from padded/estimated edge sizes."""
+        journal = self.native_history((2**54, 2**54 + 1))
+        records, terminal = self.native_transport(journal)
+        validate_movement_transport_mirrors(journal, records, terminal)
+        for field, bad in (("transaction", 2**54), ("candidate_epoch", 2**54),
+                           ("physical_payload_bytes", 2048)):
+            changed = copy.deepcopy(terminal)
+            changed[0]["device_publications"][1][field] = bad
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate_movement_transport_mirrors(journal, records, changed)
+        for index in range(len(records)):
+            changed = copy.deepcopy(records)
+            changed[index]["sequence_digest_lo"] ^= 1
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                validate_movement_transport_mirrors(journal, changed, terminal)
+        changed = copy.deepcopy(records)
+        changed[-1]["sequence_minimum_words"][16] = True
+        with self.assertRaises(ValueError):
+            validate_movement_transport_mirrors(journal, changed, terminal)
+        for field in ("activation_count", "estimated_weight_bytes", "source_world_rank"):
+            changed = copy.deepcopy(terminal)
+            changed[0]["movement"]["edges"][0][field] += 1
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate_movement_transport_mirrors(journal, records, changed)
+
+    def test_native_runtime_gate_requires_complete_transport_even_when_movement_is_optional(self):
+        """Optional movement cannot turn malformed positive publication into a pass."""
+        journal = self.native_load_ledger()
+        records, terminal = self.native_transport(journal)
+        for requirement in (MovementEvidence.REQUIRED, MovementEvidence.NOT_APPLICABLE):
+            self.assertIsNone(validate_runtime_feature_policy(records, RuntimeFeaturePolicy(), requirement,
+                terminal_movement=terminal))
+            self.assertIsNotNone(validate_runtime_feature_policy(records, RuntimeFeaturePolicy(), requirement))
+            self.assertIsNotNone(validate_runtime_feature_policy([], RuntimeFeaturePolicy(), requirement,
+                terminal_movement=terminal))
+            for omitted in range(len(records)):
+                self.assertIsNotNone(validate_runtime_feature_policy(records[:omitted] + records[omitted + 1:],
+                    RuntimeFeaturePolicy(), requirement, terminal_movement=terminal))
+        self.assertIn("static", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
+            MovementEvidence.FORBIDDEN, terminal_movement=terminal))
 
     def check(self, value, requirement=MovementRequirement.REQUIRED, expected_topology=None):
         observer = MovementLedgerObserver(requirement)
@@ -357,6 +647,135 @@ class MovementLedgerTests(unittest.TestCase):
         initial["authority"] = "host"
         with self.assertRaisesRegex(ValueError, "topology changed"):
             observer.observe(response(empty_ledger(), initial))
+
+    @classmethod
+    def pipeline_evidence(cls, devices=4, reverse=False, shared=False, mtp=False):
+        """Independent real scopes may reuse a device and the same uint64 wave IDs."""
+        movement = {"schema": 3, "scope": "model_lifetime", "complete": True, "stages": []}
+        geometry = {"schema": 2, "scope": "model_lifetime", "authority": "pipeline",
+                    "available_axes": ["participant_placement"], "stages": []}
+        terminal = {"schema": 2, "scope": "terminal_model_lifetime", "rank": 0, "stages": []}
+        records = []
+        for stage in range(2):
+            backend = "rocm" if (bool(stage) != reverse and not shared) else "cuda"
+            end = 4 * stage + 4 + int(stage == 1 and mtp)
+            identity = {"stage_index": stage, "first_layer": 4 * stage, "main_last_layer": 4 * stage + 4,
+                        "routed_last_layer": end, "terminal": stage == 1,
+                        "participants": [f"localhost:-1:{backend}:{i}" for i in range(devices // 2)]}
+            journal = cls.native_history((2**54 + 1, 2**54 + 2))
+            for edge in journal["edges"]:
+                edge["layer"] = end - 1
+                for endpoint in ("source", "destination"):
+                    edge[endpoint + "_device"] = f'{"ROCm" if backend == "rocm" else "CUDA"}:{edge[endpoint + "_participant"]}'
+            owned, final = cls.native_transport(journal)
+            for record in owned:
+                record["device"] = "ROCm:0" if backend == "rocm" else "CUDA:0"
+                record["tags"].update(first_model_layer=str(stage * 4), layer_count=str(end - stage * 4))
+            records.extend(owned)
+            movement["stages"].append({"identity": copy.deepcopy(identity), "movement": journal})
+            geometry["stages"].append({"identity": copy.deepcopy(identity),
+                                       "topology": topology(axes=("participant_placement",))})
+            del final[0]["rank"]
+            terminal["stages"].append({"identity": copy.deepcopy(identity), "transport": final[0]})
+        return movement, geometry, records, [terminal]
+
+    def test_pipeline_four_and_eight_device_scopes_preserve_colliding_native_ids(self):
+        """Both vendor orders, retained MTP and shared devices keep separate owners."""
+        for devices in (4, 8):
+            for reverse in (False, True):
+                for shared in (False, True):
+                    for mtp in (False, True):
+                        with self.subTest(devices=devices, reverse=reverse, shared=shared, mtp=mtp):
+                            journal, geometry, records, terminal = self.pipeline_evidence(devices, reverse, shared, mtp)
+                            observer = MovementLedgerObserver(MovementRequirement.REQUIRED)
+                            observer.observe(response(journal, geometry))
+                            observer.observe(response(journal, geometry))
+                            observer.finish()
+                            validate_movement_transport_mirrors(journal, records, terminal)
+                            self.assertEqual(validate_controller_movement_transport(records, terminal), [])
+
+    def test_pipeline_missing_reordered_and_foreign_scopes_fail_atomically(self):
+        """Scope corruption must not replace the observer's last good snapshot."""
+        journal, geometry, _, _ = self.pipeline_evidence()
+        observer = MovementLedgerObserver(MovementRequirement.REQUIRED)
+        observer.observe(response(journal, geometry))
+        for mutation in range(10):
+            changed = copy.deepcopy(journal)
+            if mutation == 0:
+                changed["stages"].pop()
+            elif mutation == 1:
+                changed["stages"].reverse()
+            elif mutation == 2:
+                changed["stages"][1]["identity"]["stage_index"] = 0
+            elif mutation == 3:
+                changed["stages"][1]["identity"]["first_layer"] = 3
+            elif mutation == 4:
+                changed["stages"][0]["identity"]["routed_last_layer"] = 5
+            elif mutation == 5:
+                changed["stages"][1]["movement"]["edges"][0]["layer"] = 3
+            elif mutation == 6:
+                changed["stages"][1]["movement"]["edges"][0]["destination_device"] = "CUDA:1"
+            elif mutation == 7:
+                changed["stages"][1]["identity"]["participants"].append("localhost:-1:rocm:0")
+            elif mutation == 8:
+                changed["stages"][0]["movement"] = copy.deepcopy(journal)
+            else:
+                changed["edges"] = []
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                observer.observe(response(changed, geometry))
+        observer.observe(response(journal, geometry))
+        observer.finish()
+
+    def test_pipeline_each_stage_requires_its_own_history_and_progress(self):
+        """An advancing first stage cannot conceal lost or empty sibling history."""
+        journal, geometry, _, _ = self.pipeline_evidence(8)
+        observer = MovementLedgerObserver(MovementRequirement.REQUIRED)
+        observer.observe(response(journal, geometry))
+        truncated = copy.deepcopy(journal)
+        for name in ("edges", "economy", "host_admissions"):
+            truncated["stages"][1]["movement"][name] = []
+        with self.assertRaisesRegex(ValueError, "regressed"):
+            observer.observe(response(truncated, geometry))
+        fresh = MovementLedgerObserver(MovementRequirement.REQUIRED)
+        fresh.observe(response(truncated, geometry))
+        with self.assertRaisesRegex(ValueError, "stage axis"):
+            fresh.finish()
+        observer.finish()
+
+    def test_pipeline_transport_cannot_borrow_a_sibling_receipt_or_counter(self):
+        """Equal transaction IDs, counts and bytes do not authenticate another stage."""
+        journal, geometry, records, terminal = self.pipeline_evidence(8, shared=True, mtp=True)
+        validate_movement_transport_mirrors(journal, records, terminal)
+        for mutation in range(9):
+            changed_records, changed_terminal = copy.deepcopy(records), copy.deepcopy(terminal)
+            if mutation == 0:
+                changed_records.pop()
+            elif mutation == 1:
+                changed_records[4]["tags"]["first_model_layer"] = "0"
+            elif mutation == 2:
+                changed_records[4]["tags"]["layer_count"] = "4"
+            elif mutation == 3:
+                changed_terminal[0]["stages"].pop()
+            elif mutation == 4:
+                changed_terminal[0]["stages"][1]["transport"] = copy.deepcopy(changed_terminal[0]["stages"][0]["transport"])
+            elif mutation == 5:
+                changed_terminal[0]["stages"][1]["transport"]["device_publications"].pop()
+            elif mutation == 6:
+                changed_records[4]["tags"]["first_model_layer"] = "04"
+            elif mutation == 7:
+                changed_terminal[0]["stages"][1]["transport"]["rank"] = 0
+            else:
+                changed_records[4]["device"] = "ROCm:0"
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                validate_movement_transport_mirrors(journal, changed_records, changed_terminal)
+
+    def test_pipeline_topology_cannot_certify_one_stage_with_another_axis(self):
+        """Per-stage ownership survives the parent union of movement opportunities."""
+        journal, geometry, _, _ = self.pipeline_evidence()
+        geometry["stages"][1]["topology"]["available_axes"] = ["tier_residency"]
+        geometry["available_axes"].append("tier_residency")
+        with self.assertRaisesRegex(ValueError, "contradicts"):
+            MovementLedgerObserver(MovementRequirement.REQUIRED).observe(response(journal, geometry))
 
 
 if __name__ == "__main__":

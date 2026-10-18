@@ -81,9 +81,10 @@ namespace llaminar2
      * engine against this model-owned contract.
      *
      * @param model Parsed model tensor directory.
-     * @param num_layers Exact main-transformer layer count.
+     * @param num_layers Number of owned layers, including retained routed MTP banks.
      * @param num_experts Exact routed-expert count in every layer.
-     * @return One valid gate/up/down manifest per layer in layer order.
+     * @param first_model_layer First global model layer owned by this stage.
+     * @return Compact gate/up/down manifests retaining their global layer IDs.
      * @throws std::invalid_argument For absent/non-3D/unsupported expert weights,
      *         inconsistent expert counts, or device-kernel-incompatible shapes.
      */
@@ -91,7 +92,8 @@ namespace llaminar2
     buildMoEOverlayLayerWeightManifestFromGGUF(
         const GGUFModel &model,
         int num_layers,
-        int num_experts);
+        int num_experts,
+        int first_model_layer = 0);
 
     /** @brief Process-local evidence for the materialized residency fabric. */
     struct MoEOverlayPhysicalResidencyFabricStats
@@ -250,7 +252,8 @@ namespace llaminar2
              * derive this contract from its live initial banks.  Distributed
              * composition supplies it explicitly when a process hosts an empty
              * receiving tier/layer whose only initial sources are remote.  Any
-             * supplied entry is authenticated against every local resident.
+             * supplied manifest must cover exactly the owned global stage
+             * interval, and every entry is authenticated against local residents.
              */
             std::vector<MoEOverlayLayerWeightManifest> layer_weight_manifest;
             /**

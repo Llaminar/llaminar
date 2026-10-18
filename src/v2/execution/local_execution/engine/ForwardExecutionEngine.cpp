@@ -915,14 +915,13 @@ namespace llaminar2
             const PrefillGraphExecutionObservation &observation,
             const char *cache_phase)
         {
+            // Exact graph identity and bounded live geometry remain dimensions.
+            // Request chunk positions are folded into the publication witness.
             auto tags = PerfStatsCollector::Tags{
                 {"capture_phase", observation.capture_phase},
                 {"cache_phase", cache_phase ? cache_phase : "unknown"},
-                {"chunk_index", std::to_string(observation.chunk_index)},
                 {"bucket_seq_len", std::to_string(observation.bucket_seq_len)},
-                {"real_token_start", std::to_string(observation.real_token_start)},
                 {"real_token_count", std::to_string(observation.real_token_count)},
-                {"real_token_end", std::to_string(observation.real_token_end)},
                 {"domain_id", observation.domain_id},
                 {"participant_id", std::to_string(observation.participant_id)},
                 {"placement_epoch", std::to_string(observation.placement_epoch)},
@@ -954,17 +953,23 @@ namespace llaminar2
                 reject_stage_type);
             forward_cache.last_prefill_graph_observation = observation;
 
-            PerfStatsCollector::addCounter(
+            PerfStatsCollector::addCounterWithSequence(
                 "forward_graph",
                 "prefill_graph_lifecycle",
                 1.0,
+                {static_cast<uint64_t>(observation.chunk_index),
+                 static_cast<uint64_t>(observation.real_token_start),
+                 static_cast<uint64_t>(observation.real_token_end)},
                 "prefill",
                 input.device.toString(),
                 prefillGraphObservationTags(observation, prefillGraphPhaseName(cache_phase)));
-            PerfStatsCollector::addCounter(
+            PerfStatsCollector::addCounterWithSequence(
                 "forward_graph",
                 "prefill_graph_phase",
                 1.0,
+                {static_cast<uint64_t>(observation.chunk_index),
+                 static_cast<uint64_t>(observation.real_token_start),
+                 static_cast<uint64_t>(observation.real_token_end)},
                 "prefill",
                 input.device.toString(),
                 prefillGraphObservationTags(observation, prefillGraphPhaseName(cache_phase)));
@@ -4611,10 +4616,13 @@ namespace llaminar2
                     observation,
                     prefillGraphPhaseName(cache_phase));
                 tags.emplace("launch_kind", launch_kind ? launch_kind : "unknown");
-                PerfStatsCollector::recordTimingNs(
+                PerfStatsCollector::recordTimingNsWithSequence(
                     "forward_graph",
                     "prefill_graph_launch",
                     ns,
+                    {static_cast<uint64_t>(observation.chunk_index),
+                 static_cast<uint64_t>(observation.real_token_start),
+                 static_cast<uint64_t>(observation.real_token_end)},
                     "prefill",
                     input.device.toString(),
                     std::move(tags));
@@ -4641,10 +4649,13 @@ namespace llaminar2
                     tags.emplace("timing_scope", "total_replay_gpu_event");
                     tags.emplace("sync_scope", "profiling_event_synchronized");
                     tags.emplace("launch_kind", launch_kind ? launch_kind : "unknown");
-                    PerfStatsCollector::recordTimingNs(
+                    PerfStatsCollector::recordTimingNsWithSequence(
                         "stage_gpu",
                         "prefill_graph.replay",
                         static_cast<uint64_t>(static_cast<double>(elapsed_ms) * 1.0e6),
+                    {static_cast<uint64_t>(observation.chunk_index),
+                 static_cast<uint64_t>(observation.real_token_start),
+                 static_cast<uint64_t>(observation.real_token_end)},
                         "prefill",
                         input.device.toString(),
                         std::move(tags));

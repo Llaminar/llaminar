@@ -29,8 +29,8 @@ namespace llaminar2
     struct DeviceNativeVNNIMatrixDesc
     {
         const uint8_t *payload = nullptr; ///< Compact codebook payload blocks.
-        const void *scales = nullptr;     ///< Per-block primary FP16 scale bits.
-        const void *mins = nullptr;       ///< Optional minima or secondary scales.
+        const void *scales = nullptr;     ///< Primary FP16 scale/base bits; Q6 retains original d.
+        const void *mins = nullptr;       ///< Secondary metadata: Q6/IQ2/IQ4 raw coefficients, otherwise FP16 minimum/scale.
         const void *emins = nullptr;      ///< Optional packed extended minima.
         int n = 0;                        ///< Output-column count.
         int k = 0;                        ///< Reduction width.

@@ -3,13 +3,17 @@
  * @brief Implementation of CUDA ops kernel ITensorXxx methods
  *
  * This file contains the C++ method implementations for CUDARMSNormKernelT,
- * CUDASwiGLUKernelT, and CUDARoPEKernelT. It calls the extern "C" wrapper
+ * CUDASwiGLUKernelT, CUDARoPEKernelT and CUDAEmbeddingKernelT. Quantized
+ * embedding lookup borrows original model-owned source bytes and setup-bound
+ * IQ codebooks; replay performs no conversion or table initialization. It calls the extern "C" wrapper
  * functions defined in CUDAOpsKernels.cu.
  *
  * Separating .cu and .cpp allows nvcc to compile only the CUDA code without
  * encountering issues with MPI or other complex C++ headers.
  */
 
+#include "kernels/common/NativeEmbeddingLayout.h"
+#include "kernels/common/NativeEmbeddingIQTables.h"
 #include "CUDARMSNormKernelT.h"
 #include "CUDASwiGLUKernelT.h"
 #include "CUDARoPEKernelT.h"
@@ -137,17 +141,13 @@ extern "C"
         int vocab_offset,
         cudaStream_t stream);
 
-    // Embedding lookup - EmbedQ8 (universal quantized format)
-    cudaError_t launch_embedding_lookup_q8(
-        const void *embed_q8,
-        const int *token_ids,
-        float *output,
-        int num_tokens,
-        int d_model,
-        int blocks_per_row,
-        int vocab_size,
-        int vocab_offset,
-        cudaStream_t stream);
+    // Embedding lookup - immutable original quantized source blocks
+    /** @brief Launch original native source blocks with setup-bound immutable grids. */
+    cudaError_t launch_embedding_lookup_native(
+        const void *source, const int *token_ids, float *output,
+        int num_tokens, int d_model, int vocab_size, int vocab_offset,
+        llaminar2::NativeEmbeddingLayout layout,
+        llaminar2::NativeEmbeddingIQTables tables, cudaStream_t stream);
 }
 
 namespace
@@ -2334,146 +2334,44 @@ namespace llaminar2
             return true;
         }
 
-        // --- Quantized path: consume model-owned prepared EmbedQ8 weights ---
-        if (IINT8Unpackable::fromTensor(embed_table))
+        // Prepared storage is the exact original source representation. The
+        // model owner prepared source codebooks and bytes before graph capture.
+        if (NativeEmbeddingLayout::supports(embed_table->native_type()))
         {
             const DeviceId dev_id = DeviceId::cuda(dev);
             const PreparedEmbeddingHandle *prepared = prepared_embedding_handle_;
-            const bool prepared_matches =
-                prepared &&
-                prepared->tensor == embed_table &&
-                prepared->device_id == dev_id &&
-                prepared->weights &&
-                prepared->weights->device_id == dev_id &&
-                prepared->weights->device_data &&
+            const bool prepared_matches = prepared && prepared->tensor == embed_table &&
+                prepared->device_id == dev_id && prepared->weights &&
+                prepared->weights->device_id == dev_id && prepared->weights->device_data &&
                 prepared->weights->d_model == d_model &&
-                prepared->weights->blocks_per_row > 0 &&
-                prepared->weights->vocab_size > 0;
+                prepared->weights->layout.source_type == embed_table->native_type() &&
+                prepared->weights->layout.blocks_per_row > 0 &&
+                prepared->weights->layout.row_stride_bytes > 0 &&
+                prepared->weights->vocab_size > 0 &&
+                prepared->weights->vocab_size <= size_t(INT_MAX) &&
+                prepared->weights->vocab_offset <= size_t(INT_MAX);
             if (!prepared_matches)
             {
-                LOG_ERROR("[CUDAEmbeddingKernelT] Quantized GPU embedding requires matching prepared device weights: "
-                          << "tensor=" << static_cast<const void *>(embed_table)
-                          << " format=" << tensorTypeName(embed_table->native_type())
-                          << " device=" << dev_id.to_string()
-                          << " d_model=" << d_model);
+                LOG_ERROR("[CUDAEmbeddingKernelT] Quantized lookup requires matching original-source device weights"
+                    << " tensor=" << static_cast<const void *>(embed_table)
+                    << " format=" << tensorTypeName(embed_table->native_type())
+                    << " device=" << dev_id.to_string() << " width=" << d_model);
                 return false;
             }
-
-            void *d_embed_q8 = prepared->weights->device_data;
-            const size_t blocks_per_row = prepared->weights->blocks_per_row;
-            const int vocab_offset = static_cast<int>(prepared->weights->vocab_offset);
-            const int local_vocab_size = static_cast<int>(prepared->weights->vocab_size);
-
-            if (validate_gpu_ptrs)
-            {
-                if (!validateCudaPointerForDevice(d_embed_q8, dev, "EMBED_TABLE", /*fail_on_query_error=*/true))
-                {
-                    return false;
-                }
-                if (!checkCudaNoPriorError("EmbedQ8 launch"))
-                {
-                    LOG_ERROR("[CUDAEmbeddingKernelT] EmbedQ8 launch context: dev=" << dev
-                                                                                    << " stream=" << gpu_stream_
-                                                                                    << " d_embed_q8=" << d_embed_q8
-                                                                                    << " d_token_ids=" << static_cast<void *>(d_token_ids)
-                                                                                    << " d_output=" << static_cast<void *>(d_output)
-                                                                                    << " num_tokens=" << num_tokens
-                                                                                    << " d_model=" << d_model
-                                                                                    << " blocks_per_row=" << blocks_per_row
-                                                                                    << " local_vocab_size=" << local_vocab_size
-                                                                                    << " vocab_offset=" << vocab_offset);
-                    return false;
-                }
-            }
-            // Validation readbacks require D2H plus stream synchronization, both
-            // illegal inside CUDA graph capture. The launch itself still consumes
-            // the device token IDs and remains graph-capturable.
-            if (use_device_token_ids &&
-                debugEnv().validation.validate_buffers &&
-                num_tokens > 0 &&
-                !isGraphCaptureActive())
-            {
-                std::vector<int> sampled_tokens(static_cast<size_t>(num_tokens), -1);
-                cudaError_t token_copy_err = cudaMemcpyAsync(
-                    sampled_tokens.data(),
-                    d_token_ids,
-                    static_cast<size_t>(num_tokens) * sizeof(int),
-                    cudaMemcpyDeviceToHost,
-                    static_cast<cudaStream_t>(gpu_stream_));
-                if (token_copy_err != cudaSuccess)
-                {
-                    LOG_ERROR("[CUDAEmbeddingKernelT] Failed to read device token IDs for validation: "
-                              << cudaGetErrorString(token_copy_err));
-                    return false;
-                }
-                token_copy_err = cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
-                if (token_copy_err != cudaSuccess)
-                {
-                    LOG_ERROR("[CUDAEmbeddingKernelT] Failed to synchronize device token validation: "
-                              << cudaGetErrorString(token_copy_err));
-                    return false;
-                }
-                const bool zero_token_rows_allowed =
-                    allow_out_of_range_token_ids_ ||
-                    (mpi_ctx && mpi_ctx->world_size() > 1);
-                for (int i = 0; i < num_tokens; ++i)
-                {
-                    const int token_id = sampled_tokens[static_cast<size_t>(i)];
-                    const bool in_local_range =
-                        token_id >= vocab_offset &&
-                        token_id < vocab_offset + local_vocab_size;
-                    if (!in_local_range && !zero_token_rows_allowed)
-                    {
-                        LOG_ERROR("[CUDAEmbeddingKernelT] Device-token embedding would zero single-device token="
-                                  << token_id << " local_vocab_size=" << local_vocab_size
-                                  << " vocab_offset=" << vocab_offset
-                                  << " token_index=" << i
-                                  << " num_tokens=" << num_tokens
-                                  << " token_ids_device=" << static_cast<void *>(d_token_ids)
-                                  << " output_device=" << static_cast<void *>(d_output)
-                                  << " stream=" << gpu_stream_);
-                        return false;
-                    }
-                    LOG_TRACE("[CUDAEmbeddingKernelT] Device-token embedding validation token="
-                              << token_id << " local_vocab_size=" << local_vocab_size
-                              << " vocab_offset=" << vocab_offset
-                              << " in_local_range=" << (in_local_range ? 1 : 0));
-                }
-            }
-
-            // Launch EmbedQ8 kernel
-            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::EMBEDDING_LOOKUP, gpu_stream_);
-            err = launch_embedding_lookup_q8(d_embed_q8, d_token_ids, d_output,
-                                             num_tokens, d_model,
-                                             static_cast<int>(blocks_per_row),
-                                             local_vocab_size, vocab_offset,
-                                             static_cast<cudaStream_t>(gpu_stream_));
+            const auto &weights = *prepared->weights;
+            err = launch_embedding_lookup_native(weights.device_data, d_token_ids, d_output,
+                num_tokens, d_model, static_cast<int>(weights.vocab_size),
+                static_cast<int>(weights.vocab_offset), weights.layout,
+                weights.iq_tables, static_cast<cudaStream_t>(gpu_stream_));
             if (err != cudaSuccess)
             {
-                fprintf(stderr, "[CUDAEmbeddingKernelT] EmbedQ8 kernel failed: %s\n",
-                        cudaGetErrorString(err));
-                if (validate_gpu_ptrs)
-                {
-                    LOG_ERROR("[CUDAEmbeddingKernelT] EmbedQ8 failure context: dev=" << dev
-                                                                                     << " stream=" << gpu_stream_
-                                                                                     << " d_embed_q8=" << d_embed_q8
-                                                                                     << " d_token_ids=" << static_cast<void *>(d_token_ids)
-                                                                                     << " d_output=" << static_cast<void *>(d_output)
-                                                                                     << " num_tokens=" << num_tokens
-                                                                                     << " d_model=" << d_model
-                                                                                     << " blocks_per_row=" << blocks_per_row
-                                                                                     << " local_vocab_size=" << local_vocab_size
-                                                                                     << " vocab_offset=" << vocab_offset);
-                }
+                LOG_ERROR("[CUDAEmbeddingKernelT] Original-source embedding launch failed: "
+                    << cudaGetErrorString(err) << " format=" << tensorTypeName(weights.layout.source_type));
                 return false;
             }
             recordCudaGroupedEmbeddingCall(
-                embed_table,
-                num_tokens,
-                d_model,
-                dev,
-                use_device_token_ids,
-                "prepared_device_embed_q8");
+                embed_table, num_tokens, d_model, dev, use_device_token_ids,
+                "prepared_device_native_quantized");
             return true;
         }
 

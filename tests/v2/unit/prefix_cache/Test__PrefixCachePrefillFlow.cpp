@@ -136,6 +136,7 @@ namespace
             if (!chunk_schedule_ok)
                 return false;
 
+            forward_token_batches.emplace_back(tokens, tokens + seq_len);
             position += seq_len;
             syncShiftedRowsToPosition();
             logits_buffer.assign(vocab_size(), -1.0f);
@@ -148,6 +149,8 @@ namespace
         void clear_cache() override
         {
             ++clear_calls;
+            if (fail_terminal_reset == 1) throw std::runtime_error("injected terminal reset failure");
+            if (fail_terminal_reset == 2) throw 7;
             position = 0;
             shifted_mtp_rows = 0;
         }
@@ -157,7 +160,17 @@ namespace
         int sampleGreedyOnDevice() override { return -1; }
         uint64_t moeRuntimeMovementEpoch() const override
         {
+            ++scalar_epoch_reads;
             return runtime_movement_epoch;
+        }
+
+        /** @return Completed pipeline observations only after the actual harvest boundary. */
+        MoEOptimizationStages<PrefixMovementEpochObservation> prefixMovementStages() const override
+        {
+            if (!pipeline_movement.empty())
+                EXPECT_GT(harvest_calls, 0);
+            ++pipeline_epoch_reads;
+            return pipeline_movement;
         }
 
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override
@@ -176,7 +189,8 @@ namespace
             EXPECT_EQ(admission.fingerprint_key, lookup_result.fingerprint_key);
             EXPECT_EQ(tokens, lookup_tokens);
             forward_calls_at_prepare = forward_calls;
-            prepared_checkpoint = schedule.reusableCheckpoint();
+            prepared_block_count = admission.blocks.size();
+            prepared_checkpoints = schedule.reusableCheckpoints();
             prepared_prompt = schedule.promptTokens();
             ++prepare_calls;
             return prepare_ok;
@@ -497,7 +511,7 @@ namespace
         int prepare_calls = 0;
         int prepared_prompt = 0;
         int forward_calls_at_prepare = 0;
-        std::optional<int> prepared_checkpoint;
+        std::vector<int> prepared_checkpoints;
         bool prepare_ok = true;
         int populate_calls = 0;
         int harvest_calls = 0;
@@ -510,6 +524,10 @@ namespace
         int harvested_prompt_token_count = 0;
         uint64_t harvested_fingerprint = 0;
         uint64_t runtime_movement_epoch = 0;
+        int fail_terminal_reset = 0;
+        MoEOptimizationStages<PrefixMovementEpochObservation> pipeline_movement;
+        mutable int scalar_epoch_reads = 0;
+        mutable int pipeline_epoch_reads = 0;
         std::optional<uint64_t> movement_epoch_after_harvest;
         int position = 0;
         int shifted_mtp_rows = 0;
@@ -531,6 +549,7 @@ namespace
         std::vector<int32_t> lookup_tokens;
         std::vector<int32_t> harvested_tokens;
         std::vector<int> populated_tokens;
+        size_t prepared_block_count = 0;
         std::vector<RestoredPrefixMTPDecodeBridgeRequest>
             restored_prefix_bridge_requests;
 
@@ -709,7 +728,7 @@ TEST(Test__PrefixCachePrefillFlow, HybridPrefixArchivesReusableBoundaryBeforeTai
         EXPECT_EQ(observed->harvested_fingerprint, 17u);
         EXPECT_EQ(observed->prepare_calls, 1);
         EXPECT_EQ(observed->prepared_prompt, 365);
-        EXPECT_EQ(observed->prepared_checkpoint, 320);
+        EXPECT_THAT(observed->prepared_checkpoints, ElementsAre(320));
         EXPECT_EQ(observed->forward_calls_at_prepare, 0);
         EXPECT_EQ(runner->prefixStateProbe().prefix_request.matched_tokens, 0);
     }
@@ -782,6 +801,70 @@ TEST(Test__PrefixCachePrefillFlow, HybridPrefixDoesNotRecomputeRestoredOrEmptyFr
     }
 }
 
+/** @test Off, fixed and dynamic MTP archive live sparse frontiers and consume each suffix once. */
+TEST(Test__PrefixCachePrefillFlow, HybridPrefixSparseHistoryCheckpointsPreserveMTPAndSuffixes)
+{
+    for (const bool enabled : {false, true})
+        for (const auto depth : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+            for (const int restored : {0, 4096})
+            {
+                SCOPED_TRACE(enabled);
+                SCOPED_TRACE(static_cast<int>(depth));
+                SCOPED_TRACE(restored);
+                auto mock = std::make_unique<PrefixFlowMockRunner>();
+                auto *observed = mock.get();
+                mock->mtp_enabled = enabled;
+                mock->supports_chunk_schedule = true;
+                mock->lookup_result.supported = mock->lookup_result.cache_enabled = true;
+                mock->lookup_result.block_size = 64;
+                mock->lookup_result.fingerprint_key = 17;
+                mock->lookup_result.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+                mock->lookup_result.cached_tokens = restored;
+                mock->lookup_result.has_terminal_hidden = mock->lookup_result.has_terminal_logits = restored > 0;
+                auto config = makeConfig(enabled, 3, RoutedExpertAssignmentPolicy::StaticOwner, 64);
+                auto plan = makePlan(enabled, 3, RoutedExpertAssignmentPolicy::StaticOwner, 64);
+                config.mtp.depth_policy.mode = plan.runtime.mtp.depth_policy.mode = depth;
+                OrchestrationRunner runner(config, plan, std::move(mock));
+                std::vector<int32_t> tokens(12301);
+                for (size_t index = 0; index < tokens.size(); ++index)
+                    tokens[index] = static_cast<int32_t>(index % 15);
+                ASSERT_TRUE(runner.prefill(tokens)) << runner.lastError();
+                const std::vector<int> checkpoints = restored == 0
+                    ? std::vector<int>{4096, 8192, 12288}
+                    : std::vector<int>{8192, 12288};
+                EXPECT_EQ(observed->prepared_checkpoints, checkpoints);
+                auto all_frontiers = checkpoints;
+                all_frontiers.push_back(static_cast<int>(tokens.size()));
+                EXPECT_EQ(observed->harvested_frontiers, all_frontiers);
+                EXPECT_EQ(observed->harvested_positions, all_frontiers);
+                std::vector<int> consumed;
+                for (const auto &batch : observed->forward_token_batches)
+                    consumed.insert(consumed.end(), batch.begin(), batch.end());
+                EXPECT_EQ(consumed, std::vector<int>(tokens.begin() + restored, tokens.end()));
+                EXPECT_EQ(observed->position, tokens.size());
+                if (enabled) EXPECT_EQ(observed->shifted_mtp_rows, tokens.size() - 1);
+                EXPECT_EQ(runner.prefixStateProbe().prefix_request.matched_tokens, restored);
+                EXPECT_EQ(observed->prepare_calls, 1);
+                EXPECT_EQ(observed->forward_calls_at_prepare, 0);
+            }
+}
+
+/** @test A failed sparse archive never permits inference to overwrite that live state. */
+TEST(Test__PrefixCachePrefillFlow, HybridPrefixSparsePublicationFailureStopsAtFirstFrontier)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *observed = mock.get();
+    mock->supports_chunk_schedule = true;
+    mock->lookup_result.supported = mock->lookup_result.cache_enabled = true;
+    mock->lookup_result.block_size = 64;
+    mock->lookup_result.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    mock->harvest_ok = false;
+    auto runner = makeRunner(std::move(mock), true, 3, RoutedExpertAssignmentPolicy::StaticOwner, 64);
+    EXPECT_FALSE(runner->prefill(std::vector<int32_t>(20001, 2)));
+    EXPECT_THAT(observed->harvested_frontiers, ElementsAre(4096));
+    EXPECT_EQ(observed->position, 4096);
+}
+
 TEST(Test__PrefixCachePrefillFlow, SharedPrefixRunsOnlySuffixAndHarvestsPrompt)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
@@ -837,6 +920,23 @@ TEST(Test__PrefixCachePrefillFlow, FreshPrefixMissDoesNotManufactureRequestReset
     EXPECT_EQ(mock_ptr->harvest_calls, 1);
 }
 
+/** Root teardown cannot turn either exception family into successful retirement. */
+TEST(Test__PrefixCachePrefillFlow, TerminalResetFailureIsFatalBeforePublishingRetirement)
+{
+    EXPECT_DEATH({
+        auto mock = std::make_unique<PrefixFlowMockRunner>();
+        mock->fail_terminal_reset = 1;
+        auto runner = makeRunner(std::move(mock));
+        runner->shutdown();
+    }, "terminal request retirement failed: injected terminal reset failure");
+    EXPECT_DEATH({
+        auto mock = std::make_unique<PrefixFlowMockRunner>();
+        mock->fail_terminal_reset = 2;
+        auto runner = makeRunner(std::move(mock));
+        runner->shutdown();
+    }, "terminal request retirement raised a non-standard exception");
+}
+
 TEST(Test__PrefixCachePrefillFlow,
      RequestSummaryOwnsExactAsynchronousMovementInterval)
 {
@@ -857,6 +957,42 @@ TEST(Test__PrefixCachePrefillFlow,
     EXPECT_EQ(probe.prefix_request.admission_placement_epochs.earliest(), 7u);
     EXPECT_EQ(probe.prefix_request.completion_movement_epoch, 8u);
     EXPECT_TRUE(probe.prefix_request.crossedMovementEpoch());
+}
+
+/** The root retains stage metadata after harvest without sampling a flattened epoch. */
+TEST(Test__PrefixCachePrefillFlow, PipelineRequestSummaryRetainsIndependentMovementEpochs)
+{
+    for (const int width : {2, 4})
+    {
+        auto mock = std::make_unique<PrefixFlowMockRunner>();
+        auto *participant = mock.get();
+        mock->lookup_result.supported = mock->lookup_result.cache_enabled = true;
+        mock->lookup_result.block_size = 2;
+        mock->lookup_result.placement_epochs = PrefixPlacementEpochSpan::covering(1, 100);
+        mock->runtime_movement_epoch = 100;
+        std::vector<GlobalDeviceAddress> amd, nvidia;
+        for (int i = 0; i < width; ++i)
+        {
+            amd.push_back(GlobalDeviceAddress::rocm(i));
+            nvidia.push_back(GlobalDeviceAddress::cuda(i));
+        }
+        mock->pipeline_movement = MoEOptimizationStages<PrefixMovementEpochObservation>::seal({
+            {{0, 0, 2, 2, amd, false}, {.admission = PrefixPlacementEpochSpan::at(100), .completion = 100}},
+            {{1, 2, 4, 5, nvidia, true}, {.admission = PrefixPlacementEpochSpan::at(1), .completion = 2}}});
+        const auto expected = mock->pipeline_movement;
+        auto runner = makeRunner(std::move(mock));
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+        const auto summary = runner->requestRuntimeSummary().prefix_request;
+        EXPECT_EQ(participant->pipeline_epoch_reads, 1);
+        EXPECT_EQ(participant->scalar_epoch_reads, 0);
+        EXPECT_EQ(summary.movement_stages, expected);
+        EXPECT_TRUE(summary.crossedMovementEpoch());
+        EXPECT_EQ(summary.admission_placement_epochs, PrefixPlacementEpochSpan{});
+        EXPECT_EQ(summary.completion_movement_epoch, 0);
+        // Returning the completed observation again must not traverse participants.
+        EXPECT_EQ(runner->requestRuntimeSummary().prefix_request.movement_stages, expected);
+        EXPECT_EQ(participant->pipeline_epoch_reads, 1);
+    }
 }
 
 /**
@@ -1132,6 +1268,13 @@ TEST(Test__PrefixCachePrefillFlow, LLEPFullHitAtUnalignedBoundaryRecomputesRemai
     EXPECT_FALSE(probe.prefix_request.terminal_logits_restored);
 }
 
+/**
+ * @brief Restored block counts and mixed tiers survive terminal-only harvest ownership.
+ *
+ * The terminal runtime image authenticates an unaligned full MTP hit. Its
+ * harvest witness retains just one owner, while request diagnostics must
+ * still describe every block that restoration consumed.
+ */
 TEST(Test__PrefixCachePrefillFlow, LLEPFullHitWithTerminalRuntimeSnapshotRestoresUnalignedMTPState)
 {
     auto make_block = [](int block_index,
@@ -1176,6 +1319,7 @@ TEST(Test__PrefixCachePrefillFlow, LLEPFullHitWithTerminalRuntimeSnapshotRestore
         make_block(1, 2, 2, false),
         make_block(2, 4, 1, true),
     };
+    mock_ptr->lookup_result.blocks.front().tier = PrefixStorageTier::DeviceHot;
 
     auto runner = makeRunner(std::move(mock),
                              /*mtp_enabled=*/true,
@@ -1190,6 +1334,7 @@ TEST(Test__PrefixCachePrefillFlow, LLEPFullHitWithTerminalRuntimeSnapshotRestore
     EXPECT_EQ(mock_ptr->restore_terminal_calls, 1);
     EXPECT_EQ(mock_ptr->forward_calls, 0);
     EXPECT_EQ(mock_ptr->harvest_calls, 1);
+    EXPECT_EQ(mock_ptr->prepared_block_count, 1u);
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_TRUE(probe.prefix_request.hit);
@@ -1199,6 +1344,81 @@ TEST(Test__PrefixCachePrefillFlow, LLEPFullHitWithTerminalRuntimeSnapshotRestore
     EXPECT_TRUE(probe.prefix_request.terminal_logits_restored);
     EXPECT_TRUE(probe.prefix_request.terminal_hidden_restored);
     EXPECT_TRUE(probe.prefix_request.mtp_state_restored);
+    EXPECT_TRUE(probe.prefix_request.hybrid_state_restored);
+    EXPECT_EQ(probe.prefix_request.storage_tier, "mixed");
+}
+
+/** @brief Metadata-only lookup must report archived MTP without retaining payload pointers. */
+TEST(Test__PrefixCachePrefillFlow, MetadataOnlyLookupReportsRestoredMTPSections)
+{
+    auto make_block = [](int block_index,
+                         int token_start,
+                         int token_count,
+                         bool terminal) {
+        PrefixBlockHandle block;
+        block.key.fingerprint = 0x1234;
+        block.key.block_index = block_index;
+        block.key.token_start = token_start;
+        block.key.token_count = token_count;
+        block.total_bytes = 1;
+        block.layout.block_size = 2;
+        block.layout.includes_mtp_state = true;
+        block.layout.mtp_kv_bytes = 4;
+        block.layout.hybrid_state_bytes = 16;
+        block.has_hybrid_state = terminal;
+        block.has_terminal_hidden = terminal;
+        block.has_terminal_logits = terminal;
+        block.has_model_runtime_state = terminal;
+        if (terminal)
+        {
+            block.model_runtime_state_storage =
+                std::make_shared<PrefixRuntimeStateStorage>(
+                    std::make_shared<std::vector<uint8_t>>(4, 0x7f));
+        }
+        block.total_bytes = block.layout.totalBytes() + (terminal ? 4 : 0);
+        return block;
+    };
+
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 5;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+    mock_ptr->lookup_result.has_terminal_hidden = true;
+    mock_ptr->lookup_result.blocks = {
+        make_block(0, 0, 2, false),
+        make_block(1, 2, 2, false),
+        make_block(2, 4, 1, true),
+    };
+    mock_ptr->lookup_result.blocks.front().tier = PrefixStorageTier::DeviceHot;
+
+    auto runner = makeRunner(std::move(mock),
+                             /*mtp_enabled=*/true,
+                             /*mtp_draft_tokens=*/1,
+                             RoutedExpertAssignmentPolicy::LeastLoadedResident);
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(5));
+    EXPECT_EQ(mock_ptr->restore_terminal_calls, 1);
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+    EXPECT_EQ(mock_ptr->prepared_block_count, 1u);
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_TRUE(probe.prefix_request.hit);
+    EXPECT_FALSE(probe.prefix_request.partial_hit);
+    EXPECT_EQ(probe.prefix_request.matched_tokens, 5);
+    EXPECT_EQ(probe.prefix_request.matched_blocks, 3);
+    EXPECT_TRUE(probe.prefix_request.terminal_logits_restored);
+    EXPECT_TRUE(probe.prefix_request.terminal_hidden_restored);
+    EXPECT_TRUE(probe.prefix_request.mtp_state_restored);
+    EXPECT_TRUE(probe.prefix_request.hybrid_state_restored);
+    EXPECT_EQ(probe.prefix_request.storage_tier, "mixed");
 }
 
 TEST(Test__PrefixCachePrefillFlow, LLEPConfiguredPrefillWindowSegmentsUncachedPrefill)

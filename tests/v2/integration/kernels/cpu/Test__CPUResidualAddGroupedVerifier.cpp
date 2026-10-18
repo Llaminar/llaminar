@@ -8,6 +8,10 @@
  * spans use the configured team. This suite compares FP32, BF16, and FP16
  * native output bytes against production M=1 decode across the runtime-M
  * inventory and requires exactly one grouped production counter.
+ *
+ * The focused FP32 tail case additionally checks independent exact sums, every
+ * mod4 remainder, unused-capacity guards and changing-input reuse. GPU builds
+ * retain real grouped, aligned-M1 and in-place graphs; CPU runs actual 1/2 teams.
  */
 
 #include <gtest/gtest.h>
@@ -18,6 +22,8 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/VerifierRowTestInventory.h"
+#include "utils/ResidualAddTailCases.h"
+#include "utils/OpenMPUtils.h"
 
 #include <algorithm>
 #include <array>
@@ -293,4 +299,53 @@ TEST(Test__CPUResidualAddGroupedVerifier, AllNativeFormatsMatchSerialDecodeBytes
                     CPUResidualAddKernelT<ActivationPrecision::BF16>>("BF16");
     runNativeFormat<ActivationPrecision::FP16,
                     CPUResidualAddKernelT<ActivationPrecision::FP16>>("FP16");
+}
+
+/** @test CPU compiler-vectorized and workshared tails match an integer oracle. */
+TEST(Test__CPUResidualAddGroupedVerifier, FP32TailExtentsMatchIndependentAdd)
+{
+    namespace fixture = llaminar2::test::residual_tail;
+    // FP32 residual addition uses compiler SIMD, not runtime ISA_DISPATCH.
+    // Canonical AVX2/AVX512 images own ISA coverage; these teams exercise the
+    // actual caller-thread and flat-workshare production paths without stubs.
+    for (int workers : {1, 2})
+    {
+        llaminar::v2::ThreadCountGuard threads(workers);
+        CPUResidualAddKernelT<ActivationPrecision::FP32> kernel;
+        for (size_t cols : fixture::widths)
+        {
+            const size_t capacity = fixture::rows.back() * cols;
+            std::vector<float> input, residual, expected;
+            std::vector<float> grouped(capacity + fixture::guards);
+            std::vector<float> serial(capacity + fixture::guards);
+            for (size_t replay = 0; replay < 4; ++replay)
+            {
+                fixture::operands(capacity, replay, input, residual, expected);
+                for (size_t count : fixture::replay_order)
+                {
+                    SCOPED_TRACE("workers=" + std::to_string(workers) +
+                        " cols=" + std::to_string(cols) + " M=" + std::to_string(count) +
+                        " replay=" + std::to_string(replay));
+                    const size_t live = count * cols;
+                    std::fill(grouped.begin(), grouped.end(), std::bit_cast<float>(0xffffffffu));
+                    std::fill(serial.begin(), serial.end(), std::bit_cast<float>(0xfefefefeu));
+                    ASSERT_TRUE(kernel.apply(input.data(), residual.data(), grouped.data(), live));
+                    fixture::expect(grouped, expected, live, 0xffffffffu);
+                    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+                    for (size_t row = 0; row < count; ++row)
+                        ASSERT_TRUE(kernel.apply(input.data() + row * cols,
+                            residual.data() + row * cols, serial.data() + row * cols, cols));
+                    fixture::expect(serial, expected, live, 0xfefefefeu);
+                    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+                    ASSERT_EQ(std::memcmp(grouped.data(), serial.data(), live * sizeof(float)), 0);
+                    std::fill(grouped.begin(), grouped.end(), std::bit_cast<float>(0xfdfdfdfdu));
+                    std::copy_n(residual.begin(), live, grouped.begin());
+                    ASSERT_TRUE(kernel.apply(input.data(), grouped.data(), grouped.data(), live));
+                    for (size_t i = 0; i < grouped.size(); ++i)
+                        ASSERT_EQ(std::bit_cast<std::uint32_t>(grouped[i]), i < live
+                            ? std::bit_cast<std::uint32_t>(expected[i]) : 0xfdfdfdfdu) << "element=" << i;
+                }
+            }
+        }
+    }
 }

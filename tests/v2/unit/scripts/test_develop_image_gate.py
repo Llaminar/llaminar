@@ -289,18 +289,19 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(set(workflow["on"]["pull_request_target"]["types"]),
                          {"opened", "reopened", "synchronize", "ready_for_review"})
         self.assertEqual(workflow["permissions"],
-                         {"contents": "write", "pull-requests": "write"})
+                         {"contents": "read", "pull-requests": "read"})
         self.assertEqual(set(workflow["jobs"]), {"arm"})
         job = workflow["jobs"]["arm"]
         self.assertIn("head.repo.full_name == github.repository", job["if"])
         self.assertIn("!github.event.pull_request.draft", job["if"])
         self.assertEqual(len(job["steps"]), 1)
         step = job["steps"][0]
-        self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.GITHUB_TOKEN }}")
+        self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.DEVELOP_AUTOMERGE_TOKEN }}")
         self.assertEqual(step["env"]["PR_NUMBER"],
                          "${{ github.event.pull_request.number }}")
-        self.assertIn('gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" '
-                      '--auto --squash', step["run"])
+        self.assertEqual(step["env"]["PR_HEAD_SHA"], "${{ github.event.pull_request.head.sha }}")
+        self.assertIn('gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash', step["run"])
+        self.assertIn('--match-head-commit "$PR_HEAD_SHA"', step["run"])
         self.assertNotIn("checkout", str(job))
 
     def test_all_host_ci_jobs_share_a_serial_non_discarding_queue(self):

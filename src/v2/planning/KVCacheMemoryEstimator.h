@@ -9,6 +9,7 @@
 
 #pragma once
 #include "backends/DeviceId.h"
+#include "tensors/TensorType.h"
 #include <cstddef>
 #include <string>
 
@@ -47,6 +48,15 @@ namespace llaminar2
     class KVCacheMemoryEstimator
     {
     public:
+        /**
+         * @brief Resolve native attention operands from the strict cache codec parser.
+         * @param kv_precision Canonical configured cache precision.
+         * @return Native floating/Q8 format, or FP32 for codecs requiring conversion.
+         * @throws std::invalid_argument for an unknown codec.
+         * This describes execution operands, never a second allocation ledger.
+         */
+        [[nodiscard]] static TensorType attentionExecutionFormat(const std::string &kv_precision);
+
         /**
          * @brief Estimate persistent KV-cache ownership for one device.
          * @param family Concrete cache family selected by production construction.

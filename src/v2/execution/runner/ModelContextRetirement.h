@@ -24,6 +24,31 @@
 namespace llaminar2
 {
     enum class MoEOverlayDeviceControllerDrainIntent : std::uint8_t;
+    enum class MoEOverlayMigrationStorageKind : std::uint8_t;
+
+    /** @brief Physical owner that must still exist when prepared reuse is sealed. */
+    enum class ModelContextPhysicalSealBoundary
+    {
+        Unretained, ///< No caller can reuse the prepared model.
+        LiveMutableResidency, ///< Restore recycled prepared storage while its fabric lives.
+        RetiredImmutableSources, ///< Retire all readers and scratch before checking immutable sources.
+    };
+
+    /**
+     * @brief Select the terminal boundary from the actual migration storage contract.
+     * @param authority Exported reuse lifecycle, or null for ordinary disposal.
+     * @param storage One exact storage owner per independent routed stage; empty means dense.
+     * @return Required physical sealing edge, without advancing either lifecycle.
+     * @throws std::logic_error for an invalid storage kind or unowned reuse authority.
+     *
+     * Transfer directories own separate arrivals and preserve prepared source
+     * weights. A physical residency fabric can recycle those prepared bytes and
+     * therefore needs its live restoration protocol. Epoch values cannot select
+     * between these two ownership contracts.
+     */
+    [[nodiscard]] ModelContextPhysicalSealBoundary modelContextPhysicalSealBoundary(
+        const std::shared_ptr<ModelContextReuseAuthority> &authority,
+        const std::vector<MoEOverlayMigrationStorageKind> &storage);
 
     /**
      * @brief Project actual model retention into the local overlay drain intent.

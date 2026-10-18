@@ -1,11 +1,17 @@
 /**
  * @file MoEOverlayDevicePhysicalSlotLedger.cpp
  * @brief Transactional physical lifetime bookkeeping for device-owned MoE RCU.
+ *
+ * The ledger retains prepared allocation lifetimes within one immutable
+ * pipeline stage. It never owns placement policy or a second memory budget.
+ * Global layer keys and stage-bound transaction receipts prevent a same-shaped
+ * peer stage from publishing or retiring these allocations.
  */
 
 #include "MoEOverlayDevicePhysicalSlotLedger.h"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -85,6 +91,28 @@ namespace llaminar2
     /** @brief Private active inventory and sole pending transaction. */
     struct MoEOverlayDevicePhysicalSlotLedger::Impl
     {
+        /** Bind the setup namespace before enrolling any allocation lifetime. */
+        explicit Impl(const Config &config)
+            : first_model_layer(config.first_model_layer),
+              num_layers(config.num_layers), num_experts(config.num_experts)
+        {
+        }
+
+        /** @return Whether immutable command geometry names this exact stage. */
+        bool matchesScope(const MoEOverlayDevicePhysicalMovementBatch &batch) const noexcept
+        {
+            return batch.first_model_layer == first_model_layer &&
+                   batch.num_layers == num_layers && batch.num_experts == num_experts;
+        }
+
+        /** @return Whether an allocation key belongs to the admitted model rows. */
+        bool contains(const MoEOverlayDevicePhysicalSlotKey &key) const noexcept
+        {
+            return key.layer_idx >= first_model_layer && key.expert_id >= 0 &&
+                   static_cast<std::uint32_t>(key.layer_idx - first_model_layer) < num_layers &&
+                   static_cast<std::uint32_t>(key.expert_id) < num_experts;
+        }
+
         /** Physical allocation retained independently of device descriptor bytes. */
         struct ActiveSlot
         {
@@ -115,7 +143,7 @@ namespace llaminar2
         bool exact(
             const MoEOverlayDevicePhysicalMovementBatch &batch) const noexcept
         {
-            return pending.has_value() &&
+            return matchesScope(batch) && pending.has_value() &&
                    pending->topology_fingerprint ==
                        batch.topology_fingerprint &&
                    pending->transaction_id == batch.transaction_id &&
@@ -135,6 +163,9 @@ namespace llaminar2
         }
 
         mutable std::mutex mutex;
+        const int first_model_layer;
+        const std::uint32_t num_layers;
+        const std::uint32_t num_experts;
         std::uint64_t current_epoch = 0u;
         std::vector<int> local_participant_ids;
         DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
@@ -144,9 +175,13 @@ namespace llaminar2
 
     MoEOverlayDevicePhysicalSlotLedger::MoEOverlayDevicePhysicalSlotLedger(
         Config config)
-        : impl_(std::make_unique<Impl>())
+        : impl_(std::make_unique<Impl>(config))
     {
-        if ((config.movable_projections != DeviceMoEProjectionSet::CompleteExpert &&
+        if (config.first_model_layer < 0 || config.num_layers == 0u ||
+            config.num_layers > static_cast<std::uint32_t>(
+                std::numeric_limits<int>::max() - config.first_model_layer) ||
+            config.num_experts == 0u ||
+            (config.movable_projections != DeviceMoEProjectionSet::CompleteExpert &&
              config.movable_projections != DeviceMoEProjectionSet::GateUp) || config.initial_epoch == 0u ||
             config.local_participant_ids.empty() ||
             !std::is_sorted(
@@ -158,7 +193,7 @@ namespace llaminar2
                 config.local_participant_ids.end())
         {
             throw std::invalid_argument(
-                "device physical slot ledger requires a positive epoch and sorted unique local participants");
+                "device physical slot ledger requires valid stage geometry, a positive epoch and sorted unique local participants");
         }
         impl_->current_epoch = config.initial_epoch;
         impl_->movable_projections = config.movable_projections;
@@ -168,7 +203,7 @@ namespace llaminar2
         {
             if (!slot.valid() || !slot.payload.readyFor(impl_->movable_projections) ||
                 slot.entered_epoch > config.initial_epoch ||
-                !impl_->local(slot.key.participant_id))
+                !impl_->local(slot.key.participant_id) || !impl_->contains(slot.key))
             {
                 throw std::invalid_argument(
                     "device physical slot ledger initial inventory is invalid or non-local");
@@ -195,7 +230,7 @@ namespace llaminar2
     {
         if (error)
             error->clear();
-        if (!batch.valid() || !batch.movesWeights() ||
+        if (!impl_->matchesScope(batch) || !batch.valid() || !batch.movesWeights() ||
             (batch.kind !=
                  MoEOverlayDeviceControllerTransactionKind::DynamicPlacement &&
              batch.kind != MoEOverlayDeviceControllerTransactionKind::
@@ -203,7 +238,7 @@ namespace llaminar2
         {
             return reject(
                 error,
-                "device physical slot ledger requires non-empty durable placement movement");
+                "device physical slot ledger requires non-empty durable placement movement for its exact stage");
         }
 
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -263,7 +298,7 @@ namespace llaminar2
         if (error)
             error->clear();
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!key.valid() || !impl_->exact(batch) ||
+        if (!key.valid() || !impl_->contains(key) || !impl_->exact(batch) ||
             !impl_->local(key.participant_id))
         {
             reject(

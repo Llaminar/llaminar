@@ -16,6 +16,7 @@
 #include "MoEOverlayCapacityAdmission.h"
 #include "MoEExpertOverlayExecutionPlan.h"
 #include "MoEOverlayHostDemandMemoryPlan.h"
+#include "MoEOverlayInferenceTransaction.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "loaders/GPUVramPreflight.h"
@@ -27,6 +28,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -134,6 +136,8 @@ namespace llaminar2
         /** Required whenever this rank's physical resources include a GPU. */
         std::optional<MoEOverlayGPUWeightLoadCapacityInput>
             gpu_weight_load;
+        /** Exact global routed interval, including only this owner's retained sidecars. */
+        MoEOverlayInferenceGraphFamilyIdentity graph_family;
     };
 
     /** @brief Rank-local fixed BOM plus the exact graph-row shape it priced. */
@@ -235,5 +239,21 @@ namespace llaminar2
          */
         [[nodiscard]] static MoEOverlayLocalCapacityPlannerResult plan(
             const MoEOverlayLocalCapacityPlannerInput &input);
+
+        /**
+         * @brief Assemble all local pipeline fixed owners in one setup transaction.
+         * @param parent Authored PP plan retaining exact participant and channel ownership.
+         * @param stages Ordered stage inputs sharing the same complete model metadata.
+         * @return Per-stage contributions for joint expert capacity admission. Shared
+         *         archive scratch appears once; independent RAM tiers remain additive.
+         * @throws std::invalid_argument for missing, foreign or overlapping child geometry.
+         *
+         * These are contribution certificates, not permission to materialize stages
+         * independently. resolvePipelineCapacity must admit their complete aggregate
+         * before the runtime publishes a PhysicalMemoryAuthority.
+         */
+        [[nodiscard]] static std::vector<MoEOverlayLocalCapacityPlannerResult> planPipeline(
+            const RankExecutionPlan &parent,
+            std::span<const MoEOverlayLocalCapacityPlannerInput> stages);
     };
 } // namespace llaminar2

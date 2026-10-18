@@ -1,0 +1,176 @@
+From: Llaminar native event lifetime regression
+Subject: [PATCH] Borrow the exact live producer generation for event capture checks
+
+HIP events remain valid after their producer stream is destroyed. Capture
+checks previously dereferenced the unowned stream pointer, producing a host
+use-after-free, mutex abort or hang during retained tensor-event retirement.
+Address-only membership also mistakes a reused stream address for the original
+producer. Use the existing device stream registry and monotonic stream ID to
+borrow the exact generation for capture metadata inspection. No queue owner,
+allocation, device transfer, synchronization or graph scheduling mode is added.
+
+Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
+             (therock-10.0, ROCm Core SDK 10.0.0)
+
+diff --git a/hipamd/src/hip_internal.hpp b/hipamd/src/hip_internal.hpp
+--- a/hipamd/src/hip_internal.hpp
++++ b/hipamd/src/hip_internal.hpp
+@@ -597,6 +597,36 @@
+     void RemoveStream(Stream* stream);
+     /// Returns true if stream belongs to this device
+     bool StreamExists(const Stream* stream);
++
++    /**
++     * @brief Borrow one registered stream generation without retaining its queue.
++     * The reader lock prevents RemoveStream from retiring the object until the
++     * inspection ends. The monotonic identity rejects a new stream allocated at
++     * a retired producer's address. A missing producer is a valid event state:
++     * the recorded amd::Event owns its completion independently of the stream.
++     */
++    class StreamLease final {
++     public:
++      StreamLease() = default;
++      StreamLease(const StreamLease&) = delete;
++      StreamLease& operator=(const StreamLease&) = delete;
++      StreamLease(StreamLease&&) = default;
++      StreamLease& operator=(StreamLease&&) = default;
++      /// Return the live producer only for this lease's lexical lifetime.
++      Stream* get() const { return stream_; }
++     private:
++      friend class Device;
++      StreamLease(Device& device, Stream* stream, uint64_t identity)
++          : lock_(device.streamSetLock_),
++            stream_(device.streamSet_.count(stream) != 0 &&
++                    stream->GetStreamId() == identity ? stream : nullptr) {}
++      std::shared_lock<std::shared_mutex> lock_;
++      Stream* stream_ = nullptr;
++    };
++    /** @brief Authenticate and borrow an event's original producer generation. */
++    StreamLease BorrowStream(Stream* stream, uint64_t identity) {
++      return StreamLease(*this, stream, identity);
++    }
+     /// Synchronize all streams (optionally only blocking ones)
+     void SyncAllStreams(bool cpu_wait = true, bool wait_blocking_streams_only = false);
+     /// Returns true if any stream on this device is in capture mode
+diff --git a/hipamd/src/hip_event.hpp b/hipamd/src/hip_event.hpp
+--- a/hipamd/src/hip_event.hpp
++++ b/hipamd/src/hip_event.hpp
+@@ -87,8 +87,10 @@
+ };
+ 
+ class Event {
+-  /// Capture stream where event is recorded
++  /// Non-owning producer identity; every dereference needs a registry lease.
+   hipStream_t captureStream_ = nullptr;
++  uint64_t captureStreamId_ = 0;
++  int captureDeviceId_ = -1;
+   /// Previous captured nodes before event record
+   std::vector<hip::GraphNode*> nodesPrevToRecorded_;
+ 
+@@ -141,10 +143,34 @@
+   void setDeviceId(int id) { device_id_ = id; }
+   amd::Event* event() { return event_; }
+ 
+-  /// Get capture stream where event is recorded
+-  hipStream_t GetCaptureStream() const { return captureStream_; }
+-  /// Set capture stream where event is recorded
+-  void SetCaptureStream(hipStream_t stream) { captureStream_ = stream; }
++  /**
++   * @brief Borrow the original producer without extending its native lifetime.
++   * Copy the identity under the event lock, then release it before entering
++   * the device registry. This keeps stream capture cleanup's stream -> event
++   * ordering independent of the registry -> stream inspection ordering.
++   */
++  Device::StreamLease BorrowCaptureStream() {
++    hipStream_t stream;
++    uint64_t identity;
++    int device;
++    {
++      std::scoped_lock lock(lock_);
++      stream = captureStream_;
++      identity = captureStreamId_;
++      device = captureDeviceId_;
++    }
++    if (stream == nullptr || stream == hipStreamLegacy) return {};
++    return g_devices[device]->BorrowStream(reinterpret_cast<Stream*>(stream), identity);
++  }
++  /** @brief Publish identity while record/capture still owns a live stream. */
++  void SetCaptureStream(hipStream_t stream) {
++    std::scoped_lock lock(lock_);
++    captureStream_ = stream;
++    const auto* producer = reinterpret_cast<Stream*>(stream);
++    const bool explicit_stream = stream != nullptr && stream != hipStreamLegacy;
++    captureStreamId_ = explicit_stream ? producer->GetStreamId() : 0;
++    captureDeviceId_ = explicit_stream ? producer->DeviceId() : -1;
++  }
+   /// Returns previous captured nodes before event record
+   const std::vector<hip::GraphNode*>& GetNodesPrevToRecorded() const {
+     return nodesPrevToRecorded_;
+diff --git a/hipamd/src/hip_event.cpp b/hipamd/src/hip_event.cpp
+--- a/hipamd/src/hip_event.cpp
++++ b/hipamd/src/hip_event.cpp
+@@ -399,9 +399,9 @@
+ 
+   auto* e = reinterpret_cast<hip::Event*>(event);
+   // Handle capture stream cleanup (stream might be destroyed first)
+-  hipStream_t stream = e->GetCaptureStream();
+-  if (hip::isValid(stream) && stream != nullptr && stream != hipStreamLegacy) {
+-    reinterpret_cast<hip::Stream*>(stream)->EraseCaptureEvent(event);
++  {
++    auto producer = e->BorrowCaptureStream();
++    if (producer.get() != nullptr) producer.get()->EraseCaptureEvent(event);
+   }
+ 
+   delete e;
+@@ -449,10 +449,9 @@
+   }
+ 
+   // Clean up previous capture stream association
+-  hipStream_t lastCaptureStream = e->GetCaptureStream();
+-  if (hip::isValid(lastCaptureStream) && lastCaptureStream != nullptr &&
+-      lastCaptureStream != hipStreamLegacy) {
+-    reinterpret_cast<hip::Stream*>(lastCaptureStream)->EraseCaptureEvent(event);
++  {
++    auto previous = e->BorrowCaptureStream();
++    if (previous.get() != nullptr) previous.get()->EraseCaptureEvent(event);
+   }
+   e->SetCaptureStream(stream);
+ 
+@@ -508,12 +507,10 @@
+ // ================================================================================================
+ static hipError_t checkEventCaptureRestrictions(hipEvent_t event) {
+   auto* e = reinterpret_cast<hip::Event*>(event);
+-  const auto hip_stream = e->GetCaptureStream();
+-  if (hip_stream == nullptr || hip_stream == hipStreamLegacy) {
+-    return hipSuccess;
+-  }
++  auto producer = e->BorrowCaptureStream();
++  auto* s = producer.get();
++  if (s == nullptr) return hipSuccess;
+   // Case 1: Event was recorded during an active stream capture and is part of an active capture.
+-  auto* s = reinterpret_cast<hip::Stream*>(hip_stream);
+   if (s->GetCaptureStatus() == hipStreamCaptureStatusActive && s->IsEventCaptured(event)) {
+     s->SetCaptureStatus(hipStreamCaptureStatusInvalidated);
+     return hipErrorCapturedEvent;
+diff --git a/hipamd/src/hip_stream.cpp b/hipamd/src/hip_stream.cpp
+--- a/hipamd/src/hip_stream.cpp
++++ b/hipamd/src/hip_stream.cpp
+@@ -494,14 +494,10 @@
+   CHECK_STREAM_DETACHED(stream);
+   hip::Stream* waitStream = hip::getStream(stream);
+   hip::Event* e = reinterpret_cast<hip::Event*>(event);
+-  auto eventStreamHandle = reinterpret_cast<hipStream_t>(e->GetCaptureStream());
+-  // The stream associated with the device might have been destroyed.
+-  // If so, the event has already completed and we can resume the current stream.
+-  if (!hip::isValid(eventStreamHandle)) {
+-    return hipSuccess;
+-  }
+-
+-  hip::Stream* eventStream = reinterpret_cast<hip::Stream*>(eventStreamHandle);
++  // Events outlive their recording stream. Capture metadata may only borrow
++  // the original live generation; the completion itself belongs to the event.
++  auto producer = e->BorrowCaptureStream();
++  hip::Stream* eventStream = producer.get();
+ 
+   // External-event wait: add a graph node and return immediately.
+   if (flags == hipEventWaitExternal) {

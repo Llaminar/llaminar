@@ -5,6 +5,8 @@
  * Implements IMoEKernel for CPU execution using ISA-dispatched vector
  * primitives (AVX2/AVX-512). This is the reference implementation;
  * GPU implementations (CUDA/ROCm) can override for device-native execution.
+ * Typed half router gates consume half-rounded hidden operands with FP32
+ * accumulation, retaining original FP32 hidden/Q8 authority for the experts.
  */
 
 #pragma once
@@ -71,7 +73,10 @@ namespace llaminar2
          *
          * CPU expert dispatch is host-owned, so the CPU implementation is the
          * one backend where @p host_result is a production output rather than
-         * an obsolete GPU mirror.
+         * an obsolete GPU mirror. A physical FP16 gate selects half-RNE hidden
+         * and half weights with fixed FP32 accumulation. Expert Q8 publication
+         * still consumes the original FP32 hidden; the raw float route stays Native. FP16 gate tensors select physical half A/B
+         * with FP32 accumulation; the raw float route() interface stays Native.
          */
         bool routeWithTensors(
             ITensor *hidden, ITensor *gate_weights,
@@ -253,6 +258,20 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Route already prepared FP32 or FP16 gates without a weight cache.
+         * @param hidden Original FP32 rows retained as the expert-Q8 publication source.
+         * @param gate_weights Contiguous N-by-K bytes in exactly @p gate_type.
+         * @param gate_type FP32 selects old arithmetic; FP16 selects half A/B + FP32 tree.
+         * @param seq_len Positive row count; @p d_model and @p num_experts are matrix K/N.
+         * @param top_k Unique retained experts per row.
+         * @param normalize_weights Normalize the selected original per-row probabilities.
+         * @param result Persistent CPU-owned result storage.
+         * @return True after joined logits, original softmax/top-k and Q8 publication.
+         */
+        bool routePrepared(const float *hidden, const void *gate_weights, TensorType gate_type,
+            int seq_len, int d_model, int num_experts, int top_k, bool normalize_weights, MoERoutingResult &result);
+
         /** Revoke publication metadata before beginning a new routing call. */
         void invalidateRouterQ8HiddenPublication() noexcept;
 

@@ -1,52 +1,8 @@
 /**
  * @file Test__Q8_KTensor.cpp
- * @brief Unit tests for Q8_K SIMD equivalency (scalar vs AVX2 vs AVX512)
- * @author David Sanftenberg
- * @date 2025-10-25
- *
- * Q8_K SIMD Equivalency Tests:
- * - ScalarVsAVX2Equivalency: Scalar vs AVX2 decode (8-wide processing)
- * - ScalarVsAVX512Equivalency: Scalar vs AVX512 decode (16-wide processing)
- * - AVX2VsAVX512Equivalency: AVX2 vs AVX512 decode (cross-validation)
- *
- * Edge Case Tests:
- * - EdgeCase_AllZeros: All int8 values = 0 → all float outputs = 0.0f
- * - EdgeCase_AllPositiveMax: All int8 values = 127 → all float outputs = 127.0f
- * - EdgeCase_AllNegativeMin: All int8 values = -128 → all float outputs = -128.0f
- * - EdgeCase_AlternatingSign: Positive/negative pattern (-128, 127, -128, 127, ...)
- * - EdgeCase_ChunkBoundaries: Test 8-element and 16-element boundaries (AVX2/AVX512 alignment)
- * - EdgeCase_RandomValues: Random int8 values across full range [-128, 127]
- *
- * Q8_K Block Structure:
- * - Block size: 256 elements (16 AVX512 chunks, 32 AVX2 chunks)
- * - Data: int8_t qs[256] (8-bit signed integers)
- * - Additional: int16_t bsums[16] (block sums for fast dot products, NOT used in decode)
- * - Total: 288 bytes (256 + 32)
- *
- * Q8_K Decode Formula:
- *   output[i] = (float)qs[i]
- *
- * This is the SIMPLEST quantization variant - just int8→float type conversion!
- * No scale factors, no bit unpacking, no lookup tables, no masks.
- *
- * SIMD Implementation:
- * - Scalar: Simple loop with static_cast<float>
- * - AVX2: Process 8 int8 at a time
- *   1. Load 8 int8 values (_mm_loadl_epi64)
- *   2. Sign-extend to int32 (_mm256_cvtepi8_epi32)
- *   3. Convert to float (_mm256_cvtepi32_ps)
- *   4. Store 8 floats (_mm256_storeu_ps)
- * - AVX512: Process 16 int8 at a time
- *   1. Load 16 int8 values (_mm_loadu_si128)
- *   2. Sign-extend to int32 (_mm512_cvtepi8_epi32)
- *   3. Convert to float (_mm512_cvtepi32_ps)
- *   4. Store 16 floats (_mm512_storeu_ps)
- *
- * Expected Performance:
- * - AVX512: 16 iterations (16 values per iteration)
- * - AVX2: 32 iterations (8 values per iteration)
- * - Scalar: 256 iterations (1 value per iteration)
- * - Speedup: AVX512 ~16×, AVX2 ~8× over scalar
+ * @brief Scalar/SIMD source-value checks for292-byte FP32-scaled Q8_K blocks.
+ * Legacy unit-scale fixtures explicitly initialize d=1. Focused regressions
+ * below independently encode raw GGUF bytes and exercise nonunit source d.
  */
 
 #include "tensors/Tensors.h"
@@ -82,6 +38,7 @@ protected:
     {
         Q8_KBlock block;
         std::memset(&block, 0, sizeof(Q8_KBlock));
+        block.d = 1.0f;
 
         // Copy values into qs[] (must be exactly 256 elements)
         assert(values.size() == 256 && "Q8_K block requires 256 elements");
@@ -130,6 +87,7 @@ protected:
         for (size_t b = 0; b < total_blocks; ++b)
         {
             Q8_KBlock *block = reinterpret_cast<Q8_KBlock *>(raw_data.data() + b * sizeof(Q8_KBlock));
+            block->d = 1.0f;
             for (size_t i = 0; i < 256; ++i)
             {
                 block->qs[i] = static_cast<int8_t>(dist(rng));
@@ -477,4 +435,195 @@ int main(int argc, char **argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
+}
+
+/**
+ * @brief Independent GGUF byte fixtures for original Q8_K FP32-scale values.
+ *
+ * These tests intentionally encode292-byte source blocks without using the
+ * production block struct. Existing FP16 prepared metadata is tested as an
+ * explicit precision limitation, never used as the original-value oracle.
+ */
+#include "loaders/ModelLoader.h"
+#include "tensors/NativeVnniFormatInfo.h"
+#include <array>
+#include <bit>
+#include <limits>
+#include <sys/mman.h>
+#include <unistd.h>
+
+namespace
+{
+/** @brief Serialize source blocks independently; @return Original GGUF bytes. */
+std::vector<uint8_t> q8kSourceBytes()
+{
+    constexpr size_t source_bytes = 292;
+    const std::array<float, 8> scales{
+        0.1f, -2.25f, 0x1p-25f, std::bit_cast<float>(uint32_t{0x100}),
+        -0.1f, 1.5f, -0x1p-25f, -std::bit_cast<float>(uint32_t{0x100})};
+    std::vector<uint8_t> bytes(source_bytes * scales.size());
+    for (size_t block = 0; block < scales.size(); ++block)
+    {
+        std::memcpy(bytes.data() + block * source_bytes, &scales[block], 4);
+        for (size_t partial = 0; partial < 16; ++partial)
+        {
+            int16_t sum = 0;
+            for (size_t lane = 0; lane < 16; ++lane)
+            {
+                const size_t i = partial * 16 + lane;
+                const auto q = static_cast<int8_t>(int((block * 23 + i) % 256) - 128);
+                std::memcpy(bytes.data() + block * source_bytes + 4 + i, &q, 1);
+                sum = static_cast<int16_t>(sum + q);
+            }
+            std::memcpy(bytes.data() + block * source_bytes + 260 + partial * 2, &sum, 2);
+        }
+    }
+    return bytes;
+}
+
+/** @brief Read represented values from independent serialized coordinates. */
+std::vector<float> q8kSourceOracle(const std::vector<uint8_t>& bytes)
+{
+    std::vector<float> result(bytes.size() / 292 * 256);
+    for (size_t block = 0; block < bytes.size() / 292; ++block)
+    {
+        float scale;
+        std::memcpy(&scale, bytes.data() + block * 292, 4);
+        for (size_t i = 0; i < 256; ++i)
+        {
+            int8_t q;
+            std::memcpy(&q, bytes.data() + block * 292 + 4 + i, 1);
+            result[block * 256 + i] = scale * static_cast<float>(q);
+        }
+    }
+    return result;
+}
+} // namespace
+
+TEST(Q8KSourceScale, Original292ByteDescriptorAndAllDecodeISAs)
+{
+    static_assert(std::endian::native == std::endian::little);
+    EXPECT_EQ(sizeof(Q8_KBlock), 292u);
+    EXPECT_EQ(offsetof(Q8_KBlock, d), 0u);
+    EXPECT_EQ(offsetof(Q8_KBlock, qs), 4u);
+    EXPECT_EQ(offsetof(Q8_KBlock, bsums), 260u);
+    GGUFTensorInfo info{};
+    info.type = GGUFTensorType::Q8_K;
+    EXPECT_EQ(info.getTypeSize(), 292u);
+    const auto bytes = q8kSourceBytes();
+    const auto expected = q8kSourceOracle(bytes);
+    const std::vector<uint8_t> legacy_288_bytes(8 * 288);
+    EXPECT_THROW((Q8_KTensor(std::vector<size_t>{4, 512}, legacy_288_bytes)),
+        std::invalid_argument);
+    auto tensor = std::make_shared<Q8_KTensor>(std::vector<size_t>{4, 512}, bytes);
+    std::vector<float> actual(expected.size());
+    tensor->to_fp32(actual.data());
+    EXPECT_EQ(std::memcmp(actual.data(), expected.data(), actual.size() * 4), 0);
+    for (size_t b = 0; b < 8; ++b)
+    {
+        Q8_KBlock block{};
+        std::memcpy(&block, bytes.data() + b * 292, 292);
+        std::array<float, 256> decoded{};
+        Q8_KTensor::decodeBlockScalar(block, decoded.data());
+        EXPECT_EQ(std::memcmp(decoded.data(), expected.data() + b * 256, 256 * 4), 0);
+#if defined(__AVX2__)
+        Q8_KTensor::decodeBlockAVX2(block, decoded.data());
+        EXPECT_EQ(std::memcmp(decoded.data(), expected.data() + b * 256, 256 * 4), 0);
+#endif
+#if defined(__AVX512F__)
+        Q8_KTensor::decodeBlockAVX512(block, decoded.data());
+        EXPECT_EQ(std::memcmp(decoded.data(), expected.data() + b * 256, 256 * 4), 0);
+#endif
+    }
+}
+
+TEST(Q8KSourceScale, MmapNestedSlicesKeepValuesAndOwner)
+{
+    const auto bytes = q8kSourceBytes();
+    const auto expected = q8kSourceOracle(bytes);
+    char name[] = "/tmp/llaminar-q8k-source-XXXXXX";
+    const int fd = ::mkstemp(name);
+    ASSERT_GE(fd, 0);
+    size_t written = 0;
+    while (written < bytes.size())
+    {
+        const auto count = ::write(fd, bytes.data() + written, bytes.size() - written);
+        if (count <= 0) break;
+        written += static_cast<size_t>(count);
+    }
+    void* mapping = written == bytes.size()
+        ? ::mmap(nullptr, bytes.size(), PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+    ::close(fd);
+    ::unlink(name);
+    ASSERT_NE(mapping, MAP_FAILED);
+    bool retired = false;
+    auto owner = std::shared_ptr<void>(mapping, [&](void* p) {
+        ::munmap(p, bytes.size());
+        retired = true;
+    });
+    std::weak_ptr<void> lifetime = owner;
+    auto tensor = std::make_shared<Q8_KTensor>(std::vector<size_t>{4, 512},
+        static_cast<const uint8_t*>(mapping), bytes.size(), owner);
+    owner.reset();
+    auto first = tensor->create_view({3, 512}, 512);
+    auto nested = first->create_view({1, 512}, 512);
+    tensor.reset();first.reset();
+    ASSERT_FALSE(lifetime.expired());
+    std::array<float, 512> decoded{};
+    nested->to_fp32(decoded.data());
+    EXPECT_EQ(std::memcmp(decoded.data(), expected.data() + 2 * 512, 512 * 4), 0);
+    EXPECT_EQ(nested->size_bytes(), 2 * 292u);
+    nested.reset();
+    EXPECT_TRUE(lifetime.expired());
+    EXPECT_TRUE(retired);
+}
+
+TEST(Q8KSourceScale, NativeInt8PublicationRetainsOriginalFP32Scale)
+{
+    const auto bytes = q8kSourceBytes();
+    auto tensor = std::make_shared<Q8_KTensor>(std::vector<size_t>{4, 512}, bytes);
+    for (size_t row = 0; row < 4; ++row)
+    {
+        for (size_t super = 0; super < 2; ++super)
+        {
+            const size_t b = row * 2 + super;
+            float original;
+            std::memcpy(&original, bytes.data() + b * 292, 4);
+            std::array<int8_t, 256> codes{};
+            std::array<float, 8> scales{};
+            tensor->unpack_superblock_to_int8(row, super, codes.data(), scales.data());
+            EXPECT_EQ(std::memcmp(codes.data(), bytes.data() + b * 292 + 4, 256), 0);
+            for (size_t sub = 0; sub < 8; ++sub)
+            {
+                EXPECT_EQ(std::bit_cast<uint32_t>(scales[sub]), std::bit_cast<uint32_t>(original));
+                EXPECT_EQ(std::bit_cast<uint32_t>(tensor->get_block_scale(row, super * 8 + sub)),
+                    std::bit_cast<uint32_t>(original));
+            }
+        }
+    }
+}
+
+TEST(Q8KSourceScale, ExistingPreparedFP16ScaleGapIsExplicit)
+{
+    const auto bytes = q8kSourceBytes();
+    auto tensor = std::make_shared<Q8_KTensor>(std::vector<size_t>{4, 512}, bytes);
+    std::array<uint8_t, 32> payload{};
+    std::array<uint16_t, 1> scales{};
+    VnniPackContext context{};
+    context.N = 1;
+    context.K = 512;
+    context.blocks_per_row = 16;
+    context.payload_bytes = 32;
+    context.payload_array = payload.data();
+    context.scales_array = scales.data();
+    tensor->packVnniBlock(context, 0, 0, 0);
+    EXPECT_EQ(std::memcmp(payload.data(), bytes.data() + 4, 32), 0);
+    const float original = tensor->get_block_scale(0, 0);
+    EXPECT_EQ(scales[0], fp32_to_fp16(original));
+    EXPECT_NE(fp16_to_fp32(scales[0]), original);
+    EXPECT_EQ(std::bit_cast<uint32_t>(original), std::bit_cast<uint32_t>(0.1f));
+    // FP32 source scale2^-25 is nonzero but underflows the existing prepared
+    // binary16 scale; the original tensor/embedding value remains nonzero.
+    EXPECT_EQ(tensor->get_block_scale(1, 0), 0x1p-25f);
+    EXPECT_EQ(fp16_to_fp32(fp32_to_fp16(tensor->get_block_scale(1, 0))), 0.0f);
 }

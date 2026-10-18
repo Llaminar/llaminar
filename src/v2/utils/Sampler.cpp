@@ -558,6 +558,11 @@ namespace llaminar2
         dry_token_history_.push_back(token_id);
     }
 
+    void Sampler::record_prompt_token(int token_id)
+    {
+        token_counts_.try_emplace(token_id, 0);
+    }
+
     void Sampler::reset_history()
     {
         token_counts_.clear();
@@ -725,23 +730,24 @@ namespace llaminar2
         }
     }
 
-    std::vector<LogitPenalty> Sampler::compute_penalty_map(const SamplingParams &params, int vocab_size)
+    LogitPenaltyBatch Sampler::compute_penalty_map(const SamplingParams &params, int vocab_size)
     {
         std::unordered_map<int, float> penalty_map;
 
         // Presence + frequency penalties
-        if (params.presence_penalty != 0.0f || params.frequency_penalty != 0.0f)
+        if (params.presence_penalty != 0.0f || params.frequency_penalty != 0.0f ||
+            params.repetition_penalty != 1.0f)
         {
             for (const auto &[token_id, count] : token_counts_)
             {
                 if (token_id < 0 || token_id >= vocab_size)
                     continue;
                 float p = 0.0f;
-                if (params.presence_penalty != 0.0f)
+                if (count > 0 && params.presence_penalty != 0.0f)
                     p += params.presence_penalty;
                 if (params.frequency_penalty != 0.0f)
                     p += params.frequency_penalty * static_cast<float>(count);
-                if (p != 0.0f)
+                if (p != 0.0f || params.repetition_penalty != 1.0f)
                     penalty_map[token_id] = p;
             }
         }
@@ -756,7 +762,7 @@ namespace llaminar2
         {
             result.push_back({token_id, penalty});
         }
-        return result;
+        return LogitPenaltyBatch(std::move(result), params.repetition_penalty);
     }
 
     void Sampler::apply_penalties(std::vector<float> &logits, const SamplingParams &params)
@@ -765,7 +771,8 @@ namespace llaminar2
         auto penalties = compute_penalty_map(params, static_cast<int>(logits.size()));
         for (const auto &entry : penalties)
         {
-            logits[entry.token_id] -= entry.penalty;
+            float &value = logits[entry.token_id];
+            value = sampling_math::penalizedLogit(value, penalties.repetitionPenalty(), entry.penalty);
         }
     }
 

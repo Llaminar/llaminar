@@ -403,19 +403,21 @@ namespace llaminar2
     /**
      * @brief Resolve routed-expert geometry for one runtime graph family.
      *
-     * Main decoder layers are always included. Routed-MoE NextN source layers
-     * are included only when @p mtp is enabled, because only that graph family
-     * constructs and publishes those prepared expert banks.
+     * Only the owned main decoder interval is included. Routed-MoE NextN source
+     * layers belong exclusively to the terminal stage when @p mtp retains graph
+     * capacity, including MTP-off controls that retain the same graph family.
      *
      * @param model_ctx Loaded model metadata authority.
      * @param mtp Exact MTP graph policy for the runner being constructed.
+     * @param pp_stage Optional authenticated main-layer scope; absent means the full model.
      * @return Exact runtime-active layer/expert/hidden/intermediate geometry.
      * @throws std::invalid_argument when enabled MTP metadata is incomplete or
      *         routed sidecar layer identities are not contiguous after the main graph.
      */
     MoERoutedExpertModelMetadata resolveMoERoutedExpertModelMetadataForModel(
         IModelContext &model_ctx,
-        const MTPRuntimeConfig &mtp);
+        const MTPRuntimeConfig &mtp,
+        const std::optional<FactoryPPStageConfig> &pp_stage = std::nullopt);
 
     bool applyMoEExpertOverlayConfigToGraphForTesting(
         IModelContext &model_ctx,

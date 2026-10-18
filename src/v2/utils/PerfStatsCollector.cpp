@@ -72,6 +72,8 @@ namespace llaminar2
             uint64_t sequence_word_count = 0;
             uint64_t sequence_digest_lo = 0;
             uint64_t sequence_digest_hi = 0;
+            std::vector<uint64_t> sequence_minimum_words;
+            std::vector<uint64_t> sequence_maximum_words;
         };
 
         struct PerfStatsState
@@ -573,6 +575,36 @@ namespace llaminar2
             record.sequence_word_count += static_cast<uint64_t>(words.size());
         }
 
+        /** @brief Retain exact extrema using one fixed-width vector pair per counter family. */
+        void observeSequenceRanges(PerfStatAccumulator &record,
+            std::initializer_list<uint64_t> words)
+        {
+            if (record.count == 0u)
+            {
+                record.sequence_minimum_words.assign(words.begin(), words.end());
+                record.sequence_maximum_words.assign(words.begin(), words.end());
+                return;
+            }
+            size_t index = 0;
+            for (const auto word : words)
+            {
+                record.sequence_minimum_words[index] = std::min(record.sequence_minimum_words[index], word);
+                record.sequence_maximum_words[index] = std::max(record.sequence_maximum_words[index], word);
+                ++index;
+            }
+        }
+
+        /** @brief Serialize integer observations without rounding large generation identities. */
+        std::string sequenceWordsJson(const std::vector<uint64_t> &words)
+        {
+            std::ostringstream out;
+            out << '[';
+            for (size_t index = 0; index < words.size(); ++index)
+                out << (index ? "," : "") << words[index];
+            out << ']';
+            return out.str();
+        }
+
         std::string jsonEscape(const std::string &value)
         {
             std::ostringstream out;
@@ -768,8 +800,38 @@ namespace llaminar2
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         auto &record = s.records[key];
+        if (record.sequence_word_count != 0u)
+            throw std::logic_error("PerfStats counter family omitted its lifecycle evidence");
         record.kind = PerfStatRecord::Kind::Counter;
         record.count += 1;
+        record.value += value;
+        ++s.version;
+    }
+
+    void PerfStatsCollector::addCounterWithSequence(
+        std::string domain, std::string name, double value,
+        std::initializer_list<uint64_t> words,
+        std::string phase, std::string device, Tags tags)
+    {
+        if (!isDomainEnabled(domain))
+            return;
+        if (words.size() == 0u)
+            throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
+        PerfStatKey key{PerfStatRecord::Kind::Counter, std::move(domain),
+            std::move(name), std::move(phase), std::move(device), std::move(tags)};
+        auto &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        auto &record = s.records[key];
+        // A family chooses its word schema once. Missing or differently shaped
+        // observations cannot silently authenticate only part of the event stream.
+        if (record.count != 0u &&
+            (record.sequence_word_count / record.count != words.size() ||
+             record.sequence_word_count % record.count != 0u))
+            throw std::logic_error("PerfStats counter family changed its lifecycle evidence schema");
+        record.kind = PerfStatRecord::Kind::Counter;
+        observeSequenceRanges(record, words);
+        appendSequenceStep(record, words);
+        ++record.count;
         record.value += value;
         ++s.version;
     }
@@ -796,8 +858,38 @@ namespace llaminar2
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         auto &record = s.records[key];
+        if (record.sequence_word_count != 0u)
+            throw std::logic_error("PerfStats timer family omitted its lifecycle evidence");
         record.kind = PerfStatRecord::Kind::Timer;
         record.count += 1;
+        record.total_ns += duration_ns;
+        record.min_ns = std::min(record.min_ns, duration_ns);
+        record.max_ns = std::max(record.max_ns, duration_ns);
+        ++s.version;
+    }
+
+    void PerfStatsCollector::recordTimingNsWithSequence(
+        std::string domain, std::string name, uint64_t duration_ns,
+        std::initializer_list<uint64_t> words,
+        std::string phase, std::string device, Tags tags)
+    {
+        if (!isDomainEnabled(domain))
+            return;
+        if (words.size() == 0u)
+            throw std::invalid_argument("PerfStats timer sequence requires lifecycle words");
+        PerfStatKey key{PerfStatRecord::Kind::Timer, std::move(domain),
+            std::move(name), std::move(phase), std::move(device), std::move(tags)};
+        auto &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        auto &record = s.records[key];
+        if (record.count != 0u &&
+            (record.sequence_word_count / record.count != words.size() ||
+             record.sequence_word_count % record.count != 0u))
+            throw std::logic_error("PerfStats timer family changed its lifecycle evidence schema");
+        record.kind = PerfStatRecord::Kind::Timer;
+        observeSequenceRanges(record, words);
+        appendSequenceStep(record, words);
+        ++record.count;
         record.total_ns += duration_ns;
         record.min_ns = std::min(record.min_ns, duration_ns);
         record.max_ns = std::max(record.max_ns, duration_ns);
@@ -863,6 +955,8 @@ namespace llaminar2
             record.sequence_word_count = acc.sequence_word_count;
             record.sequence_digest_lo = acc.sequence_digest_lo;
             record.sequence_digest_hi = acc.sequence_digest_hi;
+            record.sequence_minimum_words = acc.sequence_minimum_words;
+            record.sequence_maximum_words = acc.sequence_maximum_words;
             result.push_back(std::move(record));
         };
 
@@ -947,6 +1041,8 @@ namespace llaminar2
             out << "      \"avg_us\": " << std::setprecision(17) << avg_us << ",\n";
             out << "      \"min_us\": " << std::setprecision(17) << min_us << ",\n";
             out << "      \"max_us\": " << std::setprecision(17) << max_us << ",\n";
+            out << "      \"sequence_minimum_words\": " << sequenceWordsJson(record.sequence_minimum_words) << ",\n";
+            out << "      \"sequence_maximum_words\": " << sequenceWordsJson(record.sequence_maximum_words) << ",\n";
             out << "      \"sequence_word_count\": "
                 << record.sequence_word_count << ",\n";
             out << "      \"sequence_digest_lo\": "
@@ -964,7 +1060,7 @@ namespace llaminar2
     {
         const auto records = snapshot(filters);
         std::ostringstream out;
-        out << "kind,domain,name,phase,device,tags,count,value,total_ns,total_ms,avg_us,min_us,max_us,sequence_word_count,sequence_digest_lo,sequence_digest_hi\n";
+        out << "kind,domain,name,phase,device,tags,count,value,total_ns,total_ms,avg_us,min_us,max_us,sequence_word_count,sequence_digest_lo,sequence_digest_hi,sequence_minimum_words,sequence_maximum_words\n";
         for (const auto &record : records)
         {
             const double total_ms = static_cast<double>(record.total_ns) / 1.0e6;
@@ -989,7 +1085,9 @@ namespace llaminar2
                 << std::setprecision(17) << max_us << ','
                 << record.sequence_word_count << ','
                 << record.sequence_digest_lo << ','
-                << record.sequence_digest_hi << '\n';
+                << record.sequence_digest_hi << ','
+                << csvEscape(sequenceWordsJson(record.sequence_minimum_words)) << ','
+                << csvEscape(sequenceWordsJson(record.sequence_maximum_words)) << '\n';
         }
         return out.str();
     }
@@ -1160,6 +1258,15 @@ namespace llaminar2
             std::cout << summary << std::flush;
     }
 
+    std::string PerfStatsCollector::jsonExportPath()
+    {
+        const int rank = Logger::getInstance().getRank();
+        auto path = exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json");
+        if (rank > 0 && !hasRankToken(path))
+            return {};
+        return expandRankToken(std::move(path), rank);
+    }
+
     bool PerfStatsCollector::flushFromEnv()
     {
         const int rank = Logger::getInstance().getRank();
@@ -1182,20 +1289,15 @@ namespace llaminar2
                 });
         }
 
-        std::string json_path =
-            exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json");
+        const std::string json_path = jsonExportPath();
         std::string csv_path =
             exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv");
-        const bool json_is_rank_qualified = hasRankToken(json_path);
         const bool csv_is_rank_qualified = hasRankToken(csv_path);
         if (rank > 0)
         {
-            if (!json_is_rank_qualified)
-                json_path.clear();
             if (!csv_is_rank_qualified)
                 csv_path.clear();
         }
-        json_path = expandRankToken(std::move(json_path), rank);
         csv_path = expandRankToken(std::move(csv_path), rank);
 
         // Human-readable summaries remain a single rank-zero stream. Use a

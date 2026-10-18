@@ -38,6 +38,7 @@ constexpr ROCmNativeVNNIGemmShardFn shardForCodebook(uint8_t codebook_id)
     {
     case 0:
     case 4:
+    case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
         return rocmGemm_native_vnni_fp32_shard_0;
     case 5:
     case 6:
@@ -69,7 +70,8 @@ constexpr ROCmNativeVNNIGemmShardFn shardForCodebook(uint8_t codebook_id)
 /** @brief Preserve legacy policy semantics for a self-describing decoder. */
 constexpr uint8_t defaultArithmeticPolicyCodebook(uint8_t codebook_id)
 {
-    return codebook_id == llaminar2::kNativeVnniExpandedInt8MinCodebook
+    return codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} :
+           codebook_id == llaminar2::kNativeVnniExpandedInt8MinCodebook
                ? static_cast<uint8_t>(19)
                : codebook_id;
 }

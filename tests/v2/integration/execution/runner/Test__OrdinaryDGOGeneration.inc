@@ -52,7 +52,7 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryPipelineHasOneTailResponseOwner)
             // materialize fence words outside admission.
             ModelMemoryProfile profile;
             profile.architecture = "qwen35";
-            profile.n_layers = 1;
+            profile.n_layers = participant_count;
             profile.d_model = profile.head_dim = profile.vocab_size = 32;
             profile.d_ff = 64;
             profile.n_heads = profile.n_kv_heads = 1;
@@ -63,6 +63,7 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryPipelineHasOneTailResponseOwner)
                 DevicePlanConfig input;
                 input.world_rank = 0;
                 input.device = GetParam() == "CUDA" ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal);
+                input.first_layer = input.last_layer = reverse ? participant_count - 1 - ordinal : ordinal;
                 input.device_total_bytes = input.device_free_bytes = 1ull << 30;
                 input.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
                     .device = DeviceId::cpu(), .total_bytes = 1ull << 30, .admission_available_bytes = 1ull << 30};
@@ -86,8 +87,10 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryPipelineHasOneTailResponseOwner)
                 const int ordinal = reverse ? participant_count - 1 - i : i;
                 const auto device = GetParam() == "CUDA" ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal);
                 auto config = stateConfig(device);
-                config.n_layers = config.total_n_layers = 1;
-                config.layer_types.assign(1, "full_attention");
+                config.n_layers = 1;
+                config.total_n_layers = participant_count;
+                config.pp_layer_offset = i;
+                config.layer_types.assign(participant_count, "full_attention");
                 config.max_seq_len = 1024;
                 config.kv_cache_precision = KVCachePrecision::FP16;
                 // This explicit model-free constructor has no file-backed model
@@ -102,7 +105,7 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryPipelineHasOneTailResponseOwner)
                 auto owner = DeviceGraphOrchestrator::createForTest({
                     .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph,
                     .physical_memory_authority = memory});
-                owner->setPPStageConfig({.first_layer = 0, .last_layer = 1,
+                owner->setPPStageConfig({.first_layer = i, .last_layer = i + 1,
                     .has_embedding = i == 0, .has_lm_head = i + 1 == participant_count});
                 auto &context = GPUDeviceContextPool::instance().getContext(device);
                 context.submitAndWait([&] {
@@ -118,6 +121,10 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryPipelineHasOneTailResponseOwner)
             RankOrchestrator::Config rank_config;
             rank_config.mode = RankOrchestrator::ParallelismMode::PP;
             rank_config.max_seq_len = 1024;
+            for (int i = 0; i < participant_count; ++i)
+                rank_config.pp_stages.push_back({.first_layer = i, .last_layer = i + 1,
+                    .has_embedding = i == 0, .has_lm_head = i + 1 == participant_count,
+                    .stage_devices = {GlobalDeviceAddress::fromLocalDeviceId(stages[i]->primaryDeviceId())}});
             auto rank = RankOrchestrator::createForTestWithPipelineStages(
                 MockModelContext::createMinimal(), std::move(owners), rank_config);
             ASSERT_TRUE(rank->materializeServingGraphFamilyWithoutLaunch({

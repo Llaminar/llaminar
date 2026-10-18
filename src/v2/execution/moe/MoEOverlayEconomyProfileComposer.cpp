@@ -108,6 +108,7 @@ namespace llaminar2
             window.generation = 0;
             window.num_layers = metadata.num_layers;
             window.num_experts = metadata.num_experts;
+            window.first_model_layer = metadata.first_model_layer;
             const std::size_t entries = checkedProduct(
                 static_cast<std::size_t>(metadata.num_layers),
                 static_cast<std::size_t>(metadata.num_experts),
@@ -170,9 +171,8 @@ namespace llaminar2
         int previous_layer = -1;
         for (const auto &raw : totals)
         {
-            if (!raw.valid() || raw.layer < 0 ||
-                static_cast<std::size_t>(raw.layer) >=
-                    production_topology.layerCount() ||
+            if (!raw.valid() || raw.layer < production_topology.firstModelLayer() ||
+                raw.layer >= production_topology.endModelLayer() ||
                 (raw.participant_id == previous_participant &&
                  raw.layer == previous_layer))
             {
@@ -239,7 +239,8 @@ namespace llaminar2
         if (totals.empty() || layer_count == 0 ||
             totals.size() % layer_count != 0 ||
             !production_topology.valid() ||
-            production_topology.layerCount() != layer_count)
+            production_topology.layerCount() != layer_count ||
+            production_topology.firstModelLayer() != catalog.firstModelLayer())
         {
             throw std::invalid_argument(
                 "ExpertOverlay equivalent service normalization requires complete endpoint/layer geometry and a matching production topology");
@@ -271,14 +272,14 @@ namespace llaminar2
             }
             for (const int layer : group.member_layers)
             {
-                if (layer < 0 ||
-                    static_cast<std::size_t>(layer) >= layer_count ||
-                    covered[static_cast<std::size_t>(layer)])
+                if (layer < catalog.firstModelLayer() ||
+                    layer >= production_topology.endModelLayer() ||
+                    covered[static_cast<std::size_t>(layer - catalog.firstModelLayer())])
                 {
                     throw std::invalid_argument(
                         "ExpertOverlay service layer classes overlap or exceed model geometry");
                 }
-                covered[static_cast<std::size_t>(layer)] = true;
+                covered[static_cast<std::size_t>(layer - catalog.firstModelLayer())] = true;
             }
         }
         if (std::any_of(
@@ -307,7 +308,7 @@ namespace llaminar2
             {
                 const auto &raw = totals[base + layer];
                 if (!raw.valid() || raw.participant_id != participant_id ||
-                    raw.layer != static_cast<int>(layer))
+                    raw.layer != catalog.firstModelLayer() + static_cast<int>(layer))
                 {
                     throw std::invalid_argument(
                         "ExpertOverlay equivalent service totals omit or duplicate a participant/layer coordinate");
@@ -321,7 +322,7 @@ namespace llaminar2
                         raw.activation_count[phase] != 0 &&
                         raw.sample_count[phase] != 0;
                     if (!production_topology.reachable(
-                            static_cast<int>(layer), phase) &&
+                            raw.layer, phase) &&
                         has_evidence)
                     {
                         throw std::invalid_argument(
@@ -337,7 +338,7 @@ namespace llaminar2
                 for (const int layer : group.member_layers)
                 {
                     const auto &raw =
-                        totals[base + static_cast<std::size_t>(layer)];
+                        totals[base + static_cast<std::size_t>(layer - catalog.firstModelLayer())];
                     for (std::size_t phase = 0;
                          phase < kExpertHistogramProductionSourceCount;
                          ++phase)
@@ -516,11 +517,16 @@ namespace llaminar2
                 "ExpertOverlay economy profiles require an enabled overlay plan");
         }
         if (metadata.num_layers <= 0 || metadata.num_experts <= 0 ||
+            metadata.first_model_layer < 0 ||
+            metadata.num_layers > std::numeric_limits<int>::max() - metadata.first_model_layer ||
+            plan.first_model_layer != metadata.first_model_layer ||
             plan.routed_tiers.empty() || owner_map.participants().empty())
         {
             throw std::invalid_argument(
                 "ExpertOverlay economy profiles require positive model, tier, and participant geometry");
         }
+        owner_map.requireLayerGeometry(
+            metadata.num_layers, metadata.num_experts, metadata.first_model_layer);
         if (!policy.valid())
         {
             throw std::invalid_argument(
@@ -529,6 +535,7 @@ namespace llaminar2
         if (measurements.service_measurement_identity.empty() ||
             measurements.migration_measurement_identity.empty() ||
             !measurements.production_topology.valid() ||
+            measurements.production_topology.firstModelLayer() != metadata.first_model_layer ||
             measurements.production_topology.layerCount() !=
                 static_cast<std::size_t>(metadata.num_layers))
         {
@@ -607,6 +614,9 @@ namespace llaminar2
             service_rows(expected_service_rows, nullptr);
         for (const auto &row : measurements.participant_service)
         {
+            if (!metadata.containsModelLayer(row.layer))
+                throw std::invalid_argument(
+                    "ExpertOverlay service measurement belongs outside the owned layer interval");
             bool invalid_phase_evidence = false;
             for (std::size_t phase = 0;
                  phase < kExpertHistogramProductionSourceCount;
@@ -626,7 +636,6 @@ namespace llaminar2
             if (row.participant_id < 0 ||
                 static_cast<std::size_t>(row.participant_id) >=
                     participant_count ||
-                row.layer < 0 || row.layer >= metadata.num_layers ||
                 invalid_phase_evidence)
             {
                 throw std::invalid_argument(
@@ -634,7 +643,7 @@ namespace llaminar2
             }
             const std::size_t offset =
                 static_cast<std::size_t>(row.participant_id) * layer_count +
-                static_cast<std::size_t>(row.layer);
+                metadata.storageIndexForModelLayer(row.layer);
             if (service_rows[offset] != nullptr)
             {
                 throw std::invalid_argument(
@@ -676,7 +685,7 @@ namespace llaminar2
             {
                 MoERoutedTierLayerPhaseServiceCost aggregate;
                 aggregate.tier_index = static_cast<int>(tier);
-                aggregate.layer = static_cast<int>(layer);
+                aggregate.layer = metadata.first_model_layer + static_cast<int>(layer);
                 for (const int participant_id : participants_by_tier[tier])
                 {
                     const auto &row = *service_rows[
@@ -702,9 +711,11 @@ namespace llaminar2
             service_hash,
             measurements.service_measurement_identity);
         hashUnsigned(service_hash, static_cast<uint64_t>(metadata.num_layers));
+        hashUnsigned(service_hash, static_cast<uint64_t>(metadata.first_model_layer));
         hashUnsigned(service_hash, static_cast<uint64_t>(metadata.num_experts));
         hashUnsigned(service_hash, static_cast<uint64_t>(tier_count));
-        for (int layer = 0; layer < metadata.num_layers; ++layer)
+        for (int layer = metadata.first_model_layer;
+             layer < metadata.first_model_layer + metadata.num_layers; ++layer)
         {
             for (const bool reachable :
                  measurements.production_topology.sources(layer))
@@ -810,7 +821,7 @@ namespace llaminar2
                 static_cast<std::size_t>(row.destination_participant) >=
                     participant_count ||
                 row.source_participant == row.destination_participant ||
-                row.layer < 0 || row.layer >= metadata.num_layers ||
+                !metadata.containsModelLayer(row.layer) ||
                 row.transfer_and_repack_ns == 0)
             {
                 throw std::invalid_argument(
@@ -821,7 +832,7 @@ namespace llaminar2
                      participant_count +
                  static_cast<std::size_t>(row.destination_participant)) *
                     layer_count +
-                static_cast<std::size_t>(row.layer);
+                metadata.storageIndexForModelLayer(row.layer);
             if (migration_seen[offset])
             {
                 throw std::invalid_argument(
@@ -860,6 +871,7 @@ namespace llaminar2
         hashUnsigned(
             migration_hash,
             static_cast<uint64_t>(metadata.num_layers));
+        hashUnsigned(migration_hash, static_cast<uint64_t>(metadata.first_model_layer));
         hashUnsigned(
             migration_hash,
             static_cast<uint64_t>(participant_count));

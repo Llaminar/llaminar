@@ -12,6 +12,8 @@
  * a pipeline transfer consumer.
  * The shared retained-family probe covers the 448-row checkpoint boundary,
  * exact small tails and repeated request reset on both native graph backends.
+ * Lifecycle evidence authenticates exact chunk coordinates in bounded sequence
+ * words, rather than retaining a telemetry identity for every request position.
  * Backend-specific wrapper files provide the registration/support/device hooks.
  */
 
@@ -72,9 +74,17 @@ namespace
     constexpr int kKVProbeDim = kKVProbeHeads * kKVProbeHeadDim;
     constexpr int kPadTokenId = 0;
 
+    /**
+     * @brief Find one bounded lifecycle record and prove its exact chunk coordinates.
+     * @param records Production graph observations from this isolated replay.
+     * @param tags Stable graph geometry and capture-phase identity.
+     * @param coordinates Expected chunk index, first real token, and exclusive end.
+     * @return The exact counter value, or zero if the graph observation is absent.
+     */
     double findPrefillGraphLifecycleCounter(
         const std::vector<PerfStatRecord> &records,
-        const PerfStatsCollector::Tags &tags)
+        const PerfStatsCollector::Tags &tags,
+        const std::array<uint64_t, 3> &coordinates)
     {
         for (const auto &record : records)
         {
@@ -84,6 +94,11 @@ namespace
                 record.phase == "prefill" &&
                 record.tags == tags)
             {
+                EXPECT_EQ(record.count, 1u);
+                EXPECT_EQ(record.sequence_word_count, coordinates.size());
+                EXPECT_EQ(record.sequence_minimum_words,
+                          std::vector<uint64_t>(coordinates.begin(), coordinates.end()));
+                EXPECT_EQ(record.sequence_maximum_words, record.sequence_minimum_words);
                 return record.value;
             }
         }
@@ -3045,17 +3060,15 @@ namespace
             {"bucket_seq_len", std::to_string(kLargeBucketSeqLen)},
             {"cache_phase", "ready"},
             {"capture_phase", "replay"},
-            {"chunk_index", "64"},
             {"domain_id", "single"},
             {"participant_id", "0"},
             {"placement_epoch", "0"},
             {"real_token_count", "1"},
-            {"real_token_end", std::to_string(kLongContextSeqLen)},
-            {"real_token_start", std::to_string(256 * 1024)},
             {"recapture_reason", "none"},
             {"topology_signature", "0"}};
         EXPECT_DOUBLE_EQ(
-            findPrefillGraphLifecycleCounter(records, terminal_replay_tags),
+            findPrefillGraphLifecycleCounter(records, terminal_replay_tags,
+                {64, 256 * 1024, kLongContextSeqLen}),
             1.0);
 
         std::array<int32_t, 4> terminal_tokens{};
@@ -3363,16 +3376,14 @@ namespace
             {"bucket_seq_len", std::to_string(kExactBucketSeqLen)},
             {"cache_phase", "ready"},
             {"capture_phase", "replay"},
-            {"chunk_index", "0"},
             {"domain_id", "overlay_routed_rocm_hot"},
             {"participant_id", "2"},
             {"placement_epoch", "17"},
             {"real_token_count", std::to_string(kExactBucketSeqLen - 1)},
-            {"real_token_end", std::to_string(512 + kExactBucketSeqLen - 1)},
-            {"real_token_start", "512"},
             {"recapture_reason", "none"},
             {"topology_signature", std::to_string(0x321u)}};
-        EXPECT_DOUBLE_EQ(findPrefillGraphLifecycleCounter(records, replay_tags), 1.0);
+        EXPECT_DOUBLE_EQ(findPrefillGraphLifecycleCounter(records, replay_tags,
+            {0, 512, 512 + kExactBucketSeqLen - 1}), 1.0);
         PerfStatsCollector::reset();
     }
 

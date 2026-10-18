@@ -21,9 +21,13 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/DebugEnv.h"
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
+#include <limits>
+#include "../../utils/Q8ScaleUnderflowFixture.h"
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -71,6 +75,8 @@ namespace
             float maximum = 0.f;
             for (size_t lane = 0; lane < 32; ++lane)
                 maximum = std::max(maximum, std::fabs(input[block * 32 + lane]));
+            ASSERT_TRUE(std::isfinite(scales[block]) && scales[block] > 0.f)
+                << "actual router publication block=" << block;
             const float scale = device_q8_activation_contract::scale(maximum);
             ASSERT_EQ(std::bit_cast<uint32_t>(scale), std::bit_cast<uint32_t>(scales[block]))
                 << "scale block=" << block;
@@ -79,7 +85,7 @@ namespace
             {
                 const size_t index = block * 32 + lane;
                 const float scaled = device_fp32_contract::multiply(input[index], inverse);
-                const int expected = std::clamp(static_cast<int>(std::rint(scaled)), -127, 127);
+                const int expected = static_cast<int>(std::clamp(std::rint(scaled), -127.f, 127.f));
                 ASSERT_EQ(int(bytes[index]), expected) << "hidden element=" << index;
             }
         }
@@ -90,8 +96,9 @@ namespace
      * @param device Endpoint owning all buffers and the exact capture stream.
      * @param width Hidden columns; 96 exercises a partially populated wave64.
      * @param kind Production prefill or grouped serial-equivalent verification.
+     * @param scale_range Include finite half-scale limits and the captured tiny block.
      */
-    void prove(DeviceId device, int width, MoERouteLaunchKind kind)
+    void prove(DeviceId device, int width, MoERouteLaunchKind kind, bool scale_range = false)
     {
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         context.submitAndWait([&]
@@ -135,6 +142,7 @@ namespace
                 row_counts.clear();
                 for (int rows = 1; rows <= 65; ++rows) row_counts.push_back(rows);
             }
+            if (scale_range) row_counts = {1,2,16,65,512};
             std::vector<float> input(hidden->numel(), .125f);
             const int *device_length = static_cast<const int *>(length->gpu_data_ptr());
             for (const int rows : row_counts)
@@ -158,6 +166,10 @@ namespace
                 auto graph = context.createGraphCapture(stream);
                 require(graph != nullptr, "router Q8 graph owner");
                 ObservationJoin join{backend, device, stream};
+                // Warmup consumes this shape's device-owned count too. A count
+                // retained from the larger fixture is not valid for a small graph.
+                require(backend->hostToDevice(length->gpu_data_ptr(), &rows, sizeof(rows),
+                    device.ordinal, stream), "router Q8 warmup count publication");
                 require(enqueue() && backend->synchronizeStream(stream, device.ordinal), "router Q8 warmup");
                 {
                     GraphCaptureGuard recording;
@@ -185,6 +197,18 @@ namespace
                         const float magnitude = std::ldexp(1.f, int((group + replay) % 5) * 4 - 12);
                         input[i] = group % 7 == 0 ? (i % 2 ? -0.f : 0.f) :
                             magnitude * float(int((i * 19 + replay * 13) % 101) - 50);
+                        if (scale_range) {
+                            const std::array<float,8> extrema{0.f,std::numeric_limits<float>::denorm_min(),
+                                std::numeric_limits<float>::min(),0x1p-24f,0x1p-20f,
+                                127.f*0x1p-24f,1.f,127.f*65520.f};
+                            const size_t pattern=(group+replay)%(extrema.size()+1);
+                            if(pattern==extrema.size())
+                                input[i]=q8ScaleUnderflowSourceValue(i%32);
+                            else {
+                                const float maximum=extrema[pattern];
+                                input[i]=i%4==0?maximum:i%4==1?-maximum:i%4==2?0.f:-0.f;
+                            }
+                        }
                     }
                     require(backend->hostToDevice(hidden->gpu_data_ptr(), input.data(), input.size() * sizeof(float),
                         device.ordinal, stream) && backend->hostToDevice(length->gpu_data_ptr(), &logical_rows,
@@ -238,6 +262,100 @@ namespace
             prove(DeviceId::rocm(0), width, MoERouteLaunchKind::GroupedPrefill);
     }
 #endif
+
+#ifdef HAVE_CUDA
+    /** @test Explicit Q8 prefill publishes original expert operands in either router basis. */
+    TEST(MoERouterHiddenQ8Prefill, CUDACapturedBytesAndLiveRows)
+    {
+        struct PrefillPolicyScope
+        {
+            CUDARouterPrefillArithmetic prefill = debugEnv().gemm.cuda_moe_router_prefill;
+            MoERouterArithmetic router = debugEnv().gemm.moe_router_arithmetic;
+            PrefillPolicyScope() { mutableDebugEnv().gemm.cuda_moe_router_prefill = CUDARouterPrefillArithmetic::Q8; }
+            ~PrefillPolicyScope() {
+                mutableDebugEnv().gemm.cuda_moe_router_prefill = prefill;
+                mutableDebugEnv().gemm.moe_router_arithmetic = router;
+            }
+        } scope;
+        for (auto arithmetic : {MoERouterArithmetic::Native, MoERouterArithmetic::NativeHadamard32})
+        {
+            mutableDebugEnv().gemm.moe_router_arithmetic = arithmetic;
+            for (int width : {96, 2048, 3072})
+                prove(DeviceId::cuda(0), width, MoERouteLaunchKind::GroupedPrefill);
+        }
+    }
+
+    /** @test Explicit Q8 prefill cannot silently accept incompatible floating gates. */
+    TEST(MoERouterHiddenQ8Prefill, CUDARejectsIncompatiblePreparedGate)
+    {
+        struct PolicyScope
+        {
+            CUDARouterPrefillArithmetic old = debugEnv().gemm.cuda_moe_router_prefill;
+            /** @brief Select Q8 only for this isolated preparation test. */
+            PolicyScope() { mutableDebugEnv().gemm.cuda_moe_router_prefill = CUDARouterPrefillArithmetic::Q8; }
+            /** @brief Restore the process policy before another fixture executes. */
+            ~PolicyScope() { mutableDebugEnv().gemm.cuda_moe_router_prefill = old; }
+        } policy;
+        const auto device = DeviceId::cuda(0);
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        context.submitAndWait([&]
+        {
+            constexpr int rows = 32, width = 96, experts = 16, top_k = 4;
+            auto *backend = getBackendFor(device);
+            void *stream = context.defaultStream();
+            require(backend && stream, "explicit Q8 admission observation stream");
+            const auto requirements = MoEWorkspaceBuffers::cudaMoE(rows, width, 128, experts, top_k);
+            DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment());
+            require(workspace.allocate(requirements), "explicit Q8 admission workspace");
+            auto kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
+            require(kernel != nullptr, "explicit Q8 admission kernel");
+            kernel->setGPUStream(stream);
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+            require(consumer != nullptr, "explicit Q8 admission binding");
+            consumer->bindWorkspace(&workspace);
+            auto half_gate = TestTensorFactory::createFP16Random({experts, width}, -.125f, .125f, 917);
+            auto bfloat_gate = TestTensorFactory::createBF16Random({experts, width}, -.125f, .125f, 917);
+            ObservationJoin join{backend, device, stream};
+            for (TensorBase *gate : {static_cast<TensorBase *>(half_gate.get()), static_cast<TensorBase *>(bfloat_gate.get())})
+            {
+                require(gate->ensureOnDevice(device, stream), "explicit Q8 prepared source");
+                EXPECT_FALSE(kernel->prepareRouteLaunch(gate, {.kind = MoERouteLaunchKind::GroupedPrefill,
+                    .physical_rows = rows, .d_model = width, .num_experts = experts, .top_k = top_k}));
+            }
+        });
+    }
+
+    /** @test CUDA actual Q8 router publication retains finite scales at half limits. */
+    TEST(MoERouterHiddenQ8ScaleRange, CUDA) {
+        prove(DeviceId::cuda(0),96,MoERouteLaunchKind::DecodeEquivalentVerifier,true);
+    }
+#endif
+#ifdef HAVE_ROCM
+    /** @test ROCm verifier and grouped-prefill router publication share half limits. */
+    TEST(MoERouterHiddenQ8ScaleRange, ROCm) {
+        prove(DeviceId::rocm(0),96,MoERouteLaunchKind::DecodeEquivalentVerifier,true);
+        prove(DeviceId::rocm(0),96,MoERouteLaunchKind::GroupedPrefill,true);
+    }
+#endif
+
+    /** @brief Restore startup arithmetic after this isolated candidate fixture. */
+    struct HadamardPolicyScope
+    {
+        MoERouterArithmetic old = debugEnv().gemm.moe_router_arithmetic;
+        HadamardPolicyScope() { mutableDebugEnv().gemm.moe_router_arithmetic = MoERouterArithmetic::NativeHadamard32; }
+        ~HadamardPolicyScope() { mutableDebugEnv().gemm.moe_router_arithmetic = old; }
+    };
+    /** @test The model's real publication remains original-basis after rotated routing. */
+    TEST_P(MoERouterHiddenQ8, HadamardPublishesOriginalExpertBasis)
+    {
+        HadamardPolicyScope scope;
+        const DeviceId device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        for (int width : {96, 2048})
+        {
+            prove(device, width, MoERouteLaunchKind::DecodeEquivalentVerifier);
+            if (device.is_rocm()) prove(device, width, MoERouteLaunchKind::GroupedPrefill);
+        }
+    }
 
     INSTANTIATE_TEST_SUITE_P(Backends, MoERouterHiddenQ8, ::testing::ValuesIn(std::vector<std::string>{
 #ifdef HAVE_CUDA

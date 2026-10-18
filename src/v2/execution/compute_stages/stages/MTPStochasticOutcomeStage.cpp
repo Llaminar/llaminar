@@ -42,12 +42,8 @@ namespace llaminar2
             params_.comparison_rows_per_request > kMaxComparisonRows ||
             params_.verifier_row_capacity <
                 params_.comparison_rows_per_request + 1 ||
-            static_cast<int>(params_.threshold_seeds.size()) !=
-                params_.request_count ||
-            std::any_of(
-                params_.threshold_seeds.begin(),
-                params_.threshold_seeds.end(),
-                [](uint64_t seed) { return seed == 0; }))
+            !params_.threshold_seeds_device ||
+            reinterpret_cast<uintptr_t>(params_.threshold_seeds_device) % alignof(uint64_t) != 0)
         {
             LOG_ERROR("[MTPStochasticOutcomeStage] Invalid request, depth, or seed geometry");
             return false;
@@ -141,10 +137,6 @@ namespace llaminar2
                 auto *accepted = params_.accepted_rows_device +
                     static_cast<size_t>(request) * params_.accepted_row_stride;
                 const auto *position = params_.threshold_base_positions_device + request;
-                const uint64_t seed = params_.threshold_seeds[static_cast<size_t>(request)];
-                const auto bonus_offset = target_row_offset +
-                    static_cast<size_t>(params_.comparison_rows_per_request) *
-                        params_.target_distribution_row_stride;
                 if (!params_.backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
                         params_.target_token_ids_device + target_row_offset,
                         params_.target_probs_device + target_row_offset,
@@ -152,15 +144,11 @@ namespace llaminar2
                         params_.target_distribution_row_stride, tokens + 1,
                         nullptr, nullptr, params_.comparison_rows_per_request,
                         params_.device_id.gpu_ordinal(), stream, sampled, accepted,
-                        nullptr, nullptr, nullptr, seed, -1,
-                        params_.vocabulary_size, position, params_.threshold_position_offset) ||
-                    !params_.backend->enqueueSampleDistributionF32Device(
-                        params_.target_token_ids_device + bonus_offset,
-                        params_.target_probs_device + bonus_offset, params_.top_k,
-                        0.0f, params_.device_id.gpu_ordinal(), stream,
-                        sampled + params_.comparison_rows_per_request, nullptr,
-                        seed, position,
-                        params_.threshold_position_offset + params_.comparison_rows_per_request) ||
+                        nullptr, nullptr, nullptr, 0, -1,
+                        params_.vocabulary_size, position, params_.threshold_position_offset,
+                        params_.generation_control_device +
+                            static_cast<size_t>(request) * params_.generation_control_stride,
+                        params_.threshold_seeds_device + request) ||
                     !params_.backend->enqueueSummarizeSpeculativeVerifyBatchDeviceGenerationControls(
                         sampled, accepted, nullptr, params_.comparison_rows_per_request,
                         tokens, params_.stop_tokens_device +
@@ -185,7 +173,7 @@ namespace llaminar2
                          params_.target_distribution_row_stride,
                          params_.top_k,
                          params_.comparison_rows_per_request,
-                         params_.threshold_seeds[static_cast<size_t>(request)],
+                         0,
                          params_.threshold_base_positions_device + request,
                          params_.threshold_position_offset,
                          params_.verifier_input_tokens_device +
@@ -211,7 +199,8 @@ namespace llaminar2
                                  params_.output_meta_stride,
                          request == 0
                              ? params_.first_transaction_diagnostic_device
-                             : nullptr))
+                             : nullptr,
+                         params_.threshold_seeds_device + request))
             {
                 LOG_ERROR("[MTPStochasticOutcomeStage] Fused request outcome launch failed for request "
                           << request);
@@ -242,7 +231,7 @@ namespace llaminar2
         const size_t target_rows =
             static_cast<size_t>(params_.request_count) *
             static_cast<size_t>(params_.comparison_rows_per_request + 1);
-        return target_rows *
+        return static_cast<size_t>(params_.request_count) * sizeof(uint64_t) + target_rows *
                    static_cast<size_t>(params_.target_distribution_row_stride) *
                    (sizeof(int32_t) + sizeof(float)) +
                static_cast<size_t>(params_.request_count) *
@@ -293,6 +282,7 @@ namespace llaminar2
         contract.addInput(BufferId::STOCHASTIC_TARGET_PROBS);
         contract.addInput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
         contract.addInput(BufferId::MTP_VERIFIER_STOP_TOKENS);
+        contract.addInput(BufferId::SAMPLING_REQUEST_SEEDS);
         contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
         if (params_.verification == Verification::OneHotProbabilityRejection)
             contract.addOutput(BufferId::STOCHASTIC_VERIFY_ACCEPTED);
@@ -331,7 +321,7 @@ namespace llaminar2
                    other.threshold_base_positions_device &&
                params_.threshold_position_offset ==
                    other.threshold_position_offset &&
-               params_.threshold_seeds == other.threshold_seeds &&
+               params_.threshold_seeds_device == other.threshold_seeds_device &&
                params_.generation_control_device ==
                    other.generation_control_device &&
                params_.generation_control_stride ==

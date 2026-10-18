@@ -79,7 +79,7 @@ namespace llaminar2
 
     /** Version shared by host, CUDA, and ROCm telemetry code. */
     inline constexpr std::uint32_t kDeviceMoEOverlayServiceTelemetryVersion =
-        1u;
+        2u;
 
     /** Number of decode, prefill, and grouped-verifier timing planes. */
     inline constexpr std::size_t kDeviceMoEOverlayServicePhaseCount =
@@ -186,7 +186,8 @@ namespace llaminar2
         std::uint32_t layer_count = 0u;
         std::uint32_t phase_count = static_cast<std::uint32_t>(
             kDeviceMoEOverlayServicePhaseCount);
-        std::uint32_t reserved0 = 0u;
+        /** Setup-owned global origin; retained publishers never change topology. */
+        std::int32_t first_model_layer = 0;
         std::uint64_t generation = 0u;
         /** Layer cursors carrying the expected magic/version at publication. */
         std::uint32_t valid_sample_count = 0u;

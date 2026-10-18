@@ -23,11 +23,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from native_vnni_codebooks import (  # noqa: E402
-    CODEBOOK_TO_FORMAT,
     FORMAT_TO_CODEBOOK,
     GPU_FORMAT_TO_EXECUTION_CODEBOOK,
 )
 from native_vnni_prefill_policy import load_native_vnni_m_policy  # noqa: E402
+from native_vnni_dispatch.format_registry import runtime_aliases  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 DEFAULT_POLICY_HEADER = REPO_ROOT / "src/v2/utils/PrefillGraphBucketDefaults.h"
@@ -75,7 +75,10 @@ def load_prefill_m_policy(path: Path) -> list[int]:
 
 
 def canonical_label(codebook: int) -> str:
-    return CODEBOOK_TO_FORMAT.get(codebook, f"CB{codebook}").split("/")[0]
+    """Name the physical runtime branch, not a source-only alias group."""
+
+    aliases = runtime_aliases("rocm", codebook)
+    return aliases[0] if aliases else f"CB{codebook}"
 
 
 def pack_key(codebook: int, m: int, n: int, k: int) -> int:
@@ -181,6 +184,13 @@ def load_prefill_rows(paths: list[str], m_policy: list[int], include_off_policy_
                         f"expected {expected_codebook}, found {source_codebook}"
                     )
                 codebook = GPU_FORMAT_TO_EXECUTION_CODEBOOK[fmt]
+                # Source4 alone cannot authenticate the new IQ4_XS tuple.
+                # Reject old measured rows instead of relabeling them as24.
+                execution = (row.get("execution_codebook") or "").strip()
+                if fmt == "IQ4_XS" and not execution:
+                    raise SystemExit(f"{path}:{row_index}: IQ4_XS requires explicit execution_codebook=24")
+                if execution and _to_int(path, row_index, "execution_codebook", execution) != codebook:
+                    raise SystemExit(f"{path}:{row_index}: execution codebook disagrees with registry for {fmt}")
 
                 m = _to_int(path, row_index, "m", row.get("m", ""))
                 if m <= 1:

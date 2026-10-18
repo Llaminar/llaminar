@@ -454,14 +454,34 @@ namespace llaminar2
         return true;
     }
 
+    std::size_t MoEOverlayParticipantResidencyBank::storageIndexForModelLayer(int layer) const
+    {
+        if (!containsModelLayer(layer))
+            throw std::out_of_range("ExpertOverlay participant bank layer is outside its owned interval");
+        return static_cast<std::size_t>(layer - first_model_layer);
+    }
+
+    MoEOverlayParticipantLayerBank &MoEOverlayParticipantResidencyBank::layerForModelLayer(int layer)
+    {
+        return layers[storageIndexForModelLayer(layer)];
+    }
+
+    const MoEOverlayParticipantLayerBank &MoEOverlayParticipantResidencyBank::layerForModelLayer(int layer) const
+    {
+        return layers[storageIndexForModelLayer(layer)];
+    }
+
     bool MoEOverlayParticipantResidencyBank::valid(
         int expected_participant_id,
         DeviceId expected_device,
         int num_layers,
-        int num_experts) const noexcept
+        int num_experts,
+        int expected_first_model_layer) const noexcept
     {
         if (epoch == 0 || participant_id != expected_participant_id ||
             device != expected_device || num_layers <= 0 || num_experts <= 0 ||
+            first_model_layer < 0 || first_model_layer != expected_first_model_layer ||
+            num_layers > std::numeric_limits<int>::max() - first_model_layer ||
             layers.size() != static_cast<std::size_t>(num_layers))
         {
             return false;
@@ -477,6 +497,7 @@ namespace llaminar2
         const MoEOverlayParticipantResidencyBank &other) const noexcept
     {
         if (epoch != other.epoch ||
+            first_model_layer != other.first_model_layer ||
             participant_id != other.participant_id ||
             device != other.device || layers.size() != other.layers.size())
         {
@@ -619,6 +640,8 @@ namespace llaminar2
     {
         if (config_.participant_id < 0 || !config_.device.is_valid() ||
             config_.num_layers <= 0 || config_.num_experts <= 0 ||
+            config_.first_model_layer < 0 ||
+            config_.num_layers > std::numeric_limits<int>::max() - config_.first_model_layer ||
             config_.retained_epoch_capacity < 2 ||
             (config_.movable_projections != DeviceMoEProjectionSet::CompleteExpert &&
              config_.movable_projections != DeviceMoEProjectionSet::GateUp) ||
@@ -645,12 +668,12 @@ namespace llaminar2
         ExpertHistogramSource source) const noexcept
     {
         const std::size_t phase = serviceSourceIndex(source);
-        if (layer < 0 || layer >= config_.num_layers ||
+        if (layer < firstModelLayer() || layer >= endModelLayer() ||
             phase >= kExpertHistogramProductionSourceCount)
         {
             return std::numeric_limits<std::size_t>::max();
         }
-        return static_cast<std::size_t>(layer) *
+        return static_cast<std::size_t>(layer - firstModelLayer()) *
                    kExpertHistogramProductionSourceCount +
                phase;
     }
@@ -727,7 +750,7 @@ namespace llaminar2
         {
             const auto &row = rows[static_cast<std::size_t>(layer)];
             if (row.participant_id != config_.participant_id ||
-                row.layer != layer || !row.valid())
+                row.layer != firstModelLayer() + layer || !row.valid())
             {
                 if (error)
                     *error = "service snapshot contains invalid participant/layer totals";
@@ -839,7 +862,7 @@ namespace llaminar2
         {
             auto &row = (*output)[static_cast<std::size_t>(layer)];
             row.participant_id = config_.participant_id;
-            row.layer = layer;
+            row.layer = firstModelLayer() + layer;
             for (std::size_t phase = 0;
                  phase < kExpertHistogramProductionSourceCount;
                  ++phase)
@@ -897,7 +920,8 @@ namespace llaminar2
                 config_.participant_id,
                 config_.device,
                 config_.num_layers,
-                config_.num_experts) ||
+                config_.num_experts,
+                config_.first_model_layer) ||
             std::any_of(bank.layers.begin(), bank.layers.end(), [this](const auto &layer) {
                 return layer.movable_projections != config_.movable_projections;
             }))
@@ -1093,6 +1117,8 @@ namespace llaminar2
         : config_(std::move(config))
     {
         if (config_.num_layers <= 0 || config_.num_experts <= 0 ||
+            config_.first_model_layer < 0 ||
+            config_.num_layers > std::numeric_limits<int>::max() - config_.first_model_layer ||
             config_.initial_epoch == 0 ||
             config_.retained_epoch_capacity < 2)
         {
@@ -1100,6 +1126,8 @@ namespace llaminar2
                 "ExpertOverlay participant registry requires positive geometry, "
                 "an initial epoch, and two-bank capacity");
         }
+        config_.owner_map.requireLayerGeometry(
+            config_.num_layers, config_.num_experts, config_.first_model_layer);
 
         /*
          * A relay-only MPI rank deliberately owns no prepared expert bank.  It
@@ -1136,7 +1164,8 @@ namespace llaminar2
                 ? DeviceMoEProjectionSet::GateUp : DeviceMoEProjectionSet::CompleteExpert;
             if (config_.projection_preparation)
             {
-                for (int layer = 0; layer < config_.num_layers; ++layer)
+                for (int layer = config_.first_model_layer;
+                     layer < config_.first_model_layer + config_.num_layers; ++layer)
                 {
                     const auto layout = config_.projection_preparation->requireProjectionOwnershipForParticipant(
                         *participant, layer);
@@ -1156,10 +1185,12 @@ namespace llaminar2
                         .collect_economy_service_measurements =
                             config_.collect_economy_service_measurements,
                         .movable_projections = projections,
+                        .first_model_layer = config_.first_model_layer,
                     });
             assembly.initial_bank.epoch = config_.initial_epoch;
             assembly.initial_bank.participant_id = participant_id;
             assembly.initial_bank.device = participant->device;
+            assembly.initial_bank.first_model_layer = config_.first_model_layer;
             assembly.initial_bank.layers.resize(
                 static_cast<std::size_t>(config_.num_layers));
             assembly.registered_layers.assign(
@@ -1173,7 +1204,7 @@ namespace llaminar2
                 layer_bank.movable_projections = projections;
                 layer_bank.resident_mask =
                     config_.owner_map.expertMaskForParticipant(
-                        layer,
+                        config_.first_model_layer + layer,
                         participant_id,
                         config_.num_experts);
                 layer_bank.experts.resize(
@@ -1237,7 +1268,8 @@ namespace llaminar2
     {
         if (error)
             error->clear();
-        if (layer_idx < 0 || layer_idx >= config_.num_layers ||
+        if (layer_idx < config_.first_model_layer ||
+            layer_idx >= config_.first_model_layer + config_.num_layers ||
             resident_mask.size() !=
                 static_cast<std::size_t>(config_.num_experts) ||
             experts.size() != static_cast<std::size_t>(config_.num_experts))
@@ -1257,7 +1289,7 @@ namespace llaminar2
         }
         auto &assembly = found->second;
         auto &expected_layer =
-            assembly.initial_bank.layers[static_cast<std::size_t>(layer_idx)];
+            assembly.initial_bank.layerForModelLayer(layer_idx);
         if (resident_mask != expected_layer.resident_mask)
         {
             if (error)
@@ -1300,7 +1332,7 @@ namespace llaminar2
             return true;
         }
 
-        const auto layer_index = static_cast<std::size_t>(layer_idx);
+        const auto layer_index = assembly.initial_bank.storageIndexForModelLayer(layer_idx);
         if (assembly.registered_layers[layer_index] &&
             !expected_layer.sameIdentity(supplied_layer))
         {
@@ -1366,8 +1398,8 @@ namespace llaminar2
                 return false;
             }
 
-            for (int layer_idx = 0;
-                 layer_idx < config_.num_layers;
+            for (int layer_idx = config_.first_model_layer;
+                 layer_idx < config_.first_model_layer + config_.num_layers;
                  ++layer_idx)
             {
                 const auto resident_mask =
@@ -1468,6 +1500,43 @@ namespace llaminar2
             });
     }
 
+    std::size_t MoEOverlayParticipantResidencyRegistry::verifyImmutablePreparedSources(
+        const ExpertGemmRegistry &registry) const
+    {
+        std::size_t authenticated = 0;
+        for (const int id : localParticipantIds())
+        {
+            const auto *participant = config_.owner_map.participantForId(id);
+            const auto owner = endpoint(id);
+            const auto bank = owner ? owner->acquire(config_.initial_epoch) : MoEOverlayParticipantBankLease{};
+            if (!participant || !owner || !bank ||
+                !bank->valid(id, participant->device, config_.num_layers, config_.num_experts, config_.first_model_layer))
+                throw std::logic_error("Immutable prepared source seal lost its original scoped bank");
+            for (int layer = config_.first_model_layer; layer < config_.first_model_layer + config_.num_layers; ++layer)
+            {
+                const auto mask = config_.owner_map.expertMaskForParticipant(layer, id, config_.num_experts);
+                const auto &row = bank->layerForModelLayer(layer);
+                if (row.resident_mask != mask)
+                    throw std::logic_error("Immutable prepared source seal changed initial ownership");
+                const auto ownership = config_.projection_preparation
+                    ? std::optional(config_.projection_preparation->requireProjectionOwnershipForParticipant(*participant, layer))
+                    : std::nullopt;
+                std::vector<MoEOverlayPreparedExpertPayload> expected;
+                std::string error;
+                if (!resolveMoEOverlayPreparedExpertPayloads(registry, *participant, layer,
+                        config_.num_experts, mask, expected, &error, ownership))
+                    throw std::logic_error("Immutable prepared source seal cannot resolve original engines: " + error);
+                for (std::size_t expert = 0; expert < expected.size(); ++expert)
+                {
+                    if (!row.experts.at(expert).sameIdentity(expected[expert]))
+                        throw std::logic_error("Immutable prepared source seal found a replaced engine identity");
+                    if (mask[expert]) ++authenticated;
+                }
+            }
+        }
+        return authenticated;
+    }
+
     std::vector<
         MoEOverlayParticipantResidencyRegistry::InitialBankExpertSelection>
     MoEOverlayParticipantResidencyRegistry::initialBankExpertSelections() const
@@ -1515,6 +1584,7 @@ namespace llaminar2
             }
             if (lease->participant_id != participant_id ||
                 lease->device != found->second.endpoint->device() ||
+                lease->first_model_layer != config_.first_model_layer ||
                 lease->layers.size() !=
                     static_cast<std::size_t>(config_.num_layers))
             {
@@ -1522,12 +1592,12 @@ namespace llaminar2
                     "ExpertOverlay installed initial bank has stale identity or geometry");
             }
 
-            for (int layer_idx = 0;
-                 layer_idx < config_.num_layers;
+            for (int layer_idx = config_.first_model_layer;
+                 layer_idx < config_.first_model_layer + config_.num_layers;
                  ++layer_idx)
             {
                 const auto &layer =
-                    lease->layers[static_cast<std::size_t>(layer_idx)];
+                    lease->layerForModelLayer(layer_idx);
                 if (layer.resident_mask.size() !=
                     static_cast<std::size_t>(config_.num_experts))
                 {
@@ -1590,7 +1660,7 @@ namespace llaminar2
             {
                 if (!assembly.registered_layers[layer])
                     deficit.missing_layers.push_back(
-                        static_cast<int>(layer));
+                        config_.first_model_layer + static_cast<int>(layer));
             }
             deficit.publication_pending = deficit.missing_layers.empty();
             incomplete.push_back(std::move(deficit));

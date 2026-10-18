@@ -2,6 +2,9 @@
 
 /**
  * @file WeightTranslator.h
+ * @note Q8_K source d is FP32. Existing prepared arrays store FP16 scales,
+ * so reverse conversion preserves only that prepared scale, not arbitrary
+ * original d bits. Original source/native embedding storage remains exact.
  * @brief Host-side API for translating weights between GPU packed format and raw GGUF blocks.
  *
  * Provides four translation paths:
@@ -28,6 +31,7 @@
 #include "backends/IBackend.h"
 #include "loaders/gpu_pipeline/GpuPackedWeightsFormat.h"
 #include "loaders/gpu_pipeline/RepackFormat.h"
+#include "tensors/BlockStructures.h"
 
 #include <cstdint>
 #include <cstring>
@@ -60,7 +64,7 @@ inline size_t rawBlockSizeBytes(RepackFormat format)
     case RepackFormat::Q5_1:    return 24;  // Q5_1Block
     case RepackFormat::Q8_0:    return 34;  // Q8_0Block
     case RepackFormat::Q8_1:    return 36;  // Q8_1Block
-    case RepackFormat::Q8_K:    return 288; // Q8_KBlock
+    case RepackFormat::Q8_K:    return sizeof(Q8_KBlock); // Original FP32-scale source
     default:                    return 0;   // Not supported for reverse repack
     }
 }

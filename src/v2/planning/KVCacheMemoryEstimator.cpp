@@ -328,6 +328,21 @@ namespace llaminar2
         }
     } // namespace
 
+    TensorType KVCacheMemoryEstimator::attentionExecutionFormat(const std::string &kv_precision)
+    {
+        switch (parseFormat(kv_precision))
+        {
+        case KVStorageFormat::FP32: return TensorType::FP32;
+        case KVStorageFormat::BF16: return TensorType::BF16;
+        case KVStorageFormat::FP16: return TensorType::FP16;
+        case KVStorageFormat::Q8_1: return TensorType::Q8_1;
+        case KVStorageFormat::Q16_1: return TensorType::Q16_1;
+        case KVStorageFormat::TQ4:
+        case KVStorageFormat::TQ8: return TensorType::FP32;
+        }
+        throw std::invalid_argument("Invalid native attention cache format");
+    }
+
     float KVCacheMemoryEstimator::getBytesPerElement(
         const std::string &kv_precision)
     {

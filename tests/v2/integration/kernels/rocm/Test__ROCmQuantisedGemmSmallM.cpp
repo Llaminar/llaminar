@@ -5,6 +5,10 @@
  * Verifier tests use the public serial decode byte oracle. Fused fixtures
  * declare the same simultaneous projection workspace as production stages;
  * wide M cases also prove that the fixed scratch tile can be reused safely.
+ * Physical-half GDN operands additionally retain serial/verifier/fixed-column
+ * bytes across device-owned active-prefix changes without reading poisoned tails.
+ * Packed half projection coverage also exhausts finite encodings and checks
+ * the original 256-lane FMA tree plus actual compact captured launch geometry.
  */
 
 #include <gtest/gtest.h>
@@ -16,8 +20,12 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "backends/rocm/HIPGraphCapture.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
+#include "kernels/common/DeviceHalfMetadataContract.h"
+#include <bit>
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "loaders/ModelContext.h"
 #include "loaders/ModelContextConfig.h"
@@ -722,7 +730,7 @@ namespace
         return {
             {"Q4_0", 0, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createQ4_0Random(shape, seed); }},
-            {"IQ4_XS", 4, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+            {"IQ4_XS", kNativeVnniIQ4XSSourceScaleCodebook, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return createBoundedIQ4XSForGroupedMoE(shape, seed); }},
             {"Q4_K", 5, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createQ4_KRandom(shape, seed); }},
@@ -8174,4 +8182,711 @@ TEST(Test__ROCmQuantisedGemmSmallM, ROCmMoERoutedVerifierRuntimeM_AllNativeCodeg
     }
 
     PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Prove physical half A/B and FP32 C through the actual captured GDN stage.
+ *
+ * Dyadic inputs deliberately need half-RNE rounding. The independent integer
+ * oracle rounds their numerator to the nearest multiple of four (ties even),
+ * then sums signed products in int64 before one exact FP32 publication. With
+ * K=65 every product and every possible partial sum is exactly representable
+ * in FP32 (the large-input arm has a common power-of-two factor); equality
+ * therefore does not assume any particular library tree.
+ * Non-half output values distinguish compute32/C32 from the Hgemm half-C API.
+ * A large-input replay exceeds 65504 while requiring finite FP32 output.
+ * Four GDN projections include alpha/beta, odd N/K, M1 and all relevant bucket
+ * boundaries. Changed retained replays poison both half-A and all outputs.
+ * The companion live-prefix fixture proves verifier/fixed-column serial bytes;
+ * neither source test certifies performance or library algorithm economy.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, GDNPhysicalHalfOperandsAccumulateIntoFP32Captured)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    if (!hasROCmDevice()) GTEST_SKIP() << "No ROCm device available";
+    constexpr int K = 65;
+    constexpr int capacity = 513;
+    const std::array<int, 4> widths{73, 41, 32, 32};
+    const DeviceId device = DeviceId::rocm(0);
+    ScopedGPUStream owned_stream(device);
+    void *stream = owned_stream.get();
+    ASSERT_EQ(hipSetDevice(device.ordinal), hipSuccess);
+    ScopedEnv stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    struct PendingJoin
+    {
+        hipStream_t stream;
+        bool armed = true;
+        /** @brief Join the exact last submission before borrowed owners retire. */
+        ~PendingJoin() { if (armed) (void)hipStreamSynchronize(stream); }
+    };
+    for (const int M : {1, 8, 63, 64, 65, 448, 512})
+    {
+        SCOPED_TRACE("M=" + std::to_string(M));
+        auto input = TestTensorFactory::createFP32Zeros({capacity, K});
+        std::array<std::shared_ptr<FP16Tensor>, 4> weights;
+        std::array<std::unique_ptr<FP32Tensor>, 4> outputs;
+        std::array<std::unique_ptr<ROCmFloatingPointGemmKernel>, 4> engines;
+        // Setup DMA has its own join before the later stage/workspace exists.
+        PendingJoin setup_join{static_cast<hipStream_t>(stream)};
+        for (int p = 0; p < 4; ++p)
+        {
+            std::vector<uint16_t> words(static_cast<size_t>(widths[p]) * K);
+            for (int n = 0; n < widths[p]; ++n)
+                for (int k = 0; k < K; ++k)
+                {
+                    const int signed_numerator = n == 0 ? 48 :
+                        (((n + k + p) & 1) ? -1 : 1) * (32 + (n * 7 + k * 3 + p) % 17);
+                    words[static_cast<size_t>(n) * K + k] =
+                        canonicalPreparedHalfBits(static_cast<float>(signed_numerator) / 64.0f);
+                }
+            weights[p] = std::make_shared<FP16Tensor>(
+                std::vector<size_t>{static_cast<size_t>(widths[p]), K}, words);
+            outputs[p] = TestTensorFactory::createFP32Zeros({capacity, static_cast<size_t>(widths[p])});
+            ASSERT_TRUE(weights[p]->ensureOnDevice(device, stream));
+            ASSERT_TRUE(outputs[p]->allocateOnDevice(device, stream));
+            engines[p] = std::make_unique<ROCmFloatingPointGemmKernel>(
+                weights[p]->gpu_data_ptr(), widths[p], K, device.ordinal,
+                ROCmFloatingPointGemmKernel::Precision::FP16, weights[p],
+                FloatingActivationOperandPrecision::FP16RNE);
+        }
+        ASSERT_TRUE(input->allocateOnDevice(device, stream));
+        ASSERT_EQ(hipStreamSynchronize(static_cast<hipStream_t>(stream)), hipSuccess);
+        setup_join.armed = false;
+        // Explicit arithmetic is a physical storage/geometry contract even
+        // when callers construct the public engine directly instead of factory.
+        EXPECT_THROW((void)std::make_unique<ROCmFloatingPointGemmKernel>(
+            weights[0]->gpu_data_ptr(), widths[0], K, device.ordinal,
+            ROCmFloatingPointGemmKernel::Precision::FP16, weights[0],
+            FloatingActivationOperandPrecision::FP32), std::invalid_argument);
+        EXPECT_THROW((void)std::make_unique<ROCmFloatingPointGemmKernel>(
+            weights[0]->gpu_data_ptr(), 0, K, device.ordinal,
+            ROCmFloatingPointGemmKernel::Precision::FP32, weights[0],
+            FloatingActivationOperandPrecision::FP32), std::invalid_argument);
+        EXPECT_THROW((void)std::make_unique<ROCmFloatingPointGemmKernel>(
+            weights[0]->gpu_data_ptr(), widths[0], 0, device.ordinal,
+            ROCmFloatingPointGemmKernel::Precision::FP32, weights[0],
+            FloatingActivationOperandPrecision::FP32), std::invalid_argument);
+        EXPECT_THROW((void)std::make_unique<ROCmFloatingPointGemmKernel>(
+            weights[0]->gpu_data_ptr(), widths[0], K, device.ordinal,
+            ROCmFloatingPointGemmKernel::Precision::FP32, weights[0],
+            FloatingActivationOperandPrecision::FP16RNE), std::invalid_argument);
+        GDNProjectionStage::Params params;
+        params.device_id = device;
+        params.input = input.get(); params.m = M; params.k = K;
+        params.w_qkv = weights[0].get(); params.output_qkv = outputs[0].get();
+        params.n_qkv = widths[0]; params.gemm_qkv = engines[0].get();
+        params.w_z = weights[1].get(); params.output_z = outputs[1].get();
+        params.n_z = widths[1]; params.gemm_z = engines[1].get();
+        params.w_a = weights[2].get(); params.output_a = outputs[2].get();
+        params.n_a = widths[2]; params.gemm_a = engines[2].get();
+        params.w_b = weights[3].get(); params.output_b = outputs[3].get();
+        params.n_b = widths[3]; params.gemm_b = engines[3].get();
+        GDNProjectionStage stage(params);
+        stage.setGPUStream(stream);
+        const auto requirements = stage.getWorkspaceRequirements(M, 0, K);
+        DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment());
+        ASSERT_TRUE(workspace.allocate(requirements));
+        stage.bindWorkspace(&workspace);
+        ROCmDeviceContext context(device, device.ordinal);
+        std::vector<float> source(static_cast<size_t>(capacity) * K, 0.0f);
+        std::array<std::vector<float>, 4> actual;
+        for (int p = 0; p < 4; ++p) actual[p].resize(static_cast<size_t>(capacity) * widths[p]);
+        std::vector<uint16_t> half_observed(static_cast<size_t>(M) * K);
+        auto graph = std::make_unique<HIPGraphCapture>(static_cast<hipStream_t>(stream), device.ordinal);
+        // Last declared: even an ASSERT/exception after asynchronous submission
+        // joins before host DMA banks, graph, stage, workspace or weights retire.
+        PendingJoin join{static_cast<hipStream_t>(stream)};
+        ASSERT_EQ(hipMemsetAsync(input->gpu_data_ptr(), 0, source.size() * sizeof(float),
+            static_cast<hipStream_t>(stream)), hipSuccess);
+        // The first actual new GemmEx call is captured. Do not initialize a
+        // second eager projection path merely to hide library capture setup.
+        ASSERT_EQ(hipStreamSynchronize(static_cast<hipStream_t>(stream)), hipSuccess);
+        ScopedBackendGraphCapture capture(*graph, "ROCm physical-half GDN compute32");
+        ASSERT_TRUE(capture.begin());
+        const bool recorded = stage.execute(&context);
+        capture.finish();
+        ASSERT_TRUE(recorded);
+        ASSERT_TRUE(graph->instantiate());
+        for (int replay = 0; replay < 4; ++replay)
+        {
+            for (int row = 0; row < capacity; ++row)
+                for (int k = 0; k < K; ++k)
+                    source[static_cast<size_t>(row) * K + k] =
+                        static_cast<float>(4096 + ((row * 5 + k * 7 + replay * 3) % 29) * 3) / 4096.0f;
+            // The first row separately covers half-subnormal RNE ties. Only
+            // four entries are nonzero, so their products/sums remain exactly
+            // representable FP32 despite the smaller source exponent.
+            std::fill_n(source.begin(), K, 0.0f);
+            for (int k = 0; k < 4; ++k)
+                source[k] = std::ldexp(static_cast<float>(2 * k + 1 + 2 * replay), -25);
+            if (replay == 3) std::fill(source.begin(), source.end(), 2048.5f);
+            ASSERT_EQ(hipMemcpyAsync(input->gpu_data_ptr(), source.data(), source.size() * sizeof(float),
+                hipMemcpyHostToDevice, static_cast<hipStream_t>(stream)), hipSuccess);
+            void *half_bank = workspace.getBuffer(GemmWorkspaceBuffers::FULL_A_FP16);
+            ASSERT_NE(half_bank, nullptr);
+            ASSERT_EQ(hipMemsetAsync(half_bank, 0xA5, half_observed.size() * sizeof(uint16_t),
+                static_cast<hipStream_t>(stream)), hipSuccess);
+            for (int p = 0; p < 4; ++p)
+                ASSERT_EQ(hipMemsetAsync(outputs[p]->gpu_data_ptr(), 0xFF,
+                    actual[p].size() * sizeof(float), static_cast<hipStream_t>(stream)), hipSuccess);
+            ASSERT_TRUE(graph->launch());
+            for (int p = 0; p < 4; ++p)
+                ASSERT_EQ(hipMemcpyAsync(actual[p].data(), outputs[p]->gpu_data_ptr(),
+                    actual[p].size() * sizeof(float), hipMemcpyDeviceToHost,
+                    static_cast<hipStream_t>(stream)), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(half_observed.data(), half_bank,
+                half_observed.size() * sizeof(uint16_t), hipMemcpyDeviceToHost,
+                static_cast<hipStream_t>(stream)), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(static_cast<hipStream_t>(stream)), hipSuccess);
+            bool witnessed_nonhalf_output = false;
+            bool witnessed_above_half_range = false;
+            for (int row = 0; row < M; ++row)
+            {
+                std::array<int, K> rounded{};
+                for (int k = 0; k < K; ++k)
+                {
+                    if (replay == 3)
+                    {
+                        rounded[k] = 2048 * 1024;
+                        EXPECT_EQ(half_observed[static_cast<size_t>(row) * K + k], UINT16_C(0x6800));
+                        continue;
+                    }
+                    if (row == 0)
+                    {
+                        const int numerator = k < 4 ? 2 * k + 1 + 2 * replay : 0;
+                        const int quotient = numerator / 2;
+                        rounded[k] = quotient + ((numerator & 1) && (quotient & 1) ? 1 : 0);
+                        EXPECT_EQ(half_observed[k], static_cast<uint16_t>(rounded[k]));
+                        continue;
+                    }
+                    const int numerator = 4096 + ((row * 5 + k * 7 + replay * 3) % 29) * 3;
+                    const int quotient = numerator / 4;
+                    const int remainder = numerator % 4;
+                    rounded[k] = quotient + ((remainder > 2 || (remainder == 2 && (quotient & 1))) ? 1 : 0);
+                    // Every value is in [1,2), so independent half encoding is
+                    // exponent15 plus its rounded ten-bit fractional numerator.
+                    EXPECT_EQ(half_observed[static_cast<size_t>(row) * K + k],
+                        static_cast<uint16_t>(0x3C00 + rounded[k] - 1024));
+                }
+                for (int p = 0; p < 4; ++p)
+                    for (int n = 0; n < widths[p]; ++n)
+                    {
+                        int64_t sum = 0;
+                        for (int k = 0; k < K; ++k)
+                        {
+                            const int coefficient = n == 0 ? 48 :
+                                (((n + k + p) & 1) ? -1 : 1) * (32 + (n * 7 + k * 3 + p) % 17);
+                            sum += static_cast<int64_t>(rounded[k]) * coefficient;
+                        }
+                        const float expected = std::ldexp(static_cast<float>(sum), row == 0 && replay != 3 ? -30 : -16);
+                        const float value = actual[p][static_cast<size_t>(row) * widths[p] + n];
+                        EXPECT_EQ(std::bit_cast<uint32_t>(value), std::bit_cast<uint32_t>(expected))
+                            << "projection=" << p << " row=" << row << " n=" << n << " replay=" << replay;
+                        witnessed_nonhalf_output |= canonicalPreparedHalfValue(expected) != expected;
+                        witnessed_above_half_range |= expected > 65504.0f && std::isfinite(value);
+                    }
+            }
+            EXPECT_TRUE(witnessed_nonhalf_output);
+            if (replay == 3) EXPECT_TRUE(witnessed_above_half_range);
+            for (int p = 0; p < 4; ++p)
+                for (int row = M; row < capacity; ++row)
+                    for (int n = 0; n < widths[p]; ++n)
+                        EXPECT_EQ(std::bit_cast<uint32_t>(actual[p][static_cast<size_t>(row) * widths[p] + n]),
+                            UINT32_C(0xFFFFFFFF));
+        }
+        ROCmFloatingPointGemmKernel native_input_engine(weights[1]->gpu_data_ptr(),
+            widths[1], K, device.ordinal, ROCmFloatingPointGemmKernel::Precision::FP16,
+            weights[1], FloatingActivationOperandPrecision::Native);
+        native_input_engine.setGPUStream(stream);
+        native_input_engine.bindWorkspace(&workspace);
+        const std::vector<ITensorGemm::TensorProjectionDesc> mixed_operands{
+            {engines[0].get(), outputs[0].get(), widths[0], nullptr, "qkv"},
+            {&native_input_engine, outputs[1].get(), widths[1], nullptr, "z"}};
+        EXPECT_NE(engines[0]->floatingActivationOperandPrecision(),
+            native_input_engine.floatingActivationOperandPrecision());
+        void *half_bank = workspace.getBuffer(GemmWorkspaceBuffers::FULL_A_FP16);
+        ASSERT_EQ(hipMemsetAsync(half_bank, 0xA5, half_observed.size() * sizeof(uint16_t),
+            static_cast<hipStream_t>(stream)), hipSuccess);
+        for (int p = 0; p < 4; ++p)
+            ASSERT_EQ(hipMemsetAsync(outputs[p]->gpu_data_ptr(), 0xFF,
+                actual[p].size() * sizeof(float), static_cast<hipStream_t>(stream)), hipSuccess);
+        EXPECT_THROW(engines[0]->multiply_fused_tensor(input.get(), mixed_operands,
+            M, K, nullptr, &workspace), std::invalid_argument);
+        const std::vector<ITensorGemm::TensorProjectionDesc> reversed_mixed_operands{
+            {&native_input_engine, outputs[1].get(), widths[1], nullptr, "z"},
+            {engines[0].get(), outputs[0].get(), widths[0], nullptr, "qkv"}};
+        EXPECT_THROW(native_input_engine.multiply_fused_tensor(input.get(), reversed_mixed_operands,
+            M, K, nullptr, &workspace), std::invalid_argument);
+        ASSERT_EQ(hipMemcpyAsync(half_observed.data(), half_bank,
+            half_observed.size() * sizeof(uint16_t), hipMemcpyDeviceToHost,
+            static_cast<hipStream_t>(stream)), hipSuccess);
+        for (int p = 0; p < 4; ++p)
+            ASSERT_EQ(hipMemcpyAsync(actual[p].data(), outputs[p]->gpu_data_ptr(),
+                actual[p].size() * sizeof(float), hipMemcpyDeviceToHost,
+                static_cast<hipStream_t>(stream)), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(static_cast<hipStream_t>(stream)), hipSuccess);
+        for (const uint16_t word : half_observed) EXPECT_EQ(word, UINT16_C(0xA5A5));
+        for (const auto &projection : actual)
+            for (const float value : projection)
+                EXPECT_EQ(std::bit_cast<uint32_t>(value), UINT32_C(0xFFFFFFFF));
+        EXPECT_NO_THROW({ auto verifier = engines[0]->beginVerifierDecodeEquivalentScope(); });
+        EXPECT_NO_THROW({ auto partition = engines[0]->beginOutputPartitionEquivalenceScope(widths[0], widths[0]); });
+        stage.unbindWorkspace();
+    }
+    const auto records = PerfStatsCollector::snapshot({"gemm.rocm_fp16_operand_compute32_calls"});
+    EXPECT_FALSE(records.empty());
+    double consumers = 0.0;
+    for (const auto &record : records)
+    {
+        consumers += record.value;
+        EXPECT_EQ(record.tags.at("activation"), "fp16_rne");
+        EXPECT_EQ(record.tags.at("weight"), "fp16");
+        EXPECT_EQ(record.tags.at("accumulation"), "fp32");
+        EXPECT_EQ(record.tags.at("output"), "fp32");
+        EXPECT_EQ(record.tags.at("route"), "hipblas_gemm_ex");
+    }
+    const auto fixed = PerfStatsCollector::snapshot({"kernel.rocm_fp16_short_projection_group_calls"});
+    EXPECT_FALSE(fixed.empty());
+    for (const auto &record : fixed)
+    {
+        consumers += record.value * std::stoi(record.tags.at("projections"));
+        EXPECT_EQ(record.tags.at("m"), "1");
+        EXPECT_EQ(record.tags.at("projections"), "4");
+        EXPECT_EQ(record.tags.at("physical_launches"), "1");
+        EXPECT_EQ(record.tags.at("pointer_publications"), "0");
+        EXPECT_EQ(record.tags.at("route"), "fixed_order_fp16_short_group");
+        EXPECT_EQ(record.tags.at("activation"), "fp16_rne");
+        EXPECT_EQ(record.tags.at("accumulation"), "fp32");
+    }
+    const auto casts = PerfStatsCollector::snapshot({"gemm.rocm_fp16_operand_cast_calls"});
+    double producers = 0.0;
+    for (const auto &record : casts) producers += record.value;
+    EXPECT_GT(producers, 0.0);
+    // These are host construction/enqueue records, not graph replay counters.
+    EXPECT_EQ(consumers, 4.0 * producers);
+    PerfStatsCollector::reset();
+#endif
+}
+
+/**
+ * @test A real captured half-operand GEMM exposes registered cast and module
+ * library kernels through the same strict public resource inventory.
+ * @details The first GEMM is captured cold at the real QKV M512 geometry that
+ * reproduced invalid-device-symbol inspection. All resource and occupancy
+ * values are checked against the representation's native typed query APIs.
+ * Changed-input retained launches prove inspection does not alter graph work.
+ * This is observability/correctness evidence, not a performance certificate.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, GraphInventoryAcceptsCapturedHostAndModuleKernels)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    if (!hasROCmDevice()) GTEST_SKIP() << "No ROCm device available";
+    constexpr int M=512, N=8192, K=2048;
+    const DeviceId device=DeviceId::rocm(0);
+    auto &context=GPUDeviceContextPool::instance().getContext(device);
+    context.submitAndWait([&] {
+        void *stream=context.getOrCreateAuxiliaryStream("hip.inventory.host_and_module");
+        ASSERT_NE(stream,nullptr);
+        const auto hip_stream=static_cast<hipStream_t>(stream);
+        auto input=TestTensorFactory::createFP32Zeros({M,K});
+        auto output=TestTensorFactory::createFP32Zeros({M,N});
+        auto weights=std::make_shared<FP16Tensor>(std::vector<size_t>{N,K},
+            std::vector<uint16_t>(size_t(N)*K,canonicalPreparedHalfBits(1.0f/128.0f)));
+        std::fill_n(input->mutable_data(),size_t(M)*K,1.0f);
+        std::vector<float> source(size_t(M)*K), actual(size_t(M)*N);
+        std::unique_ptr<ROCmFloatingPointGemmKernel> engine;
+        std::unique_ptr<DeviceWorkspaceManager> workspace;
+        std::unique_ptr<IGPUGraphCapture> graph;
+        struct PendingJoin
+        {
+            hipStream_t stream;
+            /** @brief Join before every graph, DMA bank, engine and weight owner retires. */
+            ~PendingJoin(){(void)hipStreamSynchronize(stream);}
+        } join{hip_stream};
+        for(auto *tensor:{static_cast<TensorBase*>(input.get()),static_cast<TensorBase*>(output.get()),
+                static_cast<TensorBase*>(weights.get())})
+            TransferEngine::prepareDeviceInput(tensor,device,stream);
+        ASSERT_EQ(hipStreamSynchronize(hip_stream),hipSuccess);
+        engine=std::make_unique<ROCmFloatingPointGemmKernel>(weights->gpu_data_ptr(),N,K,device.ordinal,
+            ROCmFloatingPointGemmKernel::Precision::FP16,weights,FloatingActivationOperandPrecision::FP16RNE);
+        engine->setGPUStream(stream);
+        const auto requirements=engine->getWorkspaceRequirements(M,N,K);
+        workspace=std::make_unique<DeviceWorkspaceManager>(device,requirements.total_bytes_with_alignment());
+        ASSERT_TRUE(workspace->allocate(requirements));engine->bindWorkspace(workspace.get());
+        graph=context.createGraphCapture(stream);ASSERT_NE(graph,nullptr);
+        {
+            ScopedBackendGraphCapture capture(context,*graph,"HIP host/module kernel inventory");
+            ASSERT_TRUE(capture.begin());
+            const bool recorded=engine->multiply_tensor(input.get(),output.get(),M,N,K);
+            capture.finish();ASSERT_TRUE(recorded);
+        }
+        ASSERT_TRUE(graph->instantiate());
+        std::vector<GPUGraphKernelNodeInfo> observed;std::string error;
+        ASSERT_TRUE(graph->inspectKernelNodes(observed,&error))<<error;
+        ASSERT_FALSE(observed.empty());
+        auto *native=dynamic_cast<HIPGraphCapture*>(graph.get());ASSERT_NE(native,nullptr);
+        size_t host_count=0,module_count=0,kernel_count=0;
+        std::function<void(hipGraph_t,const std::string&)> verify;
+        verify=[&](hipGraph_t owner,const std::string &path) {
+            size_t count=0;ASSERT_EQ(hipGraphGetNodes(owner,nullptr,&count),hipSuccess);
+            std::vector<hipGraphNode_t> nodes(count);
+            ASSERT_EQ(hipGraphGetNodes(owner,nodes.data(),&count),hipSuccess);
+            for(size_t index=0;index<count;++index)
+            {
+                const std::string node_path=path+"/node["+std::to_string(index)+"]";
+                hipGraphNodeType type=hipGraphNodeTypeCount;
+                ASSERT_EQ(hipGraphNodeGetType(nodes[index],&type),hipSuccess);
+                if(type==hipGraphNodeTypeGraph)
+                {
+                    hipGraph_t child=nullptr;ASSERT_EQ(hipGraphChildGraphNodeGetGraph(nodes[index],&child),hipSuccess);
+                    ASSERT_NE(child,nullptr);verify(child,node_path+"/child");continue;
+                }
+                if(type!=hipGraphNodeTypeKernel)continue;
+                ++kernel_count;hipKernelNodeParams params{};
+                ASSERT_EQ(hipGraphKernelNodeGetParams(nodes[index],&params),hipSuccess);
+                ASSERT_NE(params.func,nullptr);
+                const auto record=std::find_if(observed.begin(),observed.end(),[&](const auto &item){return item.graph_path==node_path;});
+                ASSERT_NE(record,observed.end());
+                EXPECT_EQ(record->function_identity,reinterpret_cast<uintptr_t>(params.func));
+                EXPECT_EQ(record->grid_x,params.gridDim.x);EXPECT_EQ(record->grid_y,params.gridDim.y);EXPECT_EQ(record->grid_z,params.gridDim.z);
+                EXPECT_EQ(record->block_x,params.blockDim.x);EXPECT_EQ(record->block_y,params.blockDim.y);EXPECT_EQ(record->block_z,params.blockDim.z);
+                EXPECT_EQ(record->dynamic_shared_memory_bytes,params.sharedMemBytes);
+                hipFuncAttributes attributes{};const auto status=hipFuncGetAttributes(&attributes,params.func);
+                int active=0;const char *name=nullptr;
+                const int threads=int(params.blockDim.x*params.blockDim.y*params.blockDim.z);
+                if(status==hipSuccess)
+                {
+                    ++host_count;name=hipKernelNameRefByPtr(params.func,hip_stream);
+                    ASSERT_EQ(hipOccupancyMaxActiveBlocksPerMultiprocessor(&active,params.func,threads,params.sharedMemBytes),hipSuccess);
+                }
+                else
+                {
+                    ASSERT_EQ(status,hipErrorInvalidSymbol)<<"Only native absent-host-registration identifies an admitted module node";
+                    ++module_count;
+                    const auto function=reinterpret_cast<hipFunction_t>(params.func);
+                    int shared=0,local=0,registers=0,max_threads=0;
+                    ASSERT_EQ(hipFuncGetAttribute(&shared,HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,function),hipSuccess);
+                    ASSERT_EQ(hipFuncGetAttribute(&local,HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,function),hipSuccess);
+                    ASSERT_EQ(hipFuncGetAttribute(&registers,HIP_FUNC_ATTRIBUTE_NUM_REGS,function),hipSuccess);
+                    ASSERT_EQ(hipFuncGetAttribute(&max_threads,HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,function),hipSuccess);
+                    ASSERT_GE(shared,0);ASSERT_GE(local,0);ASSERT_GE(registers,0);ASSERT_GT(max_threads,0);
+                    attributes.sharedSizeBytes=size_t(shared);attributes.localSizeBytes=size_t(local);
+                    attributes.numRegs=registers;attributes.maxThreadsPerBlock=max_threads;
+                    name=hipKernelNameRef(function);
+                    ASSERT_EQ(hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&active,function,threads,params.sharedMemBytes),hipSuccess);
+                }
+                ASSERT_NE(name,nullptr);ASSERT_NE(name[0],'\0');EXPECT_TRUE(record->name_resolved);EXPECT_EQ(record->name,name);
+                EXPECT_EQ(record->static_shared_memory_bytes,attributes.sharedSizeBytes);
+                EXPECT_EQ(record->local_memory_bytes_per_thread,attributes.localSizeBytes);
+                EXPECT_EQ(record->registers_per_thread,uint32_t(attributes.numRegs));
+                EXPECT_EQ(record->max_threads_per_block,uint32_t(attributes.maxThreadsPerBlock));
+                ASSERT_GT(active,0);EXPECT_EQ(record->max_active_blocks_per_sm,uint32_t(active));
+            }
+        };
+        verify(native->graph(),"root");
+        ASSERT_GT(host_count,0u)<<"Actual registered FP32-to-half producer missing";
+        ASSERT_GT(module_count,0u)<<"Actual captured module-origin library GEMM missing";
+        EXPECT_EQ(kernel_count,observed.size());
+        for(int replay=0;replay<3;++replay)
+        {
+            std::fill(source.begin(),source.end(),float(replay+1));
+            ASSERT_EQ(hipMemcpyAsync(input->gpu_data_ptr(),source.data(),source.size()*sizeof(float),hipMemcpyHostToDevice,hip_stream),hipSuccess);
+            ASSERT_EQ(hipMemsetAsync(output->gpu_data_ptr(),0xff,actual.size()*sizeof(float),hip_stream),hipSuccess);
+            void *half=workspace->getBuffer(GemmWorkspaceBuffers::FULL_A_FP16);ASSERT_NE(half,nullptr);
+            ASSERT_EQ(hipMemsetAsync(half,replay%2?0x5a:0xa5,size_t(M)*K*sizeof(uint16_t),hip_stream),hipSuccess);
+            ASSERT_TRUE(graph->launch());
+            ASSERT_EQ(hipMemcpyAsync(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),hipMemcpyDeviceToHost,hip_stream),hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(hip_stream),hipSuccess);
+            for(float value:actual)ASSERT_EQ(value,16.0f*float(replay+1));
+        }
+    });
+#endif
+}
+
+/**
+ * @test Half serial, grouped verifier and fixed-column projections share bytes.
+ * @details Captured M64 consumes a device-owned live prefix; large/small/empty
+ * replays poison every inactive FP32/half/output cell. A separate captured M1
+ * transaction is the public diagnostic byte oracle, never production row replay.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, GDNHalfVerifierLiveRowsAndFixedColumnsMatchSerialCaptured)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    if (!hasROCmDevice()) GTEST_SKIP() << "No ROCm device available";
+    ScopedEnv stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    constexpr int M=64,N=73,K=65;
+    const DeviceId device=DeviceId::rocm(0);
+    ScopedGPUStream owned_stream(device);
+    const auto stream=static_cast<hipStream_t>(owned_stream.get());
+    std::vector<uint16_t> words(N*K);
+    for(int n=0;n<N;++n)for(int k=0;k<K;++k)
+        words[n*K+k]=canonicalPreparedHalfBits(float(((n+k)&1?-1:1)*(32+(n*7+k*3)%17))/64.f);
+    auto weights=std::make_shared<FP16Tensor>(std::vector<size_t>{N,K},words);
+    auto input=TestTensorFactory::createFP32Zeros({M,K});
+    auto output=TestTensorFactory::createFP32Zeros({M,N});
+    auto serial_input=TestTensorFactory::createFP32Zeros({1,K});
+    auto serial_output=TestTensorFactory::createFP32Zeros({1,N});
+    struct SetupJoin {
+        hipStream_t stream; bool armed=true;
+        ~SetupJoin(){if(armed)(void)hipStreamSynchronize(stream);}
+    } setup_join{stream};
+    ASSERT_TRUE(weights->ensureOnDevice(device,stream));
+    ROCmFloatingPointGemmKernel grouped(weights->gpu_data_ptr(),N,K,device.ordinal,
+        ROCmFloatingPointGemmKernel::Precision::FP16,weights,FloatingActivationOperandPrecision::FP16RNE);
+    ROCmFloatingPointGemmKernel serial(weights->gpu_data_ptr(),N,K,device.ordinal,
+        ROCmFloatingPointGemmKernel::Precision::FP16,weights,FloatingActivationOperandPrecision::FP16RNE);
+    grouped.setGPUStream(stream);serial.setGPUStream(stream);
+    auto requirements=grouped.getWorkspaceRequirements(M,N,K);
+    requirements.buffers.push_back({"half_gdn_test_live_count",sizeof(int32_t),256,true});
+    DeviceWorkspaceManager bank(device,requirements.total_bytes_with_alignment());
+    ASSERT_TRUE(bank.allocate(requirements));grouped.bindWorkspace(&bank);
+    const auto serial_requirements=serial.getWorkspaceRequirements(1,N,K);
+    DeviceWorkspaceManager serial_bank(device,serial_requirements.total_bytes_with_alignment());
+    ASSERT_TRUE(serial_bank.allocate(serial_requirements));serial.bindWorkspace(&serial_bank);
+    auto *count=static_cast<int32_t *>(bank.getBuffer("half_gdn_test_live_count"));
+    ASSERT_NE(count,nullptr);
+    std::vector<float> source(M*K),observed(M*N),no_row_observed(M*N),reference(N);
+    std::vector<uint16_t> half(M*K);
+    int32_t live=M;
+    auto graph=std::make_unique<HIPGraphCapture>(stream,device.ordinal);
+    auto serial_graph=std::make_unique<HIPGraphCapture>(stream,device.ordinal);
+    auto no_row_graph=std::make_unique<HIPGraphCapture>(stream,device.ordinal);
+    struct Join {
+        hipStream_t stream;
+        ~Join(){(void)hipStreamSynchronize(stream);}
+    } join{stream}; // Every DMA bank, graph, workspace and tensor precedes this join.
+    ASSERT_TRUE(input->allocateOnDevice(device,stream));ASSERT_TRUE(output->allocateOnDevice(device,stream));
+    ASSERT_TRUE(serial_input->allocateOnDevice(device,stream));ASSERT_TRUE(serial_output->allocateOnDevice(device,stream));
+    ASSERT_EQ(hipMemcpyAsync(count,&live,sizeof(live),hipMemcpyHostToDevice,stream),hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+    setup_join.armed=false;
+    {
+        auto rows=grouped.beginVerifierDecodeEquivalentScope(DeviceRowRange::deviceCounted(M,count));
+        auto columns=grouped.beginOutputPartitionEquivalenceScope(N,17);
+        ScopedBackendGraphCapture capture(*graph,"half GDN device-prefix fixed columns");
+        ASSERT_TRUE(capture.begin());
+        ASSERT_TRUE(grouped.multiply_fused_tensor(input.get(),
+            {{&grouped,output.get(),N,nullptr,"half"}},M,K,nullptr,&bank));
+        capture.finish();
+    }
+    ASSERT_TRUE(graph->instantiate());
+    {
+        ScopedBackendGraphCapture capture(*serial_graph,"half GDN ordinary serial");
+        ASSERT_TRUE(capture.begin());
+        ASSERT_TRUE(serial.multiply_tensor(serial_input.get(),serial_output.get(),1,N,K,
+            true,1.f,0.f,nullptr,nullptr,-1,&serial_bank));
+        capture.finish();
+    }
+    ASSERT_TRUE(serial_graph->instantiate());
+    const auto fixed_count=[]() {
+        double calls=0;
+        for(const auto &record:PerfStatsCollector::snapshot({"kernel.rocm_fp16_fixed_grouped_projection_calls"}))
+            if(record.kind==PerfStatRecord::Kind::Counter) calls+=record.value;
+        return calls;
+    };
+    const double fixed_before=fixed_count();
+    {
+        // A no-row verifier token still selects the same fixed half tree.
+        // active() carries that identity independently of device row metadata.
+        auto scope=grouped.beginVerifierDecodeEquivalentScope();
+        ScopedBackendGraphCapture capture(*no_row_graph,"half GDN no-row verifier token");
+        ASSERT_TRUE(capture.begin());
+        ASSERT_TRUE(grouped.multiply_fused_tensor(input.get(),
+            {{&grouped,output.get(),N,nullptr,"half"}},M,K,nullptr,&bank));
+        capture.finish();
+    }
+    ASSERT_TRUE(no_row_graph->instantiate());
+    EXPECT_GT(fixed_count(),fixed_before);
+    int replay=0;
+    for(const int value : {64,3,0,1,63,8,64})
+    {
+        live=value;++replay;
+        std::fill(source.begin(),source.end(),std::bit_cast<float>(UINT32_C(0x7FC00001)));
+        for(int row=0;row<live;++row)for(int k=0;k<K;++k)
+            source[row*K+k]=float(4096+((row*5+k*7+replay*3)%29)*3)/4096.f;
+        ASSERT_EQ(hipMemcpyAsync(input->gpu_data_ptr(),source.data(),source.size()*sizeof(float),hipMemcpyHostToDevice,stream),hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(count,&live,sizeof(live),hipMemcpyHostToDevice,stream),hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(bank.getBuffer(GemmWorkspaceBuffers::FULL_A_FP16),0xA5,half.size()*sizeof(uint16_t),stream),hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(output->gpu_data_ptr(),0xFF,observed.size()*sizeof(float),stream),hipSuccess);
+        ASSERT_TRUE(graph->launch());
+        ASSERT_EQ(hipMemcpyAsync(observed.data(),output->gpu_data_ptr(),observed.size()*sizeof(float),hipMemcpyDeviceToHost,stream),hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(half.data(),bank.getBuffer(GemmWorkspaceBuffers::FULL_A_FP16),half.size()*sizeof(uint16_t),hipMemcpyDeviceToHost,stream),hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+        if(live==M)
+        {
+            ASSERT_TRUE(no_row_graph->launch());
+            ASSERT_EQ(hipMemcpyAsync(no_row_observed.data(),output->gpu_data_ptr(),no_row_observed.size()*sizeof(float),hipMemcpyDeviceToHost,stream),hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+            EXPECT_EQ(std::memcmp(no_row_observed.data(),observed.data(),observed.size()*sizeof(float)),0);
+        }
+        for(int row=live;row<M;++row)
+        {
+            for(int n=0;n<N;++n)EXPECT_EQ(std::bit_cast<uint32_t>(observed[row*N+n]),UINT32_C(0xFFFFFFFF));
+            for(int k=0;k<K;++k)EXPECT_EQ(half[row*K+k],UINT16_C(0xA5A5));
+        }
+        for(int row=0;row<live;++row)
+        {
+            ASSERT_EQ(hipMemcpyAsync(serial_input->gpu_data_ptr(),source.data()+row*K,K*sizeof(float),hipMemcpyHostToDevice,stream),hipSuccess);
+            ASSERT_EQ(hipMemsetAsync(serial_output->gpu_data_ptr(),0xFF,N*sizeof(float),stream),hipSuccess);
+            ASSERT_TRUE(serial_graph->launch());
+            ASSERT_EQ(hipMemcpyAsync(reference.data(),serial_output->gpu_data_ptr(),N*sizeof(float),hipMemcpyDeviceToHost,stream),hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+            for(int n=0;n<N;++n)EXPECT_EQ(std::bit_cast<uint32_t>(observed[row*N+n]),std::bit_cast<uint32_t>(reference[n]));
+            for(int k=0;k<K;++k)
+            {
+                const int numerator=4096+((row*5+k*7+replay*3)%29)*3;
+                const int q=numerator/4,r=numerator%4;
+                const int rounded=q+(r>2||(r==2&&(q&1)));
+                EXPECT_EQ(half[row*K+k],uint16_t(0x3C00+rounded-1024));
+            }
+        }
+    }
+    ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+    grouped.bindWorkspace(nullptr);serial.bindWorkspace(nullptr);
+#endif
+}
+
+/**
+ * @brief Preserve every finite half value and the legacy 256-lane FP32 tree.
+ *
+ * The public captured GEMM must execute the compact 128-thread kernel. Exact
+ * CPU FMA lane sums are independent of its packed loads and HIP shuffles.
+ * Exhaustive weight words cover signed zeros, subnormals and exponent edges;
+ * odd K, row alignment, long reductions and grouped rows cover transport and
+ * tree boundaries. Existing live-row tests separately poison inactive suffixes.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, GDNHalfPackedProjectionFixedTreeCaptured)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    if (!hasROCmDevice()) GTEST_SKIP() << "No ROCm device available";
+    const DeviceId device = DeviceId::rocm(0);
+    ScopedGPUStream owned_stream(device);
+    const auto stream = static_cast<hipStream_t>(owned_stream.get());
+    ASSERT_EQ(hipSetDevice(device.ordinal), hipSuccess);
+    const auto word = [](size_t index) -> uint16_t {
+        index %= 63488;
+        return uint16_t(index < 31744 ? index : ((index - 31744) | 0x8000u));
+    };
+    const auto expand = [](uint16_t bits) -> float {
+        const int exponent = (bits >> 10) & 31;
+        const int mantissa = bits & 1023;
+        const float magnitude = exponent
+            ? std::ldexp(float(1024 + mantissa), exponent - 25)
+            : std::ldexp(float(mantissa), -24);
+        return std::copysign(magnitude, (bits & 0x8000u) ? -1.0f : 1.0f);
+    };
+
+    /**
+     * @brief Capture and compare one geometry, including output capacity guards.
+     * @param M Live rows. @param N Output columns. @param K Reduction width.
+     * @param exhaustive_weights Enumerate every finite half as a scalar weight.
+     */
+    const auto prove = [&](int M, int N, int K, bool exhaustive_weights) {
+        SCOPED_TRACE("M=" + std::to_string(M) + " N=" + std::to_string(N) +
+                     " K=" + std::to_string(K));
+        std::vector<uint16_t> words(size_t(N) * K);
+        for (size_t i = 0; i < words.size(); ++i)
+            words[i] = word(exhaustive_weights ? i : i * 193 + 17);
+        auto weights = std::make_shared<FP16Tensor>(
+            std::vector<size_t>{size_t(N), size_t(K)}, words);
+        auto input = TestTensorFactory::createFP32Zeros({size_t(M), size_t(K)});
+        auto output = TestTensorFactory::createFP32Zeros({size_t(M + 1), size_t(N)});
+        std::vector<float> source(size_t(M) * K), observed(size_t(M + 1) * N);
+        std::unique_ptr<ROCmFloatingPointGemmKernel> engine;
+        std::unique_ptr<DeviceWorkspaceManager> workspace;
+        std::unique_ptr<HIPGraphCapture> graph;
+        struct PendingJoin {
+            hipStream_t stream;
+            /** @brief Retire pending work before every borrowed owner unwinds. */
+            ~PendingJoin() { (void)hipStreamSynchronize(stream); }
+        } join{stream};
+        TransferEngine::prepareDeviceInput(weights.get(), device, stream);
+        TransferEngine::prepareDeviceInput(input.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(output.get(), device, stream);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        engine = std::make_unique<ROCmFloatingPointGemmKernel>(
+            weights->gpu_data_ptr(), N, K, device.ordinal,
+            ROCmFloatingPointGemmKernel::Precision::FP16, weights,
+            FloatingActivationOperandPrecision::FP16RNE);
+        engine->setGPUStream(stream);
+        const auto requirements = engine->getWorkspaceRequirements(M, N, K);
+        workspace = std::make_unique<DeviceWorkspaceManager>(
+            device, requirements.total_bytes_with_alignment());
+        ASSERT_TRUE(workspace->allocate(requirements));
+        engine->bindWorkspace(workspace.get());
+        graph = std::make_unique<HIPGraphCapture>(stream, device.ordinal);
+        {
+            auto verifier = engine->beginVerifierDecodeEquivalentScope();
+            ScopedBackendGraphCapture capture(*graph, "packed half fixed-tree regression");
+            ASSERT_TRUE(capture.begin());
+            const bool recorded = engine->multiply_fused_tensor(input.get(),
+                {{engine.get(), output.get(), N, nullptr, "packed_half"}},
+                M, K, nullptr, workspace.get());
+            capture.finish();
+            ASSERT_TRUE(recorded);
+        }
+        ASSERT_TRUE(graph->instantiate());
+        std::vector<GPUGraphKernelNodeInfo> nodes;
+        std::string error;
+        ASSERT_TRUE(graph->inspectKernelNodes(nodes, &error)) << error;
+        const auto projection = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+            return node.name.find("fp16_packed_batched_projection_kernel") != std::string::npos;
+        });
+        ASSERT_NE(projection, nodes.end());
+        EXPECT_EQ(projection->block_x, 128u);
+        EXPECT_EQ(projection->grid_x, unsigned(N));
+        EXPECT_EQ(projection->grid_y, unsigned(M));
+        EXPECT_EQ(projection->local_memory_bytes_per_thread, 0u);
+
+        for (int replay = 0; replay < 2; ++replay) {
+            for (size_t i = 0; i < source.size(); ++i)
+                source[i] = exhaustive_weights ? (replay ? -1.0f : 1.0f)
+                    : expand(word(i * 73 + 1 + replay * 113));
+            ASSERT_EQ(hipMemcpyAsync(input->gpu_data_ptr(), source.data(),
+                source.size() * sizeof(float), hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemsetAsync(output->gpu_data_ptr(), 0xFF,
+                observed.size() * sizeof(float), stream), hipSuccess);
+            ASSERT_TRUE(graph->launch());
+            ASSERT_EQ(hipMemcpyAsync(observed.data(), output->gpu_data_ptr(),
+                observed.size() * sizeof(float), hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            for (int row = 0; row < M; ++row) {
+                for (int n = 0; n < N; ++n) {
+                    std::array<float, 256> sums{};
+                    for (int lane = 0; lane < 256; ++lane)
+                        for (int k = lane; k < K; k += 256)
+                            sums[lane] = std::fma(source[size_t(row) * K + k],
+                                expand(words[size_t(n) * K + k]), sums[lane]);
+                    for (int stride = 128; stride; stride >>= 1)
+                        for (int lane = 0; lane < stride; ++lane)
+                            sums[lane] += sums[lane + stride];
+                    ASSERT_EQ(std::bit_cast<uint32_t>(observed[size_t(row) * N + n]),
+                              std::bit_cast<uint32_t>(sums[0]))
+                        << "row=" << row << " n=" << n << " replay=" << replay;
+                }
+            }
+            for (int n = 0; n < N; ++n)
+                ASSERT_EQ(std::bit_cast<uint32_t>(observed[size_t(M) * N + n]), UINT32_C(0xFFFFFFFF));
+        }
+    };
+    prove(1, 63488, 1, true);
+    if (HasFatalFailure()) return;
+    for (const int K : {1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 2047, 2048, 2049, 4095, 4096, 4097}) {
+        for (const int M : {1, 8, 64}) {
+            prove(M, 17, K, false);
+            if (HasFatalFailure()) return;
+        }
+    }
+#endif
 }

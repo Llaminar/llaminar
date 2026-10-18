@@ -125,8 +125,7 @@ namespace llaminar2
         std::shared_ptr<std::vector<uint8_t>> *pageable_owner,
         std::shared_ptr<void> *pinned_owner,
         void **payload,
-        const std::shared_ptr<void> &arena_payload,
-        size_t offset) const
+        const std::shared_ptr<void> &arena_section) const
     {
         if (!pageable_owner || !pinned_owner || !payload)
             return false;
@@ -144,9 +143,9 @@ namespace llaminar2
             return true;
         }
 
-        if (!arena_payload)
+        if (!arena_section)
             return false;
-        void *raw = static_cast<uint8_t *>(arena_payload.get()) + offset;
+        void *raw = arena_section.get();
         // Recurrent checkpoints overwrite their entire serialized section.
         // A host memset of large pinned images can dominate prefill (especially
         // with uncached mappings), yet contributes no observable archive data.
@@ -154,7 +153,7 @@ namespace llaminar2
         // can leave allocated bytes outside the published payload.
         if (coverage == SectionWriteCoverage::Partial)
             std::memset(raw, 0, bytes);
-        *pinned_owner = std::shared_ptr<void>(arena_payload, raw);
+        *pinned_owner = arena_section;
         *payload = raw;
         PerfStatsCollector::addCounter(
             "prefix_cache",
@@ -170,6 +169,24 @@ namespace llaminar2
     bool RamPrefixStorageBackend::canStore(size_t bytes) const
     {
         return bytes <= availableAllocationBytes();
+    }
+
+    bool RamPrefixStorageBackend::canStore(const PrefixPayloadAllocationPlan &allocation) const
+    {
+        const size_t logical = budget_bytes_ - std::min(budget_bytes_, used_bytes_);
+        if (allocation.totalBytes() > logical)
+            return false;
+        if (producer_device_.is_gpu())
+            return arena_ && arena_->canAcquireSections(allocation.sections());
+        return !reservation_.valid() || allocation.totalBytes() <= reservation_.remainingBytes();
+    }
+
+    size_t RamPrefixStorageBackend::availableArchiveBytes() const
+    {
+        const size_t logical = budget_bytes_ - std::min(budget_bytes_, used_bytes_);
+        if (producer_device_.is_gpu())
+            return arena_ ? std::min(logical, arena_->availableStorageBytes()) : 0u;
+        return reservation_.valid() ? std::min(logical, reservation_.remainingBytes()) : logical;
     }
 
     size_t RamPrefixStorageBackend::availableAllocationBytes() const
@@ -204,23 +221,15 @@ namespace llaminar2
         handle.key = key;
         handle.tier = PrefixStorageTier::Ram;
         handle.layout = layout;
-        constexpr size_t limit = std::numeric_limits<size_t>::max();
-        if (layout.fa_layers < 0 || layout.bytes_per_fa_layer_k > limit - layout.bytes_per_fa_layer_v)
-            return fail("invalid or overflowing RAM prefix attention geometry");
-        const size_t layer_bytes = layout.bytes_per_fa_layer_k + layout.bytes_per_fa_layer_v;
-        if (layout.fa_layers > 0 && layer_bytes > limit / static_cast<size_t>(layout.fa_layers))
-            return fail("overflowing RAM prefix attention layer extent");
-        const size_t kv_bytes = static_cast<size_t>(layout.fa_layers) * layer_bytes;
-        const size_t hybrid_bytes = layout.includes_hybrid_state ? layout.hybrid_state_bytes : 0u;
-        const size_t mtp_bytes = layout.includes_mtp_state ? layout.mtpKVBytes() : 0u;
-        const size_t hidden_bytes = layout.includes_terminal_hidden ? layout.terminal_hidden_bytes : 0u;
-        const size_t logits_bytes = layout.includes_terminal_logits ? layout.terminal_logits_bytes : 0u;
-        for (size_t bytes : {kv_bytes, hybrid_bytes, mtp_bytes, hidden_bytes, logits_bytes})
-        {
-            if (bytes > limit - handle.total_bytes)
-                return fail("overflowing RAM prefix serialized section extent");
-            handle.total_bytes += bytes;
-        }
+        std::optional<PrefixPayloadAllocationPlan> allocation;
+        try { allocation.emplace(PrefixPayloadAllocationPlan::archive(layout)); }
+        catch (const std::exception &exception) { return fail(exception.what()); }
+        const size_t kv_bytes = allocation->sectionBytes(PrefixPayloadSection::AttentionRows);
+        const size_t hybrid_bytes = allocation->sectionBytes(PrefixPayloadSection::RecurrentState);
+        const size_t mtp_bytes = allocation->sectionBytes(PrefixPayloadSection::ShiftedMTPRows);
+        const size_t hidden_bytes = allocation->sectionBytes(PrefixPayloadSection::TerminalHidden);
+        const size_t logits_bytes = allocation->sectionBytes(PrefixPayloadSection::TerminalLogits);
+        handle.total_bytes = allocation->totalBytes();
 
         if (!key.valid() || handle.total_bytes == 0)
             return fail("invalid prefix key or zero-byte payload layout");
@@ -243,13 +252,17 @@ namespace llaminar2
         if (allocations_.find(key) != allocations_.end())
             return fail("prefix key already owns a RAM archive allocation");
 
+        handle.payload_identity = PrefixPayloadIdentity::fresh();
+
         try
         {
             // Capacity was committed at construction; this child makes the
             // physically materialized subset observable and follows every
             // copied RAM handle until its backing sections are truly freed.
             if (!producer_device_.is_gpu())
-                handle.ram_payload_memory_lease = claimHostAllocation(handle.total_bytes);
+                for (size_t section = 0; section < 5u; ++section)
+                    handle.ram_section_memory_leases[section] = claimHostAllocation(
+                        allocation->sections()[section]);
         }
         catch (const std::exception &exception)
         {
@@ -261,15 +274,17 @@ namespace llaminar2
                         std::to_string(reservation_.capacityBytes()));
         }
 
-        std::shared_ptr<void> arena_payload;
+        std::array<std::shared_ptr<void>, 5> arena_sections;
         if (producer_device_.is_gpu())
         {
             handle.payload_readiness = std::make_shared<PrefixPayloadReadiness>();
-            arena_payload = arena_->acquire(handle.total_bytes, handle.payload_readiness);
-            if (!arena_payload)
+            auto sections = arena_->acquireSections(allocation->sections().first(5u),
+                handle.payload_readiness);
+            if (sections.empty())
                 return fail("physical RAM prefix arena ranges busy or fragmented: requested=" +
                             std::to_string(handle.total_bytes) + " largest_available=" +
                             std::to_string(arena_->availableBytes()));
+            std::move(sections.begin(), sections.end(), arena_sections.begin());
         }
 
         if (!allocateSection(
@@ -278,35 +293,35 @@ namespace llaminar2
                 &handle.kv_storage,
                 &handle.pinned_kv_storage,
                 &handle.kv_payload,
-                arena_payload, 0u) ||
+                arena_sections[0]) ||
             !allocateSection(
                 hybrid_bytes,
                 SectionWriteCoverage::Complete,
                 &handle.hybrid_storage,
                 &handle.pinned_hybrid_storage,
                 &handle.hybrid_payload,
-                arena_payload, kv_bytes) ||
+                arena_sections[1]) ||
             !allocateSection(
                 mtp_bytes,
                 SectionWriteCoverage::Partial,
                 &handle.mtp_storage,
                 &handle.pinned_mtp_storage,
                 &handle.mtp_payload,
-                arena_payload, kv_bytes + hybrid_bytes) ||
+                arena_sections[2]) ||
             !allocateSection(
                 hidden_bytes,
                 SectionWriteCoverage::Partial,
                 &handle.terminal_hidden_storage,
                 &handle.pinned_terminal_hidden_storage,
                 &handle.terminal_hidden,
-                arena_payload, kv_bytes + hybrid_bytes + mtp_bytes) ||
+                arena_sections[3]) ||
             !allocateSection(
                 logits_bytes,
                 SectionWriteCoverage::Partial,
                 &handle.terminal_logits_storage,
                 &handle.pinned_terminal_logits_storage,
                 &handle.terminal_logits,
-                arena_payload, kv_bytes + hybrid_bytes + mtp_bytes + hidden_bytes))
+                arena_sections[4]))
         {
             return fail("RAM prefix payload backing allocation failed for " +
                         producer_device_.toString() +
@@ -315,7 +330,8 @@ namespace llaminar2
 
         allocations_[key] = Allocation{handle.total_bytes, payloadOwner(handle)};
         used_bytes_ += handle.total_bytes;
-        if (arena_payload)
+        telemetry_->publishUsage(used_bytes_, allocations_.size());
+        if (producer_device_.is_gpu())
             PerfStatsCollector::addCounter("prefix_cache", "ram_arena_payload_leases",
                 1.0, "allocate", producer_device_.toString());
         return handle;
@@ -375,6 +391,7 @@ namespace llaminar2
         handle->total_bytes += bytes;
         allocation->second.bytes += bytes;
         used_bytes_ += bytes;
+        telemetry_->publishUsage(used_bytes_, allocations_.size());
         return true;
     }
 
@@ -387,6 +404,7 @@ namespace llaminar2
         }
         used_bytes_ -= std::min(used_bytes_, it->second.bytes);
         allocations_.erase(it);
+        telemetry_->publishUsage(used_bytes_, allocations_.size());
         return true;
     }
 

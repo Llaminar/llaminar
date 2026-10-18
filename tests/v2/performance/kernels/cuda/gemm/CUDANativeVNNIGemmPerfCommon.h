@@ -4,6 +4,8 @@
  *
  * Training retains the full supported prefill inventory even when serving
  * selects a smaller default cap, so explicit larger captures remain covered.
+ * IQ4_XS source/policy4 and physical24 are distinct: source4 owns the
+ * installed arithmetic schedule; physical24 owns kernel/resource observations.
  */
 
 #pragma once
@@ -72,7 +74,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
         {"IQ4_NL", 4, [](size_t n, size_t k)
          { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
         {"IQ4_XS", 4, [](size_t n, size_t k)
-         { return TestTensorFactory::createIQ4_XSRandom({n, k}); }},
+         { return TestTensorFactory::createIQ4_XSRandom({n, k}); }, kNativeVnniIQ4XSSourceScaleCodebook},
         {"Q4_1", 5, [](size_t n, size_t k)
          { return TestTensorFactory::createQ4_1Random({n, k}); }},
         {"Q4_K", 5, [](size_t n, size_t k)

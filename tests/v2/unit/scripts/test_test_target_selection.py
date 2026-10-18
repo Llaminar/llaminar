@@ -4,13 +4,16 @@
 Release excludes Unit executables, including standalone host/device arithmetic
 contracts that declare their own language level. Their property declarations
 must be excluded with them, including startup device ownership, while admitted targets retain
-every requirement and CMake must still reject invalid features. These probes
-configure tiny CPU-only projects; they never build or run an executable.
+every requirement and CMake must still reject invalid features. Native HTTP
+affinity registrations follow the same selection and preserve their exact
+OpenMP startup policy. These probes configure tiny CPU-only projects; they
+never build or run an inference or test executable.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,6 +21,7 @@ import unittest
 
 
 MODULE = Path(__file__).resolve().parents[2] / "cmake/V2TestTargetSelection.cmake"
+HTTP_REGISTRATION = MODULE.with_name("V2HttpServiceThreadAffinityTests.cmake")
 
 
 class TestTargetSelection(unittest.TestCase):
@@ -111,6 +115,76 @@ endforeach()
                     extra=f"v2_test_device_scope({target} FullInventory)")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(target, result.stderr)
+
+    def configure_http_registration(self, performance_only: bool, *, declare_target: bool = True):
+        """Generate actual production registrations without a compiler or device.
+
+        The imported executable names CMake itself only to make CTest's
+        inventory resolver independent of an unbuilt binary. It is never run.
+        Production target selection still owns whether that target exists.
+        """
+        with tempfile.TemporaryDirectory(prefix="llaminar-http-registration-") as tmp:
+            root = Path(tmp)
+            target = """
+add_executable(v2_test_server_mode IMPORTED)
+if(TARGET v2_test_server_mode)
+    set_target_properties(v2_test_server_mode PROPERTIES IMPORTED_LOCATION "${CMAKE_COMMAND}")
+endif()
+""" if declare_target else ""
+            (root / "CMakeLists.txt").write_text(f"""
+cmake_minimum_required(VERSION 3.20)
+project(HttpServiceRegistration LANGUAGES NONE)
+enable_testing()
+set(V2_PERF_TESTS_ONLY {"ON" if performance_only else "OFF"})
+include("{MODULE.as_posix()}")
+{target}
+include("{HTTP_REGISTRATION.as_posix()}")
+include("{HTTP_REGISTRATION.as_posix()}")
+""", encoding="utf-8")
+            configured = subprocess.run(
+                [self.cmake, "-S", str(root), "-B", str(root / "build"),
+                 "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={self.ninja}"],
+                capture_output=True, text=True, timeout=15, check=False)
+            if configured.returncode:
+                return configured, None
+            inventory = subprocess.run(
+                [str(Path(self.cmake).with_name("ctest")), "--test-dir", str(root / "build"),
+                 "--show-only=json-v1"],
+                capture_output=True, text=True, timeout=15, check=True)
+            return configured, json.loads(inventory.stdout)["tests"]
+
+    def test_http_service_registration_follows_target_selection(self):
+        """Both native policies survive Integration and leave no Release target reference."""
+        for performance_only in (False, True):
+            with self.subTest(performance_only=performance_only):
+                configured, tests = self.configure_http_registration(performance_only)
+                self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+                expected = {} if performance_only else {
+                    "V2_Integration_HTTPServiceThreadAffinity":
+                        ["OMP_PROC_BIND=close", "OMP_PLACES=cores", "OMP_NUM_THREADS=2"],
+                    "V2_Integration_HTTPServiceThreadAffinityUnbound":
+                        ["OMP_PROC_BIND=false", "OMP_NUM_THREADS=2"],
+                }
+                self.assertEqual({test["name"] for test in tests}, set(expected))
+                self.assertEqual(len(tests), len(expected))
+                for test in tests:
+                    properties = {value["name"]: value["value"] for value in test["properties"]}
+                    self.assertEqual(set(properties["LABELS"]), {
+                        "V2", "Integration", "ProductionTestPreflight", "HTTP",
+                        "Observability", "Threading", "Regression", "DeviceFree"})
+                    self.assertEqual(properties["TIMEOUT"], 30)
+                    command = test["command"]
+                    self.assertEqual(Path(command[0]).name, "cmake")
+                    self.assertEqual(command[1:-2], ["-E", "env", *expected[test["name"]]])
+                    self.assertEqual(command[-2], command[0])
+                    self.assertEqual(command[-1], "--gtest_filter=HttpServiceThreadAffinity.*")
+
+    def test_http_service_registration_rejects_missing_admitted_target(self):
+        """An absent Integration executable remains a fatal configure error."""
+        configured, tests = self.configure_http_registration(False, declare_target=False)
+        self.assertNotEqual(configured.returncode, 0)
+        self.assertIsNone(tests)
+        self.assertIn('No target "v2_test_server_mode"', configured.stderr)
 
 
 if __name__ == "__main__":

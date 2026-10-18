@@ -8,6 +8,8 @@
  * machine for those two votes.  MPI progress, network payloads, and backend
  * events are deliberately supplied by a separate transport: this protocol
  * decides when their results form one globally publishable epoch.
+ * Histogram ABI v4 authenticates the compact stage origin and rejects older or
+ * foreign-stage packets before publishing any received demand.
  */
 
 #pragma once
@@ -102,7 +104,7 @@ namespace llaminar2
     struct MoEOverlayDistributedHistogramHeader
     {
         static constexpr std::uint32_t kMagic = 0x484F4F4Du; // "MOOH"
-        static constexpr std::uint32_t kABIVersion = 3u;
+        static constexpr std::uint32_t kABIVersion = 4u;
         static constexpr std::size_t kWireBytes = 72u;
 
         std::uint32_t magic = kMagic;
@@ -114,7 +116,8 @@ namespace llaminar2
         std::uint32_t production_source_count =
             static_cast<std::uint32_t>(
                 kExpertHistogramProductionSourceCount);
-        std::uint32_t reserved = 0;
+        /** Model-global origin, authenticated against the receiving stage. */
+        std::int32_t first_model_layer = 0;
         std::uint64_t expert_count_entries = 0;
         std::uint64_t source_expert_count_entries = 0;
         std::uint64_t counts_fingerprint = 0;
@@ -175,6 +178,7 @@ namespace llaminar2
      * @param window Receives the authenticated generation and counts.
      * @param error Optional malformed-packet diagnostic.
      * @param transactions Local capacity and PMA; when supplied, complete batches are mandatory.
+     * @param expected_first_model_layer First model-global layer owned by the receiver.
      * @return True only for exact size, geometry, and digest agreement.
      *
      * Callers may pre-size aggregate and source count vectors to reuse
@@ -186,7 +190,8 @@ namespace llaminar2
         int expected_experts,
         DecodeExpertHistogramWindow *window,
         std::string *error = nullptr,
-        const ExpertHistogramTransactionConfig *transactions = nullptr);
+        const ExpertHistogramTransactionConfig *transactions = nullptr,
+        int expected_first_model_layer = 0);
 
     /**
      * @brief Root-authored plan plus separate execution and policy identities.
@@ -280,6 +285,7 @@ namespace llaminar2
      * @param proposal Receives the canonical plan and identities.
      * @param error Optional malformed-packet diagnostic.
      * @param transactions Local capacity/PMA requiring observed transaction evidence.
+     * @param expected_first_model_layer Receiver's admitted global stage origin.
      * @return True only after complete size, geometry, and digest validation.
      */
     bool decodeMoEOverlayDistributedResidencyProposal(
@@ -288,7 +294,8 @@ namespace llaminar2
         int expected_experts,
         MoEOverlayDistributedResidencyProposal *proposal,
         std::string *error = nullptr,
-        const ExpertHistogramTransactionConfig *transactions = nullptr);
+        const ExpertHistogramTransactionConfig *transactions = nullptr,
+        int expected_first_model_layer = 0);
 
     /** @brief Fixed-layout identity shared by every rank in one migration wave. */
     struct MoEOverlayDistributedResidencyWaveIdentity

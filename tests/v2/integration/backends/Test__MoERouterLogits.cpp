@@ -10,6 +10,7 @@
  * node inspection also proves that an empty serial wave was actually removed;
  * a tolerance-only output test cannot detect that economy regression.
  */
+#include "kernels/common/RouterQ8Launch.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -24,12 +25,8 @@
 #include <string>
 #include <vector>
 
-extern "C" bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
-    const float *, int8_t *, float *, const int8_t *, const float *, float *,
-    int, int, int, int, void *, const int *);
-extern "C" bool hipMoE_gate_logits_single_token_q8_weights(
-    const float *, int8_t *, float *, const int8_t *, const float *, float *,
-    int, int, int, void *);
+
+
 
 namespace llaminar2::test
 {

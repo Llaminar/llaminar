@@ -16,6 +16,44 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Immutable transfer ownership of one authored local pipeline stage.
+     *
+     * Physical participant identity selects the domain leader. Dense replication
+     * may label every weight view shard zero and must not multiply channel owners.
+     * Ordinary and ExpertOverlay planning use this same projection.
+     */
+    class PipelineStageTransferMemory final
+    {
+    public:
+        /**
+         * @brief Resolve native or captured transport from the complete parent.
+         * @param parent Authored rank pipeline with resolved device membership.
+         * @param stage Index in its ordered stage inventory.
+         * @return Transfer policy bound to this exact rank, interval and members.
+         * @throws std::invalid_argument for incomplete or inconsistent topology.
+         */
+        [[nodiscard]] static PipelineStageTransferMemory forStage(const RankExecutionPlan &parent, size_t stage);
+        /** @return Whether this physical endpoint owns mapped channel storage. */
+        [[nodiscard]] bool requiresHostMemory(DeviceId device) const noexcept;
+        /**
+         * @brief Attach transport only to its actual physical endpoint.
+         * @param config One matching continuation graph's memory input.
+         * @throws std::invalid_argument for foreign geometry, duplicate binding,
+         *         or missing host authority required by a mapped channel owner.
+         */
+        void bind(DevicePlanConfig &config) const;
+    private:
+        /** @brief Only forStage() may construct an authenticated stage projection. */
+        PipelineStageTransferMemory() = default;
+        int world_rank_ = -1;
+        int first_layer_ = -1;
+        int last_layer_ = -1;
+        std::vector<DeviceId> participants_;
+        std::optional<CollectiveBackendType> native_backend_;
+        std::vector<PipelineBoundarySide> captured_boundaries_;
+    };
+
     /** @brief Immutable observations and execution policies for one rank BOM. */
     struct RankMemoryPlanInputRequest
     {

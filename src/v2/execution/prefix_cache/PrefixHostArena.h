@@ -14,6 +14,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
+#include <vector>
 
 namespace llaminar2
 {
@@ -53,6 +56,24 @@ namespace llaminar2
          */
         size_t availableBytes();
 
+        /** @return Sum of reusable ranges; section admission also proves their actual geometry. */
+        size_t availableStorageBytes();
+        /**
+         * @brief Prove the exact section BOM fits the current event-safe free ranges.
+         * @param sections Ordered independent ownership extents, including zero-byte sections.
+         * @return Whether the same placement algorithm used by acquisition can admit all sections.
+         */
+        bool canAcquireSections(std::span<const size_t> sections);
+        /**
+         * @brief Atomically lease independently owned sections in the existing backing.
+         * @param sections Required serialized extents in allocation order.
+         * @param readiness Common archive producer whose completion protects retired destinations.
+         * @return One owner per section, or an empty vector without partial placement on contention.
+         * @throws std::runtime_error for a failed exact-event query; metadata allocation errors propagate.
+         */
+        std::vector<std::shared_ptr<void>> acquireSections(std::span<const size_t> sections,
+            std::shared_ptr<PrefixPayloadReadiness> readiness = {});
+
     private:
         /** @brief Placement lifecycle, independent of logical cache membership. */
         enum class State { Free, Leased, Retired };
@@ -77,6 +98,8 @@ namespace llaminar2
                         std::shared_ptr<void> memory_claim);
         /** @brief Nonblocking completion queries and adjacent free-range coalescing. */
         void collectRetired();
+        /** @brief Plan independent extents against this CPU-owned placement map while its lock is held. */
+        std::optional<std::vector<size_t>> planSections(std::span<const size_t> sections) const;
         /** @brief Transition the last range alias to pending under the placement lock. */
         void retire(size_t offset) noexcept;
         // Reverse destruction frees physical storage before its PMA claim.

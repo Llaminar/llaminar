@@ -15,6 +15,7 @@
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "utils/NUMATopology.h"
+#include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <map>
@@ -37,6 +38,16 @@ namespace
         profile.vocab_size = 320;
         profile.max_seq_len = 8192;
         profile.expert_count = moe ? 32 : 0;
+        profile.mtp_layer_count = 1;
+        test::PlanningGGUFFixture file(moe, true);
+        const auto fixture_metadata = readPlanningModelMetadata(file.path());
+        for (auto tensor : fixture_metadata.memoryProfile().tensors)
+            if (tensor.name.starts_with("blk.2."))
+            {
+                tensor.name.replace(0, 6, "blk.4.");
+                tensor.layer_index = 4;
+                profile.tensors.push_back(std::move(tensor));
+            }
         return PlanningModelMetadata(std::move(profile), 4);
     }
 

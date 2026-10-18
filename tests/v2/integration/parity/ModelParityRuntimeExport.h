@@ -282,6 +282,8 @@ namespace llaminar2::test::parity
             if (!cell.usesDynamicMTPDepth())
                 args.insert(args.end(), {"--mtp-draft-tokens", std::to_string(cell.requestedMTPDraftDepth())});
         }
+        else
+            args.insert(args.end(), {"--no-mtp", "--mtp-depth-policy", "fixed"});
         if (cell.expert_overlay)
         {
             const bool dynamic = cell.expert_overlay->movement == ModelParityExpertMovement::Dynamic;
@@ -431,7 +433,11 @@ namespace llaminar2::test::parity
                 add("--mtp-depth-cooldown", config.mtp.depth_policy.cooldown_steps);
                 add("--mtp-depth-promote-windows", config.mtp.depth_policy.promote_consecutive_windows);
             }
+            else
+                add("--mtp-depth-policy", "fixed");
         }
+        else
+            args.insert(args.end(), {"--no-mtp", "--mtp-depth-policy", "fixed"});
         add("--moe-hot-expert-cache", config.moe_hot_expert_cache.toString());
         add("--moe-residency-maintenance", moeRebalanceRuntimeModeToString(config.moe_rebalance.mode));
         // Every CLI-exposed economic scalar remains attached to its case. In

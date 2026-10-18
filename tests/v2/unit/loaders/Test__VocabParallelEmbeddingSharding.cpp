@@ -6,7 +6,7 @@
  * 1. WeightShardingConfig recognizes token_embd.weight as ColumnParallel + Vocab
  * 2. TensorParallelConfig produces correct vocab_start/vocab_count for each rank
  * 3. WeightSlicer computes correct slice boundaries for token_embd.weight
- * 4. EmbedQ8Repack vocab-range overload produces correct partial repacks
+ * 4. Prepared native embedding handles retain exact vocabulary slice ownership
  * 5. PreparedEmbeddingWeights carries vocab_offset and total_vocab metadata
  * 6. Schema embedding stage has TPMode::RowParallel annotation
  * 7. Edge cases: odd vocab sizes, 3-way splits, proportional splits
@@ -24,7 +24,7 @@
 #include "execution/local_execution/graph/GraphSchema.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
-#include "kernels/common/EmbedQ8Repack.h"
+#include "kernels/common/NativeEmbeddingLayout.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightSlicer.h"
@@ -510,248 +510,8 @@ TEST_F(Test__VocabParallelEmbeddingSharding, Slicer_TokenEmbdSlice_Qwen35Schema)
     EXPECT_EQ(s1.count, 124160u);
 }
 
-// ============================================================================
-// EmbedQ8Repack — Vocab-Range Partial Repack
-// ============================================================================
-
-namespace
-{
-    /**
-     * @brief Q8 fixture that records every 256-element grouped-unpack request.
-     *
-     * The production Q8 implementation assumes a grouped request names eight
-     * complete blocks. This fixture deliberately provides a bounded implementation
-     * so a regression that requests a partial group becomes a deterministic count
-     * assertion instead of undefined behavior whose crash depends on heap layout.
-     */
-    class GroupedUnpackObservingQ8Tensor final : public Q8_0Tensor
-    {
-    public:
-        using Q8_0Tensor::Q8_0Tensor;
-
-        /**
-         * @brief Return the number of grouped-unpack operations requested so far.
-         * @return Thread-safe grouped call count.
-         */
-        size_t groupedUnpackCalls() const noexcept
-        {
-            return grouped_unpack_calls_.load(std::memory_order_relaxed);
-        }
-
-        /**
-         * @brief Observe and safely emulate one grouped Q8 unpack.
-         *
-         * Complete source blocks are decoded through the production single-block
-         * methods. Missing tail blocks are zeroed solely to keep a bad caller alive
-         * long enough for the test to report the semantic violation.
-         *
-         * @param row_idx Source row.
-         * @param superblock_idx Eight-block group index within the row.
-         * @param output Destination for 256 unpacked values.
-         * @param scales Optional destination for eight scales.
-         * @param mins Optional destination for eight minima.
-         */
-        void unpack_superblock_to_int8(
-            size_t row_idx,
-            size_t superblock_idx,
-            int8_t *output,
-            float *scales = nullptr,
-            float *mins = nullptr) const override
-        {
-            grouped_unpack_calls_.fetch_add(1, std::memory_order_relaxed);
-
-            constexpr size_t kElementsPerBlock = 32;
-            constexpr size_t kBlocksPerGroup = 8;
-            const size_t blocks_per_row =
-                (shape()[1] + kElementsPerBlock - 1) / kElementsPerBlock;
-            const size_t first_block = superblock_idx * kBlocksPerGroup;
-
-            for (size_t sub_block = 0; sub_block < kBlocksPerGroup; ++sub_block)
-            {
-                const size_t block = first_block + sub_block;
-                int8_t *block_output = output + sub_block * kElementsPerBlock;
-                if (block < blocks_per_row)
-                {
-                    Q8_0Tensor::unpack_block_to_int8(row_idx, block, block_output);
-                    if (scales)
-                        scales[sub_block] = Q8_0Tensor::get_block_scale(row_idx, block);
-                }
-                else
-                {
-                    std::memset(block_output, 0, kElementsPerBlock);
-                    if (scales)
-                        scales[sub_block] = 0.0f;
-                }
-                if (mins)
-                    mins[sub_block] = 0.0f;
-            }
-        }
-
-    private:
-        mutable std::atomic<size_t> grouped_unpack_calls_{0};
-    };
-
-    /**
-     * @brief Construct zero-valued raw Q8 storage for a two-dimensional tensor.
-     * @param rows Number of tensor rows.
-     * @param columns Number of logical values per row.
-     * @return Raw storage containing one valid Q8 block for each 32 values.
-     */
-    std::vector<uint8_t> makeZeroQ8Storage(size_t rows, size_t columns)
-    {
-        constexpr size_t kElementsPerBlock = 32;
-        const size_t blocks_per_row =
-            (columns + kElementsPerBlock - 1) / kElementsPerBlock;
-        return std::vector<uint8_t>(
-            rows * blocks_per_row * sizeof(Q8_0Block),
-            0);
-    }
-} // namespace
-
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_Sub256WidthNeverUsesGroupedUnpack)
-{
-    constexpr size_t kVocab = 16;
-    constexpr size_t kDModel = 64;
-    GroupedUnpackObservingQ8Tensor tensor(
-        {kVocab, kDModel},
-        makeZeroQ8Storage(kVocab, kDModel));
-
-    const auto full = repackEmbeddingToQ8(&tensor, kDModel);
-    const auto terminal_row =
-        repackEmbeddingToQ8(&tensor, kDModel, kVocab - 1, 1);
-
-    EXPECT_EQ(tensor.groupedUnpackCalls(), 0u)
-        << "A 256-element unpack must never be requested for a two-block row";
-    EXPECT_EQ(full.blocks_per_row, 2u);
-    EXPECT_EQ(terminal_row.blocks_per_row, 2u);
-}
-
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_Complete256WidthRetainsGroupedUnpack)
-{
-    constexpr size_t kVocab = 16;
-    constexpr size_t kDModel = 256;
-    GroupedUnpackObservingQ8Tensor tensor(
-        {kVocab, kDModel},
-        makeZeroQ8Storage(kVocab, kDModel));
-
-    const auto full = repackEmbeddingToQ8(&tensor, kDModel);
-
-    EXPECT_EQ(tensor.groupedUnpackCalls(), kVocab)
-        << "Complete eight-block rows should retain the economical grouped path";
-    EXPECT_EQ(full.blocks_per_row, 8u);
-}
-
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_FullVocab_MatchesStandard)
-{
-    constexpr size_t kVocab = 128;
-    constexpr size_t kDModel = 64;
-
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocab, kDModel});
-
-    // Full repack via standard path
-    auto full = repackEmbeddingToQ8(tensor.get(), kDModel);
-
-    // Full repack via vocab-range path (start=0, count=full)
-    auto ranged = repackEmbeddingToQ8(tensor.get(), kDModel, 0, kVocab);
-
-    EXPECT_EQ(full.vocab_size, ranged.vocab_size);
-    EXPECT_EQ(full.blocks_per_row, ranged.blocks_per_row);
-    EXPECT_EQ(full.total_blocks, ranged.total_blocks);
-    EXPECT_EQ(full.byte_size, ranged.byte_size);
-    EXPECT_EQ(full.data, ranged.data) << "Full range should produce identical bytes";
-}
-
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_HalfVocab_CorrectSize)
-{
-    constexpr size_t kVocab = 256;
-    constexpr size_t kDModel = 64;
-
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocab, kDModel});
-
-    auto first_half = repackEmbeddingToQ8(tensor.get(), kDModel, 0, kVocab / 2);
-    auto second_half = repackEmbeddingToQ8(tensor.get(), kDModel, kVocab / 2, kVocab / 2);
-
-    // Each half should have half the vocab
-    EXPECT_EQ(first_half.vocab_size, kVocab / 2);
-    EXPECT_EQ(second_half.vocab_size, kVocab / 2);
-
-    // Blocks per row should be the same
-    EXPECT_EQ(first_half.blocks_per_row, second_half.blocks_per_row);
-
-    // Total blocks should be half
-    auto full = repackEmbeddingToQ8(tensor.get(), kDModel);
-    EXPECT_EQ(first_half.total_blocks + second_half.total_blocks, full.total_blocks);
-    EXPECT_EQ(first_half.byte_size + second_half.byte_size, full.byte_size);
-}
-
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_HalfVocab_DataMatchesFullRows)
-{
-    constexpr size_t kVocab = 128;
-    constexpr size_t kDModel = 64;
-
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocab, kDModel});
-
-    auto full = repackEmbeddingToQ8(tensor.get(), kDModel);
-    auto first_half = repackEmbeddingToQ8(tensor.get(), kDModel, 0, kVocab / 2);
-
-    // First half data should match the first half of full data
-    size_t half_bytes = first_half.byte_size;
-    ASSERT_LE(half_bytes, full.byte_size);
-    EXPECT_EQ(
-        std::vector<uint8_t>(full.data.begin(), full.data.begin() + half_bytes),
-        first_half.data)
-        << "First half repack should match first half of full repack";
-}
-
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_SecondHalf_DataMatchesFullRows)
-{
-    constexpr size_t kVocab = 128;
-    constexpr size_t kDModel = 64;
-
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocab, kDModel});
-
-    auto full = repackEmbeddingToQ8(tensor.get(), kDModel);
-    auto second_half = repackEmbeddingToQ8(tensor.get(), kDModel, kVocab / 2, kVocab / 2);
-
-    // Second half data should match the second half of full data
-    size_t half_bytes = second_half.byte_size;
-    ASSERT_LE(half_bytes * 2, full.byte_size + 1); // Allow rounding
-    EXPECT_EQ(
-        std::vector<uint8_t>(full.data.begin() + half_bytes, full.data.end()),
-        second_half.data)
-        << "Second half repack should match second half of full repack";
-}
-
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_OutOfRange_Throws)
-{
-    constexpr size_t kVocab = 128;
-    constexpr size_t kDModel = 64;
-
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocab, kDModel});
-
-    // Exceeding total vocab should throw
-    EXPECT_THROW(
-        repackEmbeddingToQ8(tensor.get(), kDModel, 64, 128),
-        std::runtime_error)
-        << "Vocab range [64, 192) exceeds total vocab 128";
-
-    EXPECT_THROW(
-        repackEmbeddingToQ8(tensor.get(), kDModel, 129, 1),
-        std::runtime_error)
-        << "Start beyond vocab should throw";
-}
-
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_SingleRow_Works)
-{
-    constexpr size_t kVocab = 128;
-    constexpr size_t kDModel = 64;
-
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocab, kDModel});
-
-    auto single = repackEmbeddingToQ8(tensor.get(), kDModel, 42, 1);
-    EXPECT_EQ(single.vocab_size, 1u);
-    EXPECT_GT(single.byte_size, 0u);
-}
+// Source-native allocation/lookup coverage now lives in the focused native
+// preservation regressions. The retired EmbedQ8 converter has no second API.
 
 // ============================================================================
 // PreparedEmbeddingWeights — Vocab Offset & Total Vocab Metadata
@@ -838,7 +598,7 @@ TEST_F(Test__VocabParallelEmbeddingSharding, PreparedWeights_MovePreservesShardi
     w.vocab_offset = 128;
     w.total_vocab = 256;
     w.d_model = 2560;
-    w.blocks_per_row = 80;
+    w.layout = NativeEmbeddingLayout::forSource(TensorType::Q8_0, w.vocab_size, w.d_model);
 
     PreparedEmbeddingWeights moved(std::move(w));
 
@@ -846,7 +606,7 @@ TEST_F(Test__VocabParallelEmbeddingSharding, PreparedWeights_MovePreservesShardi
     EXPECT_EQ(moved.vocab_offset, 128u);
     EXPECT_EQ(moved.total_vocab, 256u);
     EXPECT_EQ(moved.d_model, 2560);
-    EXPECT_EQ(moved.blocks_per_row, 80u);
+    EXPECT_EQ(moved.layout.blocks_per_row, 80u);
 }
 
 // ============================================================================
@@ -1202,84 +962,12 @@ TEST_F(Test__VocabParallelEmbeddingSharding, MultiDegree_RealVocab_TP16)
     EXPECT_EQ(total, QWEN35_VOCAB);
 }
 
-// ---- EmbedQ8Repack with N-way splits ----
 
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_4WaySplit_ReconstructsFull)
-{
-    constexpr size_t kVocab = 256;
-    constexpr size_t kDModel = 64;
-    constexpr int N = 4;
 
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocab, kDModel});
-    auto full = repackEmbeddingToQ8(tensor.get(), kDModel);
 
-    // Repack each quarter and concatenate
-    std::vector<uint8_t> reconstructed;
-    for (int r = 0; r < N; ++r)
-    {
-        size_t start = r * (kVocab / N);
-        size_t count = kVocab / N;
-        auto shard = repackEmbeddingToQ8(tensor.get(), kDModel, start, count);
 
-        EXPECT_EQ(shard.vocab_size, kVocab / N) << "Shard " << r;
-        EXPECT_EQ(shard.blocks_per_row, full.blocks_per_row) << "Shard " << r;
-        reconstructed.insert(reconstructed.end(), shard.data.begin(), shard.data.end());
-    }
 
-    EXPECT_EQ(reconstructed.size(), full.byte_size);
-    EXPECT_EQ(reconstructed, full.data)
-        << "Concatenation of 4 shards should reconstruct the full repack";
-}
 
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_8WaySplit_ReconstructsFull)
-{
-    constexpr size_t kVocab = 256;
-    constexpr size_t kDModel = 64;
-    constexpr int N = 8;
-
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocab, kDModel});
-    auto full = repackEmbeddingToQ8(tensor.get(), kDModel);
-
-    std::vector<uint8_t> reconstructed;
-    for (int r = 0; r < N; ++r)
-    {
-        size_t start = r * (kVocab / N);
-        size_t count = kVocab / N;
-        auto shard = repackEmbeddingToQ8(tensor.get(), kDModel, start, count);
-
-        EXPECT_EQ(shard.vocab_size, kVocab / N) << "Shard " << r;
-        reconstructed.insert(reconstructed.end(), shard.data.begin(), shard.data.end());
-    }
-
-    EXPECT_EQ(reconstructed.size(), full.byte_size);
-    EXPECT_EQ(reconstructed, full.data)
-        << "Concatenation of 8 shards should reconstruct the full repack";
-}
-
-TEST_F(Test__VocabParallelEmbeddingSharding, Repack_16WaySplit_ReconstructsFull)
-{
-    constexpr size_t kVocab = 256;
-    constexpr size_t kDModel = 64;
-    constexpr int N = 16;
-
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocab, kDModel});
-    auto full = repackEmbeddingToQ8(tensor.get(), kDModel);
-
-    std::vector<uint8_t> reconstructed;
-    for (int r = 0; r < N; ++r)
-    {
-        size_t start = r * (kVocab / N);
-        size_t count = kVocab / N;
-        auto shard = repackEmbeddingToQ8(tensor.get(), kDModel, start, count);
-
-        EXPECT_EQ(shard.vocab_size, kVocab / N) << "Shard " << r;
-        reconstructed.insert(reconstructed.end(), shard.data.begin(), shard.data.end());
-    }
-
-    EXPECT_EQ(reconstructed.size(), full.byte_size);
-    EXPECT_EQ(reconstructed, full.data)
-        << "Concatenation of 16 shards should reconstruct the full repack";
-}
 
 // ---- PreparedEmbeddingWeights metadata at various TP degrees ----
 

@@ -191,8 +191,17 @@ namespace llaminar2
         // Embedding Preparation & Resolution
         // =========================================================================
 
-        /// Prepare embedding weights on a target device. Delegates creation to
-        /// KernelFactory but owns the handle lifetime.
+        /**
+         * @brief Prepare unchanged native embedding blocks under the primary model owner.
+         * @param binding Frozen original source and exact target device.
+         * @param d_model Logical row width.
+         * @param vocab_offset First owned global vocabulary row.
+         * @param total_vocab Full vocabulary extent, or zero for an unsharded source.
+         * @return Stable native prepared embedding reference owned by this store.
+         * @throws std::runtime_error For an invalid binding or failed backend preparation.
+         * @throws std::invalid_argument For unsupported source or geometry.
+         * @throws std::overflow_error For backing-extent overflow.
+         */
         PreparedWeightRef prepareEmbedding(
             const WeightBinding &binding,
             int d_model,
@@ -206,6 +215,11 @@ namespace llaminar2
          * @param vocab_offset First row in the global vocabulary.
          * @param total_vocab Global vocabulary size.
          * @param memory_owner Exact admitted persistent-weight owner.
+         * @return Stable native prepared reference owning the admitted allocation.
+         * @throws std::invalid_argument For invalid owner, source or geometry.
+         * @throws std::runtime_error For an invalid binding or failed preparation.
+         * @throws std::logic_error If GPU admission has no physical-memory authority.
+         * @throws std::overflow_error For backing-extent overflow.
          */
         PreparedWeightRef prepareEmbedding(
             const WeightBinding &binding,
@@ -214,7 +228,15 @@ namespace llaminar2
             size_t total_vocab,
             PhysicalMemoryOwner memory_owner);
 
-        /// Register an already-prepared embedding handle from the pipeline.
+        /**
+         * @brief Adopt existing native blocks after authenticating their complete source geometry.
+         * @param binding Frozen original source and slice identity.
+         * @param device Exact prepared allocation endpoint.
+         * @param handle Existing pipeline-owned native embedding handle.
+         * @return Store-owned alias preserving the original allocation lifetime.
+         * @throws std::runtime_error For mismatched source, device, layout or vocabulary extent.
+         * @throws std::invalid_argument For an unsupported native source representation.
+         */
         PreparedWeightRef registerPreparedEmbeddingFromPipeline(
             const WeightBinding &binding,
             DeviceId device,

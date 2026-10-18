@@ -22,6 +22,11 @@
  *
  * Dispatch is tuned from the automated native-vnni sweep harness across all supported
  * codebooks and representative Qwen decode shapes.
+ * Q6_K ROWPAR engines use the shared source-tuple scale decoder, so the
+ * explicit row-major diagnostic layout cannot reintroduce half-product loss.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
@@ -184,6 +189,8 @@ static int serialEquivalentPolicyN(int actual_n)
 template <uint8_t ExecutionCodebook>
 inline constexpr uint8_t trainedPolicyCodebook()
 {
+    if constexpr (ExecutionCodebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
+        return 4; // Exact source4 schedule; physical template/cache remains 24.
     return ExecutionCodebook ==
                    llaminar2::kNativeVnniExpandedInt8MinCodebook
                ? static_cast<uint8_t>(19)
@@ -418,7 +425,7 @@ namespace
         NativeGemvShape &shape,
         GeneratedDispatchTuning &tuning)
     {
-        if (policy_codebook == ExecutionCodebook)
+        if (policy_codebook == trainedPolicyCodebook<ExecutionCodebook>())
         {
             return selectCachedGeneratedDispatch<ExecutionCodebook>(
                 graph_captured, m, n, k, shape, tuning);
@@ -509,7 +516,7 @@ namespace
         int k,
         GeneratedGroupedTuning &tuning)
     {
-        if (policy_codebook == ExecutionCodebook)
+        if (policy_codebook == trainedPolicyCodebook<ExecutionCodebook>())
         {
             return selectCachedGeneratedGroupedTuning<ExecutionCodebook>(
                 graph_captured, m, n, k, tuning);
@@ -1478,7 +1485,7 @@ namespace
         const llaminar2::CUDACanonicalKpartFoldPlan &plan)
     {
         using Traits = llaminar2::cuda_native_vnni::CodebookTraits<CB>;
-        if constexpr (Traits::is_dual_scale || Traits::is_asymmetric)
+        if constexpr (Traits::requires_secondary_metadata)
             if (!secondary) return false;
         if constexpr (Traits::is_dual_scale_asym)
             if (!extended_minima) return false;
@@ -1516,6 +1523,27 @@ namespace
     // doubling VRAM. Q8_0 stays on KPAR which has naturally coalesced
     // column-major access.
     // =====================================================================
+    /**
+     * @brief Project one activation row through an explicitly prepared ROWPAR layout.
+     *
+     * Weight layout changes only address order. Q6_K scales are reconstructed
+     * through the shared source-tuple decoder before the existing dot tree.
+     * @tparam NWARPS Number of cooperating warps per output-column owner.
+     * @tparam CB NativeVNNI codebook identifier.
+     * @param d_A_int8 Canonically quantized activation rows.
+     * @param d_payload_rm Immutable row-major native weight payload.
+     * @param d_scales_rm Primary metadata, including original Q6_K base words.
+     * @param d_mins_rm Secondary metadata, including raw Q6_K coefficients.
+     * @param d_emins_rm Extended minima for codebooks requiring corrections.
+     * @param d_C FP32 output rows.
+     * @param d_scales_A Canonical FP32 activation scales per 32-value block.
+     * @param N Live output-column count.
+     * @param K Reduction width, divisible by the quantization block size.
+     * @param alpha Output multiplier.
+     * @param beta Existing-output multiplier.
+     * @param d_C_existing Optional existing output consumed when beta is nonzero.
+     * @param d_bias Optional output-column bias.
+     */
     template <int NWARPS, uint8_t CB>
     __global__ void nativeVnniGemv_rowpar(
         const int8_t *__restrict__ d_A_int8,
@@ -1584,8 +1612,10 @@ namespace
                     sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g + 4]);
                 }
 
-                const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales_rm[linear]);
-                const float scale_hi = d_mins_rm ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins_rm[linear]) : 0.0f;
+                const auto scales = llaminar2::cuda_native_vnni::native_vnni_dual_scales_rn<CB>(
+                    d_scales_rm[linear], d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
+                const float scale_lo = scales.low;
+                const float scale_hi = scales.high;
                 acc += scale_a * (scale_lo * static_cast<float>(dot_lo) + scale_hi * static_cast<float>(dot_hi));
 
                 if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale_asym)
@@ -1624,7 +1654,8 @@ namespace
                     sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[g]);
                 }
 
-                const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales_rm[linear]);
+                const float scale_b = llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<CB>(
+                    d_scales_rm[linear], d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
                 acc += scale_a * scale_b * static_cast<float>(dot);
 
                 if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
@@ -1668,6 +1699,25 @@ namespace
      * and performs the serial ROWPAR reduction order for each active row while
      * reusing each decoded weight block across the rows in the tile. Runtime M
      * only changes the number of independent row tiles in the grid.
+     *
+     * @tparam ROWS_PER_TILE Number of activation rows sharing each decoded block.
+     * @tparam NWARPS Number of cooperating warps per output-column owner.
+     * @tparam CB NativeVNNI codebook identifier.
+     * @param d_A_int8 Canonically quantized activation rows.
+     * @param d_payload_rm Immutable row-major native weight payload.
+     * @param d_scales_rm Primary metadata, including original Q6_K base words.
+     * @param d_mins_rm Secondary metadata, including raw Q6_K coefficients.
+     * @param d_emins_rm Extended minima for codebooks requiring corrections.
+     * @param d_C FP32 output rows.
+     * @param d_scales_A Canonical FP32 activation scales per 32-value block.
+     * @param N Live output-column count.
+     * @param K Reduction width, divisible by the quantization block size.
+     * @param alpha Output multiplier.
+     * @param beta Existing-output multiplier.
+     * @param d_C_existing Optional existing output consumed when beta is nonzero.
+     * @param d_bias Optional output-column bias.
+     * @param M Physical activation-row stride.
+     * @param rows Device-resident active-row extent within the physical stride.
      */
     template <int ROWS_PER_TILE, int NWARPS, uint8_t CB>
     __global__ void nativeVnniGemv_rowpar_small_m(
@@ -1734,8 +1784,10 @@ namespace
 
             if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
             {
-                const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales_rm[linear]);
-                const float scale_hi = d_mins_rm ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins_rm[linear]) : 0.0f;
+                const auto scales = llaminar2::cuda_native_vnni::native_vnni_dual_scales_rn<CB>(
+                    d_scales_rm[linear], d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
+                const float scale_lo = scales.low;
+                const float scale_hi = scales.high;
                 const uint32_t emin = d_emins_rm ? d_emins_rm[linear] : 0u;
                 const float min_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
                 const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
@@ -1793,7 +1845,8 @@ namespace
             }
             else
             {
-                const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(d_scales_rm[linear]);
+                const float scale_b = llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<CB>(
+                    d_scales_rm[linear], d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
                 const float min_b = d_mins_rm ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins_rm[linear]) : 0.0f;
 
 #pragma unroll
@@ -3534,7 +3587,7 @@ namespace
     const uint16_t *secondaryPlaneForCodebook(const uint16_t *d_mins)
     {
         using Traits = llaminar2::cuda_native_vnni::CodebookTraits<CB>;
-        if constexpr (Traits::is_asymmetric || Traits::is_dual_scale)
+        if constexpr (Traits::requires_secondary_metadata)
             return d_mins;
         return nullptr;
     }
@@ -4062,7 +4115,7 @@ extern "C"
             d_C_existing,
             d_bias,
             codebook_id,
-            codebook_id,
+            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
             cuda_device_id,
             stream,
             gemv_ctx,
@@ -4098,6 +4151,8 @@ extern "C"
         if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
             return false;
         if (N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
+            return false;
+        if ((codebook_id == 11 || codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook) && !d_mins)
             return false;
         if (!cudaNativeVNNIGemvTuned_supportsCodebook(codebook_id))
             return false;
@@ -4165,7 +4220,7 @@ extern "C"
             d_C_existing,
             d_bias,
             codebook_id,
-            codebook_id,
+            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
             cuda_device_id,
             stream,
             gemv_ctx,
@@ -4197,6 +4252,8 @@ extern "C"
         if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
             return false;
         if (M < 2 || N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
+            return false;
+        if ((codebook_id == 11 || codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook) && !d_mins)
             return false;
         if (!cudaNativeVNNIGemvTuned_supportsCodebook(codebook_id))
             return false;

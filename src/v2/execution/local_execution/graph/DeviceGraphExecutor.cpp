@@ -2147,7 +2147,8 @@ namespace llaminar2
                     copy.element_size == output.element_size &&
                     copy.byte_size == output_byte_size &&
                     copy.device == copy_device &&
-                    copy.source_ptr == source_ptr;
+                    copy.source_ptr == source_ptr &&
+                    copy.row_layout == output.row_layout;
                 if (!descriptor_matches)
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
@@ -2180,6 +2181,7 @@ namespace llaminar2
                 copy.byte_size = output_byte_size;
                 copy.device = copy_device;
                 copy.source_ptr = source_ptr;
+                copy.row_layout = output.row_layout;
                 copy.descriptor_finalized = true;
                 const size_t storage_elements =
                     std::max<size_t>(
@@ -2428,6 +2430,10 @@ namespace llaminar2
              * replacing the offset pointer with the arena base address.
              */
             output.tensor = nullptr;
+            // A compact producer's physical rows acquire logical coordinates
+            // only at terminal observation. Restore the exact frozen ownership
+            // before projection; re-querying a live stage would break identity.
+            output.row_layout = copy.row_layout;
             snapshot_info.outputs.push_back(output);
         }
 

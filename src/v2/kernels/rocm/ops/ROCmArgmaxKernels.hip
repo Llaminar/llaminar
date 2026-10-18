@@ -330,7 +330,8 @@ __global__ void rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
         float value = row_data[token];
         if (request_policy.enabled != 0)
         {
-            int count = generated_token_counts[token];
+            const int history = generated_token_counts[token];
+        int count = llaminar2::sampling_math::TokenPenaltyHistory::generatedCount(history);
             if constexpr (SPECULATIVE_HISTORY)
             {
                 // Ordinary sampling consumes only the committed histogram.
@@ -342,10 +343,11 @@ __global__ void rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
                     count += verifier_input_tokens[history_index] == token ? 1 : 0;
             }
 
-            if (count > 0)
+            if (count > 0 || (request_policy.repetition_penalty != 1.0f &&
+                llaminar2::sampling_math::TokenPenaltyHistory::inPrompt(history)))
             {
                 float penalty = 0.0f;
-                if (request_policy.presence_penalty != 0.0f)
+                if (count > 0 && request_policy.presence_penalty != 0.0f)
                     penalty += request_policy.presence_penalty;
                 if (request_policy.frequency_penalty != 0.0f)
                 {
@@ -354,7 +356,8 @@ __global__ void rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
                         static_cast<float>(count);
                     penalty += frequency_component;
                 }
-                value -= penalty;
+                value = llaminar2::sampling_math::penalizedLogit(
+                    value, request_policy.repetition_penalty, penalty);
             }
         }
         if (rocm_argmax_better(value, token, local_max, local_idx))
@@ -399,17 +402,18 @@ __global__ void rocm_configure_mtp_greedy_penalty_policy_kernel(
     llaminar2::MTPGreedyPenaltyPolicy *__restrict__ controls,
     float presence_penalty,
     float frequency_penalty,
-    int first_token_already_in_history)
+    int first_token_already_in_history, float repetition_penalty)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
 
     controls->presence_penalty = presence_penalty;
     controls->frequency_penalty = frequency_penalty;
+    controls->repetition_penalty = repetition_penalty;
     controls->first_token_already_in_history =
         first_token_already_in_history != 0 ? 1 : 0;
     controls->enabled =
-        presence_penalty != 0.0f || frequency_penalty != 0.0f ? 1 : 0;
+        presence_penalty != 0.0f || frequency_penalty != 0.0f || repetition_penalty != 1.0f ? 1 : 0;
 }
 
 /**
@@ -440,12 +444,14 @@ __global__ void rocm_apply_mtp_durable_penalties_f32_rows_kernel(
          token < cols;
          token += static_cast<int>(blockDim.x * gridDim.x))
     {
-        const int count = generated_token_counts[token];
-        if (count <= 0)
+        const int history = generated_token_counts[token];
+        const int count = llaminar2::sampling_math::TokenPenaltyHistory::generatedCount(history);
+        if (count <= 0 && (request_policy.repetition_penalty == 1.0f ||
+            !llaminar2::sampling_math::TokenPenaltyHistory::inPrompt(history)))
             continue;
 
         float penalty = 0.0f;
-        if (request_policy.presence_penalty != 0.0f)
+        if (count > 0 && request_policy.presence_penalty != 0.0f)
             penalty += request_policy.presence_penalty;
         if (request_policy.frequency_penalty != 0.0f)
         {
@@ -455,7 +461,9 @@ __global__ void rocm_apply_mtp_durable_penalties_f32_rows_kernel(
         for (int row = 0; row < active_rows; ++row)
         {
             data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
-                 static_cast<size_t>(token)] -= penalty;
+                 static_cast<size_t>(token)] = llaminar2::sampling_math::penalizedLogit(
+                data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
+                 static_cast<size_t>(token)], request_policy.repetition_penalty, penalty);
         }
     }
 }
@@ -523,14 +531,16 @@ __global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
                 if (already_processed)
                     continue;
 
-                int count = generated_token_counts[token];
+                const int history = generated_token_counts[token];
+        int count = llaminar2::sampling_math::TokenPenaltyHistory::generatedCount(history);
                 for (int visible = prefix_begin; visible <= row; ++visible)
                     count += verifier_input_tokens[visible] == token ? 1 : 0;
-                if (count <= 0)
+                if (count <= 0 && (request_policy.repetition_penalty == 1.0f ||
+            !llaminar2::sampling_math::TokenPenaltyHistory::inPrompt(history)))
                     continue;
 
                 float penalty = 0.0f;
-                if (request_policy.presence_penalty != 0.0f)
+                if (count > 0 && request_policy.presence_penalty != 0.0f)
                     penalty += request_policy.presence_penalty;
                 if (request_policy.frequency_penalty != 0.0f)
                 {
@@ -539,7 +549,10 @@ __global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
                 }
                 data[static_cast<size_t>(row) *
                          static_cast<size_t>(row_stride) +
-                     static_cast<size_t>(token)] -= penalty;
+                     static_cast<size_t>(token)] = llaminar2::sampling_math::penalizedLogit(
+                data[static_cast<size_t>(row) *
+                         static_cast<size_t>(row_stride) +
+                     static_cast<size_t>(token)], request_policy.repetition_penalty, penalty);
             }
         }
         return;
@@ -563,12 +576,14 @@ __global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
         if (verifier_branch_token)
             continue;
 
-        const int count = generated_token_counts[token];
-        if (count <= 0)
+        const int history = generated_token_counts[token];
+        const int count = llaminar2::sampling_math::TokenPenaltyHistory::generatedCount(history);
+        if (count <= 0 && (request_policy.repetition_penalty == 1.0f ||
+            !llaminar2::sampling_math::TokenPenaltyHistory::inPrompt(history)))
             continue;
 
         float penalty = 0.0f;
-        if (request_policy.presence_penalty != 0.0f)
+        if (count > 0 && request_policy.presence_penalty != 0.0f)
             penalty += request_policy.presence_penalty;
         if (request_policy.frequency_penalty != 0.0f)
         {
@@ -578,7 +593,9 @@ __global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
         for (int row = 0; row < active_rows; ++row)
         {
             data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
-                 static_cast<size_t>(token)] -= penalty;
+                 static_cast<size_t>(token)] = llaminar2::sampling_math::penalizedLogit(
+                data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
+                 static_cast<size_t>(token)], request_policy.repetition_penalty, penalty);
         }
     }
 
@@ -648,7 +665,8 @@ __global__ void rocm_apply_mtp_branch_penalties_f32_row_kernel(
             if (already_processed)
                 continue;
 
-            int count = generated_token_counts[token];
+            const int history = generated_token_counts[token];
+        int count = llaminar2::sampling_math::TokenPenaltyHistory::generatedCount(history);
             for (int visible = 0; visible < branch_count; ++visible)
             {
                 count += rocm_mtp_branch_token_at(
@@ -659,18 +677,20 @@ __global__ void rocm_apply_mtp_branch_penalties_f32_row_kernel(
                              ? 1
                              : 0;
             }
-            if (count <= 0)
+            if (count <= 0 && (request_policy.repetition_penalty == 1.0f ||
+            !llaminar2::sampling_math::TokenPenaltyHistory::inPrompt(history)))
                 continue;
 
             float penalty = 0.0f;
-            if (request_policy.presence_penalty != 0.0f)
+            if (count > 0 && request_policy.presence_penalty != 0.0f)
                 penalty += request_policy.presence_penalty;
             if (request_policy.frequency_penalty != 0.0f)
             {
                 penalty += request_policy.frequency_penalty *
                            static_cast<float>(count);
             }
-            data[token] -= penalty;
+            data[token] = llaminar2::sampling_math::penalizedLogit(
+                data[token], request_policy.repetition_penalty, penalty);
         }
         return;
     }
@@ -697,19 +717,22 @@ __global__ void rocm_apply_mtp_branch_penalties_f32_row_kernel(
         if (branch_owned)
             continue;
 
-        const int count = generated_token_counts[token];
-        if (count <= 0)
+        const int history = generated_token_counts[token];
+        const int count = llaminar2::sampling_math::TokenPenaltyHistory::generatedCount(history);
+        if (count <= 0 && (request_policy.repetition_penalty == 1.0f ||
+            !llaminar2::sampling_math::TokenPenaltyHistory::inPrompt(history)))
             continue;
 
         float penalty = 0.0f;
-        if (request_policy.presence_penalty != 0.0f)
+        if (count > 0 && request_policy.presence_penalty != 0.0f)
             penalty += request_policy.presence_penalty;
         if (request_policy.frequency_penalty != 0.0f)
         {
             penalty += request_policy.frequency_penalty *
                        static_cast<float>(count);
         }
-        data[token] -= penalty;
+        data[token] = llaminar2::sampling_math::penalizedLogit(
+                data[token], request_policy.repetition_penalty, penalty);
     }
 }
 
@@ -1240,7 +1263,7 @@ bool rocmOps_configure_mtp_greedy_penalty_policy(
     float frequency_penalty,
     bool first_token_already_in_history,
     int device_idx,
-    void *stream)
+    void *stream, float repetition_penalty)
 {
     if (!controls || !stream)
         return false;
@@ -1255,7 +1278,7 @@ bool rocmOps_configure_mtp_greedy_penalty_policy(
         controls,
         presence_penalty,
         frequency_penalty,
-        first_token_already_in_history ? 1 : 0);
+        first_token_already_in_history ? 1 : 0, repetition_penalty);
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {

@@ -34,12 +34,13 @@ namespace llaminar2
         if (!native || k % (native->is_superblock ? 256u : 32u))
             throw std::invalid_argument("CPU preparation requires a supported, block-aligned source format");
         using namespace cpu::native_vnni;
-        const auto footprint = preparedFootprintForFormat(native->codebook_id, native->is_asymmetric);
+        const auto footprint = preparedFootprintForFormat(*native);
         const size_t units = multiply((n + 63) / 64, k / 32);
         const size_t blocks = multiply(units, 64);
         const size_t interleaved = multiply(units, footprint.weight_bytes_per_n_chunk_k_block);
         switch (footprint.encoding)
         {
+        case CPUNativeVNNIEncoding::NibbleLUTSourceScale:
         case CPUNativeVNNIEncoding::NibbleLUT:
         {
             // A retained scalar-oracle payload plus one temporary source-order
@@ -53,6 +54,7 @@ namespace llaminar2
         case CPUNativeVNNIEncoding::Q6KNativeDualScale:
             return {interleaved,
                 multiply(blocks, native->payload_bytes + 2 * sizeof(uint16_t))};
+        case CPUNativeVNNIEncoding::IQ3SExpandedSourceScale:
         case CPUNativeVNNIEncoding::ExpandedInt8:
         case CPUNativeVNNIEncoding::CompactMultiScale:
             // These paths already pack bounded stack blocks directly into the

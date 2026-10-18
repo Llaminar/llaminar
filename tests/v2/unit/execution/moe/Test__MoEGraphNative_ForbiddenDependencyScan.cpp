@@ -2650,8 +2650,11 @@ namespace llaminar2::test
 
         EXPECT_NE(ffn_body.find("use_mtp_runtime_table = mtp_sidecar_context"),
                   std::string::npos);
-        EXPECT_NE(ffn_body.find("std::max(config_.n_layers, layer_idx + 1)"),
+        EXPECT_NE(ffn_body.find("std::max(config_.n_layers, layer_idx - config_.pp_layer_offset + 1)"),
                   std::string::npos);
+        EXPECT_EQ(ffn_body.find("std::max(config_.n_layers, layer_idx + 1)"),
+                  std::string::npos)
+            << "MTP table capacity must count only the owning stage's rows";
         EXPECT_NE(ffn_body.find("MoERuntimeTableRole::MTPDepth"),
                   std::string::npos);
         EXPECT_NE(ffn_body.find(".mtp_depth = use_mtp_runtime_table ? mtp_depth_idx : -1"),
@@ -5736,7 +5739,7 @@ namespace llaminar2::test
             maintenance_boundary_end - maintenance_boundary_start);
         const size_t device_authority_selection =
             maintenance_boundary_body.find(
-                "usesSingleDomainNativeGpuDeviceResidentMoEOverlayAuthority()");
+                "usesNativeGpuStageMoEOverlayAuthority()");
         const size_t device_maintenance_launch =
             maintenance_boundary_body.find(
                 "runner_->maybeApplyDecodeBoundaryMaintenance(");
@@ -7121,18 +7124,18 @@ namespace llaminar2::test
         require_capacity_typed_unpack(readFile(rocm_path), "ROCm");
 
         const std::string graph = readFile(graph_path);
-        EXPECT_NE(graph.find("for (int scan_layer = 0;"),
+        EXPECT_NE(graph.find("for (int scan_layer = bound_runtime_first_layer;"),
                   std::string::npos)
-            << "Decode-maintenance allocation capacity must be derived from every model layer";
-        EXPECT_NE(graph.find("scan_layer < bound_runtime_table_layers"),
+            << "Decode-maintenance capacity must start at the owning stage's first global layer";
+        EXPECT_NE(graph.find("scan_layer < bound_runtime_first_layer + bound_runtime_table_layers"),
                   std::string::npos)
-            << "The model format preflight must cover the complete materialized runtime-table domain, including MTP layers";
+            << "Format admission must cover the complete stage runtime interval, including terminal MTP layers";
         EXPECT_NE(graph.find("DeviceMoETransferSlotDirectory::profileForLayerFormats"),
                   std::string::npos)
             << "Qwen MoE graph construction must merge exact layer formats into one explicit profile";
         EXPECT_NE(graph.find("collectGraphRebalanceTransferProfile"),
                   std::string::npos)
-            << "Prefill LLEP and decode maintenance must share the same model-wide format preflight";
+            << "Prefill LLEP and decode maintenance must share the same stage-scoped format admission";
         EXPECT_NE(graph.find("graphRebalanceTransferDirectoryKey"),
                   std::string::npos)
             << "Prefill and maintenance must derive persistent transfer storage "
@@ -8856,6 +8859,26 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
 
         const std::string contents = readFile(rocm_path);
+        // Retired weight-only policy cannot reappear as a second ownership or
+        // arithmetic authority beside model-owned prepared half gate tensors.
+        for (const char *retired : {"getOrCreateFP16RouterGateCache", "moe_router_fp16",
+                                    "ROCM_ROUTER_FP16_GATE_WEIGHTS"})
+            EXPECT_EQ(contents.find(retired), std::string::npos) << retired;
+        const size_t typed_begin = contents.find("bool launchDecodeGateLogitsForGateType(");
+        ASSERT_NE(typed_begin, std::string::npos);
+        const size_t typed_end = contents.find("\n}\n\nnamespace llaminar2", typed_begin);
+        ASSERT_NE(typed_end, std::string::npos);
+        const std::string typed = contents.substr(typed_begin, typed_end - typed_begin);
+        const size_t half_begin = typed.find("case llaminar2::TensorType::FP16:");
+        const size_t half_end = typed.find("case llaminar2::TensorType::BF16:", half_begin);
+        ASSERT_NE(half_begin, std::string::npos);
+        ASSERT_NE(half_end, std::string::npos);
+        const std::string half = typed.substr(half_begin, half_end - half_begin);
+        EXPECT_NE(half.find("!hipMoE_gate_logits_single_token_fp16_weights("), std::string::npos);
+        EXPECT_NE(half.find("FP16 gate logits kernel failed"), std::string::npos);
+        EXPECT_NE(half.find("return false;"), std::string::npos);
+        EXPECT_EQ(half.find("launchDecodeGateLogits("), std::string::npos)
+            << "A physical half gate may not enter the FP32 router after failure";
         auto require_strict_router_body =
             [&](const std::string &begin_marker,
                 const std::string &end_marker,
@@ -8878,12 +8901,20 @@ namespace llaminar2::test
             EXPECT_NE(body.find("fused K-part router runtime kernel failed"),
                       std::string::npos)
                 << label << " must fail hard when explicit K-part top-k/rebalance routing fails";
-            EXPECT_NE(body.find("FP16 router was requested but gate cache is unavailable"),
-                      std::string::npos)
-                << label << " must fail hard when explicit FP16 routing cannot build its cache";
-            EXPECT_NE(body.find("FP16 router logits kernel failed"),
-                      std::string::npos)
-                << label << " must fail hard when explicit FP16 logits fail";
+            // Physical gate identity now selects the sole typed dispatcher;
+            // there is no workspace-derived half cache to recover or replace.
+            const size_t typed_call = body.find("!launchDecodeGateLogitsForGateType(");
+            ASSERT_NE(typed_call, std::string::npos)
+                << label << " must use the typed gate dispatcher as a checked condition";
+            const size_t fail_begin = body.find('{', typed_call);
+            const size_t fail_end = body.find('}', fail_begin);
+            ASSERT_NE(fail_begin, std::string::npos);
+            ASSERT_NE(fail_end, std::string::npos);
+            const std::string failure = body.substr(fail_begin, fail_end - fail_begin);
+            EXPECT_NE(failure.find("return false;"), std::string::npos)
+                << label << " must propagate typed FP16/FP32/BF16 launch failure";
+            EXPECT_EQ(failure.find("hipMoE_"), std::string::npos)
+                << label << " may not submit an alternate kernel after typed failure";
             EXPECT_NE(body.find("wave64 decode softmax/top-k runtime kernel failed"),
                       std::string::npos)
                 << label << " must fail hard when the enabled wave top-k runtime path fails";
@@ -9968,7 +9999,7 @@ namespace llaminar2::test
                   std::string::npos)
             << "Portable restore must not resurrect rolling transfer-slot "
                "payloads through a resolver after those bytes may be reused.";
-        EXPECT_NE(graph.find("constexpr uint32_t kMoEPrefixRuntimeVersion = 5;"),
+        EXPECT_NE(graph.find("constexpr uint32_t kMoEPrefixRuntimeVersion = 6;"),
                   std::string::npos)
             << "Changing the prefix ownership boundary requires an explicit "
                "portable schema version.";
@@ -11057,9 +11088,12 @@ namespace llaminar2::test
         ASSERT_FALSE(shutdown.empty());
         EXPECT_NE(
             shutdown.find(
-                "intent ==\n            MoEOverlayMaintenanceDrainIntent::TerminalContextSeal"),
+                "intent == MoEOverlayMaintenanceDrainIntent::TerminalContextSeal &&"),
             std::string::npos)
             << "Physical restoration must remain guarded by the typed terminal intent";
+        EXPECT_NE(shutdown.find("ModelContextPhysicalSealBoundary::LiveMutableResidency"),
+                  std::string::npos)
+            << "Mutable residency must restore while its live fabric still owns the physical slots";
         EXPECT_NE(
             shutdown.find("sealReusableModelContextPhysicalState"),
             std::string::npos);

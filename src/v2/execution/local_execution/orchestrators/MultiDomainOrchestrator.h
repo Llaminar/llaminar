@@ -167,6 +167,10 @@ namespace llaminar2
         void clear_cache() override;
         /** @copydoc IInferenceRunner::purgePrefixCache */
         bool purgePrefixCache() override;
+        /** @copydoc IInferenceRunner::collectPrefixCacheShutdown */
+        void collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const override;
+        /** @copydoc IInferenceRunner::prefixCacheTelemetrySources */
+        PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override;
 
         /**
          * @brief Get current position in cache

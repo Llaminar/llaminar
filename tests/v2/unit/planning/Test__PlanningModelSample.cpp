@@ -8,9 +8,11 @@
  * their claim after the metadata owner retires and failed reads release both
  * source and temporary-reader claims. These are not numerical model proofs.
  */
+#include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PlanningExpertSample.h"
 #include "planning/PlanningMatrixSample.h"
+#include "utils/DebugEnv.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
@@ -156,6 +158,7 @@ TEST(PlanningModelSample, EveryNativeFormatReadsExactDenseRowsAndColumns)
 
 TEST(PlanningModelSample, RuntimePromotionPreservesNativeWireIdentityForEverySourceFormat)
 {
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
     for (auto format : sourceFormats())
     {
         SCOPED_TRACE(static_cast<int>(format));
@@ -330,4 +333,113 @@ TEST(PlanningModelSample, ExpertTripletDescriptionIsBackendIndependentAndMetadat
             EXPECT_THROW(PlanningExpertSampleDescription::resolve(source, invalid), std::invalid_argument);
         }
     }
+}
+
+/** @brief Router arithmetic survives publication independently of process environment. */
+TEST(PlanningModelSample, RouterOperandArithmeticIsSealedInSampleIdentity)
+{
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
+    test::PlanningGGUFFixture fixture(false, false, GGUFTensorType::Q6_K, 256, GGUFTensorType::Q6_K);
+    PlanningModelSource source(fixture.path());
+    const auto original = PlanningMatrixSamplePlan::resolve(source,
+        {"blk.0.ssm_alpha.weight", PlanningMatrixRows{3, 8}});
+    auto wire = nlohmann::json::parse(original.serialize());
+    wire["matrix"]["name"] = "blk.0.ffn_gate_inp.weight";
+    wire["gdn_arithmetic"] = "native";
+    wire["router_arithmetic"] = "fp16";
+    const auto decode = [](const auto &value) {
+        const auto text = value.dump();
+        return PlanningMatrixSamplePlan::deserialize(std::vector<uint8_t>(text.begin(), text.end()));
+    };
+    const auto half = decode(wire);
+    EXPECT_EQ(half.executionType(), TensorType::FP16);
+    EXPECT_EQ(half.operandPrecision(), FloatingActivationOperandPrecision::FP16RNE);
+    EXPECT_EQ(half.executionPayloadBytes(), 5 * 256 * sizeof(uint16_t));
+    EXPECT_EQ(half.serialize(), decode(nlohmann::json::parse(half.serialize())).serialize());
+    wire["router_arithmetic"] = "native";
+    const auto native = decode(wire);
+    EXPECT_EQ(native.executionType(), TensorType::Q6_K);
+    EXPECT_NE(native.serialize(), half.serialize());
+    wire["router_arithmetic"] = "native_hadamard32";
+    EXPECT_THROW(decode(wire), std::invalid_argument) << "Q6 router source must never be rotated and requantized";
+    wire["router_arithmetic"] = "fp16";
+    wire["matrix"]["name"] = "blk.0.ffn_gate_exps.weight";
+    EXPECT_THROW(decode(wire), std::invalid_argument);
+    wire["matrix"]["name"] = "blk.0.ffn_gate_inp.weight";
+    for (const auto invalid : {"", "auto", "FP16", "fp32"})
+    {
+        wire["router_arithmetic"] = invalid;
+        EXPECT_THROW(decode(wire), std::invalid_argument);
+    }
+    wire.erase("router_arithmetic");
+    EXPECT_THROW(decode(wire), std::invalid_argument);
+}
+
+/** @brief Source format alone cannot alias a different floating activation program. */
+TEST(PlanningModelSample, GDNOperandArithmeticIsSealedInSampleIdentity)
+{
+    struct Restore {
+        GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
+        ~Restore() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
+    } restore;
+    mutableDebugEnv().gemm.gdn_projection_arithmetic = GDNProjectionArithmetic::Native;
+    test::PlanningGGUFFixture fixture(false, false, GGUFTensorType::Q6_K, 256, GGUFTensorType::Q6_K);
+    PlanningModelSource source(fixture.path());
+    const auto original = PlanningMatrixSamplePlan::resolve(source,
+        {"blk.0.ssm_alpha.weight", PlanningMatrixRows{3, 8}});
+    auto wire = nlohmann::json::parse(original.serialize());
+    wire["architecture"] = "qwen35moe";
+    const auto decode = [](const auto &value) {
+        const auto text = value.dump();
+        return PlanningMatrixSamplePlan::deserialize(std::vector<uint8_t>(text.begin(), text.end()));
+    };
+    wire["gdn_arithmetic"] = "fp16";
+    const auto half = decode(wire);
+    EXPECT_EQ(half.executionType(), TensorType::FP16);
+    EXPECT_EQ(half.operandPrecision(), FloatingActivationOperandPrecision::FP16RNE);
+    EXPECT_EQ(half.executionPayloadBytes(), 5 * 256 * sizeof(uint16_t));
+    wire["gdn_arithmetic"] = "fp32";
+    const auto fp32 = decode(wire);
+    EXPECT_EQ(fp32.executionType(), TensorType::FP32);
+    EXPECT_EQ(fp32.operandPrecision(), FloatingActivationOperandPrecision::FP32);
+    EXPECT_NE(half.serialize(), fp32.serialize());
+    EXPECT_EQ(half.executionType(), TensorType::FP16);
+    EXPECT_EQ(half.operandPrecision(), FloatingActivationOperandPrecision::FP16RNE);
+    for (const auto mode : {"auto", "FP16", ""})
+    {
+        wire["gdn_arithmetic"] = mode;
+        EXPECT_THROW(decode(wire), std::invalid_argument);
+    }
+    wire["gdn_arithmetic"] = "fp16_alpha_beta";
+    EXPECT_THROW(decode(wire), std::invalid_argument); // Original Q6 controls cannot be converted.
+    test::PlanningGGUFFixture controls(false, false, GGUFTensorType::Q6_K, 256, GGUFTensorType::F32);
+    PlanningModelSource controls_source(controls.path());
+    auto selective_wire = nlohmann::json::parse(PlanningMatrixSamplePlan::resolve(controls_source,
+        {"blk.0.ssm_alpha.weight", PlanningMatrixRows{3, 8}}).serialize());
+    selective_wire["architecture"] = "qwen35moe";
+    selective_wire["gdn_arithmetic"] = "fp16_alpha_beta";
+    const auto selective = decode(selective_wire);
+    EXPECT_EQ(selective.executionType(), TensorType::FP16);
+    EXPECT_EQ(selective.operandPrecision(), FloatingActivationOperandPrecision::FP16RNE);
+    EXPECT_EQ(selective.executionPayloadBytes(), 5 * 256 * sizeof(uint16_t));
+    EXPECT_EQ(nlohmann::json::parse(selective.serialize())["gdn_arithmetic"], "fp16_alpha_beta");
+    EXPECT_EQ(decode(nlohmann::json::parse(selective.serialize())).serialize(), selective.serialize());
+    selective_wire["gdn_arithmetic"] = "fp16_moe_alpha_beta";
+    const auto moe_only = decode(selective_wire);
+    EXPECT_EQ(moe_only.executionType(), TensorType::FP16);
+    EXPECT_EQ(moe_only.operandPrecision(), FloatingActivationOperandPrecision::FP16RNE);
+    EXPECT_NE(moe_only.serialize(), selective.serialize());
+    EXPECT_EQ(decode(nlohmann::json::parse(moe_only.serialize())).serialize(), moe_only.serialize());
+    selective_wire["architecture"] = "qwen35";
+    const auto dense_native = decode(selective_wire);
+    EXPECT_EQ(dense_native.executionType(), TensorType::FP32);
+    EXPECT_EQ(dense_native.operandPrecision(), FloatingActivationOperandPrecision::Native);
+    selective_wire["architecture"] = "qwen35moe";
+    selective_wire["matrix"]["name"] = "blk.0.attn_qkv.weight";
+    const auto wide = decode(selective_wire);
+    EXPECT_EQ(wide.executionType(), TensorType::FP32);
+    EXPECT_EQ(wide.operandPrecision(), FloatingActivationOperandPrecision::Native);
+    wire["gdn_arithmetic"] = "fp16";
+    wire["matrix"]["name"] = "blk.0.ffn_gate.weight";
+    EXPECT_THROW(decode(wire), std::invalid_argument);
 }

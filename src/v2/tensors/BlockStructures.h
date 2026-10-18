@@ -491,14 +491,17 @@ namespace llaminar2
     };
     static_assert(sizeof(Q6_KBlock) == 210, "Q6_KBlock must be 210 bytes");
 
-    /** @brief Q8_K block: 8-bit K-quant super-block (256 elements, 288 bytes) */
+    /** @brief Q8_K block: FP32-scaled signed K-quant super-block (256 elements, 292 bytes) */
     struct Q8_KBlock
     {
+        float d;          ///< Original FP32 super-block scale; value is d * qs[i].
         int8_t qs[256];    ///< 8-bit quantized values
         int16_t bsums[16]; ///< Block sums for fast dot products
         static constexpr size_t BLOCK_SIZE = 256;
     };
-    static_assert(sizeof(Q8_KBlock) == 288, "Q8_KBlock must be 288 bytes");
+    static_assert(sizeof(Q8_KBlock) == 292, "Q8_KBlock must be 292 bytes");
+    static_assert(offsetof(Q8_KBlock, d) == 0 && offsetof(Q8_KBlock, qs) == 4 &&
+                  offsetof(Q8_KBlock, bsums) == 260, "Q8_K must match the GGUF source layout");
 
     // ========================================================================
     // IQ Formats (Importance Quantization, 256-element super-blocks)

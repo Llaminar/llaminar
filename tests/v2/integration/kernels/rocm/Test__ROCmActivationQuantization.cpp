@@ -22,6 +22,8 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <limits>
+#include "../../../utils/Q8ScaleUnderflowFixture.h"
 #include <stdexcept>
 #include <vector>
 
@@ -90,7 +92,12 @@ void oracle(const std::vector<float> &input, int rows, int width,
             for (int k=begin; k<end; ++k)
                 maximum = std::max(maximum, std::abs(input[size_t(row)*width+k]));
             const size_t out = size_t(row)*blocks+block;
-            const float scale = llaminar2::device_q8_activation_contract::scale(maximum);
+            // Independent repaired-format oracle: clamp the derived FP32
+            // scale to positive finite half range, then perform HALF-RNE.
+            const float raw_scale = maximum > 0.f
+                ? maximum * llaminar2::MoEProjectionNumericalContract::q8_scale_multiplier : 1.f;
+            const float scale = llaminar2::canonicalPreparedHalfValue(
+                std::clamp(raw_scale, 0x1p-24f, 65504.f));
             scales[out] = scale;
             sums[out] = 0;
             // The dense activation producer's ABI uses RN division followed
@@ -100,7 +107,7 @@ void oracle(const std::vector<float> &input, int rows, int width,
             for (int k=begin; k<end; ++k) {
                 const size_t i = size_t(row)*width+k;
                 const float scaled = input[i] * inverse;
-                const int q = std::clamp(int(std::rint(scaled)), -127, 127);
+                const int q = int(std::clamp(std::rint(scaled), -127.f, 127.f));
                 bytes[i] = int8_t(q);
                 sums[out] += q;
             }
@@ -112,8 +119,9 @@ void oracle(const std::vector<float> &input, int rows, int width,
  * @param rows Capture-time row count, including verifier and prefill geometry.
  * @param width Input row pitch and independent quantization-block boundary.
  * @param unaligned Exercise legal views whose base cannot use vector alignment.
+ * @param scale_range Include underflow/overflow, subnormal and captured diagnostic blocks.
  */
-void prove(int rows, int width, bool unaligned=false) {
+void prove(int rows, int width, bool unaligned = false, bool scale_range = false) {
     SCOPED_TRACE(::testing::Message() << "M=" << rows << " K=" << width
         << " unaligned=" << unaligned);
     const size_t offset = unaligned ? 1 : 0;
@@ -153,6 +161,19 @@ void prove(int rows, int width, bool unaligned=false) {
             const float magnitude = std::ldexp(1.f,int((block+replay)%5)*3-6);
             host[i] = block%13==0 ? (i%2 ? -0.f : 0.f) : magnitude *
                 float(int((i*173+block*11+replay*13)%4093)-2046)/257.f;
+            if (scale_range) {
+                const std::array<float,10> extrema{0.f,std::numeric_limits<float>::denorm_min(),
+                    std::numeric_limits<float>::min(),0x1p-24f,0x1p-20f,
+                    127.f*0x1p-25f,127.f*0x1p-24f,1.f,127.f*65520.f,
+                    std::numeric_limits<float>::max()};
+                const size_t pattern=(block+replay)%(extrema.size()+1);
+                if(pattern==extrema.size())
+                    host[i]=llaminar2::test::q8ScaleUnderflowSourceValue((i%width)%32);
+                else {
+                    const float maximum=extrema[pattern];
+                    host[i]=i%4==0?maximum:i%4==1?-maximum:i%4==2?0.f:-0.f;
+                }
+            }
         }
         oracle(host,rows,width,expected_bytes,expected_scales,expected_sums);
         checked(hipMemcpyAsync(input.data+offset,host.data(),count*sizeof(float),hipMemcpyHostToDevice,stream));
@@ -167,6 +188,9 @@ void prove(int rows, int width, bool unaligned=false) {
             checked(hipMemcpyAsync(actual_sums.data(),sums.data,(blocks+8)*sizeof(int32_t),hipMemcpyDeviceToHost,stream));
             checked(hipStreamSynchronize(stream));
             ASSERT_EQ(leading_guard,0x5a);
+            for(size_t block=0;block<blocks;++block)
+                ASSERT_TRUE(std::isfinite(actual_scales[block])&&actual_scales[block]>0.f)
+                    << "actual device scale block="<<block;
             ASSERT_EQ(actual_bytes,expected_bytes);
             ASSERT_EQ(std::memcmp(actual_scales.data(),expected_scales.data(),(blocks+8)*sizeof(float)),0);
             if (with_sums) ASSERT_EQ(actual_sums,expected_sums);
@@ -190,6 +214,13 @@ TEST(ROCmActivationQuantization, CapturedPrefillByteContract) {
     for (int rows : {1024,2048,4096}) prove(rows,96);
     for (int rows : {64,512})
         for (int width : {33,2048}) prove(rows,width,true);
+}
+
+/** @test Actual captured producers define finite bytes at both half-range boundaries. */
+TEST(ROCmActivationQuantization, CapturedFiniteScaleRange) {
+    checked(hipSetDevice(0));
+    for(int rows:{1,2,16,65,512}) prove(rows,256,false,true);
+    for(int rows:{1,65}) prove(rows,33,true,true);
 }
 
 /** @brief Nonempty producers cannot silently enter the legacy default stream. */

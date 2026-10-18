@@ -6,13 +6,25 @@
  * every execution regime decodes quantized weights and publishes FP32 block
  * contributions with the same arithmetic order. IQ lookup tables are copied
  * once during backend initialization and remain immutable device-owned state
- * throughout graph capture and replay.
+ * throughout graph capture and replay. Q6_K metadata preserves the original
+ * half base and signed coefficients; IQ2_S retains its half base and scale
+ * nibble byte. Every execution family reconstructs these source scales before
+ * applying its established contribution tree.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
+ * IQ3_S physical11 similarly widens its original base and multiplies the raw
+ * source odd coefficient in FP32 before the unchanged single-dot contribution.
  */
 
 #pragma once
 
 #include "tensors/IQQuantTables.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeVnniQ6Scale.h"
+#include "tensors/NativeVnniIQ2SScale.h"
+#include "tensors/NativeVnniIQ4XSScale.h"
+#include "tensors/NativeVnniIQ3SScale.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -70,6 +82,9 @@ namespace llaminar2::cuda_native_vnni
     template <uint8_t CODEBOOK_ID>
     struct CodebookTraits
     {
+        static constexpr bool is_iq4_source_scale =
+            CODEBOOK_ID == kNativeVnniIQ4XSSourceScaleCodebook;
+        static constexpr bool is_iq4_lut = CODEBOOK_ID == 4 || is_iq4_source_scale;
         static constexpr bool is_iq3_grid = (CODEBOOK_ID == 11 || CODEBOOK_ID == 12);
         static constexpr bool is_iq2_grid = (CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 15);
         static constexpr bool is_iq1_grid = (CODEBOOK_ID == 16 || CODEBOOK_ID == 17);
@@ -79,6 +94,9 @@ namespace llaminar2::cuda_native_vnni
             CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook;
         static constexpr bool is_dual_scale = (CODEBOOK_ID == 8 || CODEBOOK_ID == 9 || CODEBOOK_ID == 10 ||
                                                CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 17);
+        // Storage presence is independent of additive/dual arithmetic.
+        static constexpr bool requires_secondary_metadata =
+            is_asymmetric || is_dual_scale || is_iq4_source_scale || CODEBOOK_ID == 11;
         static constexpr bool is_dual_scale_asym = (CODEBOOK_ID == 10);
         static constexpr bool is_iq1_m = (CODEBOOK_ID == 17);
         static constexpr int payload_bytes =
@@ -97,9 +115,115 @@ namespace llaminar2::cuda_native_vnni
                                                        : 16;
     };
 
+    /**
+     * @brief Collapse only IQ4 peer launches while retaining descriptor identities.
+     * @param mask Actual physical formats in the immutable descriptor table.
+     * @return One IQ4-family launch bit if tuple24 is present, all others unchanged.
+     */
+    __host__ __device__ constexpr uint32_t native_vnni_iq4_launch_mask(uint32_t mask)
+    {
+        return (mask & (uint32_t{1} << kNativeVnniIQ4XSSourceScaleCodebook))
+            ? mask & ~(uint32_t{1} << 4) : mask;
+    }
+
+    /**
+     * @brief Select one exact descriptor writer for an IQ4 family specialization.
+     * @tparam CodebookId Physical specialization, with 24 owning mixed IQ4 tables.
+     * @param actual Descriptor's preserved physical id.
+     * @return True for the exact format or physical4 under explicit family24.
+     */
+    template <uint8_t CodebookId>
+    __host__ __device__ constexpr bool native_vnni_descriptor_codebook_matches(uint8_t actual)
+    {
+        return actual == CodebookId ||
+            (CodebookId == kNativeVnniIQ4XSSourceScaleCodebook && actual == 4);
+    }
+
     __device__ __forceinline__ float fp16_bits_to_float(uint16_t bits)
     {
         return __half2float(*reinterpret_cast<const __half *>(&bits));
+    }
+
+    /**
+     * @brief Resolve the symmetric single-dot scale without a half round trip.
+     * @tparam CODEBOOK_ID Physical decoder; IQ4_XS uses source tuple 24.
+     * @param primary_bits Original half base for IQ4_XS, otherwise half scale.
+     * @param secondary_bits Original encoded six-bit IQ4_XS coefficient.
+     * @return Exact source base-times-coefficient rounded once in FP32.
+     */
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ float native_vnni_single_scale_rn(
+        uint16_t primary_bits, uint16_t secondary_bits)
+    {
+        const float base = fp16_bits_to_float(primary_bits);
+        if constexpr (CodebookTraits<CODEBOOK_ID>::is_iq4_source_scale)
+            return device_fp32_contract::multiply(
+                base, static_cast<float>(native_vnni_iq4xs_scale::coefficient(secondary_bits)));
+        if constexpr (CODEBOOK_ID == 11)
+            return device_fp32_contract::multiply(
+                base, static_cast<float>(native_vnni_iq3s_scale::coefficient(secondary_bits)));
+        return base;
+    }
+
+    /**
+     * @brief Reconstructed low/high scales for one native dual-scale block.
+     */
+    struct NativeVnniDualScales
+    {
+        float low;  ///< FP32 scale for values 0 through 15.
+        float high; ///< FP32 scale for values 16 through 31.
+    };
+
+    /**
+     * @brief Resolve original-source scale tuples or widened derived half scales.
+     *
+     * Q6_K stores its source half base and a raw signed coefficient pair. Each
+     * half-times-int8 product is exactly representable in FP32; an explicit
+     * multiply retains that edge without factoring the base across dot terms.
+     * IQ2_S stores its original half base and scale-nibble byte. Its two source
+     * products retain the original multiply-then-quarter association before
+     * either integer dot term. Other dual-scale codebooks keep two half scales.
+     *
+     * @tparam CODEBOOK_ID NativeVNNI dual-scale codebook identifier.
+     * @param primary_bits Original Q6_K/IQ2_S base, or a derived low scale.
+     * @param secondary_bits Raw Q6_K coefficients, IQ2_S scale byte, or high scale.
+     * @return Source-resolved Q6_K/IQ2_S scales or widened derived half scales.
+     */
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ NativeVnniDualScales native_vnni_dual_scales_rn(
+        uint16_t primary_bits,
+        uint16_t secondary_bits)
+    {
+        static_assert(CodebookTraits<CODEBOOK_ID>::is_dual_scale);
+        const float primary = fp16_bits_to_float(primary_bits);
+        if constexpr (CODEBOOK_ID == 8)
+        {
+            return {
+                device_fp32_contract::multiply(
+                    primary,
+                    static_cast<float>(native_vnni_q6_scale::low(secondary_bits))),
+                device_fp32_contract::multiply(
+                    primary,
+                    static_cast<float>(native_vnni_q6_scale::high(secondary_bits)))};
+        }
+        else if constexpr (CODEBOOK_ID == 13)
+        {
+            return {
+                device_fp32_contract::multiply(
+                    device_fp32_contract::multiply(
+                        primary,
+                        0.5f + static_cast<float>(native_vnni_iq2s_scale::low(secondary_bits))),
+                    0.25f),
+                device_fp32_contract::multiply(
+                    device_fp32_contract::multiply(
+                        primary,
+                        0.5f + static_cast<float>(native_vnni_iq2s_scale::high(secondary_bits))),
+                    0.25f)};
+        }
+        else
+        {
+            return {primary, fp16_bits_to_float(secondary_bits)};
+        }
     }
 
     __device__ __forceinline__ int sum_packed_i8(int32_t packed)
@@ -137,8 +261,8 @@ namespace llaminar2::cuda_native_vnni
      * @param dot_lo Integer dot product for the low or complete 32-value block.
      * @param dot_hi Integer dot product for the high dual-scale half.
      * @param activation_scale FP32 scale for the quantized activation block.
-     * @param scale_bits FP16 weight scale bits for the low or complete block.
-     * @param secondary_bits FP16 asymmetric minimum or high-half scale bits.
+     * @param scale_bits FP16 low/complete scale, or original source base bits.
+     * @param secondary_bits FP16 minimum/high scale, or raw source factors.
      * @param emin_bits Packed Q2_K low/high asymmetric-minimum FP16 bits.
      * @param activation_sum Sum of all 32 quantized activation values.
      * @param activation_sum_lo Sum of the low sixteen activation values.
@@ -172,8 +296,10 @@ namespace llaminar2::cuda_native_vnni
 
         if constexpr (Traits::is_dual_scale)
         {
-            const float scale_lo = fp16_bits_to_float(scale_bits);
-            const float scale_hi = fp16_bits_to_float(secondary_bits);
+            const auto scales = native_vnni_dual_scales_rn<CODEBOOK_ID>(
+                scale_bits, secondary_bits);
+            const float scale_lo = scales.low;
+            const float scale_hi = scales.high;
             float contribution =
                 device_native_vnni_contract::dualScaleBlock(
                     dot_lo,
@@ -232,7 +358,8 @@ namespace llaminar2::cuda_native_vnni
         }
         else
         {
-            const float weight_scale = fp16_bits_to_float(scale_bits);
+            const float weight_scale = native_vnni_single_scale_rn<CODEBOOK_ID>(
+                scale_bits, secondary_bits);
             float contribution =
                 device_native_vnni_contract::singleScaleBlock(
                     dot_lo,
@@ -473,7 +600,7 @@ namespace llaminar2::cuda_native_vnni
                 packed_groups[g + 4] = static_cast<int32_t>(__vsub4(hi, 0x08080808u));
             }
         }
-        else if constexpr (CODEBOOK_ID == 4)
+        else if constexpr (CodebookTraits<CODEBOOK_ID>::is_iq4_lut)
         {
             for (int g = 0; g < 4; ++g)
             {
@@ -674,7 +801,7 @@ namespace llaminar2::cuda_native_vnni
                     packed_groups[g + 4] = static_cast<int32_t>(__vsub4(hi, 0x08080808u));
                 }
             }
-            else if constexpr (CODEBOOK_ID == 4)
+            else if constexpr (CodebookTraits<CODEBOOK_ID>::is_iq4_lut)
             {
 #pragma unroll
                 for (int g = 0; g < 4; ++g)

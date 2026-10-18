@@ -128,7 +128,7 @@ namespace llaminar2
 
         // Connectivity (for peer-to-peer)
         bool supports_p2p = false; ///< Can do GPU-direct P2P
-        int pcie_bus_id = 0;       ///< PCIe bus ID (for locality)
+        std::string pci_bus_address; ///< Complete native endpoint BDF for OS memory attribution.
         int numa_node = -1;        ///< Associated NUMA node (-1 if unknown)
 
         // PCIe link info (effective = bottleneck-aware after upstream walk)

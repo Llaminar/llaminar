@@ -1,5 +1,8 @@
 /**
  * @file ROCmMoEKernel.h
+ * @details Prepared model weight types own router operand precision. FP16 gates
+ * consume half-RNE hidden values while expert Q8 still reads original hidden;
+ * no graph-local half-weight cache may duplicate the prepared-weight authority.
  * @brief ROCm/HIP implementation of MoE kernel operations
  *
  * Implements IMoEKernel for ROCm GPU execution using HIP kernels.
@@ -1306,10 +1309,6 @@ namespace llaminar2
             const float *gate_device_ptr,
             int d_model,
             int num_experts);
-        const void *getOrCreateFP16RouterGateCache(
-            const float *gate_device_ptr,
-            int d_model,
-            int num_experts);
 
         /**
          * @brief Produce router logits and publish final FP32 route tensors.
@@ -1459,15 +1458,6 @@ namespace llaminar2
             std::size_t workspace_slot = 0;
         };
 
-        struct RouterFP16GateCacheEntry
-        {
-            DeviceResidentRouterGateCacheKey key{};
-            size_t element_count = 0;
-            void *d_gate_weights_fp16 = nullptr;
-            std::shared_ptr<RouterGateWorkspacePublication> workspace_publication;
-            std::size_t workspace_slot = 0;
-        };
-
         struct RouterQ8GateCacheEntry
         {
             DeviceResidentRouterGateCacheKey key{};
@@ -1588,7 +1578,6 @@ namespace llaminar2
         int router_q8_hidden_rows_cap_ = 0;
         int router_q8_hidden_d_model_cap_ = 0;
         int router_q8_hidden_blocks_cap_ = 0;
-        std::vector<RouterFP16GateCacheEntry> router_fp16_gate_cache_;
         std::vector<RouterQ8GateCacheEntry> router_q8_gate_cache_;
         /** Capture-time resident-set contract for one-token routing. */
         RoutedExpertResidentSetPolicy prepared_decode_resident_set_policy_ =

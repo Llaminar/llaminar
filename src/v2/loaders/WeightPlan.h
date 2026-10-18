@@ -15,6 +15,7 @@
 
 #include "WeightIdentity.h"
 #include "WeightLifecycleTrace.h"
+#include "kernels/FloatingActivationOperandPrecision.h"
 #include "planning/PhysicalMemoryBOM.h"
 
 #include <functional>
@@ -48,6 +49,7 @@ namespace llaminar2
         DeviceId device = DeviceId::cpu();
     };
 
+    /** @brief Frozen source, arithmetic and ownership consumed by one graph binding. */
     struct WeightBinding
     {
         uint64_t binding_id = 0;
@@ -58,6 +60,8 @@ namespace llaminar2
         TensorBase *tensor = nullptr;
         std::optional<PreparedWeightRef> prepared;
         bool immutable = false;
+        FloatingActivationOperandPrecision floating_operand_precision =
+            FloatingActivationOperandPrecision::Native; ///< Sealed before preparation; part of reuse identity.
     };
 
     struct WeightRequirement

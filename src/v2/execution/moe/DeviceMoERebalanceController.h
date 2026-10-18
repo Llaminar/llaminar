@@ -16,6 +16,7 @@
 #include "DeviceMoERebalancePolicyShared.h"
 #include "DeviceMoELLEPPlannerScratch.h"
 #include "MoERuntimeTable.h"
+#include "tensors/NativeVnniFormatInfo.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -1486,6 +1487,13 @@ namespace llaminar2
         return desc.movableWeightsReady();
     }
 
+    /** @brief Resolve physical decoder storage for immutable transfer descriptors.
+     * @param codebook_id Physical execution codebook, not original source identity.
+     * @param payload_bytes_per_block Receives compact payload width per 32 values.
+     * @param is_asymmetric Receives physical secondary-plane presence, including raw source coefficients.
+     * @param has_emins Receives extended-minimum-plane presence.
+     * @return Whether this physical format has a complete storage contract.
+     */
     inline bool deviceMoENativeVnniFormatForCodebook(
         uint8_t codebook_id,
         uint8_t &payload_bytes_per_block,
@@ -1500,6 +1508,11 @@ namespace llaminar2
         case 0:
         case 4:
             payload_bytes_per_block = 16;
+            return true;
+        case kNativeVnniIQ4XSSourceScaleCodebook:
+            // Physical secondary presence: raw source coefficient, not a minimum.
+            payload_bytes_per_block = 16;
+            is_asymmetric = 1;
             return true;
         case 5:
             payload_bytes_per_block = 16;
@@ -1527,6 +1540,7 @@ namespace llaminar2
             return true;
         case 11:
             payload_bytes_per_block = 13;
+            is_asymmetric = 1; // Physical raw source nibble; no additive minimum.
             return true;
         case 12:
             payload_bytes_per_block = 12;

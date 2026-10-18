@@ -11,14 +11,22 @@
  * Opt-in terminal token IDs retain already published runner output, including
  * stop tokens and forced thinking continuations. They never probe live state,
  * re-tokenize generated text, change decode batching, or enable snapshots.
+ * Live token traces include terminal IDs and distinguish tokenizer stop tokens
+ * from runner completion before those tokens are removed from client text.
  * Opt-in runtime summaries project the runner's already completed outcome;
- * JSON and logs share one snapshot, without querying GPUs or optional PerfStats.
+ * JSON, logs and lifetime counters share one snapshot, without querying GPUs
+ * or optional PerfStats. Early failure retires a host observation scope without
+ * inventing a terminal summary or invoking diagnostic cache probes.
  * Only opt-in JSON also exports one passive model-lifetime movement ledger;
  * ordinary logs do not copy the growing journal or advance maintenance.
+ * Requested SSE usage publishes exact prompt and committed-token counts once,
+ * after the terminal choice and before DONE, so clients can budget/compact their
+ * next request without re-tokenizing content or probing mutable execution state.
  */
 
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/modes/MoEMovementLedgerJson.h"
+#include "app/modes/PrefixMovementJson.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "execution/mtp/MTPRequestSamplingPolicy.h"
 #include "utils/Tokenizer.h"
@@ -36,6 +44,7 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include <string_view>
 
 using json = nlohmann::json;
 
@@ -43,6 +52,76 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Retain only an incomplete UTF-8 suffix between tokenizer pieces.
+         *
+         * Byte-level BPE may divide a single emoji between several tokens. JSON
+         * replacement applies only to genuinely malformed terminal text; a
+         * valid incomplete code point must first join its following bytes.
+         */
+        class StreamingUtf8Text
+        {
+        public:
+            /**
+             * @brief Append decoded bytes and return their complete-code-point prefix.
+             * @param bytes Next tokenizer piece, which may end inside a code point.
+             * @return Publishable bytes; at most three valid suffix bytes remain.
+             */
+            std::string process(std::string_view bytes)
+            {
+                pending_.append(bytes);
+                size_t offset = 0;
+                while (offset < pending_.size())
+                {
+                    const auto lead = static_cast<unsigned char>(pending_[offset]);
+                    const size_t width = lead < 0x80 ? 1
+                        : lead >= 0xC2 && lead <= 0xDF ? 2
+                        : lead >= 0xE0 && lead <= 0xEF ? 3
+                        : lead >= 0xF0 && lead <= 0xF4 ? 4 : 0;
+                    if (width <= 1)
+                    {
+                        ++offset;
+                        continue;
+                    }
+                    const size_t available = std::min(width, pending_.size() - offset);
+                    bool valid_prefix = true;
+                    for (size_t byte = 1; byte < available; ++byte)
+                    {
+                        const auto value = static_cast<unsigned char>(pending_[offset + byte]);
+                        valid_prefix = valid_prefix && (value & 0xC0) == 0x80;
+                        if (byte == 1)
+                            valid_prefix = valid_prefix &&
+                                !(lead == 0xE0 && value < 0xA0) &&
+                                !(lead == 0xED && value > 0x9F) &&
+                                !(lead == 0xF0 && value < 0x90) &&
+                                !(lead == 0xF4 && value > 0x8F);
+                    }
+                    if (!valid_prefix)
+                    {
+                        ++offset;
+                        continue;
+                    }
+                    if (available < width)
+                        break;
+                    offset += width;
+                }
+                std::string ready = pending_.substr(0, offset);
+                pending_.erase(0, offset);
+                return ready;
+            }
+
+            /** @return Terminal incomplete bytes, serialized with the HTTP replacement policy. */
+            std::string finish()
+            {
+                std::string remaining;
+                remaining.swap(pending_);
+                return remaining;
+            }
+
+        private:
+            std::string pending_; ///< Sole owner of not-yet-publishable text bytes.
+        };
+
         std::string dumpJsonForHttp(const json &value)
         {
             // Model/tokenizer output can occasionally contain arbitrary byte
@@ -135,19 +214,41 @@ namespace llaminar2
             return text;
         }
 
+        /** @brief Why an already published output token is consumed or withheld. */
+        enum class GeneratedTokenDisposition
+        {
+            Text,
+            StopToken,
+            RunnerComplete
+        };
+
+        /**
+         * @brief Trace an already surfaced token without observing device state.
+         * @param path Streaming or complete-response observation boundary.
+         * @param completion_index Zero-based committed output position, including EOS.
+         * @param token Authoritative generated or forced token ID.
+         * @param text CPU tokenizer preview; never re-tokenized for identity.
+         * @param forced Whether request policy forced this committed token.
+         * @param disposition Text publication or the authority terminating generation.
+         */
         void traceGeneratedToken(const char *path,
                                  int completion_index,
                                  int32_t token,
                                  const std::string &text,
-                                 bool forced)
+                                 bool forced,
+                                 GeneratedTokenDisposition disposition)
         {
             if (!traceGeneratedTokensEnabled())
                 return;
+            const char *disposition_name = disposition == GeneratedTokenDisposition::Text
+                ? "text" : disposition == GeneratedTokenDisposition::StopToken
+                    ? "stop_token" : "runner_complete";
             LOG_INFO("[ChatCompletion/token] path="
                      << path
                      << " index=" << completion_index
                      << " token=" << token
                      << " forced=" << boolString(forced)
+                     << " disposition=" << disposition_name
                      << " text=\"" << previewTokenText(text) << "\"");
         }
 
@@ -242,7 +343,7 @@ namespace llaminar2
         {
             const auto &prefix = summary.prefix_request;
             const auto &mtp = summary.mtp_request;
-            return {{"schema", 1}, {"prefix_cache", {
+            json result = {{"schema", 1}, {"prefix_cache", {
                 {"enabled", prefix.enabled}, {"bypassed", prefix.bypassed},
                 {"bypass_reason", prefix.bypass_reason}, {"hit", prefix.hit},
                 {"partial_hit", prefix.partial_hit}, {"requested_tokens", prefix.requested_tokens},
@@ -273,6 +374,16 @@ namespace llaminar2
                 {"stochastic_residual_samples", mtp.stochastic_residual_samples},
                 {"stochastic_terminal_samples", mtp.stochastic_terminal_samples},
                 {"stochastic_acceptance_rate", mtp.stochastic_acceptance_rate}}}};
+            if (!prefix.movement_stages.empty())
+            {
+                result["schema"] = 2;
+                auto &cache = result["prefix_cache"];
+                cache["admission_epoch_earliest"] = nullptr;
+                cache["admission_epoch_latest"] = nullptr;
+                cache["completion_movement_epoch"] = nullptr;
+                cache["movement_epochs"] = prefixMovementStagesJson(prefix.movement_stages);
+            }
+            return result;
         }
 
         bool runChatMoERebalanceMaintenance(
@@ -470,7 +581,8 @@ namespace llaminar2
     ChatCompletionHandler::ChatCompletionHandler(
         IOrchestrationRunner &runner, ITokenizer &tokenizer,
         const std::string &model_name)
-        : runner_(runner), tokenizer_(tokenizer), model_name_(model_name)
+        : runtime_stats_(runner.prefixCacheTelemetrySources()),
+          runner_(runner), tokenizer_(tokenizer), model_name_(model_name)
     {
     }
 
@@ -558,6 +670,16 @@ namespace llaminar2
 
             std::string role = msg["role"].get<std::string>();
 
+            if (msg.contains("reasoning_content") && !msg["reasoning_content"].is_null() &&
+                !msg["reasoning_content"].is_string())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "message reasoning_content must be a string or null"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+
             // Assistant messages with tool_calls may have null/missing content
             if (role == "assistant" && msg.contains("tool_calls"))
                 continue;
@@ -598,8 +720,59 @@ namespace llaminar2
         // Streaming and thinking control
         if (body.contains("stream"))
             request.stream = body["stream"].get<bool>();
-        if (body.contains("enable_thinking"))
-            request.enable_thinking = body["enable_thinking"].get<bool>();
+        if (body.contains("stream_options") && !body["stream_options"].is_null())
+        {
+            const auto &options = body["stream_options"];
+            if (!options.is_object() ||
+                (options.contains("include_usage") && !options["include_usage"].is_boolean()))
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "stream_options must be an object with a boolean include_usage"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+            if (options.value("include_usage", false))
+                request.streaming_usage = StreamingUsageOutput::Include;
+        }
+        if (!request.stream && request.streaming_usage == StreamingUsageOutput::Include)
+        {
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", "stream_options.include_usage requires stream=true"},
+                {"type", "invalid_request_error"}}}});
+            return std::nullopt;
+        }
+        // Official Qwen examples place this option inside chat_template_kwargs.
+        // Both accepted spellings feed one request mode, so sampling, rendering
+        // and reasoning extraction cannot disagree about the selected policy.
+        const json *nested_thinking = nullptr;
+        if (body.contains("chat_template_kwargs"))
+        {
+            const auto &kwargs = body["chat_template_kwargs"];
+            if (!kwargs.is_object())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "chat_template_kwargs must be an object"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+            if (kwargs.contains("enable_thinking")) nested_thinking = &kwargs["enable_thinking"];
+        }
+        const json *top_thinking = body.contains("enable_thinking") ? &body["enable_thinking"] : nullptr;
+        if ((top_thinking && !top_thinking->is_boolean()) ||
+            (nested_thinking && !nested_thinking->is_boolean()) ||
+            (top_thinking && nested_thinking && *top_thinking != *nested_thinking))
+        {
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", "enable_thinking must be boolean and agree with chat_template_kwargs.enable_thinking"},
+                {"type", "invalid_request_error"}}}});
+            return std::nullopt;
+        }
+        if (top_thinking) request.enable_thinking = top_thinking->get<bool>();
+        else if (nested_thinking) request.enable_thinking = nested_thinking->get<bool>();
 
         if (body.contains("return_token_ids"))
         {
@@ -683,6 +856,20 @@ namespace llaminar2
         {
             request.sampling.frequency_penalty = body["frequency_penalty"].get<float>();
             request.sampling_set.frequency_penalty = true;
+        }
+        if (body.contains("repetition_penalty"))
+        {
+            const auto &value = body["repetition_penalty"];
+            if (!value.is_number() || !std::isfinite(value.get<float>()) || value.get<float>() <= 0.0f)
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "repetition_penalty must be a positive finite number"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+            request.sampling.repetition_penalty = value.get<float>();
+            request.sampling_set.repetition_penalty = true;
         }
 
         // DRY penalty parameters
@@ -842,6 +1029,12 @@ namespace llaminar2
             if (msg.contains("content") && !msg["content"].is_null())
                 cm.content = msg["content"].get<std::string>();
 
+            // Coding clients send the separate reasoning channel back with
+            // assistant/tool-call history. Preserve it for the model template;
+            // merging it into content would change role and tool boundaries.
+            if (msg.contains("reasoning_content") && !msg["reasoning_content"].is_null())
+                cm.reasoning_content = msg["reasoning_content"].get<std::string>();
+
             // Parse tool_calls from assistant messages (store as serialized JSON strings)
             if (msg.contains("tool_calls") && msg["tool_calls"].is_array())
             {
@@ -867,20 +1060,28 @@ namespace llaminar2
     // Common inference setup (shared between streaming and non-streaming)
     // =========================================================================
 
+    bool ChatCompletionHandler::thinkingEnabled(const ChatCompletionRequest &request) const
+    {
+        return request.enable_thinking.value_or(
+            runner_.getDefaultThinkingMode() == ThinkingMode::Enabled);
+    }
+
     int ChatCompletionHandler::setupInference(
         const ChatCompletionRequest &request,
         ChatCompletionResponse &error_out,
-        std::vector<int32_t> &input_ids)
+        std::vector<int32_t> &input_ids,
+        HttpRuntimeStats::Request &observation)
     {
         // Clear KV cache for fresh conversation
         runner_.clearCache();
 
         // Per-field merge of model-recommended defaults: the model defaults apply to
-        // any field the client did NOT explicitly set. This prevents a client that sets
-        // e.g. temperature from accidentally dropping critical knobs like presence_penalty
-        // that some models (e.g. Qwen3.5) require to avoid repetition-loop degeneration.
+        // any field the client did NOT explicitly set. Use the loaded revision
+        // and the same reasoning mode as the template: architecture-only defaults
+        // incorrectly penalize Qwen3.8's thinking continuations.
         SamplingParams effective = request.sampling;
-        SamplingParams model_defaults = runner_.getRecommendedSamplingParams();
+        SamplingParams model_defaults = runner_.getRecommendedSamplingParams(
+            thinkingEnabled(request) ? ThinkingMode::Enabled : ThinkingMode::Disabled);
         const auto &set_ = request.sampling_set;
 
         if (!set_.temperature)
@@ -893,6 +1094,8 @@ namespace llaminar2
             effective.presence_penalty = model_defaults.presence_penalty;
         if (!set_.frequency_penalty)
             effective.frequency_penalty = model_defaults.frequency_penalty;
+        if (!set_.repetition_penalty)
+            effective.repetition_penalty = model_defaults.repetition_penalty;
         if (!set_.seed)
             effective.seed = model_defaults.seed;
         if (!set_.dry_multiplier)
@@ -911,7 +1114,8 @@ namespace llaminar2
                   << "top_p=" << effective.top_p << (set_.top_p ? "* " : " ")
                   << "top_k=" << effective.top_k << (set_.top_k ? "* " : " ")
                   << "presence_penalty=" << effective.presence_penalty << (set_.presence_penalty ? "* " : " ")
-                  << "frequency_penalty=" << effective.frequency_penalty << (set_.frequency_penalty ? "*" : ""));
+                  << "frequency_penalty=" << effective.frequency_penalty << (set_.frequency_penalty ? "* " : " ")
+                  << "repetition_penalty=" << effective.repetition_penalty << (set_.repetition_penalty ? "*" : ""));
 
         try
         {
@@ -946,7 +1150,7 @@ namespace llaminar2
                                            : admitted_tools.dump();
         const auto prompt_messages = toolPolicyMessages(request);
         auto token_ids = tokenizer_.encodeChat(prompt_messages, /*add_generation_prompt=*/true,
-                                               tools_json, request.enable_thinking);
+                                               tools_json, thinkingEnabled(request));
 
         if (token_ids.empty())
         {
@@ -978,7 +1182,7 @@ namespace llaminar2
                 std::minmax_element(input_ids.begin(), input_ids.end());
             LOG_INFO("[ChatCompletion/trace] setup prompt_tokens="
                      << input_ids.size()
-                     << " enable_thinking=" << boolString(request.enable_thinking)
+                     << " enable_thinking=" << boolString(thinkingEnabled(request))
                      << " thinking_budget_tokens=" << request.thinking_budget_tokens
                      << " token_min=" << (min_it != input_ids.end() ? *min_it : -1)
                      << " token_max=" << (max_it != input_ids.end() ? *max_it : -1)
@@ -986,6 +1190,7 @@ namespace llaminar2
         }
 
         const auto prefill_start = SteadyClock::now();
+        observation.prefillStarted(prefill_start);
         if (!runner_.prefill(input_ids))
         {
             error_out.http_status = 500;
@@ -993,6 +1198,7 @@ namespace llaminar2
             error_out.json_body = dumpJsonForHttp(err);
             return -1;
         }
+        observation.prefillFinished();
         if (traceGeneratedTokensEnabled())
         {
             LOG_INFO("[ChatCompletion/trace] prefill_ms="
@@ -1008,16 +1214,29 @@ namespace llaminar2
     // =========================================================================
 
     ChatCompletionResponse ChatCompletionHandler::handleRequest(
-        const ChatCompletionRequest &request)
+        const ChatCompletionRequest &request, HttpRequestArrival arrival)
     try
     {
+        auto observation = runtime_stats_.beginRequest(arrival);
         ChatCompletionResponse response;
+        if (request.streaming_usage == StreamingUsageOutput::Include)
+        {
+            response.http_status = 400;
+            response.json_body = dumpJsonForHttp({{"error", {
+                {"message", "stream_options.include_usage requires a streaming response"},
+                {"type", "invalid_request_error"}}}});
+            observation.fail(response.http_status);
+            return response;
+        }
         RequestCacheCleanup request_cleanup(runner_);
         std::vector<int32_t> input_ids;
 
-        int prompt_tokens = setupInference(request, response, input_ids);
+        int prompt_tokens = setupInference(request, response, input_ids, observation);
         if (prompt_tokens < 0)
+        {
+            observation.fail(response.http_status);
             return response;
+        }
 
         int max_context = runner_.config().max_seq_len;
 
@@ -1037,9 +1256,12 @@ namespace llaminar2
         // Grow with actual output, not an untrusted max_tokens reservation:
         // requests can ask for more tokens than are available before EOS.
         int completion_tokens = 0;
+        // Native publication commits the complete returned batch even when
+        // the HTTP consumer disconnects partway through its text deltas.
+        int committed_tokens = 0;
         std::string finish_reason = "length";
         std::string thinking_end_tag;
-        if (request.enable_thinking && tokenizer_.hasChatTemplate())
+        if (thinkingEnabled(request) && tokenizer_.hasChatTemplate())
         {
             const auto &chat_template = tokenizer_.getChatTemplate();
             if (chat_template.isThinkingModel())
@@ -1054,7 +1276,7 @@ namespace llaminar2
         // Thinking budget state
         int thinking_tokens = 0;
         bool in_thinking = true; // Assume we start in thinking mode
-        bool thinking_budget_active = (request.thinking_budget_tokens >= 0 && request.enable_thinking);
+        bool thinking_budget_active = (request.thinking_budget_tokens >= 0 && thinkingEnabled(request));
         std::vector<int32_t> stop_thinking_tokens; // Injected token sequence
         int stop_thinking_idx = 0;                 // Current position in injection
         bool injecting_stop_thinking = false;      // True while forcing stop prompt tokens
@@ -1095,6 +1317,7 @@ namespace llaminar2
             response.http_status = 500;
             json err = {{"error", {{"message", "MoE rebalance failed"}, {"type", "server_error"}}}};
             response.json_body = dumpJsonForHttp(err);
+            observation.fail(response.http_status);
             return response;
         };
 
@@ -1126,6 +1349,7 @@ namespace llaminar2
                     response.http_status = 500;
                     json err = {{"error", {{"message", std::string("Forced decode failed: ") + result.error}, {"type", "server_error"}}}};
                     response.json_body = dumpJsonForHttp(err);
+                    observation.fail(response.http_status);
                     return response;
                 }
                 step_tokens = result.tokens;
@@ -1154,6 +1378,7 @@ namespace llaminar2
                     response.http_status = 500;
                     json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
                     response.json_body = dumpJsonForHttp(err);
+                    observation.fail(response.http_status);
                     return response;
                 }
 
@@ -1167,6 +1392,7 @@ namespace llaminar2
                 step_complete = result.is_complete;
             }
 
+            committed_tokens += static_cast<int>(step_tokens.size());
             for (size_t token_idx = 0;
                  token_idx < step_tokens.size() && completion_tokens < effective_max_tokens;
                  ++token_idx)
@@ -1175,16 +1401,27 @@ namespace llaminar2
                 if (request.token_output == CompletionTokenOutput::TextAndIds)
                     completion_token_ids.push_back(next_token);
                 const bool is_final_returned_token = token_idx + 1 == step_tokens.size();
-                if (tokenizer_.is_stop_token(next_token) ||
-                    (step_complete && is_final_returned_token))
+                const bool tokenizer_stop = tokenizer_.is_stop_token(next_token);
+                const bool terminal = tokenizer_stop || (step_complete && is_final_returned_token);
+                if (!terminal && !step_forced)
+                    observation.modelTokenObserved();
+                // The terminal ID is necessary to distinguish an actual model
+                // EOS from a runner boundary. It is observed before filtering,
+                // but decoded only when its opt-in trace consumes the preview.
+                std::string token_text = !terminal || traceGeneratedTokensEnabled()
+                    ? tokenizer_.decode_token(next_token) : std::string{};
+                traceGeneratedToken("nonstream", completion_tokens, next_token,
+                                    token_text, step_forced,
+                                    tokenizer_stop ? GeneratedTokenDisposition::StopToken
+                                        : terminal ? GeneratedTokenDisposition::RunnerComplete
+                                                   : GeneratedTokenDisposition::Text);
+                if (terminal)
                 {
                     completion_tokens++;
                     finish_reason = "stop";
                     stop_generation = true;
                     break;
                 }
-
-                std::string token_text = tokenizer_.decode_token(next_token);
 
                 // Check thinking budget
                 if (thinking_budget_active && in_thinking)
@@ -1213,11 +1450,6 @@ namespace llaminar2
                     }
                 }
 
-                traceGeneratedToken("nonstream",
-                                    completion_tokens,
-                                    next_token,
-                                    token_text,
-                                    step_forced);
                 completion_tokens++;
                 const auto part = splitter.process(token_text);
                 append_output(part);
@@ -1243,16 +1475,12 @@ namespace llaminar2
             }
         }
 
+        observation.decodeFinished();
         runner_.flushStageTimeline();
         // Read once after the terminal result, before RAII request cleanup.
         // Logging and the opt-in response see the same immutable outcome.
-        std::optional<RequestRuntimeSummary> runtime_summary;
-        if (request.runtime_output == CompletionRuntimeOutput::Include ||
-            Logger::getInstance().shouldLog(LogLevel::INFO))
-        {
-            runtime_summary = runner_.requestRuntimeSummary();
-            logRuntimeStateSummary(*runtime_summary, "non-streaming");
-        }
+        const auto runtime_summary = runner_.requestRuntimeSummary();
+        logRuntimeStateSummary(runtime_summary, "non-streaming");
 
         // HTTP and SSE share marker decisions, including token-split closes;
         // non-streaming only accumulates the same safe fields into one response.
@@ -1264,7 +1492,7 @@ namespace llaminar2
         if (toolCallParsingEnabled(request))
         {
             ToolCallFormat format = runner_.getToolCallFormat();
-            tool_result = parseToolCalls(content, format);
+            tool_result = parseToolCalls(content, format, admittedToolDefinitions(request));
             has_tool_calls = tool_result.hasToolCalls();
             if (has_tool_calls)
             {
@@ -1320,7 +1548,7 @@ namespace llaminar2
 
         if (request.runtime_output == CompletionRuntimeOutput::Include)
         {
-            json_response["runtime_summary"] = runtimeSummaryJson(*runtime_summary);
+            json_response["runtime_summary"] = runtimeSummaryJson(runtime_summary);
             json_response["runtime_summary"]["expert_optimization"] =
                 moeOptimizationStatusJson(runner_.moeOptimizationStatus());
             // This is an immutable, already-published ledger, not a request
@@ -1335,6 +1563,8 @@ namespace llaminar2
         response.ok = true;
         response.http_status = 200;
         response.json_body = dumpJsonForHttp(json_response);
+        observation.complete(prompt_tokens, committed_tokens, runtime_summary,
+                             HttpRuntimeStats::Delivery::Completed);
         return response;
     }
     catch (const std::exception &e)
@@ -1352,9 +1582,10 @@ namespace llaminar2
 
     ChatCompletionResponse ChatCompletionHandler::handleStreamingRequest(
         const ChatCompletionRequest &request,
-        const StreamChunkCallback &chunk_cb)
+        const StreamChunkCallback &chunk_cb, HttpRequestArrival arrival)
     try
     {
+        auto observation = runtime_stats_.beginRequest(arrival);
         ChatCompletionResponse response;
         if (request.runtime_output == CompletionRuntimeOutput::Include)
         {
@@ -1363,6 +1594,7 @@ namespace llaminar2
             response.json_body = dumpJsonForHttp({{"error", {
                 {"message", "return_runtime_summary is implemented for non-streaming responses only"},
                 {"type", "invalid_request_error"}}}});
+            observation.fail(response.http_status);
             return response;
         }
         if (request.token_output == CompletionTokenOutput::TextAndIds)
@@ -1373,14 +1605,18 @@ namespace llaminar2
             response.json_body = dumpJsonForHttp({{"error", {
                 {"message", "return_token_ids is implemented for non-streaming responses only"},
                 {"type", "invalid_request_error"}}}});
+            observation.fail(response.http_status);
             return response;
         }
         RequestCacheCleanup request_cleanup(runner_);
         std::vector<int32_t> input_ids;
 
-        int prompt_tokens = setupInference(request, response, input_ids);
+        int prompt_tokens = setupInference(request, response, input_ids, observation);
         if (prompt_tokens < 0)
+        {
+            observation.fail(response.http_status);
             return response;
+        }
 
         // Resolve effective max_tokens: if client did not specify a positive value,
         // default to the remaining context window (max_seq_len - prompt_tokens).
@@ -1394,37 +1630,46 @@ namespace llaminar2
         std::string model = request.model.empty() ? model_name_ : request.model;
         int64_t created = static_cast<int64_t>(std::time(nullptr));
 
-        // Helper to build and emit a single SSE chunk
-        auto emit_chunk = [&](const json &delta, const char *finish_reason) -> bool
+        // Every chunk shares one immutable request identity. Usage is a terminal
+        // observation of counts already owned by response publication; it never
+        // reads live device state or changes the captured generation policy.
+        auto emit_payload = [&](const json &choices, const json &usage) -> bool
         {
-            json choice = {{"index", 0}, {"delta", delta}};
-            if (finish_reason)
-                choice["finish_reason"] = std::string(finish_reason);
-            else
-                choice["finish_reason"] = nullptr;
-
             json chunk = {
                 {"id", request_id},
                 {"object", "chat.completion.chunk"},
                 {"created", created},
                 {"model", model},
                 {"system_fingerprint", "llaminar-v2"},
-                {"choices", json::array({choice})}};
+                {"choices", choices}};
+            if (request.streaming_usage == StreamingUsageOutput::Include)
+                chunk["usage"] = usage;
 
             std::string sse_line = "data: " + dumpJsonForHttp(chunk) + "\n\n";
             return chunk_cb(sse_line);
+        };
+        auto emit_chunk = [&](const json &delta, const char *finish_reason) -> bool
+        {
+            json choice = {{"index", 0}, {"delta", delta},
+                           {"finish_reason", finish_reason ? json(finish_reason) : json(nullptr)}};
+            const bool delivered = emit_payload(json::array({choice}), nullptr);
+            if (delivered && (delta.contains("content") || delta.contains("reasoning_content") ||
+                              delta.contains("tool_calls")))
+                observation.outputPublished();
+            return delivered;
         };
 
         // First chunk: role announcement
         if (!emit_chunk({{"role", "assistant"}}, nullptr))
         {
+            observation.fail(200, HttpRuntimeStats::Delivery::Disconnected);
             response.ok = true;
             response.http_status = 200;
             return response;
         }
 
         // Set up thinking splitter
-        bool use_think_split = request.enable_thinking && tokenizer_.hasChatTemplate();
+        bool use_think_split = thinkingEnabled(request) && tokenizer_.hasChatTemplate();
         StreamingThinkSplitter splitter;
         if (use_think_split)
         {
@@ -1441,6 +1686,9 @@ namespace llaminar2
 
         // Decode loop with per-token emission
         int completion_tokens = 0;
+        // Native publication commits the complete returned batch even when
+        // the HTTP consumer disconnects partway through its text deltas.
+        int committed_tokens = 0;
         std::string finish_reason = "length";
 
         // Tool-call framing is incremental. Reasoning bypasses this splitter;
@@ -1449,7 +1697,8 @@ namespace llaminar2
         const ToolCallFormat tool_format = has_tools
             ? runner_.getToolCallFormat()
             : ToolCallFormat::NONE;
-        StreamingToolCallSplitter tool_splitter(tool_format);
+        StreamingToolCallSplitter tool_splitter(tool_format, admittedToolDefinitions(request));
+        StreamingUtf8Text utf8_text;
         size_t streamed_tool_call_index = 0;
         bool emitted_tool_call = false;
         bool client_connected = true;
@@ -1517,7 +1766,7 @@ namespace llaminar2
 
         // Thinking budget state
         int thinking_tokens = 0;
-        bool thinking_budget_active = (request.thinking_budget_tokens >= 0 && request.enable_thinking);
+        bool thinking_budget_active = (request.thinking_budget_tokens >= 0 && thinkingEnabled(request));
         std::vector<int32_t> stop_thinking_tokens;
         int stop_thinking_idx = 0;
         bool injecting_stop_thinking = false;
@@ -1559,6 +1808,7 @@ namespace llaminar2
             response.http_status = 500;
             json err = {{"error", {{"message", "MoE rebalance failed"}, {"type", "server_error"}}}};
             response.json_body = dumpJsonForHttp(err);
+            observation.fail(response.http_status);
             return response;
         };
 
@@ -1594,6 +1844,7 @@ namespace llaminar2
                     response.http_status = 500;
                     json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
                     response.json_body = dumpJsonForHttp(err);
+                    observation.fail(response.http_status);
                     return response;
                 }
                 step_tokens = result.tokens;
@@ -1635,6 +1886,7 @@ namespace llaminar2
                     response.http_status = 500;
                     json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
                     response.json_body = dumpJsonForHttp(err);
+                    observation.fail(response.http_status);
                     return response;
                 }
 
@@ -1652,6 +1904,7 @@ namespace llaminar2
                     runner_, step_tokens.size()))
                 return emit_rebalance_error();
 
+            committed_tokens += static_cast<int>(step_tokens.size());
             for (size_t token_idx = 0;
                  token_idx < step_tokens.size() && completion_tokens < effective_max_tokens;
                  ++token_idx)
@@ -1661,20 +1914,29 @@ namespace llaminar2
 
                 completion_tokens++;
 
-                if (tokenizer_.is_stop_token(next_token) ||
-                    (step_complete && is_final_returned_token))
+                const bool tokenizer_stop = tokenizer_.is_stop_token(next_token);
+                const bool terminal = tokenizer_stop || (step_complete && is_final_returned_token);
+                if (!terminal && !step_forced)
+                    observation.modelTokenObserved();
+                // Trace the same complete committed token sequence as the
+                // nonstreaming endpoint, including the withheld terminal ID.
+                std::string token_text = !terminal || traceGeneratedTokensEnabled()
+                    ? tokenizer_.decode_token(next_token) : std::string{};
+                traceGeneratedToken("stream", completion_tokens - 1, next_token,
+                                    token_text, step_forced,
+                                    tokenizer_stop ? GeneratedTokenDisposition::StopToken
+                                        : terminal ? GeneratedTokenDisposition::RunnerComplete
+                                                   : GeneratedTokenDisposition::Text);
+                if (terminal)
                 {
                     finish_reason = "stop";
                     stop_generation = true;
                     break;
                 }
 
-                std::string token_text = tokenizer_.decode_token(next_token);
-                traceGeneratedToken("stream",
-                                    completion_tokens - 1,
-                                    next_token,
-                                    token_text,
-                                    step_forced);
+                // Join byte-level tokenizer fragments before either reasoning
+                // or tool framing can publish a JSON string containing them.
+                token_text = utf8_text.process(token_text);
 
                 if (use_think_split)
                 {
@@ -1740,6 +2002,14 @@ namespace llaminar2
             }
         }
 
+        if (const std::string terminal_bytes = utf8_text.finish();
+            !terminal_bytes.empty() && client_connected)
+        {
+            emit_split_output(use_think_split
+                ? splitter.process(terminal_bytes)
+                : StreamingThinkSplitter::SplitResult{"content", terminal_bytes});
+        }
+
         // Flush any remaining buffered thinking content
         if (use_think_split)
         {
@@ -1751,12 +2021,15 @@ namespace llaminar2
         if (has_tools && client_connected)
             emit_tool_events(tool_splitter.flush());
 
+        observation.decodeFinished();
         runner_.flushStageTimeline();
-        if (Logger::getInstance().shouldLog(LogLevel::INFO))
-            logRuntimeStateSummary(runner_.requestRuntimeSummary(), "streaming");
+        const auto runtime_summary = runner_.requestRuntimeSummary();
+        logRuntimeStateSummary(runtime_summary, "streaming");
 
         if (!client_connected)
         {
+            observation.complete(prompt_tokens, committed_tokens, runtime_summary,
+                                 HttpRuntimeStats::Delivery::Disconnected);
             response.ok = true;
             response.http_status = 200;
             return response;
@@ -1764,12 +2037,19 @@ namespace llaminar2
         if (emitted_tool_call)
             finish_reason = "tool_calls";
 
-        // Final chunk with finish_reason
-        emit_chunk(json::object(), finish_reason.c_str());
+        // A successful stream closes its choice, optionally publishes exact
+        // terminal usage, then emits DONE once. A disconnected consumer owns no
+        // further output, including when it rejects the finish or usage chunk.
+        if (emit_chunk(json::object(), finish_reason.c_str()) &&
+            (request.streaming_usage == StreamingUsageOutput::Omit ||
+             emit_payload(json::array(), {{"prompt_tokens", prompt_tokens},
+                 {"completion_tokens", completion_tokens},
+                 {"total_tokens", prompt_tokens + completion_tokens}})))
+            client_connected = chunk_cb("data: [DONE]\n\n");
 
-        // [DONE] sentinel
-        chunk_cb("data: [DONE]\n\n");
-
+        observation.complete(prompt_tokens, committed_tokens, runtime_summary,
+                             client_connected ? HttpRuntimeStats::Delivery::Completed
+                                              : HttpRuntimeStats::Delivery::Disconnected);
         response.ok = true;
         response.http_status = 200;
         return response;
@@ -1786,6 +2066,37 @@ namespace llaminar2
     // =========================================================================
     // Convenience: parse + execute (routes to streaming if stream=true)
     // =========================================================================
+
+    ChatCompletionResponse ChatCompletionHandler::publishStreamingRequest(
+        const ChatCompletionRequest &request,
+        const StreamChunkCallback &chunk_cb, HttpRequestArrival arrival)
+    {
+        enum class Publication { Awaiting, Open, Closed, Disconnected };
+        Publication publication = Publication::Awaiting;
+        const auto publish = [&](const std::string &payload)
+        {
+            if (publication == Publication::Closed || publication == Publication::Disconnected)
+                return false;
+            if (!chunk_cb(payload))
+            {
+                publication = Publication::Disconnected;
+                return false;
+            }
+            publication = payload == "data: [DONE]\n\n"
+                ? Publication::Closed : Publication::Open;
+            return true;
+        };
+        auto response = handleStreamingRequest(request, publish, arrival);
+        if (!response.ok && !response.json_body.empty() &&
+            publication != Publication::Closed && publication != Publication::Disconnected)
+        {
+            // Covers admission errors and exceptions after the role chunk.
+            // Already-terminated decode failures own their original framing.
+            if (publish("data: " + response.json_body + "\n\n"))
+                publish("data: [DONE]\n\n");
+        }
+        return response;
+    }
 
     ChatCompletionResponse ChatCompletionHandler::handleRawRequest(
         const std::string &json_body,

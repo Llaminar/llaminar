@@ -34,11 +34,40 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
         request.execution.world_size != world_size ||
         request.execution.currentRankPlan().world_rank != plan.rank ||
         request.capacity_policy.overlay_world_size != world_size ||
-        !family.valid() || family.routedLayerCapacity() > request.model.n_layers ||
+        !family.valid() || family.first_model_layer != overlay->first_model_layer ||
+        family.first_model_layer >= request.model.n_layers ||
+        family.routedLayerCapacity() > request.model.n_layers - family.first_model_layer ||
         request.model.expert_count <= 0 || plan.runtime.batch_size <= 0 ||
         request.model_graph_topology_variant_count == 0 ||
         (request.model_graph_topology_variant_count > 1 && !request.snapshot_capacity.valid()))
         throw std::invalid_argument("ExpertOverlay memory inputs require complete, matching rank/model/capture ownership");
+
+    if (request.pipeline_stage)
+    {
+        const auto &scope = *request.pipeline_stage;
+        const int main_layers = request.model.n_layers - request.model.mtp_layer_count;
+        if (!scope.isValid() || request.model.mtp_layer_count < 0 || main_layers <= 0 ||
+            scope.last_layer > main_layers ||
+            scope.has_embedding != (scope.first_layer == 0) ||
+            scope.has_lm_head != (scope.last_layer == main_layers) ||
+            plan.usesLocalPP() || plan.usesGlobalTP() || plan.usesPipelineParallel() ||
+            plan.first_layer != scope.first_layer || plan.last_layer != scope.last_layer - 1 ||
+            plan.has_embedding != scope.has_embedding || plan.has_lm_head != scope.has_lm_head ||
+            family.first_model_layer != scope.first_layer || family.main_layer_count != scope.layerCount() ||
+            (!scope.has_lm_head && !family.mtp_source_layers.empty()))
+            throw std::invalid_argument("ExpertOverlay pipeline memory scope differs from its child rank or retained graph family");
+    }
+    else if (family.first_model_layer != 0 ||
+             family.main_layer_count != request.model.n_layers - request.model.mtp_layer_count)
+        throw std::invalid_argument("ExpertOverlay partial memory projection requires its authored pipeline scope");
+
+    if (request.capacity_policy.usesDeviceTransferDirectory() &&
+        (!request.capacity_policy.device_rebalance_workspace_capacity ||
+         request.capacity_policy.device_rebalance_workspace_capacity->num_layers !=
+             static_cast<std::uint32_t>(family.routedLayerCapacity()) ||
+         request.capacity_policy.device_rebalance_workspace_capacity->num_experts !=
+             static_cast<std::uint32_t>(request.model.expert_count)))
+        throw std::invalid_argument("ExpertOverlay device capacity policy differs from its retained routed graph interval");
 
     const int decode_rows = retainsMTPGraphCapacity(mtp)
         ? std::max(1, resolveMTPRetainedTargetQueryRows(mtp)) : 1;
@@ -66,7 +95,7 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
         resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp);
     const MTPGraphOwnerPlan graph_owners(mtp);
     const auto captured = resolveMoEOverlayCapturedGraphPlan(
-        request.model.n_layers, overlay->authority_execution, graph_identities,
+        family.main_layer_count, overlay->authority_execution, graph_identities,
         request.model_graph_topology_variant_count,
         family_count + graph_owners.generalAuxiliaryExecutableSlotCount(),
         graph_owners.boundedHelperExecutableSlotCount());
@@ -108,7 +137,8 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
             .host_demand_memory = std::move(host_demand),
             .captured_graph_plan = captured,
             .graph_snapshot_memory = request.snapshot_capacity,
-            .gpu_weight_load = request.gpu_weight_load},
+            .gpu_weight_load = request.gpu_weight_load,
+            .graph_family = family},
         .prefill_segment_rows = segment_rows,
         .model_graph_identity_count = graph_identities};
 }

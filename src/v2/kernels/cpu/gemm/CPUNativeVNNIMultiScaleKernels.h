@@ -2,8 +2,9 @@
  * @file CPUNativeVNNIMultiScaleKernels.h
  * @brief Lossless compact multi-scale CPU projections with shared serial/grouped arithmetic.
  *
- * Prepared blocks retain the GPU-native payload, two FP16 scales and optional
- * Q2_K minima. SIMD lanes represent output columns, so each activation word is
+ * Prepared blocks retain the GPU-native payload, two scale metadata words and optional
+ * Q2_K minima. IQ2_S retains its original half base plus raw coefficient byte,
+ * reconstructing both factors in SIMD without scalar staging. SIMD lanes represent output columns, so each activation word is
  * broadcast once and reused across columns and verifier rows. Integer lookup
  * and dot work never changes source quantization. Each row visits increasing
  * K blocks and publishes the same separately rounded contribution as CUDA/HIP.
@@ -118,6 +119,14 @@ namespace llaminar2::cpu::native_vnni::multi_scale
         {
             return std::bit_cast<F>(_mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(source))));
         }
+        /**
+         * @brief Widen opaque metadata without FP16 interpretation.
+         * @param source Eight readable unsigned metadata words.
+         * @return One zero-extended word per SIMD column.
+         */
+        static I words(const uint16_t *source)
+        { return std::bit_cast<I>(_mm256_cvtepu16_epi32(_mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(source)))); }
         /** @return FP32 values from the low FP16 half of each packed word. */
         static F halfWords(I words)
         {
@@ -202,6 +211,14 @@ namespace llaminar2::cpu::native_vnni::multi_scale
         {
             return std::bit_cast<F>(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(source))));
         }
+        /**
+         * @brief Widen opaque metadata without FP16 interpretation.
+         * @param source Sixteen readable unsigned metadata words.
+         * @return One zero-extended word per SIMD column.
+         */
+        static I words(const uint16_t *source)
+        { return std::bit_cast<I>(_mm512_cvtepu16_epi32(_mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(source)))); }
         /** @return FP32 values from the low FP16 half of each packed word. */
         static F halfWords(I words)
         {
@@ -247,8 +264,8 @@ namespace llaminar2::cpu::native_vnni::multi_scale
             dots[k / 16] += static_cast<int>(values[k]) * a.qs[k];
             sums[k / 8] += a.qs[k];
         }
-        const float scale0 = fp16_to_fp32(packed.chunkScales(chunk, kb)[column]);
-        const float scale1 = fp16_to_fp32(packed.chunkMins(chunk, kb)[column]);
+        const float scale0 = packed.blockScale(chunk, kb, column);
+        const float scale1 = packed.blockMin(chunk, kb, column);
         const float activation_scale = nativeVNNIFP16ScaleToFP32(a.d);
         float contribution = activation_scale * (scale0 * dots[0] + scale1 * dots[1]);
         if (packed.codebook_id == 10)
@@ -442,8 +459,22 @@ namespace llaminar2::cpu::native_vnni::multi_scale
                     I low[Rows]{}, high[Rows]{};
                     dotHalf<Codebook, 0, Lanes>(unit, column, activation, kb, low);
                     dotHalf<Codebook, 1, Lanes>(unit, column, activation, kb, high);
-                    const F scale0 = Ops::half(packed.chunkScales(chunk, kb) + column);
-                    const F scale1 = Ops::half(packed.chunkMins(chunk, kb) + column);
+                    F scale0 = Ops::half(packed.chunkScales(chunk, kb) + column);
+                    F scale1;
+                    if constexpr (Codebook == 13)
+                    {
+                        // The secondary is a source byte, not a second half.
+                        // Function contraction/reassociation is disabled above;
+                        // each source multiply remains a separate FP32 edge.
+                        const I metadata = Ops::words(packed.chunkMins(chunk, kb) + column);
+                        const F low_coefficient = __builtin_convertvector(metadata & 15, F);
+                        const F high_coefficient = __builtin_convertvector((metadata >> 4) & 15, F);
+                        const F base = scale0;
+                        scale0 = (base * (low_coefficient + 0.5f)) * 0.25f;
+                        scale1 = (base * (high_coefficient + 0.5f)) * 0.25f;
+                    }
+                    else
+                        scale1 = Ops::half(packed.chunkMins(chunk, kb) + column);
                     // Rows is at most four. Expanding this tiny loop keeps every
                     // accumulator/dot in a distinct register: a runtime-indexed
                     // array otherwise spills the entire tile on every K block.

@@ -136,8 +136,22 @@ namespace llaminar2
                 has_emins = format->has_emins;
                 return true;
             }
+            case CPUEncoding::IQ3SExpandedSourceScale:
+                if (cpu.codebook_id != 11 || !cpu.is_superblock || cpu.is_asymmetric || cpu.payload_bytes != 13)
+                    return reject(error, "IQ3_S source-tuple CPU stream metadata is invalid");
+                codebook = 11; payload_bytes = 13; is_asymmetric = true;
+                return true;
+            case CPUEncoding::NibbleLUTSourceScale:
+                if (cpu.codebook_id != 4 || !cpu.is_superblock ||
+                    cpu.is_asymmetric || cpu.payload_bytes != 16)
+                    return reject(error, "IQ4_XS source-tuple CPU stream metadata is invalid");
+                codebook = kNativeVnniIQ4XSSourceScaleCodebook;
+                payload_bytes = 16;
+                is_asymmetric = true; // Physical secondary plane, not additive minima.
+                return true;
             case CPUEncoding::NibbleLUT:
-                if (!isNibbleCodebook(cpu.codebook_id) ||
+                if ((cpu.codebook_id == 4 && cpu.is_superblock) ||
+                    !isNibbleCodebook(cpu.codebook_id) ||
                     cpu.payload_bytes != 16)
                 {
                     return reject(
@@ -336,7 +350,18 @@ namespace llaminar2
             cpu.is_superblock = gpu.is_superblock;
             cpu.is_asymmetric = gpu.is_asymmetric;
 
-            if (isNibbleCodebook(gpu.codebook_id))
+            if (gpu.codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
+            {
+                cpu.encoding = CPUEncoding::NibbleLUTSourceScale;
+                cpu.payload_bytes = 16;
+                cpu.is_asymmetric = false;
+            }
+            else if (gpu.codebook_id == 11)
+            {
+                cpu.encoding = CPUEncoding::IQ3SExpandedSourceScale;
+                cpu.payload_bytes = 13; cpu.is_asymmetric = false;
+            }
+            else if (isNibbleCodebook(gpu.codebook_id))
             {
                 cpu.encoding = CPUEncoding::NibbleLUT;
                 cpu.payload_bytes = 16;
@@ -744,10 +769,9 @@ namespace llaminar2
             return reject(error, "Host GPU source format identity is not cataloged");
 
         const bool exact_source_representation =
-            codebook_id == canonicalDeviceVnniCodebookId(
-                               source_format->codebook_id) &&
+            codebook_id == canonicalDeviceVnniCodebookId(*source_format) &&
             payload_bytes_per_block == source_format->payload_bytes &&
-            is_asymmetric == source_format->is_asymmetric &&
+            is_asymmetric == canonicalDeviceVnniFormat(*source_format).is_asymmetric &&
             has_emins == source_format->has_emins;
         if (exact_source_representation)
             return true;
@@ -803,8 +827,7 @@ namespace llaminar2
         }
 
         const CPUEncoding cpu_encoding =
-            cpu::native_vnni::preparedEncodingForCodebook(
-                source_format.codebook_id);
+            cpu::native_vnni::preparedEncodingForSource(source_format);
         ExpertTierWeightStreamManifest manifest;
         manifest.source_packing =
             ExpertTierWeightPacking::GpuSeparatedNativeVnni;
@@ -824,7 +847,7 @@ namespace llaminar2
         manifest.gpu_source_is_superblock =
             source_format.is_superblock ? 1u : 0u;
         manifest.gpu_codebook_id =
-            canonicalDeviceVnniCodebookId(source_format.codebook_id);
+            canonicalDeviceVnniCodebookId(source_format);
         manifest.gpu_payload_bytes_per_block =
             static_cast<uint8_t>(source_format.payload_bytes);
         manifest.cpu_is_asymmetric =
@@ -832,7 +855,7 @@ namespace llaminar2
         manifest.cpu_is_superblock =
             source_format.is_superblock ? 1u : 0u;
         manifest.gpu_is_asymmetric =
-            source_format.is_asymmetric ? 1u : 0u;
+            canonicalDeviceVnniFormat(source_format).is_asymmetric ? 1u : 0u;
         manifest.gpu_has_emins = source_format.has_emins ? 1u : 0u;
         manifest.cpu_encoding = cpu_encoding;
         manifest.cpu_data_stride =
@@ -869,10 +892,10 @@ namespace llaminar2
 
         const bool canonical_source =
             gpu_source.codebook_id ==
-                canonicalDeviceVnniCodebookId(source_format.codebook_id) &&
+                canonicalDeviceVnniCodebookId(source_format) &&
             gpu_source.payload_bytes_per_block ==
                 source_format.payload_bytes &&
-            gpu_source.is_asymmetric == source_format.is_asymmetric &&
+            gpu_source.is_asymmetric == canonicalDeviceVnniFormat(source_format).is_asymmetric &&
             gpu_source.has_emins == source_format.has_emins;
         const bool normalized_source =
             manifest.cpu_encoding == CPUEncoding::ExpandedInt8 &&
@@ -1056,7 +1079,7 @@ namespace llaminar2
                     continue;
                 }
 
-                if (cpu.encoding == CPUEncoding::NibbleLUT)
+                if (cpu.usesNibbleLUT())
                 {
                     // Compact nibbles are only transposed; quantized bits do not change.
                     for (int value = 0; value < 16; ++value)
@@ -1072,7 +1095,7 @@ namespace llaminar2
                             unit + cpu.data_stride + 128u +
                             static_cast<size_t>(n % 64) * sizeof(uint16_t),
                         sizeof(uint16_t));
-                    if (cpu.is_asymmetric)
+                    if (cpu.is_asymmetric || cpu.usesNibbleLUTSourceScale())
                     {
                         std::memcpy(
                             &output.mins[linear],
@@ -1081,6 +1104,32 @@ namespace llaminar2
                                 static_cast<size_t>(n % 64) * sizeof(uint16_t),
                             sizeof(uint16_t));
                     }
+                    continue;
+                }
+
+                if (cpu.usesIQ3SExpandedSourceScale())
+                {
+                    // Invert only the exact existing grid; never normalize to19.
+                    uint8_t high = 0;
+                    uint8_t signs[4]{};
+                    for (int group = 0; group < 8; ++group)
+                    {
+                        int8_t values[4];
+                        for (int lane = 0; lane < 4; ++lane)
+                            values[lane] = static_cast<int8_t>(cpu.native_interleaved[
+                                interleavedValueOffset(cpu,n,kb,4*group+lane)]);
+                        const auto encoded = native_vnni_iq3s_scale::encodeGridQuartet(values, iq3s_grid);
+                        if (!encoded.valid()) return reject(error, "IQ3_S CPU payload is outside original grid");
+                        destination[group] = static_cast<uint8_t>(encoded.index);
+                        high |= static_cast<uint8_t>((encoded.index >> 8) << group);
+                        signs[group/2] |= static_cast<uint8_t>(encoded.signs << (4*(group%2)));
+                    }
+                    destination[8] = high;
+                    std::memcpy(destination+9, signs, sizeof(signs));
+                    output.scales[linear] = cpu.chunkScales(n/64,kb)[n%64];
+                    output.mins[linear] = cpu.chunkMins(n/64,kb)[n%64];
+                    if (!native_vnni_iq3s_scale::valid(output.mins[linear]))
+                        return reject(error, "IQ3_S source nibble is invalid");
                     continue;
                 }
 
@@ -1145,7 +1194,7 @@ namespace llaminar2
                     }
                     destination[16 + group] = packed_high;
                 }
-                // Q6's `mins` region carries the high-half scale, not a minimum.
+                // Q6's `mins` region carries two opaque signed coefficients.
                 std::memcpy(
                     &output.scales[linear],
                     cpu.native_interleaved.data() + unit + 1536u +
@@ -1185,6 +1234,7 @@ namespace llaminar2
         if (!gpu.valid(error))
             return false;
         if (!cpu::native_vnni::is_payload_decodable(gpu.codebook_id) &&
+            gpu.codebook_id != kNativeVnniIQ4XSSourceScaleCodebook &&
             !hasCompactMultiScaleVnniPayload(gpu.codebook_id) && gpu.codebook_id != 8 &&
             gpu.codebook_id != 19 &&
             gpu.codebook_id != kNativeVnniExpandedInt8MinCodebook)
@@ -1231,7 +1281,7 @@ namespace llaminar2
                     continue;
                 }
 
-                if (output.encoding == CPUEncoding::NibbleLUT)
+                if (output.usesNibbleLUT())
                 {
                     // Scatter compact bytes into the four-value VNNI lane groups.
                     for (int value = 0; value < 16; ++value)
@@ -1260,7 +1310,7 @@ namespace llaminar2
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
                         &gpu.scales[linear],
                         sizeof(uint16_t));
-                    if (output.is_asymmetric)
+                    if (output.is_asymmetric || output.usesNibbleLUTSourceScale())
                     {
                         std::memcpy(
                             output.native_interleaved.data() +
@@ -1272,7 +1322,7 @@ namespace llaminar2
                     continue;
                 }
 
-                if (output.encoding == CPUEncoding::ExpandedInt8)
+                if (output.usesExpandedInt8())
                 {
                     // Native single-scale grids expand exactly to signed
                     // bytes. Their scale/minimum remain untouched, just like
@@ -1303,7 +1353,7 @@ namespace llaminar2
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
                         &gpu.scales[linear],
                         sizeof(uint16_t));
-                    if (output.is_asymmetric)
+                    if (output.is_asymmetric || output.usesIQ3SExpandedSourceScale())
                     {
                         std::memcpy(
                             output.native_interleaved.data() +
@@ -1349,7 +1399,7 @@ namespace llaminar2
                     storeU64(planes, low);
                     storeU64(planes + sizeof(uint64_t), high);
                 }
-                // Preserve the low- and high-half Q6 scales bit-for-bit.
+                // Preserve the original Q6 half base and signed coefficient pair.
                 std::memcpy(
                     output.native_interleaved.data() + unit + 1536u +
                         static_cast<size_t>(local_column) * sizeof(uint16_t),

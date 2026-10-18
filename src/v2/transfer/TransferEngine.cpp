@@ -3857,6 +3857,13 @@ namespace llaminar2
         const MemoryResidency residency = tensor->memoryResidency();
         TransferMethod method = planTransfer(src, target_device, residency);
 
+        // A host-resident tensor deliberately keeps host authority even when
+        // its consumer names a GPU. Do not enter the secondary-device promotion
+        // path: allocating a GPU buffer would violate this no-transfer policy
+        // and publish uninitialized storage as the current activation.
+        if (residency == MemoryResidency::HOST_RESIDENT)
+            return TransferResult::ok(method);
+
         if (method == TransferMethod::NOOP || method == TransferMethod::MAPPED_NOOP)
         {
             /*

@@ -325,6 +325,7 @@ namespace llaminar2
         out.has_terminal_hidden = ram_archive.has_terminal_hidden;
         out.has_terminal_logits = ram_archive.has_terminal_logits;
         out.has_model_runtime_state = ram_archive.has_model_runtime_state;
+        out.payload_identity = ram_archive.payload_identity;
         out.model_runtime_state_storage = ram_archive.model_runtime_state_storage;
         out.ram_runtime_state_memory_lease =
             ram_archive.ram_runtime_state_memory_lease;

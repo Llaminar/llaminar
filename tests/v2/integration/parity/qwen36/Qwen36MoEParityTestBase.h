@@ -35,6 +35,7 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "models/IGraphConfigBuilder.h"
+#include "models/ModelGenerationPolicy.h"
 #include "utils/DebugEnv.h"
 #include "utils/MTPParitySnapshotContext.h"
 #include "utils/MoERoutingBoundary.h"
@@ -1914,6 +1915,8 @@ namespace llaminar2::test::parity::qwen36
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
+        config.mtp_activation_policy = enable_mtp
+            ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled;
         config.mtp.draft_tokens = std::max(1, mtp_draft_tokens);
         config.mtp.depth_policy = mtp_depth_policy;
         config.moe_routed_expert_plan = test_case.moe_routed_expert_plan;
@@ -2154,30 +2157,10 @@ namespace llaminar2::test::parity::qwen36
             std::vector<int> encoded;
             if (!test_case.chat_messages.empty())
             {
-                /*
-                 * RuntimeInitPhase gives a model-owned template override
-                 * precedence over the GGUF-embedded template when the user did
-                 * not request an explicit override. Reproduce that exact
-                 * production rule here before encodeChat(), otherwise this
-                 * integration fixture and the HTTP server can tokenize the same
-                 * messages differently.
-                 */
-                auto config_builder = createGraphConfigBuilder(
-                    tokenizer_context->architecture());
-                if (config_builder)
-                {
-                    const auto model_template =
-                        config_builder->chatTemplateOverride();
-                    if (model_template.has_value() &&
-                        !model_template->empty())
-                    {
-                        tokenizer->setChatTemplate(
-                            ChatTemplate::create(
-                                *model_template,
-                                "",
-                                ""));
-                    }
-                }
+                // The loaded revision owns prompt policy in the production
+                // runner as well as this independent prompt materialization.
+                ModelGenerationPolicy::fromMetadata(*tokenizer_context->loader())
+                    .applyChatTemplate(*tokenizer);
                 encoded = tokenizer->encodeChat(
                     test_case.chat_messages,
                     /*add_generation_prompt=*/true,

@@ -7,7 +7,8 @@
  * demand together with a complete service profile. That path solves a fixed-
  * quota bipartite min-cost flow using integer arithmetic, so every distributed
  * participant derives the same placement without floating-point or declaration-
- * order ambiguity.
+ * order ambiguity. Compact arrays are indexed relative to the authenticated
+ * stage origin; weights, histograms and published placements retain global IDs.
  */
 
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
@@ -41,8 +42,9 @@ namespace llaminar2
 
         void validateMetadata(const MoERoutedExpertModelMetadata &metadata)
         {
-            if (metadata.num_layers <= 0)
-                throw std::invalid_argument("MoE expert planner metadata num_layers must be > 0");
+            if (metadata.num_layers <= 0 || metadata.first_model_layer < 0 ||
+                metadata.num_layers > std::numeric_limits<int>::max() - metadata.first_model_layer)
+                throw std::invalid_argument("MoE expert planner metadata requires a nonempty, nonoverflowing stage interval");
             if (metadata.num_experts <= 0)
                 throw std::invalid_argument("MoE expert planner metadata num_experts must be > 0");
             if (metadata.d_model <= 0)
@@ -150,6 +152,13 @@ namespace llaminar2
                               : (live ? live->config().num_layers : 0);
             }
 
+            /** @return Model identity of the first retained evidence row. */
+            int firstModelLayer() const noexcept
+            {
+                return frozen ? frozen->firstModelLayer()
+                              : (live ? live->firstModelLayer() : 0);
+            }
+
             int numExperts() const noexcept
             {
                 return frozen ? frozen->numExperts()
@@ -197,6 +206,7 @@ namespace llaminar2
             const MoERoutedTierServiceProfile *profile = nullptr;
             int tier_count = 0;
             int layer_count = 0;
+            int first_model_layer = 0;
             std::vector<const MoERoutedTierLayerPhaseServiceCost *> rows;
 
             explicit operator bool() const noexcept
@@ -232,7 +242,7 @@ namespace llaminar2
                 const auto offset =
                     static_cast<std::size_t>(tier) *
                         static_cast<std::size_t>(layer_count) +
-                    static_cast<std::size_t>(layer);
+                    static_cast<std::size_t>(layer - first_model_layer);
                 const auto phase = servicePhaseIndex(source);
                 const auto cost =
                     rows.at(offset)->nanoseconds_per_activation[phase];
@@ -268,6 +278,7 @@ namespace llaminar2
                     "MoE tier phase service profile requires a non-empty setup identity");
             }
             if (!profile->production_topology.valid() ||
+                profile->production_topology.firstModelLayer() != metadata.first_model_layer ||
                 profile->production_topology.layerCount() !=
                     static_cast<std::size_t>(metadata.num_layers))
             {
@@ -279,6 +290,7 @@ namespace llaminar2
             view.profile = profile;
             view.tier_count = static_cast<int>(plan.routed_tiers.size());
             view.layer_count = metadata.num_layers;
+            view.first_model_layer = metadata.first_model_layer;
             const auto expected_rows =
                 static_cast<std::size_t>(view.tier_count) *
                 static_cast<std::size_t>(view.layer_count);
@@ -291,7 +303,7 @@ namespace llaminar2
             for (const auto &row : profile->costs)
             {
                 if (row.tier_index < 0 || row.tier_index >= view.tier_count ||
-                    row.layer < 0 || row.layer >= view.layer_count)
+                    !metadata.containsModelLayer(row.layer))
                 {
                     throw std::invalid_argument(
                         "MoE tier phase service profile row lies outside plan geometry");
@@ -318,7 +330,7 @@ namespace llaminar2
                 const auto offset =
                     static_cast<std::size_t>(row.tier_index) *
                         static_cast<std::size_t>(view.layer_count) +
-                    static_cast<std::size_t>(row.layer);
+                    metadata.storageIndexForModelLayer(row.layer);
                 if (view.rows[offset] != nullptr)
                 {
                     throw std::invalid_argument(
@@ -401,6 +413,15 @@ namespace llaminar2
             return expert_order;
         }
 
+        /**
+         * @brief Read one admitted compact quota or resolve a uniform tier bound.
+         * @param tier Declarative tier and any model-aware resolved quotas.
+         * @param layer Local storage row, translated from the global layer by metadata.
+         * @param num_experts Number of logical experts in every owned layer.
+         * @param routed_expert_bytes_per_expert Prepared expert footprint input.
+         * @return Logical expert capacity; physical admission remains PMA-owned.
+         * @throws std::invalid_argument if a resolved quota row is absent.
+         */
         size_t tierCapacityPerLayer(
             const RoutedExpertTier &tier,
             int layer,
@@ -453,7 +474,7 @@ namespace llaminar2
                 const auto &tier = plan.routed_tiers[tier_idx];
                 const size_t capacity = tierCapacityPerLayer(
                     tier,
-                    layer,
+                    static_cast<int>(metadata.storageIndexForModelLayer(layer)),
                     metadata.num_experts,
                     routed_expert_bytes_per_expert);
                 size_t assigned = 0;
@@ -621,8 +642,7 @@ namespace llaminar2
 
             for (const auto &placement : options.previous_placements)
             {
-                if (placement.layer < 0 ||
-                    placement.layer >= metadata.num_layers ||
+                if (!metadata.containsModelLayer(placement.layer) ||
                     placement.routed_expert_tier.size() !=
                         static_cast<std::size_t>(metadata.num_experts))
                 {
@@ -630,7 +650,7 @@ namespace llaminar2
                         "MoE previous placements do not match model geometry");
                 }
                 auto &slot = result.at(
-                    static_cast<std::size_t>(placement.layer));
+                    metadata.storageIndexForModelLayer(placement.layer));
                 if (slot != nullptr)
                 {
                     throw std::invalid_argument(
@@ -957,7 +977,8 @@ namespace llaminar2
         {
             std::vector<RoutedExpertLayerPlacement> placements;
             placements.reserve(static_cast<size_t>(metadata.num_layers));
-            for (int layer = 0; layer < metadata.num_layers; ++layer)
+            for (int layer = metadata.first_model_layer;
+                 layer < metadata.first_model_layer + metadata.num_layers; ++layer)
             {
                 RoutedExpertLayerPlacement placement;
                 placement.layer = layer;
@@ -967,12 +988,12 @@ namespace llaminar2
 
             for (const auto &mask : explicit_masks)
             {
-                if (mask.layer < 0 || mask.layer >= metadata.num_layers)
+                if (!metadata.containsModelLayer(mask.layer))
                     throw std::invalid_argument("Explicit MoE expert tier mask references layer outside model metadata range: " + std::to_string(mask.layer));
                 if (mask.tier_index < 0 || mask.tier_index >= static_cast<int>(plan.routed_tiers.size()))
                     throw std::invalid_argument("Explicit MoE expert tier mask references unknown tier index: " + std::to_string(mask.tier_index));
 
-                auto &placement = placements[static_cast<size_t>(mask.layer)];
+                auto &placement = placements[metadata.storageIndexForModelLayer(mask.layer)];
                 for (const int expert_id : mask.expert_ids)
                 {
                     if (expert_id < 0 || expert_id >= metadata.num_experts)
@@ -1011,7 +1032,8 @@ namespace llaminar2
         {
             std::vector<RoutedExpertLayerPlacement> placements;
             placements.reserve(static_cast<size_t>(metadata.num_layers));
-            for (int layer = 0; layer < metadata.num_layers; ++layer)
+            for (int layer = metadata.first_model_layer;
+                 layer < metadata.first_model_layer + metadata.num_layers; ++layer)
             {
                 const auto expert_order = initialExpertOrder(
                     plan, layer, metadata.num_experts);
@@ -1035,10 +1057,11 @@ namespace llaminar2
             if (!histogram)
                 return staticByIdPlacements(plan, metadata, routed_expert_bytes_per_expert);
 
-            if (histogram.numLayers() < metadata.num_layers ||
+            if (histogram.firstModelLayer() != metadata.first_model_layer ||
+                histogram.numLayers() != metadata.num_layers ||
                 histogram.numExperts() < metadata.num_experts)
             {
-                throw std::invalid_argument("DecodeExpertHistogram shape is smaller than MoE expert planner model metadata");
+                throw std::invalid_argument("DecodeExpertHistogram interval or expert shape does not match MoE planner metadata");
             }
 
             const auto service_profile = phaseServiceProfileView(
@@ -1052,7 +1075,8 @@ namespace llaminar2
 
             std::vector<RoutedExpertLayerPlacement> placements;
             placements.reserve(static_cast<size_t>(metadata.num_layers));
-            for (int layer = 0; layer < metadata.num_layers; ++layer)
+            for (int layer = metadata.first_model_layer;
+                 layer < metadata.first_model_layer + metadata.num_layers; ++layer)
             {
                 const bool has_counts = histogramLayerHasCounts(
                     histogram, layer, metadata.num_experts);
@@ -1064,15 +1088,15 @@ namespace llaminar2
                         layer,
                         histogram,
                         service_profile,
-                        previous[static_cast<std::size_t>(layer)],
+                        previous[metadata.storageIndexForModelLayer(layer)],
                         routed_expert_bytes_per_expert));
                     continue;
                 }
                 if (!has_counts &&
-                    previous[static_cast<std::size_t>(layer)] != nullptr)
+                    previous[metadata.storageIndexForModelLayer(layer)] != nullptr)
                 {
                     placements.push_back(
-                        *previous[static_cast<std::size_t>(layer)]);
+                        *previous[metadata.storageIndexForModelLayer(layer)]);
                     continue;
                 }
                 const auto expert_order = has_counts
@@ -1239,10 +1263,11 @@ namespace llaminar2
             const auto histogram = histogramEvidence(options);
 
             if (histogram &&
-                (histogram.numLayers() < metadata.num_layers ||
+                (histogram.firstModelLayer() != metadata.first_model_layer ||
+                 histogram.numLayers() != metadata.num_layers ||
                  histogram.numExperts() < metadata.num_experts))
             {
-                throw std::invalid_argument("DecodeExpertHistogram shape is smaller than MoE expert planner model metadata");
+                throw std::invalid_argument("DecodeExpertHistogram interval or expert shape does not match MoE planner metadata");
             }
 
             const auto service_profile = phaseServiceProfileView(
@@ -1269,7 +1294,8 @@ namespace llaminar2
             float sum_cpu_fallback = 0.0f;
             float sum_gpu_coverage = 0.0f;
 
-            for (int layer = 0; layer < metadata.num_layers; ++layer)
+            for (int layer = metadata.first_model_layer;
+                 layer < metadata.first_model_layer + metadata.num_layers; ++layer)
             {
                 const bool has_counts = histogram && histogramLayerHasCounts(
                     histogram, layer, metadata.num_experts);
@@ -1282,14 +1308,14 @@ namespace llaminar2
                         layer,
                         histogram,
                         service_profile,
-                        previous[static_cast<std::size_t>(layer)],
+                        previous[metadata.storageIndexForModelLayer(layer)],
                         routed_expert_bytes_per_expert);
                 }
                 else if (!has_counts &&
-                         previous[static_cast<std::size_t>(layer)] != nullptr)
+                         previous[metadata.storageIndexForModelLayer(layer)] != nullptr)
                 {
                     placement =
-                        *previous[static_cast<std::size_t>(layer)];
+                        *previous[metadata.storageIndexForModelLayer(layer)];
                 }
                 else
                 {
@@ -1350,8 +1376,11 @@ namespace llaminar2
         }
 
         validateMetadata(metadata);
+        if (base_plan.first_model_layer != metadata.first_model_layer)
+            throw std::invalid_argument("MoE placement plan and model metadata name different stage origins");
 
-        const auto base_validation = validateMoERoutedExpertPlacementPlan(base_plan);
+        const auto base_validation = validateMoERoutedExpertPlacementPlan(base_plan,
+            {.layer_count = metadata.num_layers, .routed_expert_count = metadata.num_experts});
         if (!base_validation.ok())
             throw std::invalid_argument(formatValidationErrors(base_validation));
 

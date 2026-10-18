@@ -1616,7 +1616,7 @@ TEST_F(Test__SnapshotCapture_Routing, FusedResidualNormStoresSecondOutput)
 {
     // For attn_norm and ffn_norm with 2 outputs: store outputs[1] (norm_output)
     StageDumpInfo dump;
-    dump.outputs.push_back(makeFP32Output("residual", data_a.data(), 2, 4));
+    dump.outputs.push_back(makeFP32Output("residual_out", data_a.data(), 2, 4));
     dump.outputs.push_back(makeFP32Output("norm_output", data_b.data(), 2, 4));
 
     capture.captureStage("layer0_attn_norm", dump);
@@ -1630,7 +1630,7 @@ TEST_F(Test__SnapshotCapture_Routing, FusedResidualNormStoresSecondOutput)
 TEST_F(Test__SnapshotCapture_Routing, FFNNormFusedResidual)
 {
     StageDumpInfo dump;
-    dump.outputs.push_back(makeFP32Output("residual", data_a.data(), 2, 4));
+    dump.outputs.push_back(makeFP32Output("residual_out", data_a.data(), 2, 4));
     dump.outputs.push_back(makeFP32Output("norm_output", data_b.data(), 2, 4));
 
     capture.captureStage("layer3_ffn_norm", dump);

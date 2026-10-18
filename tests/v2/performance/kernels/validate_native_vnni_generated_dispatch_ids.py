@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Validate generated NativeVNNI dispatch includes against canonical codebook ids."""
+"""Validate generated source-policy and physical NativeVNNI identities.
+
+CPU/source IDs and accelerator physical IDs are separate registry namespaces.
+Admitting physical24 does not relabel any source4 measurement or dispatch key.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from native_vnni_codebooks import CODEBOOK_TO_FORMAT  # noqa: E402
+from native_vnni_dispatch.format_registry import FORMAT_SPECS, runtime_aliases  # noqa: E402
 
 # The persistent ROCm small-M workspace owns one partial-output slot for every
 # K partition and is sized for 64 partitions.  Do not confuse this independent
@@ -27,10 +32,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def _known_aliases(codebook: int) -> set[str]:
-    label = CODEBOOK_TO_FORMAT.get(codebook)
-    if not label:
-        return set()
-    return {part.strip() for part in label.split("/") if part.strip()}
+    label = CODEBOOK_TO_FORMAT.get(codebook, "")
+    # Generic includes may contain CPU/source policies or GPU physical tables.
+    # Use the authoritative runtime registry without collapsing24 into4.
+    return {part.strip() for part in label.split("/") if part.strip()} | set(
+        runtime_aliases("rocm", codebook)
+    )
 
 
 def _extract_codebooks(text: str) -> set[int]:
@@ -319,7 +326,9 @@ def validate_file(path: Path) -> int:
     if not codebooks:
         raise SystemExit(f"{path}: found no generated codebook dispatch branches")
 
-    known = set(CODEBOOK_TO_FORMAT)
+    known = set(CODEBOOK_TO_FORMAT) | {
+        spec.gpu_execution_codebook_id for spec in FORMAT_SPECS
+    }
     unknown = sorted(codebooks - known)
     if unknown:
         raise SystemExit(

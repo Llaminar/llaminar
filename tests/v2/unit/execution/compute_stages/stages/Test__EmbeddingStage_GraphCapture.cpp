@@ -1,6 +1,10 @@
 /**
  * @file Test__EmbeddingStage_GraphCapture.cpp
- * @brief Unit tests for EmbeddingStage graph-capture support
+ * @brief Unit tests for EmbeddingStage graph-capture support.
+ *
+ * GPU prepared-binding checks use an explicitly host-owned metadata fixture.
+ * Its address is never executed or freed through a GPU backend; backend-native
+ * integration tests separately validate real capture and allocation lifetimes.
  */
 
 #include <gtest/gtest.h>
@@ -22,6 +26,48 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Keep a non-null synthetic address alive for metadata validation only.
+         *
+         * Shared ownership retains this derived test owner, whose destructor
+         * clears the borrowed address before base teardown can call a backend.
+         * No GPU operation is performed and this is not a device residency proof.
+         */
+        class MetadataOnlyEmbeddingWeights final : public PreparedEmbeddingWeights
+        {
+        public:
+            /**
+             * @brief Build complete native metadata and its test-owned host bytes.
+             * @param source Native quantized source retained by the calling test.
+             * @param device Declared GPU endpoint whose binding is authenticated.
+             * @throws std::invalid_argument If the source layout is unsupported.
+             * @throws std::overflow_error If the native byte extent overflows.
+             * @throws std::bad_alloc If the small synthetic host backing is unavailable.
+             */
+            MetadataOnlyEmbeddingWeights(const TensorBase &source, DeviceId device)
+                : storage_(NativeEmbeddingLayout::forSource(
+                      source.native_type(), source.rows(), static_cast<int>(source.cols())).byte_size)
+            {
+                layout = NativeEmbeddingLayout::forSource(
+                    source.native_type(), source.rows(), static_cast<int>(source.cols()));
+                vocab_size = source.rows();
+                vocab_offset = 0;
+                total_vocab = source.rows();
+                d_model = static_cast<int>(source.cols());
+                device_id = device;
+                device_data = storage_.data();
+            }
+
+            /** @brief Retire the borrowed host address before base backend teardown. */
+            ~MetadataOnlyEmbeddingWeights()
+            {
+                device_data = nullptr;
+            }
+
+        private:
+            std::vector<uint8_t> storage_; ///< Sole owner of these synthetic metadata-test bytes.
+        };
+
         class Test__EmbeddingStage_GraphCapture : public ::testing::Test
         {
         protected:
@@ -168,8 +214,8 @@ namespace llaminar2
             PreparedEmbeddingHandle handle;
             handle.tensor = embed_table.get();
             handle.device_id = DeviceId::cuda(0);
-            handle.weights = std::make_shared<PreparedEmbeddingWeights>();
-            handle.weights->device_id = DeviceId::cuda(0);
+            handle.weights = std::make_shared<MetadataOnlyEmbeddingWeights>(
+                *embed_table, DeviceId::cuda(0));
 
             params.prepared_ref = store.registerPreparedEmbeddingFromPipeline(
                 binding, DeviceId::cuda(0), &handle);
@@ -177,6 +223,13 @@ namespace llaminar2
 
             EmbeddingStage prepared(params);
             EXPECT_TRUE(prepared.validatePreparedWeights(&error));
+            EXPECT_TRUE(error.empty());
+
+            // A valid store/ref and native layout do not authorize missing
+            // backing. Keep this negative control distinct from missing refs.
+            handle.weights->device_data = nullptr;
+            EXPECT_FALSE(prepared.validatePreparedWeights(&error));
+            EXPECT_NE(error.find("native prepared source/device/layout mismatch"), std::string::npos);
         }
     }
 }

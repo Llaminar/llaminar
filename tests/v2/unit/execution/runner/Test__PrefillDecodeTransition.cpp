@@ -17,8 +17,12 @@
  * distributions, so peaked argmax fixtures cannot conceal a different RNG key.
  * Penalty ownership is checked independently: CPU stochastic distribution
  * construction must see unmodified logits and apply history exactly once.
+ * Position-keyed sampling telemetry is checked through its bounded sequence
+ * coordinates, preserving exact logical-position assertions across requests.
  * Long checkpoint-boundary prompts use the production chunk planner in the
  * device-free runner, so serving bucket defaults cannot bypass that coverage.
+ * Stochastic admission must carry the same resolved request entropy consumed
+ * by prefill sampling and captured verification, including unseeded batches.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -2352,6 +2356,7 @@ namespace
             mock_device_penalty_policy_ = MTPGreedyPenaltyPolicy{
                 .presence_penalty = policy.presence_penalty,
                 .frequency_penalty = policy.frequency_penalty,
+                .repetition_penalty = policy.repetition_penalty,
                 .first_token_already_in_history = 0,
                 .enabled = policy.enabled() ? 1 : 0,
             };
@@ -2938,14 +2943,14 @@ namespace
             return true;
         }
 
-        bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
+        bool applyPenaltiesOnDevice(const LogitPenaltyBatch &penalties,
                                     int vocab_size) override
         {
             ++apply_main_penalties_count_;
             return applyPenaltiesToRow(logits_, 0, penalties, vocab_size);
         }
 
-        bool applyPenaltiesToMTPLogitsOnDevice(const std::vector<LogitPenalty> &penalties,
+        bool applyPenaltiesToMTPLogitsOnDevice(const LogitPenaltyBatch &penalties,
                                                int vocab_size) override
         {
             ++apply_mtp_penalties_count_;
@@ -2954,7 +2959,7 @@ namespace
 
         bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
             int row,
-            const std::vector<LogitPenalty> &penalties,
+            const LogitPenaltyBatch &penalties,
             int vocab_size) override
         {
             ++apply_all_position_penalties_count_;
@@ -4824,6 +4829,17 @@ namespace
             return true;
         }
 
+        /** @brief Observe exact prompt membership admitted before any sampling. */
+        bool initializePromptRepetitionHistory(std::span<const int32_t> tokens, int request_index = 0) override
+        {
+            prompt_history_admissions_.emplace_back(request_index, std::vector<int32_t>(tokens.begin(), tokens.end()));
+            return true;
+        }
+
+        /** @return Live unique-token membership passed to each request row. */
+        const auto &promptHistoryAdmissions() const { return prompt_history_admissions_; }
+
+        /** @brief Retain admission metadata independently of verifier descriptors. */
         bool beginDeviceResidentGeneration(
             const DeviceGenerationAdmissionRequest &request) override
         {
@@ -4835,6 +4851,8 @@ namespace
                 request.initial_leading_row_disposition;
             device_generation_admission_dispositions_.push_back(
                 request.initial_leading_row_disposition);
+            device_generation_admission_kinds_.push_back(request.kind);
+            device_generation_seed_admissions_.push_back(request.sampling_seeds);
             device_generation_admitted_ = request.valid();
             device_generation_materialized_ = false;
             device_generation_launched_ = false;
@@ -6097,6 +6115,16 @@ namespace
         {
             return device_generation_admission_dispositions_;
         }
+        /** @return Request-versus-publication boundaries observed by the backend. */
+        const std::vector<sampling_math::DeviceGenerationAdmissionKind> &deviceGenerationAdmissionKinds() const
+        {
+            return device_generation_admission_kinds_;
+        }
+        /** @return Immutable seed metadata actually handed to each device admission. */
+        const std::vector<std::optional<GenerationRequestSeeds>> &deviceGenerationSeedAdmissions() const
+        {
+            return device_generation_seed_admissions_;
+        }
         const std::vector<std::string> &deviceGenerationLifecycleEvents() const
         {
             return device_generation_lifecycle_events_;
@@ -6403,7 +6431,7 @@ namespace
 
         static bool applyPenaltiesToRow(std::vector<float> &logits,
                                         int row,
-                                        const std::vector<LogitPenalty> &penalties,
+                                        const LogitPenaltyBatch &penalties,
                                         int vocab_size)
         {
             if (vocab_size != VOCAB_SIZE || row < 0)
@@ -6968,6 +6996,9 @@ namespace
                     PendingResponse};
         std::vector<sampling_math::DeviceGenerationLeadingRowDisposition>
             device_generation_admission_dispositions_;
+        std::vector<sampling_math::DeviceGenerationAdmissionKind> device_generation_admission_kinds_;
+        std::vector<std::optional<GenerationRequestSeeds>> device_generation_seed_admissions_;
+        std::vector<std::pair<int, std::vector<int32_t>>> prompt_history_admissions_;
         int device_generation_materialization_count_{0};
         int last_device_generation_draft_depth_{0};
         DeviceGenerationLoopTopology last_device_generation_topology_{
@@ -8047,6 +8078,10 @@ namespace
             mock->lastMainLogitsBatchThresholds();
         EXPECT_THAT(mock->lastMainLogitsBatchPositionSeeds(),
                     ElementsAre(sampling.seed, sampling.seed));
+        ASSERT_THAT(mock->deviceGenerationSeedAdmissions(), SizeIs(1));
+        ASSERT_TRUE(mock->deviceGenerationSeedAdmissions().front().has_value());
+        EXPECT_THAT(mock->deviceGenerationSeedAdmissions().front()->values(),
+                    ElementsAre(sampling.seed, sampling.seed));
         EXPECT_THAT(mock->lastMainLogitsBatchResidentPositions(),
                     ElementsAre(3, 2));
         ASSERT_THAT(thresholds, SizeIs(2));
@@ -9042,6 +9077,12 @@ namespace
             mock->lastRequestBatchOutcomeInverseSampleSeeds()[1];
         EXPECT_NE(request0_seed, 0u);
         EXPECT_NE(request1_seed, 0u);
+        ASSERT_THAT(mock->deviceGenerationSeedAdmissions(), SizeIs(1));
+        ASSERT_TRUE(mock->deviceGenerationSeedAdmissions().front().has_value());
+        EXPECT_THAT(mock->deviceGenerationSeedAdmissions().front()->values(),
+                    ElementsAre(request0_seed, request1_seed));
+        EXPECT_THAT(mock->lastMainLogitsBatchPositionSeeds(),
+                    ElementsAre(request0_seed, request1_seed));
 
         ASSERT_THAT(mock->lastRequestBatchOutcomeAcceptThresholds(), SizeIs(2));
         ASSERT_THAT(mock->lastRequestBatchOutcomeResidualThresholds(), SizeIs(2));
@@ -9204,6 +9245,35 @@ namespace
         EXPECT_TRUE(step.tokens.empty());
     }
 
+    /** @brief Prompt membership includes all prompt tokens and is neutral when explicitly disabled. */
+    TEST_F(Test__PrefillDecodeTransition, PromptRepetitionAdmissionIncludesCompleteUniquePrompt)
+    {
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (bool mtp : {false, true})
+        {
+            auto [runner, mock] = createRunner(mtp, true, {}, nullptr, false, false, device);
+            SamplingParams law;
+            law.temperature = 0;
+            law.repetition_penalty = 1.1f;
+            runner->setSamplingParams(law);
+            ASSERT_TRUE(runner->prefill({4, 2, 4, 1, 1}));
+            ASSERT_EQ(mock->promptHistoryAdmissions().size(), 1u);
+            EXPECT_EQ(mock->promptHistoryAdmissions()[0].first, 0);
+            EXPECT_THAT(mock->promptHistoryAdmissions()[0].second, ElementsAre(1, 2, 4));
+            runner->clearCache();
+            law.repetition_penalty = 1.0f;
+            runner->setSamplingParams(law);
+            ASSERT_TRUE(runner->prefill({5, 4, 5}));
+            EXPECT_EQ(mock->promptHistoryAdmissions().size(), 1u);
+            runner->clearCache();
+            law.repetition_penalty = 1.05f;
+            runner->setSamplingParams(law);
+            ASSERT_TRUE(runner->prefill({6, 3, 6, 3}));
+            ASSERT_EQ(mock->promptHistoryAdmissions().size(), 2u);
+            EXPECT_THAT(mock->promptHistoryAdmissions()[1].second, ElementsAre(3, 6));
+        }
+    }
+
     /** Ordinary GPU callers return one terminal response, not a host-token loop. */
     TEST_F(Test__PrefillDecodeTransition, OrdinaryGPUResponseUsesCapturedAdmissionAndContinuation)
     {
@@ -9235,6 +9305,9 @@ namespace
                     ? DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic);
                 EXPECT_THAT(mock->deviceGenerationAdmissionDispositions(),
                     ElementsAre(Leading::PendingResponse, Leading::AlreadyEmitted));
+                EXPECT_THAT(mock->deviceGenerationAdmissionKinds(),
+                    ElementsAre(sampling_math::DeviceGenerationAdmissionKind::NewRequest,
+                                sampling_math::DeviceGenerationAdmissionKind::ContinueResponse));
                 EXPECT_EQ(mock->forwardCallCount(), 1);
                 EXPECT_EQ(mock->sampleMainLogitsCount(), 0);
         }
@@ -11730,6 +11803,9 @@ namespace
         ASSERT_FALSE(second.is_complete);
 
         EXPECT_EQ(mock->deviceGenerationAdmissionCount(), 2);
+        EXPECT_THAT(mock->deviceGenerationAdmissionKinds(),
+            ElementsAre(sampling_math::DeviceGenerationAdmissionKind::NewRequest,
+                        sampling_math::DeviceGenerationAdmissionKind::ContinueResponse));
         EXPECT_EQ(mock->deviceGenerationMaterializationCount(), 2);
         EXPECT_EQ(mock->targetSampleMainConditionAdvanceCount(), 0)
             << "A resident terminal continuation is verifier row zero; it must "
@@ -12452,6 +12528,10 @@ namespace
             EXPECT_EQ(mock->verifyStochasticRequestBatchOutcomeCount(), 1);
             EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleSeeds(),
                         ElementsAre(sampling.seed));
+            ASSERT_THAT(mock->deviceGenerationSeedAdmissions(), SizeIs(1));
+            ASSERT_TRUE(mock->deviceGenerationSeedAdmissions().front().has_value());
+            EXPECT_THAT(mock->deviceGenerationSeedAdmissions().front()->values(),
+                        ElementsAre(sampling.seed));
             EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(),
                         ElementsAre(-1))
                 << "the verifier-base snapshot, not a host-authored position, "
@@ -12578,6 +12658,10 @@ namespace
             EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(), ElementsAre(-1));
             ASSERT_THAT(mock->lastRequestBatchOutcomeInverseSampleSeeds(), SizeIs(1));
             EXPECT_NE(mock->lastRequestBatchOutcomeInverseSampleSeeds()[0], 0u);
+            ASSERT_THAT(mock->deviceGenerationSeedAdmissions(), SizeIs(1));
+            ASSERT_TRUE(mock->deviceGenerationSeedAdmissions().front().has_value());
+            EXPECT_THAT(mock->deviceGenerationSeedAdmissions().front()->values(),
+                        ElementsAre(mock->lastRequestBatchOutcomeInverseSampleSeeds()[0]));
             EXPECT_TRUE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection());
             EXPECT_EQ(mock->capturedStochasticVerifierTargetDistributionCount(), 1);
         }
@@ -14564,15 +14648,18 @@ namespace
             mock->publicationEvents(),
             ElementsAre("device_outcome_publish"));
 
+        // Participant policy counters belong to the real device orchestrator.
+        // This device-free runner proves the complete typed admission instead.
+        EXPECT_EQ(mock->deviceGenerationAdmissionCount(), 1);
+        const auto &admitted_policy = mock->lastDeviceGenerationDepthPolicy();
+        EXPECT_EQ(admitted_policy.mode, sampling_math::DeviceGenerationPolicyMode::Dynamic);
+        EXPECT_EQ(admitted_policy.minimum_depth, 1);
+        EXPECT_EQ(admitted_policy.maximum_depth, 3);
+        EXPECT_EQ(admitted_policy.initial_depth, 2);
+        EXPECT_EQ(
+            mock->deviceGenerationExecutionPolicy(mock->lastDeviceGenerationTopology()),
+            DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions);
         const auto records = PerfStatsCollector::snapshot({"mtp"});
-        EXPECT_NE(
-            findPerfRecordWithTags(
-                records,
-                PerfStatRecord::Kind::Counter,
-                "device_generation_execution_policy_selections",
-                {{"policy", "host_scheduled_captured_transactions"},
-                 {"topology", "dynamic_depth"}}),
-            nullptr);
         EXPECT_NE(
             findPerfRecordWithTags(
                 records,
@@ -14944,9 +15031,14 @@ namespace
                     records,
                     PerfStatRecord::Kind::Counter,
                     "stochastic_serial_equivalent_host_verifier_rows",
-                    {{"row", "0"},
-                     {"logical_position", "6"}});
+                    {{"row", "0"}});
             ASSERT_NE(serial_equivalent_row, nullptr);
+            EXPECT_EQ(serial_equivalent_row->count, 1u);
+            EXPECT_EQ(serial_equivalent_row->sequence_word_count, 1u);
+            EXPECT_THAT(serial_equivalent_row->sequence_minimum_words, ElementsAre(6u));
+            EXPECT_EQ(serial_equivalent_row->sequence_maximum_words,
+                      serial_equivalent_row->sequence_minimum_words);
+            EXPECT_EQ(serial_equivalent_row->tags.count("logical_position"), 0u);
             const PerfStatRecord *trace =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
@@ -15331,15 +15423,17 @@ namespace
             << "HIP hosted scheduling may observe only a dispatch ticket; no "
                "compact verifier outcome may cross to the host.";
 
+        EXPECT_EQ(mock->deviceGenerationAdmissionCount(), 1);
+        const auto &admitted_policy = mock->lastDeviceGenerationDepthPolicy();
+        EXPECT_EQ(admitted_policy.mode, sampling_math::DeviceGenerationPolicyMode::Fixed);
+        EXPECT_EQ(admitted_policy.minimum_depth, 1);
+        EXPECT_EQ(admitted_policy.maximum_depth, 1);
+        EXPECT_EQ(admitted_policy.initial_depth, 1);
+        EXPECT_EQ(mock->lastDeviceGenerationTopology(), DeviceGenerationLoopTopology::FixedDepth);
+        EXPECT_EQ(
+            mock->deviceGenerationExecutionPolicy(mock->lastDeviceGenerationTopology()),
+            DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions);
         const auto records = PerfStatsCollector::snapshot({"mtp"});
-        EXPECT_NE(
-            findPerfRecordWithTags(
-                records,
-                PerfStatRecord::Kind::Counter,
-                "device_generation_execution_policy_selections",
-                {{"policy", "host_scheduled_captured_transactions"},
-                 {"topology", "fixed_depth"}}),
-            nullptr);
         EXPECT_NE(
             findPerfRecordWithTags(
                 records,
@@ -16404,6 +16498,7 @@ namespace
         config.device_for_this_rank = GlobalDeviceAddress::cpu();
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 1;
+        config.mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
         config.mtp.verify_mode = MTPVerifyMode::Greedy;
         config.prefix_cache.enabled = false;
         config.prefix_cache.storage_mode =
@@ -16479,6 +16574,7 @@ namespace
         config.device_for_this_rank = GlobalDeviceAddress::cpu();
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 3;
+        config.mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
         config.mtp.verify_mode = MTPVerifyMode::Greedy;
         config.prefix_cache.enabled = false;
         config.prefix_cache.storage_mode =

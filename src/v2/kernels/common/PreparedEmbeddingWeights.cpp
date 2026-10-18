@@ -6,7 +6,6 @@
  */
 
 #include "PreparedEmbeddingWeights.h"
-#include "EmbedQ8Block.h"
 #include "../../backends/BackendManager.h"
 #include "../../planning/PhysicalMemoryAuthority.h"
 #include "../../utils/Logger.h"
@@ -19,38 +18,10 @@ namespace llaminar2
 
     PreparedEmbeddingWeights::PreparedEmbeddingWeights() = default;
 
-    size_t PreparedEmbeddingWeights::allocationBytes(
-        size_t vocab_size,
-        int d_model)
-    {
-        if (d_model <= 0)
-        {
-            throw std::invalid_argument(
-                "Prepared embedding allocation requires a positive model width");
-        }
-        const size_t width = static_cast<size_t>(d_model);
-        const size_t blocks_per_row = (width + 31u) / 32u;
-        if (blocks_per_row != 0u &&
-            vocab_size > std::numeric_limits<size_t>::max() /
-                             blocks_per_row)
-        {
-            throw std::overflow_error(
-                "Prepared embedding block count overflows size_t");
-        }
-        const size_t blocks = vocab_size * blocks_per_row;
-        if (blocks > std::numeric_limits<size_t>::max() /
-                         sizeof(EmbedQ8Block))
-        {
-            throw std::overflow_error(
-                "Prepared embedding byte size overflows size_t");
-        }
-        return blocks * sizeof(EmbedQ8Block);
-    }
-
     void PreparedEmbeddingWeights::bindPhysicalMemoryLease(
         PhysicalMemoryAllocationLease lease)
     {
-        if (!lease.valid() || lease.bytes() != byte_size)
+        if (!lease.valid() || lease.bytes() != layout.byte_size)
         {
             throw std::invalid_argument(
                 "Prepared embedding requires a valid exact-size physical-memory lease");
@@ -81,11 +52,11 @@ namespace llaminar2
         else
         {
             LOG_WARN("[PreparedEmbeddingWeights] No backend for device " << device_id
-                                                                         << " — leaking " << byte_size << " bytes");
+                                                                         << " — leaking " << layout.byte_size << " bytes");
         }
 
         device_data = nullptr;
-        byte_size = 0;
+        layout = {};
         /* Release the ledger claim only after the backend allocation is gone. */
         physical_memory_lease_.reset();
     }
@@ -97,8 +68,8 @@ namespace llaminar2
 
     PreparedEmbeddingWeights::PreparedEmbeddingWeights(PreparedEmbeddingWeights &&other) noexcept
         : device_data(other.device_data),
-          byte_size(other.byte_size),
-          blocks_per_row(other.blocks_per_row),
+          layout(other.layout),
+          iq_tables(other.iq_tables),
           vocab_size(other.vocab_size),
           vocab_offset(other.vocab_offset),
           total_vocab(other.total_vocab),
@@ -108,7 +79,8 @@ namespace llaminar2
               std::move(other.physical_memory_lease_))
     {
         other.device_data = nullptr;
-        other.byte_size = 0;
+        other.layout = {};
+        other.iq_tables = {};
     }
 
     PreparedEmbeddingWeights &PreparedEmbeddingWeights::operator=(PreparedEmbeddingWeights &&other) noexcept
@@ -117,8 +89,8 @@ namespace llaminar2
         {
             releaseDeviceData();
             device_data = other.device_data;
-            byte_size = other.byte_size;
-            blocks_per_row = other.blocks_per_row;
+            layout = other.layout;
+            iq_tables = other.iq_tables;
             vocab_size = other.vocab_size;
             vocab_offset = other.vocab_offset;
             total_vocab = other.total_vocab;
@@ -127,7 +99,8 @@ namespace llaminar2
             physical_memory_lease_ =
                 std::move(other.physical_memory_lease_);
             other.device_data = nullptr;
-            other.byte_size = 0;
+            other.layout = {};
+            other.iq_tables = {};
         }
         return *this;
     }

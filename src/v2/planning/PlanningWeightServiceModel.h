@@ -32,7 +32,7 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Select the largest aggregate-arithmetic source shape per format/expert triplet.
+         * @brief Select the largest aggregate-arithmetic source shape per format/operand policy/expert triplet.
          * @param model Root-published immutable GGUF directory, including main-layer boundary.
          * @return Stable ordered requests independent of tensor directory iteration order.
          *
@@ -100,7 +100,7 @@ namespace llaminar2
 
     private:
         /** @return Required format-specific projection catalog; absence is fatal, never another codebook. */
-        const PlanningKernelServiceCatalog &projection(std::string_view format) const;
+        const PlanningKernelServiceCatalog &projection(std::string_view format, FloatingActivationOperandPrecision operand_precision) const;
         /** @return Required complete-FFN format triplet; ordinary GEMM cannot substitute for it. */
         const PlanningKernelServiceCatalog &expert(const std::array<std::string, 3> &formats) const;
         PlanningKernelServiceCatalog memory_;

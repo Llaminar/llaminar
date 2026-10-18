@@ -13,6 +13,7 @@
 
 #include "backends/DeviceId.h"
 #include "DeviceMoERebalanceLoadSpreadProof.h"
+#include "MoEOptimizationStages.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,7 @@ namespace llaminar2
         None,   ///< No ExpertOverlay execution authority exists.
         Host,   ///< A host-owned multi-tier or heterogeneous authority is live.
         Device, ///< An all-GPU device authority is live, including mixed vendors.
+        Pipeline, ///< Independent stage authorities; identities remain stage-local.
     };
 
     /** Explicit lifecycle state of adaptive ExpertOverlay movement. */
@@ -67,6 +69,7 @@ namespace llaminar2
         Draining, ///< New work is closed while admitted work is reaped.
         Failed,   ///< The activity owner failed terminally.
         DeviceOwned, ///< Activity is GPU-resident; terminal receipts do not imply live quiescence.
+        StageOwned, ///< Independent stage activities are reported individually.
     };
 
     /**
@@ -171,7 +174,8 @@ namespace llaminar2
         /** @return Whether every identity required by parity is valid. */
         [[nodiscard]] bool valid() const noexcept
         {
-            return authority != MoEOptimizationAuthority::None &&
+            return (authority == MoEOptimizationAuthority::Host ||
+                    authority == MoEOptimizationAuthority::Device) &&
                    transaction > 0u && candidate_epoch > 0u && layer >= 0 &&
                    expert >= 0 && cycle_size > 0u &&
                    source_participant >= 0 &&
@@ -411,6 +415,83 @@ namespace llaminar2
     };
 
     /**
+     * @brief Immutable controller receipt after physical capacity certification.
+     *
+     * These are already-authenticated command fields and the completed physical
+     * validator's counts. Followers retain the receipt without acquiring the
+     * leader's policy authority. Neither direction totals nor estimated bytes
+     * substitute for the capacity proof or actual publication extent.
+     */
+    struct MoEOptimizationControllerMovementReceipt
+    {
+        std::uint64_t base_epoch = 0;
+        std::uint64_t promotions = 0, demotions = 0, same_priority_moves = 0;
+        std::uint64_t cross_domain_moves = 0, cross_rank_moves = 0, cross_backend_moves = 0;
+        std::uint64_t snapshot_observations = 0;
+        std::uint64_t priority_cost_before = 0, priority_cost_after = 0;
+        std::uint64_t same_priority_makespan_before = 0, same_priority_makespan_after = 0;
+        std::uint64_t accepted_cycles = 0; ///< Admitted policy cycles before physical decomposition.
+        std::uint64_t physical_cycles = 0; ///< Closed physical circuits; shared vertices may merge policy cycles.
+        std::uint64_t rejected_cycles = 0, phase_tradeoff_candidates = 0;
+        std::uint64_t improvement_floor_rejected_cycles = 0, payoff_rejected_cycles = 0;
+        std::uint64_t residency_rejected_cycles = 0;
+        MoEOptimizationTimeEconomy economy;
+        std::uint64_t changed_layers = 0, layer_scan_start = 0, layer_scan_next = 0;
+        std::uint64_t edges_checked = 0, participant_coordinates_checked = 0, tier_coordinates_checked = 0;
+        std::uint64_t malformed_edges = 0, participant_flow_violations = 0, tier_flow_violations = 0;
+
+        /** @brief Compare all authenticated command and physical validator metadata. */
+        bool operator==(const MoEOptimizationControllerMovementReceipt &) const = default;
+
+        /**
+         * @param epoch Durable epoch published by this exact completed wave.
+         * @param commands Actual number of retired physical migration edges.
+         * @return Whether the admitted economy, epoch and physical proof are coherent.
+         */
+        [[nodiscard]] bool valid(std::uint64_t epoch, std::uint64_t commands) const noexcept
+        {
+            return base_epoch > 0 && epoch > base_epoch && epoch - base_epoch == 1 &&
+                promotions <= commands && demotions <= commands - promotions &&
+                same_priority_moves == commands - promotions - demotions &&
+                cross_domain_moves <= commands && cross_rank_moves <= commands && cross_backend_moves <= commands &&
+                accepted_cycles > 0 && accepted_cycles <= commands &&
+                physical_cycles > 0 && physical_cycles <= commands && economy.valid() &&
+                edges_checked == commands && participant_coordinates_checked > 0 && tier_coordinates_checked > 0 &&
+                malformed_edges == 0 && participant_flow_violations == 0 && tier_flow_violations == 0;
+        }
+    };
+
+    /**
+     * @brief Actual physical work retired by one device-owned movement wave.
+     *
+     * This belongs to the completed movement ledger, independently of the
+     * leader's economic estimates. Distributed followers retain the same
+     * authenticated publication without claiming ownership of its policy.
+     * Native receipts report useful copied bytes; padded expert descriptors
+     * and estimated transfer costs must never supply this value.
+     */
+    struct MoEOptimizationDeviceMovementPublication
+    {
+        std::uint64_t transaction = 0u; ///< Completed protocol transaction.
+        std::uint64_t candidate_epoch = 0u; ///< Published durable placement epoch.
+        std::uint64_t command_count = 0u; ///< Exact completed migration edges.
+        std::uint64_t physical_payload_bytes = 0u; ///< Actual retired wave payload.
+        /** Present only for the topology-wide time-policy controller. */
+        std::optional<MoEOptimizationControllerMovementReceipt> controller;
+
+        /** @brief Compare the entire physical publication, without floating conversion. */
+        bool operator==(const MoEOptimizationDeviceMovementPublication &) const = default;
+
+        /** @return Whether a completed, positive-work publication is represented. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return transaction != 0u && candidate_epoch != 0u &&
+                command_count != 0u && physical_payload_bytes != 0u &&
+                (!controller || controller->valid(candidate_epoch, command_count));
+        }
+    };
+
+    /**
      * @brief Race-safe model-lifetime movement evidence snapshot.
      *
      * Implementations retain complete edges for the runner lifetime. A future
@@ -428,13 +509,26 @@ namespace llaminar2
         /** Host-policy admission proofs; distributed followers omit these. */
         std::vector<MoEOptimizationHostMovementAdmission> host_admissions;
         std::uint64_t discarded_host_admission_records = 0u;
+        /** Actual device transport receipts, including policy followers. */
+        std::vector<MoEOptimizationDeviceMovementPublication> device_publications;
+        std::uint64_t discarded_device_publications = 0u;
+
+        /** Independent PP histories; a composed ledger has no unscoped records. */
+        MoEOptimizationStages<MoEOptimizationMovementLedger> stages;
 
         /** @return Whether the complete runner-lifetime ledger is present. */
         [[nodiscard]] bool complete() const noexcept
         {
-            return discarded_edges == 0u &&
-                   discarded_economy_records == 0u &&
-                   discarded_host_admission_records == 0u;
+            if (discarded_edges || discarded_economy_records ||
+                discarded_host_admission_records || discarded_device_publications)
+                return false;
+            if (!stages.empty() && (!edges.empty() || !economy.empty() ||
+                !host_admissions.empty() || !device_publications.empty()))
+                return false;
+            for (const auto &stage : stages.entries())
+                if (!stage.value.complete())
+                    return false;
+            return true;
         }
     };
 
@@ -579,19 +673,36 @@ namespace llaminar2
         std::uint64_t completed_promotions = 0u;
         std::uint64_t completed_demotions = 0u;
         std::uint64_t completed_same_priority_moves = 0u;
+        std::uint64_t completed_decision_windows = 0u;
         std::uint64_t demand_generation = 0u;
         std::uint64_t demand_rows = 0u;
         std::uint64_t published_progress_generation = 0u;
         std::uint64_t reconciled_progress_generation = 0u;
+        /** Independent authority progress; sums cannot hide one stage regressing. */
+        MoEOptimizationStages<MoEOptimizationProgressStamp> stages;
 
         /**
          * @brief Classify this observation relative to an earlier stamp.
          * @param previous Earlier observation from the same authority lifetime.
          * @return Regressed, unchanged, or advanced monotonic progress.
          */
-        [[nodiscard]] constexpr MoEOptimizationProgressRelation relationTo(
+        [[nodiscard]] MoEOptimizationProgressRelation relationTo(
             const MoEOptimizationProgressStamp &previous) const noexcept
         {
+            bool stage_advanced = false;
+            const auto current_stages = stages.entries();
+            const auto prior_stages = previous.stages.entries();
+            if (current_stages.size() != prior_stages.size())
+                return MoEOptimizationProgressRelation::Regressed;
+            for (std::size_t i = 0; i < current_stages.size(); ++i)
+            {
+                if (current_stages[i].identity != prior_stages[i].identity)
+                    return MoEOptimizationProgressRelation::Regressed;
+                const auto relation = current_stages[i].value.relationTo(prior_stages[i].value);
+                if (relation == MoEOptimizationProgressRelation::Regressed)
+                    return relation;
+                stage_advanced |= relation == MoEOptimizationProgressRelation::Advanced;
+            }
             const bool scalar_regressed =
                 published_movement_waves <
                     previous.published_movement_waves ||
@@ -603,6 +714,7 @@ namespace llaminar2
                 completed_demotions < previous.completed_demotions ||
                 completed_same_priority_moves <
                     previous.completed_same_priority_moves ||
+                completed_decision_windows < previous.completed_decision_windows ||
                 published_progress_generation <
                     previous.published_progress_generation ||
                 reconciled_progress_generation <
@@ -625,6 +737,7 @@ namespace llaminar2
                 completed_demotions > previous.completed_demotions ||
                 completed_same_priority_moves >
                     previous.completed_same_priority_moves ||
+                completed_decision_windows > previous.completed_decision_windows ||
                 published_progress_generation >
                     previous.published_progress_generation ||
                 reconciled_progress_generation >
@@ -633,7 +746,7 @@ namespace llaminar2
                 demand_generation > previous.demand_generation ||
                 (demand_generation == previous.demand_generation &&
                  demand_rows > previous.demand_rows);
-            return scalar_advanced || demand_advanced
+            return stage_advanced || scalar_advanced || demand_advanced
                        ? MoEOptimizationProgressRelation::Advanced
                        : MoEOptimizationProgressRelation::Unchanged;
         }
@@ -684,6 +797,8 @@ namespace llaminar2
          */
         std::uint64_t reconciled_progress_generation = 0u;
         std::string diagnostic;
+        /** Sealed stage observations; parent counters are additive summaries only. */
+        MoEOptimizationStages<MoEOptimizationStatus> stages;
 
         /** @return Whether a Dynamic authority may currently publish movement. */
         [[nodiscard]] bool active() const noexcept
@@ -699,10 +814,9 @@ namespace llaminar2
          * Only durable movement, RCU demand, or published reconciliation
          * authority can renew a bounded watchdog.
          */
-        [[nodiscard]] constexpr MoEOptimizationProgressStamp
-        progressStamp() const noexcept
+        [[nodiscard]] MoEOptimizationProgressStamp progressStamp() const
         {
-            return {
+            MoEOptimizationProgressStamp result{
                 .published_movement_waves = published_movement_waves,
                 .completed_transactions =
                     completed_movement.transactions,
@@ -713,6 +827,7 @@ namespace llaminar2
                 .completed_demotions = completed_movement.demotions,
                 .completed_same_priority_moves =
                     completed_movement.same_priority_moves,
+                .completed_decision_windows = completed_decision_windows,
                 .demand_generation = demand_window.generation,
                 .demand_rows = demand_window.collected_routed_rows,
                 .published_progress_generation =
@@ -720,6 +835,15 @@ namespace llaminar2
                 .reconciled_progress_generation =
                     reconciled_progress_generation,
             };
+            if (!stages.empty())
+            {
+                std::vector<MoEOptimizationStages<MoEOptimizationProgressStamp>::Entry> values;
+                values.reserve(stages.entries().size());
+                for (const auto &stage : stages.entries())
+                    values.push_back({stage.identity, stage.value.progressStamp()});
+                result.stages = MoEOptimizationStages<MoEOptimizationProgressStamp>::seal(std::move(values));
+            }
+            return result;
         }
 
         /**
@@ -735,6 +859,14 @@ namespace llaminar2
          */
         [[nodiscard]] bool quiescentBetweenWaves() const noexcept
         {
+            if (!stages.empty())
+                return active() && std::all_of(stages.entries().begin(), stages.entries().end(), [](const auto &stage)
+                {
+                    const auto &value = stage.value;
+                    return value.state == MoEOptimizationLifecycleState::NotApplicable ||
+                        value.state == MoEOptimizationLifecycleState::MovementDisabled ||
+                        value.quiescentBetweenWaves();
+                });
             return active() &&
                    published_progress_generation ==
                        reconciled_progress_generation &&
@@ -758,8 +890,14 @@ namespace llaminar2
         [[nodiscard]] bool canBeginExclusiveCohort(
             std::uint64_t routed_rows) const noexcept
         {
-            return quiescentBetweenWaves() &&
-                   demand_window.canAdmitExclusiveCohort(routed_rows);
+            if (!quiescentBetweenWaves())
+                return false;
+            if (!stages.empty())
+                return routed_rows > 0 && std::all_of(stages.entries().begin(), stages.entries().end(), [&](const auto &stage)
+                {
+                    return !stage.value.active() || stage.value.canBeginExclusiveCohort(routed_rows);
+                });
+            return demand_window.canAdmitExclusiveCohort(routed_rows);
         }
 
         /** @return Whether measured Dynamic economy is still being learned. */

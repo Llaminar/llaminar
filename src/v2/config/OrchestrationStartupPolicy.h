@@ -12,6 +12,18 @@
 namespace llaminar2
 {
     struct OrchestrationConfig;
+    struct ModelMemoryProfile;
+
+    /**
+     * @brief Seal MTP activation from authored intent and the canonical GGUF directory.
+     * @param config Startup configuration; activation is concrete on return.
+     * @param model Source-bound metadata with the learned-head tensor inventory.
+     * @throws std::invalid_argument for missing required or incomplete learned heads.
+     *
+     * Explicit disablement remains a first-class configuration on MTP GGUFs.
+     * Disabled execution with positive retained capacity still authenticates heads.
+     */
+    void resolveMTPStartupPolicy(OrchestrationConfig &config, const ModelMemoryProfile &model);
     /**
      * @brief Publish explicit prefill and deterministic startup settings once.
      * @param config Fully parsed configuration, before any model admission.

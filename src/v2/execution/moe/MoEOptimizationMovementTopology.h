@@ -43,10 +43,26 @@ namespace llaminar2
     {
         MoEOptimizationAuthority authority = MoEOptimizationAuthority::None;
         MoEOptimizationMovementAxes axes = MoEOptimizationMovementAxes::None;
+        /** Exact independent stage opportunities; the parent axes are their union. */
+        MoEOptimizationStages<MoEOptimizationMovementTopology> stages;
 
         /** @return Whether the projection has a coherent, recognized identity. */
-        [[nodiscard]] constexpr bool valid() const noexcept
+        [[nodiscard]] bool valid() const noexcept
         {
+            if (!stages.empty())
+            {
+                bool tier = false, participant = false;
+                for (const auto &stage : stages.entries())
+                {
+                    if (!stage.value.valid())
+                        return false;
+                    tier |= hasTierResidencyAxis(stage.value.axes);
+                    participant |= hasParticipantPlacementAxis(stage.value.axes);
+                }
+                return authority == MoEOptimizationAuthority::Pipeline &&
+                    axes == (tier ? (participant ? MoEOptimizationMovementAxes::Both : MoEOptimizationMovementAxes::TierResidency)
+                                  : (participant ? MoEOptimizationMovementAxes::ParticipantPlacement : MoEOptimizationMovementAxes::None));
+            }
             const bool recognized_axes = axes == MoEOptimizationMovementAxes::None ||
                 axes == MoEOptimizationMovementAxes::TierResidency ||
                 axes == MoEOptimizationMovementAxes::ParticipantPlacement ||

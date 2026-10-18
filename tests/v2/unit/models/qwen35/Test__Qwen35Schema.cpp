@@ -1750,6 +1750,97 @@ TEST_F(Qwen35GraphBuildTest, PhaseSplitDenseDecodeUsesFullGDNResolverGeometryOnE
 }
 
 /**
+ * @brief Full decode reservation must not widen the sharded prefill gate.
+ *
+ * The same retained activation backing serves the actual phase-split production
+ * builders. Raw context, split gate and gated context must publish one identical
+ * live extent even when the shared GDN/decode arena is wider than both phases.
+ */
+TEST_F(Qwen35GraphBuildTest, PhaseSplitFAGateUsesActualHeadsInsteadOfRetainedCapacity)
+{
+    config_.qkv_column_parallel = true;
+    config_.dense_tp_enabled = true;
+    config_.dense_tp_decode_replicated = true;
+    config_.local_n_heads = 2;
+    config_.local_n_kv_heads = 1;
+    constexpr size_t capacity_rows = 5;
+    const size_t d = static_cast<size_t>(config_.d_model);
+    const size_t capacity_columns = static_cast<size_t>(config_.gdn.inner_size);
+    Qwen35Graph builder(config_, nullptr);
+    ModelWeightBindings decode_source;
+    // Construction-only source declaration, as in the existing phase-split
+    // fixtures. Each phase below supplies its actual shaped raw FA weights.
+    decode_source.get_layer_weights = [](int) { return LayerWeightBindings{}; };
+    builder.setDecodeReplicatedDenseWeightBindings(decode_source);
+    EXPECT_EQ(builder.getResolverConfig(3).local_n_heads, config_.n_heads);
+
+    auto hidden = TestTensorFactory::createFP32({capacity_rows, d});
+    auto normalized = TestTensorFactory::createFP32({capacity_rows, d});
+    auto q_raw = TestTensorFactory::createFP32({capacity_rows, capacity_columns * 2});
+    auto gate = TestTensorFactory::createFP32({capacity_rows, capacity_columns});
+    auto q = TestTensorFactory::createFP32({capacity_rows, capacity_columns});
+    auto k = TestTensorFactory::createFP32({capacity_rows, capacity_columns});
+    auto v = TestTensorFactory::createFP32({capacity_rows, capacity_columns});
+    auto context = TestTensorFactory::createFP32({capacity_rows, capacity_columns});
+    auto projected = TestTensorFactory::createFP32({capacity_rows, d});
+    ActivationBuffers buffers;
+    buffers.current_hidden = hidden.get();
+    buffers.normalized = normalized.get();
+    buffers.Q = q.get();
+    buffers.K = k.get();
+    buffers.V = v.get();
+    buffers.attn_output = context.get();
+    buffers.attn_proj = projected.get();
+    buffers.extensions[BufferId::FA_Q_RAW] = q_raw.get();
+    buffers.extensions[BufferId::FA_GATE] = gate.get();
+
+    for (const bool decode : {false, true})
+    {
+        SCOPED_TRACE(decode ? "full decode" : "sharded prefill");
+        const int rows = decode ? 1 : 3;
+        const int heads = decode ? config_.n_heads : config_.local_n_heads;
+        const int kv_heads = decode ? config_.n_kv_heads : config_.local_n_kv_heads;
+        const size_t width = static_cast<size_t>(heads * config_.head_dim);
+        const size_t kv_width = static_cast<size_t>(kv_heads * config_.head_dim);
+        auto wq = TestTensorFactory::createFP32({width * 2, d});
+        auto wk = TestTensorFactory::createFP32({kv_width, d});
+        auto wv = TestTensorFactory::createFP32({kv_width, d});
+        auto wo = TestTensorFactory::createFP32({d, width});
+        LayerWeights layer;
+        layer.attn_norm = norm_weight_.get();
+        layer.wq = wq.get();
+        layer.wk = wk.get();
+        layer.wv = wv.get();
+        layer.wo = wo.get();
+
+        auto graph = builder.buildAttentionGraph(layer, buffers, 3, rows, 1,
+                                                 stub_cache_.get(), nullptr, DeviceId::cpu());
+        const auto *gate_node = graph.getNode("layer3_attn_output_gate");
+        const auto *split_node = graph.getNode("layer3_q_gate_split");
+        const auto *context_node = graph.getNode("layer3_attention");
+        ASSERT_NE(gate_node, nullptr);
+        ASSERT_NE(split_node, nullptr);
+        ASSERT_NE(context_node, nullptr);
+        const auto *gate_stage = dynamic_cast<const AttentionOutputGateStage *>(gate_node->stage.get());
+        ASSERT_NE(gate_stage, nullptr);
+        EXPECT_EQ(gate_stage->getParams().feature_dim, static_cast<int>(width));
+        EXPECT_LT(width, capacity_columns);
+        const auto gated_dump = gate_stage->buildDumpInfoImpl();
+        const auto split_dump = split_node->stage->getDumpInfo();
+        const auto raw_dump = context_node->stage->getDumpInfo();
+        ASSERT_EQ(gated_dump.outputs.size(), 1u);
+        ASSERT_EQ(split_dump.outputs.size(), 2u);
+        ASSERT_GE(raw_dump.outputs.size(), 1u);
+        for (const auto *entry : {&gated_dump.outputs[0], &split_dump.outputs[1], &raw_dump.outputs[0]})
+        {
+            EXPECT_EQ(entry->rows, static_cast<size_t>(rows));
+            EXPECT_EQ(entry->cols, width);
+            EXPECT_EQ(entry->byte_size, static_cast<size_t>(rows) * width * sizeof(float));
+        }
+    }
+}
+
+/**
  * @brief A replicated MTP predictor reserves full sidecar buffers without
  *        widening the tensor-parallel main graph.
  */

@@ -19,6 +19,8 @@
  * @see tensors/VnniPackContext.h for packing context struct
  */
 
+#include "kernels/common/NativeEmbeddingIQTables.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "ROCmWeightPacker.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -201,15 +203,17 @@ namespace llaminar2
             const int blocks_per_row = K / 32;
             const int payload_bytes = info->payload_bytes;
             const bool is_asymmetric = info->is_asymmetric;
+            const auto physical = canonicalDeviceVnniFormat(*info);
+            const bool has_secondary = physical.is_asymmetric;
 
             // Allocate output buffers
             out.native_vnni_payload.resize(static_cast<size_t>(blocks_per_row) * N * payload_bytes);
             out.native_vnni_scales.resize(static_cast<size_t>(blocks_per_row) * N);
-            if (is_asymmetric)
+            if (has_secondary)
                 out.native_vnni_mins.resize(static_cast<size_t>(blocks_per_row) * N);
             if (info->has_emins)
                 out.native_vnni_emins.resize(static_cast<size_t>(blocks_per_row) * N);
-            out.native_vnni_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
+            out.native_vnni_codebook_id = physical.codebook_id;
             out.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
             out.native_source_identity = {
                 .codebook_id = info->codebook_id,
@@ -251,7 +255,7 @@ namespace llaminar2
             ctx.payload_bytes = payload_bytes;
             ctx.payload_array = out.native_vnni_payload.data();
             ctx.scales_array = out.native_vnni_scales.data();
-            ctx.mins_array = is_asymmetric ? out.native_vnni_mins.data() : nullptr;
+            ctx.mins_array = has_secondary ? out.native_vnni_mins.data() : nullptr;
             ctx.emins_array = info->has_emins ? out.native_vnni_emins.data() : nullptr;
 
             // Main packing loop — dispatches to per-format virtual method
@@ -268,7 +272,7 @@ namespace llaminar2
                                                                           << " (codebook=" << static_cast<int>(out.native_vnni_codebook_id) << ")"
                                                                           << " payload=" << (out.native_vnni_payload.size() / 1024) << " KB"
                                                                           << " scales=" << (out.native_vnni_scales.size() * 2 / 1024) << " KB"
-                                                                          << (is_asymmetric ? (" mins=" + std::to_string(out.native_vnni_mins.size() * 2 / 1024) + " KB") : ""));
+                                                                          << (has_secondary ? (" secondary=" + std::to_string(out.native_vnni_mins.size() * 2 / 1024) + " KB") : ""));
             return true;
         }
 
@@ -589,16 +593,17 @@ namespace llaminar2
         batch->rows_per_expert = rows_per_expert;
         batch->K = K;
         batch->blocks_per_row = blocks_per_row;
-        batch->codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
+        const auto physical = canonicalDeviceVnniFormat(*info);
+        batch->codebook_id = physical.codebook_id;
 
         batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;
         batch->scales_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
-        batch->mins_per_expert = info->is_asymmetric ? batch->scales_per_expert : 0;
+        batch->mins_per_expert = physical.is_asymmetric ? batch->scales_per_expert : 0;
         batch->emins_per_expert = info->has_emins ? batch->scales_per_expert : 0;
 
         batch->all_native_vnni.assign(static_cast<size_t>(num_experts) * batch->vnni_bytes_per_expert, uint8_t{0});
         batch->all_native_scales.assign(static_cast<size_t>(num_experts) * batch->scales_per_expert, uint16_t{0});
-        if (info->is_asymmetric)
+        if (physical.is_asymmetric)
             batch->all_native_mins.assign(static_cast<size_t>(num_experts) * batch->mins_per_expert, uint16_t{0});
         if (info->has_emins)
             batch->all_native_emins.assign(static_cast<size_t>(num_experts) * batch->emins_per_expert, uint32_t{0});
@@ -620,7 +625,7 @@ namespace llaminar2
             ctx.payload_bytes = info->payload_bytes;
             ctx.payload_array = batch->all_native_vnni.data() + e * batch->vnni_bytes_per_expert;
             ctx.scales_array = batch->all_native_scales.data() + e * batch->scales_per_expert;
-            ctx.mins_array = info->is_asymmetric
+            ctx.mins_array = physical.is_asymmetric
                                  ? batch->all_native_mins.data() + e * batch->mins_per_expert
                                  : nullptr;
             ctx.emins_array = info->has_emins
@@ -647,3 +652,39 @@ namespace llaminar2
 
     } // namespace rocm
 } // namespace llaminar2
+
+extern "C" bool rocmNativeEmbeddingIQTableView(int, llaminar2::NativeEmbeddingIQTables *);
+
+namespace llaminar2
+{
+    /**
+     * @brief Prepare a source-embedding view through the existing IQ table authority.
+     * @param ordinal Device whose backend runtime generation owns the grids.
+     * @param source_type Original source codebook; table-free formats return an empty view.
+     * @param tables Output non-owning immutable addresses used by retained lookup graphs.
+     * @return False for capture-time preparation or a failed existing-owner publication.
+     */
+    bool prepareNativeEmbeddingTablesROCm(
+        int ordinal, TensorType source_type, NativeEmbeddingIQTables &tables)
+    {
+        tables = {};
+        if (ordinal < 0 || isGraphCaptureActive()) return false;
+        switch (source_type)
+        {
+        case TensorType::IQ1_S: case TensorType::IQ1_M:
+        case TensorType::IQ2_XXS: case TensorType::IQ2_XS: case TensorType::IQ2_S:
+        case TensorType::IQ3_XXS: case TensorType::IQ3_S:
+            break;
+        default:
+            return true;
+        }
+        // This function belongs to setup. Even warm symbol lookup is not a
+        // replay operation, and a late factory must never initialize codebooks.
+#ifdef HAVE_ROCM
+        if (!rocm::ensureIQGridTablesInitialized(ordinal)) return false;
+        return rocmNativeEmbeddingIQTableView(ordinal, &tables);
+#else
+        return false;
+#endif
+    }
+}

@@ -170,6 +170,29 @@ namespace llaminar2
                 float alpha = 1.0f, float beta = 0.0f);
 
             /**
+             * @brief Submit physical half operands with FP32 accumulation/output.
+             * @param stream Exact non-null HIP stream ordering both operand banks.
+             * @param d_A Admitted row-major half activation matrix [M,K].
+             * @param d_B Persistent row-major half weight matrix [N,K].
+             * @param d_C Admitted row-major FP32 output matrix [M,N].
+             * @param M Positive live matrix rows; no mutable count is read here.
+             * @param N Positive output columns.
+             * @param K Positive reduction width.
+             * @param alpha FP32 product multiplier.
+             * @param beta FP32 existing-output multiplier.
+             * @return Whether exact-stream GemmEx enqueue succeeded.
+             *
+             * The context owns the handle and library workspace. No conversion,
+             * allocation, host transfer or synchronization occurs in this call.
+             * This library operation does not advertise serial-row equivalence.
+             */
+            bool executeFP16AccumulateFP32OnStream(
+                ExplicitGPUStream stream,
+                const void *d_A, const void *d_B, float *d_C,
+                int M, int N, int K,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /**
              * @brief Submit FP32 GEMM on one exact non-null HIP stream.
              *
              * The context's hipBLAS handle is shared by floating projections

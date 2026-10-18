@@ -16,7 +16,7 @@
 
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
-#include "models/qwen35/Qwen35GraphConfigBuilder.h"
+#include "models/ModelGenerationPolicy.h"
 #include "utils/Logger.h"
 
 #include <array>
@@ -89,15 +89,8 @@ namespace
                 "failed to construct Qwen3.6 tokenizer for structured prompt regression");
         }
 
-        Qwen35GraphConfigBuilder config_builder;
-        const auto template_override = config_builder.chatTemplateOverride();
-        if (!template_override.has_value() || template_override->empty())
-        {
-            throw std::runtime_error(
-                "Qwen3.5/3.6 structured prompt regression requires the production chat-template override");
-        }
-        tokenizer->setChatTemplate(
-            ChatTemplate::create(*template_override, "", ""));
+        ModelGenerationPolicy::fromMetadata(*tokenizer_context->loader())
+            .applyChatTemplate(*tokenizer);
 
         constexpr int kRequestedNumberedLines = 220;
         std::ostringstream user_prompt;

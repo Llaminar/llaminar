@@ -13,6 +13,7 @@
 #include "backends/CPUExecutionGeometry.h"
 #include "execution/config/RuntimeConfig.h"
 #include "planning/ModelMemoryProfile.h"
+#include "kernels/attention/AttentionExecutionPolicy.h"
 #include <cstddef>
 #include <optional>
 
@@ -89,6 +90,9 @@ struct WorkspaceMemoryGeometry
      * ordinary graph geometry when no explicit compact capacity is supplied.
      */
     std::optional<int> compact_routed_expert_token_rows;
+    TensorType attention_kv_format = TensorType::FP32; ///< Actual native attention operands.
+    attention::AttentionVisibilityPolicy attention_visibility =
+        attention::AttentionVisibilityPolicy::General; ///< Model schema's immutable visibility.
 };
 
 class WorkspaceMemoryEstimator

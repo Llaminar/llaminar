@@ -1,6 +1,10 @@
 /**
  * @file LogitsGatherer.cpp
  * @brief Implementation of combined logits buffer management and D2H gather operations
+ *
+ * Each buffer is bounded by its declared host output rows. Terminal PP copies
+ * admit only their exact output extent; no context-sized scratch is retained.
+ * Every copy validates that extent before writing bytes.
  * @author David Sanftenberg
  * @date April 2026
  */
@@ -9,6 +13,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "IInferenceRunner.h"
 
 #include <algorithm>
@@ -35,6 +40,10 @@ namespace llaminar2
             buffer_ = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{max_tokens, static_cast<size_t>(vocab_size)});
             LOG_DEBUG("LogitsGatherer: Allocated buffer [" << max_tokens << ", " << vocab_size << "]");
+            PerfStatsCollector::addCounter("execution", "host_logits_storage_bytes",
+                static_cast<double>(buffer_->numel() * sizeof(float)), "materialization", "CPU",
+                {{"row_capacity", std::to_string(max_tokens)},
+                 {"vocabulary", std::to_string(vocab_size)}});
         }
     }
 
@@ -408,8 +417,16 @@ namespace llaminar2
         size_t seq_len, int full_vocab_size)
     {
         invalidate();
-        if (!buffer_ || runners.empty())
+        if (!buffer_ || runners.empty() || !runners[0])
             return false;
+        if (seq_len == 0 || full_vocab_size <= 0 ||
+            seq_len > buffer_->numel() / static_cast<size_t>(full_vocab_size))
+        {
+            LOG_ERROR("LogitsGatherer::gather: requested output rows exceed the retained host capacity"
+                      << " rows=" << seq_len << " vocab=" << full_vocab_size
+                      << " capacity_elements=" << buffer_->numel());
+            return false;
+        }
 
         // Single device — simple memcpy from primary runner
         if (runners.size() == 1)
@@ -484,8 +501,7 @@ namespace llaminar2
 
     void LogitsGatherer::copyFromStage(
         const IInferenceRunner &stage_runner,
-        size_t copy_elements_hint,
-        int batch_size, int max_seq_len)
+        size_t copy_elements_hint)
     {
         invalidate();
         const float *stage_logits = stage_runner.logits();
@@ -502,19 +518,22 @@ namespace llaminar2
             return;
         }
 
-        // Allocate on demand if needed
-        if (!buffer_)
-        {
-            size_t max_tokens = static_cast<size_t>(batch_size) * static_cast<size_t>(max_seq_len);
-            buffer_ = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{max_tokens, static_cast<size_t>(vocab)});
-            LOG_DEBUG("LogitsGatherer::copyFromStage: Allocated buffer ["
-                      << max_tokens << ", " << vocab << "]");
-        }
-
         const size_t copy_elements = copy_elements_hint > 0
                                          ? copy_elements_hint
                                          : static_cast<size_t>(vocab);
+        // Only the exposed host output is retained. Ordinary PP publishes one
+        // terminal row; all-position output uses its distinct gather surface.
+        if (!buffer_)
+        {
+            buffer_ = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{copy_elements});
+            vocab_size_ = static_cast<size_t>(vocab);
+            PerfStatsCollector::addCounter("execution", "host_logits_storage_bytes",
+                static_cast<double>(buffer_->numel() * sizeof(float)), "materialization", "CPU",
+                {{"copy_elements", std::to_string(copy_elements)},
+                 {"vocabulary", std::to_string(vocab)}});
+        }
+
         if (copy_elements == 0 || copy_elements > buffer_->numel())
         {
             LOG_ERROR("LogitsGatherer::copyFromStage: requested copy of "

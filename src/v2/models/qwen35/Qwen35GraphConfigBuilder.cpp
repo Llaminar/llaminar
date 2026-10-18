@@ -1,10 +1,12 @@
 /**
  * @file Qwen35GraphConfigBuilder.cpp
- * @brief Implementation of Qwen35GraphConfigBuilder
+ * @brief Qwen3.5-family tensor geometry and weight wiring.
+ *
+ * Generation defaults belong to the loaded model revision, independently of
+ * the Qwen3.5 tensor layout shared by Qwen3.6 and Qwen3.8.
  */
 
 #include "Qwen35GraphConfigBuilder.h"
-#include "qwen/qwen35/Qwen35ChatTemplate.generated.h"
 #include "../GraphTypes.h"
 #include "../../execution/mtp/MTPWeightManifest.h"
 #include "../../interfaces/IModelContext.h"
@@ -271,17 +273,6 @@ namespace llaminar2
         };
 
         return weights;
-    }
-
-    std::optional<std::string> Qwen35GraphConfigBuilder::chatTemplateOverride() const
-    {
-        // Community-maintained replacement for the GGUF-embedded template,
-        // which reliably induces a post-</think> repetition loop on longer
-        // generations. The template lives at jinja/qwen/qwen35/template.jinja
-        // and is embedded into this binary at build time (see
-        // cmake/EmbedJinjaTemplate.cmake). Source URL + license are recorded
-        // both in that script invocation and in jinja/qwen/qwen35/NOTICE.md.
-        return std::string(qwen35::kCommunityChatTemplate);
     }
 
 } // namespace llaminar2

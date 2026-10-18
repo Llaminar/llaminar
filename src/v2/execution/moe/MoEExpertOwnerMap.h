@@ -39,6 +39,9 @@ namespace llaminar2
         int owner_world_rank = -1;
         bool owner_world_rank_known = false;
         GlobalDeviceAddress address;
+
+        /** @return Equality of the complete logical and physical owner identity. */
+        bool operator==(const MoEExpertOwner &) const = default;
     };
 
     /** @brief Stable participant descriptor referenced by expert owners. */
@@ -53,6 +56,9 @@ namespace llaminar2
         DeviceId device = DeviceId::invalid();
         int world_rank = -1;
         bool world_rank_known = false;
+
+        /** @return Equality of the complete participant identity, including rank. */
+        bool operator==(const MoEExpertOwnerParticipant &) const = default;
     };
 
     /** @brief Validation policy for whole-expert owner-map construction. */
@@ -176,6 +182,16 @@ namespace llaminar2
         size_t ownerCountForExpert(int layer_idx, int expert_id) const;
 
         /**
+         * @brief Authenticate complete ownership without allocating a second table.
+         * @param num_layers Number of owned contiguous layers.
+         * @param num_experts Routed experts per owned layer.
+         * @param first_model_layer First global model layer in the interval.
+         * @throws std::invalid_argument For invalid or overflowing geometry.
+         * @throws std::logic_error For incomplete or foreign ownership coordinates.
+         */
+        void requireLayerGeometry(int num_layers, int num_experts, int first_model_layer = 0) const;
+
+        /**
          * @brief Materialize the complete layered ownership table represented here.
          *
          * Residency planning, histogram attribution, and runtime-bank publication
@@ -183,16 +199,18 @@ namespace llaminar2
          * Keeping this conversion with the owner-map authority avoids each caller
          * rebuilding the dense table with subtly different completeness checks.
          *
-         * @param num_layers Exact model transformer-layer count.
+         * @param num_layers Exact number of owned contiguous model layers.
          * @param num_experts Exact routed-expert count per layer.
-         * @return Validated dense ownership indexed by layer and expert.
+         * @param first_model_layer First model-global layer in the owned interval.
+         * @return Compact ownership retaining model-global layer identities.
          * @throws std::invalid_argument for non-positive geometry or no participants.
          * @throws std::logic_error when an owner is missing, duplicated, or outside
          *         the requested model geometry.
          */
         [[nodiscard]] MoELayeredExpertOwnership layeredOwnership(
             int num_layers,
-            int num_experts) const;
+            int num_experts,
+            int first_model_layer = 0) const;
 
     private:
         /** @brief Shared implementation for initial and transition builds. */

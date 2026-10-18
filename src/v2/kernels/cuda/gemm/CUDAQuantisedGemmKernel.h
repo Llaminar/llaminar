@@ -55,6 +55,15 @@ namespace llaminar2
 
     namespace cuda
     {
+        /**
+         * @brief Prepare existing IQ grid symbols before any captured tier work.
+         * @param device_ordinal Exact CUDA endpoint/runtime generation.
+         * @return Whether synchronous cold publication completed successfully.
+         * Uses the same runtime-generation authority as production GEMV; no new
+         * table, allocation or initialization ledger is introduced. Setup only.
+         */
+        bool prepareNativeIQGridTablesCUDA(int device_ordinal);
+
 
         /**
          * @brief CUDA GEMM kernel for quantized weight tensors using CUDA packed weights

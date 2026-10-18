@@ -466,7 +466,7 @@ namespace llaminar2
          * @return Vector of bytes containing serialized data
          *
          * Binary format:
-         * [rank:4][node_id:4][local_rank:4][hostname_len:4][hostname:N]
+         * [magic:4][version:4][rank:4][node_id:4][local_rank:4][hostname_len:4][hostname:N]
          * [cpu_cores:4][cpu_workers:4][cpu_sockets:4][numa_nodes:4][cpu_memory:8]
          * [cpu_device_info:variable]
          * [gpu_count:4][gpu1_info:variable][gpu2_info:variable]...
@@ -475,7 +475,7 @@ namespace llaminar2
          * [type:4][local_device_id:4][memory_bytes:8][free_memory_bytes:8]
          * [compute_units:4][cc_major:4][cc_minor:4][tflops_fp16:4][tflops_int8:4]
          * [memory_bandwidth_gbps:4][name_len:4][name:N][uuid_len:4][uuid:N]
-         * [supports_p2p:1][pcie_bus_id:4][numa_node:4]
+         * [supports_p2p:1][pci_address_len:4][pci_address:N][numa_node:4]
          * [PCIe metadata:variable][last_level_cache_bytes:8]
          */
         static std::vector<uint8_t> serializeRankInventory(const RankInventory &inventory);

@@ -118,7 +118,10 @@ namespace
     // =========================================================================
 
     static constexpr int MIN_THREADS = 1;
-    static constexpr int MAX_THREADS = 56;
+    // CMake also reserves this many physical cores for the full fixture. Keep
+    // the intentional thread-totality sweep and scheduler demand inseparable.
+    static constexpr int MAX_THREADS = LLAMINAR_TEST_CPU_GEMM_MAX_THREADS;
+    static_assert(MAX_THREADS >= MIN_THREADS);
 
     // =========================================================================
     // Weight factory: creates quantized weights by format name

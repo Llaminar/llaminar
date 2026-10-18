@@ -895,4 +895,77 @@ namespace llaminar2::test
             std::invalid_argument);
     }
 
+    /** @brief Compact service/migration profiles preserve model-global coordinates. */
+    TEST(MoEOverlayEconomyProfileComposer, PipelineStageProfilesPreservePricesAndBindIdentity)
+    {
+        const auto baseline_plan = arbitraryPriorityPlan();
+        const auto baseline = MoEOverlayEconomyProfileComposer::compose(
+            baseline_plan, metadata(), MoEExpertOwnerMap::build(baseline_plan), completeMeasurements(), {});
+        for (const int first : {32, 40})
+        {
+            auto plan = baseline_plan;
+            plan.first_model_layer = first;
+            for (auto &row : plan.placements) row.layer += first;
+            auto model = metadata();
+            model.first_model_layer = first;
+            auto measurements = completeMeasurements();
+            measurements.production_topology = ExpertHistogramProductionTopology::uniform(2, kAllExpertHistogramProductionSources, first);
+            for (auto &row : measurements.participant_service) row.layer += first;
+            for (auto &row : measurements.directed_migration) row.layer += first;
+            const auto owners = MoEExpertOwnerMap::build(plan);
+            EXPECT_THROW((void)MoEOverlayEconomyProfileComposer::compose(
+                plan, model, MoEExpertOwnerMap::build(baseline_plan), measurements, {}), std::logic_error);
+            const auto profiles = MoEOverlayEconomyProfileComposer::compose(plan, model, owners, measurements, {});
+            ASSERT_TRUE(profiles.valid());
+            ASSERT_EQ(profiles.service->costs.size(), baseline.service->costs.size());
+            ASSERT_EQ(profiles.migration->costs.size(), baseline.migration->costs.size());
+            for (std::size_t row = 0; row < profiles.service->costs.size(); ++row)
+            {
+                EXPECT_EQ(profiles.service->costs[row].layer, baseline.service->costs[row].layer + first);
+                EXPECT_EQ(profiles.service->costs[row].nanoseconds_per_activation,
+                          baseline.service->costs[row].nanoseconds_per_activation);
+            }
+            for (std::size_t row = 0; row < profiles.migration->costs.size(); ++row)
+            {
+                EXPECT_EQ(profiles.migration->costs[row].layer, baseline.migration->costs[row].layer + first);
+                EXPECT_EQ(profiles.migration->costs[row].transfer_and_repack_ns, baseline.migration->costs[row].transfer_and_repack_ns);
+            }
+            EXPECT_NE(profiles.service->identity, baseline.service->identity);
+            EXPECT_NE(profiles.migration->identity, baseline.migration->identity);
+            EXPECT_THROW((void)MoEOverlayEconomyProfileComposer::compose(baseline_plan, model, owners, measurements, {}), std::invalid_argument);
+            auto foreign = measurements;
+            foreign.production_topology = ExpertHistogramProductionTopology::uniform(2, kAllExpertHistogramProductionSources);
+            EXPECT_THROW((void)MoEOverlayEconomyProfileComposer::compose(plan, model, owners, foreign, {}), std::invalid_argument);
+            foreign = measurements;
+            foreign.participant_service.front().layer = first - 1;
+            EXPECT_THROW((void)MoEOverlayEconomyProfileComposer::compose(plan, model, owners, foreign, {}), std::invalid_argument);
+            foreign = measurements;
+            foreign.directed_migration.front().layer = first + 2;
+            EXPECT_THROW((void)MoEOverlayEconomyProfileComposer::compose(plan, model, owners, foreign, {}), std::invalid_argument);
+        }
+    }
+
+    /** @brief Class pooling translates owned layer IDs before accessing compact rows. */
+    TEST(MoEOverlayEconomyProfileComposer, PipelineStageEquivalentServicePoolingUsesOwnedRows)
+    {
+        for (const int first : {0, 32, 40})
+        {
+            const MoEOverlayEconomyCalibrationLayerCatalog catalog({serviceLayer(first, 64), serviceLayer(first + 1, 64)});
+            const auto topology = ExpertHistogramProductionTopology::uniform(2, kAllExpertHistogramProductionSources, first);
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> totals{
+                {.participant_id = 3, .layer = first, .total_nanoseconds = {100, 200, 300},
+                 .activation_count = {2, 4, 5}, .sample_count = {1, 1, 1}},
+                {.participant_id = 3, .layer = first + 1},
+            };
+            const auto normalized = MoEOverlayEconomyProfileComposer::normalizeEquivalentServiceTotals(totals, topology, catalog);
+            ASSERT_EQ(normalized.size(), 2u);
+            for (std::size_t row = 0; row < normalized.size(); ++row)
+            {
+                EXPECT_EQ(normalized[row].layer, first + static_cast<int>(row));
+                EXPECT_EQ(normalized[row].nanoseconds_per_activation, (std::array<std::uint64_t, 3>{50, 50, 60}));
+            }
+            const auto foreign = ExpertHistogramProductionTopology::uniform(2, kAllExpertHistogramProductionSources, first + 1);
+            EXPECT_THROW((void)MoEOverlayEconomyProfileComposer::normalizeEquivalentServiceTotals(totals, foreign, catalog), std::invalid_argument);
+        }
+    }
 } // namespace llaminar2::test

@@ -23,6 +23,8 @@
 #include <unordered_map>
 #include <functional>
 #include <string>
+#include <stdexcept>
+#include <utility>
 
 namespace llaminar2
 {
@@ -47,6 +49,50 @@ namespace llaminar2
     };
 
     /**
+     * @brief Immutable sparse history adjustments and their shared repetition law.
+     *
+     * Every listed token has appeared in history. Apply the sign-aware
+     * multiplicative penalty once, then subtract its additive adjustment.
+     * Keeping one scalar per batch avoids extra per-token storage/transfers.
+     */
+    class LogitPenaltyBatch
+    {
+    public:
+        /** @brief Construct an empty, neutral history adjustment. */
+        LogitPenaltyBatch() = default;
+
+        /**
+         * @brief Own the live sparse entries and one request-wide repetition factor.
+         * @param entries Seen token IDs with their combined additive penalties.
+         * @param repetition_penalty Positive finite multiplicative factor; one is neutral.
+         * @throws std::invalid_argument If the factor is not positive and finite.
+         */
+        LogitPenaltyBatch(std::vector<LogitPenalty> entries, float repetition_penalty = 1.0f)
+            : entries_(std::move(entries)), repetition_penalty_(repetition_penalty)
+        {
+            if (!std::isfinite(repetition_penalty_) || repetition_penalty_ <= 0)
+                throw std::invalid_argument("repetition_penalty must be positive and finite");
+        }
+
+        /** @return Whether there is no live history adjustment. */
+        bool empty() const { return entries_.empty(); }
+        /** @return Number of live entries, never allocation capacity. */
+        size_t size() const { return entries_.size(); }
+        /** @return Read-only beginning of the sparse history. */
+        auto begin() const { return entries_.begin(); }
+        /** @return Read-only end of the sparse history. */
+        auto end() const { return entries_.end(); }
+        /** @return The immutable multiplicative factor shared by every seen token. */
+        float repetitionPenalty() const { return repetition_penalty_; }
+        /** @return One checked sparse entry for diagnostics and device-free tests. */
+        const LogitPenalty &operator[](size_t index) const { return entries_.at(index); }
+
+    private:
+        std::vector<LogitPenalty> entries_;
+        float repetition_penalty_ = 1.0f;
+    };
+
+    /**
      * @brief Parameters for sampling configuration
      */
     struct SamplingParams
@@ -59,6 +105,7 @@ namespace llaminar2
         // Repetition penalty parameters (applied before softmax)
         float presence_penalty = 0.0f;  ///< Penalize tokens that appeared at all (OpenAI-style, additive)
         float frequency_penalty = 0.0f; ///< Penalize tokens proportional to frequency (OpenAI-style, additive)
+        float repetition_penalty = 1.0f; ///< Sign-aware multiplier/divisor for any seen token; applied before additive penalties.
 
         // DRY (Don't Repeat Yourself) penalty parameters
         // Detects repeated N-gram patterns and penalizes tokens that would extend them.
@@ -83,7 +130,7 @@ namespace llaminar2
          */
         bool has_penalties() const
         {
-            return presence_penalty != 0.0f || frequency_penalty != 0.0f ||
+            return presence_penalty != 0.0f || frequency_penalty != 0.0f || repetition_penalty != 1.0f ||
                    (dry_multiplier != 0.0f && dry_penalty_last_n != 0);
         }
     };
@@ -249,6 +296,12 @@ namespace llaminar2
         void record_token(int token_id);
 
         /**
+         * @brief Admit a prompt token without counting it as generated output.
+         * @param token_id Prompt token, used only by multiplicative repetition.
+         */
+        void record_prompt_token(int token_id);
+
+        /**
          * @brief Reset token generation history (e.g., new conversation)
          */
         void reset_history();
@@ -277,7 +330,7 @@ namespace llaminar2
          * @param vocab_size Vocabulary size (for bounds checking)
          * @return Vector of LogitPenalty entries to subtract from logits
          */
-        std::vector<LogitPenalty> compute_penalty_map(const SamplingParams &params, int vocab_size);
+        LogitPenaltyBatch compute_penalty_map(const SamplingParams &params, int vocab_size);
 
     private:
         std::mt19937 rng_; ///< Random number generator

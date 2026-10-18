@@ -36,11 +36,25 @@ namespace llaminar2
         DeviceRowPartition partition;
         int capacity = 0;
         SnapshotRowStorage storage = SnapshotRowStorage::CompactOwned;
+
+        /** @brief Compare every immutable ownership and physical-storage field.
+         * @param other Descriptor to authenticate at native recording.
+         * @return True only for the identical participant, domain, capacity and layout. */
+        [[nodiscard]] bool operator==(const SnapshotCompactRows &other) const noexcept
+        {
+            return partition.participant() == other.partition.participant() &&
+                   partition.participants() == other.partition.participants() &&
+                   capacity == other.capacity && storage == other.storage;
+        }
     };
     /** @brief Resolved host ownership; an empty list is a valid empty participant. */
     struct SnapshotOwnedRows
     {
         std::vector<SnapshotRowInterval> intervals;
+        /** @brief Compare the complete ordered observed ownership intervals.
+         * @param other Observed descriptor to authenticate.
+         * @return True only when every interval has identical coordinates. */
+        bool operator==(const SnapshotOwnedRows &other) const = default;
     };
     /** @brief Diagnostic lifecycle: ordinary, captured compact, or observed ownership. */
     using SnapshotRowLayout = std::variant<std::monostate, SnapshotCompactRows, SnapshotOwnedRows>;

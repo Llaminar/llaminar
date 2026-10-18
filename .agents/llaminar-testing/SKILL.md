@@ -60,12 +60,21 @@ HTTP matrix, then its dependent benchmark check consumes that same image-bound
 E2E receipt. The benchmark check runs both ISAs even when the first has a
 complete red ratchet report, comments the per-cell red/amber/green numbers on
 the PR, and fails if any measured phase exceeds the high-water tolerance.
+Only after both benchmark lanes pass, the required OpenCode check runs one
+complete ten-phase app session for every blessed E2E cell and both ISAs. The
+canonical inventory owns selection; no client-specific engine policy or
+workflow-local model list is allowed. Use PMA-admitted maximum context, the
+full reasoning/output budget and no generation deadline. Require complete
+phase, protocol, native-output, runtime, resource, driver and retirement
+evidence; model-authored app quality stays separate and tool errors must be
+strictly below 5%. The aggregate and release publisher independently replay
+all evidence. The gate is scoped to master PRs after benchmarks.
 Manual-dispatch E2E or benchmark runs cannot satisfy these PR checks. Do not
 commit benchmark evidence to the open PR head: `[skip ci]` would strand its
 required checks. After a certified squash merge, the master release publisher compares
-the merge **tree** with the tested develop image tree, revalidates both phase
+the merge **tree** with the tested develop image tree, revalidates all three phase
 artifacts, and promotes those immutable image digests to dated and master/SHA
-tags. It attaches the per-ISA E2E and benchmark JSON plus chart to the GitHub
+tags. It attaches the per-ISA E2E and benchmark JSON, chart and complete coding proof to the GitHub
 release. The first dated release uses concise bootstrap notes; later notes
 cover commits since the preceding release. Its dependent job then commits the
 combined upward-only AVX512/AVX2 high-water marks, result JSON, chart, and
@@ -364,7 +373,12 @@ ctest --test-dir build_v2_integration \
   -L '^ProductionTestPreflight$'
 ```
 
-Git pre-commit runs only these two complete model-free suites on every branch.
+Git pre-commit requires these two complete model-free suites on every branch.
+`LLAMINAR_PRECOMMIT_BUILD_DIR` selects an existing Integration tree.
+`LLAMINAR_PRECOMMIT_PREREQUISITES` explicitly reuses a passed canonical receipt
+only after the hook rebuilds and authenticates the unchanged complete inventory;
+source metadata also rejects later interpreted-test/policy edits. Stale or
+mismatched evidence is fatal. No raw gate-skip mode is provided.
 The hook builds their CMake-owned dependency targets and does not launch
 numerical campaigns, E2E, containers, Release builds, or benchmarks. Register
 the tracked hooks with `git config --local core.hooksPath .githooks`; see

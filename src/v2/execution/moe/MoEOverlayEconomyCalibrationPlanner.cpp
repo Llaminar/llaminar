@@ -164,16 +164,13 @@ namespace llaminar2
 
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(manifest);
+        first_model_layer_ = manifest.front().layer_idx;
         complete_expert_bytes_per_layer_.resize(manifest.size());
         for (std::size_t layer = 0; layer < manifest.size(); ++layer)
         {
-            if (!manifest[layer].valid() ||
-                manifest[layer].layer_idx != static_cast<int>(layer) ||
-                footprints[layer].layer_idx != static_cast<int>(layer))
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay calibration layer manifest must be valid and contiguous from zero");
-            }
+            // preparedFootprints authenticated the complete contiguous interval.
+            // Catalog members retain model-global IDs; byte arrays stay compact.
+            const int model_layer = manifest[layer].layer_idx;
             const std::size_t complete_bytes = std::max(
                 footprints[layer].cpu_live_bytes,
                 footprints[layer].gpu_live_bytes);
@@ -187,17 +184,17 @@ namespace llaminar2
             auto group = std::find_if(
                 groups_.begin(),
                 groups_.end(),
-                [&manifest, &layer](const auto &candidate)
+                [this, &manifest, layer](const auto &candidate)
                 {
-                    return manifest[static_cast<std::size_t>(
+                    return manifest[storageIndexForModelLayer(
                                         candidate.representative_layer)]
                                .projections == manifest[layer].projections;
                 });
             if (group == groups_.end())
             {
                 groups_.push_back({
-                    .representative_layer = static_cast<int>(layer),
-                    .member_layers = {static_cast<int>(layer)},
+                    .representative_layer = model_layer,
+                    .member_layers = {model_layer},
                     .service_telemetry_layers = {},
                     .complete_expert_bytes = complete_bytes,
                 });
@@ -209,7 +206,7 @@ namespace llaminar2
                     throw std::logic_error(
                         "Manifest-equivalent ExpertOverlay layers produced different exact footprints");
                 }
-                group->member_layers.push_back(static_cast<int>(layer));
+                group->member_layers.push_back(model_layer);
             }
         }
 
@@ -243,7 +240,7 @@ namespace llaminar2
             for (const int member : group.member_layers)
                 hashUnsigned(hash, static_cast<std::uint64_t>(member));
 
-            const auto &representative = manifest[static_cast<std::size_t>(
+            const auto &representative = manifest[storageIndexForModelLayer(
                 group.representative_layer)];
             for (const auto &projection : representative.projections)
             {
@@ -277,6 +274,16 @@ namespace llaminar2
         identity_ = catalogIdentity(hash);
     }
 
+    std::size_t MoEOverlayEconomyCalibrationLayerCatalog::storageIndexForModelLayer(
+        int layer) const
+    {
+        if (layer < first_model_layer_ ||
+            static_cast<std::size_t>(layer - first_model_layer_) >= layerCount())
+            throw std::invalid_argument(
+                "ExpertOverlay calibration layer is outside its owned interval");
+        return static_cast<std::size_t>(layer - first_model_layer_);
+    }
+
     bool MoEOverlayEconomyCalibrationLayerCatalog::isRepresentativeLayer(
         int layer) const noexcept
     {
@@ -302,6 +309,7 @@ namespace llaminar2
         const ExpertHistogramProductionTopology &topology) const
     {
         if (!topology.valid() || topology.layerCount() != layerCount() ||
+            topology.firstModelLayer() != firstModelLayer() ||
             !std::is_sorted(participant_ids.begin(), participant_ids.end()) ||
             std::adjacent_find(participant_ids.begin(), participant_ids.end()) !=
                 participant_ids.end() ||
@@ -322,8 +330,9 @@ namespace llaminar2
             for (std::size_t layer = 0; layer < layerCount(); ++layer)
             {
                 const auto &row = rows[base + layer];
+                const int model_layer = first_model_layer_ + static_cast<int>(layer);
                 if (!row.valid() || row.participant_id != participant_ids[participant] ||
-                    row.layer != static_cast<int>(layer))
+                    row.layer != model_layer)
                 {
                     throw std::invalid_argument(
                         "ExpertOverlay service snapshot is malformed, overflowed, or non-canonical");
@@ -331,13 +340,13 @@ namespace llaminar2
                 for (std::size_t phase = 0;
                      phase < kExpertHistogramProductionSourceCount; ++phase)
                 {
-                    if (!topology.reachable(static_cast<int>(layer), phase) &&
+                    if (!topology.reachable(model_layer, phase) &&
                         row.sample_count[phase] != 0)
                     {
                         std::ostringstream message;
                         message << "ExpertOverlay service snapshot sampled a runtime-disabled inference phase"
                                 << " participant=" << row.participant_id
-                                << " layer=" << layer << " source_index=" << phase;
+                                << " layer=" << model_layer << " source_index=" << phase;
                         throw std::invalid_argument(message.str());
                     }
                 }
@@ -369,7 +378,7 @@ namespace llaminar2
                         if (!topology.requiresServiceEvidence(layer, phase))
                             continue;
                         gap.eligible_layers.push_back(layer);
-                        observed |= rows[base + static_cast<std::size_t>(layer)]
+                        observed |= rows[base + storageIndexForModelLayer(layer)]
                                         .sample_count[phase] != 0;
                     }
                     // Reachable-but-unpriced catch-up graphs cannot create a
@@ -402,7 +411,7 @@ namespace llaminar2
             const auto phase = expertHistogramProductionSourceIndex(gap.source);
             for (const int layer : gap.eligible_layers)
             {
-                const auto index = base + static_cast<std::size_t>(layer);
+                const auto index = base + storageIndexForModelLayer(layer);
                 const auto &probe = prepared[index];
                 if (probe.sample_count[phase] == 0) continue;
                 // The coverage query proved there are no live samples anywhere
@@ -559,7 +568,8 @@ namespace llaminar2
         {
             calibration_layers_.resize(static_cast<std::size_t>(layers));
             for (int layer = 0; layer < layers; ++layer)
-                calibration_layers_[static_cast<std::size_t>(layer)] = layer;
+                calibration_layers_[static_cast<std::size_t>(layer)] =
+                    config_.live_snapshot->layered_ownership.modelLayerForStorageIndex(layer);
         }
         if (!std::is_sorted(
                 calibration_layers_.begin(), calibration_layers_.end()) ||
@@ -569,8 +579,8 @@ namespace llaminar2
             std::any_of(
                 calibration_layers_.begin(),
                 calibration_layers_.end(),
-                [layers](int layer)
-                { return layer < 0 || layer >= layers; }))
+                [this](int layer)
+                { return !config_.live_snapshot->layered_ownership.containsModelLayer(layer); }))
         {
             throw std::invalid_argument(
                 "ExpertOverlay calibration layers must be sorted, unique, and inside model geometry");
@@ -672,9 +682,8 @@ namespace llaminar2
         std::uint64_t calibration_sequence) const
     {
         if (source_participant == destination_participant ||
-            calibration_sequence == 0 || layer < 0 ||
-            layer >=
-                config_.live_snapshot->layered_ownership.layerCount() ||
+            calibration_sequence == 0 ||
+            !config_.live_snapshot->layered_ownership.containsModelLayer(layer) ||
             !std::binary_search(
                 calibration_layers_.begin(),
                 calibration_layers_.end(),
@@ -713,7 +722,7 @@ namespace llaminar2
         candidate->epoch = config_.live_snapshot->epoch + 1;
         const std::size_t bytes =
             config_.complete_expert_bytes_per_layer[
-                static_cast<std::size_t>(layer)];
+                config_.live_snapshot->layered_ownership.storageIndexForModelLayer(layer)];
 
         MoEOverlayResidencyTransaction transaction;
         transaction.purpose =

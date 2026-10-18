@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_set>
 
@@ -131,8 +132,8 @@ namespace
      * @brief Run the runtime-M grouped-vs-serial proof for one weight/output pair.
      *
      * The same production kernel object serves both sides. This matters for
-     * quantized tables because it exercises the real cached EmbedQ8 preparation
-     * used by repeated decode calls while changing only the invocation width.
+     * quantized tables because it proves that independent requested source rows
+     * retain the same values while only the invocation width changes.
      */
     template <typename OutputTensorT>
     void runOutputFormatSweep(
@@ -273,7 +274,8 @@ TEST_F(Test__CPUEmbeddingGroupedVerifier, NestedSlicesMatchUnwrappedSourceBytes)
  *
  * This CPU-only contract test catches the exact failure mode that previously
  * hid Q8_K: a tensor could be loadable and constructible while an all-format
- * test table or GPU repack map omitted it. No device is initialized here.
+ * test table or GPU repack map omitted it. Source4+superblock must remain
+ * distinct from physical24 without changing source-policy4. No device is initialized here.
  */
 TEST_F(Test__CPUEmbeddingGroupedVerifier,
        CanonicalQuantizedRegistryMatchesTensorAndDevicePackingContracts)
@@ -306,8 +308,18 @@ TEST_F(Test__CPUEmbeddingGroupedVerifier,
         EXPECT_EQ(info->codebook_id, format.source_codebook_id);
         EXPECT_EQ(info->is_superblock, format.source_is_superblock);
         EXPECT_EQ(
-            canonicalDeviceVnniCodebookId(info->codebook_id),
+            canonicalDeviceVnniCodebookId(*info),
             format.device_execution_codebook_id);
+        if (format.tensor_type == TensorType::IQ4_XS)
+        {
+            EXPECT_EQ(info->codebook_id, 4); EXPECT_TRUE(info->is_superblock);
+            EXPECT_EQ(format.device_execution_codebook_id, 24);
+        }
+        if (format.tensor_type == TensorType::IQ4_NL)
+        {
+            EXPECT_EQ(info->codebook_id, 4); EXPECT_FALSE(info->is_superblock);
+            EXPECT_EQ(format.device_execution_codebook_id, 4);
+        }
         EXPECT_TRUE(codebookIdToRepackFormat(
                         info->codebook_id,
                         info->is_superblock)
@@ -360,4 +372,129 @@ TEST_F(Test__CPUEmbeddingGroupedVerifier, IsCPUOnlyAndWorkspaceFree)
         << "CPUKernelBase exposes the uniform no-op workspace contract";
     EXPECT_TRUE(workspace_consumer->getWorkspaceRequirements(4, 64, 0).buffers.empty());
     EXPECT_FALSE(workspace_consumer->hasWorkspace());
+}
+
+/** @test Native prepared layout has exact source bytes and no floating conversion route. */
+TEST_F(Test__CPUEmbeddingGroupedVerifier, NativeLayoutRetainsEverySourceFormatAndRejectsInvalidGeometry)
+{
+    for (const auto &format : quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        auto source = format.create({3, 256}, 981);
+        const auto layout = NativeEmbeddingLayout::forSource(format.tensor_type, 3, 256);
+        EXPECT_EQ(layout.source_type, format.tensor_type);
+        EXPECT_EQ(layout.byte_size, source->size_bytes());
+        EXPECT_EQ(layout.byte_size, 3u * layout.row_stride_bytes);
+        EXPECT_EQ(layout, NativeEmbeddingLayout::forFormat(format.label, 3, 256));
+        EXPECT_EQ(NativeEmbeddingLayout::forSource(format.tensor_type, 0, 256).byte_size, 0u);
+        EXPECT_THROW(NativeEmbeddingLayout::forSource(format.tensor_type, 3, 0), std::invalid_argument);
+        EXPECT_THROW(NativeEmbeddingLayout::forSource(format.tensor_type,
+            std::numeric_limits<size_t>::max(), 256), std::overflow_error);
+    }
+    for (const auto source : {TensorType::FP32, TensorType::FP16, TensorType::BF16,
+             TensorType::INT32, TensorType::TQ4, TensorType::TQ8, TensorType::AQ8})
+    {
+        EXPECT_FALSE(NativeEmbeddingLayout::supports(source));
+        EXPECT_THROW(NativeEmbeddingLayout::forSource(source, 3, 256), std::invalid_argument);
+    }
+    EXPECT_THROW(NativeEmbeddingLayout::forFormat("FP8", 3, 256), std::invalid_argument);
+}
+
+namespace
+{
+    /**
+     * @brief Compare native lookup against independent source decoding and activation conversion.
+     * @tparam Output Activation tensor precision under test.
+     * @param source Immutable quantized source with at least seven native rows.
+     */
+    template <typename Output>
+    void requireOriginalEmbeddingRows(TensorBase &source)
+    {
+        const int width = static_cast<int>(source.cols());
+        const std::array<int, 7> tokens{6, 0, 3, 6, 2, 0, 1};
+        FP32Tensor independently_decoded({source.rows(), static_cast<size_t>(width)});
+        for (size_t row = 0; row < source.rows(); ++row)
+            source.to_fp32_row(row, independently_decoded.mutable_data() + row * width);
+        CPUEmbeddingKernelT<Output> actual_kernel, reference_kernel;
+        for (const int rows : {7, 3, 1, 7, 2})
+        {
+            SCOPED_TRACE(rows);
+            Output actual({static_cast<size_t>(rows), static_cast<size_t>(width)});
+            Output expected({static_cast<size_t>(rows), static_cast<size_t>(width)});
+            ASSERT_TRUE(actual_kernel.apply_tensor(&source, tokens.data(), rows, width, &actual));
+            ASSERT_TRUE(reference_kernel.apply_tensor(&independently_decoded, tokens.data(), rows, width, &expected));
+            expectByteExact(actual.raw_data(), expected.raw_data(), actual.size_bytes(),
+                            "original source embedding values and declared activation conversion");
+        }
+    }
+}
+
+/** @test Every quantized source retains original row values in all CPU activation precisions. */
+TEST_F(Test__CPUEmbeddingGroupedVerifier, NativeQuantizedSourceValuesMatchIndependentRows)
+{
+    for (const auto &format : quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        auto source = format.create({7, 256}, 1637);
+        const auto *raw = static_cast<const uint8_t *>(source->raw_data());
+        const std::vector<uint8_t> original(raw, raw + source->size_bytes());
+        requireOriginalEmbeddingRows<FP32Tensor>(*source);
+        requireOriginalEmbeddingRows<FP16Tensor>(*source);
+        requireOriginalEmbeddingRows<BF16Tensor>(*source);
+        requireOriginalEmbeddingRows<Q8_1Tensor>(*source);
+        EXPECT_EQ(std::memcmp(source->raw_data(), original.data(), original.size()), 0);
+    }
+    // Activation conversion follows the same rounding as a direct FP32 row,
+    // including halfway cases among binary16 subnormals. These original
+    // binary32 Q8_K scales must reach the activation converter unchanged.
+    std::vector<uint8_t> bytes(7 * sizeof(Q8_KBlock));
+    auto *blocks = reinterpret_cast<Q8_KBlock *>(bytes.data());
+    constexpr std::array<float, 7> scales{
+        0x1.8p-24f, -0x1.8p-24f, 0x1.8p-23f, -0x1.8p-23f,
+        0x1.fffffep-15f, -0x1.fffffep-15f, 0x1.000002p0f};
+    for (size_t row = 0; row < scales.size(); ++row)
+    {
+        blocks[row].d = scales[row];
+        std::memset(blocks[row].qs, 1, sizeof(blocks[row].qs));
+        std::fill(std::begin(blocks[row].bsums), std::end(blocks[row].bsums), 16);
+    }
+    Q8_KTensor source({7, 256}, bytes);
+    requireOriginalEmbeddingRows<FP32Tensor>(source);
+    requireOriginalEmbeddingRows<FP16Tensor>(source);
+    requireOriginalEmbeddingRows<BF16Tensor>(source);
+    requireOriginalEmbeddingRows<Q8_1Tensor>(source);
+}
+
+/** @test Unequal Q6_K subscales and Q4_K derived minima expose the old lossy embedding conversion. */
+TEST_F(Test__CPUEmbeddingGroupedVerifier, NativeQ6KAndQ4KAdversarialScalesPreserveSourceValues)
+{
+    std::vector<uint8_t> q6_bytes(7 * sizeof(Q6_KBlock));
+    auto *q6 = reinterpret_cast<Q6_KBlock *>(q6_bytes.data());
+    for (size_t row = 0; row < 7; ++row)
+    {
+        q6[row].d = fp32_to_fp16(0.1f);
+        std::memset(q6[row].ql, 0xff, sizeof(q6[row].ql));
+        std::memset(q6[row].qh, 0xff, sizeof(q6[row].qh));
+        for (size_t scale = 0; scale < 16; ++scale)
+            q6[row].scales[scale] = static_cast<int8_t>(scale % 2 == 0 ? 1 : 11);
+    }
+    Q6_KTensor q6_source({7, 256}, q6_bytes);
+    requireOriginalEmbeddingRows<FP32Tensor>(q6_source);
+    std::vector<uint8_t> q4_bytes(7 * sizeof(Q4_KBlock));
+    auto *q4 = reinterpret_cast<Q4_KBlock *>(q4_bytes.data());
+    for (size_t row = 0; row < 7; ++row)
+    {
+        q4[row].d = fp32_to_fp16(0.1f);
+        q4[row].dmin = fp32_to_fp16(0.333f);
+        std::memset(q4[row].scales, 0x3f, sizeof(q4[row].scales));
+        std::memset(q4[row].qs, 0x21, sizeof(q4[row].qs));
+    }
+    Q4_KTensor q4_source({7, 256}, q4_bytes);
+    requireOriginalEmbeddingRows<FP32Tensor>(q4_source);
+    // Activation conversion must stay block-bounded rather than imposing a
+    // whole-row stack limit on an otherwise supported native source width.
+    auto wide_source = TestTensorFactory::createQ6_KRandom({7, 8448}, 2267);
+    requireOriginalEmbeddingRows<FP16Tensor>(*wide_source);
+    requireOriginalEmbeddingRows<BF16Tensor>(*wide_source);
+    requireOriginalEmbeddingRows<Q8_1Tensor>(*wide_source);
 }

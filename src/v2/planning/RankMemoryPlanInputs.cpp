@@ -6,7 +6,9 @@
  * This module neither owns free-byte balances nor performs driver discovery:
  * the inventory is an observation and PhysicalMemoryAuthority remains the
  * sole ledger. Local TP uses the graph's exact proportional slice, not an
- * independent integer split reconstructed from the shard count.
+ * independent integer split reconstructed from the shard count. Ordinary and
+ * ExpertOverlay pipelines share the same physical transfer-leader projection;
+ * replicated weight views do not become extra channel owners.
  */
 #include "planning/RankMemoryPlanInputs.h"
 #include "planning/ActivationBufferSizing.h"
@@ -15,6 +17,81 @@
 
 namespace llaminar2
 {
+    PipelineStageTransferMemory PipelineStageTransferMemory::forStage(const RankExecutionPlan &parent, size_t stage)
+    {
+        const auto &devices = parent.local_pp_devices;
+        const auto &boundaries = parent.local_pp_layer_boundaries;
+        const auto &stage_tp = parent.local_pp_stage_tp_info;
+        if (parent.rank < 0 || devices.size() < 2 || stage >= devices.size() ||
+            boundaries.size() != devices.size() + 1 || boundaries.front() < 0 ||
+            (!stage_tp.empty() && stage_tp.size() != devices.size()) ||
+            !std::is_sorted(boundaries.begin(), boundaries.end()) ||
+            std::adjacent_find(boundaries.begin(), boundaries.end()) != boundaries.end())
+            throw std::invalid_argument("Pipeline transfer memory requires exact nonempty stage intervals and participants");
+        PipelineStageTransferMemory result;
+        result.world_rank_ = parent.rank;
+        result.first_layer_ = boundaries[stage];
+        result.last_layer_ = boundaries[stage + 1] - 1;
+        if (stage_tp.empty() || stage_tp[stage].devices.empty())
+            result.participants_.push_back(devices[stage].toLocalDeviceId());
+        else
+            for (const auto &member : stage_tp[stage].devices)
+                result.participants_.push_back(member.toLocalDeviceId());
+        if (result.participants_.front() != devices[stage].toLocalDeviceId())
+            throw std::invalid_argument("Pipeline transfer leader differs from its authored TP domain");
+        for (size_t index = 0; index < result.participants_.size(); ++index)
+            if (!result.participants_[index].is_valid() ||
+                std::find(result.participants_.begin(), result.participants_.begin() + index,
+                    result.participants_[index]) != result.participants_.begin() + index)
+                throw std::invalid_argument("Pipeline transfer memory requires distinct valid physical participants");
+        // Only one homogeneous device per stage installs a native PP context.
+        // Nested domains and mixed backends retain their explicit boundary path.
+        const bool native = devices.front().toLocalDeviceId().is_gpu() &&
+            std::all_of(devices.begin(), devices.end(), [&](const auto &device) {
+                return device.device_type == devices.front().device_type;
+            }) && std::all_of(stage_tp.begin(), stage_tp.end(), [](const auto &entry) {
+                return entry.devices.size() <= 1;
+            });
+        if (native)
+            result.native_backend_ = result.participants_.front().is_cuda()
+                ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        const auto leader = result.participants_.front();
+        const auto cross_backend = [&](size_t peer) {
+            const auto other = devices[peer].toLocalDeviceId();
+            return leader.is_gpu() && other.is_gpu() && leader.type != other.type;
+        };
+        if (stage && cross_backend(stage - 1))
+            result.captured_boundaries_.push_back(PipelineBoundarySide::LaterDomain);
+        if (stage + 1 < devices.size() && cross_backend(stage + 1))
+            result.captured_boundaries_.push_back(PipelineBoundarySide::EarlierDomain);
+        return result;
+    }
+
+    bool PipelineStageTransferMemory::requiresHostMemory(DeviceId device) const noexcept
+    {
+        return device == participants_.front() &&
+            std::find(captured_boundaries_.begin(), captured_boundaries_.end(), PipelineBoundarySide::EarlierDomain) !=
+                captured_boundaries_.end();
+    }
+
+    void PipelineStageTransferMemory::bind(DevicePlanConfig &config) const
+    {
+        if (config.world_rank != world_rank_ || config.first_layer != first_layer_ || config.last_layer != last_layer_ ||
+            config.execution_role != DeviceExecutionMemoryRole::ContinuationGraph || config.local_pipeline_backend ||
+            !config.captured_pipeline_boundaries.empty() ||
+            std::find(participants_.begin(), participants_.end(), config.device) == participants_.end())
+            throw std::invalid_argument("Pipeline transfer memory cannot bind a foreign or already bound device graph");
+        if (requiresHostMemory(config.device) &&
+            (!config.associated_host_memory || !config.associated_host_memory->valid() ||
+             config.associated_host_memory->world_rank != world_rank_ || !config.associated_host_memory->device.is_cpu()))
+            throw std::invalid_argument("Pipeline mapped channel owner requires its exact physical host authority");
+        if (config.device == participants_.front())
+        {
+            config.local_pipeline_backend = native_backend_;
+            config.captured_pipeline_boundaries = captured_boundaries_;
+        }
+    }
+
     std::vector<DevicePlanConfig> buildRankMemoryPlanInputs(
         const RankMemoryPlanInputRequest &request)
     {
@@ -205,16 +282,6 @@ namespace llaminar2
             const auto &pp_devices = request.plan.local_pp_devices;
             const auto &boundaries = request.plan.local_pp_layer_boundaries;
             const auto &stage_tp = request.plan.local_pp_stage_tp_info;
-            // Only the homogeneous, one-device-per-stage composition installs
-            // the native pipeline communicator. Nested/heterogeneous transport
-            // has a different owner and must not be priced as this resource.
-            const bool native_pipeline = pp_devices.size() > 1 &&
-                pp_devices.front().toLocalDeviceId().is_gpu() &&
-                std::all_of(pp_devices.begin(), pp_devices.end(), [&](const auto &address) {
-                    return address.device_type == pp_devices.front().device_type;
-                }) && std::all_of(stage_tp.begin(), stage_tp.end(), [](const auto &stage) {
-                    return stage.devices.size() <= 1;
-                });
             if (boundaries.size() != pp_devices.size() + 1 ||
                 !std::is_sorted(boundaries.begin(), boundaries.end()) ||
                 std::adjacent_find(boundaries.begin(), boundaries.end()) != boundaries.end())
@@ -223,31 +290,22 @@ namespace llaminar2
             // Cross-backend channels attach to domain leaders, not every TP
             // member. Source order also assigns host mapping ownership, so the
             // same physical slots cannot be charged once by each endpoint.
-            const auto bindCapturedBoundaries = [&](DevicePlanConfig &cfg, size_t stage) {
-                if (!cfg.device.is_gpu() || cfg.shard_index != 0) return;
-                const auto cross_backend = [&](size_t peer) {
-                    const auto device = pp_devices[peer].toLocalDeviceId();
-                    return device.is_gpu() && device.type != cfg.device.type;
-                };
-                if (stage && cross_backend(stage - 1))
-                    cfg.captured_pipeline_boundaries.push_back(PipelineBoundarySide::LaterDomain);
-                if (stage + 1 < pp_devices.size() && cross_backend(stage + 1))
+            const auto bindTransfers = [&](DevicePlanConfig &cfg, const PipelineStageTransferMemory &transfer) {
+                if (transfer.requiresHostMemory(cfg.device) && !cfg.associated_host_memory)
                 {
-                    cfg.captured_pipeline_boundaries.push_back(PipelineBoundarySide::EarlierDomain);
-                    if (!cfg.associated_host_memory)
-                    {
-                        const auto host = inventoryForDevice(DeviceId::cpu());
-                        cfg.associated_host_memory = PhysicalMemoryResource{
-                            .world_rank = request.plan.rank, .device = DeviceId::cpu(),
-                            .total_bytes = host.total_bytes,
-                            .admission_available_bytes = PhysicalMemoryAuthority::admissionCapacity(
-                                host.free_bytes, request.max_cpu_memory_bytes)};
-                    }
+                    const auto host = inventoryForDevice(DeviceId::cpu());
+                    cfg.associated_host_memory = PhysicalMemoryResource{
+                        .world_rank = request.plan.rank, .device = DeviceId::cpu(),
+                        .total_bytes = host.total_bytes,
+                        .admission_available_bytes = PhysicalMemoryAuthority::admissionCapacity(
+                            host.free_bytes, request.max_cpu_memory_bytes)};
                 }
+                transfer.bind(cfg);
             };
 
             for (size_t stage = 0; stage < pp_devices.size(); ++stage)
             {
+                const auto transfer = PipelineStageTransferMemory::forStage(request.plan, stage);
                 int stage_first = boundaries[stage];
                 int stage_last = boundaries[stage + 1] - 1;
 
@@ -278,7 +336,7 @@ namespace llaminar2
                         cfg.last_layer = stage_last;
                         cfg.owns_embedding =
                             request.plan.has_embedding && stage_first == 0;
-                        bindCapturedBoundaries(cfg, stage);
+                        bindTransfers(cfg, transfer);
                         device_configs.push_back(cfg);
                     }
                 }
@@ -291,10 +349,7 @@ namespace llaminar2
                     cfg.last_layer = stage_last;
                     cfg.owns_embedding =
                         request.plan.has_embedding && stage_first == 0;
-                    if (native_pipeline)
-                        cfg.local_pipeline_backend = cfg.device.is_cuda()
-                            ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
-                    bindCapturedBoundaries(cfg, stage);
+                    bindTransfers(cfg, transfer);
                     device_configs.push_back(cfg);
                 }
             }

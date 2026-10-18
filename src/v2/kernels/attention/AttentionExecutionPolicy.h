@@ -13,9 +13,32 @@
 #pragma once
 
 #include <cstdint>
+#include "../../tensors/TensorType.h"
 
 namespace llaminar2::attention
 {
+    /** Immutable visibility of a captured attention transaction. */
+    enum class AttentionVisibilityPolicy : std::uint8_t
+    {
+        General, ///< Noncausal, masked or sliding-window attention.
+        CausalFullContext, ///< Causal attention without an external mask/window.
+    };
+
+    /**
+     * @brief Resolve setup-owned visibility without consulting live device state.
+     * @param causal Whether future keys are hidden.
+     * @param window_size Positive sliding-window width, or nonpositive for full context.
+     * @param has_external_mask Whether a separate mask operand is present.
+     * @return Complete immutable visibility policy for admission and capture.
+     */
+    [[nodiscard]] constexpr AttentionVisibilityPolicy attentionVisibilityPolicy(
+        bool causal, int window_size, bool has_external_mask) noexcept
+    {
+        return causal && window_size <= 0 && !has_external_mask
+            ? AttentionVisibilityPolicy::CausalFullContext
+            : AttentionVisibilityPolicy::General;
+    }
+
     /**
      * @brief Physical axis used to expose parallel work during prefill.
      *
@@ -165,6 +188,11 @@ namespace llaminar2::attention
         int head_dim = 0;          ///< Elements in one query/key/value head.
         int kv_capacity = 0;       ///< Stable physical K/V row capacity.
         AttentionExecutionPolicy execution_policy{}; ///< Declarative graph policy.
+        TensorType native_kv_format = TensorType::FP32; ///< Actual execution operands.
+        AttentionVisibilityPolicy visibility = AttentionVisibilityPolicy::General; ///< Immutable mask/window policy.
+        int visible_kv_heads = 0; ///< Native KV heads addressable by the participant.
+        int head_start = 0; ///< Global query offset for replicated KV.
+        int replicated_gqa_n_rep = 0; ///< Zero for participant-local KV shards.
 
         /** @return True when every required immutable dimension is positive. */
         [[nodiscard]] constexpr bool valid() const noexcept

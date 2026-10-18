@@ -5,9 +5,16 @@
  * These tests protect the boundary between metadata-only memory planning and
  * the exact graph-family allocator. In particular, a 4K Qwen35MoE graph must
  * reserve enough memory before weight loading for the production CUDA/ROCm
- * requirement factories to publish all stable workspace names.
+ * requirement factories to publish all stable workspace names. Replicated MTP
+ * attention keeps its complete head geometry even beside a sharded main graph;
+ * long-context admission must cover each of its four conversion buffers.
+ * Native FP16 admission is compared with exhaustive captured-member geometry,
+ * independently of the estimator's bounded family-envelope search. Historical
+ * runtime anchors exclude the retired ROCm half-router workspace copy: prepared
+ * half gates now belong to model weights, outside the graph workspace arena.
  */
 
+#include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include <gtest/gtest.h>
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "backends/DeviceId.h"
@@ -15,6 +22,8 @@
 #include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/attention/AttentionWorkspaceContract.h"
+#include "kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
+#include "utils/DebugEnv.h"
 #include "kernels/common/EmbeddingWorkspaceContract.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
@@ -530,6 +539,7 @@ TEST(Test__WorkspaceMemoryEstimator, ROCm_AddsExactMoERequirementFactoryBytes)
 TEST(Test__WorkspaceMemoryEstimator,
      ROCmFusedProjectionWorkspaceCanonicalizesAcrossLayers)
 {
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
     auto profile = qwen35MoEProfile(false);
     profile.expert_count = 0;
     profile.expert_used_count = 0;
@@ -953,10 +963,15 @@ TEST(Test__WorkspaceMemoryEstimator,
         ++exercised_codebooks;
     }
     EXPECT_EQ(exercised_codebooks, 21u);
-    EXPECT_EQ(expected, 374859776ULL)
+    // The old observation included 128 half-gate slots in graph workspace.
+    // Model-owned prepared gates retire that complete bank, independently of
+    // the original quantized expert codebook or the selected router precision.
+    constexpr size_t retired_half_router_bank_bytes =
+        128ULL * 256ULL * 2048ULL * sizeof(uint16_t);
+    EXPECT_EQ(expected, 240642048ULL)
         << "The nine-row Qwen3.6-35B mapped/compact follower family must "
            "retain the exact typed ROCm MoE and NativeVNNI workspace ABI.";
-    EXPECT_GE(expected, 365474564ULL)
+    EXPECT_GE(expected, 365474564ULL - retired_half_router_bank_bytes)
         << "Admission must cover the mapped 40-layer serial plan observed by "
            "the production graph allocator.";
 }
@@ -1088,6 +1103,108 @@ TEST(Test__WorkspaceMemoryEstimator, Qwen35MoE4K_CoversObservedCUDAFamilyPlan)
            "plan measured for Qwen3.6-35B-A3B at 4K rows.";
 }
 
+/** @test Continuations retain the same direct and compact route workspace as expert-only participants. */
+TEST(Test__WorkspaceMemoryEstimator, ContinuationIncludesCompactExpertRouteWorkspace)
+{
+    const auto profile = qwen35MoEProfile(false);
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const int rows : {1, 16, 128, 768, 4096})
+        {
+            auto geometry = graphGeometry(device);
+            geometry.resident_graph_rows = rows;
+            const auto direct = WorkspaceMemoryEstimator::estimate(profile, geometry);
+            geometry.compact_routed_expert_token_rows = rows;
+            const auto combined = WorkspaceMemoryEstimator::estimate(profile, geometry);
+            auto expected = device.is_cuda()
+                ? MoEWorkspaceBuffers::cudaMoE(rows, 2048, 512, 256, 8)
+                : MoEWorkspaceBuffers::rocmMoE(rows, 2048, 512, 256, 8);
+            const auto direct_routes = expected.total_bytes_with_alignment();
+            expected.merge(device.is_cuda()
+                ? MoEWorkspaceBuffers::cudaMoE(rows * 8, 2048, 512, 256, 1)
+                : MoEWorkspaceBuffers::rocmMoE(rows * 8, 2048, 512, 256, 1));
+            EXPECT_EQ(combined - direct, expected.total_bytes_with_alignment() - direct_routes)
+                << device.toString() << " rows=" << rows;
+        }
+}
+
+/** @test Every quantized continuation retains the compact expert projection ABI by stable name. */
+TEST(Test__WorkspaceMemoryEstimator, ContinuationIncludesCompactQuantizedProjectionWorkspace)
+{
+    auto profile = qwen35MoEProfile(false);
+    profile.tensors = {
+        {"blk.0.ffn_gate_exps.weight", 0, "", size_t(512 * 2048) * 256, 2048, 0},
+        {"blk.0.ffn_up_exps.weight", 0, "", size_t(512 * 2048) * 256, 2048, 0},
+        {"blk.0.ffn_down_exps.weight", 0, "", size_t(2048 * 512) * 256, 512, 0},
+    };
+    for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
+    {
+        const auto type = static_cast<TensorType>(raw);
+        if (!isNativeVnniFormat(type) && !isInt8VnniFormat(type))
+            continue;
+        for (auto &tensor : profile.tensors)
+            tensor.quant_type = tensorTypeName(type);
+        for (const int rows : {1, 16, 128, 768, 4096})
+        {
+            auto geometry = graphGeometry(DeviceId::rocm(0));
+            geometry.resident_graph_rows = rows;
+            geometry.apportioned_routed_experts = true;
+            const auto direct_bytes = WorkspaceMemoryEstimator::estimate(profile, geometry);
+            geometry.compact_routed_expert_token_rows = rows;
+            const auto combined_bytes = WorkspaceMemoryEstimator::estimate(profile, geometry);
+
+            auto direct = MoEWorkspaceBuffers::rocmMoE(rows, 2048, 512, 256, 8);
+            direct.merge(rocm::quantized_gemm_workspace::projectionRequirements(rows, 512, 2048));
+            direct.merge(rocm::quantized_gemm_workspace::projectionRequirements(rows, 2048, 512));
+            rocm::quantized_gemm_workspace::appendFusedProjectionRequirements(
+                direct, rows, std::vector<int>(16, 512));
+            auto combined = direct;
+            combined.merge(MoEWorkspaceBuffers::rocmMoE(rows * 8, 2048, 512, 256, 1));
+            combined.merge(rocm::quantized_gemm_workspace::projectionRequirements(rows * 8, 512, 2048));
+            combined.merge(rocm::quantized_gemm_workspace::projectionRequirements(rows * 8, 2048, 512));
+            EXPECT_EQ(combined_bytes - direct_bytes,
+                combined.total_bytes_with_alignment() - direct.total_bytes_with_alignment())
+                << tensorTypeName(type) << " rows=" << rows;
+        }
+    }
+}
+
+/** @test Floating compact endpoints merge their output bank with the direct graph on both GPUs. */
+TEST(Test__WorkspaceMemoryEstimator, ContinuationIncludesCompactFloatingProjectionWorkspace)
+{
+    auto profile = qwen35MoEProfile(false);
+    profile.tensors = {
+        {"blk.0.ffn_gate_exps.weight", 0, "", size_t(512 * 2048) * 256, 2048, 0},
+        {"blk.0.ffn_down_exps.weight", 0, "", size_t(2048 * 512) * 256, 512, 0},
+    };
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const auto format : {"F16", "BF16", "F32"})
+            for (const int rows : {1, 16, 128, 768, 4096})
+            {
+                for (auto &tensor : profile.tensors)
+                    tensor.quant_type = format;
+                auto geometry = graphGeometry(device);
+                geometry.apportioned_routed_experts = true;
+                geometry.resident_graph_rows = rows;
+                const auto direct_bytes = WorkspaceMemoryEstimator::estimate(profile, geometry);
+                geometry.compact_routed_expert_token_rows = rows;
+                const auto combined_bytes = WorkspaceMemoryEstimator::estimate(profile, geometry);
+                auto direct = device.is_cuda()
+                    ? MoEWorkspaceBuffers::cudaMoE(rows, 2048, 512, 256, 8)
+                    : MoEWorkspaceBuffers::rocmMoE(rows, 2048, 512, 256, 8);
+                if (device.is_cuda())
+                    direct.merge(cuda::floating_gemm_workspace::projectionRequirements(rows, 2048));
+                auto combined = direct;
+                combined.merge(device.is_cuda()
+                    ? MoEWorkspaceBuffers::cudaMoE(rows * 8, 2048, 512, 256, 1)
+                    : MoEWorkspaceBuffers::rocmMoE(rows * 8, 2048, 512, 256, 1));
+                if (device.is_cuda())
+                    combined.merge(cuda::floating_gemm_workspace::projectionRequirements(rows * 8, 2048));
+                EXPECT_EQ(combined_bytes - direct_bytes,
+                    combined.total_bytes_with_alignment() - direct.total_bytes_with_alignment())
+                    << device.toString() << " " << format << " rows=" << rows;
+            }
+}
+
 /**
  * @brief Largest-bucket admission must dominate intermediate attention peaks.
  *
@@ -1127,6 +1244,74 @@ TEST(Test__WorkspaceMemoryEstimator, PrefillFamilyCoversIntermediateAttentionBuc
                 }
             }
         }
+    }
+}
+
+/**
+ * @brief Replicated MTP attention cannot inherit the main model's TP head slice.
+ *
+ * Changing only the retained-head declaration must admit the additional live
+ * conversion widths. The old estimator reserved identical bytes for both
+ * profiles and failed Qwen3.8 TP2 materialization at 262,144 tokens. The paired
+ * disabled control proves that mere presence of learned weights costs nothing
+ * when the request topology does not retain MTP execution.
+ */
+TEST(Test__WorkspaceMemoryEstimator, RetainedMTPAttentionUsesReplicatedHeadGeometry)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    profile.d_model = 5120;
+    profile.d_ff = 17408;
+    profile.n_heads = 24;
+    profile.n_kv_heads = 4;
+    profile.head_dim = 256;
+    profile.vocab_size = 248320;
+    profile.max_seq_len = 262144;
+    installQwen122HybridLayerInventory(profile);
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int tp : {1, 2, 4, 8})
+    for (const int context : {4096, 32768, 262144})
+    for (const int rows : {1, 17, 384, 512})
+    {
+        SCOPED_TRACE(::testing::Message() << device.toString() << " TP=" << tp
+            << " context=" << context << " rows=" << rows);
+        auto geometry = graphGeometry(device, profile.d_ff / tp, tp);
+        geometry.last_layer = 47;
+        geometry.resident_graph_rows = rows;
+        geometry.max_context_rows = context;
+        geometry.local_query_heads = profile.n_heads / tp;
+        geometry.local_kv_heads = std::max(1, profile.n_kv_heads / tp);
+        geometry.mtp_target_query_rows = 16;
+        profile.mtp_layer_count = 0;
+        const auto sharded_only = WorkspaceMemoryEstimator::estimate(profile, geometry);
+        profile.mtp_layer_count = 1;
+        const auto with_replicated_head = WorkspaceMemoryEstimator::estimate(profile, geometry);
+        size_t additional_live_bytes = 0;
+        if (device.is_gpu())
+        {
+            // K/V conversion belongs to two distinct consumers: attention and
+            // the cache. Each owns one K and one V buffer over the full horizon.
+            additional_live_bytes = size_t{4} * sizeof(float) * context * profile.head_dim *
+                (profile.n_kv_heads - geometry.local_kv_heads);
+        }
+        else
+        {
+            const auto bytes = [&](int heads)
+            {
+                return attention_workspace::cpuParallelRequirements({
+                    .compact_query_rows = attention::kMaxGroupedVerifierAttentionRows,
+                    .local_query_heads = heads, .head_dim = profile.head_dim,
+                    .worker_count = geometry.device_compute_units}).total_bytes_with_alignment();
+            };
+            additional_live_bytes = bytes(profile.n_heads) - bytes(geometry.local_query_heads);
+        }
+        ASSERT_GE(with_replicated_head, sharded_only);
+        EXPECT_GE(with_replicated_head - sharded_only, additional_live_bytes);
+
+        geometry.mtp_target_query_rows = 0;
+        const auto disabled_with_heads = WorkspaceMemoryEstimator::estimate(profile, geometry);
+        profile.mtp_layer_count = 0;
+        EXPECT_EQ(disabled_with_heads, WorkspaceMemoryEstimator::estimate(profile, geometry));
     }
 }
 
@@ -1228,6 +1413,7 @@ TEST(Test__WorkspaceMemoryEstimator,
 TEST(Test__WorkspaceMemoryEstimator,
      Qwen122ROCmTP4Depth15CoversExactQuantizedGemmFamily)
 {
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
     auto profile = qwen35MoEProfile(false);
     profile.architecture = "qwen35moe";
     profile.d_model = 3072;
@@ -1327,8 +1513,13 @@ TEST(Test__WorkspaceMemoryEstimator,
     const size_t removed_unadmitted_summaries =
         rocmAttentionDescriptorBytes(geometry, 8, 2, 256, geometry.max_context_rows) -
         rocmAttentionDescriptorBytes(geometry, 8, 2, 256, geometry.resident_graph_rows);
+    // This recorded runtime anchor predates model-owned half router gates.
+    // Retire precisely its 128-slot gate bank; every remaining live interval
+    // retains the original lower/upper admission bounds below.
+    constexpr size_t retired_half_router_bank_bytes =
+        128ULL * 256ULL * 3072ULL * sizeof(uint16_t);
     const std::size_t exact_runtime_serial_family_bytes =
-        2546278148ULL - removed_unadmitted_summaries;
+        2546278148ULL - removed_unadmitted_summaries - retired_half_router_bank_bytes;
     EXPECT_GE(bytes, exact_runtime_serial_family_bytes)
         << "Preflight must cover the runtime interval plan before expert "
            "weights consume the remaining VRAM.";
@@ -1488,4 +1679,180 @@ TEST(Test__WorkspaceMemoryEstimator, ROCm_SameAsGPU)
         1, 4096, 896, 4864, 151936, DeviceId::rocm(0));
 
     EXPECT_EQ(cuda_bytes, rocm_bytes);
+}
+
+namespace
+{
+/** Restore capture overrides so geometry admission uses ordinary production policy. */
+class ScopedAutomaticAttentionAdmission final
+{
+public:
+    /** Save the authored process policy and select automatic capture geometry. */
+    ScopedAutomaticAttentionAdmission()
+        : query_(mutableDebugEnv().attention.cuda_fa2_q_warp_groups),
+          values_(mutableDebugEnv().attention.cuda_fa2_hd256_pv_warps),
+          tile_(mutableDebugEnv().attention.cuda_fa2_tile_kv)
+    {
+        auto &policy = mutableDebugEnv().attention;
+        policy.cuda_fa2_q_warp_groups = policy.cuda_fa2_hd256_pv_warps = policy.cuda_fa2_tile_kv = 0;
+    }
+    /** Restore overrides before another test constructs a retained graph. */
+    ~ScopedAutomaticAttentionAdmission()
+    {
+        auto &policy = mutableDebugEnv().attention;
+        policy.cuda_fa2_q_warp_groups = query_;
+        policy.cuda_fa2_hd256_pv_warps = values_;
+        policy.cuda_fa2_tile_kv = tile_;
+    }
+private:
+    int query_, values_, tile_; ///< Setup-owned policy only; no device state.
+};
+
+/**
+ * @brief Enumerate actual capturable members independently of the envelope search.
+ * @param geometry Complete native format, visibility, head ownership and device facts.
+ * @param heads Local query heads selected by the fixture.
+ * @param kv_heads Actual visible native K/V heads.
+ * @param repetition Global GQA repetition, or zero for a local K/V shard.
+ * @return Exact stable-name union needed by every admitted member and decode.
+ *
+ * This oracle deliberately visits every positive M. It never calls the bounded
+ * family-envelope algorithm used by the estimator, so an omitted M511 boundary,
+ * compact stride, replicated offset or large bucket changes the expected bytes.
+ */
+size_t enumeratedAttentionAdmission(const WorkspaceMemoryGeometry &geometry,
+    int heads, int kv_heads, int repetition)
+{
+    size_t output = 0, maxima = 0, denominator = 0;
+    for (int rows = 1; rows <= geometry.resident_graph_rows; ++rows)
+    {
+        const auto consume = [&](const auto &plan)
+        {
+            EXPECT_TRUE(plan.valid);
+            output = std::max(output, plan.partial_output_bytes);
+            maxima = std::max(maxima, plan.partial_m_bytes);
+            denominator = std::max(denominator, plan.partial_l_bytes);
+        };
+        if (geometry.device.is_cuda())
+        {
+            const auto plan = cuda::fa2_policy::selectFA2PrefillParallelPlan({
+                .batch_size = 1, .query_rows = rows, .local_query_heads = heads, .head_dim = 256,
+                .kv_capacity = geometry.max_context_rows, .sm_count = geometry.device_compute_units,
+                .requested_axis = attention::AttentionPrefillParallelAxis::GeometrySelected,
+                .visible_kv_heads = kv_heads, .head_start = geometry.local_query_head_start,
+                .replicated_gqa_n_rep = repetition, .native_kv_format = geometry.attention_kv_format,
+                .visibility = geometry.attention_visibility});
+            if (rows == geometry.resident_graph_rows && rows >= 512 &&
+                geometry.attention_visibility == attention::AttentionVisibilityPolicy::CausalFullContext)
+            {
+                // The physical short-prefix bank stays 32 slots on both sides
+                // of KV8192/8193, although logical canonical partitions grow.
+                EXPECT_EQ(plan.summary_capacity, 32);
+                EXPECT_EQ(plan.summary_layout, cuda::fa2_policy::FA2PrefillSummaryLayout::TensorCompactFour);
+            }
+            consume(plan);
+        }
+        else
+            consume(rocm::fa2_policy::selectROCmFA2PrefillParallelPlan({
+                .batch_size = 1, .query_rows = rows, .local_query_heads = heads, .head_dim = 256,
+                .kv_capacity = geometry.max_context_rows, .compute_unit_count = geometry.device_compute_units,
+                .lds_capacity_bytes = rocm::fa2_policy::kROCmFA2LDSCapacityBytes,
+                .requested_axis = attention::AttentionPrefillParallelAxis::GeometrySelected,
+                .kv_format = geometry.attention_kv_format, .visibility = geometry.attention_visibility}));
+    }
+    return attention_workspace::requirements({
+        .compact_query_rows = attention::kMaxGroupedVerifierAttentionRows, .request_count = 1,
+        .local_query_heads = heads, .local_kv_heads = kv_heads, .head_dim = 256,
+        .context_rows = geometry.max_context_rows, .partial_output_floor_bytes = output,
+        .partial_m_floor_bytes = maxima, .partial_l_floor_bytes = denominator}).total_bytes_with_alignment();
+}
+} // namespace
+
+/**
+ * @test FP16 operand/visibility admission equals every actual captured family member.
+ *
+ * The difference against General visibility removes unrelated graph consumers.
+ * CUDA M4096 distinguishes native compact storage above 8K, while its native
+ * and generic banks both contain 32 slots at 8K. ROCm's score-owner policy changes
+ * the family envelope on both sides. M511/512 and KV8192/8193 cover both
+ * the native admission boundary and the canonical/compact summary transition.
+ */
+TEST(Test__WorkspaceMemoryEstimator, FP16PrefillAdmissionCoversEnumeratedCaptureGeometry)
+{
+    ScopedAutomaticAttentionAdmission automatic;
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const bool moe : {false, true})
+    for (const bool replicated : {false, true})
+    for (const int rows : {511, 512, 4096})
+    for (const int capacity : {8192, 8193})
+    {
+        SCOPED_TRACE(::testing::Message() << device.toString() << " MoE=" << moe
+            << " replicated=" << replicated << " M=" << rows << " KV=" << capacity);
+        auto profile = qwen35MoEProfile(false);
+        profile.architecture = moe ? "qwen35moe" : "qwen35";
+        profile.n_heads = moe ? 16 : 24;
+        profile.n_kv_heads = moe ? 2 : 4;
+        profile.head_dim = 256;
+        if (!moe) profile.expert_count = profile.expert_used_count = 0;
+        auto native = graphGeometry(device, profile.d_ff / 2, 2);
+        native.resident_graph_rows = rows;
+        native.max_context_rows = capacity;
+        native.local_query_heads = profile.n_heads / 2;
+        native.local_query_head_start = native.local_query_heads;
+        native.local_kv_heads = replicated ? profile.n_kv_heads : profile.n_kv_heads / 2;
+        native.attention_kv_format = TensorType::FP16;
+        native.attention_visibility = attention::AttentionVisibilityPolicy::CausalFullContext;
+        auto general = native;
+        general.attention_visibility = attention::AttentionVisibilityPolicy::General;
+        const int repetition = replicated ? profile.n_heads / profile.n_kv_heads : 0;
+        const size_t expected_native = enumeratedAttentionAdmission(native, native.local_query_heads,
+            native.local_kv_heads, repetition);
+        const size_t expected_general = enumeratedAttentionAdmission(general, native.local_query_heads,
+            native.local_kv_heads, repetition);
+        EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, native) + expected_general,
+            WorkspaceMemoryEstimator::estimate(profile, general) + expected_native);
+        if (rows == 4096)
+        {
+            // At 8K, CUDA's canonical 32-slot bank is already the exact compact
+            // extent. At 8193 the generic bank grows to 33 and native stays 32.
+            if (device.is_cuda() && capacity == 8192)
+                EXPECT_EQ(expected_native, expected_general);
+            else
+                EXPECT_NE(expected_native, expected_general);
+        }
+    }
+}
+
+/** @brief Selective alpha/beta admission covers the exact persistent half operand bank. */
+TEST(Test__WorkspaceMemoryEstimator, HalfAlphaBetaAdmitsOnlyScopedOperandWorkspace)
+{
+    struct Restore {
+        GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
+        ~Restore() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
+    } restore;
+    auto profile = qwen35MoEProfile(false);
+    profile.tensors = {
+        {"blk.0.ssm_alpha.weight", 0, "F32", size_t(32 * 2048), 2048, 0},
+        {"blk.0.ssm_beta.weight", 0, "F32", size_t(32 * 2048), 2048, 0},
+    };
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const int rows : {1, 16, 512, 2048})
+        {
+            auto geometry = graphGeometry(device);
+            geometry.resident_graph_rows = rows;
+            mutableDebugEnv().gemm.gdn_projection_arithmetic = GDNProjectionArithmetic::Native;
+            const auto native = WorkspaceMemoryEstimator::estimate(profile, geometry);
+            mutableDebugEnv().gemm.gdn_projection_arithmetic = GDNProjectionArithmetic::FP16MoEAlphaBeta;
+            const auto selective = WorkspaceMemoryEstimator::estimate(profile, geometry);
+            auto before = device.is_cuda() ?
+                cuda::floating_gemm_workspace::projectionRequirements(rows, 32) :
+                rocm::floating_gemm_workspace::projectionRequirements();
+            auto after = before;
+            after.merge(device.is_cuda() ?
+                cuda::floating_gemm_workspace::projectionRequirements(rows, 32, 2048, FloatingActivationOperandPrecision::FP16RNE) :
+                rocm::floating_gemm_workspace::projectionRequirements(rows, 2048, FloatingActivationOperandPrecision::FP16RNE));
+            EXPECT_EQ(selective - native, after.total_bytes_with_alignment() - before.total_bytes_with_alignment())
+                << device.toString() << " rows=" << rows;
+            EXPECT_GT(selective, native);
+        }
 }

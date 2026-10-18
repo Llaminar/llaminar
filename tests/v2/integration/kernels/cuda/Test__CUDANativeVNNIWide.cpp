@@ -7,7 +7,12 @@
  * but has independent activation loading and output publication. Every replay
  * poisons the outputs before computing them; guard bytes detect tail writes.
  * The format catalog supplies both ordinary and CPU-promotion representations.
- * This functional gate deliberately contains no performance threshold.
+ * This functional gate deliberately contains no performance threshold. Q6_K
+ * metadata is authored as original half bases and signed source coefficients;
+ * its second word is never treated as a derived half scale.
+ * IQ2_S synthetic metadata uses original half bases and raw coefficient bytes.
+ * IQ4_XS physical24 uses independently authored original half bases/raw6
+ * coefficients and retains source4 arithmetic policy in captured comparisons.
  */
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
@@ -17,6 +22,7 @@
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/BlockStructures.h"
 
 #include <array>
 #include <bit>
@@ -172,6 +178,42 @@ void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k
     {
         scales[i] = static_cast<uint16_t>(0x1000U + (mixed(i) & 0x1fffU));
         secondary[i] = static_cast<uint16_t>(0x1000U + (mixed(i + 77) & 0x1fffU));
+        if (codebook == 8)
+        {
+            // Independent source words, not two derived half products. Bases
+            // repeat across the eight logical blocks in each source superblock.
+            const size_t source_index = i % n + static_cast<size_t>(n) * ((i / n) / 8);
+            llaminar2::Q6_KBlock source{};
+            source.d = static_cast<uint16_t>(0x1000U + (mixed(source_index) & 0x1fffU));
+            source.scales[0] = static_cast<int8_t>(static_cast<int>(mixed(i + 77) & 255U) - 128);
+            source.scales[1] = static_cast<int8_t>(static_cast<int>(mixed(i + 119) & 255U) - 128);
+            scales[i] = source.d;
+            secondary[i] = static_cast<uint16_t>(static_cast<uint8_t>(source.scales[0])) |
+                (static_cast<uint16_t>(static_cast<uint8_t>(source.scales[1])) << 8);
+        }
+        if (codebook == 11)
+        {
+            // Original source half d repeats across eight blocks; raw nibble
+            // is independently authored, never an FP16-derived scale.
+            const size_t source_index=i%n+size_t(n)*((i/n)/8);
+            scales[i]=uint16_t(0x1000U+(mixed(source_index)&0x1fffU));
+            secondary[i]=uint16_t(mixed(i+77)&15u);
+        }
+        if (codebook == 13)
+        {
+            // Original IQ2_S d repeats across its eight32-value subblocks;
+            // the second word is an independent source byte, not another half.
+            const size_t source_index = i % n + static_cast<size_t>(n) * ((i / n) / 8);
+            scales[i] = static_cast<uint16_t>(0x1000U + (mixed(source_index) & 0x1fffU));
+            secondary[i] = static_cast<uint8_t>(mixed(i + 77));
+        }
+        if (codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
+        {
+            // Independently valid original half base + encoded6 source word.
+            const size_t source_index = i % n + static_cast<size_t>(n) * ((i / n) / 8);
+            scales[i] = static_cast<uint16_t>(0x1000U + (mixed(source_index) & 0x1fffU));
+            secondary[i] = static_cast<uint16_t>(mixed(i + 77) & 63u);
+        }
         minima[i] = scales[i] | (static_cast<uint32_t>(secondary[i]) << 16);
     }
     for (int i = 0; i < m * k; ++i)
@@ -211,7 +253,8 @@ void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k
             ASSERT_TRUE(cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
                 a.data, p.data, s.data, secondary_s.data, em.data, destination,
                 sa.data, m, n, k, 1.0f, 0.0f, nullptr, nullptr,
-                static_cast<uint8_t>(codebook), static_cast<uint8_t>(codebook), 0, stream,
+                static_cast<uint8_t>(codebook),
+                codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : static_cast<uint8_t>(codebook), 0, stream,
                 execution.context.get(), nullptr));
         }
         else
@@ -257,7 +300,7 @@ TEST(CUDANativeVNNIWide, CapturedGroupedRegisterBoundsMatchSerialAllFormats)
     for (const auto &source : llaminar2::native_vnni_formats::kAllSourceFormats)
     {
         const auto &format = *source.metadata;
-        formats.emplace(llaminar2::canonicalDeviceVnniCodebookId(format.codebook_id),
+        formats.emplace(llaminar2::canonicalDeviceVnniCodebookId(format),
                         format.payload_bytes);
         const auto promoted = llaminar2::migrationStableDeviceVnniFormat(format);
         formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
@@ -290,7 +333,7 @@ TEST(CUDANativeVNNIWide, CapturedAllCodebooksAndTileTailsMatchSinglePartition)
     for (const auto &source : llaminar2::native_vnni_formats::kAllSourceFormats)
     {
         const auto &format = *source.metadata;
-        formats.emplace(llaminar2::canonicalDeviceVnniCodebookId(format.codebook_id),
+        formats.emplace(llaminar2::canonicalDeviceVnniCodebookId(format),
                         format.payload_bytes);
         const auto promoted = llaminar2::migrationStableDeviceVnniFormat(format);
         formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);

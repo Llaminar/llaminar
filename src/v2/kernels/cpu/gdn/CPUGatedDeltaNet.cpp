@@ -14,7 +14,7 @@
  *    independent value columns to spare workers without changing any reduction.
  *
  * The kernel owns ALL preprocessing:
- * - L2 normalization of Q and K (when use_qk_l2norm is true)
+ * - Q/K normalization by sqrt(sum(x*x) + 1e-6) when use_qk_l2norm is true
  * - Query scaling by 1/sqrt(d_k)
  * - Gate computation: g = -exp(A_log) * softplus(alpha + dt_bias)
  * - Beta sigmoid: beta_sig = sigmoid(beta_raw)
@@ -307,7 +307,7 @@ namespace llaminar2
         float norm_sq = 0.0f;
         for (int d = 0; d < head_dim; ++d)
             norm_sq += vec[d] * vec[d];
-        const float inv_norm = 1.0f / std::max(std::sqrt(norm_sq), eps);
+        const float inv_norm = 1.0f / std::sqrt(norm_sq + eps);
         for (int d = 0; d < head_dim; ++d)
             vec[d] *= inv_norm;
     }
@@ -332,7 +332,7 @@ namespace llaminar2
         for (; d < head_dim; ++d)
             norm_sq += vec[d] * vec[d];
 
-        const float inv_norm = 1.0f / std::max(std::sqrt(norm_sq), eps);
+        const float inv_norm = 1.0f / std::sqrt(norm_sq + eps);
         const __m256 vinv = _mm256_set1_ps(inv_norm);
         d = 0;
         for (; d < hd_vec; d += 8)
@@ -357,7 +357,7 @@ namespace llaminar2
         for (; d < head_dim; ++d)
             norm_sq += vec[d] * vec[d];
 
-        const float inv_norm = 1.0f / std::max(std::sqrt(norm_sq), eps);
+        const float inv_norm = 1.0f / std::sqrt(norm_sq + eps);
         const __m512 vinv = _mm512_set1_ps(inv_norm);
         d = 0;
         for (; d < hd_vec; d += 16)
@@ -405,6 +405,9 @@ namespace llaminar2
     // (shared between recurrent_step and chunk_forward)
     // =========================================================================
 
+    // Qwen/FLA adds epsilon to squared norm; clamping the norm itself
+    // changes low-magnitude Q/K values and the recurrent state. Preserve the
+    // existing ISA reduction trees and fused query scaling association.
     // L2-normalize Q with fused scale, L2-normalize K (no scale)
     static void gdn_preprocess_qk_l2norm_scalar(
         const float *q_src, const float *k_src,
@@ -414,14 +417,14 @@ namespace llaminar2
         float nq = 0.0f;
         for (int d = 0; d < dim; ++d)
             nq += q_src[d] * q_src[d];
-        const float inv_q = scale / std::max(std::sqrt(nq), eps);
+        const float inv_q = scale / std::sqrt(nq + eps);
         for (int d = 0; d < dim; ++d)
             q_dst[d] = q_src[d] * inv_q;
 
         float nk = 0.0f;
         for (int d = 0; d < dim; ++d)
             nk += k_src[d] * k_src[d];
-        const float inv_k = 1.0f / std::max(std::sqrt(nk), eps);
+        const float inv_k = 1.0f / std::sqrt(nk + eps);
         for (int d = 0; d < dim; ++d)
             k_dst[d] = k_src[d] * inv_k;
     }
@@ -456,7 +459,7 @@ namespace llaminar2
             float norm_sq = _mm512_reduce_add_ps(vsum);
             for (; d < dim; ++d)
                 norm_sq += q_src[d] * q_src[d];
-            const float inv = scale / std::max(std::sqrt(norm_sq), eps);
+            const float inv = scale / std::sqrt(norm_sq + eps);
             const __m512 vinv = _mm512_set1_ps(inv);
             d = 0;
             for (; d < hd_vec; d += 16)
@@ -477,7 +480,7 @@ namespace llaminar2
             float norm_sq = _mm512_reduce_add_ps(vsum);
             for (; d < dim; ++d)
                 norm_sq += k_src[d] * k_src[d];
-            const float inv = 1.0f / std::max(std::sqrt(norm_sq), eps);
+            const float inv = 1.0f / std::sqrt(norm_sq + eps);
             const __m512 vinv = _mm512_set1_ps(inv);
             d = 0;
             for (; d < hd_vec; d += 16)

@@ -27,6 +27,7 @@
 #include "WeightPlacementMap.h"
 #include "WeightManagerConfig.h"
 #include "PreparedWeightAdmission.h"
+#include "PreparedWeightRepresentationContract.h"
 #include "PreparedDeviceAllocationLedger.h"
 #include "MmapReclaimLifecycle.h"
 #include "../execution/moe/MoEExpertOverlayPreparationPlan.h"
@@ -986,24 +987,25 @@ namespace llaminar2
         static ShardingMode toShardingMode(WeightShardingMode mode);
 
         /**
-         * @brief Identity of one immutable model-prepared FP32 override.
+         * @brief Identity of one immutable model-prepared floating override.
          *
          * A canonical source can be bound under different semantic roles and
          * to different devices and logical slices.  All three facts affect the
          * representation and its eventual device residency, so none may be
          * inferred from tensor shape or omitted from cache identity.
          */
-        struct ModelPreparedFp32OverrideKey
+        struct ModelPreparedFloatingOverrideKey
         {
             std::string canonical_name; ///< Stable model weight identity.
             WeightRole role = WeightRole::Other; ///< Graph semantic role.
             DeviceId target_device = DeviceId::invalid(); ///< Exact consumer.
             WeightSliceSpec slice; ///< Exact logical source interval represented.
+            ModelPreparedWeightRepresentation representation; ///< Immutable destination scalar format.
 
             /** @return true when all representation-defining fields match. */
-            bool operator==(const ModelPreparedFp32OverrideKey &other) const
+            bool operator==(const ModelPreparedFloatingOverrideKey &other) const
             {
-                return canonical_name == other.canonical_name &&
+                return representation == other.representation && canonical_name == other.canonical_name &&
                        role == other.role &&
                        target_device == other.target_device &&
                        slice.source_rows == other.slice.source_rows &&
@@ -1020,13 +1022,13 @@ namespace llaminar2
         };
 
         /** @brief Hashes the complete prepared-override identity. */
-        struct ModelPreparedFp32OverrideKeyHash
+        struct ModelPreparedFloatingOverrideKeyHash
         {
             /**
              * @param key Complete override identity.
              * @return Stable process-local hash suitable for unordered lookup.
              */
-            size_t operator()(const ModelPreparedFp32OverrideKey &key) const noexcept
+            size_t operator()(const ModelPreparedFloatingOverrideKey &key) const noexcept
             {
                 size_t hash = std::hash<std::string>{}(key.canonical_name);
                 hash ^= std::hash<int>{}(static_cast<int>(key.role)) +
@@ -1038,6 +1040,7 @@ namespace llaminar2
                     hash ^= std::hash<size_t>{}(value) +
                             0x9e3779b9u + (hash << 6u) + (hash >> 2u);
                 };
+                mix(static_cast<size_t>(key.representation));
                 mix(key.slice.source_rows);
                 mix(key.slice.source_cols);
                 mix(key.slice.row_start);
@@ -1055,7 +1058,7 @@ namespace llaminar2
         };
 
         /**
-         * @brief Acquire a model-owned FP32 representation for special graph roles.
+         * @brief Acquire a model-owned floating representation for special graph roles.
          *
          * The returned object is cached for the lifetime of this WeightManager,
          * not the lifetime of a FrozenModelWeightSet or graph runner.  This is
@@ -1069,11 +1072,11 @@ namespace llaminar2
          * @param logical_slice Exact source interval represented by @p source.
          * @param logical_derivation Sharding/alias derivation that produced the
          *        logical value; scalar conversion does not replace this fact.
-         * @return Shared immutable FP32 tensor, or nullptr when no override applies.
+         * @return Shared immutable selected tensor, or nullptr when no override applies.
          * @throws std::runtime_error when an uncached override is requested after
          *         its source bytes have already been released.
          */
-        std::shared_ptr<TensorBase> createModelPreparedFp32Override(
+        std::shared_ptr<TensorBase> createModelPreparedFloatingOverride(
             const std::string &name,
             WeightRole role,
             const TensorBase *source,
@@ -1092,14 +1095,14 @@ namespace llaminar2
          * Immutable derived values whose lifetime is the complete model context.
          *
          * These deliberately do not participate in host-weight release sweeps:
-         * they are small canonical graph inputs needed to rematerialize runners
+         * they are canonical graph inputs needed to rematerialize runners
          * after the corresponding raw source bytes have been reclaimed.
          */
         std::unordered_map<
-            ModelPreparedFp32OverrideKey,
+            ModelPreparedFloatingOverrideKey,
             std::shared_ptr<TensorBase>,
-            ModelPreparedFp32OverrideKeyHash>
-            model_prepared_fp32_overrides_;
+            ModelPreparedFloatingOverrideKeyHash>
+            model_prepared_floating_overrides_;
         mutable std::mutex cache_mutex_;                                            ///< Protects cache_ and decode_cache_ access
         mutable std::unordered_map<std::string, ShardingMode> sharding_mode_cache_; ///< Cached sharding modes
         mutable std::mutex sharding_mode_cache_mutex_;                              ///< Protects sharding_mode_cache_ (separate from cache_mutex_ to avoid deadlock — getShardingMode may be called while cache_mutex_ is held)

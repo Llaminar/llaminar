@@ -117,14 +117,16 @@ namespace llaminar2
         int max_decode_rows = 0;
         int max_request_count = 0;
         int max_mtp_draft_depth = 0;
+        /** Model-global origin of the compact main/runtime interval. */
+        int first_model_layer = 0;
 
         /** @return Whether all retained-family bounds are self-consistent. */
         [[nodiscard]] bool valid() const noexcept;
 
         /**
-         * @brief Return the model-global layer slots addressable by this family.
+         * @brief Return the compact runtime rows addressable by this family.
          *
-         * Main decoder layers occupy the dense interval beginning at zero.
+         * Main decoder layers begin at @ref first_model_layer.
          * Routed NextN graphs keep their raw GGUF source-layer identities, so
          * the runtime table must extend through the greatest retained source
          * layer rather than blindly using the model's raw block count.
@@ -132,6 +134,17 @@ namespace llaminar2
          * @return Positive layer-slot capacity for a valid family, otherwise zero.
          */
         [[nodiscard]] int routedLayerCapacity() const noexcept;
+
+        /**
+         * @brief Restrict a model family to one authored routed placement interval.
+         * @param first_model_layer Global identity of the stage's first main layer.
+         * @param routed_layer_count Exact compact row count retained by placement.
+         * @return Stage family; only the terminal stage owns routed NextN sources.
+         * @throws std::invalid_argument If the interval is outside this family or
+         *         omits/invents a required terminal sidecar row.
+         */
+        [[nodiscard]] MoEOverlayInferenceGraphFamilyIdentity forRoutedLayerInterval(
+            int first_model_layer, int routed_layer_count) const;
     };
 
     /**

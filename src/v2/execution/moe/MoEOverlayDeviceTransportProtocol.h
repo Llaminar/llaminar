@@ -29,9 +29,20 @@ namespace llaminar2
         std::uint32_t participant_count = 0u;
         std::uint32_t num_layers = 0u;
         std::uint32_t num_experts = 0u;
+        /** Global layer of compact command row zero, fixed by fabric setup. */
+        std::int32_t first_model_layer = 0;
 
         /** @return Whether header, entries, digest, and geometry are coherent. */
         [[nodiscard]] bool valid() const noexcept;
+
+        /**
+         * @brief Resolve a compact command row at the physical transfer boundary.
+         * @param storage_index Participant-local row encoded by the device.
+         * @return Global model layer without touching command or weight payloads.
+         * @throws std::out_of_range for invalid stage geometry or a foreign row.
+         */
+        [[nodiscard]] int modelLayerForStorageIndex(
+            std::uint32_t storage_index) const;
 
         /** @return Whether this command requires physical weight transport. */
         [[nodiscard]] bool movesWeights() const noexcept

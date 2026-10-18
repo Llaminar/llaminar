@@ -9,6 +9,9 @@
  * Native launches and the graph-resident transfer worker call the same unit
  * functions. Conversion is therefore not a separately queued prerequisite of
  * background copying and cannot be stranded behind a future inference reader.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
@@ -104,7 +107,7 @@ namespace llaminar2
         {
             if constexpr (Codebook == 0)
                 return static_cast<int>(value) - 8;
-            if constexpr (Codebook == 4)
+            if constexpr (Codebook == 4 || Codebook == kNativeVnniIQ4XSSourceScaleCodebook)
             {
                 // Divergent constant-memory indices serialize each warp by
                 // distinct index. Read four warp-uniform words, then select
@@ -242,7 +245,7 @@ namespace llaminar2
                 static_cast<std::int16_t>(compensation);
             reinterpret_cast<std::uint16_t *>(unit + 1152u)[local_column] =
                 scales[linear];
-            if constexpr (Asymmetric)
+            if constexpr (Asymmetric || Codebook == kNativeVnniIQ4XSSourceScaleCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(unit + 1280u)[local_column] =
                     mins[linear];
@@ -354,7 +357,7 @@ namespace llaminar2
             reinterpret_cast<std::uint16_t *>(unit + 2176u)[local_column] =
                 scales[linear];
             if constexpr (
-                Codebook == 7 || Codebook == 16 ||
+                Codebook == 7 || Codebook == 11 || Codebook == 16 ||
                 Codebook == kNativeVnniExpandedInt8MinCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(unit + 2304u)[local_column] =
@@ -525,7 +528,7 @@ namespace llaminar2
         }
 
         /** CPU expanded INT8 units to separated GPU projection. */
-        template <bool Asymmetric>
+        template <bool Asymmetric, uint8_t SourceCodebook = 19>
         __device__ __forceinline__ void cpuToGpuExpandedUnitsCUDAUnit(
             const std::uint8_t *__restrict__ cpu_chunk,
             int N,
@@ -551,19 +554,46 @@ namespace llaminar2
                 cpu_chunk + static_cast<std::size_t>(local_unit) * cpu_stride;
             const std::size_t linear =
                 static_cast<std::size_t>(kb) * N + n;
-            std::uint8_t *destination = payload + linear * 32u;
-            gatherCpuPayloadVectors<32>(unit, local_column, destination);
+            static_assert(SourceCodebook == 19 || SourceCodebook == 11);
+            std::uint8_t *destination = payload + linear * (SourceCodebook == 11 ? 13u : 32u);
+            if constexpr (SourceCodebook == 11)
+            {
+                // Exact cold movement inverse; no re-quantization/normalized19.
+                const uint16_t secondary=reinterpret_cast<const uint16_t*>(unit+2304u)[local_column];
+                if (!native_vnni_iq3s_scale::valid(secondary)) { __trap(); return; }
+                uint32_t low_words[2]{},sign_word=0;uint8_t high=0;
+                for (int group = 0; group < 8; ++group)
+                {
+                    int8_t values[4];
+                    for (int lane = 0; lane < 4; ++lane)
+                        values[lane] = static_cast<int8_t>(unit[interleavedValueOffset(local_column,group*4+lane)]);
+                    const auto encoded = native_vnni_iq3s_scale::encodeGridQuartet(values,cuda_native_vnni::d_iq3s_grid);
+                    if (!encoded.valid()) { __trap(); return; }
+                    low_words[group/4] |= uint32_t{static_cast<uint8_t>(encoded.index)} << (8*(group%4));
+                    high |= static_cast<uint8_t>((encoded.index >> 8) << group);
+                    sign_word |= uint32_t{encoded.signs} << (4*group);
+                }
+                // No byte of this block is published before all membership and
+                // coefficient checks succeed. Packed registers avoid a13B local mirror.
+                for(int i=0;i<8;++i) destination[i]=static_cast<uint8_t>(low_words[i/4]>>(8*(i%4)));
+                destination[8]=high;
+                for(int i=0;i<4;++i) destination[9+i]=static_cast<uint8_t>(sign_word>>(8*i));
+                scales[linear]=reinterpret_cast<const uint16_t*>(unit+2176u)[local_column];
+                mins[linear]=secondary;
+                return;
+            }
+            else gatherCpuPayloadVectors<32>(unit, local_column, destination);
             scales[linear] =
                 reinterpret_cast<const std::uint16_t *>(unit + 2176u)[local_column];
             if constexpr (Asymmetric)
             {
-                mins[linear] = reinterpret_cast<const std::uint16_t *>(
-                    unit + 2304u)[local_column];
+                const uint16_t secondary = reinterpret_cast<const std::uint16_t *>(unit+2304u)[local_column];
+                mins[linear] = secondary;
             }
         }
 
         /** Native entry retains the existing grid and forwards one complete unit. */
-        template <bool Asymmetric>
+        template <bool Asymmetric, uint8_t SourceCodebook = 19>
         __global__ void cpuToGpuExpandedUnitsCUDA(
             const std::uint8_t *__restrict__ cpu_chunk,
             int N,
@@ -574,7 +604,7 @@ namespace llaminar2
             std::uint16_t *__restrict__ scales,
             std::uint16_t *__restrict__ mins)
         {
-            cpuToGpuExpandedUnitsCUDAUnit<Asymmetric>(
+            cpuToGpuExpandedUnitsCUDAUnit<Asymmetric, SourceCodebook>(
                 cpu_chunk, N, blocks_per_row, first_unit, cpu_stride, payload, scales, mins, blockIdx.x);
         }
 
@@ -715,6 +745,10 @@ namespace llaminar2
                 case Encoding::NibbleLUT:
                     return layout.gpu_codebook_id == 0 || layout.gpu_codebook_id == 4 ||
                         layout.gpu_codebook_id == 5;
+                case Encoding::IQ3SExpandedSourceScale:
+                    return layout.gpu_codebook_id == 11;
+                case Encoding::NibbleLUTSourceScale:
+                    return layout.gpu_codebook_id == kNativeVnniIQ4XSSourceScaleCodebook;
                 case Encoding::Q6KNativeDualScale:
                     return layout.gpu_codebook_id == 8;
                 case Encoding::CompactMultiScale:
@@ -813,7 +847,12 @@ namespace llaminar2
                         else
                             LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit, 5, true);
                     }
-                    else if (layout.cpu_encoding == Encoding::ExpandedInt8)
+                    else if (layout.cpu_encoding == Encoding::NibbleLUTSourceScale)
+                    {
+                        LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit,
+                            kNativeVnniIQ4XSSourceScaleCodebook, false);
+                    }
+                    else if (layout.cpu_encoding == Encoding::ExpandedInt8 || layout.cpu_encoding == Encoding::IQ3SExpandedSourceScale)
                     {
 #define LLAMINAR_TRANSFER_DECODED_UNIT(CODEBOOK) \
     case CODEBOOK: gpuToCpuDecodedUnitsCUDAUnit<CODEBOOK>(source.payload, source.scales, \
@@ -851,6 +890,18 @@ namespace llaminar2
                         LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuNibbleUnitsCUDAUnit, true);
                     else
                         LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuNibbleUnitsCUDAUnit, false);
+                }
+                else if (layout.cpu_encoding == Encoding::NibbleLUTSourceScale)
+                {
+                    // The true parameter means copy the raw secondary word;
+                    // no minimum arithmetic or half conversion occurs here.
+                    LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuNibbleUnitsCUDAUnit, true);
+                }
+                else if (layout.cpu_encoding == Encoding::IQ3SExpandedSourceScale)
+                {
+                    cpuToGpuExpandedUnitsCUDAUnit<false,11>(chunk,layout.N,layout.blocks_per_row,
+                        description.first_unit,layout.cpu_block_stride,destination.payload,
+                        destination.scales,destination.mins,unit);
                 }
                 else if (layout.cpu_encoding == Encoding::ExpandedInt8)
                 {
@@ -1017,7 +1068,17 @@ namespace llaminar2
             }
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
+                 cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+        {
+            gpuToCpuNibbleUnitsCUDA<kNativeVnniIQ4XSSourceScaleCodebook, false>
+                <<<grid, block, 0, cuda_stream>>>(
+                    source.payload, source.scales, source.mins, layout.N,
+                    layout.blocks_per_row, first_unit, layout.cpu_block_stride,
+                    device_cpu_chunk);
+        }
+        else if (layout.cpu_encoding ==
+                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8 ||
+                 layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
         {
 #define LLAMINAR_LAUNCH_DECODED_SOURCE(CODEBOOK)                         \
     gpuToCpuDecodedUnitsCUDA<CODEBOOK><<<grid, block, 0, cuda_stream>>>( \
@@ -1113,6 +1174,21 @@ namespace llaminar2
                     first_unit, layout.cpu_block_stride, destination.payload,
                     destination.scales, destination.mins);
             }
+        }
+        else if (layout.cpu_encoding ==
+                 cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+        {
+            // Raw source coefficient words share the existing secondary slot.
+            cpuToGpuNibbleUnitsCUDA<true><<<grid, block, 0, cuda_stream>>>(
+                device_cpu_chunk, layout.N, layout.blocks_per_row,
+                first_unit, layout.cpu_block_stride, destination.payload,
+                destination.scales, destination.mins);
+        }
+        else if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+        {
+            cpuToGpuExpandedUnitsCUDA<false,11><<<grid,block,0,cuda_stream>>>(
+                device_cpu_chunk,layout.N,layout.blocks_per_row,first_unit,
+                layout.cpu_block_stride,destination.payload,destination.scales,destination.mins);
         }
         else if (layout.cpu_encoding ==
                  cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)

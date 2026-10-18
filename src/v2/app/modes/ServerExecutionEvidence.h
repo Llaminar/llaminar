@@ -11,8 +11,10 @@
 #pragma once
 
 #include "config/OrchestrationConfig.h"
+#include "backends/DevicePCIAddress.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/PersistentStateMemoryEstimator.h"
 #include "utils/PerfStatsCollector.h"
@@ -225,7 +227,7 @@ namespace llaminar2
      * @param device Selected local participant, never an idle discoverable GPU.
      * @param inventory Exact execution-communicator rank inventory.
      * @param numa_node CPU binding from the admitted rank plan.
-     * @return Startup-only tags joining local ordinals to physical node/UUID/NUMA.
+     * @return Startup-only tags joining local ordinals to physical node/UUID/NUMA and GPU PCI endpoint.
      * @throws std::invalid_argument For incomplete or ambiguous observed identity.
      *
      * Distinct ranks may see the same GPU under different ordinals. UUIDs keep
@@ -238,7 +240,7 @@ namespace llaminar2
         if (inventory.rank < 0 || inventory.node_id < 0 ||
             !device.is_valid() || (!device.is_cpu() && !device.is_gpu()))
             throw std::invalid_argument("Server participant evidence requires physical rank/device identity");
-        std::string physical_id;
+        std::string physical_id, pci_bus_address;
         if (device.is_cpu())
         {
             if (numa_node < 0 || (inventory.cpu.numa_node >= 0 && inventory.cpu.numa_node != numa_node))
@@ -252,14 +254,34 @@ namespace llaminar2
             };
             if (std::count_if(inventory.gpus.begin(), inventory.gpus.end(), matches) != 1)
                 throw std::invalid_argument("Server GPU participant lacks unique inventory ownership");
-            physical_id = std::find_if(inventory.gpus.begin(), inventory.gpus.end(), matches)->uuid;
+            const auto &gpu = *std::find_if(inventory.gpus.begin(), inventory.gpus.end(), matches);
+            physical_id = gpu.uuid;
+            pci_bus_address = DevicePCIAddress::parse(gpu.pci_bus_address).toString();
             if (physical_id.empty())
                 throw std::invalid_argument("Server GPU participant lacks a physical UUID");
         }
         return {{"schema", "1"}, {"source", "resolved_execution_plan"},
                 {"identity_source", "communicator_cluster_inventory"},
                 {"node_id", std::to_string(inventory.node_id)},
-                {"backend", deviceTypeToString(device.type)}, {"physical_id", physical_id}};
+                {"backend", deviceTypeToString(device.type)}, {"physical_id", physical_id},
+                {"pci_bus_address", pci_bus_address}};
+    }
+
+    /**
+     * @brief Bind passive host PID observations to this execution rank.
+     * @param namespace_pid Native getpid() value in the inference process namespace.
+     * @return Startup tags joined to the last Linux NSpid entry by the observer.
+     * @throws std::invalid_argument For a missing or non-process identity.
+     *
+     * Process start ticks and Docker cgroup ownership come from the host observer.
+     * No environment rank, PID ordering, or extra MPI collective is consulted.
+     */
+    inline PerfStatsCollector::Tags serverProcessIdentityTags(int namespace_pid)
+    {
+        if (namespace_pid <= 0)
+            throw std::invalid_argument("Server process evidence requires a positive native PID");
+        return {{"schema", "1"}, {"identity_source", "native_pid_namespace"},
+                {"pid", std::to_string(namespace_pid)}};
     }
 
     /**

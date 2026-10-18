@@ -11,6 +11,16 @@
  * - Various matrix sizes (decode, prefill, large)
  * - Real tensor objects through KernelFactory dispatch
  *
+ * CPU references receive their exact consumer-declared invocation workspace
+ * from the shared PMA fixture. Prepared engines do not own implicit scratch;
+ * the native CUDA grouped path is additionally compared byte-for-byte with
+ * serial CUDA decode, independently of numerical CPU reference tolerances.
+ * Q6_K source-scale regressions additionally inspect actual packed words and
+ * captured source-equation results, including the explicit ROWPAR engines.
+ * Explicit floating GDN operand fixtures exercise real half-A/half-B GemmEx
+ * with FP32 C/accumulation, pedantic full-FP32 controls, immutable fused-mode
+ * rejection and exact complete-M extents on retained changing-input graphs.
+ *
  * **Pass Criteria**:
  * - Cosine similarity >= 0.999 (very high correlation)
  * - No NaN/Inf in outputs
@@ -21,13 +31,20 @@
  */
 
 #include <gtest/gtest.h>
+#include "tensors/IQQuantTables.h"
 #include "transfer/TransferEngine.h"
 
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
+#include "tensors/FP16Utils.h"
+#include "kernels/common/DeviceFP32NumericalContract.h"
+#include "kernels/common/FixedHalfProjectionGroup.h"
 #include "tensors/TensorKernels.h" // For TensorProjectionDesc
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/gemm/CUDAWeightPacker.h"
+#include "kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
+#include "kernels/cuda/gemm/CUDAFloatingPointGemmWorkspaceContract.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "backends/ComputeBackend.h"
@@ -54,17 +71,21 @@
 #include "backends/cuda/CUDABackend.h"
 #include "backends/cuda/CUDAGraphCapture.h"
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #endif
 
 // Now include test utils
 #include "../../../utils/CUDATestUtils.h"
+#include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/CPUProjectionTestWorkspace.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/NativeVNNIEquivalenceInventory.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/VerifierRowTestInventory.h"
 
 #include <vector>
+#include <bit>
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -92,6 +113,16 @@ using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 #ifdef HAVE_CUDA
 extern "C"
 {
+    void cudaNativeVNNIGemvSweep_setConfig(
+        int kernel_family, int tile_n, int cpt, int target_waves,
+        int mkg, int max_kb, int exact_kb, int force_two_phase);
+    /**
+     * @brief Select the existing grouped-row geometry for diagnostic capture.
+     * @param rows_per_tile Live grouped-row tile policy; cleared with the sweep.
+     */
+    void cudaNativeVNNIGemvSweep_setGroupedRows(int rows_per_tile);
+    void cudaNativeVNNIGemvSweep_clearConfig();
+    bool cudaNativeVNNIGemvSweep_isActive();
     void cudaNativeVNNIPrefill_setBK256Mode(int mode);
     int cudaNativeVNNIPrefill_getBK256Mode();
     void cudaNativeVNNIPrefill_setCanonicalKPartitionMode(bool enabled);
@@ -850,7 +881,17 @@ namespace
     };
 
     /**
-     * @brief CPU multiply via tensor interface — wraps raw float* in FP32Tensors.
+     * @brief Execute the CPU reference with its own admitted invocation arena.
+     * @param kernel Prepared CPU engine declaring the required scratch banks.
+     * @param A_data Input matrix bytes copied into the reference tensor.
+     * @param C_data Output matrix, also the initial value when beta is nonzero.
+     * @param M Live reference rows.
+     * @param N Output columns.
+     * @param K Input columns.
+     * @param transpose_B Weight-layout contract passed to the prepared engine.
+     * @param alpha Input product multiplier.
+     * @param beta Existing output multiplier.
+     * @return Whether the exact reference invocation completed successfully.
      */
     bool cpuMultiplyToVector(ITensorGemm *kernel, const float *A_data,
                              float *C_data, int M, int N, int K,
@@ -861,7 +902,9 @@ namespace
         auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
         if (beta != 0.0f)
             std::memcpy(C_tensor->mutable_data(), C_data, (size_t)M * N * sizeof(float));
-        bool ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K, transpose_B, alpha, beta);
+        CPUProjectionTestWorkspace workspace(cpuProjectionTestRequirements(M, {kernel}));
+        bool ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K,
+            transpose_B, alpha, beta, nullptr, nullptr, -1, workspace.get());
         if (ok)
             std::memcpy(C_data, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;
@@ -1963,6 +2006,271 @@ protected:
         workspace_.reset();
     }
 
+#ifdef HAVE_CUDA
+    /**
+     * @brief Capture actual ordinary GDN operand arithmetic and exact physical extents.
+     * @param half True selects real half A/B; false selects strict pedantic FP32.
+     * @param fixed_live_rows Exercise device-counted rows plus fixed columns.
+     * @param no_row_scope Exercise an explicit verifier scope without optional row metadata.
+     *
+     * Independent integer numerators make all products and partial sums exact
+     * FP32. Column0 exceeds65504 and catches half accumulation/output. Column1
+     * retains non-half weight bits in the strict control. No eager GEMM warmup
+     * precedes the first real library submission inside capture.
+     */
+    void runExplicitFloatingOperands(bool half, bool fixed_live_rows = false, bool no_row_scope = false)
+    {
+        using Floating = llaminar2::cuda::CUDAFloatingPointGemmKernel;
+        using Operand = FloatingActivationOperandPrecision;
+        const auto operand = half ? Operand::FP16RNE : Operand::FP32;
+        ScopedEnv enabled_stats("LLAMINAR_PERF_STATS_JSON", "1");
+        PerfStatsCollector::reset();
+        ScopedGPUStream owner(gpu_device_);
+        auto stream = static_cast<cudaStream_t>(owner.get());
+        ASSERT_NE(stream, nullptr);
+        auto &context = GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal);
+        const auto mathMode = [&]()
+        {
+            const auto submission = context.acquireBlasSubmission();
+            auto handle = static_cast<cublasHandle_t>(submission.handle());
+            cublasMath_t math = CUBLAS_DEFAULT_MATH;
+            cublasAtomicsMode_t atomics = CUBLAS_ATOMICS_NOT_ALLOWED;
+            if (cublasGetMathMode(handle, &math) != CUBLAS_STATUS_SUCCESS ||
+                cublasGetAtomicsMode(handle, &atomics) != CUBLAS_STATUS_SUCCESS ||
+                atomics != CUBLAS_ATOMICS_NOT_ALLOWED)
+                throw std::runtime_error("Explicit operand fixture requires non-atomic context handle");
+            return math;
+        };
+        const auto original_math = mathMode();
+        /** @brief Independent RNE quotient for positive numerators with denominator4. */
+        const auto round4 = [](int numerator)
+        {
+            int q = numerator / 4;
+            const int remainder = numerator % 4;
+            return q + (remainder > 2 || (remainder == 2 && (q & 1)));
+        };
+        // Tail geometry plus a tensor-core-eligible M512/N128/K128 representative.
+        for (const int K : {65, 128})
+        {
+            constexpr int capacity = 513;
+            const std::vector<int> widths = K == 65 ? std::vector<int>{33, 17, 19, 31}
+                                                    : std::vector<int>{128, 128, 128, 128};
+            std::vector<std::unique_ptr<TensorBase>> weights;
+            std::vector<std::unique_ptr<FP32Tensor>> outputs;
+            std::vector<std::unique_ptr<Floating>> engines;
+            std::vector<ITensorGemm *> kernels;
+            std::vector<TensorProjectionDesc> projections;
+            auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(K)});
+            std::vector<float> host_input(static_cast<size_t>(capacity) * K,
+                std::numeric_limits<float>::quiet_NaN());
+            std::vector<std::vector<float>> actual;
+            std::vector<std::uint16_t> half_bank(static_cast<size_t>(capacity) * K);
+            int *raw_count = nullptr;
+            ASSERT_EQ(cudaMalloc(&raw_count, sizeof(int)), cudaSuccess);
+            std::unique_ptr<int, decltype(&cudaFree)> count_owner(raw_count, cudaFree);
+            int published_count = 0; // Borrowed upload storage outlives the pending-join owner below.
+
+            /** @brief Join before borrowed host/tensor/kernel owners retire on every failure edge. */
+            struct Retire
+            {
+                cudaStream_t stream;
+                std::vector<ITensorGemm *> &kernels;
+                ~Retire()
+                {
+                    (void)cudaStreamSynchronize(stream);
+                    for (auto *kernel : kernels) kernel->clearGPUStreamBinding();
+                }
+            } retire{stream, kernels};
+            ASSERT_TRUE(input->ensureOnDevice(gpu_device_, stream));
+            for (size_t projection = 0; projection < widths.size(); ++projection)
+            {
+                const int N = widths[projection];
+                const std::vector<size_t> shape{static_cast<size_t>(N), static_cast<size_t>(K)};
+                std::vector<float> values(static_cast<size_t>(N) * K);
+                std::vector<std::uint16_t> encoded(values.size());
+                for (int n = 0; n < N; ++n)
+                    for (int k = 0; k < K; ++k)
+                    {
+                        const size_t at = static_cast<size_t>(n) * K + k;
+                        const int coefficient = static_cast<int>((n * 3 + k + projection) % 15) - 7;
+                        values[at] = n == 0 ? 1024.0f : n == 1
+                            ? (k == 0 ? static_cast<float>(4096 + 3 * static_cast<int>(projection + 1)) / 4096.0f : 0.0f)
+                            : static_cast<float>(coefficient) / 64.0f;
+                        encoded[at] = n == 1 && k == 0
+                            ? static_cast<std::uint16_t>(0x3c00 + round4(4096 + 3 * static_cast<int>(projection + 1)) - 1024)
+                            : fp32_to_fp16(values[at]);
+                    }
+                if (half) weights.push_back(std::make_unique<FP16Tensor>(shape, std::move(encoded)));
+                else
+                {
+                    auto fp32 = std::make_unique<FP32Tensor>(shape);
+                    std::copy(values.begin(), values.end(), fp32->mutable_data());
+                    weights.push_back(std::move(fp32));
+                }
+                ASSERT_TRUE(weights.back()->ensureOnDevice(gpu_device_, stream));
+                outputs.push_back(std::make_unique<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(N)}));
+                ASSERT_TRUE(outputs.back()->allocateOnDevice(gpu_device_, stream));
+                actual.emplace_back(static_cast<size_t>(capacity) * N);
+                engines.push_back(std::make_unique<Floating>(weights.back().get(), gpu_device_.ordinal,
+                    half ? Floating::Precision::FP16 : Floating::Precision::FP32, operand));
+                engines.back()->setGPUStream(stream);
+                EXPECT_EQ(engines.back()->floatingActivationOperandPrecision(), operand);
+                kernels.push_back(engines.back().get());
+                projections.push_back({engines.back().get(), outputs.back().get(), N, nullptr, "gdn_test"});
+            }
+            ASSERT_TRUE(setupSharedWorkspaceForExecutionRows(kernels, {1, 8, 63, 64, 65, 448, 512, capacity}, widths, K));
+            void *bank = half ? workspace_->getBuffer(GemmWorkspaceBuffers::FULL_A_FP16) : nullptr;
+            if (half)
+            {
+                ASSERT_NE(bank, nullptr);
+                ASSERT_EQ(workspace_->getBufferSize(GemmWorkspaceBuffers::FULL_A_FP16), half_bank.size() * 2);
+                ASSERT_EQ(cudaMemsetAsync(bank, 0xa5, half_bank.size() * 2, stream), cudaSuccess);
+                // Both directions must reject before any cast/publication, even
+                // when a Native FP32-A consumer uses the same half B encoding.
+                Floating native(weights.front().get(), gpu_device_.ordinal, Floating::Precision::FP16);
+                native.setGPUStream(stream);native.bindWorkspace(workspace_.get());
+                std::vector<TensorProjectionDesc> mixed{{engines.front().get(), outputs.front().get(), widths.front(), nullptr, "half"},
+                    {&native, outputs.front().get(), widths.front(), nullptr, "native"}};
+                EXPECT_THROW(engines.front()->multiply_fused_tensor(input.get(), mixed, 1, K, nullptr, workspace_.get()), std::invalid_argument);
+                EXPECT_THROW(native.multiply_fused_tensor(input.get(), mixed, 1, K, nullptr, workspace_.get()), std::invalid_argument);
+                {
+                    ScopedGPUStream other_stream(gpu_device_);
+                    engines.back()->setGPUStream(other_stream.get());
+                    EXPECT_THROW(engines.front()->multiply_fused_tensor(input.get(), projections, 1, K, nullptr, workspace_.get()), std::invalid_argument);
+                    engines.back()->setGPUStream(stream);
+                }
+                ASSERT_EQ(cudaMemcpyAsync(half_bank.data(), bank, half_bank.size() * 2, cudaMemcpyDeviceToHost, stream), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+                EXPECT_TRUE(std::all_of(half_bank.begin(), half_bank.end(), [](auto bits) { return bits == 0xa5a5; }));
+                native.clearGPUStreamBinding();native.unbindWorkspace();
+            }
+            // Check a large→small→large sequence with fresh input publications.
+            const std::vector<int> rows = K == 65 ? std::vector<int>{512, 1, 8, 63, 64, 65, 448, 512}
+                                                 : std::vector<int>{512, 1, 512};
+            for (const int M : rows)
+            {
+                SCOPED_TRACE("half=" + std::to_string(half) + " K=" + std::to_string(K) + " M=" + std::to_string(M));
+                TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+                CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+                /** @brief Replay must join before its retained graph is destroyed. */
+                struct ReplayRetire
+                {
+                    cudaStream_t stream;
+                    ~ReplayRetire() { (void)cudaStreamSynchronize(stream); }
+                } replay_retire{stream};
+                ScopedBackendGraphCapture recording(context, graph, "explicit floating GDN operands");
+                std::unique_ptr<ITensorGemm::VerifierKernelModeScope> verifier;
+                /** @brief Strictly nested partition tokens must retire in reverse acquisition order.
+                 * std::vector element destruction order does not provide this scope-stack contract.
+                 */
+                struct PartitionOwners
+                {
+                    std::vector<std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>> tokens;
+                    ~PartitionOwners() { while (!tokens.empty()) tokens.pop_back(); }
+                } partitions;
+                if (fixed_live_rows || no_row_scope)
+                {
+                    verifier = no_row_scope ? engines.front()->beginVerifierDecodeEquivalentScope()
+                        : engines.front()->beginVerifierDecodeEquivalentScope(DeviceRowRange::deviceCounted(M, raw_count));
+                    if (fixed_live_rows)
+                    for (size_t i = 0; i < engines.size(); ++i)
+                        partitions.tokens.push_back(engines[i]->beginOutputPartitionEquivalenceScope(widths[i], 16));
+                }
+                std::vector<TensorProjectionDesc> remaining(projections.begin() + 1, projections.end());
+                ASSERT_TRUE(recording.begin());
+                if (fixed_live_rows)
+                {
+                    ASSERT_TRUE(engines.front()->multiply_tensor(input.get(), outputs.front().get(), M, widths.front(), K,
+                        true, 1.0f, 0.0f, nullptr, nullptr, gpu_device_.ordinal, workspace_.get()));
+                    ASSERT_TRUE(engines[1]->multiply_fused_tensor(input.get(), remaining, M, K, nullptr, workspace_.get()));
+                }
+                else
+                    ASSERT_TRUE(engines.front()->multiply_fused_tensor(input.get(), projections, M, K, nullptr, workspace_.get()));
+                recording.finish();
+                ASSERT_TRUE(graph.instantiate());
+                EXPECT_EQ(mathMode(), original_math);
+                if (fixed_live_rows || no_row_scope)
+                {
+                    const auto records = PerfStatsCollector::snapshot({"kernel.cuda_fp16_grouped_verifier_projection_calls", "kernel.cuda_fp16_short_projection_group_calls"});
+                    EXPECT_TRUE(std::any_of(records.begin(), records.end(), [M](const auto &record) {
+                        const auto m = record.tags.find("m"), route = record.tags.find("route");
+                        return record.value > 0 && m != record.tags.end() && m->second == std::to_string(M) &&
+                            route != record.tags.end() && route->second == (M <= kShortHalfProjectionMaxRows
+                                ? "fixed_order_fp16_short_group" : "fixed_order_fp16_batched_projection");
+                    })) << "The actual fixed half path must run for this physical row extent";
+                }
+                for (int replay = 0; replay < (fixed_live_rows ? 5 : 3); ++replay)
+                {
+                    const int active = fixed_live_rows ? (replay == 1 ? 0 : replay == 2 ? 1 : replay == 3 ? M / 2 : M) : M;
+                    published_count = active;
+                    ASSERT_EQ(cudaMemcpyAsync(raw_count, &published_count, sizeof(int), cudaMemcpyHostToDevice, stream), cudaSuccess);
+                    std::fill(host_input.begin(), host_input.end(), std::numeric_limits<float>::quiet_NaN());
+                    for (int row = 0; row < active; ++row)
+                        for (int k = 0; k < K; ++k)
+                        {
+                            const int t = k == 0 ? 0 : (row + 3 * k + replay) % 37;
+                            host_input[static_cast<size_t>(row) * K + k] = static_cast<float>(4096 + 3 * t) / 4096.0f;
+                        }
+                    ASSERT_EQ(cudaMemcpyAsync(input->gpu_data_ptr(), host_input.data(), host_input.size() * 4, cudaMemcpyHostToDevice, stream), cudaSuccess);
+                    TransferEngine::publishCurrentDeviceWrite(input.get(), stream);
+                    TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+                    for (size_t i = 0; i < widths.size(); ++i)
+                        ASSERT_EQ(cudaMemsetAsync(outputs[i]->gpu_data_ptr(), 0xff, actual[i].size() * 4, stream), cudaSuccess);
+                    if (half) ASSERT_EQ(cudaMemsetAsync(bank, 0xa5, half_bank.size() * 2, stream), cudaSuccess);
+                    ASSERT_TRUE(graph.launch());
+                    for (size_t i = 0; i < widths.size(); ++i)
+                        ASSERT_EQ(cudaMemcpyAsync(actual[i].data(), outputs[i]->gpu_data_ptr(), actual[i].size() * 4, cudaMemcpyDeviceToHost, stream), cudaSuccess);
+                    if (half) ASSERT_EQ(cudaMemcpyAsync(half_bank.data(), bank, half_bank.size() * 2, cudaMemcpyDeviceToHost, stream), cudaSuccess);
+                    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+                    bool observed_nonhalf_A_witness = false;
+                    for (size_t i = 0; i < widths.size(); ++i)
+                        for (int row = 0; row < capacity; ++row)
+                            for (int n = 0; n < widths[i]; ++n)
+                            {
+                                const float got = actual[i][static_cast<size_t>(row) * widths[i] + n];
+                                if (row >= active) { EXPECT_TRUE(std::isnan(got));continue; }
+                                std::int64_t sum = 0, rounded_sum = 0;
+                                for (int k = 0; k < K; ++k)
+                                {
+                                    const int t = k == 0 ? 0 : (row + 3 * k + replay) % 37;
+                                    const int numerator = 4096 + 3 * t;
+                                    const int a = half ? round4(numerator) : numerator;
+                                    const int coefficient = static_cast<int>((n * 3 + k + i) % 15) - 7;
+                                    if (n == 0) { sum += a;rounded_sum += round4(numerator); }
+                                    else if (n > 1) sum += static_cast<std::int64_t>(a) * coefficient;
+                                }
+                                const float expected = n == 0 ? static_cast<float>(sum) / (half ? 1.0f : 4.0f)
+                                    : n == 1 ? static_cast<float>(half ? round4(4096 + 3 * static_cast<int>(i + 1)) : 4096 + 3 * static_cast<int>(i + 1)) / (half ? 1024.0f : 4096.0f)
+                                    : static_cast<float>(sum) / (half ? 65536.0f : 262144.0f);
+                                ASSERT_TRUE(std::isfinite(got));
+                                EXPECT_EQ(std::bit_cast<std::uint32_t>(got), std::bit_cast<std::uint32_t>(expected))
+                                    << "projection=" << i << " row=" << row << " column=" << n;
+                                if (n == 0)
+                                {
+                                    EXPECT_GT(got, 65504.0f);
+                                    if (!half && got != static_cast<float>(rounded_sum)) observed_nonhalf_A_witness = true;
+                                }
+                            }
+                    if (!half && active > 0) EXPECT_TRUE(observed_nonhalf_A_witness);
+                    if (half)
+                        for (int row = 0; row < capacity; ++row)
+                            for (int k = 0; k < K; ++k)
+                            {
+                                const auto bits = half_bank[static_cast<size_t>(row) * K + k];
+                                if (row >= active) EXPECT_EQ(bits, 0xa5a5);
+                                else
+                                {
+                                    const int t = k == 0 ? 0 : (row + 3 * k + replay) % 37;
+                                    EXPECT_EQ(bits, static_cast<std::uint16_t>(0x3c00 + round4(4096 + 3 * t) - 1024));
+                                }
+                            }
+                }
+            }
+            for (auto &engine : engines) engine->unbindWorkspace();
+        }
+    }
+#endif
+
     std::unique_ptr<DeviceWorkspaceManager> workspace_;
 };
 
@@ -1971,6 +2279,25 @@ protected:
 // ============================================================================
 
 #ifdef HAVE_CUDA
+
+/** @brief Real FP16 A/B retained GEMM must accumulate/write FP32, including overflow-of-half sums. */
+TEST_F(Test__CUDAGemmParity, FP16OperandsAccumulateFP32Captured)
+{
+    runExplicitFloatingOperands(true);
+}
+
+/** @brief Physical half serial/grouped/live/fixed-column graphs keep exact source arithmetic and inactive poison. */
+TEST_F(Test__CUDAGemmParity, FP16OperandsVerifierLiveRowsAndFixedColumnsCaptured)
+{
+    runExplicitFloatingOperands(true, true);
+    runExplicitFloatingOperands(true, false, true);
+}
+
+/** @brief Scoped pedantic FP32 must retain non-half A/B words despite the context fast-math default. */
+TEST_F(Test__CUDAGemmParity, FP32OperandsPedanticCaptured)
+{
+    runExplicitFloatingOperands(false);
+}
 
 TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
 {
@@ -3859,6 +4186,248 @@ TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNOut_M4MatchesFourSingleRowDecodeGEMVs
     EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
         << "M=4 Qwen3.6 row-equivalence test must not leak CUDA dynamic state";
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/**
+ * @brief Preserve original Q6_K scale tuples through captured CUDA consumers.
+ *
+ * The independently authored blocks include non-half-representable derived
+ * scales, derived-half overflow, signed coefficients, and a subnormal base.
+ * Only two source codes are nonzero, so each result has one active 32-value
+ * contribution and an independent explicit-rounding source equation. Exact
+ * Q8 activations remain enabled. Changed retained replays cover default M1,
+ * grouped M8, ordinary M512 prefill, and both explicit ROWPAR bypasses.
+ */
+TEST_F(Test__CUDAGemmParity, Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExact)
+{
+    constexpr int N = 256, K = 256, maximum_m = 512;
+    constexpr std::array<uint16_t, 6> bases{
+        0x3555, 0x3c01, 0x7bff, 0x0001, 0x8000, 0xbc01};
+    constexpr std::array<int8_t, 6> low{3, 17, 127, -127, 0, -19};
+    constexpr std::array<int8_t, 6> high{-5, -31, -128, 126, -1, 23};
+    std::vector<uint8_t> raw(static_cast<size_t>(N) * sizeof(Q6_KBlock));
+    for (int n = 0; n < N; ++n)
+    {
+        Q6_KBlock block{};
+        // Raw code 32 means zero. Only indices 0 and 16 contain code 33.
+        std::fill(std::begin(block.qh), std::end(block.qh), uint8_t{0xaa});
+        block.ql[0] = block.ql[16] = 1;
+        block.d = bases[n % bases.size()];
+        block.scales[0] = low[n % low.size()];
+        block.scales[1] = high[n % high.size()];
+        std::memcpy(raw.data() + static_cast<size_t>(n) * sizeof(block),
+                    &block, sizeof(block));
+    }
+    auto weights = std::make_unique<Q6_KTensor>(
+        std::vector<size_t>{N, K}, raw);
+    ScopedGPUStream stream_owner(gpu_device_);
+    auto stream = static_cast<cudaStream_t>(stream_owner.get());
+    auto prepared = makeGpuPreparedGemm(
+        weights.get(), gpu_device_, "test.q6_source_scale", ModelContextId{19943});
+    auto *kernel = prepared.kernel;
+    ASSERT_NE(kernel, nullptr);
+    ASSERT_FALSE(cudaNativeVNNIGemvSweep_isActive());
+    kernel->setGPUStream(stream);
+    ASSERT_TRUE(setupSharedWorkspaceForExecutionRows(
+        {kernel}, {1, 8, maximum_m}, {N}, K));
+
+    DeviceNativeVNNIMatrixDesc desc{};
+    ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc));
+    ASSERT_EQ(desc.codebook_id, 8);
+    ASSERT_NE(desc.mins, nullptr);
+    ASSERT_EQ(desc.blocks_per_row, K / 32);
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{maximum_m, K});
+    auto output = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{maximum_m, N});
+    std::vector<float> input_host(static_cast<size_t>(maximum_m) * K, 0.0f);
+    std::vector<float> actual(static_cast<size_t>(maximum_m) * N);
+    std::vector<uint16_t> primary(static_cast<size_t>(N) * K / 32);
+    std::vector<uint16_t> secondary(primary.size());
+    std::vector<uint8_t> payload(primary.size() * 24);
+    std::vector<int8_t> activation_codes(static_cast<size_t>(maximum_m) * K);
+    std::vector<float> activation_scales(static_cast<size_t>(maximum_m) * K / 32);
+    std::unique_ptr<CUDAGemvContext, decltype(&cudaGemvContext_destroy)> gemv(
+        cudaGemvContext_create(gpu_device_.ordinal), &cudaGemvContext_destroy);
+    std::unique_ptr<CUDARowMajorWeights, decltype(&cudaRowMajorWeights_destroy)> rowmajor(
+        nullptr, &cudaRowMajorWeights_destroy);
+
+    /** @brief Join all borrowed setup storage and clear the kernel stream. */
+    struct SetupRetirement
+    {
+        cudaStream_t stream; ///< Exact setup/observation stream.
+        ITensorGemm *kernel; ///< Kernel whose borrowed stream binding is retired.
+        /** @brief Retire submitted work before tensor/host/pool ownership ends. */
+        ~SetupRetirement()
+        {
+            (void)cudaStreamSynchronize(stream);
+            kernel->clearGPUStreamBinding();
+        }
+    } retirement{stream, kernel};
+    ASSERT_NE(gemv, nullptr);
+    cudaGemvContext_bindWorkspace(
+        gemv.get(),
+        static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS)),
+        workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+    ASSERT_TRUE(input->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(output->allocateOnDevice(gpu_device_, stream));
+    ASSERT_EQ(cudaMemcpyAsync(primary.data(), desc.scales, primary.size() * 2,
+                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(secondary.data(), desc.mins, secondary.size() * 2,
+                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(payload.data(), desc.payload, payload.size(),
+                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    for (int b = 0; b < K / 32; ++b)
+        for (int n = 0; n < N; ++n)
+        {
+            const size_t index = static_cast<size_t>(b) * N + n;
+            ASSERT_EQ(primary[index], bases[n % bases.size()]);
+            // Independent byte composition; do not reuse the production pack helper.
+            const uint16_t coefficient_bits = b == 0
+                ? static_cast<uint16_t>(static_cast<uint8_t>(low[n % low.size()])) |
+                      (static_cast<uint16_t>(static_cast<uint8_t>(high[n % high.size()])) << 8)
+                : 0;
+            ASSERT_EQ(secondary[index], coefficient_bits);
+            for (size_t byte = 0; byte < 24; ++byte)
+                ASSERT_EQ(payload[index * 24 + byte],
+                    byte >= 16 ? 0xaa : (b == 0 && byte == 0 ? 0x11 : 0));
+        }
+    rowmajor.reset(cudaRowMajorWeights_createForCodebook(
+        desc.payload, static_cast<const uint16_t *>(desc.scales),
+        static_cast<const uint16_t *>(desc.mins),
+        static_cast<const uint32_t *>(desc.emins), N, K, 8,
+        gpu_device_.ordinal, stream));
+    ASSERT_NE(rowmajor, nullptr);
+    auto *quantized = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+    auto *scales = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+    ASSERT_NE(quantized, nullptr);
+    ASSERT_NE(scales, nullptr);
+
+    /**
+     * @brief Restore the explicit diagnostic dispatch after one captured arm.
+     */
+    struct RowparSelection
+    {
+        bool enabled; ///< Whether this arm owns the explicit sweep override.
+        /**
+         * @brief Select the existing two-warp ROWPAR engine when requested.
+         * @param select Whether this arm explicitly owns the ROWPAR override.
+         */
+        explicit RowparSelection(bool select) : enabled(select)
+        {
+            if (enabled) cudaNativeVNNIGemvSweep_setConfig(3, 2, 1, 1, 1, 1, 0, 0);
+        }
+        /** @brief Restore normal generated dispatch even after a fatal assertion. */
+        ~RowparSelection()
+        {
+            if (enabled) cudaNativeVNNIGemvSweep_clearConfig();
+        }
+    };
+    /**
+     * @brief Capture one unchanged execution family and replay changed inputs.
+     * @param explicit_rowpar Whether to exercise the direct metadata bypass.
+     * @param M Exact live activation rows for the retained graph.
+     */
+    const auto run = [&](bool explicit_rowpar, int M)
+    {
+        SCOPED_TRACE("rowpar=" + std::to_string(explicit_rowpar) + " M=" + std::to_string(M));
+        RowparSelection selection(explicit_rowpar);
+        // Admit the currently published external producer on this exact
+        // consumer stream before capture; an upload or prior replay may have
+        // published a new completion-event generation since the last arm.
+        TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+        CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+        /** @brief Join replay/DMA before the retained graph is destroyed. */
+        struct ReplayRetirement
+        {
+            cudaStream_t stream; ///< Exact retained submission stream.
+            /** @brief Retire pending submissions on assertion failure as well. */
+            ~ReplayRetirement() { (void)cudaStreamSynchronize(stream); }
+        } replay_retirement{stream};
+        ScopedBackendGraphCapture recording(graph, "Q6_K exact source scales");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_EQ(cudaMemsetAsync(output->gpu_data_ptr(), 0xff,
+            static_cast<size_t>(M) * N * sizeof(float), stream), cudaSuccess);
+        ASSERT_TRUE(cudaQuantGemm_quantizeActivationsBlockwise(
+            static_cast<const float *>(input->gpu_data_ptr()), quantized, scales,
+            M, K, gpu_device_.ordinal, stream));
+        if (explicit_rowpar)
+        {
+            auto *rowmajor_pointer = rowmajor.get();
+            const bool launched = M == 1
+                ? cudaNativeVNNIGemvTuned_fp32(
+                    quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
+                    static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
+                    static_cast<float *>(output->gpu_data_ptr()), scales, N, K,
+                    1.0f, 0.0f, nullptr, nullptr, 8, gpu_device_.ordinal, stream,
+                    gemv.get(), &rowmajor_pointer)
+                : cudaNativeVNNIGemvTuned_small_m_fp32(
+                    quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
+                    static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
+                    static_cast<float *>(output->gpu_data_ptr()), scales, M, N, K,
+                    1.0f, 0.0f, nullptr, nullptr, 8, gpu_device_.ordinal, stream,
+                    gemv.get(), &rowmajor_pointer);
+            ASSERT_TRUE(launched);
+            ASSERT_EQ(rowmajor_pointer, rowmajor.get());
+        }
+        else
+        {
+            ASSERT_TRUE(kernel->multiply_tensor(input.get(), output.get(), M, N, K));
+        }
+        recording.finish();
+        ASSERT_TRUE(graph.instantiate());
+        for (int replay = 0; replay < 2; ++replay)
+        {
+            for (int row = 0; row < M; ++row)
+            {
+                input_host[static_cast<size_t>(row) * K] = replay == 0 ? 1.0f : -1.0f;
+                input_host[static_cast<size_t>(row) * K + 16] = row % 2 ? -1.0f : 1.0f;
+                // A zero-weight sentinel fixes the Q8 step at one. The two
+                // nonzero weight codes then produce exact +/-1 integer dots,
+                // isolating source-scale loss from existing family reductions.
+                input_host[static_cast<size_t>(row) * K + 31] = 127.0f;
+            }
+            ASSERT_EQ(cudaMemcpyAsync(input->gpu_data_ptr(), input_host.data(),
+                static_cast<size_t>(M) * K * sizeof(float), cudaMemcpyHostToDevice, stream), cudaSuccess);
+            TransferEngine::publishCurrentDeviceWrite(input.get(), stream);
+            // Publication invalidates the old event/consumer admission. Join
+            // this generation outside capture before its retained consumer.
+            TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+            ASSERT_TRUE(graph.launch());
+            ASSERT_EQ(cudaMemcpyAsync(actual.data(), output->gpu_data_ptr(),
+                static_cast<size_t>(M) * N * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(activation_codes.data(), quantized,
+                static_cast<size_t>(M) * K, cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(activation_scales.data(), scales,
+                static_cast<size_t>(M) * K / 32 * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            for (int row = 0; row < M; ++row)
+            {
+                ASSERT_EQ(activation_scales[static_cast<size_t>(row) * K / 32], 1.0f);
+                for (int k = 0; k < K; ++k)
+                    ASSERT_EQ(activation_codes[static_cast<size_t>(row) * K + k],
+                        static_cast<int8_t>(input_host[static_cast<size_t>(row) * K + k]));
+                for (int n = 0; n < N; ++n)
+                {
+                    const float base = fp16_to_fp32(bases[n % bases.size()]);
+                    const float scale_low = device_fp32_contract::multiply(base, static_cast<float>(low[n % low.size()]));
+                    const float scale_high = device_fp32_contract::multiply(base, static_cast<float>(high[n % high.size()]));
+                    const float paired = device_fp32_contract::add(
+                        device_fp32_contract::multiply(scale_low, input_host[static_cast<size_t>(row) * K]),
+                        device_fp32_contract::multiply(scale_high, input_host[static_cast<size_t>(row) * K + 16]));
+                    const float expected = device_fp32_contract::add(0.0f, paired);
+                    ASSERT_TRUE(std::isfinite(actual[static_cast<size_t>(row) * N + n]));
+                    expectBitwiseEqualFloatRow("Q6_K source-scale equation",
+                        &actual[static_cast<size_t>(row) * N + n], &expected, 1);
+                }
+            }
+        }
+    };
+    for (const int M : {1, 8, maximum_m}) ASSERT_NO_FATAL_FAILURE(run(false, M));
+    for (const int M : {1, 8}) ASSERT_NO_FATAL_FAILURE(run(true, M));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    cleanupWorkspaceIfNeeded(kernel);
 }
 
 /**
@@ -11074,6 +11643,288 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_q.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_k.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_v.get());
+}
+
+/** @brief Original IQ2_S factors and unchanged Q8 must survive actual optimized capture. */
+TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreExact)
+{
+    constexpr std::array<uint16_t, 10> bases{
+        0x3555, 0x3c01, 0x0001, 0x03ff, 0x0400,
+        0x7bff, 0x8001, 0xbc01, 0x0000, 0x8000};
+    constexpr int N = 256 * bases.size() + 1, K = 288, maximum_m = 512;
+    constexpr int source_rows = N + 2, source_offset = 1;
+    constexpr int superblocks = (K + 255) / 256;
+    std::vector<IQ2_SBlock> originals(static_cast<size_t>(source_rows) * superblocks);
+    for (int n = 0; n < source_rows; ++n)
+        for (int sb = 0; sb < superblocks; ++sb)
+        {
+            auto &block = originals[static_cast<size_t>(n) * superblocks + sb];
+            const int logical = std::max(0, n - source_offset);
+            block.d = bases[(logical / 256 + sb) % bases.size()];
+            for (int sub = 0; sub < 8; ++sub)
+            {
+                block.scales[sub] = static_cast<uint8_t>(logical + sub * 17 + sb * 31);
+                for (int group = 0; group < 4; ++group)
+                {
+                    // Group0 grid0 supplies equal sentinel magnitudes. Other
+                    // groups span source high-index bits and mixed sign words.
+                    const unsigned index = group == 0 ? 0u :
+                        static_cast<unsigned>(n * (17 + group * 12) + sub * 43 + sb * 59) % 1024u;
+                    block.qs[sub * 4 + group] = static_cast<uint8_t>(index);
+                    block.qh[sub] |= static_cast<uint8_t>((index >> 8) << (group * 2));
+                    block.qs[32 + sub * 4 + group] = group == 0
+                        ? static_cast<uint8_t>(0x02u | (n & 1u))
+                        : static_cast<uint8_t>(n * 29 + sub * 11 + group * 71);
+                }
+            }
+        }
+    std::vector<uint8_t> raw(originals.size() * sizeof(IQ2_SBlock));
+    std::memcpy(raw.data(), originals.data(), raw.size());
+    auto parent = std::make_shared<IQ2_STensor>(
+        std::vector<size_t>{source_rows, K}, raw);
+    auto weights = parent->create_view({N, K}, static_cast<size_t>(source_offset) * K);
+    // Independent source codebook equation: read original bytes and the fixed
+    // published grid, never the native payload decoder or metadata helper.
+    const auto integer_value = [](const IQ2_SBlock &block, int sub, int value)
+    {
+        const int group = value / 8, lane = value % 8;
+        const unsigned index = block.qs[sub * 4 + group] |
+            (((static_cast<unsigned>(block.qh[sub]) >> (group * 2)) & 3u) << 8);
+        const int magnitude = static_cast<int>((iq2s_grid[index] >> (lane * 8)) & 255u);
+        return (block.qs[32 + sub * 4 + group] & (1u << lane)) ? -magnitude : magnitude;
+    };
+    ScopedGPUStream stream_owner(gpu_device_);
+    auto stream = static_cast<cudaStream_t>(stream_owner.get());
+    auto prepared = makeGpuPreparedGemm(
+        weights.get(), gpu_device_, "test.iq2s_source_scale", ModelContextId{19944});
+    auto *kernel = prepared.kernel;
+    ASSERT_NE(kernel, nullptr);
+    ASSERT_FALSE(cudaNativeVNNIGemvSweep_isActive());
+    kernel->setGPUStream(stream);
+    ASSERT_TRUE(setupSharedWorkspaceForExecutionRows(
+        {kernel}, {1, 3, 8, maximum_m}, {N}, K));
+
+    DeviceNativeVNNIMatrixDesc desc{};
+    ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc));
+    ASSERT_EQ(desc.codebook_id, 13);
+    ASSERT_NE(desc.mins, nullptr);
+    ASSERT_EQ(desc.blocks_per_row, K / 32);
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{maximum_m, K});
+    auto output = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{maximum_m, N});
+    std::vector<float> input_host(static_cast<size_t>(maximum_m) * K, 0.0f);
+    std::vector<float> actual(static_cast<size_t>(maximum_m) * N);
+    std::vector<uint16_t> primary(static_cast<size_t>(N) * K / 32);
+    std::vector<uint16_t> secondary(primary.size());
+    std::vector<uint8_t> payload(primary.size() * 9);
+    std::vector<int8_t> activation_codes(static_cast<size_t>(maximum_m) * K);
+    std::vector<float> activation_scales(static_cast<size_t>(maximum_m) * K / 32);
+    std::unique_ptr<CUDAGemvContext, decltype(&cudaGemvContext_destroy)> gemv(
+        cudaGemvContext_create(gpu_device_.ordinal), &cudaGemvContext_destroy);
+    std::unique_ptr<CUDARowMajorWeights, decltype(&cudaRowMajorWeights_destroy)> rowmajor(
+        nullptr, &cudaRowMajorWeights_destroy);
+
+    /** @brief Join all borrowed setup storage and clear the kernel stream. */
+    struct SetupRetirement
+    {
+        cudaStream_t stream; ///< Exact setup/observation stream.
+        ITensorGemm *kernel; ///< Kernel whose borrowed stream binding is retired.
+        /** @brief Retire submitted work before tensor/host/pool ownership ends. */
+        ~SetupRetirement()
+        {
+            (void)cudaStreamSynchronize(stream);
+            kernel->clearGPUStreamBinding();
+        }
+    } retirement{stream, kernel};
+    ASSERT_NE(gemv, nullptr);
+    cudaGemvContext_bindWorkspace(
+        gemv.get(),
+        static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS)),
+        workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+    ASSERT_TRUE(input->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(output->allocateOnDevice(gpu_device_, stream));
+    ASSERT_EQ(cudaMemcpyAsync(primary.data(), desc.scales, primary.size() * 2,
+                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(secondary.data(), desc.mins, secondary.size() * 2,
+                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(payload.data(), desc.payload, payload.size(),
+                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    for (int b = 0; b < K / 32; ++b)
+        for (int n = 0; n < N; ++n)
+        {
+            const size_t index = static_cast<size_t>(b) * N + n;
+            const auto &source = originals[
+                static_cast<size_t>(n + source_offset) * superblocks + b / 8];
+            const int sub = b % 8;
+            EXPECT_EQ(primary[index], source.d);
+            EXPECT_EQ(secondary[index], static_cast<uint16_t>(source.scales[sub]));
+            EXPECT_EQ(secondary[index] >> 8, 0u);
+            for (int group = 0; group < 4; ++group)
+            {
+                ASSERT_EQ(payload[index * 9 + group], source.qs[sub * 4 + group]);
+                ASSERT_EQ(payload[index * 9 + 5 + group], source.qs[32 + sub * 4 + group]);
+            }
+            ASSERT_EQ(payload[index * 9 + 4], source.qh[sub]);
+        }
+    rowmajor.reset(cudaRowMajorWeights_createForCodebook(
+        desc.payload, static_cast<const uint16_t *>(desc.scales),
+        static_cast<const uint16_t *>(desc.mins),
+        static_cast<const uint32_t *>(desc.emins), N, K, 13,
+        gpu_device_.ordinal, stream));
+    ASSERT_NE(rowmajor, nullptr);
+    auto *quantized = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+    auto *scales = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+    ASSERT_NE(quantized, nullptr);
+    ASSERT_NE(scales, nullptr);
+
+    /** @brief Own one existing diagnostic selector only while recording. */
+    struct DiagnosticSelection
+    {
+        bool enabled; ///< Whether this arm owns an explicit family override.
+        int previous; ///< Previous verifier arithmetic policy restored on exit.
+        /**
+         * @brief Select existing DIRECT/ROWPAR dispatch without changing math.
+         * @param family Negative means generated default;2 DIRECT;3 ROWPAR.
+         */
+        explicit DiagnosticSelection(int family)
+            : enabled(family >= 0),
+              previous(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
+        {
+            if (enabled)
+            {
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+                cudaNativeVNNIGemvSweep_setConfig(
+                    family, family == 3 ? 2 : 64, 1, 1, 1, 1, 0, 0);
+                cudaNativeVNNIGemvSweep_setGroupedRows(8);
+            }
+        }
+        /** @brief Restore generated dispatch even on a failed assertion. */
+        ~DiagnosticSelection()
+        {
+            if (enabled)
+            {
+                cudaNativeVNNIGemvSweep_clearConfig();
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous);
+            }
+        }
+    };
+    /**
+     * @brief Capture one unchanged execution family and replay changed inputs.
+     * @param family Generated default(-1), DIRECT(2), or ROWPAR(3).
+     * @param M Exact live activation rows for the retained graph.
+     */
+    const auto run = [&](int family, int M)
+    {
+        SCOPED_TRACE("family=" + std::to_string(family) + " M=" + std::to_string(M));
+        DiagnosticSelection selection(family);
+        // Admit the currently published external producer on this exact
+        // consumer stream before capture; an upload or prior replay may have
+        // published a new completion-event generation since the last arm.
+        TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+        CUDAGraphCapture graph(stream, gpu_device_.ordinal);
+        /** @brief Join replay/DMA before the retained graph is destroyed. */
+        struct ReplayRetirement
+        {
+            cudaStream_t stream; ///< Exact retained submission stream.
+            /** @brief Retire pending submissions on assertion failure as well. */
+            ~ReplayRetirement() { (void)cudaStreamSynchronize(stream); }
+        } replay_retirement{stream};
+        ScopedBackendGraphCapture recording(graph, "IQ2_S exact source scales");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_EQ(cudaMemsetAsync(output->gpu_data_ptr(), 0xff,
+            static_cast<size_t>(M) * N * sizeof(float), stream), cudaSuccess);
+        ASSERT_TRUE(cudaQuantGemm_quantizeActivationsBlockwise(
+            static_cast<const float *>(input->gpu_data_ptr()), quantized, scales,
+            M, K, gpu_device_.ordinal, stream));
+        if (family >= 0)
+        {
+            auto *rowmajor_pointer = rowmajor.get();
+            const bool launched = M == 1
+                ? cudaNativeVNNIGemvTuned_fp32(
+                    quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
+                    static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
+                    static_cast<float *>(output->gpu_data_ptr()), scales, N, K,
+                    1.0f, 0.0f, nullptr, nullptr, 13, gpu_device_.ordinal, stream,
+                    gemv.get(), &rowmajor_pointer)
+                : cudaNativeVNNIGemvTuned_small_m_fp32(
+                    quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
+                    static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
+                    static_cast<float *>(output->gpu_data_ptr()), scales, M, N, K,
+                    1.0f, 0.0f, nullptr, nullptr, 13, gpu_device_.ordinal, stream,
+                    gemv.get(), &rowmajor_pointer);
+            ASSERT_TRUE(launched);
+            ASSERT_EQ(rowmajor_pointer, rowmajor.get());
+        }
+        else
+        {
+            ASSERT_TRUE(kernel->multiply_tensor(input.get(), output.get(), M, N, K));
+        }
+        recording.finish();
+        ASSERT_TRUE(graph.instantiate());
+        for (int replay = 0; replay < 2; ++replay)
+        {
+            for (int row = 0; row < M; ++row)
+            {
+                input_host[static_cast<size_t>(row) * K] = replay == 0 ? 1.0f : -1.0f;
+                input_host[static_cast<size_t>(row) * K + 16] = row % 2 ? -1.0f : 1.0f;
+                // Equal-magnitude grid0 sentinels have opposite signs, so
+                // their integer products cancel while fixing Q8 step at one.
+                input_host[static_cast<size_t>(row) * K + 1] = 127.0f;
+                input_host[static_cast<size_t>(row) * K + 2] = 127.0f;
+            }
+            ASSERT_EQ(cudaMemcpyAsync(input->gpu_data_ptr(), input_host.data(),
+                static_cast<size_t>(M) * K * sizeof(float), cudaMemcpyHostToDevice, stream), cudaSuccess);
+            TransferEngine::publishCurrentDeviceWrite(input.get(), stream);
+            // Publication invalidates the old event/consumer admission. Join
+            // this generation outside capture before its retained consumer.
+            TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+            ASSERT_TRUE(graph.launch());
+            ASSERT_EQ(cudaMemcpyAsync(actual.data(), output->gpu_data_ptr(),
+                static_cast<size_t>(M) * N * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(activation_codes.data(), quantized,
+                static_cast<size_t>(M) * K, cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(activation_scales.data(), scales,
+                static_cast<size_t>(M) * K / 32 * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            for (int row = 0; row < M; ++row)
+            {
+                ASSERT_EQ(activation_scales[static_cast<size_t>(row) * K / 32], 1.0f);
+                for (int k = 0; k < K; ++k)
+                    ASSERT_EQ(activation_codes[static_cast<size_t>(row) * K + k],
+                        static_cast<int8_t>(input_host[static_cast<size_t>(row) * K + k]));
+                for (int n = 0; n < N; ++n)
+                {
+                    const auto &source = originals[
+                        static_cast<size_t>(n + source_offset) * superblocks];
+                    int dots[2]{};
+                    for (int k = 0; k < 32; ++k)
+                        dots[k / 16] += integer_value(source, 0, k) *
+                            static_cast<int>(input_host[static_cast<size_t>(row) * K + k]);
+                    const float base = fp16_to_fp32(source.d);
+                    const float scale_low = device_fp32_contract::multiply(
+                        device_fp32_contract::multiply(base,
+                            0.5f + static_cast<float>(source.scales[0] & 15u)), 0.25f);
+                    const float scale_high = device_fp32_contract::multiply(
+                        device_fp32_contract::multiply(base,
+                            0.5f + static_cast<float>(source.scales[0] >> 4)), 0.25f);
+                    const float paired = device_fp32_contract::add(
+                        device_fp32_contract::multiply(scale_low, static_cast<float>(dots[0])),
+                        device_fp32_contract::multiply(scale_high, static_cast<float>(dots[1])));
+                    const float expected = device_fp32_contract::add(0.0f, paired);
+                    ASSERT_TRUE(std::isfinite(actual[static_cast<size_t>(row) * N + n]));
+                    expectBitwiseEqualFloatRow("IQ2_S source-scale equation",
+                        &actual[static_cast<size_t>(row) * N + n], &expected, 1);
+                }
+            }
+        }
+    };
+    for (const int M : {1, 3, 8, maximum_m}) ASSERT_NO_FATAL_FAILURE(run(-1, M));
+    for (const int family : {2, 3})
+        for (const int M : {1, 8}) ASSERT_NO_FATAL_FAILURE(run(family, M));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    cleanupWorkspaceIfNeeded(kernel);
 }
 
 #endif // HAVE_CUDA

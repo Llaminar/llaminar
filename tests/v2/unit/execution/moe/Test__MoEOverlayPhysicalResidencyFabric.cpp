@@ -41,7 +41,8 @@ namespace
     /** @brief Build one metadata-only routed-MoE layer without reading payloads. */
     GGUFModel oneLayerExpertModel(
         GGUFTensorType type,
-        std::uint64_t experts = 2)
+        std::uint64_t experts = 2,
+        int first_model_layer = 0)
     {
         GGUFModel model;
         model.tensors = {
@@ -61,6 +62,8 @@ namespace
                 .type = type,
             },
         };
+        for (auto &tensor : model.tensors)
+            tensor.name.replace(4, 1, std::to_string(first_model_layer));
         return model;
     }
 
@@ -317,6 +320,7 @@ namespace
         const std::array<MoEOverlayPreparedExpertPayload, ExpertCount> &experts)
     {
         static_assert(ExpertCount > 0);
+        const int first = snapshot->layered_ownership.firstModelLayer();
         auto registry =
             std::make_shared<MoEOverlayParticipantResidencyRegistry>(
                 MoEOverlayParticipantResidencyRegistry::Config{
@@ -326,13 +330,14 @@ namespace
                     .num_experts = static_cast<int>(ExpertCount),
                     .initial_epoch = snapshot->epoch,
                     .retained_epoch_capacity = 2,
+                    .first_model_layer = first,
                 });
 
         std::string error;
         for (const int participant_id : std::array<int, 2>{0, 1})
         {
             const auto mask = snapshot->owner_map.expertMaskForParticipant(
-                0, participant_id, static_cast<int>(ExpertCount));
+                first, participant_id, static_cast<int>(ExpertCount));
             if (std::none_of(mask.begin(), mask.end(), [](bool resident)
                              { return resident; }))
             {
@@ -353,7 +358,7 @@ namespace
             }
             if (!registry->registerInitialLayer(
                     participant_id,
-                    0,
+                    first,
                     mask,
                     resident_engines,
                     &error))
@@ -383,6 +388,7 @@ namespace
     {
         static_assert(LayerCount > 1);
         static_assert(ExpertCount > 0);
+        const int first = snapshot->layered_ownership.firstModelLayer();
         auto registry =
             std::make_shared<MoEOverlayParticipantResidencyRegistry>(
                 MoEOverlayParticipantResidencyRegistry::Config{
@@ -392,15 +398,15 @@ namespace
                     .num_experts = static_cast<int>(ExpertCount),
                     .initial_epoch = snapshot->epoch,
                     .retained_epoch_capacity = 2,
+                    .first_model_layer = first,
                 });
 
         std::string error;
         for (const int participant_id : std::array<int, 2>{0, 1})
         {
-            for (int layer_idx = 0;
-                 layer_idx < static_cast<int>(LayerCount);
-                 ++layer_idx)
+            for (int row = 0; row < static_cast<int>(LayerCount); ++row)
             {
+                const int layer_idx = first + row;
                 const auto mask = snapshot->owner_map.expertMaskForParticipant(
                     layer_idx,
                     participant_id,
@@ -419,7 +425,7 @@ namespace
                     if (mask[static_cast<std::size_t>(expert_id)])
                     {
                         resident_engines[static_cast<std::size_t>(expert_id)] =
-                            experts[static_cast<std::size_t>(layer_idx)]
+                            experts[static_cast<std::size_t>(row)]
                                    [static_cast<std::size_t>(expert_id)];
                     }
                 }
@@ -601,6 +607,8 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                 .payload = expert_one,
             },
         },
+        .num_layers = 1u,
+        .num_experts = 2u,
     });
 
     const auto move = deviceLedgerSwap(
@@ -719,13 +727,14 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     };
 
     for (const auto &format : formats)
+    for (const int first : {0, 32, 40})
     {
         SCOPED_TRACE(static_cast<std::uint32_t>(format.gguf_type));
         const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
-            oneLayerExpertModel(format.gguf_type), 1, 2);
+            oneLayerExpertModel(format.gguf_type, 2, first), 1, 2, first);
         ASSERT_EQ(manifest.size(), 1u);
         ASSERT_TRUE(manifest.front().valid());
-        EXPECT_EQ(manifest.front().layer_idx, 0);
+        EXPECT_EQ(manifest.front().layer_idx, first);
 
         for (std::size_t role = 0; role < 3; ++role)
         {
@@ -772,12 +781,14 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     };
 
     for (const auto &format : formats)
+    for (const int first : {0, 32, 40})
     {
         SCOPED_TRACE(static_cast<std::uint32_t>(format.gguf_type));
         const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
-            oneLayerExpertModel(format.gguf_type), 1, 2);
+            oneLayerExpertModel(format.gguf_type, 2, first), 1, 2, first);
         ASSERT_EQ(manifest.size(), 1u);
         ASSERT_TRUE(manifest.front().valid());
+        EXPECT_EQ(manifest.front().layer_idx, first);
         for (const auto &projection : manifest.front().projections)
         {
             EXPECT_TRUE(projection.format.isFloating());
@@ -787,6 +798,24 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             EXPECT_FALSE(projection.format.native_vnni.present);
         }
     }
+}
+
+/** @brief Only owned tensor metadata is required; neighboring stages stay opaque. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageManifestExcludesForeignLayers)
+{
+    auto model = oneLayerExpertModel(GGUFTensorType::Q4_K, 2, 32);
+    auto next = oneLayerExpertModel(GGUFTensorType::F16, 2, 33);
+    model.tensors.insert(model.tensors.end(), next.tensors.begin(), next.tensors.end());
+    model.tensors.push_back({.name = "blk.0.ffn_gate_exps.weight"});
+    const auto owned = buildMoEOverlayLayerWeightManifestFromGGUF(model, 2, 2, 32);
+    ASSERT_EQ(owned.size(), 2u);
+    EXPECT_EQ(owned.front().layer_idx, 32);
+    EXPECT_EQ(owned.back().layer_idx, 33);
+    EXPECT_TRUE(owned.front().projections.front().format.isNativeVnni());
+    EXPECT_TRUE(owned.back().projections.front().format.isFloating());
+    EXPECT_THROW((void)buildMoEOverlayLayerWeightManifestFromGGUF(model, 3, 2, 32), std::invalid_argument);
+    EXPECT_THROW((void)buildMoEOverlayLayerWeightManifestFromGGUF(model, 2, 2, -1), std::invalid_argument);
+    EXPECT_THROW((void)buildMoEOverlayLayerWeightManifestFromGGUF(model, 2, 2, std::numeric_limits<int>::max()), std::invalid_argument);
 }
 
 TEST(Test__MoEOverlayPhysicalResidencyFabric,
@@ -1470,4 +1499,203 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             << "A sealed fabric returns the immutable terminal value instead of "
                "replaying physical copies";
     }
+}
+
+/**
+ * @brief Every prepared format moves and seals at global stage coordinates.
+ *
+ * Two owned layers share one shadow slot per participant. The test sends one
+ * complete cycle through the real CPU provider and restores it before sealing;
+ * exact bytes and PMA charges prove both correctness and compact storage.
+ */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageTransfersAndSealsEveryPreparedFormat)
+{
+    std::vector<ExpertWeightFormat> formats;
+    for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        formats.push_back(ExpertWeightFormat::nativeVnni({
+            .codebook_id = source.metadata->codebook_id,
+            .is_superblock = source.metadata->is_superblock, .present = true,
+        }));
+    for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+        formats.push_back(ExpertWeightFormat::floating(type));
+    for (std::size_t format_index = 0; format_index < formats.size(); ++format_index)
+    for (const int first : {32, 40})
+    {
+        SCOPED_TRACE(format_index);
+        SCOPED_TRACE(first);
+        const auto format = formats[format_index];
+        auto make_snapshot = [first](std::uint64_t epoch, bool swapped)
+        {
+            auto plan = twoCpuTierPlan({0, 1}, RoutedExpertResidencyPolicy::RoutedTierRebalanced, 2);
+            plan.first_model_layer = first;
+            for (auto &row : plan.placements) row.layer += first;
+            if (swapped) plan.placements[1].routed_expert_tier = {1, 0};
+            auto snapshot = std::make_shared<MoEOverlayResidencySnapshot>();
+            snapshot->epoch = epoch;
+            snapshot->placement_plan = std::make_shared<const MoERoutedExpertPlacementPlan>(plan);
+            snapshot->owner_map = MoEExpertOwnerMap::build(plan);
+            snapshot->layered_ownership = snapshot->owner_map.layeredOwnership(2, 2, first);
+            return snapshot;
+        };
+        const auto initial = make_snapshot(1, false);
+        const std::array<std::array<MoEOverlayPreparedExpertPayload, 2>, 2> experts{{
+            {makeSourceExpertAtLayer(0, first, 0, 11, format),
+             makeSourceExpertAtLayer(1, first, 1, 53, format)},
+            {makeSourceExpertAtLayer(0, first + 1, 0, 139, format),
+             makeSourceExpertAtLayer(1, first + 1, 1, 223, format)},
+        }};
+        auto registry = makeRegistry(initial, experts);
+        const auto memory = admitCpuShadowPools(format, 2, 1);
+        auto fabric = MoEOverlayPhysicalResidencyFabric::create({
+            .memory_authority = memory.authority, .registry = registry,
+            .initial_snapshot = initial, .shadow_slots_per_endpoint_layer = 1,
+            .staging_capacity_bytes = 64, .maximum_concurrent_cycles = 1,
+        });
+        ASSERT_EQ(fabric->stats().endpoint_layer_pools, 4u);
+        EXPECT_EQ(memory.authority->claimedBytes(DeviceId::cpu(),
+            PhysicalMemoryOwner::ExpertShadowSlots, PhysicalMemoryMaterializationKind::NewAllocation), memory.bytes);
+        {
+            MoEOverlayParticipantPreparedWaveFactory factory({.registry = registry, .transfer_provider = fabric});
+            MoEOverlayTierMigrationTransport transport({.factory = &factory, .projections_per_expert = 3});
+            std::shared_ptr<const MoEOverlayResidencySnapshot> previous = initial;
+            for (const std::uint64_t epoch : {2u, 3u})
+            {
+                const auto candidate = make_snapshot(epoch, epoch == 2);
+                MoEOverlayResidencyTransaction transaction{
+                    .expected_epoch = epoch - 1, .previous = previous, .candidate = candidate,
+                };
+                for (const int expert : {0, 1})
+                {
+                    const auto source = *previous->owner_map.ownerFor(first + 1, expert);
+                    const auto destination = *candidate->owner_map.ownerFor(first + 1, expert);
+                    transaction.migrations.push_back({
+                        .layer_idx = first + 1, .expert_id = expert, .estimated_weight_bytes = memory.bytes / 2,
+                        .direction = source.tier_idx < destination.tier_idx
+                            ? MoEOverlayTierMigrationDirection::Demotion : MoEOverlayTierMigrationDirection::Promotion,
+                        .source = source, .destination = destination,
+                    });
+                    transaction.shadow_requirements.push_back({
+                        .layer_idx = first + 1, .tier_idx = destination.tier_idx,
+                        .destination_participant = destination.owner_participant, .slot_count = 1,
+                    });
+                }
+                transaction.migration_cycles = {{.layer_idx = first + 1, .migration_indices = {0, 1}}};
+                ASSERT_TRUE(transaction.valid());
+                auto started = transport.beginStage(transaction);
+                ASSERT_EQ(started.status, MoEOverlayResidencyStageStartStatus::Started) << started.error;
+                ASSERT_TRUE(started.valid());
+                auto &wave = *started.wave;
+                std::string error;
+                auto progress = MoEOverlayResidencyWaveProgress::Pending;
+                for (int poll = 0; poll < 4096 && progress == MoEOverlayResidencyWaveProgress::Pending; ++poll)
+                {
+                    // The composite transport starts every admitted projection
+                    // before waiting for the whole-wave CPU launch barrier.
+                    progress = wave.pollStage(&error);
+                    if (progress == MoEOverlayResidencyWaveProgress::Pending)
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                if (progress != MoEOverlayResidencyWaveProgress::Ready)
+                {
+                    wave.abortStaged();
+                    std::string abort_error;
+                    for (int poll = 0; poll < 4096 &&
+                         wave.pollAbort(&abort_error) == MoEOverlayResidencyWaveProgress::Pending; ++poll)
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                ASSERT_EQ(progress, MoEOverlayResidencyWaveProgress::Ready) << error;
+                ASSERT_TRUE(wave.beginPrepare(&error)) << error;
+                ASSERT_EQ(wave.pollPrepare(&error), MoEOverlayResidencyWaveProgress::Ready) << error;
+                ASSERT_TRUE(wave.beginPublication(&error)) << error;
+                ASSERT_EQ(wave.pollPublication(&error), MoEOverlayResidencyWaveProgress::Ready) << error;
+                wave.markAuthorityPublished();
+                EXPECT_EQ(wave.pollRetirementFence({
+                    .admission = MoEOverlayRetirementAdmissionState::Open,
+                    .readers = MoEOverlayRetirementReaderState::Active}, &error),
+                    MoEOverlayRetirementFenceProgress::Pending);
+                ASSERT_EQ(wave.pollRetirementFence({
+                    .admission = MoEOverlayRetirementAdmissionState::Open,
+                    .readers = MoEOverlayRetirementReaderState::Drained}, &error),
+                    MoEOverlayRetirementFenceProgress::ReadyToCloseAdmission) << error;
+                EXPECT_EQ(wave.pollRetirementFence({
+                    .admission = MoEOverlayRetirementAdmissionState::Closed,
+                    .readers = MoEOverlayRetirementReaderState::Active}, &error),
+                    MoEOverlayRetirementFenceProgress::Pending);
+                ASSERT_EQ(wave.pollRetirementFence({
+                    .admission = MoEOverlayRetirementAdmissionState::Closed,
+                    .readers = MoEOverlayRetirementReaderState::Drained}, &error),
+                    MoEOverlayRetirementFenceProgress::ReadyToRetire) << error;
+                wave.retirePrevious();
+                for (const int participant : {0, 1})
+                {
+                    const auto bank = registry->endpoint(participant)->acquire(epoch);
+                    ASSERT_TRUE(bank);
+                    EXPECT_EQ(bank->layers.size(), 2u);
+                    for (const int row : {0, 1})
+                    {
+                        const auto &layer = bank->layerForModelLayer(first + row);
+                        EXPECT_EQ(layer.resident_mask, candidate->owner_map.expertMaskForParticipant(first + row, participant, 2));
+                        for (const int expert : {0, 1})
+                            if (layer.resident_mask[expert])
+                                EXPECT_EQ(preparedBytes(layer.experts[expert]), preparedBytes(experts[row][expert]));
+                    }
+                }
+                previous = candidate;
+            }
+            std::string error;
+            const auto seal = fabric->sealReusableInitialPlacement(3, &error);
+            ASSERT_TRUE(seal) << error;
+            EXPECT_TRUE(seal->valid());
+            for (const auto &bank : seal->local_banks)
+            {
+                EXPECT_EQ(bank.first_model_layer, first);
+                EXPECT_EQ(bank.layers.size(), 2u);
+            }
+            EXPECT_EQ(fabric->stats().cpu_copy_operations, 12u);
+            EXPECT_EQ(fabric->stats().blocking_synchronizations, 0u);
+        }
+        fabric.reset();
+        EXPECT_EQ(memory.authority->claimedBytes(DeviceId::cpu(),
+            PhysicalMemoryOwner::ExpertShadowSlots, PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+    }
+}
+
+/** @brief Foreign manifests and registries fail before claiming any physical shadow bytes. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageRejectsForeignFabricAdmission)
+{
+    const auto make_snapshot = [](int first)
+    {
+        auto plan = twoCpuTierPlan({0, 1}, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+        plan.first_model_layer = first;
+        plan.placements.front().layer = first;
+        auto snapshot = std::make_shared<MoEOverlayResidencySnapshot>();
+        snapshot->epoch = 1;
+        snapshot->placement_plan = std::make_shared<const MoERoutedExpertPlacementPlan>(plan);
+        snapshot->owner_map = MoEExpertOwnerMap::build(plan);
+        snapshot->layered_ownership = snapshot->owner_map.layeredOwnership(1, 2, first);
+        return snapshot;
+    };
+    const auto initial = make_snapshot(32);
+    const auto format = sourceProjectionSpecs().front().format;
+    const std::array<MoEOverlayPreparedExpertPayload, 2> experts{
+        makeSourceExpertAtLayer(0, 32, 0, 11), makeSourceExpertAtLayer(1, 32, 1, 53)};
+    const auto registry = makeRegistry(initial, experts);
+    const auto memory = admitCpuShadowPools(format, 2, 1);
+    MoEOverlayPhysicalResidencyFabric::Config config{
+        .memory_authority = memory.authority, .registry = registry,
+        .initial_snapshot = initial, .shadow_slots_per_endpoint_layer = 1,
+        .staging_capacity_bytes = 64, .maximum_concurrent_cycles = 1,
+    };
+    config.layer_weight_manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
+        oneLayerExpertModel(GGUFTensorType::Q4_0, 2, 40), 1, 2, 40);
+    EXPECT_THROW((void)MoEOverlayPhysicalResidencyFabric::create(config), std::invalid_argument);
+    config.layer_weight_manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
+        oneLayerExpertModel(GGUFTensorType::Q4_0, 2, 32), 1, 2, 32);
+    config.layer_weight_manifest.push_back(config.layer_weight_manifest.front());
+    EXPECT_THROW((void)MoEOverlayPhysicalResidencyFabric::create(config), std::invalid_argument);
+    config.layer_weight_manifest.clear();
+    config.initial_snapshot = make_snapshot(40);
+    EXPECT_THROW((void)MoEOverlayPhysicalResidencyFabric::create(config), std::runtime_error);
+    EXPECT_EQ(memory.authority->claimedBytes(DeviceId::cpu(),
+        PhysicalMemoryOwner::ExpertShadowSlots, PhysicalMemoryMaterializationKind::NewAllocation), 0u);
 }

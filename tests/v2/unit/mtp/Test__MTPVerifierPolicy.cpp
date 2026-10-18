@@ -10,11 +10,14 @@
 
 #include "execution/mtp/MTPVerifierPolicy.h"
 #include "execution/mtp/MTPServingForwardCaptureGeometry.h"
+#include "execution/mtp/MTPMainForwardPolicy.h"
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/FixedHalfProjectionGroup.h"
 #include "kernels/common/DeviceRowWorkGrid.h"
 #include "tensors/TensorKernels.h"
 #include <algorithm>
 #include <limits>
+#include <thread>
 #include <vector>
 
 namespace llaminar2
@@ -104,6 +107,72 @@ TEST(Test__MTPVerifierPolicy, RetainedVerifierWinsSharedArenaCaptureOrdering)
     EXPECT_FALSE(materializeMTPWideCheckpointLaneFirst(true, 8, disabled));
 }
 
+/** @test Every admissible request width was captured and charged before request admission. */
+TEST(Test__MTPVerifierPolicy, RetainedVerifierFamilyCoversEveryRequestWidth)
+{
+    for (int depth = 1; depth <= kMaximumSupportedMTPDraftDepth; ++depth)
+    for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Observe, MTPDepthPolicyMode::Dynamic})
+    for (int selected = 1; selected <= depth; ++selected)
+    {
+        SCOPED_TRACE(::testing::Message() << depth << '/' << int(mode) << '/' << selected);
+        MTPRuntimeConfig mtp;
+        mtp.enabled = true;
+        mtp.draft_tokens = selected;
+        mtp.graph_capacity_draft_tokens = depth;
+        mtp.depth_policy.mode = mode;
+        mtp.depth_policy.initial_depth = selected;
+        mtp.depth_policy.max_depth = selected;
+        const auto family = resolveMTPServingForwardCaptureFamily(mtp, depth + 1);
+        ASSERT_FALSE(family.empty());
+        EXPECT_EQ(family.front().verifier_rows, depth + 1);
+        EXPECT_EQ(family.back().verifier_rows, 2);
+        EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp),
+            kMTPConditionForwardPurposes.size() + 2 * family.size());
+        int previous = depth + 2;
+        for (const auto &geometry : family)
+        {
+            EXPECT_LT(geometry.verifier_rows, previous);
+            previous = geometry.verifier_rows;
+            EXPECT_EQ(geometry.draft_depth + 1, geometry.verifier_rows);
+            for (const auto outcome : {MTPVerifierOutcomeGraphMode::Greedy, MTPVerifierOutcomeGraphMode::Disabled})
+            {
+                const MTPVerifierForwardPolicy policy(outcome, geometry.verifier_rows, family.front());
+                EXPECT_EQ(policy.physicalRows(), geometry.verifier_rows);
+                EXPECT_EQ(policy.outcome(), outcome);
+            }
+        }
+        const auto width_policy = mode == MTPDepthPolicyMode::Dynamic
+            ? MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope : MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket;
+        const int rows = mtpVerifierPhysicalPaddedSeqLen(1, selected + 1, depth + 1, width_policy);
+        EXPECT_EQ(std::count_if(family.begin(), family.end(), [&](const auto &geometry) {
+            return geometry.verifier_rows == rows;
+        }), 1) << "A live request must select exactly one pre-existing graph";
+    }
+}
+
+/** @test Fixed depth seven retains four widths; malformed members cannot enter a replay. */
+TEST(Test__MTPVerifierPolicy, FixedDepthOvercapacityRetainsExactVerifierMembers)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 7;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    mtp.graph_capacity_draft_tokens = 15;
+    const auto family = resolveMTPServingForwardCaptureFamily(mtp, 16);
+    std::vector<int> widths;
+    for (const auto &geometry : family) widths.push_back(geometry.verifier_rows);
+    EXPECT_EQ(widths, (std::vector<int>{16, 8, 4, 2}));
+    EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp), 10u);
+    EXPECT_EQ(resolveMTPDeviceGenerationDepthPolicy(mtp).maximum_depth, 7);
+    for (const int invalid : {-1, 0, 1, 3, 5, 7, 9, 15, 17, std::numeric_limits<int>::max()})
+        EXPECT_THROW((void)MTPVerifierForwardPolicy(MTPVerifierOutcomeGraphMode::Disabled, invalid, family.front()), std::invalid_argument);
+    EXPECT_THROW((void)MTPVerifierForwardPolicy(static_cast<MTPVerifierOutcomeGraphMode>(99), 8, family.front()), std::invalid_argument);
+    EXPECT_THROW((void)MTPVerifierForwardPolicy(MTPVerifierOutcomeGraphMode::Disabled, 8, {}), std::invalid_argument);
+    for (const int mismatched : {0, 8, 32})
+        EXPECT_THROW((void)resolveMTPServingForwardCaptureFamily(mtp, mismatched), std::invalid_argument);
+    EXPECT_TRUE(resolveMTPServingForwardCaptureFamily({}, 0).empty());
+}
+
 /** @brief Bounded grids cover every live row exactly once without consulting its owner. */
 TEST(Test__MTPVerifierPolicy, CountedWorkerGridCoversEveryLiveTile)
 {
@@ -171,6 +240,49 @@ TEST(Test__MTPVerifierPolicy, VerifierRecordingScopesRestoreGeometry)
         EXPECT_EQ(Scope::rowsFor(16)->countOwner(), &owner);
     }
     EXPECT_EQ(Scope::rowsFor(3), nullptr);
+}
+
+/** @brief Fully active verifier scopes retain arithmetic across nesting and exceptions. */
+TEST(Test__MTPVerifierPolicy, VerifierArithmeticScopeIsIndependentOfRowCounts)
+{
+    using Scope = ITensorGemm::VerifierKernelModeScope;
+    EXPECT_FALSE(Scope::active());
+    {
+        Scope outer;
+        EXPECT_TRUE(Scope::active());
+        EXPECT_EQ(Scope::rowsFor(16), nullptr);
+        try
+        {
+            Scope inner(DeviceRowRange::fullyActive(3));
+            EXPECT_TRUE(Scope::active());
+            EXPECT_NE(Scope::rowsFor(3), nullptr);
+            throw std::runtime_error("recording failure");
+        }
+        catch (const std::runtime_error &) {}
+        EXPECT_TRUE(Scope::active());
+        EXPECT_EQ(Scope::rowsFor(16), nullptr);
+    }
+    EXPECT_FALSE(Scope::active());
+    EXPECT_EQ(Scope::rowsFor(16), nullptr);
+}
+
+/** @brief Independent graph recorders never inherit another thread's verifier contract. */
+TEST(Test__MTPVerifierPolicy, VerifierArithmeticScopeIsThreadLocal)
+{
+    using Scope = ITensorGemm::VerifierKernelModeScope;
+    Scope parent(DeviceRowRange::fullyActive(3));
+    std::thread other([] {
+        EXPECT_FALSE(Scope::active());
+        EXPECT_EQ(Scope::rowsFor(16), nullptr);
+        {
+            Scope inner;
+            EXPECT_TRUE(Scope::active());
+        }
+        EXPECT_FALSE(Scope::active());
+    });
+    other.join();
+    EXPECT_TRUE(Scope::active());
+    EXPECT_NE(Scope::rowsFor(3), nullptr);
 }
 
 TEST(Test__MTPVerifierPolicy, DeviceRowsRetainCapacityAcrossDepthChanges)
@@ -384,3 +496,32 @@ TEST(Test__MTPVerifierPolicy, NonGreedyWithoutStochasticVerifierIsUnsupported)
 }
 
 } // namespace llaminar2
+
+/** @test Capture metadata rejects incomplete owners, capacity overflow and aliases before launch. */
+TEST(Test__MTPVerifierPolicy, ShortHalfProjectionBindingsAreBoundedAndNonempty)
+{
+    using llaminar2::FixedHalfProjectionGroup;
+    std::uint16_t input{}, weights[9]{}; float outputs[9]{};
+    EXPECT_THROW((void)FixedHalfProjectionGroup::single(nullptr,weights,outputs,1),std::invalid_argument);
+    EXPECT_THROW((void)FixedHalfProjectionGroup::single(&input,nullptr,outputs,1),std::invalid_argument);
+    EXPECT_THROW((void)FixedHalfProjectionGroup::single(&input,weights,nullptr,1),std::invalid_argument);
+    EXPECT_THROW((void)FixedHalfProjectionGroup::single(&input,weights,outputs,0),std::invalid_argument);
+    auto group=FixedHalfProjectionGroup::single(&input,weights,outputs,1);
+    const auto retained=group;
+    EXPECT_THROW(group.append(weights+1,outputs,3),std::invalid_argument);
+    EXPECT_THROW(group.append(nullptr,outputs+1,3),std::invalid_argument);
+    EXPECT_THROW(group.append(weights+1,outputs+1,-1),std::invalid_argument);
+    int total=1;
+    for(int i=1;i<8;++i) {
+        group.append(weights+i,outputs+i,i*3); total+=i*3;
+        EXPECT_EQ(group.size(),i+1); EXPECT_EQ(group.totalColumns(),total);
+        EXPECT_EQ(group.columns(i),i*3); EXPECT_EQ(group.columnEnd(i),total);
+        EXPECT_EQ(group.weight(i),weights+i); EXPECT_EQ(group.output(i),outputs+i);
+    }
+    EXPECT_THROW(group.append(weights+8,outputs+8,1),std::length_error);
+    EXPECT_EQ(group.size(),8); EXPECT_EQ(group.totalColumns(),total);
+    EXPECT_EQ(retained.size(),1); EXPECT_EQ(retained.totalColumns(),1); EXPECT_EQ(retained.input(),&input);
+    auto limit=FixedHalfProjectionGroup::single(&input,weights,outputs,std::numeric_limits<int>::max());
+    EXPECT_THROW(limit.append(weights+1,outputs+1,1),std::overflow_error);
+    EXPECT_EQ(limit.totalColumns(),std::numeric_limits<int>::max()); EXPECT_EQ(limit.size(),1);
+}

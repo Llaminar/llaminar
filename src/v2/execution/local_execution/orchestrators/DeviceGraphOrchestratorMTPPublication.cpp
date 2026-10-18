@@ -189,7 +189,14 @@ namespace llaminar2
 
         params.request_count = request.requestCount();
         params.verifier_rows_per_request = verifier_rows_per_request;
-        params.max_state_commit_rows = request.max_state_commit_rows;
+        // The compact-outcome path embeds its host clipping limit in the
+        // launch. A bounded controller derives clipping from its device
+        // response ledger instead. Carrying the unused host limit into that
+        // graph identity would replace the graph whenever a streaming window
+        // changes the leading-row disposition, despite identical GPU work.
+        params.max_state_commit_rows =
+            params.authority == MTPSpeculativeStatePublicationStage::Authority::CompactOutcome
+                ? request.max_state_commit_rows : 0;
 
         params.publish_shifted_kv = request.publish_mtp_shifted_kv;
         params.shifted_target_cached_tokens_device =

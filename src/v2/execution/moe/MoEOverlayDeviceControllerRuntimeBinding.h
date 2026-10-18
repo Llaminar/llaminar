@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <type_traits>
 
 namespace llaminar2
@@ -399,6 +400,54 @@ namespace llaminar2
         /** Setup-only owner of complete retained-layer runtime publication. */
         IMoEOverlayDeviceInitialRuntimePublisher *initial_runtime_publisher =
             nullptr;
+        /** Global identity of compact runtime row zero; immutable graph topology. */
+        std::int32_t first_model_layer = 0;
+
+        /** @return Whether the complete global interval fits the model-layer namespace. */
+        [[nodiscard]] constexpr bool layerScopeValid() const noexcept
+        {
+            return first_model_layer >= 0 && layer_count > 0u &&
+                layer_count <= static_cast<std::uint32_t>(
+                    std::numeric_limits<std::int32_t>::max() - first_model_layer);
+        }
+
+        /**
+         * @brief Authenticate an owner's interval before interpreting its compact rows.
+         * @param first Global identity published by the runtime or residency authority.
+         * @param count Exact owned row count; preceding model layers are absent.
+         * @return True only for the same complete valid interval.
+         */
+        [[nodiscard]] constexpr bool matchesLayerScope(int first, std::uint32_t count) const noexcept
+        {
+            return layerScopeValid() && first == first_model_layer && count == layer_count;
+        }
+
+        /**
+         * @brief Translate a compact controller row to its exact model identity.
+         * @param row Storage row in this binding's runtime or mapped publication.
+         * @return Global identity used by placement banks, weights and movement receipts.
+         * @throws std::out_of_range If the row or bound interval is invalid.
+         */
+        [[nodiscard]] constexpr int modelLayerForStorageIndex(std::uint32_t row) const
+        {
+            if (!layerScopeValid() || row >= layer_count)
+                throw std::out_of_range("MoE controller runtime row is outside its bound stage");
+            return first_model_layer + static_cast<int>(row);
+        }
+
+        /**
+         * @brief Translate a global layer to a checked compact controller row.
+         * @param layer Exact model-global layer identity.
+         * @return Row suitable for local arrays and controller kernels only.
+         * @throws std::out_of_range If the layer belongs to another stage.
+         */
+        [[nodiscard]] constexpr std::uint32_t storageIndexForModelLayer(int layer) const
+        {
+            if (!layerScopeValid() || layer < first_model_layer ||
+                static_cast<std::uint32_t>(layer - first_model_layer) >= layer_count)
+                throw std::out_of_range("MoE controller model layer is outside its bound stage");
+            return static_cast<std::uint32_t>(layer - first_model_layer);
+        }
 
         /**
          * @return Whether global identity, local runtime identity, and geometry
@@ -410,7 +459,7 @@ namespace llaminar2
                    overlay_participant_id >= 0 &&
                    domain_participant_count > 0u &&
                    domain_participant_id < domain_participant_count &&
-                   layer_count > 0u && expert_count > 0u && top_k > 0u;
+                   layerScopeValid() && expert_count > 0u && top_k > 0u;
         }
 
         /**

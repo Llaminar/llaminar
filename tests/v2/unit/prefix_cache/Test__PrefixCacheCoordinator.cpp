@@ -160,6 +160,8 @@ TEST(Test__PrefixCacheCoordinator, ReusableCheckpointIsSharedAcrossMixedColdPart
     const auto nested = makePrefixLookupResult(coordinatePrefixLookups({
         makePrefixParticipantLookup(0, DeviceId::cpu(), coordinated)}), 64);
     EXPECT_EQ(nested.reusablePrefillCheckpoint(365, 0), 320);
+    EXPECT_EQ(PrefixHarvestSchedule::forPrefill(nested, 20416, 0).reusableCheckpoints(),
+              std::vector<int>({4096, 8192, 16384, 20352}));
     EXPECT_EQ(makePrefixLookupResult(coordinatePrefixLookups({attention}), 64).checkpoint_policy,
         PrefixCheckpointPolicy::TerminalOnly);
 }

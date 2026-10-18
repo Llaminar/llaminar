@@ -742,16 +742,16 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             serial.execution_epoch == mtp_grouped_execution_epoch_;
         const uint64_t serial_trajectory_epoch =
             serial.boundary.before.moe_runtime_movement_epoch ==
-                    serial.execution_epoch &&
+                    PrefixMovementEpochSnapshot::leaf(serial.execution_epoch) &&
                 serial.boundary.after.moe_runtime_movement_epoch ==
-                    serial.execution_epoch
+                    PrefixMovementEpochSnapshot::leaf(serial.execution_epoch)
                 ? serial.execution_epoch
                 : 0u;
         const uint64_t grouped_trajectory_epoch =
             boundary.before.moe_runtime_movement_epoch ==
-                    mtp_grouped_execution_epoch_ &&
+                    PrefixMovementEpochSnapshot::leaf(mtp_grouped_execution_epoch_) &&
                 boundary.after.moe_runtime_movement_epoch ==
-                    mtp_grouped_execution_epoch_
+                    PrefixMovementEpochSnapshot::leaf(mtp_grouped_execution_epoch_)
                 ? mtp_grouped_execution_epoch_
                 : 0u;
 

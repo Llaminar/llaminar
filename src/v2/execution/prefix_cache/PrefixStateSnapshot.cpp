@@ -4,12 +4,15 @@
  *
  * Payload handles carry the state they can actually restore. Neither clamping
  * nor checkpoint planning may infer recurrent state from a later token cursor.
+ * Harvest retains only its terminal reuse witness after restoration transfers
+ * the complete source chain into the producer's event-owned lifetime.
  */
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
 
 #include <algorithm>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 
 namespace llaminar2
 {
@@ -124,9 +127,31 @@ namespace llaminar2
         {
             throw std::invalid_argument("prefix harvest requires a valid coordinated prefill admission");
         }
-        return PrefixHarvestSchedule(
-            prompt_tokens, admission.reusablePrefillCheckpoint(
-                prompt_tokens, restored_tokens, stable_segment_tokens));
+        std::vector<int> checkpoints;
+        if (const auto tail = admission.reusablePrefillCheckpoint(
+                prompt_tokens, restored_tokens, stable_segment_tokens))
+        {
+            int64_t alignment = admission.block_size;
+            if (stable_segment_tokens > 0)
+                alignment = alignment / std::gcd(admission.block_size, stable_segment_tokens) *
+                            stable_segment_tokens;
+            // Recurrent images can be hundreds of MiB. A checkpoint at each
+            // cache block would overwhelm both storage tiers. Start at 4K
+            // tokens and double the spacing: at 256K this adds only six images
+            // to the existing near-tail checkpoint. Absolute frontiers are
+            // stable across growing requests, so restored history is neither
+            // recomputed nor copied again. This policy has no chat/client input.
+            constexpr int64_t first_sparse_frontier = 4096;
+            const int64_t first =
+                ((first_sparse_frontier + alignment - 1) / alignment) * alignment;
+            for (int64_t frontier = first; frontier < *tail; frontier *= 2)
+            {
+                if (frontier > restored_tokens)
+                    checkpoints.push_back(static_cast<int>(frontier));
+            }
+            checkpoints.push_back(*tail);
+        }
+        return PrefixHarvestSchedule(prompt_tokens, std::move(checkpoints));
     }
 
     PrefixLookupResult PrefixLookupResult::clampedTo(int token_count) const
@@ -187,6 +212,39 @@ namespace llaminar2
         }
 
         return result;
+    }
+
+    PrefixLookupResult PrefixLookupResult::forHarvest(int restored_tokens) const
+    {
+        auto admission = clampedTo(restored_tokens);
+        if (admission.payload_plan)
+        {
+            auto endpoint = admission.payload_plan->retireForHarvest(admission.blocks.empty()
+                ? std::nullopt : std::optional{admission.blocks.back().key});
+            if (!admission.blocks.empty()) admission.blocks.back() = std::move(endpoint);
+        }
+        admission.payload_plan.reset();
+        admission.payload_purpose_ = PayloadPurpose::HarvestWitness;
+        if (admission.blocks.size() > 1u)
+        {
+            auto terminal = std::move(admission.blocks.back());
+            admission.blocks.clear();
+            admission.blocks.push_back(std::move(terminal));
+        }
+        return admission;
+    }
+
+    std::vector<PrefixBlockHandle> PrefixLookupResult::materializeRestoreBlocks() const
+    {
+        const auto &selected = restoreBlocks();
+        return payload_plan ? payload_plan->materialize(selected) : selected;
+    }
+
+    const std::vector<PrefixBlockHandle> &PrefixLookupResult::restoreBlocks() const
+    {
+        if (payload_purpose_ != PayloadPurpose::RestoreSources)
+            throw std::logic_error("prefix harvest admission cannot restore a consumed block chain");
+        return blocks;
     }
 
 } // namespace llaminar2

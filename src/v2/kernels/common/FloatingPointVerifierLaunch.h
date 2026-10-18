@@ -10,6 +10,7 @@
 #pragma once
 
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/FixedHalfProjectionGroup.h"
 
 extern "C"
 {
@@ -178,3 +179,60 @@ extern "C"
         const llaminar2::DeviceRowRange *row_range = nullptr);
 
 }
+
+/** @brief CUDA actual-half fixed-order projection, opaque pointer-array ABI as existing x16 launcher.
+ * @param a Half A device addresses. @param b Half B device addresses. @param c FP32 outputs.
+ * @param m Physical rows. @param n Output columns. @param k Reduction width.
+ * @param batches Projection count <=8. @param device Owning ordinal. @param stream Exact stream.
+ * @param rows Optional device-owned live rows. @return Submission success.
+ */
+extern "C" bool cudaFp16_tiny_batched_projection(const float *const *a, const float *const *b,
+    float *const *c, int m, int n, int k, int batches, int device, void *stream,
+    const llaminar2::DeviceRowRange *rows = nullptr);
+
+extern "C"
+{
+    /**
+     * @brief Enqueue fixed-order physical FP16 A/B with FP32 accumulation/output.
+     * @param d_A_array Persistent opaque pointers to half input matrices [M,K].
+     * @param d_B_array Persistent opaque pointers to half weight matrices [N,K].
+     * @param d_C_array Persistent FP32 outputs [M,N].
+     * @param M Physical rows, independent of the device-owned live prefix.
+     * @param N Output columns, independent of the fixed per-column reduction.
+     * @param K Reduction width. @param batch_count Independent projections <=8.
+     * @param device_id Exact owning ordinal. @param stream Exact non-null stream.
+     * @param row_range Borrowed live metadata, or null for fully active rows.
+     * @return Whether validation and asynchronous submission succeeded.
+     */
+    bool rocmFp16_batched_projection(
+        const float *const *d_A_array, const float *const *d_B_array,
+        float *const *d_C_array, int M, int N, int K, int batch_count,
+        int device_id, void *stream,
+        const llaminar2::DeviceRowRange *row_range = nullptr);
+}
+
+/**
+ * @brief Enqueue one compact short-row half projection group without pointer staging.
+ * @param group Validated persistent addresses and distinct output column strides.
+ * @param m Physical rows in the measured short-row domain [1,31].
+ * @param k Positive reduction width, including odd and unaligned tails.
+ * @param device_id Owning native ordinal. @param stream Exact non-null stream.
+ * @param rows Optional borrowed device-live range with physical capacity m.
+ * @return Validation/submission success; no allocation, transfer or host count read.
+ */
+extern "C" bool cudaFp16_short_projection_group(
+    const llaminar2::FixedHalfProjectionGroup &group, int m, int k,
+    int device_id, void *stream, const llaminar2::DeviceRowRange *rows = nullptr);
+
+/**
+ * @brief Enqueue one compact short-row half projection group without pointer staging.
+ * @param group Validated persistent addresses and distinct output column strides.
+ * @param m Physical rows in the measured short-row domain [1,31].
+ * @param k Positive reduction width, including odd and unaligned tails.
+ * @param device_id Owning native ordinal. @param stream Exact non-null stream.
+ * @param rows Optional borrowed device-live range with physical capacity m.
+ * @return Validation/submission success; no allocation, transfer or host count read.
+ */
+extern "C" bool rocmFp16_short_projection_group(
+    const llaminar2::FixedHalfProjectionGroup &group, int m, int k,
+    int device_id, void *stream, const llaminar2::DeviceRowRange *rows = nullptr);

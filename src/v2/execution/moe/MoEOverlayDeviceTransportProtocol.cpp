@@ -291,15 +291,32 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @return Whether command identity and immutable stage geometry match.
+         *
+         * Equal-shaped pipeline stages may share topology and transaction
+         * numbers. Every scheduler and completion edge must also bind the
+         * origin before it can acknowledge work or release physical storage.
+         */
+        bool matchesTransportGeometry(
+            const MoEOverlayDeviceControllerTransportBinding &binding,
+            const MoEOverlayDeviceTransportCommandBatch &batch) noexcept
+        {
+            return binding.valid() && batch.valid() &&
+                batch.header.topology_fingerprint == binding.topology_fingerprint &&
+                batch.participant_count == binding.layout->participant_count &&
+                batch.num_layers == binding.layout->num_layers &&
+                batch.num_experts == binding.layout->num_experts &&
+                batch.first_model_layer == binding.layout->first_model_layer;
+        }
+
         /** @return Whether @p batch still names the live controller transaction. */
         bool exactControllerTransaction(
             const MoEOverlayDeviceControllerTransportBinding &binding,
             const MoEOverlayDeviceTransportCommandBatch &batch,
             MoEOverlayDeviceControllerState state) noexcept
         {
-            return binding.valid() && batch.valid() &&
-                batch.header.topology_fingerprint ==
-                    binding.topology_fingerprint &&
+            return matchesTransportGeometry(binding, batch) &&
                 loadAcquire(binding.controller->transaction_id) ==
                     batch.header.transaction_id &&
                 loadAcquire(binding.controller->transaction_kind) ==
@@ -375,13 +392,30 @@ namespace llaminar2
         }
     } // namespace
 
+    int MoEOverlayDeviceTransportCommandBatch::modelLayerForStorageIndex(
+        std::uint32_t storage_index) const
+    {
+        if (first_model_layer < 0 || num_layers == 0u ||
+            num_layers > static_cast<std::uint32_t>(
+                std::numeric_limits<std::int32_t>::max() - first_model_layer) ||
+            storage_index >= num_layers)
+        {
+            throw std::out_of_range(
+                "device movement row is outside its immutable pipeline stage");
+        }
+        return first_model_layer + static_cast<int>(storage_index);
+    }
+
     bool MoEOverlayDeviceTransportCommandBatch::valid() const noexcept
     {
         if (header.magic != kMoEOverlayDeviceControllerMagic ||
             header.version != kMoEOverlayDeviceControllerVersion ||
             header.topology_fingerprint == 0u || header.transaction_id == 0u ||
             header.base_epoch == 0u || participant_count == 0u ||
-            num_layers == 0u || num_experts == 0u ||
+            first_model_layer < 0 || num_layers == 0u ||
+            num_layers > static_cast<std::uint32_t>(
+                std::numeric_limits<std::int32_t>::max() - first_model_layer) ||
+            num_experts == 0u ||
             entries.size() != header.command_count ||
             header.parallel_command_count != header.command_count ||
             header.movement_round_count !=
@@ -601,6 +635,7 @@ namespace llaminar2
         result.batch.participant_count = binding_.layout->participant_count;
         result.batch.num_layers = binding_.layout->num_layers;
         result.batch.num_experts = binding_.layout->num_experts;
+        result.batch.first_model_layer = binding_.layout->first_model_layer;
         result.batch.entries.resize(header.command_count);
         if (header.command_count != 0u)
         {
@@ -711,9 +746,7 @@ namespace llaminar2
     {
         if (error)
             error->clear();
-        if (!batch.valid() ||
-            batch.header.topology_fingerprint !=
-                binding_.topology_fingerprint ||
+        if (!matchesTransportGeometry(binding_, batch) ||
             loadAcquire(binding_.transport->status_code) !=
                 static_cast<std::uint32_t>(
                     MoEOverlayDeviceControllerError::None) ||
@@ -769,9 +802,7 @@ namespace llaminar2
     bool MoEOverlayDeviceTransportProtocol::allGroupsPrepared(
         const MoEOverlayDeviceTransportCommandBatch &batch) const noexcept
     {
-        return binding_.valid() && batch.valid() &&
-               batch.header.topology_fingerprint ==
-                   binding_.topology_fingerprint &&
+        return matchesTransportGeometry(binding_, batch) &&
                loadAcquire(binding_.controller->transaction_id) >=
                    batch.header.transaction_id &&
                allGroupsReached(
@@ -782,9 +813,7 @@ namespace llaminar2
     bool MoEOverlayDeviceTransportProtocol::commitRequested(
         const MoEOverlayDeviceTransportCommandBatch &batch) const noexcept
     {
-        return batch.valid() &&
-               batch.header.topology_fingerprint ==
-                   binding_.topology_fingerprint &&
+        return matchesTransportGeometry(binding_, batch) &&
                loadAcquire(binding_.controller->commit_transaction) ==
                    batch.header.transaction_id &&
                loadAcquire(binding_.controller->state) ==
@@ -805,9 +834,7 @@ namespace llaminar2
     bool MoEOverlayDeviceTransportProtocol::authorityRejected(
         const MoEOverlayDeviceTransportCommandBatch &batch) const noexcept
     {
-        return batch.valid() &&
-               batch.header.topology_fingerprint ==
-                   binding_.topology_fingerprint &&
+        return matchesTransportGeometry(binding_, batch) &&
                loadAcquire(binding_.controller->transaction_id) ==
                    batch.header.transaction_id &&
                (loadAcquire(binding_.controller->state) ==
@@ -865,9 +892,7 @@ namespace llaminar2
     bool MoEOverlayDeviceTransportProtocol::allGroupsPublished(
         const MoEOverlayDeviceTransportCommandBatch &batch) const noexcept
     {
-        return binding_.valid() && batch.valid() &&
-               batch.header.topology_fingerprint ==
-                   binding_.topology_fingerprint &&
+        return matchesTransportGeometry(binding_, batch) &&
                loadAcquire(binding_.controller->transaction_id) >=
                    batch.header.transaction_id &&
                allGroupsReached(
@@ -960,9 +985,7 @@ namespace llaminar2
     bool MoEOverlayDeviceTransportProtocol::allGroupsRetired(
         const MoEOverlayDeviceTransportCommandBatch &batch) const noexcept
     {
-        return binding_.valid() && batch.valid() &&
-               batch.header.topology_fingerprint ==
-                   binding_.topology_fingerprint &&
+        return matchesTransportGeometry(binding_, batch) &&
                durablePlacementKind(static_cast<
                    MoEOverlayDeviceControllerTransactionKind>(
                    batch.header.kind)) &&
@@ -976,9 +999,7 @@ namespace llaminar2
     bool MoEOverlayDeviceTransportProtocol::transactionComplete(
         const MoEOverlayDeviceTransportCommandBatch &batch) const noexcept
     {
-        return binding_.valid() && batch.valid() &&
-               batch.header.topology_fingerprint ==
-                   binding_.topology_fingerprint &&
+        return matchesTransportGeometry(binding_, batch) &&
                loadAcquire(binding_.controller->completed_transaction) >=
                    batch.header.transaction_id;
     }
@@ -986,7 +1007,7 @@ namespace llaminar2
     bool MoEOverlayDeviceTransportProtocol::restorationRequested(
         const MoEOverlayDeviceTransportCommandBatch &batch) const noexcept
     {
-        return batch.valid() &&
+        return matchesTransportGeometry(binding_, batch) &&
                batch.header.kind == static_cast<std::uint32_t>(
                    MoEOverlayDeviceControllerTransactionKind::
                        CurrentBatchLLEP) &&

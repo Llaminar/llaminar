@@ -2378,7 +2378,7 @@ class CrossHostRunnerTests(unittest.TestCase):
         proof = {"case": scenario["id"], "scenario": scenario, "execution": {"observed": True}}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            artifacts.write_json(path / "cell.driver-diagnostics.json", clean_driver_evidence())
+            artifacts.write_json(path / "cell.driver-diagnostics.json", clean_driver_evidence(path))
             artifacts.write_json(path / "long_context_results.json", complete)
             artifacts.write_json(path / "runtime.cross-host.json", proof)
             artifacts.write_json(path / "tool_calling_results.json", {"schema": 1, "complete": True,
@@ -2448,7 +2448,7 @@ class CrossHostRunnerTests(unittest.TestCase):
                     scenario = next(row for row in parent["configuration"]["cross_host_e2e"]
                                     if row["id"] == ident)
                     log.write("preserved HTTP diagnostic\n")
-                    artifacts.write_json(directory / "cell.driver-diagnostics.json", clean_driver_evidence())
+                    artifacts.write_json(directory / "cell.driver-diagnostics.json", clean_driver_evidence(directory))
                     artifacts.write_json(directory / "runtime.cross-host.json", {
                         "case": ident, "scenario": scenario, "execution": {"observed": True}})
                     artifacts.write_json(directory / "long_context_results.json", {
@@ -3971,6 +3971,7 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("patches/rocm-hip-sdma-stream-sharing.patch", toolchain)
         self.assertIn("patches/rocm-hip-sdma-event-publication.patch", toolchain)
         self.assertIn("patches/rocm-hip-graph-progress-safe-collapse.patch", toolchain)
+        self.assertIn("patches/rocm-hip-event-producer-lifetime.patch", toolchain)
         # Those four backports are part of the pinned upstream monorepo now.
         # Applying them again would make the upgrade a second orphaned repair.
         for old_patch in ("node-identity", "queue-placement", "packet-publication", "entry-ordering"):
@@ -4042,6 +4043,7 @@ class InfrastructureTests(unittest.TestCase):
                 ROOT / "scripts/docker/patches/rocm-hip-sdma-stream-sharing.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-sdma-event-publication.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-event-producer-lifetime.patch",
             )
             parts = [pins[key] for key in ("LLAMINAR_ROCM_VERSION", "LLAMINAR_ROCM_DEB_VERSION",
                      "LLAMINAR_ROCM_SYSTEMS_REVISION", "LLAMINAR_HIP_LIBRARY_VERSION")]

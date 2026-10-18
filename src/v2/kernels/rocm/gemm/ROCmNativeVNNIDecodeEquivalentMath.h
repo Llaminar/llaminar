@@ -2,8 +2,9 @@
  * @file ROCmNativeVNNIDecodeEquivalentMath.h
  * @brief Canonical FP32 update operations shared by ROCm NativeVNNI kernels.
  *
- * NativeVNNI stores one INT8 dot-product payload with one or two FP16 weight
- * scales per 32-value K block.  A grouped verifier or prefill kernel may use a
+ * NativeVNNI stores an integer dot-product payload with four bytes of Q6 or
+ * IQ2_S/IQ3_S source factors, IQ4_XS original base/coefficient words, or one/two FP16 scales for other formats, per32 values.
+ * A grouped verifier or prefill kernel may use a
  * different output tile from serial M=1 decode, but it must not change the
  * floating-point expression tree that publishes the row.  Even algebraically
  * equivalent rewrites can round differently and make speculative verification
@@ -18,10 +19,90 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #include "kernels/common/DeviceNativeVNNIContributionContract.h"
+#include "tensors/NativeVnniQ6Scale.h"
+#include "tensors/NativeVnniIQ2SScale.h"
+#include "tensors/NativeVnniIQ4XSScale.h"
+#include "tensors/NativeVnniIQ3SScale.h"
+#include "tensors/NativeVnniFormatInfo.h"
 
 #include <cstdint>
+
+/** @brief Two source-resolved FP32 scales consumed by the unchanged dot contract. */
+struct ROCmNativeVNNIDualWeightScales
+{
+    float low;  ///< Exact Q6/IQ2_S source factor, otherwise widened-half scale.
+    float high; ///< Exact Q6/IQ2_S source factor, otherwise widened-half scale.
+};
+
+/**
+ * @brief Interpret the existing two metadata words by their execution codebook.
+ * @tparam Codebook NativeVNNI execution codebook; Q6_K is8, IQ2_S is13.
+ * @param primary Original Q6/IQ2_S half d, otherwise low derived-half scale.
+ * @param secondary Q6 signed pair, IQ2_S source nibble byte, or high half scale.
+ * @return Resolved scales before the existing dual-scale dot/application tree.
+ * @details The Q6 coefficient word is never half-converted. Original half times
+ * signed int8 is exactly representable in FP32. Explicit multiplication retains
+ * source signs/zeros without factoring d outside either dot contribution.
+ * IQ2_S resolves each unsigned nibble as (d*(0.5+nibble))*0.25, retaining
+ * the original source association before the unchanged dual-dot contract.
+ */
+template <int Codebook>
+__device__ __forceinline__ ROCmNativeVNNIDualWeightScales
+rocm_native_vnni_load_dual_weight_scales(uint16_t primary, uint16_t secondary)
+{
+    if constexpr (Codebook == 8)
+    {
+        const float base = __half2float(*reinterpret_cast<const __half *>(&primary));
+        return {
+            llaminar2::device_fp32_contract::multiply(base,
+                static_cast<float>(llaminar2::native_vnni_q6_scale::low(secondary))),
+            llaminar2::device_fp32_contract::multiply(base,
+                static_cast<float>(llaminar2::native_vnni_q6_scale::high(secondary)))};
+    }
+    else if constexpr (Codebook == 13)
+    {
+        const float base = __half2float(*reinterpret_cast<const __half *>(&primary));
+        // The secondary word is source metadata, never a half. Preserve the
+        // source decoder's two multiplication boundaries before dot scaling.
+        return {
+            llaminar2::device_fp32_contract::multiply(
+                llaminar2::device_fp32_contract::multiply(base,
+                    0.5f + static_cast<float>(llaminar2::native_vnni_iq2s_scale::low(secondary))), 0.25f),
+            llaminar2::device_fp32_contract::multiply(
+                llaminar2::device_fp32_contract::multiply(base,
+                    0.5f + static_cast<float>(llaminar2::native_vnni_iq2s_scale::high(secondary))), 0.25f)};
+    }
+    else
+    {
+        return {
+            __half2float(*reinterpret_cast<const __half *>(&primary)),
+            __half2float(*reinterpret_cast<const __half *>(&secondary))};
+    }
+}
+
+/**
+ * @brief Resolve original IQ3_S/IQ4_XS factors before the unchanged single-dot tree.
+ * @tparam Codebook Physical decoder;11 stores d/raw nibble,24 stores d/raw encoded6.
+ * @param primary Original half d for11/24, otherwise the unchanged half scale.
+ * @param secondary Raw nibble for11 or encoded coefficient for24, ignored for other formats.
+ * @return Source d*(1+2*nibble) for11 or d*(encoded-32) for24; other scales widened.
+ */
+template <int Codebook>
+__device__ __forceinline__ float rocm_native_vnni_load_single_weight_scale(
+    uint16_t primary, uint16_t secondary)
+{
+    const float base = __half2float(*reinterpret_cast<const __half *>(&primary));
+    if constexpr (Codebook == 11)
+        return llaminar2::device_fp32_contract::multiply(base,
+            static_cast<float>(llaminar2::native_vnni_iq3s_scale::coefficient(secondary)));
+    if constexpr (Codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
+        return llaminar2::device_fp32_contract::multiply(base,
+            static_cast<float>(llaminar2::native_vnni_iq4xs_scale::coefficient(secondary)));
+    return base;
+}
 
 /**
  * @brief Commit one single-scale NativeVNNI K block in serial-decode order.
@@ -33,7 +114,7 @@
  *
  * @param accumulator Running FP32 dot-product accumulator.
  * @param dot INT32 dot product for the complete 32-value K block.
- * @param weight_scale FP16-derived weight scale for the K block.
+ * @param weight_scale Source-resolved or unchanged FP16-derived weight scale for the K block.
  * @param activation_scale FP32 scale for the quantized activation K block.
  * @return The updated FP32 accumulator.
  */
@@ -106,8 +187,8 @@ rocm_native_vnni_commit_corrected_single_scale_block(
  * @param accumulator Running FP32 dot-product accumulator.
  * @param low_dot INT32 dot product for elements 0..15 of the K block.
  * @param high_dot INT32 dot product for elements 16..31 of the K block.
- * @param low_weight_scale FP16-derived weight scale for elements 0..15.
- * @param high_weight_scale FP16-derived weight scale for elements 16..31.
+ * @param low_weight_scale Source-resolved FP32 weight scale for elements 0..15.
+ * @param high_weight_scale Source-resolved FP32 weight scale for elements 16..31.
  * @param activation_scale FP32 scale for the quantized activation K block.
  * @return The updated FP32 accumulator.
  */

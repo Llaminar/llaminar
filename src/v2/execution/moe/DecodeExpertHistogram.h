@@ -2,6 +2,10 @@
  * @file DecodeExpertHistogram.h
  * @brief Per-layer routing demand with one RCU generation and physical owner.
  *
+ * Public layer coordinates retain model identities. A pipeline stage stores
+ * only its owned interval, and frozen generations carry that interval through
+ * transaction authentication instead of aliasing another stage's local rows.
+ *
  * Tracks expert activation patterns during MoE decode for socket-aware
  * dynamic rebalancing. Designed for zero allocation on the hot path
  * after initialization. Transaction-enabled banks retain complete route batches
@@ -20,6 +24,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -57,7 +62,7 @@ namespace llaminar2
         int top_k = 0;
         int window_size = 256; ///< Decode tokens per window epoch
         /// Layer index that advances the decode-token window. A negative value
-        /// falls back to num_layers - 1 for dense/all-routed legacy configs.
+        /// selects the final owned model layer when omitted (-1).
         int token_boundary_layer_idx = -1;
         std::vector<DeviceId> sockets;
         /// Complete per-layer expert ownership used by load diagnostics.
@@ -126,12 +131,15 @@ namespace llaminar2
          * @brief Retain one source mask per contiguous routed layer.
          * @param layer_sources Layer-ordered masks; individual retained but
          *        inactive auxiliary layers may have an all-false mask.
+         * @param first_model_layer First model-global identity in these masks.
          * @throws std::invalid_argument when the vector is empty or its union
          *         contains no reachable production phase.
          */
         explicit ExpertHistogramProductionTopology(
-            std::vector<ExpertHistogramProductionSourceMask> layer_sources)
-            : layer_sources_(std::move(layer_sources)),
+            std::vector<ExpertHistogramProductionSourceMask> layer_sources,
+            int first_model_layer = 0)
+            : first_model_layer_(first_model_layer),
+              layer_sources_(std::move(layer_sources)),
               service_economy_sources_(layer_sources_)
         {
             if (!valid())
@@ -147,14 +155,17 @@ namespace llaminar2
          * @param service_economy_sources Phases whose recurring service cost
          *        participates in migration admission. Every set bit must also
          *        be reachable at the same layer.
+         * @param first_model_layer First model-global identity in both arrays.
          * @throws std::invalid_argument for empty, mismatched, or contradictory
          *         topology.
          */
         ExpertHistogramProductionTopology(
             std::vector<ExpertHistogramProductionSourceMask> layer_sources,
             std::vector<ExpertHistogramProductionSourceMask>
-                service_economy_sources)
-            : layer_sources_(std::move(layer_sources)),
+                service_economy_sources,
+            int first_model_layer = 0)
+            : first_model_layer_(first_model_layer),
+              layer_sources_(std::move(layer_sources)),
               service_economy_sources_(
                   std::move(service_economy_sources))
         {
@@ -165,12 +176,21 @@ namespace llaminar2
             }
         }
 
-        /** @return A uniform topology used by phase-symmetric graph families. */
+        /**
+         * @brief Build compact masks for a phase-symmetric retained interval.
+         * @param layer_count Positive number of owned rows.
+         * @param sources Reachable and economy-priced phases at every row.
+         * @param first_model_layer First model-global layer identity.
+         * @return Validated topology without storage for preceding stages.
+         * @throws std::invalid_argument for an empty or overflowing interval.
+         */
         [[nodiscard]] static ExpertHistogramProductionTopology uniform(
             int layer_count,
-            ExpertHistogramProductionSourceMask sources)
+            ExpertHistogramProductionSourceMask sources,
+            int first_model_layer = 0)
         {
-            if (layer_count <= 0 ||
+            if (layer_count <= 0 || first_model_layer < 0 ||
+                layer_count > std::numeric_limits<int>::max() - first_model_layer ||
                 !validExpertHistogramProductionSourceMask(sources))
             {
                 throw std::invalid_argument(
@@ -178,7 +198,8 @@ namespace llaminar2
             }
             return ExpertHistogramProductionTopology(
                 std::vector<ExpertHistogramProductionSourceMask>(
-                    static_cast<std::size_t>(layer_count), sources));
+                    static_cast<std::size_t>(layer_count), sources),
+                first_model_layer);
         }
 
         /**
@@ -193,8 +214,10 @@ namespace llaminar2
          * as part of MTP and remain phase-empty when MTP is disabled.
          *
          * @param retained_layer_count Total main plus predictor layer count.
-         * @param main_inference_layer_count Exclusive main-layer boundary.
+         * @param main_inference_layer_count Exclusive main-layer boundary within
+         *        this retained interval, expressed as a model-global identity.
          * @param regime Typed serving policy governing MTP and serial decode.
+         * @param first_model_layer First model-global layer retained by this stage.
          * @return Exact immutable per-layer production reachability.
          * @throws std::invalid_argument for an invalid layer boundary.
          */
@@ -202,12 +225,16 @@ namespace llaminar2
         forRetainedExecution(
             int retained_layer_count,
             int main_inference_layer_count,
-            ExpertHistogramServingRegime regime);
+            ExpertHistogramServingRegime regime,
+            int first_model_layer = 0);
 
         /** @return Whether retained geometry and its derived source union exist. */
         [[nodiscard]] bool valid() const noexcept
         {
-            if (layer_sources_.empty() ||
+            if (first_model_layer_ < 0 ||
+                layer_sources_.size() > static_cast<std::size_t>(
+                    std::numeric_limits<int>::max() - first_model_layer_) ||
+                layer_sources_.empty() ||
                 layer_sources_.size() != service_economy_sources_.size() ||
                 !validExpertHistogramProductionSourceMask(activeSources()) ||
                 !validExpertHistogramProductionSourceMask(
@@ -237,6 +264,15 @@ namespace llaminar2
             return layer_sources_.size();
         }
 
+        /** @return First model-global identity represented by the compact masks. */
+        [[nodiscard]] int firstModelLayer() const noexcept { return first_model_layer_; }
+
+        /** @return Exclusive model-global boundary of the retained interval. */
+        [[nodiscard]] int endModelLayer() const noexcept
+        {
+            return first_model_layer_ + static_cast<int>(layer_sources_.size());
+        }
+
         /**
          * @return Exact reachable-source mask for @p layer.
          * @throws std::out_of_range when the layer is outside retained geometry.
@@ -244,9 +280,7 @@ namespace llaminar2
         [[nodiscard]] const ExpertHistogramProductionSourceMask &sources(
             int layer) const
         {
-            if (layer < 0)
-                throw std::out_of_range("Negative expert histogram layer");
-            return layer_sources_.at(static_cast<std::size_t>(layer));
+            return layer_sources_.at(storageIndexForModelLayer(layer));
         }
 
         /** @return Whether one exact layer/phase coordinate can execute. */
@@ -267,13 +301,8 @@ namespace llaminar2
         [[nodiscard]] const ExpertHistogramProductionSourceMask &
         economySources(int layer) const
         {
-            if (layer < 0)
-            {
-                throw std::out_of_range(
-                    "Negative expert histogram economy layer");
-            }
             return service_economy_sources_.at(
-                static_cast<std::size_t>(layer));
+                storageIndexForModelLayer(layer));
         }
 
         /**
@@ -330,6 +359,20 @@ namespace llaminar2
             const ExpertHistogramProductionTopology &) const = default;
 
     private:
+        /**
+         * @brief Authenticate a model layer before indexing the stage's masks.
+         * @param layer Model-global layer identity.
+         * @return Compact row index owned by this topology.
+         * @throws std::out_of_range for a layer owned by another stage.
+         */
+        [[nodiscard]] std::size_t storageIndexForModelLayer(int layer) const
+        {
+            if (layer < firstModelLayer() || layer >= endModelLayer())
+                throw std::out_of_range("Expert histogram layer is outside its owned interval");
+            return static_cast<std::size_t>(layer - first_model_layer_);
+        }
+
+        int first_model_layer_ = 0;
         std::vector<ExpertHistogramProductionSourceMask> layer_sources_;
         /** Reachable phases whose recurring cost is part of movement policy. */
         std::vector<ExpertHistogramProductionSourceMask>
@@ -398,6 +441,16 @@ namespace llaminar2
         std::vector<uint64_t> source_expert_counts;
         /** Observed batches authenticated against these exact counts/generation. */
         std::shared_ptr<const DecodeExpertTransactionWindow> transaction_demand;
+
+        /** Model-global origin of compact count and transaction arrays. */
+        int first_model_layer = 0;
+
+        /** @return Whether an identity belongs to this window, without overflow. */
+        [[nodiscard]] bool containsModelLayer(int layer) const noexcept
+        {
+            return first_model_layer >= 0 && layer >= first_model_layer &&
+                   layer - first_model_layer < num_layers;
+        }
 
         /** @brief Read one frozen layer/expert count, rejecting invalid geometry. */
         [[nodiscard]] uint64_t activationCount(
@@ -530,6 +583,9 @@ namespace llaminar2
         /** @return Authenticated layer count. */
         [[nodiscard]] int numLayers() const noexcept;
 
+        /** @return Authenticated model-global origin of this immutable window. */
+        [[nodiscard]] int firstModelLayer() const noexcept;
+
         /** @return Authenticated routed-expert count. */
         [[nodiscard]] int numExperts() const noexcept;
 
@@ -584,6 +640,21 @@ namespace llaminar2
 
         /** @brief Validate geometry and materialize two admitted, stable banks. */
         explicit DecodeExpertHistogram(DecodeExpertHistogramConfig config);
+
+        /** @return Immutable model-global origin, independent of owner updates. */
+        [[nodiscard]] int firstModelLayer() const noexcept { return first_model_layer_; }
+
+        /** @return Exclusive model-global boundary authenticated at construction. */
+        [[nodiscard]] int endModelLayer() const noexcept
+        {
+            return first_model_layer_ + config_.num_layers;
+        }
+
+        /** @return Whether this stage owns the requested model-global layer. */
+        [[nodiscard]] bool containsModelLayer(int layer) const noexcept
+        {
+            return layer >= firstModelLayer() && layer < endModelLayer();
+        }
 
         // ── Hot path (allocation-free) ────────────────────
 
@@ -823,7 +894,21 @@ namespace llaminar2
     private:
         bool isTokenBoundaryLayer(int layer_idx) const;
 
+        /**
+         * @brief Translate a public model layer to a compact, immutable bank row.
+         * @param layer Model-global layer identity.
+         * @return Local storage row without reading mutable ownership state.
+         * @throws std::out_of_range for another stage's layer.
+         */
+        [[nodiscard]] std::size_t storageIndexForModelLayer(int layer) const
+        {
+            if (!containsModelLayer(layer))
+                throw std::out_of_range("Histogram layer is outside its owned interval");
+            return static_cast<std::size_t>(layer - first_model_layer_);
+        }
+
         DecodeExpertHistogramConfig config_;
+        const int first_model_layer_;
         /** Live adaptive capacity; `config_` remains immutable setup identity. */
         std::atomic<int> active_window_size_;
 

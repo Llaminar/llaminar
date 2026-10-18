@@ -14,7 +14,8 @@
  *      vs 8 bpw for INT8) — halving HBM bandwidth requirements
  *   2. Decode quantized weights to INT8 in-register during the load phase
  *      (Decode-in-Load architecture)
- *   3. Use FP32 accumulators with per-block FP16 scales (no separate epilogue)
+ *   3. Use FP32 accumulators with source-exact Q6/IQ2_S/IQ4_XS factors or prepared half scales
+ *      for other formats (no separate epilogue)
  *   4. Apply activation scale inline → FP32 output directly
  *
  * The decode-in-load approach stores decoded INT8 weights in LDS (same format
@@ -83,6 +84,7 @@ extern "C" bool rocmGemv_native_vnni_query_serial_m1_config_with_policy(
 
 enum NativeVNNIGemmFormat : uint8_t {
     NVNNI_GEMM_Q4_0    = 0,   // 4-bit symmetric, linear decode (q - 8)
+    NVNNI_GEMM_IQ4_XS_SOURCE = llaminar2::kNativeVnniIQ4XSSourceScaleCodebook,
     NVNNI_GEMM_IQ4_NL  = 4,   // 4-bit symmetric, LUT decode via v_perm_b32
     NVNNI_GEMM_Q4_1    = 5,   // 4-bit asymmetric (q as-is, has min)
     NVNNI_GEMM_Q5_0    = 6,   // 5-bit symmetric, linear decode (q - 16)
@@ -135,7 +137,7 @@ struct NVNNIGemmTraits {
     static constexpr bool is_2bit   = (FMT == NVNNI_GEMM_Q2_K);
     static constexpr bool is_8bit =
         FMT == NVNNI_GEMM_Q8_0 || FMT == NVNNI_GEMM_EXPANDED_INT8_MIN;
-    static constexpr bool uses_lut  = (FMT == NVNNI_GEMM_IQ4_NL);
+    static constexpr bool uses_lut  = (FMT == NVNNI_GEMM_IQ4_NL || FMT == NVNNI_GEMM_IQ4_XS_SOURCE);
     static constexpr int  payload_bytes =
         is_8bit ? 32 :                              // Q8_0: 32 raw INT8 values
         is_iq1_grid ? 6 :                          // IQ1_S/IQ1_M: qs[4]+qh[2], native size
@@ -145,7 +147,8 @@ struct NVNNIGemmTraits {
     static constexpr int center_4bit = (FMT == NVNNI_GEMM_Q4_0) ? 8 : 0;
     static constexpr int center_5bit = (FMT == NVNNI_GEMM_Q5_0) ? 16 : 0;
     // Does the compute phase need an auxiliary scale/min?
-    static constexpr bool needs_aux_compute = is_dual_scale || is_asymmetric;
+    static constexpr bool needs_aux_compute = is_dual_scale || is_asymmetric ||
+        FMT == NVNNI_GEMM_IQ3_S || FMT == NVNNI_GEMM_IQ4_XS_SOURCE;
     // Aux value always loaded from d_block_mins (no embedded scales anymore).
     static constexpr bool loads_aux_from_global = needs_aux_compute;
     // Cooperative sum_a precompute: Pattern DA needs per-half sums for emin
@@ -297,7 +300,7 @@ __device__ __forceinline__ void decode_block(
             packed_groups[g + 4] = static_cast<int32_t>((((raw[g] >> 4) & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
         }
     }
-    else if constexpr (FMT == NVNNI_GEMM_IQ4_NL)
+    else if constexpr (FMT == NVNNI_GEMM_IQ4_NL || FMT == NVNNI_GEMM_IQ4_XS_SOURCE)
     {
         // IQ4_NL: v_perm_b32 codebook LUT
         constexpr uint32_t CB_LO_A = 0xBFAD9881u, CB_LO_B = 0xF6EADDCFu;
@@ -650,8 +653,8 @@ __device__ __forceinline__ void decode_block(
  * @param bp Quantization-block index within the current shared-memory slot.
  * @param a_buf Packed activation operands, indexed by K group then row.
  * @param b_buf Decoded weight operands, indexed by K group then column.
- * @param s_buf First FP16 weight scale for each block/column.
- * @param aux_buf Second scale or asymmetric correction for each block/column.
+ * @param s_buf Q6/IQ4_XS original half d, otherwise first prepared half weight scale.
+ * @param aux_buf Q6 signed factors, IQ4_XS raw encoded6, or format-specific half auxiliary.
  * @param iq1_m_qh_buf IQ1_M delta-sign bits; unused for other codebooks.
  * @param emin_lo_buf Lower-half asymmetric correction coefficients.
  * @param emin_hi_buf Upper-half asymmetric correction coefficients.
@@ -748,10 +751,10 @@ __device__ __forceinline__ void accumulate_block_gemm(
             {
                 const int column = column_base + nn;
                 const int sn = bp * N_TILE + t_n * N_PER_THREAD + column;
-                const float scale_lo = __half2float(
-                    *reinterpret_cast<const __half*>(&s_buf[sn]));
-                const float scale_hi = __half2float(
-                    *reinterpret_cast<const __half*>(&aux_buf[sn]));
+                const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
+                    s_buf[sn], aux_buf[sn]);
+                const float scale_lo = weight_scales.low;
+                const float scale_hi = weight_scales.high;
                 #pragma unroll
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                 {
@@ -923,7 +926,9 @@ __device__ __forceinline__ void accumulate_block_gemm(
         for (int nn = 0; nn < N_PER_THREAD; ++nn)
         {
             const uint16_t s_bits = s_buf[bp * N_TILE + t_n * N_PER_THREAD + nn];
-            block_scale[nn] = __half2float(*reinterpret_cast<const __half*>(&s_bits));
+            block_scale[nn] = rocm_native_vnni_load_single_weight_scale<FMT>(s_bits,
+                (FMT == NVNNI_GEMM_IQ3_S || FMT == NVNNI_GEMM_IQ4_XS_SOURCE) ?
+                    aux_buf[bp * N_TILE + t_n * N_PER_THREAD + nn] : uint16_t{0});
         }
         #pragma unroll
         for (int mm = 0; mm < M_PER_THREAD; ++mm)
@@ -1151,7 +1156,7 @@ void native_vnni_gemm_kernel(
     // =========================================================================
     __shared__ int32_t a_lds[2][KT * M_TILE];       // A: same layout as INT8 V3
     __shared__ int32_t b_lds[2][KT * N_TILE];       // B: decoded INT8 (same layout as V3)
-    __shared__ uint16_t scale_lds[2][BPT * N_TILE];  // Per-block FP16 scales
+    __shared__ uint16_t scale_lds[2][BPT * N_TILE];  // Raw per-block16-bit metadata
     __shared__ uint16_t aux_lds[2][Traits::needs_aux_compute ? BPT * N_TILE : 1];  // Aux scale/min
     __shared__ uint16_t iq1_m_qh_lds[
         2][FMT == NVNNI_GEMM_IQ1_M ? BPT * N_TILE : 1];
@@ -1255,8 +1260,8 @@ void native_vnni_gemm_kernel(
     // Staging registers for pipeline
     uint4 a_staging[A_NUM_PASSES];
     uint32_t b_payload_dw[PD];  // variable-size payload dwords
-    uint16_t b_scale_staging;   // 1 FP16 scale
-    uint16_t b_aux_staging;     // 1 FP16 aux scale/min (for needs_aux_compute)
+    uint16_t b_scale_staging;   // Original Q6 d or derived-half scale
+    uint16_t b_aux_staging;     // Q6 signed coefficients or format half auxiliary
     uint16_t b_emin_lo_staging; // embedded min lo (for dual_scale_asym)
     uint16_t b_emin_hi_staging; // embedded min hi (for dual_scale_asym)
 
@@ -2352,9 +2357,10 @@ void streaming_lm_head_kernel(
                     }
                 }
 
-                const float slo =
-                    __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                const float shi = __half2float(*reinterpret_cast<const __half*>(&aux_bits));
+                const auto weight_scales = rocm_native_vnni_load_dual_weight_scales<FMT>(
+                    scale_bits, aux_bits);
+                const float slo = weight_scales.low;
+                const float shi = weight_scales.high;
                 uint16_t iq1_m_qh = 0;
                 if constexpr (FMT == NVNNI_GEMM_IQ1_M)
                     iq1_m_qh = static_cast<uint16_t>(b_payload_dw[1]);
@@ -2507,8 +2513,7 @@ void streaming_lm_head_kernel(
                     }
                 }
             }
-            const float block_scale = __half2float(
-                *reinterpret_cast<const __half*>(&scale_bits));
+            const float block_scale = rocm_native_vnni_load_single_weight_scale<FMT>(scale_bits, aux_bits);
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
                 acc[mm] = rocm_native_vnni_commit_single_scale_block(
@@ -2630,6 +2635,8 @@ static bool launch_native_vnni_gemm(
     int device_id, void* stream,
     uint8_t arithmetic_policy_codebook_id)
 {
+    if constexpr (FMT == NVNNI_GEMM_IQ3_S || FMT == NVNNI_GEMM_IQ4_XS_SOURCE)
+        if (!d_block_mins) return false;
     constexpr int BPT = 2;
     constexpr int BLOCK_SIZE = 256;
 
@@ -3055,7 +3062,7 @@ static bool launch_native_vnni_gemm(
     // continues through the same total generic dispatch below; an admitted
     // measured producer that cannot launch is an error, never a second choice.
     if (const auto exact = llaminar2::rocm::selectDensePrefillExactConfig(
-            static_cast<uint8_t>(FMT), M, N, K,
+            FMT == NVNNI_GEMM_IQ4_XS_SOURCE ? uint8_t{4} : static_cast<uint8_t>(FMT), M, N, K,
             llaminar2::rocm::DensePrefillWeightFamily::NativeLowBit))
     {
         switch (exact->producer)
@@ -3411,6 +3418,7 @@ bool LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL(
 #if LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 0
     case NVNNI_GEMM_Q4_0:     LAUNCH_GEMM(NVNNI_GEMM_Q4_0);
     case NVNNI_GEMM_IQ4_NL:   LAUNCH_GEMM(NVNNI_GEMM_IQ4_NL);
+    case NVNNI_GEMM_IQ4_XS_SOURCE: LAUNCH_GEMM(NVNNI_GEMM_IQ4_XS_SOURCE);
 #elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 1
     case NVNNI_GEMM_Q4_1:     LAUNCH_GEMM(NVNNI_GEMM_Q4_1);
     case NVNNI_GEMM_Q5_0:     LAUNCH_GEMM(NVNNI_GEMM_Q5_0);

@@ -2,7 +2,7 @@
  * @file EmbeddingStage.cpp
  * @brief Participant-local embedding execution and prepared-weight contracts.
  *
- * Quantized sources consume model-owned EmbedQ8 handles, while native floating
+ * Quantized sources consume model-owned native source handles, while native floating
  * sources use their raw resident storage. Wrappers are resolved through the
  * unpacking interface's actual capability, never their C++ inheritance alone.
  */
@@ -53,6 +53,18 @@ namespace llaminar2
             return false;
         }
 
+        const auto *handle = params_.prepared_store->embeddingHandle(params_.prepared_ref.value());
+        const auto expected = NativeEmbeddingLayout::forSource(
+            embed_base->native_type(), embed_base->rows(), params_.d_model);
+        if (handle->tensor != embed_base || handle->device_id != params_.device_id ||
+            !handle->weights || handle->weights->device_id != params_.device_id ||
+            handle->weights->layout != expected || !handle->weights->device_data ||
+            handle->weights->vocab_size != embed_base->rows() ||
+            handle->weights->d_model != params_.d_model)
+        {
+            if (error) *error = "EmbeddingStage native prepared source/device/layout mismatch";
+            return false;
+        }
         if (error)
             error->clear();
         return true;
@@ -537,7 +549,7 @@ namespace llaminar2
         auto contract = StageBufferContract::build()
                             .addOutput(*params_.output_buffer_id);
         // Quantized GPU embeddings consume the PreparedWeightStore-owned
-        // EmbedQ8 allocation. Floating-point and CPU embeddings read the raw
+        // native-block allocation. Floating-point and CPU embeddings read the raw
         // source tensor directly.
         if (params_.embed_table)
         {

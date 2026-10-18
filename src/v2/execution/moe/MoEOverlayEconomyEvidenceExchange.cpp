@@ -280,7 +280,8 @@ namespace llaminar2
                 if (!row.valid() || !participant ||
                     !participant->world_rank_known ||
                     participant->world_rank != static_cast<int>(rank) ||
-                    row.layer < 0 || row.layer >= num_layers)
+                    row.layer < production_topology.firstModelLayer() ||
+                    row.layer >= production_topology.endModelLayer())
                 {
                     throw std::invalid_argument(
                         "ExpertOverlay service ranks supplied a malformed, out-of-range, or wrongly owned row");
@@ -317,7 +318,8 @@ namespace llaminar2
         std::sort(participant_ids.begin(), participant_ids.end());
         for (const int participant : participant_ids)
         {
-            for (int layer = 0; layer < num_layers; ++layer)
+            for (int layer = production_topology.firstModelLayer();
+                 layer < production_topology.endModelLayer(); ++layer)
             {
                 const auto found = merged.find({participant, layer});
                 if (found == merged.end())

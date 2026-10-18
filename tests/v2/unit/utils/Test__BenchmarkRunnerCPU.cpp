@@ -2534,7 +2534,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     snapshot.execution_path = "GRAPH";
     snapshot.primary_device = DeviceId::cpu();
     snapshot.current_position = 12;
-    snapshot.moe_runtime_movement_epoch = 7;
+    snapshot.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(7);
     snapshot.prefix_cache_config_enabled = true;
     snapshot.prefix_cache_ready = true;
     snapshot.prefix_cache_lookups = 3;

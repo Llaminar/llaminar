@@ -288,7 +288,8 @@ namespace llaminar2
             return false;
         }
         if (params_.authority == Authority::BoundedGeneration &&
-            (!params_.generation_response_tokens_device ||
+            (params_.max_state_commit_rows != 0 ||
+             !params_.generation_response_tokens_device ||
              params_.generation_response_token_stride <= 0 ||
              !params_.generation_control_device ||
              params_.generation_control_stride <= 0 ||
@@ -299,7 +300,7 @@ namespace llaminar2
              !params_.next_sidecar_condition_tokens_device ||
              !params_.next_sidecar_position_ids_device))
         {
-            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Controller-owned publication has no persistent response ledger or next-sidecar mailbox");
+            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Controller-owned publication requires its sole device response ledger, next-sidecar mailbox and no host commit limit");
             return false;
         }
         if (params_.dynamic_moe_commit_boundary &&

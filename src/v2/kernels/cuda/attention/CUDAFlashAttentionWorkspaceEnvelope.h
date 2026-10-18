@@ -24,11 +24,13 @@ namespace llaminar2::cuda::fa2_policy
      * Large query grids can select direct attention while smaller grids still
      * use context summaries. Bound the search using the persistent scheduler's
      * grid-wave ceiling and widest compiled query tile. Beyond that ceiling,
-     * every grouping has only one context slot and cannot select context mode.
+     * every generic grouping has only one context slot. Qualified tensor bodies
+     * remain fast above that boundary and use their compact physical stride.
      * Within it, policy changes occur at 16-row tile boundaries (including the
      * explicit 17/128-row transitions). Visit each interval's largest M in
      * descending order: summary bytes grow with M, so the first context plan
-     * is the exact envelope. Work is bounded by device geometry, not context
+     * is the exact generic envelope. Compare it with the largest tensor member,
+     * including the M511 boundary preceding native M512. Work is bounded by device geometry, not context
      * length. Callers reserve these bytes; they must not launch this plan in
      * place of an actual request's independently selected capture policy.
      */
@@ -47,6 +49,11 @@ namespace llaminar2::cuda::fa2_policy
         const int maximum_groups = maximumFA2QueryWarpGroups(geometry.head_dim);
         if (maximum_groups == 0)
             return {};
+        const auto largest = selectFA2PrefillParallelPlan(geometry);
+        if (!largest.valid) return {};
+        auto best = largest.usesContextParallelism() &&
+                    largest.summary_layout == FA2PrefillSummaryLayout::TensorCompactFour
+                        ? largest : FA2PrefillParallelPlan{};
 
         const std::int64_t blocks_per_tile =
             static_cast<std::int64_t>(geometry.batch_size) * geometry.local_query_heads;
@@ -65,11 +72,13 @@ namespace llaminar2::cuda::fa2_policy
             auto candidate = geometry;
             candidate.query_rows = rows;
             const auto plan = selectFA2PrefillParallelPlan(candidate);
-            if (plan.usesContextParallelism())
-                return plan;
-            rows = ((rows - 1) / kFA2QueryRowsPerWarpGroup) * kFA2QueryRowsPerWarpGroup;
+            if (plan.usesContextParallelism() &&
+                plan.summary_layout == FA2PrefillSummaryLayout::Canonical256)
+                return best.partial_output_bytes > plan.partial_output_bytes ? best : plan;
+            rows = rows == 512 ? 511
+                : ((rows - 1) / kFA2QueryRowsPerWarpGroup) * kFA2QueryRowsPerWarpGroup;
         }
-        return {};
+        return best;
     }
 
 } // namespace llaminar2::cuda::fa2_policy

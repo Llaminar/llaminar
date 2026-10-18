@@ -14,6 +14,8 @@
  */
 
 #include "KernelFactory.h"
+#include "../transfer/TransferEngine.h"
+#include <cstring>
 #include "../backends/BackendManager.h"
 #include "../backends/GPUDeviceContextPool.h"
 #include "../planning/KVCacheMemoryEstimator.h"
@@ -58,7 +60,7 @@
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "../loaders/MmapRegion.h"
-#include "common/EmbedQ8Repack.h"
+#include "common/NativeEmbeddingLayout.h"
 // CUDA kernel classes
 #ifdef HAVE_CUDA
 #include "cuda/gemm/CUDAQuantisedGemmKernel.h"        // Quantized tensors via CUTLASS INT8
@@ -3002,11 +3004,28 @@ namespace llaminar
 
             namespace
             {
+                /**
+                 * @brief Prepare the engine for its immutable device and operand contract.
+                 * @param tensor Retained original or explicitly prepared model weights.
+                 * @param target_device Exact execution placement.
+                 * @param operand_precision Arithmetic sealed before kernel preparation.
+                 * @return Backend engine retaining the supplied arithmetic identity.
+                 * @throws std::invalid_argument If a GPU floating mode bypasses its owned pool.
+                 */
                 static std::unique_ptr<llaminar2::ITensorGemm> createPreparedKernelForDevice(
                     const llaminar2::TensorBase *tensor,
-                    llaminar2::DeviceId target_device)
+                    llaminar2::DeviceId target_device,
+                    llaminar2::FloatingActivationOperandPrecision operand_precision)
                 {
                     const auto dev_type = KernelFactory::getDeviceType(target_device);
+                    if (operand_precision != llaminar2::FloatingActivationOperandPrecision::Native)
+                    {
+                        if (!target_device.is_cpu())
+                            throw std::invalid_argument("Explicit GPU floating operands require the prepared weight pool");
+                        return std::make_unique<llaminar2::gemm::FloatingPointGemmKernel>(
+                            tensor, llaminar2::gemm::FloatingPointGemmKernel::NumericalPolicy::BackendNative,
+                            operand_precision);
+                    }
 
 #ifdef HAVE_ROCM
                     if (dev_type == DeviceType::ROCm)
@@ -3159,7 +3178,8 @@ namespace llaminar
             std::shared_ptr<KernelFactory::PreparedGemmHandle> KernelFactory::prepareGemmHandleLocal(
                 const llaminar2::TensorBase *tensor,
                 llaminar2::DeviceId target_device,
-                GemmPreparationKind prep_kind)
+                GemmPreparationKind prep_kind,
+                llaminar2::FloatingActivationOperandPrecision operand_precision)
             {
                 if (!tensor)
                     throw std::runtime_error("KernelFactory::prepareGemmHandleLocal: null tensor");
@@ -3183,7 +3203,7 @@ namespace llaminar
                 if (quantized && resolved_kind == GemmPreparationKind::CPU_PACKED)
                     (void)ensurePackedWeightsInTensorCache(tensor);
 
-                auto bound_kernel = createPreparedKernelForDevice(tensor, target_device);
+                auto bound_kernel = createPreparedKernelForDevice(tensor, target_device, operand_precision);
                 if (!bound_kernel)
                     throw std::runtime_error("KernelFactory::prepareGemmHandleLocal: failed to bind prepared kernel");
 
@@ -3540,18 +3560,16 @@ namespace llaminar
                 const llaminar2::TensorBase *tensor,
                 int d_model,
                 llaminar2::DeviceId target_device,
+                const llaminar2::PinnedHostTransferBuffer *upload_staging,
                 size_t vocab_offset,
                 size_t total_vocab)
             {
                 if (!tensor)
                     throw std::runtime_error("prepareEmbeddingHandleLocal: null tensor");
 
-                // Embedding preparation needs the format-neutral unpacking
-                // contract, not GEMM's NativeVNNI capability metadata. Q8_K is
-                // intentionally a legacy INT8-VNNI GEMM format and therefore
-                // has no NativeVnniFormatInfo, but it still provides complete
-                // IINT8Unpackable rows for the universal EmbedQ8 representation.
-                if (!llaminar2::IINT8Unpackable::fromTensor(tensor))
+                // Prepared lookup owns original native blocks. Floating tables
+                // retain their existing direct path; no codebook is requantized.
+                if (!llaminar2::NativeEmbeddingLayout::supports(tensor->native_type()))
                     return nullptr;
 
                 const size_t shard_rows = tensor->rows();
@@ -3559,16 +3577,27 @@ namespace llaminar
                 const bool is_sharded = (shard_rows < effective_total);
 
                 auto weights = std::make_shared<llaminar2::PreparedEmbeddingWeights>();
-                weights->blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
+                weights->layout = llaminar2::NativeEmbeddingLayout::forSource(
+                    tensor->native_type(), shard_rows, d_model);
+                if (tensor->cols() != static_cast<size_t>(d_model) ||
+                    !tensor->raw_data() || tensor->size_bytes() < weights->layout.byte_size)
+                    throw std::invalid_argument("Native embedding source extent does not match its row layout");
+                if (vocab_offset > effective_total || shard_rows > effective_total - vocab_offset)
+                    throw std::invalid_argument("Native embedding vocabulary slice exceeds its source vocabulary");
                 weights->vocab_size = shard_rows;
-                weights->byte_size =
-                    llaminar2::PreparedEmbeddingWeights::allocationBytes(
-                        shard_rows,
-                        d_model);
                 weights->vocab_offset = vocab_offset;
                 weights->total_vocab = effective_total;
                 weights->d_model = d_model;
                 weights->device_id = target_device;
+
+                // Authenticate the setup source before backend lookup/allocation.
+                // Read-only GGUF pages cannot be borrowed as writable HIP pins.
+                if (target_device.is_gpu() &&
+                    (!upload_staging ||
+                     upload_staging->registrationDevice() != target_device ||
+                     !upload_staging->isBound() || upload_staging->sizeBytes() == 0))
+                    throw std::invalid_argument(
+                        "Native GPU embedding requires bound exact-device pinned upload staging");
 
                 llaminar2::IBackend *backend = llaminar2::getBackendFor(target_device);
                 if (!backend)
@@ -3577,31 +3606,19 @@ namespace llaminar
                     return nullptr;
                 }
 
-                weights->device_data = backend->allocate(weights->byte_size, target_device.ordinal);
+                weights->device_data = backend->allocate(weights->layout.byte_size, target_device.ordinal);
                 if (!weights->device_data)
                 {
                     LOG_ERROR("[PreparedEmbeddingWeights] GPU allocation failed for "
-                              << target_device.to_string() << " (" << (weights->byte_size / (1024 * 1024)) << " MB)");
+                              << target_device.to_string() << " (" << (weights->layout.byte_size / (1024 * 1024)) << " MB)");
                     return nullptr;
                 }
 
-                // Repack and upload embeddings by contiguous vocabulary rows.
-                // The old path materialized the entire EmbedQ8 table in a host
-                // vector before the first H2D copy, which could independently
-                // exceed the load-pipeline staging cap for large vocabularies.
-                const auto &load_cfg = llaminar2::debugEnv().rocm;
-                const size_t staging_budget_bytes = load_cfg.repack_budget_mb > 0
-                                                        ? static_cast<size_t>(load_cfg.repack_budget_mb) *
-                                                              1024ULL * 1024ULL
-                                                        : weights->byte_size;
-                const size_t bytes_per_row = weights->blocks_per_row * sizeof(llaminar2::EmbedQ8Block);
-                const size_t rows_per_chunk = std::max<size_t>(
-                    1, staging_budget_bytes > 0 ? staging_budget_bytes / bytes_per_row : shard_rows);
-                const bool can_discard_mmap_rows = tensor->is_mmap_data() && shard_rows > 0 &&
-                                                   tensor->size_bytes() % shard_rows == 0;
-                const size_t raw_bytes_per_row = can_discard_mmap_rows
-                                                     ? tensor->size_bytes() / shard_rows
-                                                     : 0;
+                // Copy unchanged native bytes through the admitted pinned source.
+                // Source metadata is part of each original block; no derived
+                // scale, integer grid or whole-table FP32 shadow is created.
+                const size_t chunk_capacity = target_device.is_gpu()
+                    ? upload_staging->sizeBytes() : weights->layout.byte_size;
                 const auto *raw_base = static_cast<const uint8_t *>(tensor->raw_data());
 
                 bool upload_ok = true;
@@ -3619,24 +3636,47 @@ namespace llaminar
                             "prepareEmbeddingHandleLocal: target GPU has no explicit setup stream");
                     }
                 }
-                for (size_t row = 0; row < shard_rows; row += rows_per_chunk)
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda() &&
+                    !llaminar2::prepareNativeEmbeddingTablesCUDA(
+                        target_device.ordinal, tensor->native_type(), weights->iq_tables))
+                    throw std::runtime_error("Native CUDA embedding codebook publication failed");
+#endif
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm() &&
+                    !llaminar2::prepareNativeEmbeddingTablesROCm(
+                        target_device.ordinal, tensor->native_type(), weights->iq_tables))
+                    throw std::runtime_error("Native ROCm embedding codebook publication failed");
+#endif
+                for (size_t offset = 0; offset < weights->layout.byte_size;)
                 {
-                    const size_t row_count = std::min(rows_per_chunk, shard_rows - row);
-                    auto repacked = llaminar2::repackEmbeddingToQ8(tensor, d_model, row, row_count);
-                    auto *dst = static_cast<uint8_t *>(weights->device_data) + row * bytes_per_row;
-                    if (!backend->hostToDevice(dst, repacked.data.data(), repacked.byte_size,
+                    const size_t bytes = std::min(chunk_capacity, weights->layout.byte_size - offset);
+                    const void *source = raw_base + offset;
+                    if (target_device.is_gpu())
+                    {
+                        std::memcpy(upload_staging->mutableData(), source, bytes);
+                        source = upload_staging->data();
+                    }
+                    auto *dst = static_cast<uint8_t *>(weights->device_data) + offset;
+                    // This setup boundary waits for its exact event before the
+                    // next chunk can overwrite the pinned payload or reclaim mmap pages.
+                    if (!backend->hostToDevice(dst, source, bytes,
                                                target_device.ordinal, setup_stream))
                     {
                         upload_ok = false;
                         break;
                     }
 
-                    if (can_discard_mmap_rows && raw_base)
+                    if (tensor->is_mmap_data())
                     {
                         llaminar2::MmapRegion::adviseDontneedRange(
-                            raw_base + row * raw_bytes_per_row,
-                            row_count * raw_bytes_per_row);
+                            raw_base + offset, bytes);
                     }
+                    if (target_device.is_gpu())
+                        llaminar2::PerfStatsCollector::addCounter(
+                            "weight_loading", "native_embedding_pinned_upload_bytes",
+                            static_cast<double>(bytes), "setup", target_device.toString());
+                    offset += bytes;
                 }
 
                 if (!upload_ok)
@@ -3654,9 +3694,9 @@ namespace llaminar
                           << (is_sharded ? (" (vocab_offset=" + std::to_string(vocab_offset) +
                                             " of " + std::to_string(effective_total) + ")")
                                          : "")
-                          << " → " << (weights->byte_size / (1024 * 1024)) << " MB"
-                          << " (" << weights->blocks_per_row << " blocks/row, staging <= "
-                          << (staging_budget_bytes / (1024 * 1024)) << " MB)");
+                          << " → " << (weights->layout.byte_size / (1024 * 1024)) << " MB"
+                          << " (" << weights->layout.blocks_per_row << " native blocks/row, staging <= "
+                          << chunk_capacity << " bytes)");
 
                 auto handle = std::make_shared<llaminar2::PreparedEmbeddingHandle>();
                 handle->tensor = tensor;

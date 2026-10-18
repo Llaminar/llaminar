@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Install release-branch protection after PR checks have run once.
 
-The master rule requires four GitHub Actions checks. The develop rule requires
+The master rule requires five GitHub Actions checks. The develop rule requires
 the image-bound PR prerequisite check and blocks direct human pushes. Its only
 bypass is the repository's dedicated release-evidence deploy key, used to
 publish the certified post-squash two-parent ancestry join. Never grant the
@@ -28,6 +28,7 @@ REQUIRED_CHECKS = (
     "Admit exact develop image source",
     "Published E2E (AVX512 and AVX2)",
     "Published benchmarks (AVX512 and AVX2)",
+    "Published OpenCode (AVX512 and AVX2)",
 )
 DEVELOP_REQUIRED_CHECK = "Unit + ProductionTestPreflight (AVX512)"
 RELEASE_DEPLOY_KEY_TITLE = "llaminar-release-evidence"

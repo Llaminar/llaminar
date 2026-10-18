@@ -5,10 +5,13 @@
  * Transaction tests exercise the actual histogram ingress and RCU rotation, not
  * a parallel recorder. Counts and complete batches must survive as one immutable
  * sample while inference continues into the next preallocated generation.
+ * Pipeline-stage cases prove compact storage, global layer identity and exact
+ * stage authentication through ordinary ingress, RCU reuse and wire transport.
  */
 
 #include <gtest/gtest.h>
 #include "execution/moe/DecodeExpertHistogram.h"
+#include "execution/moe/MoEOverlayDistributedResidencyProtocol.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include <algorithm>
 #include <atomic>
@@ -252,9 +255,17 @@ TEST(Test__DecodeExpertHistogram, TransactionQuarantineUsesExistingAdmissionAndR
     EXPECT_EQ(optimization.transaction_demand->routes(0, 0).expert_ids[0], 2);
 }
 
-TEST(Test__DecodeExpertHistogram, TransactionConcurrentRotationRetainsEveryAdmittedBatch)
+/**
+ * @brief Race the production RCU handoff against one stage's routed batches.
+ * @param origin Model-global identity of the only stored layer.
+ *
+ * Every admitted route must appear exactly once across retired generations,
+ * including when the bank is indexed by a nonzero model identity.
+ */
+static void verifyConcurrentTransactionRotation(int origin)
 {
     auto cfg = makeConfig(1, 4, 2, 512);
+    cfg.ownership = MoELayeredExpertOwnership::uniform(1, 2, {0, 1, 0, 1}, origin);
     cfg.transaction_demand = ExpertHistogramTransactionConfig{{512, 2, 2}, transactionMemory(1u << 20)};
     DecodeExpertHistogram hist(cfg);
     std::atomic<bool> done{false};
@@ -263,7 +274,7 @@ TEST(Test__DecodeExpertHistogram, TransactionConcurrentRotationRetainsEveryAdmit
         const int ids[]{0, 1};
         std::array<uint64_t, 4> scratch{};
         const RoutedExpertHistogramMerge row{.source = ExpertHistogramSource::DecodeToken,
-            .layer_idx = 0, .real_token_count = 1, .bucket_token_count = 1,
+            .layer_idx = origin, .real_token_count = 1, .bucket_token_count = 1,
             .top_k = 2, .route_stride = 2, .count_window_tokens = true};
         for (int token = 0; token < 4096; ++token)
         {
@@ -279,7 +290,7 @@ TEST(Test__DecodeExpertHistogram, TransactionConcurrentRotationRetainsEveryAdmit
     {
         const auto frozen = hist.freezeAndRotateWindow();
         EXPECT_TRUE(frozen.valid());
-        EXPECT_EQ(frozen.transaction_demand->layerTransactions(0).size(), frozen.token_count);
+        EXPECT_EQ(frozen.transaction_demand->layerTransactions(origin).size(), frozen.token_count);
         observed += frozen.token_count;
     } while (!done.load(std::memory_order_acquire));
     producer.join();
@@ -288,6 +299,17 @@ TEST(Test__DecodeExpertHistogram, TransactionConcurrentRotationRetainsEveryAdmit
     observed += tail.token_count;
     EXPECT_GT(admitted, 0u);
     EXPECT_EQ(observed, admitted);
+}
+
+TEST(Test__DecodeExpertHistogram, TransactionConcurrentRotationRetainsEveryAdmittedBatch)
+{
+    verifyConcurrentTransactionRotation(0);
+}
+
+TEST(Test__DecodeExpertHistogram, PipelineStageConcurrentRotationRetainsEveryAdmittedBatch)
+{
+    verifyConcurrentTransactionRotation(32);
+    verifyConcurrentTransactionRotation(63);
 }
 
 TEST(Test__DecodeExpertHistogram, TransactionBOMCoversExactWorstCaseWithoutReserve)
@@ -1475,4 +1497,156 @@ TEST(Test__DecodeExpertHistogram,
     EXPECT_EQ(hist.windowTokenCount(), 0u);
     for (int expert = 0; expert < cfg.num_experts; ++expert)
         EXPECT_EQ(hist.activationCount(0, expert), 0u);
+}
+
+TEST(Test__DecodeExpertHistogram, PipelineStageCountsKeepGlobalIdentityAcrossRotation)
+{
+    for (const int origin : {0, 20, 40})
+    {
+        auto cfg = makeConfig(2, 4, 2, 8);
+        cfg.ownership = MoELayeredExpertOwnership::uniform(2, 2, {0, 1, 0, 1}, origin);
+        DecodeExpertHistogram hist(cfg);
+        for (int epoch = 0; epoch < 20; ++epoch)
+        {
+            const int ids[]{0, 3};
+            const float weights[]{0.25f, 0.75f};
+            hist.record(origin, ids, weights, 2);
+            hist.record(origin + 1, ids, weights, 2);
+            EXPECT_EQ(hist.windowTokenCount(), 1u);
+            EXPECT_EQ(hist.socketLoads(origin), (std::vector<uint64_t>{1, 1}));
+            EXPECT_FLOAT_EQ(hist.weightedActivation(origin + 1, 3), 0.75f);
+            EXPECT_FLOAT_EQ(hist.averageSocketImbalance(), 1.0f);
+            auto owned = cfg.ownership;
+            owned.assignOwner(origin, 3, 0);
+            const auto imbalance = hist.placementImbalance(owned);
+            EXPECT_TRUE(imbalance.valid);
+            EXPECT_EQ(imbalance.worst_layer, origin);
+            hist.updateOwnership(owned);
+            const auto window = hist.freezeAndRotateWindow();
+            ASSERT_TRUE(window.valid());
+            EXPECT_EQ(window.first_model_layer, origin);
+            EXPECT_EQ(window.expert_counts.size(), 8u);
+            EXPECT_EQ(window.source_expert_counts.size(), 24u);
+            EXPECT_EQ(window.activationCount(origin + 1, 3), 1u);
+            EXPECT_EQ(window.validatedView().firstModelLayer(), origin);
+            EXPECT_EQ(window.validatedView().activationCount(
+                ExpertHistogramSource::DecodeToken, origin, 0), 1u);
+            EXPECT_EQ(hist.activationCount(origin, 0), 0u);
+            EXPECT_THROW((void)hist.layerHistogram(origin - 1), std::out_of_range);
+            EXPECT_THROW((void)window.layerHistogram(origin + 2), std::out_of_range);
+            EXPECT_THROW(hist.recordTokenBoundary(origin - 1), std::invalid_argument);
+            EXPECT_THROW(hist.mergeLayerCounts(origin + 2, window.expert_counts.data(), 4),
+                         std::invalid_argument);
+            EXPECT_THROW(hist.updateOwnership(MoELayeredExpertOwnership::uniform(
+                2, 2, {0, 1, 0, 1}, origin + 1)), std::invalid_argument);
+            hist.updateOwnership(cfg.ownership);
+        }
+    }
+}
+
+TEST(Test__DecodeExpertHistogram, PipelineStageTransactionWireBindsOriginAndCompactExtent)
+{
+    auto cfg = makeConfig(3, 4, 2, 8);
+    cfg.ownership = MoELayeredExpertOwnership::uniform(3, 2, {0, 1, 0, 1}, 32);
+    cfg.token_boundary_layer_idx = 33;
+    cfg.transaction_demand = ExpertHistogramTransactionConfig{{8, 4, 2}, transactionMemory(65536)};
+    DecodeExpertHistogram hist(cfg);
+    EXPECT_EQ(transactionClaims(cfg.transaction_demand->memory),
+              2u * 3u * cfg.transaction_demand->capacity.allocationBytes());
+    const int rows[]{0, 1, 2, 3};
+    std::array<uint64_t, 4> scratch{};
+    for (int layer = 32; layer < 35; ++layer)
+    {
+        ASSERT_TRUE(hist.mergeRoutedExpertRows(rows,
+            {.source = ExpertHistogramSource::GroupedVerifier, .layer_idx = layer,
+             .real_token_count = 2, .bucket_token_count = 2, .top_k = 2,
+             .route_stride = 2, .count_window_tokens = true}, scratch));
+    }
+    const auto frozen = hist.freezeAndRotateWindow();
+    ASSERT_TRUE(frozen.valid());
+    EXPECT_EQ(frozen.token_count, 2u);
+    ASSERT_NE(frozen.transaction_demand, nullptr);
+    EXPECT_EQ(frozen.transaction_demand->tokenBoundaryLayer(), 33);
+    EXPECT_EQ(frozen.transaction_demand->routes(34, 0).logical_rows, 2u);
+    EXPECT_THROW((void)frozen.transaction_demand->routes(0, 0), std::out_of_range);
+    // Every layer sends one frontier, one descriptor and four live IDs.
+    EXPECT_EQ(frozen.transaction_demand->wireBytes(), 16u + 3u * (16u + 8u + 16u));
+    auto receiver = *cfg.transaction_demand;
+    receiver.memory = transactionMemory(65536);
+    std::vector<uint8_t> packet(frozen.transaction_demand->wireBytes());
+    frozen.transaction_demand->encodeWire(packet);
+    auto envelope = frozen;
+    envelope.transaction_demand.reset();
+    const auto decoded = DecodeExpertTransactionWindow::decodeWire(receiver, envelope, packet);
+    EXPECT_TRUE(decoded->matches(frozen));
+    ++envelope.first_model_layer; // Boundary 33 still fits; origin must reject it independently.
+    EXPECT_FALSE(decoded->matches(envelope));
+    EXPECT_THROW((void)DecodeExpertTransactionWindow::decodeWire(receiver, envelope, packet),
+                 std::invalid_argument);
+    auto relabelled = frozen;
+    ++relabelled.first_model_layer;
+    EXPECT_FALSE(relabelled.valid());
+}
+
+TEST(Test__DecodeExpertHistogram, PipelineStageHistogramTransportRejectsSameSizedForeignStage)
+{
+    auto cfg = makeConfig(2, 4, 2, 8);
+    cfg.ownership = MoELayeredExpertOwnership::uniform(2, 2, {0, 1, 0, 1}, 32);
+    DecodeExpertHistogram hist(cfg);
+    const uint64_t counts[]{3, 2, 1, 0};
+    hist.mergeLayerCounts(33, counts, 4, true, ExpertHistogramSource::PrefillChunk);
+    const auto source = hist.freezeAndRotateWindow();
+    std::vector<uint8_t> packet(moeOverlayDistributedHistogramWireBytes(source));
+    std::string error;
+    ASSERT_TRUE(encodeMoEOverlayDistributedHistogramWindow(source, packet, &error)) << error;
+    DecodeExpertHistogramWindow received;
+    ASSERT_TRUE(decodeMoEOverlayDistributedHistogramWindow(
+        packet, 2, 4, &received, &error, nullptr, 32)) << error;
+    EXPECT_EQ(received.first_model_layer, 32);
+    EXPECT_EQ(received.expert_counts, source.expert_counts);
+    EXPECT_EQ(received.activationCount(33, 0), 3u);
+    EXPECT_FALSE(decodeMoEOverlayDistributedHistogramWindow(
+        packet, 2, 4, &received, &error, nullptr, 31));
+    EXPECT_FALSE(received.valid());
+    auto obsolete = packet;
+    obsolete[4] = 3; // ABI v3 has no authenticated stage origin.
+    EXPECT_FALSE(decodeMoEOverlayDistributedHistogramWindow(
+        obsolete, 2, 4, &received, &error, nullptr, 32));
+    auto shifted = source;
+    ++shifted.first_model_layer;
+    EXPECT_NE(fingerprintDecodeExpertHistogramWindow(source),
+              fingerprintDecodeExpertHistogramWindow(shifted));
+}
+
+TEST(Test__DecodeExpertHistogram, PipelineStageTopologySeparatesMainLayersAndTailMTP)
+{
+    for (const int origin : {0, 20, 40})
+    for (const auto regime : {ExpertHistogramServingRegime::Serial,
+                             ExpertHistogramServingRegime::PositiveDepthMTP,
+                             ExpertHistogramServingRegime::AdaptiveSerialOrMTP})
+    {
+        const auto topology = ExpertHistogramProductionTopology::forRetainedExecution(
+            4, origin + 3, regime, origin);
+        EXPECT_EQ(topology.layerCount(), 4u);
+        EXPECT_EQ(topology.firstModelLayer(), origin);
+        EXPECT_EQ(topology.endModelLayer(), origin + 4);
+        EXPECT_TRUE(topology.reachable(origin, 1));
+        EXPECT_FALSE(topology.reachable(origin + 3, 1));
+        EXPECT_EQ(topology.reachable(origin + 3, 2), regime != ExpertHistogramServingRegime::Serial);
+        EXPECT_EQ(topology.requiresServiceEvidence(origin, 0),
+                  regime != ExpertHistogramServingRegime::PositiveDepthMTP);
+        EXPECT_THROW((void)topology.sources(origin - 1), std::out_of_range);
+        EXPECT_THROW((void)topology.economySources(origin + 4), std::out_of_range);
+    }
+    auto cfg = makeConfig(2, 4, 2, 8);
+    cfg.ownership = MoELayeredExpertOwnership::uniform(2, 2, {0, 1, 0, 1}, 32);
+    cfg.token_boundary_layer_idx = 1;
+    EXPECT_THROW(DecodeExpertHistogram{cfg}, std::invalid_argument);
+    EXPECT_THROW((void)ExpertHistogramProductionTopology::forRetainedExecution(
+        4, 45, ExpertHistogramServingRegime::Serial, 40), std::invalid_argument);
+    EXPECT_THROW((void)ExpertHistogramProductionTopology::uniform(
+        std::numeric_limits<int>::max(), kAllExpertHistogramProductionSources, 32),
+        std::invalid_argument);
+    EXPECT_THROW((void)ExpertHistogramProductionTopology::forRetainedExecution(
+        4, 4, static_cast<ExpertHistogramServingRegime>(255)), std::invalid_argument);
 }

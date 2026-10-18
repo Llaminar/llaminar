@@ -112,6 +112,7 @@ protected:
         const int lo = include_neg128 ? -128 : -127;
         std::uniform_int_distribution<int> qdist(lo, 127);
         Q8_KBlock blk{};
+        blk.d = 1.0f;
         for (auto &q : blk.qs)
             q = static_cast<int8_t>(qdist(rng_));
         std::memset(blk.bsums, 0, sizeof(blk.bsums));
@@ -455,6 +456,7 @@ TEST_F(Test__RequantizeRowToInt8, Q8_K_NoClamping_DirectCopy)
 {
     // Values in [-127, 127] → direct memcpy, no rescaling
     Q8_KBlock blk{};
+        blk.d = 1.0f;
     for (int i = 0; i < 256; ++i)
         blk.qs[i] = static_cast<int8_t>(i % 255 - 127); // range [-127, 127]
     std::vector<Q8_KBlock> blocks = {blk};
@@ -476,6 +478,7 @@ TEST_F(Test__RequantizeRowToInt8, Q8_K_WithNeg128_Rescales)
 {
     // Insert -128 values → must rescale to fit [-127, 127]
     Q8_KBlock blk{};
+        blk.d = 1.0f;
     std::fill_n(blk.qs, 256, static_cast<int8_t>(0));
     blk.qs[0] = -128;
     blk.qs[100] = 127;
@@ -524,7 +527,9 @@ TEST_F(Test__RequantizeRowToInt8, Q8_K_MultiSuperblock)
 TEST_F(Test__RequantizeRowToInt8, Q8_K_ZeroRow)
 {
     Q8_KBlock blk{};
+        blk.d = 1.0f;
     std::memset(&blk, 0, sizeof(Q8_KBlock));
+    blk.d = 1.0f;
     std::vector<Q8_KBlock> blocks = {blk};
     auto tensor = makeQ8_KTensor(1, 256, blocks);
 

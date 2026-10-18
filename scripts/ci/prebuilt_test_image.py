@@ -51,10 +51,10 @@ def inventory(build: Path) -> dict:
             raise ValueError(f"installed test executable is missing: {name}: CTest omitted command")
         for argument in test.get("command", []):
             path = Path(argument)
-            if path.is_relative_to(build) and path.name.startswith("v2_") and not path.is_file():
+            if path.is_relative_to(build) and path.name.startswith(("v2_", "llaminar_")) and not path.is_file():
                 raise ValueError(f"installed test executable is missing: {name}: {path}")
     for path in build.rglob("*"):
-        if path.is_file() and (path.name.startswith("v2_") or path.name.startswith("libllaminar")):
+        if path.is_file() and path.name.startswith(("v2_", "llaminar_", "libllaminar")):
             files.append(path)
     return {"build_dir": str(build), "tests": tests,
             "files": {str(path.relative_to(build)): {"bytes": path.stat().st_size,

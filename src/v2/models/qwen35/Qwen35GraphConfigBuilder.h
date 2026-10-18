@@ -8,13 +8,15 @@
  * - GDN weight loading (attn_qkv, attn_gate, ssm_*)
  * - Per-layer head dimensions (FA=256, GDN=128)
  * - Partial RoPE factor for FA layers
+ *
+ * Prompt and sampling defaults are resolved by ModelGenerationPolicy using
+ * the loaded revision's metadata, separately from this shared tensor layout.
  */
 
 #pragma once
 
 #include "../qwen/QwenStandardGraphConfigBuilder.h"
 
-#include <optional>
 #include <string>
 
 namespace llaminar2
@@ -62,16 +64,6 @@ namespace llaminar2
          */
         ModelWeights buildWeights(WeightAccessor get_weight) override;
 
-        /**
-         * @brief Returns the community-maintained Qwen 3.5 chat template.
-         *
-         * The template embedded in many Qwen 3.5 GGUF artifacts has been
-         * observed to leave the model in a degenerate repetition state after
-         * the `</think>` block closes. We replace it with a community-
-         * maintained variant (MIT licensed — see Qwen35ChatTemplate.h for
-         * full attribution and source URL).
-         */
-        std::optional<std::string> chatTemplateOverride() const override;
     };
 
 } // namespace llaminar2

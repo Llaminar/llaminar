@@ -14,6 +14,7 @@
 
 #include "backends/DeviceId.h"
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
+#include "execution/prefix_cache/PrefixRestoreMetadata.h"
 
 #include <cstdint>
 #include <mpi.h>
@@ -127,6 +128,14 @@ namespace llaminar2
         bool allAndBool(bool local_value, bool *global_value) override;
         /** @copydoc IPrefixCollectiveCoordinator::allOrBool */
         bool allOrBool(bool local_value, bool *global_value) override;
+
+        /**
+         * @brief Merge restored sections and tiers across the admitted rank domain.
+         * @param local This rank's already-combined participant metadata.
+         * @param global Receives the union from all participating ranks.
+         * @return Whether one fixed-size metadata collective completed successfully.
+         */
+        bool allRestoreMetadata(PrefixRestoreMetadata local, PrefixRestoreMetadata *global);
 
     private:
         MPI_Comm communicator_ = MPI_COMM_NULL;

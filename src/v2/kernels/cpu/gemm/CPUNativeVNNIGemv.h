@@ -37,6 +37,8 @@
  *
  * Uses NativeVNNITileConfig (from CPUNativeVNNITileConfig.h) to select
  * N-block size based on detected L1/L2/L3 and shape category.
+ * The scalar Q6 diagnostic also retains the production paths' explicit rounding
+ * boundaries so it can check original source factors without introducing FMA drift.
  */
 
 #pragma once
@@ -1441,6 +1443,12 @@ namespace llaminar2::cpu::native_vnni
      *
      * For nibble-LUT formats (Q4_0, IQ4_NL, Q4_1, IQ4_XS): decodes from payload.
      * For INT8 pre-decoded formats: reads from int8_flat buffer.
+     * Q6 uses the original base/coefficient metadata with separate FP32 edges.
+     * @param packed Prepared source payload and per-block metadata.
+     * @param A_q8 Unchanged Q8 activation blocks for one row.
+     * @param C Destination for N output values.
+     * @param N Live output columns, excluding padded allocation capacity.
+     * @param K_blocks Number of live 32-element reduction blocks.
      */
     inline void gemv_native_vnni_scalar(
         const CPUNativeVNNIPackedWeights &packed,
@@ -1540,15 +1548,19 @@ namespace llaminar2::cpu::native_vnni
                             }
                         }
 
-                        const float low_term =
-                            packed.blockScale(chunk, kb, n_local) *
-                            static_cast<float>(dot_low);
-                        const float high_term =
-                            packed.blockMin(chunk, kb, n_local) *
-                            static_cast<float>(dot_high);
-                        const float dot_term = low_term + high_term;
-                        const float contribution = a_scale * dot_term;
-                        acc = acc + contribution;
+                        // The scalar diagnostic must retain the same separately
+                        // rounded dependencies as the SIMD and device Q6 paths.
+                        // Ordinary expressions permit contraction under -mfma,
+                        // hiding source-factor errors behind a different oracle.
+                        const float low_term = device_fp32_contract::multiply(
+                            packed.blockScale(chunk, kb, n_local),
+                            static_cast<float>(dot_low));
+                        const float high_term = device_fp32_contract::multiply(
+                            packed.blockMin(chunk, kb, n_local),
+                            static_cast<float>(dot_high));
+                        const float dot_term = device_fp32_contract::add(low_term, high_term);
+                        const float contribution = device_fp32_contract::multiply(a_scale, dot_term);
+                        acc = device_fp32_contract::add(acc, contribution);
                         continue;
                     }
 
@@ -1935,14 +1947,10 @@ namespace llaminar2::cpu::native_vnni
                     reinterpret_cast<const __m256i *>(comp_ptr + 48)))));
 
         const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-        const __m512 scale0 = _mm512_cvtph_ps(_mm256_load_si256(
-            reinterpret_cast<const __m256i *>(b_scales)));
-        const __m512 scale1 = _mm512_cvtph_ps(_mm256_load_si256(
-            reinterpret_cast<const __m256i *>(b_scales + 16)));
-        const __m512 scale2 = _mm512_cvtph_ps(_mm256_load_si256(
-            reinterpret_cast<const __m256i *>(b_scales + 32)));
-        const __m512 scale3 = _mm512_cvtph_ps(_mm256_load_si256(
-            reinterpret_cast<const __m256i *>(b_scales + 48)));
+        const __m512 scale0 = packed.loadScales512(b_scales);
+        const __m512 scale1 = packed.loadScales512(b_scales + 16);
+        const __m512 scale2 = packed.loadScales512(b_scales + 32);
+        const __m512 scale3 = packed.loadScales512(b_scales + 48);
         const float a_scale = nativeVNNIFP16ScaleToFP32(a_blk.d);
 
         if constexpr (IsAsymmetric)
@@ -2104,10 +2112,10 @@ namespace llaminar2::cpu::native_vnni
 
             // Convert exact integer dots through the selected publication tree.
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            const __m512 scale0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales)));
-            const __m512 scale1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16)));
-            const __m512 scale2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32)));
-            const __m512 scale3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48)));
+            const __m512 scale0 = packed.loadScales512(b_scales);
+            const __m512 scale1 = packed.loadScales512(b_scales + 16);
+            const __m512 scale2 = packed.loadScales512(b_scales + 32);
+            const __m512 scale3 = packed.loadScales512(b_scales + 48);
 
             // Asymmetric correction: acc += a_scale * sum_qs * b_min[n]
             // Formula: weight = scale * int_val + min, so the offset term
@@ -2406,12 +2414,8 @@ namespace llaminar2::cpu::native_vnni
 
                     const uint16_t *scales =
                         packed.chunkScales(chunk, kb) + zbase * 16;
-                    const __m512 scale0 = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(scales)));
-                    const __m512 scale1 = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(scales + 16)));
+                    const __m512 scale0 = packed.loadScales512(scales);
+                    const __m512 scale1 = packed.loadScales512(scales + 16);
                     const float a0_scale =
                         nativeVNNIFP16ScaleToFP32(a0.d);
                     const float a1_scale =
@@ -2810,10 +2814,10 @@ namespace llaminar2::cpu::native_vnni
 
             // Convert exact integer dots through the selected publication tree.
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            const __m512 scale0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales)));
-            const __m512 scale1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16)));
-            const __m512 scale2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32)));
-            const __m512 scale3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48)));
+            const __m512 scale0 = packed.loadScales512(b_scales);
+            const __m512 scale1 = packed.loadScales512(b_scales + 16);
+            const __m512 scale2 = packed.loadScales512(b_scales + 32);
+            const __m512 scale3 = packed.loadScales512(b_scales + 48);
 
             // Asymmetric correction: acc += a_scale * sum_qs * b_min[n]
             // mins are FP16; load via F16C convert to FP32
@@ -3613,10 +3617,10 @@ namespace llaminar2::cpu::native_vnni
             ia1_3 = _mm512_sub_epi32(ia1_3, bias_c3);
 
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            __m512 bs0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales)));
-            __m512 bs1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16)));
-            __m512 bs2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32)));
-            __m512 bs3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48)));
+            __m512 bs0 = packed.loadScales512(b_scales);
+            __m512 bs1 = packed.loadScales512(b_scales + 16);
+            __m512 bs2 = packed.loadScales512(b_scales + 32);
+            __m512 bs3 = packed.loadScales512(b_scales + 48);
 
             const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
             const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
@@ -3821,10 +3825,10 @@ namespace llaminar2::cpu::native_vnni
 
             // Scale (shared b_scales loads)
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            __m512 bs0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales)));
-            __m512 bs1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16)));
-            __m512 bs2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32)));
-            __m512 bs3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48)));
+            __m512 bs0 = packed.loadScales512(b_scales);
+            __m512 bs1 = packed.loadScales512(b_scales + 16);
+            __m512 bs2 = packed.loadScales512(b_scales + 32);
+            __m512 bs3 = packed.loadScales512(b_scales + 48);
 
             if (packed.is_asymmetric)
             {
@@ -3965,12 +3969,8 @@ namespace llaminar2::cpu::native_vnni
 
                     const uint16_t *scales =
                         packed.chunkScales(chunk, kb) + zbase * 16;
-                    const __m512 scale0 = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(scales)));
-                    const __m512 scale1 = _mm512_cvtph_ps(
-                        _mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(scales + 16)));
+                    const __m512 scale0 = packed.loadScales512(scales);
+                    const __m512 scale1 = packed.loadScales512(scales + 16);
                     const float activation_scale0 =
                         nativeVNNIFP16ScaleToFP32(activation0.d);
                     const float activation_scale1 =
@@ -4420,9 +4420,9 @@ namespace llaminar2::cpu::native_vnni
 
                 const uint16_t *scale_ptr = packed.chunkScales(chunk, kb) + zbase * 16;
                 const __m512 bscale0 =
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scale_ptr)));
+                    packed.loadScales512(scale_ptr);
                 const __m512 bscale1 =
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scale_ptr + 16)));
+                    packed.loadScales512(scale_ptr + 16);
                 const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
                 const float a2_scale = nativeVNNIFP16ScaleToFP32(a2.d);
@@ -4576,9 +4576,9 @@ namespace llaminar2::cpu::native_vnni
 
                 const uint16_t *scale_ptr = packed.chunkScales(chunk, kb) + zbase * 16;
                 const __m512 bscale0 =
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scale_ptr)));
+                    packed.loadScales512(scale_ptr);
                 const __m512 bscale1 =
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scale_ptr + 16)));
+                    packed.loadScales512(scale_ptr + 16);
                 const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
                 const float a2_scale = nativeVNNIFP16ScaleToFP32(a2.d);
@@ -4723,7 +4723,7 @@ namespace llaminar2::cpu::native_vnni
 
                 const uint16_t *scale_ptr = packed.chunkScales(chunk, kb) + z * 16;
                 const __m512 bscale =
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scale_ptr)));
+                    packed.loadScales512(scale_ptr);
 
                 const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
@@ -4890,9 +4890,9 @@ namespace llaminar2::cpu::native_vnni
 
                 const uint16_t *scale_ptr = packed.chunkScales(chunk, kb) + zbase * 16;
                 const __m512 bscale0 =
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scale_ptr)));
+                    packed.loadScales512(scale_ptr);
                 const __m512 bscale1 =
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scale_ptr + 16)));
+                    packed.loadScales512(scale_ptr + 16);
 
                 const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);

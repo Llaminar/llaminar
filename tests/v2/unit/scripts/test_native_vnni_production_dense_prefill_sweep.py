@@ -7,6 +7,8 @@ Auto may select a different physical family than a forced tournament tile;
 that distinction must survive validation without weakening either contract.
 Matrix cardinality follows the canonical capture, format and shape inventories,
 so adding a shared CUDA/ROCm bucket extends coverage without a second row list.
+ROCm synthetic measurements retain source and physical execution IDs separately;
+physical24 cannot be inferred from a historical source4-only packet.
 """
 
 from __future__ import annotations
@@ -265,6 +267,7 @@ def _write_cell(
                     "phase": "prefill",
                     "format": cell.source_format.label,
                     "codebook": cell.source_format.source_codebook_id,
+                    "execution_codebook": cell.source_format.runtime_codebook("rocm"),
                     "shape": cell.shape.name,
                     "category": cell.shape.aspect_bucket.value,
                     "m": cell.m,
@@ -338,7 +341,9 @@ def _write_cell(
                 if backend == "cuda":
                     writer.writerow({**common, **_cuda_launch(candidate)})
                 else:
-                    writer.writerow({**common, "variant": candidate})
+                    writer.writerow({**common,
+                        "execution_codebook": cell.source_format.runtime_codebook("rocm"),
+                        "variant": candidate})
     paths.log.write_text("complete\n", encoding="utf-8")
     return cell, paths
 
@@ -492,6 +497,29 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                 )
                 self.assertEqual(result.sample_count, result.candidate_count * 3)
                 self.assertEqual(result.winner_min_us, 10.0)
+
+    def test_rocm_iq4xs_packets_require_actual_physical24(self) -> None:
+        """Source4 stays original; neither packet can silently claim old4."""
+        cell = next(cell for cell in production_dense_prefill_cells("rocm")
+                    if cell.source_format.label == "IQ4_XS")
+        for field in ("aggregate", "timing"):
+            with self.subTest(packet=field), tempfile.TemporaryDirectory() as tmp:
+                _, paths = _write_cell(Path(tmp), "rocm", cell=cell, bench_runs=3)
+                validate_production_dense_prefill_cell(paths.aggregate, paths.timing, cell, bench_runs=3)
+                packet = getattr(paths, field)
+                with packet.open(newline="", encoding="utf-8") as handle:
+                    reader = csv.DictReader(handle)
+                    columns = reader.fieldnames
+                    rows = list(reader)
+                self.assertTrue(all(row["codebook"] == "4" and row["execution_codebook"] == "24"
+                                    for row in rows))
+                rows[0]["execution_codebook"] = "4"
+                with packet.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=columns)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with self.assertRaisesRegex(ValueError, "physical execution codebook disagrees"):
+                    validate_production_dense_prefill_cell(paths.aggregate, paths.timing, cell, bench_runs=3)
 
     def test_both_backends_reject_direct_or_partial_captured_timing(self) -> None:
         """A valid byte oracle cannot certify the wrong execution/timing mode."""
@@ -1287,10 +1315,10 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
 
     def test_overlay_pools_source_aliases_into_one_concrete_runtime_key(self) -> None:
         cells = production_dense_prefill_cells("cuda")
-        anchor = next(cell for cell in cells if cell.source_format.label == "IQ4_NL")
+        anchor = next(cell for cell in cells if cell.source_format.label == "Q4_1")
         aliases = tuple(
             cell for cell in cells
-            if cell.source_format.label in {"IQ4_NL", "IQ4_XS"}
+            if cell.source_format.label in {"Q4_1", "Q4_K"}
             and cell.shape.name == anchor.shape.name
             and cell.m == anchor.m
         )
@@ -1309,13 +1337,48 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             )
             self.assertEqual(len(entries), 1)
             entry = entries[0]
-            self.assertEqual(entry.key.execution_codebook, 4)
-            self.assertEqual(entry.source_formats, ("IQ4_NL", "IQ4_XS"))
+            self.assertEqual(entry.key.execution_codebook, 5)
+            self.assertEqual(entry.source_formats, ("Q4_1", "Q4_K"))
             self.assertEqual(entry.candidate_id, "AUTO")
             self.assertEqual(entry.launch, (2, 1, 0, 0, 0))
             rendered = render_dense_overlay(entries)
             self.assertIn("selectCUDADensePrefillOverlay", rendered)
             self.assertNotIn("AUTO", rendered)
+
+    def test_iq4nl_and_iq4xs_retain_distinct_physical_overlay_keys(self) -> None:
+        """Shared source4 policy does not pool distinct factor programs4/24."""
+        cells = production_dense_prefill_cells("cuda")
+        anchor = next(cell for cell in cells if cell.source_format.label == "IQ4_NL")
+        selected = tuple(
+            cell for cell in cells
+            if cell.source_format.label in {"IQ4_NL", "IQ4_XS"}
+            and cell.shape.name == anchor.shape.name and cell.m == anchor.m
+        )
+        self.assertEqual(len(selected), 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for cell in selected:
+                _write_cell(root, "cuda", bench_runs=3, cell=cell)
+            # Different physical programs may independently own different tile
+            # observations. True aliases above still reject this disagreement.
+            xs = next(cell for cell in selected if cell.source_format.label == "IQ4_XS")
+            paths = production_dense_prefill_cell_paths(root, xs)
+            with paths.aggregate.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            rows[0]["observed_tile_id"] = "3"
+            with paths.aggregate.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CUDA_AGGREGATE_COLUMNS)
+                writer.writeheader(); writer.writerows(rows)
+            _commit_test_cells(root, "cuda", selected)
+            entries = collect_dense_overlay_entries(
+                root, "cuda", cells=selected, warmup_runs=2, bench_runs=3)
+            self.assertEqual(len(entries), 2)
+            by_codebook = {entry.key.execution_codebook: entry for entry in entries}
+            self.assertEqual(set(by_codebook), {4, 24})
+            self.assertEqual(by_codebook[4].source_formats, ("IQ4_NL",))
+            self.assertEqual(by_codebook[24].source_formats, ("IQ4_XS",))
+            self.assertEqual(by_codebook[4].launch, (2, 1, 0, 0, 0))
+            self.assertEqual(by_codebook[24].launch, (3, 1, 0, 0, 0))
 
     def test_rocm_overlay_preserves_full_tile_specialization(self) -> None:
         """Checked and proof-carrying kernels are distinct runtime launches."""
@@ -1360,10 +1423,10 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
 
     def test_overlay_rejects_aliases_with_conflicting_physical_auto_launches(self) -> None:
         cells = production_dense_prefill_cells("cuda")
-        anchor = next(cell for cell in cells if cell.source_format.label == "IQ4_NL")
+        anchor = next(cell for cell in cells if cell.source_format.label == "Q4_1")
         aliases = tuple(
             cell for cell in cells
-            if cell.source_format.label in {"IQ4_NL", "IQ4_XS"}
+            if cell.source_format.label in {"Q4_1", "Q4_K"}
             and cell.shape.name == anchor.shape.name
             and cell.m == anchor.m
         )

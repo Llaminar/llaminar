@@ -1,6 +1,10 @@
 /**
  * @file MoEOverlayDeviceServiceTelemetryPublisher.cpp
  * @brief Retained finite GPU-to-mapped-page economy observation graphs.
+ *
+ * Setup binds each mapped page to one immutable participant and global layer
+ * interval. Device graphs own cumulative samples and publication generations;
+ * the host only acquires coherent observations after the inference boundary.
  */
 
 #include "MoEOverlayDeviceServiceTelemetryPublisher.h"
@@ -186,6 +190,12 @@ namespace llaminar2
         endpoint.host_publication = static_cast<
             MoEOverlayDeviceServiceTelemetryPublicationHeader *>(
             endpoint.publication_region->mutableHostData());
+        // Topology is setup-owned, unlike the device-authored cumulative cells
+        // and generation. This mapped record has one immutable runtime owner.
+        *endpoint.host_publication = MoEOverlayDeviceServiceTelemetryPublicationHeader{
+            .participant_id = endpoint.binding.overlay_participant_id,
+            .layer_count = endpoint.binding.layer_count,
+            .first_model_layer = endpoint.binding.first_model_layer};
         endpoint.device_publication = static_cast<
             MoEOverlayDeviceServiceTelemetryPublicationHeader *>(
             endpoint.publication_region->deviceAlias(
@@ -348,6 +358,7 @@ namespace llaminar2
                     if (!trySnapshotMoEOverlayServiceTelemetryPublication(
                             endpoint.host_publication,
                             endpoint.binding.overlay_participant_id,
+                            endpoint.binding.first_model_layer,
                             endpoint.binding.layer_count,
                             &snapshot.rows,
                             &snapshot.publication_generation) ||
@@ -374,31 +385,31 @@ namespace llaminar2
                             {"participant",
                              std::to_string(
                                  endpoint.binding.overlay_participant_id)},
-                            {"publication_generation",
-                             std::to_string(
-                                 snapshot.publication_generation)},
                         };
-                    PerfStatsCollector::addCounter(
+                    PerfStatsCollector::addCounterWithSequence(
                         "moe_overlay_residency",
                         "device_service_snapshot_valid_samples",
                         static_cast<double>(
                             snapshot.valid_sample_count),
+                        {snapshot.publication_generation},
                         "maintenance",
                         config_.perf_device,
                         cursor_tags);
-                    PerfStatsCollector::addCounter(
+                    PerfStatsCollector::addCounterWithSequence(
                         "moe_overlay_residency",
                         "device_service_snapshot_begun_samples",
                         static_cast<double>(
                             snapshot.begun_sample_count),
+                        {snapshot.publication_generation},
                         "maintenance",
                         config_.perf_device,
                         cursor_tags);
-                    PerfStatsCollector::addCounter(
+                    PerfStatsCollector::addCounterWithSequence(
                         "moe_overlay_residency",
                         "device_service_snapshot_armed_samples",
                         static_cast<double>(
                             snapshot.armed_sample_count),
+                        {snapshot.publication_generation},
                         "maintenance",
                         config_.perf_device,
                         cursor_tags);
@@ -439,28 +450,28 @@ namespace llaminar2
                             {"participant",
                              std::to_string(
                                  endpoint.binding.overlay_participant_id)},
-                            {"publication_generation",
-                             std::to_string(
-                                 snapshot.publication_generation)},
                             {"source", servicePhaseName(phase)}};
-                        PerfStatsCollector::addCounter(
+                        PerfStatsCollector::addCounterWithSequence(
                             "moe_overlay_residency",
                             "device_service_snapshot_samples",
                             static_cast<double>(samples),
+                            {snapshot.publication_generation},
                             "maintenance",
                             config_.perf_device,
                             tags);
-                        PerfStatsCollector::addCounter(
+                        PerfStatsCollector::addCounterWithSequence(
                             "moe_overlay_residency",
                             "device_service_snapshot_activations",
                             static_cast<double>(activations),
+                            {snapshot.publication_generation},
                             "maintenance",
                             config_.perf_device,
                             tags);
-                        PerfStatsCollector::addCounter(
+                        PerfStatsCollector::addCounterWithSequence(
                             "moe_overlay_residency",
                             "device_service_snapshot_dropped_samples",
                             static_cast<double>(dropped),
+                            {snapshot.publication_generation},
                             "maintenance",
                             config_.perf_device,
                             tags);

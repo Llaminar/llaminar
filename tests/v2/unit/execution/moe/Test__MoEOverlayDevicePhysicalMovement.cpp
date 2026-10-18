@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -308,6 +309,137 @@ namespace llaminar2::test
             };
         }
     } // namespace
+
+    /** Both durable objectives translate every row without changing payload volume. */
+    TEST(Test__MoEOverlayDevicePhysicalMovement,
+         PipelineStageDurableCyclesRetainGlobalLayerIdentity)
+    {
+        for (const auto kind : {MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
+                               MoEOverlayDeviceControllerTransactionKind::PreparedContextRestore})
+        for (const int origin : {0, 32, 40, std::numeric_limits<int>::max() - 3})
+        for (std::uint32_t row = 0u; row < 3u; ++row)
+        {
+            SCOPED_TRACE(::testing::Message() << "kind=" << static_cast<int>(kind)
+                << " origin=" << origin << " row=" << row);
+            auto command = commandBatch(kind, 7u, {
+                move(MoEOverlayDeviceMovementOp::DurableMove, row, 3, 3, 0),
+                move(MoEOverlayDeviceMovementOp::DurableMove, row, 2, 2, 1),
+                move(MoEOverlayDeviceMovementOp::DurableMove, row, 0, 0, 2),
+                move(MoEOverlayDeviceMovementOp::DurableMove, row, 1, 1, 3),
+            });
+            const auto zero_origin = makeMoEOverlayDevicePhysicalMovementBatch(command, topology());
+            command.first_model_layer = origin;
+            ASSERT_TRUE(command.valid());
+            const auto physical = makeMoEOverlayDevicePhysicalMovementBatch(command, topology());
+            ASSERT_TRUE(physical.valid());
+            EXPECT_EQ(physical.first_model_layer, origin);
+            EXPECT_EQ(physical.num_layers, 3u);
+            EXPECT_EQ(physical.packed_weight_bytes, 16384u);
+            ASSERT_EQ(physical.migrations.size(), 4u);
+            ASSERT_EQ(physical.migration_cycles.size(), 1u);
+            ASSERT_EQ(physical.shadow_requirements.size(), 4u);
+            const int global_layer = origin + static_cast<int>(row);
+            EXPECT_EQ(physical.migration_cycles.front().layer_idx, global_layer);
+            for (std::size_t index = 0; index < physical.migrations.size(); ++index)
+            {
+                const auto &migration = physical.migrations[index];
+                EXPECT_EQ(migration.layer_idx, global_layer);
+                EXPECT_EQ(migration.source.layer_idx, global_layer);
+                EXPECT_EQ(migration.destination.layer_idx, global_layer);
+                EXPECT_EQ(migration.estimated_weight_bytes, 4096u);
+                EXPECT_EQ(migration.source.device, zero_origin.migrations[index].source.device);
+                EXPECT_EQ(migration.destination.device, zero_origin.migrations[index].destination.device);
+                EXPECT_EQ(command.entries[index].layer, row);
+                EXPECT_EQ(physical.shadow_requirements[index].layer_idx, global_layer);
+                EXPECT_EQ(physical.shadow_requirements[index].slot_count, 1u);
+            }
+            EXPECT_EQ(physical.execution_fingerprint == zero_origin.execution_fingerprint, origin == 0);
+        }
+    }
+
+    /** Transient assignments retain compact device rows; only actual arrivals move bytes. */
+    TEST(Test__MoEOverlayDevicePhysicalMovement,
+         PipelineStageLLEPArrivalsAndAssignmentsKeepExactExtent)
+    {
+        for (const int origin : {0, 32, 40, std::numeric_limits<int>::max() - 3})
+        {
+            auto command = commandBatch(MoEOverlayDeviceControllerTransactionKind::CurrentBatchLLEP,
+                17u, {assignment(2, 5, 1),
+                      move(MoEOverlayDeviceMovementOp::TransientArrival, 2, 7, 0, 2,
+                           8192u, MoEOverlayDeviceMovementAxis::ParticipantPlacement)});
+            command.first_model_layer = origin;
+            const auto physical = makeMoEOverlayDevicePhysicalMovementBatch(command, topology());
+            ASSERT_TRUE(physical.valid());
+            ASSERT_EQ(physical.migrations.size(), 1u);
+            EXPECT_EQ(physical.migrations[0].layer_idx, origin + 2);
+            EXPECT_EQ(physical.migrations[0].source.layer_idx, origin + 2);
+            EXPECT_EQ(physical.migrations[0].destination.layer_idx, origin + 2);
+            EXPECT_EQ(physical.command_count, 2u);
+            EXPECT_EQ(physical.packed_weight_bytes, 8192u);
+            EXPECT_TRUE(physical.migration_cycles.empty());
+            ASSERT_EQ(physical.shadow_requirements.size(), 1u);
+            EXPECT_EQ(physical.shadow_requirements[0].layer_idx, origin + 2);
+
+            auto resident = commandBatch(MoEOverlayDeviceControllerTransactionKind::CurrentBatchLLEP,
+                17u, {assignment(2, 5, 1)});
+            resident.first_model_layer = origin;
+            const auto assignment_only = makeMoEOverlayDevicePhysicalMovementBatch(resident, topology());
+            ASSERT_TRUE(assignment_only.valid());
+            EXPECT_EQ(assignment_only.first_model_layer, origin);
+            EXPECT_FALSE(assignment_only.movesWeights());
+            EXPECT_EQ(assignment_only.packed_weight_bytes, 0u);
+        }
+    }
+
+    /** No-movement receipts still distinguish equal-shaped stages and bound arithmetic. */
+    TEST(Test__MoEOverlayDevicePhysicalMovement,
+         PipelineStageNoOpIdentityAndInvalidIntervals)
+    {
+        for (const auto kind : {MoEOverlayDeviceControllerTransactionKind::StaticCheck,
+                               MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
+                               MoEOverlayDeviceControllerTransactionKind::PreparedContextRestore})
+        {
+            auto command = commandBatch(kind, 23u, {});
+            const auto zero_origin = makeMoEOverlayDevicePhysicalMovementBatch(command, topology());
+            command.first_model_layer = 32;
+            const auto physical = makeMoEOverlayDevicePhysicalMovementBatch(command, topology());
+            ASSERT_TRUE(physical.valid());
+            EXPECT_EQ(physical.first_model_layer, 32);
+            EXPECT_FALSE(physical.movesWeights());
+            EXPECT_NE(physical.execution_fingerprint, zero_origin.execution_fingerprint);
+            for (const int invalid_origin : {-1, std::numeric_limits<int>::max() - 2})
+            {
+                command.first_model_layer = invalid_origin;
+                EXPECT_FALSE(command.valid());
+                EXPECT_THROW((void)makeMoEOverlayDevicePhysicalMovementBatch(command, topology()),
+                    std::invalid_argument);
+                auto invalid = physical;
+                invalid.first_model_layer = invalid_origin;
+                EXPECT_FALSE(invalid.valid());
+            }
+        }
+    }
+
+    /** A coherent foreign migration must fail before cycle or shadow-slot admission. */
+    TEST(Test__MoEOverlayDevicePhysicalMovement,
+         PipelineStageRejectsForeignPhysicalLayerCoordinates)
+    {
+        auto command = commandBatch(MoEOverlayDeviceControllerTransactionKind::CurrentBatchLLEP,
+            17u, {move(MoEOverlayDeviceMovementOp::TransientArrival, 1, 7, 0, 2,
+                8192u, MoEOverlayDeviceMovementAxis::ParticipantPlacement)});
+        command.first_model_layer = 32;
+        const auto physical = makeMoEOverlayDevicePhysicalMovementBatch(command, topology());
+        ASSERT_TRUE(physical.valid());
+        for (const int foreign_layer : {0, 31, 35, std::numeric_limits<int>::max()})
+        {
+            auto foreign = physical;
+            foreign.migrations[0].layer_idx = foreign_layer;
+            foreign.migrations[0].source.layer_idx = foreign_layer;
+            foreign.migrations[0].destination.layer_idx = foreign_layer;
+            foreign.shadow_requirements[0].layer_idx = foreign_layer;
+            EXPECT_FALSE(foreign.valid()) << foreign_layer;
+        }
+    }
 
     TEST(Test__MoEOverlayDevicePhysicalMovement,
          ProjectionDiagnosticsPreserveExactPendingEndpointsAndReadiness)

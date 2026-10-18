@@ -20,6 +20,7 @@
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
+#include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "utils/Logger.h"
 
@@ -38,6 +39,40 @@ namespace llaminar2
 
 namespace
 {
+
+/**
+ * @brief Read immutable attention visibility from the declarative model schema.
+ * @param architecture Registered model architecture being admitted.
+ * @return Full causal visibility only when every declared attention reader has it.
+ *
+ * Admission must not infer visibility from a model name or assume the runtime
+ * stage's default. Named recurrent templates may contain no attention reader;
+ * every real attention reader contributes its explicit causal/window policy.
+ * Additional input operands exclude the unmasked Q/K/V specialization.
+ */
+attention::AttentionVisibilityPolicy modelAttentionVisibility(const std::string &architecture)
+{
+    const auto schema = SchemaFactoryRegistry::getFactory(architecture)->createSchema();
+    bool seen_attention = false;
+    bool full_context = true;
+    const auto inspect = [&](const LayerTemplate &layer)
+    {
+        for (const auto &stage : layer.attention_stages)
+        {
+            if (stage.type != StageType::AttentionCompute) continue;
+            seen_attention = true;
+            full_context = full_context &&
+                stage.causal.has_value() && stage.window_size.has_value() &&
+                attention::attentionVisibilityPolicy(*stage.causal, *stage.window_size,
+                    stage.inputs.size() != 3) == attention::AttentionVisibilityPolicy::CausalFullContext;
+        }
+    };
+    inspect(schema.layer_template);
+    for (const auto &[name, layer] : schema.named_templates) inspect(layer);
+    return seen_attention && full_context
+        ? attention::AttentionVisibilityPolicy::CausalFullContext
+        : attention::AttentionVisibilityPolicy::General;
+}
 
 std::string formatMB(size_t bytes)
 {
@@ -352,12 +387,30 @@ size_t routedParticipantActivationBytes(
 
 } // anonymous namespace
 
-MemoryPlan MemoryPlanner::plan(
+/** @brief Setup-only object identities; this is never a byte or allocation ledger. */
+struct MemoryPlanner::SharedOwnerIdentities
+{
+    std::set<std::pair<int, std::string>> prefix_archives;
+};
+
+/**
+ * @brief Price one group's distinct owners inside a complete planning transaction.
+ * @param profile Immutable complete source metadata.
+ * @param device_configs This group's actual retained graph owners.
+ * @param shared Archive identities already owned by earlier groups.
+ * @return Fixed contribution; shared archive scratch is emitted only once.
+ *
+ * The set records object identity, never byte capacity or live allocation state.
+ * Only MemoryPlanner owns its lifetime and no caller can reset it between groups.
+ */
+MemoryPlan MemoryPlanner::planOwnerGroup(
     const ModelMemoryProfile& profile,
-    const std::vector<DevicePlanConfig>& device_configs)
+    const std::vector<DevicePlanConfig>& device_configs,
+    SharedOwnerIdentities &shared)
 {
     MemoryPlan result;
     result.devices.reserve(device_configs.size());
+    auto &accounted_prefix_archives = shared.prefix_archives;
 
     /*
      * openShared() retains one archive object, lock domain, and scratch buffer
@@ -365,8 +418,6 @@ MemoryPlan MemoryPlanner::plan(
      * may reference that same physical host allocation, so price its archive
      * key once rather than inventing one scratch per logical device plan.
      */
-    std::set<std::pair<int, std::string>> accounted_prefix_archives;
-
     for (const auto& cfg : device_configs)
     {
         if (cfg.concurrent_workspace_owners == 0u)
@@ -1231,6 +1282,11 @@ MemoryPlan MemoryPlanner::plan(
                     .mtp_terminal_logits_collective =
                         terminal_logits_collective,
                     .compact_routed_expert_token_rows = compact_routed_expert_token_rows,
+                    .attention_kv_format = KVCacheMemoryEstimator::attentionExecutionFormat(cfg.kv_precision),
+                    .attention_visibility = cfg.device.is_gpu() &&
+                            KVCacheMemoryEstimator::attentionExecutionFormat(cfg.kv_precision) == TensorType::FP16
+                        ? modelAttentionVisibility(profile.architecture)
+                        : attention::AttentionVisibilityPolicy::General,
                 });
         }
         else
@@ -1397,9 +1453,9 @@ MemoryPlan MemoryPlanner::plan(
      * presentation only; allocation authority comes from MemoryPlan::admit(). */
     result.sealPhysicalPlan();
 
-    /* Diagnose only complete physical rows. A logical sub-plan can fit while
-     * the aggregate allocator does not, which is precisely the split-brain
-     * failure this plan representation is intended to make impossible. */
+    /* Diagnose this group's physical contributions. A multi-group caller must
+     * admit the complete aggregate: an individually fitting stage does not
+     * prove that the other stages can share the same allocator. */
     for (const auto &device_plan : result.devices)
     {
         if (!device_plan.fits())
@@ -1422,6 +1478,28 @@ MemoryPlan MemoryPlanner::plan(
         }
     }
 
+    return result;
+}
+
+MemoryPlan MemoryPlanner::plan(
+    const ModelMemoryProfile &profile,
+    const std::vector<DevicePlanConfig> &device_configs)
+{
+    auto groups = planGroups(profile, std::span(&device_configs, 1));
+    return std::move(groups.front());
+}
+
+std::vector<MemoryPlan> MemoryPlanner::planGroups(
+    const ModelMemoryProfile &profile,
+    std::span<const std::vector<DevicePlanConfig>> device_groups)
+{
+    if (device_groups.empty())
+        throw std::invalid_argument("Memory planning requires an explicit ownership-group inventory");
+    SharedOwnerIdentities shared;
+    std::vector<MemoryPlan> result;
+    result.reserve(device_groups.size());
+    for (const auto &group : device_groups)
+        result.push_back(planOwnerGroup(profile, group, shared));
     return result;
 }
 

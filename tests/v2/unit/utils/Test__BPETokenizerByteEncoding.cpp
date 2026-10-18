@@ -1,391 +1,263 @@
 /**
  * @file Test__BPETokenizerByteEncoding.cpp
- * @brief Unit tests for BPETokenizer byte encoding/decoding
- * @author David Sanftenberg
- * @date 2025-11-28
+ * @brief Model-free production tokenizer regressions against independent HF oracles.
  *
- * Tests the GPT-2 style byte-level encoding/decoding that underlies
- * the BPE tokenizer. These are pure unit tests that don't require
- * model loading.
+ * Small vocabulary projections and golden spans/IDs are frozen from upstream
+ * tokenizer policies, with source hashes in the fixture. Tests exercise real
+ * GGUF admission and BPE, never a copied byte encoder. Indentation can round-
+ * trip with incorrect IDs, so both exact IDs and decoded bytes are asserted.
  */
-
+#include "utils/Tokenizer.h"
+#include "loaders/ModelLoader.h"
 #include <gtest/gtest.h>
-#include <string>
-#include <vector>
-#include <unordered_map>
-#include <iomanip>
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <fstream>
+#include <future>
 
 namespace
 {
-    // Replicate the GPT-2 byte encoder logic for testing
-    class ByteEncoderTest
+    using namespace llaminar2;
+    using nlohmann::json;
+
+    /** @brief Read the small independent oracle once without models or network. */
+    const json& fixture()
     {
-    public:
-        ByteEncoderTest()
-        {
-            initializeByteEncoder();
-        }
+        static const json value = [] {
+            std::ifstream stream(LLAMINAR_BPE_FIXTURE_PATH);
+            if (!stream) throw std::runtime_error("Missing frozen byte-BPE reference fixture");
+            return json::parse(stream);
+        }();
+        return value;
+    }
 
-        std::string encode(unsigned char byte) const
-        {
-            return byte_encoder_[byte];
-        }
+    /** @brief Store GGUF's length-prefixed UTF-8 bytes, without a terminator. */
+    GGUFValue stringValue(const std::string& value)
+    {
+        const uint64_t length = value.size();
+        GGUFValue result{.type = GGUFValueType::STRING,
+                         .data = std::vector<uint8_t>(sizeof(length) + length)};
+        std::memcpy(result.data.data(), &length, sizeof(length));
+        std::memcpy(result.data.data() + sizeof(length), value.data(), length);
+        return result;
+    }
 
-        int decode(const std::string &encoded) const
+    /** @brief Store arrays in the same representation as the GGUF loader. */
+    GGUFValue arrayValue(const std::vector<std::string>& value)
+    {
+        return {.type = GGUFValueType::ARRAY, .array_length = value.size(), .string_array_value = value};
+    }
+
+    /** @brief Build complete metadata including authoritative added-token types. */
+    std::map<std::string, GGUFValue> metadata(const std::string& profile)
+    {
+        const auto& vocab = fixture()["vocabularies"][fixture()["profiles"][profile]["vocabulary"].get<std::string>()];
+        auto tokens = vocab["tokens"].get<std::vector<std::string>>();
+        tokens.insert(tokens.end(), {"<|im_start|>", "<|im_end|>", "<think>", "</think>"});
+        std::vector<uint32_t> types(tokens.size(), 1);
+        std::fill(types.end() - 4, types.end(), 3);
+        GGUFValue typeValue{.type = GGUFValueType::ARRAY,
+                            .data = std::vector<uint8_t>(types.size() * sizeof(uint32_t)),
+                            .array_length = types.size()};
+        std::memcpy(typeValue.data.data(), types.data(), typeValue.data.size());
+        return {{"tokenizer.ggml.model", stringValue("gpt2")},
+                {"tokenizer.ggml.pre", stringValue(profile)},
+                {"tokenizer.ggml.tokens", arrayValue(tokens)},
+                {"tokenizer.ggml.merges", arrayValue(vocab["merges"].get<std::vector<std::string>>())},
+                {"tokenizer.ggml.token_type", std::move(typeValue)}};
+    }
+
+    TEST(BPETokenizer, DeclaredUnicodeBoundariesMatchIndependentReference)
+    {
+        for (const auto& [name, reference] : fixture()["profiles"].items())
         {
-            auto it = byte_decoder_.find(encoded);
-            if (it != byte_decoder_.end())
+            TextPreTokenizer splitter(parseTextPreTokenizerProfile(name));
+            for (size_t i = 0; i < fixture()["inputs"].size(); ++i)
             {
-                return it->second;
-            }
-            return -1;
-        }
-
-        const std::vector<std::string> &encoder() const { return byte_encoder_; }
-        const std::unordered_map<std::string, int> &decoder() const { return byte_decoder_; }
-
-    private:
-        void initializeByteEncoder()
-        {
-            byte_encoder_.resize(256);
-            int n = 0;
-            for (int b = 0; b < 256; ++b)
-            {
-                if (b >= 33 && b <= 126)
+                SCOPED_TRACE(name + " case " + std::to_string(i));
+                const auto text = fixture()["inputs"][i].get<std::string>();
+                const auto spans = splitter.split(text);
+                std::vector<std::string> actual;
+                size_t offset = 0;
+                for (const auto span : spans)
                 {
-                    // Printable ASCII: single-byte identity mapping
-                    byte_encoder_[b] = std::string(1, static_cast<char>(b));
-                    byte_decoder_[std::string(1, static_cast<char>(b))] = b;
+                    EXPECT_FALSE(span.empty());
+                    EXPECT_EQ(span.data(), text.data() + offset);
+                    offset += span.size();
+                    actual.emplace_back(span);
                 }
-                else if ((b >= 161 && b <= 172) || (b >= 174 && b <= 255))
-                {
-                    // Latin-1 Supplement: identity mapping but needs UTF-8 encoding
-                    int codepoint = b;
-                    char utf8[3];
-                    utf8[0] = static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F));
-                    utf8[1] = static_cast<char>(0x80 | (codepoint & 0x3F));
-                    utf8[2] = '\0';
-                    std::string encoded(utf8, 2);
-                    byte_encoder_[b] = encoded;
-                    byte_decoder_[encoded] = b;
-                }
-                else
-                {
-                    // Non-printable: map to Unicode U+0100 + n
-                    int codepoint = 256 + n;
-                    char utf8[3];
-                    utf8[0] = static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F));
-                    utf8[1] = static_cast<char>(0x80 | (codepoint & 0x3F));
-                    utf8[2] = '\0';
-                    std::string encoded(utf8, 2);
-                    byte_encoder_[b] = encoded;
-                    byte_decoder_[encoded] = b;
-                    n++;
-                }
-            }
-        }
-
-        std::vector<std::string> byte_encoder_;
-        std::unordered_map<std::string, int> byte_decoder_;
-    };
-
-    // =============================================================================
-    // Printable ASCII Tests (bytes 33-126)
-    // =============================================================================
-
-    TEST(ByteEncodingTest, PrintableASCII_Identity)
-    {
-        ByteEncoderTest encoder;
-
-        // Printable ASCII should map to single-byte strings
-        for (int b = 33; b <= 126; ++b)
-        {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            EXPECT_EQ(encoded.size(), 1) << "Byte " << b << " should encode to single byte";
-            EXPECT_EQ(static_cast<unsigned char>(encoded[0]), b)
-                << "Byte " << b << " should be identity mapped";
-        }
-    }
-
-    TEST(ByteEncodingTest, PrintableASCII_RoundTrip)
-    {
-        ByteEncoderTest encoder;
-
-        for (int b = 33; b <= 126; ++b)
-        {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            int decoded = encoder.decode(encoded);
-            EXPECT_EQ(decoded, b) << "Byte " << b << " should round-trip correctly";
-        }
-    }
-
-    TEST(ByteEncodingTest, PrintableASCII_SpecificChars)
-    {
-        ByteEncoderTest encoder;
-
-        // Test specific important characters
-        EXPECT_EQ(encoder.encode('!'), "!");  // 33
-        EXPECT_EQ(encoder.encode('"'), "\""); // 34
-        EXPECT_EQ(encoder.encode('+'), "+");  // 43
-        EXPECT_EQ(encoder.encode('.'), ".");  // 46
-        EXPECT_EQ(encoder.encode('0'), "0");  // 48
-        EXPECT_EQ(encoder.encode('A'), "A");  // 65
-        EXPECT_EQ(encoder.encode('a'), "a");  // 97
-        EXPECT_EQ(encoder.encode('~'), "~");  // 126
-    }
-
-    // =============================================================================
-    // Latin-1 Supplement Tests (bytes 161-172, 174-255)
-    // =============================================================================
-
-    TEST(ByteEncodingTest, Latin1Supplement_UTF8Encoding)
-    {
-        ByteEncoderTest encoder;
-
-        // Latin-1 Supplement bytes should encode as 2-byte UTF-8
-        for (int b = 161; b <= 172; ++b)
-        {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            EXPECT_EQ(encoded.size(), 2) << "Byte " << b << " should encode to 2-byte UTF-8";
-
-            // Verify UTF-8 structure: 110xxxxx 10xxxxxx
-            unsigned char b1 = static_cast<unsigned char>(encoded[0]);
-            unsigned char b2 = static_cast<unsigned char>(encoded[1]);
-            EXPECT_EQ(b1 & 0xE0, 0xC0) << "First byte should start with 110";
-            EXPECT_EQ(b2 & 0xC0, 0x80) << "Second byte should start with 10";
-        }
-
-        for (int b = 174; b <= 255; ++b)
-        {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            EXPECT_EQ(encoded.size(), 2) << "Byte " << b << " should encode to 2-byte UTF-8";
-        }
-    }
-
-    TEST(ByteEncodingTest, Latin1Supplement_RoundTrip)
-    {
-        ByteEncoderTest encoder;
-
-        for (int b = 161; b <= 172; ++b)
-        {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            int decoded = encoder.decode(encoded);
-            EXPECT_EQ(decoded, b) << "Byte " << b << " should round-trip correctly";
-        }
-
-        for (int b = 174; b <= 255; ++b)
-        {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            int decoded = encoder.decode(encoded);
-            EXPECT_EQ(decoded, b) << "Byte " << b << " should round-trip correctly";
-        }
-    }
-
-    TEST(ByteEncodingTest, Latin1Supplement_SpecificBytes)
-    {
-        ByteEncoderTest encoder;
-
-        // Byte 0xE4 (228) = ä (U+00E4) = UTF-8 C3 A4
-        std::string encoded_e4 = encoder.encode(0xE4);
-        EXPECT_EQ(encoded_e4.size(), 2);
-        EXPECT_EQ(static_cast<unsigned char>(encoded_e4[0]), 0xC3);
-        EXPECT_EQ(static_cast<unsigned char>(encoded_e4[1]), 0xA4);
-
-        // Byte 0xE5 (229) = å (U+00E5) = UTF-8 C3 A5
-        std::string encoded_e5 = encoder.encode(0xE5);
-        EXPECT_EQ(encoded_e5.size(), 2);
-        EXPECT_EQ(static_cast<unsigned char>(encoded_e5[0]), 0xC3);
-        EXPECT_EQ(static_cast<unsigned char>(encoded_e5[1]), 0xA5);
-
-        // Byte 0xBD (189) = ½ (U+00BD) = UTF-8 C2 BD
-        std::string encoded_bd = encoder.encode(0xBD);
-        EXPECT_EQ(encoded_bd.size(), 2);
-        EXPECT_EQ(static_cast<unsigned char>(encoded_bd[0]), 0xC2);
-        EXPECT_EQ(static_cast<unsigned char>(encoded_bd[1]), 0xBD);
-    }
-
-    // =============================================================================
-    // Non-Printable Byte Tests (0-32, 127-160, 173)
-    // =============================================================================
-
-    TEST(ByteEncodingTest, NonPrintable_MapsToU0100Plus)
-    {
-        ByteEncoderTest encoder;
-
-        // Non-printable bytes map to U+0100 + n
-        // First non-printable is byte 0, should map to U+0100
-        std::string encoded_0 = encoder.encode(0);
-        EXPECT_EQ(encoded_0.size(), 2);
-        // U+0100 = UTF-8 C4 80
-        EXPECT_EQ(static_cast<unsigned char>(encoded_0[0]), 0xC4);
-        EXPECT_EQ(static_cast<unsigned char>(encoded_0[1]), 0x80);
-
-        // Byte 32 (space) should map to U+0120 = UTF-8 C4 A0
-        std::string encoded_space = encoder.encode(' ');
-        EXPECT_EQ(encoded_space.size(), 2);
-        EXPECT_EQ(static_cast<unsigned char>(encoded_space[0]), 0xC4);
-        EXPECT_EQ(static_cast<unsigned char>(encoded_space[1]), 0xA0);
-    }
-
-    TEST(ByteEncodingTest, NonPrintable_RoundTrip)
-    {
-        ByteEncoderTest encoder;
-
-        // Test all non-printable ranges
-        for (int b = 0; b <= 32; ++b)
-        {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            int decoded = encoder.decode(encoded);
-            EXPECT_EQ(decoded, b) << "Byte " << b << " should round-trip correctly";
-        }
-
-        // Byte 127 (DEL)
-        EXPECT_EQ(encoder.decode(encoder.encode(127)), 127);
-
-        // Bytes 128-160
-        for (int b = 128; b <= 160; ++b)
-        {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            int decoded = encoder.decode(encoded);
-            EXPECT_EQ(decoded, b) << "Byte " << b << " should round-trip correctly";
-        }
-
-        // Byte 173 (soft hyphen)
-        EXPECT_EQ(encoder.decode(encoder.encode(173)), 173);
-    }
-
-    // =============================================================================
-    // UTF-8 Multi-Byte Sequence Tests (Chinese, Emoji, etc.)
-    // =============================================================================
-
-    TEST(ByteEncodingTest, ChineseCharacter_ByteSequence)
-    {
-        ByteEncoderTest encoder;
-
-        // 你 = UTF-8: E4 BD A0
-        std::string ni = "你";
-        ASSERT_EQ(ni.size(), 3);
-
-        unsigned char b1 = static_cast<unsigned char>(ni[0]); // 0xE4
-        unsigned char b2 = static_cast<unsigned char>(ni[1]); // 0xBD
-        unsigned char b3 = static_cast<unsigned char>(ni[2]); // 0xA0
-
-        EXPECT_EQ(b1, 0xE4);
-        EXPECT_EQ(b2, 0xBD);
-        EXPECT_EQ(b3, 0xA0);
-
-        // Each byte should encode and round-trip
-        EXPECT_EQ(encoder.decode(encoder.encode(b1)), b1);
-        EXPECT_EQ(encoder.decode(encoder.encode(b2)), b2);
-        EXPECT_EQ(encoder.decode(encoder.encode(b3)), b3);
-    }
-
-    TEST(ByteEncodingTest, ChineseCharacter_FullRoundTrip)
-    {
-        ByteEncoderTest encoder;
-
-        // Test encoding "你好" byte by byte and reconstructing
-        std::string original = "你好";
-        std::string encoded_combined;
-
-        for (unsigned char c : original)
-        {
-            encoded_combined += encoder.encode(c);
-        }
-
-        // Now decode back
-        std::string decoded;
-        size_t i = 0;
-        while (i < encoded_combined.size())
-        {
-            unsigned char b1 = static_cast<unsigned char>(encoded_combined[i]);
-
-            if ((b1 & 0xE0) == 0xC0 && i + 1 < encoded_combined.size())
-            {
-                // 2-byte UTF-8 sequence
-                std::string utf8_char = encoded_combined.substr(i, 2);
-                int byte_val = encoder.decode(utf8_char);
-                if (byte_val >= 0)
-                {
-                    decoded += static_cast<char>(byte_val);
-                }
-                i += 2;
-            }
-            else
-            {
-                // Single byte
-                std::string single(1, encoded_combined[i]);
-                int byte_val = encoder.decode(single);
-                if (byte_val >= 0)
-                {
-                    decoded += static_cast<char>(byte_val);
-                }
-                i++;
+                EXPECT_EQ(offset, text.size());
+                EXPECT_EQ(actual, reference["cases"][i]["spans"].get<std::vector<std::string>>());
             }
         }
-
-        EXPECT_EQ(decoded, original) << "Chinese text should round-trip correctly";
     }
 
-    TEST(ByteEncodingTest, Emoji_ByteSequence)
+    TEST(BPETokenizer, IndentationIdentifiersAndEmojiHaveExactReferenceTokenIds)
     {
-        ByteEncoderTest encoder;
-
-        // 😀 = UTF-8: F0 9F 98 80 (4 bytes)
-        std::string emoji = "😀";
-        ASSERT_EQ(emoji.size(), 4);
-
-        // Each byte should round-trip
-        for (unsigned char c : emoji)
+        for (const auto& [name, reference] : fixture()["profiles"].items())
         {
-            EXPECT_EQ(encoder.decode(encoder.encode(c)), c)
-                << "Byte 0x" << std::hex << (int)c << " should round-trip";
+            const auto tokenizer = BPETokenizer::create(metadata(name));
+            ASSERT_NE(tokenizer, nullptr);
+            for (size_t i = 0; i < fixture()["inputs"].size(); ++i)
+            {
+                SCOPED_TRACE(name + " case " + std::to_string(i));
+                const auto text = fixture()["inputs"][i].get<std::string>();
+                const auto ids = tokenizer->encode(text, false, false);
+                EXPECT_EQ(ids, reference["cases"][i]["ids"].get<std::vector<int>>());
+                EXPECT_EQ(tokenizer->decode(ids, false), reference["cases"][i]["normalized"].get<std::string>());
+            }
         }
     }
 
-    // =============================================================================
-    // Decoder Map Integrity Tests
-    // =============================================================================
-
-    TEST(ByteEncodingTest, DecoderHas256Entries)
+    TEST(BPETokenizer, SpecialTokensDelimitOrdinaryUnicodeWithoutChangingIds)
     {
-        ByteEncoderTest encoder;
-        EXPECT_EQ(encoder.decoder().size(), 256)
-            << "Decoder should have exactly 256 entries (one per byte)";
+        const auto tokenizer = BPETokenizer::create(metadata("qwen35"));
+        ASSERT_NE(tokenizer, nullptr);
+        const std::string text = "<|im_start|>user\n👩🏽‍💻 café\n<|im_end|><think>    def f():\n</think>";
+        std::vector<int> expected{1000};
+        for (const auto& [part, terminator] : std::vector<std::pair<std::string, int>>{
+                 {"user\n👩🏽‍💻 café\n", 1001}, {"", 1002}, {"    def f():\n", 1003}})
+        {
+            const auto ids = tokenizer->encode(part, false, false);
+            expected.insert(expected.end(), ids.begin(), ids.end());
+            expected.push_back(terminator);
+        }
+        EXPECT_EQ(tokenizer->encode(text, false, false), expected);
+        EXPECT_EQ(tokenizer->decode(expected, false),
+                  "<|im_start|>user\n👩🏽‍💻 café\n<|im_end|><think>    def f():\n</think>");
     }
 
-    TEST(ByteEncodingTest, EncoderDecoderBijection)
+    TEST(BPETokenizer, UnicodeNFCUsesTheDeclaredProfileAndPreservesEmojiAndNuls)
     {
-        ByteEncoderTest encoder;
-
-        // Each byte should have a unique encoding
-        std::unordered_map<std::string, int> seen;
-        for (int b = 0; b < 256; ++b)
+        const std::vector<std::pair<std::string, std::string>> examples{
+            {"e\u0301 cafe\u0301", "é café"},
+            {"\u212a \u212b \u1100\u1161\u11a8", "K Å 각"},
+            {"🙂 👩🏽‍💻 🇬🇧 ❤️ 1️⃣ 🚀", "🙂 👩🏽‍💻 🇬🇧 ❤️ 1️⃣ 🚀"},
+            {std::string("e\u0301\0suffix", 10), std::string("é\0suffix", 9)},
+            {"ﬁ ① Ａ", "ﬁ ① Ａ"}}; // NFC must not become compatibility normalization.
+        for (const auto name : {"qwen2", "qwen35", "gpt-2", "llama-bpe"})
         {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            auto it = seen.find(encoded);
-            EXPECT_EQ(it, seen.end())
-                << "Encoding for byte " << b << " collides with byte " << it->second;
-            seen[encoded] = b;
+            const auto tokenizer = BPETokenizer::create(metadata(name));
+            ASSERT_NE(tokenizer, nullptr);
+            for (const auto& [original, normalized] : examples)
+            {
+                SCOPED_TRACE(name);
+                const auto ids = tokenizer->encode(original, false, false);
+                const auto& expected = std::string_view(name).starts_with("qwen") ? normalized : original;
+                EXPECT_EQ(tokenizer->decode(ids, false), expected);
+                EXPECT_EQ(ids, tokenizer->encode(expected, false, false));
+            }
         }
     }
 
-    TEST(ByteEncodingTest, AllBytesRoundTrip)
+    TEST(BPETokenizer, VocabularyWithoutAddedTokensStillHonorsBoundaries)
     {
-        ByteEncoderTest encoder;
-
-        for (int b = 0; b < 256; ++b)
-        {
-            std::string encoded = encoder.encode(static_cast<unsigned char>(b));
-            int decoded = encoder.decode(encoded);
-            EXPECT_EQ(decoded, b) << "Byte " << b << " should round-trip";
-        }
+        auto values = metadata("qwen35");
+        // All entries are ordinary, including the four fixture spellings.
+        auto& types = values["tokenizer.ggml.token_type"].data;
+        const uint32_t ordinary = 1;
+        for (size_t offset = 0; offset < types.size(); offset += sizeof(ordinary))
+            std::memcpy(types.data() + offset, &ordinary, sizeof(ordinary));
+        const auto tokenizer = BPETokenizer::create(values);
+        ASSERT_NE(tokenizer, nullptr);
+        const auto text = fixture()["inputs"][2].get<std::string>();
+        EXPECT_EQ(tokenizer->encode(text, false, false),
+                  fixture()["profiles"]["qwen35"]["cases"][2]["ids"].get<std::vector<int>>());
     }
 
-} // anonymous namespace
+    TEST(BPETokenizer, AdmissionRejectsUnknownMissingAndWrongTypedPolicies)
+    {
+        for (const auto key : {"tokenizer.ggml.pre", "tokenizer.ggml.model"})
+        {
+            auto values = metadata("qwen35");
+            values.erase(key);
+            EXPECT_EQ(BPETokenizer::create(values), nullptr);
+            values[key] = stringValue("unknown");
+            EXPECT_EQ(BPETokenizer::create(values), nullptr);
+            values[key] = arrayValue({"qwen35"});
+            EXPECT_EQ(BPETokenizer::create(values), nullptr);
+        }
+        EXPECT_THROW(parseTextPreTokenizerProfile(""), std::invalid_argument);
+        EXPECT_THROW(parseTextPreTokenizerProfile("Qwen3.8-27B"), std::invalid_argument);
+        auto values = metadata("qwen35");
+        values["tokenizer.ggml.tokens"].string_array_value[0] = "missing-byte";
+        EXPECT_EQ(BPETokenizer::create(values), nullptr);
+    }
 
-int main(int argc, char **argv)
-{
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+    TEST(BPETokenizer, EveryByteDecodesThroughTheProductionVocabulary)
+    {
+        // The first 256 upstream GPT byte-BPE tokens cover every byte once.
+        const auto tokenizer = BPETokenizer::create(metadata("qwen35"));
+        ASSERT_NE(tokenizer, nullptr);
+        std::array<bool, 256> seen{};
+        for (int id = 0; id < 256; ++id)
+        {
+            const auto value = tokenizer->decode_token(id);
+            ASSERT_EQ(value.size(), 1);
+            const auto byte = static_cast<unsigned char>(value[0]);
+            EXPECT_FALSE(seen[byte]);
+            seen[byte] = true;
+        }
+        EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) { return value; }));
+    }
+
+    TEST(BPETokenizer, InvalidUtf8NeverProducesPartialPromptTokens)
+    {
+        const auto tokenizer = BPETokenizer::create(metadata("qwen35"));
+        ASSERT_NE(tokenizer, nullptr);
+        for (const auto& invalid : {std::string("\x80"), std::string("\xc0\xaf"), std::string("\xed\xa0\x80"),
+                                    std::string("\xf4\x90\x80\x80"), std::string("\xf0\x9f\x91")})
+            for (const auto& prefix : {std::string(), std::string("    valid text\n<|im_start|>")})
+                EXPECT_THROW(tokenizer->encode(prefix + invalid, false, false), std::runtime_error);
+    }
+
+    TEST(BPETokenizer, LongPromptAndConcurrentRequestsRetainIndependentMatchState)
+    {
+        const auto tokenizer = BPETokenizer::create(metadata("qwen35"));
+        ASSERT_NE(tokenizer, nullptr);
+        const std::string line = "    def answer():\n        return 123 # 👩🏽‍💻\n";
+        const auto lineTokens = tokenizer->encode(line, false, false);
+        std::string text;
+        std::vector<int> expected;
+        for (int i = 0; i < 4096; ++i)
+        {
+            text += line;
+            expected.insert(expected.end(), lineTokens.begin(), lineTokens.end());
+        }
+        EXPECT_EQ(tokenizer->encode(text, false, false), expected);
+        std::vector<std::future<bool>> calls;
+        for (int thread = 0; thread < 8; ++thread)
+            calls.push_back(std::async(std::launch::async, [tokenizer, line, lineTokens] {
+                for (int repeat = 0; repeat < 20; ++repeat)
+                    if (tokenizer->encode(line, false, false) != lineTokens) return false;
+                return true;
+            }));
+        for (auto& call : calls) EXPECT_TRUE(call.get());
+    }
+
+    TEST(BPETokenizer, ContextSizedRunsPreserveCompleteLinearCoverage)
+    {
+        // A long coding prompt may contain a single huge literal or whitespace
+        // run. Match limits must not impose a hidden small prompt restriction.
+        for (const auto& [name, reference] : fixture()["profiles"].items())
+        {
+            TextPreTokenizer splitter(parseTextPreTokenizerProfile(name));
+            for (const char byte : {' ', 'a', '1', '_'})
+            {
+                SCOPED_TRACE(name + " byte " + std::to_string(byte));
+                const std::string text(1 << 20, byte);
+                const auto spans = splitter.split(text);
+                size_t offset = 0;
+                for (const auto span : spans)
+                {
+                    ASSERT_FALSE(span.empty());
+                    ASSERT_EQ(span.data(), text.data() + offset);
+                    offset += span.size();
+                }
+                EXPECT_EQ(offset, text.size());
+            }
+        }
+    }
 }

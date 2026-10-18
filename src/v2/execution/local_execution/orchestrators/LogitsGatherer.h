@@ -5,6 +5,8 @@
  * Extracted from RankOrchestrator to isolate logits gathering
  * responsibilities: buffer allocation/pinning, column-parallel D2H gather
  * from TP device runners, and PP stage logits copy.
+ * Capacity describes actual exposed output rows, never the model's KV horizon.
+ * Main terminal output and all-position verifier output are separate owners.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -63,7 +65,7 @@ namespace llaminar2
          * @brief Construct a LogitsGatherer with a pre-allocated FP32 buffer.
          *
          * @param vocab_size Full vocabulary size (total across all TP devices)
-         * @param max_tokens Maximum tokens (batch_size * max_seq_len)
+         * @param max_tokens Explicit output row capacity; one for main terminal logits.
          * @param backend_resolver Optional backend resolver for deterministic unit tests.
          *                         When null, LogitsGatherer uses the global BackendManager.
          */
@@ -131,12 +133,11 @@ namespace llaminar2
          * @param copy_elements_hint Explicit element count when the caller already
          *                           knows the PP-stage logits width; 0 means copy
          *                           one full stage vocabulary row.
-         * @param batch_size Batch size for buffer allocation
-         * @param max_seq_len Max sequence length for buffer allocation
+         * Storage is materialized for the explicit copy extent only. A KV
+         * horizon cannot be passed through this output-copy interface.
          */
         void copyFromStage(const IInferenceRunner &stage_runner,
-                           size_t copy_elements_hint,
-                           int batch_size, int max_seq_len);
+                           size_t copy_elements_hint = 0);
 
         // =========================================================================
         // Access

@@ -93,7 +93,7 @@ namespace llaminar2
          * preparation. This setup-time form lets physical-memory admission run
          * before prepared engines and their device pointers exist.
          *
-         * @param layer_weight_manifest Contiguous gate/up/down model manifest.
+         * @param layer_weight_manifest Contiguous gate/up/down manifest for this stage's owned global layers.
          * @param projection_set The frozen domain's movable projections only.
          * @return Cross-layer allocation and wire-capacity union.
          * @throws std::invalid_argument for malformed, mixed projection, or

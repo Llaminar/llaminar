@@ -131,6 +131,7 @@ namespace llaminar2
             mix(command.participant_count);
             mix(command.num_layers);
             mix(command.num_experts);
+            mix(static_cast<std::uint32_t>(command.first_model_layer));
             for (const auto &entry : command.entries)
             {
                 mix(entry.magic);
@@ -159,7 +160,7 @@ namespace llaminar2
         MoEExpertOwner physicalOwner(
             const MoEOverlayDeviceControllerTopology &topology,
             std::uint32_t participant_id,
-            std::uint32_t layer,
+            int layer,
             std::uint32_t expert)
         {
             if (participant_id >= topology.participants.size())
@@ -174,7 +175,7 @@ namespace llaminar2
                     "device physical movement participant catalogue is not dense all-GPU topology");
             }
             return {
-                .layer_idx = static_cast<int>(layer),
+                .layer_idx = layer,
                 .expert_id = static_cast<int>(expert),
                 .tier_idx = participant.tier_idx,
                 .owner_participant = participant.participant_id,
@@ -267,13 +268,15 @@ namespace llaminar2
         std::vector<MoEOverlayTierMigrationCycle> durableCycles(
             const std::vector<MoEOverlayTierMigration> &migrations,
             std::uint32_t participant_count,
-            std::uint32_t num_layers)
+            std::uint32_t num_layers,
+            int first_model_layer)
         {
             std::vector<MoEOverlayTierMigrationCycle> result;
             std::vector<bool> used(migrations.size(), false);
 
-            for (std::uint32_t layer = 0u; layer < num_layers; ++layer)
+            for (std::uint32_t row = 0u; row < num_layers; ++row)
             {
+                const int layer = first_model_layer + static_cast<int>(row);
                 std::vector<std::vector<std::size_t>> outgoing(
                     participant_count);
                 std::vector<std::size_t> incoming_count(participant_count, 0u);
@@ -450,7 +453,9 @@ namespace llaminar2
         if (kind == MoEOverlayDeviceControllerTransactionKind::Invalid ||
             topology_fingerprint == 0u || transaction_id == 0u ||
             base_epoch == 0u || command_digest == 0u ||
-            participant_count < 2u || num_layers == 0u ||
+            participant_count < 2u || first_model_layer < 0 || num_layers == 0u ||
+            num_layers > static_cast<std::uint32_t>(
+                std::numeric_limits<std::int32_t>::max() - first_model_layer) ||
             num_experts == 0u || !execution_fingerprint.valid())
         {
             return false;
@@ -460,8 +465,8 @@ namespace llaminar2
         std::set<std::pair<int, int>> durable_experts;
         for (const auto &migration : migrations)
         {
-            if (migration.layer_idx < 0 || migration.expert_id < 0 ||
-                static_cast<std::uint32_t>(migration.layer_idx) >= num_layers ||
+            if (migration.layer_idx < first_model_layer || migration.expert_id < 0 ||
+                static_cast<std::uint32_t>(migration.layer_idx - first_model_layer) >= num_layers ||
                 static_cast<std::uint32_t>(migration.expert_id) >= num_experts ||
                 migration.source.layer_idx != migration.layer_idx ||
                 migration.destination.layer_idx != migration.layer_idx ||
@@ -577,6 +582,7 @@ namespace llaminar2
             .num_layers = command.num_layers,
             .num_experts = command.num_experts,
             .execution_fingerprint = fingerprintCommand(command),
+            .first_model_layer = command.first_model_layer,
         };
 
         for (const auto &entry : command.entries)
@@ -592,18 +598,21 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "device physical movement payload exceeds local size_t");
             }
+            // Command rows remain compact on device. Only physical owners,
+            // migration cycles and allocation keys use model-global layers.
+            const int model_layer = command.modelLayerForStorageIndex(entry.layer);
             auto source = physicalOwner(
                 topology,
                 entry.source_participant,
-                entry.layer,
+                model_layer,
                 entry.expert);
             auto destination = physicalOwner(
                 topology,
                 entry.destination_participant,
-                entry.layer,
+                model_layer,
                 entry.expert);
             result.migrations.push_back({
-                .layer_idx = static_cast<int>(entry.layer),
+                .layer_idx = model_layer,
                 .expert_id = static_cast<int>(entry.expert),
                 .activation_count = 0u,
                 .estimated_weight_bytes =
@@ -625,7 +634,8 @@ namespace llaminar2
             result.migration_cycles = durableCycles(
                 result.migrations,
                 result.participant_count,
-                result.num_layers);
+                result.num_layers,
+                result.first_model_layer);
         }
 
         if (!result.valid())

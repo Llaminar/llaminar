@@ -13,6 +13,8 @@
 #include <optional>
 
 #include "utils/PrefillGraphBucketDefaults.h"
+#include "config/GDNProjectionArithmeticPolicy.h"
+#include "config/MoERouterArithmeticPolicy.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "collective/AllreducePrecisionPolicy.h"
 
@@ -373,6 +375,19 @@ namespace llaminar2
      */
     struct GemmConfig
     {
+        /**
+         * @brief Setup-only LLAMINAR_GDN_PROJECTION_ARITHMETIC=native|fp32|fp16|fp16_alpha_beta|fp16_moe_alpha_beta.
+         *
+         * FP32 uses strict floating operands. FP16 uses half-RNE operands
+         * with FP32 accumulation/output. Decode and verifier use one fixed
+         * reduction tree; ordinary GPU prefill uses floating GEMM.
+         * The default FP16MoEAlphaBeta applies half operands only to original floating
+         * qwen35moe alpha/beta matrices; dense GDN stays native. Explicit FP16AlphaBeta
+         * selects alpha/beta for both dense and MoE models. Experts, routers and full-attention keep their own policy.
+         */
+        GDNProjectionArithmetic gdn_projection_arithmetic = kDefaultGDNProjectionArithmetic;
+        MoERouterArithmetic moe_router_arithmetic = MoERouterArithmetic::Native; ///< Setup-only LLAMINAR_MOE_ROUTER_ARITHMETIC=native|fp16|native_hadamard32; rotation applies only to existing Q8 router paths.
+
         // Q8_1 GEMM compensation strategy
         bool use_sa_compensation = false; ///< Use sA-based compensation (vs sum_qs-based, experimental)
 
@@ -412,6 +427,7 @@ namespace llaminar2
         int cuda_moe_imma_down_columns = 32;    ///< Capture-time grouped-IMMA down output width (LLAMINAR_CUDA_MOE_IMMA_DOWN_COLUMNS, valid 32|64|128|256).
         int cuda_moe_imma_gateup_schedule = 0;  ///< Gate/up warp ownership (LLAMINAR_CUDA_MOE_IMMA_GATEUP_SCHEDULE, 0=parallel banks, 1=paired projections).
         bool cuda_moe_imma_geometry_override_active = false; ///< True only when a profiler/trainer or explicit environment overrides installed IMMA dispatch.
+        CUDARouterPrefillArithmetic cuda_moe_router_prefill = CUDARouterPrefillArithmetic::FP32; ///< Explicit ordinary CUDA router prefill operands (LLAMINAR_CUDA_MOE_ROUTER_PREFILL=fp32|q8); decode remains independently selected.
         bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8)
         bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN)
         int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
@@ -424,6 +440,12 @@ namespace llaminar2
 
         void reload()
         {
+            const char *gdn_arithmetic = std::getenv("LLAMINAR_GDN_PROJECTION_ARITHMETIC");
+            gdn_projection_arithmetic = gdn_arithmetic ? parseGDNProjectionArithmetic(gdn_arithmetic) :
+                kDefaultGDNProjectionArithmetic;
+            const char *router_arithmetic = std::getenv("LLAMINAR_MOE_ROUTER_ARITHMETIC");
+            moe_router_arithmetic = parseMoERouterArithmetic(
+                router_arithmetic ? router_arithmetic : "native");
             const char *sa_comp_env = std::getenv("LLAMINAR_USE_SA_COMPENSATION");
             if (sa_comp_env)
             {
@@ -620,6 +642,11 @@ namespace llaminar2
             const char *moe_router_q8_env = std::getenv("LLAMINAR_CUDA_MOE_ROUTER_Q8");
             if (moe_router_q8_env)
                 cuda_moe_router_q8 = (std::atoi(moe_router_q8_env) != 0);
+            cuda_moe_router_prefill = CUDARouterPrefillArithmetic::FP32;
+            if (const char *value = std::getenv("LLAMINAR_CUDA_MOE_ROUTER_PREFILL"))
+                cuda_moe_router_prefill = parseCUDARouterPrefillArithmetic(value);
+            if (cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8 && !cuda_moe_router_q8)
+                throw std::invalid_argument("CUDA Q8 prefill requires the prepared Q8 router enabled");
             const char *moe_reuse_router_q8_hidden_env = std::getenv("LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN");
             if (moe_reuse_router_q8_hidden_env)
                 cuda_moe_reuse_router_q8_hidden = (std::atoi(moe_reuse_router_q8_hidden_env) != 0);
@@ -791,7 +818,7 @@ namespace llaminar2
         std::optional<int> debug_kv_append_source_layer;      ///< Selected layer for source K/V snapshots; nullopt means all layers.
         int cuda_fa2_tile_kv = 0;                             ///< CUDA FA2 KV tile override (LLAMINAR_FA2_TILE_KV, default 0=auto).
         int cuda_fa2_q_warp_groups = 0;                       ///< CUDA FA2 16-row Q groups per block (LLAMINAR_FA2_Q_WARP_GROUPS; 0=geometry policy, positive values select a compiled tournament candidate).
-        int cuda_fa2_hd256_pv_warps = 4;                      ///< CUDA HD256 FA2 P@V warps per 16-row Q group (LLAMINAR_FA2_HD256_PV_WARPS; valid: 1, 2, or 4; default 4).
+        int cuda_fa2_hd256_pv_warps = 0;                      ///< CUDA HD256-family P@V warps (LLAMINAR_FA2_HD256_PV_WARPS): 0 selects shape policy (default), explicit 1/2/4; -1 rejects malformed input.
 
         // Wo projection mode (JIT backend only)
         // When enabled, Wo weights are expected to be passed as packed QuantisedPackedWeights
@@ -875,14 +902,33 @@ namespace llaminar2
                                          ? std::atoi(cuda_fa2_q_warp_groups_env)
                                          : 0;
 
-            const char *cuda_fa2_hd256_pv_warps_env =
-                std::getenv("LLAMINAR_FA2_HD256_PV_WARPS");
-            cuda_fa2_hd256_pv_warps = cuda_fa2_hd256_pv_warps_env
-                                          ? std::atoi(cuda_fa2_hd256_pv_warps_env)
-                                          : 4;
+            cuda_fa2_hd256_pv_warps = parseCUDAFA2PVWarps(
+                std::getenv("LLAMINAR_FA2_HD256_PV_WARPS"));
         }
 
     private:
+        /**
+         * @brief Preserve automatic selection without accepting malformed overrides.
+         * @param value Optional environment value; unset selects geometry policy.
+         * @return Zero for automatic, 1/2/4 for explicit warps, or -1 for rejection
+         *         by the launch validator before native submission.
+         */
+        static int parseCUDAFA2PVWarps(const char *value)
+        {
+            if (!value)
+                return 0;
+            if (value[0] == '\0' || value[1] != '\0')
+                return -1;
+            switch (value[0])
+            {
+            case '0': return 0;
+            case '1': return 1;
+            case '2': return 2;
+            case '4': return 4;
+            default: return -1;
+            }
+        }
+
         /// @brief Parses optional layer selectors where unset or empty means every layer.
         static std::optional<int> selectedLayerFromEnv(const char *name)
         {
@@ -2776,7 +2822,6 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=0` - Disable multi-stream GDN decode projection GEMVs (default: on outside deterministic mode)
      * - `LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER=0` - Disable grouped MoE decode router logits path (default: on)
      * - `LLAMINAR_ROCM_MOE_ROUTER_Q8=0` - Disable cached Q8 router gate weights for ROCm MoE decode routing (default: on)
-     * - `LLAMINAR_ROCM_MOE_ROUTER_FP16=1` - Enable cached FP16 router gate weights for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE=1` - Enable K-partitioned FP32 router logits for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPARTS=<2|4|8|16>` - K partitions for FP32 router logits decode routing (default: 8)
      * - `LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK=0` - Disable shared-memory ROCm MoE decode softmax/top-k runtime kernel for <=256 experts (default: on)
@@ -2852,7 +2897,6 @@ namespace llaminar2
         bool moe_grouped_decode = true;            ///< Enable grouped MoE decode down path when supported (LLAMINAR_ROCM_MOE_GROUPED_DECODE)
         bool moe_grouped_decode_router = true;     ///< Enable grouped MoE decode router logits path (LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_router_q8 = true;                 ///< Enable cached Q8 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_Q8)
-        bool moe_router_fp16 = false;              ///< Enable cached FP16 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_FP16, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_router_kpart_decode = false;      ///< Enable K-partitioned FP32 router logits for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         int moe_router_kparts = 8;                 ///< K partitions for FP32 router logits decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPARTS)
         bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=256 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
@@ -2934,7 +2978,6 @@ namespace llaminar2
             moe_grouped_decode = true;
             moe_grouped_decode_router = true;
             moe_router_q8 = true;
-            moe_router_fp16 = false;
             moe_router_kpart_decode = false;
             moe_router_kparts = 8;
             moe_router_wave_topk = true;
@@ -3296,12 +3339,6 @@ namespace llaminar2
                 moe_router_q8 = (std::atoi(moe_router_q8_env) != 0);
             }
 
-            const char *moe_router_fp16_env = std::getenv("LLAMINAR_ROCM_MOE_ROUTER_FP16");
-            if (moe_router_fp16_env)
-            {
-                moe_router_fp16 = (std::atoi(moe_router_fp16_env) != 0);
-            }
-
             const char *moe_router_kpart_decode_env = std::getenv("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE");
             if (moe_router_kpart_decode_env)
             {
@@ -3349,7 +3386,6 @@ namespace llaminar2
                 concurrent_prefill = false;
                 concurrent_decode = false;
                 gdn_concurrent_decode = false;
-                moe_router_fp16 = false;
                 moe_router_kpart_decode = false;
                 moe_router_wave_topk = false;
                 moe_grouped_decode_router = false;

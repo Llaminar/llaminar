@@ -675,6 +675,16 @@ or pipeline stages. `StageRunnerFactory` applies the same rule for every local
 stage owned by a `GlobalOrchestrator` and keeps each stage's collective context
 and prepared-weight store alive with its runner.
 
+`RankOrchestratorConfig` owns the pure PP child projection used by both
+single-device and nested-TP construction. An expert runtime belongs to one
+`MoEOverlayPipelineStageBinding`: its main-layer interval, retained terminal
+MTP capacity, ordered continuation participants, initial owner map, histogram
+and prepared-bank registry must agree. TP siblings share that binding; a PP
+parent cannot broadcast its model-wide authority into every child. All stage
+handoffs are validated before the first child materializes weights, and their
+runtime owners remain alive until the child graphs retire. These are ownership
+contracts, not another physical-memory admission or accounting surface.
+
 `MultiDomainOrchestrator`, `ModelExecutor`, and
 `HeterogeneousLayerExecutor` remain in the tree, but they are not the primary
 production entry path. `LayerExecutor` and `ILayerExecutor` are compatibility
@@ -932,6 +942,33 @@ topology or format still fails. The immutable replica-count grant travels with
 the resolved placement plan into graph setup and retained-runner reuse. Rolling
 transfer lanes remain unchanged, and admission never switches Dynamic or an
 enabled cache off. The grant is geometry, not a parallel physical-byte ledger.
+
+`resolvePipelineCapacity` admits ordered stage inputs through that same capacity
+implementation. Distinct fixed contributions on a shared CPU/GPU allocator add
+to one BOM; conflicting observations or alternate names for one allocator are
+errors. All fixed banks, exact quotas and migration sources precede optional
+placement. Compact layer quotas and copy counts stay local to each stage, while
+every result retains the same complete admission certificate. A bounded cache
+search first proves all stage minima together, then maximizes grants in authored
+stage order without changing retained grants. Shared backing contributes once;
+mutually exclusive setup storage uses the canonical typed envelope before
+admission. This setup API does not construct or publish stage runtime owners.
+
+`ResolvedRankOrchestration` preserves an authored local MoE pipeline as the
+parent execution plan and publishes immutable `ResolvedMoEPipelineStage` child
+projections. Each child retains its global main interval, terminal roles, actual
+participants and collective policy, with one hardware-bound expert authority.
+Parent placement selectors are absent from child configurations; local stage
+edges never become fabricated MPI neighbors. These values describe topology,
+not admitted runtime owners.
+
+`MoEOverlayMemoryPlanInputs` requires the authored boundary when pricing a
+pipeline child and checks it against the rank, retained family and controller
+capacity. Full parent tensor metadata stays intact. Main capture frontiers use
+the owned main-layer count; routed evidence and CPU setup probes use the exact
+owned routed interval, including retained terminal sidecars. The local fixed-BOM
+planner requires that graph-family identity explicitly and cannot inspect a
+neighbor's source matrices as part of the child's workspace estimate.
 
 `MTPGraphOwnerPlan` supplies the same general/bounded-helper owner partition to
 ordinary and ExpertOverlay admission. `ComputeGraph` declares the executable
@@ -1318,8 +1355,16 @@ incompatible state image.
 
 `PrefixHarvestSchedule` seals the common restored boundary's reusable and
 terminal publication frontiers before prefill. Rank and pipeline composites
-forward each child's own lookup identity with that same schedule. Participant
-storage prepares only the missing record geometry, counting shared KV/MTP keys
+forward each child's own lookup identity with that same schedule. Recurrent
+caches retain aligned frontiers starting at 4,096 tokens and doubling
+thereafter, plus the nearest aligned pre-tail frontier. This bounded geometric
+policy preserves earlier leading prefixes when any client rewrites history;
+it consumes only newly computed state and does not replay restored tokens.
+Attention-only caches need no extra recurrent checkpoints. Every frontier
+respects cache-block and routed-prefill alignment, and existing PMA tier budgets
+still own all archive bytes. Checkpoints are neither pinned indefinitely nor
+given a separate capacity reservation.
+Participant storage prepares only the missing record geometry, counting shared KV/MTP keys
 once and retaining exact full-hit terminal archives. This starts necessary LRU
 victim persistence early enough to overlap computation; it never reserves RAM
 or treats queued bytes as physically free. The RAM backend's PMA reservation
@@ -1340,7 +1385,7 @@ vector allocation claims. Cache-key equality does not establish allocation
 identity: stale aliases cannot retire or attach state to a newer incarnation.
 
 `DiskPrefixStorageBackend` owns one ordered `PrefixArchivePersistence` worker
-per shared archive. Native payload readiness, checksum, write and fsync execute
+per shared archive. Native payload readiness, write and fsync execute
 there; early request preparation polls immutable identity-bound receipts. At
 the intentional RAM/SSD storage boundary, required publication completes only
 the specific pending receipts needed for its actual PMA allocation, never the
@@ -1531,6 +1576,22 @@ penalty-history or shifted-predictor storage; all such mixtures fail before
 enqueue. The role participates in graph identity. This participant-local
 operation alone does not supply the pipeline command/activation transport or
 certify a complete speculative pipeline program.
+
+Only `CompactOutcome` embeds a host commit-row limit. `BoundedGeneration`
+derives its live limit from the device response ledger and rejects a second
+host limit; its materializer does not carry the streaming window's compact
+clipping policy into capture identity. A change in leading-row disposition
+therefore updates device data without rebuilding the publication graph.
+
+Captured stochastic outcomes consume request seeds from the same arena-owned
+`SAMPLING_REQUEST_SEEDS` bank as ordinary sampling. Request admission publishes
+that bank through the existing controller event; reset clears data and the next
+admission supplies fresh seed bytes. Both serial-equivalent verification and
+one-hot probability rejection retain the seed address in capture identity,
+never its contents. Zero seed data fails the device controller before any
+outcome can commit. Standalone kernel probes may select a scalar seed explicitly;
+binding both scalar and device seed authorities is invalid. Changing request
+entropy alone preserves the outcome graph and its complete generation parent.
 
 Verifier preparation has the matching explicit `VerifierInputOwner` and
 `PipelineFollower` roles (`Unbound` cannot execute). The owner assembles tokens,

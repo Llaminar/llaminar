@@ -16,6 +16,10 @@
 #include <vector>
 
 #include "config/OrchestrationConfigParser.h"
+#include "config/OrchestrationConfigDocument.h"
+#include "config/OrchestrationStartupPolicy.h"
+#include "planning/PlanningModelMetadata.h"
+#include "../../utils/PlanningGGUFFixture.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/mtp/MTPGraphOwnerPlan.h"
@@ -110,7 +114,8 @@ TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
     EXPECT_EQ(config.prefix_cache.terminal_state, PrefixCacheTerminalStateMode::Auto);
     EXPECT_EQ(config.prefix_cache.moe_policy, PrefixCacheMoEPolicy::PlacementFingerprint);
 
-    EXPECT_FALSE(config.mtp.enabled);
+    EXPECT_EQ(config.mtp_activation_policy, MTPActivationPolicy::Automatic);
+    EXPECT_FALSE(config.mtp.enabled) << "Activation is sealed against the GGUF before admission";
     EXPECT_EQ(config.mtp.draft_tokens, 1);
     EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, 0);
     EXPECT_EQ(config.mtp.max_request_batch, 1);
@@ -121,7 +126,7 @@ TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
         << "Public authoring leaves terminal weights to topology compilation; "
            "CPU and GPU continuation domains have different defaults.";
     EXPECT_TRUE(config.mtp.require_terminal_hidden_for_full_hit);
-    EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Fixed);
+    EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
     EXPECT_EQ(config.mtp.depth_policy.max_depth, 0);
     EXPECT_EQ(config.mtp.depth_policy.initial_depth, 0);
@@ -133,6 +138,77 @@ TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
     EXPECT_FALSE(config.mtp.depth_policy.demote_zero_accept_rate.has_value());
     EXPECT_DOUBLE_EQ(resolveMTPZeroAcceptDemotionRate(config.mtp), 0.30);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
+}
+
+/** @test GGUF heads select dynamic MTP automatically; explicit off survives saved input. */
+TEST(Test__PrefixMTPConfig, GGUFHeadsOwnAutomaticActivationAndExplicitDisablement)
+{
+    for (const bool moe : {false, true})
+        for (const bool has_heads : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << "moe=" << moe << " heads=" << has_heads);
+            test::PlanningGGUFFixture file(moe, has_heads);
+            const auto metadata = readPlanningModelMetadata(file.path());
+            OrchestrationConfig automatic;
+            automatic = deserializeOrchestrationConfig(serializeOrchestrationConfig(automatic));
+            EXPECT_EQ(automatic.mtp_activation_policy, MTPActivationPolicy::Automatic);
+            resolveMTPStartupPolicy(automatic, metadata.memoryProfile());
+            EXPECT_EQ(automatic.mtp.enabled, has_heads);
+            EXPECT_EQ(automatic.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+            EXPECT_EQ(automatic.mtp_activation_policy, has_heads
+                ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled);
+
+            ArgvHelper args({"llaminar2", "--no-mtp"});
+            auto disabled = createOrchestrationConfigParser()->parseArgs(args.argc(), args.argv());
+            auto roundtrip = deserializeOrchestrationConfig(serializeOrchestrationConfig(disabled));
+            resolveMTPStartupPolicy(roundtrip, metadata.memoryProfile());
+            EXPECT_FALSE(roundtrip.mtp.enabled);
+            EXPECT_FALSE(retainsMTPGraphCapacity(roundtrip.mtp));
+            EXPECT_EQ(roundtrip.mtp_activation_policy, MTPActivationPolicy::Disabled);
+
+            OrchestrationConfigParser parser;
+            for (const auto intent : {std::string("auto"), std::string("true"), std::string("false")})
+            {
+                auto authored = parser.parseYamlString("mtp:\n  enabled: " + intent + "\n");
+                EXPECT_NE(authored.toString().find("enabled: " + intent), std::string::npos);
+                if (intent == "true" && !has_heads)
+                    EXPECT_THROW(resolveMTPStartupPolicy(authored, metadata.memoryProfile()), std::invalid_argument);
+                else
+                {
+                    resolveMTPStartupPolicy(authored, metadata.memoryProfile());
+                    EXPECT_EQ(authored.mtp.enabled, intent != "false" && has_heads);
+                }
+            }
+
+            ArgvHelper on({"llaminar2", "--mtp"});
+            auto required = createOrchestrationConfigParser()->parseArgs(on.argc(), on.argv());
+            if (has_heads)
+                EXPECT_NO_THROW(resolveMTPStartupPolicy(required, metadata.memoryProfile()));
+            else
+                EXPECT_THROW(resolveMTPStartupPolicy(required, metadata.memoryProfile()), std::invalid_argument);
+        }
+}
+
+/** @test Incomplete heads fail automatic/required admission; an explicit serial graph needs none. */
+TEST(Test__PrefixMTPConfig, IncompleteGGUFHeadsFailWithoutDowngradingMTP)
+{
+    test::PlanningGGUFFixture file(false, true);
+    auto profile = readPlanningModelMetadata(file.path()).memoryProfile();
+    std::erase_if(profile.tensors, [](const auto &tensor) {
+        return tensor.name == "blk.2.nextn.eh_proj.weight";
+    });
+    for (auto activation : {MTPActivationPolicy::Automatic, MTPActivationPolicy::Enabled})
+    {
+        OrchestrationConfig config;
+        config.mtp_activation_policy = activation;
+        EXPECT_THROW(resolveMTPStartupPolicy(config, profile), std::invalid_argument);
+    }
+    OrchestrationConfig disabled;
+    disabled.mtp_activation_policy = MTPActivationPolicy::Disabled;
+    EXPECT_NO_THROW(resolveMTPStartupPolicy(disabled, profile));
+    EXPECT_FALSE(disabled.mtp.enabled);
+    disabled.mtp.graph_capacity_draft_tokens = 15;
+    EXPECT_THROW(resolveMTPStartupPolicy(disabled, profile), std::invalid_argument);
 }
 
 /** @test Public default admits non-greedy sampling without a verification flag. */

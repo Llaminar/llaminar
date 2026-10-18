@@ -1,11 +1,16 @@
 /**
  * @file Test__MoEOverlayParticipantResidency.cpp
  * @brief Device-free RCU tests for participant-local prepared expert banks.
+ *
+ * Publication and retirement retain exact model-global stage identities while
+ * storing only owned rows. GPU identities in these tests are inert metadata;
+ * native device publication remains the explicit backend integration gate.
  */
 
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
 #include "execution/moe/MoEOverlayFixedDownProjectionBank.h"
+#include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/DecodeExpertHistogram.h"
 
@@ -100,7 +105,8 @@ namespace
         return residency.installReadyBank(std::move(*prepared), error);
     }
 
-    MoEExpertOwnerMap twoParticipantOwnerMap(int num_layers = 1)
+    /** @brief Build canonical ownership for an exact compact global interval. */
+    MoEExpertOwnerMap twoParticipantOwnerMap(int num_layers = 1, int first_model_layer = 0)
     {
         RoutedExpertDomain first_domain;
         first_domain.name = "first";
@@ -138,11 +144,12 @@ namespace
         plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan.domains = {std::move(first_domain), std::move(second_domain)};
         plan.routed_tiers = {std::move(first_tier), std::move(second_tier)};
+        plan.first_model_layer = first_model_layer;
         plan.placements.reserve(static_cast<std::size_t>(num_layers));
         for (int layer = 0; layer < num_layers; ++layer)
         {
             plan.placements.push_back({
-                .layer = layer,
+                .layer = first_model_layer + layer,
                 .routed_expert_tier = {0, 1},
             });
         }
@@ -655,6 +662,65 @@ namespace
         }
         return fixture;
     }
+    /**
+     * @brief Author a complete stage-scoped physical wave without invoking the planner.
+     *
+     * This fixture isolates participant publication from controller planning:
+     * both snapshots carry checked global ownership and exact cycle capacity.
+     */
+    ParticipantMigrationFixture stageMigrationFixture(int first)
+    {
+        ParticipantMigrationFixture fixture;
+        auto make_snapshot = [first](std::uint64_t epoch, bool swapped)
+        {
+            auto plan = dynamicTwoParticipantPlan();
+            plan.first_model_layer = first;
+            plan.placements.front().layer = first;
+            if (swapped) plan.placements.front().routed_expert_tier = {1, 0};
+            auto snapshot = std::make_shared<MoEOverlayResidencySnapshot>();
+            snapshot->epoch = epoch;
+            snapshot->placement_plan = std::make_shared<const MoERoutedExpertPlacementPlan>(plan);
+            snapshot->owner_map = MoEExpertOwnerMap::build(plan);
+            snapshot->layered_ownership = snapshot->owner_map.layeredOwnership(1, 2, first);
+            return snapshot;
+        };
+        fixture.transaction.expected_epoch = 1;
+        fixture.transaction.previous = make_snapshot(1, false);
+        fixture.transaction.candidate = make_snapshot(2, true);
+        for (const int expert : {0, 1})
+        {
+            const auto &source = *fixture.transaction.previous->owner_map.ownerFor(first, expert);
+            const auto &destination = *fixture.transaction.candidate->owner_map.ownerFor(first, expert);
+            fixture.transaction.migrations.push_back({
+                .layer_idx = first, .expert_id = expert, .estimated_weight_bytes = 64,
+                .direction = expert == 0 ? MoEOverlayTierMigrationDirection::Demotion
+                                         : MoEOverlayTierMigrationDirection::Promotion,
+                .source = source, .destination = destination,
+            });
+            fixture.transaction.shadow_requirements.push_back({
+                .layer_idx = first, .tier_idx = destination.tier_idx,
+                .destination_participant = destination.owner_participant, .slot_count = 1,
+            });
+        }
+        fixture.transaction.migration_cycles = {{.layer_idx = first, .migration_indices = {0, 1}}};
+        if (!fixture.transaction.valid())
+            throw std::logic_error("stage migration fixture has an invalid capacity cycle");
+        fixture.registry = std::make_shared<MoEOverlayParticipantResidencyRegistry>(
+            MoEOverlayParticipantResidencyRegistry::Config{
+                .owner_map = fixture.transaction.previous->owner_map, .local_participant_ids = {0, 1},
+                .num_layers = 1, .num_experts = 2, .initial_epoch = 1, .first_model_layer = first,
+            });
+        std::string error;
+        for (const int participant : {0, 1})
+        {
+            std::vector<MoEOverlayPreparedExpertPayload> engines(2);
+            engines[participant] = payload(8600 + participant * 10);
+            const auto mask = fixture.transaction.previous->owner_map.expertMaskForParticipant(first, participant, 2);
+            if (!fixture.registry->registerInitialLayer(participant, first, mask, engines, &error))
+                throw std::logic_error(error);
+        }
+        return fixture;
+    }
 } // namespace
 
 /** @brief Payloads cannot represent partial families or leave false-ready moved-from values. */
@@ -971,15 +1037,15 @@ TEST(MoEOverlayPreparedPayload, RuntimeResetAndPrefixRestoreRetainFixedDownBindi
         auto raw_snapshot = std::make_unique<DeviceMoELayerRuntime>(state);
         const auto accepted_epoch = state.active_epoch;
         raw_snapshot->banks[raw_snapshot->active_bank].experts[1].projection_set = DeviceMoEProjectionSet::CompleteExpert;
-        EXPECT_THROW(table.restoreRuntimeStateSnapshot(raw_snapshot.get(), 1), std::invalid_argument);
+        EXPECT_THROW(table.restoreRuntimeStateSnapshot(raw_snapshot.get(), 1, 0), std::invalid_argument);
         EXPECT_EQ(table.hostLayerState(0).active_epoch, accepted_epoch);
         *raw_snapshot = state;
         raw_snapshot->participant_count = 4;
-        EXPECT_THROW(table.restoreRuntimeStateSnapshot(raw_snapshot.get(), 1), std::invalid_argument);
+        EXPECT_THROW(table.restoreRuntimeStateSnapshot(raw_snapshot.get(), 1, 0), std::invalid_argument);
         EXPECT_EQ(table.fixedDownProjectionBank(0), fixed.get());
         *raw_snapshot = state;
         raw_snapshot->banks[raw_snapshot->active_bank].epoch = 0;
-        EXPECT_THROW(table.restoreRuntimeStateSnapshot(raw_snapshot.get(), 1), std::invalid_argument);
+        EXPECT_THROW(table.restoreRuntimeStateSnapshot(raw_snapshot.get(), 1, 0), std::invalid_argument);
 
         table.resetDecodeRuntimeState();
         // A stale full-FFN resolver is not a permissible rehydration of a pair.
@@ -2375,4 +2441,435 @@ TEST(Test__MoEOverlayParticipantResidency,
     --regressed[1].sample_count[2];
     EXPECT_FALSE(endpoint.importServiceMeasurements(regressed, &error));
     EXPECT_NE(error.find("conflicts"), std::string::npos);
+}
+
+/** @brief Retained epochs keep exact global identity and bounded compact storage. */
+TEST(Test__MoEOverlayParticipantResidency, PipelineStageBanksRetainIdentityAcrossRetirement)
+{
+    for (const int first : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const auto projections : {DeviceMoEProjectionSet::CompleteExpert, DeviceMoEProjectionSet::GateUp})
+    {
+        if (device.is_cpu() && projections == DeviceMoEProjectionSet::GateUp) continue;
+        SCOPED_TRACE(static_cast<int>(projections));
+        SCOPED_TRACE(first);
+        SCOPED_TRACE(device.to_string());
+        MoEOverlayParticipantResidency endpoint({
+            .participant_id = 4, .device = device, .num_layers = 2, .num_experts = 2,
+            .retained_epoch_capacity = 2, .movable_projections = projections, .first_model_layer = first,
+        });
+        const auto make_payload = [projections](int base)
+        {
+            auto value = payload(base);
+            return projections == DeviceMoEProjectionSet::CompleteExpert
+                ? value : MoEOverlayPreparedExpertPayload::gateUp(value.gate(), value.up());
+        };
+        auto initial = initialBank(payload(8000));
+        initial.layers[0].movable_projections = projections;
+        initial.layers[0].setResidentExpert(0, make_payload(8000));
+        initial.device = device;
+        initial.first_model_layer = first;
+        initial.layers.push_back(initial.layers.front());
+        ASSERT_TRUE(initial.valid(4, device, 2, 2, first));
+        EXPECT_EQ(endpoint.firstModelLayer(), first);
+        EXPECT_EQ(endpoint.endModelLayer(), first + 2);
+        EXPECT_EQ(initial.storageIndexForModelLayer(first + 1), 1u);
+        EXPECT_THROW((void)initial.layerForModelLayer(first - 1), std::out_of_range);
+        EXPECT_THROW((void)initial.layerForModelLayer(first + 2), std::out_of_range);
+        std::string error;
+        ASSERT_EQ(prepareAndInstall(endpoint, initial, &error),
+                  MoEOverlayParticipantBankInstallStatus::Installed) << error;
+        const auto old = endpoint.acquire(1);
+        ASSERT_TRUE(old);
+        auto candidate = endpoint.cloneCandidate(1, 2);
+        candidate.layerForModelLayer(first + 1).clearExpert(0);
+        candidate.layerForModelLayer(first + 1).setResidentExpert(1, make_payload(8100));
+        ASSERT_EQ(prepareAndInstall(endpoint, candidate, &error),
+                  MoEOverlayParticipantBankInstallStatus::Installed) << error;
+        const auto current = endpoint.acquire(2);
+        ASSERT_TRUE(current);
+        EXPECT_EQ(current->layers.size(), 2u);
+        EXPECT_EQ(current->first_model_layer, first);
+        EXPECT_TRUE(old->layerForModelLayer(first + 1).resident_mask[0]);
+        EXPECT_FALSE(current->layerForModelLayer(first + 1).resident_mask[0]);
+        auto next = endpoint.cloneCandidate(2, 3);
+        EXPECT_EQ(prepareAndInstall(endpoint, next, &error),
+                  MoEOverlayParticipantBankInstallStatus::CapacityUnavailable);
+        ASSERT_TRUE(endpoint.retire(1));
+        EXPECT_FALSE(endpoint.acquire(1));
+        ASSERT_EQ(prepareAndInstall(endpoint, next, &error),
+                  MoEOverlayParticipantBankInstallStatus::Installed) << error;
+        EXPECT_EQ(endpoint.retainedEpochCount(), 2u);
+        // Removing the published slot cannot invalidate an outstanding reader.
+        EXPECT_TRUE(old->layerForModelLayer(first + 1).resident_mask[0]);
+        EXPECT_TRUE(endpoint.acquire(3)->sameIdentity(next));
+    }
+}
+
+/** @brief Neither equal dimensions nor matching epochs can authenticate another stage. */
+TEST(Test__MoEOverlayParticipantResidency, PipelineStageRejectsForeignAndOverflowingBanks)
+{
+    MoEOverlayParticipantResidency::Config config{
+        .participant_id = 4, .device = DeviceId::cpu(), .num_layers = 1,
+        .num_experts = 2, .first_model_layer = 32,
+    };
+    MoEOverlayParticipantResidency endpoint(config);
+    auto bank = initialBank(payload(8200));
+    bank.first_model_layer = 32;
+    std::string error;
+    ASSERT_EQ(prepareAndInstall(endpoint, bank, &error),
+              MoEOverlayParticipantBankInstallStatus::Installed);
+    for (const int foreign : {-1, 0, 31, 33, std::numeric_limits<int>::max()})
+    {
+        auto other = bank;
+        other.first_model_layer = foreign;
+        EXPECT_FALSE(other.sameIdentity(bank));
+        EXPECT_FALSE(other.valid(4, DeviceId::cpu(), 1, 2, 32));
+        EXPECT_EQ(prepareAndInstall(endpoint, other, &error),
+                  MoEOverlayParticipantBankInstallStatus::Invalid);
+        EXPECT_EQ(endpoint.retainedEpochCount(), 1u);
+    }
+    config.first_model_layer = -1;
+    EXPECT_THROW((MoEOverlayParticipantResidency{config}), std::invalid_argument);
+    config.first_model_layer = std::numeric_limits<int>::max();
+    EXPECT_THROW((MoEOverlayParticipantResidency{config}), std::invalid_argument);
+    config.first_model_layer = std::numeric_limits<int>::max() - 1;
+    config.num_layers = 2;
+    EXPECT_THROW((MoEOverlayParticipantResidency{config}), std::invalid_argument);
+}
+
+/** @brief Registration, deficit reports and retained selections use model-global IDs. */
+TEST(Test__MoEOverlayParticipantResidencyRegistry, PipelineStageRegistrationUsesOnlyOwnedRows)
+{
+    for (const int first : {0, 32, 40, std::numeric_limits<int>::max() - 2})
+    {
+        SCOPED_TRACE(first);
+        const auto owners = twoParticipantOwnerMap(2, first);
+        MoEOverlayParticipantResidencyRegistry registry({
+            .owner_map = owners, .local_participant_ids = {1, 0}, .num_layers = 2,
+            .num_experts = 2, .initial_epoch = 1, .first_model_layer = first,
+        });
+        const auto missing = registry.incompleteInitialBanks();
+        ASSERT_EQ(missing.size(), 2u);
+        for (const auto &row : missing)
+            EXPECT_EQ(row.missing_layers, (std::vector<int>{first, first + 1}));
+        std::string error;
+        for (const int participant : {0, 1})
+        {
+            std::vector<MoEOverlayPreparedExpertPayload> engines(2);
+            engines[participant] = payload(8300 + participant * 10);
+            const auto mask = owners.expertMaskForParticipant(first, participant, 2);
+            EXPECT_FALSE(registry.registerInitialLayer(participant, first - 1, mask, engines, &error));
+            EXPECT_FALSE(registry.registerInitialLayer(participant, first + 2, mask, engines, &error));
+            // Reverse layer order exercises partial publication and compact offsets.
+            ASSERT_TRUE(registry.registerInitialLayer(participant, first + 1, mask, engines, &error)) << error;
+            EXPECT_FALSE(registry.endpoint(participant)->acquire(1));
+            ASSERT_TRUE(registry.registerInitialLayer(participant, first, mask, engines, &error)) << error;
+        }
+        ASSERT_TRUE(registry.allInitialBanksReady());
+        EXPECT_TRUE(registry.incompleteInitialBanks().empty());
+        const auto selections = registry.initialBankExpertSelections();
+        ASSERT_EQ(selections.size(), 4u);
+        for (std::size_t row = 0; row < selections.size(); ++row)
+        {
+            EXPECT_EQ(selections[row].layer_idx, first + static_cast<int>(row % 2));
+            EXPECT_EQ(selections[row].expert_ids, (std::vector<int>{static_cast<int>(row / 2)}));
+            EXPECT_TRUE(selections[row].matches_frozen_owner_map);
+        }
+        for (const int participant : {0, 1})
+        {
+            const auto bank = registry.endpoint(participant)->acquire(1);
+            ASSERT_TRUE(bank);
+            EXPECT_EQ(bank->layers.size(), 2u);
+            EXPECT_TRUE(bank->valid(participant, DeviceId::cpu(), 2, 2, first));
+        }
+    }
+}
+
+/** Immutable native source seals compare exact handles across four/eight participant stage scopes. */
+TEST(Test__MoEOverlayParticipantResidencyRegistry, ImmutablePreparedSourceSealAuthenticatesEveryStageHandle)
+{
+    for (const int total : {4, 8})
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    for (const int stage : {0, 1})
+    {
+        SCOPED_TRACE(total);
+        SCOPED_TRACE(static_cast<int>(backend));
+        SCOPED_TRACE(stage);
+        const int width = total / 2;
+        const int first = stage == 0 ? 0 : 32;
+        const int layers = stage == 0 ? 2 : 3; // Includes one terminal routed sidecar row.
+        RoutedExpertDomain domain;
+        domain.name = "source";
+        domain.scope = ExecutionDomainScope::RANK_LOCAL;
+        domain.backend = backend == DeviceType::CPU ? CollectiveBackendType::HOST :
+            backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        domain.owner_rank = 0;
+        for (int index = 0; index < width; ++index)
+        {
+            domain.participants.push_back(backend == DeviceType::CPU ? GlobalDeviceAddress::cpu(index) :
+                backend == DeviceType::CUDA ? GlobalDeviceAddress::cuda(index) : GlobalDeviceAddress::rocm(index));
+        }
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan.continuation_domain = plan.shared_expert_domain = "source";
+        plan.domains = {domain};
+        plan.routed_tiers = {{.name = "all", .domain = "source", .priority = 0, .fallback = true}};
+        plan.first_model_layer = first;
+        for (int row = 0; row < layers; ++row)
+            plan.placements.push_back({.layer = first + row, .routed_expert_tier = std::vector<int>(width, 0)});
+        const auto owners = MoEExpertOwnerMap::build(plan);
+        std::vector<int> ids;
+        for (int index = 0; index < width; ++index) ids.push_back(index);
+        MoEOverlayParticipantResidencyRegistry registry({.owner_map = owners, .local_participant_ids = ids,
+            .num_layers = layers, .num_experts = width, .initial_epoch = 1, .first_model_layer = first});
+        ExpertGemmRegistry prepared, changed;
+        const auto populate = [&](ExpertGemmRegistry &target, int base)
+        {
+            for (const int id : ids)
+            {
+                const auto *participant = owners.participantForId(id);
+                ASSERT_NE(participant, nullptr);
+                for (int layer = first; layer < first + layers; ++layer)
+                {
+                    const auto mask = owners.expertMaskForParticipant(layer, id, width);
+                    for (int expert = 0; expert < width; ++expert)
+                    {
+                        if (!mask[expert]) continue;
+                        for (const auto role : {ExpertGemmRegistry::WeightRole::GATE,
+                             ExpertGemmRegistry::WeightRole::UP, ExpertGemmRegistry::WeightRole::DOWN})
+                        {
+                            auto engine = std::make_shared<IdentityGemm>(base++);
+                            target.registerEngineForParticipant(participant->domain_name, participant->device,
+                                participant->world_rank_known ? participant->world_rank : -1,
+                                participant->domain_participant_index, layer, expert, role, engine.get(), engine);
+                        }
+                    }
+                }
+            }
+        };
+        populate(prepared, 12000);
+        EXPECT_THROW((void)registry.verifyImmutablePreparedSources(prepared), std::logic_error);
+        std::string error;
+        ASSERT_TRUE(registry.finalizeInitialBanksFromPreparedRegistry(prepared, &error)) << error;
+        EXPECT_EQ(registry.verifyImmutablePreparedSources(prepared), static_cast<std::size_t>(width * layers));
+        populate(changed, 12000); // Same declared shapes/numbers do not mean the same retained engines.
+        EXPECT_THROW((void)registry.verifyImmutablePreparedSources(changed), std::logic_error);
+        changed.clear();
+        EXPECT_THROW((void)registry.verifyImmutablePreparedSources(changed), std::logic_error);
+        EXPECT_EQ(registry.verifyImmutablePreparedSources(prepared), static_cast<std::size_t>(width * layers));
+        ASSERT_TRUE(registry.endpoint(ids.back())->retire(1));
+        EXPECT_THROW((void)registry.verifyImmutablePreparedSources(prepared), std::logic_error);
+    }
+}
+
+/** @brief Even a relay rank authenticates exact owner geometry before publishing readiness. */
+TEST(Test__MoEOverlayParticipantResidencyRegistry, PipelineStageRejectsForeignOwnerGeometry)
+{
+    for (const auto local : {std::vector<int>{0, 1}, std::vector<int>{}})
+    {
+        MoEOverlayParticipantResidencyRegistry::Config config{
+            .owner_map = twoParticipantOwnerMap(2, 32), .local_participant_ids = local,
+            .num_layers = 2, .num_experts = 2, .initial_epoch = 1, .first_model_layer = 32,
+        };
+        EXPECT_NO_THROW((MoEOverlayParticipantResidencyRegistry{config}));
+        config.first_model_layer = 40;
+        EXPECT_THROW((MoEOverlayParticipantResidencyRegistry{config}), std::logic_error);
+        config.first_model_layer = 32;
+        config.num_layers = 1;
+        EXPECT_THROW((MoEOverlayParticipantResidencyRegistry{config}), std::logic_error);
+        config.first_model_layer = std::numeric_limits<int>::max();
+        EXPECT_THROW((MoEOverlayParticipantResidencyRegistry{config}), std::invalid_argument);
+    }
+}
+
+/** @brief Compact service cells export global rows and reject foreign imports atomically. */
+TEST(Test__MoEOverlayParticipantResidency, PipelineStageServiceMeasurementsPreserveGlobalRows)
+{
+    for (const int first : {0, 32, 40})
+    {
+        MoEOverlayParticipantResidency cpu({
+            .participant_id = 3, .device = DeviceId::cpu(), .num_layers = 2,
+            .num_experts = 2, .collect_economy_service_measurements = true,
+            .first_model_layer = first,
+        });
+        for (const auto phase : {ExpertHistogramSource::DecodeToken,
+                                 ExpertHistogramSource::PrefillChunk,
+                                 ExpertHistogramSource::GroupedVerifier})
+        {
+            EXPECT_EQ(cpu.recordServiceMeasurement(first, phase, 100, 2),
+                      MoEOverlayServiceMeasurementRecordStatus::Recorded);
+            EXPECT_EQ(cpu.recordServiceMeasurement(first + 1, phase, 200, 3),
+                      MoEOverlayServiceMeasurementRecordStatus::Recorded);
+            EXPECT_EQ(cpu.recordServiceMeasurement(first - 1, phase, 100, 2),
+                      MoEOverlayServiceMeasurementRecordStatus::Invalid);
+            EXPECT_EQ(cpu.recordServiceMeasurement(first + 2, phase, 100, 2),
+                      MoEOverlayServiceMeasurementRecordStatus::Invalid);
+        }
+        std::vector<MoEOverlayParticipantLayerServiceTotals> rows;
+        ASSERT_TRUE(cpu.trySnapshotServiceMeasurements(&rows));
+        ASSERT_EQ(rows.size(), 2u);
+        EXPECT_EQ(rows[0].layer, first);
+        EXPECT_EQ(rows[1].layer, first + 1);
+        EXPECT_EQ(rows[0].total_nanoseconds[0], 100u);
+        EXPECT_EQ(rows[1].total_nanoseconds[0], 200u);
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            MoEOverlayParticipantResidency gpu({
+                .participant_id = 3, .device = device, .num_layers = 2,
+                .num_experts = 2, .collect_economy_service_measurements = true,
+                .first_model_layer = first,
+            });
+            std::string error;
+            ASSERT_TRUE(gpu.importServiceMeasurements(rows, &error)) << error;
+            auto invalid = rows;
+            invalid[0].total_nanoseconds[0] += 100;
+            invalid[1].layer += 2;
+            EXPECT_FALSE(gpu.importServiceMeasurements(invalid, &error));
+            std::vector<MoEOverlayParticipantLayerServiceTotals> observed;
+            ASSERT_TRUE(gpu.trySnapshotServiceMeasurements(&observed));
+            ASSERT_EQ(observed.size(), 2u);
+            EXPECT_EQ(observed[0].total_nanoseconds, rows[0].total_nanoseconds);
+            EXPECT_EQ(observed[1].layer, first + 1);
+        }
+    }
+}
+
+/** @brief Reusable-context seals authenticate stage identities before accepting bank payloads. */
+TEST(Test__MoEOverlayParticipantResidency, PipelineStageReusableSealRejectsForeignBanks)
+{
+    for (const int first : {0, 32, 40})
+    {
+        MoEOverlayReusableContextSeal seal;
+        seal.source_epoch = 1;
+        seal.canonical_owner_map = twoParticipantOwnerMap(2, first);
+        for (const int participant : {0, 1})
+        {
+            auto bank = initialBank(payload(8400));
+            bank.participant_id = participant;
+            bank.first_model_layer = first;
+            if (participant == 1)
+            {
+                bank.layers[0].clearExpert(0);
+                bank.layers[0].setResidentExpert(1, payload(8500));
+            }
+            bank.layers.push_back(bank.layers.front());
+            seal.local_banks.push_back(std::move(bank));
+        }
+        ASSERT_TRUE(seal.valid());
+        auto wrong = seal;
+        wrong.canonical_owner_map = twoParticipantOwnerMap(2, first + 2);
+        EXPECT_FALSE(wrong.valid());
+        wrong = seal;
+        wrong.local_banks[1].first_model_layer += 2;
+        EXPECT_FALSE(wrong.valid());
+        wrong = seal;
+        wrong.local_banks[1].layers.pop_back();
+        EXPECT_FALSE(wrong.valid());
+    }
+}
+
+/** @brief A complete physical wave publishes and retires compact nonzero-origin banks. */
+TEST(Test__MoEOverlayParticipantMigration, PipelineStageWavePublishesExactGlobalOwners)
+{
+    for (const int first : {0, 32, 40})
+    {
+        auto fixture = stageMigrationFixture(first);
+        const auto old = fixture.registry->endpoint(0)->acquire(1);
+        auto provider = std::make_shared<IdentityTransferProvider>();
+        MoEOverlayParticipantPreparedWaveFactory factory({
+            .registry = fixture.registry, .transfer_provider = provider,
+        });
+        auto wave = factory.prepare(fixture.transaction);
+        ASSERT_EQ(wave.status, MoEOverlayResidencyStageStartStatus::Started) << wave.error;
+        ASSERT_TRUE(wave.valid(6));
+        EXPECT_EQ(provider->prepare_calls, 1);
+        std::string error;
+        for (const auto &transfer : wave.transfers)
+            ASSERT_EQ(transfer->poll(&error), MoEOverlayResidencyWaveProgress::Ready) << error;
+        ASSERT_TRUE(wave.inactive_bank->beginPrepare(&error)) << error;
+        ASSERT_EQ(wave.inactive_bank->pollPrepare(&error), MoEOverlayResidencyWaveProgress::Ready) << error;
+        for (const int participant : {0, 1})
+        {
+            const auto bank = fixture.registry->endpoint(participant)->acquire(2);
+            ASSERT_TRUE(bank);
+            EXPECT_EQ(bank->layers.size(), 1u);
+            EXPECT_EQ(bank->first_model_layer, first);
+            EXPECT_EQ(bank->layerForModelLayer(first).resident_mask,
+                      fixture.transaction.candidate->owner_map.expertMaskForParticipant(first, participant, 2));
+        }
+        ASSERT_TRUE(wave.inactive_bank->beginPublication(&error)) << error;
+        ASSERT_EQ(wave.inactive_bank->pollPublication(&error), MoEOverlayResidencyWaveProgress::Ready) << error;
+        ASSERT_EQ(wave.inactive_bank->pollRetirementFence(&error), MoEOverlayResidencyWaveProgress::Ready) << error;
+        wave.inactive_bank->retirePrevious();
+        EXPECT_FALSE(fixture.registry->endpoint(0)->acquire(1));
+        EXPECT_TRUE(fixture.registry->endpoint(0)->acquire(2));
+        EXPECT_TRUE(old->layerForModelLayer(first).resident_mask[0]);
+    }
+}
+
+/** @brief A foreign stage fails before any transfer is submitted or epoch slot is installed. */
+TEST(Test__MoEOverlayParticipantMigration, PipelineStageForeignSnapshotFailsBeforeTransfer)
+{
+    auto local = stageMigrationFixture(32);
+    auto foreign = stageMigrationFixture(40);
+    auto provider = std::make_shared<IdentityTransferProvider>();
+    MoEOverlayParticipantPreparedWaveFactory factory({
+        .registry = local.registry, .transfer_provider = provider,
+    });
+    auto wave = factory.prepare(foreign.transaction);
+    EXPECT_EQ(wave.status, MoEOverlayResidencyStageStartStatus::Failed);
+    EXPECT_FALSE(wave.error.empty());
+    EXPECT_TRUE(wave.transfers.empty());
+    EXPECT_EQ(provider->prepare_calls, 0);
+    for (const int participant : {0, 1})
+    {
+        EXPECT_EQ(local.registry->endpoint(participant)->retainedEpochCount(), 1u);
+        EXPECT_FALSE(local.registry->endpoint(participant)->acquire(2));
+    }
+}
+
+
+/** Fixed down-column bindings retain global identity in compact stage tables. */
+TEST(Test__MoEOverlayParticipantResidency, PipelineStageRuntimeRetainsFixedDownBindings)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const int first : {32, 40})
+        {
+            SCOPED_TRACE(device.toString() + ":" + std::to_string(first));
+            ExpertGemmRegistry registry;
+            const MoEExpertOwnerParticipant participant{
+                .participant_id = 7, .domain_name = "compute", .domain_participant_index = 1,
+                .device = device, .world_rank = 2, .world_rank_known = true};
+            const auto ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
+                {2, 256, 512}, 1, 2);
+            std::vector<std::shared_ptr<const MoEOverlayFixedDownProjectionBank>> banks;
+            for (int layer = first; layer < first + 2; ++layer)
+            {
+                for (int expert = 0; expert < 2; ++expert)
+                {
+                    auto engine = std::make_shared<IdentityGemm>(expert + 10 * layer);
+                    registry.registerEngineForParticipant("compute", device, 2, 1, layer, expert,
+                        ExpertGemmRegistry::WeightRole::DOWN, engine.get(), engine, ownership);
+                }
+                banks.push_back(MoEOverlayFixedDownProjectionBank::resolve(
+                    registry, participant, layer, ownership));
+            }
+            MoERuntimeTable::Config config{
+                .device_id = device, .num_layers = 2, .num_experts = 2, .top_k = 1,
+                .mirror_to_device = false, .fixed_down_banks = banks,
+                .first_model_layer = first};
+            MoERuntimeTable table(config);
+            EXPECT_EQ(table.fixedDownProjectionBank(first), banks[0].get());
+            EXPECT_EQ(table.retainFixedDownProjectionBank(first + 1).get(), banks[1].get());
+            table.resetDecodeRuntimeState();
+            EXPECT_EQ(table.fixedDownProjectionBank(first + 1), banks[1].get());
+            EXPECT_THROW(table.retainFixedDownProjectionBank(first - 1), std::out_of_range);
+            config.first_model_layer = first - 1;
+            EXPECT_THROW((MoERuntimeTable(config)), std::invalid_argument);
+            config.first_model_layer = first;
+            std::swap(config.fixed_down_banks[0], config.fixed_down_banks[1]);
+            EXPECT_THROW((MoERuntimeTable(config)), std::invalid_argument);
+        }
 }

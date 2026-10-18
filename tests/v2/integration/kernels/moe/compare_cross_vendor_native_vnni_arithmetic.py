@@ -4,7 +4,8 @@
 The C++ emitters own the canonical format inventory, production preparation,
 and arithmetic checkpoints. This driver keeps CUDA and HIP in separate
 processes, validates their emitted manifests, and joins every FP32 word and
-prepared byte without a tolerance. Per-format CSV reports survive failures so
+prepared byte without a tolerance. Q6_K coefficient sidecars use raw uint16
+metadata; a half-scale declaration is rejected. Per-format CSV reports survive failures so
 the first divergent boundary can be diagnosed without rerunning the campaign.
 """
 
@@ -364,7 +365,7 @@ def _read_artifact_manifest(
     ]
     if fields != expected_fields:
         raise ValueError(f"{path}: expected fields {expected_fields}, got {fields}")
-    element_sizes = {"bytes": 1, "i8": 1, "fp16_bits": 2, "u32": 4, "fp32": 4}
+    element_sizes = {"bytes": 1, "i8": 1, "u16": 2, "fp16_bits": 2, "u32": 4, "fp32": 4}
     result: dict[str, ArtifactSpec] = {}
     for row in rows:
         name = row["artifact"]
@@ -379,6 +380,13 @@ def _read_artifact_manifest(
         )
         if spec.byte_count <= 0 or spec.element_type not in element_sizes:
             raise ValueError(f"{path}: invalid artifact contract for {name}")
+        if name.startswith("prepared.") and name.endswith(".mins.bin"):
+            expected_type = "u16" if format_name in {"Q6_K", "IQ2_S", "IQ3_S", "IQ4_XS"} else "fp16_bits"
+            if spec.element_type != expected_type:
+                raise ValueError(
+                    f"{path}: {format_name} secondary metadata requires {expected_type}, "
+                    f"got {spec.element_type} for {name}"
+                )
         shaped = spec.rows > 0 or spec.routes > 0 or spec.width > 0
         if shaped:
             if min(spec.rows, spec.routes, spec.width) <= 0:

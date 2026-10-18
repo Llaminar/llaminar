@@ -1,6 +1,10 @@
 /**
  * @file Test__RamPrefixStorageBackend.cpp
- * @brief Unit coverage for typed RAM prefix payloads and readiness ownership.
+ * @brief Device-free coverage for RAM archives, physical claims and section placement.
+ *
+ * Fragmented restores keep their actual read sections alive while admitting
+ * new archives into unrelated free ranges. Failed section BOMs must preserve
+ * all existing owners and capacity without a partial placement publication.
  */
 
 #include <gtest/gtest.h>
@@ -128,6 +132,84 @@ TEST(Test__RamPrefixStorageBackend, ArenaFragmentationCoalescesOnlyReleasedNeigh
     ranges[3].reset();
     EXPECT_EQ(arena->availableBytes(), 256u);
     EXPECT_NE(arena->acquire(256u), nullptr);
+}
+
+/** @test Pending row readers permit fragmented section reuse without overwriting their bytes. */
+TEST(Test__RamPrefixStorageBackend, ArenaIndependentSectionsReuseFragmentedRestoreHoles)
+{
+    constexpr size_t capacity = 40u;
+    constexpr std::array<size_t, 6> sections{4u, 8u, 0u, 0u, 0u, 0u};
+    auto arena = makeArena(capacity);
+    for (unsigned iteration = 0u; iteration < 20u; ++iteration)
+    {
+        SCOPED_TRACE(iteration);
+        std::array<std::vector<std::shared_ptr<void>>, 3> archives;
+        for (auto &archive : archives)
+        {
+            ASSERT_TRUE(arena->canAcquireSections(sections));
+            archive = arena->acquireSections(sections);
+            ASSERT_EQ(archive.size(), sections.size());
+            std::memset(archive[0].get(), 0xb6, sections[0]);
+            std::memset(archive[1].get(), 0x8b, sections[1]);
+            for (size_t section = 2u; section < sections.size(); ++section)
+                EXPECT_EQ(archive[section], nullptr);
+        }
+        // Earlier checkpoints supply only KV rows. The terminal checkpoint's
+        // recurrent section remains a real reader and cannot be reclaimed.
+        archives[0][1].reset();
+        archives[1][1].reset();
+        EXPECT_EQ(arena->availableStorageBytes(), 20u);
+        EXPECT_EQ(arena->availableBytes(), 8u);
+
+        // The aggregate fits but one nine-byte section cannot fit any hole.
+        // No early four-byte placement may survive this rejected transaction.
+        constexpr std::array<size_t, 2> impossible{4u, 9u};
+        EXPECT_FALSE(arena->canAcquireSections(impossible));
+        EXPECT_TRUE(arena->acquireSections(impossible).empty());
+        EXPECT_EQ(arena->availableStorageBytes(), 20u);
+        EXPECT_EQ(arena->availableBytes(), 8u);
+        ASSERT_TRUE(arena->canAcquireSections(sections));
+        auto next = arena->acquireSections(sections);
+        ASSERT_EQ(next.size(), sections.size());
+        std::memset(next[0].get(), 0x3c, sections[0]);
+        std::memset(next[1].get(), 0x71, sections[1]);
+        for (const auto &archive : archives)
+        {
+            const auto *bytes = static_cast<const uint8_t *>(archive[0].get());
+            EXPECT_TRUE(std::all_of(bytes, bytes + sections[0],
+                [](uint8_t byte) { return byte == 0xb6; }));
+        }
+        const auto *terminal = static_cast<const uint8_t *>(archives.back()[1].get());
+        EXPECT_TRUE(std::all_of(terminal, terminal + sections[1],
+            [](uint8_t byte) { return byte == 0x8b; }));
+        EXPECT_EQ(arena->availableStorageBytes(), 8u);
+        archives = {};
+        next.clear();
+        EXPECT_EQ(arena->availableStorageBytes(), capacity);
+        EXPECT_EQ(arena->availableBytes(), capacity);
+    }
+}
+
+/** @test Empty and overflowing section geometries never manufacture physical ownership. */
+TEST(Test__RamPrefixStorageBackend, ArenaSectionGeometryRejectsOverflowWithoutPartialLeases)
+{
+    auto arena = makeArena(13u);
+    constexpr std::array<size_t, 6> empty{};
+    ASSERT_TRUE(arena->canAcquireSections(empty));
+    const auto empty_owners = arena->acquireSections(empty);
+    ASSERT_EQ(empty_owners.size(), empty.size());
+    for (const auto &owner : empty_owners) EXPECT_EQ(owner, nullptr);
+    constexpr std::array<size_t, 3> overflow{1u, std::numeric_limits<size_t>::max(), 1u};
+    EXPECT_FALSE(arena->canAcquireSections(overflow));
+    EXPECT_TRUE(arena->acquireSections(overflow).empty());
+    EXPECT_EQ(arena->availableStorageBytes(), 13u);
+    constexpr std::array<size_t, 3> odd{3u, 0u, 10u};
+    auto owners = arena->acquireSections(odd);
+    ASSERT_EQ(owners.size(), odd.size());
+    EXPECT_EQ(owners[1], nullptr);
+    EXPECT_EQ(arena->availableStorageBytes(), 0u);
+    owners.clear();
+    EXPECT_EQ(arena->availableBytes(), 13u);
 }
 
 /** @test Randomized odd geometries retain exact byte capacity and disjoint live ranges. */
@@ -303,6 +385,36 @@ TEST(Test__RamPrefixStorageBackend, AllocatesTypedPayloadSegmentsWithinBudget)
     EXPECT_TRUE(backend.release(handle));
     EXPECT_EQ(backend.usedBytes(), 0u);
     EXPECT_FALSE(backend.release(handle));
+}
+
+/** @brief Passive occupancy follows exact backend keys, including runtime sections and rejected mutations. */
+TEST(Test__RamPrefixStorageBackend, TelemetryOccupancyTracksOnlyCommittedKeys)
+{
+    RamPrefixStorageBackend backend(100);
+    const auto telemetry = backend.telemetry();
+    EXPECT_EQ(telemetry->snapshot().used_bytes, 0u);
+    auto handle = backend.allocate(keyFor(0), makeLayout());
+    ASSERT_TRUE(handle.valid());
+    EXPECT_EQ(telemetry->snapshot().capacity_bytes, 100u);
+    EXPECT_EQ(telemetry->snapshot().used_bytes, 32u);
+    EXPECT_EQ(telemetry->snapshot().entries, 1u);
+    ASSERT_TRUE(backend.attachModelRuntimeState(&handle,
+        std::make_shared<std::vector<uint8_t>>(17, 0x42)));
+    const auto with_runtime = telemetry->snapshot();
+    EXPECT_EQ(with_runtime.used_bytes, 49u);
+    EXPECT_FALSE(backend.allocate(keyFor(0), makeLayout()).valid());
+    EXPECT_FALSE(backend.allocate(keyFor(1), makeLayout(100, 100)).valid());
+    EXPECT_EQ(telemetry->snapshot().revision, with_runtime.revision);
+    EXPECT_TRUE(backend.release(handle));
+    EXPECT_EQ(telemetry->snapshot().used_bytes, 0u);
+    EXPECT_EQ(telemetry->snapshot().entries, 0u);
+    const auto released = telemetry->snapshot().revision;
+    EXPECT_FALSE(backend.release(handle));
+    EXPECT_EQ(telemetry->snapshot().revision, released);
+    // Observations describe indexed payloads, not external aliases. Polling
+    // cannot reclaim or inspect this still-readable consumer's bytes.
+    ASSERT_NE(handle.kv_storage, nullptr);
+    EXPECT_EQ(handle.model_runtime_state_storage->data()[0], 0x42);
 }
 
 TEST(Test__RamPrefixStorageBackend, AllocatesHybridPayloadSegment)

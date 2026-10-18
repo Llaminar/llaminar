@@ -1,5 +1,8 @@
 /**
  * @file ROCmMoEKernel.cpp
+ * @details Model-prepared FP16 router gates select half-RNE hidden operands.
+ * Native FP32/BF16 and Q8 paths retain their own policies; no half-only gate
+ * cache or workspace-owned floating weight derivative duplicates model storage.
  * @brief ROCm MoE kernel implementation — calls extern "C" HIP bridges
  *
  * Separating .hip and .cpp allows hipcc to compile only the HIP code
@@ -14,6 +17,7 @@
  * zero contributions for inactive routes; gate/up alone owns no down output.
  */
 
+#include "kernels/common/RouterQ8Launch.h"
 #include "ROCmMoEKernel.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
 #include "kernels/common/MoEGroupedIntermediateExchangeKernels.h"
@@ -60,8 +64,6 @@ namespace
         "rocm_moe_grouped_expert_masks";
     constexpr const char *kROCmRouterQ8GatePublicationDomain =
         "rocm_moe_router_q8_gate_cache";
-    constexpr const char *kROCmRouterFP16GatePublicationDomain =
-        "rocm_moe_router_fp16_gate_cache";
 
     /**
      * @brief Preserve every router identity component for workspace sharing.
@@ -75,7 +77,8 @@ namespace
             .word2 = static_cast<std::uint64_t>(
                 static_cast<std::uint32_t>(key.d_model)),
             .word3 = static_cast<std::uint64_t>(
-                static_cast<std::uint32_t>(key.num_experts)),
+                static_cast<std::uint32_t>(key.num_experts)) |
+                (static_cast<std::uint64_t>(key.basis) << 32u),
         };
     }
 
@@ -273,7 +276,8 @@ namespace
         switch (codebook_id)
         {
         case 0:  // Q4_0
-        case 4:  // IQ4_NL / IQ4_XS
+        case 4:  // IQ4_NL
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: // IQ4_XS original tuple
         case 5:  // Q4_1 / Q4_K
         case 6:  // Q5_0
         case 7:  // Q5_1 / Q5_K
@@ -300,9 +304,11 @@ namespace
     {
         switch (codebook_id)
         {
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: // Raw source coefficient, not a min
+        case 11: // Mandatory original IQ3_S source nibble; not a minimum
         case 5:  // Q4_1 / Q4_K min correction
         case 7:  // Q5_1 / Q5_K min correction
-        case 8:  // Q6_K high half scale
+        case 8:  // Q6_K packed signed low/high subscales
         case 9:  // Q3_K high half scale
         case 10: // Q2_K high half scale
         case 13: // IQ2_S high half scale
@@ -363,8 +369,8 @@ namespace
     {
         if (!desc.source_identity_present)
         {
-            return desc.codebook_id !=
-                   llaminar2::kNativeVnniExpandedInt8MinCodebook;
+            return desc.codebook_id != llaminar2::kNativeVnniIQ4XSSourceScaleCodebook &&
+                   desc.codebook_id != llaminar2::kNativeVnniExpandedInt8MinCodebook;
         }
         const auto *source =
             llaminar2::native_vnni_formats::forSourceIdentity(
@@ -586,10 +592,6 @@ extern "C"
         int device_idx, void *stream,
         const int *device_effective_seq_len);
 
-    bool hipMoE_fp32_to_fp16(
-        const float *input, void *output_fp16, int count,
-        int device_idx, void *stream);
-
     bool hipMoE_gate_logits_single_token_fp16_weights(
         const float *hidden, const void *gate_weights_fp16, float *logits,
         int d_model, int num_experts,
@@ -618,23 +620,11 @@ extern "C"
         int device_idx, void *stream,
         const int *device_effective_seq_len = nullptr);
 
-    bool hipMoE_quantize_router_gate_q8(
-        const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
-        int d_model, int num_experts,
-        int device_idx, void *stream);
 
-    bool hipMoE_gate_logits_single_token_q8_weights(
-        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
-        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
-        int d_model, int num_experts,
-        int device_idx, void *stream);
 
-    bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
-        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
-        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
-        int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream,
-        const int *device_effective_seq_len = nullptr);
+
+
+
 
     bool hipMoE_softmax_topk_decode_runtime(
         float *logits,
@@ -1474,10 +1464,15 @@ namespace
      *
      * @param codebook_mask Bit @c n is set when codebook @c n occurs in the
      *                      uploaded descriptor table.
-     * @return The unique codebook id, or -1 when the table is empty or mixed.
+     * @return The unique decoder family, or -1 for unrelated mixed formats.
+     * @details Physical4/24 share LUT integer decode. Family24 resolves each
+     * descriptor scale independently; original physical masks remain retained.
      */
     int singleCodebookFromMask(uint32_t codebook_mask)
     {
+        const uint32_t iq4_tuple = llaminar2::nativeVnniCodebookMaskBit(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+        if (codebook_mask & iq4_tuple)
+            codebook_mask &= ~llaminar2::nativeVnniCodebookMaskBit(uint8_t{4});
         if (codebook_mask == 0 ||
             (codebook_mask & (codebook_mask - 1u)) != 0u)
         {
@@ -2312,7 +2307,6 @@ namespace llaminar2
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
-        router_fp16_gate_cache_.clear();
         router_q8_gate_cache_.clear();
         for (auto &table : grouped_down_desc_tables_)
         {
@@ -3224,6 +3218,11 @@ namespace llaminar2
         publication.blocks_per_row_capacity =
             router_q8_hidden_blocks_cap_;
         publication.capture_recorded = recorded_during_capture;
+        if (routerQ8Basis(debugEnv().gemm.moe_router_arithmetic) == RouterQ8Basis::SignedHadamard32)
+            PerfStatsCollector::addCounter("kernel", "rocm_moe_router_hadamard32_calls", 1.0,
+                "router", "rocm:" + std::to_string(device_ordinal_),
+                {{"rows", std::to_string(rows)}, {"expert_hidden_basis", "original"}, {"block", "32"}});
+
     }
 
     bool ROCmMoEKernel::canReuseRouterQ8Hidden(
@@ -3283,7 +3282,8 @@ namespace llaminar2
 
         const DeviceResidentRouterGateCacheKey cache_key =
             DeviceResidentRouterGateCacheKey::make(
-                workspace_->id(), gate_device_ptr, d_model, num_experts);
+                workspace_->id(), gate_device_ptr, d_model, num_experts,
+                routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
         for (const auto &entry : router_q8_gate_cache_)
         {
             if (entry.key == cache_key &&
@@ -3408,7 +3408,7 @@ namespace llaminar2
                             d_model,
                             num_experts,
                             device_ordinal_,
-                            stream))
+                            stream, routerQ8Basis(debugEnv().gemm.moe_router_arithmetic)))
                     {
                         LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] "
                                   "FP32->Q8 router gate conversion launch failed");
@@ -3477,194 +3477,6 @@ namespace llaminar2
         return &router_q8_gate_cache_.back();
     }
 
-    const void *ROCmMoEKernel::getOrCreateFP16RouterGateCache(
-        const float *gate_device_ptr,
-        int d_model,
-        int num_experts)
-    {
-        if (!debugEnv().rocm.moe_router_fp16)
-            return nullptr;
-        if (!gate_device_ptr || d_model <= 0 || num_experts <= 0)
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] invalid FP16 router gate request");
-            return nullptr;
-        }
-        if (!workspace_)
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
-                      "graph-owned workspace is required before cache publication");
-            return nullptr;
-        }
-
-        const DeviceResidentRouterGateCacheKey cache_key =
-            DeviceResidentRouterGateCacheKey::make(
-                workspace_->id(), gate_device_ptr, d_model, num_experts);
-        for (const auto &entry : router_fp16_gate_cache_)
-        {
-            if (entry.key == cache_key &&
-                entry.d_gate_weights_fp16)
-            {
-                return entry.d_gate_weights_fp16;
-            }
-        }
-
-        const bool capture_active = isGraphCaptureActive() ||
-                                    (deviceContext() && deviceContext()->isDeviceGraphCaptureActive());
-        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-        void *stream = getStream();
-        if (stream)
-        {
-            const hipError_t capture_err = hipStreamIsCapturing(static_cast<hipStream_t>(stream), &capture_status);
-            if (capture_err != hipSuccess)
-                capture_status = hipStreamCaptureStatusNone;
-        }
-        if (capture_active || capture_status == hipStreamCaptureStatusActive)
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] FP16 router cache miss during graph capture");
-            return nullptr;
-        }
-        if (!stream)
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] explicit HIP stream is required");
-            return nullptr;
-        }
-
-        const size_t d_model_sz = static_cast<size_t>(d_model);
-        const size_t experts_sz = static_cast<size_t>(num_experts);
-        if (d_model_sz > std::numeric_limits<size_t>::max() / experts_sz)
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] router gate size overflow");
-            return nullptr;
-        }
-        const size_t element_count = d_model_sz * experts_sz;
-        if (element_count > static_cast<size_t>(std::numeric_limits<int>::max()))
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] router gate too large for conversion kernel: elements="
-                      << element_count);
-            return nullptr;
-        }
-
-        if (!setMoEDevice(device_ordinal_, "getOrCreateFP16RouterGateCache"))
-            return nullptr;
-
-        void *gate_weights_base = nullptr;
-        const size_t weights_payload_bytes =
-            element_count * sizeof(uint16_t);
-        if (!bindWorkspaceBuffer(&gate_weights_base,
-                                 MoEWorkspaceBuffers::ROCM_ROUTER_FP16_GATE_WEIGHTS,
-                                 weights_payload_bytes,
-                                 "ROCm FP16 router gate weights"))
-        {
-            return nullptr;
-        }
-
-        const auto publication_result =
-            workspace_->getOrCreatePersistentPublication(
-                kROCmRouterFP16GatePublicationDomain,
-                routerPublicationKey(cache_key),
-                MoEWorkspaceBuffers::kRouterGateCacheSlots,
-                [&](std::size_t slot) -> std::shared_ptr<void>
-                {
-                    void *weights = workspace_->getPersistentSlotBuffer(
-                        MoEWorkspaceBuffers::ROCM_ROUTER_FP16_GATE_WEIGHTS,
-                        MoEWorkspaceBuffers::kRouterGateCacheSlots,
-                        slot,
-                        weights_payload_bytes);
-                    if (!weights)
-                        return {};
-
-                    hipEvent_t ready_event = nullptr;
-                    hipError_t event_err = hipEventCreateWithFlags(
-                        &ready_event, hipEventDisableTiming);
-                    if (event_err != hipSuccess || !ready_event)
-                    {
-                        LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
-                                  "failed to create immutable publication event: "
-                                  << hipGetErrorString(event_err));
-                        return {};
-                    }
-
-                    auto publication =
-                        std::shared_ptr<RouterGateWorkspacePublication>(
-                            new RouterGateWorkspacePublication{
-                                .ready_event = static_cast<void *>(ready_event),
-                                .primary_weights = weights,
-                                .scales = nullptr,
-                                .workspace_slot = slot,
-                            },
-                            [](RouterGateWorkspacePublication *value)
-                            {
-                                if (value && value->ready_event)
-                                {
-                                    (void)hipEventDestroy(
-                                        static_cast<hipEvent_t>(
-                                            value->ready_event));
-                                }
-                                delete value;
-                            });
-
-                    if (!hipMoE_fp32_to_fp16(
-                            gate_device_ptr,
-                            weights,
-                            static_cast<int>(element_count),
-                            device_ordinal_,
-                            stream))
-                    {
-                        LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
-                                  "FP32->FP16 router gate conversion launch failed");
-                        return {};
-                    }
-
-                    event_err = hipEventRecord(
-                        ready_event, static_cast<hipStream_t>(stream));
-                    if (event_err != hipSuccess)
-                    {
-                        LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
-                                  "failed to record immutable publication event: "
-                                  << hipGetErrorString(event_err));
-                        std::terminate();
-                    }
-                    return publication;
-                });
-        if (!publication_result)
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
-                      "failed to publish immutable router gate");
-            return nullptr;
-        }
-
-        auto publication =
-            std::static_pointer_cast<RouterGateWorkspacePublication>(
-                publication_result.publication);
-        const hipError_t wait_err = hipStreamWaitEvent(
-            static_cast<hipStream_t>(stream),
-            static_cast<hipEvent_t>(publication->ready_event),
-            0);
-        if (wait_err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] "
-                      "failed to adopt immutable router publication: "
-                      << hipGetErrorString(wait_err));
-            return nullptr;
-        }
-
-        RouterFP16GateCacheEntry entry{};
-        entry.key = cache_key;
-        entry.element_count = element_count;
-        entry.d_gate_weights_fp16 = publication->primary_weights;
-        entry.workspace_publication = std::move(publication);
-        entry.workspace_slot = publication_result.slot;
-        router_fp16_gate_cache_.push_back(std::move(entry));
-
-        LOG_DEBUG("[ROCmMoEKernel] Adopted FP16 router gate source_device="
-                  << static_cast<const void *>(gate_device_ptr)
-                  << " workspace_id=" << cache_key.workspace_id
-                  << " slot=" << publication_result.slot
-                  << " created=" << publication_result.created
-                  << " shape=[" << num_experts << "," << d_model << "] bytes="
-                  << (element_count * sizeof(uint16_t)));
-        return router_fp16_gate_cache_.back().d_gate_weights_fp16;
-    }
 
     // =========================================================================
     // routeCore() — Shared GPU routing logic: gate GEMM + direct FP32 publication.
@@ -3705,7 +3517,10 @@ namespace llaminar2
                 .capacity = seq_len, .width = d_model, .experts = num_experts,
                 .top_k = top_k, .normalize = normalize_weights,
                 .live_rows = device_effective_seq_len, .hidden = hidden,
-                .format = format, .gate = gate, .gate_scales = scales,
+                .format = format,
+                .q8_basis = format == MoERouterPreparedFormat::BlockQ8 ?
+                    routerQ8Basis(debugEnv().gemm.moe_router_arithmetic) : RouterQ8Basis::Original,
+                .gate = gate, .gate_scales = scales,
                 .hidden_q8 = d_router_q8_hidden_, .hidden_scales = d_router_q8_hidden_scales_,
                 .logits = d_route_logits_, .selected = owned->selected,
                 .selected_bytes = owned->selected_bytes};
@@ -3774,7 +3589,7 @@ namespace llaminar2
                         num_experts,
                         device_ordinal_,
                         getStream(),
-                        device_effective_seq_len);
+                        device_effective_seq_len, routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
                     if (logits_ready)
                     {
                         used_q8_grouped_router = true;
@@ -3785,30 +3600,6 @@ namespace llaminar2
                                 (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
                                 isHipStreamCapturing(getStream()));
                     }
-                }
-                else if (rocm_env.moe_router_fp16)
-                {
-                    const void *gate_fp16 = getOrCreateFP16RouterGateCache(
-                        static_cast<const float *>(gate_weights),
-                        d_model,
-                        num_experts);
-                    if (!gate_fp16)
-                    {
-                        LOG_ERROR("[ROCmMoEKernel::routeCore] FP16 prefill router gate cache unavailable");
-                        return false;
-                    }
-                    logits_ready = owned ? route_owned(MoERouterPreparedFormat::FP16, gate_fp16)
-                        : hipMoE_gate_logits_fp16_decode_equivalent_rows(
-                        hidden,
-                        gate_fp16,
-                        d_route_logits_,
-                        seq_len,
-                        d_model,
-                        num_experts,
-                        device_ordinal_,
-                        getStream(),
-                        device_effective_seq_len);
-                    used_fp16_grouped_router = logits_ready;
                 }
                 else
                 {
@@ -4966,9 +4757,10 @@ namespace llaminar2
             return false;
         }
         if (gate_weights->native_type() != TensorType::FP32 &&
+            gate_weights->native_type() != TensorType::FP16 &&
             gate_weights->native_type() != TensorType::BF16)
         {
-            LOG_ERROR("[" << kContext << "] router gate must be FP32 or BF16, got "
+            LOG_ERROR("[" << kContext << "] router gate must be FP32, FP16 or BF16, got "
                       << tensorTypeName(gate_weights->native_type()));
             return false;
         }
@@ -5049,19 +4841,6 @@ namespace llaminar2
             return true;
         }
 
-        const bool fp16_cache_is_consumed =
-            rocm_env.moe_router_fp16 &&
-            (plan.kind != MoERouteLaunchKind::GroupedPrefill ||
-             plan.physical_rows > 1);
-        if (fp16_cache_is_consumed &&
-            !getOrCreateFP16RouterGateCache(
-                gate_device,
-                plan.d_model,
-                plan.num_experts))
-        {
-            LOG_ERROR("[" << kContext << "] failed to publish immutable FP16 router gate");
-            return false;
-        }
         return true;
     }
 
@@ -5205,7 +4984,7 @@ namespace llaminar2
                     num_experts,
                     device_ordinal_,
                     getStream(),
-                    device_effective_seq_len))
+                    device_effective_seq_len, routerQ8Basis(debugEnv().gemm.moe_router_arithmetic)))
             {
                 LOG_ERROR("[" << kContext << "] grouped Q8 verifier logits failed");
                 return false;
@@ -5218,41 +4997,9 @@ namespace llaminar2
         }
         else if (gate_is_fp32)
         {
-            const void *g_fp16 = getOrCreateFP16RouterGateCache(
-                static_cast<const float *>(d_gate), d_model, num_experts);
-            if (rocm_env.moe_router_fp16 && !g_fp16)
-            {
-                LOG_ERROR("[" << kContext << "] FP16 router was requested but gate cache is unavailable");
-                return false;
-            }
-            if (g_fp16)
-            {
-                if (!hipMoE_gate_logits_fp16_decode_equivalent_rows(
-                        d_hidden,
-                        g_fp16,
-                        d_route_logits_,
-                        seq_len,
-                        d_model,
-                        num_experts,
-                        device_ordinal_,
-                        getStream(),
-                        device_effective_seq_len))
-                {
-                    LOG_ERROR("[" << kContext << "] grouped FP16 verifier logits failed");
-                    return false;
-                }
-                used_fp16_grouped_router = true;
-            }
-            else if (!launchDecodeEquivalentFP32Rows(
-                         d_hidden,
-                         static_cast<const float *>(d_gate),
-                         d_route_logits_,
-                         seq_len,
-                         d_model,
-                         num_experts,
-                         device_ordinal_,
-                         getStream(),
-                         device_effective_seq_len))
+            if (!launchDecodeEquivalentFP32Rows(d_hidden, static_cast<const float *>(d_gate),
+                    d_route_logits_, seq_len, d_model, num_experts, device_ordinal_,
+                    getStream(), device_effective_seq_len))
             {
                 LOG_ERROR("[" << kContext << "] grouped FP32 verifier logits failed");
                 return false;
@@ -5442,7 +5189,7 @@ namespace llaminar2
                 h, d_router_q8_hidden_, d_router_q8_hidden_scales_,
                 q8_gate->d_gate_weights_q8, q8_gate->d_gate_scales,
                 d_route_logits_, d_model, num_experts,
-                device_ordinal_, stream);
+                device_ordinal_, stream, routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
             if (!logits_ready)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router logits kernel failed");
@@ -5503,29 +5250,6 @@ namespace llaminar2
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] fused K-part router runtime kernel failed");
                 return false;
-            }
-        }
-
-        if (!runtime_ready && !logits_ready && gate_is_fp32)
-        {
-            const void *g_fp16 = getOrCreateFP16RouterGateCache(
-                static_cast<const float *>(g), d_model, num_experts);
-            if (rocm_env.moe_router_fp16 && !g_fp16)
-            {
-                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] FP16 router was requested but gate cache is unavailable");
-                return false;
-            }
-            if (g_fp16)
-            {
-                logits_ready = hipMoE_gate_logits_single_token_fp16_weights(
-                    h, g_fp16, d_route_logits_,
-                    d_model, num_experts,
-                    device_ordinal_, getStream());
-                if (!logits_ready)
-                {
-                    LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] FP16 router logits kernel failed");
-                    return false;
-                }
             }
         }
 
@@ -5761,7 +5485,7 @@ namespace llaminar2
                 h, d_router_q8_hidden_, d_router_q8_hidden_scales_,
                 q8_gate->d_gate_weights_q8, q8_gate->d_gate_scales,
                 d_route_logits_, d_model, num_experts,
-                device_ordinal_, stream);
+                device_ordinal_, stream, routerQ8Basis(debugEnv().gemm.moe_router_arithmetic));
             if (!logits_ready)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router logits kernel failed");
@@ -5822,29 +5546,6 @@ namespace llaminar2
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] fused K-part router runtime kernel failed");
                 return false;
-            }
-        }
-
-        if (!runtime_ready && !logits_ready && gate_is_fp32)
-        {
-            const void *g_fp16 = getOrCreateFP16RouterGateCache(
-                static_cast<const float *>(g), d_model, num_experts);
-            if (rocm_env.moe_router_fp16 && !g_fp16)
-            {
-                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] FP16 router was requested but gate cache is unavailable");
-                return false;
-            }
-            if (g_fp16)
-            {
-                logits_ready = hipMoE_gate_logits_single_token_fp16_weights(
-                    h, g_fp16, d_route_logits_,
-                    d_model, num_experts,
-                    device_ordinal_, getStream());
-                if (!logits_ready)
-                {
-                    LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] FP16 router logits kernel failed");
-                    return false;
-                }
             }
         }
 
@@ -7275,6 +6976,13 @@ namespace llaminar2
                 codebook_id = codebook;
         }
 
+        // The IQ4 LUT family may contain source-tuple24 and ordinary4.
+        // One template24 launch owns the family; each descriptor retains its
+        // independent factor words and the original physical mask is unchanged.
+        const int iq4_family_codebook = singleCodebookFromMask(codebook_mask);
+        if (iq4_family_codebook >= 0)
+            codebook_id = static_cast<uint8_t>(iq4_family_codebook);
+
         // Publish immutable IQ tables before accepting or reusing a retained
         // descriptor table. A cache hit must never bypass device prerequisites.
         if (groupedPrefillMaskNeedsIQTables(codebook_mask) &&
@@ -7385,7 +7093,7 @@ namespace llaminar2
                 return -1;
             }
 
-            if (gate_desc.codebook_id != up_desc.codebook_id)
+            if (!areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id))
             {
                 LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Gate/up codebook mismatch for expert "
                           << expert_id << ": gate=" << static_cast<int>(gate_desc.codebook_id)
@@ -7437,6 +7145,9 @@ namespace llaminar2
             if ((codebook_mask & (codebook_mask - 1u)) == 0u)
                 codebook_id = codebook;
         }
+        const int iq4_family_codebook = singleCodebookFromMask(codebook_mask);
+        if (iq4_family_codebook >= 0)
+            codebook_id = static_cast<uint8_t>(iq4_family_codebook);
 
         // Gate/up graphs use the same device-constant tables as down graphs.
         // Establish the prerequisite before a cached table can be returned.
@@ -7858,7 +7569,7 @@ namespace llaminar2
                 return false;
             }
             if (!gate_desc.valid() || !up_desc.valid() ||
-                gate_desc.codebook_id != up_desc.codebook_id ||
+                !areNativeVnniGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateGroupedGateUpDesc(gate_desc, d_model, intermediate) ||
                 !validateGroupedGateUpDesc(up_desc, d_model, intermediate))
             {
@@ -9937,19 +9648,26 @@ namespace llaminar2
             return false;
         }
 
-        const uint8_t codebook_id = down_descs[0].codebook_id;
+        uint8_t codebook_id = down_descs[0].codebook_id;
         for (int i = 0; i < num_active; ++i)
         {
             if (expert_ids[i] < 0 || !down_descs[i].valid() ||
                 down_descs[i].n != d_model || down_descs[i].k != intermediate ||
                 down_descs[i].blocks_per_row != static_cast<uint32_t>(intermediate / 32) ||
-                down_descs[i].codebook_id != codebook_id ||
+                !areNativeVnniGateUpCodebooksCompatible(
+                    down_descs[i].codebook_id, codebook_id) ||
                 (groupedDecodeRequiresMins(down_descs[i].codebook_id) && !down_descs[i].mins) ||
                 (groupedDecodeRequiresEmins(down_descs[i].codebook_id) && !down_descs[i].emins))
             {
                 return false;
             }
         }
+
+        // Preserve the old IQ4_NL/IQ4_XS mixed-down domain: the LUT decode
+        // is shared, but physical24 resolves only its own raw source factors.
+        for (int i = 0; i < num_active; ++i)
+            if (down_descs[i].codebook_id == kNativeVnniIQ4XSSourceScaleCodebook)
+                codebook_id = kNativeVnniIQ4XSSourceScaleCodebook;
 
         if (!groupedDecodeSupportsCodebook(codebook_id))
         {

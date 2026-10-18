@@ -1,3 +1,4 @@
+#include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include <gtest/gtest.h>
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/WeightShardGeometry.h"
@@ -5,7 +6,7 @@
 #include "loaders/WeightSlicer.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "backends/DeviceId.h"
-#include "kernels/common/EmbedQ8Block.h"
+#include "kernels/common/NativeEmbeddingLayout.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
@@ -185,7 +186,7 @@ namespace
             {"Q4_K", 144.0f / 256.0f},
             {"Q5_K", 176.0f / 256.0f},
             {"Q6_K", 210.0f / 256.0f},
-            {"Q8_K", 288.0f / 256.0f},
+            {"Q8_K", 292.0f / 256.0f},
             {"IQ4_NL", 18.0f / 32.0f},
             {"IQ4_XS", 136.0f / 256.0f},
             {"IQ2_XXS", 66.0f / 256.0f},
@@ -218,12 +219,12 @@ namespace
             {"Q6_K", 28.0f / 32.0f},
             {"Q8_K", 34.0f / 32.0f},
             {"IQ4_NL", 18.0f / 32.0f},
-            {"IQ4_XS", 18.0f / 32.0f},
+            {"IQ4_XS", 20.0f / 32.0f},
             {"IQ2_XXS", 10.0f / 32.0f},
             {"IQ2_XS", 13.0f / 32.0f},
             {"IQ3_XXS", 14.0f / 32.0f},
             {"IQ2_S", 13.0f / 32.0f},
-            {"IQ3_S", 15.0f / 32.0f},
+            {"IQ3_S", 17.0f / 32.0f},
             {"IQ1_S", 10.0f / 32.0f},
             {"IQ1_M", 10.0f / 32.0f},
         };
@@ -727,7 +728,7 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_IQProfileUsesCompactGPUPacking)
     const auto estimate = WeightMemoryEstimator::estimate(profile, DeviceId::cuda(0));
     const size_t elements = 4096ULL * 4096ULL;
     const size_t expected_gpu_bytes =
-        static_cast<size_t>(static_cast<float>(elements) * (15.0f / 32.0f)) +
+        static_cast<size_t>(static_cast<float>(elements) * (17.0f / 32.0f)) +
         static_cast<size_t>(static_cast<float>(elements) * (14.0f / 32.0f)) +
         static_cast<size_t>(static_cast<float>(elements) * (16.0f / 32.0f)) +
         static_cast<size_t>(static_cast<float>(elements) * (10.0f / 32.0f));
@@ -780,7 +781,7 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_Q4KUsesCompactGPUPacking)
     EXPECT_LT(estimate.device_bytes, static_cast<size_t>(static_cast<float>(q4k_tensor.elements) * 1.0f));
 }
 
-TEST(Test__WeightMemoryEstimator, QuantizedEmbeddingUsesPreparedEmbedQ8Bytes)
+TEST(Test__WeightMemoryEstimator, QuantizedEmbeddingUsesOriginalNativeBytes)
 {
     ModelMemoryProfile profile;
     profile.architecture = "qwen35";
@@ -801,7 +802,7 @@ TEST(Test__WeightMemoryEstimator, QuantizedEmbeddingUsesPreparedEmbedQ8Bytes)
             profile,
             DeviceId::cuda(0));
     const size_t expected_embedding_bytes =
-        1000ULL * 2ULL * 36ULL;
+        1000ULL * sizeof(Q4_KBlock);
     const size_t expected_tied_lm_head_bytes =
         32000ULL + 4096ULL + 4096ULL;
 
@@ -845,14 +846,14 @@ TEST(Test__WeightMemoryEstimator, ExplicitLMHeadPreventsSyntheticTiedCopy)
     EXPECT_EQ(estimate.tied_lm_head_bytes, 0u);
     EXPECT_EQ(
         estimate.prepared_embedding_bytes,
-        1000ULL * 2ULL * 36ULL);
+        1000ULL * 2ULL * sizeof(Q8_0Block));
 }
 
 /**
  * @brief Native embedding views remain physical allocations, not zero-cost preparation sources.
  *
  * A mirrored table lives beside the vocabulary shard. Its component estimate
- * must therefore include FP32/FP16/BF16 just as it includes prepared EmbedQ8.
+ * must therefore include FP32/FP16/BF16 just as it includes prepared native quantized blocks.
  * Odd vocabulary counts expose rounding losses through every supported TP
  * degree. Device identifiers here are metadata only; no backend is initialized.
  */
@@ -949,7 +950,7 @@ TEST(Test__WeightMemoryEstimator,
                      ? 1u
                      : 0u);
             const size_t expected_prepared =
-                expected_rows * 2u * sizeof(EmbedQ8Block);
+                expected_rows * 2u * sizeof(Q8_0Block);
             EXPECT_EQ(
                 estimate.prepared_embedding_bytes,
                 expected_prepared)
@@ -1008,6 +1009,7 @@ TEST(Test__WeightMemoryEstimator, TPSharded_ReplicatesNormWeights)
 TEST(Test__WeightMemoryEstimator,
      Qwen35GDNSchemaShardingConservesBytesThroughTP8)
 {
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
     ModelMemoryProfile profile;
     profile.architecture = "qwen35";
     profile.n_layers = 1;
@@ -1097,6 +1099,7 @@ TEST(Test__WeightMemoryEstimator,
 TEST(Test__WeightMemoryEstimator,
      Qwen35Q8AlphaBetaPricePreparedFP32AcrossCudaRocmAndTP)
 {
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
     ModelMemoryProfile profile;
     profile.architecture = "qwen35";
     profile.n_layers = 1;

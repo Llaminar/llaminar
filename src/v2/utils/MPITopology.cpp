@@ -38,7 +38,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint32_t kInventoryMagic = 0x4c494e56u; ///< LINV, not an unversioned rank id.
-        constexpr uint32_t kInventoryVersion = 3u; ///< Distinguishes CPU execution workers from physical cores.
+        constexpr uint32_t kInventoryVersion = 4u; ///< Carries the complete native GPU PCI endpoint.
         /** @brief Lend a checked communicator to a standalone topology constructor. */
         MPIContext standaloneTopologyContext(MPI_Comm comm)
         {
@@ -159,7 +159,7 @@ namespace llaminar2
             writeString(buffer, info.name);
             writeString(buffer, info.uuid);
             writeValue(buffer, static_cast<uint8_t>(info.supports_p2p ? 1 : 0));
-            writeValue(buffer, static_cast<int32_t>(info.pcie_bus_id));
+            writeString(buffer, info.pci_bus_address);
             writeValue(buffer, static_cast<int32_t>(info.numa_node));
             // PCIe link info
             writeValue(buffer, static_cast<int32_t>(info.pcie_gen));
@@ -189,7 +189,7 @@ namespace llaminar2
             info.name = readString(ptr, end);
             info.uuid = readString(ptr, end);
             info.supports_p2p = (readValue<uint8_t>(ptr, end) != 0);
-            info.pcie_bus_id = readValue<int32_t>(ptr, end);
+            info.pci_bus_address = readString(ptr, end);
             info.numa_node = readValue<int32_t>(ptr, end);
             // PCIe link info
             info.pcie_gen = readValue<int32_t>(ptr, end);

@@ -2,6 +2,9 @@
  * @file CPUMoEKernel.cpp
  * @brief CPU implementation of MoE kernel operations
  *
+ * Typed FP16 router gates round hidden operands to half in SIMD registers,
+ * accumulate/output FP32, and leave the original hidden/Q8 expert publication
+ * untouched. No second gate cache or activation mirror is introduced.
  * Owns CPU routing, placement-epoch operations and canonical Q8 input
  * publication. Ordinary and transported expert inputs share the same exact
  * block arithmetic; worksharing changes row ownership, never numerical order.
@@ -18,6 +21,7 @@
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
 #include "../gemm/CPUNativeVNNIGemv.h"
+#include "../gemm/FloatingPointGemmKernel.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -871,8 +875,17 @@ namespace llaminar2
     }
 
     bool CPUMoEKernel::route(
+        const float *hidden, const float *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights, MoERoutingResult &result)
+    {
+        return routePrepared(hidden, gate_weights, TensorType::FP32,
+            seq_len,d_model,num_experts,top_k,normalize_weights,result);
+    }
+
+    bool CPUMoEKernel::routePrepared(
         const float *hidden,
-        const float *gate_weights,
+        const void *gate_weights, TensorType gate_type,
         int seq_len, int d_model,
         int num_experts, int top_k,
         bool normalize_weights,
@@ -880,7 +893,8 @@ namespace llaminar2
     {
         invalidateRouterQ8HiddenPublication();
         if (!hidden || !gate_weights || seq_len <= 0 || d_model <= 0 ||
-            num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+            num_experts <= 0 || top_k <= 0 || top_k > num_experts ||
+            (gate_type != TensorType::FP32 && gate_type != TensorType::FP16))
         {
             LOG_ERROR("[CPUMoEKernel::route] invalid routing pointer or dimensions");
             return false;
@@ -920,16 +934,35 @@ namespace llaminar2
          * normalization then retain their serial per-row operation order. The
          * schedule changes ownership only; it cannot change any row's bytes.
          */
+        // Half dots reuse one fixed SIMD schedule across every live M. This
+        // joined dot phase precedes the unchanged per-row finalization phase;
+        // no hidden roundtrip, activation bank, or duplicate gate cache exists.
+        if (gate_type == TensorType::FP16)
+        {
+            if (!gemm::run_gpu_aligned_expert_fp32_matmul<TensorType::FP16, true>(
+                    hidden, gate_weights, result.router_logits.data(), seq_len,num_experts,d_model))
+                return false;
+            // Disabled CPU statistics must not construct allocating tag maps.
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
+            {
+                PerfStatsCollector::addCounter("kernel", "cpu_moe_fp16_operand_router_calls", 1.0,
+                    "router", "cpu", {{"rows",std::to_string(seq_len)},{"num_experts",std::to_string(num_experts)},
+                    {"hidden_operand","half_rne"},{"gate_weights","fp16"},{"accumulation","fp32"},
+                    {"expert_q8_source","original_fp32_hidden"},{"reduction","fixed_256_lane_tree"}});
+            }
+        }
         const int row_tiles = seq_len / 4 + (seq_len % 4 != 0);
         auto route_rows = [&]()
         {
+            if (gate_type == TensorType::FP32)
+            {
 #pragma omp for collapse(2) schedule(static)
             for (int tile = 0; tile < row_tiles; ++tile)
             {
                 for (int expert = 0; expert < num_experts; ++expert)
                 {
                     const int first_row = tile * 4;
-                    const float *weights = gate_weights +
+                    const float *weights = static_cast<const float *>(gate_weights) +
                         static_cast<size_t>(expert) * d_model;
                     if (seq_len - first_row >= 4)
                     {
@@ -951,6 +984,7 @@ namespace llaminar2
                                     d_model);
                     }
                 }
+            }
             }
 
 #pragma omp for schedule(static)
@@ -1031,8 +1065,23 @@ namespace llaminar2
             return false;
         }
 
-        if (!route(hidden->data(),
-                   gate_weights->data(),
+        if (seq_len <= 0 || d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts ||
+            hidden->native_type() != TensorType::FP32 ||
+            (gate_weights->native_type() != TensorType::FP32 && gate_weights->native_type() != TensorType::FP16) ||
+            output_indices->native_type() != TensorType::FP32 || output_weights->native_type() != TensorType::FP32 ||
+            hidden->numel() / static_cast<size_t>(d_model) < static_cast<size_t>(seq_len) ||
+            gate_weights->numel() / static_cast<size_t>(d_model) < static_cast<size_t>(num_experts) ||
+            output_indices->numel() / static_cast<size_t>(top_k) < static_cast<size_t>(seq_len) ||
+            output_weights->numel() / static_cast<size_t>(top_k) < static_cast<size_t>(seq_len))
+            return false;
+        const auto *half_gate = dynamic_cast<const FP16Tensor *>(gate_weights);
+        if (gate_weights->native_type() == TensorType::FP16 &&
+            (!half_gate || hidden->cols() != static_cast<size_t>(d_model) ||
+             half_gate->cols() != static_cast<size_t>(d_model))) return false;
+        const void *gate_data = half_gate ? static_cast<const void *>(half_gate->typed_data())
+                                         : static_cast<const void *>(gate_weights->data());
+        if (!routePrepared(hidden->data(),
+                   gate_data, gate_weights->native_type(),
                    seq_len,
                    d_model,
                    num_experts,

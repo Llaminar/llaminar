@@ -12,7 +12,8 @@
  *
  * Every replay-varying value is read from device storage: logical positions,
  * verifier input tokens, stop controls, generation budgets, and compact output
- * rows.  Request seeds and launch geometry are immutable capture identity.  The
+ * rows and admitted request seeds. Seed addresses and launch geometry are
+ * immutable capture identity; resetting seed bytes never replaces a graph. The
  * stage performs no allocation, transfer, callback, event creation, or stream
  * synchronization and rejects a null graph stream.
  */
@@ -26,7 +27,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace llaminar2
 {
@@ -80,7 +80,7 @@ namespace llaminar2
 
             const int32_t *threshold_base_positions_device = nullptr;
             int threshold_position_offset = 1;
-            std::vector<uint64_t> threshold_seeds;
+            const uint64_t *threshold_seeds_device = nullptr; ///< Admitted seed per request, published before replay.
 
             int *generation_control_device = nullptr;
             int generation_control_stride = 0;
@@ -155,9 +155,8 @@ namespace llaminar2
         /**
          * @brief Compare every address and scalar embedded in captured nodes.
          *
-         * Device contents are excluded because they are replay inputs.  Seeds
-         * are included because each fused kernel node receives its request seed
-         * by value.
+         * Device contents, including request seeds, are replay inputs. The seed
+         * bank address is included because each kernel consumes that exact row.
          */
         [[nodiscard]] bool hasSameCaptureIdentity(
             const Params &other) const noexcept;

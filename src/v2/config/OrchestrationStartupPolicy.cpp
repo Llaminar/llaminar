@@ -9,6 +9,8 @@
  */
 #include "OrchestrationStartupPolicy.h"
 #include "OrchestrationConfig.h"
+#include "execution/mtp/MTPWeightManifest.h"
+#include "planning/ModelMemoryProfile.h"
 #include "utils/DebugEnv.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include <cstdlib>
@@ -17,6 +19,40 @@
 
 namespace llaminar2
 {
+    void resolveMTPStartupPolicy(OrchestrationConfig &config, const ModelMemoryProfile &model)
+    {
+        switch (config.mtp_activation_policy)
+        {
+        case MTPActivationPolicy::Automatic:
+            // A programmatically supplied enabled runtime policy is explicit.
+            // Otherwise the learned-block count selects the automatic intent;
+            // directory completeness is required before any BOM is admitted.
+            config.mtp.enabled = config.mtp.enabled || model.mtp_layer_count > 0;
+            break;
+        case MTPActivationPolicy::Enabled:
+            config.mtp.enabled = true;
+            break;
+        case MTPActivationPolicy::Disabled:
+            config.mtp.enabled = false;
+            break;
+        }
+        if (retainsMTPGraphCapacity(config.mtp))
+        {
+            const auto manifest = discoverMTPWeightManifest(model, true);
+            if (!manifest.available)
+            {
+                auto diagnostic = manifest.diagnostic;
+                if (!manifest.missing_required.empty())
+                    diagnostic += "; missing required tensor: " + manifest.missing_required.front();
+                throw std::invalid_argument(diagnostic +
+                    "; supply complete learned MTP/NextN weights or use --no-mtp "
+                    "without retained MTP graph capacity");
+            }
+        }
+        config.mtp_activation_policy = config.mtp.enabled
+            ? MTPActivationPolicy::Enabled : MTPActivationPolicy::Disabled;
+    }
+
     void publishOrchestrationStartupPolicy(const OrchestrationConfig &config)
     {
         std::optional<std::string> buckets;

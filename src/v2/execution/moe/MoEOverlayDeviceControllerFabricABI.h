@@ -25,7 +25,7 @@ namespace llaminar2
 
     /** Version of every fixed-width fabric record in this header. */
     inline constexpr std::uint32_t kMoEOverlayDeviceControllerFabricVersion =
-        17u;
+        18u;
 
     /** Snapshot and durable history planes: decode, prefill, grouped verifier. */
     inline constexpr std::uint32_t
@@ -190,7 +190,10 @@ namespace llaminar2
          */
         std::uint64_t demand_histogram_rebase_ready
             [kMoEOverlayDeviceControllerFabricMaxParticipants] = {};
-        std::uint64_t reserved[4] = {};
+        /** Global origin authenticated before another rank joins these pages. */
+        std::int32_t first_model_layer = 0;
+        std::uint32_t reserved0 = 0u;
+        std::uint64_t reserved[3] = {};
     };
 
     /**
@@ -256,7 +259,8 @@ namespace llaminar2
         std::uint64_t payload_geometry_fingerprint = 0u;
         /** Converts layer activation history into a token payoff horizon. */
         std::uint32_t routed_experts_per_token = 0u;
-        std::uint32_t reserved0 = 0u;
+        /** Model-global identity of compact controller row zero. */
+        std::int32_t first_model_layer = 0;
         std::uint64_t reserved[1] = {};
     };
 

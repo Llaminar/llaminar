@@ -47,21 +47,20 @@ namespace llaminar2
             std::string *error) noexcept
         {
             const std::uint8_t canonical =
-                canonicalDeviceVnniCodebookId(source.codebook_id);
+                canonicalDeviceVnniCodebookId(source);
             if (descriptor.codebook_id == canonical)
             {
                 format = {
                     .payload_bytes =
                         static_cast<std::uint8_t>(source.payload_bytes),
-                    .is_asymmetric = source.is_asymmetric,
+                    .is_asymmetric = canonicalDeviceVnniFormat(source).is_asymmetric,
                     .has_emins = source.has_emins,
                 };
                 return true;
             }
 
             const auto cpu_encoding =
-                cpu::native_vnni::preparedEncodingForCodebook(
-                    source.codebook_id);
+                cpu::native_vnni::preparedEncodingForSource(source);
             if (cpu_encoding !=
                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
             {

@@ -8,10 +8,12 @@
  * poisoned, and ROCm's Q8 side product must still contain all live input rows.
  * This proves a local kernel boundary, not inter-device transport or model wiring.
  */
+#include "kernels/common/RouterQ8Launch.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/MoERouterOwnedRows.h"
+#include "kernels/cuda/moe/CUDARouterQ8Prefill.h"
 #include "utils/TestTensorFactory.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -25,8 +27,7 @@
 
 extern "C"
 {
-    bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(const float *, int8_t *, float *,
-        const int8_t *, const float *, float *, int, int, int, int, void *, const int *);
+
     bool hipMoE_gate_logits_fp32_decode_equivalent_rows(const float *, const float *, float *,
         int, int, int, int, void *, const int *);
     bool hipMoE_gate_logits_fp16_decode_equivalent_rows(const float *, const void *, float *,
@@ -36,6 +37,7 @@ extern "C"
     bool hipMoE_softmax_topk_decode_equivalent_rows(float *, float *, float *, int, int, int,
         bool, int, void *, const int *, void *);
     bool cudaMoE_route_logits(const float *, const float *, float *, int, int, int, int, void *);
+    bool cudaMoE_route_logits_fp16(const float *, const void *, float *, int, int, int, int, void *, const int *);
     bool cudaMoE_route_logits_bf16(const float *, const void *, float *, int, int, int, int, void *);
     bool cudaMoE_softmax_topk(float *, float *, float *, int, int, int, bool, int, void *, const int *, void *);
 }
@@ -60,10 +62,11 @@ namespace
     };
 
     /** @brief Invoke only the explicitly requested native backend. */
-    bool enqueueOwned(DeviceId device, const MoERouterOwnedRowsLaunch &launch, void *stream)
+    bool enqueueOwned(DeviceId device, const MoERouterOwnedRowsLaunch &launch, void *stream,
+                      const cuda::RouterQ8PrefillHardware &hardware)
     {
 #ifdef HAVE_CUDA
-        if (device.is_cuda()) return llaminar2::cuda::routeOwnedRows(launch, stream);
+        if (device.is_cuda()) return llaminar2::cuda::routeOwnedRows(launch, stream, hardware);
 #endif
 #ifdef HAVE_ROCM
         if (device.is_rocm()) return llaminar2::rocm::routeOwnedRows(launch, stream);
@@ -78,9 +81,16 @@ namespace
 #ifdef HAVE_CUDA
         if (device.is_cuda())
         {
-            const bool logits = p.format == MoERouterPreparedFormat::FP32
+            const bool logits = p.format == MoERouterPreparedFormat::BlockQ8
+                ? cudaMoE_gate_logits_q8_weights_decode_equivalent_rows(p.hidden, p.hidden_q8,
+                    p.hidden_scales, static_cast<const int8_t *>(p.gate), p.gate_scales, p.logits,
+                    p.capacity, p.width, p.experts, device.ordinal, stream, p.q8_basis)
+                : p.format == MoERouterPreparedFormat::FP32
                 ? cudaMoE_route_logits(p.hidden, static_cast<const float *>(p.gate), p.logits,
                     p.capacity, p.width, p.experts, device.ordinal, stream)
+                : p.format == MoERouterPreparedFormat::FP16
+                    ? cudaMoE_route_logits_fp16(p.hidden, p.gate, p.logits,
+                        p.capacity, p.width, p.experts, device.ordinal, stream, p.live_rows)
                 : cudaMoE_route_logits_bf16(p.hidden, p.gate, p.logits,
                     p.capacity, p.width, p.experts, device.ordinal, stream);
             return logits && cudaMoE_softmax_topk(p.logits, indices, weights, p.capacity,
@@ -106,7 +116,7 @@ namespace
             case MoERouterPreparedFormat::BlockQ8:
                 logits = hipMoE_gate_logits_q8_weights_decode_equivalent_rows(p.hidden,
                     p.hidden_q8, p.hidden_scales, static_cast<const int8_t *>(p.gate), p.gate_scales,
-                    p.logits, p.capacity, p.width, p.experts, device.ordinal, stream, p.live_rows); break;
+                    p.logits, p.capacity, p.width, p.experts, device.ordinal, stream, p.live_rows, p.q8_basis); break;
             }
             return logits && hipMoE_softmax_topk_decode_equivalent_rows(p.logits, indices,
                 weights, p.capacity, p.experts, p.top_k, p.normalize, device.ordinal,
@@ -124,7 +134,7 @@ namespace
      * @param experts Router columns.
      * @param degrees Logical domain sizes, including more participants than live rows. */
     void prove(DeviceId device, MoERouterPreparedFormat format, int capacity, int width,
-               int experts, const std::vector<int> &degrees)
+               int experts, const std::vector<int> &degrees, RouterQ8Basis basis = RouterQ8Basis::Original)
     {
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         context.submitAndWait([&]
@@ -140,8 +150,16 @@ namespace
             auto hidden = TestTensorFactory::createFP32({input_elements});
             auto length = TestTensorFactory::createINT32({1});
             std::unique_ptr<TensorBase> gate;
+            std::vector<std::uint16_t> original_half;
             if (format == MoERouterPreparedFormat::FP16)
-                gate = TestTensorFactory::createFP16Random({size_t(experts), size_t(width)}, -.125f, .125f, 1772);
+            {
+                // Independent literal source words include signs, subnormals and
+                // non-unit significands. Arithmetic never rewrites this owner.
+                constexpr std::uint16_t words[]{0x0000, 0x8000, 0x0001, 0x8001, 0x2c01, 0xac03, 0x3005, 0xb007};
+                original_half.resize(size_t(experts) * width);
+                for (size_t i = 0; i < original_half.size(); ++i) original_half[i] = words[i % std::size(words)];
+                gate = std::make_unique<FP16Tensor>(std::vector<size_t>{size_t(experts), size_t(width)}, original_half);
+            }
             else if (format == MoERouterPreparedFormat::BF16)
                 gate = TestTensorFactory::createBF16Random({size_t(experts), size_t(width)}, -.125f, .125f, 1772);
             else if (format == MoERouterPreparedFormat::BlockQ8)
@@ -176,6 +194,7 @@ namespace
                 .capacity = capacity, .width = width, .experts = experts, .top_k = top_k,
                 .live_rows = static_cast<const int32_t *>(length->gpu_data_ptr()),
                 .hidden = static_cast<const float *>(hidden->gpu_data_ptr()), .format = format,
+                .q8_basis = basis,
                 .gate = gate->gpu_data_ptr(), .gate_scales = static_cast<const float *>(gate_scales->gpu_data_ptr()),
                 .hidden_q8 = static_cast<int8_t *>(q8->gpu_data_ptr()),
                 .hidden_scales = static_cast<float *>(scales->gpu_data_ptr()),
@@ -188,17 +207,24 @@ namespace
             auto *oracle_weights = static_cast<float *>(reference_weights->gpu_data_ptr());
             oracle.hidden_q8 = static_cast<int8_t *>(reference_q8->gpu_data_ptr());
             oracle.hidden_scales = static_cast<float *>(reference_scales->gpu_data_ptr());
+            std::vector<std::uint16_t> terminal_half(original_half.size());
+            std::vector<float> terminal_hidden(format == MoERouterPreparedFormat::FP16 ? input_elements : 0);
             ObservationJoin outer_join{backend, device, stream};
-            EXPECT_FALSE(enqueueOwned(device, launch, nullptr));
+            cuda::RouterQ8PrefillHardware hardware;
+#ifdef HAVE_CUDA
+            if (device.is_cuda())
+                require(cuda::prepareRouterQ8PrefillHardware(device.ordinal, stream, hardware), "Owned router hardware preparation");
+#endif
+            EXPECT_FALSE(enqueueOwned(device, launch, nullptr, hardware));
             auto invalid = launch;
             invalid.live_rows = nullptr;
-            EXPECT_FALSE(enqueueOwned(device, invalid, stream));
+            EXPECT_FALSE(enqueueOwned(device, invalid, stream, hardware));
             invalid = launch; invalid.partition = {};
-            EXPECT_FALSE(enqueueOwned(device, invalid, stream));
+            EXPECT_FALSE(enqueueOwned(device, invalid, stream, hardware));
             invalid = launch; invalid.capacity = 1;
-            EXPECT_FALSE(enqueueOwned(device, invalid, stream));
+            EXPECT_FALSE(enqueueOwned(device, invalid, stream, hardware));
             invalid = launch; invalid.selected_bytes = nullptr;
-            EXPECT_FALSE(enqueueOwned(device, invalid, stream));
+            EXPECT_FALSE(enqueueOwned(device, invalid, stream, hardware));
 
             std::vector<int> counts{capacity, 0, capacity / 2, 1};
             if (capacity == 65 && width == 96)
@@ -223,18 +249,19 @@ namespace
                     auto graph = context.createGraphCapture(stream);
                     require(bool(graph), "Owned router graph owner");
                     ObservationJoin join{backend, device, stream};
-                    require(enqueueOwned(device, launch, stream) && backend->synchronizeStream(stream, device.ordinal),
+                    require(enqueueOwned(device, launch, stream, hardware) && backend->synchronizeStream(stream, device.ordinal),
                         "Owned router preparation");
                     {
                         ScopedBackendGraphCapture recording(context, *graph, "Owned router live rows");
                         require(recording.begin(), "Owned router capture begin");
-                        require(enqueueOwned(device, launch, stream), "Owned router captured body");
+                        require(enqueueOwned(device, launch, stream, hardware), "Owned router captured body");
                         recording.finish();
                     }
                     std::vector<GPUGraphKernelNodeInfo> nodes;
                     ASSERT_TRUE(graph->inspectKernelNodes(nodes));
                     const bool owns_capacity = launch.partition.capacityFor(capacity) > 0;
-                    ASSERT_EQ(nodes.size(), 1u + owns_capacity + (format == MoERouterPreparedFormat::BlockQ8));
+                    ASSERT_EQ(nodes.size(), 1u + owns_capacity + (format == MoERouterPreparedFormat::BlockQ8) +
+                        (owns_capacity && basis == RouterQ8Basis::SignedHadamard32));
                     for (const auto &node : nodes) EXPECT_EQ(node.local_memory_bytes_per_thread, 0u) << node.name;
                     require(graph->instantiate(), "Owned router instantiate");
                     int generation = 0;
@@ -280,31 +307,58 @@ namespace
                         }
                     }
                 }
+            if (format == MoERouterPreparedFormat::FP16)
+            {
+                require(backend->deviceToHost(terminal_half.data(), gate->gpu_data_ptr(), terminal_half.size() * sizeof(uint16_t), device.ordinal, stream) &&
+                    backend->deviceToHost(terminal_hidden.data(), hidden->gpu_data_ptr(), terminal_hidden.size() * sizeof(float), device.ordinal, stream) &&
+                    backend->synchronizeStream(stream, device.ordinal), "Half router immutable source observation");
+                EXPECT_EQ(terminal_half, original_half);
+                EXPECT_EQ(std::memcmp(terminal_hidden.data(), input.data(), terminal_hidden.size() * sizeof(float)), 0)
+                    << "Router half rounding must not replace original expert hidden bytes";
+            }
         });
     }
 
     /** @brief Sweep supported prepared gate formats without changing numeric policy. */
     void proveBackend(DeviceId device)
     {
-        std::vector<MoERouterPreparedFormat> formats{MoERouterPreparedFormat::FP32, MoERouterPreparedFormat::BF16};
-        if (device.is_rocm())
-            formats.insert(formats.end(), {MoERouterPreparedFormat::FP16, MoERouterPreparedFormat::BlockQ8});
+        std::vector<MoERouterPreparedFormat> formats{MoERouterPreparedFormat::FP32, MoERouterPreparedFormat::BF16, MoERouterPreparedFormat::FP16};
+        formats.push_back(MoERouterPreparedFormat::BlockQ8);
         for (const auto format : formats)
         {
             prove(device, format, 2, 96, 17, {2, 8});
             prove(device, format, 65, 96, 17, {2, 3, 4, 8});
             prove(device, format, 512, 2048, 256, {2});
+            // Half expert tiles must stay exact beyond the default M512 bucket,
+            // including owned/local row offsets and a partial expert tile.
+            if (format == MoERouterPreparedFormat::FP16)
+                prove(device, format, 4096, 65, 17, {2, 4});
             prove(device, format, 33, 2080, 17, {2, 3});
             if (format != MoERouterPreparedFormat::BlockQ8)
                 prove(device, format, 17, 31, 17, {2});
         }
     }
 #ifdef HAVE_CUDA
-    /** @test CUDA's native prefill FP32/BF16 rows retain exact selection bytes. */
+    /** @test CUDA's native prefill FP32/BF16 and actual-half rows retain exact selection bytes. */
     TEST(MoERouterOwnedRows, CUDA) { proveBackend(DeviceId::cuda(0)); }
+    /** @test CUDA rotated Q8 prefill preserves compact ownership and every expert input row. */
+    TEST(MoERouterOwnedRows, CUDAHadamard)
+    {
+        prove(DeviceId::cuda(0), MoERouterPreparedFormat::BlockQ8, 2, 96, 17, {2, 8}, RouterQ8Basis::SignedHadamard32);
+        prove(DeviceId::cuda(0), MoERouterPreparedFormat::BlockQ8, 65, 96, 17, {2, 3, 4, 8}, RouterQ8Basis::SignedHadamard32);
+        prove(DeviceId::cuda(0), MoERouterPreparedFormat::BlockQ8, 512, 2048, 256, {2}, RouterQ8Basis::SignedHadamard32);
+    }
 #endif
 #ifdef HAVE_ROCM
     /** @test Every ROCm prepared router format retains exact rows and input publication. */
     TEST(MoERouterOwnedRows, ROCm) { proveBackend(DeviceId::rocm(0)); }
+    /** @test Rotated router coordinates never escape the compact local routing phase. */
+    TEST(MoERouterOwnedRows, ROCmHadamard)
+    {
+        prove(DeviceId::rocm(0), MoERouterPreparedFormat::BlockQ8, 2, 96, 17, {2, 8}, RouterQ8Basis::SignedHadamard32);
+        prove(DeviceId::rocm(0), MoERouterPreparedFormat::BlockQ8, 65, 96, 17, {2, 3, 4, 8}, RouterQ8Basis::SignedHadamard32);
+        prove(DeviceId::rocm(0), MoERouterPreparedFormat::BlockQ8, 512, 2048, 256, {2}, RouterQ8Basis::SignedHadamard32);
+    }
+
 #endif
 }

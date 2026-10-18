@@ -2,10 +2,13 @@
 
 /**
  * @file VnniUnpackKernels.h
+ * @note Q8_K source d is FP32. Existing prepared arrays store FP16 scales,
+ * so reverse conversion preserves only that prepared scale, not arbitrary
+ * original d bits. Original source/native embedding storage remains exact.
  * @brief ROCm/HIP kernels for reverse repack: GPU separated VNNI → raw GGUF blocks.
  *
  * HIP counterpart of kernels/cuda/repack/CUDAVnniUnpackKernels.h.
- * Q8_K is also reversible because its raw payload is preserved and its partial
+ * Q8_K codes are preserved; its FP32 scale is narrowed by preparation. Its partial
  * sums are derived from those bytes.  See CUDAVnniUnpackKernels.h for the full
  * format table shared by both backends.
  */
@@ -19,8 +22,10 @@ namespace llaminar2 {
 /**
  * @brief Launch HIP kernel to reverse-repack GPU separated VNNI → raw GGUF blocks.
  *
- * Supports all losslessly reversible formats, including Q8_1 and Q8_K.  Returns
- * false for unsupported scale-compressed superblock formats.
+ * Supports Q8_1 and prepared-FP16-scale Q8_K reconstruction. Returns
+ * false for unimplemented superblock reverse formats. Q6 source-factor metadata
+ * now preserves its original scales, but this API does not yet reconstruct its
+ * bitplanes into complete source superblocks; no implicit reverse path is added.
  *
  * @param format       Quantization format
  * @param d_payload    GPU separated payload [blocks_per_row * N * payload_bytes]

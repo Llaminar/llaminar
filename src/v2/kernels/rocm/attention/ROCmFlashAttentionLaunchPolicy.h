@@ -7,7 +7,9 @@
  * parallel execution assigns fixed 256-key summaries to a bounded persistent
  * grid and merges those summaries in ascending key order. This header resolves
  * that choice solely from immutable graph geometry and reports the exact arena
- * capacity required by the selected graph.
+ * capacity required by the selected graph. Query score ownership is likewise
+ * immutable: the measured native-half M512 XOR tile keeps scores in registers
+ * while preserving the same canonical FP32 arithmetic and KV state bytes.
  *
  * Live K/V length is deliberately absent from every policy input. HIP graph
  * replay reads that value from device-owned attention parameters. A context
@@ -18,6 +20,7 @@
 #pragma once
 
 #include "../../attention/AttentionExecutionPolicy.h"
+#include "../../../tensors/TensorType.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,11 +34,31 @@ namespace llaminar2::rocm::fa2_policy
     /** Threads in one gfx906 wavefront. */
     inline constexpr int kROCmFA2WavefrontSize = 64;
 
-    /** Number of K/V LDS buffers in the software pipeline. */
-    inline constexpr int kROCmFA2KVStages = 2;
+    /**
+     * @brief Select the physical K/V buffers for an exact compiled tile.
+     *
+     * The 256-wide 16x16 tile has one pipeline stage. Its query scan keeps
+     * distinct K/V planes, while its context producer reuses one plane after QK. Narrower heads and generic tile geometries retain their
+     * two-buffer schedule. The arithmetic tile and 256-key reduction boundary
+     * remain unchanged; only storage lifetime and cooperative copy width vary.
+     *
+     * @param head_dim Width of one attention head, or zero for a generic kernel.
+     * @param query_rows Physical query tile height, or zero for a generic kernel.
+     * @param kv_rows Physical K/V tile height, or zero for a generic kernel.
+     * @return Exactly one or two K/V buffer pairs.
+     */
+    [[nodiscard]]
+#if defined(__HIPCC__)
+    __host__ __device__
+#endif
+    inline constexpr int rocmFA2KVStages(
+        int head_dim, int query_rows, int kv_rows) noexcept
+    {
+        return head_dim == 256 && query_rows == 16 && kv_rows == 16 ? 1 : 2;
+    }
 
-    /** FP16 elements appended to each Q/K/V LDS row. */
-    inline constexpr int kROCmFA2QKVLDSPad = 2;
+    /** Keep every compiled Q/K/V LDS row aligned for 128-bit reads and writes. */
+    inline constexpr int kROCmFA2QKVLDSPad = 8;
 
     /** FP32 elements appended to each score LDS row. */
     inline constexpr int kROCmFA2ScoreLDSPad = 1;
@@ -64,11 +87,11 @@ namespace llaminar2::rocm::fa2_policy
     /**
      * @brief Resident context-phase workgroups assigned to each MI50 CU.
      *
-     * Every compiled FA2 tile consumes more than half of gfx906's 64 KiB LDS,
-     * so at most one phase workgroup can reside on a CU. A persistent grid wider
-     * than the CU count can add queued capacity work but cannot add residency.
+     * Query scans and other distinct-plane kernels retain the measured two-
+     * group register envelope. The wide context producer proves three groups;
+     * exact LDS capacity independently bounds both physical schedules.
      */
-    inline constexpr int kROCmFA2ContextPhaseResidentBlocksPerCU = 1;
+    inline constexpr int kROCmFA2ContextPhaseMaximumBlocksPerCU = 2;
 
     /** Near-full single-wave occupancy required for device-direct merging. */
     inline constexpr int kROCmFA2DirectWaveOccupancyNumerator = 9;
@@ -91,6 +114,63 @@ namespace llaminar2::rocm::fa2_policy
         std::size_t lds_capacity_bytes = 0; ///< LDS bytes available per workgroup.
     };
 
+    /** Immutable visibility facts that select an ordinary query implementation. */
+    using ROCmFA2VisibilityPolicy = attention::AttentionVisibilityPolicy;
+
+    /** Physical authority for the QK score consumed by its P/V lane. */
+    enum class ROCmFA2ScoreStorage : std::uint8_t
+    {
+        SharedMatrix, ///< Canonical padded LDS score matrix.
+        RegisterOwnedXorTile, ///< Native-half Q/K tiles; score remains in its lane.
+    };
+
+    /** Setup-owned query facts; live KV length never selects a physical layout. */
+    struct ROCmFA2QueryScoreGeometry
+    {
+        int batch_size = 0; ///< Captured requests.
+        int query_rows = 0; ///< Captured physical query rows, including bucket padding.
+        int head_dim = 0; ///< Immutable head width.
+        TensorType kv_format = TensorType::FP32; ///< Actual native execution operands.
+        ROCmFA2VisibilityPolicy visibility = ROCmFA2VisibilityPolicy::General;
+    };
+
+    /**
+     * @brief Select the measured exact score owner solely from immutable inputs.
+     * @param geometry Native operand, visibility and captured query geometry.
+     * @return One first-class score layout; all other shapes retain their canonical layout.
+     *
+     * The native-half body preserves the four FP32 QK chains, ascending
+     * FP32 P/V operations and 256-key merge order. Its XOR Q/K layout removes
+     * score LDS traffic and admits four spill-free workgroups per gfx906 CU.
+     * Larger buckets add independent sixteen-query tiles, not per-block
+     * storage. M512 is the minimum qualified bucket, never an upper bound.
+     */
+    [[nodiscard]]
+#if defined(__HIPCC__)
+    __host__ __device__
+#endif
+    inline constexpr ROCmFA2ScoreStorage selectROCmFA2QueryScoreStorage(
+        const ROCmFA2QueryScoreGeometry &geometry) noexcept
+    {
+        return geometry.batch_size == 1 && geometry.query_rows >= 512 &&
+                       geometry.head_dim == 256 && geometry.kv_format == TensorType::FP16 &&
+                       geometry.visibility == ROCmFA2VisibilityPolicy::CausalFullContext
+                   ? ROCmFA2ScoreStorage::RegisterOwnedXorTile
+                   : ROCmFA2ScoreStorage::SharedMatrix;
+    }
+
+    /** @return A stable capture-inventory spelling for the physical score owner. */
+    [[nodiscard]] inline constexpr const char *rocmFA2ScoreStorageName(
+        ROCmFA2ScoreStorage storage) noexcept
+    {
+        switch (storage)
+        {
+        case ROCmFA2ScoreStorage::SharedMatrix: return "shared_matrix";
+        case ROCmFA2ScoreStorage::RegisterOwnedXorTile: return "register_owned_xor_tile";
+        }
+        return "invalid";
+    }
+
     /** Immutable launch geometry for one participant-local prefill graph. */
     struct ROCmFA2PrefillParallelGeometry
     {
@@ -103,6 +183,15 @@ namespace llaminar2::rocm::fa2_policy
         std::size_t lds_capacity_bytes = kROCmFA2LDSCapacityBytes;
         attention::AttentionPrefillParallelAxis requested_axis =
             attention::AttentionPrefillParallelAxis::QuerySequence;
+        TensorType kv_format = TensorType::FP32; ///< Actual native execution operands.
+        ROCmFA2VisibilityPolicy visibility = ROCmFA2VisibilityPolicy::General;
+    };
+
+    /** Concrete prefill axis embedded in one HIP graph. */
+    enum class ROCmFA2PrefillPhysicalMode : std::uint8_t
+    {
+        QuerySequence,
+        KeyValueContext,
     };
 
     /** Fully resolved direct-kernel tile geometry. */
@@ -112,14 +201,10 @@ namespace llaminar2::rocm::fa2_policy
         int kv_rows = 0;          ///< Physical K/V rows staged per iteration.
         int threads_per_row = 0;  ///< Output-dimension owners per query row.
         std::size_t lds_bytes = 0; ///< Exact dynamic LDS allocation.
+        ROCmFA2PrefillPhysicalMode schedule =
+            ROCmFA2PrefillPhysicalMode::QuerySequence; ///< Physical reader lifetime.
+        ROCmFA2ScoreStorage score_storage = ROCmFA2ScoreStorage::SharedMatrix;
         bool valid = false;       ///< True only for a compiled specialization.
-    };
-
-    /** Concrete prefill axis embedded in one HIP graph. */
-    enum class ROCmFA2PrefillPhysicalMode : std::uint8_t
-    {
-        QuerySequence,
-        KeyValueContext,
     };
 
     /**
@@ -180,19 +265,70 @@ namespace llaminar2::rocm::fa2_policy
     }
 
     /**
+     * @brief Count simultaneously live K/V planes for the physical schedule.
+     * @param head_dim Compiled head width, or zero for generic geometry.
+     * @param query_rows Compiled query tile height, or zero for generic geometry.
+     * @param kv_rows Compiled K/V tile height, or zero for generic geometry.
+     * @param schedule Physical query scan or context-summary producer.
+     * @param score_storage Immutable shared-matrix or register-owned layout.
+     * @return One shared plane for the wide context producer, otherwise two.
+     *
+     * The wide context producer retires every K reader before V overwrites the
+     * same plane. Query scans retain concurrent K/V publication because smaller
+     * grids cannot amortize the additional overwrite/publication barrier.
+     */
+    [[nodiscard]]
+#if defined(__HIPCC__)
+    __host__ __device__
+#endif
+    inline constexpr int rocmFA2LiveKVPlanes(
+        int head_dim, int query_rows, int kv_rows, ROCmFA2PrefillPhysicalMode schedule,
+        ROCmFA2ScoreStorage score_storage = ROCmFA2ScoreStorage::SharedMatrix) noexcept
+    {
+        if (score_storage == ROCmFA2ScoreStorage::RegisterOwnedXorTile)
+            return schedule == ROCmFA2PrefillPhysicalMode::QuerySequence &&
+                           head_dim == 256 && query_rows == 16 && kv_rows == 16 ? 1 : 0;
+        if (score_storage != ROCmFA2ScoreStorage::SharedMatrix)
+            return 0;
+        if (schedule != ROCmFA2PrefillPhysicalMode::QuerySequence &&
+            schedule != ROCmFA2PrefillPhysicalMode::KeyValueContext)
+            return 0;
+        return schedule == ROCmFA2PrefillPhysicalMode::KeyValueContext && head_dim == 256 &&
+               query_rows == 16 && kv_rows == 16 ? 1 : 2;
+    }
+
+    /**
      * @brief Calculate the exact LDS bytes for one MI50 prefill tile.
      *
-     * The layout is one FP16 Q tile, two pipelined FP16 K/V pairs, and one
+     * The layout is one FP16 Q tile, the schedule-owned FP16 K/V planes, and one
      * FP32 score tile. The formula is shared by policy tests and the HIP launch
      * bridge so a benchmark cannot label a geometry different from the kernel
      * it actually launches.
+     * @param head_dim Width of each Q/K/V head.
+     * @param query_rows Compiled physical query tile height.
+     * @param kv_rows Compiled physical K/V tile height.
+     * @param schedule Immutable physical query/context reader lifetime.
+     * @param score_storage Actual shared-matrix or register-owned score layout.
+     * @return Exact consumed LDS bytes, or zero for an invalid geometry.
      */
     [[nodiscard]] inline constexpr std::size_t rocmFA2LDSBytes(
         int head_dim,
         int query_rows,
-        int kv_rows) noexcept
+        int kv_rows,
+        ROCmFA2PrefillPhysicalMode schedule = ROCmFA2PrefillPhysicalMode::QuerySequence,
+        ROCmFA2ScoreStorage score_storage = ROCmFA2ScoreStorage::SharedMatrix) noexcept
     {
-        if (head_dim <= 0 || head_dim > 256 || query_rows <= 0 ||
+        if (score_storage == ROCmFA2ScoreStorage::RegisterOwnedXorTile)
+        {
+            return schedule == ROCmFA2PrefillPhysicalMode::QuerySequence &&
+                           head_dim == 256 && query_rows == 16 && kv_rows == 16
+                       ? 2U * 16U * 256U * sizeof(std::uint16_t) : 0;
+        }
+        if (score_storage != ROCmFA2ScoreStorage::SharedMatrix)
+            return 0;
+        if ((schedule != ROCmFA2PrefillPhysicalMode::QuerySequence &&
+             schedule != ROCmFA2PrefillPhysicalMode::KeyValueContext) ||
+            head_dim <= 0 || head_dim > 256 || query_rows <= 0 ||
             kv_rows <= 0 ||
             kROCmFA2CanonicalContextPartitionKeys % kv_rows != 0)
         {
@@ -207,7 +343,8 @@ namespace llaminar2::rocm::fa2_policy
             static_cast<std::size_t>(query_rows) * qkv_stride *
             sizeof(std::uint16_t);
         const std::size_t kv_bytes =
-            static_cast<std::size_t>(kROCmFA2KVStages) * 2U *
+            static_cast<std::size_t>(rocmFA2KVStages(head_dim, query_rows, kv_rows)) *
+            static_cast<std::size_t>(rocmFA2LiveKVPlanes(head_dim, query_rows, kv_rows, schedule)) *
             static_cast<std::size_t>(kv_rows) * qkv_stride *
             sizeof(std::uint16_t);
         const std::size_t score_bytes =
@@ -222,17 +359,38 @@ namespace llaminar2::rocm::fa2_policy
      * candidates prefer more query reuse. An explicit K/V width is accepted
      * only by the isolated tournament and never causes substitution when it
      * cannot fit.
+     * @param head_dim Width of one attention head.
+     * @param lds_capacity_bytes Physical per-workgroup LDS limit.
+     * @param explicit_kv_rows Exact diagnostic tile width, or zero for selection.
+     * @param schedule Physical query/context schedule recorded in the tile.
+     * @param score_storage Exact compiled score layout, never silently substituted.
+     * @return The admitted tile and exact storage extent, or an invalid plan.
      */
     [[nodiscard]] inline constexpr ROCmFA2TilePlan selectROCmFA2Tile(
         int head_dim,
         std::size_t lds_capacity_bytes = kROCmFA2LDSCapacityBytes,
-        int explicit_kv_rows = 0) noexcept
+        int explicit_kv_rows = 0,
+        ROCmFA2PrefillPhysicalMode schedule = ROCmFA2PrefillPhysicalMode::QuerySequence,
+        ROCmFA2ScoreStorage score_storage = ROCmFA2ScoreStorage::SharedMatrix) noexcept
     {
         if (head_dim <= 0 || head_dim > 256 || lds_capacity_bytes == 0 ||
             explicit_kv_rows < 0)
         {
             return {};
         }
+
+        if (score_storage == ROCmFA2ScoreStorage::RegisterOwnedXorTile)
+        {
+            const std::size_t bytes = rocmFA2LDSBytes(head_dim, 16, 16, schedule, score_storage);
+            if (bytes == 0 || bytes > lds_capacity_bytes ||
+                (explicit_kv_rows != 0 && explicit_kv_rows != 16))
+                return {};
+            return {.query_rows = 16, .kv_rows = 16, .threads_per_row = 16,
+                    .lds_bytes = bytes, .schedule = schedule,
+                    .score_storage = score_storage, .valid = true};
+        }
+        if (score_storage != ROCmFA2ScoreStorage::SharedMatrix)
+            return {};
 
         struct Candidate
         {
@@ -261,7 +419,7 @@ namespace llaminar2::rocm::fa2_policy
             const std::size_t bytes = rocmFA2LDSBytes(
                 head_dim,
                 candidate.query_rows,
-                candidate.kv_rows);
+                candidate.kv_rows, schedule);
             if (bytes == 0 || bytes > lds_capacity_bytes)
                 continue;
 
@@ -275,6 +433,7 @@ namespace llaminar2::rocm::fa2_policy
                     .kv_rows = candidate.kv_rows,
                     .threads_per_row = threads_per_row,
                     .lds_bytes = bytes,
+                    .schedule = schedule,
                     .valid = true,
                 };
                 winner_area = area;
@@ -360,7 +519,7 @@ namespace llaminar2::rocm::fa2_policy
     /**
      * @brief Select the bounded physical grid for persistent phase execution.
      *
-     * The default exposes one LDS-heavy workgroup per CU and lets each block
+     * The default exposes the LDS-resident workgroups per CU and lets each block
      * stride the immutable logical partition owners. Explicit values exist for
      * the isolated tournament and byte-equivalence sweep only; they must cover
      * at least one task and cannot exceed the logical task space.
@@ -390,9 +549,22 @@ namespace llaminar2::rocm::fa2_policy
                        : 0;
         }
 
+        if (!tile.valid || tile.lds_bytes == 0 ||
+            tile.lds_bytes > geometry.lds_capacity_bytes)
+        {
+            return 0;
+        }
+        const auto lds_residency = geometry.lds_capacity_bytes / tile.lds_bytes;
+        // Only the one-plane 256-wide kernel has a measured three-group
+        // register envelope. Other compiled geometries retain their own cap.
+        const auto register_residency = rocmFA2LiveKVPlanes(
+            geometry.head_dim, tile.query_rows, tile.kv_rows, tile.schedule) == 1
+                ? 3 : kROCmFA2ContextPhaseMaximumBlocksPerCU;
+        const auto resident_blocks_per_cu =
+            lds_residency < register_residency ? lds_residency : register_residency;
         const std::int64_t resident_blocks =
             static_cast<std::int64_t>(geometry.compute_unit_count) *
-            kROCmFA2ContextPhaseResidentBlocksPerCU;
+            resident_blocks_per_cu;
         return static_cast<int>(
             logical_blocks < resident_blocks
                 ? logical_blocks
@@ -616,9 +788,9 @@ namespace llaminar2::rocm::fa2_policy
         int explicit_reducer_block_slots = 0,
         int explicit_context_phase_block_slots = 0) noexcept
     {
-        const ROCmFA2TilePlan tile = selectROCmFA2Tile(
+        ROCmFA2TilePlan tile = selectROCmFA2Tile(
             geometry.head_dim,
-            geometry.lds_capacity_bytes);
+            geometry.lds_capacity_bytes, 0, ROCmFA2PrefillPhysicalMode::KeyValueContext);
         const std::int64_t query_blocks =
             rocmFA2QueryGridBlocks(geometry, tile);
         if (!tile.valid || query_blocks <= 0 || geometry.kv_capacity <= 0 ||
@@ -656,11 +828,25 @@ namespace llaminar2::rocm::fa2_policy
             break;
         case attention::AttentionPrefillParallelAxis::GeometrySelected:
         {
-            const std::int64_t context_phase_envelope =
+            std::int64_t context_phase_envelope =
                 static_cast<std::int64_t>(geometry.compute_unit_count) *
                 kROCmFA2ContextTargetBlockWaves;
+            const auto query_storage = selectROCmFA2QueryScoreStorage({
+                .batch_size = geometry.batch_size, .query_rows = geometry.query_rows,
+                .head_dim = geometry.head_dim, .kv_format = geometry.kv_format,
+                .visibility = geometry.visibility});
+            if (query_storage == ROCmFA2ScoreStorage::RegisterOwnedXorTile)
+            {
+                // The register-score body is economical once its independent
+                // query grid fills the actual retained context producer grid.
+                // The old eight-wave target described the shared-score body;
+                // applying it here needlessly selects a slower transaction.
+                context_phase_envelope = selectROCmFA2ContextPhaseBlockSlots(
+                    geometry, tile, slots);
+            }
             if (max_partitions > 1 && slots > 1 &&
-                !rocmFA2HasPackedSingleCUWave(geometry, tile) &&
+                !(query_storage == ROCmFA2ScoreStorage::SharedMatrix &&
+                  rocmFA2HasPackedSingleCUWave(geometry, tile)) &&
                 query_blocks < context_phase_envelope)
             {
                 mode = ROCmFA2PrefillPhysicalMode::KeyValueContext;
@@ -669,6 +855,18 @@ namespace llaminar2::rocm::fa2_policy
         }
         default:
             return {};
+        }
+
+        if (mode == ROCmFA2PrefillPhysicalMode::QuerySequence)
+        {
+            const auto score_storage = selectROCmFA2QueryScoreStorage({
+                .batch_size = geometry.batch_size, .query_rows = geometry.query_rows,
+                .head_dim = geometry.head_dim, .kv_format = geometry.kv_format,
+                .visibility = geometry.visibility});
+            tile = selectROCmFA2Tile(geometry.head_dim, geometry.lds_capacity_bytes,
+                                     0, ROCmFA2PrefillPhysicalMode::QuerySequence, score_storage);
+            if (!tile.valid)
+                return {};
         }
 
         ROCmFA2PrefillParallelPlan plan{
@@ -776,9 +974,9 @@ namespace llaminar2::rocm::fa2_policy
             return {};
         }
 
-        const ROCmFA2TilePlan tile = selectROCmFA2Tile(
+        ROCmFA2TilePlan tile = selectROCmFA2Tile(
             geometry.head_dim,
-            geometry.lds_capacity_bytes);
+            geometry.lds_capacity_bytes, 0, ROCmFA2PrefillPhysicalMode::KeyValueContext);
         if (!tile.valid)
             return {};
 
@@ -810,6 +1008,31 @@ namespace llaminar2::rocm::fa2_policy
             geometry.query_rows < occupancy_limited_rows
                 ? geometry.query_rows
                 : occupancy_limited_rows;
+
+        const auto query_storage = selectROCmFA2QueryScoreStorage({
+            .batch_size = geometry.batch_size, .query_rows = candidate_rows,
+            .head_dim = geometry.head_dim, .kv_format = geometry.kv_format,
+            .visibility = geometry.visibility});
+        if (query_storage == ROCmFA2ScoreStorage::RegisterOwnedXorTile)
+        {
+            const auto context_slots = selectROCmFA2ContextPartitionSlots(
+                geometry, tile,
+                static_cast<int>((static_cast<std::int64_t>(geometry.kv_capacity) +
+                    kROCmFA2CanonicalContextPartitionKeys - 1) /
+                    kROCmFA2CanonicalContextPartitionKeys));
+            const std::int64_t phase_blocks = selectROCmFA2ContextPhaseBlockSlots(
+                geometry, tile, context_slots);
+            if (phase_blocks <= 0)
+                return {};
+            const std::int64_t fast_context_rows =
+                ((phase_blocks - 1) / blocks_per_query_tile) * tile.query_rows;
+            // M511 remains a legal shared-score graph. Its workspace may be
+            // larger than every fast context graph, even when M512 is direct.
+            const int largest_context_rows = static_cast<int>(
+                fast_context_rows > 511 ? fast_context_rows : 511);
+            if (candidate_rows > largest_context_rows)
+                candidate_rows = largest_context_rows;
+        }
 
         while (candidate_rows > 0)
         {

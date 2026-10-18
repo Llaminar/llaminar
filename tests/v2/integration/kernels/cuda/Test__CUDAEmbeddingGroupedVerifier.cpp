@@ -18,12 +18,15 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/KernelFactory.h"
+#include "transfer/TransferEngine.h"
+#include "kernels/common/NativeEmbeddingLayout.h"
 #include "kernels/cuda/ops/CUDAEmbeddingKernelT.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorSlice.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../utils/EmbeddingVerifierFormats.h"
+#include "../../../utils/Q8KEmbeddingSourceScaleFixture.h"
 #include "../../../utils/VerifierRowTestInventory.h"
 
 #ifdef HAVE_CUDA
@@ -202,7 +205,8 @@ namespace
         const EmbeddingVerifierFormatCase &format,
         uint32_t seed,
         cudaStream_t stream,
-        SourceView source_view = SourceView::Direct)
+        SourceView source_view = SourceView::Direct,
+        int only_rows = 0)
     {
         constexpr int vocab_size = 67;
         constexpr int d_model = 256;
@@ -217,12 +221,10 @@ namespace
         ASSERT_NE(embedding_table, nullptr);
         ASSERT_STREQ(tensorTypeName(embedding_table->native_type()), format.label);
 
-        std::vector<float> floating_reference;
-        if (!format.prepared_embed_q8)
-        {
-            floating_reference.resize(vocab_size * d_model);
-            embedding_table->to_fp32(floating_reference.data());
-        }
+        // The independent oracle is the original Tensor's source dequantizer,
+        // never a copied GPU decoder or the former secondary Q8 representation.
+        std::vector<float> source_reference(vocab_size * d_model);
+        embedding_table->to_fp32(source_reference.data());
         const int vocab_offset = source_view == SourceView::NestedVocabularyShard ? 17 : 0;
         if (source_view == SourceView::NestedVocabularyShard)
         {
@@ -238,18 +240,30 @@ namespace
             embedding_table = std::make_unique<TensorSlice>(std::move(embedding_table), metadata);
             embedding_table = std::make_unique<TensorSlice>(std::move(embedding_table), metadata);
             for (auto &token : tokens) token += vocab_offset;
+            // Valid tokens owned by neighboring vocabulary shards must publish
+            // zero here, while the final local source row remains observable.
+            tokens[0] = vocab_offset - 1;
+            tokens[1] = vocab_offset + vocab_size;
+            tokens[2] = vocab_offset + vocab_size - 1;
         }
-        ASSERT_EQ(IINT8Unpackable::fromTensor(embedding_table.get()) != nullptr,
-                  format.prepared_embed_q8);
+        ASSERT_EQ(NativeEmbeddingLayout::supports(embedding_table->native_type()),
+                  format.prepared_native_quantized);
 
         std::shared_ptr<PreparedEmbeddingHandle> prepared;
-        if (format.prepared_embed_q8)
+        if (format.prepared_native_quantized)
         {
+            const auto source_layout = NativeEmbeddingLayout::forSource(
+                embedding_table->native_type(), vocab_size, d_model);
+            auto upload_staging = TransferEngine::instance().allocatePinnedHostBuffer(
+                source_layout.byte_size, device);
             prepared = KernelFactory::prepareEmbeddingHandleLocal(
-                embedding_table.get(), d_model, device, vocab_offset, vocab_size + vocab_offset);
+                embedding_table.get(), d_model, device, upload_staging.get(),
+                vocab_offset, vocab_size + vocab_offset);
             ASSERT_NE(prepared, nullptr) << format.label;
             ASSERT_NE(prepared->weights, nullptr) << format.label;
             ASSERT_NE(prepared->weights->device_data, nullptr) << format.label;
+            ASSERT_EQ(prepared->weights->layout,
+                NativeEmbeddingLayout::forSource(embedding_table->native_type(), vocab_size, d_model));
         }
         else
         {
@@ -270,6 +284,7 @@ namespace
         CUDAEmbeddingKernelT kernel(0);
         kernel.setGPUStream(stream);
         kernel.setVocabRange(vocab_offset, vocab_size);
+        kernel.setAllowOutOfRangeTokenIds(source_view == SourceView::NestedVocabularyShard);
         if (prepared)
             kernel.setPreparedEmbeddingHandle(prepared.get());
 
@@ -280,7 +295,9 @@ namespace
         ASSERT_TRUE(workspace.allocate(requirements));
         kernel.bindWorkspace(&workspace);
 
-        for (int verifier_rows : kGroupedVerifierRuntimeRows)
+        std::vector<int> row_counts(kGroupedVerifierRuntimeRows.begin(), kGroupedVerifierRuntimeRows.end());
+        if (only_rows > 0) row_counts = {only_rows};
+        for (int verifier_rows : row_counts)
         {
             SCOPED_TRACE(std::string(format.label) + " M=" + std::to_string(verifier_rows));
             FP32Tensor grouped_output(
@@ -343,16 +360,22 @@ namespace
 
             ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
             expectByteExact(grouped, serial, std::string(format.label) + " CUDA embedding");
-            if (!floating_reference.empty())
-            {
-                std::vector<float> expected(grouped.size());
-                for (int row = 0; row < verifier_rows; ++row)
+            std::vector<float> expected(grouped.size(), 0.f);
+            for (int row = 0; row < verifier_rows; ++row)
+                if (tokens[row] >= vocab_offset && tokens[row] < vocab_offset + vocab_size)
                     std::memcpy(expected.data() + row * d_model,
-                                floating_reference.data() + (tokens[row] - vocab_offset) * d_model,
+                                source_reference.data() + (tokens[row] - vocab_offset) * d_model,
                                 d_model * sizeof(float));
-                // A grouped/serial comparison alone would accept both paths
-                // returning zeros. Check against the untouched source bytes.
-                expectByteExact(grouped, expected, std::string(format.label) + " native source");
+            // Q4_K/Q5_K source subtract versus add-of-negative can differ only
+            // in signed zero. Retain exact nonzero bits and all floating bytes.
+            const bool source_signed_zero = embedding_table->native_type() == TensorType::Q4_K ||
+                                            embedding_table->native_type() == TensorType::Q5_K;
+            for (size_t i = 0; i < grouped.size(); ++i)
+            {
+                if (source_signed_zero && grouped[i] == 0.f && expected[i] == 0.f) continue;
+                ASSERT_EQ(std::memcmp(&grouped[i], &expected[i], sizeof(float)), 0)
+                    << format.label << " original-source element=" << i
+                    << " actual=" << grouped[i] << " expected=" << expected[i];
             }
             expectGroupedCounter(
                 format.label,
@@ -404,6 +427,28 @@ TEST_F(Test__CUDAEmbeddingGroupedVerifier, NestedVocabularySlicesPreserveCapture
         SCOPED_TRACE(format.label);
         runFormat(format, seed++, stream.get(), SourceView::NestedVocabularyShard);
     }
+}
+
+/**
+ * @brief Reproduce secondary embedding-scale rounding against original source values.
+ * @details All quantized codebooks use captured M8 lookup through nested native
+ * source slices. The oracle is each untouched Tensor's independent dequantizer;
+ * opposite vocabulary-shard tokens must zero and the last local row must survive.
+ */
+TEST_F(Test__CUDAEmbeddingGroupedVerifier, SourceQuantizationMetadataIsNotRoundedAgain)
+{
+    ScopedCudaStream stream;
+    ASSERT_TRUE(stream.create());
+    ScopedPerfStats perfstats;
+    uint32_t seed = 193700;
+    for (const auto &format : embeddingVerifierFormats())
+        if (format.prepared_native_quantized)
+            runFormat(format, seed++, stream.get(), SourceView::NestedVocabularyShard, 8);
+    // The M16 nested-shard token window reads every signed scale edge; the
+    // helper compares all values with original Tensor::to_fp32, then checks
+    // captured grouped bytes against serial M1 on the same explicit stream.
+    runFormat(q8KEmbeddingSourceScaleEdges(), 0, stream.get(),
+              SourceView::NestedVocabularyShard, 16);
 }
 
 /** @brief Prove the removed lazy workspace-repack route cannot execute. */

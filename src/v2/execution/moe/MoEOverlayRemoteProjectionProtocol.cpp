@@ -103,13 +103,13 @@ namespace llaminar2
             const NativeVnniFormatInfo &source) noexcept
         {
             const std::uint8_t canonical =
-                canonicalDeviceVnniCodebookId(source.codebook_id);
+                canonicalDeviceVnniCodebookId(source);
             if (manifest.gpu_codebook_id == canonical)
             {
                 return manifest.gpu_payload_bytes_per_block ==
                            source.payload_bytes &&
                        manifest.gpu_is_asymmetric ==
-                           static_cast<std::uint8_t>(source.is_asymmetric) &&
+                           static_cast<std::uint8_t>(canonicalDeviceVnniFormat(source).is_asymmetric) &&
                        manifest.gpu_has_emins ==
                            static_cast<std::uint8_t>(source.has_emins);
             }
@@ -119,8 +119,7 @@ namespace llaminar2
              * destination GPU then executes normalized signed bytes while the
              * source identity remains the mathematical GGUF provenance.
              */
-            if (cpu::native_vnni::preparedEncodingForCodebook(
-                    source.codebook_id) !=
+            if (cpu::native_vnni::preparedEncodingForSource(source) !=
                 cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
             {
                 return false;
@@ -196,8 +195,7 @@ namespace llaminar2
             manifest.cpu_is_superblock =
                 source_identity.is_superblock ? 1u : 0u;
             manifest.cpu_encoding =
-                cpu::native_vnni::preparedEncodingForCodebook(
-                    source_identity.codebook_id);
+                cpu::native_vnni::preparedEncodingForSource(*source);
             manifest.cpu_data_stride =
                 cpu::native_vnni::preparedDataStride(manifest.cpu_encoding);
             manifest.cpu_block_stride = static_cast<std::uint32_t>(
@@ -403,8 +401,7 @@ namespace llaminar2
                     static_cast<std::uint8_t>(source->is_asymmetric) ||
                 cpu_is_superblock != source_is_superblock ||
                 cpu_encoding !=
-                    cpu::native_vnni::preparedEncodingForCodebook(
-                        source_codebook_id) ||
+                    cpu::native_vnni::preparedEncodingForSource(*source) ||
                 cpu_data_stride !=
                     cpu::native_vnni::preparedDataStride(cpu_encoding) ||
                 cpu_block_stride !=

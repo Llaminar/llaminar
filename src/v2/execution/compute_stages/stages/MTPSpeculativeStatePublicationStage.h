@@ -185,6 +185,12 @@ namespace llaminar2
 
             int request_count = 0;
             int verifier_rows_per_request = 0;
+            /**
+             * CompactOutcome's immutable host clipping policy. Other
+             * authorities require zero: BoundedGeneration derives the live
+             * limit from device control, while PipelineFollower consumes
+             * already committed metadata. Neither embeds a host limit.
+             */
             int max_state_commit_rows = 0;
 
             std::vector<IMoEGroupedVerifierHistogramPublisher *>

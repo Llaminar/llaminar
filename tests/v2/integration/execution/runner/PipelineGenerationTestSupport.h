@@ -44,6 +44,12 @@ namespace llaminar2::test
 class PipelineMTPStateOwnership : public ::testing::TestWithParam<std::string>
 {
 protected:
+    /**
+     * @brief Prove serial tokens and retained publication across streaming budgets.
+     * @param mode Explicit fixed or adaptive production depth policy.
+     */
+    void runPublicMTPStreamingProof(MTPDepthPolicyMode mode);
+
     /** @brief Small real Qwen schema; model weights are unnecessary for state admission. */
     static GraphConfig stateConfig(DeviceId device)
     {
@@ -161,7 +167,10 @@ public:
         append.device_id = input.device;
         append.K = append.V = buffers_.current_hidden;
         append.kv_cache = input.kv_cache;
-        append.layer_idx = append.seq_idx = 0;
+        // A stage's main cache uses global layer coordinates. The sidecar
+        // below has its own local layer zero and must not inherit this offset.
+        append.layer_idx = config().pp_layer_offset;
+        append.seq_idx = 0;
         append.num_tokens = append.seq_len = input.seq_len;
         append.batch_size = 1;
         // A scalar condition's length bank contains its absolute KV position,
@@ -290,15 +299,16 @@ public:
     /** @brief Honor the production PP entrypoint with this fixture's owned stages.
      * @param input Exact invocation, including the participant-local hidden bank.
      * @param output Receives this stage's hidden/logit publications.
-     * @param first_layer First fixture layer (one local KV layer).
-     * @param last_layer Exclusive fixture layer bound.
+     * @param first_layer Global index of this stage's one main-model KV layer.
+     * @param last_layer Exclusive global layer bound.
      * @param embedding Must match the entry stage selected at construction.
      * @param head Must match the vocabulary owner selected at construction.
      * @return The same real embedding/KV/row-selection kernels, scoped to this stage. */
     ComputeGraph buildPartialForwardGraph(const ForwardInput &input, ForwardOutput &output,
         int first_layer, int last_layer, bool embedding, bool head) override
     {
-        if (first_layer != 0 || last_layer != 1 || embedding != owns_embedding || head != owns_head)
+        if (first_layer != config().pp_layer_offset || last_layer != first_layer + 1 ||
+            embedding != owns_embedding || head != owns_head)
             throw std::invalid_argument("Ordinary pipeline fixture role differs from the runner plan");
         return buildForwardGraph(input, output);
     }

@@ -6,12 +6,15 @@
  * aliases, reversed receipt order, missing results and malformed work/graph/ISA
  * fields must not become a usable catalog. No test here opens a device.
  */
+#include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include "planning/PlanningKernelServiceCatalog.h"
 #include "planning/PlanningWeightServiceModel.h"
 #include "planning/PlanningCommunicationService.h"
 #include "planning/PlanningCommunicationCost.h"
 #include "planning/PlanningRequestCostModel.h"
+#include "config/OrchestrationConfigParser.h"
 #include "utils/CPUFeatures.h"
+#include "utils/DebugEnv.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
@@ -625,6 +628,7 @@ TEST(PlanningWeightServiceModel, SamplingIsBoundedByFamiliesAndIndependentOfDire
 
 TEST(PlanningWeightServiceModel, PromotedSourcesMeasureAndPriceTheirExecutedFamily)
 {
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
     PlanningGGUFFixture file(false, false, GGUFTensorType::Q8_0, 256, GGUFTensorType::Q8_0);
     PlanningModelSource source(file.path());
     auto profile = source.metadata().memoryProfile();
@@ -864,6 +868,85 @@ TEST(PlanningRequestCostModel, FloatingHomogeneousMoETPAdmitsDynamicWithoutChang
             EXPECT_EQ(candidate.config().moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
         }
 }
+
+/** @brief Four/eight physical owners use the same scoped request-cost composition. */
+class PipelineRequestCost : public ::testing::TestWithParam<int> {};
+
+/** @test A later PP expert stage must use its own root, participants and quotas. */
+TEST_P(PipelineRequestCost, HybridMoEUsesStageScopedEvidence)
+{
+    auto cluster = requestInventory(true);
+    cluster.world_size = 1;
+    cluster.ranks.resize(1);
+    auto &rank = cluster.ranks.front();
+    // Every participant retains its configured RAM tier. This observation must
+    // cover the complete transaction, including eight independently owned tiers.
+    rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = rank.cpu_memory_bytes = size_t{256} << 30;
+    for (auto &socket : rank.cpu_socket_info) socket.memory_bytes = size_t{256} << 30;
+    const int width = GetParam() / 2;
+    const auto templates = rank.gpus;
+    rank.gpus.clear();
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const auto base = *std::find_if(templates.begin(), templates.end(),
+            [&](const auto &gpu) { return gpu.type == backend; });
+        for (int index = 0; index < width; ++index)
+        {
+            auto gpu = base;
+            gpu.local_device_id = 4 + index * 10;
+            gpu.uuid = std::string(deviceTypeToString(backend)) + "-cost-owner-" + std::to_string(index);
+            rank.gpus.push_back(std::move(gpu));
+        }
+        auto &matrix = backend == DeviceType::CUDA ? rank.p2p_cuda : rank.p2p_rocm;
+        (backend == DeviceType::CUDA ? rank.p2p_cuda_count : rank.p2p_rocm_count) = width;
+        matrix.assign(size_t(width * width), false);
+        for (int index = 0; index < width; ++index) matrix[index * width + index] = true;
+    }
+    cluster.buildNodeAggregations();
+    PlanningGGUFFixture file(true, true, GGUFTensorType::IQ4_XS);
+    PlanningModelSource source(file.path());
+    constexpr std::array precisions{PlanningAllreducePrecision::FP32};
+    const auto sample = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{},
+        256, 64, precisions, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+    const auto encoded = nativeReceipts(sample, 1);
+    const auto observed = PlanningCommunicationService::acceptLocal(sample, 1, borrow(encoded));
+    const auto weights = requestWeights(source, cluster);
+    const auto arithmetic = requestArithmetic(cluster);
+    const PlanningRequestCostModel costs(source.metadata(), cluster, weights, arithmetic,
+        PlanningCommunicationCost(cluster, observed.native, {}, observed.host_device));
+    const PlanningRequestCostModel missing_links(source.metadata(), cluster, weights, arithmetic,
+        PlanningCommunicationCost(cluster, observed.native, {}));
+    for (const bool reverse : {false, true})
+    {
+        const auto domain = [width](std::string name, bool rocm) {
+            std::string members;
+            for (int index = width - 1; index >= 0; --index)
+                members += (members.empty() ? "" : ",") + std::string(rocm ? "rocm:" : "cuda:") + std::to_string(4 + index * 10);
+            return name + "=" + members + ";scope=rank_local;backend=" + (rocm ? "rccl" : "nccl") + ";owner=0";
+        };
+        std::vector<std::string> args{"llaminar2", "--define-domain", domain("head", reverse),
+            "--define-domain", domain("tail", !reverse), "--pp-stage", "0=head:0-0", "--pp-stage", "1=tail:1-1"};
+        std::vector<char *> argv;
+        for (auto &arg : args) argv.push_back(arg.data());
+        auto config = OrchestrationConfigParser{}.parseArgs(argv.size(), argv.data());
+        config.model_path = source.path();
+        config.max_seq_len = 8192;
+        config.prefill_max_bucket_size = 64;
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+        config.routed_expert_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+        const auto admitted = AdmittedOrchestrationCandidate::admit(
+            {OrchestrationStrategy::PipelineParallel, ExecutionRankMembership(cluster, {0}), std::move(config)}, source,
+            {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1, .maximum_cached_prefill_buckets = 8});
+        const auto estimate = costs.evaluate(admitted, {64, 16});
+        EXPECT_GT(estimate.requestSeconds(), 0);
+        EXPECT_NE(estimate.evidence().find("all-expert down slices"), std::string::npos);
+        EXPECT_EQ(estimate.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
+        EXPECT_THROW(missing_links.evaluate(admitted, {64, 16}), std::invalid_argument);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(DeviceCounts, PipelineRequestCost, ::testing::Values(4, 8),
+    [](const auto &info) { return "Devices" + std::to_string(info.param); });
 
 TEST(PlanningWeightServiceModel, InterpolatesInvocationTimeAndNeverReusesCachedComputeAsBandwidth)
 {
@@ -1426,5 +1509,33 @@ TEST(PlanningCommunicationService, MalformedHostDeviceReceiptsCannotEscapeTheSha
         const auto text = wire.dump();
         broken[0] = {text.begin(), text.end()};
         EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(broken)), std::exception);
+    }
+}
+
+/** @brief Equal half storage does not merge Native FP32-A and GDN half-A evidence. */
+TEST(PlanningWeightServiceModel, GDNHalfOperandsKeepSeparateServiceFamilies)
+{
+    PlanningGGUFFixture file(false, false, GGUFTensorType::F16, 256, GGUFTensorType::F16);
+    PlanningModelSource source(file.path());
+    auto profile = source.metadata().memoryProfile();
+    profile.architecture = "qwen35moe";
+    struct Restore {
+        GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
+        ~Restore() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
+    } restore;
+    for (const auto mode : {GDNProjectionArithmetic::FP16, GDNProjectionArithmetic::FP16AlphaBeta, GDNProjectionArithmetic::FP16MoEAlphaBeta})
+    {
+        mutableDebugEnv().gemm.gdn_projection_arithmetic = mode;
+        const auto selected = PlanningWeightServiceModel::samples(PlanningModelMetadata(profile, 2));
+        bool native_half = false, gdn_half = false;
+        for (const auto &sample : selected)
+            if (const auto *request = std::get_if<PlanningModelSampleRequest>(&sample))
+            {
+                native_half |= request->tensor_name == "blk.0.ffn_gate.weight" ||
+                    request->tensor_name == "blk.0.ffn_down.weight" || request->tensor_name == "blk.0.ffn_up.weight";
+                gdn_half |= request->tensor_name == "blk.0.ssm_alpha.weight" || request->tensor_name == "blk.0.ssm_beta.weight";
+            }
+        EXPECT_TRUE(native_half);
+        EXPECT_TRUE(gdn_half);
     }
 }

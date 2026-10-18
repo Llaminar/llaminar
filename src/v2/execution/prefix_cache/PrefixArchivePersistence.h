@@ -5,7 +5,10 @@
  * One service belongs to each process-shared disk archive. It borrows existing
  * payload owners rather than allocating another block or maintaining a memory
  * ledger. Request threads enqueue mutations and consume immutable receipts;
- * only the writer performs payload checksums, native writes and durability I/O.
+ * only the writer performs native writes and durability I/O; metadata identity
+ * determines reuse without inspecting payload contents.
+ * Revalidating an unchanged durable record publishes a metadata-only receipt;
+ * a stale participant observation never forces a duplicate payload append.
  */
 #pragma once
 
@@ -25,12 +28,16 @@ namespace llaminar2
 {
     class DiskPrefixStorageBackend;
 
+    /** @brief Distinguish new payload I/O from authenticated existing backing. */
+    enum class PrefixArchiveWriteDisposition { Stored, Reused };
+
     /** @brief Durable put publication, including archive-owned capacity victims. */
     struct PrefixArchiveWritePublication
     {
         PrefixBlockHandle disk_handle;
         std::vector<PrefixCacheKey> evicted_keys;
         std::thread::id executor;
+        PrefixArchiveWriteDisposition disposition = PrefixArchiveWriteDisposition::Stored;
     };
 
     /** @brief A tombstone is durable; earlier queued puts cannot resurrect it. */
@@ -80,7 +87,7 @@ namespace llaminar2
          * Early preparation uses publication() to overlap archive work with
          * inference. Required RAM/SSD publication may join this receipt when
          * its physical capacity depends on the original payload retiring.
-         * The caller performs no payload readiness, checksum or native I/O.
+         * The caller performs no payload readiness or native I/O.
          */
         [[nodiscard]] std::shared_ptr<const PrefixArchivePublication> waitForPublication() const;
 
@@ -120,7 +127,7 @@ namespace llaminar2
         ~PrefixArchivePersistence();
         PrefixArchivePersistence(const PrefixArchivePersistence &) = delete;
         PrefixArchivePersistence &operator=(const PrefixArchivePersistence &) = delete;
-        /** @brief Enqueue one immutable owner; perform no checksum or file I/O. */
+        /** @brief Enqueue one immutable owner; perform no payload scan or file I/O. */
         PrefixArchivePersistenceTicket write(PrefixBlockHandle handle);
         /** @brief Order retirement after existing work, superseding queued puts. */
         PrefixArchivePersistenceTicket retire(const PrefixCacheKey &key);

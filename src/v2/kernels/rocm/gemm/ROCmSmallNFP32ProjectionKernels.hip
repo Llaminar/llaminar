@@ -8,9 +8,12 @@
  * hipBLAS shape-dependent accumulation changes in publication-sensitive state.
  * Each output column has the same 256-lane K reduction regardless of physical
  * output width, so narrow shards and a mirrored full vocabulary remain exact.
+ * Explicit half activation specializations read only live rows from the existing
+ * retained half bank; serial and verifier dispatch share the same arithmetic.
  */
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #include "kernels/common/FloatingPointVerifierLaunch.h"
 
@@ -55,46 +58,23 @@ namespace
     }
 
     /**
-     * @brief Convert IEEE FP16 bits to FP32 in device scalar code.
+     * @brief Expand every IEEE half word exactly using native widening.
+     * @param h Physical half word; no activation or weight requantization occurs.
+     * @return The exact legacy FP32 bits, including signed zero and NaN payload.
      *
-     * ROCm verifier rows use this conversion inside the fixed K loop so the
-     * grouped path and serial M=1 path cannot diverge through different BLAS
-     * kernels or hardware reduction policies.
+     * Native widening handles all finite words and infinities exactly. Signaling
+     * NaNs use the original bit construction so conversion itself cannot quiet
+     * their payload. This replaces exponent/normalization branches in each K
+     * iteration without changing any product or reduction.
      */
     __device__ __forceinline__ float fp16_bits_to_float(uint16_t h)
     {
-        uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
-        int32_t exp = (static_cast<int32_t>(h) & 0x7C00) >> 10;
-        uint32_t mantissa = static_cast<uint32_t>(h) & 0x03FFu;
-
-        uint32_t f = 0;
-        if (exp == 0)
-        {
-            if (mantissa == 0)
-            {
-                f = sign;
-            }
-            else
-            {
-                exp = 1;
-                while ((mantissa & 0x400u) == 0)
-                {
-                    mantissa <<= 1;
-                    --exp;
-                }
-                mantissa &= 0x3FFu;
-                f = sign | (static_cast<uint32_t>(exp + 112) << 23) | (mantissa << 13);
-            }
-        }
-        else if (exp == 0x1F)
-        {
-            f = sign | 0x7F800000u | (mantissa << 13);
-        }
-        else
-        {
-            f = sign | (static_cast<uint32_t>(exp + 112) << 23) | (mantissa << 13);
-        }
-        return uint32_bits_to_float(f);
+        const uint32_t native = __float_as_uint(__half2float(__ushort_as_half(h)));
+        const uint32_t original_nan = (uint32_t(h & 0x8000u) << 16) |
+            0x7F800000u | (uint32_t(h & 0x03FFu) << 13);
+        const uint32_t nan_mask = 0u - uint32_t((h & 0x7FFFu) > 0x7C00u);
+        // A bit select retains every NaN payload without divergent EXEC masks.
+        return uint32_bits_to_float(native ^ ((native ^ original_nan) & nan_mask));
     }
 
     __device__ __forceinline__ float bf16_bits_to_float(uint16_t bf16)
@@ -208,13 +188,11 @@ namespace
     }
 
     /**
-     * @brief Fixed-order projection for FP32 activation rows and 16-bit weights.
+     * @brief Fixed-order projection with 16-bit weights and original FP32 A.
      *
-     * The current GPU floating GEMM adapters keep hidden rows and outputs in
-     * FP32.  This kernel adds the missing grouped verifier implementation for
-     * FP16/BF16 persistent weight tensors by reading the raw 16-bit weight rows
-     * directly and converting each element inside the same scalar K loop used
-     * for serial decode.
+     * Original FP32 activation storage retains its 256 physical lane mapping.
+     * Actual half A/B uses the compact kernel below with the same logical tree.
+     * Inactive rows return before dereferencing either operand or output.
      */
     __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
         void fp32x16_batched_projection_kernel(
@@ -248,8 +226,12 @@ namespace
                 (weight_dtype == SMALL_PROJECTION_WEIGHT_BF16)
                     ? bf16_bits_to_float(weight_bits)
                     : fp16_bits_to_float(weight_bits);
-            sum += A[static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k)] *
-                   weight;
+            const size_t activation_index =
+                static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k);
+            // Preserve the original FP32 products, strided lane ownership
+            // and fixed 256-lane reduction tree.
+            const float activation = A[activation_index];
+            sum += activation * weight;
         }
 
         __shared__ float scratch[SMALL_N_FP32_BLOCK];
@@ -265,6 +247,165 @@ namespace
 
         if (threadIdx.x == 0)
             C[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = scratch[0];
+    }
+
+    /**
+     * @brief Adjacent canonical lanes share one packed load, retaining their sums.
+     *
+     * Two independent logical lane sums per physical thread preserve stride256.
+     * Packed aligned operand words cut memory instructions. Scalar edge loads
+     * cover odd alignment/K without changing either accumulator. The first two
+     * reduction levels use shared memory; the remaining wave64 tree is identical
+     * on the configured gfx906 production target.
+     * @param ap Device array of physical-half activation owners.
+     * @param bp Device array of physical-half weight owners.
+     * @param cp Device array of FP32 result owners.
+     * @tparam FixedK Measured model widths specialize address/loop bounds; zero retains arbitrary K.
+     * @param m Admitted physical rows. @param n Output columns. @param runtime_k Reduction width.
+     * @param rows Device-owned live-row range, resolved before any operand load.
+     */
+    template<int FixedK = 0>
+    __global__ __launch_bounds__(128)
+    void fp16_packed_batched_projection_kernel(
+        const float *const *ap,
+        const float *const *bp,
+        float *const *cp,
+        int m,
+        int n,
+        int runtime_k,
+        llaminar2::DeviceRowRange rows)
+    {
+        const int k = FixedK ? FixedK : runtime_k;
+        const int col = static_cast<int>(blockIdx.x);
+        const int row = static_cast<int>(blockIdx.y);
+        const int lane = static_cast<int>(threadIdx.x);
+        if (row >= rows.activeRows() || col >= n)
+            return;
+
+        const auto *a = reinterpret_cast<const uint16_t *>(ap[blockIdx.z]);
+        const auto *b = reinterpret_cast<const uint16_t *>(bp[blockIdx.z]);
+        float *c = cp[blockIdx.z];
+        if (!a || !b || !c)
+            return;
+        a += static_cast<size_t>(row) * k;
+        b += static_cast<size_t>(col) * k;
+        const bool packed =
+            ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b)) & 3u) == 0;
+
+        // Physical lane i carries the original independent logical lanes 2i
+        // and 2i+1. Combining their products before reduction would change MTP.
+        float first = 0.0f;
+        float second = 0.0f;
+        int j = 2 * lane;
+        #pragma unroll
+        for (; j + 1 < k; j += SMALL_N_FP32_BLOCK)
+        {
+            uint32_t aw;
+            uint32_t bw;
+            if (packed)
+            {
+                aw = *reinterpret_cast<const uint32_t *>(a + j);
+                bw = *reinterpret_cast<const uint32_t *>(b + j);
+            }
+            else
+            {
+                aw = uint32_t(a[j]) | (uint32_t(a[j + 1]) << 16);
+                bw = uint32_t(b[j]) | (uint32_t(b[j + 1]) << 16);
+            }
+            const float w0 = fp16_bits_to_float(uint16_t(bw));
+            const float w1 = fp16_bits_to_float(uint16_t(bw >> 16));
+            first += fp16_bits_to_float(uint16_t(aw)) * w0;
+            second += fp16_bits_to_float(uint16_t(aw >> 16)) * w1;
+        }
+        if (j < k)
+            first += fp16_bits_to_float(a[j]) * fp16_bits_to_float(b[j]);
+
+        // Publish every original lane sum before changing ownership. The first
+        // two levels join offsets128 and64; the last wave retains offsets32..1.
+        __shared__ float scratch[SMALL_N_FP32_BLOCK];
+        scratch[2 * lane] = first;
+        scratch[2 * lane + 1] = second;
+        __syncthreads();
+        float value = scratch[lane] + scratch[lane + 128];
+        scratch[lane] = value;
+        __syncthreads();
+        if (lane < 64)
+        {
+            value += scratch[lane + 64];
+            for (int stride = 32; stride > 0; stride >>= 1)
+                value += __shfl_down(value, stride, 64);
+            if (lane == 0)
+                c[static_cast<size_t>(row) * n + col] = value;
+        }
+    }
+
+
+    /**
+     * @brief Fuse ragged half projections while retaining each original FP32 operation.
+     *
+     * The compact column grid selects immutable bindings directly from kernel
+     * arguments. There is no device pointer publication, padding, new workspace,
+     * or changed reduction partition. Inactive rows retire before operand loads.
+     * @tparam FixedK Measured width specialization; zero admits arbitrary K.
+     * @param g Validated borrowed input/weight/output owners and column ends.
+     * @param runtime_k Positive reduction width. @param rows Device-live row authority.
+     */
+    template<int FixedK = 0>
+    __global__ __launch_bounds__(128)
+    void short_half_projection_group_kernel(
+        llaminar2::FixedHalfProjectionGroup g, int runtime_k,
+        llaminar2::DeviceRowRange rows)
+    {
+        const int k = FixedK ? FixedK : runtime_k;
+        const int row = blockIdx.y, flat = blockIdx.x, lane = threadIdx.x;
+        if (row >= rows.activeRows()) return;
+        int p = 0;
+        while (flat >= g.columnEnd(p)) ++p;
+        const int first_column = p ? g.columnEnd(p - 1) : 0;
+        const int col = flat - first_column, n = g.columnEnd(p) - first_column;
+        const uint16_t *a = g.input() + size_t(row) * k;
+        const uint16_t *b = g.weight(p) + size_t(col) * k;
+        const bool packed = ((reinterpret_cast<uintptr_t>(a) |
+                              reinterpret_cast<uintptr_t>(b)) & 3u) == 0;
+        float first = 0.0f, second = 0.0f;
+        int j = 2 * lane;
+        #pragma unroll
+        for (; j + 1 < k; j += 256)
+        {
+            uint32_t aw, bw;
+            if (packed)
+            {
+                aw = *reinterpret_cast<const uint32_t *>(a + j);
+                bw = *reinterpret_cast<const uint32_t *>(b + j);
+            }
+            else
+            {
+                aw = uint32_t(a[j]) | (uint32_t(a[j + 1]) << 16);
+                bw = uint32_t(b[j]) | (uint32_t(b[j + 1]) << 16);
+            }
+            const float w0 = fp16_bits_to_float(uint16_t(bw));
+            const float w1 = fp16_bits_to_float(uint16_t(bw >> 16));
+            first += fp16_bits_to_float(uint16_t(aw)) * w0;
+            second += fp16_bits_to_float(uint16_t(aw >> 16)) * w1;
+        }
+        if (j < k) first += fp16_bits_to_float(a[j]) * fp16_bits_to_float(b[j]);
+
+        // Each physical lane retains two independent original sums. Publish
+        // them before the unchanged 128/64 and final wave64 reduction edges.
+        __shared__ float scratch[256];
+        scratch[2 * lane] = first;
+        scratch[2 * lane + 1] = second;
+        __syncthreads();
+        float value = scratch[lane] + scratch[lane + 128];
+        scratch[lane] = value;
+        __syncthreads();
+        if (lane < 64)
+        {
+            value += scratch[lane + 64];
+            for (int stride = 32; stride > 0; stride >>= 1)
+                value += __shfl_down(value, stride, 64);
+            if (lane == 0) g.output(p)[size_t(row) * n + col] = value;
+        }
     }
 
     /**
@@ -527,6 +668,71 @@ extern "C" bool rocmFp32x16_batched_projection(
     return complete_kernel_launch(hip_stream, "rocmFp32x16_batched_projection");
 }
 
+/**
+ * @brief Submit fixed-order physical half A/B projections on exact live rows.
+ * @details Pointer arrays are the existing opaque ABI; the specialization widens
+ * each half operand and keeps the serial 256-lane accumulation/reduction tree.
+ * No inactive suffix, host count, allocation or alternate launch is consumed.
+ */
+extern "C" bool rocmFp16_batched_projection(
+    const float *const *d_A_array,
+    const float *const *d_B_array,
+    float *const *d_C_array,
+    int M,
+    int N,
+    int K,
+    int batch_count,
+    int device_id,
+    void *stream,
+    const llaminar2::DeviceRowRange *row_range)
+{
+    if (row_range && row_range->physicalRows() != M)
+        return false;
+    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
+    if (!d_A_array || !d_B_array || !d_C_array ||
+        M <= 0 ||
+        N <= 0 ||
+        K <= 0 ||
+        batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
+        !stream)
+    {
+        std::fprintf(
+            stderr,
+            "[rocmFp16_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d stream=%p\n",
+            M,
+            N,
+            K,
+            batch_count,
+            stream);
+        return false;
+    }
+
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    hipError_t err = hipSetDevice(device_id);
+    if (err != hipSuccess)
+    {
+        std::fprintf(
+            stderr,
+            "[rocmFp16_batched_projection] hipSetDevice failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+
+    dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
+    dim3 block(SMALL_N_FP32_BLOCK / 2);
+    // All widths retain the same canonical lane order; the measured model
+    // widths expose constant loop bounds without limiting generic geometry.
+    const auto launch = [&]<int FixedK>() {
+        hipLaunchKernelGGL((fp16_packed_batched_projection_kernel<FixedK>),
+            grid, block, 0, hip_stream, d_A_array, d_B_array, d_C_array, M, N, K, rows);
+    };
+    if (K == 2048) launch.template operator()<2048>();
+    else if (K == 4096) launch.template operator()<4096>();
+    else launch.template operator()<0>();
+
+    return complete_kernel_launch(hip_stream, "rocmFp16_batched_projection");
+}
+
 extern "C" bool rocmFloating_swiglu_down_projection(
     const float *d_gate,
     const float *d_up,
@@ -595,4 +801,24 @@ extern "C" bool rocmFloating_swiglu_down_projection(
         rows);
 
     return complete_kernel_launch(hip_stream, "rocmFloating_swiglu_down_projection");
+}
+
+/** @brief Submit validated short-row bindings; see the shared launch ABI contract. */
+extern "C" bool rocmFp16_short_projection_group(
+    const llaminar2::FixedHalfProjectionGroup &group, int m, int k,
+    int device_id, void *stream, const llaminar2::DeviceRowRange *row_range)
+{
+    if (!stream || m <= 0 || m > llaminar2::kShortHalfProjectionMaxRows || k <= 0 ||
+        (row_range && row_range->physicalRows() != m)) return false;
+    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(m);
+    if (hipSetDevice(device_id) != hipSuccess) return false;
+    const auto native = static_cast<hipStream_t>(stream);
+    const auto launch = [&]<int K>() {
+        hipLaunchKernelGGL((short_half_projection_group_kernel<K>),
+            dim3(group.totalColumns(), m), dim3(128), 0, native, group, k, rows);
+    };
+    if (k == 2048) launch.template operator()<2048>();
+    else if (k == 4096) launch.template operator()<4096>();
+    else launch.template operator()<0>();
+    return complete_kernel_launch(native, "rocmFp16_short_projection_group");
 }

@@ -6,6 +6,9 @@
  *
  * Tests the orchestrator's execution, caching, and device context management
  * functionality, verifying clean separation from graph building.
+ * Long-prefix fixtures exercise real archive admission and participant lookup
+ * with small host-owned payloads so historical checkpoint retention is tested
+ * independently of model weights, accelerator availability, and generation.
  */
 
 #include <gtest/gtest.h>
@@ -25,6 +28,9 @@
 #include "execution/moe/MoERebalanceController.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "models/qwen/QwenStandardGraph.h"
+#include "models/qwen35/Qwen35Graph.h"
+#include "execution/prefix_cache/DiskPrefixStorageBackend.h"
+#include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "loaders/WeightPlan.h"
 #include "loaders/WeightManager.h"
@@ -36,11 +42,16 @@
 #include "../../../../mocks/MockLocalTPContext.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/Sha256.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "kernels/cpu/CPURingKVCache.h"
+#include "kernels/KernelFactory.h"
+#include "kernels/HybridKVCacheConfig.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -2076,7 +2087,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseVerifierUsesFullAllPosition
         << "Replicated dense decode must clear stale local all-position logits before RankOrchestrator samples.";
 
     const auto forward_pos = source.find(
-        "const float *DeviceGraphOrchestrator::forwardImpl");
+        "std::optional<const float *> DeviceGraphOrchestrator::forwardImpl");
     ASSERT_NE(forward_pos, std::string::npos);
     EXPECT_NE(
         source.find("bindAllPositionLogitsOutputs(", forward_pos),
@@ -2935,8 +2946,8 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBo
  *
  * Cache retain/release leases serialize eviction against the request path and
  * add shared bookkeeping to every restore. Production instead moves copied
- * PrefixBlockHandle owners into the mutation event, allowing metadata eviction
- * while RAM/VRAM source bytes remain alive until the exact GPU work completes.
+ * typed read leases into the mutation event, allowing metadata eviction while
+ * the actual RAM/VRAM source sections remain alive until GPU work completes.
  */
 TEST_F(
     Test__DeviceGraphOrchestrator,
@@ -2971,19 +2982,23 @@ TEST_F(
         source.substr(terminal_restore_pos, harvest_pos - terminal_restore_pos);
     EXPECT_NE(
         populate_body.find(
-            "retained_restore_sources = hit.blocks"),
+            "retained_promotion_sources.push_back(PrefixPayloadReadLease::wholeArchive(handle))"),
         std::string::npos)
         << "Lower-tier blocks supplying asynchronous promotion bytes must "
            "remain owned through the restore completion event";
     EXPECT_NE(
         populate_body.find(
-            "retained_restore_sources.push_back(std::move(source))"),
+            "PrefixPayloadReadLease::sequenceRows(std::move(restore_blocks[index]))"),
         std::string::npos)
-        << "Every working block supplying asynchronous KV/GDN/MTP restore "
-           "bytes must move behind the restore completion event";
+        << "Earlier checkpoints must retain their consumed KV/MTP sections "
+           "behind the restore completion event";
+    EXPECT_NE(populate_body.find(
+        "PrefixPayloadReadLease::wholeArchive(std::move(restore_blocks[index]))"),
+        std::string::npos)
+        << "The terminal checkpoint's recurrent and terminal sections remain real readers";
     EXPECT_NE(
         terminal_restore_body.find(
-            "retained_terminal_sources.push_back(std::move(terminal))"),
+            "retained_terminal_sources.push_back(PrefixPayloadReadLease::wholeArchive(std::move(terminal)))"),
         std::string::npos)
         << "Terminal logits/hidden restore must retain its exact source owner";
     const auto terminal_join_pos =
@@ -3117,7 +3132,7 @@ TEST_F(
     EXPECT_EQ(terminal_restore_body.find("prefix_cache_->retain"), std::string::npos);
 
     EXPECT_NE(
-        header.find("std::vector<PrefixBlockHandle> retained_payload_sources"),
+        header.find("std::vector<PrefixPayloadReadLease> retained_payload_sources"),
         std::string::npos);
     EXPECT_NE(
         header.find("struct PendingPrefixPayloadUse"),
@@ -3304,7 +3319,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardImplPublishesLogicalTokenOffsetAtRe
             "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
-    const auto forward_pos = source.find("const float *DeviceGraphOrchestrator::forwardImpl(");
+    const auto forward_pos = source.find("std::optional<const float *> DeviceGraphOrchestrator::forwardImpl(");
     ASSERT_NE(forward_pos, std::string::npos);
     const auto build_input_pos = source.find("ForwardInput input;", forward_pos);
     ASSERT_NE(build_input_pos, std::string::npos);
@@ -3462,6 +3477,165 @@ TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintNamesEachLogicalPayload
     EXPECT_NE(hit0.fingerprint_key, hit1.fingerprint_key)
         << "TP participants share lookup coordination but require distinct "
            "durable keys so one KV/logit payload shard cannot overwrite another.";
+}
+
+/**
+ * @test A long hybrid prefix needs all attention rows and only its final state.
+ *
+ * Every historical chat frontier has a complete recurrent image on disk. The
+ * RAM budget admits the actual restore working set, but cannot admit all old
+ * recurrent images together. Lookup must not manufacture a short hit merely
+ * by hydrating and retaining state which the selected restore never consumes.
+ * The real participant lookup runs without weights, inference, or devices.
+ */
+TEST_F(Test__DeviceGraphOrchestrator,
+       HybridPrefixLookupDoesNotRetainEveryHistoricalCheckpoint)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    struct FixtureDirectory
+    {
+        std::filesystem::path path = std::filesystem::temp_directory_path() /
+            ("llaminar-rich-prefix-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        /** @brief Create this test's exclusively owned native archive directory. */
+        FixtureDirectory() { std::filesystem::create_directory(path); }
+        /** @brief Remove only this fixture after every archive owner has retired. */
+        ~FixtureDirectory() { std::error_code error; std::filesystem::remove_all(path, error); }
+    } directory;
+    const auto model_path = directory.path / "identity.fixture";
+    { std::ofstream model(model_path); model << "device-free prefix identity"; }
+    auto context = std::make_shared<llaminar2::test::MockModelContext>();
+    context->setPath(model_path.string());
+
+    auto cfg = makeMaintenanceMoEGraphConfig();
+    cfg.layer_types = {"gdn", "full_attention"};
+    cfg.moe = {};
+    constexpr int blocks = 24;
+    std::vector<int32_t> tokens(blocks * cfg.prefix_cache.block_size);
+    for (size_t index = 0; index < tokens.size(); ++index)
+        tokens[index] = static_cast<int32_t>(index % cfg.vocab_size);
+
+    PrefixPayloadLayout layout;
+    uint64_t fingerprint = 0;
+    {
+        DeviceGraphOrchestrator probe(std::make_shared<Qwen35Graph>(cfg, nullptr), nullptr);
+        probe.retainModelContext(context);
+        ASSERT_TRUE(probe.initializeInferenceStateFromArena(1, tokens.size(), DeviceId::cpu()));
+        const auto admission = probe.lookupPrefix(tokens);
+        ASSERT_TRUE(admission.supported) << admission.bypass_reason;
+        fingerprint = admission.fingerprint_key;
+        layout = buildDensePrefixPayloadLayout(*probe.inferenceState().kv_cache,
+            DeviceId::cpu(), cfg.prefix_cache.block_size);
+    }
+    ASSERT_TRUE(layout.includes_hybrid_state);
+    ASSERT_GT(layout.hybrid_state_bytes, 0u);
+    cfg.prefix_cache.ram_budget_bytes = blocks * layout.faKVBytes() + layout.hybrid_state_bytes;
+    cfg.prefix_cache.disk_budget_bytes = blocks * layout.totalBytes();
+    cfg.prefix_cache.storage_mode = PrefixCacheStorageMode::Tiered;
+    cfg.prefix_cache.disk_dir = directory.path.string();
+    ASSERT_LT(cfg.prefix_cache.ram_budget_bytes, cfg.prefix_cache.disk_budget_bytes);
+    const auto identity = sha256FileSetIdentityHex({model_path});
+    ASSERT_TRUE(identity.has_value());
+    {
+        DiskPrefixStorageBackend archive(directory.path / (*identity + ".kvcache"),
+            cfg.prefix_cache.disk_budget_bytes, *identity);
+        RamPrefixStorageBackend staging(layout.totalBytes());
+        uint64_t parent = 0;
+        for (int block = 0; block < blocks; ++block)
+        {
+            const int first = block * cfg.prefix_cache.block_size;
+            const int last = first + cfg.prefix_cache.block_size;
+            const auto key = makePrefixCacheKey(fingerprint, parent, block, first,
+                {tokens.begin() + first, tokens.begin() + last});
+            parent = key.stableHash();
+            auto source = staging.allocate(key, layout);
+            ASSERT_TRUE(source.valid());
+            source.has_hybrid_state = true;
+            std::fill(source.kv_storage->begin(), source.kv_storage->end(),
+                static_cast<uint8_t>(block + 1));
+            PrefixBlockHandle persisted;
+            std::string error;
+            ASSERT_TRUE(archive.writeBlock(source, &persisted, nullptr, &error)) << error;
+            ASSERT_TRUE(staging.release(source));
+        }
+    }
+    HybridKVCacheConfig hybrid;
+    hybrid.layer_types = cfg.layer_types;
+    hybrid.gdn_conv_kernel_size = cfg.gdn.conv_kernel_size;
+    hybrid.gdn_state_size = cfg.gdn.state_size;
+    hybrid.gdn_inner_size = cfg.gdn.inner_size;
+    hybrid.gdn_group_count = cfg.gdn.group_count;
+    hybrid.gdn_time_step_rank = cfg.gdn.time_step_rank;
+    hybrid.n_heads = cfg.n_heads;
+    llaminar::v2::kernels::KVCacheConfig kv;
+    kv.precision = layout.k_precision;
+    kv.device = DeviceId::cpu();
+    kv.num_layers = cfg.n_layers;
+    kv.batch_size = 1;
+    kv.max_seq_len = tokens.size();
+    kv.n_kv_heads = cfg.n_kv_heads;
+    kv.head_dim = cfg.head_dim;
+    kv.hybrid_config = &hybrid;
+    const size_t recurrent_bytes = hybrid.gdnStateGeometry().localPayloadBytes(hybrid.countGDNLayers());
+    const size_t archive_scratch = PrefixArchiveIOGeometry::scratchBytes();
+    const size_t capacity = kv.estimateBytes() + recurrent_bytes + archive_scratch + cfg.prefix_cache.ram_budget_bytes;
+    const PhysicalMemoryResource resource{.world_rank = 0, .device = DeviceId::cpu(),
+        .total_bytes = capacity, .admission_available_bytes = capacity};
+    PhysicalMemoryPlanBuilder plan;
+    plan.add(resource, PhysicalMemoryOwner::KVCache, kv.estimateBytes());
+    plan.add(resource, PhysicalMemoryOwner::RecurrentLiveState, recurrent_bytes);
+    plan.add(resource, PhysicalMemoryOwner::PrefixArchiveStaging, archive_scratch);
+    plan.add(resource, PhysicalMemoryOwner::PrefixHostTier, cfg.prefix_cache.ram_budget_bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto runner = DeviceGraphOrchestrator::createForTest({
+        .model_ctx = context, .graph_builder = std::make_shared<Qwen35Graph>(cfg, nullptr),
+        .physical_memory_authority = authority});
+    ASSERT_TRUE(runner->initializeInferenceStateFromArena(1, tokens.size(), DeviceId::cpu()));
+    const auto hit = runner->lookupPrefix(tokens);
+    ASSERT_TRUE(hit.supported) << hit.bypass_reason;
+    ASSERT_EQ(hit.fingerprint_key, fingerprint);
+    EXPECT_EQ(hit.cached_tokens, tokens.size());
+    EXPECT_EQ(hit.blocks.size(), blocks);
+    // Metadata selection must not consume the RAM tier. The subsequent read
+    // proves exact bytes and the independently charged, bounded working set.
+    ASSERT_TRUE(hit.payload_plan);
+    for (const auto &block : hit.blocks)
+        EXPECT_EQ(block.kv_payload, nullptr);
+    const auto restored = hit.materializeRestoreBlocks();
+    ASSERT_EQ(restored.size(), blocks);
+    size_t restored_bytes = 0u;
+    for (size_t index = 0; index < restored.size(); ++index)
+    {
+        const auto &block = restored[index];
+        restored_bytes += block.total_bytes;
+        ASSERT_NE(block.kvKData(), nullptr);
+        EXPECT_TRUE(std::all_of(block.kvKData(), block.kvKData() + block.kvBytes(),
+            [index](uint8_t value) { return value == index + 1u; }));
+        EXPECT_EQ(block.has_hybrid_state, index + 1u == restored.size());
+        EXPECT_EQ(block.hybrid_payload != nullptr, index + 1u == restored.size());
+    }
+    EXPECT_EQ(restored_bytes, cfg.prefix_cache.ram_budget_bytes);
+    const auto observed_bytes = [](const char *name)
+    {
+        double bytes = 0.0;
+        for (const auto &record : PerfStatsCollector::snapshot({"prefix_cache"}))
+            if (record.name == name) bytes += record.value;
+        return bytes;
+    };
+    EXPECT_EQ(observed_bytes("selected_restore_sequence_bytes"), (blocks - 1u) * layout.faKVBytes());
+    EXPECT_EQ(observed_bytes("selected_restore_checkpoint_bytes"), layout.totalBytes());
+    EXPECT_EQ(observed_bytes("selected_restore_unread_checkpoint_bytes"),
+        (blocks - 1u) * layout.hybrid_state_bytes);
+    EXPECT_EQ(observed_bytes("selected_disk_read_bytes"), restored_bytes);
+    // Borrowing the already sealed read set does not represent another read
+    // or another acquisition of physical owners in cumulative statistics.
+    EXPECT_EQ(hit.materializeRestoreBlocks().size(), restored.size());
+    EXPECT_EQ(observed_bytes("selected_restore_checkpoint_bytes"), layout.totalBytes());
+    EXPECT_EQ(observed_bytes("selected_disk_read_bytes"), restored_bytes);
+    EXPECT_EQ(hit.forHarvest(hit.cached_tokens).blocks.back().key, restored.back().key);
+    PerfStatsCollector::reset();
 }
 
 TEST(InferenceStateResetRequest, ServingGraphSetupScrubsAllOwnersAndPreservesExecutables)

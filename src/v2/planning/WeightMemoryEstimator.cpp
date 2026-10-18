@@ -1,10 +1,19 @@
+/**
+ * @file WeightMemoryEstimator.cpp
+ * @brief Typed source/prepared weight geometry contributions for physical admission.
+ *
+ * Estimation follows the same native embedding block contract as materialization.
+ * It contributes exact representation bytes to existing admission owners; it is
+ * not a second live allocation ledger. Tied lookup and LM-head representations
+ * remain distinct physical consumers of one logical source tensor.
+ */
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/WeightShardGeometry.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
-#include "kernels/common/EmbedQ8Block.h"
-#include "kernels/common/PreparedEmbeddingWeights.h"
+#include "kernels/common/NativeEmbeddingLayout.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
+#include "utils/DebugEnv.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
@@ -122,16 +131,16 @@ namespace llaminar2
             return (bytes + alignment - 1) & ~(alignment - 1);
         }
 
-        /** @brief Price one model-owned FP32 representation without overflow. */
-        size_t preparedFp32Bytes(size_t elements, DeviceId device)
+        /** @brief Price one model-owned floating representation without overflow. */
+        size_t preparedFloatingBytes(size_t elements, DeviceId device, size_t scalar_bytes)
         {
             if (elements >
-                std::numeric_limits<size_t>::max() / sizeof(float))
+                std::numeric_limits<size_t>::max() / scalar_bytes)
             {
                 throw std::overflow_error(
-                    "Prepared FP32 weight allocation overflows size_t");
+                    "Prepared floating weight allocation overflows size_t");
             }
-            const size_t bytes = elements * sizeof(float);
+            const size_t bytes = elements * scalar_bytes;
             return device.is_gpu()
                        ? alignUp(bytes, kWeightPoolAlignment)
                        : bytes;
@@ -332,7 +341,7 @@ namespace llaminar2
         {
             const size_t metadata_bytes =
                 sizeof(uint16_t) +
-                (format->is_asymmetric ? sizeof(uint16_t) : 0) +
+                (canonicalDeviceVnniFormat(*format).is_asymmetric ? sizeof(uint16_t) : 0) +
                 (format->has_emins ? sizeof(uint32_t) : 0);
             return static_cast<float>(
                        static_cast<size_t>(format->payload_bytes) +
@@ -484,16 +493,17 @@ namespace llaminar2
             const WeightRole role = inferWeightRole(t.name);
             const auto prepared_representation =
                 PreparedWeightRepresentationContract::resolve(
-                    role, std::string_view(t.quant_type));
-            if (prepared_representation ==
-                ModelPreparedWeightRepresentation::FP32)
+                    role, std::string_view(t.quant_type), t.name, profile.architecture,
+                    debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
+            if (prepared_representation != ModelPreparedWeightRepresentation::SourceNative)
             {
                 /*
                  * These bytes replace the source codebook in the persistent
                  * execution pool. The same typed contract is consumed by
                  * WeightManager before it constructs that pool.
                  */
-                device_size = preparedFp32Bytes(selected_elements, device);
+                device_size = preparedFloatingBytes(selected_elements, device,
+                    prepared_representation == ModelPreparedWeightRepresentation::FP16 ? sizeof(uint16_t) : sizeof(float));
             }
             else if (device.is_gpu())
             {
@@ -502,8 +512,8 @@ namespace llaminar2
                     profile.d_model > 0)
                 {
                     /*
-                     * GPU embedding lookup consumes the universal EmbedQ8
-                     * representation, not the GEMM-native packed layout.
+                     * GPU embedding lookup consumes original native source blocks,
+                     * not a requantized or GEMM-native packed representation.
                      * A model with tied output weights also needs a separate
                      * GEMM representation because the LM head performs a
                      * matrix multiply over the same logical source tensor.
@@ -520,9 +530,8 @@ namespace llaminar2
                         selected_elements /
                         static_cast<size_t>(profile.d_model);
                     device_size =
-                        PreparedEmbeddingWeights::allocationBytes(
-                            local_rows,
-                            profile.d_model);
+                        NativeEmbeddingLayout::forFormat(
+                            t.quant_type, local_rows, profile.d_model).byte_size;
                     est.prepared_embedding_bytes += device_size;
 
                 }
@@ -563,7 +572,7 @@ namespace llaminar2
                 !isQuantizedFormat(t.quant_type))
             {
                 // "Prepared" describes the graph-ready lookup view, not only
-                // the EmbedQ8 representation. Native floating lookup reads a
+                // a derived quantized representation. Native floating lookup reads a
                 // raw device allocation prepared by WeightManager. Publish its
                 // existing bytes as a component so a mirrored vocabulary view
                 // is admitted beside the primary shard. This is a subset of

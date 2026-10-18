@@ -360,10 +360,12 @@ TEST(MoEProjectionPreparation, RegistryAuthenticatesEveryLocalLayerBeforePublica
             EXPECT_THROW((MoEOverlayParticipantResidencyRegistry{invalid}), std::invalid_argument);
             invalid = config;
             invalid.num_layers = 2;
-            EXPECT_THROW((MoEOverlayParticipantResidencyRegistry{invalid}), std::invalid_argument);
+            // Complete canonical ownership is authenticated before projection
+            // geometry; a foreign interval is an ownership contract failure.
+            EXPECT_THROW((MoEOverlayParticipantResidencyRegistry{invalid}), std::logic_error);
             invalid = config;
             invalid.num_experts = 2;
-            EXPECT_THROW((MoEOverlayParticipantResidencyRegistry{invalid}), std::invalid_argument);
+            EXPECT_THROW((MoEOverlayParticipantResidencyRegistry{invalid}), std::logic_error);
         }
     }
 }

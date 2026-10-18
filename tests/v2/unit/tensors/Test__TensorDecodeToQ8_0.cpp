@@ -506,8 +506,10 @@ TEST_F(TensorDecodeToQ8_0Test, Q8_K_BasicDecode)
     std::vector<size_t> shape = {1, SUPER_BLOCK_SIZE};
 
     // Create Q8_K block
-    Q8_KBlock q8k_block;
+    Q8_KBlock q8k_block{};
+    q8k_block.d = 1.0f;
     std::memset(&q8k_block, 0, sizeof(q8k_block));
+    q8k_block.d = 1.0f;
 
     // Fill with known int8 pattern
     for (int i = 0; i < 256; ++i)
@@ -562,6 +564,7 @@ TEST_F(TensorDecodeToQ8_0Test, Q8_K_MultipleRows)
     for (size_t r = 0; r < rows; ++r)
     {
         std::memset(&q8k_blocks[r], 0, sizeof(Q8_KBlock));
+        q8k_blocks[r].d = 1.0f;
 
         // Fill with row-specific pattern
         for (int i = 0; i < 256; ++i)

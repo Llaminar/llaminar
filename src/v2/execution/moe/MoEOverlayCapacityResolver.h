@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -433,6 +434,29 @@ namespace llaminar2
             const MoEOverlayCapacityResolverInput &input);
 
         /**
+         * @brief Admit disjoint pipeline stages against one physical BOM.
+         * @param stages Stage inputs ordered by increasing global layer interval.
+         *        Each physical budget contributes that stage's distinct fixed
+         *        allocations. Shared resources must have identical observations
+         *        and one diagnostic identity. Charge shared backing only once;
+         *        serialize and envelope temporary setup storage before this call.
+         * @return Stage-local quotas and copy counts, all retaining the same
+         *         complete topology-wide admission certificate.
+         * @throws MoEOverlayCapacityExhausted if aggregate owners cannot fit.
+         * @throws std::invalid_argument for empty, overlapping, unordered or
+         *         malformed stages, resource aliases or conflicting observations.
+         * @throws std::overflow_error if any aggregate charge cannot be represented.
+         *
+         * All fixed banks, migration sources and exact quotas are charged before
+         * automatic placement in any stage. Priority fill follows authored stage
+         * order; tier identities and priorities are local to each stage. This is
+         * the same resolver used by single-stage admission, with no per-stage
+         * allocator ledger or independently spendable remaining-memory budget.
+         */
+        [[nodiscard]] static std::vector<MoEOverlayResolvedCapacityPlan>
+        resolvePipeline(std::span<const MoEOverlayCapacityResolverInput> stages);
+
+        /**
          * @brief Install resolved per-layer quotas into a placement-plan copy.
          *
          * Stable tier indices, opaque names, integer priorities, and coverage
@@ -441,8 +465,8 @@ namespace llaminar2
          * the installed quotas; an unplaced plan can be passed directly to
          * @ref MoERoutedExpertPlacementPlanner afterwards.
          *
-         * @param plan Bound declarative tier/domain plan.
-         * @param capacity Exact physical capacity result for the same tiers.
+         * @param plan Bound declarative tier/domain plan with its global layer origin.
+         * @param capacity Exact physical capacity result for the same tiers and owned interval.
          * @return A copied plan carrying authoritative layer quotas.
          * @throws std::invalid_argument for identity or geometry mismatch.
          */
@@ -452,9 +476,9 @@ namespace llaminar2
 
         /**
          * @brief Compute CPU/GPU allocated bytes for every manifest layer.
-         * @param manifest Complete authenticated gate/up/down layer contracts.
+         * @param manifest Contiguous authenticated gate/up/down contracts for the owned interval.
          * @param projections Movable family; the source manifest remains complete.
-         * @return Layer-ordered exact prepared allocation footprints.
+         * @return Compact exact allocation footprints retaining global model-layer IDs.
          * @throws std::invalid_argument for an incomplete/non-contiguous layer.
          * @throws std::overflow_error when geometry exceeds addressable bytes.
          */

@@ -127,12 +127,17 @@ namespace llaminar2
             std::vector<MoEOverlayDeviceInitialPhysicalSlot> initial_slots;
             /** Immutable family accepted for sources and every future arrival. */
             DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
+            /** Immutable global layer interval, including ranks with no local slots. */
+            int first_model_layer = 0;
+            std::uint32_t num_layers = 0u;
+            /** Exact per-layer expert geometry of the admitted runtime. */
+            std::uint32_t num_experts = 0u;
         };
 
         /**
          * @brief Validate and enroll the immutable initial physical inventory.
          * @throws std::invalid_argument for invalid epochs, participants,
-         *         duplicate slots, or incomplete prepared engines.
+         *         stage geometry, foreign/duplicate slots, or incomplete engines.
          */
         explicit MoEOverlayDevicePhysicalSlotLedger(Config config);
 

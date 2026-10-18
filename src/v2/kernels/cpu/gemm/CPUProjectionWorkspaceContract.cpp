@@ -34,8 +34,7 @@ namespace llaminar2
         if (format == "F32" || format == "F16" || format == "BF16") return {};
         const auto *native = native_vnni_formats::forQuantType(format);
         if (!native) throw std::invalid_argument("CPU projection workspace has an unsupported source format");
-        return prepared(cpu::native_vnni::preparedFootprintForFormat(native->codebook_id,
-            native->is_asymmetric), native->codebook_id, geometry);
+        return prepared(cpu::native_vnni::preparedFootprintForFormat(*native), native->codebook_id, geometry);
     }
 
     WorkspaceRequirements CPUProjectionWorkspaceContract::prepared(

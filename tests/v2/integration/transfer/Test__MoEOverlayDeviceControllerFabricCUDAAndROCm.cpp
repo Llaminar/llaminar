@@ -3375,12 +3375,14 @@ namespace llaminar2::test
          * @brief Construct both rank views concurrently so first-touch precedes registration.
          * @param resolved_topology Immutable production-shaped device topology.
          * @param policy_input Exact mapped snapshot and command geometry.
+         * @param first_model_layer Global layer represented by compact row zero.
          * @return Fully registered CUDA/ROCm fabric pair.
          */
         ControllerFabricPair makeControllerFabricPair(
             std::shared_ptr<const MoEOverlayDeviceControllerTopology>
                 resolved_topology,
-            const MoEOverlayDevicePlacementPolicyInput &policy_input)
+            const MoEOverlayDevicePlacementPolicyInput &policy_input,
+            int first_model_layer = 0)
         {
             ControllerFabricPair result;
             std::exception_ptr cuda_error;
@@ -3409,6 +3411,7 @@ namespace llaminar2::test
                         policy_input.dynamic_maximum_cycles_per_layer,
                     .dynamic_maximum_commands_per_wave =
                         policy_input.dynamic_maximum_commands_per_wave,
+                    .first_model_layer = first_model_layer,
                 };
             };
             std::thread cuda_builder(
@@ -3733,8 +3736,12 @@ namespace llaminar2::test
         };
     } // namespace
 
-    /** Prove immutable mapped staging and controller-certified reuse on one backend. */
-    void proveMappedParticipantInbox(DeviceType type)
+    /**
+     * @brief Prove mapped staging and stage-bound controller completion on a backend.
+     * @param type Native driver family to exercise without inference or host policy.
+     * @param first_model_layer Global layer represented by compact fixture row zero.
+     */
+    void proveMappedParticipantInbox(DeviceType type, int first_model_layer = 0)
     {
         IBackend *const backend = type == DeviceType::CUDA
             ? getCUDABackend() : getROCmBackend();
@@ -3753,7 +3760,7 @@ namespace llaminar2::test
         ASSERT_EQ(resolved_topology->participants[4].world_rank, 1);
 
         const auto participant = type == DeviceType::CUDA ? 0u : 2u;
-        auto fabrics = makeControllerFabricPair(resolved_topology, policy_input);
+        auto fabrics = makeControllerFabricPair(resolved_topology, policy_input, first_model_layer);
         auto &fabric = type == DeviceType::CUDA ? *fabrics.cuda_rank : *fabrics.rocm_rank;
         const auto transport_binding = fabric.transportBinding(
             resolved_topology->groupForParticipant(participant)->group_id);
@@ -3762,7 +3769,8 @@ namespace llaminar2::test
             backend,
             resolved_topology->participants[participant],
             *resolved_topology,
-            policy_input);
+            policy_input, nullptr, {}, moe_runtime_abi::HistogramSource::Decode,
+            first_model_layer);
         ScopedGPUStream consumer_stream(
             resolved_topology->participants[participant].device);
         MoEOverlayDevicePreparedArrivalInbox inbox({
@@ -3778,6 +3786,7 @@ namespace llaminar2::test
             resolved_topology->participants.size());
         command.num_layers = policy_input.num_layers;
         command.num_experts = policy_input.num_experts;
+        command.first_model_layer = first_model_layer;
         command.entries = {
             MoEOverlayDeviceMovementCommand{
                 .op = static_cast<std::uint32_t>(
@@ -3855,6 +3864,20 @@ namespace llaminar2::test
         }
 
         std::string error;
+        // Even with zero local arrivals, stage geometry must be checked before
+        // the inbox is claimed or a mapped descriptor is overwritten.
+        for (int mutation = 0; mutation < 3; ++mutation)
+        {
+            auto foreign_command = command;
+            if (mutation == 0)
+                foreign_command.first_model_layer = first_model_layer == 0 ? 32 : 0;
+            if (mutation == 1) ++foreign_command.num_layers;
+            if (mutation == 2) ++foreign_command.num_experts;
+            const auto foreign = makeMoEOverlayDevicePhysicalMovementBatch(
+                foreign_command, *resolved_topology);
+            ASSERT_TRUE(foreign.valid());
+            EXPECT_FALSE(inbox.stage(foreign, prepared, &error));
+        }
         ASSERT_TRUE(inbox.stage(batch, prepared, &error)) << error;
         EXPECT_FALSE(inbox.stage(batch, prepared, &error))
             << "An in-flight publication must be immutable";
@@ -3871,6 +3894,10 @@ namespace llaminar2::test
                          command.header.transaction_id, __ATOMIC_RELEASE);
         auto wrong_command = command;
         ++wrong_command.header.command_digest;
+        EXPECT_FALSE(inbox.finishWave(protocol, wrong_command, &error));
+        wrong_command = command;
+        wrong_command.first_model_layer = first_model_layer == 0 ? 32 : 0;
+        ASSERT_TRUE(wrong_command.valid());
         EXPECT_FALSE(inbox.finishWave(protocol, wrong_command, &error));
         EXPECT_TRUE(inbox.finishWave(protocol, command, &error)) << error;
         EXPECT_FALSE(inbox.finishWave(protocol, command, &error));
@@ -3941,6 +3968,20 @@ namespace llaminar2::test
          ROCmMappedInboxSkipsSiblingLifetimesAndRequiresExactCompletion)
     {
         proveMappedParticipantInbox(DeviceType::ROCm);
+    }
+
+    /** CUDA mapped inboxes reject equal-shaped foreign stages before publication. */
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         PipelineStageCUDAMappedInboxRequiresExactStage)
+    {
+        proveMappedParticipantInbox(DeviceType::CUDA, 32);
+    }
+
+    /** ROCm mapped aliases retain the same global-layer completion contract. */
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         PipelineStageROCmMappedInboxRequiresExactStage)
+    {
+        proveMappedParticipantInbox(DeviceType::ROCm, 40);
     }
 
     /**
@@ -6645,8 +6686,13 @@ namespace llaminar2::test
         EXPECT_THROW(rocm_service->start(), std::logic_error);
     }
 
-    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
-         DeviceLocalServiceTotalsPublishAsCoherentMappedSnapshots)
+    /**
+     * @brief Replay one captured publication on both vendors for an exact stage.
+     * @param first_model_layer Global origin; storage remains exactly two rows.
+     * The same native graph must preserve immutable setup metadata while its
+     * cumulative cells and seqlock generation advance on successive launches.
+     */
+    static void proveCapturedServicePublication(int first_model_layer)
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
@@ -6670,6 +6716,7 @@ namespace llaminar2::test
                 .num_experts = 16u,
                 .command_capacity = 8u,
                 .initial_durable_epoch = 3u,
+                .first_model_layer = first_model_layer,
             };
         };
         std::thread cuda_builder([&]
@@ -6705,7 +6752,7 @@ namespace llaminar2::test
         if (rocm_error)
             std::rethrow_exception(rocm_error);
 
-        const auto prove_backend = [resolved_topology](
+        const auto prove_backend = [resolved_topology, first_model_layer](
             IBackend *backend,
             MoEOverlayNodeLocalDeviceControllerFabric &fabric,
             DeviceType type)
@@ -6746,8 +6793,10 @@ namespace llaminar2::test
                 sizeof(host_samples), ordinal));
             void *const stream = backend->createStream(ordinal);
             void *const terminal = backend->createEvent(ordinal);
+            std::unique_ptr<IGPUGraphCapture> graph;
             const auto cleanup = [&]
             {
+                graph.reset();
                 kernel.reset();
                 if (terminal)
                     backend->destroyEvent(terminal, ordinal);
@@ -6774,13 +6823,20 @@ namespace llaminar2::test
                 sizeof(host_samples),
                 ordinal,
                 stream));
-            ASSERT_TRUE(kernel->publishMoEOverlayServiceTelemetry(
-                launch,
-                device_cells,
-                device_samples,
-                kLayers,
-                participant->participant_id,
-                binding.service_telemetry_publication));
+            ASSERT_TRUE(backend->recordEvent(terminal, ordinal, stream));
+            ASSERT_TRUE(await(backend, terminal, ordinal, std::chrono::seconds(5)));
+            auto &worker = GPUDeviceContextPool::instance().getContext(binding.device);
+            bool captured = false;
+            worker.submitAndWait([&]
+            {
+                graph = worker.createGraphCapture(stream);
+                captured = graph && graph->beginCapture() &&
+                    kernel->publishMoEOverlayServiceTelemetry(
+                        launch, device_cells, device_samples, kLayers,
+                        participant->participant_id, binding.service_telemetry_publication) &&
+                    graph->endCapture() && graph->instantiate() && graph->launchOnStream(stream);
+            });
+            ASSERT_TRUE(captured);
             ASSERT_TRUE(backend->recordEvent(terminal, ordinal, stream));
             ASSERT_TRUE(await(
                 backend, terminal, ordinal, std::chrono::seconds(5)));
@@ -6796,7 +6852,7 @@ namespace llaminar2::test
                 ASSERT_TRUE(rows[layer].valid());
                 EXPECT_EQ(rows[layer].participant_id,
                           participant->participant_id);
-                EXPECT_EQ(rows[layer].layer, static_cast<int>(layer));
+                EXPECT_EQ(rows[layer].layer, first_model_layer + static_cast<int>(layer));
                 for (std::size_t phase = 0u;
                      phase < kDeviceMoEOverlayServicePhaseCount;
                      ++phase)
@@ -6824,25 +6880,35 @@ namespace llaminar2::test
                 sizeof(host),
                 ordinal,
                 stream));
-            ASSERT_TRUE(kernel->publishMoEOverlayServiceTelemetry(
-                launch,
-                device_cells,
-                device_samples,
-                kLayers,
-                participant->participant_id,
-                binding.service_telemetry_publication));
+            bool replayed = false;
+            worker.submitAndWait([&] { replayed = graph->launchOnStream(stream); });
+            ASSERT_TRUE(replayed);
             ASSERT_TRUE(backend->recordEvent(terminal, ordinal, stream));
             ASSERT_TRUE(await(
                 backend, terminal, ordinal, std::chrono::seconds(5)));
             ASSERT_TRUE(fabric.trySnapshotServiceTelemetry(
                 participant->participant_id, &rows, &generation));
             EXPECT_EQ(generation, 4u);
+            EXPECT_EQ(rows[1].layer, first_model_layer + 1);
             EXPECT_EQ(rows[1].sample_count[2], host[5].sample_count);
             cleanup();
         };
 
         prove_backend(cuda, *cuda_fabric, DeviceType::CUDA);
         prove_backend(rocm, *rocm_fabric, DeviceType::ROCm);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         DeviceLocalServiceTotalsPublishAsCoherentMappedSnapshots)
+    {
+        proveCapturedServicePublication(0);
+    }
+
+    /** Nonzero global IDs survive native graph capture and replay on both vendors. */
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         PipelineStageCapturedServicePublicationKeepsGlobalRows)
+    {
+        proveCapturedServicePublication(32);
     }
 
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,

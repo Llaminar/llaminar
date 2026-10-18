@@ -8,6 +8,7 @@
  */
 
 #include "CUDAHelpers.cuh"
+#include "../../common/DeviceFP32NumericalContract.h"
 #include <cstdio>
 
 // =========================================================================
@@ -26,7 +27,9 @@ __global__ void residual_add_fp32_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size)
     {
-        output[idx] = input[idx] + residual[idx];
+        // A preceding shared-gate publication may be subnormal. Preserve both
+        // operands and the separately rounded sum under CUDA --ftz=true.
+        output[idx] = llaminar2::device_fp32_contract::add(input[idx], residual[idx]);
     }
 }
 

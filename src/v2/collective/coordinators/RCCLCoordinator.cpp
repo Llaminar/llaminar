@@ -15,6 +15,8 @@
  * stream; each participant retains a consistent communicator operation order.
  * No coordinator queue, default stream or host wait is inserted into those
  * captured operations, including output-partitioned sum/reduce-scatter.
+ * Used and unused communicators share mandatory native finalization; retirement
+ * performs no allocation or synthetic collective and never abandons handles.
  */
 
 #include "RCCLCoordinator.h"
@@ -231,6 +233,13 @@ namespace llaminar2
             return false;
         }
 
+        if (!rccl::isCommFinalizeAvailable())
+        {
+            last_error_ = "RCCL runtime lacks required communicator finalization";
+            LOG_ERROR("[RCCLCoordinator] " << last_error_);
+            return false;
+        }
+
         // Store device ordinals
         device_ordinals_ = device_ordinals;
         num_devices_ = static_cast<int>(device_ordinals.size());
@@ -247,6 +256,7 @@ namespace llaminar2
                   return s; }());
 
         // Reset state
+        collective_performed_.store(false, std::memory_order_release);
         init_success_.store(false);
         init_complete_.store(false);
         running_.store(false);
@@ -321,10 +331,9 @@ namespace llaminar2
          * joining any of them. This mirrors CUDA and keeps backend failure
          * lifecycles symmetric.
          *
-         * RCCL communicator cleanup on this hardware is unsafe before the first
-         * collective initializes its internal mappings. In that unused case no
-         * device work exists to unblock, so preserve the established graceful
-         * cleanup path instead of invoking ncclCommAbort.
+         * An unused communicator has no collective device work to interrupt.
+         * Leave its handles to ordinary native finalization; cleanup never
+         * manufactures a first collective merely to retire an unused owner.
          */
         initialized_.store(false, std::memory_order_release);
         const bool has_collective_work =
@@ -706,10 +715,35 @@ namespace llaminar2
 #endif
     }
 
+    /**
+     * @brief Retire every native owner on its coordinator thread, including unused cliques.
+     *
+     * Teardown joins existing work, finalizes the complete clique, then destroys
+     * communicators before their events/streams. It creates no device work or
+     * storage. Native lifecycle failures are fatal rather than leaking handles
+     * or returning a partially retired owner to the process pool.
+     */
     void RCCLCoordinator::cleanupOnThread()
     {
 #ifdef HAVE_RCCL
         LOG_TRACE("[RCCLCoordinator] Cleaning up RCCL resources on coordinator thread");
+
+        const auto require_hip = [&](hipError_t status, const char *operation, std::size_t rank)
+        {
+            if (status == hipSuccess) return;
+            LOG_ERROR("[RCCLCoordinator] Retirement " << operation << " failed for rank " << rank
+                      << ": " << hipGetErrorString(status));
+            std::terminate();
+        };
+        const auto select_device = [&](std::size_t rank)
+        {
+            if (rank >= device_ordinals_.size())
+            {
+                LOG_ERROR("[RCCLCoordinator] Retirement has a foreign endpoint rank " << rank);
+                std::terminate();
+            }
+            require_hip(trackedHipSetDevice(device_ordinals_[rank]), "device selection", rank);
+        };
 
         // Step 1: Synchronize all streams before destroying any resources.
         // This ensures any internally-queued RCCL/HIP work completes before we
@@ -718,182 +752,46 @@ namespace llaminar2
         {
             if (streams_[i] != nullptr)
             {
-                if (i < static_cast<int>(device_ordinals_.size()))
-                {
-                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                }
-                HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
+                select_device(i);
+                require_hip(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])), "stream completion", i);
             }
         }
 
-        // Step 2: Prime communicators if no collective was ever performed.
-        // RCCL lazily allocates internal work buffers on first collective use.
-        // Both ncclCommDestroy and ncclCommAbort on unused communicators trigger
-        // crashes in the ROCm CLR ("Memobj map does not have ptr: 0x0") because
-        // they try to unmap memory that was never mapped. Simply skipping cleanup
-        // leaks RCCL internal state, causing subsequent ncclCommInitRank calls to
-        // fail with GPU memory access faults.
-        //
-        // Solution: perform a trivial 1-element allreduce to force RCCL to allocate
-        // its internal buffers, then ncclCommDestroy can safely clean them up.
-        if (!collective_performed_.load() && !comms_.empty() && comms_[0] != nullptr)
+        // Unused communicators retire through the same native finalization
+        // contract as used ones. Teardown must not allocate unadmitted buffers
+        // or launch a synthetic collective, especially at process retirement.
+        // Finalize the complete clique before releasing any communicator.
+        // Finalize is a required runtime ABI, authenticated during initialize.
+        for (std::size_t i = 0; i < comms_.size(); ++i)
         {
-            LOG_DEBUG("[RCCLCoordinator] Priming " << num_devices_
-                                                   << " unused communicators with trivial allreduce before cleanup");
-
-            // Allocate tiny device buffers on each GPU
-            std::vector<void *> prime_bufs(num_devices_, nullptr);
-            bool alloc_ok = true;
-            for (int i = 0; i < num_devices_ && alloc_ok; ++i)
+            if (!comms_[i]) continue;
+            select_device(i);
+            const auto status = rccl::ncclCommFinalize(static_cast<rccl::ncclComm_t>(comms_[i]));
+            if (status != rccl::ncclSuccess)
             {
-                HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                if (hipMalloc(&prime_bufs[i], sizeof(float)) != hipSuccess)
-                {
-                    LOG_WARN("[RCCLCoordinator] hipMalloc for prime buffer failed on device "
-                             << device_ordinals_[i]);
-                    alloc_ok = false;
-                }
-            }
-
-            if (alloc_ok)
-            {
-                // Perform trivial allreduce to initialize RCCL internal buffers
-                rccl::ncclResult_t r = rccl::ncclGroupStart();
-                if (r == rccl::ncclSuccess)
-                {
-                    bool ops_ok = true;
-                    for (int i = 0; i < num_devices_ && ops_ok; ++i)
-                    {
-                        HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                        r = rccl::ncclAllReduce(
-                            prime_bufs[i], prime_bufs[i], 1,
-                            rccl::ncclFloat, rccl::ncclSum,
-                            static_cast<rccl::ncclComm_t>(comms_[i]),
-                            static_cast<hipStream_t>(streams_[i]));
-                        if (r != rccl::ncclSuccess)
-                        {
-                            LOG_WARN("[RCCLCoordinator] Prime allreduce failed: "
-                                     << rccl::ncclGetErrorString(r));
-                            ops_ok = false;
-                        }
-                    }
-                    rccl::ncclGroupEnd();
-
-                    if (ops_ok)
-                    {
-                        // Synchronize all streams to ensure the trivial op completes
-                        for (int i = 0; i < num_devices_; ++i)
-                        {
-                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                            HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
-                        }
-                        collective_performed_.store(true);
-                        LOG_DEBUG("[RCCLCoordinator] Communicators primed successfully");
-                    }
-                }
-            }
-
-            // Free temporary buffers
-            for (int i = 0; i < num_devices_; ++i)
-            {
-                if (prime_bufs[i] != nullptr)
-                {
-                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                    HIP_CHECK_VOID(hipFree(prime_bufs[i]));
-                }
+                LOG_ERROR("[RCCLCoordinator] Communicator finalization failed on device "
+                          << device_ordinals_[i] << ": " << rccl::ncclGetErrorString(status));
+                std::terminate();
             }
         }
-
-        // Step 3: Release RCCL communicators.
-        //
-        // RCCL/ROCm CLR has bugs with communicator cleanup on MI60 GPUs:
-        // - ncclCommDestroy alone: segfaults inside librccl.so with 4 communicators
-        //   created via ncclCommInitAll (null deref at internal struct offset)
-        // - ncclCommAbort: corrupts glibc heap metadata, causing SIGABRT during
-        //   subsequent cleanup
-        //
-        // Solution: Use the proper NCCL 2.14+ shutdown sequence:
-        //   ncclCommFinalize → hipStreamSynchronize → ncclCommDestroy
-        // ncclCommFinalize tells RCCL to flush async operations and prepare
-        // internal state for clean destruction.
-        if (!comms_.empty())
+        for (std::size_t i = 0; i < streams_.size(); ++i)
         {
-            bool has_finalize = rccl::isCommFinalizeAvailable();
-
-            if (has_finalize)
-            {
-                // Step 3a: Finalize all communicators first
-                for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
-                {
-                    if (comms_[i] != nullptr)
-                    {
-                        if (i < static_cast<int>(device_ordinals_.size()))
-                        {
-                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                        }
-                        rccl::ncclResult_t r = rccl::ncclCommFinalize(static_cast<rccl::ncclComm_t>(comms_[i]));
-                        if (r != rccl::ncclSuccess)
-                        {
-                            LOG_WARN("[RCCLCoordinator] ncclCommFinalize failed for device "
-                                     << (i < static_cast<int>(device_ordinals_.size()) ? device_ordinals_[i] : -1)
-                                     << ": " << rccl::ncclGetErrorString(r));
-                        }
-                    }
-                }
-
-                // Step 3b: Synchronize all streams after finalize
-                for (int i = 0; i < static_cast<int>(streams_.size()); ++i)
-                {
-                    if (streams_[i] != nullptr)
-                    {
-                        if (i < static_cast<int>(device_ordinals_.size()))
-                        {
-                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                        }
-                        HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
-                    }
-                }
-
-                // Step 3c: Now destroy communicators (safe after finalize+sync)
-                for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
-                {
-                    if (comms_[i] != nullptr)
-                    {
-                        if (i < static_cast<int>(device_ordinals_.size()))
-                        {
-                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                        }
-                        rccl::ncclResult_t r = rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comms_[i]));
-                        if (r != rccl::ncclSuccess)
-                        {
-                            LOG_WARN("[RCCLCoordinator] ncclCommDestroy failed for device "
-                                     << (i < static_cast<int>(device_ordinals_.size()) ? device_ordinals_[i] : -1)
-                                     << ": " << rccl::ncclGetErrorString(r));
-                        }
-                        comms_[i] = nullptr;
-                    }
-                }
-            }
-            else
-            {
-                // Fallback: ncclCommFinalize not available — skip cleanup to avoid crash
-                LOG_DEBUG("[RCCLCoordinator] ncclCommFinalize not available, skipping comm cleanup "
-                          "(OS will reclaim resources at exit)");
-                for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
-                {
-                    comms_[i] = nullptr;
-                }
-            }
+            if (!streams_[i]) continue;
+            select_device(i);
+            require_hip(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])), "stream completion", i);
         }
-        else
+        for (std::size_t i = 0; i < comms_.size(); ++i)
         {
-            // Priming failed - last resort: null pointers (leaks RCCL state but avoids crash)
-            LOG_WARN("[RCCLCoordinator] Cannot properly clean up communicators - "
-                     "priming failed, nulling pointers (may leak RCCL state)");
-            for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+            if (!comms_[i]) continue;
+            select_device(i);
+            const auto status = rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comms_[i]));
+            if (status != rccl::ncclSuccess)
             {
-                comms_[i] = nullptr;
+                LOG_ERROR("[RCCLCoordinator] Communicator destruction failed on device "
+                          << device_ordinals_[i] << ": " << rccl::ncclGetErrorString(status));
+                std::terminate();
             }
+            comms_[i] = nullptr;
         }
         comms_.clear();
 
@@ -902,11 +800,8 @@ namespace llaminar2
         {
             if (completion_events_[i] != nullptr)
             {
-                if (i < static_cast<int>(device_ordinals_.size()))
-                {
-                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                }
-                HIP_CHECK_VOID(hipEventDestroy(static_cast<hipEvent_t>(completion_events_[i])));
+                select_device(i);
+                require_hip(hipEventDestroy(static_cast<hipEvent_t>(completion_events_[i])), "event destruction", i);
                 completion_events_[i] = nullptr;
             }
         }
@@ -917,11 +812,8 @@ namespace llaminar2
         {
             if (streams_[i] != nullptr)
             {
-                if (i < static_cast<int>(device_ordinals_.size()))
-                {
-                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
-                }
-                HIP_CHECK_VOID(hipStreamDestroy(static_cast<hipStream_t>(streams_[i])));
+                select_device(i);
+                require_hip(hipStreamDestroy(static_cast<hipStream_t>(streams_[i])), "stream destruction", i);
                 streams_[i] = nullptr;
             }
         }

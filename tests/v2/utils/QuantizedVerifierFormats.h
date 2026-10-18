@@ -7,7 +7,8 @@
  * stronger nonzero fixture, but they must preserve the complete entry set.
  * Keeping source and device codebook metadata beside the creator also catches
  * preparation bugs where a source layout is accepted but published under an
- * incompatible execution descriptor.
+ * incompatible execution descriptor. IQ4_XS retains source4 but publishes
+ * physical24 with a raw coefficient secondary plane.
  */
 
 #pragma once
@@ -18,8 +19,11 @@
 
 #include <cstring>
 #include <cstdint>
+#include <algorithm>
+#include <cmath>
 #include <functional>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -61,7 +65,7 @@ namespace llaminar2::test
              { return TestTensorFactory::createQ4_0Random(shape, seed); }},
             {"IQ4_NL", TensorType::IQ4_NL, 4, false, 4, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }},
-            {"IQ4_XS", TensorType::IQ4_XS, 4, true, 4, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+            {"IQ4_XS", TensorType::IQ4_XS, 4, true, kNativeVnniIQ4XSSourceScaleCodebook, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }},
             {"Q4_1", TensorType::Q4_1, 5, false, 5, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createQ4_1Random(shape, seed); }},
@@ -110,7 +114,14 @@ namespace llaminar2::test
      * random factory is useful for tensor-decoder coverage, but its synthetic
      * scales can make a gate/up/down composition overflow or collapse to zero.
      * Keeping `ls` close to 32 produces finite, nonzero routed-expert rows while
-     * preserving the real IQ4_XS source layout and codebook-4 preparation path.
+     * preserving source/arithmetic4 and physical24 original-factor preparation.
+     * Independent PRNG draws for each payload and scale avoid short row periods:
+     * correlated two-row patterns previously saturated every gate negative and
+     * underflowed the composed SwiGLU Q8 scale, making replica parity vacuous.
+     *
+     * @param shape Native matrix dimensions [rows, cols].
+     * @param seed Stable seed for independent packed payload and scale draws.
+     * @return Bounded native IQ4_XS tensor with varied rows and expert slices.
      */
     inline std::unique_ptr<TensorBase> createBoundedMoEIQ4XS(
         const std::vector<size_t> &shape,
@@ -124,6 +135,7 @@ namespace llaminar2::test
 
         std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ4_XSBlock));
         auto *blocks = reinterpret_cast<IQ4_XSBlock *>(raw_data.data());
+        std::mt19937 rng(seed);
         for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
         {
             auto &block = blocks[block_idx];
@@ -134,7 +146,7 @@ namespace llaminar2::test
             for (int sub = 0; sub < 8; ++sub)
             {
                 const uint16_t ls = static_cast<uint16_t>(
-                    33u + ((seed + block_idx + static_cast<size_t>(sub)) & 0x3u));
+                    33u + (rng() & 0x3u));
                 block.scales_l[sub / 2] |= static_cast<uint8_t>(
                     (ls & 0x0fu) << (4 * (sub & 1)));
                 block.scales_h |= static_cast<uint16_t>(
@@ -143,15 +155,58 @@ namespace llaminar2::test
 
             for (size_t value = 0; value < std::size(block.qs); ++value)
             {
-                const uint8_t lo = static_cast<uint8_t>(
-                    (seed + block_idx * 19u + value * 5u) & 0x0fu);
-                const uint8_t hi = static_cast<uint8_t>(
-                    ((seed >> 4) + block_idx * 23u + value * 7u) & 0x0fu);
+                const uint8_t lo = static_cast<uint8_t>(rng() & 0x0fu);
+                const uint8_t hi = static_cast<uint8_t>(rng() & 0x0fu);
                 block.qs[value] = static_cast<uint8_t>(lo | (hi << 4));
             }
         }
 
         return std::make_unique<IQ4_XSTensor>(shape, raw_data);
+    }
+
+    /**
+     * @brief Bound a composed verifier input to the native Q8 metadata domain.
+     * @param gate Native gate weights before preparation retires source storage.
+     * @param up Native up weights with the same reduction dimension.
+     * @param maximum_hidden_value Largest absolute value across all input patterns.
+     * @return Exact power-of-two input multiplier, at most one.
+     * @throws std::invalid_argument for invalid dimensions or nonfinite fixtures.
+     *
+     * Generic decoder fixtures deliberately use very different weight scales.
+     * An unnormalized Q8_K matrix can produce billion-scale SwiGLU values from
+     * the wide hidden pattern, outside binary16 Q8 scale storage. A row L1 bound
+     * limits both projections to 512, hence their product to 262144. Scaling the
+     * input by a power of two retains its pattern and relative amplitude sweep
+     * without re-encoding any native weight, codebook or correction plane.
+     */
+    inline float composedMoEVerifierInputMultiplier(
+        const TensorBase &gate, const TensorBase &up, float maximum_hidden_value)
+    {
+        if (gate.shape().size() != 2 || up.shape().size() != 2 ||
+            gate.cols() != up.cols() || maximum_hidden_value <= 0 ||
+            !std::isfinite(maximum_hidden_value))
+            throw std::invalid_argument("Composed MoE fixture has invalid input geometry");
+        double maximum_projection = 0;
+        std::vector<float> row(static_cast<size_t>(gate.cols()));
+        for (const TensorBase *weights : {&gate, &up})
+            for (size_t r = 0; r < static_cast<size_t>(weights->rows()); ++r)
+            {
+                weights->to_fp32_row(r, row.data());
+                double norm = 0;
+                for (const float value : row)
+                {
+                    if (!std::isfinite(value))
+                        throw std::invalid_argument("Composed MoE fixture has nonfinite weights");
+                    norm += std::abs(static_cast<double>(value));
+                }
+                maximum_projection = std::max(maximum_projection,
+                    norm * static_cast<double>(maximum_hidden_value));
+            }
+        float multiplier = 1.f;
+        while (maximum_projection * multiplier > 512.) multiplier *= .5f;
+        if (multiplier == 0.f)
+            throw std::invalid_argument("Composed MoE fixture input bound underflowed");
+        return multiplier;
     }
 
     /**

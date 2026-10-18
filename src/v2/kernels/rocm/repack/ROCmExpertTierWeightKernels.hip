@@ -6,10 +6,13 @@
  * therefore implements the identical one-block-per-CPU-unit arithmetic and
  * differs only in runtime launch/error handling. Complete unit ownership keeps
  * writes deterministic on both 32- and 64-lane hardware execution widths.
+ * IQ3_S source tuples retain original half/raw-nibble words and invert only
+ * exact canonical signed-grid quartets when restoring the13-byte GPU payload.
  */
 
 #include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
 #include "backends/rocm/HipDeviceGuard.h"
+#include "tensors/NativeVnniIQ3SScale.h"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -499,9 +502,11 @@ namespace llaminar2
         /**
          * @brief Transpose separated compact nibbles into final CPU units.
          * @tparam Codebook Nibble execution codebook.
-         * @tparam Asymmetric Whether the minimum region is present.
+         * @tparam HasSecondaryMetadata Whether a raw secondary word region is present.
+         * IQ4_XS copies encoded coefficients unchanged; ordinary asymmetric
+         * formats copy their existing binary16 minima.
          */
-        template <std::uint8_t Codebook, bool Asymmetric>
+        template <std::uint8_t Codebook, bool HasSecondaryMetadata>
         __global__ void gpuToCpuNibbleUnitsROCm(
             const std::uint8_t *__restrict__ payload,
             const std::uint16_t *__restrict__ scales,
@@ -544,7 +549,7 @@ namespace llaminar2
                 static_cast<std::int16_t>(compensation);
             reinterpret_cast<std::uint16_t *>(unit + 1152u)[local_column] =
                 scales[linear];
-            if constexpr (Asymmetric)
+            if constexpr (HasSecondaryMetadata)
             {
                 reinterpret_cast<std::uint16_t *>(unit + 1280u)[local_column] =
                     mins[linear];
@@ -649,7 +654,7 @@ namespace llaminar2
             reinterpret_cast<std::uint16_t *>(unit + 2176u)[local_column] =
                 scales[linear];
             if constexpr (
-                Codebook == 7 || Codebook == 16 ||
+                Codebook == 7 || Codebook == 11 || Codebook == 16 ||
                 Codebook == kNativeVnniExpandedInt8MinCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(
@@ -658,7 +663,20 @@ namespace llaminar2
             }
         }
 
-        /** @brief Transpose separated native Q6_K into dual-scale CPU units. */
+        /**
+         * @brief Transpose Q6 payload and original factor words into CPU units.
+         * @details Metadata is copied verbatim: original half d and two signed
+         * subscales. CPU and GPU consumers share that encoding; no half conversion
+         * or reconstruction occurs at this movement boundary.
+         * @param payload Borrowed compact GPU Q6 payload plane.
+         * @param scales Borrowed original half d words.
+         * @param secondary_scales Borrowed packed signed coefficient words.
+         * @param N Logical matrix rows, excluding allocation capacity.
+         * @param blocks_per_row Logical32-value block count per row.
+         * @param first_unit First native CPU unit in this bounded transfer.
+         * @param cpu_stride Existing1792-byte CPU unit stride.
+         * @param cpu_chunk Destination admitted native CPU transfer bytes.
+         */
         __global__ void gpuToCpuQ6UnitsROCm(
             const std::uint8_t *__restrict__ payload,
             const std::uint16_t *__restrict__ scales,
@@ -733,9 +751,11 @@ namespace llaminar2
 
         /**
          * @brief Deinterleave CPU compact-nibble units into separated GPU data.
-         * @tparam Asymmetric Whether the minimum region is present.
+         * @tparam HasSecondaryMetadata Whether a raw secondary word region is present.
+         * IQ4_XS copies encoded coefficients unchanged; ordinary asymmetric
+         * formats copy their existing binary16 minima.
          */
-        template <bool Asymmetric>
+        template <bool HasSecondaryMetadata>
         __global__ void cpuToGpuNibbleUnitsROCm(
             const std::uint8_t *__restrict__ cpu_chunk,
             int N,
@@ -767,7 +787,7 @@ namespace llaminar2
             }
             scales[linear] =
                 reinterpret_cast<const std::uint16_t *>(unit + 1152u)[local_column];
-            if constexpr (Asymmetric)
+            if constexpr (HasSecondaryMetadata)
             {
                 mins[linear] = reinterpret_cast<const std::uint16_t *>(
                     unit + 1280u)[local_column];
@@ -776,9 +796,22 @@ namespace llaminar2
 
         /**
          * @brief Deinterleave CPU expanded-INT8 units into separated GPU data.
-         * @tparam Asymmetric Whether the minimum region is present.
+         * @tparam Asymmetric Existing expanded19/23 additive-minimum storage.
+         * @tparam SourceCodebook Source11 restores exact IQ3_S grids;19 retains INT8.
+         * @param cpu_chunk Borrowed CPU units, already ordered on this stream.
+         * @param N Live output rows, excluding padded columns.
+         * @param blocks_per_row Logical32-value K block count.
+         * @param first_unit First global CPU unit in the transfer chunk.
+         * @param cpu_stride Complete source encoding unit stride.
+         * @param payload Destination13-byte IQ3_S or32-byte INT8 payload plane.
+         * @param scales Destination original IQ3_S half or existing INT8 half words.
+         * @param mins Destination raw IQ3_S nibble or existing minimum words.
+         * @details IQ3_S inverse membership uses only the existing resident512
+         * grid, at most10 comparisons per quartet. Invalid values/metadata trap
+         * before any destination block bytes are published; no approximation,
+         * alternate format, host mirror or dynamic storage is introduced.
          */
-        template <bool Asymmetric>
+        template <bool Asymmetric, std::uint8_t SourceCodebook = 19>
         __global__ void cpuToGpuExpandedUnitsROCm(
             const std::uint8_t *__restrict__ cpu_chunk,
             int N,
@@ -802,6 +835,40 @@ namespace llaminar2
                 cpu_chunk + static_cast<std::size_t>(blockIdx.x) * cpu_stride;
             const std::size_t linear =
                 static_cast<std::size_t>(kb) * N + n;
+            if constexpr (SourceCodebook == 11)
+            {
+                static_assert(!Asymmetric, "IQ3_S raw source nibble is not an additive minimum");
+                const std::uint16_t raw = reinterpret_cast<const std::uint16_t *>(unit + 2304u)[local_column];
+                if (!native_vnni_iq3s_scale::valid(raw)) __builtin_trap();
+                std::uint8_t low[8]{};
+                std::uint8_t high = 0;
+                std::uint8_t signs[4]{};
+#pragma unroll
+                for (unsigned group = 0; group < 8; ++group)
+                {
+                    std::int8_t values[4];
+#pragma unroll
+                    for (unsigned lane = 0; lane < 4; ++lane)
+                        values[lane] = static_cast<std::int8_t>(unit[
+                            interleavedValueOffsetROCm(local_column, group * 4 + lane)]);
+                    const auto encoded = native_vnni_iq3s_scale::encodeGridQuartet(values,kTierIQ3SGridROCm);
+                    if (!encoded.valid()) __builtin_trap();
+                    low[group] = static_cast<std::uint8_t>(encoded.index);
+                    high |= static_cast<std::uint8_t>((encoded.index >> 8) << group);
+                    signs[group / 2] |= static_cast<std::uint8_t>(encoded.signs << (4 * (group % 2)));
+                }
+                // Retain all source words only after every quartet is valid.
+                std::uint8_t *destination = payload + linear * 13u;
+#pragma unroll
+                for (unsigned group = 0; group < 8; ++group) destination[group] = low[group];
+                destination[8] = high;
+#pragma unroll
+                for (unsigned byte = 0; byte < 4; ++byte) destination[9 + byte] = signs[byte];
+                scales[linear] = reinterpret_cast<const std::uint16_t *>(unit + 2176u)[local_column];
+                mins[linear] = raw;
+                return;
+            }
+            static_assert(SourceCodebook == 11 || SourceCodebook == 19);
             std::uint8_t *destination = payload + linear * 32u;
             for (int value = 0; value < 32; ++value)
             {
@@ -817,7 +884,19 @@ namespace llaminar2
             }
         }
 
-        /** @brief Deinterleave CPU native-Q6 units into separated GPU data. */
+        /**
+         * @brief Deinterleave source-factor CPU Q6 units into separated GPU data.
+         * @details Preserve both metadata words exactly across repeated tier cycles;
+         * the second word is packed signed coefficients, never a binary16 value.
+         * @param cpu_chunk Borrowed source-factor native CPU transfer units.
+         * @param N Logical output rows, excluding padded CPU columns.
+         * @param blocks_per_row Logical32-value block count per row.
+         * @param first_unit First native unit represented by this transfer.
+         * @param cpu_stride Existing1792-byte CPU unit stride.
+         * @param payload Destination compact GPU Q6 payload plane.
+         * @param scales Destination original half d words.
+         * @param secondary_scales Destination packed signed coefficient words.
+         */
         __global__ void cpuToGpuQ6UnitsROCm(
             const std::uint8_t *__restrict__ cpu_chunk,
             int N,
@@ -982,6 +1061,20 @@ namespace llaminar2
                 source, {}, nullptr, device_cpu_chunk, layout, first_unit);
             return hipPeekAtLastError() == hipSuccess;
         }
+        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+        {
+            hipLaunchKernelGGL((gpuToCpuDecodedUnitsROCm<11>), grid, block, 0,
+                hip_stream, source.payload, source.scales, source.mins, source.emins,
+                layout.N, layout.blocks_per_row, first_unit, layout.cpu_block_stride, device_cpu_chunk);
+            return hipPeekAtLastError() == hipSuccess;
+        }
+        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+        {
+            hipLaunchKernelGGL((gpuToCpuNibbleUnitsROCm<4, true>), grid, block, 0,
+                hip_stream, source.payload, source.scales, source.mins, layout.N,
+                layout.blocks_per_row, first_unit, layout.cpu_block_stride, device_cpu_chunk);
+            return hipPeekAtLastError() == hipSuccess;
+        }
         if (layout.cpu_encoding ==
             cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)
         {
@@ -1094,6 +1187,20 @@ namespace llaminar2
         {
             compactMultiScaleUnitsROCm<false><<<grid, block, 0, hip_stream>>>(
                 {}, destination, device_cpu_chunk, nullptr, layout, first_unit);
+            return hipPeekAtLastError() == hipSuccess;
+        }
+        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::IQ3SExpandedSourceScale)
+        {
+            hipLaunchKernelGGL((cpuToGpuExpandedUnitsROCm<false,11>), grid, block, 0,
+                hip_stream, device_cpu_chunk, layout.N, layout.blocks_per_row, first_unit,
+                layout.cpu_block_stride, destination.payload, destination.scales, destination.mins);
+            return hipPeekAtLastError() == hipSuccess;
+        }
+        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUTSourceScale)
+        {
+            hipLaunchKernelGGL((cpuToGpuNibbleUnitsROCm<true>), grid, block, 0,
+                hip_stream, device_cpu_chunk, layout.N, layout.blocks_per_row, first_unit,
+                layout.cpu_block_stride, destination.payload, destination.scales, destination.mins);
             return hipPeekAtLastError() == hipSuccess;
         }
         if (layout.cpu_encoding ==

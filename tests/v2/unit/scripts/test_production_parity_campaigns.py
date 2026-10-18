@@ -84,7 +84,8 @@ class EmptyGTestGateTests(unittest.TestCase):
 class DeviceInventoryGateTests(unittest.TestCase):
     """Prove CMake startup ownership reaches the actual preflight scheduler."""
 
-    def configure_scope(self, directory: Path, scope: str, labels: str) -> subprocess.CompletedProcess:
+    def configure_scope(self, directory: Path, scope: str, labels: str,
+                        environment: str = "") -> subprocess.CompletedProcess:
         """Compile the real registration helper with a device-free imported executable.
 
         An imported Python executable supplies only a CMake target identity;
@@ -98,7 +99,7 @@ class DeviceInventoryGateTests(unittest.TestCase):
             f'add_v2_test(V2_Integration_Inventory_{backend} '
             f'COMMAND $<TARGET_FILE:inventory_probe> --filter={backend} '
             f'LABELS "V2;{labels};{backend};ProductionTestPreflight" '
-            'MPI_PROCS 1 NO_MODELS TIMEOUT 30)'
+            f'MPI_PROCS 1 NO_MODELS TIMEOUT 30 {environment})'
             for backend in ("CUDA", "ROCm")
         ]
         (directory / "CMakeLists.txt").write_text(
@@ -139,11 +140,35 @@ class DeviceInventoryGateTests(unittest.TestCase):
         for scope, labels, diagnostic in (
             ("FullInventroy", "Integration", "Unknown device scope"),
             ("FullInventory", "Unit", "Device-free Unit target"),
+            ("FullInventory", "Integration;DeviceFree", "Device-free integration target"),
         ):
             with self.subTest(scope=scope, labels=labels), tempfile.TemporaryDirectory(prefix="llaminar-inventory-invalid-") as directory:
                 result = self.configure_scope(Path(directory), scope, labels)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(diagnostic, result.stdout + result.stderr)
+
+    def test_device_free_integrations_inherit_the_unit_startup_boundary(self) -> None:
+        """Real CTest metadata must disable vendor discovery for both host test kinds."""
+        for labels in ("Unit", "Integration;DeviceFree"):
+            with self.subTest(labels=labels), tempfile.TemporaryDirectory(prefix="llaminar-cpu-scope-") as directory:
+                root = Path(directory)
+                result = self.configure_scope(root, "DeclaredBackends", labels)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                document = json.loads(subprocess.check_output(
+                    ["ctest", "--test-dir", str(root / "build"), "--show-only=json-v1"], text=True))
+                self.assertEqual(len(document["tests"]), 2)
+                for test in document["tests"]:
+                    properties = {item["name"]: item["value"] for item in test["properties"]}
+                    self.assertIn("LLAMINAR_FORCE_CPU_ONLY_STARTUP=1", properties["ENVIRONMENT"])
+
+    def test_device_free_startup_cannot_be_overridden_by_local_environment(self) -> None:
+        """The registration rejects conflicting intent instead of trusting environment order."""
+        for labels in ("Unit", "Integration;DeviceFree"):
+            with self.subTest(labels=labels), tempfile.TemporaryDirectory(prefix="llaminar-cpu-conflict-") as directory:
+                result = self.configure_scope(Path(directory), "DeclaredBackends", labels,
+                    'ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0"')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Device-free test overrides CPU-only startup", result.stdout + result.stderr)
 
     def test_full_inventory_is_exclusive_for_every_launcher_and_backend(self) -> None:
         """Startup ownership applies to CPU-labelled and non-MPI probes too."""

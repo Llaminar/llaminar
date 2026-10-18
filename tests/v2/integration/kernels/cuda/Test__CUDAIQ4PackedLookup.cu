@@ -2,8 +2,8 @@
  * @file Test__CUDAIQ4PackedLookup.cu
  * @brief Captured IQ4 lookup and packed-operand bytes against a scalar oracle.
  *
- * IQ4_NL and IQ4_XS use the same physical codebook after preparation. This
- * focused test exercises their actual shared word and vector helpers, not a
+ * IQ4_NL physical4 and IQ4_XS physical24 share only the integer LUT decoder.
+ * This focused physical4 control exercises the shared word/vector helpers, not a
  * second GPU implementation that could drift alongside a projection kernel.
  * Every sixteen-bit selector occurs in both half-word positions, surrounded
  * by complementary or mixed codes. The host oracle indexes sixteen signed

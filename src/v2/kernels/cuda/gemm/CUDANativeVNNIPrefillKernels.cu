@@ -25,6 +25,8 @@
  * Canonical partial storage has unspecified prior bytes. Its complete writer
  * defines every consumed partition, including empty K partitions, before the
  * ordered reducer is admitted; no destination initialization is necessary.
+ * IQ4_XS physical24 retains raw source factors; secondary metadata stages with
+ * the existing primary plane and resolves before the unchanged source4 tree.
  */
 
 #include <cuda_runtime.h>
@@ -811,6 +813,7 @@ namespace
         {
         case 0:
         case 4:
+        case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
         case 5:
         case 6:
         case 7:
@@ -857,7 +860,8 @@ namespace
     /**
      * @brief Resolve one authenticated dense-prefill launch before capture.
      *
-     * Exact overlays are keyed only by the runtime-visible codebook and matrix
+     * Exact overlays use source4 for the explicit IQ4 tuple family and otherwise
+     * the runtime-visible codebook and matrix
      * geometry `(M,N,K)`. Profiler force controls have higher precedence so the
      * sweep can continue to measure every physical candidate after an overlay
      * has been installed. Ordinary production has no such controls and sees the
@@ -886,8 +890,13 @@ namespace
         if (profiler_override)
             return DensePrefillOverlayStatus::NotSelected;
 
+        // IQ4_XS owns physical24 kernels and resources, but retains exactly
+        // the source4 tile/staging/reduction schedule rather than losing its
+        // admitted cells when the physical metadata identity changes.
+        const uint8_t policy_codebook = codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
+            ? uint8_t{4} : codebook;
         if (!llaminar2::cuda::generated::selectCUDADensePrefillOverlay(
-                codebook, M, N, K, config))
+                policy_codebook, M, N, K, config))
         {
             return DensePrefillOverlayStatus::NotSelected;
         }
@@ -1258,7 +1267,7 @@ namespace
             return tile == 2 ? ordinary_hint : 1;
         }
         if constexpr (CanonicalKpart &&
-                      (CB == 0 || CB == 4 || CB == 6 || CB == 11 ||
+                      (CB == 0 || CB == 4 || CB == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook || CB == 6 || CB == 11 ||
                        CB == 12 || CB == 15 || CB == 19))
         {
             return tile <= 3 ? ordinary_hint : 1;
@@ -2236,6 +2245,7 @@ extern "C"
         {
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(0);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(4);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(5);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(6);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(7);
@@ -2309,6 +2319,7 @@ extern "C"
         {
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(0);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(4);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(5);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(6);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(7);
@@ -2469,7 +2480,7 @@ extern "C"
     {
         return cudaNativeVNNIPrefill_getWorkspacePlanWithPolicy(
             codebook_id,
-            codebook_id,
+            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
             M,
             N,
             K,
@@ -2527,7 +2538,7 @@ extern "C"
                 for (const auto &entry :
                      llaminar2::cuda::generated::kCUDADensePrefillOverlayEntries)
                 {
-                    if (entry.codebook != codebook_id ||
+                    if (entry.codebook != (codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id) ||
                         entry.n != N || entry.k != K ||
                         entry.m <= 1 || entry.m > max_M)
                     {
@@ -2575,7 +2586,7 @@ extern "C"
     {
         return cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
             codebook_id,
-            codebook_id,
+            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
             max_M,
             N,
             K,
@@ -2666,6 +2677,14 @@ extern "C" bool cudaNativeVNNIPrefill_fp32_withPolicy(
             serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
             cuda_stream, prefill_ctx);
         break;
+    case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        if (!d_mins) return false;
+        ok = launchGenericPrefillBK64<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(
+            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
+        break;
     case 6: // Q5_0
         ok = launchGenericPrefillBK64<6>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
@@ -2674,8 +2693,9 @@ extern "C" bool cudaNativeVNNIPrefill_fp32_withPolicy(
             cuda_stream, prefill_ctx);
         break;
     case 11: // IQ3_S
+        if (!d_mins) return false; // Mandatory original source nibble.
         ok = launchGenericPrefillBK64<11>(
-            d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
             serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
             cuda_stream, prefill_ctx);
@@ -2883,7 +2903,7 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
         d_C_existing,
         d_bias,
         codebook_id,
-        codebook_id,
+        codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
         cuda_device_id,
         stream,
         prefill_ctx);

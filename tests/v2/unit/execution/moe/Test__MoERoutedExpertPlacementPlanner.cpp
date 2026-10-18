@@ -1,3 +1,11 @@
+/**
+ * @file Test__MoERoutedExpertPlacementPlanner.cpp
+ * @brief Device-free proofs of exact quotas, demand costs and compact stage plans.
+ *
+ * Stage regressions preserve global expert/weight identities while proving that
+ * every storage row and memory estimate covers only the owning pipeline stage.
+ */
+
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "execution/moe/DecodeExpertHistogram.h"
 
@@ -324,8 +332,156 @@ namespace llaminar2::test
         {
             const std::string message = error.what();
             EXPECT_NE(
-                message.find("no-fallback tier capacity cannot cover every expert"),
+                message.find("capacity covers only 5 of 6"),
                 std::string::npos);
+        }
+    }
+
+    TEST(Test__MoERoutedExpertPlacementPlanner, PipelineStagePlanningHasNoPrecedingLayerPadding)
+    {
+        for (const int origin : {0, 20, 40})
+        for (const int layers : {1, 2, 21})
+        for (const auto policy : {RoutedExpertResidencyPolicy::StaticById,
+                                  RoutedExpertResidencyPolicy::HistogramTieredCache,
+                                  RoutedExpertResidencyPolicy::RoutedTierRebalanced})
+        {
+            auto plan = twoTierRocmCpuPlan(policy);
+            plan.first_model_layer = origin;
+            plan.routed_tiers[0].resolved_live_experts_per_layer.assign(layers, 2);
+            plan.routed_tiers[1].resolved_live_experts_per_layer.assign(layers, 4);
+            auto model = metadata(layers);
+            model.first_model_layer = origin;
+            const auto result = MoERoutedExpertPlacementPlanner::plan(plan, model);
+            ASSERT_EQ(result.planned_plan.placements.size(), static_cast<size_t>(layers));
+            EXPECT_EQ(result.planned_plan.placementLayerCapacity(), layers);
+            EXPECT_EQ(result.memory.total_shared_expert_bytes,
+                      layers * result.memory.shared_expert_bytes_per_layer);
+            EXPECT_EQ(result.memory.total_routed_expert_bytes,
+                      layers * 6u * result.memory.routed_expert_bytes_per_expert);
+            for (int row = 0; row < layers; ++row)
+            {
+                EXPECT_EQ(result.planned_plan.placements[row].layer, origin + row);
+                EXPECT_EQ(result.planned_plan.placements[row].routed_expert_tier,
+                          (std::vector<int>{0, 0, 1, 1, 1, 1}));
+            }
+        }
+    }
+
+    TEST(Test__MoERoutedExpertPlacementPlanner, PipelineStageDynamicCostsUseGlobalEvidenceAndLocalQuotas)
+    {
+        for (const auto policy : {RoutedExpertResidencyPolicy::HistogramTieredCache,
+                                  RoutedExpertResidencyPolicy::RoutedTierRebalanced})
+        {
+            auto plan = twoTierRocmCpuPlan(policy);
+            plan.first_model_layer = 32;
+            plan.routed_tiers[0].resolved_live_experts_per_layer = {2, 4};
+            plan.routed_tiers[1].resolved_live_experts_per_layer = {4, 2};
+            auto model = metadata();
+            model.first_model_layer = 32;
+            DecodeExpertHistogramConfig cfg;
+            cfg.num_layers = 2;
+            cfg.num_experts = 6;
+            cfg.top_k = 1;
+            cfg.sockets = {DeviceId::cpu()};
+            cfg.ownership = MoELayeredExpertOwnership::uniform(2, 1, {0, 0, 0, 0, 0, 0}, 32);
+            DecodeExpertHistogram histogram(cfg);
+            const uint64_t counts[]{1, 2, 3, 4, 5, 6};
+            histogram.mergeLayerCounts(32, counts, 6, true, ExpertHistogramSource::PrefillChunk);
+            histogram.mergeLayerCounts(33, counts, 6, true, ExpertHistogramSource::PrefillChunk);
+            MoERoutedTierServiceProfile profile;
+            profile.identity = "stage32-costs";
+            profile.production_topology = ExpertHistogramProductionTopology::uniform(
+                2, kAllExpertHistogramProductionSources, 32);
+            for (int layer = 32; layer < 34; ++layer)
+            for (int tier_id = 0; tier_id < 2; ++tier_id)
+            {
+                const uint64_t cost = tier_id == 0 ? 1 : 9;
+                profile.costs.push_back({tier_id, layer, {cost, cost, cost}});
+            }
+            const auto live = MoERoutedExpertPlacementPlanner::plan(
+                plan, model, {.decode_histogram = &histogram, .phase_service_profile = &profile});
+            EXPECT_EQ(live.planned_plan.placements[0].routed_expert_tier,
+                      (std::vector<int>{1, 1, 1, 1, 0, 0}));
+            EXPECT_EQ(live.planned_plan.placements[1].routed_expert_tier,
+                      (std::vector<int>{1, 1, 0, 0, 0, 0}));
+            const auto window = histogram.freezeAndRotateWindow();
+            const auto frozen = MoERoutedExpertPlacementPlanner::plan(plan, model,
+                {.decode_histogram_window = &window, .phase_service_profile = &profile});
+            EXPECT_EQ(frozen.planned_plan.placements[0].routed_expert_tier,
+                      live.planned_plan.placements[0].routed_expert_tier);
+            auto empty = histogram.freezeAndRotateWindow();
+            MoERoutedExpertPlacementPlannerOptions incumbent;
+            incumbent.decode_histogram_window = &empty;
+            incumbent.rebalancer.previous_placements = live.planned_plan.placements;
+            const auto retained = MoERoutedExpertPlacementPlanner::plan(plan, model, incumbent);
+            EXPECT_EQ(retained.planned_plan.placements[1].routed_expert_tier,
+                      live.planned_plan.placements[1].routed_expert_tier);
+            --incumbent.rebalancer.previous_placements.front().layer;
+            EXPECT_THROW((void)MoERoutedExpertPlacementPlanner::plan(plan, model, incumbent),
+                         std::invalid_argument);
+            auto foreign = window;
+            --foreign.first_model_layer;
+            EXPECT_THROW((void)MoERoutedExpertPlacementPlanner::plan(plan, model,
+                {.decode_histogram_window = &foreign}), std::invalid_argument);
+            profile.production_topology = ExpertHistogramProductionTopology::uniform(
+                2, kAllExpertHistogramProductionSources, 31);
+            EXPECT_THROW((void)MoERoutedExpertPlacementPlanner::plan(plan, model,
+                {.decode_histogram_window = &window, .phase_service_profile = &profile}),
+                std::invalid_argument);
+        }
+    }
+
+    TEST(Test__MoERoutedExpertPlacementPlanner, PipelineStageExplicitMasksRejectMissingAndForeignRows)
+    {
+        auto plan = twoTierRocmCpuPlan(RoutedExpertResidencyPolicy::ExplicitMasks);
+        plan.first_model_layer = 32;
+        auto model = metadata();
+        model.first_model_layer = 32;
+        MoERoutedExpertPlacementPlannerOptions options;
+        options.explicit_masks = {{32, 0, {0, 1, 2}}, {32, 1, {3, 4, 5}},
+                                  {33, 0, {0, 1, 2}}, {33, 1, {3, 4, 5}}};
+        const auto complete = MoERoutedExpertPlacementPlanner::plan(plan, model, options);
+        EXPECT_EQ(complete.planned_plan.placementLayerCapacity(), 2);
+        for (const int foreign : {0, 31, 34})
+        {
+            auto invalid = options;
+            invalid.explicit_masks.front().layer = foreign;
+            EXPECT_THROW((void)MoERoutedExpertPlacementPlanner::plan(plan, model, invalid),
+                         std::invalid_argument);
+        }
+        options.explicit_masks.pop_back();
+        EXPECT_THROW((void)MoERoutedExpertPlacementPlanner::plan(plan, model, options),
+                     std::invalid_argument);
+        --model.first_model_layer;
+        EXPECT_THROW((void)MoERoutedExpertPlacementPlanner::plan(plan, model), std::invalid_argument);
+    }
+
+    TEST(Test__MoERoutedExpertPlacementPlanner, PipelineStageIntervalsRejectOverflowBeforeAllocation)
+    {
+        auto plan = twoTierRocmCpuPlan();
+        auto model = metadata();
+        for (const int origin : {-1, std::numeric_limits<int>::max()})
+        {
+            plan.first_model_layer = origin;
+            model.first_model_layer = origin;
+            EXPECT_THROW((void)MoERoutedExpertPlacementPlanner::plan(plan, model), std::invalid_argument);
+            EXPECT_FALSE(validateMoERoutedExpertPlacementPlan(plan, {.layer_count = 2}).ok());
+        }
+    }
+
+    TEST(Test__MoERoutedExpertPlacementPlanner, PipelineStageRejectsRaggedQuotasBeforeAccounting)
+    {
+        for (const int origin : {0, 32})
+        {
+            auto plan = twoTierRocmCpuPlan();
+            plan.first_model_layer = origin;
+            plan.routed_tiers[0].resolved_live_experts_per_layer = {2, 2};
+            plan.routed_tiers[1].resolved_live_experts_per_layer = {4};
+            auto model = metadata();
+            model.first_model_layer = origin;
+            EXPECT_THROW((void)MoERoutedExpertPlacementPlanner::plan(plan, model), std::invalid_argument);
+            plan.routed_tiers[1].resolved_live_experts_per_layer.clear();
+            EXPECT_THROW((void)MoERoutedExpertPlacementPlanner::plan(plan, model), std::invalid_argument);
         }
     }
 

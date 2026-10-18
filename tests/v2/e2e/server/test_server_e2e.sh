@@ -19,6 +19,9 @@
 # Explicit cross-host cases additionally prove distinct physical MPI hosts and
 # matched payload/completed CPU expert work. Cloud/image/cleanup certification
 # belongs to the outer runner; this observer never provisions infrastructure.
+# IPC sharing also shares PID identity so dependency mutexes retain unique
+# owners. Retirement authenticates the container's mount namespace before
+# signalling a visible process, including when host PID sharing is explicit.
 #
 # Each backend test:
 #   Every MPI rank exports its own evidence; after shutdown the harness requires
@@ -67,6 +70,8 @@
 #                       Optional docker --ipc mode. Default: Docker private IPC
 #                       namespace with LLAMINAR_E2E_DOCKER_SHM_SIZE applied.
 #                       Set to host only when host /dev/shm is known large.
+#                       Host/container IPC also joins the matching PID namespace.
+#                       Extra Docker arguments cannot override this pairing.
 #   LLAMINAR_E2E_DOCKER_USER User passed to docker run --user. Defaults to
 #                       0:0 so nested devcontainer bind mounts are writable.
 #   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP
@@ -260,7 +265,7 @@ Environment:
   LLAMINAR_E2E_DOCKER_NETWORK         Docker network mode (default: auto)
   LLAMINAR_E2E_DOCKER_GPUS            GPU flag for docker run (default: auto)
   LLAMINAR_E2E_DOCKER_SHM_SIZE        Container /dev/shm size (default: 16g)
-  LLAMINAR_E2E_DOCKER_IPC             Optional docker --ipc mode (default: private)
+  LLAMINAR_E2E_DOCKER_IPC             IPC mode (default: private); shared modes also join matching PID namespace
   LLAMINAR_E2E_DOCKER_USER            docker run --user value (default: 0:0)
   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP    Add seccomp=unconfined for NUMA syscalls (default: 1)
   LLAMINAR_E2E_DOCKER_CAPS            Capabilities to add (default: SYS_NICE SYS_PTRACE)
@@ -766,6 +771,8 @@ signal_container_llaminar_processes() {
     docker exec "$container" /bin/sh -lc '
 set -eu
 signal_name="$1"
+owner_namespace="$(readlink /proc/self/ns/mnt)"
+[ -n "$owner_namespace" ]
 sent=0
 fallback_pid=""
 for comm in /proc/[0-9]*/comm; do
@@ -773,6 +780,9 @@ for comm in /proc/[0-9]*/comm; do
     [ "$(cat "$comm" 2>/dev/null || true)" = "llaminar2" ] || continue
     pid="${comm%/comm}"
     pid="${pid##*/}"
+    # Host/peer PID sharing exposes unrelated jobs. The kernel mount namespace
+    # identifies this container independently of a process name or local TID.
+    [ "$(readlink "/proc/${pid}/ns/mnt" 2>/dev/null || true)" = "$owner_namespace" ] || continue
     [ -n "$fallback_pid" ] || fallback_pid="$pid"
     if tr "\000" "\n" <"/proc/${pid}/environ" 2>/dev/null | grep -qx "OMPI_COMM_WORLD_RANK=0"; then
         kill "-${signal_name}" "$pid" >/dev/null 2>&1 && sent=1 || true
@@ -882,12 +892,13 @@ start_server_process() {
         --mount "type=bind,src=$(python3 "${REPO_ROOT}/scripts/ci/docker_paths.py" "$model_dir"),dst=${model_dir},readonly"
         --mount "type=bind,src=$(python3 "${REPO_ROOT}/scripts/ci/docker_paths.py" "$log_dir_abs"),dst=${log_dir_abs}"
     )
-    if [[ -n "$DOCKER_IPC" && "${DOCKER_IPC,,}" != "none" ]]; then
-        docker_args+=(--ipc "$DOCKER_IPC")
-    fi
-    if [[ "${DOCKER_IPC,,}" != "host" ]]; then
-        docker_args+=(--shm-size="$DOCKER_SHM_SIZE")
-    fi
+    local namespace_output
+    local -a namespace_args
+    namespace_output="$(python3 "${REPO_ROOT}/scripts/ci/docker_paths.py" \
+        --container-namespace-args "$DOCKER_IPC" "$DOCKER_SHM_SIZE" \
+        "${DOCKER_EXTRA_ARGS[@]}")" || return
+    mapfile -t namespace_args <<< "$namespace_output"
+    docker_args+=("${namespace_args[@]}")
     if [[ "$DOCKER_NUMA_SECCOMP" != "0" ]]; then
         docker_args+=(--security-opt seccomp=unconfined)
     fi
@@ -2030,7 +2041,7 @@ from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
 from llep_verifier_perf_policy import validate_llep_verifier_policy
 from mtp_device_generation_perf_policy import (
     validate_cuda_dynamic_mtp_device_generation_policy,
-    validate_rocm_host_scheduled_mtp_device_generation_policy,
+    validate_host_scheduled_mtp_device_generation_policy,
 )
 from request_input_lifetime_perf_policy import (
     validate_request_input_lifetime_policy,
@@ -2257,7 +2268,8 @@ if suite_option_set.intersection({"e2e-certification", "generation-regression"})
     except (KeyError, ValueError):
         print("FAIL: E2E certification requires canonical typed movement evidence")
         sys.exit(0)
-    runtime_feature_error = validate_runtime_feature_policy(records, features, required_movement)
+    runtime_feature_error = validate_runtime_feature_policy(records, features, required_movement,
+        terminal_movement=data.get("terminal_movement", ()))
     if runtime_feature_error:
         print(f"FAIL: {runtime_feature_error}")
         sys.exit(0)
@@ -2273,7 +2285,7 @@ if suite_option_set.intersection({"e2e-certification", "generation-regression"})
             observations = json.loads(Path(generation_observations).read_text())
             observation_traces(configuration, observations)
             final_journal = observations["requests"][-1]["response"]["runtime_summary"]["expert_movement"]
-            validate_movement_transport_mirrors(final_journal, records)
+            validate_movement_transport_mirrors(final_journal, records, data.get("terminal_movement", ()))
         except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
             print(f"FAIL: generation transport/journal evidence: {error}")
             sys.exit(0)
@@ -2409,8 +2421,9 @@ if require_stochastic_mtp:
             sys.exit(0)
     if hosted_generation_parent:
         device_generation_validation = (
-            validate_rocm_host_scheduled_mtp_device_generation_policy(
+            validate_host_scheduled_mtp_device_generation_policy(
                 records,
+                device_kinds=execution.device_kinds,
                 expected_minimum_depth=expected_minimum_depth,
                 expected_maximum_depth=expected_maximum_depth,
             )

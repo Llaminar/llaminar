@@ -26,7 +26,7 @@ namespace llaminar2::test
     struct EmbeddingVerifierFormatCase
     {
         const char *label;             ///< Stable diagnostic and perf-counter label.
-        bool prepared_embed_q8;        ///< True when GPU execution requires prepared EmbedQ8 weights.
+        bool prepared_native_quantized; ///< True when GPU execution consumes original quantized source blocks.
         const char *cpu_weight_route;  ///< Expected CPU perfstats route.
         const char *gpu_weight_route;  ///< Expected CUDA/ROCm perfstats route.
         std::function<std::unique_ptr<TensorBase>(const std::vector<size_t> &, uint32_t)> create;
@@ -39,6 +39,7 @@ namespace llaminar2::test
      * codebooks. GPU tests prepare each quantized source through
      * KernelFactory::prepareEmbeddingHandleLocal(), while FP32 remains directly
      * resident on the target device.
+     * @return Immutable canonical floating and quantized source-format inventory.
      */
     inline const std::vector<EmbeddingVerifierFormatCase> &embeddingVerifierFormats()
     {
@@ -58,8 +59,8 @@ namespace llaminar2::test
                 result.push_back({
                     format.label,
                     true,
-                    "cached_embed_q8",
-                    "prepared_device_embed_q8",
+                    "native_quantized",
+                    "prepared_device_native_quantized",
                     format.create});
             }
             return result;

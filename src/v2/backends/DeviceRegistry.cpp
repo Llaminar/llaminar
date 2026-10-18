@@ -3,7 +3,9 @@
  * @brief Singleton device registry implementation
  *
  * Provides centralized device discovery for CPU NUMA nodes, CUDA GPUs,
- * and ROCm GPUs. Uses GlobalDeviceAddress as the canonical identifier.
+ * and ROCm GPUs. Uses GlobalDeviceAddress as the canonical identifier. Initial
+ * discovery and refresh obey the process's typed backend-startup policy before
+ * entering any vendor runtime, including peer-capability and memory queries.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -12,6 +14,7 @@
 #include "DeviceRegistry.h"
 #include "BackendManager.h"
 #include "GPUEnumeration.h"
+#include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 
 #include <fstream>
@@ -51,6 +54,13 @@ namespace llaminar2
     // Discovery
     // =========================================================================
 
+    /**
+     * @brief Replace the registry's inventory using the active startup policy.
+     *
+     * The registry mutex owns replacement of addresses, properties, and peer
+     * matrices. Clear previous observations before selecting permitted vendor
+     * discovery so refresh cannot retain a now-excluded device or peer edge.
+     */
     void DeviceRegistry::discover()
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -62,10 +72,15 @@ namespace llaminar2
         cuda_p2p_.reset();
         rocm_p2p_.reset();
 
-        // Discover all device types
+        // The same startup authority governs HardwareInventory and this public
+        // registry. Filtering the results after enumeration is too late: free
+        // memory and P2P queries can already create forbidden vendor contexts.
         discoverCpuDevices();
-        discoverCudaDevices();
-        discoverRocmDevices();
+        const auto &startup = debugEnv().backend_startup;
+        if (startup.cudaEnabled())
+            discoverCudaDevices();
+        if (startup.rocmEnabled())
+            discoverRocmDevices();
 
         discovered_ = true;
 

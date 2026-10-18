@@ -63,6 +63,7 @@ namespace llaminar2
             explicit MemoryInputsFixture(DeviceType backend, int world_size = 1)
             {
                 model.n_layers = 3;
+                model.mtp_layer_count = 1;
                 model.expert_count = 8;
                 model.expert_used_count = 2;
                 rank.rank = 0;
@@ -77,7 +78,7 @@ namespace llaminar2
                 execution = resolveMoEExpertOverlayExecutionPlan(config.moe_routed_expert_plan,
                     {.current_world_rank = 0, .world_size = world_size});
                 policy = resolveMoEOverlayCapacityAdmissionPolicy(
-                    *config.moe_routed_expert_plan, config, world_size, 3, 8);
+                    *config.moe_routed_expert_plan, config, world_size, 2, 8);
                 family = {.graph_family_generation = 1, .main_layer_count = 2,
                     .mtp_source_layers = {}, .max_graph_rows = 256, .max_decode_rows = 1,
                     .max_request_count = 1, .max_mtp_draft_depth = 0};
@@ -91,6 +92,33 @@ namespace llaminar2
                     .retained_mtp = rank.runtime.mtp, .graph_family = family,
                     .prefill = {.bucket_rows = buckets, .minimum_sequence_rows = 1, .maximum_cached_buckets = 16},
                     .gpu_weight_load = {.maximum_source_bytes = 1234}};
+            }
+
+            /**
+             * @brief Project one explicit child while retaining full parent metadata.
+             * @param first First owned global main layer.
+             * @param last Exclusive owned main end; 64 owns the terminal head.
+             * @param retain_mtp Whether this graph family retains the learned predictor.
+             * @return Exact boundary passed to the same production memory adapter.
+             */
+            FactoryPPStageConfig stage(int first, int last, bool retain_mtp)
+            {
+                model.n_layers = 65;
+                rank.first_layer = first;
+                rank.last_layer = last - 1;
+                rank.has_embedding = first == 0;
+                rank.has_lm_head = last == 64;
+                rank.runtime.mtp.enabled = retain_mtp;
+                config.moe_routed_expert_plan->first_model_layer = first;
+                family.first_model_layer = first;
+                family.main_layer_count = last - first;
+                family.mtp_source_layers = retain_mtp && rank.has_lm_head ? std::vector<int>{64} : std::vector<int>{};
+                family.max_decode_rows = std::max(1, resolveMTPRetainedTargetQueryRows(rank.runtime.mtp));
+                family.max_mtp_draft_depth = resolveMTPRetainedDraftCapacity(rank.runtime.mtp);
+                policy = resolveMoEOverlayCapacityAdmissionPolicy(*config.moe_routed_expert_plan,
+                    config, inventory.world_size, family.routedLayerCapacity(), model.expert_count);
+                return {.first_layer = first, .last_layer = last,
+                    .has_embedding = rank.has_embedding, .has_lm_head = rank.has_lm_head};
             }
         };
     }
@@ -245,6 +273,8 @@ namespace llaminar2
             fixture.family.max_decode_rows = resolveMTPRetainedTargetQueryRows(fixture.rank.runtime.mtp);
             fixture.family.max_request_count = requests;
             fixture.family.max_mtp_draft_depth = resolveMTPRetainedDraftCapacity(fixture.rank.runtime.mtp);
+            fixture.policy = resolveMoEOverlayCapacityAdmissionPolicy(*fixture.config.moe_routed_expert_plan,
+                fixture.config, fixture.inventory.world_size, fixture.family.routedLayerCapacity(), fixture.model.expert_count);
             const auto result = buildMoEOverlayMemoryPlanInputs(fixture.request(), 1);
             EXPECT_EQ(result.prefill_segment_rows, 1);
             EXPECT_EQ(result.local_capacity.resident_graph_rows, 16 * requests);
@@ -328,5 +358,82 @@ namespace llaminar2
         fixture.family.max_decode_rows = 1;
         fixture.config.max_gpu_memory_mb = std::numeric_limits<std::size_t>::max();
         EXPECT_THROW((void)buildMoEOverlayMemoryPlanInputs(fixture.request(), 8), std::overflow_error);
+    }
+
+    /** @test Main capture frontiers exclude appended predictor blocks. */
+    TEST(MoEOverlayMemoryPlanInputs, PipelineCaptureUsesOwnedMainLayers)
+    {
+        MemoryInputsFixture fixture(DeviceType::CPU);
+        const auto result = buildMoEOverlayMemoryPlanInputs(fixture.request(), 8);
+        EXPECT_EQ(result.local_capacity.captured_graph_plan.compilation.compilation_units_per_model_graph,
+                  size_t(fixture.family.main_layer_count + 1));
+        EXPECT_EQ(result.local_capacity.graph_family.routedLayerCapacity(), 2);
+    }
+
+    /** @test All backends retain global origins and compact row counts without truncating metadata. */
+    TEST(MoEOverlayMemoryPlanInputs, PipelineScopePreservesOwnedMainAndRoutedSidecars)
+    {
+        for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+            for (const int first : {0, 32, 40})
+                for (const bool retained : {false, true})
+                    for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+                    {
+                        SCOPED_TRACE(::testing::Message() << deviceTypeToString(backend) << '/' << first << '/' << retained << '/' << int(mode));
+                        MemoryInputsFixture fixture(backend);
+                        fixture.rank.runtime.mtp.depth_policy.mode = mode;
+                        const auto scope = fixture.stage(first, first == 0 ? 32 : 64, retained);
+                        auto request = fixture.request();
+                        request.pipeline_stage = scope;
+                        const auto result = buildMoEOverlayMemoryPlanInputs(request, 8);
+                        const auto &input = result.local_capacity;
+                        EXPECT_EQ(input.model_profile, &fixture.model);
+                        EXPECT_EQ(input.model_profile->n_layers, 65);
+                        EXPECT_EQ(input.graph_family.first_model_layer, first);
+                        EXPECT_EQ(input.graph_family.main_layer_count, scope.layerCount());
+                        EXPECT_EQ(input.graph_family.routedLayerCapacity(), scope.layerCount() + (retained && scope.has_lm_head ? 1 : 0));
+                        EXPECT_EQ(input.graph_family.mtp_source_layers, fixture.family.mtp_source_layers);
+                        EXPECT_EQ(input.captured_graph_plan.compilation.compilation_units_per_model_graph,
+                            backend == DeviceType::CPU ? size_t(scope.layerCount() + 1) : 1u);
+                        if (input.host_demand_memory)
+                            EXPECT_EQ(input.host_demand_memory->geometry().num_layers, input.graph_family.routedLayerCapacity());
+                    }
+    }
+
+    /** @test Foreign origins, missing boundaries and nonterminal predictors fail before admission. */
+    TEST(MoEOverlayMemoryPlanInputs, PipelineScopeRejectsForeignOrIncompleteOwnership)
+    {
+        for (int mutation = 0; mutation < 15; ++mutation)
+        {
+            SCOPED_TRACE(mutation);
+            MemoryInputsFixture fixture(DeviceType::ROCm);
+            const auto scope = fixture.stage(32, 64, true);
+            auto request = fixture.request();
+            request.pipeline_stage = scope;
+            switch (mutation)
+            {
+                case 0: request.pipeline_stage.reset(); break;
+                case 1: request.pipeline_stage->first_layer = 31; break;
+                case 2: request.pipeline_stage->last_layer = 63; break;
+                case 3: request.pipeline_stage->has_embedding = true; break;
+                case 4: request.pipeline_stage->has_lm_head = false; break;
+                case 5: fixture.rank.first_layer = 0; break;
+                case 6: fixture.rank.has_lm_head = false; break;
+                case 7: fixture.family.first_model_layer = 0; break;
+                case 8: fixture.config.moe_routed_expert_plan->first_model_layer = 0; break;
+                case 9: fixture.family.mtp_source_layers = {65}; break;
+                case 10: fixture.rank.next_rank = 1; break;
+                case 11:
+                    request.pipeline_stage = fixture.stage(0, 32, true);
+                    fixture.family.mtp_source_layers = {64};
+                    break;
+                case 12:
+                    request.pipeline_stage = fixture.stage(0, 32, false);
+                    request.pipeline_stage.reset();
+                    break;
+                case 13: fixture.policy.device_rebalance_workspace_capacity->num_layers = 65; break;
+                case 14: fixture.policy.device_rebalance_workspace_capacity->num_experts = 9; break;
+            }
+            EXPECT_THROW((void)buildMoEOverlayMemoryPlanInputs(request, 8), std::invalid_argument);
+        }
     }
 }

@@ -1,10 +1,13 @@
 /**
  * @file IQ3_STensor.cpp
- * @brief IQ3_S quantized tensor implementation (3-bit small IQ with signs)
+ * @brief IQ3_S source-grid tensor with lossless original factor publication.
+ * Native preparation retains original half d plus its raw nibble; no derived
+ * scale is narrowed. Signed-grid payload bytes and source decoding stay intact.
  * @author David Sanftenberg
  */
 
 #include "TensorClasses.h"
+#include "NativeVnniIQ3SScale.h"
 #include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
@@ -481,12 +484,15 @@ namespace llaminar2
         payload_buf[8] = blk->qh[sub_idx];
         std::memcpy(payload_buf + 9, blk->signs + sub_idx * 4, 4);
 
-        const float d_val = fp16_to_fp32(blk->d);
         const uint8_t sc_byte = blk->scales[sub_idx / 2];
         const int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
 
         std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 13);
-        ctx.scales_array[linear] = fp32_to_fp16(d_val * static_cast<float>(1 + 2 * nibble));
+        if (!ctx.mins_array)
+            throw std::invalid_argument("IQ3_S source preparation requires raw coefficient storage");
+        ctx.scales_array[linear] = blk->d;
+        ctx.mins_array[linear] = native_vnni_iq3s_scale::encodeSourceCoefficient(
+            static_cast<uint8_t>(nibble));
     }
 
 } // namespace llaminar2

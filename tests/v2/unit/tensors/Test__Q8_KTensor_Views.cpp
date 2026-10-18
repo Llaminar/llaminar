@@ -27,6 +27,7 @@ namespace
 
         for (size_t i = 0; i < total_blocks; ++i)
         {
+            blocks[i].d = 1.0f; // Existing view topology fixture uses unit-scale values.
             // Set pattern in quantized data (256 int8_t values)
             for (size_t j = 0; j < 256; ++j)
             {

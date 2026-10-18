@@ -16,6 +16,7 @@
 #include "ComputeBackend.h"
 #include "GPUEnumeration.h"
 #include "DeviceUUID.h"
+#include "DevicePCIAddress.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -58,6 +59,12 @@ namespace llaminar2
                 dev.name = std::string(prop.name);
                 dev.device_id = i;
                 dev.uuid = formatDeviceUUID(prop.uuid.bytes);
+                // Preserve the driver's full endpoint, including PCI function.
+                // Reconstructing from ordinal or link bottleneck loses identity.
+                char pci_address[32]{};
+                if (cudaDeviceGetPCIBusId(pci_address, sizeof(pci_address), i) != cudaSuccess)
+                    throw std::runtime_error("CUDA discovery could not read the native PCI endpoint");
+                dev.pci_bus_address = DevicePCIAddress::parse(pci_address).toString();
                 dev.compute_capability = prop.major * 10 + prop.minor;
                 dev.compute_units = prop.multiProcessorCount;
                 dev.last_level_cache_bytes = prop.l2CacheSize > 0 ? static_cast<size_t>(prop.l2CacheSize) : 0;

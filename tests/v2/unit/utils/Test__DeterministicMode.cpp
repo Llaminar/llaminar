@@ -1,5 +1,15 @@
+/**
+ * @file Test__DeterministicMode.cpp
+ * @brief Device-free regression of immutable arithmetic and launch policies.
+ *
+ * Policy selection runs before capture. These tests retain measured launch
+ * boundaries across unseen row counts and distinguish physical format identity
+ * from shared arithmetic schedules without executing a GPU kernel.
+ */
+
 #include <gtest/gtest.h>
 
+#include "kernels/cuda/moe/CUDARouterQ8Prefill.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoERouterPrefillPolicy.h"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
@@ -31,7 +41,10 @@ namespace
                     saved.old_value = old;
                 }
                 saved_.push_back(std::move(saved));
-                setenv(entry.first, entry.second, 1);
+                if (entry.second)
+                    setenv(entry.first, entry.second, 1);
+                else
+                    unsetenv(entry.first);
             }
             mutableDebugEnv().reload();
         }
@@ -61,6 +74,82 @@ namespace
 
         std::vector<Entry> saved_;
     };
+}
+
+/** @brief The qualified alpha/beta default preserves independent router and wide-projection policy. */
+TEST(Test__DeterministicMode, ProjectionArithmeticDefaultsAndExplicitOverrides)
+{
+    ScopedEnv defaults({{"LLAMINAR_GDN_PROJECTION_ARITHMETIC", nullptr},
+                        {"LLAMINAR_MOE_ROUTER_ARITHMETIC", nullptr},
+                        {"LLAMINAR_CUDA_MOE_ROUTER_PREFILL", nullptr},
+                        {"LLAMINAR_CUDA_MOE_ROUTER_Q8", nullptr}});
+    EXPECT_EQ(kDefaultGDNProjectionArithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
+    EXPECT_EQ(GemmConfig{}.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
+    EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
+    EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, MoERouterArithmetic::Native);
+    EXPECT_EQ(GemmConfig{}.cuda_moe_router_prefill, CUDARouterPrefillArithmetic::FP32);
+    EXPECT_TRUE(GemmConfig{}.cuda_moe_router_q8);
+    {
+        ScopedEnv alpha_beta({{"LLAMINAR_GDN_PROJECTION_ARITHMETIC", "fp16_alpha_beta"}});
+        EXPECT_EQ(GemmConfig{}.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16AlphaBeta);
+        EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, MoERouterArithmetic::Native);
+    }
+    {
+        ScopedEnv moe_alpha_beta({{"LLAMINAR_GDN_PROJECTION_ARITHMETIC", "fp16_moe_alpha_beta"}});
+        EXPECT_EQ(GemmConfig{}.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
+        EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
+    }
+    {
+        ScopedEnv native({{"LLAMINAR_GDN_PROJECTION_ARITHMETIC", "native"}});
+        EXPECT_EQ(GemmConfig{}.gdn_projection_arithmetic, GDNProjectionArithmetic::Native);
+        EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, GDNProjectionArithmetic::Native);
+        EXPECT_EQ(GemmConfig{}.moe_router_arithmetic, MoERouterArithmetic::Native);
+    }
+    EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16MoEAlphaBeta);
+    constexpr cuda::RouterQ8PrefillHardware device{0,82,16};
+    EXPECT_EQ(cuda::routerQ8PrefillGeometry(512,2048,256,{}).warps,0);
+    for (int rows=1; rows<=8192; ++rows)
+        for (int experts : {1,17,32,65,128,257,512,1024})
+            for (int width : {32,96,512,2048,3072,8192,12288})
+            {
+                const auto tile = cuda::routerQ8PrefillGeometry(rows,width,experts,device);
+                ASSERT_TRUE(tile.warps==1 || tile.warps==2 || tile.warps==4 || tile.warps==8 || tile.warps==16);
+                ASSERT_EQ(tile.warps,(tile.rows/16)*(tile.experts/8)*tile.k_warps);
+                ASSERT_TRUE(tile.k_warps==1 || (tile.rows==16 && tile.experts==8 && width/32>=tile.k_warps));
+                ASSERT_EQ(tile.constant_width,width<=8192 && (width&(width-1))==0 ? width : 0);
+            }
+    // The same M selects different parallelism when expert width or device size
+    // changes. Transformed matrices with the same aligned tile grid agree.
+    EXPECT_EQ(cuda::routerQ8PrefillGeometry(512,2048,256,device).warps,1);
+    EXPECT_EQ(cuda::routerQ8PrefillGeometry(512,2048,512,device).warps,2);
+    EXPECT_EQ(cuda::routerQ8PrefillGeometry(512,2048,1024,device).warps,4);
+    EXPECT_GT(cuda::routerQ8PrefillGeometry(512,2048,64,device).k_warps,1);
+    EXPECT_EQ(cuda::routerQ8PrefillGeometry(1024,2048,256,device).warps,
+              cuda::routerQ8PrefillGeometry(512,2048,512,device).warps);
+    EXPECT_EQ(cuda::routerQ8PrefillGeometry(512,2048,256,{0,41,16}).warps,2);
+    EXPECT_EQ(cuda::routerQ8PrefillGeometry(512,2048,256,{0,164,16}).k_warps,2);
+    EXPECT_EQ(cuda::routerQ8PrefillGeometry(513,2048,256,device).warps,
+              cuda::routerQ8PrefillGeometry(512,2048,256,device).warps);
+    EXPECT_EQ(parseCUDARouterPrefillArithmetic("q8"), CUDARouterPrefillArithmetic::Q8);
+    for (const auto invalid : {"", "auto", "Q8", "fp16"})
+        EXPECT_THROW(parseCUDARouterPrefillArithmetic(invalid), std::invalid_argument);
+    {
+        ScopedEnv prefill({{"LLAMINAR_CUDA_MOE_ROUTER_PREFILL", "q8"}});
+        EXPECT_EQ(debugEnv().gemm.cuda_moe_router_prefill, CUDARouterPrefillArithmetic::Q8);
+        EXPECT_TRUE(debugEnv().gemm.cuda_moe_router_q8);
+    }
+    EXPECT_EQ(parseMoERouterArithmetic("native"), MoERouterArithmetic::Native);
+    EXPECT_EQ(parseMoERouterArithmetic("fp16"), MoERouterArithmetic::FP16);
+    EXPECT_EQ(parseMoERouterArithmetic("native_hadamard32"), MoERouterArithmetic::NativeHadamard32);
+    EXPECT_EQ(moeRouterArithmeticName(MoERouterArithmetic::NativeHadamard32), "native_hadamard32");
+    EXPECT_EQ(routerQ8Basis(MoERouterArithmetic::NativeHadamard32), RouterQ8Basis::SignedHadamard32);
+    EXPECT_EQ(routerQ8Basis(MoERouterArithmetic::FP16), RouterQ8Basis::Original);
+    for (const auto invalid : {"", "auto", "FP16", "fp32", "q8"})
+        EXPECT_THROW(parseMoERouterArithmetic(invalid), std::invalid_argument);
+    ScopedEnv env({{"LLAMINAR_MOE_ROUTER_ARITHMETIC", "fp16"},
+                   {"LLAMINAR_GDN_PROJECTION_ARITHMETIC", "fp16"}});
+    EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, GDNProjectionArithmetic::FP16);
+    EXPECT_EQ(debugEnv().gemm.moe_router_arithmetic, MoERouterArithmetic::FP16);
 }
 
 /**
@@ -198,6 +287,8 @@ TEST(Test__DeterministicMode, CudaMoERouterPrefillGeometryIsMTotal)
  * The selector executes at graph-capture time and must always return a compiled
  * geometry. Every real Qwen3.6 UD-IQ3_S routed tuple, plus the separately
  * measured IQ2_S/IQ3_S tuple, pins its contiguous 32-to-64-column regime.
+ * Both physical IQ4 identities retain that same measured source4 boundary;
+ * adopting source factors must not demote physical4 to an unmeasured regime.
  * Unseen formats and geometries retain the paired schedule and conservative
  * 32-column geometry without leaving an M dispatch hole.
  */
@@ -214,8 +305,9 @@ TEST(Test__DeterministicMode, CudaMoEGroupedImmaPolicyIsMTotal)
         int last_columns32_rows;
         bool columns32_for_all_rows;
     };
-    constexpr std::array<ExactRegime, 4> exact_regimes{{
+    constexpr std::array<ExactRegime, 5> exact_regimes{{
         {13, 4, 768, false},
+        {13, llaminar2::kNativeVnniIQ4XSSourceScaleCodebook, 768, false},
         {13, 8, 600, false},
         {11, 8, 0, true},
         {13, 11, 768, false},
@@ -282,7 +374,6 @@ TEST(Test__DeterministicMode, DebugEnvRetainsArithmeticInvariantCudaDecodeConcur
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "1"},
         {"LLAMINAR_ROCM_GDN_CONCURRENT_DECODE", "1"},
         {"LLAMINAR_ROCM_MOE_ROUTER_Q8", "1"},
-        {"LLAMINAR_ROCM_MOE_ROUTER_FP16", "1"},
         {"LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "1"},
         {"LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "1"},
         {"LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN", "1"},
@@ -300,7 +391,6 @@ TEST(Test__DeterministicMode, DebugEnvRetainsArithmeticInvariantCudaDecodeConcur
     EXPECT_FALSE(env_snapshot.rocm.concurrent_decode);
     EXPECT_FALSE(env_snapshot.rocm.gdn_concurrent_decode);
     EXPECT_TRUE(env_snapshot.rocm.moe_router_q8);
-    EXPECT_FALSE(env_snapshot.rocm.moe_router_fp16);
     EXPECT_FALSE(env_snapshot.rocm.moe_router_kpart_decode);
     EXPECT_FALSE(env_snapshot.rocm.moe_router_wave_topk);
     EXPECT_TRUE(env_snapshot.rocm.moe_reuse_router_q8_hidden);

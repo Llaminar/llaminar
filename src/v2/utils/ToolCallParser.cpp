@@ -6,7 +6,8 @@
  * contract.  Each implementation accepts one exact grammar and preserves a
  * malformed block as ordinary content.  It must not probe several parsers in
  * sequence: doing so could turn arbitrary generated text into an executable
- * tool invocation.
+ * tool invocation. Native Qwen argument boundaries use the admitted schema
+ * and the parameter's newline framing so literal file bytes remain data.
  */
 
 #include "ToolCallParser.h"
@@ -203,27 +204,135 @@ namespace llaminar2
     /**
      * @brief Decode a native parameter body into one JSON argument value.
      *
-     * Structured values and JSON primitives retain their types.  Plain text
-     * remains a string, which is the representation used by the Qwen template
-     * for ordinary string parameters.
+     * The template puts one framing newline before and after each value. Only
+     * those two bytes are syntax; indentation and additional newlines belong
+     * to file contents and edit search strings. JSON-looking string values
+     * must stay strings, including quotes, numbers, booleans and JSON documents.
+     * Non-string parameters are JSON values according to their declared schema.
+     * @param body Raw parameter bytes between the native delimiters.
+     * @param schema Declared property schema from the admitted function.
+     * @return Decoded value, or no value when a typed JSON body is malformed.
      */
-    static json decodeQwenParameterValue(std::string_view body)
+    static std::optional<json> decodeQwenParameterValue(std::string_view body,
+                                                     const json &schema)
     {
-        const std::string value = trimAsciiWhitespace(body);
-        if (value.empty())
-            return "";
+        if (body.starts_with("\r\n"))
+            body.remove_prefix(2);
+        else if (body.starts_with('\n'))
+            body.remove_prefix(1);
+        if (body.ends_with("\r\n"))
+            body.remove_suffix(2);
+        else if (body.ends_with('\n'))
+            body.remove_suffix(1);
 
-        json parsed = json::parse(value, nullptr, false);
-        if (!parsed.is_discarded())
-            return parsed;
-        return value;
+        if (schema.value("type", json{}) == "string")
+            return std::string(body);
+
+        json parsed = json::parse(body, nullptr, false);
+        if (parsed.is_discarded())
+            return std::nullopt;
+        return parsed;
+    }
+
+    /** @return An admitted function's parameter schema, without guessing unknown tools. */
+    static const json *qwenFunctionParameters(const json &tools, const std::string &name)
+    {
+        if (!tools.is_array())
+            return nullptr;
+        for (const auto &tool : tools)
+        {
+            if (!tool.is_object() || !tool.contains("function"))
+                continue;
+            const auto &function = tool["function"];
+            if (function.is_object() && function.value("name", json{}) == name &&
+                function.contains("parameters") && function["parameters"].is_object())
+                return &function["parameters"];
+        }
+        return nullptr;
+    }
+
+    /**
+     * @brief Find the outer Qwen terminator after the function's closing frontier.
+     * @param text Complete or growing native generation bytes.
+     * @param begin First payload byte after the outer opening tag.
+     * @return Closing-tag position, or npos until its structural predecessor exists.
+     *
+     * File contents routinely contain literal protocol tags. A tool terminator
+     * inside a parameter is data unless it follows the function terminator;
+     * streaming and complete-response parsing must use the same boundary rule.
+     */
+    static size_t qwenToolBlockEnd(std::string_view text, size_t begin)
+    {
+        constexpr std::string_view function_close = "</function>";
+        constexpr std::string_view tool_close = "</tool_call>";
+        for (size_t close = text.find(tool_close, begin); close != std::string_view::npos;
+             close = text.find(tool_close, close + tool_close.size()))
+        {
+            size_t predecessor = close;
+            while (predecessor > begin && std::isspace(static_cast<unsigned char>(text[predecessor - 1])))
+                --predecessor;
+            if (predecessor >= begin + function_close.size() &&
+                text.substr(predecessor - function_close.size(), function_close.size()) == function_close)
+                return close;
+        }
+        return std::string_view::npos;
+    }
+
+    /**
+     * @brief Find a framed parameter terminator followed by an admitted element.
+     * @param body Native function bytes.
+     * @param begin First value byte after the parameter opening tag.
+     * @param function_end Authenticated closing position of the containing function.
+     * @param properties Object containing the admitted function's argument schemas.
+     * @return Structural closing position, or npos for an incomplete parameter.
+     *
+     * A newline-framed value has a line boundary on either side of its closing
+     * tag. Native generations can omit the newline before that tag, especially
+     * when asked to write a string without a trailing newline. Entirely inline
+     * tag pairs remain file content, even if their names match real arguments.
+     * An unknown parameter name cannot establish a grammar boundary inside a
+     * value. Compact native parameters retain their unframed delimiters.
+     */
+    static size_t qwenParameterEnd(std::string_view body, size_t begin,
+                                   size_t function_end, const json &properties)
+    {
+        constexpr std::string_view close_tag = "</parameter>";
+        constexpr std::string_view open_tag = "<parameter=";
+        const bool newline_framed = body.substr(begin).starts_with('\n') ||
+                                    body.substr(begin).starts_with("\r\n");
+        for (size_t close = body.find(close_tag, begin); close < function_end;
+             close = body.find(close_tag, close + close_tag.size()))
+        {
+            size_t next = close + close_tag.size();
+            bool closes_line = close > begin && body[close - 1] == '\n';
+            while (next < function_end && std::isspace(static_cast<unsigned char>(body[next])))
+            {
+                closes_line |= body[next] == '\n';
+                ++next;
+            }
+            if (newline_framed && !closes_line)
+                continue;
+            if (next == function_end)
+                return close;
+            if (!body.substr(next).starts_with(open_tag))
+                continue;
+            const size_t name_begin = next + open_tag.size();
+            const size_t name_end = body.find('>', name_begin);
+            if (name_end >= function_end)
+                continue;
+            const std::string name = trimAsciiWhitespace(body.substr(name_begin, name_end - name_begin));
+            if (isQwenToolName(name) && properties.contains(name) && properties[name].is_object())
+                return close;
+        }
+        return std::string_view::npos;
     }
 
     /**
      * @brief Parse the payload of one complete Qwen @c <tool_call> block.
      * @return A call only when every delimiter and identifier is valid.
      */
-    static std::optional<ToolCall> parseQwen3XmlPayload(std::string_view payload)
+    static std::optional<ToolCall> parseQwen3XmlPayload(std::string_view payload,
+                                                     const json &tools)
     {
         static constexpr std::string_view function_open = "<function=";
         static constexpr std::string_view function_close = "</function>";
@@ -242,6 +351,10 @@ namespace llaminar2
                 function_open.size(),
                 function_name_end - function_open.size()));
         if (!isQwenToolName(function_name))
+            return std::nullopt;
+
+        const json *parameters = qwenFunctionParameters(tools, function_name);
+        if (!parameters)
             return std::nullopt;
 
         const size_t function_close_pos = body.rfind(function_close);
@@ -282,18 +395,38 @@ namespace llaminar2
             if (!isQwenToolName(parameter_name) || arguments.contains(parameter_name))
                 return std::nullopt;
 
+            const auto properties = parameters->find("properties");
+            if (properties == parameters->end() || !properties->is_object() ||
+                !properties->contains(parameter_name) || !(*properties)[parameter_name].is_object())
+                return std::nullopt;
             const size_t value_begin = parameter_name_end + 1;
-            const size_t parameter_close_pos = body.find(parameter_close, value_begin);
+            const size_t parameter_close_pos = qwenParameterEnd(
+                body, value_begin, function_close_pos, *properties);
             if (parameter_close_pos == std::string::npos ||
                 parameter_close_pos > function_close_pos)
             {
                 return std::nullopt;
             }
-            arguments[parameter_name] = decodeQwenParameterValue(
+            auto value = decodeQwenParameterValue(
                 std::string_view(body).substr(
                     value_begin,
-                    parameter_close_pos - value_begin));
+                    parameter_close_pos - value_begin), (*properties)[parameter_name]);
+            if (!value)
+                return std::nullopt;
+            arguments[parameter_name] = std::move(*value);
             cursor = parameter_close_pos + parameter_close.size();
+        }
+
+        // A complete outer delimiter does not prove a complete invocation.
+        // Keep incomplete model output inert instead of asking the client to
+        // execute an argument object that violates its required-key contract.
+        if (const auto required = parameters->find("required"); required != parameters->end())
+        {
+            if (!required->is_array())
+                return std::nullopt;
+            for (const auto& name : *required)
+                if (!name.is_string() || !arguments.contains(name.get_ref<const std::string&>()))
+                    return std::nullopt;
         }
 
         ToolCall call;
@@ -304,7 +437,7 @@ namespace llaminar2
     }
 
     /** @brief Extract every complete Qwen tool-call block in generation order. */
-    static ToolCallParseResult parseQwen3Xml(const std::string &text)
+    static ToolCallParseResult parseQwen3Xml(const std::string &text, const json &tools)
     {
         static const std::string open_tag = "<tool_call>";
         static const std::string close_tag = "</tool_call>";
@@ -322,7 +455,7 @@ namespace llaminar2
             result.content += text.substr(cursor, block_begin - cursor);
 
             const size_t payload_begin = block_begin + open_tag.size();
-            const size_t block_end = text.find(close_tag, payload_begin);
+            const size_t block_end = qwenToolBlockEnd(text, payload_begin);
             if (block_end == std::string::npos)
             {
                 LOG_WARN("[ToolCallParser] Unclosed Qwen <tool_call> tag at position "
@@ -332,7 +465,7 @@ namespace llaminar2
             }
 
             auto call = parseQwen3XmlPayload(
-                std::string_view(text).substr(payload_begin, block_end - payload_begin));
+                std::string_view(text).substr(payload_begin, block_end - payload_begin), tools);
             if (call)
             {
                 result.tool_calls.push_back(std::move(*call));
@@ -446,7 +579,8 @@ namespace llaminar2
     // Public API
     // =========================================================================
 
-    ToolCallParseResult parseToolCalls(const std::string &text, ToolCallFormat format)
+    ToolCallParseResult parseToolCalls(const std::string &text, ToolCallFormat format,
+                                     const json &tools)
     {
         switch (format)
         {
@@ -454,7 +588,7 @@ namespace llaminar2
             return parseHermes2Pro(text);
 
         case ToolCallFormat::QWEN_3_XML:
-            return parseQwen3Xml(text);
+            return parseQwen3Xml(text, tools);
 
         case ToolCallFormat::GENERIC:
             return parseGeneric(text);
@@ -512,8 +646,8 @@ namespace llaminar2
         return event;
     }
 
-    StreamingToolCallSplitter::StreamingToolCallSplitter(ToolCallFormat format)
-        : format_(format)
+    StreamingToolCallSplitter::StreamingToolCallSplitter(ToolCallFormat format, json tools)
+        : format_(format), tools_(std::move(tools))
     {
         switch (format_)
         {
@@ -595,8 +729,9 @@ namespace llaminar2
                 break;
             }
 
-            const size_t close = buffer_.find(
-                close_marker_, open_marker_.size());
+            const size_t close = format_ == ToolCallFormat::QWEN_3_XML
+                ? qwenToolBlockEnd(buffer_, open_marker_.size())
+                : buffer_.find(close_marker_, open_marker_.size());
             if (close == std::string::npos)
             {
                 if (terminal)
@@ -613,7 +748,7 @@ namespace llaminar2
 
             const size_t block_size = close + close_marker_.size();
             const std::string block = buffer_.substr(0, block_size);
-            ToolCallParseResult parsed = parseToolCalls(block, format_);
+            ToolCallParseResult parsed = parseToolCalls(block, format_, tools_);
             if (parsed.hasToolCalls() && parsed.content.empty())
             {
                 for (auto &call : parsed.tool_calls)

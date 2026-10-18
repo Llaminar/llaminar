@@ -162,14 +162,15 @@ namespace llaminar2
 
     bool MoEOverlayInferenceGraphFamilyIdentity::valid() const noexcept
     {
-        if (graph_family_generation == 0 || main_layer_count <= 0 ||
+        if (graph_family_generation == 0 || first_model_layer < 0 || main_layer_count <= 0 ||
+            main_layer_count > std::numeric_limits<int>::max() - first_model_layer ||
             max_graph_rows <= 0 || max_decode_rows <= 0 ||
             max_decode_rows > max_graph_rows || max_request_count <= 0 ||
             max_mtp_draft_depth < 0)
         {
             return false;
         }
-        int previous_layer = main_layer_count - 1;
+        int previous_layer = first_model_layer + main_layer_count - 1;
         for (const int layer : mtp_source_layers)
         {
             if (layer <= previous_layer ||
@@ -183,7 +184,8 @@ namespace llaminar2
     int MoEOverlayInferenceGraphFamilyIdentity::routedLayerCapacity()
         const noexcept
     {
-        if (main_layer_count <= 0)
+        if (first_model_layer < 0 || main_layer_count <= 0 ||
+            main_layer_count > std::numeric_limits<int>::max() - first_model_layer)
             return 0;
         if (mtp_source_layers.empty())
             return main_layer_count;
@@ -192,12 +194,33 @@ namespace llaminar2
          * A dense NextN source may sit between routed sources, so vector size
          * is not a valid substitute for the final addressable index. */
         const int final_source_layer = mtp_source_layers.back();
-        if (final_source_layer < main_layer_count ||
+        if (final_source_layer < first_model_layer + main_layer_count ||
             final_source_layer == std::numeric_limits<int>::max())
         {
             return 0;
         }
-        return final_source_layer + 1;
+        return final_source_layer - first_model_layer + 1;
+    }
+
+    MoEOverlayInferenceGraphFamilyIdentity
+    MoEOverlayInferenceGraphFamilyIdentity::forRoutedLayerInterval(
+        int first, int count) const
+    {
+        if (!valid() || first < first_model_layer || count <= 0 ||
+            first >= first_model_layer + main_layer_count ||
+            count > std::numeric_limits<int>::max() - first)
+            throw std::invalid_argument("MoE graph family requires an owned nonempty routed stage interval");
+        auto stage = *this;
+        stage.first_model_layer = first;
+        const int remaining_main_layers = first_model_layer + main_layer_count - first;
+        stage.main_layer_count = std::min(count, remaining_main_layers);
+        if (stage.main_layer_count < remaining_main_layers)
+            stage.mtp_source_layers.clear();
+        // A terminal stage retains the original manifest, including gaps
+        // between routed NextN sources. Nonterminal stages own no sidecars.
+        if (!stage.valid() || stage.routedLayerCapacity() != count)
+            throw std::invalid_argument("MoE stage placement differs from its retained main/NextN graph family");
+        return stage;
     }
 
     MoEOverlayInferenceGraphFamilyIdentity
@@ -302,9 +325,10 @@ namespace llaminar2
             });
 
         StableTopologyDigest digest;
-        digest.addString("MoEOverlayInferenceTopology/v1");
+        digest.addString("MoEOverlayInferenceTopology/v2");
         digest.addScalar(source_world_rank);
         digest.addScalar(target_world_rank);
+        digest.addScalar(graph_family.first_model_layer);
         digest.addScalar(graph_family.main_layer_count);
         digest.addScalar(graph_family.max_graph_rows);
         digest.addScalar(graph_family.max_decode_rows);

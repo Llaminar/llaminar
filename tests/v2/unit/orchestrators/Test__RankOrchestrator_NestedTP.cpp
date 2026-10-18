@@ -2,8 +2,9 @@
  * @file Test__RankOrchestrator_NestedTP.cpp
  * @brief Unit tests for nested RankOrchestrator creation in TP+PP hybrid mode
  *
- * Tests the Phase 5 implementation where PP stages configured as TP domains
- * create nested RankOrchestrators instead of single DeviceGraphOrchestrators.
+ * Tests the production configuration projection used when PP stages create
+ * nested TP RankOrchestrators. Settings and partial-graph ownership are read
+ * from that projection rather than reconstructed by the test.
  *
  * Test cases:
  * - InitializePP_TPDomain_CreatesNestedMDO: Verify TP domain creates MDO
@@ -139,10 +140,7 @@ namespace llaminar2::test
     // =========================================================================
 
     /**
-     * @brief Verify that TP configuration would be correctly built for nested MDO
-     *
-     * This tests the Config struct creation logic that would be used when
-     * creating a nested RankOrchestrator for a TP domain stage.
+     * @brief Verify the production child projection preserves TP and runtime policy.
      */
     TEST_F(Test__RankOrchestrator_NestedTP, NestedConfig_PropagatesTPSettings)
     {
@@ -167,17 +165,7 @@ namespace llaminar2::test
 
         outer_config.pp_stages = {stage0};
 
-        // Simulate nested config creation (matches implementation logic)
-        Config nested_config;
-        nested_config.mode = ParallelismMode::TP;
-        nested_config.devices = stage0.stage_devices;
-        nested_config.weights = stage0.tp_weights;
-        nested_config.backend = stage0.tp_backend;
-        nested_config.max_seq_len = outer_config.max_seq_len;
-        nested_config.batch_size = outer_config.batch_size;
-        nested_config.activation_precision = outer_config.activation_precision;
-        nested_config.kv_cache_scale_k = outer_config.kv_cache_scale_k;
-        nested_config.kv_cache_scale_v = outer_config.kv_cache_scale_v;
+        const auto nested_config = outer_config.forPipelineStage(0);
 
         // Verify nested config has correct TP settings
         EXPECT_EQ(nested_config.mode, ParallelismMode::TP);
@@ -412,21 +400,9 @@ namespace llaminar2::test
         stage0.has_embedding = true;
         stage0.has_lm_head = false; // KEY: Stage 0 does NOT have LM head
 
-        // Create FactoryPPStageConfig as done in InferenceRunnerFactory
-        FactoryPPStageConfig factory_pp_config;
-        factory_pp_config.first_layer = stage0.first_layer;
-        factory_pp_config.last_layer = stage0.last_layer;
-        factory_pp_config.has_embedding = stage0.has_embedding;
-        factory_pp_config.has_lm_head = stage0.has_lm_head;
-
-        // Create nested MDO config (simulating what parent MDO does)
-        Config nested_config;
-        nested_config.mode = ParallelismMode::TP;
-        nested_config.devices = stage0.stage_devices;
-        nested_config.backend = stage0.tp_backend;
-
-        // KEY FIX: This line was missing and caused the bug!
-        nested_config.nested_pp_stage_config = factory_pp_config;
+        Config parent;
+        parent.pp_stages = {stage0};
+        const auto nested_config = parent.forPipelineStage(0);
 
         // Verify nested_pp_stage_config is present and correct
         ASSERT_TRUE(nested_config.nested_pp_stage_config.has_value());
@@ -437,13 +413,9 @@ namespace llaminar2::test
     }
 
     /**
-     * @brief Test: Nested config without PP stage config would cause full graph build
-     *
-     * This is the anti-pattern that caused the bug. If nested_pp_stage_config
-     * is NOT set, the DeviceGraphOrchestrators won't call setPPStageConfig()
-     * and will build full graphs including LM_HEAD even when they shouldn't.
+     * @brief The child projection retains partial-graph ownership independently of its parent.
      */
-    TEST_F(Test__RankOrchestrator_NestedTP, NestedMDO_MissingPPConfig_WouldBuildFullGraph)
+    TEST_F(Test__RankOrchestrator_NestedTP, NestedMDO_ProjectionOwnsPartialGraphScope)
     {
         PPStageConfig stage0;
         stage0.first_layer = 0;
@@ -451,29 +423,15 @@ namespace llaminar2::test
         stage0.stage_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
         stage0.has_lm_head = false;
 
-        // Incorrect: Create nested config WITHOUT setting nested_pp_stage_config
-        Config nested_config_without_pp;
-        nested_config_without_pp.mode = ParallelismMode::TP;
-        nested_config_without_pp.devices = stage0.stage_devices;
-        // NOT setting: nested_config_without_pp.nested_pp_stage_config = ...
-
-        // Without nested_pp_stage_config, the DGOs would build full graphs!
-        EXPECT_FALSE(nested_config_without_pp.nested_pp_stage_config.has_value());
-
-        // Correct: Create nested config WITH nested_pp_stage_config
-        Config nested_config_with_pp;
-        nested_config_with_pp.mode = ParallelismMode::TP;
-        nested_config_with_pp.devices = stage0.stage_devices;
-
-        FactoryPPStageConfig factory_pp_config;
-        factory_pp_config.first_layer = 0;
-        factory_pp_config.last_layer = 12;
-        factory_pp_config.has_lm_head = false;
-        nested_config_with_pp.nested_pp_stage_config = factory_pp_config;
-
-        // With nested_pp_stage_config, DGOs know to build partial graphs
-        EXPECT_TRUE(nested_config_with_pp.nested_pp_stage_config.has_value());
-        EXPECT_FALSE(nested_config_with_pp.nested_pp_stage_config->has_lm_head);
+        Config parent;
+        parent.pp_stages = {stage0};
+        const auto nested_config = parent.forPipelineStage(0);
+        parent.pp_stages.clear();
+        ASSERT_TRUE(nested_config.nested_pp_stage_config);
+        EXPECT_EQ(nested_config.nested_pp_stage_config->first_layer, 0);
+        EXPECT_EQ(nested_config.nested_pp_stage_config->last_layer, 12);
+        EXPECT_FALSE(nested_config.nested_pp_stage_config->has_lm_head);
+        EXPECT_TRUE(nested_config.validate());
     }
 
     /**

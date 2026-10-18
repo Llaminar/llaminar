@@ -11,6 +11,8 @@
  * native failures and invalid accounting remain errors regardless of duration.
  * The same owner-only completion-edge reduction as CUDA runs before native
  * compilation; replay never walks or edits the retained dependency graph.
+ * Setup-only kernel inspection distinguishes registered host stubs from
+ * admitted module handles and retains each representation's typed resource APIs.
  */
 
 #ifdef HAVE_ROCM
@@ -31,6 +33,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace llaminar2
@@ -555,6 +558,77 @@ namespace llaminar2
             return true;
         }
 
+        /** @brief A registered host stub in HIP's static kernel registry. */
+        struct HIPRegisteredHostKernel { const void *address; };
+        /** @brief A module handle already admitted by a valid kernel graph node. */
+        struct HIPModuleKernel { hipFunction_t function; };
+        using HIPInspectedKernel = std::variant<HIPRegisteredHostKernel, HIPModuleKernel>;
+
+        /**
+         * @brief Resolve both admitted graph-kernel representations and their resources.
+         * @param raw Non-null function returned for a validated HIP kernel graph node.
+         * @param path Exact diagnostic node path.
+         * @param function Typed native representation on success.
+         * @param attributes Required public resource fields on success.
+         * @param error Fatal native diagnostic on failure.
+         * @return True only when all required resource queries succeed.
+         * @details The pinned runtime's GraphKernelNode::getFunc admits a module
+         * handle specifically on hipErrorInvalidSymbol from its host registry.
+         * Mirror that distinction for an already admitted node. Other errors
+         * never authorize casting a failed host lookup to a module function.
+         */
+        bool resolveHIPGraphKernel(
+            const void *raw, const std::string &path,
+            HIPInspectedKernel &function, hipFuncAttributes &attributes,
+            std::string &error)
+        {
+            hipError_t status = hipFuncGetAttributes(&attributes, raw);
+            if (status == hipSuccess)
+            {
+                function = HIPRegisteredHostKernel{raw};
+                return true;
+            }
+            if (status != hipErrorInvalidSymbol)
+            {
+                error = "hipFuncGetAttributes failed at " + path + ": " + hipGetErrorString(status);
+                return false;
+            }
+            const auto module = reinterpret_cast<hipFunction_t>(const_cast<void *>(raw));
+            function = HIPModuleKernel{module};
+            int shared = 0, local = 0, registers = 0, max_threads = 0;
+            const std::array<std::pair<hipFunction_attribute, int *>, 4> queries{{
+                {HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, &shared},
+                {HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, &local},
+                {HIP_FUNC_ATTRIBUTE_NUM_REGS, &registers},
+                {HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, &max_threads}}};
+            for (const auto &[attribute, value] : queries)
+            {
+                status = hipFuncGetAttribute(value, attribute, module);
+                if (status != hipSuccess)
+                {
+                    error = "hipFuncGetAttribute(" + std::to_string(int(attribute)) +
+                        ") failed at " + path + ": " + hipGetErrorString(status);
+                    return false;
+                }
+                if (*value < 0)
+                {
+                    error = "HIP module resource attribute " + std::to_string(int(attribute)) +
+                        " is negative at " + path;
+                    return false;
+                }
+            }
+            if (max_threads == 0)
+            {
+                error = "HIP module kernel has zero maximum threads per block at " + path;
+                return false;
+            }
+            attributes.sharedSizeBytes = static_cast<size_t>(shared);
+            attributes.localSizeBytes = static_cast<size_t>(local);
+            attributes.numRegs = registers;
+            attributes.maxThreadsPerBlock = max_threads;
+            return true;
+        }
+
         /**
          * @brief Recursively append every HIP kernel node in one captured graph.
          *
@@ -618,18 +692,15 @@ namespace llaminar2
                         return false;
                     }
 
-                    const char *runtime_name =
-                        hipKernelNameRefByPtr(params.func, stream);
-                    const bool name_resolved =
-                        runtime_name != nullptr && runtime_name[0] != '\0';
+                    HIPInspectedKernel function = HIPRegisteredHostKernel{params.func};
                     hipFuncAttributes attributes{};
-                    status = hipFuncGetAttributes(&attributes, params.func);
-                    if (status != hipSuccess)
-                    {
-                        error = "hipFuncGetAttributes failed at " + node_path +
-                                ": " + hipGetErrorString(status);
+                    if (!resolveHIPGraphKernel(params.func, node_path, function, attributes, error))
                         return false;
-                    }
+                    const auto *module = std::get_if<HIPModuleKernel>(&function);
+                    const char *runtime_name = module != nullptr
+                        ? hipKernelNameRef(module->function)
+                        : hipKernelNameRefByPtr(std::get<HIPRegisteredHostKernel>(function).address, stream);
+                    const bool name_resolved = runtime_name != nullptr && runtime_name[0] != '\0';
 
                     const uint64_t captured_block_threads =
                         static_cast<uint64_t>(params.blockDim.x) *
@@ -646,16 +717,19 @@ namespace llaminar2
                         return false;
                     }
                     int max_active_blocks_per_sm = 0;
-                    status = hipOccupancyMaxActiveBlocksPerMultiprocessor(
-                        &max_active_blocks_per_sm,
-                        params.func,
-                        static_cast<int>(captured_block_threads),
-                        params.sharedMemBytes);
+                    status = module != nullptr
+                        ? hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &max_active_blocks_per_sm, module->function,
+                            static_cast<int>(captured_block_threads), params.sharedMemBytes)
+                        : hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &max_active_blocks_per_sm, std::get<HIPRegisteredHostKernel>(function).address,
+                            static_cast<int>(captured_block_threads), params.sharedMemBytes);
                     if (status != hipSuccess ||
                         max_active_blocks_per_sm <= 0)
                     {
-                        error = "hipOccupancyMaxActiveBlocksPerMultiprocessor "
-                                "failed at " +
+                        error = std::string(module != nullptr
+                                    ? "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor "
+                                    : "hipOccupancyMaxActiveBlocksPerMultiprocessor ") + "failed at " +
                                 node_path + ": " + hipGetErrorString(status);
                         return false;
                     }

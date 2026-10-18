@@ -11,6 +11,7 @@
 #pragma once
 
 #include "execution/prefix_cache/PrefixPlacementEpochSpan.h"
+#include "execution/moe/MoEOptimizationStages.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -97,6 +98,36 @@ namespace llaminar2
     };
 
     /**
+     * @brief One authority's admission interval and completed placement epoch.
+     *
+     * A pipeline keeps these observations in their stage namespace. Epoch 100
+     * in one stage says nothing about epoch 2 in another. This metadata never
+     * replaces the participant's fingerprint or decides payload compatibility.
+     */
+    struct PrefixMovementEpochObservation
+    {
+        /** Exact lookup interval within this authority's namespace. */
+        PrefixPlacementEpochSpan admission;
+        /** Epoch observed after that authority completed harvest. */
+        uint64_t completion = 0;
+        /** Leaf marker required by the checked pipeline stage container. */
+        MoEOptimizationStages<PrefixMovementEpochObservation> stages;
+
+        /** @return Equality of every retained admission/completion coordinate. */
+        bool operator==(const PrefixMovementEpochObservation &) const = default;
+
+        /** @return Whether this authority published after any admitted lookup. */
+        bool crossed() const
+        {
+            if (!stages.empty())
+                throw std::logic_error("Prefix movement stage must be a leaf observation");
+            if (completion < admission.latest())
+                throw std::logic_error("Prefix movement completion precedes its admission");
+            return completion > admission.earliest();
+        }
+    };
+
+    /**
      * @brief Immutable outcome of the most recent prefix-cache request.
      *
      * ExpertOverlay movement may publish while an already admitted request is
@@ -125,6 +156,8 @@ namespace llaminar2
         PrefixPlacementEpochSpan admission_placement_epochs;
         /** Live placement epoch sampled after prefix harvest completed. */
         uint64_t completion_movement_epoch = 0;
+        /** Independent PP authorities; scalar epoch fields are unused when present. */
+        MoEOptimizationStages<PrefixMovementEpochObservation> movement_stages;
 
         /**
          * @return Whether placement publication crossed this request.
@@ -133,8 +166,15 @@ namespace llaminar2
          * deliberately discard its prefix archive and make the next lookup a
          * cold miss.
          */
-        [[nodiscard]] bool crossedMovementEpoch() const noexcept
+        [[nodiscard]] bool crossedMovementEpoch() const
         {
+            if (!movement_stages.empty())
+            {
+                bool crossed = false;
+                for (const auto &stage : movement_stages.entries())
+                    crossed = stage.value.crossed() || crossed;
+                return crossed;
+            }
             return completion_movement_epoch > admission_placement_epochs.earliest();
         }
 
@@ -152,8 +192,25 @@ namespace llaminar2
          *         archive before @p next performed its coordinated lookup.
          */
         [[nodiscard]] bool movementPrecededAdmissionOf(
-            const PrefixCacheRequestSummary &next) const noexcept
+            const PrefixCacheRequestSummary &next) const
         {
+            const auto before = movement_stages.entries();
+            const auto after = next.movement_stages.entries();
+            if (before.size() != after.size())
+                throw std::logic_error("Prefix movement comparison changed pipeline topology");
+            if (!before.empty())
+            {
+                bool moved = false;
+                for (std::size_t i = 0; i < before.size(); ++i)
+                {
+                    if (before[i].identity != after[i].identity)
+                        throw std::logic_error("Prefix movement comparison changed stage identity");
+                    // Validate every scope even when an earlier stage moved.
+                    moved = before[i].value.crossed() ||
+                        after[i].value.admission.latest() > before[i].value.completion || moved;
+                }
+                return moved;
+            }
             return crossedMovementEpoch() ||
                    next.admission_placement_epochs.latest() >
                        completion_movement_epoch;

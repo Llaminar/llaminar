@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 #include "GpuPreparedGemmHarness.h"
+#include "loaders/PreparedHalfWeights.h"
 #include "QuantizedVerifierFormats.h"
 #include "ScopedGPUStream.h"
 #include "VerifierRowTestInventory.h"
@@ -59,6 +60,7 @@ namespace llaminar2::test
      * @param k Shared activation width.
      * @param columns QKV, Z, alpha and beta output widths.
      * @param cases Complete capture family retained over one workspace.
+     * @param control_precision Alpha/beta operands; native projections retain their codebooks.
      */
     inline void runGDNProjectionCaptureCase(
         DeviceId device, IDeviceContext &context,
@@ -66,7 +68,8 @@ namespace llaminar2::test
         const QuantizedVerifierFormatCase &qkv_format,
         const QuantizedVerifierFormatCase &z_format,
         int k, std::array<int, 4> columns,
-        std::span<const GDNProjectionCaptureRows> cases)
+        std::span<const GDNProjectionCaptureRows> cases,
+        FloatingActivationOperandPrecision control_precision = FloatingActivationOperandPrecision::Native)
     {
         ASSERT_FALSE(cases.empty());
         SCOPED_TRACE(::testing::Message() << qkv_format.label << "+"
@@ -79,13 +82,15 @@ namespace llaminar2::test
         ScopedGPUStream stream_owner(device);
         void *stream = stream_owner.get();
 
-        std::array<std::unique_ptr<TensorBase>, 4> weights;
+        std::array<std::shared_ptr<TensorBase>, 4> weights;
         weights[0] = qkv_format.create({size_t(columns[0]), size_t(k)}, 98901);
         weights[1] = z_format.create({size_t(columns[1]), size_t(k)}, 98902);
         weights[2] = TestTensorFactory::createFP32Random(
             {size_t(columns[2]), size_t(k)}, -0.125f, 0.125f, 98903);
         weights[3] = TestTensorFactory::createFP32Random(
             {size_t(columns[3]), size_t(k)}, -0.125f, 0.125f, 98904);
+        if (control_precision == FloatingActivationOperandPrecision::FP16RNE)
+            for (size_t i : {2u, 3u}) weights[i] = materializePreparedHalfWeights(*weights[i]);
         const std::array<const char *, 4> names{"qkv", "z", "alpha", "beta"};
         std::array<GpuPreparedGemm, 4> prepared;
         std::array<std::unique_ptr<FP32Tensor>, 4> outputs;
@@ -94,7 +99,7 @@ namespace llaminar2::test
             const std::string name = std::string("test.gdn.mixed.") + names[i];
             prepared[i] = i < 2
                 ? makeGpuPreparedGemm(weights[i].get(), device, name)
-                : makeGpuPreparedFloatingPointGemm(weights[i].get(), device, name);
+                : makeGpuPreparedFloatingPointGemm(weights[i].get(), device, name, ModelContextId{9900}, control_precision);
             ASSERT_NE(prepared[i].kernel, nullptr);
             outputs[i] = TestTensorFactory::createFP32Zeros(
                 {size_t(capacity), size_t(columns[i])});

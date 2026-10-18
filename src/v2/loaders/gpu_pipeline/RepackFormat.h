@@ -39,7 +39,7 @@ enum class RepackFormat : uint8_t {
     IQ1_M   = 17,  ///< IQ 1-bit (256-element super-blocks, 56 bytes)
     Q8_0    = 18,  ///< Symmetric 8-bit (32-element blocks, 34 bytes)
     Q8_1    = 19,  ///< Symmetric 8-bit plus precomputed sum (32-element blocks, 36 bytes)
-    Q8_K    = 20,  ///< Raw signed 8-bit K-quant (256-element blocks, 288 bytes)
+    Q8_K    = 20,  ///< FP32-scaled signed 8-bit K-quant (256-element source blocks, 292 bytes)
     RAW_FP  = 255, ///< Floating-point passthrough (no repack, direct H2D copy)
 };
 

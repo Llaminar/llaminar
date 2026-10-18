@@ -10866,7 +10866,7 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Q8_K → Q8_0
+        // Explicit Q8_K → Q8_0 conversion narrows FP32 d to destination FP16 metadata.
         // =====================================================================
 
         inline void decode_q8_k_to_q8_0_scalar(
@@ -10882,7 +10882,7 @@ namespace llaminar2
 
             const int8_t *src = block.qs + subblock_idx * Q8_0Block::BLOCK_SIZE;
             std::memcpy(q8_qs, src, Q8_0Block::BLOCK_SIZE * sizeof(int8_t));
-            *q8_scale = fp32_to_fp16(1.0f);
+            *q8_scale = fp32_to_fp16(block.d);
         }
 
 #if defined(__AVX2__)
@@ -10900,7 +10900,7 @@ namespace llaminar2
             const int8_t *src = block.qs + subblock_idx * Q8_0Block::BLOCK_SIZE;
             const __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src));
             _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), data);
-            *q8_scale = fp32_to_fp16(1.0f);
+            *q8_scale = fp32_to_fp16(block.d);
         }
 #endif
 
@@ -10919,7 +10919,7 @@ namespace llaminar2
             const int8_t *src = block.qs + subblock_idx * Q8_0Block::BLOCK_SIZE;
             const __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src));
             _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), data);
-            *q8_scale = fp32_to_fp16(1.0f);
+            *q8_scale = fp32_to_fp16(block.d);
         }
 #endif
 

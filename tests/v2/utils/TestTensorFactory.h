@@ -298,7 +298,7 @@ namespace llaminar2::test
         /**
          * @brief Create a native Q8_K tensor with deterministic random blocks.
          *
-         * Q8_K stores 256 signed bytes plus sixteen 16-element partial sums per
+         * Q8_K stores one FP32 scale, 256 signed bytes and sixteen partial sums per
          * super-block. Populating the sums as well as the payload keeps this
          * fixture valid for embedding, GEMM, and future all-format consumers.
          *
@@ -323,6 +323,10 @@ namespace llaminar2::test
             for (size_t block_index = 0; block_index < total_blocks; ++block_index)
             {
                 auto &block = blocks[block_index];
+                // Deterministic nonunit signed scales remain exactly representable
+                // in the existing FP16 prepared ABI, while exercising source d.
+                block.d = (block_index % 2 ? -1.0f : 1.0f) *
+                          static_cast<float>(1 + block_index % 4) * 0.03125f;
                 for (size_t partial = 0; partial < 16; ++partial)
                 {
                     int32_t sum = 0;

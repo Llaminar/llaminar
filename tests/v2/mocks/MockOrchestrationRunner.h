@@ -139,7 +139,8 @@ namespace llaminar2::test
 
         // Sampling and profiling
         MOCK_METHOD(void, setSamplingParams, (const SamplingParams &params), (override));
-        MOCK_METHOD(SamplingParams, getRecommendedSamplingParams, (), (const, override));
+        MOCK_METHOD(SamplingParams, getRecommendedSamplingParams, (ThinkingMode mode), (const, override));
+        MOCK_METHOD(ThinkingMode, getDefaultThinkingMode, (), (const, override));
         MOCK_METHOD(void, flushStageTimeline, (), (override));
         MOCK_METHOD(void, setSkipLogitsGatherDecode, (bool skip), (override));
         MOCK_METHOD(void, setSkipLogitsGatherPrefill, (bool skip), (override));

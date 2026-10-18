@@ -4,7 +4,10 @@
  *
  * Creates synthetic GGUF blocks with known values, packs them via both
  * the CPU reference path and the GPU kernel, then compares byte-for-byte
- * (payload) and value-for-value (scales/mins with FP16 tolerance).
+ * (payload) and value-for-value (scales/mins with FP16 tolerance). Q6 metadata
+ * is independently checked as exact original d and signed subscale bytes.
+ * IQ2_S and IQ4_XS parity compare original source d/coefficient words exactly,
+ * not as halves; the independent IQ4_XS oracle extracts literal source bits.
  */
 
 #include <gtest/gtest.h>
@@ -13,6 +16,7 @@
 #include <cmath>
 #include <vector>
 #include <numeric>
+#include <stdexcept>
 
 #include "kernels/rocm/repack/VnniRepackKernels.h"
 #include "tensors/BlockStructures.h"
@@ -282,7 +286,15 @@ void cpu_pack_q5k(const Q5_KBlock* blocks, int N, int K,
     }
 }
 
-/// CPU reference: pack Q6_K blocks into VNNI layout (24B payload + scale + min)
+/**
+ * @brief Independently pack source Q6 payload and original factor words.
+ * @param blocks Immutable original source superblocks.
+ * @param N Complete matrix rows.
+ * @param K Logical source row width.
+ * @param payload Destination block-major24-byte payloads.
+ * @param scales Destination original half d words.
+ * @param mins Destination packed signedlow/high coefficient words.
+ */
 void cpu_pack_q6k(const Q6_KBlock* blocks, int N, int K,
                   std::vector<uint8_t>& payload,
                   std::vector<uint16_t>& scales,
@@ -330,9 +342,9 @@ void cpu_pack_q6k(const Q6_KBlock* blocks, int N, int K,
             const int8_t* signed_scales = reinterpret_cast<const int8_t*>(blk.scales);
             const int sc_lo_idx = half * 8 + sub_in_half * 2;
             const int sc_hi_idx = sc_lo_idx + 1;
-            const float d = cpu_fp16_to_fp32(blk.d);
-            scales[linear] = cpu_fp32_to_fp16(d * static_cast<float>(signed_scales[sc_lo_idx]));
-            mins[linear]   = cpu_fp32_to_fp16(d * static_cast<float>(signed_scales[sc_hi_idx]));
+            scales[linear] = blk.d;
+            mins[linear] = static_cast<uint16_t>(static_cast<uint8_t>(signed_scales[sc_lo_idx])) |
+                (static_cast<uint16_t>(static_cast<uint8_t>(signed_scales[sc_hi_idx])) << 8);
         }
     }
 }
@@ -699,14 +711,24 @@ void fill_iq1m_blocks(IQ1_MBlock* blocks, int count) {
 // IQ format CPU reference pack functions
 // ============================================================================
 
+/**
+ * @brief Independently transpose original IQ4_XS payload and source-factor words.
+ * @param blocks Row-padded original superblocks, before preparation.
+ * @param N Logical source rows. @param K Logical columns, divisible by32.
+ * @param payload Receives unchanged sixteen source bytes per logical block.
+ * @param scales Receives original binary16 d bits, without arithmetic.
+ * @param coefficients Receives original encoded6 ls in low bits; high10 remain0.
+ */
 void cpu_pack_iq4xs(const IQ4_XSBlock* blocks, int N, int K,
                     std::vector<uint8_t>& payload,
-                    std::vector<uint16_t>& scales)
+                    std::vector<uint16_t>& scales,
+                    std::vector<uint16_t>& coefficients)
 {
     const int blocks_per_row = K / 32;
     const int sb_per_row = (K + 255) / 256;
     payload.resize(static_cast<size_t>(blocks_per_row) * N * 16);
     scales.resize(static_cast<size_t>(blocks_per_row) * N);
+    coefficients.resize(static_cast<size_t>(blocks_per_row) * N);
 
     for (int n = 0; n < N; ++n) {
         for (int b = 0; b < blocks_per_row; ++b) {
@@ -719,20 +741,24 @@ void cpu_pack_iq4xs(const IQ4_XSBlock* blocks, int N, int K,
 
             const int ls = ((blk.scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf)
                          | (((blk.scales_h >> (2 * sub_idx)) & 3) << 4);
-            float d_f = cpu_fp16_to_fp32(blk.d);
-            scales[linear] = cpu_fp32_to_fp16(d_f * static_cast<float>(ls - 32));
+            // This oracle reads original source words directly. It does not
+            // call the production tuple encoder/resolver or narrow a product.
+            scales[linear] = blk.d;
+            coefficients[linear] = static_cast<uint16_t>(ls);
         }
     }
 }
 
 void cpu_pack_iq3s(const IQ3_SBlock* blocks, int N, int K,
                    std::vector<uint8_t>& payload,
-                   std::vector<uint16_t>& scales)
+                   std::vector<uint16_t>& scales,
+                   std::vector<uint16_t>& source_nibbles)
 {
     const int blocks_per_row = K / 32;
     const int sb_per_row = (K + 255) / 256;
     payload.resize(static_cast<size_t>(blocks_per_row) * N * 13);
     scales.resize(static_cast<size_t>(blocks_per_row) * N);
+    source_nibbles.resize(scales.size());
 
     for (int n = 0; n < N; ++n) {
         for (int b = 0; b < blocks_per_row; ++b) {
@@ -746,10 +772,10 @@ void cpu_pack_iq3s(const IQ3_SBlock* blocks, int N, int K,
             dst[8] = blk.qh[sub_idx];
             std::memcpy(dst + 9, blk.signs + sub_idx * 4, 4);
 
-            float d_f = cpu_fp16_to_fp32(blk.d);
             uint8_t sc_byte = blk.scales[sub_idx / 2];
             int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
-            scales[linear] = cpu_fp32_to_fp16(d_f * static_cast<float>(1 + 2 * nibble));
+            scales[linear] = blk.d;
+            source_nibbles[linear] = static_cast<uint16_t>(nibble);
         }
     }
 }
@@ -813,10 +839,9 @@ void cpu_pack_iq2s(const IQ2_SBlock* blocks, int N, int K,
             dst[4] = blk.qh[sub_idx];
             std::memcpy(dst + 5, blk.qs + 32 + sub_idx * 4, 4);
 
-            float d_f = cpu_fp16_to_fp32(blk.d);
-            uint8_t sc = blk.scales[sub_idx];
-            scales[linear] = cpu_fp32_to_fp16(d_f * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
-            mins[linear]   = cpu_fp32_to_fp16(d_f * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
+            // Independent original words: no factor helper or half conversion.
+            scales[linear] = blk.d;
+            mins[linear] = static_cast<uint16_t>(blk.scales[sub_idx]);
         }
     }
 }
@@ -1045,6 +1070,24 @@ protected:
 // ============================================================================
 
 #ifdef HAVE_ROCM
+
+/** @brief Join exact-stream test work before any borrowed DMA storage retires. */
+class Q6RepackObservationJoin
+{
+public:
+    /**
+     * @param stream Non-null stream owning all observed repack and transfer work.
+     * @throws std::invalid_argument If the explicit producer stream is absent.
+     */
+    explicit Q6RepackObservationJoin(hipStream_t stream) : stream_(stream)
+    {
+        if (!stream_) throw std::invalid_argument("Q6 repack observation requires a stream");
+    }
+    /** @brief Join pending work even after a fatal assertion before buffers retire. */
+    ~Q6RepackObservationJoin() { EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess); }
+private:
+    hipStream_t stream_; ///< Borrowed producer outlives this joined observation.
+};
 
 template<typename T>
 struct GpuBuffer {
@@ -1591,33 +1634,67 @@ TEST_F(Test__VnniRepackKernels, Q6_K_Parity) {
     ASSERT_EQ(gpu_payload.size(), cpu_payload.size());
     EXPECT_EQ(gpu_payload, cpu_payload) << "Q6_K payload mismatch";
 
-    // Scales/mins: allow 1 ULP FP16 tolerance
-    ASSERT_EQ(gpu_scales.size(), cpu_scales.size());
-    ASSERT_EQ(gpu_mins.size(), cpu_mins.size());
+    // Q6 metadata carries original factors, not approximate derived halves.
+    EXPECT_EQ(gpu_scales, cpu_scales) << "Q6_K original d words mismatch";
+    EXPECT_EQ(gpu_mins, cpu_mins) << "Q6_K packed signed subscales mismatch";
+#endif
+}
 
-    int scale_mismatches = 0;
-    int min_mismatches = 0;
-    for (size_t i = 0; i < cpu_scales.size(); ++i) {
-        if (!fp16_approx_equal(gpu_scales[i], cpu_scales[i])) {
-            scale_mismatches++;
-            if (scale_mismatches <= 5)
-                ADD_FAILURE() << "Q6_K scale mismatch at index " << i
-                              << ": GPU=0x" << std::hex << gpu_scales[i]
-                              << " CPU=0x" << cpu_scales[i] << std::dec;
+/**
+ * @test Original Q6 scale words survive GPU preparation without half rounding.
+ * @details All signed coefficient values, both halves, all eight subblocks,
+ * source half subnormals/signs/zeros and finite derived-scale overflow are
+ * checked directly against original bytes. No production pack helper builds
+ * the expected metadata, and no half-ULP tolerance can conceal factor loss.
+ */
+TEST_F(Test__VnniRepackKernels, Q6_K_SourceScaleFactorsPreserveOriginalWords)
+{
+#ifdef HAVE_ROCM
+    constexpr int N = 64;
+    constexpr int K = 512;
+    constexpr int superblocks = K / 256;
+    constexpr int blocks_per_row = K / 32;
+    constexpr uint16_t source_words[] = {
+        0x3c01, 0x0001, 0x8001, 0x7bff, 0xfbff, 0x8000, 0x0000, 0x0401};
+    std::vector<Q6_KBlock> original(N * superblocks);
+    fill_q6k_blocks(original.data(), static_cast<int>(original.size()));
+    for (size_t index = 0; index < original.size(); ++index)
+    {
+        auto &block = original[index];
+        block.d = source_words[index % 8];
+        for (int coefficient = 0; coefficient < 16; ++coefficient)
+            block.scales[coefficient] = static_cast<int8_t>(
+                static_cast<int>((index * 16 + coefficient) % 256) - 128);
+    }
+    GpuBuffer<Q6_KBlock> d_source(original.size());
+    GpuBuffer<uint8_t> d_payload(N * blocks_per_row * 24);
+    GpuBuffer<uint16_t> d_primary(N * blocks_per_row);
+    GpuBuffer<uint16_t> d_secondary(N * blocks_per_row);
+    std::vector<uint16_t> primary(N * blocks_per_row), secondary(N * blocks_per_row);
+    Q6RepackObservationJoin observation(hip_stream_);
+    ASSERT_EQ(hipMemcpyAsync(d_source.ptr, original.data(), original.size() * sizeof(Q6_KBlock),
+        hipMemcpyHostToDevice, hip_stream_), hipSuccess);
+    ASSERT_TRUE(launchVnniRepack(RepackFormat::Q6_K, d_source.ptr,
+        d_payload.ptr, d_primary.ptr, d_secondary.ptr, N, K, producerStream()));
+    ASSERT_EQ(hipMemcpyAsync(primary.data(), d_primary.ptr, primary.size() * sizeof(uint16_t),
+        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(secondary.data(), d_secondary.ptr, secondary.size() * sizeof(uint16_t),
+        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
+    for (int row = 0; row < N; ++row)
+    {
+        for (int block = 0; block < blocks_per_row; ++block)
+        {
+            const auto &source = original[row * superblocks + block / 8];
+            const int low = source.scales[2 * (block % 8)];
+            const int high = source.scales[2 * (block % 8) + 1];
+            const size_t at = static_cast<size_t>(block) * N + row;
+            ASSERT_EQ(primary[at], source.d) << "row=" << row << " block=" << block;
+            const uint16_t expected = static_cast<uint16_t>(static_cast<uint8_t>(low)) |
+                (static_cast<uint16_t>(static_cast<uint8_t>(high)) << 8);
+            ASSERT_EQ(secondary[at], expected) << "row=" << row << " block=" << block;
         }
     }
-    EXPECT_EQ(scale_mismatches, 0) << "Total Q6_K scale mismatches: " << scale_mismatches;
-
-    for (size_t i = 0; i < cpu_mins.size(); ++i) {
-        if (!fp16_approx_equal(gpu_mins[i], cpu_mins[i])) {
-            min_mismatches++;
-            if (min_mismatches <= 5)
-                ADD_FAILURE() << "Q6_K min mismatch at index " << i
-                              << ": GPU=0x" << std::hex << gpu_mins[i]
-                              << " CPU=0x" << cpu_mins[i] << std::dec;
-        }
-    }
-    EXPECT_EQ(min_mismatches, 0) << "Total Q6_K min mismatches: " << min_mismatches;
 #endif
 }
 
@@ -1812,40 +1889,36 @@ TEST_F(Test__VnniRepackKernels, IQ4_XS_Parity) {
     fill_iq4xs_blocks(host_blocks.data(), total_superblocks);
 
     std::vector<uint8_t> cpu_payload;
-    std::vector<uint16_t> cpu_scales;
-    cpu_pack_iq4xs(host_blocks.data(), N, K, cpu_payload, cpu_scales);
+    std::vector<uint16_t> cpu_scales, cpu_coefficients;
+    cpu_pack_iq4xs(host_blocks.data(), N, K, cpu_payload, cpu_scales, cpu_coefficients);
 
     GpuBuffer<IQ4_XSBlock> d_blocks(total_superblocks);
     GpuBuffer<uint8_t>     d_payload(total_output * 16);
     GpuBuffer<uint16_t>    d_scales(total_output);
+    GpuBuffer<uint16_t>    d_coefficients(total_output);
     d_blocks.upload(host_blocks.data());
 
     bool ok = launchVnniRepack(RepackFormat::IQ4_XS, d_blocks.ptr,
-                               d_payload.ptr, d_scales.ptr, nullptr,
+                               d_payload.ptr, d_scales.ptr, d_coefficients.ptr,
                                N, K, producerStream());
     ASSERT_TRUE(ok);
     ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
-    std::vector<uint16_t> gpu_scales;
+    std::vector<uint16_t> gpu_scales, gpu_coefficients;
     d_payload.download(gpu_payload);
     d_scales.download(gpu_scales);
+    d_coefficients.download(gpu_coefficients);
 
     ASSERT_EQ(gpu_payload.size(), cpu_payload.size());
     EXPECT_EQ(gpu_payload, cpu_payload) << "IQ4_XS payload mismatch";
 
     ASSERT_EQ(gpu_scales.size(), cpu_scales.size());
-    int mismatches = 0;
-    for (size_t i = 0; i < cpu_scales.size(); ++i) {
-        if (!fp16_approx_equal(gpu_scales[i], cpu_scales[i])) {
-            mismatches++;
-            if (mismatches <= 5)
-                ADD_FAILURE() << "IQ4_XS scale mismatch at " << i
-                              << ": GPU=0x" << std::hex << gpu_scales[i]
-                              << " CPU=0x" << cpu_scales[i] << std::dec;
-        }
-    }
-    EXPECT_EQ(mismatches, 0) << "Total IQ4_XS scale mismatches: " << mismatches;
+    EXPECT_EQ(gpu_scales, cpu_scales) << "IQ4_XS original half-base words differ";
+    ASSERT_EQ(gpu_coefficients.size(), cpu_coefficients.size());
+    EXPECT_EQ(gpu_coefficients, cpu_coefficients)
+        << "IQ4_XS original encoded6 coefficient words differ";
+
 #endif
 }
 
@@ -1866,40 +1939,31 @@ TEST_F(Test__VnniRepackKernels, IQ3_S_Parity) {
     fill_iq3s_blocks(host_blocks.data(), total_superblocks);
 
     std::vector<uint8_t> cpu_payload;
-    std::vector<uint16_t> cpu_scales;
-    cpu_pack_iq3s(host_blocks.data(), N, K, cpu_payload, cpu_scales);
+    std::vector<uint16_t> cpu_scales, cpu_nibbles;
+    cpu_pack_iq3s(host_blocks.data(), N, K, cpu_payload, cpu_scales, cpu_nibbles);
 
     GpuBuffer<IQ3_SBlock> d_blocks(total_superblocks);
     GpuBuffer<uint8_t>    d_payload(total_output * 13);
-    GpuBuffer<uint16_t>   d_scales(total_output);
+    GpuBuffer<uint16_t>   d_scales(total_output), d_nibbles(total_output);
     d_blocks.upload(host_blocks.data());
 
     bool ok = launchVnniRepack(RepackFormat::IQ3_S, d_blocks.ptr,
-                               d_payload.ptr, d_scales.ptr, nullptr,
+                               d_payload.ptr, d_scales.ptr, d_nibbles.ptr,
                                N, K, producerStream());
     ASSERT_TRUE(ok);
     ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
 
     std::vector<uint8_t> gpu_payload;
-    std::vector<uint16_t> gpu_scales;
+    std::vector<uint16_t> gpu_scales, gpu_nibbles;
     d_payload.download(gpu_payload);
     d_scales.download(gpu_scales);
+    d_nibbles.download(gpu_nibbles);
 
     ASSERT_EQ(gpu_payload.size(), cpu_payload.size());
     EXPECT_EQ(gpu_payload, cpu_payload) << "IQ3_S payload mismatch";
 
-    ASSERT_EQ(gpu_scales.size(), cpu_scales.size());
-    int mismatches = 0;
-    for (size_t i = 0; i < cpu_scales.size(); ++i) {
-        if (!fp16_approx_equal(gpu_scales[i], cpu_scales[i])) {
-            mismatches++;
-            if (mismatches <= 5)
-                ADD_FAILURE() << "IQ3_S scale mismatch at " << i
-                              << ": GPU=0x" << std::hex << gpu_scales[i]
-                              << " CPU=0x" << cpu_scales[i] << std::dec;
-        }
-    }
-    EXPECT_EQ(mismatches, 0) << "Total IQ3_S scale mismatches: " << mismatches;
+    EXPECT_EQ(gpu_scales, cpu_scales) << "IQ3_S original half bases differ";
+    EXPECT_EQ(gpu_nibbles, cpu_nibbles) << "IQ3_S original raw nibble words differ";
 #endif
 }
 
@@ -2005,7 +2069,7 @@ TEST_F(Test__VnniRepackKernels, IQ2_S_Parity) {
 
     int scale_mismatches = 0, min_mismatches = 0;
     for (size_t i = 0; i < cpu_scales.size(); ++i) {
-        if (!fp16_approx_equal(gpu_scales[i], cpu_scales[i])) {
+        if (gpu_scales[i] != cpu_scales[i]) {
             scale_mismatches++;
             if (scale_mismatches <= 5)
                 ADD_FAILURE() << "IQ2_S scale mismatch at " << i
@@ -2014,7 +2078,7 @@ TEST_F(Test__VnniRepackKernels, IQ2_S_Parity) {
         }
     }
     for (size_t i = 0; i < cpu_mins.size(); ++i) {
-        if (!fp16_approx_equal(gpu_mins[i], cpu_mins[i])) {
+        if (gpu_mins[i] != cpu_mins[i]) {
             min_mismatches++;
             if (min_mismatches <= 5)
                 ADD_FAILURE() << "IQ2_S min mismatch at " << i
@@ -2030,6 +2094,162 @@ TEST_F(Test__VnniRepackKernels, IQ2_S_Parity) {
 // ============================================================================
 // Test: IQ2_XS parity (asymmetric, uses ksigns)
 // ============================================================================
+
+/** @brief Original IQ2_S factors and unchanged Q8 must survive actual optimized capture. */
+TEST_F(Test__VnniRepackKernels, IQ2_S_SourceFactorsAndPayloadPreserveOffsetsAndTails)
+{
+#ifdef HAVE_ROCM
+    constexpr int N = 67, K = 288, source_first = 3;
+    constexpr int output_N = 79, output_first = 5;
+    constexpr int superblocks = (K + 255) / 256, blocks_per_row = K / 32;
+    constexpr uint16_t words[] = {
+        0x3c01, 0x0001, 0x8001, 0x03ff, 0x0401, 0x7bff,
+        0xfbff, 0xbc01, 0x8000, 0x0000};
+    std::vector<IQ2_SBlock> original((source_first + N + 2) * superblocks);
+    fill_iq2s_blocks(original.data(), static_cast<int>(original.size()));
+    for (size_t index = 0; index < original.size(); ++index)
+    {
+        original[index].d = words[index % 10];
+        for (int subblock = 0; subblock < 8; ++subblock)
+            original[index].scales[subblock] = static_cast<uint8_t>(index * 8 + subblock);
+    }
+    const size_t count = static_cast<size_t>(output_N) * blocks_per_row;
+    GpuBuffer<IQ2_SBlock> d_source(original.size());
+    GpuBuffer<uint8_t> d_payload(count * 9);
+    GpuBuffer<uint16_t> d_primary(count), d_secondary(count);
+    std::vector<uint8_t> payload(count * 9);
+    std::vector<uint16_t> primary(count), secondary(count);
+    Q6RepackObservationJoin observation(hip_stream_);
+    ASSERT_EQ(hipMemcpyAsync(d_source.ptr, original.data(), original.size() * sizeof(IQ2_SBlock),
+        hipMemcpyHostToDevice, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_payload.ptr, 0x5a, count * 9, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_primary.ptr, 0x5a, count * sizeof(uint16_t), hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_secondary.ptr, 0x5a, count * sizeof(uint16_t), hip_stream_), hipSuccess);
+    // Two independently submitted source chunks populate one block-major
+    // destination; neither source nor destination row origins are zero.
+    constexpr int first_count = 31;
+    for (const int begin : {0, first_count})
+    {
+        const int rows = begin == 0 ? first_count : N - first_count;
+        ASSERT_TRUE(launchVnniRepack(RepackFormat::IQ2_S,
+            d_source.ptr + (source_first + begin) * superblocks,
+            d_payload.ptr, d_primary.ptr, d_secondary.ptr, nullptr,
+            rows, K, output_N, output_first + begin, producerStream()));
+    }
+    ASSERT_EQ(hipMemcpyAsync(payload.data(), d_payload.ptr, payload.size(),
+        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(primary.data(), d_primary.ptr, count * sizeof(uint16_t),
+        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(secondary.data(), d_secondary.ptr, count * sizeof(uint16_t),
+        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
+    for (int block = 0; block < blocks_per_row; ++block)
+        for (int row = 0; row < output_N; ++row)
+        {
+            const size_t at = static_cast<size_t>(block) * output_N + row;
+            SCOPED_TRACE(::testing::Message() << "block=" << block << " row=" << row);
+            if (row < output_first || row >= output_first + N)
+            {
+                EXPECT_EQ(primary[at], 0x5a5a);
+                EXPECT_EQ(secondary[at], 0x5a5a);
+                for (int byte = 0; byte < 9; ++byte)
+                    EXPECT_EQ(payload[at * 9 + byte], 0x5a);
+                continue;
+            }
+            const auto &source = original[(source_first + row - output_first) * superblocks + block / 8];
+            const int subblock = block % 8;
+            EXPECT_EQ(primary[at], source.d);
+            EXPECT_EQ(secondary[at], static_cast<uint16_t>(source.scales[subblock]));
+            for (int byte = 0; byte < 9; ++byte)
+            {
+                const uint8_t expected = byte < 4 ? source.qs[subblock * 4 + byte]
+                    : byte == 4 ? source.qh[subblock]
+                    : source.qs[32 + subblock * 4 + byte - 5];
+                EXPECT_EQ(payload[at * 9 + byte], expected);
+            }
+        }
+#endif
+}
+
+TEST_F(Test__VnniRepackKernels, IQ3_S_SourceFactorsAndPayloadPreserveOffsetsAndTails)
+{
+#ifdef HAVE_ROCM
+    constexpr int N = 67, K = 288, source_first = 3;
+    constexpr int output_N = 79, output_first = 5;
+    constexpr int superblocks = (K + 255) / 256, blocks_per_row = K / 32;
+    constexpr uint16_t words[] = {
+        0x3c01, 0x0001, 0x8001, 0x03ff, 0x0401, 0x7bff,
+        0xfbff, 0xbc01, 0x8000, 0x0000};
+    std::vector<IQ3_SBlock> original((source_first + N + 2) * superblocks);
+    fill_iq3s_blocks(original.data(), static_cast<int>(original.size()));
+    for (size_t index = 0; index < original.size(); ++index)
+    {
+        original[index].d = words[index % 10];
+        for (int byte = 0; byte < 4; ++byte)
+            original[index].scales[byte] = static_cast<uint8_t>(index * 4 + byte);
+    }
+    const size_t count = static_cast<size_t>(output_N) * blocks_per_row;
+    GpuBuffer<IQ3_SBlock> d_source(original.size());
+    GpuBuffer<uint8_t> d_payload(count * 13);
+    GpuBuffer<uint16_t> d_primary(count), d_secondary(count);
+    std::vector<uint8_t> payload(count * 13);
+    std::vector<uint16_t> primary(count), secondary(count);
+    Q6RepackObservationJoin observation(hip_stream_);
+    ASSERT_EQ(hipMemcpyAsync(d_source.ptr, original.data(), original.size() * sizeof(IQ3_SBlock),
+        hipMemcpyHostToDevice, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_payload.ptr, 0x5a, count * 13, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_primary.ptr, 0x5a, count * sizeof(uint16_t), hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_secondary.ptr, 0x5a, count * sizeof(uint16_t), hip_stream_), hipSuccess);
+    // Missing raw coefficient storage must fail before any repack enqueue.
+    EXPECT_FALSE(launchVnniRepack(RepackFormat::IQ3_S, d_source.ptr,
+        d_payload.ptr, d_primary.ptr, nullptr, nullptr, N, K,
+        output_N, output_first, producerStream()));
+    // Two independently submitted source chunks populate one block-major
+    // destination; neither source nor destination row origins are zero.
+    constexpr int first_count = 31;
+    for (const int begin : {0, first_count})
+    {
+        const int rows = begin == 0 ? first_count : N - first_count;
+        ASSERT_TRUE(launchVnniRepack(RepackFormat::IQ3_S,
+            d_source.ptr + (source_first + begin) * superblocks,
+            d_payload.ptr, d_primary.ptr, d_secondary.ptr, nullptr,
+            rows, K, output_N, output_first + begin, producerStream()));
+    }
+    ASSERT_EQ(hipMemcpyAsync(payload.data(), d_payload.ptr, payload.size(),
+        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(primary.data(), d_primary.ptr, count * sizeof(uint16_t),
+        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(secondary.data(), d_secondary.ptr, count * sizeof(uint16_t),
+        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
+    for (int block = 0; block < blocks_per_row; ++block)
+        for (int row = 0; row < output_N; ++row)
+        {
+            const size_t at = static_cast<size_t>(block) * output_N + row;
+            SCOPED_TRACE(::testing::Message() << "block=" << block << " row=" << row);
+            if (row < output_first || row >= output_first + N)
+            {
+                EXPECT_EQ(primary[at], 0x5a5a);
+                EXPECT_EQ(secondary[at], 0x5a5a);
+                for (int byte = 0; byte < 13; ++byte)
+                    EXPECT_EQ(payload[at * 13 + byte], 0x5a);
+                continue;
+            }
+            const auto &source = original[(source_first + row - output_first) * superblocks + block / 8];
+            const int subblock = block % 8;
+            EXPECT_EQ(primary[at], source.d);
+            EXPECT_EQ(secondary[at], static_cast<uint16_t>((source.scales[subblock / 2] >> (4 * (subblock % 2))) & 15u));
+            EXPECT_EQ(secondary[at] & 0xfff0u, 0u);
+            for (int byte = 0; byte < 13; ++byte)
+            {
+                const uint8_t expected = byte < 8 ? source.qs[subblock * 8 + byte]
+                    : byte == 8 ? source.qh[subblock]
+                    : source.signs[subblock * 4 + byte - 9];
+                EXPECT_EQ(payload[at * 13 + byte], expected);
+            }
+        }
+#endif
+}
 
 TEST_F(Test__VnniRepackKernels, IQ2_XS_Parity) {
 #ifdef HAVE_ROCM

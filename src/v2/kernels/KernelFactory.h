@@ -70,6 +70,7 @@
 #pragma once
 
 #include "memory/CPUWeightStoragePlacement.h"
+#include "FloatingActivationOperandPrecision.h"
 
 #include "../backends/DeviceType.h"            // Shared DeviceType enum
 #include "../backends/DeviceId.h"              // Type-safe device identification
@@ -92,6 +93,7 @@ namespace llaminar2
     enum class KVCacheLayoutMode : uint8_t;
     class ITensor;
     class TensorBase;
+    class PinnedHostTransferBuffer;
     class IPackedWeights;
     class ITensorGemm;
     class ITensorRoPE;
@@ -1350,11 +1352,19 @@ namespace llaminar
                  * The returned handle is owned by the caller. This is the model-context
                  * path used by PreparedWeightStore; TensorBase destructors and global
                  * KernelFactory cleanup do not participate in its lifetime.
+                 * @param tensor Original or model-owned prepared weight tensor.
+                 * @param target_device Exact execution endpoint.
+                 * @param prep_kind Explicit preparation family or source-derived AUTO.
+                 * @param operand_precision Immutable floating input rounding contract.
+                 * @return Model-owned prepared engine and source identity.
+                 * @throws std::invalid_argument For incompatible operand/storage choices.
                  */
                 static std::shared_ptr<PreparedGemmHandle> prepareGemmHandleLocal(
                     const llaminar2::TensorBase *tensor,
                     llaminar2::DeviceId target_device,
-                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
+                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO,
+                    llaminar2::FloatingActivationOperandPrecision operand_precision =
+                        llaminar2::FloatingActivationOperandPrecision::Native);
 
                 /**
                  * @brief Create a sliced CPU GEMM kernel without using the global sliced cache.
@@ -1373,12 +1383,23 @@ namespace llaminar
                     llaminar2::DeviceId target_device);
 
                 /**
-                 * @brief Prepare embedding weights without inserting into KernelFactory global registries.
+                 * @brief Copy unchanged native embedding blocks into a model-owned allocation.
+                 * @param tensor Live original quantized source table or vocabulary view.
+                 * @param d_model Logical source row width.
+                 * @param target_device Exact preparation endpoint; GPU setup uses its explicit stream.
+                 * @param upload_staging Required bound, exact-device pinned source for GPU setup; CPU accepts null.
+                 * @param vocab_offset First owned global vocabulary row.
+                 * @param total_vocab Full vocabulary extent, or zero for an unsharded table.
+                 * @return Owned source-native handle, or null for floating/unsupported sources or backend failure.
+                 * @throws std::invalid_argument For incompatible source bytes, shape or vocabulary extent.
+                 * @throws std::overflow_error For source-native geometry overflow.
+                 * @throws std::runtime_error For missing source/setup stream or failed codebook publication.
                  */
                 static std::shared_ptr<llaminar2::PreparedEmbeddingHandle> prepareEmbeddingHandleLocal(
                     const llaminar2::TensorBase *tensor,
                     int d_model,
                     llaminar2::DeviceId target_device,
+                    const llaminar2::PinnedHostTransferBuffer *upload_staging,
                     size_t vocab_offset = 0,
                     size_t total_vocab = 0);
 
@@ -1390,6 +1411,7 @@ namespace llaminar
                  * @param slot_name Existing physical slot, including coalesced expert slabs.
                  * @param row_offset First matrix row within that slot's physical layout.
                  * @param layout Initial-only or migration-reusable allocation stride.
+                 * @param operand_precision Immutable floating arithmetic; Native preserves existing callers.
                  * @return Backend engine with unbound execution stream/workspace.
                  * @throws std::invalid_argument for unsupported metadata, device or layout.
                  * @throws std::out_of_range for a matrix that exceeds any pool region.
@@ -1404,7 +1426,9 @@ namespace llaminar
                     std::shared_ptr<llaminar2::LoadOrchestrator> owner,
                     const std::string &slot_name, size_t row_offset = 0,
                     llaminar2::GPUPreparedWeightPoolLayout layout =
-                        llaminar2::GPUPreparedWeightPoolLayout::SourceNative);
+                        llaminar2::GPUPreparedWeightPoolLayout::SourceNative,
+                    llaminar2::FloatingActivationOperandPrecision operand_precision =
+                        llaminar2::FloatingActivationOperandPrecision::Native);
 
                 /**
                  * @brief Prepare repacked GEMM weights for a borrowed expert view.

@@ -1393,9 +1393,9 @@ TEST_F(WeightManagerComputeSliceBoundariesTest,
         auto second = manager.getWeightForDevice("token_embd.weight", DeviceId::cuda(1));
         ASSERT_NE(first, nullptr);
         ASSERT_NE(second, nullptr);
-        EXPECT_EQ(first->isHostResident(), format.prepared_embed_q8);
-        EXPECT_EQ(second->isHostResident(), format.prepared_embed_q8);
-        EXPECT_EQ(first.get() == second.get(), format.prepared_embed_q8);
+        EXPECT_EQ(first->isHostResident(), format.prepared_native_quantized);
+        EXPECT_EQ(second->isHostResident(), format.prepared_native_quantized);
+        EXPECT_EQ(first.get() == second.get(), format.prepared_native_quantized);
         EXPECT_STREQ(tensorTypeName(first->native_type()), format.label);
         EXPECT_EQ(first->native_type(), second->native_type());
         ASSERT_EQ(first->size_bytes(), second->size_bytes());

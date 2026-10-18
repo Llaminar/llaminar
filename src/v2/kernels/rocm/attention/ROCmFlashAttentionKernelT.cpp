@@ -6,6 +6,8 @@
  * defined in ROCmFlashAttentionKernels.hip. Decode owns one capacity-stable
  * parallel split envelope for ordinary and grouped rows. Deterministic mode
  * uses the same ordered reduction rather than serializing each KV traversal.
+ * Native scalar decode retains the cache format even below a wavefront-wide
+ * head, so grouped verification shares its query rounding and dot arithmetic.
  *
  * Target Architecture: AMD MI50 (gfx906 / Vega 20)
  *
@@ -373,6 +375,16 @@ namespace llaminar2
          * Device properties are setup-time facts. Live K/V length is not read
          * here and remains exclusively in the device-owned parameter record
          * consumed by the captured guarded-direct, phase, and reducer kernels.
+         * @param batch_size Captured request count.
+         * @param query_rows Physical query bucket rows.
+         * @param local_query_heads Participant-owned query heads.
+         * @param head_dim Immutable head width.
+         * @param kv_capacity Stable physical cache row capacity.
+         * @param device_idx Exact HIP participant.
+         * @param execution_policy Declared query/context ownership.
+         * @param kv_format Actual native operands consumed by the kernel.
+         * @param visibility Setup-owned masking/window facts.
+         * @return The exact immutable tile, score ownership and workspace plan.
          */
         static fa2_policy::ROCmFA2PrefillParallelPlan
         resolvePrefillPlanForDevice(
@@ -382,7 +394,10 @@ namespace llaminar2
             int head_dim,
             int kv_capacity,
             int device_idx,
-            const attention::AttentionExecutionPolicy &execution_policy)
+            const attention::AttentionExecutionPolicy &execution_policy,
+            TensorType kv_format = TensorType::FP32,
+            fa2_policy::ROCmFA2VisibilityPolicy visibility =
+                fa2_policy::ROCmFA2VisibilityPolicy::General)
         {
             const fa2_policy::ROCmFA2PhysicalDeviceProperties properties =
                 queryROCmFlashAttentionDeviceProperties(device_idx);
@@ -397,6 +412,8 @@ namespace llaminar2
                 .lds_capacity_bytes = properties.lds_capacity_bytes,
                 .requested_axis =
                     execution_policy.prefill_parallel_axis,
+                .kv_format = kv_format,
+                .visibility = visibility,
             });
         }
 
@@ -440,6 +457,8 @@ namespace llaminar2
                     {"kv_capacity", std::to_string(kv_capacity)},
                     {"tile_q", std::to_string(plan.tile.query_rows)},
                     {"tile_kv", std::to_string(plan.tile.kv_rows)},
+                    {"score_storage", fa2_policy::rocmFA2ScoreStorageName(plan.tile.score_storage)},
+                    {"tile_lds_bytes", std::to_string(plan.tile.lds_bytes)},
                     {"query_grid_blocks",
                      std::to_string(plan.query_grid_blocks)},
                     {"context_partitions",
@@ -1179,7 +1198,9 @@ namespace llaminar2
                     prefill_capture.head_dim,
                     prefill_capture.kv_capacity,
                     device_idx_,
-                    prefill_capture.execution_policy);
+                    prefill_capture.execution_policy,
+                    prefill_capture.native_kv_format,
+                    prefill_capture.visibility);
                 if (!capture_plan.valid)
                 {
                     LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Invalid ROCm FA2 prefill plan before device attention-param publication");
@@ -1319,10 +1340,11 @@ namespace llaminar2
 
                 kv_native_type = K->native_type();
 
-                // For prefill (head_dim >= 64) or decode, dispatch to
-                // native FP16/Q8_1 kernel — eliminates FP32 conversion pipeline entirely
+                // Decode admits sub-wavefront heads in the same native-format
+                // body as grouped verification. Converting narrow FP16 caches
+                // to FP32 here would change query rounding and dot arithmetic.
                 if (!disable_native_kv &&
-                    head_dim >= 64 &&
+                    (seq_len == 1 || head_dim >= 64) &&
                     (kv_native_type == TensorType::FP16 ||
                      kv_native_type == TensorType::BF16 ||
                      (kv_native_type == TensorType::Q8_1 && head_dim % 32 == 0)))
@@ -1389,6 +1411,10 @@ namespace llaminar2
                 dynamic_attn_kv_stride_ > 0
                     ? dynamic_attn_kv_stride_
                     : kv_len;
+            // The plan and native launcher consume the same published mask
+            // address. Neither derives score ownership from device-live rows.
+            const float *mask_ptr = workspace_mask
+                ? static_cast<const float *>(workspace_mask->gpu_data_ptr()) : nullptr;
             const fa2_policy::ROCmFA2PrefillParallelPlan prefill_plan =
                 resolvePrefillPlanForDevice(
                     batch_size,
@@ -1397,7 +1423,11 @@ namespace llaminar2
                     head_dim,
                     launch_kv_capacity,
                     dev,
-                    execution_policy);
+                    execution_policy,
+                    use_native_kv ? kv_native_type : TensorType::FP32,
+                    causal && window_size <= 0 && !mask_ptr
+                        ? fa2_policy::ROCmFA2VisibilityPolicy::CausalFullContext
+                        : fa2_policy::ROCmFA2VisibilityPolicy::General);
             if (!prefill_plan.valid)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Invalid declared ROCm prefill capture plan"
@@ -1522,12 +1552,6 @@ namespace llaminar2
                     return false;
                 }
                 d_attn_params = static_cast<const attention::AttentionDeviceParams *>(d_buf);
-            }
-
-            const float *mask_ptr = nullptr;
-            if (workspace_mask)
-            {
-                mask_ptr = static_cast<const float *>(workspace_mask->gpu_data_ptr());
             }
 
             float *context_O_partial = nullptr;

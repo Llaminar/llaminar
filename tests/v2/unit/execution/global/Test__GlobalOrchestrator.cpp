@@ -4,6 +4,8 @@
  *
  * Tests the cross-machine MPI cluster inference orchestrator using
  * MockMPIContext and MockDeviceRunner (no real MPI or devices needed).
+ * Prefix regressions prove that each stage keeps its admitted identity while
+ * consumed restore chains retire before new archive capacity is requested.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -207,6 +209,11 @@ namespace llaminar2::test
         {
             return lookup;
         }
+        /** @brief Model a completed CPU restore without retaining borrowed payloads. */
+        bool populatePrefix(const PrefixLookupResult &hit, int = 0) override
+        {
+            return hit.cached_tokens == lookup.cached_tokens;
+        }
         /** @brief Authenticate the exact child identity and coordinated frontier. */
         bool preparePrefixHarvest(
             const PrefixLookupResult &admission,
@@ -215,14 +222,16 @@ namespace llaminar2::test
         {
             EXPECT_EQ(admission.fingerprint_key, lookup.fingerprint_key);
             prepared_tokens = tokens;
-            prepared_checkpoint = schedule.reusableCheckpoint();
+            prepared_checkpoints = schedule.reusableCheckpoints();
+            prepared_block_count = admission.blocks.size();
             ++prepare_calls;
             return prepare_ok;
         }
         PrefixLookupResult lookup;
         std::vector<int32_t> prepared_tokens;
-        std::optional<int> prepared_checkpoint;
+        std::vector<int> prepared_checkpoints;
         int prepare_calls = 0;
+        size_t prepared_block_count = 0u;
         bool prepare_ok = true;
     };
 
@@ -732,6 +741,66 @@ namespace llaminar2::test
     // Validation Tests
     // =========================================================================
 
+    /** @brief A PP rank exports only its own cache publishers without contacting remote stages. */
+    TEST_F(Test__GlobalOrchestrator, PrefixTelemetryExportsOnlyLocalStages)
+    {
+        class ObservedParticipant final : public MockDeviceRunner
+        {
+        public:
+            std::shared_ptr<PrefixCacheTelemetry> publisher = std::make_shared<PrefixCacheTelemetry>();
+            /** @return Local metadata ownership, independent of pipeline head/tail roles. */
+            PrefixCacheTelemetrySources prefixCacheTelemetrySources() const override
+            {
+                return {{.participant = "fixture", .ram_enabled = true, .ram_capacity_bytes = 100,
+                         .publisher = publisher}};
+            }
+        };
+        for (int rank : {0, 1})
+        {
+            MockMPIContext mpi(rank, 2);
+            auto participant = std::make_unique<ObservedParticipant>();
+            const auto publisher = participant->publisher;
+            GlobalOrchestrator orchestrator(makeConfig(buildTwoStagePPTopo(), rank, 2, &mpi,
+                std::move(participant)));
+            const auto barriers = mpi.barrier_call_count();
+            const auto sources = orchestrator.prefixCacheTelemetrySources();
+            ASSERT_EQ(sources.size(), 1u);
+            EXPECT_EQ(sources[0].publisher, publisher);
+            EXPECT_EQ(mpi.barrier_call_count(), barriers);
+        }
+    }
+
+    /** @brief Registry aggregation preserves movement in a lower-epoch local stage. */
+    TEST_F(Test__GlobalOrchestrator, PipelinePrefixProbeDetectsMovementBelowSiblingMaximum)
+    {
+        class ObservedParticipant final : public MockDeviceRunner
+        {
+        public:
+            uint64_t observed_epoch = 0;
+            /** @return Metadata from this participant's own movement authority. */
+            PrefixRuntimeStateSnapshot prefixStateProbe(const PrefixProbeCapturePolicy &) const override
+            {
+                PrefixRuntimeStateSnapshot result;
+                result.initialized = true;
+                result.moe_runtime_movement_epoch = PrefixMovementEpochSnapshot::leaf(observed_epoch);
+                return result;
+            }
+        };
+        const auto topology = buildTwoStageSameTPTopo();
+        auto first = std::make_unique<ObservedParticipant>();
+        first->observed_epoch = 100;
+        auto second = std::make_unique<ObservedParticipant>();
+        second->observed_epoch = 1;
+        auto *observer = second.get();
+        StageRunnerRegistry registry;
+        registry.add(makeStageRunnerEntry(topology, 0, 0, std::move(first)));
+        registry.add(makeStageRunnerEntry(topology, 0, 1, std::move(second)));
+        const auto before = registry.prefixStateProbeAll({});
+        observer->observed_epoch = 2;
+        const auto after = registry.prefixStateProbeAll({});
+        EXPECT_NE(before.moe_runtime_movement_epoch, after.moe_runtime_movement_epoch);
+    }
+
     /** @brief A remote endpoint must never resolve to a different local layer scope. */
     TEST_F(Test__GlobalOrchestrator, RegistryHasNoStandInForRemoteEndpoints)
     {
@@ -903,10 +972,37 @@ namespace llaminar2::test
             EXPECT_TRUE(orch.preparePrefixHarvest(admission, tokens, schedule));
             EXPECT_EQ(observed->prepare_calls, 1);
             EXPECT_EQ(observed->prepared_tokens, tokens);
-            EXPECT_EQ(observed->prepared_checkpoint, 2);
+            EXPECT_EQ(observed->prepared_checkpoints, std::vector<int>({2}));
             EXPECT_EQ(observed->forward_call_count(), 0u);
             observed->prepare_ok = false;
             EXPECT_FALSE(orch.preparePrefixHarvest(admission, tokens, schedule));
+        }
+    }
+
+    /** @test Global stages retire restored chains before preparing their next archive. */
+    TEST_F(Test__GlobalOrchestrator, PrefixHarvestReleasesRestoredBlockChain)
+    {
+        for (int rank : {0, 1})
+        {
+            MockMPIContext mpi(rank, 2);
+            auto child = std::make_unique<PrefixPreparationMockRunner>(100u + rank);
+            auto *observed = child.get();
+            child->lookup.cached_tokens = 6;
+            for (int block = 0; block < 3; ++block)
+            {
+                PrefixBlockHandle handle;
+                handle.key.token_start = block * 2;
+                handle.key.token_count = 2;
+                child->lookup.blocks.push_back(std::move(handle));
+            }
+            GlobalOrchestrator orch(makeConfig(
+                buildTwoStagePPTopo(), rank, 2, &mpi, std::move(child)));
+            const std::vector<int32_t> tokens(6, 1);
+            const auto admission = orch.lookupPrefix(tokens);
+            ASSERT_TRUE(orch.populatePrefix(admission));
+            const auto schedule = PrefixHarvestSchedule::forPrefill(admission, 6, 6);
+            ASSERT_TRUE(orch.preparePrefixHarvest(admission, tokens, schedule));
+            EXPECT_EQ(observed->prepared_block_count, 1u);
         }
     }
 

@@ -15,12 +15,53 @@
 #include "execution/moe/MoEExpertOverlayAuthorityPlan.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace llaminar2
 {
     class IExecutionPlanBuilder;
     class PlanningModelMetadata;
     struct ClusterInventory;
+    class ResolvedRankOrchestration;
+
+    /**
+     * @brief Immutable topology and BOM projection of one authored local PP stage.
+     *
+     * The parent remains the rank's execution plan. The child rank view supplies
+     * owned layers and exact participants to memory planning; its missing global
+     * edge roles describe a local pipeline boundary, never a fabricated MPI peer.
+     * Only the production compiler can construct this metadata-only value.
+     */
+    class ResolvedMoEPipelineStage final
+    {
+    public:
+        /** @return Main-model interval and global embedding/output ownership. */
+        [[nodiscard]] const FactoryPPStageConfig &scope() const noexcept { return scope_; }
+        /** @return Stage-only normalized policy and expert domain declarations. */
+        [[nodiscard]] const OrchestrationConfig &config() const noexcept { return config_; }
+        /** @return Stage-owned memory-planning view inside the enclosing rank. */
+        [[nodiscard]] const RankExecutionPlan &rankPlan() const noexcept { return rank_plan_; }
+        /** @return Hardware-resolved expert role of this stage on the parent rank. */
+        [[nodiscard]] const MoEExpertOverlayExecutionPlan &overlayExecution() const noexcept { return execution_; }
+
+    private:
+        friend class ResolvedRankOrchestration;
+        /**
+         * @brief Retain one compiler-authenticated scope and its exact projections.
+         * @param scope Owned main interval and global component roles.
+         * @param config Normalized child expert and serving policy.
+         * @param rank_plan Child projection of the retained parent rank plan.
+         * @param execution Bound child expert authority role on that rank.
+         */
+        ResolvedMoEPipelineStage(FactoryPPStageConfig scope, OrchestrationConfig config,
+            RankExecutionPlan rank_plan, MoEExpertOverlayExecutionPlan execution)
+            : scope_(scope), config_(std::move(config)), rank_plan_(std::move(rank_plan)), execution_(std::move(execution)) {}
+        FactoryPPStageConfig scope_;
+        OrchestrationConfig config_;
+        RankExecutionPlan rank_plan_;
+        MoEExpertOverlayExecutionPlan execution_;
+    };
 
     /**
      * @brief Validated configuration and exact rank plan published as one result.
@@ -61,6 +102,9 @@ namespace llaminar2
         /** @return Explicit origin for passive diagnostics, never an execution decision. */
         [[nodiscard]] MoEExpertOverlayAuthorityPlanDisposition overlayOrigin() const noexcept
         { return overlay_origin_; }
+        /** @return Ordered local PP expert stages; empty for ordinary execution. */
+        [[nodiscard]] const std::vector<ResolvedMoEPipelineStage> &pipelineStages() const noexcept
+        { return pipeline_stages_; }
 
     private:
         /** @brief Only resolve() may seal a complete validated topology. */
@@ -73,5 +117,6 @@ namespace llaminar2
         RankExecutionPlan rank_plan_;
         std::optional<MoEExpertOverlayExecutionPlan> overlay_execution_;
         MoEExpertOverlayAuthorityPlanDisposition overlay_origin_;
+        std::vector<ResolvedMoEPipelineStage> pipeline_stages_;
     };
 }

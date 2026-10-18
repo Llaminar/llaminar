@@ -5,6 +5,8 @@
  * These tests exercise the production graph builders and CPU implementations
  * to prove MTP policy, verifier, recurrent-state, and prefix-cache contracts
  * without occupying a GPU in the unit gate.
+ * Bounded telemetry retains exact lifecycle coordinates in sequence words;
+ * tests authenticate those words without rebuilding unbounded tag identities.
  */
 
 #include <gtest/gtest.h>
@@ -1290,8 +1292,9 @@ namespace
                 record.name == name &&
                 recordTagsContain(record, tags))
             {
-                EXPECT_NE(record.tags.find("previous_live_state_epoch"), record.tags.end());
-                EXPECT_NE(record.tags.find("live_state_epoch"), record.tags.end());
+                EXPECT_EQ(record.sequence_word_count, record.count * 5u);
+                EXPECT_EQ(record.tags.count("previous_live_state_epoch"), 0u);
+                EXPECT_EQ(record.tags.count("live_state_epoch"), 0u);
                 EXPECT_NE(record.tags.find("mutation_reason"), record.tags.end());
                 total += record.value;
             }
@@ -6037,10 +6040,14 @@ TEST(Test__MTPGraphConstruction, CPUSeparatePrefillTransactionsPublishCrossSegme
         records,
         PerfStatRecord::Kind::Counter,
         "shifted_prefill_segment_bridge_rows",
-        {{"position", std::to_string(first_segment.size())},
-         {"segment_rows", std::to_string(second_segment.size())}});
+        {{"segment_rows", std::to_string(second_segment.size())}});
     ASSERT_NE(bridge_record, nullptr);
     EXPECT_DOUBLE_EQ(bridge_record->value, 1.0);
+    EXPECT_EQ(bridge_record->count, 1u);
+    EXPECT_EQ(bridge_record->sequence_word_count, 1u);
+    EXPECT_THAT(bridge_record->sequence_minimum_words, ::testing::ElementsAre(first_segment.size()));
+    EXPECT_EQ(bridge_record->sequence_maximum_words, bridge_record->sequence_minimum_words);
+    EXPECT_EQ(bridge_record->tags.count("position"), 0u);
 
     PerfStatsCollector::reset();
 }
@@ -6177,6 +6184,8 @@ TEST(Test__MTPGraphConstruction, PrefixHarvestPersistsAndRestoresShiftedMTPKVPay
     EXPECT_EQ(hit.cached_tokens, static_cast<int>(prefix_tokens.size()));
     ASSERT_EQ(hit.blocks.size(), 2u);
     for (const auto &block : hit.blocks)
+        EXPECT_EQ(block.mtp_storage, nullptr) << "Lookup retains metadata until read-set selection";
+    for (const auto &block : hit.materializeRestoreBlocks())
     {
         ASSERT_TRUE(block.layout.includes_mtp_state);
         ASSERT_NE(block.mtp_storage, nullptr);
@@ -6260,7 +6269,10 @@ TEST(Test__MTPGraphConstruction, PartialTerminalBlockRestoresShiftedMTPKVPayload
     ASSERT_EQ(hit.blocks.size(), 1u);
     EXPECT_EQ(hit.blocks[0].key.token_count, 3);
     EXPECT_TRUE(hit.blocks[0].layout.includes_mtp_state);
-    ASSERT_NE(hit.blocks[0].mtp_storage, nullptr);
+    EXPECT_EQ(hit.blocks[0].mtp_storage, nullptr);
+    const auto restore_blocks = hit.materializeRestoreBlocks();
+    ASSERT_EQ(restore_blocks.size(), 1u);
+    ASSERT_NE(restore_blocks[0].mtp_storage, nullptr);
 
     ASSERT_TRUE(orchestrator.populatePrefix(hit));
     const PrefixStateSnapshot restored =
@@ -7151,6 +7163,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEPlacementWi
         fixture.config.max_seq_len,
         DeviceId::cpu()));
 
+    const auto before_restore = orchestrator.prefixStateProbe();
     PrefixStateSnapshot checkpoint;
     checkpoint.valid = true;
     checkpoint.logical_checkpoint = true;
@@ -7164,7 +7177,6 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEPlacementWi
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto reset_tags = PerfStatsCollector::Tags{
         {"model", "moe"},
-        {"moe_placement_epoch", "0"},
         {"operation", "restore_logical_checkpoint"},
         {"mutation_reason", "prefix_restore"},
         {"kernel_dynamic_state", "reset"},
@@ -7177,6 +7189,16 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEPlacementWi
             "live_prefix_replay_state_after_mutation",
             reset_tags),
         1.0);
+    const auto *mutation = findMTPRecordContaining(records, PerfStatRecord::Kind::Counter,
+        "live_prefix_replay_state_after_mutation", reset_tags);
+    ASSERT_NE(mutation, nullptr);
+    EXPECT_EQ(mutation->count, 1u);
+    EXPECT_EQ(mutation->sequence_word_count, 5u);
+    EXPECT_THAT(mutation->sequence_minimum_words, ::testing::ElementsAre(
+        before_restore.live_state_epoch, after_restore.live_state_epoch,
+        after_restore.live_state_mutations, 0u, 0u));
+    EXPECT_EQ(mutation->sequence_maximum_words, mutation->sequence_minimum_words);
+    EXPECT_EQ(mutation->tags.count("moe_placement_epoch"), 0u);
     const auto legacy_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
         {"reason", "moe_live_state_mutation_guard"}};

@@ -277,4 +277,11 @@ namespace llaminar2
         return global_ok;
     }
 
+    /** @copydoc MoEGraphRoleRunner::collectPrefixCacheShutdown */
+    void MoEGraphRoleRunner::collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const
+    {
+        for (const auto &runner : config_.local_participant_runners)
+            if (runner) runner->collectPrefixCacheShutdown(shutdown);
+    }
+
 } // namespace llaminar2

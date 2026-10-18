@@ -7,18 +7,197 @@
  * broad synthetic geometry lattice so an unseen positive query size, local TP
  * head shard, batch size, or SM count cannot leave a dispatch hole.  No CUDA
  * runtime call or GPU work occurs in this unit suite.
+ * Shared-tile ownership, its exact resource BOM, and strict capture overrides
+ * are checked here independently of the native byte-equivalence sweeps.
+ * Larger tensor buckets preserve the optimized body and compact physical
+ * summaries while the device controller retains the complete logical context.
  */
 
 #include <gtest/gtest.h>
 
 #include "kernels/cuda/attention/CUDAFlashAttentionWorkspaceEnvelope.h"
+#include "kernels/cuda/attention/CUDATensorContextPartition.cuh"
+#include "kernels/cuda/attention/CUDATensorPrefillGeometry.h"
+#include "utils/DebugEnv.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+
+/** Larger and partial query buckets retain the same native tensor architecture. */
+TEST(CUDAFlashAttentionLaunchPolicy, TensorPrefillQueryBucketsHaveNoM512Ceiling)
+{
+    namespace policy = llaminar2::cuda::tensor_prefill;
+    constexpr std::array<std::array<int, 4>, 6> mappings{{
+        {8, 1, 0, 0}, {12, 2, 0, 0}, {16, 2, 0, 0},
+        {24, 4, 0, 0}, {8, 2, 8, 8}, {12, 4, 12, 6}}};
+    for (const auto mapping : mappings)
+    for (const int rows : {-1, 0, 1, 128, 511, 512, 513, 1023, 1024, 1025,
+                           2048, 4096, 65536, std::numeric_limits<int>::max()})
+    {
+        policy::Geometry geometry{
+            .batch_size = 1, .query_rows = rows, .head_dim = 256,
+            .query_heads = mapping[0], .kv_heads = mapping[1], .head_start = mapping[2],
+            .gqa_repetition = mapping[3], .kv_format = llaminar2::TensorType::FP16,
+            .visibility = llaminar2::attention::AttentionVisibilityPolicy::CausalFullContext};
+        EXPECT_EQ(policy::selectHeadGeometry(geometry).has_value(), rows >= 512);
+        if (geometry.gqa_repetition == 0)
+        {
+            geometry.head_start = geometry.query_heads;
+            EXPECT_EQ(policy::selectHeadGeometry(geometry).has_value(), rows >= 512);
+        }
+        geometry.batch_size = 2;
+        EXPECT_FALSE(policy::selectHeadGeometry(geometry));
+        geometry.batch_size = 1;
+        geometry.head_dim = 128;
+        EXPECT_FALSE(policy::selectHeadGeometry(geometry));
+        geometry.head_dim = 256;
+        geometry.kv_format = llaminar2::TensorType::BF16;
+        EXPECT_FALSE(policy::selectHeadGeometry(geometry));
+        geometry.kv_format = llaminar2::TensorType::FP16;
+        geometry.visibility = llaminar2::attention::AttentionVisibilityPolicy::General;
+        EXPECT_FALSE(policy::selectHeadGeometry(geometry));
+    }
+}
+
+/** @brief Short prefills keep each complete and partial 256-key summary. */
+TEST(CUDAFlashAttentionLaunchPolicy, TensorPrefillShortContextsRetainCanonicalPartitions)
+{
+    using namespace llaminar2::cuda::tensor_attention_policy;
+    for (int keys = 1; keys <= 8192; ++keys)
+    {
+        const auto observed = plan<SplitPolicy::Four>(keys, 1024);
+        EXPECT_EQ(observed.key_span, 256) << keys;
+        EXPECT_EQ(observed.count, (keys + 255) / 256) << keys;
+    }
+}
+
+/** @brief Every long-context tail has disjoint complete coverage in four summaries. */
+TEST(CUDAFlashAttentionLaunchPolicy, TensorPrefillLongContextsHaveCompleteCompactCoverage)
+{
+    using namespace llaminar2::cuda::tensor_attention_policy;
+    for (int keys = 8193; keys <= 262144; ++keys)
+    {
+        const auto observed = plan<SplitPolicy::Four>(keys, 1024);
+        ASSERT_GT(observed.count, 0) << keys;
+        ASSERT_LE(observed.count, 4) << keys;
+        ASSERT_EQ(observed.key_span % 256, 0) << keys;
+        ASSERT_LT((observed.count - 1) * observed.key_span, keys) << keys;
+        ASSERT_GE(observed.count * observed.key_span, keys) << keys;
+    }
+}
+
+/** @brief Admitting more storage cannot change arithmetic or live summary traffic. */
+TEST(CUDAFlashAttentionLaunchPolicy, TensorPrefillIgnoresUnusedSummaryCapacity)
+{
+    using namespace llaminar2::cuda::tensor_attention_policy;
+    for (const int keys : {1, 255, 256, 257, 8191, 8192, 8193, 16384, 16793, 65536, 262144})
+    {
+        const int canonical = (keys + 255) / 256;
+        const auto exact = plan<SplitPolicy::Four>(keys, canonical);
+        for (const int capacity : {canonical, canonical + 1, canonical + 256, 2048})
+        {
+            const auto excess = plan<SplitPolicy::Four>(keys, capacity);
+            EXPECT_EQ(excess.key_span, exact.key_span) << keys << '/' << capacity;
+            EXPECT_EQ(excess.count, exact.count) << keys << '/' << capacity;
+        }
+    }
+    const auto empty = plan<SplitPolicy::Four>(0, 1024);
+    EXPECT_EQ(empty.key_span, 256);
+    EXPECT_EQ(empty.count, 1);
+}
+
+/** Compact physical admission cannot shrink the live key span or its arithmetic. */
+TEST(CUDAFlashAttentionLaunchPolicy, TensorPrefillCompactCapacityPreservesEveryPrefix)
+{
+    using namespace llaminar2::cuda::tensor_attention_policy;
+    for (const int horizon : {256, 257, 4096, 8192, 8193, 16384, 65536, 262144})
+    {
+        const int physical = summaryCapacity(horizon);
+        const int canonical = 1 + (horizon - 1) / 256;
+        EXPECT_EQ(physical, std::min(canonical, 32));
+        for (int keys = 0; keys <= horizon; ++keys)
+        {
+            const auto compact = plan<SplitPolicy::Four>(keys, physical);
+            const auto original = plan<SplitPolicy::Four>(keys, canonical);
+            ASSERT_EQ(compact.key_span, original.key_span) << horizon << '/' << keys;
+            ASSERT_EQ(compact.count, original.count) << horizon << '/' << keys;
+            ASSERT_LE(compact.count, physical);
+            if (keys > 0) ASSERT_GE(static_cast<int64_t>(compact.key_span) * compact.count, keys);
+        }
+    }
+    EXPECT_EQ(summaryCapacity(0), 0);
+    EXPECT_EQ(summaryCapacity(-1), 0);
+    EXPECT_EQ(summaryCapacity(std::numeric_limits<int>::max()), 32);
+    EXPECT_EQ(plan<SplitPolicy::Four>(8192, 31).count, 0);
+    EXPECT_EQ(plan<SplitPolicy::Four>(65536, 3).count, 0);
+}
+
+/** A larger M cannot leave the tensor architecture because the legacy grid saturates. */
+TEST(CUDAFlashAttentionLaunchPolicy, TensorPrefillAutomaticDispatchAndFamilyAreMTotal)
+{
+    using namespace llaminar2;
+    using namespace cuda::fa2_policy;
+    constexpr std::array<std::array<int, 4>, 6> mappings{{
+        {8, 1, 0, 0}, {12, 2, 0, 0}, {16, 2, 0, 0},
+        {24, 4, 0, 0}, {8, 2, 8, 8}, {12, 4, 12, 6}}};
+    for (const auto mapping : mappings)
+    for (const int capacity : {8192, 65536, 262144})
+    {
+        FA2PrefillParallelGeometry geometry{
+            .batch_size = 1, .query_rows = 4096, .local_query_heads = mapping[0],
+            .head_dim = 256, .kv_capacity = capacity, .sm_count = 82,
+            .requested_axis = attention::AttentionPrefillParallelAxis::GeometrySelected,
+            .visible_kv_heads = mapping[1], .head_start = mapping[2],
+            .replicated_gqa_n_rep = mapping[3], .native_kv_format = TensorType::FP16,
+            .visibility = attention::AttentionVisibilityPolicy::CausalFullContext};
+        const auto family = selectFA2GeometrySelectedWorkspaceEnvelope(geometry);
+        size_t maximum = 0;
+        for (int rows = 1; rows <= 4096; ++rows)
+        {
+            geometry.query_rows = rows;
+            const auto member = selectFA2PrefillParallelPlan(geometry);
+            ASSERT_TRUE(member.valid);
+            maximum = std::max(maximum, member.partial_output_bytes);
+            if (rows < 512) continue;
+            ASSERT_TRUE(member.usesDeviceAdaptiveParallelism()) << rows;
+            EXPECT_EQ(member.summary_layout, FA2PrefillSummaryLayout::TensorCompactFour) << rows;
+            EXPECT_EQ(member.max_context_partitions, capacity / 256);
+            EXPECT_EQ(member.summary_capacity, 32);
+            EXPECT_EQ(member.partial_output_bytes, static_cast<size_t>(rows) * mapping[0] * 32 * 256 * sizeof(float));
+        }
+        EXPECT_EQ(family.partial_output_bytes, maximum) << mapping[0] << '/' << capacity;
+        for (const int rows : {4097, 8192, 65536, std::numeric_limits<int>::max()})
+        {
+            geometry.query_rows = rows;
+            const auto member = selectFA2PrefillParallelPlan(geometry);
+            ASSERT_TRUE(member.valid);
+            ASSERT_TRUE(member.usesDeviceAdaptiveParallelism());
+            EXPECT_EQ(member.summary_layout, FA2PrefillSummaryLayout::TensorCompactFour);
+        }
+        geometry.query_rows = 4096;
+        for (const int groups : {1, 2})
+        for (const int pv : {1, 2, 4})
+        for (const int tile : {16, 32, 64})
+        {
+            geometry.query_warp_groups_override = groups;
+            geometry.pv_warps_override = pv;
+            geometry.tile_kv_override = tile;
+            geometry.requested_axis = attention::AttentionPrefillParallelAxis::KeyValueContext;
+            const auto member = selectFA2PrefillParallelPlan(geometry);
+            ASSERT_TRUE(member.valid);
+            const bool native = groups == 2 && pv == 2 && tile == 16;
+            EXPECT_EQ(member.summary_capacity, native ? 32 : capacity / 256);
+            EXPECT_EQ(member.summary_layout == FA2PrefillSummaryLayout::TensorCompactFour, native);
+        }
+    }
+}
 
 namespace
 {
@@ -27,6 +206,8 @@ namespace
     using llaminar2::cuda::fa2_policy::FA2PrefillPhysicalMode;
     using llaminar2::cuda::fa2_policy::FA2QueryPartitionGeometry;
     using llaminar2::cuda::fa2_policy::FA2HeadMappingGeometry;
+    using llaminar2::cuda::fa2_policy::FA2TileStoragePolicy;
+    using llaminar2::cuda::fa2_policy::FA2TileStorageTraits;
     using llaminar2::cuda::fa2_policy::fa2DynamicSharedMemoryBytes;
     using llaminar2::cuda::fa2_policy::fa2QueryGridBlocks;
     using llaminar2::cuda::fa2_policy::isCompiledFA2PVWarpGeometry;
@@ -37,6 +218,8 @@ namespace
     using llaminar2::cuda::fa2_policy::maximumFA2ReducerDimensionWarps;
     using llaminar2::cuda::fa2_policy::preferredFA2QueryGridWaves;
     using llaminar2::cuda::fa2_policy::selectFA2QueryWarpGroups;
+    using llaminar2::cuda::fa2_policy::selectFA2TileStoragePolicy;
+    using llaminar2::cuda::fa2_policy::selectFA2PVWarpCount;
     using llaminar2::cuda::fa2_policy::selectFA2KVTile;
     using llaminar2::cuda::fa2_policy::selectFA2ContextPartitionSlots;
     using llaminar2::cuda::fa2_policy::selectFA2DeviceDirectPartitionLimit;
@@ -44,6 +227,147 @@ namespace
     using llaminar2::cuda::fa2_policy::selectFA2GeometrySelectedWorkspaceEnvelope;
     using llaminar2::cuda::fa2_policy::selectFA2ReducerDimensionWarps;
     using llaminar2::attention::AttentionPrefillParallelAxis;
+
+    /** @brief Own one reversible environment change without reloading global state. */
+    class ScopedPVWarpEnvironment final
+    {
+    public:
+        /** @brief Save the caller's value for restoration on every test exit. */
+        ScopedPVWarpEnvironment()
+        {
+            if (const char *value = std::getenv(kName))
+                saved_ = value;
+        }
+
+        /** @brief Restore the exact previous environment, including absence. */
+        ~ScopedPVWarpEnvironment()
+        {
+            set(saved_ ? saved_->c_str() : nullptr);
+        }
+
+        ScopedPVWarpEnvironment(const ScopedPVWarpEnvironment &) = delete;
+        ScopedPVWarpEnvironment &operator=(const ScopedPVWarpEnvironment &) = delete;
+
+        /**
+         * @brief Replace this test's override for the next local config reload.
+         * @param value Exact text, or null to test the unset default.
+         */
+        void set(const char *value)
+        {
+            if (value)
+                ASSERT_EQ(setenv(kName, value, 1), 0);
+            else
+                ASSERT_EQ(unsetenv(kName), 0);
+        }
+
+    private:
+        static constexpr const char *kName = "LLAMINAR_FA2_HD256_PV_WARPS";
+        std::optional<std::string> saved_;
+    };
+
+    /** @brief Every admitted geometry selects exactly one physical tile owner. */
+    TEST(CUDAFlashAttentionLaunchPolicy, TileStoragePolicyIsTotalAndClosed)
+    {
+        for (int width = 1; width <= 256; ++width)
+        {
+            for (int groups = 1; groups <= maximumFA2QueryWarpGroups(width); ++groups)
+            {
+                const auto selected = selectFA2TileStoragePolicy(width, groups);
+                ASSERT_TRUE(selected.has_value());
+                EXPECT_EQ(*selected, width == 256 && groups == 1
+                    ? FA2TileStoragePolicy::WarpSpecializedHalf
+                    : FA2TileStoragePolicy::CooperativeFloat);
+            }
+            EXPECT_FALSE(selectFA2TileStoragePolicy(width, -1));
+            EXPECT_FALSE(selectFA2TileStoragePolicy(width, 0));
+            EXPECT_FALSE(selectFA2TileStoragePolicy(width, maximumFA2QueryWarpGroups(width) + 1));
+        }
+        for (const int width : {-1, 0, 257, 512})
+            EXPECT_FALSE(selectFA2TileStoragePolicy(width, 1));
+    }
+
+    /** @brief Lock independently calculated physical allocations for both schedules. */
+    TEST(CUDAFlashAttentionLaunchPolicy, TileStorageOwnsExactSharedMemoryBOM)
+    {
+        using Half = FA2TileStorageTraits<FA2TileStoragePolicy::WarpSpecializedHalf>;
+        using Float = FA2TileStorageTraits<FA2TileStoragePolicy::CooperativeFloat>;
+        EXPECT_EQ(Half::producer_warps, 2);
+        EXPECT_EQ(Half::kv_stages, 2);
+        EXPECT_EQ(Half::value_element_bytes, 2u);
+        EXPECT_EQ(Float::producer_warps, 0);
+        EXPECT_EQ(Float::kv_stages, 1);
+        EXPECT_EQ(Float::value_element_bytes, 4u);
+        EXPECT_EQ(fa2DynamicSharedMemoryBytes(256, 1, 16), 43776u);
+        EXPECT_EQ(fa2DynamicSharedMemoryBytes(256, 2, 16), 45312u);
+        EXPECT_EQ(fa2DynamicSharedMemoryBytes(192, 2, 16), 35072u);
+        EXPECT_EQ(fa2DynamicSharedMemoryBytes(128, 4, 16), 36608u);
+        EXPECT_EQ(fa2DynamicSharedMemoryBytes(64, 6, 32), 43008u);
+    }
+
+    /** @brief Automatic P/V ownership remains explicit and every override is closed. */
+    TEST(CUDAFlashAttentionLaunchPolicy, AutomaticPVWarpsFollowTileOwnership)
+    {
+        EXPECT_EQ(selectFA2PVWarpCount(256, 1), 4);
+        EXPECT_EQ(selectFA2PVWarpCount(256, 2), 2);
+        EXPECT_EQ(selectFA2PVWarpCount(192, 1), 4);
+        EXPECT_EQ(selectFA2PVWarpCount(192, 2), 4);
+        EXPECT_EQ(selectFA2PVWarpCount(128, 4), 1);
+        EXPECT_EQ(selectFA2PVWarpCount(64, 6), 1);
+        for (const int width : {144, 192, 240, 256})
+        for (const int groups : {1, 2})
+        {
+            for (const int warps : {1, 2, 4})
+                EXPECT_EQ(selectFA2PVWarpCount(width, groups, warps), warps);
+            for (const int warps : {-1, 3, 8, std::numeric_limits<int>::max()})
+                EXPECT_EQ(selectFA2PVWarpCount(width, groups, warps), 0);
+        }
+        EXPECT_EQ(selectFA2PVWarpCount(256, 0), 0);
+        EXPECT_EQ(selectFA2PVWarpCount(256, 3), 0);
+        EXPECT_EQ(selectFA2PVWarpCount(0, 1), 0);
+        EXPECT_EQ(selectFA2PVWarpCount(257, 1), 0);
+    }
+
+    /** @brief Malformed text must not become the valid automatic value through atoi. */
+    TEST(CUDAFlashAttentionLaunchPolicy, PVWarpEnvironmentRejectsMalformedOverrides)
+    {
+        ScopedPVWarpEnvironment environment;
+        environment.set(nullptr);
+        llaminar2::AttentionConfig config;
+        EXPECT_EQ(config.cuda_fa2_hd256_pv_warps, 0);
+        for (const auto &[value, expected] : std::array{
+                 std::pair{"0", 0}, std::pair{"1", 1}, std::pair{"2", 2}, std::pair{"4", 4},
+                 std::pair{"", -1}, std::pair{"auto", -1}, std::pair{"garbage", -1},
+                 std::pair{"2x", -1}, std::pair{" 2", -1}, std::pair{"2 ", -1},
+                 std::pair{"02", -1}, std::pair{"-1", -1}, std::pair{"3", -1},
+                 std::pair{"8", -1}, std::pair{"2147483648", -1}})
+        {
+            SCOPED_TRACE(value);
+            environment.set(value);
+            config.reload();
+            EXPECT_EQ(config.cuda_fa2_hd256_pv_warps, expected);
+            if (expected < 0)
+                EXPECT_EQ(selectFA2PVWarpCount(256, 2, config.cuda_fa2_hd256_pv_warps), 0);
+        }
+        environment.set(nullptr);
+        config.reload();
+        EXPECT_EQ(config.cuda_fa2_hd256_pv_warps, 0);
+    }
+
+    /** @brief Long Qwen TP2 tiles share conversions while small grids keep producers. */
+    TEST(CUDAFlashAttentionLaunchPolicy, HD256GridPolicySelectsMeasuredStorage)
+    {
+        for (const int heads : {8, 12})
+        {
+            const FA2QueryPartitionGeometry small{
+                .batch_size = 1, .query_rows = 32, .local_query_heads = heads,
+                .head_dim = 256, .sm_count = 82};
+            EXPECT_EQ(selectFA2QueryWarpGroups(small), 1);
+            auto large = small;
+            large.query_rows = 512;
+            EXPECT_EQ(selectFA2QueryWarpGroups(large), 2);
+        }
+        EXPECT_EQ(preferredFA2QueryGridWaves(256), 2);
+    }
 
     /**
      * @brief One named release geometry used to make policy changes reviewable.

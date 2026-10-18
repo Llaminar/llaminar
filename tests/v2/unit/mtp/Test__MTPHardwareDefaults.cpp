@@ -109,7 +109,7 @@ TEST(MTPHardwareDefaults, SingleAndHomogeneousLocalTPUseMeasuredCardProfile)
             EXPECT_FALSE(mtp.depth_policy.demote_zero_accept_rate.has_value());
             EXPECT_FALSE(mtp.enabled);
             EXPECT_EQ(mtp.draft_tokens, 1);
-            EXPECT_EQ(mtp.depth_policy.mode, MTPDepthPolicyMode::Fixed);
+            EXPECT_EQ(mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
             EXPECT_EQ(mtp.graph_capacity_draft_tokens, 0);
         }
     }

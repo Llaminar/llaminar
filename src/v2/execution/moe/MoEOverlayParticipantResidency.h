@@ -8,6 +8,8 @@
  * carried by the packet and retain every prepared GEMM lifetime used by that
  * epoch until the residency authority retires it.  This file supplies that
  * participant-local RCU storage without owning routing or global publication.
+ * Each bank binds one immutable global layer interval; storage is compact and
+ * checked model-layer lookups prevent another pipeline stage from aliasing it.
  */
 
 #pragma once
@@ -144,13 +146,55 @@ namespace llaminar2
         int participant_id = -1;
         DeviceId device = DeviceId::invalid();
         std::vector<MoEOverlayParticipantLayerBank> layers;
+        /** First global model layer represented by the compact bank. */
+        int first_model_layer = 0;
 
-        /** @return Whether identity, geometry, masks, and engine payloads are exact. */
+        /**
+         * @param layer Global main or routed-sidecar layer identity.
+         * @return Whether that layer has a compact row in this bank.
+         */
+        [[nodiscard]] bool containsModelLayer(int layer) const noexcept
+        {
+            return first_model_layer >= 0 && layer >= first_model_layer &&
+                   static_cast<std::size_t>(layer - first_model_layer) < layers.size();
+        }
+
+        /**
+         * @brief Translate an owned model-layer identity into compact bank storage.
+         * @param layer Global main or routed-sidecar layer.
+         * @return Checked zero-based bank row.
+         * @throws std::out_of_range For a layer outside this bank's interval.
+         */
+        [[nodiscard]] std::size_t storageIndexForModelLayer(int layer) const;
+
+        /**
+         * @param layer Global model layer owned by this bank.
+         * @return Mutable pre-publication row for the requested layer.
+         * @throws std::out_of_range For a layer outside this bank's interval.
+         */
+        [[nodiscard]] MoEOverlayParticipantLayerBank &layerForModelLayer(int layer);
+
+        /**
+         * @param layer Global model layer owned by this bank.
+         * @return Immutable leased row for the requested layer.
+         * @throws std::out_of_range For a layer outside this bank's interval.
+         */
+        [[nodiscard]] const MoEOverlayParticipantLayerBank &layerForModelLayer(int layer) const;
+
+        /**
+         * @param expected_participant_id Canonical endpoint identity.
+         * @param expected_device Physical execution owner of the prepared engines.
+         * @param num_layers Exact owned layer count, excluding other PP stages.
+         * @param num_experts Routed expert count per owned layer.
+         * @param expected_first_model_layer First global layer admitted for the endpoint.
+         * @return Whether identity, interval, masks and engine payloads are exact.
+         */
         [[nodiscard]] bool valid(
             int expected_participant_id,
             DeviceId expected_device,
             int num_layers,
-            int num_experts) const noexcept;
+            int num_experts,
+            int expected_first_model_layer = 0) const noexcept;
 
         /** @return Whether two banks are the same immutable publication. */
         [[nodiscard]] bool sameIdentity(
@@ -338,6 +382,8 @@ namespace llaminar2
             bool collect_economy_service_measurements = false;
             /** Movable family fixed for this endpoint before its first epoch. */
             DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
+            /** First global model layer owned by every retained epoch. */
+            int first_model_layer = 0;
         };
 
         /**
@@ -368,6 +414,12 @@ namespace llaminar2
         {
             return config_.num_layers;
         }
+
+        /** @return First global model layer owned by this endpoint. */
+        [[nodiscard]] int firstModelLayer() const noexcept { return config_.first_model_layer; }
+
+        /** @return Exclusive end of this endpoint's validated model-layer interval. */
+        [[nodiscard]] int endModelLayer() const noexcept { return firstModelLayer() + numLayers(); }
 
         /** @return Fixed routed-expert count per layer. */
         [[nodiscard]] int numExperts() const noexcept
@@ -632,6 +684,8 @@ namespace llaminar2
              * payload arrival cannot change the endpoint's projection family.
              */
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> projection_preparation;
+            /** First global model layer owned by all endpoints in this registry. */
+            int first_model_layer = 0;
         };
 
         /**
@@ -714,6 +768,19 @@ namespace llaminar2
         [[nodiscard]] bool allInitialBanksReady() const noexcept;
 
         /**
+         * @brief Authenticate immutable prepared sources after their native readers retire.
+         * @param registry The original model-owned engine registry.
+         * @return Exact count of authenticated resident expert payloads.
+         * @throws std::logic_error for missing banks, changed masks or replaced engine identities.
+         *
+         * This checks scoped handles and projection metadata only. It performs
+         * no device operation or payload read. Callers must select the immutable
+         * transfer-directory storage contract and retire its producers first;
+         * this method cannot certify recycled physical-fabric payload bytes.
+         */
+        [[nodiscard]] std::size_t verifyImmutablePreparedSources(const ExpertGemmRegistry &registry) const;
+
+        /**
          * @brief Snapshot expert selections from every installed initial bank.
          *
          * Results are ordered by participant and then layer. The method is a
@@ -769,6 +836,14 @@ namespace llaminar2
         {
             return config_.initial_epoch;
         }
+
+        /**
+         * @return Immutable setup ownership used to authenticate initial banks.
+         * This is the initial epoch's identity, never the live device placement.
+         * Stage handoff checks it before graph construction or maintenance starts.
+         */
+        [[nodiscard]] const MoEExpertOwnerMap &initialOwnerMap() const noexcept
+        { return config_.owner_map; }
 
     private:
         /**

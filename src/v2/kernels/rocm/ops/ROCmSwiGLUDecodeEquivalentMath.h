@@ -77,9 +77,9 @@ __device__ __forceinline__ int32_t quantizeQ8FromScale(
 /**
  * @brief Quantize one SwiGLU value with serial M=1 Q8 rounding semantics.
  *
- * Serial decode rounds the scaled FP32 value to an integer first and clamps
- * that integer second. Keeping this order shared avoids a fused grouped kernel
- * silently adopting a float-clamp-before-round expression.
+ * Serial decode rounds the scaled FP32 value to an integral value first, then
+ * saturates that rounded value before converting to integer storage. This
+ * retains RNE-before-saturation without an out-of-range float-to-int cast.
  *
  * @param value FP32 activation value to quantize.
  * @param inverse_scale Reciprocal of the block's canonical Q8 scale.
@@ -89,13 +89,12 @@ __device__ __forceinline__ int32_t quantizeQ8(
     float value,
     float inverse_scale)
 {
-    int32_t quantized =
-        static_cast<int32_t>(rintf(value * inverse_scale));
-    if (quantized < -127)
-        quantized = -127;
-    if (quantized > 127)
-        quantized = 127;
-    return quantized;
+    // Preserve rounded-multiply/RNE order, then bound the rounded float before
+    // integer conversion. Finite values can exceed INT32 under explicit Q8
+    // half-range saturation; converting before saturation is not defined.
+    const float rounded = rintf(value * inverse_scale);
+    const float bounded = fminf(127.0f, fmaxf(-127.0f, rounded));
+    return static_cast<int32_t>(bounded);
 }
 
 } // namespace llaminar2::rocm::decode_equivalent

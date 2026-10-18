@@ -1666,14 +1666,13 @@ namespace llaminar2
         const auto bank =
             params_.overlay_participant_residency->acquire(
                 durable_parent_epoch);
-        if (!bank ||
-            static_cast<size_t>(params_.layer_idx) >= bank->layers.size())
+        if (!bank || !bank->containsModelLayer(params_.layer_idx))
         {
             throw std::runtime_error(
                 "CPU LLEP packed clone cannot acquire its durable parent bank");
         }
         const auto &layer =
-            bank->layers[static_cast<size_t>(params_.layer_idx)];
+            bank->layerForModelLayer(params_.layer_idx);
         const size_t expert_index = static_cast<size_t>(expert_id);
         if (!layer.valid(params_.num_experts) ||
             !layer.resident_mask[expert_index] ||
@@ -2693,16 +2692,14 @@ namespace llaminar2
                 execution_residency_bank->participant_id !=
                     params_.runtime_participant_index ||
                 execution_residency_bank->device != params_.device_id ||
-                static_cast<size_t>(params_.layer_idx) >=
-                    execution_residency_bank->layers.size())
+                !execution_residency_bank->containsModelLayer(params_.layer_idx))
             {
                 LOG_ERROR("[MoELocalExpertStage] Sparse packet references absent or retired residency epoch "
                           << input.residency_epoch);
                 return false;
             }
             execution_layer_bank =
-                &execution_residency_bank->layers[
-                    static_cast<size_t>(params_.layer_idx)];
+                &execution_residency_bank->layerForModelLayer(params_.layer_idx);
             /*
              * prepareReadyBank() validates every layer, mask bit, and expert
              * triplet before installReadyBank() publishes the prebuilt node.

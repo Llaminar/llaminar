@@ -46,7 +46,8 @@ namespace llaminar2
 
             RoutedExpertDomain domain;
             domain.name = kImplicitDomainName;
-            domain.scope = ExecutionDomainScope::RANK_LOCAL;
+            domain.scope = request.local_tp_participants.size() == 1u
+                ? ExecutionDomainScope::SINGLE : ExecutionDomainScope::RANK_LOCAL;
             domain.backend = request.local_tp_backend;
             domain.participants = request.local_tp_participants;
             domain.weights = request.local_tp_weights;
@@ -117,6 +118,24 @@ namespace llaminar2
             frozen->authority_execution = required;
             return frozen;
         }
+
+        /**
+         * @brief Reject a physical policy that cannot represent this owner epoch.
+         * @param request Exact local participant and compute declaration.
+         * @throws std::invalid_argument for unsupported compute or workshare geometry.
+         */
+        void requireImplicitPolicy(const MoEExpertOverlayAuthorityPlanRequest &request)
+        {
+            if (request.routed_compute_policy != RoutedExpertComputePolicy::Automatic &&
+                request.routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
+                request.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+                throw std::invalid_argument(
+                    "Implicit ExpertOverlay authority requires routed_compute=auto, apportioned or gate-up-owned-down-columns; "
+                    "replicated and tensor-sharded residency need a typed multi-owner epoch representation");
+            if (!request.local_tp_weights.empty() &&
+                request.local_tp_weights.size() != request.local_tp_participants.size())
+                throw std::invalid_argument("Implicit ExpertOverlay LocalTP weights must match its participant count");
+        }
     } // namespace
 
     MoEExpertOverlayAuthorityPlanResult
@@ -167,23 +186,7 @@ namespace llaminar2
                 "one explicit ExpertOverlay domain plan so execution cannot "
                 "fall through to the retired legacy residency authority");
         }
-        if (request.routed_compute_policy != RoutedExpertComputePolicy::Automatic &&
-            request.routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
-            request.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns)
-        {
-            throw std::invalid_argument(
-                "Implicit ExpertOverlay authority requires "
-                "routed_compute=auto, apportioned or gate-up-owned-down-columns; replicated and tensor-sharded "
-                "residency need a typed multi-owner epoch representation");
-        }
-        if (!request.local_tp_weights.empty() &&
-            request.local_tp_weights.size() !=
-                request.local_tp_participants.size())
-        {
-            throw std::invalid_argument(
-                "Implicit ExpertOverlay LocalTP weights must match its "
-                "participant count");
-        }
+        requireImplicitPolicy(request);
 
         auto plan = buildImplicitLocalTPPlan(request);
         validateMoERoutedExpertPlacementPlanOrThrow(*plan);
@@ -193,6 +196,23 @@ namespace llaminar2
                 MoEExpertOverlayAuthorityPlanDisposition::
                     SynthesizedLocalTP,
         };
+    }
+
+    std::shared_ptr<MoERoutedExpertPlacementPlan>
+    normalizeMoEExpertOverlayPipelineStagePlan(
+        const MoEExpertOverlayAuthorityPlanRequest &request,
+        const FactoryPPStageConfig &scope)
+    {
+        if (!scope.isValid() || (scope.has_embedding && scope.first_layer != 0) ||
+            !request.model_has_routed_experts || request.world_rank < 0 ||
+            request.local_tp_participants.empty() || request.requested_plan ||
+            request.has_pipeline_parallel || request.has_cross_rank_tensor_parallel)
+            throw std::invalid_argument("ExpertOverlay pipeline synthesis requires one projected stage without inherited parent authority");
+        requireImplicitPolicy(request);
+        auto plan = buildImplicitLocalTPPlan(request);
+        plan->first_model_layer = scope.first_layer;
+        validateMoERoutedExpertPlacementPlanOrThrow(*plan);
+        return plan;
     }
 
 } // namespace llaminar2

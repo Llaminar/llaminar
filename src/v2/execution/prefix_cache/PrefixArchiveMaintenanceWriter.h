@@ -8,9 +8,10 @@
  * native write implementation, including an OverlayFS backing file. There is
  * no submitted-range queue, join lifecycle, extra thread or payload allocation.
  *
- * Only the existing maintenance worker uses this writer. Inference keeps using
- * the old immutable inode while copying proceeds. The final file fsync, exact
- * committed-frontier check, rename and directory fsync still own publication.
+ * Only the archive maintenance worker uses this writer, for journal metadata.
+ * Payloads live in separate immutable inodes and are never read by compaction.
+ * The final metadata tail, file fsync, rename and directory fsync own publication;
+ * payload eviction does not depend on this worker catching a moving frontier.
  */
 #pragma once
 

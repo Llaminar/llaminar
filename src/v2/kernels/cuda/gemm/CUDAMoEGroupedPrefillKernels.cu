@@ -15,6 +15,9 @@
  * scheduling cannot alter a result byte. There are no atomics, allocations,
  * transfers, default streams, host-authored replay metadata, or synchronization
  * calls in this path.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 
 #include "CUDAMoEGroupedPrefillKernels.h"
@@ -100,6 +103,7 @@ namespace
     constexpr uint32_t kSupportedCodebookMask =
         (uint32_t{1} << 0) |
         (uint32_t{1} << 4) |
+        (uint32_t{1} << llaminar2::kNativeVnniIQ4XSSourceScaleCodebook) |
         (uint32_t{1} << 5) |
         (uint32_t{1} << 6) |
         (uint32_t{1} << 7) |
@@ -231,9 +235,29 @@ namespace
         return desc.payload && desc.scales &&
                desc.n == N && desc.k == K &&
                desc.blocks_per_row == static_cast<uint32_t>(K / kQuantBlock) &&
-               desc.codebook_id == CodebookId &&
-               (!(Traits::is_asymmetric || Traits::is_dual_scale) || desc.mins) &&
+               llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
+               (!Traits::requires_secondary_metadata ||
+                (Traits::is_iq4_source_scale && desc.codebook_id == 4) || desc.mins) &&
                (!Traits::is_dual_scale_asym || desc.emins);
+    }
+
+    /**
+     * @brief Validate an IQ4 peer operand while the exact gate id owns dispatch.
+     * @tparam CodebookId Physical gate format of this specialization.
+     * @param desc Operand whose physical metadata remains authoritative.
+     * @param N Output columns.
+     * @param K Input columns.
+     * @return True only for the declared format or its explicit IQ4 LUT peer.
+     */
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ bool pairedDescriptorMatches(
+        const llaminar2::DeviceNativeVNNIMatrixDesc &desc, int N, int K)
+    {
+        if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut)
+            return desc.codebook_id == 4 ? descriptorMatches<4>(desc, N, K)
+                : desc.codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook &&
+                  descriptorMatches<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(desc, N, K);
+        return descriptorMatches<CodebookId>(desc, N, K);
     }
 
     /**
@@ -242,6 +266,7 @@ namespace
      * MMA changes only how the exact integer terms are obtained. Activation
      * sums, scale/minimum metadata, IQ1 delta terms, and every FP32 rounding
      * boundary remain identical to serial DP4A decode.
+     * @param physical_codebook Actual operand identity within the IQ4 payload family.
      */
     template <uint8_t CodebookId>
     __device__ __forceinline__ float contributionFromMma(
@@ -253,10 +278,19 @@ namespace
         const uint16_t *mins,
         const uint32_t *emins,
         size_t linear,
-        float activation_scale)
+        float activation_scale,
+        uint8_t physical_codebook = CodebookId)
     {
         using Traits =
             llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>;
+        if constexpr (Traits::is_iq4_lut)
+        {
+            const float scale = physical_codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
+                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(scales[linear], mins[linear])
+                : llaminar2::cuda_native_vnni::fp16_bits_to_float(scales[linear]);
+            return llaminar2::device_native_vnni_contract::singleScaleBlock(
+                dot_lo, scale, activation_scale);
+        }
         const uint16_t secondary_bits =
             mins ? mins[linear] : uint16_t{0};
         const uint32_t emin_bits =
@@ -301,12 +335,14 @@ namespace
     }
 
     /**
-     * @brief Publish an ordinary dual-scale MMA dot from staged raw FP16 bits.
+     * @brief Publish a dual-scale MMA dot from staged raw metadata words.
      *
-     * IQ2_S uses independent scales for the low and high sixteen-value halves
-     * but has no minimum or IQ1 correction term. The paired gate/up kernel can
-     * therefore stage the two raw scale words once per output column and reuse
-     * them for all sixteen rows. This helper deliberately enters the same
+     * IQ2_S stages its original half base and raw scale-nibble byte; Q6_K
+     * stages its half base and signed coefficient pair. Both reconstruct their
+     * independent sixteen-value scales in the shared contribution resolver.
+     * Other ordinary dual-scale formats stage two derived half words. The
+     * paired gate/up kernel reuses those exact metadata words across sixteen
+     * rows, and this helper enters the same
      * canonical contribution function as the generic path; shared-memory
      * placement changes where metadata is loaded, never its arithmetic.
      *
@@ -314,8 +350,8 @@ namespace
      * @param dot_lo Exact low-half integer dot product from IMMA.
      * @param dot_hi Exact high-half integer dot product from IMMA.
      * @param activation_scale Exact FP32 activation scale for this row/block.
-     * @param packed_scales Low-scale bits in bits 0--15 and high-scale bits in
-     *        bits 16--31.
+     * @param packed_scales Primary metadata in bits 0--15 and secondary
+     *        metadata in bits16--31; original source factors are never half-converted.
      * @return Canonically rounded FP32 contribution for this quant block.
      */
     template <uint8_t CodebookId>
@@ -349,37 +385,47 @@ namespace
     }
 
     /**
-     * @brief Publish a symmetric MMA dot from one staged raw FP16 scale.
+     * @brief Publish a symmetric MMA dot from staged original metadata words.
      *
-     * Symmetric codebooks have no correction metadata, so a scale loaded once
-     * per output column can be shared by all sixteen row owners. The call still
+     * One32-bit shared slot holds the raw primary word and, for tuple24, the
+     * raw source coefficient. IQ4_NL retains only its original half scale.
+     * Metadata loaded once per column is shared by all sixteen row owners. The call still
      * enters the canonical NativeVNNI FP32 publication contract and therefore
      * preserves every serial-row rounding boundary.
      *
      * @tparam CodebookId NativeVNNI symmetric codebook identifier.
      * @param dot Exact integer dot product from IMMA.
      * @param activation_scale Exact FP32 activation scale for this row/block.
-     * @param scale_bits Raw FP16 weight-scale bits.
+     * @param scale_bits Primary word in low16, raw coefficient in high16 for24.
+     * @param physical_codebook Actual descriptor identity;4 never reads a coefficient.
      * @return Canonically rounded FP32 contribution for this quant block.
      */
     template <uint8_t CodebookId>
     __device__ __forceinline__ float contributionFromStagedSymmetricMma(
         int32_t dot,
         float activation_scale,
-        uint16_t scale_bits)
+        uint32_t scale_bits, uint8_t physical_codebook)
     {
         using Traits =
             llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>;
         static_assert(!Traits::is_asymmetric);
         static_assert(!Traits::is_dual_scale);
         static_assert(!Traits::is_iq1_m);
+        if constexpr (Traits::is_iq4_lut)
+        {
+            const float scale = physical_codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
+                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(
+                      static_cast<uint16_t>(scale_bits), static_cast<uint16_t>(scale_bits >> 16))
+                : llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(scale_bits));
+            return llaminar2::device_native_vnni_contract::singleScaleBlock(dot, scale, activation_scale);
+        }
         return llaminar2::cuda_native_vnni::
             native_vnni_block_contribution_from_reduced_terms_rn<CodebookId>(
                 dot,
                 /*dot_hi=*/0,
                 activation_scale,
-                scale_bits,
-                /*secondary_bits=*/0,
+                static_cast<uint16_t>(scale_bits),
+                /*secondary_bits=*/static_cast<uint16_t>(scale_bits >> 16),
                 /*emin_bits=*/0,
                 /*activation_sum=*/0,
                 /*activation_sum_lo=*/0,
@@ -548,7 +594,7 @@ namespace
                 shared_warp_weights + local_column * kQuantBlock +
                 lookup * sizeof(uint64_t)) = signed_grid;
         }
-        else if constexpr (CodebookId == 4)
+        else if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut)
         {
             const int local_column = lane >> 2;
             const int group = lane & 3;
@@ -737,7 +783,7 @@ namespace
         }
 
         const auto descriptor = descriptors[expert];
-        if (descriptor.codebook_id != CodebookId)
+        if (!llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(descriptor.codebook_id))
             return;
         if (!descriptorMatches<CodebookId>(descriptor, N, K) ||
             k_partitions <= 0)
@@ -755,7 +801,7 @@ namespace
             kColumnsPerWarp;
 
         constexpr bool kStageIQ4Metadata =
-            CodebookId == 4 && ColumnsPerBlock == 32;
+            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut && ColumnsPerBlock == 32;
         constexpr int kScaleColumns =
             Geometry::projection_warps * kColumnsPerWarp;
         constexpr int kOperandBytes =
@@ -839,6 +885,9 @@ namespace
                             const size_t linear =
                                 static_cast<size_t>(block) * N + column;
                             scale_bits = weight_scales[linear];
+                            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_source_scale)
+                                if (descriptor.codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
+                                    scale_bits |= uint32_t{weight_mins[linear]} << 16;
                         }
                         shared_weight_scales[
                             warp * kColumnsPerWarp + lane] = scale_bits;
@@ -895,8 +944,7 @@ namespace
                             contributionFromStagedSymmetricMma<CodebookId>(
                                 dot_lo[element],
                                 activation_scale,
-                                static_cast<uint16_t>(
-                                    shared_weight_scales[scale_index])));
+                                shared_weight_scales[scale_index], descriptor.codebook_id));
                     }
                     else
                     {
@@ -915,7 +963,7 @@ namespace
                                 weight_mins,
                                 weight_emins,
                                 linear,
-                                activation_scale));
+                                activation_scale, descriptor.codebook_id));
                     }
                 }
                 __syncthreads();
@@ -1019,11 +1067,11 @@ namespace
         }
 
         /*
-         * Gate/up table upload rejects unlike codebooks for one expert. Testing
-         * the gate id therefore gives every thread the same specialization
+         * Gate/up table upload permits only equal or explicit IQ4 peers. Testing
+         * the exact gate id gives every thread the same specialization
          * decision and makes the early exit safe before any CTA barrier.
          */
-        if (gate_descriptors[expert].codebook_id != CodebookId)
+        if (!llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(gate_descriptors[expert].codebook_id))
             return;
 
         const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -1038,8 +1086,7 @@ namespace
         const auto descriptor = is_up_projection
                                     ? up_descriptors[expert]
                                     : gate_descriptors[expert];
-        if (!descriptorMatches<CodebookId>(descriptor, N, K) ||
-            descriptor.codebook_id != CodebookId || k_partitions <= 0)
+        if (!pairedDescriptorMatches<CodebookId>(descriptor, N, K) || k_partitions <= 0)
         {
             failFastInvalidGroupedImmaState();
             return;
@@ -1171,7 +1218,7 @@ namespace
                         weight_mins,
                         weight_emins,
                         linear,
-                        activation_scale);
+                        activation_scale, descriptor.codebook_id);
                     partial[element] = __fadd_rn(
                         partial[element],
                         contribution);
@@ -1245,11 +1292,15 @@ namespace
                                           swigluValue(gate, up)
                                     : 0.0f;
 
-            float abs_value = fabsf(value);
+            float abs_value =
+
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+
+                    value, 0.0f);
 #pragma unroll
             for (int mask = 16; mask > 0; mask >>= 1)
             {
-                abs_value = fmaxf(
+                abs_value = llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
                     abs_value,
                     __shfl_xor_sync(0xffffffffu, abs_value, mask));
             }
@@ -1335,13 +1386,13 @@ namespace
             failFastInvalidGroupedImmaState();
             return;
         }
-        if (gate_descriptors[expert].codebook_id != CodebookId)
+        if (!llaminar2::cuda_native_vnni::native_vnni_descriptor_codebook_matches<CodebookId>(gate_descriptors[expert].codebook_id))
             return;
 
         const auto &gate_descriptor = gate_descriptors[expert];
         const auto &up_descriptor = up_descriptors[expert];
         if (!descriptorMatches<CodebookId>(gate_descriptor, N, K) ||
-            !descriptorMatches<CodebookId>(up_descriptor, N, K) ||
+            !pairedDescriptorMatches<CodebookId>(up_descriptor, N, K) ||
             k_partitions <= 0)
         {
             failFastInvalidGroupedImmaState();
@@ -1639,7 +1690,7 @@ namespace
                                 gate_mins,
                                 gate_emins,
                                 linear,
-                                activation_scale));
+                                activation_scale, gate_descriptor.codebook_id));
                         up_partial[element] = __fadd_rn(
                             up_partial[element],
                             contributionFromMma<CodebookId>(
@@ -1651,7 +1702,7 @@ namespace
                                 up_mins,
                                 up_emins,
                                 linear,
-                                activation_scale));
+                                activation_scale, up_descriptor.codebook_id));
                     }
                 }
                 __syncthreads();
@@ -1710,11 +1761,13 @@ namespace
             const float value = quant_column_active
                                     ? shared_values[fragment_index]
                                     : 0.0f;
-            float abs_value = fabsf(value);
+            float abs_value =
+                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+                    value, 0.0f);
 #pragma unroll
             for (int mask = 16; mask > 0; mask >>= 1)
             {
-                abs_value = fmaxf(
+                abs_value = llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
                     abs_value,
                     __shfl_xor_sync(0xffffffffu, abs_value, mask));
             }
@@ -1957,6 +2010,7 @@ namespace
 
         LAUNCH_CODEBOOK(0);
         LAUNCH_CODEBOOK(4);
+        LAUNCH_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
         LAUNCH_CODEBOOK(5);
         LAUNCH_CODEBOOK(6);
         LAUNCH_CODEBOOK(7);
@@ -2019,6 +2073,7 @@ namespace
 
         LAUNCH_GATE_UP_CODEBOOK(0);
         LAUNCH_GATE_UP_CODEBOOK(4);
+        LAUNCH_GATE_UP_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
         LAUNCH_GATE_UP_CODEBOOK(5);
         LAUNCH_GATE_UP_CODEBOOK(6);
         LAUNCH_GATE_UP_CODEBOOK(7);
@@ -2082,6 +2137,7 @@ namespace
 
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(0);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(4);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(5);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(6);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(7);
@@ -2160,6 +2216,7 @@ extern "C" bool cudaMoEGroupedImma_project(
     int device_idx,
     void *stream)
 {
+    codebook_mask = llaminar2::cuda_native_vnni::native_vnni_iq4_launch_mask(codebook_mask);
     if (!d_A_int8 || !d_scales_A || !d_desc_table ||
         !d_group_counts || !d_group_offsets || !d_directory || !d_output ||
         !stream || directory_entries <= 0 || num_experts <= 0 ||
@@ -2229,6 +2286,7 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     int device_idx,
     void *stream)
 {
+    codebook_mask = llaminar2::cuda_native_vnni::native_vnni_iq4_launch_mask(codebook_mask);
     if (!d_A_int8 || !d_scales_A || !d_gate_desc_table ||
         !d_up_desc_table || !d_group_counts || !d_group_offsets ||
         !d_directory || !d_swiglu_int8 || !d_swiglu_scales || !stream ||
@@ -2442,6 +2500,7 @@ namespace
         {
             QUERY_CODEBOOK(0);
             QUERY_CODEBOOK(4);
+            QUERY_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
             QUERY_CODEBOOK(5);
             QUERY_CODEBOOK(6);
             QUERY_CODEBOOK(7);
@@ -2492,6 +2551,7 @@ namespace
         {
             QUERY_GATE_UP_CODEBOOK(0);
             QUERY_GATE_UP_CODEBOOK(4);
+            QUERY_GATE_UP_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
             QUERY_GATE_UP_CODEBOOK(5);
             QUERY_GATE_UP_CODEBOOK(6);
             QUERY_GATE_UP_CODEBOOK(7);

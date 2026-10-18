@@ -5,7 +5,7 @@
  * Tests verify:
  * 1. PreparedWeightStore owns embedding handles and can release them
  * 2. FP32/FP16/BF16 tensors and nested slices reject packed preparation
- * 3. Q8_0 and Q4_0 tensors get proper EmbedQ8 repack + handle metadata
+ * 3. Q8_0 and Q4_0 tensors get proper native source copy + handle metadata
  * 4. Prepared refs and tensor lookups resolve existing handles without creating entries
  * 5. Different bindings get separate embedding entries
  * 6. Null tensor input throws
@@ -13,6 +13,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #include <algorithm>
 #include <array>
@@ -25,7 +26,7 @@
 #include "backends/ComputeBackend.h"
 #include "execution/compute_stages/stages/EmbeddingStage.h"
 #include "kernels/KernelFactory.h"
-#include "kernels/common/EmbedQ8Repack.h"
+#include "kernels/common/NativeEmbeddingLayout.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
 #include "loaders/PreparedWeightStore.h"
 #include "planning/PhysicalMemoryAuthority.h"
@@ -153,13 +154,13 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, NestedSlicesPreserveEveryFormatC
         {
             SCOPED_TRACE(nesting);
             EXPECT_EQ(IINT8Unpackable::fromTensor(tensor.get()) != nullptr,
-                      format.prepared_embed_q8);
-            if (!format.prepared_embed_q8)
+                      format.prepared_native_quantized);
+            if (!format.prepared_native_quantized)
             {
                 for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
                 {
                     // Validation is device-free: no GPU is initialized. It
-                    // must not demand an EmbedQ8 handle for native storage.
+                    // must not demand an native quantized handle for native storage.
                     EmbeddingStage::Params params;
                     params.device_id = device;
                     params.embed_table = tensor.get();
@@ -168,8 +169,7 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, NestedSlicesPreserveEveryFormatC
                     EXPECT_TRUE(stage.validatePreparedWeights(&error)) << error;
                 }
                 EXPECT_EQ(KernelFactory::prepareEmbeddingHandleLocal(
-                              tensor.get(), 256, DeviceId::cpu()), nullptr);
-                EXPECT_THROW(repackEmbeddingToQ8(tensor.get(), 256), std::runtime_error);
+                              tensor.get(), 256, DeviceId::cpu(), nullptr), nullptr);
                 if (const auto *slice = dynamic_cast<const TensorSlice *>(tensor.get()))
                 {
                     std::array<int8_t, 32> output;
@@ -182,8 +182,8 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, NestedSlicesPreserveEveryFormatC
             }
             else
             {
-                auto packed = repackEmbeddingToQ8(tensor.get(), 256);
-                EXPECT_GT(packed.data.size(), 0u);
+                const auto layout = NativeEmbeddingLayout::forSource(tensor->native_type(), tensor->rows(), 256);
+                EXPECT_EQ(layout.byte_size, tensor->size_bytes());
             }
             tensor = std::make_unique<TensorSlice>(std::move(tensor), SliceMetadata{});
         }
@@ -207,19 +207,18 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, Q8_0TensorGetsPreparation)
     EXPECT_EQ(handle->device_id, DeviceId::cpu());
     ASSERT_NE(handle->weights, nullptr);
     EXPECT_NE(handle->weights->device_data, nullptr);
-    EXPECT_GT(handle->weights->byte_size, 0u);
+    EXPECT_GT(handle->weights->layout.byte_size, 0u);
     EXPECT_EQ(handle->weights->vocab_size, kVocabSize);
     EXPECT_EQ(handle->weights->d_model, kDModelInt);
-    EXPECT_GT(handle->weights->blocks_per_row, 0u);
+    EXPECT_GT(handle->weights->layout.blocks_per_row, 0u);
 }
 
 TEST_F(
     Test__PreparedEmbeddingWeightsLifecycle,
     AdditionalEmbeddingClaimsAndReleasesItsExactOwnerLine)
 {
-    const size_t bytes = PreparedEmbeddingWeights::allocationBytes(
-        kVocabSize,
-        kDModelInt);
+    const size_t bytes = NativeEmbeddingLayout::forSource(
+        TensorType::Q8_0, kVocabSize, kDModelInt).byte_size;
     PhysicalMemoryBOMBuilder bom({
         .world_rank = 0,
         .device = DeviceId::cpu(),
@@ -295,13 +294,14 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, HandleMetadataCorrect)
     ASSERT_NE(handle->weights, nullptr);
 
     const size_t expected_blocks_per_row = (kDModel + 31) / 32;
-    EXPECT_EQ(handle->weights->blocks_per_row, expected_blocks_per_row);
+    EXPECT_EQ(handle->weights->layout.blocks_per_row, expected_blocks_per_row);
 
-    const size_t expected_byte_size = kVocabSize * expected_blocks_per_row * 36;
-    EXPECT_EQ(handle->weights->byte_size, expected_byte_size);
+    const size_t expected_byte_size = kVocabSize * expected_blocks_per_row * sizeof(Q8_0Block);
+    EXPECT_EQ(handle->weights->layout.byte_size, expected_byte_size);
 }
 
-TEST_F(Test__PreparedEmbeddingWeightsLifecycle, EmbeddingUploadIsCorrectWhenStagingBudgetForcesChunks)
+/** @test CPU source copies preserve bytes independently of the GPU setup cap. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, CPUEmbeddingSourceBytesIgnoreGPUStagingPolicy)
 {
     struct ConfigRestore
     {
@@ -312,9 +312,9 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, EmbeddingUploadIsCorrectWhenStag
               mutableDebugEnv().rocm.repack_budget_mb};
 
     mutableDebugEnv().rocm.repack_budget_mb = 1;
-    constexpr size_t large_vocab = 16384;
+    constexpr size_t large_vocab = 65536;
     auto tensor = TestTensorFactory::createQ4_0Random({large_vocab, kDModel});
-    auto expected = repackEmbeddingToQ8(tensor.get(), kDModelInt);
+    const size_t expected_bytes = tensor->size_bytes();
 
     PreparedWeightStore store(kModelId);
     auto ref = prepareEmbedding(store, 1, tensor.get());
@@ -323,10 +323,10 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, EmbeddingUploadIsCorrectWhenStag
     ASSERT_NE(handle, nullptr);
     ASSERT_NE(handle->weights, nullptr);
     ASSERT_NE(handle->weights->device_data, nullptr);
-    ASSERT_GT(expected.byte_size, 1024u * 1024u);
-    ASSERT_EQ(handle->weights->byte_size, expected.byte_size);
+    ASSERT_GT(expected_bytes, 1024u * 1024u);
+    ASSERT_EQ(handle->weights->layout.byte_size, expected_bytes);
     EXPECT_EQ(std::memcmp(handle->weights->device_data,
-                          expected.data.data(), expected.byte_size),
+                          tensor->raw_data(), expected_bytes),
               0);
 }
 
@@ -417,11 +417,11 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, NullTensorThrows)
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, MoveConstructorTransfersOwnership)
 {
     PreparedEmbeddingWeights src;
-    src.device_data = malloc(256);
-    src.byte_size = 256;
-    src.blocks_per_row = 2;
+    src.device_data = malloc(4 * 2 * sizeof(Q8_0Block));
+    src.layout = NativeEmbeddingLayout::forSource(TensorType::Q8_0, 4, 64);
     src.vocab_size = 4;
-    src.d_model = 32;
+    src.d_model = 64;
+    src.total_vocab = 4;
     src.device_id = DeviceId::cpu();
 
     void *original_ptr = src.device_data;
@@ -429,20 +429,23 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, MoveConstructorTransfersOwnershi
     PreparedEmbeddingWeights dst(std::move(src));
 
     EXPECT_EQ(dst.device_data, original_ptr);
-    EXPECT_EQ(dst.byte_size, 256u);
-    EXPECT_EQ(dst.blocks_per_row, 2u);
+    EXPECT_EQ(dst.layout.byte_size, 4u * 2u * sizeof(Q8_0Block));
+    EXPECT_EQ(dst.layout.blocks_per_row, 2u);
     EXPECT_EQ(dst.vocab_size, 4u);
-    EXPECT_EQ(dst.d_model, 32);
+    EXPECT_EQ(dst.d_model, 64);
 
     EXPECT_EQ(src.device_data, nullptr);
-    EXPECT_EQ(src.byte_size, 0u);
+    EXPECT_EQ(src.layout.byte_size, 0u);
 }
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, MoveAssignmentTransfersOwnership)
 {
     PreparedEmbeddingWeights src;
-    src.device_data = malloc(128);
-    src.byte_size = 128;
+    src.device_data = malloc(4 * sizeof(Q8_0Block));
+    src.layout = NativeEmbeddingLayout::forSource(TensorType::Q8_0, 4, 32);
+    src.vocab_size = 4;
+    src.total_vocab = 4;
+    src.d_model = 32;
     src.device_id = DeviceId::cpu();
 
     void *original_ptr = src.device_data;
@@ -451,9 +454,9 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, MoveAssignmentTransfersOwnership
     dst = std::move(src);
 
     EXPECT_EQ(dst.device_data, original_ptr);
-    EXPECT_EQ(dst.byte_size, 128u);
+    EXPECT_EQ(dst.layout.byte_size, 4u * sizeof(Q8_0Block));
     EXPECT_EQ(src.device_data, nullptr);
-    EXPECT_EQ(src.byte_size, 0u);
+    EXPECT_EQ(src.layout.byte_size, 0u);
 }
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, DestructorSafeOnNullData)
@@ -462,4 +465,43 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, DestructorSafeOnNullData)
         PreparedEmbeddingWeights w;
     }
     SUCCEED();
+}
+
+/** @test Every prepared codebook keeps original payload and original scale bytes. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, AllNativePreparedBytesPreserveOriginalSourceMetadata)
+{
+    for (const auto &format : quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        auto source = format.create({7, 256}, 139);
+        PreparedWeightStore store(kModelId);
+        const auto binding = makeEmbeddingBinding(71, source.get());
+        const auto ref = store.prepareEmbedding(binding, 256);
+        const auto *handle = store.embeddingHandle(ref);
+        ASSERT_NE(handle, nullptr);
+        ASSERT_NE(handle->weights, nullptr);
+        EXPECT_EQ(handle->weights->layout,
+            NativeEmbeddingLayout::forSource(format.tensor_type, 7, 256));
+        ASSERT_EQ(handle->weights->layout.byte_size, source->size_bytes());
+        EXPECT_EQ(std::memcmp(handle->weights->device_data, source->raw_data(), source->size_bytes()), 0);
+    }
+}
+
+/** @test Native GPU upload rejects an absent/foreign/unbound source before backend lookup. */
+TEST(PreparedEmbeddingUploadContract, RejectsMissingUnboundAndWrongDeviceBeforeAllocation)
+{
+    auto tensor = TestTensorFactory::createQ4_0Random({67, 256}, 193701);
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        EXPECT_THROW(KernelFactory::prepareEmbeddingHandleLocal(
+            tensor.get(), 256, device, nullptr), std::invalid_argument);
+        auto unbound = TransferEngine::instance().declarePinnedHostBuffer(4096, device);
+        EXPECT_THROW(KernelFactory::prepareEmbeddingHandleLocal(
+            tensor.get(), 256, device, unbound.get()), std::invalid_argument);
+        const DeviceId foreign(device.type, 1);
+        auto wrong_device = TransferEngine::instance().declarePinnedHostBuffer(4096, foreign);
+        EXPECT_THROW(KernelFactory::prepareEmbeddingHandleLocal(
+            tensor.get(), 256, device, wrong_device.get()), std::invalid_argument);
+    }
 }

@@ -10,6 +10,10 @@
  * Qwen3.5-122B expert geometry, and retains exact CSV and binary checkpoints.
  * The companion Python driver joins those process-isolated artifacts without
  * introducing a numerical tolerance.
+ * Q6_K coefficient words are emitted as raw uint16 metadata, never labelled
+ * as floating half scales. Other source formats retain their existing types.
+ * IQ2_S coefficient bytes and IQ4_XS six-bit source coefficients also publish
+ * as raw uint16 metadata, with all unused high bits zero.
  */
 
 #include "backends/BackendManager.h"
@@ -298,7 +302,7 @@ namespace llaminar2::test
                     << ',' << static_cast<unsigned int>(
                            descriptor.source_is_superblock)
                     << ',' << source_format.payload_bytes << ','
-                    << (source_format.is_asymmetric ? 1 : 0) << ','
+                    << (canonicalDeviceVnniFormat(source_format).is_asymmetric ? 1 : 0) << ','
                     << (source_format.has_emins ? 1 : 0) << '\n';
             }
 
@@ -421,7 +425,10 @@ namespace llaminar2::test
         }
 
         /**
-         * @brief Emit compact live regions for one prepared matrix.
+         * @brief Emit compact live regions with codebook-correct metadata types.
+         *
+         * Q6_K secondary words contain two signed source coefficients, not
+         * FP16 values. Preserve their raw uint16 representation in evidence.
          * @param writer Evidence owner receiving exact device bytes.
          * @param matrix Production-prepared matrix to observe.
          * @param source_format Canonical source-format storage contract.
@@ -451,7 +458,9 @@ namespace llaminar2::test
             {
                 writer.emitDeviceBlob(
                     prefix + ".mins.bin", matrix.descriptor.mins,
-                    sizes.mins_bytes, "fp16_bits");
+                    sizes.mins_bytes,
+                    (source_format.codebook_id == 8 || source_format.codebook_id == 11 || source_format.codebook_id == 13 ||
+                     (source_format.codebook_id == 4 && source_format.is_superblock)) ? "u16" : "fp16_bits");
             }
             if (sizes.emins_bytes != 0u)
             {

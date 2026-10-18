@@ -2561,3 +2561,98 @@ TEST(Test__MoERebalanceController, DynamicMasksReflectLayerSpecificOwners)
         }
     }
 }
+
+/** @brief The IQ4_XS tuple is a 20-byte block and requires stable auxiliary capacity.
+ * No tensor/device payload is executed. Inert arrays establish valid borrowed
+ * addresses while the production pure descriptor contract selects capacities.
+ */
+TEST(DeviceMoETransferFormats, IQ4XSSourceTupleRetainsSecondaryCapacityAndIdentity)
+{
+    std::array<uint8_t, 32> payload{}, destination_payload{};
+    std::array<uint16_t, 2> primary{0x3c01u, 0x8001u}, coefficient{35u, 63u};
+    std::array<uint16_t, 2> destination_primary{}, destination_coefficient{};
+    DeviceNativeVNNIMatrixDesc source{};
+    source.payload = payload.data(); source.scales = primary.data(); source.mins = coefficient.data();
+    source.n = 2; source.k = 32; source.blocks_per_row = 1;
+    source.codebook_id = 24; source.source_codebook_id = 4;
+    source.source_is_superblock = 1; source.source_identity_present = 1;
+    uint8_t width = 0, auxiliary = 0, emins = 0;
+    ASSERT_TRUE(deviceMoEProjectionFormat(source, width, auxiliary, emins));
+    EXPECT_EQ(width, 16); EXPECT_EQ(auxiliary, 1); EXPECT_EQ(emins, 0);
+    EXPECT_EQ(unsigned(width) + 2u + unsigned(auxiliary) * 2u, 20u);
+    ASSERT_TRUE(deviceMoEProjectionAllocationCapacity(source, width, auxiliary, emins));
+    EXPECT_EQ(width, 16); EXPECT_EQ(auxiliary, 1); EXPECT_EQ(emins, 0);
+
+    DeviceNativeVNNIMatrixDesc destination = source;
+    destination.payload = destination_payload.data(); destination.scales = destination_primary.data();
+    destination.mins = destination_coefficient.data(); destination.codebook_id = 4;
+    destination.source_is_superblock = 0;
+    destination.allocation_payload_bytes_per_block = 16;
+    destination.allocation_has_mins = 0;
+    EXPECT_FALSE(deviceMoEMatrixFitsTransferCapacity(source, destination));
+    destination.allocation_has_mins = 1;
+    EXPECT_TRUE(deviceMoEMatrixFitsTransferCapacity(source, destination));
+    deviceMoERetargetTransferMatrixFormat(destination, source);
+    EXPECT_EQ(destination.codebook_id, 24); EXPECT_EQ(destination.source_codebook_id, 4);
+    EXPECT_EQ(destination.source_is_superblock, 1); EXPECT_EQ(destination.source_identity_present, 1);
+    EXPECT_EQ(destination.arithmeticPolicyCodebookId(), 4);
+    EXPECT_EQ(destination.payload, destination_payload.data());
+    EXPECT_EQ(destination.scales, destination_primary.data());
+    EXPECT_EQ(destination.mins, destination_coefficient.data());
+    EXPECT_EQ(destination.allocation_has_mins, 1);
+
+    // IQ4_NL retains its old plane-free physical 4 layout and source policy 4.
+    source.codebook_id = 4; source.source_is_superblock = 0; source.mins = nullptr;
+    ASSERT_TRUE(deviceMoEProjectionFormat(source, width, auxiliary, emins));
+    EXPECT_EQ(width, 16); EXPECT_EQ(auxiliary, 0); EXPECT_EQ(emins, 0);
+    source.codebook_id = 25;
+    EXPECT_FALSE(deviceMoEProjectionFormat(source, width, auxiliary, emins));
+}
+
+/**
+ * @brief IQ3_S transfers retain original base and raw source-nibble planes.
+ *
+ * Independently fixed physical extents prevent a missing metadata flag from
+ * making both the capacity admission and its expected result omit live bytes.
+ * Retargeting changes only identity; destination addresses and capacity survive.
+ */
+TEST(DeviceMoETransferFormats, IQ3SSourceTupleRetainsSecondaryCapacityAndIdentity)
+{
+    std::array<uint8_t, 26> payload{}, destination_payload{};
+    std::array<uint16_t, 2> primary{0x3c01u, 0x8001u}, coefficient{0u, 15u};
+    std::array<uint16_t, 2> destination_primary{}, destination_coefficient{};
+    DeviceNativeVNNIMatrixDesc source{};
+    source.payload = payload.data(); source.scales = primary.data(); source.mins = coefficient.data();
+    source.n = 2; source.k = 32; source.blocks_per_row = 1;
+    source.codebook_id = 11; source.source_codebook_id = 11;
+    source.source_is_superblock = 1; source.source_identity_present = 1;
+    uint8_t width = 0, secondary = 0, emins = 0;
+    ASSERT_TRUE(deviceMoEProjectionFormat(source, width, secondary, emins));
+    EXPECT_EQ(width, 13); EXPECT_EQ(secondary, 1); EXPECT_EQ(emins, 0);
+    EXPECT_EQ(unsigned(width) + 2u + unsigned(secondary) * 2u, 17u);
+    ASSERT_TRUE(deviceMoEProjectionAllocationCapacity(source, width, secondary, emins));
+    EXPECT_EQ(width, 13); EXPECT_EQ(secondary, 1); EXPECT_EQ(emins, 0);
+    DeviceMoEExpertDirectoryEntry entry{};
+    EXPECT_EQ(deviceMoEMatrixPayloadBytes(source, entry), 26u);
+    EXPECT_EQ(deviceMoEMatrixScalesBytes(source), 4u);
+    EXPECT_EQ(deviceMoEMatrixMinsBytes(source, entry), 4u);
+    EXPECT_EQ(deviceMoEMatrixEminsBytes(source, entry), 0u);
+
+    DeviceNativeVNNIMatrixDesc destination = source;
+    destination.payload = destination_payload.data(); destination.scales = destination_primary.data();
+    destination.mins = destination_coefficient.data(); destination.codebook_id = 12;
+    destination.source_codebook_id = 12;
+    destination.allocation_payload_bytes_per_block = 13;
+    destination.allocation_has_mins = 0;
+    EXPECT_FALSE(deviceMoEMatrixFitsTransferCapacity(source, destination));
+    destination.allocation_has_mins = 1;
+    EXPECT_TRUE(deviceMoEMatrixFitsTransferCapacity(source, destination));
+    deviceMoERetargetTransferMatrixFormat(destination, source);
+    EXPECT_EQ(destination.codebook_id, 11); EXPECT_EQ(destination.source_codebook_id, 11);
+    EXPECT_EQ(destination.source_is_superblock, 1); EXPECT_EQ(destination.source_identity_present, 1);
+    EXPECT_EQ(destination.payload, destination_payload.data());
+    EXPECT_EQ(destination.scales, destination_primary.data());
+    EXPECT_EQ(destination.mins, destination_coefficient.data());
+    EXPECT_EQ(destination.allocation_payload_bytes_per_block, 13);
+    EXPECT_EQ(destination.allocation_has_mins, 1);
+}

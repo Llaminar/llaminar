@@ -40,8 +40,8 @@ namespace llaminar2
 
         // Output arrays (pre-allocated by packNativeVNNI)
         uint8_t *payload_array; ///< [blocks_per_row × N × payload_bytes]
-        uint16_t *scales_array; ///< [blocks_per_row × N]
-        uint16_t *mins_array;   ///< [blocks_per_row × N] (nullptr for symmetric)
+        uint16_t *scales_array; ///< [blocks_per_row × N] FP16 factor/base.
+        uint16_t *mins_array;   ///< Same extent: FP16 minimum/scale or Q6_K/IQ2_S raw coefficients.
         uint32_t *emins_array;  ///< [blocks_per_row × N] (nullptr except Q2_K)
 
         /// First source K block represented in these destination arrays.

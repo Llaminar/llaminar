@@ -311,8 +311,8 @@ TEST(ServerExecutionEvidence, PolicyUsesAdmittedDefaultsWithoutCLIFlags)
 TEST(ServerExecutionEvidence, PhysicalParticipantsAreNotVisibilityOrRankCounts)
 {
     RankInventory first{.rank = 0, .node_id = 0};
-    first.gpus = {{.type = DeviceType::CUDA, .local_device_id = 2, .uuid = "cuda-physical"},
-                  {.type = DeviceType::ROCm, .local_device_id = 3, .uuid = "rocm-physical"}};
+    first.gpus = {{.type = DeviceType::CUDA, .local_device_id = 2, .uuid = "cuda-physical", .pci_bus_address = "0001:41:03.2"},
+                  {.type = DeviceType::ROCm, .local_device_id = 3, .uuid = "rocm-physical", .pci_bus_address = "0002:84:1f.7"}};
     auto second = first;
     second.rank = 1;
     second.gpus[0].local_device_id = 0;

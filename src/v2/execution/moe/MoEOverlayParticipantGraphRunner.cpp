@@ -789,8 +789,8 @@ namespace llaminar2
         main_spec.row_capacity = config_.max_graph_activation_rows;
         main_spec.source_layers.reserve(
             static_cast<size_t>(main_layer_count_));
-        for (int layer = 0; layer < main_layer_count_; ++layer)
-            main_spec.source_layers.push_back(layer);
+        for (int row = 0; row < main_layer_count_; ++row)
+            main_spec.source_layers.push_back(transaction_graph_family_.first_model_layer + row);
         {
             ScopedWeightLoadDetailTimer timer(
                 "overlay.graph.build_main_family");
@@ -1280,6 +1280,10 @@ namespace llaminar2
         const auto &configured_participants =
             configured_owner_map.participants();
         const bool same_topology =
+            snapshot->placement_plan->first_model_layer ==
+                config_.placement_plan->first_model_layer &&
+            snapshot->placement_plan->placementLayerCapacity() ==
+                config_.placement_plan->placementLayerCapacity() &&
             published_participants.size() == configured_participants.size() &&
             std::equal(
                 published_participants.begin(),
@@ -1389,7 +1393,9 @@ namespace llaminar2
                 config_.max_graph_activation_rows,
                 config_.max_decode_activation_rows,
                 config_.max_request_count,
-                config_.max_mtp_draft_depth);
+                config_.max_mtp_draft_depth).forRoutedLayerInterval(
+                    config_.placement_plan->first_model_layer,
+                    config_.placement_plan->placementLayerCapacity());
         main_layer_count_ = transaction_graph_family_.main_layer_count;
         mtp_source_layers_ = transaction_graph_family_.mtp_source_layers;
         routed_layer_capacity_ =
@@ -1769,6 +1775,7 @@ namespace llaminar2
             const auto &layout = config_.device_controller_fabric->layout();
             const auto &header = layout.header;
             if (!layout.valid() ||
+                header.first_model_layer != transaction_graph_family_.first_model_layer ||
                 header.num_layers !=
                     static_cast<std::uint32_t>(runtime_layer_count) ||
                 header.num_experts !=
@@ -1957,6 +1964,7 @@ namespace llaminar2
                                 runtime->route_scratch,
                             .overlay_epoch_arena = runtime->epoch_arena,
                             .overlay_epoch_ticket_slot = 0u,
+                            .first_model_layer = transaction_graph_family_.first_model_layer,
                         });
                 });
             if (!runtime->route_scratch || !runtime->epoch_arena ||
@@ -3067,16 +3075,9 @@ namespace llaminar2
                             }
                         }
 
-                        if (layer < 0 ||
-                            static_cast<std::size_t>(layer) >=
-                                gpu_runtime->initialized_layers.size())
-                        {
-                            throw std::out_of_range(
-                                "Mapped follower source layer is outside its topology-wide runtime table");
-                        }
                         auto &initialized =
-                            gpu_runtime->initialized_layers[
-                                static_cast<std::size_t>(layer)];
+                            gpu_runtime->initialized_layers.at(
+                                gpu_runtime->runtime_table->storageIndexForModelLayer(layer));
                         if (initialized == 0u)
                         {
                                     MoEPlacementUpdate update;
@@ -6413,14 +6414,14 @@ namespace llaminar2
             MoEOverlayDeviceControllerRuntimeBinding binding{
                 .device = runtime.device,
                 .runtime_layers_device =
-                    runtime.runtime_table->deviceLayerState(0),
+                    runtime.runtime_table->deviceLayerState(runtime.runtime_table->firstModelLayer()),
                 .runtime_table_host = runtime.runtime_table.get(),
                 .service_telemetry_device =
                     runtime.runtime_table
                         ->deviceOverlayServiceTelemetry(),
                 .service_samples_device =
                     runtime.runtime_table
-                        ->deviceOverlayServiceTelemetrySample(0),
+                        ->deviceOverlayServiceTelemetrySample(runtime.runtime_table->firstModelLayer()),
                 .overlay_participant_id = runtime.participant_id,
                 .domain_participant_id =
                     runtime.domain_participant_id,
@@ -6444,6 +6445,7 @@ namespace llaminar2
                     ParticipantGpuRuntime *>(&runtime),
                 .initial_runtime_publisher = const_cast<
                     ParticipantGpuRuntime *>(&runtime),
+                .first_model_layer = runtime.runtime_table->firstModelLayer(),
             };
             if (!binding.backgroundPublicationValid() ||
                 !binding.initialRuntimePublicationValid())

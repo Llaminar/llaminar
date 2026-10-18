@@ -5,12 +5,17 @@
  * This explicit HIP suite mirrors the CUDA matrix. It additionally exercises
  * the BF16 stream-binding path that was previously absent from the ROCm adapter
  * and requires all operands to remain device-owned.
+ *
+ * The focused FP32 tail case additionally checks independent exact sums, every
+ * mod4 remainder, unused-capacity guards and changing-input reuse. GPU builds
+ * retain real grouped, aligned-M1 and in-place graphs; CPU runs actual 1/2 teams.
  */
 
 #include <gtest/gtest.h>
 
 #include "kernels/rocm/ops/ROCmResidualAddKernelT.h"
 #include "utils/GpuResidualAddGroupedVerifierHarness.h"
+#include "utils/GpuResidualAddTailHarness.h"
 
 #include <hip/hip_runtime.h>
 
@@ -88,4 +93,15 @@ TEST(Test__ROCmResidualAddGroupedVerifier, AllNativeFormatsMatchSerialDecodeByte
         static_cast<void *>(stream.get()),
         "ROCm",
         "rocm_residual_add_grouped_verifier_rows_calls");
+}
+
+/** @test Every normal-FP32 vector/tail value survives changed captured replays. */
+TEST(Test__ROCmResidualAddGroupedVerifier, FP32TailExtentsMatchIndependentCapturedAdd)
+{
+    int device_count = 0;
+    if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0)
+        GTEST_SKIP() << "No ROCm device available";
+    llaminar2::test::residual_tail::runGPU<
+        llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32>>(
+            DeviceId::rocm(0));
 }

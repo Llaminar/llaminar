@@ -18,6 +18,9 @@
  * retain their event-poll obligation until advanceBackground returns Idle.
  * Request admission observes the one-shot economy activation atomically; an
  * active request never joins the background candidate-scoring mutex.
+ * Each authority owns one exact global layer interval. Plans and movement
+ * records keep global identities; price, forecast and hysteresis arrays store
+ * only that interval's compact rows, rejecting evidence from another stage.
  */
 
 #include "MoEOverlayResidencyAuthority.h"
@@ -349,7 +352,7 @@ namespace llaminar2
             ParticipantRebalancePlan result{
                 .ownership = base_owner_map.layeredOwnership(
                     window.numLayers(),
-                    window.numExperts()),
+                    window.numExperts(), window.firstModelLayer()),
             };
             if (!policy.enabled)
                 return result;
@@ -712,6 +715,7 @@ namespace llaminar2
                 if (participants == 0 ||
                     participants > std::numeric_limits<std::uint32_t>::max() ||
                     topology.layerCount() != static_cast<std::size_t>(observed.numLayers()) ||
+                    topology.firstModelLayer() != observed.firstModelLayer() ||
                     rows.size() != participants * topology.layerCount())
                     throw std::logic_error(
                         "ExpertOverlay observed service objective has invalid certified geometry");
@@ -750,7 +754,7 @@ namespace llaminar2
                     if (!topology_.requiresServiceEvidence(layer, phase)) continue;
                     for (std::size_t participant = 0; participant < prices_.size(); ++participant)
                         prices_[participant] = rows_[
-                            participant * topology_.layerCount() + static_cast<std::size_t>(layer)]
+                            participant * topology_.layerCount() + storageIndexForModelLayer(layer)]
                             ->nanoseconds_per_activation[phase];
                     auto &transactions = result.transactions_[phase];
                     transactions.reserve(prepared.transactions[phase].size());
@@ -804,7 +808,7 @@ namespace llaminar2
                 {
                     for (std::size_t participant = 0; participant < prices_.size(); ++participant)
                         prices_[participant] = rows_[
-                            participant * topology_.layerCount() + static_cast<std::size_t>(layer)]
+                            participant * topology_.layerCount() + storageIndexForModelLayer(layer)]
                             ->nanoseconds_per_activation[phase];
                     for (const auto &[batch, occurrences] : prepared.transactions[phase])
                     {
@@ -856,6 +860,20 @@ namespace llaminar2
             }
 
         private:
+            /**
+             * @brief Translate an owned global identity into the certified price row.
+             * @param layer Model-global routed layer, never an allocation index.
+             * @return Compact row shared by observation and price topology.
+             * @throws std::out_of_range If another stage's identity is supplied.
+             */
+            std::size_t storageIndexForModelLayer(int layer) const
+            {
+                if (layer < observed_.firstModelLayer() ||
+                    layer - observed_.firstModelLayer() >= observed_.numLayers())
+                    throw std::out_of_range("ExpertOverlay service layer is outside its stage");
+                return static_cast<std::size_t>(layer - observed_.firstModelLayer());
+            }
+
             /** @brief Phase-pure equivalent invocations and exact multiplicities. */
             struct PreparedLayer
             {
@@ -1237,6 +1255,7 @@ namespace llaminar2
             {
                 if (!observed || !observed->valid() || !policy.valid() ||
                     observed->num_layers != counts_.num_layers ||
+                    observed->first_model_layer != counts_.first_model_layer ||
                     observed->num_experts != counts_.num_experts ||
                     observed->generation < observed_->generation)
                     throw std::invalid_argument("ExpertOverlay forecast received invalid or regressing demand");
@@ -1415,13 +1434,14 @@ namespace llaminar2
         int layer_idx,
         int expert_id) const
     {
-        if (layer_idx < 0 || layer_idx >= num_layers || expert_id < 0 ||
+        if (!histogram_window || !histogram_window->containsModelLayer(layer_idx) ||
+            histogram_window->num_layers != num_layers || expert_id < 0 ||
             expert_id >= num_experts)
         {
             throw std::out_of_range(
                 "ExpertOverlay authoritative plan coordinate is out of range");
         }
-        return static_cast<size_t>(layer_idx) *
+        return static_cast<size_t>(layer_idx - firstModelLayer()) *
                    static_cast<size_t>(num_experts) +
                static_cast<size_t>(expert_id);
     }
@@ -1521,7 +1541,10 @@ namespace llaminar2
     {
         if (!previous || !candidate || !previous->valid() ||
             !candidate->valid() || expected_epoch != previous->epoch ||
-            candidate->epoch != expected_epoch + 1)
+            candidate->epoch != expected_epoch + 1 ||
+            previous->layered_ownership.firstModelLayer() != candidate->layered_ownership.firstModelLayer() ||
+            previous->layered_ownership.layerCount() != candidate->layered_ownership.layerCount() ||
+            previous->layered_ownership.expertCount() != candidate->layered_ownership.expertCount())
         {
             return false;
         }
@@ -1561,7 +1584,10 @@ namespace llaminar2
         }
         if (histogram_window &&
             (!histogram_window->valid() ||
-             histogram_window->generation != histogram_generation))
+             histogram_window->generation != histogram_generation ||
+             histogram_window->first_model_layer != previous->layered_ownership.firstModelLayer() ||
+             histogram_window->num_layers != previous->layered_ownership.layerCount() ||
+             histogram_window->num_experts != previous->layered_ownership.expertCount()))
         {
             return false;
         }
@@ -1625,13 +1651,13 @@ namespace llaminar2
             }
             if (histogram_window)
             {
-                if (migration.layer_idx >= histogram_window->num_layers ||
+                if (!histogram_window->containsModelLayer(migration.layer_idx) ||
                     migration.expert_id >= histogram_window->num_experts)
                 {
                     return false;
                 }
                 const size_t histogram_index =
-                    static_cast<size_t>(migration.layer_idx) *
+                    static_cast<size_t>(migration.layer_idx - histogram_window->first_model_layer) *
                         static_cast<size_t>(histogram_window->num_experts) +
                     static_cast<size_t>(migration.expert_id);
                 if (migration.activation_count !=
@@ -1811,6 +1837,7 @@ namespace llaminar2
      */
     struct MoEOverlayResidencyAuthority::EconomyState
     {
+        int first_model_layer = 0;
         int num_layers = 0;
         int num_experts = 0;
         int tier_count = 0;
@@ -1823,7 +1850,26 @@ namespace llaminar2
         std::optional<PlacementDemandForecast> forecast;
         std::vector<uint64_t> last_moved_generation;
 
-        /** @brief Return one prevalidated directed endpoint/layer cost row. */
+        /**
+         * @brief Authenticate a global layer before indexing stage-local evidence.
+         * @param layer Global model identity retained by physical movement records.
+         * @return Compact price and hysteresis row.
+         * @throws std::out_of_range For a layer outside the admitted stage.
+         */
+        std::size_t storageIndexForModelLayer(int layer) const
+        {
+            if (layer < first_model_layer || layer - first_model_layer >= num_layers)
+                throw std::out_of_range("ExpertOverlay economy layer is outside its stage");
+            return static_cast<std::size_t>(layer - first_model_layer);
+        }
+
+        /**
+         * @param source_participant Certified source endpoint ID.
+         * @param destination_participant Distinct certified destination ID.
+         * @param layer Owned global model layer.
+         * @return Prevalidated directed endpoint/layer cost row.
+         * @throws std::out_of_range If the coordinate exceeds admitted storage.
+         */
         const MoEOverlayParticipantLayerMigrationCost &migrationCost(
             int source_participant,
             int destination_participant,
@@ -1835,13 +1881,20 @@ namespace llaminar2
                 (static_cast<std::size_t>(source_participant) * participants +
                  static_cast<std::size_t>(destination_participant)) *
                     static_cast<std::size_t>(num_layers) +
-                static_cast<std::size_t>(layer));
+                storageIndexForModelLayer(layer));
         }
 
-        /** @brief Flatten one layer/expert hysteresis coordinate. */
+        /**
+         * @param layer Owned global model layer.
+         * @param expert Logical routed expert ID.
+         * @return Compact hysteresis index, independent of the stage origin.
+         * @throws std::out_of_range If either coordinate is outside the stage.
+         */
         std::size_t expertOffset(int layer, int expert) const
         {
-            return static_cast<std::size_t>(layer) *
+            if (expert < 0 || expert >= num_experts)
+                throw std::out_of_range("ExpertOverlay economy expert is out of range");
+            return storageIndexForModelLayer(layer) *
                        static_cast<std::size_t>(num_experts) +
                    static_cast<std::size_t>(expert);
         }
@@ -1888,6 +1941,7 @@ namespace llaminar2
              */
             DecodeExpertHistogramWindow validation_window;
             validation_window.generation = 0;
+            validation_window.first_model_layer = config.model_metadata.first_model_layer;
             validation_window.num_layers = config.model_metadata.num_layers;
             validation_window.num_experts = config.model_metadata.num_experts;
             const std::size_t entries = checkedSizeProduct(
@@ -1929,6 +1983,7 @@ namespace llaminar2
         }
 
         auto state = std::make_unique<EconomyState>();
+        state->first_model_layer = config.model_metadata.first_model_layer;
         state->num_layers = config.model_metadata.num_layers;
         state->num_experts = config.model_metadata.num_experts;
         state->tier_count = static_cast<int>(
@@ -1936,6 +1991,7 @@ namespace llaminar2
         state->participant_count = static_cast<int>(
             initial_snapshot.owner_map.participants().size());
         if (!service_profile.production_topology.valid() ||
+            service_profile.production_topology.firstModelLayer() != state->first_model_layer ||
             service_profile.production_topology.layerCount() !=
                 static_cast<std::size_t>(state->num_layers))
         {
@@ -1972,7 +2028,7 @@ namespace llaminar2
         {
             if (row.tier_index < 0 ||
                 row.tier_index >= state->tier_count ||
-                row.layer < 0 || row.layer >= state->num_layers)
+                !config.model_metadata.containsModelLayer(row.layer))
             {
                 throw std::invalid_argument(
                     "ExpertOverlay service profile row is outside live residency geometry");
@@ -1980,7 +2036,7 @@ namespace llaminar2
             const std::size_t offset =
                 static_cast<std::size_t>(row.tier_index) *
                     static_cast<std::size_t>(state->num_layers) +
-                static_cast<std::size_t>(row.layer);
+                state->storageIndexForModelLayer(row.layer);
             if (service_rows_seen[offset])
             {
                 throw std::invalid_argument(
@@ -2008,7 +2064,7 @@ namespace llaminar2
         {
             if (row.participant_id < 0 ||
                 row.participant_id >= state->participant_count ||
-                row.layer < 0 || row.layer >= state->num_layers)
+                !config.model_metadata.containsModelLayer(row.layer))
             {
                 throw std::invalid_argument(
                     "ExpertOverlay participant service profile row is outside live residency geometry");
@@ -2016,7 +2072,7 @@ namespace llaminar2
             const std::size_t offset =
                 static_cast<std::size_t>(row.participant_id) *
                     static_cast<std::size_t>(state->num_layers) +
-                static_cast<std::size_t>(row.layer);
+                state->storageIndexForModelLayer(row.layer);
             if (state->participant_service_cost_rows[offset])
             {
                 throw std::invalid_argument(
@@ -2080,7 +2136,7 @@ namespace llaminar2
                 row.destination_participant < 0 ||
                 row.destination_participant >= state->participant_count ||
                 row.source_participant == row.destination_participant ||
-                row.layer < 0 || row.layer >= state->num_layers ||
+                !config.model_metadata.containsModelLayer(row.layer) ||
                 row.transfer_and_repack_ns == 0)
             {
                 throw std::invalid_argument(
@@ -2091,7 +2147,7 @@ namespace llaminar2
                      participants +
                  static_cast<std::size_t>(row.destination_participant)) *
                     static_cast<std::size_t>(state->num_layers) +
-                static_cast<std::size_t>(row.layer);
+                state->storageIndexForModelLayer(row.layer);
             if (state->migration_cost_rows[offset])
             {
                 throw std::invalid_argument(
@@ -2185,6 +2241,14 @@ namespace llaminar2
           initial_histogram_window_tokens_(
               config_.histogram ? config_.histogram->windowSize() : 0)
     {
+        if (config_.model_metadata.first_model_layer < 0 ||
+            config_.model_metadata.num_layers <= 0 ||
+            config_.model_metadata.num_experts <= 0 ||
+            config_.model_metadata.num_layers > std::numeric_limits<int>::max() -
+                config_.model_metadata.first_model_layer ||
+            config_.initial_plan.first_model_layer != config_.model_metadata.first_model_layer)
+            throw std::invalid_argument(
+                "ExpertOverlay initial plan must match a valid owned model-layer interval");
         if (!config_.initial_plan.usesExpertOverlayAuthority())
         {
             throw std::invalid_argument(
@@ -2197,6 +2261,10 @@ namespace llaminar2
         }
         if (config_.histogram)
         {
+            if (config_.histogram->firstModelLayer() != config_.model_metadata.first_model_layer ||
+                config_.histogram->config().num_layers != config_.model_metadata.num_layers ||
+                config_.histogram->config().num_experts != config_.model_metadata.num_experts)
+                throw std::invalid_argument("ExpertOverlay histogram must match its owned stage geometry");
             const int initial_window = config_.histogram->windowSize();
             if (!std::isfinite(
                     config_.histogram_window_growth_factor) ||
@@ -2249,7 +2317,8 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "ExpertOverlay economy layer catalog requires Dynamic maintenance");
             }
-            if (config_.economy_layer_catalog->layerCount() !=
+            if (config_.economy_layer_catalog->firstModelLayer() != config_.model_metadata.first_model_layer ||
+                config_.economy_layer_catalog->layerCount() !=
                 static_cast<std::size_t>(
                     config_.model_metadata.num_layers))
             {
@@ -2996,6 +3065,7 @@ namespace llaminar2
                 config_.histogram->freezeAndRotateWindow());
         if (!window->valid() ||
             window->num_layers != config_.model_metadata.num_layers ||
+            window->first_model_layer != config_.model_metadata.first_model_layer ||
             window->num_experts != config_.model_metadata.num_experts)
         {
             /* The completed drain has no resumable work once its bank has
@@ -3366,6 +3436,7 @@ namespace llaminar2
                 config_.histogram->freezeAndRotateWindow());
         if (!window->valid() ||
             window->num_layers != config_.model_metadata.num_layers ||
+            window->first_model_layer != config_.model_metadata.first_model_layer ||
             window->num_experts != config_.model_metadata.num_experts)
         {
             throw std::runtime_error(
@@ -3392,6 +3463,7 @@ namespace llaminar2
         }
         if (!window || !window->valid() ||
             window->num_layers != config_.model_metadata.num_layers ||
+            window->first_model_layer != config_.model_metadata.first_model_layer ||
             window->num_experts != config_.model_metadata.num_experts)
         {
             throw std::invalid_argument(
@@ -6129,7 +6201,10 @@ namespace llaminar2
         if (!transaction.valid() ||
             transaction.purpose !=
                 MoEOverlayResidencyTransactionPurpose::PlacementChange ||
-            !transaction.histogram_window)
+            !transaction.histogram_window ||
+            transaction.histogram_window->first_model_layer != config_.model_metadata.first_model_layer ||
+            transaction.histogram_window->num_layers != config_.model_metadata.num_layers ||
+            transaction.histogram_window->num_experts != config_.model_metadata.num_experts)
         {
             throw std::invalid_argument(
                 "Only a valid live ExpertOverlay placement transaction can be published as an authoritative plan");
@@ -6168,8 +6243,9 @@ namespace llaminar2
         }
 
         size_t changed_entries = 0;
-        for (int layer_idx = 0; layer_idx < plan.num_layers; ++layer_idx)
+        for (int row = 0; row < plan.num_layers; ++row)
         {
+            const int layer_idx = plan.firstModelLayer() + row;
             const auto placement = std::find_if(
                 transaction.candidate->placement_plan->placements.begin(),
                 transaction.candidate->placement_plan->placements.end(),
@@ -6260,6 +6336,7 @@ namespace llaminar2
         }
         if (!plan.valid() ||
             plan.num_layers != config_.model_metadata.num_layers ||
+            plan.firstModelLayer() != config_.model_metadata.first_model_layer ||
             plan.num_experts != config_.model_metadata.num_experts)
         {
             throw std::invalid_argument(
@@ -6280,8 +6357,9 @@ namespace llaminar2
             *previous->placement_plan;
         MoELayeredExpertOwnership candidate_ownership =
             previous->layered_ownership;
-        for (int layer_idx = 0; layer_idx < plan.num_layers; ++layer_idx)
+        for (int row = 0; row < plan.num_layers; ++row)
         {
+            const int layer_idx = plan.firstModelLayer() + row;
             const auto placement = std::find_if(
                 candidate_plan.placements.begin(),
                 candidate_plan.placements.end(),
@@ -6324,8 +6402,9 @@ namespace llaminar2
         transaction.previous = previous;
         transaction.candidate = std::move(candidate);
 
-        for (int layer_idx = 0; layer_idx < plan.num_layers; ++layer_idx)
+        for (int row = 0; row < plan.num_layers; ++row)
         {
+            const int layer_idx = plan.firstModelLayer() + row;
             for (int expert_id = 0; expert_id < plan.num_experts; ++expert_id)
             {
                 const auto &entry =
@@ -7081,6 +7160,8 @@ namespace llaminar2
     {
         if (epoch == 0)
             throw std::invalid_argument("MoE overlay residency epoch must be positive");
+        if (plan.first_model_layer != metadata.first_model_layer)
+            throw std::invalid_argument("MoE overlay snapshot plan belongs to another pipeline stage");
         const MoERoutedExpertPlacementValidationOptions validation_options{
             .layer_count = metadata.num_layers,
             .routed_expert_count = metadata.num_experts,
@@ -7117,7 +7198,7 @@ namespace llaminar2
                                                        *mutable_plan));
         auto layered = owner_map.layeredOwnership(
             metadata.num_layers,
-            metadata.num_experts);
+            metadata.num_experts, metadata.first_model_layer);
 
         auto snapshot = std::make_shared<MoEOverlayResidencySnapshot>();
         snapshot->epoch = epoch;
@@ -7144,8 +7225,7 @@ namespace llaminar2
                 change.previous_participant < 0 ||
                 change.current_participant < 0 ||
                 change.previous_participant == change.current_participant ||
-                change.layer_idx >=
-                    candidate.layered_ownership.layerCount() ||
+                !candidate.layered_ownership.containsModelLayer(change.layer_idx) ||
                 change.expert_id >=
                     candidate.layered_ownership.expertCount() ||
                 change.current_participant >=

@@ -20,6 +20,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../utils/GDNAdditiveEpsilonFixture.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -231,8 +232,8 @@ namespace
                 q_norm_sq += q[i] * q[i];
                 k_norm_sq += k[i] * k[i];
             }
-            float inv_q = scale / std::max(std::sqrt(q_norm_sq), l2_eps);
-            float inv_k = 1.0f / std::max(std::sqrt(k_norm_sq), l2_eps);
+            float inv_q = scale / std::sqrt(q_norm_sq + l2_eps);
+            float inv_k = 1.0f / std::sqrt(k_norm_sq + l2_eps);
             for (int i = 0; i < d_k; ++i)
             {
                 q_proc[i] = q[i] * inv_q;
@@ -2638,6 +2639,7 @@ TEST(Test__GDNMathematicalCorrectness, AttentionOutputGate_PreciseReference)
     params.gate = gate.get();
     params.output = output.get();
     params.seq_len = 1;
+    params.feature_dim = n;
 
     auto ctx = makeCPUContext();
     AttentionOutputGateStage stage(params);
@@ -2660,4 +2662,33 @@ TEST(Test__GDNMathematicalCorrectness, AttentionOutputGate_PreciseReference)
     }
     EXPECT_LT(max_rel_err, 0.005f)
         << "Max relative sigmoid error should be < 0.5%";
+}
+
+/** @test Independent near-zero closed form rejects norm clamping on every CPU ISA. */
+TEST(Test__GDNMathematicalCorrectness, Recurrence_AdditiveEpsilonNearZero)
+{
+    for (int dk : {64, 128})
+    {
+        for (int rows : {1, 3, 9})
+        {
+            SCOPED_TRACE("dk=" + std::to_string(dk) + " rows=" + std::to_string(rows));
+            llaminar2::test::GDNAdditiveEpsilonFixture f(rows, dk);
+            CPUGatedDeltaNet chunk, serial;
+            auto chunk_state = f.zero_state, serial_state = f.zero_state;
+            std::vector<float> chunk_output(rows * f.heads * f.dv), serial_output(chunk_output.size());
+            ASSERT_TRUE(chunk.chunk_forward(f.q.data(), f.k.data(), f.v.data(),
+                f.alpha.data(), f.beta.data(), f.a_log.data(), f.dt_bias.data(),
+                chunk_output.data(), chunk_state.data(), rows, f.heads, dk, f.dv, 64, true));
+            for (int row = 0; row < rows; ++row)
+            {
+                ASSERT_TRUE(serial.recurrent_step(f.q.data() + row * f.heads * dk,
+                    f.k.data() + row * f.heads * dk, f.v.data() + row * f.heads * f.dv,
+                    f.alpha.data() + row * f.heads, f.beta.data() + row * f.heads,
+                    f.a_log.data(), f.dt_bias.data(), serial_output.data() + row * f.heads * f.dv,
+                    serial_state.data(), f.heads, dk, f.dv, true));
+            }
+            f.expect(chunk_output, chunk_state);
+            f.expect(serial_output, serial_state);
+        }
+    }
 }

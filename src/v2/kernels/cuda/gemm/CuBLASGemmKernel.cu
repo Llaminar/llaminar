@@ -6,6 +6,9 @@
  * Library creation/destruction therefore belongs exclusively to device-context
  * initialization/retirement. Each host call locks handle configuration through
  * submission and binds its own arena workspace after selecting its exact stream.
+ * Explicit operand policy never inherits the shared handle's fast math mode:
+ * FP32 uses pedantic compute; FP16 A/B retain FP32 C and disallow reduced
+ * reduction precision. Scoped handle math is restored while its lock is held.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -24,6 +27,7 @@
 #include <array>
 #include <cstdlib>
 #include <vector>
+#include <exception>
 
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
@@ -68,6 +72,44 @@ namespace llaminar2
                 return cublasSetWorkspace(handle, buffer, kBiasMatmulWorkspaceBytes) ==
                        CUBLAS_STATUS_SUCCESS;
             }
+
+            /**
+             * @brief Restore operation-local math before releasing the shared handle lock.
+             *
+             * @param handle Context-owned handle whose submission lock the caller holds.
+             * @param mode Exact arithmetic mode for this operation.
+             * @param enabled Native calls retain their existing configuration unchanged.
+             * @throws std::runtime_error A math-mode query/publication fails.
+             */
+            class ScopedBlasMathMode final
+            {
+            public:
+                ScopedBlasMathMode(cublasHandle_t handle, cublasMath_t mode, bool enabled)
+                    : handle_(handle), active_(enabled)
+                {
+                    cublasAtomicsMode_t atomics = CUBLAS_ATOMICS_NOT_ALLOWED;
+                    cublasPointerMode_t pointers = CUBLAS_POINTER_MODE_HOST;
+                    if (active_ && (cublasGetAtomicsMode(handle_, &atomics) != CUBLAS_STATUS_SUCCESS ||
+                        atomics != CUBLAS_ATOMICS_NOT_ALLOWED ||
+                        cublasGetPointerMode(handle_, &pointers) != CUBLAS_STATUS_SUCCESS || pointers != CUBLAS_POINTER_MODE_HOST))
+                        throw std::runtime_error("Explicit cuBLAS operands require non-atomic reduction and host coefficients");
+                    if (active_ && (cublasGetMathMode(handle_, &previous_) != CUBLAS_STATUS_SUCCESS ||
+                        cublasSetMathMode(handle_, mode) != CUBLAS_STATUS_SUCCESS))
+                        throw std::runtime_error("Cannot publish explicit cuBLAS operand arithmetic");
+                }
+                /** @brief Fatal restoration failure cannot leave another operation a stale math mode. */
+                ~ScopedBlasMathMode() noexcept
+                {
+                    if (active_ && cublasSetMathMode(handle_, previous_) != CUBLAS_STATUS_SUCCESS)
+                        std::terminate();
+                }
+                ScopedBlasMathMode(const ScopedBlasMathMode &) = delete;
+                ScopedBlasMathMode &operator=(const ScopedBlasMathMode &) = delete;
+            private:
+                cublasHandle_t handle_; ///< Borrowed under the context submission lock.
+                cublasMath_t previous_ = CUBLAS_DEFAULT_MATH; ///< Exact enclosing mode.
+                bool active_; ///< Native calls do not mutate the context configuration.
+            };
 
             __global__ void prepare_batched_same_a_pointer_arrays_kernel(
                 const float *d_A,
@@ -154,16 +196,24 @@ namespace llaminar2
         // Constructor / Destructor
         // =====================================================================
 
-        CuBLASGemmKernel::CuBLASGemmKernel(int device_id, Precision precision)
+        CuBLASGemmKernel::CuBLASGemmKernel(int device_id, Precision precision,
+            FloatingActivationOperandPrecision operand_precision)
             : CuBLASGemmKernel(
                   &GPUDeviceContextPool::instance().getNvidiaContext(device_id),
-                  precision)
+                  precision, operand_precision)
         {
         }
 
-        CuBLASGemmKernel::CuBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision)
-            : precision_(precision)
+        CuBLASGemmKernel::CuBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision,
+            FloatingActivationOperandPrecision operand_precision)
+            : precision_(precision), operand_precision_(operand_precision)
         {
+            if ((operand_precision_ == FloatingActivationOperandPrecision::FP32 && precision_ != Precision::FP32) ||
+                (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && precision_ != Precision::FP16) ||
+                (operand_precision_ != FloatingActivationOperandPrecision::Native &&
+                 operand_precision_ != FloatingActivationOperandPrecision::FP32 &&
+                 operand_precision_ != FloatingActivationOperandPrecision::FP16RNE))
+                throw std::invalid_argument("cuBLAS prepared weight and operand arithmetic disagree");
             if (!ctx || !ctx->isInitialized())
                 throw std::invalid_argument("CuBLAS GEMM requires an initialized worker context");
             setDeviceContext(ctx);
@@ -187,6 +237,8 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                throw std::invalid_argument("Half operands require the typed half-A/half-B FP32-output API");
             const auto submission = device_ctx_->acquireBlasSubmission();
             const auto handle_ = static_cast<cublasHandle_t>(submission.handle());
             if (!handle_)
@@ -283,6 +335,15 @@ namespace llaminar2
             // cuBLAS call: gemm(opB, opA, N, M, K, alpha, B, ldb, A, lda, beta, C, ldc)
             // Computes: op(B_cm) @ op(A_cm) where B_cm, A_cm are cuBLAS's col-major views
 
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP32)
+            {
+                ScopedBlasMathMode math(handle_, CUBLAS_PEDANTIC_MATH, true);
+                CUBLAS_CHECK(cublasGemmEx(handle_, opB, opA, N, M, K, &alpha,
+                    d_B, CUDA_R_32F, ldb, d_A, CUDA_R_32F, lda, &beta,
+                    d_C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+                return true;
+            }
+
             CUBLAS_CHECK(cublasSgemm(
                 handle_,
                 opB, opA,
@@ -293,6 +354,32 @@ namespace llaminar2
                 &beta,
                 d_C, ldc));
 
+            return true;
+        }
+
+        bool CuBLASGemmKernel::executeFP16AccumulateFP32(
+            const void *d_A, const void *d_B, float *d_C, int M, int N, int K)
+        {
+            if (operand_precision_ != FloatingActivationOperandPrecision::FP16RNE || precision_ != Precision::FP16 ||
+                !d_A || !d_B || !d_C || M <= 0 || N <= 0 || K <= 0)
+                throw std::invalid_argument("Explicit half A/B GEMM requires valid FP32-output geometry");
+            const auto submission = device_ctx_->acquireBlasSubmission();
+            const auto handle = static_cast<cublasHandle_t>(submission.handle());
+            if (!handle) throw std::logic_error("Half GEMM has no context cuBLAS handle");
+            const auto stream = static_cast<cudaStream_t>(requireStream("CuBLAS FP16 A/B FP32 accumulation"));
+            CUDA_CHECK(cudaSetDevice(device_id_));
+            CUBLAS_CHECK(cublasSetStream(handle, stream));
+            if (!bindMatmulWorkspace(handle, workspace_)) return false;
+            // Real half operands are already prepared. FP32 C and compute type
+            // prevent the old Hgemm half-output contract. The flag additionally
+            // forbids lower-precision partial reduction even with tensor cores.
+            const auto mode = static_cast<cublasMath_t>(CUBLAS_TENSOR_OP_MATH |
+                CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+            ScopedBlasMathMode math(handle, mode, true);
+            const float alpha = 1.0f, beta = 0.0f;
+            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+                &alpha, d_B, CUDA_R_16F, K, d_A, CUDA_R_16F, K, &beta,
+                d_C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             return true;
         }
 
@@ -307,6 +394,8 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
+            if (operand_precision_ != FloatingActivationOperandPrecision::Native)
+                throw std::invalid_argument("Explicit GDN operand GEMM does not support a bias epilogue");
             const auto submission = device_ctx_->acquireBlasSubmission();
             const auto lt_handle_ = static_cast<cublasLtHandle_t>(submission.ltHandle());
             if (!lt_handle_)
@@ -509,6 +598,8 @@ namespace llaminar2
             float alpha, float beta,
             DeviceWorkspaceManager *workspace_override)
         {
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                throw std::invalid_argument("Half fused groups require the explicit shared-half-A projection path");
             const auto submission = device_ctx_->acquireBlasSubmission();
             const auto handle_ = static_cast<cublasHandle_t>(submission.handle());
             if (!handle_)
@@ -634,7 +725,17 @@ namespace llaminar2
                 }
             }
 
-            cublasStatus_t status = cublasSgemmBatched(
+            ScopedBlasMathMode math(handle_, CUBLAS_PEDANTIC_MATH,
+                operand_precision_ == FloatingActivationOperandPrecision::FP32);
+            cublasStatus_t status;
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP32)
+                status = cublasGemmBatchedEx(handle_, opB, opA, N, M, K, &alpha,
+                    reinterpret_cast<const void *const *>(d_B_array), CUDA_R_32F, ldb,
+                    reinterpret_cast<const void *const *>(d_A_array), CUDA_R_32F, lda, &beta,
+                    reinterpret_cast<void *const *>(d_C_array), CUDA_R_32F, ldc, batch_count,
+                    CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
+            else
+                status = cublasSgemmBatched(
                 handle_,
                 opB, opA,
                 N, M, K,
@@ -722,14 +823,16 @@ namespace llaminar2
 
         // Stub implementations when CUDA is not available
 
-        CuBLASGemmKernel::CuBLASGemmKernel(int device_id, Precision precision)
-            : device_id_(device_id), precision_(precision)
+        CuBLASGemmKernel::CuBLASGemmKernel(int device_id, Precision precision,
+            FloatingActivationOperandPrecision operand_precision)
+            : device_id_(device_id), precision_(precision), operand_precision_(operand_precision)
         {
             throw std::runtime_error("[CuBLASGemmKernel] CUDA support not compiled");
         }
 
-        CuBLASGemmKernel::CuBLASGemmKernel(IWorkerGPUContext * /*ctx*/, Precision precision)
-            : precision_(precision)
+        CuBLASGemmKernel::CuBLASGemmKernel(IWorkerGPUContext * /*ctx*/, Precision precision,
+            FloatingActivationOperandPrecision operand_precision)
+            : precision_(precision), operand_precision_(operand_precision)
         {
             throw std::runtime_error("[CuBLASGemmKernel] CUDA support not compiled");
         }
@@ -746,6 +849,10 @@ namespace llaminar2
         {
             return false;
         }
+
+        bool CuBLASGemmKernel::executeFP16AccumulateFP32(
+            const void *, const void *, float *, int, int, int)
+        { return false; }
 
         bool CuBLASGemmKernel::execute_with_bias(
             const float *, const float *, float *,

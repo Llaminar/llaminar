@@ -6,11 +6,15 @@
  * points but share the same kernel requirement formulas. This keeps GGUF
  * preflight aware of routed-expert, recurrent, and dense graph-family pressure
  * before weights consume the memory that exact graph capture will need.
+ * Main and replicated MTP attention contribute their actual participant
+ * geometries to one stable-name union, including full-context conversion banks.
  */
 
 #include "planning/WorkspaceMemoryEstimator.h"
 
 #include "config/GDNHeadAssignment.h"
+#include "loaders/PreparedWeightRepresentationContract.h"
+#include "utils/DebugEnv.h"
 #include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
@@ -129,6 +133,10 @@ std::size_t hybridRecurrentLayerCount(
     return layers.size();
 }
 
+/** @brief Recover checked, already-batched direct token and compact route extents. */
+std::pair<int, int> compactRoutedExpertWorkspaceRows(
+    const ModelMemoryProfile& profile, const WorkspaceMemoryGeometry& geometry);
+
 /**
  * @brief Compute the exact MoE requirement contribution for one GPU participant.
  *
@@ -136,12 +144,13 @@ std::size_t hybridRecurrentLayerCount(
  * represented by the base estimate, so their aligned requirement is additive.
  * The same requirement factories are queried later by MoEExpertComputeStage;
  * using them here prevents metadata and graph construction from drifting.
+ * @param profile Complete model routing geometry.
+ * @param geometry Direct graph rows and any retained compact expert endpoint.
+ * @return Aligned stable-name workspace requirement, without duplicate shared buffers.
  */
 size_t exactMoEWorkspaceBytes(
     const ModelMemoryProfile& profile,
-    int batch_size,
-    int resident_graph_rows,
-    DeviceId device)
+    const WorkspaceMemoryGeometry& geometry)
 {
     if (profile.expert_count == 0)
         return 0;
@@ -155,9 +164,10 @@ size_t exactMoEWorkspaceBytes(
             "expert_used_count, and expert_feed_forward_length");
     }
 
-    const size_t batches = static_cast<size_t>(std::max(1, batch_size));
+    const auto device = geometry.device;
+    const size_t batches = static_cast<size_t>(std::max(1, geometry.batch_size));
     const size_t rows =
-        static_cast<size_t>(std::max(1, resident_graph_rows));
+        static_cast<size_t>(std::max(1, geometry.resident_graph_rows));
     if (rows > static_cast<size_t>(std::numeric_limits<int>::max()) / batches)
     {
         throw std::runtime_error(
@@ -188,6 +198,19 @@ size_t exactMoEWorkspaceBytes(
     {
         throw std::runtime_error(
             "MoE workspace planning received a non-GPU device after GPU sizing began");
+    }
+    if (geometry.compact_routed_expert_token_rows)
+    {
+        // Continuations that own experts also retain the compact endpoint.
+        // Each routed row is a single expert invocation, so top-k becomes one
+        // while the row count includes the original top-k. Merge stable names
+        // once, exactly as the serial graph-family workspace allocator does.
+        const auto compact_rows = compactRoutedExpertWorkspaceRows(profile, geometry).second;
+        requirements.merge(device.is_cuda()
+            ? MoEWorkspaceBuffers::cudaMoE(compact_rows, profile.d_model,
+                profile.expert_feed_forward_length, profile.expert_count, 1)
+            : MoEWorkspaceBuffers::rocmMoE(compact_rows, profile.d_model,
+                profile.expert_feed_forward_length, profile.expert_count, 1));
     }
     return requirements.total_bytes_with_alignment();
 }
@@ -835,6 +858,8 @@ size_t exactROCmQuantizedGemmWorkspaceBytes(
             static_cast<std::size_t>(std::max(1, geometry.resident_graph_rows)),
             "ROCm prefill rows"),
         "ROCm prefill rows");
+    const int compact_expert_rows = geometry.compact_routed_expert_token_rows
+        ? compactRoutedExpertWorkspaceRows(profile, geometry).second : 0;
     const int terminal_rows = std::max(
         1,
         geometry.mtp_target_query_rows > 0
@@ -864,8 +889,13 @@ size_t exactROCmQuantizedGemmWorkspaceBytes(
         has_explicit_terminal = has_explicit_terminal || terminal;
         const bool mtp_sidecar = isRetainedMTPSidecarLayer(
             tensor, profile, geometry);
-        const int projection_rows =
+        int projection_rows =
             terminal || mtp_sidecar ? terminal_rows : prefill_rows;
+        // A continuation also retains the one-row-per-route expert endpoint.
+        // Its prepared kernels share these stable names with direct execution;
+        // admit the wider invocation before either graph publishes addresses.
+        if (isRoutedExpertWeight(tensor.name))
+            projection_rows = std::max(projection_rows, compact_expert_rows);
         const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
             tensor, profile, geometry, sharding, full_terminal);
         if (!shape.valid())
@@ -1053,6 +1083,8 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
                 std::max(1, geometry.resident_graph_rows)),
             "CUDA prefill rows"),
         "CUDA prefill rows");
+    const int compact_expert_rows = geometry.compact_routed_expert_token_rows
+        ? compactRoutedExpertWorkspaceRows(profile, geometry).second : 0;
     const int terminal_rows = std::max(
         1,
         geometry.mtp_target_query_rows > 0
@@ -1074,10 +1106,10 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
                 tensor.quant_type + " tensor " + tensor.name);
         }
         const std::uint8_t codebook =
-            canonicalDeviceVnniCodebookId(format->codebook_id);
+            canonicalDeviceVnniCodebookId(*format);
         return cuda::quantized_gemm_workspace::NativeCodebooks{
             .execution = codebook,
-            .arithmetic = codebook,
+            .arithmetic = canonicalDeviceVnniCodebookId(format->codebook_id),
         };
     };
 
@@ -1101,8 +1133,12 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
         has_explicit_terminal = has_explicit_terminal || terminal;
         const bool mtp_sidecar = isRetainedMTPSidecarLayer(
             tensor, profile, geometry);
-        const int projection_rows =
+        int projection_rows =
             terminal || mtp_sidecar ? terminal_rows : prefill_rows;
+        // CUDA and ROCm retain the same compact endpoint row ownership. Only
+        // the requirement factory's device-specific dispatch policy differs.
+        if (isRoutedExpertWeight(tensor.name))
+            projection_rows = std::max(projection_rows, compact_expert_rows);
         const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
             tensor, profile, geometry, sharding, full_terminal);
         if (!shape.valid())
@@ -1398,7 +1434,10 @@ size_t maximumFloatingProjectionColumns(
         const bool routed = isRoutedExpertWeight(tensor.name);
         if (tensor.layer_index < geometry.first_layer ||
             tensor.layer_index > geometry.last_layer ||
-            (routed_only && !routed) || !isFloatingWeight(tensor) ||
+            (routed_only && !routed) ||
+            (!isFloatingWeight(tensor) && PreparedWeightRepresentationContract::resolve(
+                inferWeightRole(tensor.name), tensor.quant_type, tensor.name, profile.architecture,
+                debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic) == ModelPreparedWeightRepresentation::SourceNative) ||
             tensor.K == 0 || tensor.elements < tensor.K)
         {
             continue;
@@ -1455,18 +1494,50 @@ size_t gpuFloatingPointWorkspaceBytes(
     if (columns == 0)
         return 0;
 
+    WorkspaceRequirements scoped_gdn;
+    if (!routed_only && debugEnv().gemm.gdn_projection_arithmetic != GDNProjectionArithmetic::Native)
+    {
+        const auto sharding = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
+        for (const auto &tensor : profile.tensors)
+        {
+            if (!workspaceOwnsTensor(tensor, profile, geometry) ||
+                PreparedWeightRepresentationContract::effectiveGDNArithmetic(
+                    inferWeightRole(tensor.name), tensor.name, profile.architecture,
+                    debugEnv().gemm.gdn_projection_arithmetic) != GDNProjectionArithmetic::FP16) continue;
+            const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding, false);
+            if (!shape.valid()) throw std::invalid_argument("GDN half workspace has no source matrix geometry: " + tensor.name);
+            if (geometry.device.is_rocm())
+                scoped_gdn.merge(rocm::floating_gemm_workspace::projectionRequirements(
+                    execution_rows, shape.input_columns, FloatingActivationOperandPrecision::FP16RNE));
+            else
+                scoped_gdn.merge(cuda::floating_gemm_workspace::projectionRequirements(
+                    execution_rows, shape.output_columns, shape.input_columns, FloatingActivationOperandPrecision::FP16RNE));
+        }
+    }
+
     // The routed-only ROCm caller already composes the descriptor-based
     // direct/compact GEMM contract. Dense/continuation graphs need its same
     // BLAS region and pointer ABI here, without a second live ledger.
     if (geometry.device.is_rocm())
-        return routed_only ? 0u : rocm::floating_gemm_workspace::projectionRequirements()
-            .total_bytes_with_alignment();
+    {
+        if (routed_only) return 0;
+        scoped_gdn.merge(rocm::floating_gemm_workspace::projectionRequirements());
+        return scoped_gdn.total_bytes_with_alignment();
+    }
 
     // Count both physical pointer triplets: the wrapper and its cuBLAS
     // adapter use distinct captured addresses. Runtime and admission now
     // compose the same names instead of separately reconstructing their sum.
-    return cuda::floating_gemm_workspace::projectionRequirements(execution_rows, columns)
-        .total_bytes_with_alignment();
+    auto requirements = cuda::floating_gemm_workspace::projectionRequirements(execution_rows, columns);
+    requirements.merge(scoped_gdn);
+    if (!routed_only && geometry.compact_routed_expert_token_rows)
+    {
+        const auto routed_columns = maximumFloatingProjectionColumns(profile, geometry, true);
+        if (routed_columns > 0)
+            requirements.merge(cuda::floating_gemm_workspace::projectionRequirements(
+                compactRoutedExpertWorkspaceRows(profile, geometry).second, routed_columns));
+    }
+    return requirements.total_bytes_with_alignment();
 }
 
 /** @brief Whether this participant materializes at least one full-attention layer. */
@@ -1508,7 +1579,45 @@ bool hasFullAttentionLayer(
 }
 
 /**
- * @brief Exact complete attention arena selected by backend capture policy.
+ * @brief Describe the independently replicated learned MTP attention member.
+ * @param profile Complete model metadata, including trailing learned blocks.
+ * @param geometry Main participant and retained verifier declaration.
+ * @return Full-head compact geometry, or no member when MTP is not retained.
+ *
+ * Sharded main heads do not describe the learned predictor. Its compact query
+ * width and complete request-major KV horizon are separate axes; neither may
+ * inherit the main graph's prefill bucket or TP slices.
+ */
+std::optional<WorkspaceMemoryGeometry> retainedMTPAttentionGeometry(
+    const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry)
+{
+    if (geometry.mtp_target_query_rows <= 0 || profile.mtp_layer_count <= 0)
+        return std::nullopt;
+    return WorkspaceMemoryGeometry{
+        .device = geometry.device,
+        .device_compute_units = geometry.device_compute_units,
+        .cpu_execution = geometry.cpu_execution,
+        .batch_size = geometry.batch_size,
+        .resident_graph_rows = geometry.mtp_target_query_rows,
+        .max_context_rows = geometry.max_context_rows,
+        .local_d_ff = profile.d_ff,
+        .local_query_heads = profile.n_heads,
+        .local_kv_heads = profile.n_kv_heads,
+        .local_vocab = profile.vocab_size,
+        .first_layer = profile.n_layers - profile.mtp_layer_count,
+        .last_layer = profile.n_layers - 1,
+        .total_shards = 1,
+        .attention_kv_format = geometry.attention_kv_format,
+        .attention_visibility = geometry.attention_visibility,
+    };
+}
+
+/**
+ * @brief Exact attention descriptors for one concrete participant geometry.
+ * @param profile Complete model head dimensions.
+ * @param geometry Actual sharded main or replicated compact member.
+ * @return Mergeable canonical descriptors with backend-selected partial floors.
  *
  * CUDA declares the current resident prefill graph. ROCm additionally declares
  * its non-monotonic geometry-selected family envelope, exactly as
@@ -1516,15 +1625,10 @@ bool hasFullAttentionLayer(
  * canonical contract also retains split-decode, device-param, and FP32 K/V
  * conversion buffers so admission and the runtime kernel cannot diverge.
  */
-size_t exactAttentionWorkspaceBytes(
+WorkspaceRequirements exactAttentionMemberRequirements(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry)
 {
-    if (!hasFullAttentionLayer(
-            profile, geometry.first_layer, geometry.last_layer))
-    {
-        return 0;
-    }
     const bool has_exact_local_query_heads =
         geometry.local_query_heads > 0;
     if (geometry.device_compute_units <= 0 || geometry.batch_size <= 0 ||
@@ -1555,8 +1659,7 @@ size_t exactAttentionWorkspaceBytes(
                    .local_query_heads = local_query_heads,
                    .head_dim = profile.head_dim,
                    .worker_count = geometry.device_compute_units,
-               })
-            .total_bytes_with_alignment();
+               });
     }
     if (!geometry.device.is_gpu())
     {
@@ -1573,6 +1676,14 @@ size_t exactAttentionWorkspaceBytes(
     size_t partial_m = 0;
     size_t partial_l = 0;
 
+    const int local_kv_heads =
+        geometry.local_kv_heads > 0
+            ? geometry.local_kv_heads
+            : std::max(
+                  1,
+                  (profile.n_kv_heads + geometry.total_shards - 1) /
+                      geometry.total_shards);
+
     if (geometry.device.is_cuda())
     {
         const cuda::fa2_policy::FA2PrefillParallelGeometry current{
@@ -1584,6 +1695,15 @@ size_t exactAttentionWorkspaceBytes(
             .sm_count = geometry.device_compute_units,
             .requested_axis =
                 attention::AttentionPrefillParallelAxis::GeometrySelected,
+            .visible_kv_heads = local_kv_heads,
+            .head_start = geometry.local_query_head_start,
+            .replicated_gqa_n_rep = local_query_heads < profile.n_heads && local_kv_heads == profile.n_kv_heads
+                ? profile.n_heads / profile.n_kv_heads : 0,
+            .native_kv_format = geometry.attention_kv_format,
+            .visibility = geometry.attention_visibility,
+            .query_warp_groups_override = debugEnv().attention.cuda_fa2_q_warp_groups,
+            .pv_warps_override = debugEnv().attention.cuda_fa2_hd256_pv_warps,
+            .tile_kv_override = debugEnv().attention.cuda_fa2_tile_kv,
         };
         const auto plan = cuda::fa2_policy::selectFA2PrefillParallelPlan(current);
         if (!plan.valid)
@@ -1621,6 +1741,8 @@ size_t exactAttentionWorkspaceBytes(
                 rocm::fa2_policy::kROCmFA2LDSCapacityBytes,
             .requested_axis =
                 attention::AttentionPrefillParallelAxis::GeometrySelected,
+            .kv_format = geometry.attention_kv_format,
+            .visibility = geometry.attention_visibility,
         };
         const auto plan =
             rocm::fa2_policy::selectROCmFA2PrefillParallelPlan(current);
@@ -1645,13 +1767,6 @@ size_t exactAttentionWorkspaceBytes(
         }
     }
 
-    const int local_kv_heads =
-        geometry.local_kv_heads > 0
-            ? geometry.local_kv_heads
-            : std::max(
-                  1,
-                  (profile.n_kv_heads + geometry.total_shards - 1) /
-                      geometry.total_shards);
     const attention::AttentionWorkspaceCardinality cardinality =
         attention::planAttentionWorkspaceCardinality(
             geometry.resident_graph_rows,
@@ -1673,8 +1788,25 @@ size_t exactAttentionWorkspaceBytes(
                // later precision choice cannot invalidate physical capacity.
                .include_device_params = true,
                .include_fp32_kv_conversion = true,
-           })
-        .total_bytes_with_alignment();
+           });
+}
+
+/**
+ * @brief Merge actual main and retained MTP attention by stable workspace name.
+ * @param profile Complete main and learned-block metadata.
+ * @param geometry Main participant's admitted execution family.
+ * @return Bytes in the shared descriptor union, without summing aliases.
+ */
+size_t exactAttentionWorkspaceBytes(
+    const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry)
+{
+    WorkspaceRequirements requirements;
+    if (hasFullAttentionLayer(profile, geometry.first_layer, geometry.last_layer))
+        requirements = exactAttentionMemberRequirements(profile, geometry);
+    if (const auto sidecar = retainedMTPAttentionGeometry(profile, geometry))
+        requirements.merge(exactAttentionMemberRequirements(profile, *sidecar));
+    return requirements.total_bytes_with_alignment();
 }
 
 /**
@@ -1711,7 +1843,7 @@ size_t exactKVConversionWorkspaceBytes(
         static_cast<size_t>(local_kv_heads),
         static_cast<size_t>(profile.head_dim),
         "KV conversion local width");
-    const WorkspaceRequirements requirements =
+    WorkspaceRequirements requirements =
         kv_cache_workspace::conversionRequirements({
             .configured_batch_size = geometry.batch_size,
             .configured_context_rows = geometry.max_context_rows,
@@ -1723,6 +1855,21 @@ size_t exactKVConversionWorkspaceBytes(
                 "KV conversion FP32 row"),
             .native_row_bytes = 0u,
         });
+    if (const auto sidecar = retainedMTPAttentionGeometry(profile, geometry))
+    {
+        const size_t replicated_width = checkedMultiply(
+            static_cast<size_t>(sidecar->local_kv_heads),
+            static_cast<size_t>(profile.head_dim), "replicated MTP KV width");
+        requirements.merge(kv_cache_workspace::conversionRequirements({
+            .configured_batch_size = sidecar->batch_size,
+            .configured_context_rows = sidecar->max_context_rows,
+            .requested_graph_rows = sidecar->resident_graph_rows,
+            .requested_batch_size = sidecar->batch_size,
+            .conversion_row_bytes = checkedMultiply(
+                replicated_width, sizeof(float), "replicated MTP KV conversion row"),
+            .native_row_bytes = 0u,
+        }));
+    }
     return requirements.total_bytes_with_alignment();
 }
 
@@ -1874,11 +2021,7 @@ size_t WorkspaceMemoryEstimator::estimate(
         "CPU invocation-owned projection requirements");
 
     const size_t moe_bytes = geometry.device.is_gpu()
-        ? exactMoEWorkspaceBytes(
-              profile,
-              geometry.batch_size,
-              geometry.resident_graph_rows,
-              geometry.device)
+        ? exactMoEWorkspaceBytes(profile, geometry)
         : 0u;
     bytes = checkedAdd(
         bytes,

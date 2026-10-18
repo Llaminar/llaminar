@@ -10,6 +10,8 @@
  * a model throughput prediction. No speed threshold belongs in preflight.
  * Coalesced binding witnesses compare every independently addressable expert
  * against its standalone captured execution, including migration-reserved pools.
+ * IQ3_S and IQ4_XS additionally prove both metadata words against original
+ * source bits, independently of the standalone preparation and format helpers.
  */
 #include "planning/PlanningExecutionMeasurement.h"
 #include "planning/PlanningModelMetadata.h"
@@ -125,6 +127,80 @@ namespace
     }
 
     /**
+     * @brief Check lossless source factors across coalesced groups and load chunks.
+     * @param weights Original independently encoded expert matrices, never repacked in place.
+     * @param slot Finalized persistent pool regions after all load work has drained.
+     * @param backend Exact backend owning the finalized regions.
+     * @param device Device on which the regions were prepared.
+     * @param stream Owning worker's explicit stream for diagnostic downloads.
+     *
+     * Source type selects this oracle directly. Neither the allocation helper
+     * nor the production coefficient encoder supplies expected words, so two
+     * preparation paths cannot agree while silently losing original factors.
+     */
+    void expectCoalescedSourceFactors(
+        const std::vector<std::unique_ptr<TensorBase>> &weights,
+        const WeightVRAMPool::WeightSlot &slot, IBackend &backend,
+        DeviceId device, void *stream)
+    {
+        ASSERT_FALSE(weights.empty());
+        const auto type = weights.front()->native_type();
+        if (type != TensorType::IQ3_S && type != TensorType::IQ4_XS) return;
+        constexpr size_t rows = 256;
+        constexpr size_t blocks_per_row = 8;
+        const size_t words = weights.size() * rows * blocks_per_row;
+        ASSERT_NE(slot.d_native_vnni_scales, nullptr);
+        ASSERT_NE(slot.d_native_vnni_mins, nullptr);
+        ASSERT_EQ(slot.scales_bytes, words * sizeof(uint16_t));
+        ASSERT_EQ(slot.mins_bytes, words * sizeof(uint16_t));
+        ASSERT_NE(stream, nullptr);
+        std::vector<uint16_t> bases(words), coefficients(words);
+        // load()/finalize() have already drained the producer streams. These
+        // diagnostic copies and their completion remain outside graph capture.
+        ASSERT_TRUE(backend.deviceToHostOnStream(bases.data(), slot.d_native_vnni_scales,
+            slot.scales_bytes, device.ordinal, stream));
+        ASSERT_TRUE(backend.deviceToHostOnStream(coefficients.data(), slot.d_native_vnni_mins,
+            slot.mins_bytes, device.ordinal, stream));
+        ASSERT_TRUE(backend.synchronizeStream(stream, device.ordinal));
+        for (size_t group = 0; group < weights.size(); ++group)
+        {
+            const auto &weight = *weights[group];
+            ASSERT_EQ(weight.rows(), rows);
+            ASSERT_EQ(weight.cols(), 256u);
+            const auto *raw = static_cast<const uint8_t *>(weight.raw_data());
+            for (size_t row = 0; row < rows; ++row)
+                for (size_t block = 0; block < blocks_per_row; ++block)
+                {
+                    SCOPED_TRACE(::testing::Message() << "group=" << group
+                        << " row=" << row << " block=" << block);
+                    uint16_t base = 0, coefficient = 0;
+                    // Each source row is one 256-value superblock. Copying
+                    // avoids assuming the byte-backed tensor's host alignment.
+                    if (type == TensorType::IQ4_XS)
+                    {
+                        IQ4_XSBlock source{};
+                        std::memcpy(&source, raw + row * sizeof(source), sizeof(source));
+                        base = source.d;
+                        coefficient = static_cast<uint16_t>(
+                            ((source.scales_l[block / 2] >> (4 * (block % 2))) & 15u) |
+                            (((source.scales_h >> (2 * block)) & 3u) << 4));
+                    }
+                    else
+                    {
+                        IQ3_SBlock source{};
+                        std::memcpy(&source, raw + row * sizeof(source), sizeof(source));
+                        base = source.d;
+                        coefficient = static_cast<uint16_t>(
+                            (source.scales[block / 2] >> (4 * (block % 2))) & 15u);
+                    }
+                    const size_t index = (group * blocks_per_row + block) * rows + row;
+                    EXPECT_EQ(bases[index], base);
+                    EXPECT_EQ(coefficients[index], coefficient);
+                }
+        }
+    }
+
+    /**
      * @brief Prove source-sampled expert matrices through actual backend preparation.
      *
      * The sparse fixture contains one nonzero final expert. Its source owner is
@@ -235,6 +311,45 @@ namespace
                 {
                     weights.push_back(format.create({256, 256}, 731 + group));
                     const auto &tensor = weights.back();
+                    // Construct varied original coefficient bits before either
+                    // preparation path sees the source. Odd strides span every
+                    // nibble/six-bit value, including both extrema, and give
+                    // rows, subblocks and groups distinct metadata patterns.
+                    auto *raw = static_cast<uint8_t *>(tensor->raw_mutable_data());
+                    for (size_t row = 0; row < 256; ++row)
+                    {
+                        if (format.tensor_type == TensorType::IQ3_S)
+                        {
+                            IQ3_SBlock source{};
+                            std::memcpy(&source, raw + row * sizeof(source), sizeof(source));
+                            std::memset(source.scales, 0, sizeof(source.scales));
+                            for (size_t sub = 0; sub < 8; ++sub)
+                            {
+                                const auto coefficient = static_cast<uint8_t>(
+                                    (static_cast<size_t>(group) * 3 + row * 5 + sub * 7) & 15u);
+                                source.scales[sub / 2] |= static_cast<uint8_t>(
+                                    coefficient << (4 * (sub % 2)));
+                            }
+                            std::memcpy(raw + row * sizeof(source), &source, sizeof(source));
+                        }
+                        else if (format.tensor_type == TensorType::IQ4_XS)
+                        {
+                            IQ4_XSBlock source{};
+                            std::memcpy(&source, raw + row * sizeof(source), sizeof(source));
+                            std::memset(source.scales_l, 0, sizeof(source.scales_l));
+                            source.scales_h = 0;
+                            for (size_t sub = 0; sub < 8; ++sub)
+                            {
+                                const auto coefficient = static_cast<uint16_t>(
+                                    (static_cast<size_t>(group) * 19 + row * 13 + sub * 9) & 63u);
+                                source.scales_l[sub / 2] |= static_cast<uint8_t>(
+                                    (coefficient & 15u) << (4 * (sub % 2)));
+                                source.scales_h |= static_cast<uint16_t>(
+                                    (coefficient >> 4) << (2 * sub));
+                            }
+                            std::memcpy(raw + row * sizeof(source), &source, sizeof(source));
+                        }
+                    }
                     const auto *begin = static_cast<const uint8_t *>(tensor->raw_data());
                     source_bytes.insert(source_bytes.end(), begin, begin + tensor->size_bytes());
                     auto prepared = floating
@@ -268,9 +383,9 @@ namespace
                         const auto allocation = layout == GPUPreparedWeightPoolLayout::MigrationReusable
                             ? reusableDeviceVnniAllocationFormat(source)
                             : NativeVnniReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
-                                source.is_asymmetric, source.has_emins};
+                                canonicalDeviceVnniFormat(source).is_asymmetric, source.has_emins};
                         job.format = codebookIdToRepackFormat(source.codebook_id, source.is_superblock).value();
-                        job.is_asymmetric = source.is_asymmetric;
+                        job.is_asymmetric = canonicalDeviceVnniFormat(source).is_asymmetric;
                         job.packed_payload_capacity_bytes_per_block = allocation.payload_bytes_per_block;
                         owner->planWeight(device.ordinal, job.name, job.N, job.K,
                             allocation.payload_bytes_per_block, allocation.has_mins, allocation.has_emins, job.raw_bytes);
@@ -281,6 +396,9 @@ namespace
                     owner->addWeightJob(device.ordinal, job);
                     owner->load();
                     owner->finalize();
+                    const auto slot = owner->getPool(device.ordinal)->getSlot(job.name);
+                    ASSERT_TRUE(slot.has_value());
+                    expectCoalescedSourceFactors(weights, *slot, *backend, device, context.defaultStream());
                     std::vector<std::unique_ptr<ITensorGemm>> kernels;
                     for (int group = 0; group != 3; ++group)
                         kernels.push_back(kf::KernelFactory::createGemmFromGPUWeightPool(

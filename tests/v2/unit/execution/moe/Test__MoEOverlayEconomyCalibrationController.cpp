@@ -284,10 +284,12 @@ namespace llaminar2::test
 
         /** @brief Build two integer-priority tiers with one expert each. */
         std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot(
-            int layer_count = 1)
+            int layer_count = 1,
+            int first_model_layer = 0)
         {
             auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
+            plan->first_model_layer = first_model_layer;
             plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan->continuation_domain = "tier_a_domain";
             plan->shared_expert_domain = "tier_a_domain";
@@ -315,7 +317,7 @@ namespace llaminar2::test
                  .max_experts_per_layer = 1,
                  .fallback = true},
             };
-            for (int layer = 0; layer < layer_count; ++layer)
+            for (int layer = first_model_layer; layer < first_model_layer + layer_count; ++layer)
             {
                 plan->placements.push_back({
                     .layer = layer,
@@ -328,14 +330,14 @@ namespace llaminar2::test
             result->placement_plan = plan;
             result->owner_map = MoEExpertOwnerMap::build(*plan);
             result->layered_ownership =
-                result->owner_map.layeredOwnership(layer_count, 2);
+                result->owner_map.layeredOwnership(layer_count, 2, first_model_layer);
             if (!result->valid())
                 throw std::logic_error("test snapshot is invalid");
             return result;
         }
 
         /** @brief Build explicit two-rank ownership for service merge tests. */
-        MoEExpertOwnerMap distributedOwnerMap(int layer_count = 2)
+        MoEExpertOwnerMap distributedOwnerMap(int layer_count = 2, int first_model_layer = 0)
         {
             auto first = domain(
                 "first_domain",
@@ -352,6 +354,7 @@ namespace llaminar2::test
 
             MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
+            plan.first_model_layer = first_model_layer;
             plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan.continuation_domain = first.name;
             plan.shared_expert_domain = first.name;
@@ -370,7 +373,7 @@ namespace llaminar2::test
                  .max_experts_per_layer = 1,
                  .fallback = true},
             };
-            for (int layer = 0; layer < layer_count; ++layer)
+            for (int layer = first_model_layer; layer < first_model_layer + layer_count; ++layer)
             {
                 plan.placements.push_back({
                     .layer = layer,
@@ -1420,5 +1423,116 @@ namespace llaminar2::test
          PreparedEvidenceCertifiesWithoutRoutingOrChangingDeviceCounters)
     {
         verifyCertification(ServiceEvidenceOrigin::PreparedKernels);
+    }
+    /** @brief Equivalence classes and expanded evidence retain owned global IDs. */
+    TEST(MoEOverlayEconomyCalibrationLayerCatalog, PipelineStageGroupsAndMigrationRowsStayCompact)
+    {
+        for (const int first : {0, 32, 40})
+        {
+            const MoEOverlayEconomyCalibrationLayerCatalog catalog({
+                layerManifest(first, 96, native_vnni_formats::Q4_0),
+                layerManifest(first + 1, 96, native_vnni_formats::Q4_0),
+                layerManifest(first + 2, 128, native_vnni_formats::Q4_0),
+            });
+            EXPECT_EQ(catalog.firstModelLayer(), first);
+            EXPECT_EQ(catalog.layerCount(), 3u);
+            EXPECT_EQ(catalog.completeExpertBytesPerLayer().size(), 3u);
+            EXPECT_EQ(catalog.representativeLayers(), (std::vector<int>{first, first + 2}));
+            EXPECT_EQ(catalog.groups().front().member_layers, (std::vector<int>{first, first + 1}));
+            MoEOverlaySealedMigrationMeasurements measurements{
+                .identity = "stage-representatives",
+                .rows = {migrationRow(0, 1, first), migrationRow(0, 1, first + 2),
+                         migrationRow(1, 0, first), migrationRow(1, 0, first + 2)},
+            };
+            const auto expanded = catalog.expand(measurements);
+            ASSERT_EQ(expanded.rows.size(), 6u);
+            for (const auto &row : expanded.rows)
+                EXPECT_TRUE(row.layer >= first && row.layer < first + 3);
+            measurements.rows.front().layer = first + 3;
+            EXPECT_THROW((void)catalog.expand(measurements), std::invalid_argument);
+        }
+        const MoEOverlayEconomyCalibrationLayerCatalog left({layerManifest(32, 96, native_vnni_formats::Q4_0)});
+        const MoEOverlayEconomyCalibrationLayerCatalog right({layerManifest(40, 96, native_vnni_formats::Q4_0)});
+        EXPECT_NE(left.identity(), right.identity());
+    }
+
+    /** @brief Service matrices cannot borrow evidence from an equal-sized foreign stage. */
+    TEST(MoEOverlayEconomyCalibrationLayerCatalog, PipelineStagePreparedEvidenceUsesGlobalIdentity)
+    {
+        for (const int first : {0, 32, 40})
+        {
+            const MoEOverlayEconomyCalibrationLayerCatalog catalog({
+                layerManifest(first, 256, native_vnni_formats::Q4_K),
+                layerManifest(first + 1, 256, native_vnni_formats::Q5_K),
+                layerManifest(first + 2, 256, native_vnni_formats::Q4_K),
+            });
+            const auto topology = ExpertHistogramProductionTopology::uniform(3, kAllExpertHistogramProductionSources, first);
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> live{
+                serviceRow(0, first, 10), serviceRow(0, first + 1, 20), serviceRow(0, first + 2, 30),
+                {.participant_id = 3, .layer = first}, {.participant_id = 3, .layer = first + 1},
+                serviceRow(3, first + 2, 40),
+            };
+            auto prepared = live;
+            prepared[3] = serviceRow(3, first, 4000);
+            prepared[4] = serviceRow(3, first + 1, 5000);
+            EXPECT_EQ(catalog.serviceEvidenceGaps(live, {0, 3}, topology).size(), 3u);
+            const auto combined = catalog.withPreparedServiceEvidence(live, prepared, {0, 3}, topology);
+            EXPECT_TRUE(catalog.serviceEvidenceGaps(combined, {0, 3}, topology).empty());
+            for (std::size_t row = 0; row < live.size(); ++row)
+                EXPECT_EQ(combined[row].total_nanoseconds, (row == 4 ? prepared[row] : live[row]).total_nanoseconds);
+            const auto foreign = ExpertHistogramProductionTopology::uniform(3, kAllExpertHistogramProductionSources, first + 1);
+            EXPECT_THROW((void)catalog.serviceEvidenceGaps(live, {0, 3}, foreign), std::invalid_argument);
+            prepared[4].layer = first + 4;
+            EXPECT_THROW((void)catalog.withPreparedServiceEvidence(live, prepared, {0, 3}, topology), std::invalid_argument);
+        }
+    }
+
+    /** @brief Calibration enumerates only owned rows and prices their compact byte entries. */
+    TEST(MoEOverlayEconomyCalibrationPlanner, PipelineStageSwapsUseOwnedGlobalLayers)
+    {
+        for (const int first : {0, 32, 40})
+        {
+            MoEOverlayEconomyCalibrationPlanner planner({
+                .live_snapshot = snapshot(2, first),
+                .complete_expert_bytes_per_layer = {1024, 4096},
+            });
+            ASSERT_EQ(planner.requiredCoordinates().size(), 4u);
+            for (const auto &coordinate : planner.requiredCoordinates())
+                EXPECT_TRUE(coordinate.layer >= first && coordinate.layer < first + 2);
+            const auto swap = planner.buildPairSwap(0, 1, first + 1, 1);
+            ASSERT_TRUE(swap.valid());
+            ASSERT_EQ(swap.migrations.size(), 2u);
+            for (const auto &edge : swap.migrations)
+            {
+                EXPECT_EQ(edge.layer_idx, first + 1);
+                EXPECT_EQ(edge.estimated_weight_bytes, 4096u);
+            }
+            EXPECT_THROW((void)planner.buildPairSwap(0, 1, first - 1, 2), std::invalid_argument);
+            EXPECT_THROW((void)planner.buildPairSwap(0, 1, first + 2, 2), std::invalid_argument);
+        }
+    }
+    /** @brief Rank-wise reduction preserves compact stage rows and exact owner provenance. */
+    TEST(MoEOverlayEconomyEvidenceMerger, PipelineStageMergesOnlyOwnedLayerEvidence)
+    {
+        const auto owners = distributedOwnerMap(2, 32);
+        const auto topology = ExpertHistogramProductionTopology::uniform(2, kAllExpertHistogramProductionSources, 32);
+        const std::vector<std::vector<MoEOverlayParticipantLayerServiceTotals>> rows{
+            {serviceRow(0, 32, 100), serviceRow(0, 33, 200)},
+            {serviceRow(1, 32, 300), serviceRow(1, 33, 400)},
+        };
+        const auto merged = MoEOverlayEconomyEvidenceMerger::mergeService(rows, owners, topology);
+        ASSERT_EQ(merged.size(), 4u);
+        for (std::size_t index = 0; index < merged.size(); ++index)
+        {
+            EXPECT_EQ(merged[index].layer, 32 + static_cast<int>(index % 2));
+            EXPECT_EQ(merged[index].participant_id, static_cast<int>(index / 2));
+            EXPECT_EQ(merged[index].total_nanoseconds, rows[index / 2][index % 2].total_nanoseconds);
+        }
+        auto foreign = rows;
+        foreign[0][0].layer = 0;
+        EXPECT_THROW((void)MoEOverlayEconomyEvidenceMerger::mergeService(foreign, owners, topology), std::invalid_argument);
+        auto wrong_rank = rows;
+        std::swap(wrong_rank[0], wrong_rank[1]);
+        EXPECT_THROW((void)MoEOverlayEconomyEvidenceMerger::mergeService(wrong_rank, owners, topology), std::invalid_argument);
     }
 } // namespace llaminar2::test

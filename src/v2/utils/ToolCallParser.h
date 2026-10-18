@@ -37,9 +37,12 @@ namespace llaminar2
      *
      * @param text Raw model output text
      * @param format The tool call format to parse for
+     * @param tools Admitted OpenAI function definitions. Native Qwen parameters
+     *        derive their types from this schema, never their generated spelling.
      * @return ToolCallParseResult with content and extracted tool_calls
      */
-    ToolCallParseResult parseToolCalls(const std::string &text, ToolCallFormat format);
+    ToolCallParseResult parseToolCalls(const std::string &text, ToolCallFormat format,
+                                     const nlohmann::json &tools = nlohmann::json::array());
 
     /**
      * @brief Check if text contains potential tool call markers for the given format
@@ -92,8 +95,10 @@ namespace llaminar2
         /**
          * @brief Bind the immutable model-native grammar for this stream.
          * @param format Format selected by the admitted model schema.
+         * @param tools Immutable admitted function definitions for this request.
          */
-        explicit StreamingToolCallSplitter(ToolCallFormat format);
+        explicit StreamingToolCallSplitter(ToolCallFormat format,
+                                           nlohmann::json tools = nlohmann::json::array());
 
         /**
          * @brief Consume one answer-text fragment.
@@ -118,6 +123,7 @@ namespace llaminar2
         std::vector<Event> drain(bool terminal);
 
         ToolCallFormat format_{ToolCallFormat::NONE};
+        nlohmann::json tools_; ///< Request-owned schemas outlive every buffered parameter.
         std::string open_marker_;
         std::string close_marker_;
         Phase phase_{Phase::Content};

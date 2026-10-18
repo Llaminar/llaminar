@@ -6,6 +6,8 @@
  * balanced, disjoint, complete, and represented identically as sorted packed
  * expert IDs and graph-facing masks. They are deliberately device-free so the
  * physical-weight and graph-policy contract remains part of the fast unit gate.
+ * Pipeline-stage cases retain model-global layer IDs in compact ownership,
+ * prove exact mask extents, and reject incomplete or cross-stage epoch maps.
  */
 
 #include "execution/moe/MoEExpertOwnerMap.h"
@@ -14,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -219,6 +222,147 @@ namespace llaminar2::test
         EXPECT_THROW(
             (void)MoEExpertOwnerMap::buildExplicit(plan, ownership),
             std::invalid_argument);
+    }
+
+    /**
+     * @brief Stage storage scales with owned layers while all public IDs remain global.
+     *
+     * CPU, CUDA and ROCm use the same metadata-only ownership authority. Vary
+     * the origin, retained tail and owner order to catch accidental zero-origin
+     * indexing without initializing any backend or allocating model storage.
+     */
+    TEST(Test__MoEExpertOwnerMap, PipelineStageOwnershipUsesCompactGlobalLayerRows)
+    {
+        for (const auto backend : {CollectiveBackendType::MPI,
+                                  CollectiveBackendType::NCCL,
+                                  CollectiveBackendType::RCCL})
+        for (const auto order : {RoutedExpertOwnerOrder::Ordinal,
+                                RoutedExpertOwnerOrder::Random})
+        for (const int first : {0, 20, 40})
+        for (const int count : {1, 2, 21})
+        {
+            SCOPED_TRACE(::testing::Message() << "first=" << first << " count=" << count);
+            auto plan = disjointRocmPlan(RoutedExpertComputePolicy::Apportioned);
+            plan.owner_order = order;
+            auto &domain = plan.domains.front();
+            domain.backend = backend;
+            if (backend == CollectiveBackendType::MPI)
+                domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
+            else if (backend == CollectiveBackendType::NCCL)
+                domain.participants = {GlobalDeviceAddress::cuda(0, 0), GlobalDeviceAddress::cuda(1, 0)};
+            const auto first_placement = plan.placements.front();
+            plan.placements.clear();
+            for (int layer = first; layer < first + count; ++layer)
+            {
+                auto placement = first_placement;
+                placement.layer = layer;
+                plan.placements.push_back(std::move(placement));
+            }
+            const auto owner_map = MoEExpertOwnerMap::build(plan);
+            const auto ownership = owner_map.layeredOwnership(count, 6, first);
+            EXPECT_EQ(ownership.firstModelLayer(), first);
+            EXPECT_EQ(ownership.endModelLayer(), first + count);
+            EXPECT_EQ(ownership.layerCount(), count);
+            EXPECT_EQ(owner_map.owners().size(), static_cast<size_t>(count * 6));
+            const auto explicit_map = MoEExpertOwnerMap::buildExplicit(plan, ownership);
+            for (int participant = 0; participant < ownership.participantCount(); ++participant)
+            {
+                const auto masks = ownership.masksForParticipant(participant);
+                ASSERT_EQ(masks.size(), static_cast<size_t>(count));
+                for (int row = 0; row < count; ++row)
+                {
+                    const int layer = ownership.modelLayerForStorageIndex(row);
+                    EXPECT_EQ(layer, first + row);
+                    EXPECT_EQ(ownership.storageIndexForModelLayer(layer), static_cast<size_t>(row));
+                    ASSERT_EQ(masks[row].size(), 6u);
+                    for (int expert = 0; expert < 6; ++expert)
+                    {
+                        const auto *owner = explicit_map.ownerFor(layer, expert);
+                        ASSERT_NE(owner, nullptr);
+                        EXPECT_EQ(owner->owner_participant, ownership.owner(layer, expert));
+                        EXPECT_EQ(masks[row][expert], owner->owner_participant == participant);
+                    }
+                }
+            }
+            EXPECT_THROW((void)ownership.owner(first - 1, 0), std::out_of_range);
+            EXPECT_THROW((void)ownership.owner(first + count, 0), std::out_of_range);
+            EXPECT_THROW((void)ownership.modelLayerForStorageIndex(count), std::out_of_range);
+        }
+    }
+
+    /** @brief A stage-local swap publishes global IDs and preserves exact capacities. */
+    TEST(Test__MoEExpertOwnerMap, PipelineStageOwnershipChangesKeepGlobalIdentities)
+    {
+        const auto previous = MoELayeredExpertOwnership::uniform(2, 2, {0, 0, 1, 1}, 20);
+        auto candidate = previous;
+        candidate.assignOwner(21, 0, 1);
+        candidate.assignOwner(21, 2, 0);
+        EXPECT_EQ(candidate.changesFrom(previous),
+                  (std::vector<MoELayeredExpertOwnershipChange>{
+                      {21, 0, 0, 1}, {21, 2, 1, 0}}));
+        EXPECT_TRUE(candidate.hasSameLayerCapacitiesAs(previous));
+        EXPECT_EQ(candidate.ownersForLayer(20), previous.ownersForLayer(20));
+        EXPECT_THROW(candidate.assignOwner(0, 0, 1), std::out_of_range);
+        candidate.assignOwner(20, 0, 1);
+        EXPECT_FALSE(candidate.hasSameLayerCapacitiesAs(previous));
+    }
+
+    /** @brief Equal dimensions do not make distinct pipeline stages interchangeable. */
+    TEST(Test__MoEExpertOwnerMap, PipelineStageOwnershipRejectsCrossStageEpochComparison)
+    {
+        const auto head = MoELayeredExpertOwnership::uniform(20, 2, {0, 1}, 0);
+        const auto tail = MoELayeredExpertOwnership::uniform(20, 2, {0, 1}, 20);
+        EXPECT_NE(head, tail);
+        EXPECT_THROW((void)tail.changesFrom(head), std::invalid_argument);
+        EXPECT_THROW((void)tail.hasSameLayerCapacitiesAs(head), std::invalid_argument);
+        EXPECT_THROW((void)head.storageIndexForModelLayer(20), std::out_of_range);
+        EXPECT_THROW((void)tail.storageIndexForModelLayer(0), std::out_of_range);
+    }
+
+    /** @brief Missing stage rows and foreign rows must fail before ownership publication. */
+    TEST(Test__MoEExpertOwnerMap, PipelineStageOwnershipRequiresExactLayerCoverage)
+    {
+        auto plan = disjointRocmPlan(RoutedExpertComputePolicy::Apportioned);
+        const auto row = plan.placements.front();
+        plan.placements.clear();
+        for (int layer = 20; layer < 23; ++layer)
+        {
+            auto placement = row;
+            placement.layer = layer;
+            plan.placements.push_back(std::move(placement));
+        }
+        const auto complete = MoEExpertOwnerMap::build(plan);
+        for (size_t missing = 0; missing < plan.placements.size(); ++missing)
+        {
+            auto incomplete = plan;
+            incomplete.placements.erase(incomplete.placements.begin() + missing);
+            const auto owner_map = MoEExpertOwnerMap::build(incomplete);
+            EXPECT_THROW((void)owner_map.layeredOwnership(3, 6, 20), std::logic_error);
+            EXPECT_THROW((void)MoEExpertOwnerMap::buildExplicit(
+                incomplete, complete.layeredOwnership(3, 6, 20)), std::invalid_argument);
+        }
+        EXPECT_THROW((void)complete.layeredOwnership(2, 6, 20), std::logic_error);
+        EXPECT_THROW((void)complete.layeredOwnership(3, 6, 19), std::logic_error);
+        EXPECT_THROW((void)complete.layeredOwnership(3, 6, 21), std::logic_error);
+        const auto other_stage = MoELayeredExpertOwnership::uniform(3, 3, {0, 0, 0, 1, 1, 1}, 0);
+        EXPECT_THROW((void)MoEExpertOwnerMap::buildExplicit(plan, other_stage), std::invalid_argument);
+    }
+
+    /** @brief Layer interval validation precedes large allocations and integer arithmetic. */
+    TEST(Test__MoEExpertOwnerMap, PipelineStageOwnershipRejectsInvalidLayerIntervals)
+    {
+        constexpr int max = std::numeric_limits<int>::max();
+        EXPECT_THROW((MoELayeredExpertOwnership{2, {{0, 1}}, -1}), std::invalid_argument);
+        EXPECT_THROW((MoELayeredExpertOwnership{2, {{0, 1}}, max}), std::invalid_argument);
+        EXPECT_THROW((void)MoELayeredExpertOwnership::uniform(max, 2, {0, 1}, 1), std::invalid_argument);
+        const auto edge = MoELayeredExpertOwnership::uniform(2, 2, {0, 1}, max - 2);
+        EXPECT_EQ(edge.endModelLayer(), max);
+        EXPECT_EQ(edge.modelLayerForStorageIndex(1), max - 1);
+        EXPECT_EQ(edge.owner(max - 1, 1), 1);
+        const auto owner_map = MoEExpertOwnerMap::build(
+            disjointRocmPlan(RoutedExpertComputePolicy::Apportioned));
+        EXPECT_THROW((void)owner_map.layeredOwnership(1, 6, -1), std::invalid_argument);
+        EXPECT_THROW((void)owner_map.layeredOwnership(max, 6, 1), std::invalid_argument);
     }
 
     TEST(Test__MoEExpertOwnerMap, RejectsTensorShardedComputeForWholeExpertOwnerMap)

@@ -8,6 +8,9 @@
  * - BF16 weights × BF16 activations → FP32 output
  *
  * Quantized weights use CPUNativeVNNIGemmKernel's canonical packed layout.
+ * Explicit FP16RNE engines consume half-rounded A and prepared half B through
+ * SIMD register conversions and a fixed256-lane FP32 tree for every runtime M.
+ * They allocate no activation mirror and retain immutable policy in service views.
  * Service-measurement execution handles may alias an existing prepared
  * engine's immutable tensor. Each invocation receives participant-owned
  * SwiGLU scratch; shared prepared engines retain no mutable arena binding.
@@ -34,6 +37,8 @@
 #include <limits>
 #include <memory>
 #include <unordered_map>
+#include <type_traits>
+#include "../../FloatingActivationOperandPrecision.h"
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
@@ -544,6 +549,48 @@ namespace llaminar2
         }
 
         /**
+         * @brief Round one scalar FP32 operand through IEEE binary16 RNE.
+         *
+         * SIMD paths use F16C/AVX512 conversions in registers. This bitwise scalar
+         * implementation also rounds subnormal ties, independent of MXCSR/FTZ;
+         * it is used only by the actual Scalar ISA implementation. No clipping
+         * or activation-Q8 policy is applied to floating operands.
+         * @param value Original FP32 operand.
+         * @return Exactly widened binary16 RNE value, including signed zero.
+         */
+        inline float roundFloatingOperandHalfRNE(float value) noexcept
+        {
+            uint32_t bits; std::memcpy(&bits, &value, sizeof(bits));
+            const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
+            const uint32_t mantissa = bits & 0x7fffffu;
+            int exponent = static_cast<int>((bits >> 23) & 0xffu) - 127 + 15;
+            uint16_t half;
+            if (((bits >> 23) & 0xffu) == 0xffu)
+                half = static_cast<uint16_t>(sign | 0x7c00u | (mantissa ? ((mantissa >> 13) | 0x200u) : 0u));
+            else if (exponent <= 0)
+            {
+                if (exponent < -10) half = sign;
+                else
+                {
+                    const uint32_t significand = mantissa | 0x800000u;
+                    const int shift = 14 - exponent;
+                    const uint32_t low = significand & ((uint32_t{1} << shift) - 1u);
+                    const uint32_t tie = uint32_t{1} << (shift - 1);
+                    const uint32_t truncated = significand >> shift;
+                    half = static_cast<uint16_t>(sign | (truncated + (low > tie || (low == tie && (truncated & 1u)))));
+                }
+            }
+            else if (exponent >= 31) half = static_cast<uint16_t>(sign | 0x7c00u);
+            else
+            {
+                uint32_t rounded = mantissa + 0xfffu + ((mantissa >> 13) & 1u);
+                if (rounded >= 0x800000u) { ++exponent; rounded = 0; }
+                half = static_cast<uint16_t>(sign | (exponent << 10) | (rounded >> 13));
+            }
+            return fp16_to_fp32(half);
+        }
+
+        /**
          * @brief Decode one GPU-aligned floating-expert weight without changing bits.
          *
          * @tparam WeightType Native floating tensor storage type.
@@ -670,15 +717,17 @@ namespace llaminar2
          *
          * @tparam WeightType Native floating tensor storage type.
          * @tparam Rows Compile-time row count in `[1,4]`.
+         * @tparam HalfRNE Round original FP32 A to binary16 RNE in SIMD registers.
+         * @tparam HalfStorage Read already-physical-half A without another conversion.
          * @param activations First activation row for this tile.
          * @param weights Complete row-major transposed weight tensor.
          * @param weight_row Element offset of the selected output column.
          * @param k Reduction width and activation-row stride.
          * @param reduced Exact tree root for each row.
          */
-        template <TensorType WeightType, int Rows>
+        template <TensorType WeightType, int Rows, bool HalfRNE = false, bool HalfStorage = false>
         inline void dot_gpu_aligned_expert_rows_avx512(
-            const float *activations,
+            const std::conditional_t<HalfStorage, uint16_t, float> *activations,
             const void *weights,
             std::size_t weight_row,
             int k,
@@ -739,14 +788,21 @@ namespace llaminar2
 #pragma GCC unroll 4
                         for (int row = 0; row < Rows; ++row)
                         {
-                            const float *activation_values =
+                            const auto *activation_values =
                                 activations +
                                 static_cast<std::size_t>(row) * k +
                                 static_cast<std::size_t>(first_k);
+                            __m512 activation;
+                            if constexpr (HalfStorage)
+                                activation = load_gpu_aligned_expert_weight_avx512<TensorType::FP16>(activation_values, 0, mask);
+                            else
+                            {
+                                activation = _mm512_maskz_loadu_ps(mask, activation_values);
+                                if constexpr (HalfRNE)
+                                    activation = _mm512_cvtph_ps(_mm512_cvtps_ph(activation, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                            }
                             accumulators[row][block] = _mm512_fmadd_ps(
-                                _mm512_maskz_loadu_ps(mask, activation_values),
-                                weight_values,
-                                accumulators[row][block]);
+                                activation, weight_values, accumulators[row][block]);
                         }
                     }
                 }
@@ -788,6 +844,8 @@ namespace llaminar2
          * words as the scalar and device loaders.
          *
          * @tparam WeightType Native floating tensor storage type.
+         * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
+         * @tparam HalfStorage A already has physical half storage; widen exact words.
          * @param weights Contiguous row-major weight storage.
          * @param index First element index.
          * @param valid Number of active lanes in `[1,8]`.
@@ -911,16 +969,20 @@ namespace llaminar2
          * this avoids spills while preserving each lane's K accumulation order.
          *
          * @tparam WeightType Native floating tensor storage type.
+         * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
+         * @tparam HalfStorage A already has physical half storage; widen exact words.
          * @tparam Rows Compile-time row count in `[1,4]`.
+         * @tparam HalfRNE Round original FP32 A to binary16 RNE in SIMD registers.
+         * @tparam HalfStorage Read already-physical-half A without another conversion.
          * @param activations First activation row for this tile.
          * @param weights Complete row-major transposed weight tensor.
          * @param weight_row Element offset of the selected output column.
          * @param k Reduction width and activation-row stride.
          * @param reduced Exact tree root for each row.
          */
-        template <TensorType WeightType, int Rows>
+        template <TensorType WeightType, int Rows, bool HalfRNE = false, bool HalfStorage = false>
         inline void dot_gpu_aligned_expert_rows_avx2(
-            const float *activations,
+            const std::conditional_t<HalfStorage, uint16_t, float> *activations,
             const void *weights,
             std::size_t weight_row,
             int k,
@@ -969,15 +1031,21 @@ namespace llaminar2
 #pragma GCC unroll 4
                         for (int row = 0; row < Rows; ++row)
                         {
-                            const float *activation_values =
+                            const auto *activation_values =
                                 activations +
                                 static_cast<std::size_t>(row) * k +
                                 static_cast<std::size_t>(first_k);
+                            __m256 activation;
+                            if constexpr (HalfStorage)
+                                activation = load_gpu_aligned_expert_weight_avx2<TensorType::FP16>(activation_values, 0, valid);
+                            else
+                            {
+                                activation = load_gpu_aligned_expert_activation_avx2(activation_values, valid);
+                                if constexpr (HalfRNE)
+                                    activation = _mm256_cvtph_ps(_mm256_cvtps_ph(activation, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                            }
                             accumulators[row][block] = _mm256_fmadd_ps(
-                                load_gpu_aligned_expert_activation_avx2(
-                                    activation_values, valid),
-                                weight_values,
-                                accumulators[row][block]);
+                                activation, weight_values, accumulators[row][block]);
                         }
                     }
                 }
@@ -1021,6 +1089,8 @@ namespace llaminar2
          * runtime dispatch uses the process-wide typed ISA authority.
          *
          * @tparam WeightType Native floating tensor storage type.
+         * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
+         * @tparam HalfStorage A already has physical half storage; widen exact words.
          * @param A Row-major FP32 activations `[M,K]`.
          * @param B Row-major transposed weights `[N,K]`.
          * @param C Row-major FP32 output `[M,N]`.
@@ -1032,9 +1102,9 @@ namespace llaminar2
          * @param bias Optional FP32 output-column bias.
          * @return True after every output word is published.
          */
-        template <TensorType WeightType, ISALevel ISA>
+        template <TensorType WeightType, ISALevel ISA, bool HalfRNE = false, bool HalfStorage = false>
         inline bool run_gpu_aligned_expert_fp32_matmul_isa(
-            const float *A,
+            const std::conditional_t<HalfStorage, uint16_t, float> *A,
             const void *B,
             float *C,
             int M,
@@ -1085,7 +1155,7 @@ namespace llaminar2
                         {
                             const std::size_t weight_row =
                                 static_cast<std::size_t>(column) * K;
-                            const float *tile_activations =
+                            const auto *tile_activations =
                                 A + static_cast<std::size_t>(first_row) * K;
                             // Specializing the small runtime row tail lets the
                             // scheduler keep several independent logical-lane
@@ -1095,7 +1165,7 @@ namespace llaminar2
                                 case 1:
                                     dot_gpu_aligned_expert_rows_avx512<
                                         WeightType,
-                                        1>(tile_activations,
+                                        1, HalfRNE, HalfStorage>(tile_activations,
                                            B,
                                            weight_row,
                                            K,
@@ -1104,7 +1174,7 @@ namespace llaminar2
                                 case 2:
                                     dot_gpu_aligned_expert_rows_avx512<
                                         WeightType,
-                                        2>(tile_activations,
+                                        2, HalfRNE, HalfStorage>(tile_activations,
                                            B,
                                            weight_row,
                                            K,
@@ -1113,7 +1183,7 @@ namespace llaminar2
                                 case 3:
                                     dot_gpu_aligned_expert_rows_avx512<
                                         WeightType,
-                                        3>(tile_activations,
+                                        3, HalfRNE, HalfStorage>(tile_activations,
                                            B,
                                            weight_row,
                                            K,
@@ -1122,7 +1192,7 @@ namespace llaminar2
                                 case 4:
                                     dot_gpu_aligned_expert_rows_avx512<
                                         WeightType,
-                                        4>(tile_activations,
+                                        4, HalfRNE, HalfStorage>(tile_activations,
                                            B,
                                            weight_row,
                                            K,
@@ -1137,14 +1207,14 @@ namespace llaminar2
                         {
                             const std::size_t weight_row =
                                 static_cast<std::size_t>(column) * K;
-                            const float *tile_activations =
+                            const auto *tile_activations =
                                 A + static_cast<std::size_t>(first_row) * K;
                             switch (tile_rows)
                             {
                                 case 1:
                                     dot_gpu_aligned_expert_rows_avx2<
                                         WeightType,
-                                        1>(tile_activations,
+                                        1, HalfRNE, HalfStorage>(tile_activations,
                                            B,
                                            weight_row,
                                            K,
@@ -1153,7 +1223,7 @@ namespace llaminar2
                                 case 2:
                                     dot_gpu_aligned_expert_rows_avx2<
                                         WeightType,
-                                        2>(tile_activations,
+                                        2, HalfRNE, HalfStorage>(tile_activations,
                                            B,
                                            weight_row,
                                            K,
@@ -1162,7 +1232,7 @@ namespace llaminar2
                                 case 3:
                                     dot_gpu_aligned_expert_rows_avx2<
                                         WeightType,
-                                        3>(tile_activations,
+                                        3, HalfRNE, HalfStorage>(tile_activations,
                                            B,
                                            weight_row,
                                            K,
@@ -1171,7 +1241,7 @@ namespace llaminar2
                                 case 4:
                                     dot_gpu_aligned_expert_rows_avx2<
                                         WeightType,
-                                        4>(tile_activations,
+                                        4, HalfRNE, HalfStorage>(tile_activations,
                                            B,
                                            weight_row,
                                            K,
@@ -1188,10 +1258,10 @@ namespace llaminar2
                                 K,
                                 [&](int tile_row, int k)
                                 {
-                                    return A[
-                                        static_cast<std::size_t>(
-                                            first_row + tile_row) * K +
-                                        static_cast<std::size_t>(k)];
+                                    const auto value = A[static_cast<std::size_t>(first_row + tile_row) * K + static_cast<std::size_t>(k)];
+                                    if constexpr (HalfStorage) return fp16_to_fp32(value);
+                                    else if constexpr (HalfRNE) return roundFloatingOperandHalfRNE(value);
+                                    else return value;
                                 },
                                 [&](int k)
                                 {
@@ -1212,12 +1282,19 @@ namespace llaminar2
                                 static_cast<std::size_t>(
                                     first_row + tile_row) * N +
                                 static_cast<std::size_t>(column);
-                            float value = alpha * reduced[
-                                static_cast<std::size_t>(tile_row)];
-                            value += bias_value;
-                            if (beta != 0.0f)
-                                value += beta * C[output_index];
-                            C[output_index] = value;
+                            if constexpr (HalfRNE)
+                            {
+                                C[output_index] = completeSkinnyMatmulValue(
+                                    reduced[static_cast<std::size_t>(tile_row)], alpha, beta,
+                                    C + output_index, bias ? bias + column : nullptr);
+                            }
+                            else
+                            {
+                                float value = alpha * reduced[static_cast<std::size_t>(tile_row)];
+                                value += bias_value;
+                                if (beta != 0.0f) value += beta * C[output_index];
+                                C[output_index] = value;
+                            }
                         }
                     }
                 }
@@ -1229,10 +1306,12 @@ namespace llaminar2
         /**
          * @brief Execute the portable scalar GPU-aligned expert schedule.
          * @tparam WeightType Native floating tensor storage type.
+         * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
+         * @tparam HalfStorage A already has physical half storage; widen exact words.
          */
-        template <TensorType WeightType>
+        template <TensorType WeightType, bool HalfRNE = false, bool HalfStorage = false>
         inline bool run_gpu_aligned_expert_fp32_matmul_scalar(
-            const float *A,
+            const std::conditional_t<HalfStorage, uint16_t, float> *A,
             const void *B,
             float *C,
             int M,
@@ -1243,7 +1322,7 @@ namespace llaminar2
             const float *bias = nullptr)
         {
             return run_gpu_aligned_expert_fp32_matmul_isa<
-                WeightType, ISALevel::Scalar>(
+                WeightType, ISALevel::Scalar, HalfRNE, HalfStorage>(
                 A, B, C, M, N, K, alpha, beta, bias);
         }
 
@@ -1251,10 +1330,12 @@ namespace llaminar2
         /**
          * @brief Execute the AVX2 GPU-aligned expert schedule.
          * @tparam WeightType Native floating tensor storage type.
+         * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
+         * @tparam HalfStorage A already has physical half storage; widen exact words.
          */
-        template <TensorType WeightType>
+        template <TensorType WeightType, bool HalfRNE = false, bool HalfStorage = false>
         inline bool run_gpu_aligned_expert_fp32_matmul_avx2(
-            const float *A,
+            const std::conditional_t<HalfStorage, uint16_t, float> *A,
             const void *B,
             float *C,
             int M,
@@ -1265,7 +1346,7 @@ namespace llaminar2
             const float *bias = nullptr)
         {
             return run_gpu_aligned_expert_fp32_matmul_isa<
-                WeightType, ISALevel::AVX2>(
+                WeightType, ISALevel::AVX2, HalfRNE, HalfStorage>(
                 A, B, C, M, N, K, alpha, beta, bias);
         }
 #endif
@@ -1274,10 +1355,12 @@ namespace llaminar2
         /**
          * @brief Execute the AVX-512 GPU-aligned expert schedule.
          * @tparam WeightType Native floating tensor storage type.
+         * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
+         * @tparam HalfStorage A already has physical half storage; widen exact words.
          */
-        template <TensorType WeightType>
+        template <TensorType WeightType, bool HalfRNE = false, bool HalfStorage = false>
         inline bool run_gpu_aligned_expert_fp32_matmul_avx512(
-            const float *A,
+            const std::conditional_t<HalfStorage, uint16_t, float> *A,
             const void *B,
             float *C,
             int M,
@@ -1288,7 +1371,7 @@ namespace llaminar2
             const float *bias = nullptr)
         {
             return run_gpu_aligned_expert_fp32_matmul_isa<
-                WeightType, ISALevel::AVX512>(
+                WeightType, ISALevel::AVX512, HalfRNE, HalfStorage>(
                 A, B, C, M, N, K, alpha, beta, bias);
         }
 #endif
@@ -1302,11 +1385,13 @@ namespace llaminar2
          * selects one complete implementation for the process.
          *
          * @tparam WeightType Native floating tensor storage type.
+         * @tparam HalfRNE Round FP32 A to half in registers, preserving the fixed FP32 tree.
+         * @tparam HalfStorage A already has physical half storage; widen exact words.
          * @return True after the selected exact-tree implementation completes.
          */
-        template <TensorType WeightType>
+        template <TensorType WeightType, bool HalfRNE = false, bool HalfStorage = false>
         inline bool run_gpu_aligned_expert_fp32_matmul(
-            const float *A,
+            const std::conditional_t<HalfStorage, uint16_t, float> *A,
             const void *B,
             float *C,
             int M,
@@ -1320,17 +1405,17 @@ namespace llaminar2
             {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
             case ISALevel::AVX512:
-                return run_gpu_aligned_expert_fp32_matmul_avx512<WeightType>(
+                return run_gpu_aligned_expert_fp32_matmul_avx512<WeightType, HalfRNE, HalfStorage>(
                     A, B, C, M, N, K, alpha, beta, bias);
 #endif
 #if defined(__AVX2__)
             case ISALevel::AVX2:
-                return run_gpu_aligned_expert_fp32_matmul_avx2<WeightType>(
+                return run_gpu_aligned_expert_fp32_matmul_avx2<WeightType, HalfRNE, HalfStorage>(
                     A, B, C, M, N, K, alpha, beta, bias);
 #endif
             case ISALevel::Scalar:
             default:
-                return run_gpu_aligned_expert_fp32_matmul_scalar<WeightType>(
+                return run_gpu_aligned_expert_fp32_matmul_scalar<WeightType, HalfRNE, HalfStorage>(
                     A, B, C, M, N, K, alpha, beta, bias);
             }
         }
@@ -2231,12 +2316,14 @@ namespace llaminar2
              *
              * @param weight_tensor Borrowed weight tensor (FP32, FP16, or BF16).
              * @param numerical_policy Backend-native or GPU-aligned expert arithmetic.
+             * @param operand_precision Immutable Native/FP32/FP16RNE operand identity.
              */
             explicit FloatingPointGemmKernel(
                 const TensorBase *weight_tensor,
-                NumericalPolicy numerical_policy = NumericalPolicy::BackendNative)
+                NumericalPolicy numerical_policy = NumericalPolicy::BackendNative,
+                FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native)
                 : weight_tensor_(weight_tensor),
-                  numerical_policy_(numerical_policy)
+                  numerical_policy_(numerical_policy), operand_precision_(operand_precision)
             {
                 validateBoundWeight();
             }
@@ -2251,22 +2338,30 @@ namespace llaminar2
              *
              * @param weight_tensor Shared weight tensor (FP32, FP16, or BF16).
              * @param numerical_policy Backend-native or GPU-aligned expert arithmetic.
+             * @param operand_precision Immutable Native/FP32/FP16RNE operand identity.
              * @param placement Final CPU storage placement, certified before the native copy.
              */
             explicit FloatingPointGemmKernel(
                 std::shared_ptr<const TensorBase> weight_tensor,
                 NumericalPolicy numerical_policy = NumericalPolicy::BackendNative,
-                CPUWeightStoragePlacement placement = CPUWeightStoragePlacement::local())
+                CPUWeightStoragePlacement placement = CPUWeightStoragePlacement::local(),
+                FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native)
                 : weight_tensor_lifetime_(
                       cloneExpertExecutionStorage(weight_tensor, placement)),
                   weight_tensor_(weight_tensor_lifetime_.get()),
-                  numerical_policy_(numerical_policy),
+                  numerical_policy_(numerical_policy), operand_precision_(operand_precision),
                   owned_weight_bytes_(weight_tensor_lifetime_->size_bytes())
             {
                 validateBoundWeight();
             }
 
             ~FloatingPointGemmKernel() override = default;
+
+            /** @return Immutable arithmetic identity retained by service aliases. */
+            FloatingActivationOperandPrecision operandPrecision() const noexcept { return operand_precision_; }
+            /** @return Public immutable floating activation policy used by fusion/planning. */
+            FloatingActivationOperandPrecision floatingActivationOperandPrecision() const noexcept override { return operand_precision_; }
+
 
             /**
              * @brief Fork execution bindings while retaining the exact prepared tensor.
@@ -2283,7 +2378,8 @@ namespace llaminar2
                 std::shared_ptr<const FloatingPointGemmKernel> source)
                 : weight_tensor_lifetime_(source, source ? source->weight_tensor_ : nullptr),
                   weight_tensor_(weight_tensor_lifetime_.get()),
-                  numerical_policy_(source ? source->numerical_policy_ : NumericalPolicy::BackendNative)
+                  numerical_policy_(source ? source->numerical_policy_ : NumericalPolicy::BackendNative),
+                  operand_precision_(source ? source->operand_precision_ : FloatingActivationOperandPrecision::Native)
             {
                 if (!source || !weight_tensor_)
                     throw std::invalid_argument("CPU floating execution view requires a prepared source");
@@ -2460,6 +2556,9 @@ namespace llaminar2
 
                 // Extract bias pointer (FP32 fused bias only for now)
                 const float *bias_ptr = bias ? bias->data() : nullptr;
+
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return executeHalfOperands(A, C, m, n, k, transpose_B, alpha, beta, bias, activation_row_offset);
 
                 const size_t row_offset = static_cast<size_t>(activation_row_offset) * k;
 
@@ -2690,6 +2789,9 @@ namespace llaminar2
                 // Extract bias pointer (FP32 fused bias only for now)
                 const float *bias_ptr = bias ? bias->data() : nullptr;
 
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return executeHalfOperands(A, C, m, n, k, transpose_B, alpha, beta, bias, activation_row_offset);
+
                 const size_t row_offset = static_cast<size_t>(activation_row_offset) * k;
 
                 switch (weight_type_)
@@ -2884,6 +2986,9 @@ namespace llaminar2
                 float alpha = 1.0f, float beta = 0.0f,
                 DeviceWorkspaceManager *workspace = nullptr) override
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // Explicit half operands are linear-projection engines, not attention/shared-SwiGLU policies.
+
                 (void)workspace;
                 if (!weight_tensor_ || !gate || !up || !output ||
                     m <= 0 || n <= 0 || k <= 0)
@@ -3053,6 +3158,9 @@ namespace llaminar2
                 float alpha = 1.0f, float beta = 0.0f,
                 DeviceWorkspaceManager *workspace = nullptr) override
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // Explicit half operands are linear-projection engines, not attention/shared-SwiGLU policies.
+
                 (void)workspace;
                 if (!weight_tensor_ || !gate || !up || !output ||
                     m < 1 || n <= 0 || k <= 0)
@@ -3269,6 +3377,15 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override
             {
+                for (const auto &projection : projections)
+                {
+                    const auto *engine = dynamic_cast<const FloatingPointGemmKernel *>(projection.kernel);
+                    if (!engine || engine->operand_precision_ != operand_precision_)
+                        return false; // Reject the entire mixed transaction before any output write.
+                }
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return executeHalfBundle(input, projections, m, k);
+
                 (void)mpi_ctx;
                 (void)workspace;
 
@@ -3513,6 +3630,15 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override
             {
+                for (const auto &projection : projections)
+                {
+                    const auto *engine = dynamic_cast<const FloatingPointGemmKernel *>(projection.kernel);
+                    if (!engine || engine->operand_precision_ != operand_precision_)
+                        return false; // Reject the entire mixed transaction before any output write.
+                }
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return executeHalfBundle(input, projections, m, k);
+
                 (void)mpi_ctx;
                 (void)workspace;
 
@@ -3872,6 +3998,9 @@ namespace llaminar2
                 int device_idx,
                 ActivationFormat format_A, ActivationFormat format_B)
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // Explicit half operands are linear-projection engines, not attention/shared-SwiGLU policies.
+
                 (void)mpi_ctx;
                 (void)device_idx;
 
@@ -3935,6 +4064,9 @@ namespace llaminar2
                 int device_idx,
                 ActivationFormat format_A, ActivationFormat format_B)
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // Explicit half operands are linear-projection engines, not attention/shared-SwiGLU policies.
+
                 // 1. GEMM with scale
                 if (!multiply_activations_typed_impl(A, B, C, m, n, k, transpose_B, scale, 0.0f, mpi_ctx, device_idx, format_A, format_B))
                 {
@@ -3988,6 +4120,9 @@ namespace llaminar2
                 bool transpose_B, float alpha, float beta,
                 const IMPIContext *mpi_ctx, int device_idx)
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // This prepared mode owns typed linear tensor projections only.
+
                 if (!B && weight_tensor_)
                 {
                     return run_onednn_fp32_matmul(A, nullptr, C, m, n, k, transpose_B, alpha, beta);
@@ -4013,6 +4148,9 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // This prepared mode owns typed linear tensor projections only.
+
                 const auto &a_shape = A->shape();
                 const auto &b_shape = B->shape();
                 int m = static_cast<int>(a_shape[0]);
@@ -4077,6 +4215,9 @@ namespace llaminar2
                 bool transpose_B, int softmax_axis, const float *mask,
                 const IMPIContext *mpi_ctx, int device_idx)
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // This prepared mode owns typed linear tensor projections only.
+
                 // 1. GEMM: C = A * B
                 // Direct weight GEMM via stored weight tensor
                 if (!run_onednn_fp32_matmul(A, nullptr, C, m, n, k, transpose_B, 1.0f, 0.0f))
@@ -4129,6 +4270,9 @@ namespace llaminar2
                 ActivationFormat format_A,
                 ActivationFormat format_B) override
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // Explicit half operands are linear-projection engines, not attention/shared-SwiGLU policies.
+
                 (void)mpi_ctx;
                 (void)device_idx;
                 (void)softmax_axis; // We always do row-wise softmax
@@ -4234,6 +4378,9 @@ namespace llaminar2
                 bool transpose_B, float alpha, float beta,
                 const IMPIContext *mpi_ctx, int device_idx) override
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // This prepared mode owns typed linear tensor projections only.
+
                 (void)mpi_ctx;
                 (void)device_idx;
 
@@ -4248,6 +4395,9 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx, int device_idx,
                 ActivationFormat format_A, ActivationFormat format_B) override
             {
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                    return false; // Explicit half operands are linear-projection engines, not attention/shared-SwiGLU policies.
+
                 (void)mpi_ctx;
                 (void)device_idx;
 
@@ -4311,6 +4461,83 @@ namespace llaminar2
             }
 
         private:
+            /**
+             * @brief Validate complete explicit-half linear geometry before any write.
+             * @return True for exact row-major FP32/FP16 A, half B and FP32 C extents.
+             */
+            bool validHalfOperands(const TensorBase *input, const TensorBase *output,
+                int m, int n, int k, bool transpose, const TensorBase *bias, int row_offset) const
+            {
+                return input && output && weight_tensor_ && weight_type_ == TensorType::FP16 &&
+                    transpose && m > 0 && n > 0 && k > 0 && row_offset >= 0 && n <= get_n() && k == get_k() &&
+                    (input->native_type() == TensorType::FP32 || input->native_type() == TensorType::FP16) &&
+                    output->native_type() == TensorType::FP32 && input->cols() == static_cast<size_t>(k) &&
+                    static_cast<size_t>(row_offset) <= input->numel() / k &&
+                    static_cast<size_t>(m) <= input->numel() / k - static_cast<size_t>(row_offset) &&
+                    static_cast<size_t>(m) <= output->numel() / static_cast<size_t>(n) &&
+                    input->raw_data() && output->raw_data() && weight_tensor_->raw_data() &&
+                    dynamic_cast<const FP16Tensor *>(weight_tensor_) &&
+                    (input->native_type() != TensorType::FP16 || dynamic_cast<const FP16Tensor *>(input)) &&
+                    (!bias || (bias->native_type() == TensorType::FP32 && bias->numel() >= static_cast<size_t>(n) && bias->raw_data()));
+            }
+
+            /**
+             * @brief Execute physical half A/B with FP32 lanes and an M-independent tree.
+             * @param input Original FP32 input or already physical-half storage.
+             * @param output FP32 destination; inactive capacity is not read/written.
+             * @param m Exact live row count; @p n and @p k are exact matrix dimensions.
+             * @param transpose Must be true for prepared N-by-K model weights.
+             * @param alpha Dot-product scaling; @p beta scales an existing FP32 output.
+             * @param bias Optional FP32 bias, applied after the complete dot.
+             * @param row_offset First live source row; no pointer rebinding or temporary bank.
+             * @return False before any write on an unsupported/incomplete contract.
+             */
+            bool executeHalfOperands(const TensorBase *input, TensorBase *output,
+                int m, int n, int k, bool transpose, float alpha, float beta,
+                const TensorBase *bias, int row_offset) const
+            {
+                if (!validHalfOperands(input, output, m, n, k, transpose, bias, row_offset)) return false;
+                const auto *weight = dynamic_cast<const FP16Tensor *>(weight_tensor_);
+                if (!weight) return false;
+                // Disabled CPU statistics must not construct allocating tag maps.
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
+                {
+                    PerfStatsCollector::addCounter("kernel", "cpu_fp16_operand_compute32_calls", 1.0, "gemm", "cpu",
+                        {{"m",std::to_string(m)},{"n",std::to_string(n)},{"k",std::to_string(k)},
+                         {"isa",isaLevelName(activeISALevel())},{"activation_rounding","half_rne"},{"weights","fp16"},{"accumulation","fp32"},{"output","fp32"},
+                         {"reduction","fixed_256_lane_tree"},{"activation_storage",input->native_type()==TensorType::FP16?"fp16":"fp32"}});
+                }
+                const size_t offset = static_cast<size_t>(row_offset) * k;
+                if (input->native_type() == TensorType::FP32)
+                    return run_gpu_aligned_expert_fp32_matmul<TensorType::FP16, true>(
+                        input->data()+offset, weight->typed_data(), output->mutable_data(), m,n,k,alpha,beta,bias?bias->data():nullptr);
+                const auto *half = dynamic_cast<const FP16Tensor *>(input);
+                return half && run_gpu_aligned_expert_fp32_matmul<TensorType::FP16, true, true>(
+                    half->typed_data()+offset, weight->typed_data(), output->mutable_data(), m,n,k,alpha,beta,bias?bias->data():nullptr);
+            }
+
+            /**
+             * @brief Validate an entire immutable half bundle, then publish each output.
+             * @return False without writes on any precision/type/extent mismatch.
+             */
+            bool executeHalfBundle(const TensorBase *input, const std::vector<TensorProjectionDesc> &projections,
+                int m, int k) const
+            {
+                if (projections.empty()) return false;
+                for (const auto &p : projections)
+                {
+                    const auto *engine = dynamic_cast<const FloatingPointGemmKernel *>(p.kernel);
+                    if (!engine || engine->operand_precision_ != operand_precision_ ||
+                        !engine->validHalfOperands(input,p.output,m,p.n,k,true,p.bias,0)) return false;
+                }
+                for (const auto &p : projections)
+                {
+                    const auto *engine = static_cast<const FloatingPointGemmKernel *>(p.kernel);
+                    if (!engine->executeHalfOperands(input,p.output,m,p.n,k,true,1.f,0.f,p.bias,0)) return false;
+                }
+                return true;
+            }
+
             /**
              * @brief Down-project precomputed SwiGLU rows with the GPU tree.
              *
@@ -4395,10 +4622,22 @@ namespace llaminar2
              */
             void validateBoundWeight()
             {
+                if (operand_precision_ != FloatingActivationOperandPrecision::Native &&
+                    operand_precision_ != FloatingActivationOperandPrecision::FP32 &&
+                    operand_precision_ != FloatingActivationOperandPrecision::FP16RNE)
+                    throw std::invalid_argument("Unknown CPU floating operand policy");
                 if (!weight_tensor_)
+                {
+                    if (operand_precision_ != FloatingActivationOperandPrecision::Native)
+                        throw std::invalid_argument("Explicit CPU floating operand policy requires prepared weights");
                     return;
+                }
 
                 weight_type_ = weight_tensor_->native_type();
+                if ((operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && weight_type_ != TensorType::FP16) ||
+                    (operand_precision_ == FloatingActivationOperandPrecision::FP32 && weight_type_ != TensorType::FP32))
+                    throw std::invalid_argument("CPU explicit floating operand policy and prepared storage disagree");
+
                 if (weight_type_ != TensorType::FP32 &&
                     weight_type_ != TensorType::FP16 &&
                     weight_type_ != TensorType::BF16)
@@ -4415,6 +4654,7 @@ namespace llaminar2
             const TensorBase *weight_tensor_ = nullptr; ///< Exact tensor used by GEMM.
             TensorType weight_type_ = TensorType::FP32;
             NumericalPolicy numerical_policy_ = NumericalPolicy::BackendNative;
+            const FloatingActivationOperandPrecision operand_precision_ = FloatingActivationOperandPrecision::Native; ///< Sealed prepared operand identity.
             const size_t owned_weight_bytes_ = 0; ///< Zero for non-allocating execution views.
         };
 

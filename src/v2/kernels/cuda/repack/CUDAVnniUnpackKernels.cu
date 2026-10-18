@@ -177,6 +177,7 @@ __global__ void cuda_unpack_vnni_to_q8_1(
 
 __global__ void cuda_unpack_vnni_to_q8_k(
     const uint8_t* __restrict__ d_payload,
+    const uint16_t* __restrict__ d_scales,
     Q8_KBlock*     __restrict__ d_raw,
     int N, int blocks_per_row, int superblocks_per_row)
 {
@@ -188,6 +189,10 @@ __global__ void cuda_unpack_vnni_to_q8_k(
     const int subblock = b % 8;
     const size_t linear = static_cast<size_t>(b) * N + n;
     auto& blk = d_raw[n * superblocks_per_row + superblock];
+    // Only subblock0 owns the shared source-scale field. The execution
+    // representation already rounded it to FP16; reverse conversion widens
+    // that value and cannot reconstruct discarded FP32 source bits.
+    if (subblock == 0) blk.d = __half2float(*reinterpret_cast<const __half*>(d_scales + linear));
     int8_t* dst = blk.qs + subblock * 32;
     const uint8_t* src = d_payload + linear * 32;
     unpack_copy16(dst, src);
@@ -268,7 +273,7 @@ bool launchVnniUnpackCUDA(
     case RepackFormat::Q8_K: {
         const int superblocks_per_row = (K + 255) / 256;
         cuda_unpack_vnni_to_q8_k<<<grid, block, 0, cuda_stream>>>(
-            d_payload,
+            d_payload, d_scales,
             static_cast<Q8_KBlock*>(d_raw_blocks),
             N, blocks_per_row, superblocks_per_row);
         break;

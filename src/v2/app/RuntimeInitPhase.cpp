@@ -7,6 +7,8 @@
  * from affinity, never from the numeric MPI rank or a hostfile slot order.
  * Model-aware placement belongs to the shared rank resolver. Startup reports
  * the runner's resolved configuration instead of binding an overlay itself.
+ * The runner also publishes revision-owned prompt defaults; the frontend applies
+ * only an explicit user template override.
  * Saved rank selection is interpreted before CPU placement. Automatic search
  * runs once on discovery root and publishes a complete apply document. Both
  * selections enter the same MPI admission transaction before runner creation.
@@ -23,9 +25,7 @@
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "execution/runner/RankInitializationLifecycle.h"
 #include <type_traits>
-#include "models/IGraphConfigBuilder.h"
 #include "planning/ClusterInventoryGatherer.h"
-#include "utils/ChatTemplate.h"
 #include "utils/Tokenizer.h"
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
@@ -437,16 +437,6 @@ namespace llaminar2
                 tokenizer = runner->tokenizer();
                 if (!tokenizer) throw std::runtime_error("Runner did not publish a tokenizer");
                 ChatTemplateResolver::resolve(config.chat_template_override, tokenizer, mpi_ctx->rank());
-                if (config.chat_template_override.empty() && !runner->architecture().empty())
-                {
-                    auto builder = createGraphConfigBuilder(runner->architecture());
-                    if (builder)
-                    {
-                        const auto model_template = builder->chatTemplateOverride();
-                        if (model_template && !model_template->empty())
-                            tokenizer->setChatTemplate(ChatTemplate::create(*model_template, "", ""));
-                    }
-                }
                 return true;
             });
 

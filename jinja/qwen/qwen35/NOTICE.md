@@ -33,10 +33,11 @@ THE SOFTWARE.
 The chat template shipped embedded in various Qwen 3.5 GGUF artifacts has
 been observed to leave the model in a degenerate repetition state after the
 `</think>` block. The community-maintained template in this directory is
-used as a drop-in replacement by `Qwen35GraphConfigBuilder::chatTemplateOverride()`.
+used by `ModelGenerationPolicy::applyChatTemplate()` for the identified Qwen3.5
+and Qwen3.6 revisions; newer revisions retain their own GGUF template.
 
 The `.jinja` file is embedded into the binary at build time by CMake
-(see `src/v2/models/qwen35/CMakeLists-fragment` / the custom command that
+(see `src/v2/CMakeLists.txt` and the custom command that
 generates `Qwen35ChatTemplate.generated.h`). There is no filesystem
 dependency at runtime.
 

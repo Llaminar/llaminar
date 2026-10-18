@@ -57,8 +57,8 @@ namespace llaminar2::device_native_vnni_contract
      * @brief Publish one dual-scale 32-value block contribution.
      * @param low_dot Exact dot product for values 0 through 15.
      * @param high_dot Exact dot product for values 16 through 31.
-     * @param low_weight_scale FP16-derived low-half scale.
-     * @param high_weight_scale FP16-derived high-half scale.
+     * @param low_weight_scale Source-resolved FP32 low-half scale.
+     * @param high_weight_scale Source-resolved FP32 high-half scale.
      * @param activation_scale FP32 activation-block scale.
      * @return Canonically rounded contribution, not yet accumulated.
      */

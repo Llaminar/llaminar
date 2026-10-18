@@ -1,17 +1,28 @@
 /**
  * @file CUDAFlashAttentionKernels.cu
- * @brief CUDA device kernels for Flash Attention 2 (Ampere) and Flash Decoding
+ * @brief Captured CUDA attention and conditional dispatch to safeguarded tensor prefill.
  *
  * This file contains the CUDA device kernels and extern "C" wrapper functions
  * called from the C++ implementation file.
  *
+ * Full HD256 FP16 buckets select the native warp-owned tensor-prefill
+ * family through a typed host function handle. Graph control retains
+ * device linking; the numerical family has no cross-TU device calls.
+ * Its bounded half PV tiles retain FP32 running softmax and summaries.
+ *
  * Algorithms implemented:
  * - Flash Attention 2 with Pipelined Prefetching: Optimized for Ampere (SM >= 8.0)
- *   - Uses dedicated producer warps to overlap global-to-shared K/V loads
- *   - Vectorized FP16/BF16/FP32 cache loads into double-buffered K/V tiles
+ *   - A typed geometry policy selects dedicated half-value producers or
+ *     cooperative FP32 value tiles, with exact per-policy shared-memory BOMs
+ *   - Native FP16/BF16/FP32 cache storage retains its canonical operand rounding
+ *   - Aligned FP32 context summaries use vector stores with exact scalar tails
  *   - Producer/consumer warp specialization
  *   - WMMA (Tensor Core) acceleration for Q @ K^T matmul
  *   - Adaptive tile sizing for head_dim=64, head_dim=128, and head_dim=256
+ *   - Exact-width head specializations remove runtime address arithmetic;
+ *     partial-width heads retain their admitted live element extent
+ *   - Additive attention biases are applied after query/key normalization;
+ *     one score owner publishes the same masked FP32 values to every P@V stripe
  * - Flash Decoding: Split-K parallelism for single-token decode
  *   - One terminal partial publication for both empty and nonempty live spans,
  *     preventing early-exit output addresses from spilling across K/V traversal
@@ -21,6 +32,9 @@
  */
 
 #include <cuda_runtime.h>
+#include "CUDATensorPrefillKernels.h"
+#include "CUDATensorContextPartition.cuh"
+#include <tuple>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <type_traits>
@@ -45,6 +59,45 @@ using namespace nvcuda;
 
 namespace
 {
+    using llaminar2::cuda::fa2_policy::FA2TileStoragePolicy;
+    using llaminar2::cuda::fa2_policy::FA2TileStorageTraits;
+
+    /** On-chip values retain native-cache half rounding before FP32 accumulation. */
+    template <FA2TileStoragePolicy Policy>
+    using FA2ValueElement = std::conditional_t<
+        Policy == FA2TileStoragePolicy::CooperativeFloat, float, half>;
+
+    /** Pair type belonging to the selected shared value representation. */
+    template <FA2TileStoragePolicy Policy>
+    using FA2ValuePair = std::conditional_t<
+        Policy == FA2TileStoragePolicy::CooperativeFloat, float2, half2>;
+
+    /** @brief Convert one already-rounded native operand pair for shared publication.
+     * @tparam Policy Capture-frozen shared representation.
+     * @param pair Exact half operands used by the canonical arithmetic.
+     * @return The same values in the selected on-chip representation. */
+    template <FA2TileStoragePolicy Policy>
+    __device__ __forceinline__ FA2ValuePair<Policy> fa2SharedValuePair(half2 pair)
+    {
+        if constexpr (Policy == FA2TileStoragePolicy::CooperativeFloat)
+            return __half22float2(pair);
+        else
+            return pair;
+    }
+
+    /** @brief Read one shared pair as the canonical FP32 P/V operands.
+     * @tparam Policy Capture-frozen shared representation.
+     * @param pair Published shared values.
+     * @return Exact FP32 expansion; this does not change accumulation precision. */
+    template <FA2TileStoragePolicy Policy>
+    __device__ __forceinline__ float2 fa2ReadValuePair(FA2ValuePair<Policy> pair)
+    {
+        if constexpr (Policy == FA2TileStoragePolicy::CooperativeFloat)
+            return pair;
+        else
+            return __half22float2(pair);
+    }
+
     // =========================================================================
     // Constants
     // =========================================================================
@@ -53,6 +106,15 @@ namespace
 
     /** @brief Physical cache dtype, independent of FP32 model activations. */
     enum class NativeKVType { FP32, FP16, BF16 };
+
+    /**
+     * @brief Whether the live head width equals its compiled register extent.
+     *
+     * Both modes use the same arithmetic body. ExactWidth exposes immutable
+     * geometry to the compiler; PartialWidth keeps the actual row stride and
+     * masks the unused register lanes without reading or writing padding.
+     */
+    enum class FA2HeadGeometry { ExactWidth, PartialWidth };
 
     /** @brief Native element type; no whole-cache conversion buffer is used. */
     template <NativeKVType TYPE>
@@ -99,8 +161,6 @@ namespace
     // =========================================================================
 
     // Pipeline configuration
-    constexpr int FA2_NUM_STAGES = 2;       // Double buffering
-    constexpr int FA2_PRODUCER_WARPS = 2;   // Warps dedicated to loading (fixed)
     /// Maximum compact verifier rows represented by DEVICE_PARAMS.
     constexpr int MAX_DYNAMIC_ATTENTION_PARAM_ROWS =
         llaminar2::attention::kMaxGroupedVerifierAttentionRows;
@@ -378,9 +438,7 @@ namespace
         if (qkv_pad !=
                 llaminar2::cuda::fa2_policy::kFA2QKVSharedMemoryPad ||
             scores_pad !=
-                llaminar2::cuda::fa2_policy::kFA2ScoreSharedMemoryPad ||
-            FA2_NUM_STAGES !=
-                llaminar2::cuda::fa2_policy::kFA2KVSharedMemoryStages)
+                llaminar2::cuda::fa2_policy::kFA2ScoreSharedMemoryPad)
         {
             return 0;
         }
@@ -411,6 +469,7 @@ namespace
      */
     struct FA2KernelConfig
     {
+        FA2TileStoragePolicy tile_storage = FA2TileStoragePolicy::WarpSpecializedHalf;
         int tile_q;
         int tile_kv;
         int num_q_warp_groups;
@@ -441,6 +500,11 @@ namespace
         int selected_q_warp_groups)
     {
         FA2KernelConfig cfg{};
+        const auto storage = llaminar2::cuda::fa2_policy::selectFA2TileStoragePolicy(
+            head_dim, selected_q_warp_groups);
+        if (!storage)
+            return cfg;
+        cfg.tile_storage = *storage;
 
         // Query grouping was selected once from immutable launch geometry.
         // Every grouping retains the same per-row QK, online-softmax, and P@V
@@ -488,16 +552,16 @@ namespace
             return cfg;
 
         cfg.pv_warps_per_q_group =
-            head_dim > 128
-                ? llaminar2::debugEnv().attention.cuda_fa2_hd256_pv_warps
-                : 1;
-        if (!llaminar2::cuda::fa2_policy::isCompiledFA2PVWarpGeometry(
-                head_dim,
-                cfg.pv_warps_per_q_group))
-        {
+            llaminar2::cuda::fa2_policy::selectFA2PVWarpCount(
+                head_dim, target_q_warp_groups,
+                llaminar2::debugEnv().attention.cuda_fa2_hd256_pv_warps);
+        if (cfg.pv_warps_per_q_group == 0)
             return {};
-        }
-        cfg.block_size = (FA2_PRODUCER_WARPS + cfg.consumerWarps()) * WARP_SIZE;
+        const int producer_warps =
+            cfg.tile_storage == FA2TileStoragePolicy::WarpSpecializedHalf
+                ? FA2TileStorageTraits<FA2TileStoragePolicy::WarpSpecializedHalf>::producer_warps
+                : FA2TileStorageTraits<FA2TileStoragePolicy::CooperativeFloat>::producer_warps;
+        cfg.block_size = (producer_warps + cfg.consumerWarps()) * WARP_SIZE;
         return cfg;
     }
 
@@ -510,9 +574,10 @@ namespace
      * are multiples of sixteen and launch admission requires aligned K/V bases,
      * so every source vector and padded shared-memory destination is aligned.
      * The caller's existing CTA barriers publish the current tile and protect
-     * double-buffer reuse; this helper introduces no extra ordering operation.
+     * shared-stage reuse; this helper introduces no extra ordering operation.
      *
      * @tparam KV_TYPE Native floating-point cache storage; only tile operands convert.
+     * @tparam TILE_STORAGE Capture-frozen loader ownership and shared value type.
      * @param K Source cache base, aligned to sixteen bytes.
      * @param V Source value-cache base with the same geometry and alignment.
      * @param K_dst Current shared-memory key tile.
@@ -528,9 +593,9 @@ namespace
      * @param ring_row_origin Physical row representing logical cache row zero.
      * @param ring_row_capacity Zero for linear storage, positive for a ring.
      */
-    template <NativeKVType KV_TYPE>
+    template <NativeKVType KV_TYPE, FA2TileStoragePolicy TILE_STORAGE>
     __device__ __forceinline__ void stageFA2KVTile(
-        const void *K, const void *V, half *K_dst, half *V_dst,
+        const void *K, const void *V, half *K_dst, FA2ValueElement<TILE_STORAGE> *V_dst,
         int batch_idx, int kv_stride, int n_kv_heads, int kv_head_idx,
         int head_dim, int smem_stride, int kv_start, int tile_rows,
         int ring_row_origin, int ring_row_capacity)
@@ -541,7 +606,9 @@ namespace
             static_cast<size_t>(batch_idx) * kv_stride * n_kv_heads * head_dim;
         for (int item = static_cast<int>(threadIdx.x);
              item < tile_rows * vectors_per_row;
-             item += FA2_PRODUCER_WARPS * WARP_SIZE)
+             item += (TILE_STORAGE == FA2TileStoragePolicy::WarpSpecializedHalf
+                          ? FA2TileStorageTraits<TILE_STORAGE>::producer_warps * WARP_SIZE
+                          : blockDim.x))
         {
             const int row = item / vectors_per_row;
             const int d = (item % vectors_per_row) * kVectorElements;
@@ -555,15 +622,30 @@ namespace
                                    n_kv_heads * head_dim +
                 kv_head_idx * head_dim + d;
             half *key_destination = K_dst + row * smem_stride + d;
-            half *value_destination = V_dst + row * smem_stride + d;
+            FA2ValueElement<TILE_STORAGE> *value_destination = V_dst + row * smem_stride + d;
             if constexpr (KV_TYPE == NativeKVType::FP16)
             {
                 *reinterpret_cast<uint4 *>(key_destination) =
                     *reinterpret_cast<const uint4 *>(
                         static_cast<const half *>(K) + source_offset);
-                *reinterpret_cast<uint4 *>(value_destination) =
-                    *reinterpret_cast<const uint4 *>(
-                        static_cast<const half *>(V) + source_offset);
+                const uint4 value = *reinterpret_cast<const uint4 *>(
+                    static_cast<const half *>(V) + source_offset);
+                if constexpr (TILE_STORAGE == FA2TileStoragePolicy::CooperativeFloat)
+                {
+                    const unsigned int value_words[4] = {value.x, value.y, value.z, value.w};
+                    auto *value_pairs = reinterpret_cast<FA2ValuePair<TILE_STORAGE> *>(value_destination);
+#pragma unroll
+                    for (int pair = 0; pair < 4; ++pair)
+                    {
+                        value_pairs[pair] = make_float2(
+                            __half2float(__ushort_as_half(static_cast<unsigned short>(value_words[pair]))),
+                            __half2float(__ushort_as_half(static_cast<unsigned short>(value_words[pair] >> 16))));
+                    }
+                }
+                else
+                {
+                    *reinterpret_cast<uint4 *>(value_destination) = value;
+                }
             }
             else if constexpr (KV_TYPE == NativeKVType::BF16)
             {
@@ -577,16 +659,16 @@ namespace
                 const unsigned int key_words[4] = {key.x, key.y, key.z, key.w};
                 const unsigned int value_words[4] = {value.x, value.y, value.z, value.w};
                 auto *key_pairs = reinterpret_cast<half2 *>(key_destination);
-                auto *value_pairs = reinterpret_cast<half2 *>(value_destination);
+                auto *value_pairs = reinterpret_cast<FA2ValuePair<TILE_STORAGE> *>(value_destination);
 #pragma unroll
                 for (int pair = 0; pair < 4; ++pair)
                 {
                     key_pairs[pair] = __floats2half2_rn(
                         __uint_as_float(key_words[pair] << 16),
                         __uint_as_float(key_words[pair] & 0xffff0000u));
-                    value_pairs[pair] = __floats2half2_rn(
+                    value_pairs[pair] = fa2SharedValuePair<TILE_STORAGE>(__floats2half2_rn(
                         __uint_as_float(value_words[pair] << 16),
-                        __uint_as_float(value_words[pair] & 0xffff0000u));
+                        __uint_as_float(value_words[pair] & 0xffff0000u)));
                 }
             }
             else
@@ -596,11 +678,11 @@ namespace
                 const float4 value = *reinterpret_cast<const float4 *>(
                     static_cast<const float *>(V) + source_offset);
                 auto *key_pairs = reinterpret_cast<half2 *>(key_destination);
-                auto *value_pairs = reinterpret_cast<half2 *>(value_destination);
+                auto *value_pairs = reinterpret_cast<FA2ValuePair<TILE_STORAGE> *>(value_destination);
                 key_pairs[0] = __floats2half2_rn(key.x, key.y);
                 key_pairs[1] = __floats2half2_rn(key.z, key.w);
-                value_pairs[0] = __floats2half2_rn(value.x, value.y);
-                value_pairs[1] = __floats2half2_rn(value.z, value.w);
+                value_pairs[0] = fa2SharedValuePair<TILE_STORAGE>(__floats2half2_rn(value.x, value.y));
+                value_pairs[1] = fa2SharedValuePair<TILE_STORAGE>(__floats2half2_rn(value.z, value.w));
             }
         }
     }
@@ -608,8 +690,9 @@ namespace
     /**
      * @brief Flash Attention 2 kernel with pipelined prefetching (Ampere, SM >= 8.0)
      *
-     * Uses producer/consumer warp specialization to overlap K/V loads with
-     * computation, double-buffered shared memory, and WMMA Tensor Core QK.
+     * The capture-time storage policy selects either dedicated producers with
+     * two disjoint half-value stages or cooperative consumers with one FP32
+     * value stage. Both use WMMA Tensor Core QK and the same FP32 P/V order.
      *
      * Template parameters:
      *   MAX_Q_WARP_GROUPS: Maximum independent 16-row WMMA score groups
@@ -638,16 +721,25 @@ namespace
      * threads while every row executes one canonical compiled instruction body.
      *   KV_TYPE: Native FP16/BF16/FP32 storage. Only producer loads differ;
      *            shared operands and the arithmetic tree remain unchanged.
+     *   TILE_STORAGE: Capture-frozen loader ownership and on-chip V type.
+     *                 Cooperative tiles convert values once for every Q row.
+     *   HEAD_GEOMETRY: Exact-width heads expose HEAD_DIM to address and loop
+     *                  arithmetic. Partial widths retain the runtime extent.
      */
     template <int MAX_Q_WARP_GROUPS,
               int PV_WARPS_PER_Q_GROUP,
               int HEAD_DIM,
               int TILE_KV,
-              NativeKVType KV_TYPE = NativeKVType::FP32,
-              bool WRITE_CONTEXT_PARTIAL = false>
+              NativeKVType KV_TYPE,
+              bool WRITE_CONTEXT_PARTIAL,
+              FA2HeadGeometry HEAD_GEOMETRY,
+              FA2TileStoragePolicy TILE_STORAGE>
     // Launchers may omit query groups, but never exceed this producer/consumer
     // geometry. Publish the bound so register allocation sees the real CTA.
-    __global__ __launch_bounds__((FA2_PRODUCER_WARPS + MAX_Q_WARP_GROUPS * PV_WARPS_PER_Q_GROUP) * WARP_SIZE)
+    __global__ __launch_bounds__((FA2TileStorageTraits<TILE_STORAGE>::producer_warps +
+                                  MAX_Q_WARP_GROUPS * PV_WARPS_PER_Q_GROUP) * WARP_SIZE,
+                                 (TILE_STORAGE == FA2TileStoragePolicy::CooperativeFloat &&
+                                  HEAD_DIM == 256 && PV_WARPS_PER_Q_GROUP == 4 ? 2 : 1))
     void flash_attention_2_pipelined_kernel(
         const float *__restrict__ Q,
         const void *__restrict__ K,
@@ -679,6 +771,16 @@ namespace
         int device_direct_partition_limit = 0,
         int explicit_context_partition = -1)
     {
+        constexpr int FA2_PRODUCER_WARPS = FA2TileStorageTraits<TILE_STORAGE>::producer_warps;
+        constexpr int FA2_NUM_STAGES = FA2TileStorageTraits<TILE_STORAGE>::kv_stages;
+        using SharedValue = FA2ValueElement<TILE_STORAGE>;
+        // The launcher selects this specialization from the admitted geometry.
+        // These constants change address calculation, never accumulation order.
+        if constexpr (HEAD_GEOMETRY == FA2HeadGeometry::ExactWidth)
+            head_dim = HEAD_DIM;
+        tile_kv = TILE_KV;
+        qkv_pad = FA2_QKV_PAD;
+        scores_pad = FA2_SCORES_LD_PAD;
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
         int position_offset_runtime = position_offset;
@@ -795,8 +897,8 @@ namespace
             }
         }
 
-        // Warp role: producer (warps 0-1) or consumer (warps 2+)
-        // Use template parameter for consumer warp count
+        // Dedicated producers exist only in the half-value policy. The float
+        // policy gives every launched warp a consumer role and shares loading.
         const bool is_producer = (warp_id < FA2_PRODUCER_WARPS);
         constexpr int MAX_CONSUMER_WARPS =
             MAX_Q_WARP_GROUPS * PV_WARPS_PER_Q_GROUP;
@@ -825,11 +927,9 @@ namespace
         const bool owns_score_tile =
             is_active_consumer && pv_warp_in_group == 0;
 
-        // Shared memory layout with double buffering:
-        // Buffer 0: K_tile[tile_kv, head_dim], V_tile[tile_kv, head_dim]
-        // Buffer 1: K_tile[tile_kv, head_dim], V_tile[tile_kv, head_dim]
-        // Q_tile: [tile_q, head_dim] (loaded once)
-        // scores: [tile_q, tile_kv]
+        // The header's exact resource BOM owns Q, policy-specific K/V stages,
+        // and scores, including padding. Half stages interleave K/V; the
+        // cooperative stage holds half K followed by exactly expanded float V.
         extern __shared__ char smem[];
 
         const int smem_stride = head_dim + qkv_pad;
@@ -838,16 +938,29 @@ namespace
 
         half *Q_tile_fp16 = reinterpret_cast<half *>(smem);
         half *KV_buffers = Q_tile_fp16 + tile_q * smem_stride;
-        float *scores = reinterpret_cast<float *>(KV_buffers + FA2_NUM_STAGES * 2 * kv_tile_size);
+        // Both layouts occupy exactly the shared-header BOM. Cooperative
+        // values convert once for all consuming rows; dedicated producers
+        // retain their two disjoint half-value stages for small HD256 tiles.
+        SharedValue *V_buffers = reinterpret_cast<SharedValue *>(
+            KV_buffers + FA2_NUM_STAGES * kv_tile_size);
+        float *scores = nullptr;
+        if constexpr (TILE_STORAGE == FA2TileStoragePolicy::CooperativeFloat)
+            scores = V_buffers + FA2_NUM_STAGES * kv_tile_size;
+        else
+            scores = reinterpret_cast<float *>(KV_buffers + FA2_NUM_STAGES * 2 * kv_tile_size);
 
         // Helper to get K/V tile for a stage
         auto get_K_tile = [&](int stage) -> half *
         {
-            return KV_buffers + stage * 2 * kv_tile_size;
+            return KV_buffers + stage * kv_tile_size *
+                (TILE_STORAGE == FA2TileStoragePolicy::WarpSpecializedHalf ? 2 : 1);
         };
-        auto get_V_tile = [&](int stage) -> half *
+        auto get_V_tile = [&](int stage) -> SharedValue *
         {
-            return KV_buffers + stage * 2 * kv_tile_size + kv_tile_size;
+            if constexpr (TILE_STORAGE == FA2TileStoragePolicy::CooperativeFloat)
+                return V_buffers + stage * kv_tile_size;
+            else
+                return KV_buffers + stage * 2 * kv_tile_size + kv_tile_size;
         };
 
         // Consumer warps: warp-cooperative per-row accumulators.  Every warp
@@ -875,7 +988,16 @@ namespace
             HEAD_DIM / (2 * PV_WARPS_PER_Q_GROUP);
         const int active_dims_per_lane =
             head_dim / (2 * PV_WARPS_PER_Q_GROUP);
-        const int dim_start = dim_partition * active_dims_per_lane;
+        // Change only dimension placement. Adjacent four-float groups
+        // retain vector stores and avoid identical banks for the two half-warps.
+        constexpr bool kStripedOutputDimensions =
+            TILE_STORAGE == FA2TileStoragePolicy::CooperativeFloat &&
+            HEAD_DIM == 256 && PV_WARPS_PER_Q_GROUP > 1 &&
+            HEAD_GEOMETRY == FA2HeadGeometry::ExactWidth;
+        constexpr int kDimensionStripeStride =
+            kStripedOutputDimensions ? 8 * PV_WARPS_PER_Q_GROUP : 4;
+        const int dim_start = dim_partition *
+            (kStripedOutputDimensions ? 4 : active_dims_per_lane);
         // Pointers for this batch/head
         const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
 
@@ -933,16 +1055,16 @@ namespace
         // =====================================================================
         // Pipeline prologue: Start loading first tile(s)
         // =====================================================================
-        if (is_producer && num_kv_tiles > 0)
+        if ((FA2_PRODUCER_WARPS == 0 || is_producer) && num_kv_tiles > 0)
         {
             const int kv_start_0 = kv_partition_begin;
             const int kv_end_0 = min(kv_start_0 + tile_kv, kv_partition_end);
             const int actual_len_0 = kv_end_0 - kv_start_0;
 
             half *K_dst_0 = get_K_tile(0);
-            half *V_dst_0 = get_V_tile(0);
+            SharedValue *V_dst_0 = get_V_tile(0);
 
-            stageFA2KVTile<KV_TYPE>(
+            stageFA2KVTile<KV_TYPE, TILE_STORAGE>(
                 K, V, K_dst_0, V_dst_0, batch_idx, kv_stride, n_kv_heads,
                 kv_head_idx, head_dim, smem_stride, kv_start_0, actual_len_0,
                 ring_row_origin, ring_row_capacity);
@@ -974,27 +1096,35 @@ namespace
 
             // Get current buffers
             half *K_tile_fp16 = get_K_tile(current_stage);
-            half *V_tile_fp16 = get_V_tile(current_stage);
+            SharedValue *V_tile = get_V_tile(current_stage);
 
             // ----------------------------------------------------------------
             // PRODUCER WARPS: Start loading next tile into next_stage buffer
             // ----------------------------------------------------------------
-            if (is_producer && kv_tile_iter + 1 < num_kv_tiles)
+            // The typed policy fixes which edge permits the next tile load.
+            // Dedicated producers fill the disjoint second stage while QK/PV
+            // consume this one. Cooperative loaders reuse storage after P/V.
+            const auto load_next_tile = [&]()
             {
-                const int next_kv_start =
-                    kv_partition_begin + (kv_tile_iter + 1) * tile_kv;
-                const int next_kv_end =
-                    min(next_kv_start + tile_kv, kv_partition_end);
-                const int next_actual_len = next_kv_end - next_kv_start;
+                if ((FA2_PRODUCER_WARPS == 0 || is_producer) && kv_tile_iter + 1 < num_kv_tiles)
+                {
+                    const int next_kv_start =
+                        kv_partition_begin + (kv_tile_iter + 1) * tile_kv;
+                    const int next_kv_end =
+                        min(next_kv_start + tile_kv, kv_partition_end);
+                    const int next_actual_len = next_kv_end - next_kv_start;
 
-                half *K_dst = get_K_tile(next_stage);
-                half *V_dst = get_V_tile(next_stage);
+                    half *K_dst = get_K_tile(next_stage);
+                    SharedValue *V_dst = get_V_tile(next_stage);
 
-                stageFA2KVTile<KV_TYPE>(
-                    K, V, K_dst, V_dst, batch_idx, kv_stride, n_kv_heads,
-                    kv_head_idx, head_dim, smem_stride, next_kv_start,
-                    next_actual_len, ring_row_origin, ring_row_capacity);
-            }
+                    stageFA2KVTile<KV_TYPE, TILE_STORAGE>(
+                        K, V, K_dst, V_dst, batch_idx, kv_stride, n_kv_heads,
+                        kv_head_idx, head_dim, smem_stride, next_kv_start,
+                        next_actual_len, ring_row_origin, ring_row_capacity);
+                }
+            };
+            if constexpr (TILE_STORAGE == FA2TileStoragePolicy::WarpSpecializedHalf)
+                load_next_tile();
 
             // ----------------------------------------------------------------
             // CONSUMER WARPS: Compute Q @ K^T using WMMA
@@ -1052,6 +1182,10 @@ namespace
                     {
                         const int kv_pos = kv_start + j;
                         bool masked = false;
+                        // A finite mask is already in softmax-logit units.
+                        // Normalize only QK, then add the bias. Scaling their
+                        // sum weakens every finite bias by sqrt(head_dim).
+                        float score = my_scores[j] * softmax_scale;
 
                         if (causal &&
                             kv_pos > my_consumer_q_row +
@@ -1080,13 +1214,10 @@ namespace
                             if (mask_val <= -1.0e20f)
                                 masked = true;
                             else
-                                my_scores[j] += mask_val;
+                                score += mask_val;
                         }
 
-                        if (masked)
-                            my_scores[j] = -FLT_MAX;
-                        else
-                            my_scores[j] *= softmax_scale;
+                        my_scores[j] = masked ? -FLT_MAX : score;
                     }
                 }
             }
@@ -1158,7 +1289,7 @@ namespace
                         l_i *= scale_old;
 
                         float l_ij = 0.0f;
-#pragma unroll
+#pragma unroll 16
                         for (int j = 0; j < kReductionTileKV; ++j)
                         {
                             if (j < reduction_len)
@@ -1167,16 +1298,16 @@ namespace
                                     __expf(my_scores[j] - m_i_new);
                                 l_ij += p;
 
-                                const half2 *V_row_h2 =
-                                    reinterpret_cast<const half2 *>(
-                                        V_tile_fp16 +
+                                const FA2ValuePair<TILE_STORAGE> *V_row_values =
+                                    reinterpret_cast<const FA2ValuePair<TILE_STORAGE> *>(
+                                        V_tile +
                                         (reduction_start + j) * smem_stride +
                                         dim_start);
 #pragma unroll
                                 for (int d = 0; d < dims_per_lane; d += 2)
                                 {
                                     const float2 v =
-                                        __half22float2(V_row_h2[d >> 1]);
+                                        fa2ReadValuePair<TILE_STORAGE>(V_row_values[(d / 4) * (kDimensionStripeStride / 2) + (d % 4) / 2]);
                                     O_acc[d] += p * v.x;
                                     O_acc[d + 1] += p * v.y;
                                 }
@@ -1190,6 +1321,13 @@ namespace
             }
 
             __syncthreads();
+
+            if constexpr (TILE_STORAGE == FA2TileStoragePolicy::CooperativeFloat)
+            {
+                load_next_tile();
+                // All readers retired above; publish the reused single stage.
+                __syncthreads();
+            }
 
             if constexpr (!WRITE_CONTEXT_PARTIAL)
             {
@@ -1224,7 +1362,7 @@ namespace
                             for (int d = 0; d < dims_per_lane; ++d)
                             {
                                 if (d < active_dims_per_lane)
-                                    O_row[dim_start + d] = O_acc[d];
+                                    O_row[dim_start + (d / 4) * kDimensionStripeStride + (d % 4)] = O_acc[d];
                             }
                         }
                         else
@@ -1239,8 +1377,8 @@ namespace
                             {
                                 if (d < active_dims_per_lane)
                                 {
-                                    O_row[dim_start + d] =
-                                        O_row[dim_start + d] * previous_scale +
+                                    O_row[dim_start + (d / 4) * kDimensionStripeStride + (d % 4)] =
+                                        O_row[dim_start + (d / 4) * kDimensionStripeStride + (d % 4)] * previous_scale +
                                         O_acc[d] * partition_scale;
                                 }
                             }
@@ -1289,7 +1427,7 @@ namespace
                     for (int d = 0; d < dims_per_lane; ++d)
                     {
                         if (d < active_dims_per_lane)
-                            O_row[dim_start + d] = O_acc[d] * inverse_l;
+                            O_row[dim_start + (d / 4) * kDimensionStripeStride + (d % 4)] = O_acc[d] * inverse_l;
                     }
                 }
                 else
@@ -1305,11 +1443,28 @@ namespace
                         O_partial +
                         summary_index * static_cast<size_t>(head_dim);
 
-#pragma unroll
-                    for (int d = 0; d < dims_per_lane; ++d)
+                    // Each lane owns one contiguous stripe. Publishing four
+                    // FP32 values together reduces store instructions without
+                    // changing any accumulation or the ascending reducer.
+                    // Partial runtime widths and unaligned arena views retain
+                    // their exact scalar extent; no padding is written.
+                    static_assert(dims_per_lane % 4 == 0);
+                    if (active_dims_per_lane == dims_per_lane &&
+                        (reinterpret_cast<uintptr_t>(O_summary + dim_start) & 15u) == 0)
                     {
-                        if (d < active_dims_per_lane)
-                            O_summary[dim_start + d] = O_acc[d];
+#pragma unroll
+                        for (int d = 0; d < dims_per_lane; d += 4)
+                            *reinterpret_cast<float4 *>(O_summary + dim_start + (d / 4) * kDimensionStripeStride + (d % 4)) =
+                                make_float4(O_acc[d], O_acc[d + 1], O_acc[d + 2], O_acc[d + 3]);
+                    }
+                    else
+                    {
+#pragma unroll
+                        for (int d = 0; d < dims_per_lane; ++d)
+                        {
+                            if (d < active_dims_per_lane)
+                                O_summary[dim_start + (d / 4) * kDimensionStripeStride + (d % 4)] = O_acc[d];
+                        }
                     }
 
                     // All P@V stripes reconstruct identical scalar state. One
@@ -1336,9 +1491,9 @@ namespace
                 {
                     if (d < active_dims_per_lane)
                     {
-                        O_row[dim_start + d] =
+                        O_row[dim_start + (d / 4) * kDimensionStripeStride + (d % 4)] =
                             merged_l > 0.0f
-                                ? O_row[dim_start + d] * inv_l
+                                ? O_row[dim_start + (d / 4) * kDimensionStripeStride + (d % 4)] * inv_l
                                 : 0.0f;
                     }
                 }
@@ -1388,7 +1543,7 @@ namespace
      * @tparam DIMENSION_WARPS_PER_ROW Independent 32-dimension stripes assigned
      *         to each query-row/head reduction.
      */
-    template <int DIMENSION_WARPS_PER_ROW>
+    template <int DIMENSION_WARPS_PER_ROW, bool COMPACT = false>
     __global__ __launch_bounds__(256, 2)
     void flash_attention_2_context_reduce_kernel(
         const float *__restrict__ O_partial,
@@ -1437,20 +1592,17 @@ namespace
         float merged_m = -FLT_MAX;
         float merged_l = 0.0f;
 
-        const int live_context_partitions = device_params
-                                                ? min(
-                                                      max_context_partitions,
-                                                      max(
-                                                          1,
-                                                          (device_params->kv_len +
-                                                           llaminar2::cuda::fa2_policy::
-                                                               kFA2CanonicalContextPartitionKeys -
-                                                           1) /
-                                                              llaminar2::cuda::fa2_policy::
-                                                                  kFA2CanonicalContextPartitionKeys))
-                                                : max_context_partitions;
-        if (live_context_partitions <= device_direct_partition_limit)
-            return;
+        // Ownership of direct versus context work retains the canonical
+        // controller predicate. Only the context branch's summary extent is
+        // compacted; a small split count must never suppress a required merge.
+        const int canonical_partitions = device_params
+            ? min(max_context_partitions,max(1,(device_params->kv_len+255)/256))
+            : max_context_partitions;
+        if (canonical_partitions <= device_direct_partition_limit) return;
+        const int live_keys = device_params ? device_params->kv_len : max_context_partitions*256;
+        const int live_context_partitions = COMPACT
+            ? llaminar2::cuda::tensor_attention_policy::plan<llaminar2::cuda::tensor_attention_policy::SplitPolicy::Four>(
+                live_keys,max_context_partitions).count : canonical_partitions;
 
         for (int partition = 0;
              partition < live_context_partitions;
@@ -1527,42 +1679,8 @@ namespace
         }
     }
 
-    // Explicit instantiations retain one widest query-group body per head
-    // dimension. Runtime active-group selection changes the CTA size and row
-    // ownership while the same compiled body preserves one arithmetic implementation.
-#define FA2_INSTANTIATE(QW, PVW, HD, TKV, KV16)                                      \
-    template __global__ void flash_attention_2_pipelined_kernel<                     \
-        QW, PVW, HD, TKV, KV16>(                                                     \
-        const float *, const void *, const void *, float *,                           \
-        int, int, int, int, int, int, float, bool, int, int,                          \
-        const llaminar2::attention::AttentionDeviceParams *, const float *,           \
-        int, int, int, int, int, int, float *, float *, float *, int, int, int, int)
-
-#define FA2_INSTANTIATE_TILES(QW, PVW, HD, KV16) \
-    FA2_INSTANTIATE(QW, PVW, HD, 16, KV16);      \
-    FA2_INSTANTIATE(QW, PVW, HD, 32, KV16);      \
-    FA2_INSTANTIATE(QW, PVW, HD, 64, KV16)
-
-    FA2_INSTANTIATE_TILES(6, 1, 64, NativeKVType::FP32);
-    FA2_INSTANTIATE_TILES(4, 1, 128, NativeKVType::FP32);
-    FA2_INSTANTIATE_TILES(2, 1, 256, NativeKVType::FP32);
-    FA2_INSTANTIATE_TILES(2, 2, 256, NativeKVType::FP32);
-    FA2_INSTANTIATE_TILES(2, 4, 256, NativeKVType::FP32);
-
-    FA2_INSTANTIATE_TILES(6, 1, 64, NativeKVType::FP16);
-    FA2_INSTANTIATE_TILES(4, 1, 128, NativeKVType::FP16);
-    FA2_INSTANTIATE_TILES(2, 1, 256, NativeKVType::FP16);
-    FA2_INSTANTIATE_TILES(2, 2, 256, NativeKVType::FP16);
-    FA2_INSTANTIATE_TILES(2, 4, 256, NativeKVType::FP16);
-
-    FA2_INSTANTIATE_TILES(6, 1, 64, NativeKVType::BF16);
-    FA2_INSTANTIATE_TILES(4, 1, 128, NativeKVType::BF16);
-    FA2_INSTANTIATE_TILES(2, 1, 256, NativeKVType::BF16);
-    FA2_INSTANTIATE_TILES(2, 2, 256, NativeKVType::BF16);
-    FA2_INSTANTIATE_TILES(2, 4, 256, NativeKVType::BF16);
-
-#undef FA2_INSTANTIATE_TILES
-#undef FA2_INSTANTIATE
+    // Direct and context dispatch instantiate the complete typed geometry
+    // inventory below. No default-policy body exists outside those launchers.
     // =========================================================================
     // Flash Decoding - Split-K Kernel (FP32)
     // =========================================================================
@@ -2827,11 +2945,10 @@ static int fa2_prefill_launch(
 
     const int configured_hd256_pv_warps =
         llaminar2::debugEnv().attention.cuda_fa2_hd256_pv_warps;
-    if (!llaminar2::cuda::fa2_policy::isCompiledFA2PVWarpGeometry(
-            head_dim,
-            head_dim > 128 ? configured_hd256_pv_warps : 1))
+    if (llaminar2::cuda::fa2_policy::selectFA2PVWarpCount(
+            head_dim, selected_q_warp_groups, configured_hd256_pv_warps) == 0)
     {
-        printf("[cudaFlashAttn_prefill_fa2] Error: LLAMINAR_FA2_HD256_PV_WARPS=%d is invalid for head_dim=%d; HD256 expects 1, 2, or 4\n",
+        printf("[cudaFlashAttn_prefill_fa2] Error: LLAMINAR_FA2_HD256_PV_WARPS=%d is invalid for head_dim=%d; HD256 expects 0 (automatic), 1, 2, or 4\n",
                configured_hd256_pv_warps,
                head_dim);
         return -1;
@@ -2869,7 +2986,18 @@ static int fa2_prefill_launch(
 #define FA2_LAUNCH(QW, PVW, HD, TKV)                                                                       \
     do                                                                                                     \
     {                                                                                                      \
-        auto kernel_fn = flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_TYPE>;                    \
+        auto kernel_fn = [&]() { \
+            if constexpr (HD == 256) { \
+                if (cfg.tile_storage == FA2TileStoragePolicy::WarpSpecializedHalf) \
+                    return flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_TYPE, false, \
+                        FA2HeadGeometry::ExactWidth, FA2TileStoragePolicy::WarpSpecializedHalf>; \
+            } \
+            return head_dim == HD \
+                ? flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_TYPE, false, \
+                    FA2HeadGeometry::ExactWidth, FA2TileStoragePolicy::CooperativeFloat> \
+                : flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_TYPE, false, \
+                    FA2HeadGeometry::PartialWidth, FA2TileStoragePolicy::CooperativeFloat>; \
+        }(); \
         err = cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.smem_size); \
         if (err != cudaSuccess)                                                                            \
         {                                                                                                  \
@@ -2953,6 +3081,9 @@ enum class FA2ContextPartitionSchedule
 /**
  * @brief Immutable arguments shared by one captured partition transaction.
  */
+/** Captured summary arithmetic; allocation capacity remains independent. */
+enum class FA2SummaryPolicy { Canonical, Compact };
+
 struct FA2ContextTransactionArguments
 {
     const float *Q = nullptr;
@@ -2982,6 +3113,7 @@ struct FA2ContextTransactionArguments
     int device_direct_partition_limit = 0;
     int reducer_dimension_warps = 0;
     void *capture_conditional = nullptr;
+    FA2SummaryPolicy summary_policy = FA2SummaryPolicy::Canonical;
 };
 
 #if CUDART_VERSION >= 12030
@@ -3149,8 +3281,9 @@ static bool appendFA2ReducerConditionalNode(
     };
     const cudaKernelNodeParams node_params{
         .func = reinterpret_cast<void *>(
-            flash_attention_2_context_reduce_kernel<
-                DIMENSION_WARPS_PER_ROW>),
+            arguments.summary_policy == FA2SummaryPolicy::Compact
+                ? flash_attention_2_context_reduce_kernel<DIMENSION_WARPS_PER_ROW,true>
+                : flash_attention_2_context_reduce_kernel<DIMENSION_WARPS_PER_ROW,false>),
         .gridDim = grid,
         .blockDim = dim3(256, 1, 1),
         .sharedMemBytes = 0,
@@ -3172,6 +3305,8 @@ static bool appendFA2ReducerConditionalNode(
  * @tparam HD Compile-time head-dimension ceiling.
  * @tparam TKV Physical K/V shared-memory tile.
  * @tparam KV_TYPE Physical floating-point K/V storage.
+ * @tparam HEAD_GEOMETRY Exact or partial live width within the compiled extent.
+ * @tparam TILE_STORAGE Physical shared-tile ownership included in the native function identity.
  * @param arguments Immutable transaction tensors and logical geometry.
  * @param config Capture-time physical launch configuration.
  * @param schedule Sequence-node or context-grid physical scheduling. During
@@ -3182,19 +3317,59 @@ static bool appendFA2ReducerConditionalNode(
  * @param stream Exact non-null producer stream captured by the caller.
  * @return Zero on successful launch submission, otherwise a fatal launch error.
  */
-template <int QW, int PVW, int HD, int TKV, NativeKVType KV_TYPE>
+template <int QW, int PVW, int HD, int TKV, NativeKVType KV_TYPE,
+          FA2HeadGeometry HEAD_GEOMETRY, FA2TileStoragePolicy TILE_STORAGE>
 static int launchFA2ContextTransactionSpecialization(
     const FA2ContextTransactionArguments &arguments,
     const FA2KernelConfig &config,
     FA2ContextPartitionSchedule schedule,
     cudaStream_t stream)
 {
-    auto context_phase =
-        flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_TYPE, true>;
+    auto context_selection = [&]()
+    {
+        if constexpr (QW == 2 && PVW == 2 && HD == 256 && TKV == 16 &&
+            KV_TYPE == NativeKVType::FP16 &&
+            HEAD_GEOMETRY == FA2HeadGeometry::ExactWidth &&
+            TILE_STORAGE == FA2TileStoragePolicy::CooperativeFloat)
+        {
+            constexpr size_t shared_bytes = llaminar2::cuda::tensor_prefill::kSharedBytes;
+            constexpr int fixed_threads = llaminar2::cuda::tensor_prefill::kThreads;
+            constexpr int fixed_rows = llaminar2::cuda::tensor_prefill::kRows;
+            const auto head_geometry = llaminar2::cuda::tensor_prefill::selectHeadGeometry({
+                .batch_size = arguments.batch_size, .query_rows = arguments.seq_len,
+                .head_dim = arguments.head_dim, .query_heads = arguments.n_heads,
+                .kv_heads = arguments.n_kv_heads, .head_start = arguments.head_start,
+                .gqa_repetition = arguments.gqa_n_rep, .kv_format = llaminar2::TensorType::FP16,
+                .visibility = llaminar2::attention::attentionVisibilityPolicy(
+                    arguments.causal, arguments.window_size, arguments.mask != nullptr)});
+            if (head_geometry && arguments.context_partition_size == 256 && config.tile_q == 32)
+                return std::tuple{llaminar2::cuda::tensor_prefill::kernel(*head_geometry),
+                                  shared_bytes, fixed_threads, fixed_rows, true};
+        }
+        return std::tuple{&flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_TYPE, true,
+            HEAD_GEOMETRY, TILE_STORAGE>, config.smem_size, config.block_size, config.tile_q, false};
+    }();
+    const auto context_phase = std::get<0>(context_selection);
+    auto context_config = config;
+    context_config.smem_size = std::get<1>(context_selection);
+    context_config.block_size = std::get<2>(context_selection);
+    context_config.tile_q = std::get<3>(context_selection);
+    const bool compact_context = std::get<4>(context_selection);
+    const int context_slots = compact_context
+        ? std::min(arguments.context_partition_slots,llaminar2::cuda::tensor_prefill::kSplitLimit)
+        : arguments.context_partition_slots;
+    auto context_arguments = arguments;
+    // The controller retains the complete logical KV envelope. Only native
+    // producer/reducer addressing uses the compact physical summary stride.
+    if (compact_context)
+        context_arguments.max_context_partitions = llaminar2::cuda::tensor_attention_policy::summaryCapacity(arguments.kv_capacity);
+    auto reducer_arguments = context_arguments;
+    reducer_arguments.summary_policy = compact_context
+        ? FA2SummaryPolicy::Compact : FA2SummaryPolicy::Canonical;
     const cudaError_t attribute_status = cudaFuncSetAttribute(
         context_phase,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        config.smem_size);
+        context_config.smem_size);
     if (attribute_status != cudaSuccess)
     {
         printf("[cudaFlashAttn_context_transaction] Failed to set phase-one "
@@ -3205,6 +3380,7 @@ static int launchFA2ContextTransactionSpecialization(
 
     const int query_tiles =
         (arguments.seq_len + config.tile_q - 1) / config.tile_q;
+    const int context_query_tiles = (arguments.seq_len + context_config.tile_q - 1) / context_config.tile_q;
 
     constexpr int kReducerThreads = 256;
     constexpr int kReducerWarps = kReducerThreads / WARP_SIZE;
@@ -3227,7 +3403,7 @@ static int launchFA2ContextTransactionSpecialization(
 
     auto direct_phase =
         flash_attention_2_pipelined_kernel<
-            QW, PVW, HD, TKV, KV_TYPE, false>;
+            QW, PVW, HD, TKV, KV_TYPE, false, HEAD_GEOMETRY, TILE_STORAGE>;
     if (arguments.device_direct_partition_limit > 0)
     {
         const cudaError_t direct_attribute_status = cudaFuncSetAttribute(
@@ -3296,16 +3472,16 @@ static int launchFA2ContextTransactionSpecialization(
             }
 
             const dim3 context_grid(
-                arguments.n_heads * arguments.context_partition_slots,
-                query_tiles,
+                arguments.n_heads * context_slots,
+                context_query_tiles,
                 arguments.batch_size);
             if (!appendFA2AdaptivePhaseNode(
                     *transaction,
                     FA2AdaptivePhasePlacement::ContextIfBody,
                     reinterpret_cast<void *>(context_phase),
                     context_grid,
-                    arguments,
-                    config,
+                    context_arguments,
+                    context_config,
                     arguments.O_partial,
                     arguments.m_partial,
                     arguments.l_partial,
@@ -3326,28 +3502,28 @@ static int launchFA2ContextTransactionSpecialization(
                     *transaction,
                     llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
                     reducer_grid,
-                    arguments);
+                    reducer_arguments);
                 break;
             case 2:
                 reducer_appended = appendFA2ReducerConditionalNode<2>(
                     *transaction,
                     llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
                     reducer_grid,
-                    arguments);
+                    reducer_arguments);
                 break;
             case 4:
                 reducer_appended = appendFA2ReducerConditionalNode<4>(
                     *transaction,
                     llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
                     reducer_grid,
-                    arguments);
+                    reducer_arguments);
                 break;
             case 8:
                 reducer_appended = appendFA2ReducerConditionalNode<8>(
                     *transaction,
                     llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
                     reducer_grid,
-                    arguments);
+                    reducer_arguments);
                 break;
             }
             if (!reducer_appended || !transaction->commit())
@@ -3403,7 +3579,7 @@ static int launchFA2ContextTransactionSpecialization(
     const auto launch_partition_grid =
         [&](dim3 grid, int explicit_partition)
     {
-        context_phase<<<grid, config.block_size, config.smem_size, stream>>>(
+        context_phase<<<grid, context_config.block_size, context_config.smem_size, stream>>>(
             arguments.Q,
             arguments.K,
             arguments.V,
@@ -3430,7 +3606,7 @@ static int launchFA2ContextTransactionSpecialization(
             arguments.m_partial,
             arguments.l_partial,
             arguments.context_partition_size,
-            arguments.max_context_partitions,
+            context_arguments.max_context_partitions,
             arguments.device_direct_partition_limit,
             explicit_partition);
     };
@@ -3439,8 +3615,8 @@ static int launchFA2ContextTransactionSpecialization(
     {
         launch_partition_grid(
             dim3(
-                arguments.n_heads * arguments.context_partition_slots,
-                query_tiles,
+                arguments.n_heads * context_slots,
+                context_query_tiles,
                 arguments.batch_size),
             /*explicit_partition=*/-1);
     }
@@ -3448,38 +3624,41 @@ static int launchFA2ContextTransactionSpecialization(
     {
         const dim3 partition_grid(
             arguments.n_heads,
-            query_tiles,
+            context_query_tiles,
             arguments.batch_size);
         for (int partition = 0;
-             partition < arguments.max_context_partitions;
+             partition < context_arguments.max_context_partitions;
              ++partition)
         {
             launch_partition_grid(partition_grid, partition);
         }
     }
 
-#define FA2_LAUNCH_CONTEXT_REDUCER(DIMENSION_WARPS)                    \
-    flash_attention_2_context_reduce_kernel<DIMENSION_WARPS><<<       \
-        reducer_grid, kReducerThreads, 0, stream>>>(                   \
-        arguments.O_partial, arguments.m_partial, arguments.l_partial, \
-        arguments.O, arguments.seq_len, arguments.n_heads,            \
-        arguments.head_dim, arguments.max_context_partitions,          \
-        arguments.device_direct_partition_limit,                       \
-        arguments.device_params)
+    const auto launch_reducer = [&]<int Warps>()
+    {
+        auto reducer = compact_context
+            ? flash_attention_2_context_reduce_kernel<Warps,true>
+            : flash_attention_2_context_reduce_kernel<Warps,false>;
+        reducer<<<reducer_grid,kReducerThreads,0,stream>>>(
+            arguments.O_partial,arguments.m_partial,arguments.l_partial,
+            arguments.O,arguments.seq_len,arguments.n_heads,arguments.head_dim,
+            reducer_arguments.max_context_partitions,arguments.device_direct_partition_limit,
+            arguments.device_params);
+    };
 
     switch (arguments.reducer_dimension_warps)
     {
     case 1:
-        FA2_LAUNCH_CONTEXT_REDUCER(1);
+        launch_reducer.template operator()<1>();
         break;
     case 2:
-        FA2_LAUNCH_CONTEXT_REDUCER(2);
+        launch_reducer.template operator()<2>();
         break;
     case 4:
-        FA2_LAUNCH_CONTEXT_REDUCER(4);
+        launch_reducer.template operator()<4>();
         break;
     case 8:
-        FA2_LAUNCH_CONTEXT_REDUCER(8);
+        launch_reducer.template operator()<8>();
         break;
     default:
         printf("[cudaFlashAttn_context_transaction] Reducer dimension "
@@ -3487,7 +3666,6 @@ static int launchFA2ContextTransactionSpecialization(
         return -1;
     }
 
-#undef FA2_LAUNCH_CONTEXT_REDUCER
 
     const cudaError_t launch_status = cudaGetLastError();
     if (launch_status != cudaSuccess)
@@ -3663,9 +3841,22 @@ static int fa2_context_transaction_launch(
         .capture_conditional = capture_conditional,
     };
 
-#define FA2_CONTEXT_DISPATCH(QW, PVW, HD, TKV)                              \
-    return launchFA2ContextTransactionSpecialization<                       \
-        QW, PVW, HD, TKV, KV_TYPE>(arguments, config, schedule, stream)
+#define FA2_CONTEXT_DISPATCH(QW, PVW, HD, TKV) \
+    do { \
+        if constexpr (HD == 256) { \
+            if (config.tile_storage == FA2TileStoragePolicy::WarpSpecializedHalf) \
+                return launchFA2ContextTransactionSpecialization<QW, PVW, HD, TKV, KV_TYPE, \
+                    FA2HeadGeometry::ExactWidth, FA2TileStoragePolicy::WarpSpecializedHalf>( \
+                        arguments, config, schedule, stream); \
+        } \
+        return head_dim == HD \
+            ? launchFA2ContextTransactionSpecialization<QW, PVW, HD, TKV, KV_TYPE, \
+                  FA2HeadGeometry::ExactWidth, FA2TileStoragePolicy::CooperativeFloat>( \
+                      arguments, config, schedule, stream) \
+            : launchFA2ContextTransactionSpecialization<QW, PVW, HD, TKV, KV_TYPE, \
+                  FA2HeadGeometry::PartialWidth, FA2TileStoragePolicy::CooperativeFloat>( \
+                      arguments, config, schedule, stream); \
+    } while (0)
 
 #define FA2_CONTEXT_DISPATCH_TILE(QW, PVW, HD) \
     do                                          \

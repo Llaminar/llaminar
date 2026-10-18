@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string>
@@ -901,7 +902,15 @@ namespace llaminar2::test::parity
                     device.observation_observed = true;
                     device.observations_valid =
                         device.observations_valid &&
-                        positiveIntegerTag(record, "transaction") &&
+                        record.count > 0 && record.value == static_cast<double>(record.count) &&
+                        record.sequence_word_count == record.count &&
+                        record.tags.count("transaction") == 0 &&
+                        record.sequence_minimum_words.size() == 1 &&
+                        record.sequence_maximum_words.size() == 1 &&
+                        record.sequence_minimum_words.front() > 0 &&
+                        record.sequence_minimum_words.front() <= record.sequence_maximum_words.front() &&
+                        record.sequence_maximum_words.front() <=
+                            static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) &&
                         positiveIntegerTag(record, "next_depth") &&
                         (tagEquals(record, "complete", "true") ||
                          tagEquals(record, "complete", "false")) &&

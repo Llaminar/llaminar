@@ -12,6 +12,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../../utils/GDNAdditiveEpsilonFixture.h"
 
 #include "execution/compute_stages/stages/GDNLinkedLiveStateGeometry.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -4265,6 +4266,53 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
                 oracle_state,
                 0,
                 replay_state.size());
+        }
+    }
+}
+
+
+/** @test Captured native Q/K normalization obeys the independent additive-epsilon equation. */
+TEST(Test__ROCmGDNPaddedRealLength, RecurrenceAdditiveEpsilonNearZeroCaptured)
+{
+    if (!hasROCm()) GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "set device");
+    for (int dk : {64, 128})
+    {
+        for (int rows : {1, 2, 9, 425, 512})
+        {
+            SCOPED_TRACE("dk=" + std::to_string(dk) + " rows=" + std::to_string(rows));
+            llaminar2::test::GDNAdditiveEpsilonFixture f(rows, dk);
+            HipFloatBuffer q(f.q), k(f.k), v(f.v), alpha(f.alpha), beta(f.beta),
+                a_log(f.a_log), dt_bias(f.dt_bias), output(rows * f.heads * f.dv, 123.f);
+            HipStreamHandle stream;
+            ROCmGatedDeltaNet chunk(0);
+            HipGDNStateOwner state_owner(chunk, f.zero_state.size());
+            chunk.setGPUStream(stream.stream);
+            ASSERT_TRUE(chunk.importState(f.zero_state.data(), nullptr, stream.stream));
+            // Materialize retained workspace before capture. Preprocessing may write
+            // raw operands, so every replay restores the original bytes and state.
+            ASSERT_TRUE(chunk.chunk_forward(q.ptr, k.ptr, v.ptr, alpha.ptr, beta.ptr,
+                a_log.ptr, dt_bias.ptr, output.ptr, nullptr, rows, f.heads, dk, f.dv, 64, true));
+            checkHip(hipStreamSynchronize(stream.stream), "warmup completion");
+            HipCapturedGraph graph(stream.stream, [&]() {
+                return chunk.chunk_forward(q.ptr, k.ptr, v.ptr, alpha.ptr, beta.ptr,
+                    a_log.ptr, dt_bias.ptr, output.ptr, nullptr, rows, f.heads, dk, f.dv, 64, true);
+            });
+            for (int replay = 0; replay < 2; ++replay)
+            {
+                q.copyFrom(f.q);
+                k.copyFrom(f.k);
+                v.copyFrom(f.v);
+                alpha.copyFrom(f.alpha);
+                beta.copyFrom(f.beta);
+                output.fill(123.f);
+                ASSERT_TRUE(chunk.importState(f.zero_state.data(), nullptr, stream.stream));
+                graph.launch(stream.stream);
+                checkHip(hipStreamSynchronize(stream.stream), "diagnostic completion");
+                std::vector<float> terminal(f.zero_state.size());
+                ASSERT_TRUE(chunk.exportState(terminal.data(), nullptr, stream.stream));
+                f.expect(output.toHost(), terminal);
+            }
         }
     }
 }

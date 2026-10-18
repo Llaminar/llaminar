@@ -197,12 +197,15 @@ namespace llaminar2
         /** @return Run-scoped shared-memory name with no topology role words. */
         std::string makeChannelName(
             std::uint64_t node_namespace,
-            std::uint64_t topology_fingerprint)
+            std::uint64_t topology_fingerprint,
+            std::int32_t first_model_layer,
+            std::uint32_t num_layers)
         {
             std::ostringstream name;
             name << "/llaminar_moectrl_" << std::hex << std::setw(16)
                  << std::setfill('0') << node_namespace << '_'
-                 << std::setw(16) << topology_fingerprint;
+                 << std::setw(16) << topology_fingerprint
+                 << "_layers_" << first_model_layer << '_' << num_layers;
             return name.str();
         }
 
@@ -215,7 +218,8 @@ namespace llaminar2
          */
         std::uint64_t payloadGeometryFingerprint(
             const std::vector<std::uint64_t> &bytes,
-            std::uint32_t num_layers) noexcept
+            std::uint32_t num_layers,
+            std::int32_t first_model_layer) noexcept
         {
             std::uint64_t hash = 1469598103934665603ULL;
             const auto mix = [&hash](std::uint64_t value)
@@ -227,11 +231,28 @@ namespace llaminar2
                 }
             };
             mix(num_layers);
+            mix(static_cast<std::uint32_t>(first_model_layer));
             for (std::uint32_t layer = 0u; layer < num_layers; ++layer)
                 mix(bytes.empty() ? 0u : bytes[layer]);
             return hash == 0u ? 1u : hash;
         }
     } // namespace
+
+    bool MoEOverlayDeviceControllerFabricLayout::containsModelLayer(int layer) const noexcept
+    {
+        return header.first_model_layer >= 0 && header.num_layers > 0u &&
+            header.num_layers <= static_cast<std::uint32_t>(
+                std::numeric_limits<int>::max() - header.first_model_layer) &&
+            layer >= header.first_model_layer &&
+            static_cast<std::uint32_t>(layer - header.first_model_layer) < header.num_layers;
+    }
+
+    std::uint32_t MoEOverlayDeviceControllerFabricLayout::storageIndexForModelLayer(int layer) const
+    {
+        if (!containsModelLayer(layer))
+            throw std::out_of_range("MoE controller evidence layer is outside the mapped stage");
+        return static_cast<std::uint32_t>(layer - header.first_model_layer);
+    }
 
     struct MoEOverlayNodeLocalDeviceControllerFabric::MappingLifetime
     {
@@ -266,6 +287,9 @@ namespace llaminar2
             header.mapping_bytes != mapping_bytes ||
             header.group_count != groups.size() ||
             header.participant_count == 0u || header.num_layers == 0u ||
+            header.first_model_layer < 0 ||
+            header.num_layers > static_cast<std::uint32_t>(
+                std::numeric_limits<int>::max() - header.first_model_layer) ||
             header.num_experts == 0u || header.command_capacity == 0u ||
             header.routed_experts_per_token == 0u ||
             header.routed_experts_per_token > header.num_experts ||
@@ -497,9 +521,12 @@ namespace llaminar2
         std::uint32_t dynamic_minimum_improvement_per_mille,
         std::uint32_t dynamic_maximum_cycles_per_layer,
         std::uint32_t dynamic_maximum_commands_per_wave,
-        std::uint32_t routed_experts_per_token)
+        std::uint32_t routed_experts_per_token,
+        std::int32_t first_model_layer)
     {
         if (!topology.valid() || num_layers == 0u || num_experts == 0u ||
+            first_model_layer < 0 ||
+            num_layers > static_cast<std::uint32_t>(std::numeric_limits<int>::max() - first_model_layer) ||
             num_layers > kMoEOverlayDeviceControllerFabricMaxLayers ||
             num_experts > kMoEOverlayDeviceControllerFabricMaxExperts ||
             command_capacity == 0u || routed_experts_per_token == 0u ||
@@ -809,8 +836,9 @@ namespace llaminar2
             .dynamic_maximum_commands_per_wave =
                 dynamic_maximum_commands_per_wave,
             .payload_geometry_fingerprint = payloadGeometryFingerprint(
-                payload_bytes_per_layer, num_layers),
+                payload_bytes_per_layer, num_layers, first_model_layer),
             .routed_experts_per_token = routed_experts_per_token,
+            .first_model_layer = first_model_layer,
         };
         if (layout_header_offset != result.leader_owned_begin || !result.valid())
         {
@@ -879,7 +907,8 @@ namespace llaminar2
             config_.dynamic_minimum_improvement_per_mille,
             config_.dynamic_maximum_cycles_per_layer,
             config_.dynamic_maximum_commands_per_wave,
-            config_.routed_experts_per_token);
+            config_.routed_experts_per_token,
+            config_.first_model_layer);
 
         for (const auto &group : config_.topology->groups)
             participating_world_ranks_.push_back(group.root_world_rank);
@@ -933,7 +962,9 @@ namespace llaminar2
 
         channel_name_ = makeChannelName(
             mpi_topology->node_shared_memory_namespace(),
-            config_.topology->topology_fingerprint);
+            config_.topology->topology_fingerprint,
+            config_.first_model_layer,
+            config_.num_layers);
         try
         {
             mapOrAttach();
@@ -1083,6 +1114,7 @@ namespace llaminar2
                 config_.mpi_ctx->topology()->node_shared_memory_namespace();
             setup->mapping_bytes = layout_.mapping_bytes;
             setup->num_layers = config_.num_layers;
+            setup->first_model_layer = config_.first_model_layer;
             setup->num_experts = config_.num_experts;
             setup->routed_experts_per_token =
                 config_.routed_experts_per_token;
@@ -1130,6 +1162,7 @@ namespace llaminar2
                 config_.mpi_ctx->topology()->node_shared_memory_namespace() ||
             setup->mapping_bytes != layout_.mapping_bytes ||
             setup->num_layers != config_.num_layers ||
+            setup->first_model_layer != config_.first_model_layer ||
             setup->num_experts != config_.num_experts ||
             setup->routed_experts_per_token !=
                 config_.routed_experts_per_token ||
@@ -1234,6 +1267,7 @@ namespace llaminar2
                 service->participant_id = static_cast<std::int32_t>(
                     group.participant_ids[member]);
                 service->layer_count = config_.num_layers;
+                service->first_model_layer = config_.first_model_layer;
             }
         }
 
@@ -1531,6 +1565,8 @@ namespace llaminar2
                 kMoEOverlayDeviceControllerFabricMagic ||
             published_layout->version !=
                 kMoEOverlayDeviceControllerFabricVersion ||
+            published_layout->first_model_layer != config_.first_model_layer ||
+            published_layout->num_layers != config_.num_layers ||
             published_layout->inference_epoch_record_offset !=
                 layout_.header.inference_epoch_record_offset ||
             published_layout->payload_bytes_per_layer_offset !=
@@ -2108,7 +2144,9 @@ namespace llaminar2
                 layout_.header.num_layers ||
             !profiles.service->production_topology.valid() ||
             profiles.service->production_topology.layerCount() !=
-                layout_.header.num_layers)
+                layout_.header.num_layers ||
+            profiles.service->production_topology.firstModelLayer() !=
+                layout_.header.first_model_layer)
         {
             throw std::invalid_argument(
                 "certified device economy service profile has incomplete tier/layer topology");
@@ -2134,8 +2172,7 @@ namespace llaminar2
             if (row.tier_index < 0 || row.layer < 0 ||
                 static_cast<std::uint32_t>(row.tier_index) >=
                     layout_.header.tier_count ||
-                static_cast<std::uint32_t>(row.layer) >=
-                    layout_.header.num_layers)
+                !layout_.containsModelLayer(row.layer))
             {
                 throw std::invalid_argument(
                     "certified device economy service profile contains an invalid coordinate");
@@ -2148,7 +2185,7 @@ namespace llaminar2
                 const std::size_t offset =
                     (static_cast<std::size_t>(row.tier_index) *
                          layout_.header.num_layers +
-                     static_cast<std::size_t>(row.layer)) *
+                     layout_.storageIndexForModelLayer(row.layer)) *
                         kMoEOverlayDeviceControllerEconomyServicePhaseCount +
                     phase;
                 const bool active =
@@ -2212,7 +2249,7 @@ namespace llaminar2
                     participant_count ||
                 static_cast<std::size_t>(row.destination_participant) >=
                     participant_count ||
-                static_cast<std::size_t>(row.layer) >= layer_count ||
+                !layout_.containsModelLayer(row.layer) ||
                 row.transfer_and_repack_ns == 0u)
             {
                 throw std::invalid_argument(
@@ -2223,7 +2260,7 @@ namespace llaminar2
                      participant_count +
                  static_cast<std::size_t>(row.destination_participant)) *
                     layer_count +
-                static_cast<std::size_t>(row.layer);
+                layout_.storageIndexForModelLayer(row.layer);
             if (migration_seen[offset])
             {
                 throw std::invalid_argument(
@@ -2435,6 +2472,7 @@ namespace llaminar2
             return trySnapshotMoEOverlayServiceTelemetryPublication(
                 publication,
                 participant_id,
+                layout_.header.first_model_layer,
                 layout_.header.num_layers,
                 output,
                 generation);
@@ -2464,6 +2502,10 @@ namespace llaminar2
                layout->version == kMoEOverlayDeviceControllerFabricVersion &&
                layout->topology_fingerprint == topology_fingerprint &&
                layout->command_capacity == command_capacity &&
+               layout->first_model_layer >= 0 && layout->num_layers > 0u &&
+               layout->num_layers <= static_cast<std::uint32_t>(
+                   std::numeric_limits<std::int32_t>::max() - layout->first_model_layer) &&
+               layout->num_experts > 0u && layout->participant_count > 0u &&
                transport->magic == kMoEOverlayDeviceControllerFabricMagic &&
                transport->version ==
                    kMoEOverlayDeviceControllerFabricVersion &&

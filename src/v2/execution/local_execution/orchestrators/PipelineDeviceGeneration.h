@@ -57,6 +57,18 @@ public:
      * @return Whether every stage submitted its complete schedule. */
     bool prefill(const int *tokens, int count, const PrefillChunkSchedulerPolicy &policy,
         int pad_token, bool allow_padding);
+    /** @brief Admit one ordinary input token through all captured pipeline domains.
+     * @param token_id Request input consumed with scalar decode arithmetic.
+     * @return Whether every domain submitted its retained input transaction.
+     * This handles an initial or restored-prefix input; generation remains
+     * owned by the admitted device controller. */
+    bool forwardDecodeInput(int32_t token_id);
+    /** @brief Replay one restored-prefix bridge through every captured stage edge.
+     * @param request The exact restored history and single new request token.
+     * @return Whether all domains submitted their participant-local bridge.
+     * Each domain owns its TP fanout; the pipeline admits all domains together
+     * so activation transfers have both endpoints without host staging. */
+    bool restoredPrefixMTPDecodeBridge(const RestoredPrefixMTPDecodeBridgeRequest &request);
     /** @brief Submit an initial scalar condition on every main-model participant.
      * @param purpose Immutable commit ownership shared with serving-time capture.
      * @param terminal Exact tail operation which owns/publishes the input mailbox.
@@ -119,6 +131,11 @@ private:
     enum class Phase { Idle, Admitted, Materialized, Submitted, Failed };
     /** @brief Persistent worker fanout for setup, never a per-token dispatch. */
     bool prepareParticipants(DeviceGenerationSamplingMode sampling);
+    /** @brief Submit one request input through every domain's existing TP authority.
+     * @param forward Exact ordinary or restored-MTP scalar entry point.
+     * @return Whether all domains submitted their captured activation edges.
+     * Upstream domains retire their unused logits handoffs before reuse. */
+    bool forwardMainInput(const std::function<bool(IInferenceRunner &)> &forward);
     /** @brief Fan out one typed main-forward transaction without duplicating tail state.
      * @param policy Frozen local condition/verifier topology.
      * @param terminal Sole terminal input/outcome owner.

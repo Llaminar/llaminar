@@ -153,6 +153,12 @@ namespace llaminar2
             return complete_expert_bytes_per_layer_.size();
         }
 
+        /** @return First global model layer in this catalog's compact interval. */
+        [[nodiscard]] int firstModelLayer() const noexcept
+        {
+            return first_model_layer_;
+        }
+
         /** @return Conservative complete-expert byte footprints for every layer. */
         [[nodiscard]] const std::vector<std::size_t> &
         completeExpertBytesPerLayer() const noexcept
@@ -218,6 +224,15 @@ namespace llaminar2
                 representative_measurements) const;
 
     private:
+        /**
+         * @brief Translate an owned global layer into compact catalog storage.
+         * @param layer Global model-layer ID from a manifest or evidence row.
+         * @return Index within this stage's layer arrays.
+         * @throws std::invalid_argument For a layer outside the owned interval.
+         */
+        [[nodiscard]] std::size_t storageIndexForModelLayer(int layer) const;
+
+        int first_model_layer_ = 0;
         std::string identity_;
         std::vector<MoEOverlayEconomyCalibrationLayerGroup> groups_;
         std::vector<int> representative_layers_;

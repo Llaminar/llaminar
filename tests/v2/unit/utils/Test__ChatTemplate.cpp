@@ -745,6 +745,29 @@ TEST(Test__ChatTemplate, Qwen35AssistantContinuationKeepsExistingReasoning)
         seed + "Check the compass.\n</think>\n\nThe keeper turned north."));
 }
 
+/** @test Native templates, rather than HTTP parsing, own historical reasoning retention. */
+TEST(Test__ChatTemplate, SeparateReasoningChannelRespectsNativeHistoryPolicy)
+{
+    auto tmpl = ChatTemplate::create(std::string(qwen35::kCommunityChatTemplate), "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+    ChatMessage older{"assistant", "First answer."};
+    older.reasoning_content = "Older reasoning should be stripped by this Qwen3.5 template.";
+    ChatMessage active{"assistant", ""};
+    active.reasoning_content = "Preserve literal \\n and emoji 🧪 for the next tool turn.";
+    active.tool_calls.push_back(R"({"id":"call_1","type":"function","function":{"name":"write","arguments":"{\"content\":\"123\"}"}})");
+    ChatMessage tool{"tool", "Written"};
+    tool.tool_call_id = "call_1";
+    const std::vector<ChatMessage> messages = {
+        {"user", "First task"}, older, {"user", "Second task"}, active, tool};
+    for (bool thinking : {false, true})
+    {
+        const auto rendered = tmpl->apply(messages, true, thinking);
+        EXPECT_EQ(rendered.find(*older.reasoning_content), std::string::npos);
+        EXPECT_NE(rendered.find("<think>\n" + *active.reasoning_content + "\n</think>"), std::string::npos);
+        EXPECT_NE(rendered.find("<function=write>\n<parameter=content>\n123\n</parameter>"), std::string::npos);
+    }
+}
+
 /**
  * OpenAI carries arguments as a JSON string; the Qwen template requires a
  * structured map so it can recreate the native parameter blocks on the next

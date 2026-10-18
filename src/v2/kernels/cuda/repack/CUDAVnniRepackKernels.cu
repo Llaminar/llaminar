@@ -7,16 +7,27 @@
  * shares the Q4_0 kernel body because their packed block geometry is identical.
  * Each kernel maps one thread to one (n, b) block position, performing
  * the same nibble repack and scale extraction as the CPU reference path.
+ * Q6_K retains its original FP16 base and signed sixteen-value coefficients
+ * in the existing two metadata words; IQ2_S retains its original half base and
+ * scale-nibble byte. Preparation never rounds those formats' scale products.
+ * IQ4_XS physical format 24 preserves the original half base and raw six-bit
+ * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
+ * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include "kernels/cuda/repack/CUDAVnniRepackKernels.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/NativeVnniQ6Scale.h"
+#include "tensors/NativeVnniIQ2SScale.h"
+#include "tensors/NativeVnniIQ4XSScale.h"
+#include "tensors/NativeVnniIQ3SScale.h"
 
 namespace llaminar2 {
 
@@ -346,11 +357,9 @@ __global__ void cuda_repack_q8_1_to_vnni(
 // ============================================================================
 
 /**
- * @brief Normalize one 32-value slice of Q8_K into raw-INT8 device layout.
- *
- * Q8_K has no in-block scale; its values are already the represented signed
- * integers.  Each prepared 32-value block therefore receives FP16 1.0.  The
- * source `bsums` are derived metadata and are unnecessary after preparation.
+ * @brief Copy source Q8_K codes and apply the existing prepared FP16-scale ABI.
+ * Source d is FP32; narrowing here is explicit and not source-value lossless.
+ * Original/native embedding storage retains d and never uses this conversion.
  */
 __global__ void cuda_repack_q8_k_to_vnni(
     const Q8_KBlock* __restrict__ d_raw,
@@ -371,7 +380,7 @@ __global__ void cuda_repack_q8_k_to_vnni(
     const int8_t* src = blk.qs + subblock * 32;
     copy16(dst, src);
     copy16(dst + 16, src + 16);
-    d_scales[linear] = 0x3c00u; // IEEE FP16 1.0.
+    d_scales[linear] = canonicalPreparedHalfBits(blk.d); // Existing prepared FP16 metadata ABI.
 }
 
 // ============================================================================
@@ -491,6 +500,22 @@ __global__ void cuda_repack_q5k_to_vnni(
 // Kernel 7: Q6_K repack
 // ============================================================================
 
+/**
+ * @brief Reorder Q6_K codes while preserving the complete source scale tuple.
+ *
+ * The two existing metadata words hold the original half base and two signed
+ * coefficients, rather than rounded half products. Consumers reconstruct each
+ * product in FP32 before the unchanged low/high dot contribution program.
+ *
+ * @param d_raw Immutable original Q6_K super-blocks in source row order.
+ * @param d_payload Destination 24-byte native code payload per 32 values.
+ * @param d_scales Destination original FP16 base words.
+ * @param d_mins Destination packed signed low/high coefficient words.
+ * @param N Live source rows.
+ * @param K Logical source columns, divisible by the 256-value super-block.
+ * @param sb_per_row Source super-block stride per row.
+ * @param destination Persistent packed destination geometry.
+ */
 __global__ void cuda_repack_q6k_to_vnni(
     const Q6_KBlock* __restrict__ d_raw,
     uint8_t*         __restrict__ d_payload,
@@ -543,11 +568,10 @@ __global__ void cuda_repack_q6k_to_vnni(
     const int8_t* signed_scales = reinterpret_cast<const int8_t*>(blk.scales);
     const int sc_lo_idx = half * 8 + sub_in_half * 2;
     const int sc_hi_idx = sc_lo_idx + 1;
-    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    d_scales[linear] = canonicalPreparedHalfBits(
-        d_f * static_cast<float>(signed_scales[sc_lo_idx]));
-    d_mins[linear] = canonicalPreparedHalfBits(
-        d_f * static_cast<float>(signed_scales[sc_hi_idx]));
+    d_scales[linear] = blk.d;
+    d_mins[linear] = native_vnni_q6_scale::pack(
+        signed_scales[sc_lo_idx],
+        signed_scales[sc_hi_idx]);
 }
 
 // ============================================================================
@@ -707,6 +731,7 @@ __global__ void cuda_repack_iq4xs_to_vnni(
     const IQ4_XSBlock* __restrict__ d_raw,
     uint8_t*           __restrict__ d_payload,
     uint16_t*          __restrict__ d_scales,
+    uint16_t*          __restrict__ d_mins,
     int N, int K, int sb_per_row,
     PackedVnniDestination destination)
 {
@@ -727,9 +752,10 @@ __global__ void cuda_repack_iq4xs_to_vnni(
 
     const int ls = ((blk.scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf)
                  | (((blk.scales_h >> (2 * sub_idx)) & 3) << 4);
-    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    d_scales[linear] = canonicalPreparedHalfBits(
-        d_f * static_cast<float>(ls - 32));
+    // Preserve both original source factors; the consumer multiplies in FP32.
+    d_scales[linear] = blk.d;
+    d_mins[linear] = llaminar2::native_vnni_iq4xs_scale::encodeSourceCoefficient(
+        static_cast<uint8_t>(ls));
 }
 
 // ============================================================================
@@ -740,6 +766,7 @@ __global__ void cuda_repack_iq3s_to_vnni(
     const IQ3_SBlock* __restrict__ d_raw,
     uint8_t*          __restrict__ d_payload,
     uint16_t*         __restrict__ d_scales,
+    uint16_t*         __restrict__ d_coefficients,
     int N, int K, int sb_per_row,
     PackedVnniDestination destination)
 {
@@ -759,11 +786,11 @@ __global__ void cuda_repack_iq3s_to_vnni(
     dst[8] = blk.qh[sub_idx];
     memcpy(dst + 9, blk.signs + sub_idx * 4, 4);
 
-    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     uint8_t sc_byte = blk.scales[sub_idx / 2];
     int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
-    d_scales[linear] = canonicalPreparedHalfBits(
-        d_f * static_cast<float>(1 + 2 * nibble));
+    d_scales[linear] = blk.d;
+    d_coefficients[linear] = llaminar2::native_vnni_iq3s_scale::encodeSourceCoefficient(
+        static_cast<uint8_t>(nibble));
 }
 
 // ============================================================================
@@ -814,6 +841,22 @@ __global__ void cuda_repack_iq3xxs_to_vnni(
 // Kernel 13: IQ2_S repack (asymmetric)
 // ============================================================================
 
+/**
+ * @brief Reorder IQ2_S grid/sign payload while retaining original scale words.
+ *
+ * The existing two planes hold original half d and one raw scale-nibble byte
+ * (reserved high byte zero). Consumers reconstruct source scales in FP32;
+ * repacking neither rounds products to half nor changes the grid/sign bytes.
+ *
+ * @param d_raw Original immutable IQ2_S super-blocks in source row order.
+ * @param d_payload Destination nine-byte grid/sign payload per32 values.
+ * @param d_scales Destination original half base words.
+ * @param d_mins Destination source scale bytes, zero-extended to uint16.
+ * @param N Live source rows.
+ * @param K Logical source columns, divisible by32.
+ * @param sb_per_row Source super-block stride, including a partial last block.
+ * @param destination Persistent block-major/coalesced destination geometry.
+ */
 __global__ void cuda_repack_iq2s_to_vnni(
     const IQ2_SBlock* __restrict__ d_raw,
     uint8_t*          __restrict__ d_payload,
@@ -838,12 +881,8 @@ __global__ void cuda_repack_iq2s_to_vnni(
     dst[4] = blk.qh[sub_idx];
     memcpy(dst + 5, blk.qs + 32 + sub_idx * 4, 4);
 
-    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    uint8_t sc = blk.scales[sub_idx];
-    d_scales[linear] = canonicalPreparedHalfBits(
-        d_f * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
-    d_mins[linear] = canonicalPreparedHalfBits(
-        d_f * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
+    d_scales[linear] = blk.d;
+    d_mins[linear] = native_vnni_iq2s_scale::pack(blk.scales[sub_idx]);
 }
 
 // ============================================================================
@@ -1196,21 +1235,23 @@ bool launchVnniRepackCUDA(
         break;
     }
     case RepackFormat::IQ4_XS: {
+        if (!d_raw_blocks || !d_payload || !d_scales || !d_mins) return false;
         const int sb_per_row = (K + 255) / 256;
         dim3 block(64, 4);
         dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
         cuda_repack_iq4xs_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ4_XSBlock*>(d_raw_blocks),
-            d_payload, d_scales, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ3_S: {
+        if (!d_mins) throw std::invalid_argument("IQ3_S requires original coefficient metadata");
         const int sb_per_row = (K + 255) / 256;
         dim3 block(64, 4);
         dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
         cuda_repack_iq3s_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ3_SBlock*>(d_raw_blocks),
-            d_payload, d_scales, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ3_XXS: {

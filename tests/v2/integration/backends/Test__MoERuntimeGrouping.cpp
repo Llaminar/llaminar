@@ -6,6 +6,7 @@
  * sparse routing inputs. Counts use bounded integer arithmetic; grouped rows
  * must retain serial original-route order and exact weight bits regardless of
  * integer update order. The public runtime table owns all device publications.
+ * Native scratch-capacity coverage uses both backends and never runs in Unit.
  * This model-free regression intentionally has no timing threshold.
  * The standalone expert-prefix bridge also sweeps warp/block boundaries,
  * multiple chunks, near-limit integer totals and poisoned replay storage.
@@ -357,6 +358,75 @@ namespace llaminar2::test
                                 std::bit_cast<uint32_t>(expected_weights[slot])) << "grouped slot=" << slot;
                     }
                 }
+        });
+    }
+
+    /** @test Both native backends retain every scratch bank across reset and growth. */
+    TEST_P(MoERuntimeGrouping, PrefillRouteScratchAllocationTracksCapacity)
+    {
+        const auto device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        context.submitAndWait([&] {
+            auto *backend = getBackendFor(device);
+            auto *stream = context.defaultStream();
+            ASSERT_NE(backend, nullptr);
+            ASSERT_NE(stream, nullptr);
+            DeviceMoERuntimeTable::Config config;
+            config.device_id = device;
+            config.num_layers = 2;
+            config.num_experts = 4;
+            config.top_k = 2;
+            config.mirror_to_device = true;
+            config.prefill_token_capacity = 8;
+
+            MoERuntimeTable table(config);
+            EXPECT_TRUE(table.hasPrefillRouteScratchCapacity(0, 8));
+            EXPECT_TRUE(table.hasPrefillRouteScratchCapacity(1, 4));
+            EXPECT_FALSE(table.hasPrefillRouteScratchCapacity(0, 9));
+
+            const auto &state = table.hostLayerState(0);
+            EXPECT_EQ(state.prefill_token_capacity, 8u);
+            EXPECT_EQ(state.prefill_route_capacity, 16u);
+            EXPECT_NE(state.route_expert_ids, nullptr);
+            EXPECT_NE(state.route_weights, nullptr);
+            EXPECT_NE(state.expert_counts, nullptr);
+            EXPECT_NE(state.expert_offsets, nullptr);
+            EXPECT_NE(state.grouped_token_ids, nullptr);
+            EXPECT_NE(state.grouped_route_weights, nullptr);
+            EXPECT_NE(state.reserved_ptrs[0], nullptr)
+                << "prefill LLEP split-table scratch must be a first-class runtime buffer";
+            EXPECT_NE(state.reserved_ptrs[1], nullptr)
+                << "full current-batch LLEP assignment spans must be first-class runtime scratch";
+            EXPECT_NE(state.reserved_ptrs[2], nullptr)
+                << "full current-batch LLEP transfer plans must be first-class runtime scratch";
+            EXPECT_EQ(state.reserved_u64[0], 4u * kDeviceMoEMaxParticipants);
+            EXPECT_EQ(state.reserved_u64[1], 4u * kDeviceMoEMaxParticipants);
+            EXPECT_EQ(state.reserved_u64[2], 0u);
+            EXPECT_EQ(state.reserved_u64[3], 0u);
+            EXPECT_NE(table.deviceLayerState(0), &table.hostLayerState(0));
+
+            void *split_scratch_before_reset = state.reserved_ptrs[0];
+            void *span_scratch_before_reset = state.reserved_ptrs[1];
+            void *transfer_scratch_before_reset = state.reserved_ptrs[2];
+
+            table.resetDecodeRuntimeState(stream);
+            EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[0], split_scratch_before_reset)
+                << "decode-runtime reset must preserve prefill LLEP scratch bindings";
+            EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[1], span_scratch_before_reset)
+                << "decode-runtime reset must preserve full current-batch LLEP span scratch";
+            EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[2], transfer_scratch_before_reset)
+                << "decode-runtime reset must preserve full current-batch LLEP transfer scratch";
+
+            table.ensurePrefillRouteScratchCapacity(12, stream);
+            ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            EXPECT_TRUE(table.hasPrefillRouteScratchCapacity(0, 12));
+            EXPECT_EQ(table.hostLayerState(0).prefill_token_capacity, 12u);
+            EXPECT_EQ(table.hostLayerState(0).prefill_route_capacity, 24u);
+            EXPECT_NE(table.hostLayerState(0).reserved_ptrs[0], nullptr);
+            EXPECT_NE(table.hostLayerState(0).reserved_ptrs[1], nullptr);
+            EXPECT_NE(table.hostLayerState(0).reserved_ptrs[2], nullptr);
+            EXPECT_EQ(table.hostLayerState(0).reserved_u64[0], 4u * kDeviceMoEMaxParticipants);
+            EXPECT_EQ(table.hostLayerState(0).reserved_u64[1], 4u * kDeviceMoEMaxParticipants);
         });
     }
 

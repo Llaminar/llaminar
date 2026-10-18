@@ -161,8 +161,8 @@ namespace llaminar2
                 void *startup_h2d_pinned_scales = nullptr;
                 void *startup_h2d_pinned_vnni = nullptr;
                 uint8_t *d_native_vnni_payload = nullptr;
-                void *d_native_vnni_scales = nullptr; // __half* on device; void* for header compatibility
-                void *d_native_vnni_mins = nullptr;   // __half* on device; NULL for symmetric formats
+                void *d_native_vnni_scales = nullptr; // Original Q6 d, otherwise half scale bits.
+                void *d_native_vnni_mins = nullptr;   // Packed Q6 subscales, otherwise format auxiliary bits.
                 void *d_native_vnni_emins = nullptr;  // uint32_t* packed {lo,hi} emins; Q2_K only
                 void *startup_h2d_pinned_native_vnni = nullptr;
                 void *startup_h2d_pinned_native_scales = nullptr;
@@ -176,10 +176,10 @@ namespace llaminar2
             std::vector<float> scales;          ///< [N] per-column (per-output-feature) scale factors
 
             // Native-VNNI compact container (Q4_0, IQ4_NL)
-            // Achieves lossless weight reconstruction by keeping per-block FP16 scales separate.
+            // Q6 preserves original factors; other codebooks retain prepared FP16 metadata.
             std::vector<uint8_t> native_vnni_payload; ///< [blocks_per_row × N × 16] nibble payload interleaved by N
-            std::vector<uint16_t> native_vnni_scales; ///< [blocks_per_row × N] FP16 per-block scales (raw uint16_t bits)
-            std::vector<uint16_t> native_vnni_mins;   ///< [blocks_per_row × N] FP16 per-block mins (asymmetric formats only)
+            std::vector<uint16_t> native_vnni_scales; ///< [blocks_per_row × N] Q6 source d or prepared FP16 scale bits.
+            std::vector<uint16_t> native_vnni_mins;   ///< [blocks_per_row × N] Q6 packed signed subscales or format aux bits.
             std::vector<uint32_t> native_vnni_emins;  ///< [blocks_per_row × N] packed {lo,hi} emins (Q2_K only)
             uint8_t native_vnni_codebook_id = 0;      ///< NativeVNNIFormat: 0=Q4_0, 4=IQ4_NL/IQ4_XS, 5=Q4_1/Q4_K, 6=Q5_0, 7=Q5_1/Q5_K, 8=Q6_K, 9=Q3_K, 10=Q2_K, 11=IQ3_S, 12=IQ3_XXS, 13=IQ2_S, 14=IQ2_XS, 15=IQ2_XXS, 16=IQ1_S, 17=IQ1_M
             uint32_t native_vnni_blocks_per_row = 0;  ///< K / 32

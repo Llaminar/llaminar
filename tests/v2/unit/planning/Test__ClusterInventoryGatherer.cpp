@@ -52,6 +52,7 @@ namespace
         device.numa_node = 7;
         device.name = "fixture GPU";
         device.uuid = "fixture-" + std::to_string(static_cast<int>(backend)) + "-" + std::to_string(ordinal);
+        device.pci_bus_address = "0001:42:1f.7";
         device.total_memory_bytes = 10000;
         device.free_memory_bytes = 8123;
         device.compute_units = 42;
@@ -179,6 +180,7 @@ TEST_P(InventoryGPUProjection, PreservesSparseOrdinalCapacityAndPCIe)
         EXPECT_EQ(gpu.pcie_max_speed_gts, 16.0);
         EXPECT_TRUE(gpu.pcie_degraded);
         EXPECT_EQ(gpu.pcie_bottleneck_bdf, "0000:81:00.0");
+        EXPECT_EQ(gpu.pci_bus_address, "0001:42:1f.7");
         EXPECT_EQ(gpu.tflops_fp16, 0.0) << "Missing throughput is not a fabricated estimate";
     }
 }
@@ -235,6 +237,7 @@ TEST(Test__ClusterInventoryGatherer, P2PReordersAndFiltersBothBackendsWithoutLos
         EXPECT_EQ(decoded.p2p_rocm, rank.p2p_rocm);
         EXPECT_EQ(decoded.gpus[0].free_memory_bytes, rank.gpus[0].free_memory_bytes);
         EXPECT_EQ(decoded.gpus[0].pcie_bottleneck_bdf, rank.gpus[0].pcie_bottleneck_bdf);
+        EXPECT_EQ(decoded.gpus[0].pci_bus_address, rank.gpus[0].pci_bus_address);
         EXPECT_EQ(decoded.gpus[0].last_level_cache_bytes, rank.gpus[0].last_level_cache_bytes);
     }
 }

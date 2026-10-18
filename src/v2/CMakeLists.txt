@@ -1,4 +1,6 @@
-# Llaminar v2 - Clean greenfield implementation
+# Llaminar V2 build and public target contracts.
+# Backend dependencies, generated model resources, and public header usage
+# requirements are owned here so serving tools compile independently of tests.
 cmake_minimum_required(VERSION 3.18)
 
 # Define custom build types BEFORE project() so they're recognized.
@@ -268,7 +270,8 @@ if(HAVE_CUDA)
     
     # CUDA optimization flags for Release builds
     # --use_fast_math: Enable fast math intrinsics (~10-30% speedup, slight precision loss)
-    # --ftz=true: Flush denormals to zero (faster, no denormals in LLM inference anyway)
+    # --ftz=true: Flush ordinary CUDA arithmetic; shared explicit cross-backend
+    # FP32 primitives opt out where their byte contract preserves subnormals.
     # --prec-div=false: Fast division (slightly less accurate, negligible for inference)
     # --prec-sqrt=false: Fast sqrt (slightly less accurate)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math --ftz=true --prec-div=false --prec-sqrt=false")
@@ -411,6 +414,7 @@ if(HAVE_CUDA)
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
         # MoE (Mixture of Experts) kernels
         kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
+        kernels/cuda/moe/CUDARouterQ8Prefill.cu       # Exact block32 INT8 tensor-core router prefill
         kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.cu # Device-owned node-local sparse activation packets
         kernels/cuda/moe/CUDAMoEOverlayDeviceControllerKernels.cu # Node-local sole-controller lifecycle
         kernels/cuda/moe/CUDAMoEOverlayEpochKernels.cu # Captured ExpertOverlay placement-epoch RCU
@@ -430,6 +434,14 @@ if(HAVE_CUDA)
         set_source_files_properties(
             kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu
             PROPERTIES COMPILE_OPTIONS "--split-compile=8"
+        )
+        # Attention owns one arithmetic body specialized across native formats,
+        # exact/partial widths, tile ownership and direct/context execution.
+        # Parallelize optimization of that complete family instead of making a
+        # single serial compiler worker dominate every local tuning rebuild.
+        set_source_files_properties(
+            kernels/cuda/attention/CUDAFlashAttentionKernels.cu
+            PROPERTIES COMPILE_OPTIONS "--split-compile=0"
         )
     endif()
     
@@ -466,6 +478,25 @@ if(HAVE_CUDA)
         kernels/cuda/kvcache/CUDARingKVCacheBase.cpp
         ${CUDA_KERNEL_SOURCES}
     )
+    # Pure tensor prefill exports only host native-function handles. It has
+    # no cross-TU device calls, so compile its complete numerical code object.
+    # Graph/conditional controllers still use cuda_backend's device link. The
+    # directory-wide fatal spill guard and shipped architecture set apply to
+    # this target exactly as to every other project-owned CUDA kernel.
+    add_library(cuda_tensor_prefill OBJECT
+        kernels/cuda/attention/CUDATensorPrefillKernels.cu)
+    set_target_properties(cuda_tensor_prefill PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_EXTENSIONS ON
+        POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(cuda_tensor_prefill PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(cuda_tensor_prefill PRIVATE CUDA::cudart)
+    target_sources(cuda_backend PRIVATE $<TARGET_OBJECTS:cuda_tensor_prefill>)
+
     # Resolve CUDA device symbols at library build time so downstream executables
     # (500+ test binaries) don't each need their own nvcc device-link step.
     set_target_properties(cuda_backend PROPERTIES
@@ -929,7 +960,8 @@ if(HAVE_ROCM)
     file(SHA256 "${RCCL_CAPTURE_PATCH_FILE}" RCCL_CAPTURE_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-device-live-rows.patch" RCCL_ROWS_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-native-host-storage.patch" RCCL_HOST_STORAGE_PATCH_HASH)
-    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}")
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-communicator-protocol-defaults.patch" RCCL_PROTOCOL_PATCH_HASH)
+    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}")
     
     # Check if RCCL build is up-to-date
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")
@@ -964,6 +996,7 @@ if(HAVE_ROCM)
             -G Ninja
             -DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}
             -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
             -DCMAKE_C_COMPILER=${RCCL_C_COMPILER}
             -DCMAKE_CXX_COMPILER=${RCCL_CXX_COMPILER}
             -DCMAKE_PREFIX_PATH=${ROCM_PATH}
@@ -1311,6 +1344,43 @@ message(STATUS "V2: BLAS backend: OneDNN")
 # FTXUI Integration (for interactive chat UI)
 # =============================================================================
 include(FetchContent)
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
+# Pinned Unicode regex support for model-declared byte-BPE boundaries. Keep the
+# dependency static and private to this small target: serving needs no new DSO,
+# and PCRE2 headers/options must not leak into the inference core's compile ABI.
+FetchContent_Declare(pcre2
+    URL https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.gz
+    URL_HASH SHA256=929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae
+)
+FetchContent_Declare(utf8proc
+    URL https://github.com/JuliaStrings/utf8proc/archive/refs/tags/v2.11.3.tar.gz
+    URL_HASH SHA256=abfed50b6d4da51345713661370290f4f4747263ee73dc90356299dfc7990c78
+)
+function(llaminar_configure_pre_tokenizer)
+    set(BUILD_SHARED_LIBS OFF)
+    set(BUILD_STATIC_LIBS ON)
+    set(PCRE2_BUILD_PCRE2_8 ON)
+    set(PCRE2_BUILD_PCRE2_16 OFF)
+    set(PCRE2_BUILD_PCRE2_32 OFF)
+    set(PCRE2_STATIC_PIC ON)
+    set(PCRE2_SUPPORT_UNICODE ON)
+    set(PCRE2_SUPPORT_JIT OFF)
+    set(PCRE2_BUILD_PCRE2GREP OFF)
+    set(PCRE2_BUILD_TESTS OFF)
+    FetchContent_MakeAvailable(pcre2)
+    set(UTF8PROC_ENABLE_TESTING OFF CACHE BOOL "Disable utf8proc upstream test downloads" FORCE)
+    set(UTF8PROC_INSTALL OFF CACHE BOOL "Keep utf8proc private to the tokenizer" FORCE)
+    FetchContent_MakeAvailable(utf8proc)
+    set_target_properties(utf8proc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_library(llaminar2_text_pre_tokenizer STATIC utils/TextPreTokenizer.cpp)
+    set_target_properties(llaminar2_text_pre_tokenizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_features(llaminar2_text_pre_tokenizer PRIVATE cxx_std_23)
+    target_link_libraries(llaminar2_text_pre_tokenizer PRIVATE pcre2-8-static utf8proc)
+endfunction()
+llaminar_configure_pre_tokenizer()
+
 FetchContent_Declare(ftxui
     GIT_REPOSITORY https://github.com/ArthurSonzogni/ftxui
     GIT_TAG v5.0.0
@@ -1478,6 +1548,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayHostDemandMemoryPlan.cpp
     execution/moe/MoEExpertOverlayAuthorityPlan.cpp
     execution/moe/MoEOptimizationMovementTopology.cpp
+    execution/moe/MoEOptimizationPipeline.cpp
     execution/moe/MoEExpertOwnerMap.cpp
     execution/moe/MoEOverlayDevicePlacementPolicy.cpp
     execution/moe/MoEOverlayDeviceControllerProtocol.cpp
@@ -1492,6 +1563,10 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayHostAuthorityDeviceBankPublisher.cpp
     execution/moe/MoEOverlayDeviceControllerGraphService.cpp
     execution/moe/MoEOverlayResidencyAuthority.cpp
+    execution/moe/MoEOverlayResidencySetup.cpp
+    execution/moe/MoEPipelinePreparedPlan.cpp
+    execution/runner/PreparedWeightAuthorityIdentity.cpp
+    execution/moe/MoEOverlayPipelineStageBinding.cpp
     execution/moe/DeviceMoEOverlayEpochArena.cpp
     execution/moe/MoEOverlayDeviceEpochProtocol.cpp
     execution/moe/MoEOverlayDistributedResidencyProtocol.cpp
@@ -1547,12 +1622,14 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/prefix_cache/DiskPrefixStorageBackend.cpp
     execution/prefix_cache/PrefixArchivePersistence.cpp
     execution/prefix_cache/PrefixCacheCoordinator.cpp
+    execution/prefix_cache/PrefixRestoreMetadata.cpp
     execution/prefix_cache/PrefixCacheFingerprint.cpp
     execution/prefix_cache/PrefixCacheKey.cpp
     execution/prefix_cache/PrefixPayloadLayout.cpp
     execution/prefix_cache/PrefixCacheStateProbe.cpp
     execution/prefix_cache/PrefixStateSnapshot.cpp
     execution/prefix_cache/PrefixStateCache.cpp
+    execution/prefix_cache/PrefixCacheShutdown.cpp
     execution/prefix_cache/PrefixStorageBackend.cpp
     execution/prefix_cache/PrefixHostArena.cpp
     execution/prefix_cache/RamPrefixStorageBackend.cpp
@@ -1605,6 +1682,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/orchestrators/LogitsGatherer.cpp
     execution/local_execution/orchestrators/DeviceSampler.cpp
     execution/local_execution/orchestrators/RankOrchestrator.cpp
+    execution/local_execution/orchestrators/RankOrchestratorMovement.cpp
+    execution/local_execution/orchestrators/RankOrchestratorConfig.cpp
     execution/local_execution/model/HeterogeneousLayerExecutor.cpp
     execution/local_execution/coherence/CrossDomainTransfer.cpp
     execution/config/HybridPrecisionConfig.cpp
@@ -1673,6 +1752,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/RankMemoryPlanInputs.cpp
     planning/MoEOverlayPlanningInputs.cpp
     planning/MoEOverlayMemoryPlanInputs.cpp
+    planning/MoEPipelineMemoryAdmission.cpp
     planning/PlanningModelMetadata.cpp
     planning/PlanningPublication.cpp
     planning/ResolvedRankOrchestration.cpp
@@ -1732,9 +1812,13 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     app/modes/BenchmarkMode.cpp
     app/modes/ServerMode.cpp
     app/modes/ChatCompletionHandler.cpp
+    app/modes/HttpRuntimeStats.cpp
+    app/modes/HttpProcessStats.cpp
+    app/modes/HttpPrefixCacheStats.cpp
     app/modes/CompletionMode.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
+    models/ModelGenerationPolicy.cpp
     loaders/ModelContextConfig.cpp
     loaders/WeightManager.cpp
     loaders/PreparedOverlaySourceRetirement.cpp
@@ -1993,10 +2077,15 @@ target_include_directories(llaminar2_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 
-# cpp-httplib and nlohmann/json for ServerMode
+# Public request/statistics headers expose nlohmann::json. Consumers, including
+# the image-bound native evidence decoder, inherit that header dependency from
+# the core; test-directory include paths must not supply it accidentally.
+target_include_directories(llaminar2_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
+)
+# The HTTP listener implementation alone uses cpp-httplib.
 target_include_directories(llaminar2_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor/cpp-httplib
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
 )
 
 # Enable pipeline snapshot capture (for parity testing and debugging)
@@ -2052,6 +2141,7 @@ endif()
 
 # Required dependencies
 target_include_directories(llaminar2_core PUBLIC ${NUMA_INCLUDE_DIR})
+target_link_libraries(llaminar2_core PRIVATE llaminar2_text_pre_tokenizer)
 
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
@@ -2211,6 +2301,17 @@ endif()
 add_executable(llaminar2 Main.cpp)
 target_link_libraries(llaminar2 llaminar2_core)
 
+# Metadata-only decoding belongs to the same runtime image as the server under
+# test. It authenticates OpenCode output without model execution or another
+# independently linked parser implementation.
+add_executable(llaminar_native_tool_evidence_decoder tools/NativeToolEvidenceDecoder.cpp)
+target_link_libraries(llaminar_native_tool_evidence_decoder PRIVATE llaminar2_core)
+add_executable(llaminar_model_kld_canary tools/ModelKLDCanary.cpp)
+target_link_libraries(llaminar_model_kld_canary PRIVATE llaminar2_core)
+# The numerical observer must use the same shipped core as serving; no SDK or
+# local rebuild is needed in the master PR model gate.
+add_dependencies(llaminar2 llaminar_native_tool_evidence_decoder llaminar_model_kld_canary)
+
 # GEMM tile-config sweep benchmark (CUDA only, optional)
 if(HAVE_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../benchmarks/v2/gemm_sweep_main.cu")
     add_executable(gemm_sweep ../../benchmarks/v2/gemm_sweep_main.cu)
@@ -2243,7 +2344,7 @@ endif()
 # TODO: Intel MKL backend - not yet implemented
 
 # Install targets
-install(TARGETS llaminar2 llaminar2_core
+install(TARGETS llaminar2 llaminar2_core llaminar_native_tool_evidence_decoder llaminar_model_kld_canary
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib

@@ -7,6 +7,7 @@
  * mathematics, graph execution, or evidence publication ordering.
  */
 #include "NodeExpertOverlayParityFixture.h"
+#include "utils/ControllerMovementEvidence.h"
 
 namespace llaminar2::test::parity::qwen35moe::node_overlay
 {
@@ -56,15 +57,15 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             EconomyAuthorityLedgers,
             EconomyAuthorityPublishedWaves,
             CapacityConservationCertifications,
-            TaggedTransactions,
-            TaggedCommands,
-            TaggedPhysicalBytes,
-            TaggedPromotions,
-            TaggedDemotions,
-            TaggedSamePriorityMoves,
-            TaggedCrossDomainMoves,
-            TaggedCrossRankMoves,
-            TaggedCrossBackendMoves,
+            PublishedTransactions,
+            PublishedCommands,
+            PublishedPhysicalBytes,
+            PublishedPromotions,
+            PublishedDemotions,
+            PublishedSamePriorityMoves,
+            PublishedCrossDomainMoves,
+            PublishedCrossRankMoves,
+            PublishedCrossBackendMoves,
             EvidenceViolations,
             EvidenceCount,
         };
@@ -153,14 +154,6 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             const auto parsed = std::from_chars(begin, end, value);
             return parsed.ec == std::errc{} && parsed.ptr == end;
         };
-        const auto parse_i64 = [](const std::string &text,
-                                  std::int64_t &value)
-        {
-            const char *const begin = text.data();
-            const char *const end = begin + text.size();
-            const auto parsed = std::from_chars(begin, end, value);
-            return parsed.ec == std::errc{} && parsed.ptr == end;
-        };
         const auto tag_u64 = [&](const PerfStatRecord &record,
                                  const char *name,
                                  uint64_t &value)
@@ -170,8 +163,33 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                    parse_u64(found->second, value);
         };
 
-        for (const auto &record : PerfStatsCollector::snapshot(
-                 {"moe_overlay_controller", "moe_overlay_residency"}))
+        const auto records = PerfStatsCollector::snapshot({"moe_overlay_controller", "moe_overlay_residency"});
+        const auto transport_error = llaminar2::test::validateControllerMovementPerfStats(
+            records, movement_ledger, convergence_migration_cycles_per_wave_);
+        if (!transport_error.empty())
+        {
+            ++local[EvidenceViolations];
+            ADD_FAILURE() << transport_error;
+        }
+        for (const auto &publication : movement_ledger.device_publications)
+        {
+            if (!publication.valid() || !publication.controller)
+            {
+                ++local[EvidenceViolations];
+                continue;
+            }
+            const auto &receipt = *publication.controller;
+            ++local[PublishedTransactions];
+            local[PublishedCommands] += publication.command_count;
+            local[PublishedPhysicalBytes] += publication.physical_payload_bytes;
+            local[PublishedPromotions] += receipt.promotions;
+            local[PublishedDemotions] += receipt.demotions;
+            local[PublishedSamePriorityMoves] += receipt.same_priority_moves;
+            local[PublishedCrossDomainMoves] += receipt.cross_domain_moves;
+            local[PublishedCrossRankMoves] += receipt.cross_rank_moves;
+            local[PublishedCrossBackendMoves] += receipt.cross_backend_moves;
+        }
+        for (const auto &record : records)
         {
             if (record.kind != PerfStatRecord::Kind::Counter)
                 continue;
@@ -242,74 +260,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 add(EconomyReady, record.value);
             }
             else if (record.name == "dynamic_movement_transactions")
-            {
-                uint64_t transaction = 0u;
-                uint64_t base_epoch = 0u;
-                uint64_t candidate_epoch = 0u;
-                uint64_t commands = 0u;
-                uint64_t bytes = 0u;
-                uint64_t promotions = 0u;
-                uint64_t demotions = 0u;
-                uint64_t same_priority = 0u;
-                uint64_t cross_domain = 0u;
-                uint64_t cross_rank = 0u;
-                uint64_t cross_backend = 0u;
-                uint64_t accepted_cycles = 0u;
-                uint64_t service_gain = 0u;
-                uint64_t net_benefit = 0u;
-                const auto policy_owner = record.tags.find("policy_owner");
-                const auto blocking = record.tags.find("blocking_inference");
-                const bool valid =
-                    record.phase == "maintenance" && record.value > 0.0 &&
-                    record.count > 0u &&
-                    tag_u64(record, "transaction", transaction) &&
-                    transaction > 0u &&
-                    tag_u64(record, "base_epoch", base_epoch) &&
-                    tag_u64(record, "candidate_epoch", candidate_epoch) &&
-                    candidate_epoch == base_epoch + 1u &&
-                    tag_u64(record, "movement_commands", commands) &&
-                    commands > 0u &&
-                    tag_u64(record, "physical_bytes", bytes) && bytes > 0u &&
-                    tag_u64(record, "promotions", promotions) &&
-                    tag_u64(record, "demotions", demotions) &&
-                    tag_u64(record, "same_priority_moves", same_priority) &&
-                    tag_u64(record, "cross_domain_moves", cross_domain) &&
-                    tag_u64(record, "cross_rank_moves", cross_rank) &&
-                    tag_u64(record, "cross_backend_moves", cross_backend) &&
-                    tag_u64(record, "accepted_cycles", accepted_cycles) &&
-                    accepted_cycles > 0u &&
-                    accepted_cycles <=
-                        convergence_migration_cycles_per_wave_ &&
-                    tag_u64(
-                        record,
-                        "projected_service_gain_ns",
-                        service_gain) &&
-                    service_gain > 0u &&
-                    tag_u64(
-                        record,
-                        "projected_net_benefit_ns",
-                        net_benefit) &&
-                    net_benefit > 0u &&
-                    policy_owner != record.tags.end() &&
-                    policy_owner->second == "device" &&
-                    blocking != record.tags.end() &&
-                    blocking->second == "false";
-                if (!valid)
-                {
-                    ++local[EvidenceViolations];
-                    continue;
-                }
                 add(Transactions, record.value);
-                add(TaggedTransactions, record.value);
-                local[TaggedCommands] += commands;
-                local[TaggedPhysicalBytes] += bytes;
-                local[TaggedPromotions] += promotions;
-                local[TaggedDemotions] += demotions;
-                local[TaggedSamePriorityMoves] += same_priority;
-                local[TaggedCrossDomainMoves] += cross_domain;
-                local[TaggedCrossRankMoves] += cross_rank;
-                local[TaggedCrossBackendMoves] += cross_backend;
-            }
             else if (record.name == "dynamic_movement_commands")
                 add(Commands, record.value);
             else if (record.name == "dynamic_physical_bytes")
@@ -326,94 +277,15 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 add(CrossRankMoves, record.value);
             else if (record.name == "dynamic_cross_backend_moves")
                 add(CrossBackendMoves, record.value);
-            else if (record.name ==
-                     "dynamic_capacity_conservation_certifications")
-            {
-                uint64_t edges = 0u;
-                uint64_t participant_coordinates = 0u;
-                uint64_t tier_coordinates = 0u;
-                uint64_t malformed = 0u;
-                uint64_t participant_violations = 0u;
-                uint64_t tier_violations = 0u;
-                const auto direction_proxy = record.tags.find(
-                    "direction_counts_are_capacity_proof");
-                const bool valid =
-                    record.value == 1.0 && record.count == 1u &&
-                    tag_u64(record, "edges_checked", edges) && edges > 0u &&
-                    tag_u64(
-                        record,
-                        "participant_coordinates_checked",
-                        participant_coordinates) &&
-                    participant_coordinates > 0u &&
-                    tag_u64(
-                        record,
-                        "tier_coordinates_checked",
-                        tier_coordinates) &&
-                    tier_coordinates > 0u &&
-                    tag_u64(record, "malformed_edges", malformed) &&
-                    malformed == 0u &&
-                    tag_u64(
-                        record,
-                        "participant_flow_violations",
-                        participant_violations) &&
-                    participant_violations == 0u &&
-                    tag_u64(
-                        record,
-                        "tier_flow_violations",
-                        tier_violations) &&
-                    tier_violations == 0u &&
-                    direction_proxy != record.tags.end() &&
-                    direction_proxy->second == "false";
-                if (valid)
-                    add(
-                        CapacityConservationCertifications,
-                        record.value);
-                else
-                    ++local[EvidenceViolations];
-            }
+            else if (record.name == "dynamic_capacity_conservation_certifications")
+                add(CapacityConservationCertifications, record.value);
             else if (record.name == "background_notification_batches")
                 add(BackgroundNotifications, record.value);
             else if (record.name ==
                      "physical_wave_parallel_operations_started")
                 add(PhysicalOperations, record.value);
             else if (record.name == "dynamic_migration_edges")
-            {
-                std::int64_t source_priority = 0;
-                std::int64_t destination_priority = 0;
-                uint64_t estimated_bytes = 0u;
-                const auto direction = record.tags.find("direction");
-                const auto source = record.tags.find("source_priority");
-                const auto destination =
-                    record.tags.find("destination_priority");
-                const auto blocking = record.tags.find("blocking_inference");
-                const bool parsed =
-                    direction != record.tags.end() &&
-                    source != record.tags.end() &&
-                    destination != record.tags.end() &&
-                    parse_i64(source->second, source_priority) &&
-                    parse_i64(destination->second, destination_priority) &&
-                    tag_u64(
-                        record,
-                        "estimated_weight_bytes",
-                        estimated_bytes) &&
-                    estimated_bytes > 0u;
-                const bool direction_valid = parsed &&
-                    ((direction->second == "promotion" &&
-                      destination_priority < source_priority) ||
-                     (direction->second == "demotion" &&
-                      destination_priority > source_priority) ||
-                     (direction->second == "same_priority" &&
-                      destination_priority == source_priority));
-                if (!direction_valid || blocking == record.tags.end() ||
-                    blocking->second != "false")
-                {
-                    ++local[EvidenceViolations];
-                }
-                else
-                {
-                    add(MigrationEdges, record.value);
-                }
-            }
+                add(MigrationEdges, record.value);
         }
         local[UniqueImprovingEpochs] = improving_epochs.size();
 
@@ -522,17 +394,17 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         EXPECT_LE(global[CrossRankMoves], global[Commands]);
         EXPECT_EQ(global[MigrationEdges], global[Commands]);
 
-        EXPECT_EQ(global[TaggedTransactions], global[Transactions]);
-        EXPECT_EQ(global[TaggedCommands], global[Commands]);
-        EXPECT_EQ(global[TaggedPhysicalBytes], global[PhysicalBytes]);
-        EXPECT_EQ(global[TaggedPromotions], global[Promotions]);
-        EXPECT_EQ(global[TaggedDemotions], global[Demotions]);
+        EXPECT_EQ(global[PublishedTransactions], global[Transactions]);
+        EXPECT_EQ(global[PublishedCommands], global[Commands]);
+        EXPECT_EQ(global[PublishedPhysicalBytes], global[PhysicalBytes]);
+        EXPECT_EQ(global[PublishedPromotions], global[Promotions]);
+        EXPECT_EQ(global[PublishedDemotions], global[Demotions]);
         EXPECT_EQ(
-            global[TaggedSamePriorityMoves],
+            global[PublishedSamePriorityMoves],
             global[SamePriorityMoves]);
-        EXPECT_EQ(global[TaggedCrossDomainMoves], global[CrossDomainMoves]);
-        EXPECT_EQ(global[TaggedCrossRankMoves], global[CrossRankMoves]);
-        EXPECT_EQ(global[TaggedCrossBackendMoves], global[CrossBackendMoves]);
+        EXPECT_EQ(global[PublishedCrossDomainMoves], global[CrossDomainMoves]);
+        EXPECT_EQ(global[PublishedCrossRankMoves], global[CrossRankMoves]);
+        EXPECT_EQ(global[PublishedCrossBackendMoves], global[CrossBackendMoves]);
     }
 
     /**

@@ -1991,7 +1991,7 @@ namespace llaminar2
                     packed.N,
                     packed.K,
                     format.payload_bytes,
-                    format.is_asymmetric,
+                    canonicalDeviceVnniFormat(format).is_asymmetric,
                     format.has_emins,
                     source_bytes);
                 transfer_sources.push_back(std::move(*source));
@@ -2038,7 +2038,7 @@ namespace llaminar2
                 job.name = slot_name;
                 job.N = packed.N;
                 job.K = packed.K;
-                job.is_asymmetric = format.is_asymmetric;
+                job.is_asymmetric = canonicalDeviceVnniFormat(format).is_asymmetric;
                 job.host_raw_data = source.native->nativeBlocks().data();
                 job.raw_bytes = source.native->nativeBlocks().size();
                 job.format = source.format;
@@ -2096,7 +2096,7 @@ namespace llaminar2
                         static_cast<uint16_t *>(slot->d_native_vnni_scales),
                         static_cast<uint16_t *>(slot->d_native_vnni_mins),
                         static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                        canonicalDeviceVnniCodebookId(format.codebook_id), blocks_per_row,
+                        canonicalDeviceVnniCodebookId(format), blocks_per_row,
                         orchestrator,
                         sourceIdentityFor(format));
                 }
@@ -2110,7 +2110,7 @@ namespace llaminar2
                         slot->d_native_vnni_scales,
                         slot->d_native_vnni_mins,
                         slot->d_native_vnni_emins,
-                        canonicalDeviceVnniCodebookId(format.codebook_id), blocks_per_row,
+                        canonicalDeviceVnniCodebookId(format), blocks_per_row,
                         orchestrator,
                         sourceIdentityFor(format));
                 }
@@ -2348,7 +2348,7 @@ namespace llaminar2
                 const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
                 orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
-                                         vnni->payload_bytes, vnni->is_asymmetric,
+                                         vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                                          vnni->has_emins, raw_bytes);
                 max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
                 ++total_planned;
@@ -2408,7 +2408,7 @@ namespace llaminar2
                 job.format = *repack_fmt;
                 job.N = static_cast<int>(view->rows());
                 job.K = static_cast<int>(view->cols());
-                job.is_asymmetric = vnni->is_asymmetric;
+                job.is_asymmetric = canonicalDeviceVnniFormat(*vnni).is_asymmetric;
 
                 orchestrator->addWeightJob(gpu_ordinal, job);
             }
@@ -2457,7 +2457,7 @@ namespace llaminar2
                         static_cast<uint16_t *>(slot->d_native_vnni_scales),
                         static_cast<uint16_t *>(slot->d_native_vnni_mins),
                         static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
+                        canonicalDeviceVnniCodebookId(*vnni), blocks_per_row,
                         orchestrator,
                         sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
                 }
@@ -2471,7 +2471,7 @@ namespace llaminar2
                         slot->d_native_vnni_scales,
                         slot->d_native_vnni_mins,
                         slot->d_native_vnni_emins,
-                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
+                        canonicalDeviceVnniCodebookId(*vnni), blocks_per_row,
                         orchestrator,
                         sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
                 }
@@ -2620,7 +2620,7 @@ namespace llaminar2
                native_vnni_formats::forSourceIdentity(
                    source_identity.codebook_id,
                    source_identity.is_superblock) != nullptr &&
-               canonicalDeviceVnniCodebookId(source_identity.codebook_id) ==
+               canonicalDeviceVnniCodebookId(source_identity) ==
                    codebook_id &&
                transfer_slot_lifetime != nullptr;
     }
@@ -3374,7 +3374,7 @@ namespace llaminar2
             }
             if (!source_engine->exportNativeVNNISourceIdentity(source_identity) ||
                 !source_identity.present ||
-                canonicalDeviceVnniCodebookId(source_identity.codebook_id) !=
+                canonicalDeviceVnniCodebookId(source_identity) !=
                     out.codebook_id)
             {
                 LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source "
@@ -3429,11 +3429,11 @@ namespace llaminar2
 
             if (const NativeVnniFormatInfo *vnni = vnni_info_for(grp, expert_id);
                 vnni &&
-                (src_desc.codebook_id != canonicalDeviceVnniCodebookId(vnni->codebook_id) ||
+                (src_desc.codebook_id != canonicalDeviceVnniCodebookId(*vnni) ||
                  source_identity.codebook_id != vnni->codebook_id ||
                  source_identity.is_superblock != vnni->is_superblock ||
                  payload_bytes_per_block != static_cast<uint8_t>(vnni->payload_bytes) ||
-                 (is_asymmetric != 0) != vnni->is_asymmetric ||
+                 (is_asymmetric != 0) != canonicalDeviceVnniFormat(*vnni).is_asymmetric ||
                  (has_emins != 0) != vnni->has_emins))
             {
                 LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: destination "
@@ -4397,7 +4397,7 @@ namespace llaminar2
                 spec.N = N;
                 spec.K = K;
                 spec.payload_bytes_per_block = vnni->payload_bytes;
-                spec.is_asymmetric = vnni->is_asymmetric;
+                spec.is_asymmetric = canonicalDeviceVnniFormat(*vnni).is_asymmetric;
                 spec.has_emins = vnni->has_emins;
                 spec.codebook_id = vnni->codebook_id;
                 specs.push_back(std::move(spec));
@@ -4468,7 +4468,7 @@ namespace llaminar2
                     static_cast<uint16_t *>(slot.d_native_vnni_scales),
                     static_cast<uint16_t *>(slot.d_native_vnni_mins),
                     static_cast<uint32_t *>(slot.d_native_vnni_emins),
-                    canonicalDeviceVnniCodebookId(vnni.codebook_id), blocks_per_row,
+                    canonicalDeviceVnniCodebookId(vnni), blocks_per_row,
                     lifetime_owner,
                     sourceIdentityFor(vnni));
             }
@@ -4482,7 +4482,7 @@ namespace llaminar2
                     slot.d_native_vnni_scales,
                     slot.d_native_vnni_mins,
                     slot.d_native_vnni_emins,
-                    canonicalDeviceVnniCodebookId(vnni.codebook_id), blocks_per_row,
+                    canonicalDeviceVnniCodebookId(vnni), blocks_per_row,
                     lifetime_owner,
                     sourceIdentityFor(vnni));
             }
@@ -4717,7 +4717,7 @@ namespace llaminar2
                         N,
                         K,
                         vnni->payload_bytes,
-                        vnni->is_asymmetric,
+                        canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                         vnni->has_emins,
                         /*raw_gguf_bytes=*/0);
                 }
@@ -4812,12 +4812,12 @@ namespace llaminar2
                 auto src_desc = makeGpuExpertPackedDescriptor(
                     src_matrix,
                     vnni->payload_bytes,
-                    vnni->is_asymmetric,
+                    canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                     vnni->has_emins);
                 auto dst_desc = makeGpuExpertPackedDescriptor(
                     dst_matrix,
                     vnni->payload_bytes,
-                    vnni->is_asymmetric,
+                    canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                     vnni->has_emins);
 
                 const auto copy_start = Clock::now();
@@ -4857,7 +4857,7 @@ namespace llaminar2
                     auto active_desc = makeGpuExpertPackedDescriptor(
                         active_matrix,
                         vnni->payload_bytes,
-                        vnni->is_asymmetric,
+                        canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                         vnni->has_emins);
 
                     GpuExpertStagedActivation activation;

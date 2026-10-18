@@ -12,6 +12,7 @@
 
 #include "../../loaders/IModelLoader.h"
 #include "../../loaders/ModelLoader.h"
+#include "planning/ModelMemoryProfile.h"
 
 #include <algorithm>
 #include <limits>
@@ -26,22 +27,24 @@ namespace llaminar2
         constexpr int kSupportedMTPDepth = 1;
 
         /** @return Whether every required source role is present in this exact directory. */
-        bool hasAll(const IModelLoader &loader, const std::vector<std::string> &names)
+        template<class HasTensor>
+        bool hasAll(const HasTensor &has_tensor, const std::vector<std::string> &names)
         {
             return std::all_of(names.begin(), names.end(),
                                [&](const std::string &name)
                                {
-                                   return loader.hasTensor(name);
+                                   return has_tensor(name);
                                });
         }
 
         /** @return Missing source names, preserving role order for useful diagnostics. */
-        std::vector<std::string> missingFrom(const IModelLoader &loader, const std::vector<std::string> &names)
+        template<class HasTensor>
+        std::vector<std::string> missingFrom(const HasTensor &has_tensor, const std::vector<std::string> &names)
         {
             std::vector<std::string> missing;
             for (const auto &name : names)
             {
-                if (!loader.hasTensor(name))
+                if (!has_tensor(name))
                     missing.push_back(name);
             }
             return missing;
@@ -361,14 +364,14 @@ namespace llaminar2
         return raw_layer_count;
     }
 
-    MTPWeightManifest discoverMTPWeightManifest(
-        const IModelLoader &loader,
-        const std::string &architecture,
+    /** @brief One discovery algorithm for source loaders and published tensor directories. */
+    template<class HasTensor>
+    static MTPWeightManifest discoverMTPManifestForDirectory(
+        int depth,
         int base_layer_count,
-        bool explicit_mtp)
+        bool explicit_mtp,
+        const HasTensor &has_tensor)
     {
-        const int depth = mtpLearnedBlockCount(loader, architecture, base_layer_count);
-
         if (depth <= 0)
         {
             return unavailable(explicit_mtp
@@ -393,7 +396,7 @@ namespace llaminar2
             {
                 auto nextn_manifest = makeNextNManifest(depth, source_layer_start, moe_ffn_layout);
                 auto nextn_required = nextn_manifest.requiredNames();
-                auto nextn_missing = missingFrom(loader, nextn_required);
+                auto nextn_missing = missingFrom(has_tensor, nextn_required);
                 if (nextn_missing.empty())
                 {
                     nextn_manifest.available = true;
@@ -416,7 +419,7 @@ namespace llaminar2
         for (int i = 0; i < depth; ++i)
             generic_manifest.depths.push_back(makeGenericMTPDepth(i));
         auto generic_required = generic_manifest.requiredNames();
-        if (hasAll(loader, generic_required))
+        if (hasAll(has_tensor, generic_required))
         {
             generic_manifest.available = true;
             generic_manifest.diagnostic = "using mtp.layers MTP layout";
@@ -426,7 +429,7 @@ namespace llaminar2
         auto manifest = unavailable("MTP tensors are incomplete");
         manifest.depth = depth;
         manifest.missing_required = std::move(best_nextn_missing);
-        auto generic_missing = missingFrom(loader, generic_required);
+        auto generic_missing = missingFrom(has_tensor, generic_required);
         manifest.missing_required.insert(
             manifest.missing_required.end(),
             generic_missing.begin(),
@@ -436,6 +439,26 @@ namespace llaminar2
             std::unique(manifest.missing_required.begin(), manifest.missing_required.end()),
             manifest.missing_required.end());
         return manifest;
+    }
+
+    MTPWeightManifest discoverMTPWeightManifest(
+        const IModelLoader &loader, const std::string &architecture,
+        int base_layer_count, bool explicit_mtp)
+    {
+        return discoverMTPManifestForDirectory(
+            mtpLearnedBlockCount(loader, architecture, base_layer_count),
+            base_layer_count, explicit_mtp,
+            [&](const std::string &name) { return loader.hasTensor(name); });
+    }
+
+    MTPWeightManifest discoverMTPWeightManifest(const ModelMemoryProfile &profile,
+                                             bool explicit_mtp)
+    {
+        return discoverMTPManifestForDirectory(profile.mtp_layer_count,
+            profile.n_layers, explicit_mtp, [&](const std::string &name) {
+                return std::any_of(profile.tensors.begin(), profile.tensors.end(),
+                    [&](const auto &tensor) { return tensor.name == name; });
+            });
     }
 
 } // namespace llaminar2

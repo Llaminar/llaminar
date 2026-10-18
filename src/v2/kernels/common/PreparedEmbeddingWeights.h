@@ -1,18 +1,18 @@
 /**
  * @file PreparedEmbeddingWeights.h
- * @brief GPU-resident prepared embedding table following the PreparedGemmWeights pattern
+ * @brief Model-owned source-native embedding allocation and its exact representation
  *
- * Holds repacked EmbedQ8 embedding data in device memory. Created during weight
- * loading (Phase 4), cached in KernelFactory by {tensor, device} key.
- *
- * Unlike the previous workspace-based approach, this struct owns its GPU
- * allocation directly — no dependency on workspace lifecycle or lazy
- * initialization during the first forward pass.
+ * Quantized source blocks are copied without requantization or scale conversion.
+ * The prepared store owns the stable handle and its physical-memory lease before
+ * graph capture. Lookup consumes this allocation directly on its exact device;
+ * no runtime weight preparation or workspace-owned replacement exists.
  */
 
 #pragma once
 
 #include "../../backends/DeviceId.h"
+#include "NativeEmbeddingLayout.h"
+#include "NativeEmbeddingIQTables.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -24,21 +24,11 @@ namespace llaminar2
     /**
      * @brief GPU-resident prepared embedding weights
      *
-     * Contains repacked EmbedQ8Block data uploaded to a specific GPU device.
+     * Contains unchanged native source blocks uploaded to one exact device.
      * Owns the device allocation and frees it on destruction.
      */
     struct PreparedEmbeddingWeights
     {
-        /**
-         * @brief Compute the exact backing allocation for an embedding shard.
-         * @param vocab_size Number of rows resident in this shard.
-         * @param d_model Logical embedding width.
-         * @return Checked bytes occupied by the universal EmbedQ8 layout.
-         */
-        [[nodiscard]] static size_t allocationBytes(
-            size_t vocab_size,
-            int d_model);
-
         /**
          * @brief Bind the allocation's sole live physical-memory claim.
          * @param lease Exact claim acquired before `device_data` allocation.
@@ -48,22 +38,33 @@ namespace llaminar2
         void bindPhysicalMemoryLease(
             PhysicalMemoryAllocationLease lease);
 
-        void *device_data = nullptr; ///< GPU pointer to EmbedQ8Block array
-        size_t byte_size = 0;        ///< Total bytes allocated on device
-        size_t blocks_per_row = 0;   ///< EmbedQ8 blocks per vocabulary entry
+        void *device_data = nullptr; ///< Backend pointer to unchanged source-native blocks.
+        NativeEmbeddingLayout layout{}; ///< Sole physical format/stride/extent authority.
+        NativeEmbeddingIQTables iq_tables{}; ///< Borrowed immutable backend codebooks bound before capture.
         size_t vocab_size = 0;       ///< Number of vocabulary entries in this shard
         size_t vocab_offset = 0;     ///< First vocab index in this shard (0 when unsharded)
         size_t total_vocab = 0;      ///< Total vocab size across all shards
         int d_model = 0;             ///< Embedding dimension
         DeviceId device_id;          ///< Device this data lives on
 
+        /** @brief Release native backing before retiring its sole physical-memory lease. */
         ~PreparedEmbeddingWeights();
 
         // Non-copyable, movable
+        /** @brief Construct an empty handle with no physical allocation authority. */
         PreparedEmbeddingWeights();
         PreparedEmbeddingWeights(const PreparedEmbeddingWeights &) = delete;
         PreparedEmbeddingWeights &operator=(const PreparedEmbeddingWeights &) = delete;
+        /**
+         * @brief Transfer the complete physical allocation and borrowed codebooks.
+         * @param other Previous sole allocation owner, empty after this move.
+         */
         PreparedEmbeddingWeights(PreparedEmbeddingWeights &&other) noexcept;
+        /**
+         * @brief Retire this allocation and adopt the complete source representation.
+         * @param other Previous sole allocation owner, empty after this move.
+         * @return This new allocation owner.
+         */
         PreparedEmbeddingWeights &operator=(PreparedEmbeddingWeights &&other) noexcept;
 
     private:

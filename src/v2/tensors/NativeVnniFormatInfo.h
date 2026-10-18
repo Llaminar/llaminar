@@ -3,6 +3,7 @@
 
 /**
  * @file NativeVnniFormatInfo.h
+ * IQ3_S physical11 retains original half/nibble metadata with source11 arithmetic.
  * @brief Intrinsic format metadata for native-VNNI quantization formats
  *
  * Describes encoding properties that are invariant for each quantization format:
@@ -10,7 +11,8 @@
  * returned by IINT8Unpackable::vnniFormatInfo() on each tensor class, replacing
  * the external dispatch table.
  *
- * Codebook IDs match the NativeVNNIFormat enum in ROCmGemvKernel_native_VNNI.hip.
+ * Source IDs retain GGUF arithmetic identity. Source-aware physical mapping
+ * separately assigns IQ4_XS execution24 while IQ4_NL retains execution4.
  */
 
 #pragma once
@@ -34,12 +36,37 @@ namespace llaminar2
      */
     inline constexpr std::uint8_t kNativeVnniExpandedInt8MinCodebook = 23;
 
+    /** @brief IQ4_XS physical tuple: nibble payload, original half base, raw six-bit coefficient. */
+    inline constexpr std::uint8_t kNativeVnniIQ4XSSourceScaleCodebook = 24;
+
+    /** @brief Test the common IQ4 lookup-table payload family.
+     * @param codebook Physical accelerator codebook.
+     * @return Whether the unchanged IQ4 LUT decodes its nibble payload.
+     */
+    [[nodiscard]] inline constexpr bool isNativeVnniIQ4LUTCodebook(uint8_t codebook) noexcept
+    {
+        return codebook == 4 || codebook == kNativeVnniIQ4XSSourceScaleCodebook;
+    }
+
+    /** @brief Validate paired gate/up payload compatibility without conflating scales.
+     * @param gate Physical gate codebook.
+     * @param up Physical up codebook.
+     * @return Equal codebooks or the two members of the IQ4 LUT family.
+     */
+    [[nodiscard]] inline constexpr bool areNativeVnniGateUpCodebooksCompatible(
+        uint8_t gate, uint8_t up) noexcept
+    {
+        return gate == up || (isNativeVnniIQ4LUTCodebook(gate) && isNativeVnniIQ4LUTCodebook(up));
+    }
+
+
     /**
      * @brief Identify compact payloads whose two native scales must survive CPU preparation.
      * @param codebook Canonical execution codebook, independent of source aliases.
      * @return Whether the common compact multi-scale CPU representation applies.
      *
-     * Q6_K has its own already-lossless bitplane representation. The remaining
+     * Q6_K retains its bitplanes, original half base and signed coefficient pair. IQ2_S
+     * retains its half base and original coefficient byte. The remaining
      * dual-scale formats retain their original payload, including IQ1_M signs;
      * Q2_K additionally retains the packed pair of effective minima.
      */
@@ -106,8 +133,10 @@ namespace llaminar2
      * @brief Byte lengths of the four persistent native-VNNI storage regions.
      *
      * GPU preparation stores each logical 32-value execution block as one
-     * compressed payload plus FP16 scale metadata. Asymmetric formats add an
-     * FP16 minimum and Q2_K adds one packed effective-minimum word. Keeping
+     * compressed payload plus a primary FP16 scale/base word. Asymmetric formats
+     * and source-tuple formats add a secondary word (Q6_K signed coefficients,
+     * IQ2_S source byte, IQ4_XS six-bit coefficient, otherwise FP16 scale/minimum)
+     * and Q2_K adds one packed effective-minimum word. Keeping
      * this calculation beside the format catalog makes the loader, memory
      * planner, and tests consume exactly the same storage contract.
      */
@@ -277,7 +306,7 @@ namespace llaminar2
     } // namespace native_vnni_formats
 
     /**
-     * @brief Return the codebook consumed by accelerator kernels after repack.
+     * @brief Normalize source arithmetic aliases without selecting a physical tuple.
      * @param source_codebook_id Codebook advertised by the source tensor.
      * @return Canonical CUDA/ROCm execution codebook.
      *
@@ -307,9 +336,49 @@ namespace llaminar2
     {
         std::uint8_t codebook_id = 0;
         std::uint8_t payload_bytes_per_block = 0;
-        bool is_asymmetric = false;
+        bool is_asymmetric = false; ///< Physical secondary-plane presence, including raw source coefficients.
         bool has_emins = false;
     };
+
+    /** @brief Derive canonical physical bytes from unambiguous original provenance.
+     * @param source Original GGUF descriptor, including the superblock bit.
+     * @return Device decoder and plane-presence metadata; is_asymmetric here names
+     *         the historical secondary-plane storage flag, not additive-minimum math.
+     */
+    [[nodiscard]] inline constexpr NativeVnniMigrationStableDeviceFormat
+    canonicalDeviceVnniFormat(const NativeVnniFormatInfo &source) noexcept
+    {
+        const bool iq4xs = source.codebook_id == 4 && source.is_superblock;
+        return {
+            .codebook_id = iq4xs ? kNativeVnniIQ4XSSourceScaleCodebook
+                                : canonicalDeviceVnniCodebookId(source.codebook_id),
+            .payload_bytes_per_block = static_cast<uint8_t>(source.payload_bytes),
+            .is_asymmetric = source.is_asymmetric || iq4xs || source.codebook_id == 11,
+            .has_emins = source.has_emins,
+        };
+    }
+
+    /** @brief Resolve a physical codebook while retaining the source-only overload.
+     * @param source Original GGUF descriptor.
+     * @return Canonical physical execution ID, distinct from source arithmetic ID4.
+     */
+    [[nodiscard]] inline constexpr uint8_t canonicalDeviceVnniCodebookId(
+        const NativeVnniFormatInfo &source) noexcept
+    {
+        return canonicalDeviceVnniFormat(source).codebook_id;
+    }
+
+    /** @brief Resolve canonical physical ID from an authenticated source tuple.
+     * @param source Original source identity with explicit presence.
+     * @return Physical ID, or255 for absent/uncataloged provenance.
+     */
+    [[nodiscard]] inline constexpr uint8_t canonicalDeviceVnniCodebookId(
+        NativeVnniSourceIdentity source) noexcept
+    {
+        const auto *format = source.present ? native_vnni_formats::forSourceIdentity(
+            source.codebook_id, source.is_superblock) : nullptr;
+        return format ? canonicalDeviceVnniCodebookId(*format) : uint8_t{255};
+    }
 
     /**
      * @brief Physical capacity required by a recyclable GPU expert slot.
@@ -336,15 +405,9 @@ namespace llaminar2
         const NativeVnniFormatInfo &source) noexcept
     {
         if (source.codebook_id == 0 || source.codebook_id == 4 ||
-            source.codebook_id == 5)
+            source.codebook_id == 5 || source.codebook_id == 11)
         {
-            return {
-                .codebook_id =
-                    canonicalDeviceVnniCodebookId(source.codebook_id),
-                .payload_bytes_per_block = 16,
-                .is_asymmetric = source.is_asymmetric,
-                .has_emins = false,
-            };
+            return canonicalDeviceVnniFormat(source);
         }
         if (source.codebook_id == 8 ||
             hasCompactMultiScaleVnniPayload(source.codebook_id))
@@ -403,8 +466,13 @@ namespace llaminar2
         const NativeVnniFormatInfo &source,
         uint8_t execution_codebook) noexcept
     {
+        // Retire only the lossy native alias. Explicit existing ExpandedInt8
+        // preparation remains representable by physical19 below; no loader or
+        // migration factory automatically selects it for native IQ4_XS.
+        if (source.codebook_id == 4 && source.is_superblock && execution_codebook == 4)
+            return false;
         if (execution_codebook ==
-            canonicalDeviceVnniCodebookId(source.codebook_id))
+            canonicalDeviceVnniCodebookId(source))
         {
             return true;
         }
@@ -478,7 +546,7 @@ namespace llaminar2
 
         if (!source.present)
         {
-            if (runtime_mutable)
+            if (runtime_mutable || execution_codebook == kNativeVnniIQ4XSSourceScaleCodebook)
                 return false;
             envelope.execution_codebook_mask |= execution_bit;
             envelope.policy_codebook_mask |= execution_bit;
@@ -497,10 +565,10 @@ namespace llaminar2
             return false;
         }
 
-        const uint8_t canonical_codebook =
-            canonicalDeviceVnniCodebookId(source.codebook_id);
-        const uint32_t canonical_bit =
-            nativeVnniCodebookMaskBit(canonical_codebook);
+        const uint32_t canonical_bit = nativeVnniCodebookMaskBit(
+            canonicalDeviceVnniCodebookId(*source_format));
+        const uint32_t policy_bit = nativeVnniCodebookMaskBit(
+            canonicalDeviceVnniCodebookId(source.codebook_id));
         if (canonical_bit == 0u)
             return false;
 
@@ -517,7 +585,7 @@ namespace llaminar2
         }
 
         envelope.execution_codebook_mask |= reachable_execution;
-        envelope.policy_codebook_mask |= canonical_bit;
+        envelope.policy_codebook_mask |= policy_bit;
         return true;
     }
 
@@ -534,13 +602,14 @@ namespace llaminar2
         size_t columns,
         const NativeVnniFormatInfo &format) noexcept
     {
+        const auto physical = canonicalDeviceVnniFormat(format);
         const size_t block_count = rows * (columns / 32);
         return {
             .payload_bytes =
                 block_count * static_cast<size_t>(format.payload_bytes),
             .scales_bytes = block_count * sizeof(uint16_t),
             .mins_bytes =
-                format.is_asymmetric ? block_count * sizeof(uint16_t) : 0,
+                physical.is_asymmetric ? block_count * sizeof(uint16_t) : 0,
             .emins_bytes =
                 format.has_emins ? block_count * sizeof(uint32_t) : 0,
         };

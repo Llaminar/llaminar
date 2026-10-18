@@ -182,8 +182,12 @@ namespace llaminar2::test
         }
         catch (const std::invalid_argument &error)
         {
-            EXPECT_NE(std::string(error.what()).find("no-fallback tier capacity cannot cover every expert"),
-                      std::string::npos);
+            // The complete input validator rejects insufficient fixed capacity
+            // before the planner assigns an expert to any tier.
+            EXPECT_NE(std::string(error.what()).find("has no fallback tier"),
+                      std::string::npos) << error.what();
+            EXPECT_NE(std::string(error.what()).find("capacity covers only 2 of 4 routed experts"),
+                      std::string::npos) << error.what();
         }
 
         auto with_fallback = insufficient;

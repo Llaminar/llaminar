@@ -443,4 +443,23 @@ namespace llaminar2
         return nullptr;
     }
 
+    PrefixCacheTelemetrySources PipelineRunner::prefixCacheTelemetrySources() const
+    {
+        PrefixCacheTelemetrySources result;
+        for (const auto &stage : stages_)
+            if (stage.runner)
+            {
+                const auto sources = stage.runner->prefixCacheTelemetrySources();
+                result.insert(result.end(), sources.begin(), sources.end());
+            }
+        return result;
+    }
+
+    /** @copydoc PipelineRunner::collectPrefixCacheShutdown */
+    void PipelineRunner::collectPrefixCacheShutdown(PrefixCacheShutdown &shutdown) const
+    {
+        for (const auto &stage : stages_)
+            if (stage.runner) stage.runner->collectPrefixCacheShutdown(shutdown);
+    }
+
 } // namespace llaminar2

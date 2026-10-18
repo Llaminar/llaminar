@@ -43,10 +43,16 @@ namespace llaminar2 {
 /// Magic bytes identifying a packed weights blob: "LPWT"
 static constexpr uint32_t PACKED_WEIGHTS_MAGIC = 0x5457504C; // "LPWT" in little-endian
 
-/// Version 3 requires lossless native multi-scale preparation. Version-2
-/// archives may contain lossy expanded experts with otherwise valid metadata;
-/// reject them rather than accepting stale arithmetic from an older producer.
-static constexpr uint32_t PACKED_WEIGHTS_VERSION = 3;
+/// Version 5 additionally retains original IQ2_S bases and coefficient bytes.
+/// Version-4 IQ2_S archives narrowed both derived factors to half. Their
+/// same-sized words have different semantics and must be rejected before any
+/// payload is adopted. Q6_K's version-4 lossless representation is unchanged.
+/// Version-3 Q6 and version-2 expanded multi-scale archives also remain rejected.
+/// Version6 preserves IQ4_XS original half bases and encoded signed coefficients.
+/// Version5 and earlier archives are rejected before any section is adopted.
+/// Version7 retains IQ3_S original half bases and raw nibbles in CPU encoding5.
+/// Earlier archives are rejected before any payload is adopted.
+static constexpr uint32_t PACKED_WEIGHTS_VERSION = 7;
 
 #pragma pack(push, 1)
 
@@ -108,6 +114,10 @@ inline cpu::native_vnni::CPUNativeVNNIEncoding decodePreparedEncoding(
     using Encoding = cpu::native_vnni::CPUNativeVNNIEncoding;
     switch (value)
     {
+    case static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale):
+        return Encoding::IQ3SExpandedSourceScale;
+    case static_cast<uint8_t>(Encoding::NibbleLUTSourceScale):
+        return Encoding::NibbleLUTSourceScale;
     case static_cast<uint8_t>(Encoding::NibbleLUT):
         return Encoding::NibbleLUT;
     case static_cast<uint8_t>(Encoding::ExpandedInt8):
@@ -120,6 +130,32 @@ inline cpu::native_vnni::CPUNativeVNNIEncoding decodePreparedEncoding(
         throw std::invalid_argument(
             "Packed-weight transfer received an unknown prepared encoding");
     }
+}
+
+/** @brief Validate IQ3_S/IQ4_XS source tuples before adopting CPU sections.
+ * @param header Archive or direct-transfer scalar header.
+ * @return Whether encoding4 identifies exactly the IQ4_XS source tuple, and
+ *         ordinary IQ4_XS does not claim the retired derived-half nibble encoding.
+ */
+inline bool validNativeSourceScaleTupleHeader(const PackedWeightsHeader &header) noexcept
+{
+    using Encoding = cpu::native_vnni::CPUNativeVNNIEncoding;
+    if (header.prepared_encoding == static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale))
+        return header.codebook_id == 11 && header.is_superblock == 1 &&
+               header.is_asymmetric == 0 && header.payload_bytes == 13 &&
+               header.data_stride == static_cast<int32_t>(cpu::native_vnni::preparedDataStride(Encoding::IQ3SExpandedSourceScale)) &&
+               header.interleaved_block_stride == static_cast<int32_t>(cpu::native_vnni::preparedInterleavedBlockStride(Encoding::IQ3SExpandedSourceScale, false)) &&
+               header.has_native_blocks == 0;
+    if (header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUTSourceScale))
+        return header.codebook_id == 4 && header.is_superblock == 1 &&
+               header.is_asymmetric == 0 && header.payload_bytes == 16 &&
+               header.data_stride == static_cast<int32_t>(cpu::native_vnni::preparedDataStride(
+                   Encoding::NibbleLUTSourceScale)) &&
+               header.interleaved_block_stride == static_cast<int32_t>(
+                   cpu::native_vnni::preparedInterleavedBlockStride(Encoding::NibbleLUTSourceScale, false)) &&
+               header.has_native_blocks == 0;
+    return !(header.codebook_id == 4 && header.is_superblock != 0 &&
+             header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUT));
 }
 
 /**
@@ -286,6 +322,7 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     const auto &sections = descriptor.sections;
     if (header.magic != PACKED_WEIGHTS_MAGIC ||
         header.version != PACKED_WEIGHTS_VERSION ||
+        !validNativeSourceScaleTupleHeader(header) ||
         header.format !=
             static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_VNNI))
     {
@@ -495,6 +532,9 @@ inline std::unique_ptr<IPackedWeights> deserialize(
         LOG_WARN("[PackedWeightsSerialization] Unsupported format: " << header.format);
         return nullptr;
     }
+
+    if (!validNativeSourceScaleTupleHeader(header))
+        return nullptr;
 
     // Read section table.
     PackedWeightsSectionTable sections;

@@ -21,6 +21,10 @@
  * Its raw sample CSV is diagnostic evidence, never an installable tournament.
  * Q8 source formats use their own blockwise INT8 producer inventory. Their
  * independent byte proofs may not be mislabeled as low-bit NativeVNNI tuning.
+ * Aggregate and event CSVs retain source codebook and physical execution ID
+ * separately. IQ4_XS source4 executes24; source-policy4 remains the arithmetic
+ * schedule authority. Candidate inspection proves the actual physical launch
+ * before either CSV row can be published, never reinterpreting old measurements.
  *
  * @note Requires ROCm device. Run with build_v2_release for representative timing.
  */
@@ -697,8 +701,7 @@ namespace
             }
             requireHip(hipSetDevice(kDeviceOrdinal), "select device");
             expected_codebook_ = canonicalDeviceVnniCodebookId(
-                requireNativeVnniInfo(weights, "ROCm tournament source weights")
-                    .codebook_id);
+                requireNativeVnniInfo(weights, "ROCm tournament source weights"));
             if (!packWeightsToROCm(weights, packed_))
                 throw std::runtime_error(
                     "failed to pack persistent ROCm NativeVNNI weights");
@@ -1570,7 +1573,7 @@ namespace
             csv = std::fopen(csv_path.c_str(), "w");
             ASSERT_NE(csv, nullptr) << "Failed to open ROCm NativeVNNI sweep CSV: " << csv_path;
             std::fprintf(csv,
-                         "backend,phase,format,codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,byte_mismatches_vs_auto,first_byte_mismatch_vs_auto,is_best,observed_n_tile,observed_m_tile,observed_min_blocks,observed_unroll,observed_full_tiles,registers_per_thread,local_memory_bytes_per_thread,static_shared_memory_bytes,max_threads_per_block,max_active_blocks_per_sm,observed_producer,dynamic_shared_memory_bytes\n");
+                         "backend,phase,format,codebook,execution_codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,byte_mismatches_vs_auto,first_byte_mismatch_vs_auto,is_best,observed_n_tile,observed_m_tile,observed_min_blocks,observed_unroll,observed_full_tiles,registers_per_thread,local_memory_bytes_per_thread,static_shared_memory_bytes,max_threads_per_block,max_active_blocks_per_sm,observed_producer,dynamic_shared_memory_bytes\n");
         }
 
         std::FILE *timing_csv = nullptr;
@@ -1582,7 +1585,7 @@ namespace
                 << timing_csv_path;
             std::fprintf(
                 timing_csv,
-                "backend,phase,format,codebook,shape,m,n,k,variant,"
+                "backend,phase,format,codebook,execution_codebook,shape,m,n,k,variant,"
                 "sample_index,timed_replays,latency_us,latency_us_hex,captured_operations\n");
         }
 
@@ -1614,7 +1617,9 @@ namespace
                     continue;
 
                 auto weights = format.create(static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
-                const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), format.name).codebook_id;
+                const auto &source_format = requireNativeVnniInfo(weights.get(), format.name);
+                const uint8_t codebook_id = source_format.codebook_id;
+                const uint8_t execution_codebook_id = canonicalDeviceVnniCodebookId(source_format);
 
                 for (const int M : m_values)
                 {
@@ -1652,10 +1657,11 @@ namespace
                                 const double latency_us = samples[sample_index];
                                 std::fprintf(
                                     timing_csv,
-                                    "rocm,prefill,%s,%u,%s,%d,%d,%d,%s,"
+                                    "rocm,prefill,%s,%u,%u,%s,%d,%d,%d,%s,"
                                     "%zu,1,%.9f,%a,%d\n",
                                     format.name.c_str(),
                                     static_cast<unsigned>(codebook_id),
+                                    static_cast<unsigned>(execution_codebook_id),
                                     shape.name.c_str(), M, shape.N, shape.K,
                                     variant.name.c_str(), sample_index,
                                     latency_us, latency_us,
@@ -1682,9 +1688,10 @@ namespace
                         if (csv)
                         {
                             std::fprintf(csv,
-                                         "rocm,prefill,%s,%u,%s,%s,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.6f,%d,%zu,%zu,%d,%d,%d,%d,%d,%d,%d,%zu,%zu,%d,%d,%s,%zu\n",
+                                         "rocm,prefill,%s,%u,%u,%s,%s,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.6f,%d,%zu,%zu,%d,%d,%d,%d,%d,%d,%d,%zu,%zu,%d,%d,%s,%zu\n",
                                          format.name.c_str(),
                                          static_cast<unsigned>(codebook_id),
+                                         static_cast<unsigned>(execution_codebook_id),
                                          shape.name.c_str(),
                                          shape.category.c_str(),
                                          M,
