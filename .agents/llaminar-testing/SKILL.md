@@ -11,9 +11,10 @@ the gate appropriate to the task; a focused pass is not a full model or image
 certificate. Reuse the existing drivers and typed matrix instead of maintaining
 another model/topology list.
 
-For mathematical model parity, prove the live inference path against an
-independent reference pack generated from the declared real GGUF. Preserve every
-stage comparison and canonical CSV while amortizing immutable model setup;
+For mathematical model parity, use the production PyTorch parity framework in
+`tests/v2/integration/parity/` to prove the live inference path against an
+independent CPU/FP32 reference pack generated from the same real GGUF. Preserve
+every stage comparison and canonical CSV while amortizing immutable model setup;
 numerical checkpoints, not an extra whole-model hash pass, prove weight equivalence.
 
 ## Routine regression versus mathematical diagnosis
@@ -94,13 +95,18 @@ workspace and model tmpfs mounts are explicit same-path roots declared through
 the runner deployment.
 Do not run fixed-depth MTP cells or mathematical HF parity by default.
 
-Token drift or a suspected accuracy bug calls for the **specific matching
-diagnostic mathematical HF parity cell**: retain its failing HTTP request and
-tokens, select the same model/topology/precision/movement/MTP configuration,
-and use checkpoint CSVs to locate the first divergent stage. Do not respond
-by regenerating expected tokens or routinely launching the entire expensive
-mathematical matrix. Fixed-depth mathematical coverage remains available for
-focused diagnosis; the full mathematical suite is explicit opt-in only.
+For detailed debugging of a numerical inference failure (including token drift,
+high KL divergence, NaN/Inf, or unexpected MoE routing), use the **production
+PyTorch parity framework**. Preserve the failing request and token IDs, then
+run the matching mathematical parity cell through
+`scripts/ci/run_production_parity_campaigns.py --exact-cell` with the
+same model, topology, precision, movement, and MTP configuration. Its CPU/FP32
+PyTorch reference uses weights from the exact production GGUF. Compare the
+prefill and decode checkpoint CSVs to find the first divergent phase, step,
+layer, and stage before changing arithmetic or tolerances. Do not regenerate
+expected tokens or routinely launch the entire expensive mathematical matrix.
+Fixed-depth mathematical coverage remains available for focused diagnosis;
+the full mathematical suite is explicit opt-in only.
 For an image pipeline, `--diagnostic-mathematical-parity` is that explicit
 opt-in; `--through parity` alone is rejected. The normal piecewise boundaries
 are `--through prerequisites` and `--through generation` before HTTP E2E.
