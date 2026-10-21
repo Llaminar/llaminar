@@ -1,10 +1,10 @@
 # QFN tuning dashboard
 
-Updated: 2026-10-21 21:59 UTC.
+Updated: 2026-10-21 23:00 UTC.
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.
 
-**Priority:** the next focused win is **four-MI50 decode against Castagna Veloce's 42.959 tok/s**, while preserving the prefill lead and numerical acceptance. The four policy pairs below have been exercised: retain `TensorParallel + GateUpOwnedDownColumns` as the fastest numerically green pair. The requested [CPU ngram investigation](QFN_NGRAM_CPU_PATH_INVESTIGATION.md#measured-follow-up-host-worker-placement-2026-10-21) found all four lookup-service workers sharing one physical core. Candidate69 fixes that placement with green regressions and unchanged logits; paired throughput is effectively unchanged. Test the prepared compact-intermediate import candidate next. TP4 names the participant count, not either policy pair. Other topology tuning is parked until this focused pass is settled; then resume A before novel compositions and remaining families in B–D.
+**Priority:** the next focused win is **four-MI50 decode against Castagna Veloce's 42.959 tok/s**, while preserving the prefill lead and numerical acceptance. The four policy pairs below have been exercised: retain `TensorParallel + GateUpOwnedDownColumns` as the fastest numerically green pair. The requested [CPU ngram investigation](QFN_NGRAM_CPU_PATH_INVESTIGATION.md#measured-follow-up-host-worker-placement-2026-10-21) found all four lookup-service workers sharing one physical core. Candidate69 fixes that placement with green regressions and unchanged logits; paired throughput is effectively unchanged. The [compact-import follow-up](QFN_COMPACT_INTERMEDIATE_IMPORT_TUNING.md) is accurate and faster in isolation, but its complete A/B/B/A gives only −0.060% prefill / +0.194% decode with overlapping ranges. It is not promoted. Refresh the accepted-runtime timeline before choosing the next production change. TP4 names the participant count, not either policy pair. Other topology tuning is parked until this focused pass is settled; then resume A before novel compositions and remaining families in B–D.
 
 Current evidence: all five admitted rows passed checkpoint60 accuracy. **A1–A4 now have uninstrumented Llaminar observations; A4 is ahead of Castagna in both phases, while A1 decode and A2 prefill remain behind their selected references.** A3 is ahead of the recorded upstream samples, whose decode variance remains unresolved, but A2 and A3 both remain below Strata's approved approximate-policy decode reference. Strata's full-routing and default-tail7 controls are complete for A2/A3. Complete checkpoint60 Unit/production preflight and all five model accuracy cells passed, with clean drivers, unchanged runtime metadata, exact reset replay and normal native retirement. The qualified source is committed and pushed to `feat/qwen-flash-next` as `6c06e8efe`; its commit hook authenticated all 2,454 prerequisite registrations without rerunning them.
 
@@ -16,7 +16,7 @@ Accuracy legend: **🟢 GREEN** = all required numerical groups and execution/re
 
 | ID | Topology / actual work placement | Ngrams | Reference engine | Accuracy | Llaminar prefill | Reference prefill | Strata prefill | Llaminar decode | Reference decode | Strata decode | Next action |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts | RAM | Castagna | [🟢 GREEN G60][a1]; L69† Release accuracy green | 785.182 L69† | 467.821 F62§ | — | 33.238 L69† | 42.959 F62§ | — | Lookup-worker placement fixed; paired throughput effectively unchanged. Test compact imports next; full preflight remains pending. |
+| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts | RAM | Castagna | [🟢 GREEN G60][a1]; L69† Release accuracy green | 785.182 L69† | 467.821 F62§ | — | 33.238 L69† | 42.959 F62§ | — | Lookup-worker placement fixed. Compact-import follow-up has no established model gain; refresh timeline attribution. Full preflight remains pending. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |
@@ -298,12 +298,27 @@ live gather, including explicit prefill preparation; measured decode gathers
 have a 45.006 µs median and 146.648 µs p95 under instrumentation. These timings
 do not isolate the model critical path and do not enter the throughput table.
 
-The next candidate changes only construction-time eligibility of these I/O
-workers using the existing OpenMP partition authority. Polling, metadata
-authentication, table locking, native bytes and inference arithmetic remain
-fixed. Actual worker/lifecycle regressions and uninstrumented paired timing
-must pass before accepting it. See the [investigation follow-up](QFN_NGRAM_CPU_PATH_INVESTIGATION.md#measured-follow-up-host-worker-placement-2026-10-21)
+Candidate69 corrected construction-time eligibility of these I/O workers using
+the existing OpenMP partition authority. Worker/lifecycle regressions and exact
+logit comparisons passed. Its [paired timing](../../../../parity-results/qwen-flash-next/ngram69-abba-comparison.json)
+is effectively unchanged, so retain the placement correction without claiming a
+throughput win. Polling, metadata authentication, table locking, native bytes and
+inference arithmetic remain fixed. See the [investigation follow-up](QFN_NGRAM_CPU_PATH_INVESTIGATION.md#measured-follow-up-host-worker-placement-2026-10-21)
 for component timings, counts and the rejected initial probe attachment.
+
+## Compact-import follow-up
+
+The [candidate67 investigation](QFN_COMPACT_INTERMEDIATE_IMPORT_TUNING.md) retains
+all failed and corrected CUDA evidence, 21/21 focused passes, 754/754 Unit passes,
+Release compiler resources and unchanged numerical results. All 26 files / 185
+final-logit rows are byte-identical to checkpoint69. The captured pack/import
+component takes 28.26% less time on ROCm and 37.07% less on CUDA, but the complete
+[model comparison](../../../../parity-results/qwen-flash-next/compact67-cuda-fixed-after69-abba-comparison.json)
+is effectively unchanged: control **785.062 / 33.325 tok/s**, candidate
+**784.594 / 33.389**, with overlapping sample ranges and twelve identical output
+sequences. Keep L69 as the accepted dashboard record. The experiment is preserved
+without claiming an end-to-end win. Fresh attribution must use the accepted
+runtime; historical L62 traces cannot rank current exposed costs.
 
 ## Remaining qualification work
 
