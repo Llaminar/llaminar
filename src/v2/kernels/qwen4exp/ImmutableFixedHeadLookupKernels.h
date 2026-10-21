@@ -185,6 +185,18 @@ public:
      */
     virtual void decode(const ImmutableFixedHeadLookupArgs &args,void *stream) const=0;
 };
+/**
+ * @brief Prepare only the explicitly selected compiled native backend.
+ * @param device Original participant device; CPU and invalid identities reject.
+ * @param plan Checked original source/head geometry, unchanged by selection.
+ * @return The selected backend's actual immutable native decoder bundle.
+ * @throws std::invalid_argument If the device is not a supported native GPU or
+ * its backend was disabled at compilation. No alternate factory is attempted.
+ * @details Implemented by the common kernel owner at cold preparation. Disabled
+ * backends introduce no unresolved factory references in CPU-only binaries.
+ */
+std::unique_ptr<IImmutableFixedHeadLookupKernels> createImmutableFixedHeadLookupKernels(
+    DeviceId device,ImmutableFixedHeadLookupPlan plan);
 /** @brief Prepare CUDA codebook bindings outside capture.
  * @param plan Checked CUDA range and source geometry.
  * @return Stateless original-native operation bundle. */

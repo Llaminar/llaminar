@@ -69,17 +69,24 @@ TEST(Qwen4ExpHCUpWorkspace, SemanticConsumersIncludeBothTerminalHeads)
 {
     for(auto name:{"blk.0.hc_attn_up.weight","blk.47.hc_ffn_up.weight","output_hc_up.weight",
                    "blk.48.hc_attn_up.weight","blk.48.nextn.hc_head_up.weight"})
+    {
+        EXPECT_TRUE(isHyperConnectionUpProjection(inferWeightRole(name),name))<<name;
         EXPECT_FALSE(contribution(DeviceId::cpu(),15,name).buffers.empty())<<name;
+    }
     for(auto name:{"blk.0.hc_attn_down.weight","blk.0.hc_attn_inject.weight","blk.0.hc_ffn_inject.weight",
                    "blk.48.nextn.eh_proj.weight","blk.0.ffn_up.weight","output.weight"})
+    {
+        EXPECT_FALSE(isHyperConnectionUpProjection(inferWeightRole(name),name))<<name;
         EXPECT_TRUE(contribution(DeviceId::cpu(),15,name).buffers.empty())<<name;
+    }
+    EXPECT_FALSE(isHyperConnectionUpProjection(WeightRole::Other,"blk.0.hc_attn_up.weight"));
     EXPECT_TRUE(contribution(DeviceId::cpu(),15,"blk.0.hc_attn_up.weight","Q8_0",
         Precision::TwoTermQ8,WeightRole::Other).buffers.empty());
 }
 /** @test Explicit candidate selection cannot silently change native source precision. */
 TEST(Qwen4ExpHCUpWorkspace, RejectsForeignSourceGeometryDeviceAndPolicy)
 {
-    for(auto format:{"F32","F16","BF16","Q6_K","Q8_1","IQ4_NL"})
+    for(auto format:{"FP8","Q16_1","INT8","unknown"})
         EXPECT_THROW((void)contribution(DeviceId::cpu(),15,"blk.0.hc_attn_up.weight",format),std::invalid_argument)<<format;
     EXPECT_THROW((void)contribution(DeviceId::invalid(),15),std::invalid_argument);
     EXPECT_THROW((void)contribution(DeviceId::cpu(),0),std::invalid_argument);
@@ -91,6 +98,35 @@ TEST(Qwen4ExpHCUpWorkspace, RejectsForeignSourceGeometryDeviceAndPolicy)
     EXPECT_NO_THROW(validateQ8ResidualCorrectionGeometry(std::numeric_limits<int>::max(),
         std::numeric_limits<int>::max(),std::numeric_limits<int>::max()-31));
 }
+/** @test Every native quantized source owns the same two activation banks, without weight conversion. */
+TEST(Qwen4ExpHCUpWorkspace, AllNativeSourceFormatsUseCanonicalCorrectionBanks)
+{
+    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+    for(const int rows:{1,15,512})
+    for(const auto &source:native_vnni_formats::kAllSourceFormats)
+    {
+        const auto actual=Qwen4ExpHCUpWorkspace::requirements(device,Precision::TwoTermQ8,true,
+            WeightRole::HyperConnectionProjection,"blk.0.hc_attn_up.weight",source.quant_type,rows,65,256);
+        const auto expected=device.is_cpu()?cpuQ8ResidualCorrectionWorkspaceRequirements(rows,65,256)
+            :gpuQ8ResidualCorrectionWorkspaceRequirements(rows,65,256);
+        ASSERT_EQ(actual.buffers.size(),expected.buffers.size())<<source.quant_type;
+        for(const auto &bank:expected.buffers)
+            EXPECT_EQ(bytes(actual,bank.name),bank.size_bytes)<<source.quant_type;
+        EXPECT_EQ(actual.total_bytes_with_alignment(),expected.total_bytes_with_alignment())<<source.quant_type;
+    }
+}
+/** @test Floating HC sources retain their native operation even when quantized correction is selected. */
+TEST(Qwen4ExpHCUpWorkspace, FloatingSourcePolicyDoesNotInventQ8Workspace)
+{
+    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+    for(const auto format:{"F32","FP32","F16","FP16","BF16"})
+    {
+        EXPECT_EQ(resolveQwen4ExpHCUpArithmetic(Precision::TwoTermQ8,format),Qwen4ExpHCUpArithmetic::FloatingNative);
+        EXPECT_TRUE(contribution(device,15,"blk.0.hc_attn_up.weight",format).buffers.empty());
+        EXPECT_TRUE(contribution(device,15,"blk.0.hc_attn_up.weight",format,Precision::SingleQ8).buffers.empty());
+        EXPECT_THROW((void)resolveQwen4ExpHCUpArithmetic(static_cast<Precision>(9),format),std::invalid_argument);
+    }
+}
 /** @test Ordinary arithmetic and other model families add no correction bytes. */
 TEST(Qwen4ExpHCUpWorkspace, SingleQ8AndOrdinaryModelsKeepExistingRequirements)
 {
@@ -99,7 +135,7 @@ TEST(Qwen4ExpHCUpWorkspace, SingleQ8AndOrdinaryModelsKeepExistingRequirements)
         EXPECT_TRUE(contribution(device,1024,"blk.0.hc_attn_up.weight","Q8_0",Precision::TwoTermQ8,
             WeightRole::HyperConnectionProjection,false).buffers.empty());
     }
-    EXPECT_EQ(WorkspaceMemoryGeometry{}.qfn_hc_up_activation,Precision::SingleQ8);
+    EXPECT_EQ(WorkspaceMemoryGeometry{}.qfn_hc_up_activation,kDefaultQwen4ExpHCUpActivation);
 }
 /** @test Serial layers and main/predictor graphs share stable names at the largest capacity. */
 TEST(Qwen4ExpHCUpWorkspace, LayerCountDoesNotMultiplyPhysicalScratch)

@@ -11,12 +11,13 @@ add_executable(v2_perf_qwen_sparse_selection EXCLUDE_FROM_ALL
     "${_qfn_test_sources}/performance/kernels/cpu/attention/Perf__QwenSparseSelection.cpp")
 target_link_libraries(v2_perf_qwen_sparse_selection PRIVATE llaminar2_core GTest::gtest_main)
 
+# The same component supports CPU-only builds; CPU selection performs no GPU setup.
+add_executable(v2_perf_q8_residual_prepared_projection
+    "${_qfn_test_sources}/performance/kernels/Perf__Q8ResidualPreparedProjection.cpp")
+target_include_directories(v2_perf_q8_residual_prepared_projection PRIVATE "${_qfn_test_sources}")
+target_link_libraries(v2_perf_q8_residual_prepared_projection PRIVATE llaminar2_core GTest::gtest)
 if(HAVE_CUDA OR HAVE_ROCM)
-    add_executable(v2_perf_q8_residual_prepared_projection
-        "${_qfn_test_sources}/performance/kernels/Perf__Q8ResidualPreparedProjection.cpp")
     v2_test_device_scope(v2_perf_q8_residual_prepared_projection FullInventory)
-    target_include_directories(v2_perf_q8_residual_prepared_projection PRIVATE "${_qfn_test_sources}")
-    target_link_libraries(v2_perf_q8_residual_prepared_projection PRIVATE llaminar2_core GTest::gtest)
 
     add_executable(v2_perf_immutable_adaptive_lookup
         "${_qfn_test_sources}/performance/kernels/qwen4exp/Measure__ImmutableAdaptiveLookup.cpp")

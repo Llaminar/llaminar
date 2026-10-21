@@ -37,6 +37,16 @@ TEST(Test__PrefixCacheFingerprint, FlashNextHCUpActivationSeparatesRestarts)
         EXPECT_EQ(key, hashPrefixFingerprintFields("runtime", restarted));
     }
     EXPECT_EQ(keys.size(), 3u);
+    auto default_fields = base;
+    appendQwen4ExpArithmeticFingerprintFields(default_fields, kDefaultQwen4ExpHCUpActivation);
+    auto explicit_fields = base;
+    appendQwen4ExpArithmeticFingerprintFields(explicit_fields, QuantizedActivationOperandPrecision::TwoTermQ8);
+    auto opt_out_fields = base;
+    appendQwen4ExpArithmeticFingerprintFields(opt_out_fields, QuantizedActivationOperandPrecision::SingleQ8);
+    EXPECT_EQ(hashPrefixFingerprintFields("runtime", default_fields),
+              hashPrefixFingerprintFields("runtime", explicit_fields));
+    EXPECT_NE(hashPrefixFingerprintFields("runtime", default_fields),
+              hashPrefixFingerprintFields("runtime", opt_out_fields));
 }
 
 /** @brief Reject conflicting or invalid arithmetic before mutating compatibility material. */

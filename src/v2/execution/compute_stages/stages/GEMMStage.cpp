@@ -19,6 +19,8 @@
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../loaders/PreparedWeightStore.h"
 
+#include "utils/OpenMPUtils.h"
+#include "models/qwen4exp/Qwen4ExpHCUpArithmetic.h"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -246,6 +248,7 @@ namespace llaminar2
         if(params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8&&
             params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::TwoTermQ8)
             throw std::invalid_argument("GEMM activation operand precision is invalid");
+        initializeHCUpSubmissionIdentities();
         if(params_.request_rows) {
             params_.validate();
             if(params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8)
@@ -262,8 +265,10 @@ namespace llaminar2
             validateQ8ResidualCorrectionGeometry(params_.m,params_.n,params_.k);
             if(!params_.A||!params_.B||!params_.C||params_.A==params_.C||params_.gate_input||params_.bias||params_.bias_tensor||
                 params_.alpha!=1.f||params_.beta!=0.f||params_.A->native_type()!=TensorType::FP32||
-                params_.C->native_type()!=TensorType::FP32||params_.B->native_type()!=TensorType::Q8_0)
-                throw std::invalid_argument("Two-term Q8 requires a plain prepared native Q8_0 projection with distinct FP32 operands");
+                params_.C->native_type()!=TensorType::FP32)
+                throw std::invalid_argument("Two-term Q8 requires a plain prepared native quantized projection with distinct FP32 operands");
+            (void)requireQ8ResidualSourceFormat(tensorTypeName(params_.B->native_type()),params_.m,
+                params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size()),params_.k);
             validateQ8ResidualTensorCapacities(params_.m,params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size()),
                 params_.k,params_.A->numel(),params_.C->numel());
             const auto*input=dynamic_cast<const TensorBase*>(params_.A);
@@ -364,6 +369,96 @@ namespace llaminar2
             }
         }
         return true;
+    }
+
+    void GEMMStage::initializeHCUpSubmissionIdentities()
+    {
+        const auto binding=params_.prepared_store && params_.prepared_ref
+            ? params_.prepared_store->binding(*params_.prepared_ref) : std::nullopt;
+        if(!binding || !isHyperConnectionUpProjection(binding->identity.role,binding->identity.canonical_name))
+            return;
+        if(!binding->immutable || !params_.B || binding->tensor!=params_.B ||
+            params_.prepared_ref->device!=params_.device_id)
+            throw std::invalid_argument("HC-up requires its exact immutable prepared source/device binding");
+        const auto source_arithmetic=resolveQwen4ExpHCUpArithmetic(
+            params_.quantized_operand_precision,tensorTypeName(params_.B->native_type()));
+        const char *source_arithmetic_name=nullptr;
+        switch(source_arithmetic)
+        {
+        case Qwen4ExpHCUpArithmetic::FloatingNative: source_arithmetic_name="floating_native";break;
+        case Qwen4ExpHCUpArithmetic::QuantizedSingleQ8: source_arithmetic_name="quantized_single_q8";break;
+        case Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8: source_arithmetic_name="quantized_two_term_q8";break;
+        default: throw std::logic_error("Unknown HC-up source arithmetic observation");
+        }
+        for (size_t operation_index=0; operation_index<hc_submission_identities_.size(); ++operation_index)
+        {
+            const auto operation=static_cast<HCUpSubmissionOperation>(operation_index);
+            const char *operation_name = nullptr;
+            switch (operation)
+            {
+            case HCUpSubmissionOperation::Ordinary: operation_name = "ordinary"; break;
+            case HCUpSubmissionOperation::DecodeEquivalent: operation_name = "decode_equivalent"; break;
+            case HCUpSubmissionOperation::FusedSwiGLU: operation_name = "fused_swiglu"; break;
+            case HCUpSubmissionOperation::ResidualCorrected: operation_name = "q8_residual_corrected"; break;
+            default: throw std::logic_error("Unknown HC-up host submission operation");
+            }
+            // Read only immutable descriptor metadata. In particular, a counted GPU
+            // row's pointed-to value is never sampled by host observability.
+            const bool consumes_prefix = operation == HCUpSubmissionOperation::ResidualCorrected ||
+                operation == HCUpSubmissionOperation::DecodeEquivalent;
+            const auto rows = consumes_prefix
+                ? params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m))
+                : DeviceRowRange::fullyActive(params_.m);
+            const auto identity = rows.captureIdentity();
+            PerfStatsCollector::Tags tags{
+                    {"canonical_name", binding->identity.canonical_name},
+                    {"weight_role", "HyperConnectionProjection"}, {"source_format", tensorTypeName(params_.B->native_type())},
+                    {"source_arithmetic",source_arithmetic_name},
+                    {"operand_precision", source_arithmetic==Qwen4ExpHCUpArithmetic::FloatingNative ? "native_floating" :
+                        std::string(quantizedActivationOperandPrecisionName(params_.quantized_operand_precision))},
+                    {"operation", operation_name}, {"observation", "host_execute_or_capture"},
+                    {"m", std::to_string(params_.m)}, {"n", std::to_string(params_.output_range.empty() ? params_.n : static_cast<int>(params_.output_range.size()))}, {"k", std::to_string(params_.k)},
+                    {"row_binding", identity.count ? "counted_prefix" : "fully_active"},
+                    {"count_owner",std::to_string(reinterpret_cast<uintptr_t>(identity.count))},
+                    {"count_capacity", std::to_string(identity.count_capacity)},
+                    {"first_physical_row", std::to_string(identity.first_physical_row)},
+                    {"physical_rows", std::to_string(identity.physical_rows)},
+                    {"row_schema_version", std::to_string(identity.schema_version)},
+                    {"repeats_per_row", std::to_string(identity.repeats_per_row)},
+                    {"verifier_requested", params_.force_decode_equivalent_verifier_prefill ? "true" : "false"}};
+            if (operation==HCUpSubmissionOperation::DecodeEquivalent && params_.request_rows)
+            {
+                // Request-local holes are not a flattened prefix. Bind only
+                // immutable request coordinates; never inspect live lengths.
+                const auto &requests=*params_.request_rows;
+                tags["row_binding"]=requests.lengthOwner() ? "request_counted_prefixes" : "request_fully_active";
+                tags["length_owner"]=std::to_string(reinterpret_cast<uintptr_t>(requests.lengthOwner()));
+                tags["requests"]=std::to_string(requests.requests());
+                tags["rows_per_request"]=std::to_string(requests.rowsPerRequest());
+                tags["physical_rows"]=std::to_string(requests.physicalRows());
+                for(const auto *prefix_only : {"count_owner","count_capacity","first_physical_row","row_schema_version","repeats_per_row"})
+                    tags.erase(prefix_only);
+            }
+            hc_submission_identities_[operation_index].emplace(PerfStatsCollector::bindCounter(
+                "kernel", "hc_up_projection_submissions", "submission", params_.device_id.toString(),std::move(tags)));
+        }
+    }
+
+    void GEMMStage::recordHCUpSubmission(int columns, HCUpSubmissionOperation operation)
+    {
+        // Non-HC execution does not even inspect collection policy or the team.
+        if (!hc_submission_identities_[0]) return;
+        if ((params_.device_id.is_cpu() && omp_in_parallel() && omp_get_thread_num()!=0) ||
+            !PerfStatsCollector::isDomainEnabled("kernel"))
+            return;
+        const auto index=static_cast<size_t>(operation);
+        if(index>=hc_submission_identities_.size())
+            throw std::logic_error("Unknown HC-up host submission operation");
+        if(!hc_submission_identities_[index]) return;
+        const int bound_columns=params_.output_range.empty() ? params_.n : static_cast<int>(params_.output_range.size());
+        if(columns!=bound_columns)
+            throw std::logic_error("HC-up submission changed its bound output geometry");
+        PerfStatsCollector::addCounter(*hc_submission_identities_[index]);
     }
 
     bool GEMMStage::execute(IDeviceContext *ctx)
@@ -487,6 +582,7 @@ namespace llaminar2
             gemm->multiply_q8_residual_corrected(A_extent,C_extent,
                 params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m)),effective_n,params_.k,getWorkspace());
             publishStageOutput(C_extent);
+            recordHCUpSubmission(effective_n, HCUpSubmissionOperation::ResidualCorrected);
             traceOutput("C",params_.C);
             return true;
         }
@@ -503,8 +599,9 @@ namespace llaminar2
         {
             auto *A_base = requireTensorBase(params_.A, "input A");
             auto *C_base = asTensorBase(params_.C, "output C");
-            return executeDecodeEquivalentVerifierPrefill(
-                A_base, C_base, gemm, effective_n);
+            const bool success = executeDecodeEquivalentVerifierPrefill(A_base, C_base, gemm, effective_n);
+            if (success) recordHCUpSubmission(effective_n, HCUpSubmissionOperation::DecodeEquivalent);
+            return success;
         }
 
         // Fused SwiGLU + GEMM: output = W @ (silu(gate) * up)
@@ -527,6 +624,7 @@ namespace llaminar2
             }
 
             publishStageOutput(C_base);
+            recordHCUpSubmission(effective_n, HCUpSubmissionOperation::FusedSwiGLU);
             LOG_TRACE("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
             traceOutput("C", params_.C);
             return true;
@@ -553,6 +651,7 @@ namespace llaminar2
             if (success)
             {
                 publishStageOutput(C_base);
+                recordHCUpSubmission(effective_n, HCUpSubmissionOperation::Ordinary);
                 traceOutput("C", params_.C);
             }
             return success;

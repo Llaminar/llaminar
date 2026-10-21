@@ -165,3 +165,27 @@ TEST(ImmutableFixedHeadLookup, CounterBindingRequiresOriginalRequestAndCompleteS
     reject([](auto &a){a.tokenRows=DeviceRowRange::deviceCounted(15,
         a.counters.control+sampling_math::kDeviceGenerationControlFixedHeadCallsLow);});
 }
+
+/** @test CPU-only linkage and explicitly disabled selections reject without native work. */
+TEST(ImmutableFixedHeadLookup, CompiledBackendSelectionRejectsDisabledAndNonGPU)
+{
+    // Calling the real selector also retains its owning object in static links;
+    // a CPU-only build must resolve no disabled CUDA/HIP factory symbols.
+    const auto reject=[&](DeviceId device,const char *message) {
+        try {
+            (void)createImmutableFixedHeadLookupKernels(device,plan());
+            FAIL()<<"Unsupported fixed-head backend was accepted";
+        } catch(const std::invalid_argument &error) {
+            EXPECT_STREQ(error.what(),message);
+        }
+    };
+    reject(DeviceId::cpu(),"Fixed-head lookup requires an explicit CUDA or ROCm participant");
+    reject(DeviceId::invalid(),"Fixed-head lookup requires an explicit CUDA or ROCm participant");
+#ifndef HAVE_CUDA
+    reject(DeviceId::cuda(0),"Fixed-head lookup CUDA backend is not compiled");
+#endif
+#ifndef HAVE_ROCM
+    reject(DeviceId::rocm(0),"Fixed-head lookup ROCm backend is not compiled");
+#endif
+    // Compiled native branches execute only in their existing explicit device suites.
+}

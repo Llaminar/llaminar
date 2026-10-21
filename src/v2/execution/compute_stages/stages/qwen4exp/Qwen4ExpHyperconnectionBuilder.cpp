@@ -9,6 +9,7 @@
  * collective, activation allocation, packing or backend selection is hidden in this builder.
  */
 #include "Qwen4ExpHyperconnectionBuilder.h"
+#include "models/qwen4exp/Qwen4ExpHCUpArithmetic.h"
 #include "../GEMMStage.h"
 #include "../../../../loaders/PreparedWeightStore.h"
 #include "../../../local_execution/graph/ComputeGraph.h"
@@ -64,9 +65,10 @@ void install(ComputeGraph &graph,std::vector<PendingNode> pending,DeviceId devic
 /**
  * @brief Reject ambiguous lifetimes and noncanonical GEMM row authorities.
  * @param c Immutable primitive/common/up-only query declarations for this mixer.
+ * @param up_arithmetic Actual operation resolved from this mixer’s original up source.
  * @throws std::invalid_argument Before graph mutation for invalid policy, geometry or different live-count owners.
  */
-void validateContext(const Qwen4ExpHyperconnectionContext &c)
+void validateContext(const Qwen4ExpHyperconnectionContext &c,Qwen4ExpHCUpArithmetic up_arithmetic)
 {
     require(c.device.is_valid()&&!c.prefix.empty()&&c.rows.capacity>0&&c.hidden>0&&c.hidden<=std::numeric_limits<int>::max()/4&&
                 c.lowRank>0&&std::isfinite(c.epsilon)&&c.epsilon>0,"Qwen4Exp mixer requires explicit participant, names and positive geometry");
@@ -79,9 +81,9 @@ void validateContext(const Qwen4ExpHyperconnectionContext &c)
         require(c.projectionRows->physicalRows()==c.rows.capacity&&c.projectionRows->capacity()==c.rows.capacity,
                 "Qwen4Exp mixer projection row contract must match admitted matrix geometry");
     }
-    require(!c.upProjectionRows || c.upOperandPrecision==QuantizedActivationOperandPrecision::TwoTermQ8,
-            "Qwen4Exp up-only query rows require explicit TwoTermQ8 arithmetic");
-    if(c.upOperandPrecision==QuantizedActivationOperandPrecision::TwoTermQ8)
+    require(!c.upProjectionRows || up_arithmetic==Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8,
+            "Qwen4Exp up-only query rows require an actual two-term native quantized source operation");
+    if(up_arithmetic==Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8)
     {
         // Validate the effective alternative, including legacy predictor common
         // rows and an omitted descriptor. No optional-field combination may
@@ -141,7 +143,24 @@ std::vector<PendingNode> readNodes(const Qwen4ExpHyperconnectionContext &c,
     const Qwen4ExpHyperconnectionReadWeights &w,const Qwen4ExpHyperconnectionReadBuffers &b,
     const std::vector<std::string> &dependencies)
 {
-    validateContext(c);
+    const auto up_arithmetic=resolveQwen4ExpHCUpArithmetic(
+        c.upOperandPrecision,tensorTypeName(w.up.tensor()->native_type()));
+    validateContext(c,up_arithmetic);
+    // Floating sources have their own native operation and never acquire Q8
+    // workspace. Both quantized choices bind the unchanged native source.
+    QuantizedActivationOperandPrecision up_precision;
+    switch(up_arithmetic)
+    {
+    case Qwen4ExpHCUpArithmetic::FloatingNative:
+    case Qwen4ExpHCUpArithmetic::QuantizedSingleQ8:
+        up_precision=QuantizedActivationOperandPrecision::SingleQ8;
+        break;
+    case Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8:
+        up_precision=QuantizedActivationOperandPrecision::TwoTermQ8;
+        break;
+    default:
+        throw std::invalid_argument("Qwen4Exp mixer has an invalid source arithmetic operation");
+    }
     const std::array views{b.trunk,b.normalized,b.down,b.activatedDown,b.readLogits,b.mixed};
     for(std::size_t i=0;i<views.size();++i)
         for(std::size_t j=i+1;j<views.size();++j)
@@ -158,7 +177,7 @@ std::vector<PendingNode> readNodes(const Qwen4ExpHyperconnectionContext &c,
     nodes.push_back({down,projection(c,w.down,b.normalized,b.down,c.lowRank,4*c.hidden),{norm}});
     nodes.push_back({activation,std::make_unique<Stage>(Stage::Params{.device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
         .operation=Stage::ResidualDown{c.lowRank,b.down,b.activatedDown}}),{down}});
-    nodes.push_back({up,projection(c,w.up,b.activatedDown,b.readLogits,4*c.hidden,c.lowRank,c.upOperandPrecision),{activation}});
+    nodes.push_back({up,projection(c,w.up,b.activatedDown,b.readLogits,4*c.hidden,c.lowRank,up_precision),{activation}});
     nodes.push_back({read,std::make_unique<Stage>(Stage::Params{.device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
         .operation=Stage::ResidualRead{c.hidden,b.normalized,b.readLogits,b.mixed}}),{up,norm}});
     return nodes;
@@ -196,7 +215,8 @@ Qwen4ExpHyperconnectionBuilder::BlockRead Qwen4ExpHyperconnectionBuilder::append
     const Qwen4ExpHyperconnectionContext &c,const Qwen4ExpHyperconnectionBlockWeights &w,
     const Qwen4ExpHyperconnectionReadBuffers &b,const std::vector<std::string> &dependencies)
 {
-    validateContext(c);
+    validateContext(c,resolveQwen4ExpHCUpArithmetic(
+        c.upOperandPrecision,tensorTypeName(w.read.up.tensor()->native_type())));
     w.inject.requireGeometry(4,4*c.hidden);
     require(w.inject.ref().device==c.device,"Qwen4Exp paired injection belongs to another participant");
     auto nodes=readNodes(c,w.read,b,dependencies);

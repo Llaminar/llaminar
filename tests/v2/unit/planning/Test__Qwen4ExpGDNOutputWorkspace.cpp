@@ -73,10 +73,10 @@ TEST(Qwen4ExpGDNOutputWorkspace, ExactNativeBanksAndHCMaximumReuse)
         }
     }
 }
-/** @test Foreign native formats and unsupported physical/count geometry fail before capture. */
+/** @test Floating/unknown sources and unsupported physical/count geometry fail before capture. */
 TEST(Qwen4ExpGDNOutputWorkspace, PreciseSourceAndInvocationRejection)
 {
-    for (const auto format : {"F32", "F16", "BF16", "Q8_1", "Q4_0", "UNKNOWN"})
+    for (const auto format : {"F32", "FP32", "F16", "FP16", "BF16", "UNKNOWN", ""})
         EXPECT_THROW(Qwen4ExpProjectionWorkspace::requirements(DeviceId::cpu(), single, two, true,
             WeightRole::GDNProjection, "blk.0.ssm_out.weight", format, 15, 2560, 6144), std::invalid_argument);
     for (const int rows : {0, -1}) EXPECT_THROW(output(DeviceId::cpu(), rows), std::invalid_argument);
@@ -106,4 +106,24 @@ TEST(Qwen4ExpGDNOutputWorkspace, PreciseSourceAndInvocationRejection)
         WeightRole::HyperConnectionProjection, "blk.48.nextn.hc_head_up.weight", 15, complete));
     EXPECT_THROW(Qwen4ExpProjectionWorkspace::selected(single,
         static_cast<QuantizedActivationOperandPrecision>(255), true, WeightRole::Other, {}), std::invalid_argument);
+}
+
+/** @test Every canonical native source owns the exact original output banks on all backends. */
+TEST(Qwen4ExpGDNOutputWorkspace, AllNativeSourceFormatsUseCanonicalCorrectionBanks)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int rows : {1, 15, 512})
+    for (const auto &source : native_vnni_formats::kAllSourceFormats)
+    {
+        SCOPED_TRACE(::testing::Message() << source.quant_type << " " << device.toString() << " M=" << rows);
+        const auto actual = Qwen4ExpProjectionWorkspace::requirements(device, single, two, true,
+            WeightRole::GDNProjection, "blk.0.ssm_out.weight", source.quant_type, rows, 2560, 6144);
+        const auto expected = device.is_cpu() ? cpuQ8ResidualCorrectionWorkspaceRequirements(rows, 2560, 6144)
+            : gpuQ8ResidualCorrectionWorkspaceRequirements(rows, 2560, 6144);
+        EXPECT_EQ(actual.buffers.size(), expected.buffers.size());
+        EXPECT_EQ(capacities(actual), capacities(expected));
+        EXPECT_EQ(actual.total_bytes_with_alignment(), expected.total_bytes_with_alignment());
+        EXPECT_TRUE(Qwen4ExpProjectionWorkspace::requirements(device, single, single, true,
+            WeightRole::GDNProjection, "blk.0.ssm_out.weight", source.quant_type, rows, 2560, 6144).buffers.empty());
+    }
 }

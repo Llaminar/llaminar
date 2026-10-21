@@ -61,8 +61,7 @@ std::shared_ptr<const Qwen4ExpFixedHeadLookupStage::Frame> Qwen4ExpFixedHeadLook
         storage.transportRows.buffer,storage.localNative.buffer,storage.gatheredNative.buffer};
     for(std::size_t i=0;i<tensors.size();++i)for(std::size_t j=0;j<i;++j)
         require(tensors[i]!=tensors[j] && buffers[i]!=buffers[j],"Fixed-head lookup banks require distinct arena owners and roles");
-    auto kernels=device.is_cuda()?qwen4exp::createCUDAImmutableFixedHeadLookupKernels(plan):
-        qwen4exp::createROCmImmutableFixedHeadLookupKernels(plan);
+    auto kernels=qwen4exp::createImmutableFixedHeadLookupKernels(device,plan);
     require(kernels!=nullptr,"Fixed-head lookup native decoder preparation failed");
     return std::make_shared<const Frame>(Frame{std::move(storage),ids,output,std::move(kernels)});
 }

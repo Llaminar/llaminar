@@ -70,7 +70,7 @@ struct Qwen4ExpHyperconnectionContext
     Qwen4ExpProjectionArithmetic arithmetic; ///< Explicit projection numeric policy.
     std::optional<DeviceRowRange> projectionRows; ///< Existing verifier row contract, when selected.
     std::string readNodeName; ///< Optional exact public terminal name; empty selects prefix+read.
-    QuantizedActivationOperandPrecision upOperandPrecision=QuantizedActivationOperandPrecision::SingleQ8; ///< Explicit HC-up arithmetic; other projections retain SingleQ8.
+    QuantizedActivationOperandPrecision upOperandPrecision=QuantizedActivationOperandPrecision::SingleQ8; ///< Frozen quantized HC-up policy; floating up sources retain native floating GEMM.
     std::optional<DeviceRowRange> upProjectionRows; ///< Explicit TwoTerm up-only original query authority; down/inject retain their existing dispatch.
 };
 /** @brief Read weights, including already-converted distinct norm gains. */

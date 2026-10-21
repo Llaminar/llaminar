@@ -5,7 +5,8 @@
  * Tests GDNProjectionStage, ShortConv1dStage, and GDNRecurrenceStage
  * for correctness, state management, and OpenMP parallelization. Prepared
  * projection mocks additionally prove mixed decoder grouping and exactly-once
- * failure handling without allocating or initializing any GPU.
+ * failure handling without allocating or initializing any GPU. Tiny real-source
+ * bundles cover both original Q8 and mixed Q4/Q8 prepared projection ownership.
  *
  * Three test categories:
  * 1. Stage tests with real CPU kernels (end-to-end correctness)
@@ -6972,5 +6973,15 @@ TEST(Test__GDNKernels, Projection_QKVTwoTermFourDistinctSourcesSmallCPU)
     auto context = makeCPUContext();
     test::GDNQKVBundleFixture fixture(DeviceId::cpu(), *context, nullptr, nullptr,
         64, {128, 64, 2, 2});
+    fixture.prove();
+}
+
+/** @brief Expanded QKV source support still owns a distinct real native engine. */
+TEST(Test__GDNKernels, Projection_QKVTwoTermMixedNativeSourcesSmallCPU)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    auto context = makeCPUContext();
+    test::GDNQKVBundleFixture fixture(DeviceId::cpu(), *context, nullptr, nullptr,
+        64, {128, 64, 2, 2}, TensorType::Q4_0);
     fixture.prove();
 }

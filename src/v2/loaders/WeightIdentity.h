@@ -17,6 +17,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace llaminar2
@@ -76,6 +77,20 @@ namespace llaminar2
         /** Predictor embedding/hidden mixing projection. */
         PredictorProjection,
     };
+
+    /**
+     * @brief Identify the original HC-up source roles shared by planning and observation.
+     * @param role Source-owned semantic role, independent of tensor geometry.
+     * @param name Original canonical GGUF tensor name, including any block prefix.
+     * @return True only for the existing block/terminal/predictor HC-up names.
+     * @note This is a source-role predicate, never a precision or serving selector.
+     */
+    inline bool isHyperConnectionUpProjection(WeightRole role, std::string_view name) noexcept
+    {
+        return role == WeightRole::HyperConnectionProjection &&
+            (name == "output_hc_up.weight" || name.ends_with(".hc_attn_up.weight") ||
+             name.ends_with(".hc_ffn_up.weight") || name.ends_with(".nextn.hc_head_up.weight"));
+    }
 
     /** @brief Whether a Qwen4 immutable scalar/operator weight must materialize as FP32. */
     inline bool isImmutableFP32WeightRole(WeightRole role) noexcept

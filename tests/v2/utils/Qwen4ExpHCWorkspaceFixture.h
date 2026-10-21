@@ -1,9 +1,12 @@
 /**
  * @file Qwen4ExpHCWorkspaceFixture.h
- * @brief Small native-source metadata fixture for exact HC workspace admission.
+ * @brief Native-source metadata fixture with an explicit SingleQ8 delta baseline.
  *
- * The fixture isolates the selected activation banks while retaining positive
- * attention and context geometry. It loads no weights and discovers no device.
+ * The fixture isolates selected activation banks while retaining positive
+ * attention and context geometry; it loads no weights and discovers no device.
+ * Delta oracles author their baseline independently of production defaults.
+ * Default-selection tests opt into the actual default explicitly so promotion
+ * cannot silently erase the source-backed residual allocation requirement.
  */
 #pragma once
 #include "CPUExecutionTestGeometry.h"
@@ -41,10 +44,13 @@ inline ModelMemoryProfile qfnHCWorkspaceProfile()
  */
 inline WorkspaceMemoryGeometry qfnHCWorkspaceGeometry(DeviceId device, int rows)
 {
-    return {.device = device, .device_compute_units = device.is_cpu() ? 1 : 64,
+    WorkspaceMemoryGeometry geometry{.device = device, .device_compute_units = device.is_cpu() ? 1 : 64,
         .cpu_execution = device.is_cpu() ? kSyntheticCPUExecutionGeometry : CPUExecutionGeometry{},
         .batch_size = 1, .resident_graph_rows = rows, .max_context_rows = 4096,
         .local_d_ff = 256, .local_query_heads = 4, .local_kv_heads = 2,
         .local_vocab = 32, .first_layer = 0, .last_layer = 1, .total_shards = 1};
+    // This fixture explicitly authors the SingleQ8 baseline for delta oracles.
+    geometry.qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    return geometry;
 }
 } // namespace llaminar2::test

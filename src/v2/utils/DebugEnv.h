@@ -392,9 +392,9 @@ namespace llaminar2
          *
          * Applies only to Flash Next HC-up projections. The graph copies this
          * policy before workspace preparation; execution never rereads it.
-         * SingleQ8 remains the production default during numerical evaluation.
+         * TwoTermQ8 is the QFN HC-up default; single_q8 remains an explicit opt-out.
          */
-        QuantizedActivationOperandPrecision qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
         /**
          * @brief Setup-only LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION=single_q8|two_term_q8.
          *
@@ -480,7 +480,7 @@ namespace llaminar2
                 kDefaultGDNProjectionArithmetic;
             const char *qfn_hc_up = std::getenv("LLAMINAR_QFN_HC_UP_ACTIVATION");
             qfn_hc_up_activation = qfn_hc_up ? parseQuantizedActivationOperandPrecision(qfn_hc_up) :
-                QuantizedActivationOperandPrecision::SingleQ8;
+                kDefaultQwen4ExpHCUpActivation;
             const char *qfn_gdn_output = std::getenv("LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION");
             qfn_gdn_output_activation = qfn_gdn_output ? parseQuantizedActivationOperandPrecision(qfn_gdn_output) :
                 QuantizedActivationOperandPrecision::SingleQ8;

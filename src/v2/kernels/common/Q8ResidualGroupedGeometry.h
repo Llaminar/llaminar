@@ -24,20 +24,41 @@ struct Q8ResidualGroupedGeometry {
  bool operator==(const Q8ResidualGroupedGeometry&)const=default;
 };
 /**
+ * @brief Bound per-thread accumulators for the original correction program.
+ * @param backend Compiled native arithmetic engine.
+ * @param codebook Actual immutable execution format embedded in capture.
+ * @return Cooperative output-column extent shared by admission and the kernel.
+ *
+ * IQ1_M retains four signed subgroup corrections for each of two terms.
+ * Its CUDA tile uses half as many output accumulators per thread so the
+ * unchanged dual-dot/correction tree fits the two-CTA register envelope.
+ * Other formats, including the existing Q8 fast specialization, retain64.
+ */
+[[nodiscard]]
+#if defined(__CUDACC__) || defined(__HIPCC__)
+__host__ __device__
+#endif
+inline constexpr int q8ResidualCooperativeColumns(
+ Q8ResidualGroupedBackend backend,std::uint8_t codebook) noexcept {
+ return backend==Q8ResidualGroupedBackend::CUDA&&codebook==17?32:64;
+}
+/**
  * @brief Resolve a backend-native tile without querying a device or reading counts.
  * @param backend Compiled participant arithmetic engine.
  * @param rows Admitted physical rows, not a host-observed live count.
  * @param columns Prepared native output width, including valid partial final columns.
+ * @param codebook Immutable execution format; default19 preserves the original Q8 policy.
  * @return Exact immutable launch family and bounded grid.
  * @throws std::invalid_argument For invalid geometry or backend.
  */
 inline Q8ResidualGroupedGeometry q8ResidualGroupedGeometry(
- Q8ResidualGroupedBackend backend,int rows,int columns) {
+ Q8ResidualGroupedBackend backend,int rows,int columns,std::uint8_t codebook=19) {
  if(rows<=0||columns<=0||(backend!=Q8ResidualGroupedBackend::CUDA&&backend!=Q8ResidualGroupedBackend::ROCm))
   throw std::invalid_argument("Two-term grouped projection needs positive geometry and an explicit backend");
  const int matrixRows=backend==Q8ResidualGroupedBackend::CUDA?64:32;
- const bool matrix=rows>=matrixRows&&columns>=64;
- const int rowTile=matrix?matrixRows:(rows==1?1:4),columnTile=matrix?64:128;
+ const int matrixColumns=q8ResidualCooperativeColumns(backend,codebook);
+ const bool matrix=rows>=matrixRows&&columns>=matrixColumns;
+ const int rowTile=matrix?matrixRows:(rows==1?1:4),columnTile=matrix?matrixColumns:128;
  return {matrix?Q8ResidualGroupedStrategy::CooperativeMatrix:Q8ResidualGroupedStrategy::RowVector,
   rowTile,columnTile,matrix?256:128,
   ((static_cast<std::uint64_t>(rows)+rowTile-1)/rowTile)*

@@ -93,10 +93,32 @@ TEST(Qwen4ExpHCUpWorkspaceAdmission, NativeSourceValidationPrecedesAdmission)
         auto profile = test::qfnHCWorkspaceProfile();
         auto geometry = test::qfnHCWorkspaceGeometry(device, 512);
         geometry.qfn_hc_up_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
-        profile.tensors.front().quant_type = "F16";
+        profile.tensors.front().quant_type = "uncataloged_quant";
         EXPECT_THROW(WorkspaceMemoryEstimator::estimate(profile, geometry), std::invalid_argument);
         geometry.first_layer = 1;
         EXPECT_NO_THROW(WorkspaceMemoryEstimator::estimate(profile, geometry));
+    }
+}
+
+/** @test Actual remote and local estimators agree that floating HC has no residual banks. */
+TEST(Qwen4ExpHCUpWorkspaceAdmission, FloatingSourceHasNoCorrectionDelta)
+{
+    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+    for(const int rows:{1,15,512})
+    for(const auto format:{"F32","F16","BF16"})
+    {
+        SCOPED_TRACE(::testing::Message()<<device.toString()<<" rows="<<rows<<" source="<<format);
+        auto profile=test::qfnHCWorkspaceProfile();
+        auto &source=profile.tensors.front();
+        source.quant_type=format;
+        source.K=4;source.elements=512u*source.K;
+        source.native_bytes=source.elements*(std::string_view(format)=="F32"?4:2);
+        profile.flash_next->residual_gate_rank=4;
+        auto geometry=test::qfnHCWorkspaceGeometry(device,rows);
+        geometry.qfn_hc_up_activation=QuantizedActivationOperandPrecision::SingleQ8;
+        const auto ordinary=WorkspaceMemoryEstimator::estimate(profile,geometry);
+        geometry.qfn_hc_up_activation=QuantizedActivationOperandPrecision::TwoTermQ8;
+        EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile,geometry),ordinary);
     }
 }
 
@@ -112,3 +134,22 @@ TEST(Qwen4ExpHCUpWorkspaceAdmission, BuildWithoutCUDAStillPricesRemoteCorrection
     EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry), remote);
 }
 #endif
+
+/** @test QFN default uses exactly the explicit corrected BOM; opt-out retains its original bill. */
+TEST(Qwen4ExpHCUpWorkspaceAdmission, DefaultEqualsExplicitCorrectionAndKeepsOptOut)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int rows : {1, 15, 512})
+    {
+        const auto profile = test::qfnHCWorkspaceProfile();
+        auto geometry = test::qfnHCWorkspaceGeometry(device, rows);
+        const auto single = WorkspaceMemoryEstimator::estimate(profile, geometry);
+        geometry.qfn_hc_up_activation = WorkspaceMemoryGeometry{}.qfn_hc_up_activation;
+        const auto default_bytes = WorkspaceMemoryEstimator::estimate(profile, geometry);
+        geometry.qfn_hc_up_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
+        EXPECT_EQ(default_bytes, WorkspaceMemoryEstimator::estimate(profile, geometry));
+        EXPECT_GT(default_bytes, single);
+        geometry.qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        EXPECT_EQ(single, WorkspaceMemoryEstimator::estimate(profile, geometry));
+    }
+}

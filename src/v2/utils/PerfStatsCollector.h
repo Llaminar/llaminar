@@ -22,9 +22,11 @@
 #include <cstdint>
 #include <initializer_list>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <utility>
 
 namespace llaminar2
 {
@@ -147,6 +149,39 @@ namespace llaminar2
         static void resetPreserving(
             const std::vector<std::string> &domains_to_preserve,
             const std::vector<RecordFamily> &record_families_to_preserve);
+
+        /**
+         * @brief Immutable counter dimensions bound at producer setup.
+         * @details Owns metadata only, never a record pointer or measurement epoch.
+         * Reset and filtering remain exclusively collector-owned. Copies share
+         * immutable metadata; updates reuse it without copying strings or tags.
+         */
+        class CounterIdentity
+        {
+            struct Impl;
+            std::shared_ptr<const Impl> impl_;
+            explicit CounterIdentity(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) {}
+            friend class PerfStatsCollector;
+        };
+
+        /** @brief Bind stable counter dimensions once; does not publish a record.
+         * @param domain Existing collection domain.
+         * @param name Existing counter family.
+         * @param phase Stable execution phase.
+         * @param device Stable participant identity.
+         * @param tags Immutable bounded dimensions, never live device values.
+         * @return Metadata identity reusable across measurement resets.
+         */
+        static CounterIdentity bindCounter(std::string domain, std::string name,
+            std::string phase = {}, std::string device = {}, Tags tags = {});
+
+        /** @brief Update the current collector epoch using setup-bound metadata.
+         * @param identity Immutable dimensions; no record address is retained.
+         * @param value Counter increment following one successful host operation.
+         * @details Disabled updates return before locking. Enabled updates retain
+         * the existing map and mutex; insertion after reset may allocate a record.
+         */
+        static void addCounter(const CounterIdentity &identity, double value = 1.0);
 
         static void addCounter(
             std::string domain,

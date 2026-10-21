@@ -694,6 +694,42 @@ namespace llaminar2
         }
     } // namespace
 
+    /** @brief Stable metadata only; the collector owns all mutable accumulators. */
+    struct PerfStatsCollector::CounterIdentity::Impl
+    {
+        PerfStatKey key;
+    };
+
+    PerfStatsCollector::CounterIdentity PerfStatsCollector::bindCounter(
+        std::string domain, std::string name, std::string phase,
+        std::string device, Tags tags)
+    {
+        if (domain.empty() || name.empty())
+            throw std::invalid_argument("Counter identity requires domain and name");
+        return CounterIdentity(std::make_shared<const CounterIdentity::Impl>(
+            CounterIdentity::Impl{PerfStatKey{PerfStatRecord::Kind::Counter,
+                std::move(domain), std::move(name), std::move(phase),
+                std::move(device), std::move(tags)}}));
+    }
+
+    void PerfStatsCollector::addCounter(const CounterIdentity &identity, double value)
+    {
+        if (!identity.impl_)
+            throw std::invalid_argument("Counter identity has been moved from");
+        const auto &key = identity.impl_->key;
+        if (!isDomainEnabled(key.domain))
+            return;
+        auto &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        auto &record = s.records[key];
+        if (record.sequence_word_count != 0u)
+            throw std::logic_error("PerfStats counter family omitted its lifecycle evidence");
+        record.kind = PerfStatRecord::Kind::Counter;
+        ++record.count;
+        record.value += value;
+        ++s.version;
+    }
+
     bool PerfStatsCollector::isEnabled()
     {
         return collectionPolicy().enabled;

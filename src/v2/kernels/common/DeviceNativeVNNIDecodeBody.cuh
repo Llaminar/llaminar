@@ -1,0 +1,783 @@
+/**
+ * @file DeviceNativeVNNIDecodeBody.cuh
+ * @brief Single canonical GPU integer decoder and rounded block contribution body.
+ *
+ * Included inside the CUDA native namespace or HIP's borrowed-table adapter.
+ * The enclosing owner supplies immutable IQ grids and native packed-byte
+ * subtraction/permutation. This body is extracted unchanged from the installed
+ * CUDA decoder: source formats, metadata factors and correction trees therefore
+ * cannot drift between ordinary native projection and paired-Q8 projection.
+ * Deliberately no include guard: the enclosing typed adapter owns inclusion.
+ */
+    template <uint8_t CODEBOOK_ID>
+    struct CodebookTraits
+    {
+        static constexpr bool is_iq4_source_scale =
+            CODEBOOK_ID == kNativeVnniIQ4XSSourceScaleCodebook;
+        static constexpr bool is_iq4_lut = CODEBOOK_ID == 4 || is_iq4_source_scale;
+        static constexpr bool is_iq3_grid = (CODEBOOK_ID == 11 || CODEBOOK_ID == 12);
+        static constexpr bool is_iq2_grid = (CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 15);
+        static constexpr bool is_iq1_grid = (CODEBOOK_ID == 16 || CODEBOOK_ID == 17);
+        static constexpr bool is_iq_grid = is_iq3_grid || is_iq2_grid || is_iq1_grid;
+        static constexpr bool is_asymmetric =
+            CODEBOOK_ID == 5 || CODEBOOK_ID == 7 || CODEBOOK_ID == 16 ||
+            CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook;
+        static constexpr bool is_dual_scale = (CODEBOOK_ID == 8 || CODEBOOK_ID == 9 || CODEBOOK_ID == 10 ||
+                                               CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 17);
+        // Storage presence is independent of additive/dual arithmetic.
+        static constexpr bool requires_secondary_metadata =
+            is_asymmetric || is_dual_scale || is_iq4_source_scale || CODEBOOK_ID == 11;
+        static constexpr bool is_dual_scale_asym = (CODEBOOK_ID == 10);
+        static constexpr bool is_iq1_m = (CODEBOOK_ID == 17);
+        static constexpr int payload_bytes =
+            (CODEBOOK_ID == 19 ||
+             CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook)
+                                                        ? 32
+            : (CODEBOOK_ID == 6 || CODEBOOK_ID == 7)   ? 20
+            : (CODEBOOK_ID == 8)                       ? 24
+            : (CODEBOOK_ID == 9)                       ? 12
+            : (CODEBOOK_ID == 10)                      ? 8
+            : (CODEBOOK_ID == 11)                      ? 13
+            : (CODEBOOK_ID == 12)                      ? 12
+            : (CODEBOOK_ID == 13 || CODEBOOK_ID == 14) ? 9
+            : (CODEBOOK_ID == 15)                      ? 8
+            : (CODEBOOK_ID == 16 || CODEBOOK_ID == 17) ? 6
+                                                       : 16;
+    };
+
+    /**
+     * @brief Collapse only IQ4 peer launches while retaining descriptor identities.
+     * @param mask Actual physical formats in the immutable descriptor table.
+     * @return One IQ4-family launch bit if tuple24 is present, all others unchanged.
+     */
+    __host__ __device__ constexpr uint32_t native_vnni_iq4_launch_mask(uint32_t mask)
+    {
+        return (mask & (uint32_t{1} << kNativeVnniIQ4XSSourceScaleCodebook))
+            ? mask & ~(uint32_t{1} << 4) : mask;
+    }
+
+    /**
+     * @brief Select one exact descriptor writer for an IQ4 family specialization.
+     * @tparam CodebookId Physical specialization, with 24 owning mixed IQ4 tables.
+     * @param actual Descriptor's preserved physical id.
+     * @return True for the exact format or physical4 under explicit family24.
+     */
+    template <uint8_t CodebookId>
+    __host__ __device__ constexpr bool native_vnni_descriptor_codebook_matches(uint8_t actual)
+    {
+        return actual == CodebookId ||
+            (CodebookId == kNativeVnniIQ4XSSourceScaleCodebook && actual == 4);
+    }
+
+    __device__ __forceinline__ float fp16_bits_to_float(uint16_t bits)
+    {
+        return __half2float(*reinterpret_cast<const __half *>(&bits));
+    }
+
+    /**
+     * @brief Resolve the symmetric single-dot scale without a half round trip.
+     * @tparam CODEBOOK_ID Physical decoder; IQ4_XS uses source tuple 24.
+     * @param primary_bits Original half base for IQ4_XS, otherwise half scale.
+     * @param secondary_bits Original encoded six-bit IQ4_XS coefficient.
+     * @return Exact source base-times-coefficient rounded once in FP32.
+     */
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ float native_vnni_single_scale_rn(
+        uint16_t primary_bits, uint16_t secondary_bits)
+    {
+        const float base = fp16_bits_to_float(primary_bits);
+        if constexpr (CodebookTraits<CODEBOOK_ID>::is_iq4_source_scale)
+            return device_fp32_contract::multiply(
+                base, static_cast<float>(native_vnni_iq4xs_scale::coefficient(secondary_bits)));
+        if constexpr (CODEBOOK_ID == 11)
+            return device_fp32_contract::multiply(
+                base, static_cast<float>(native_vnni_iq3s_scale::coefficient(secondary_bits)));
+        return base;
+    }
+
+    /**
+     * @brief Reconstructed low/high scales for one native dual-scale block.
+     */
+    struct NativeVnniDualScales
+    {
+        float low;  ///< FP32 scale for values 0 through 15.
+        float high; ///< FP32 scale for values 16 through 31.
+    };
+
+    /**
+     * @brief Resolve original-source scale tuples or widened derived half scales.
+     *
+     * Q6_K stores its source half base and a raw signed coefficient pair. Each
+     * half-times-int8 product is exactly representable in FP32; an explicit
+     * multiply retains that edge without factoring the base across dot terms.
+     * IQ2_S stores its original half base and scale-nibble byte. Its two source
+     * products retain the original multiply-then-quarter association before
+     * either integer dot term. Other dual-scale codebooks keep two half scales.
+     *
+     * @tparam CODEBOOK_ID NativeVNNI dual-scale codebook identifier.
+     * @param primary_bits Original Q6_K/IQ2_S base, or a derived low scale.
+     * @param secondary_bits Raw Q6_K coefficients, IQ2_S scale byte, or high scale.
+     * @return Source-resolved Q6_K/IQ2_S scales or widened derived half scales.
+     */
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ NativeVnniDualScales native_vnni_dual_scales_rn(
+        uint16_t primary_bits,
+        uint16_t secondary_bits)
+    {
+        static_assert(CodebookTraits<CODEBOOK_ID>::is_dual_scale);
+        const float primary = fp16_bits_to_float(primary_bits);
+        if constexpr (CODEBOOK_ID == 8)
+        {
+            return {
+                device_fp32_contract::multiply(
+                    primary,
+                    static_cast<float>(native_vnni_q6_scale::low(secondary_bits))),
+                device_fp32_contract::multiply(
+                    primary,
+                    static_cast<float>(native_vnni_q6_scale::high(secondary_bits)))};
+        }
+        else if constexpr (CODEBOOK_ID == 13)
+        {
+            return {
+                device_fp32_contract::multiply(
+                    device_fp32_contract::multiply(
+                        primary,
+                        0.5f + static_cast<float>(native_vnni_iq2s_scale::low(secondary_bits))),
+                    0.25f),
+                device_fp32_contract::multiply(
+                    device_fp32_contract::multiply(
+                        primary,
+                        0.5f + static_cast<float>(native_vnni_iq2s_scale::high(secondary_bits))),
+                    0.25f)};
+        }
+        else
+        {
+            return {primary, fp16_bits_to_float(secondary_bits)};
+        }
+    }
+
+    __device__ __forceinline__ int sum_packed_i8(int32_t packed)
+    {
+        const int8_t *vals = reinterpret_cast<const int8_t *>(&packed);
+        return static_cast<int>(vals[0]) + static_cast<int>(vals[1]) +
+               static_cast<int>(vals[2]) + static_cast<int>(vals[3]);
+    }
+
+    /**
+     * @brief Convert one exact INT8 dot-product block into its canonical FP32
+     *        NativeVNNI contribution.
+     *
+     * CUDA has several economical engines capable of producing the same exact
+     * integer dot products: serial DP4A decode, grouped DP4A verification, and
+     * grouped tensor-core MMA. Integer equality is not sufficient for MTP,
+     * however. Re-parenthesizing the scale, asymmetric-minimum, or IQ1_M delta
+     * terms changes FP32 result bytes and can change later sampling decisions.
+     *
+     * This function is therefore the single arithmetic publication contract
+     * shared by every CUDA NativeVNNI engine. Callers may obtain the integer
+     * terms differently, but they must pass those exact terms here before
+     * adding the returned contribution to an output accumulator. Every
+     * multiply and add names round-to-nearest explicitly so nvcc cannot fuse
+     * or reassociate one kernel family differently from another.
+     *
+     * Unused correction arguments are compiled away for codebooks that do not
+     * need them. Keeping one complete signature is intentional: it makes a new
+     * format's correction requirements visible at every execution engine and
+     * prevents a tensor-core-only approximation from quietly appearing. The
+     * final scale/correction tree delegates to the cross-backend contribution
+     * contract, so expert residency cannot select a different expression.
+     *
+     * @tparam CODEBOOK_ID NativeVNNI codebook identifier.
+     * @param dot_lo Integer dot product for the low or complete 32-value block.
+     * @param dot_hi Integer dot product for the high dual-scale half.
+     * @param activation_scale FP32 scale for the quantized activation block.
+     * @param scale_bits FP16 low/complete scale, or original source base bits.
+     * @param secondary_bits FP16 minimum/high scale, or raw source factors.
+     * @param emin_bits Packed Q2_K low/high asymmetric-minimum FP16 bits.
+     * @param activation_sum Sum of all 32 quantized activation values.
+     * @param activation_sum_lo Sum of the low sixteen activation values.
+     * @param activation_sum_hi Sum of the high sixteen activation values.
+     * @param iq1m_qh Packed IQ1_M delta-sign bytes from the weight payload.
+     * @param subgroup_sum0 Sum of IQ1_M activation values 0 through 7.
+     * @param subgroup_sum1 Sum of IQ1_M activation values 8 through 15.
+     * @param subgroup_sum2 Sum of IQ1_M activation values 16 through 23.
+     * @param subgroup_sum3 Sum of IQ1_M activation values 24 through 31.
+     * @return Canonically rounded FP32 contribution for this 32-value block.
+     */
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ float
+    native_vnni_block_contribution_from_reduced_terms_rn(
+        int dot_lo,
+        int dot_hi,
+        float activation_scale,
+        uint16_t scale_bits,
+        uint16_t secondary_bits,
+        uint32_t emin_bits,
+        int activation_sum,
+        int activation_sum_lo,
+        int activation_sum_hi,
+        uint16_t iq1m_qh,
+        int subgroup_sum0,
+        int subgroup_sum1,
+        int subgroup_sum2,
+        int subgroup_sum3)
+    {
+        using Traits = CodebookTraits<CODEBOOK_ID>;
+
+        if constexpr (Traits::is_dual_scale)
+        {
+            const auto scales = native_vnni_dual_scales_rn<CODEBOOK_ID>(
+                scale_bits, secondary_bits);
+            const float scale_lo = scales.low;
+            const float scale_hi = scales.high;
+            float contribution =
+                device_native_vnni_contract::dualScaleBlock(
+                    dot_lo,
+                    dot_hi,
+                    scale_lo,
+                    scale_hi,
+                    activation_scale);
+
+            if constexpr (Traits::is_dual_scale_asym)
+            {
+                const float min_lo =
+                    fp16_bits_to_float(static_cast<uint16_t>(emin_bits));
+                const float min_hi =
+                    fp16_bits_to_float(static_cast<uint16_t>(emin_bits >> 16));
+                contribution = device_native_vnni_contract::accumulate(
+                    contribution,
+                    device_native_vnni_contract::dualScaleCorrection(
+                        activation_sum_lo,
+                        activation_sum_hi,
+                        min_lo,
+                        min_hi,
+                        activation_scale));
+            }
+
+            if constexpr (Traits::is_iq1_m)
+            {
+                constexpr float kIQ1MDelta = 0.125f;
+                const uint8_t qh0 = static_cast<uint8_t>(iq1m_qh);
+                const uint8_t qh1 =
+                    static_cast<uint8_t>(iq1m_qh >> 8);
+                const float delta0 =
+                    (qh0 & 0x08) ? -kIQ1MDelta : kIQ1MDelta;
+                const float delta1 =
+                    (qh0 & 0x80) ? -kIQ1MDelta : kIQ1MDelta;
+                const float delta2 =
+                    (qh1 & 0x08) ? -kIQ1MDelta : kIQ1MDelta;
+                const float delta3 =
+                    (qh1 & 0x80) ? -kIQ1MDelta : kIQ1MDelta;
+                contribution = device_native_vnni_contract::accumulate(
+                    contribution,
+                    device_native_vnni_contract::iq1MDeltaCorrection(
+                        subgroup_sum0,
+                        subgroup_sum1,
+                        subgroup_sum2,
+                        subgroup_sum3,
+                        delta0,
+                        delta1,
+                        delta2,
+                        delta3,
+                        scale_lo,
+                        scale_hi,
+                        activation_scale));
+            }
+
+            return contribution;
+        }
+        else
+        {
+            const float weight_scale = native_vnni_single_scale_rn<CODEBOOK_ID>(
+                scale_bits, secondary_bits);
+            float contribution =
+                device_native_vnni_contract::singleScaleBlock(
+                    dot_lo,
+                    weight_scale,
+                    activation_scale);
+
+            if constexpr (Traits::is_asymmetric)
+            {
+                const float weight_min =
+                    fp16_bits_to_float(secondary_bits);
+                contribution = device_native_vnni_contract::accumulate(
+                    contribution,
+                    device_native_vnni_contract::singleScaleCorrection(
+                        activation_sum,
+                        weight_min,
+                        activation_scale));
+            }
+
+            return contribution;
+        }
+    }
+
+    __device__ __forceinline__ uint32_t load_payload_word(const uint8_t *payload, int group_idx)
+    {
+        return *reinterpret_cast<const uint32_t *>(payload + (group_idx & 3) * 4);
+    }
+
+    __device__ __forceinline__ int32_t pack_i8x4(int8_t v0, int8_t v1, int8_t v2, int8_t v3)
+    {
+        union
+        {
+            int8_t vals[4];
+            int32_t packed;
+        } out{{v0, v1, v2, v3}};
+        return out.packed;
+    }
+
+    __device__ __forceinline__ int8_t iq4nl_lookup_reg(uint32_t idx)
+    {
+        constexpr uint32_t kPack0 = 0xbfad9881u;
+        constexpr uint32_t kPack1 = 0xf6eaddcfu;
+        constexpr uint32_t kPack2 = 0x26190d01u;
+        constexpr uint32_t kPack3 = 0x71594535u;
+
+        uint32_t packed = kPack0;
+        switch ((idx >> 2) & 0x3u)
+        {
+        case 0:
+            packed = kPack0;
+            break;
+        case 1:
+            packed = kPack1;
+            break;
+        case 2:
+            packed = kPack2;
+            break;
+        default:
+            packed = kPack3;
+            break;
+        }
+
+        const uint32_t shift = (idx & 0x3u) * 8u;
+        return static_cast<int8_t>((packed >> shift) & 0xFFu);
+    }
+
+    /**
+     * @brief Expand eight IQ4_NL codes with register-only byte permutations.
+     * @param w Four packed bytes, each containing a low and high nibble code.
+     * @param out_lo Four signed lookup bytes for the low nibble of each input byte.
+     * @param out_hi Four signed lookup bytes for the high nibble of each input byte.
+     *
+     * IQ4_NL and IQ4_XS share this physical lookup after weight preparation.
+     * Decode adjacent nibbles before separating their destinations: this avoids
+     * building two packed selectors and two byte-wise blend masks. No scale,
+     * integer dot product, or FP32 reduction arithmetic changes at any caller.
+     */
+    __device__ __forceinline__ void iq4nl_decode_word(
+        uint32_t w, uint32_t &out_lo, uint32_t &out_hi)
+    {
+        constexpr uint32_t kLut0 = 0xbfad9881u; // vals[0..3]
+        constexpr uint32_t kLut1 = 0xf6eaddcfu; // vals[4..7]
+        constexpr uint32_t kLut2 = 0x26190d01u; // vals[8..11]
+        constexpr uint32_t kLut3 = 0x71594535u; // vals[12..15]
+
+        // __byte_perm indexes eight source bytes with each selector's low
+        // three bits. Look up both halves of the sixteen-entry table, then
+        // use each code's bit 3 to choose the corresponding result byte.
+        // 0x3210 preserves positions; OR-ing 4 selects the upper table half.
+        const uint32_t halves = 0x32103210u | ((w >> 1) & 0x44444444u);
+        const uint32_t first = __byte_perm(
+            __byte_perm(kLut0, kLut1, w),
+            __byte_perm(kLut2, kLut3, w), halves);
+        const uint32_t last = __byte_perm(
+            __byte_perm(kLut0, kLut1, w >> 16),
+            __byte_perm(kLut2, kLut3, w >> 16), halves >> 16);
+
+        // The two intermediate words hold codes [0..3] and [4..7] in nibble
+        // order. Gather even codes into low bytes and odd codes into high
+        // bytes, retaining the packed dp4a operand layout used by all callers.
+        out_lo = __byte_perm(first, last, 0x6420);
+        out_hi = __byte_perm(first, last, 0x7531);
+    }
+
+    __device__ __forceinline__ uint32_t centered_sub_16(uint32_t value)
+    {
+        value ^= 0x80808080u;
+        value -= 0x10101010u;
+        value ^= 0x80808080u;
+        return value;
+    }
+
+    __device__ __forceinline__ uint32_t centered_sub_4(uint32_t value)
+    {
+        value ^= 0x80808080u;
+        value -= 0x04040404u;
+        value ^= 0x80808080u;
+        return value;
+    }
+
+    __device__ __forceinline__ uint32_t q3k_highbit_pack(uint32_t hb4)
+    {
+        return ((hb4 & 0x1u) << 2) |
+               ((hb4 & 0x2u) << 9) |
+               ((hb4 & 0x4u) << 16) |
+               ((hb4 & 0x8u) << 23);
+    }
+
+    /**
+     * @brief Apply four IQ sign bits with exact packed-byte arithmetic.
+     *
+     * Expanding this operation as four scalar ternaries makes nvcc emit a long
+     * predicate/negate/permute chain in every IQ-grid decoder. Instead, first
+     * spread the four sign bits into the low bit of four independent bytes.
+     * `__vsub4(0, bits)` then turns each selected byte into `0xff`, and
+     * `(value ^ mask) - mask` performs two's-complement negation independently
+     * in each byte. The result is byte-identical to the scalar expression while
+     * avoiding cross-byte borrows and keeping all four values vectorized.
+     *
+     * IQ grids contain representable signed magnitudes, so negation cannot
+     * encounter the exceptional INT8_MIN value.
+     *
+     * @param grid4 Four positive grid magnitudes packed as signed INT8 bytes.
+     * @param sign_lo4 One sign selector bit for each packed byte.
+     * @return Four signed grid values packed in their original byte order.
+     */
+    __device__ __forceinline__ uint32_t iq_apply_signs_4(
+        uint32_t grid4,
+        uint8_t sign_lo4)
+    {
+        /*
+         * Multiplication by 0x00204081 places nibble bit i at bit 8*i;
+         * masking retains exactly those four byte-low predicates. This is the
+         * same bit expansion as the former shift/OR chain, expressed as one
+         * integer multiply plus one mask so every IQ-grid decoder performs less
+         * scalar address-generation work before the vector byte subtraction.
+         */
+        const uint32_t sign_bits =
+            (static_cast<uint32_t>(sign_lo4 & 0x0Fu) * 0x00204081u) &
+            0x01010101u;
+        const uint32_t sign_mask = __vsub4(0u, sign_bits);
+        return __vsub4(grid4 ^ sign_mask, sign_mask);
+    }
+
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ uint32_t iq3_grid_lookup(int idx)
+    {
+        if constexpr (CODEBOOK_ID == 11)
+        {
+#if __CUDA_ARCH__ >= 350
+            return __ldg(&d_iq3s_grid[idx]);
+#else
+            return d_iq3s_grid[idx];
+#endif
+        }
+        else
+            return d_iq3xxs_grid[idx];
+    }
+
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ uint64_t iq2_grid_lookup(int idx)
+    {
+        if constexpr (CODEBOOK_ID == 13)
+        {
+#if __CUDA_ARCH__ >= 350
+            return __ldg(&d_iq2s_grid[idx]);
+#else
+            return d_iq2s_grid[idx];
+#endif
+        }
+        else if constexpr (CODEBOOK_ID == 14)
+        {
+#if __CUDA_ARCH__ >= 350
+            return __ldg(&d_iq2xs_grid[idx]);
+#else
+            return d_iq2xs_grid[idx];
+#endif
+        }
+        else
+            return d_iq2xxs_grid[idx];
+    }
+
+    __device__ __forceinline__ uint64_t iq1_grid_lookup(int idx)
+    {
+#if __CUDA_ARCH__ >= 350
+        return __ldg(&d_iq1s_grid[idx]);
+#else
+        return d_iq1s_grid[idx];
+#endif
+    }
+
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ int payload_bytes_for_codebook()
+    {
+        return CodebookTraits<CODEBOOK_ID>::payload_bytes;
+    }
+
+    /**
+     * @brief Decode one compact source block into eight exact INT8 words.
+     * @tparam CODEBOOK_ID Compile-time source payload/centering contract.
+     * @param payload One immutable 32-element native block.
+     * @param packed_groups Receives the original element order, four per word.
+     *
+     * Bit-plane expansion is integer-only. Scaling and signed/asymmetric
+     * contribution arithmetic remain in the shared FP32 contract, so every
+     * ordinary, grouped, and tensor-core caller observes the same values.
+     */
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ void decode_groups(const uint8_t *payload, int32_t (&packed_groups)[8])
+    {
+        if constexpr (CODEBOOK_ID == 0)
+        {
+            for (int g = 0; g < 4; ++g)
+            {
+                const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
+                const uint32_t lo = raw & 0x0F0F0F0Fu;
+                const uint32_t hi = (raw >> 4) & 0x0F0F0F0Fu;
+                packed_groups[g] = static_cast<int32_t>(__vsub4(lo, 0x08080808u));
+                packed_groups[g + 4] = static_cast<int32_t>(__vsub4(hi, 0x08080808u));
+            }
+        }
+        else if constexpr (CodebookTraits<CODEBOOK_ID>::is_iq4_lut)
+        {
+            for (int g = 0; g < 4; ++g)
+            {
+                const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
+                uint32_t lo = 0;
+                uint32_t hi = 0;
+                iq4nl_decode_word(raw, lo, hi);
+                packed_groups[g] = static_cast<int32_t>(lo);
+                packed_groups[g + 4] = static_cast<int32_t>(hi);
+            }
+        }
+        else if constexpr (CODEBOOK_ID == 5)
+        {
+            for (int g = 0; g < 4; ++g)
+            {
+                const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
+                packed_groups[g] = static_cast<int32_t>(raw & 0x0F0F0F0Fu);
+                packed_groups[g + 4] = static_cast<int32_t>((raw >> 4) & 0x0F0F0F0Fu);
+            }
+        }
+        else if constexpr (CODEBOOK_ID == 6 || CODEBOOK_ID == 7)
+        {
+            const uint32_t qh_bits = *reinterpret_cast<const uint32_t *>(payload + 16);
+            for (int g = 0; g < 4; ++g)
+            {
+                const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
+                const uint32_t hb4_lo = (qh_bits >> (g * 4)) & 0xFu;
+                const uint32_t hb4_hi = (qh_bits >> (g * 4 + 16)) & 0xFu;
+                // The same integer high plane serves Q5_0, Q5_1 and Q5_K.
+                // Signed centering and all FP32 contribution order stay below.
+                const uint32_t hb_lo =
+                    native_vnni::q5HighBitsToPackedBytes(hb4_lo);
+                const uint32_t hb_hi =
+                    native_vnni::q5HighBitsToPackedBytes(hb4_hi);
+                uint32_t lo = (raw & 0x0F0F0F0Fu) | hb_lo;
+                uint32_t hi = ((raw >> 4) & 0x0F0F0F0Fu) | hb_hi;
+                if constexpr (CODEBOOK_ID == 6)
+                {
+                    lo = centered_sub_16(lo);
+                    hi = centered_sub_16(hi);
+                }
+                packed_groups[g] = static_cast<int32_t>(lo);
+                packed_groups[g + 4] = static_cast<int32_t>(hi);
+            }
+        }
+        else if constexpr (CODEBOOK_ID == 8)
+        {
+            const uint8_t *qh = payload + 16;
+            for (int g = 0; g < 4; ++g)
+            {
+                const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
+                packed_groups[g] = pack_i8x4(
+                    static_cast<int8_t>(((raw & 0x0F) | ((qh[g] & 0x03) << 4)) - 32),
+                    static_cast<int8_t>((((raw >> 8) & 0x0F) | (((qh[g] >> 2) & 0x03) << 4)) - 32),
+                    static_cast<int8_t>((((raw >> 16) & 0x0F) | (((qh[g] >> 4) & 0x03) << 4)) - 32),
+                    static_cast<int8_t>((((raw >> 24) & 0x0F) | (((qh[g] >> 6) & 0x03) << 4)) - 32));
+                packed_groups[g + 4] = pack_i8x4(
+                    static_cast<int8_t>((((raw >> 4) & 0x0F) | ((qh[g + 4] & 0x03) << 4)) - 32),
+                    static_cast<int8_t>((((raw >> 12) & 0x0F) | (((qh[g + 4] >> 2) & 0x03) << 4)) - 32),
+                    static_cast<int8_t>((((raw >> 20) & 0x0F) | (((qh[g + 4] >> 4) & 0x03) << 4)) - 32),
+                    static_cast<int8_t>((((raw >> 28) & 0x0F) | (((qh[g + 4] >> 6) & 0x03) << 4)) - 32));
+            }
+        }
+        else if constexpr (CODEBOOK_ID == 9)
+        {
+            const uint32_t hbits = *reinterpret_cast<const uint32_t *>(payload + 8);
+            for (int half = 0; half < 2; ++half)
+            {
+                const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + half * 4);
+                for (int g = 0; g < 4; ++g)
+                {
+                    const uint32_t hb4 = (hbits >> ((half * 4 + g) * 4)) & 0xFu;
+                    const uint32_t packed = ((raw >> (g * 2)) & 0x03030303u) | q3k_highbit_pack(hb4);
+                    packed_groups[half * 4 + g] = static_cast<int32_t>(centered_sub_4(packed));
+                }
+            }
+        }
+        else if constexpr (CODEBOOK_ID == 10)
+        {
+            for (int half = 0; half < 2; ++half)
+            {
+                const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + half * 4);
+                for (int g = 0; g < 4; ++g)
+                {
+                    packed_groups[half * 4 + g] = pack_i8x4(
+                        static_cast<int8_t>((raw >> (g * 2 + 0)) & 0x03),
+                        static_cast<int8_t>((raw >> (g * 2 + 8)) & 0x03),
+                        static_cast<int8_t>((raw >> (g * 2 + 16)) & 0x03),
+                        static_cast<int8_t>((raw >> (g * 2 + 24)) & 0x03));
+                }
+            }
+        }
+        else if constexpr (CODEBOOK_ID == 11 || CODEBOOK_ID == 12)
+        {
+            const uint8_t qh_byte = (CODEBOOK_ID == 11) ? payload[8] : 0;
+            const int sign_base = (CODEBOOK_ID == 11) ? 9 : 8;
+            for (int g = 0; g < 8; ++g)
+            {
+                int idx = payload[g];
+                if constexpr (CODEBOOK_ID == 11)
+                    idx |= static_cast<int>((qh_byte >> g) & 1u) << 8;
+                const uint32_t grid4 = iq3_grid_lookup<CODEBOOK_ID>(idx);
+                const uint8_t signs = payload[sign_base + g / 2];
+                const uint8_t nibble = (g & 1) ? static_cast<uint8_t>(signs >> 4) : static_cast<uint8_t>(signs & 0x0F);
+                packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, nibble));
+            }
+        }
+        else if constexpr (CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 15)
+        {
+            const uint8_t qh_byte = (CODEBOOK_ID == 15) ? 0 : payload[4];
+            const int sign_base = (CODEBOOK_ID == 15) ? 4 : 5;
+            for (int l = 0; l < 4; ++l)
+            {
+                int idx = payload[l];
+                if constexpr (CODEBOOK_ID == 13)
+                    idx |= static_cast<int>((qh_byte >> (2 * l)) & 0x3u) << 8;
+                else if constexpr (CODEBOOK_ID == 14)
+                    idx |= static_cast<int>((qh_byte >> l) & 0x1u) << 8;
+                const uint64_t grid8 = iq2_grid_lookup<CODEBOOK_ID>(idx);
+                const uint32_t lo = static_cast<uint32_t>(grid8);
+                const uint32_t hi = static_cast<uint32_t>(grid8 >> 32);
+                const uint8_t signs = payload[sign_base + l];
+                packed_groups[l * 2] = static_cast<int32_t>(iq_apply_signs_4(lo, signs & 0x0F));
+                packed_groups[l * 2 + 1] = static_cast<int32_t>(iq_apply_signs_4(hi, signs >> 4));
+            }
+        }
+        else if constexpr (CODEBOOK_ID == 16)
+        {
+            const uint16_t qh_word = static_cast<uint16_t>(payload[4]) | (static_cast<uint16_t>(payload[5]) << 8);
+            for (int l = 0; l < 4; ++l)
+            {
+                const int idx = payload[l] | (static_cast<int>((qh_word >> (3 * l)) & 0x7u) << 8);
+                const uint64_t grid8 = iq1_grid_lookup(idx);
+                packed_groups[l * 2] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+                packed_groups[l * 2 + 1] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+            }
+        }
+        else if constexpr (CODEBOOK_ID == 17)
+        {
+            const uint8_t qh0 = payload[4];
+            const uint8_t qh1 = payload[5];
+            const int idx0 = payload[0] | (static_cast<int>(qh0 & 0x07u) << 8);
+            const int idx1 = payload[1] | (static_cast<int>((qh0 >> 4) & 0x07u) << 8);
+            const int idx2 = payload[2] | (static_cast<int>(qh1 & 0x07u) << 8);
+            const int idx3 = payload[3] | (static_cast<int>((qh1 >> 4) & 0x07u) << 8);
+            uint64_t grid8 = iq1_grid_lookup(idx0);
+            packed_groups[0] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+            packed_groups[1] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+            grid8 = iq1_grid_lookup(idx1);
+            packed_groups[2] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+            packed_groups[3] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+            grid8 = iq1_grid_lookup(idx2);
+            packed_groups[4] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+            packed_groups[5] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+            grid8 = iq1_grid_lookup(idx3);
+            packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+            packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+        }
+        else if constexpr (
+            CODEBOOK_ID == 19 ||
+            CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook)
+        {
+            // Both normalized INT8 formats store 32 signed bytes directly;
+            // codebook 23 adds its minimum only in the contribution helper.
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+            {
+                packed_groups[g] = *reinterpret_cast<const int32_t *>(payload + g * 4);
+            }
+        }
+    }
+
+    // =====================================================================
+    // Vectorized variant: uses 128-bit (int4) loads for 16-byte codebooks.
+    // Reduces instruction count at the cost of software pipelining.
+    // Use for compute-bound kernels (kpar); prefer scalar decode_groups for
+    // memory-bound kernels (wide) where load-compute overlap matters.
+    // =====================================================================
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ void decode_groups_vec(const uint8_t *payload, int32_t (&packed_groups)[8])
+    {
+        if constexpr (CodebookTraits<CODEBOOK_ID>::payload_bytes == 16)
+        {
+            const int4 v = *reinterpret_cast<const int4 *>(payload);
+            const uint32_t raws[4] = {
+                static_cast<uint32_t>(v.x), static_cast<uint32_t>(v.y),
+                static_cast<uint32_t>(v.z), static_cast<uint32_t>(v.w)};
+
+            if constexpr (CODEBOOK_ID == 0)
+            {
+#pragma unroll
+                for (int g = 0; g < 4; ++g)
+                {
+                    const uint32_t raw = raws[g];
+                    const uint32_t lo = raw & 0x0F0F0F0Fu;
+                    const uint32_t hi = (raw >> 4) & 0x0F0F0F0Fu;
+                    packed_groups[g] = static_cast<int32_t>(__vsub4(lo, 0x08080808u));
+                    packed_groups[g + 4] = static_cast<int32_t>(__vsub4(hi, 0x08080808u));
+                }
+            }
+            else if constexpr (CodebookTraits<CODEBOOK_ID>::is_iq4_lut)
+            {
+#pragma unroll
+                for (int g = 0; g < 4; ++g)
+                {
+                    const uint32_t raw = raws[g];
+                    uint32_t lo = 0;
+                    uint32_t hi = 0;
+                    iq4nl_decode_word(raw, lo, hi);
+                    packed_groups[g] = static_cast<int32_t>(lo);
+                    packed_groups[g + 4] = static_cast<int32_t>(hi);
+                }
+            }
+            else if constexpr (CODEBOOK_ID == 5)
+            {
+#pragma unroll
+                for (int g = 0; g < 4; ++g)
+                {
+                    packed_groups[g] = static_cast<int32_t>(raws[g] & 0x0F0F0F0Fu);
+                    packed_groups[g + 4] = static_cast<int32_t>((raws[g] >> 4) & 0x0F0F0F0Fu);
+                }
+            }
+            else
+            {
+                decode_groups<CODEBOOK_ID>(payload, packed_groups);
+            }
+        }
+        else if constexpr (
+            CODEBOOK_ID == 19 ||
+            CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook)
+        {
+            // Payload layout is identical; asymmetric correction consumes the
+            // separate minimum plane after these vectorized loads.
+            const int4 v0 = *reinterpret_cast<const int4 *>(payload);
+            const int4 v1 = *reinterpret_cast<const int4 *>(payload + 16);
+            packed_groups[0] = v0.x;
+            packed_groups[1] = v0.y;
+            packed_groups[2] = v0.z;
+            packed_groups[3] = v0.w;
+            packed_groups[4] = v1.x;
+            packed_groups[5] = v1.y;
+            packed_groups[6] = v1.z;
+            packed_groups[7] = v1.w;
+        }
+        else
+        {
+            // Non-16-byte codebooks: fall back to scalar decode
+            decode_groups<CODEBOOK_ID>(payload, packed_groups);
+        }
+    }

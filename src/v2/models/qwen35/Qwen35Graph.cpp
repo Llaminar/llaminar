@@ -917,11 +917,13 @@ namespace llaminar2
             config_.qfn_gdn_qkv_activation, true, binding ? binding->identity.role : WeightRole::Other,
             binding ? binding->identity.canonical_name : std::string_view{}, config_.flash_next.get());
         if (precision != QuantizedActivationOperandPrecision::TwoTermQ8 || !binding || !binding->immutable ||
-            !weight || binding->tensor != weight || weight->native_type() != TensorType::Q8_0 ||
+            !weight || binding->tensor != weight ||
             binding->identity.layer != source_layer ||
             binding->identity.canonical_name != "blk." + std::to_string(source_layer) + ".attn_qkv.weight" ||
             binding->floating_operand_precision != FloatingActivationOperandPrecision::Native)
-            throw std::invalid_argument("QFN GDN-QKV TwoTermQ8 requires its immutable original main GDN native Q8_0 binding");
+            throw std::invalid_argument("QFN GDN-QKV TwoTermQ8 requires its immutable original main GDN native quantized binding");
+        (void)requireQ8ResidualSourceFormat(tensorTypeName(weight->native_type()),seq_len,
+            static_cast<int>(weight->rows()),static_cast<int>(weight->cols()));
         Qwen4ExpProjectionWorkspace::validateGDNQKVInvocation(precision, true, binding->identity.role,
             binding->identity.canonical_name, config_.flash_next.get(), batch_size, binding->slice);
         if (weight->shape().size() != 2 || weight->shape()[0] != binding->slice.source_rows ||
@@ -964,9 +966,10 @@ namespace llaminar2
             binding ? binding->identity.role : WeightRole::Other,
             binding ? binding->identity.canonical_name : std::string_view{});
         if (precision != QuantizedActivationOperandPrecision::TwoTermQ8 || !binding ||
-            !binding->immutable || binding->tensor != weight || !weight ||
-            weight->native_type() != TensorType::Q8_0)
-            throw std::invalid_argument("QFN GDN-output TwoTermQ8 requires its immutable original native Q8_0 source binding");
+            !binding->immutable || binding->tensor != weight || !weight)
+            throw std::invalid_argument("QFN GDN-output TwoTermQ8 requires its immutable original native quantized source binding");
+        (void)requireQ8ResidualSourceFormat(tensorTypeName(weight->native_type()),seq_len,
+            static_cast<int>(weight->rows()),static_cast<int>(weight->cols()));
         Qwen4ExpProjectionWorkspace::validateGDNOutputInvocation(precision, true,
             binding->identity.role, binding->identity.canonical_name, batch_size, binding->slice);
         if (weight->shape().size() != 2 || weight->shape()[0] != binding->slice.source_rows ||
@@ -1017,9 +1020,10 @@ namespace llaminar2
             !binding->immutable || binding->tensor != weight || !weight ||
             source_layer < 0 || source_layer >= main_layers ||
             binding->identity.layer != source_layer ||
-            binding->identity.canonical_name != "blk." + std::to_string(source_layer) + ".attn_output.weight" ||
-            weight->native_type() != TensorType::Q8_0)
-            throw std::invalid_argument("QFN FA-output TwoTermQ8 requires its immutable original main Q8_0 source binding");
+            binding->identity.canonical_name != "blk." + std::to_string(source_layer) + ".attn_output.weight")
+            throw std::invalid_argument("QFN FA-output TwoTermQ8 requires its immutable original main native quantized source binding");
+        (void)requireQ8ResidualSourceFormat(tensorTypeName(weight->native_type()),seq_len,
+            static_cast<int>(weight->rows()),static_cast<int>(weight->cols()));
         Qwen4ExpProjectionWorkspace::validateFAOutputInvocation(precision, true,
             binding->identity.role, binding->identity.canonical_name, main_layers, batch_size, binding->slice);
         const auto original_k = static_cast<std::size_t>(config_.n_heads) * static_cast<std::size_t>(config_.head_dim);

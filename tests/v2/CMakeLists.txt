@@ -26471,6 +26471,13 @@ add_v2_test(V2_Integration_Qwen4ExpHCUpWorkspaceAdmission
     COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator> --gtest_filter=Qwen4ExpHCUpWorkspaceAdmission.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;MTP;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+# Original floating HC sources retain their native graph when the quantized
+# policy changes. This regression runs actual tiny prepared CPU projections.
+add_v2_test(V2_Integration_Qwen4ExpHCUpFloatingSourcePolicy
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=Qwen4ExpHyperconnectionBuilder.QuantizedPolicyPreservesActualFloatingSourceArithmetic:Qwen4ExpHyperconnectionBuilder.FloatingSourceRejectsQuantizedOnlyQueryBeforeGraphMutation
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Policy;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_Qwen4ExpPreparedStorageCPU
     V2_Integration_CPU_GEMMStageCountedM1
@@ -26480,6 +26487,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_Qwen4ExpPredictorWorkspaceRows
     V2_Integration_Qwen4ExpHCUpWorkspaceContracts
     V2_Integration_Qwen4ExpHCUpWorkspaceAdmission
+    V2_Integration_Qwen4ExpHCUpFloatingSourcePolicy
 )
 if(HAVE_CUDA OR HAVE_ROCM)
     target_sources(v2_test_qwen4exp_device_primitives PRIVATE
@@ -27841,6 +27849,15 @@ add_v2_test(V2_Integration_Qwen4ExpHCQueryAuthority
         "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_Qwen4ExpHCQueryRowsCPU V2_Integration_Qwen4ExpHCQueryAuthority)
+add_v2_test(V2_Integration_Qwen4ExpHCUpOriginalFormatRows
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=Qwen4ExpHyperconnectionBuilder.UpRowsAdmitEveryOriginalQuantizedSource
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;HC;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+        "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_Qwen4ExpHCUpOriginalFormatRows)
 if(HAVE_CUDA OR HAVE_ROCM)
     target_sources(v2_test_qwen4exp_device_primitives PRIVATE
         integration/kernels/qwen4exp/Test__Qwen4ExpHCQueryRowsDevice.cpp)
@@ -29442,6 +29459,14 @@ endif()
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPU_GDNQKVTwoTermOriginalBundle
     V2_Integration_GDNQKVTwoTermBindingContract)
+add_v2_test(V2_Integration_GDNQKVTwoTermMixedSourceContract
+    COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+        --gtest_filter=Test__GDNKernels.Projection_QKVTwoTermMixedNativeSourcesSmallCPU
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;GDN;PreparedWeights;DeviceFree;Q4_0;Q8_0;FP16RNE;ByteExact;Workspace;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_GDNQKVTwoTermMixedSourceContract)
 if(HAVE_CUDA)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_CUDA_GDNQKVTwoTermOriginalBundle)
@@ -30149,6 +30174,107 @@ add_v2_test(V2_Integration_Qwen4ExpLocalPairedBuildInputs
     ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 if(TEST V2_Integration_Qwen4ExpLocalPairedBuildInputs)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpLocalPairedBuildInputs)
+endif()
+
+# Compose before the final V2_PRODUCTION_TEST_PREFLIGHT_TESTS inventory snapshot.
+# Release keeps only the independently declared performance target, never these fixtures.
+if(NOT V2_PERF_TESTS_ONLY)
+    target_sources(v2_test_qwen4exp_primitives PRIVATE
+        unit/kernels/Test__Q8ResidualAllFormats.cpp)
+    target_sources(v2_integration_cpu_native_vnni_gemv PRIVATE
+        integration/kernels/Test__Q8ResidualAllFormatsCPU.cpp)
+    add_v2_test(V2_Integration_TwoTermAllFormatsSourceMetadataAndTinyCPU
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=Q8ResidualAllFormats.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;AllFormats;TwoTermQ8;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    if(TEST V2_Integration_TwoTermAllFormatsSourceMetadataAndTinyCPU)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TwoTermAllFormatsSourceMetadataAndTinyCPU)
+    endif()
+    foreach(V2_TT_ISA IN ITEMS Default AVX2)
+        set(V2_TT_CPU_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_DYNAMIC=false")
+        if(V2_TT_ISA STREQUAL "AVX2")
+            list(APPEND V2_TT_CPU_ENV "LLAMINAR_ISA_LEVEL=avx2")
+        endif()
+        foreach(V2_TT_CPU_CASE IN ITEMS NativeRowsThreadsAndLargeSmallReuse NativeLargeTiledRows)
+            set(V2_TT_ALIAS V2_Integration_CPU_TwoTermAllFormats_${V2_TT_ISA}_${V2_TT_CPU_CASE})
+            add_v2_test(${V2_TT_ALIAS}
+                COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+                    --gtest_filter=Q8ResidualAllFormatsCPU.${V2_TT_CPU_CASE}
+                LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeVNNI;AllFormats;TwoTermQ8;ByteExact;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120
+                ENVIRONMENT ${V2_TT_CPU_ENV})
+            if(TEST ${V2_TT_ALIAS})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_TT_ALIAS})
+            endif()
+        endforeach()
+    endforeach()
+    if(HAVE_CUDA OR HAVE_ROCM)
+        target_sources(v2_test_qwen4exp_device_primitives PRIVATE
+            integration/kernels/Test__Q8ResidualAllFormatsDevice.cpp)
+    endif()
+    foreach(V2_TT_BACKEND IN ITEMS CUDA ROCm)
+        if((V2_TT_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (V2_TT_BACKEND STREQUAL "ROCm" AND HAVE_ROCM))
+            if(V2_TT_BACKEND STREQUAL "CUDA")
+                set(V2_TT_GPU_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+            else()
+                set(V2_TT_GPU_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+            endif()
+            foreach(V2_TT_SUFFIX IN ITEMS "" LargeTiled UntiledLarge OriginalBlock32 ConcurrentColdIQ)
+                set(V2_TT_ALIAS V2_Integration_${V2_TT_BACKEND}_TwoTermAllFormats${V2_TT_SUFFIX})
+                add_v2_test(${V2_TT_ALIAS}
+                    COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                        --gtest_filter=Q8ResidualAllFormatsDevice.${V2_TT_BACKEND}${V2_TT_SUFFIX}
+                    LABELS "V2;Integration;ProductionTestPreflight;${V2_TT_BACKEND};NativeVNNI;AllFormats;TwoTermQ8;Capture;ByteExact;Regression"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 120
+                    ENVIRONMENT ${V2_TT_GPU_ENV})
+                if(TEST ${V2_TT_ALIAS})
+                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_TT_ALIAS})
+                endif()
+            endforeach()
+        endif()
+    endforeach()
+endif()
+
+if(NOT V2_PERF_TESTS_ONLY)
+# Definitions belong before inventory's selection-only span.
+add_v2_test(V2_Integration_PerfStatsBoundCounterIdentity
+    COMMAND $<TARGET_FILE:v2_test_perf_stats_collector>
+        --gtest_filter=PerfStatsCollector.BoundCounterIdentityUsesCurrentEpochAndCollectionPolicy
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;PerfStats;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
+# Append only after the main V2_PRODUCTION_TEST_PREFLIGHT_TESTS set.
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PerfStatsBoundCounterIdentity)
+# Existing V2_Integration_Q8ResidualCorrectionCPU selects Q8ResidualCorrection.*,
+# including all HC submission/source/physical-row/reset/workshare cases.
+
+endif()
+
+# Append after the sealed all-format target/registration; no new runner or capability.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_qwen4exp_device_primitives)
+    foreach(V2_TT_PROMOTED_BACKEND IN ITEMS CUDA ROCm)
+        if((V2_TT_PROMOTED_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (V2_TT_PROMOTED_BACKEND STREQUAL "ROCm" AND HAVE_ROCM))
+            if(V2_TT_PROMOTED_BACKEND STREQUAL "CUDA")
+                set(V2_TT_PROMOTED_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+            else()
+                set(V2_TT_PROMOTED_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+            endif()
+            set(V2_TT_PROMOTED_ALIAS V2_Integration_${V2_TT_PROMOTED_BACKEND}_TwoTermPromotedAsymmetric)
+            add_v2_test(${V2_TT_PROMOTED_ALIAS}
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=Q8ResidualAllFormatsDevice.${V2_TT_PROMOTED_BACKEND}ExpandedMinimumPromotion
+                LABELS "V2;Integration;ProductionTestPreflight;${V2_TT_PROMOTED_BACKEND};NativeVNNI;Migration;TwoTermQ8;Capture;ByteExact;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120
+                ENVIRONMENT ${V2_TT_PROMOTED_ENV})
+            if(TEST ${V2_TT_PROMOTED_ALIAS})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_TT_PROMOTED_ALIAS})
+            endif()
+        endif()
+    endforeach()
 endif()
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)

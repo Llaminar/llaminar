@@ -15,6 +15,7 @@
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "utils/DebugEnv.h"
 #include <gtest/gtest.h>
+#include <map>
 #include <tuple>
 
 namespace
@@ -126,7 +127,7 @@ TEST(Qwen4ExpGDNQKVWorkspace, FullSourceFormatAndRequestAreStrict)
     }
     EXPECT_NO_THROW(Qwen4ExpProjectionWorkspace::validateGDNQKVInvocation(two, true, WeightRole::FusedQKV,
         "blk.0.attn_qkv.weight", &config, 1, full));
-    for (const auto format : {"F32", "F16", "BF16", "Q4_K", "Q8_K"})
+    for (const auto format : {"F32", "FP32", "F16", "FP16", "BF16", "UNKNOWN", ""})
     {
         EXPECT_THROW(Qwen4ExpProjectionWorkspace::requirements(DeviceId::cpu(), single, single, true,
             WeightRole::FusedQKV, "blk.0.attn_qkv.weight", format, 1, 10240, 2560,
@@ -246,4 +247,35 @@ TEST(Qwen4ExpGDNQKVWorkspace, FloatingGDNRejectsOutputCorrectionBeforeAdmission)
                     }
                 }
             }
+}
+
+/** @test Every original native format contributes exact full-QKV banks without changing policy defaults. */
+TEST(Qwen4ExpGDNQKVWorkspace, AllNativeSourceFormatsUseCanonicalCorrectionBanks)
+{
+    // This factory borrows original model/mixer geometry; its explicit format
+    // argument is the native source descriptor, not a request to convert weights.
+    const auto profile = source();
+    const auto capacities = [](const WorkspaceRequirements &requirements)
+    {
+        std::map<std::string, std::size_t> result;
+        for (const auto &buffer : requirements.buffers) result.emplace(buffer.name, buffer.size_bytes);
+        return result;
+    };
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int rows : {1, 15, 512})
+    for (const auto &native : native_vnni_formats::kAllSourceFormats)
+    {
+        SCOPED_TRACE(::testing::Message() << native.quant_type << " " << device.toString() << " M=" << rows);
+        const auto actual = Qwen4ExpProjectionWorkspace::requirements(device, single, single, true,
+            WeightRole::FusedQKV, "blk.0.attn_qkv.weight", native.quant_type, rows, 10240, 2560,
+            single, 48, two, &profile);
+        const auto expected = device.is_cpu() ? cpuQ8ResidualCorrectionWorkspaceRequirements(rows, 10240, 2560)
+            : gpuQ8ResidualCorrectionWorkspaceRequirements(rows, 10240, 2560);
+        EXPECT_EQ(actual.buffers.size(), expected.buffers.size());
+        EXPECT_EQ(capacities(actual), capacities(expected));
+        EXPECT_EQ(actual.total_bytes_with_alignment(), expected.total_bytes_with_alignment());
+        EXPECT_TRUE(Qwen4ExpProjectionWorkspace::requirements(device, single, single, true,
+            WeightRole::FusedQKV, "blk.0.attn_qkv.weight", native.quant_type, rows, 10240, 2560,
+            single, 48, single, &profile).buffers.empty());
+    }
 }

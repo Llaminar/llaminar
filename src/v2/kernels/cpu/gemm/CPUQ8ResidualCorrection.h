@@ -5,6 +5,8 @@
  * Existing VNNI microkernels retain their canonical block contributions and
  * independent register accumulators; a typed store policy folds each real
  * row's two final terms once. Two real rows share immutable weight loads.
+ * Canonical native source codebooks keep their original packed decode, minima
+ * and subscale arithmetic; only the independently quantized activation changes.
  * Output/scratch holes are untouched. The CPU authority validates the complete
  * live prefix before starting its workshare. The operation owns no hot heap
  * allocation; standalone OpenMP team runtime overhead is shared with SingleQ8.
@@ -39,9 +41,76 @@ inline void quantizeResidualBlock(const float*input,const Q8_1Block&primary,Q8_1
  */
 inline void validateCPUQ8ResidualSource(const CPUNativeVNNIPackedWeights&packed,int m,int n,int k) {
  validateQ8ResidualCorrectionGeometry(m,n,k);
- if(packed.codebook_id!=native_vnni_formats::Q8_0.codebook_id||!packed.usesExpandedInt8()||packed.is_asymmetric||packed.is_superblock||
-    packed.N!=n||packed.K!=k||!packed.hasInterleavedData()||packed.numerical_policy!=CPUProjectionNumericalPolicy::BackendNative)
-  throw std::invalid_argument("Two-term Q8 requires the exact prepared Q8_0 source, complete native reduction blocks and geometry");
+ const auto &format=requireQ8ResidualSourceFormat(
+  NativeVnniSourceIdentity{packed.codebook_id,packed.is_superblock,true},m,n,k);
+ if(packed.N!=n||packed.K!=k||packed.blocks_per_row!=k/32||!packed.hasInterleavedData()||
+    packed.is_asymmetric!=format.is_asymmetric||packed.payload_bytes!=format.payload_bytes||
+    packed.encoding!=preparedEncodingForSource(format)||
+    packed.data_stride!=preparedDataStride(packed.encoding)||
+    packed.interleaved_block_stride!=preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric)||
+    packed.numerical_policy!=CPUProjectionNumericalPolicy::BackendNative)
+  throw std::invalid_argument("Two-term CPU quantized projection requires its exact canonical prepared source tuple and geometry");
+}
+/**
+ * @brief Evaluate two real rows as four independent original-source dot chains.
+ * @param packed Immutable canonical nibble, expanded, Q6 or multi-scale source.
+ * @param primary0 First real row's unchanged native activation blocks.
+ * @param residual0 First real row's independently quantized residual blocks.
+ * @param primary1 Second row's blocks, or null for an odd final row.
+ * @param residual1 Second row's residual blocks, paired with primary1.
+ * @param destination0 First row's valid output interval.
+ * @param destination1 Second row's valid output interval, or null.
+ * @param chunk Original64-column packed-source chunk.
+ * @param valid Actual output columns within that final chunk.
+ * @param avx512 Actual runtime ISA selected before the workshare.
+ *
+ * These are existing grouped microkernels, not serial M1 inference replay.
+ * Each chain visits the complete K range in its original order, including
+ * source-specific minima and IQ subscales. A bounded stack tile receives only
+ * four64-column fragments; the two final terms fold once without an MxN mirror.
+ * Q8_0 retains its existing fused-store fast path outside this helper.
+ */
+inline void cpuNativeResidualChunk(const CPUNativeVNNIPackedWeights &packed,
+ const Q8_1Block *primary0,const Q8_1Block *residual0,
+ const Q8_1Block *primary1,const Q8_1Block *residual1,
+ float *destination0,float *destination1,int chunk,int valid,bool avx512)
+{
+ alignas(64) float term0[64],term1[64],term2[64],term3[64];
+ const int blocks=packed.blocks_per_row;
+ const bool nibble=packed.usesNibbleLUT();
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+ if(avx512)
+ {
+  const auto lut=nibble?build_decode_lut(packed.codebook_id):_mm512_setzero_si512();
+  if(primary1)
+  {
+   if(nibble)gemm_4row_native_1z_chunk(packed,primary0,residual0,primary1,residual1,
+     term0,term1,term2,term3,chunk,0,blocks,lut,false);
+   else gemm_4row_non_nibble_2z_chunk(packed,primary0,residual0,primary1,residual1,
+     term0,term1,term2,term3,chunk,0,blocks,false);
+  }
+  else if(nibble)gemm_2row_native_chunk(packed,primary0,residual0,term0,term1,chunk,0,blocks,lut,false);
+  else gemm_2row_non_nibble_chunk(packed,primary0,residual0,term0,term1,chunk,0,blocks,false);
+ }
+ else
+#endif
+ {
+  const auto lut=nibble?build_decode_lut_avx2_for_codebook(packed.codebook_id):_mm256_setzero_si256();
+  if(nibble)gemm_2row_native_chunk_avx2(packed,primary0,residual0,term0,term1,chunk,0,blocks,lut,false);
+  else gemm_2row_non_nibble_chunk_avx2(packed,primary0,residual0,term0,term1,chunk,0,blocks,false);
+  if(primary1)
+  {
+   if(nibble)gemm_2row_native_chunk_avx2(packed,primary1,residual1,term2,term3,chunk,0,blocks,lut,false);
+   else gemm_2row_non_nibble_chunk_avx2(packed,primary1,residual1,term2,term3,chunk,0,blocks,false);
+  }
+ }
+ for(int column=0;column<64;column+=8)
+ {
+  _mm256_store_ps(term0+column,_mm256_add_ps(_mm256_load_ps(term0+column),_mm256_load_ps(term1+column)));
+  if(primary1)_mm256_store_ps(term2+column,_mm256_add_ps(_mm256_load_ps(term2+column),_mm256_load_ps(term3+column)));
+ }
+ std::copy_n(term0,valid,destination0);
+ if(primary1)std::copy_n(term2,valid,destination1);
 }
 /** @brief Execute the explicit paired-Q8 operation over one borrowed prepared source.
  * @param packed Actual prepared native source with fixed arithmetic policy.
@@ -64,7 +133,7 @@ inline void cpuQ8ResidualCorrectedProjection(const CPUNativeVNNIPackedWeights&pa
   Q8ResidualStorageSpan{residual.data(),needed*sizeof(Q8_1Block),alignof(Q8_1Block)}};
  const std::array reads{
   Q8ResidualStorageSpan{input,static_cast<std::size_t>(physical)*k*sizeof(float),alignof(float)},
-  Q8ResidualStorageSpan{packed.native_interleaved.data(),packed.native_interleaved.size(),1},
+  Q8ResidualStorageSpan{packed.interleavedBase(),interleavedWorkspaceSize(packed),1},
   Q8ResidualStorageSpan{rows.countOwner(),rows.countOwner()?sizeof(std::int32_t):0,alignof(std::int32_t)}};
  validateQ8ResidualStorage(writes,reads);
  const int live=rows.activeRowsFor(rows.countOwner()?*rows.countOwner():rows.capacity());
@@ -96,6 +165,17 @@ inline void cpuQ8ResidualCorrectedProjection(const CPUNativeVNNIPackedWeights&pa
   for(std::int64_t task=0;task<tiles*chunks;++task) {
    const auto row=task%tiles*2,chunk=task/tiles;
    const int valid=std::min<std::int64_t>(64,n-chunk*64);
+   // Preserve the original Q8_0 kernel and its register-store fold exactly.
+   // All other canonical encodings retain their own source arithmetic above.
+   if(packed.codebook_id!=native_vnni_formats::Q8_0.codebook_id||packed.is_superblock||
+      packed.is_asymmetric||!packed.usesExpandedInt8())
+   {
+    const bool second=row+1<live;
+    cpuNativeResidualChunk(packed,primary.data()+row*bpr,residual.data()+row*bpr,
+      second?primary.data()+(row+1)*bpr:nullptr,second?residual.data()+(row+1)*bpr:nullptr,
+      output+row*n+chunk*64,second?output+(row+1)*n+chunk*64:nullptr,chunk,valid,avx512);
+    continue;
+   }
    alignas(64) float tail0[64],tail1[64];
    float *destination0=valid==64?output+row*n+chunk*64:tail0;
    float *destination1=row+1<live?(valid==64?output+(row+1)*n+chunk*64:tail1):nullptr;

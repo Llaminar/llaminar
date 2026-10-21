@@ -10,6 +10,7 @@
 #include "backends/DeviceId.h"
 #include "loaders/WeightIdentity.h"
 #include "kernels/common/Q8ResidualCorrection.h"
+#include "Qwen4ExpHCUpArithmetic.h"
 #include "kernels/cpu/gemm/CPUQ8ResidualCorrectionWorkspace.h"
 #include <string_view>
 namespace llaminar2 {
@@ -31,9 +32,7 @@ struct Qwen4ExpHCUpWorkspace final
         if(policy==QuantizedActivationOperandPrecision::SingleQ8)return false;
         if(policy!=QuantizedActivationOperandPrecision::TwoTermQ8)
             throw std::invalid_argument("HC workspace has an unknown activation arithmetic policy");
-        if(!flash_next||role!=WeightRole::HyperConnectionProjection)return false;
-        return name=="output_hc_up.weight"||name.ends_with(".hc_attn_up.weight")||
-            name.ends_with(".hc_ffn_up.weight")||name.ends_with(".nextn.hc_head_up.weight");
+        return flash_next && isHyperConnectionUpProjection(role,name);
     }
     /**
      * @brief Contribute the actual two-term stage contract without preparing weights.
@@ -42,7 +41,7 @@ struct Qwen4ExpHCUpWorkspace final
      * @param flash_next Authenticated model-family presence.
      * @param role Canonical source role.
      * @param name Original native tensor name, including its source block.
-     * @param native_format Original GGUF format; this mode requires unchanged Q8_0.
+     * @param native_format Original source format; only quantized sources own Q8 banks.
      * @param m Admitted physical rows for this precise graph role.
      * @param n Participant-local output columns.
      * @param k Participant-local reduction width.
@@ -54,8 +53,9 @@ struct Qwen4ExpHCUpWorkspace final
         std::string_view name,std::string_view native_format,int m,int n,int k)
     {
         if(!selected(policy,flash_next,role,name))return {};
-        if(native_format!="Q8_0")
-            throw std::invalid_argument("Two-term HC-up workspace requires original native Q8_0 weights");
+        if(resolveQwen4ExpHCUpArithmetic(policy,native_format)==Qwen4ExpHCUpArithmetic::FloatingNative)
+            return {};
+        (void)requireQ8ResidualSourceFormat(native_format,m,n,k);
         if(device.is_cpu())return cpuQ8ResidualCorrectionWorkspaceRequirements(m,n,k);
         if(device.is_cuda()||device.is_rocm())return gpuQ8ResidualCorrectionWorkspaceRequirements(m,n,k);
         throw std::invalid_argument("Two-term HC-up workspace requires a supported physical participant");

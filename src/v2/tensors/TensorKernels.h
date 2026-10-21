@@ -1755,7 +1755,7 @@ namespace llaminar2
          * @return Number of input features this kernel expects, or 0 if unknown
          */
         virtual int get_k() const { return 0; }
-        /** @brief Declare explicit two-term Q8 scratch against this actual prepared source.
+        /** @brief Declare two Q8 activation banks against the actual native quantized source.
          * @param m Physical maximum rows retained by the stage.
          * @param n Exact prepared output width.
          * @param k Exact prepared reduction width.
@@ -1765,6 +1765,8 @@ namespace llaminar2
         virtual WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const
         { (void)m;(void)n;(void)k;throw std::logic_error("Selected prepared GEMM does not implement two-term Q8 arithmetic"); }
         /** @brief Evaluate independent primary/residual Q8 integer dots and add once.
+         * The original quantized weight codebook, scales, minima and IQ metadata
+         * remain authoritative for both terms. No alternate weight copy is made.
          * @param input Prepared native FP32 source; no placement repair is permitted.
          * @param output Prepared distinct native FP32 destination.
          * @param rows Explicit physical/live geometry on its execution owner.

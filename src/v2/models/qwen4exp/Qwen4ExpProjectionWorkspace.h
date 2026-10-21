@@ -280,7 +280,7 @@ struct Qwen4ExpProjectionWorkspace final
      * @param flash_next Authenticated QFN model family.
      * @param role Original canonical source role.
      * @param name Exact source tensor name.
-     * @param format Original GGUF format; selected operations require native Q8_0.
+     * @param format Original GGUF format; selected quantized operations retain its native codebook.
      * @param m Admitted physical token rows, independent of live prefix count.
      * @param n Participant-local output width.
      * @param k Participant-local complete K32 reduction width.
@@ -303,6 +303,8 @@ struct Qwen4ExpProjectionWorkspace final
     {
         if (!selected(hc_up, gdn_output, flash_next, role, name, fa_output, main_layers, gdn_qkv, qfn_profile))
             return {};
+        if (Qwen4ExpHCUpWorkspace::selected(hc_up,flash_next,role,name))
+            return Qwen4ExpHCUpWorkspace::requirements(device,hc_up,flash_next,role,name,format,m,n,k);
         if (gdnQKVProfilePrecision(gdn_qkv, flash_next, role, name, qfn_profile) ==
             QuantizedActivationOperandPrecision::TwoTermQ8)
         {
@@ -314,8 +316,7 @@ struct Qwen4ExpProjectionWorkspace final
             if (n <= 0 || k <= 0 || static_cast<uint64_t>(n) != original_rows || k != qfn_profile->d_model)
                 throw std::invalid_argument("QFN GDN-QKV workspace requires the whole original native matrix");
         }
-        if (format != "Q8_0")
-            throw std::invalid_argument("QFN activation correction requires original native Q8_0 projection weights");
+        (void)requireQ8ResidualSourceFormat(format,m,n,k);
         if (device.is_cpu())
             return cpuQ8ResidualCorrectionWorkspaceRequirements(m, n, k);
         if (device.is_cuda() || device.is_rocm())

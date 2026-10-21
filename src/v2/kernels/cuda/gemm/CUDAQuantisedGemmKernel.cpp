@@ -33,6 +33,8 @@
 #include "kernels/common/NativeEmbeddingIQTables.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "CUDAQuantisedGemmKernel.h"
+#include "kernels/common/GPUQ8ResidualNative.h"
+#include "backends/BackendManager.h"
 #include "CUDAQuantisedGemmWorkspaceContract.h"
 #include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
 #include "CUDADeviceWorkspace.h"
@@ -526,6 +528,11 @@ namespace llaminar2
             uint8_t native_codebook_id = 0;
             uint32_t native_blocks_per_row = 0;
             NativeVnniSourceIdentity native_source_identity;
+            // Borrowed immutable IQ view is bound cold once and never replaced.
+            // A backend reset invalidates it together with the prepared weights.
+            NativeEmbeddingIQTables residual_iq_tables;
+            std::atomic<std::uint64_t> residual_iq_generation{0};
+            std::once_flag residual_iq_once;
             NativeVnniReusableDeviceAllocationFormat native_allocation_format;
             CUDARowMajorWeights *rowmajor = nullptr;
 
@@ -1475,48 +1482,108 @@ namespace llaminar2
             }
         }
 
-        WorkspaceRequirements CUDAQuantisedGemmKernel::q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const
+        WorkspaceRequirements CUDAQuantisedGemmKernel::q8ResidualCorrectionWorkspaceRequirements(int m, int n,
+                                                                                                 int k) const
         {
-            validateQ8ResidualCorrectionGeometry(m,n,k);
+            validateQ8ResidualCorrectionGeometry(m, n, k);
             NativeVnniSourceIdentity source;
-            if(!weights_converted()||!impl_||!exportNativeVNNISourceIdentity(source)||source.codebook_id!=native_vnni_formats::Q8_0.codebook_id||source.is_superblock||
-                impl_->native_codebook_id!=native_vnni_formats::Q8_0.codebook_id||impl_->native_blocks_per_row!=static_cast<unsigned>(k/32)||
-                !impl_->d_weights_native_vnni||!impl_->d_weights_native_scales||impl_->d_weights_native_mins||impl_->d_weights_native_emins||
-                (impl_->native_allocation_format.payload_bytes_per_block&&impl_->native_allocation_format.payload_bytes_per_block!=native_vnni_formats::Q8_0.payload_bytes)||
-                impl_->native_allocation_format.has_mins||impl_->native_allocation_format.has_emins||
-                n!=static_cast<int>(N_)||k!=static_cast<int>(K_))
-                throw std::invalid_argument("Two-term CUDA Q8 requires an already prepared exact Q8_0 source and geometry");
-            return gpuQ8ResidualCorrectionWorkspaceRequirements(m,n,k);
+            if (!weights_converted() || !impl_ || !exportNativeVNNISourceIdentity(source) ||
+                n != static_cast<int>(N_) || k != static_cast<int>(K_))
+                throw std::invalid_argument(
+                    "TwoTerm CUDA requires already prepared original source and exact geometry");
+            const DeviceNativeVNNIMatrixDesc descriptor{
+                .payload = impl_->d_weights_native_vnni,
+                .scales = impl_->d_weights_native_scales,
+                .mins = impl_->d_weights_native_mins,
+                .emins = impl_->d_weights_native_emins,
+                .n = n,
+                .k = k,
+                .blocks_per_row = impl_->native_blocks_per_row,
+                .codebook_id = impl_->native_codebook_id,
+                .allocation_payload_bytes_per_block = impl_->native_allocation_format.payload_bytes_per_block,
+                .allocation_has_mins = static_cast<std::uint8_t>(impl_->native_allocation_format.has_mins),
+                .allocation_has_emins = static_cast<std::uint8_t>(impl_->native_allocation_format.has_emins),
+                .source_codebook_id = source.codebook_id,
+                .source_is_superblock = static_cast<std::uint8_t>(source.is_superblock),
+                .source_identity_present = static_cast<std::uint8_t>(source.present)};
+            (void)requireQ8ResidualNativeMatrix(descriptor, m, n, k);
+            if (q8ResidualNeedsIQTables(descriptor.codebook_id))
+            {
+                auto *backend = getCUDABackend();
+                const auto generation = backend ? backend->deviceRuntimeGeneration(cuda_device_id_) : 0;
+                if (!generation)
+                    throw std::logic_error("TwoTerm CUDA IQ prepared source generation is unavailable");
+                if (!isGraphCaptureActive())
+                {
+                    // Multiple cold graph builders may query this same prepared
+                    // engine. Publish once; no execution path enters this guard.
+                    std::call_once(impl_->residual_iq_once, [&] {
+                        NativeEmbeddingIQTables tables;
+                        if (!prepareNativeEmbeddingTablesCUDA(cuda_device_id_, TensorType::IQ3_S, tables))
+                            throw std::logic_error("TwoTerm CUDA IQ table binding requires cold source setup");
+                        if (backend->deviceRuntimeGeneration(cuda_device_id_) != generation)
+                            throw std::logic_error("TwoTerm IQ backend generation changed during cold binding");
+                        impl_->residual_iq_tables = tables;
+                        impl_->residual_iq_generation.store(generation, std::memory_order_release);
+                    });
+                }
+                // Capture never waits on cold setup or attempts table binding.
+                // Acquire also makes the immutable pointer view safe to read.
+                if (impl_->residual_iq_generation.load(std::memory_order_acquire) != generation)
+                    throw std::logic_error("TwoTerm CUDA IQ declaration requires its original cold generation");
+            }
+            return gpuQ8ResidualCorrectionWorkspaceRequirements(m, n, k);
         }
 
-        void CUDAQuantisedGemmKernel::multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,
-            DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace)
+        void CUDAQuantisedGemmKernel::multiply_q8_residual_corrected(const TensorBase *input,
+                                                                     TensorBase *output, DeviceRowRange rows,
+                                                                     int n, int k,
+                                                                     DeviceWorkspaceManager *workspace)
         {
-            validateQ8ResidualCorrectionGeometry(rows.physicalRows(),n,k);
-            const DeviceId target=DeviceId::cuda(cuda_device_id_);
-            if(!workspace||workspace->device()!=target||!input||!output||input==output||
-                input->native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||output->isMapped()||
-                n!=static_cast<int>(N_)||k!=static_cast<int>(K_)||!weights_converted())
-                throw std::invalid_argument("Two-term CUDA Q8 requires prepared FP32 tensor operands, exact participant workspace and immutable native weights");
-            validateQ8ResidualTensorCapacities(rows.physicalRows(),n,k,input->numel(),output->numel());
-            void*stream=gpu_stream_;
-            if(!stream)throw std::invalid_argument("Two-term CUDA Q8 requires its exact producer stream");
-            TransferEngine::requireDeviceInput(const_cast<TensorBase*>(input),target,stream);
-            TransferEngine::requireDeviceOutput(output,target,stream);
+            validateQ8ResidualCorrectionGeometry(rows.physicalRows(), n, k);
+            const DeviceId target = DeviceId::cuda(cuda_device_id_);
+            if (!workspace || workspace->device() != target || !input || !output || input == output ||
+                input->native_type() != TensorType::FP32 || output->native_type() != TensorType::FP32 ||
+                output->isMapped() || n != static_cast<int>(N_) || k != static_cast<int>(K_) ||
+                !weights_converted())
+                throw std::invalid_argument("Two-term CUDA Q8 requires prepared FP32 tensor operands, exact "
+                                            "participant workspace and immutable native weights");
+            validateQ8ResidualTensorCapacities(rows.physicalRows(), n, k, input->numel(), output->numel());
+            void *stream = gpu_stream_;
+            if (!stream)
+                throw std::invalid_argument("Two-term CUDA Q8 requires its exact producer stream");
+            if (q8ResidualNeedsIQTables(impl_->native_codebook_id))
+            {
+                auto *backend = getCUDABackend();
+                const auto generation = impl_->residual_iq_generation.load(std::memory_order_acquire);
+                if (!backend || !generation || backend->deviceRuntimeGeneration(cuda_device_id_) != generation)
+                    throw std::logic_error("TwoTerm CUDA IQ execution requires its original cold prepared generation");
+            }
             DeviceNativeVNNIMatrixDesc weights;
-            if(!exportNativeVNNIMatrixDesc(weights))throw std::logic_error("Prepared two-term CUDA Q8 source export failed");
-            const auto values=static_cast<std::size_t>(rows.physicalRows())*k,scales=values/32*sizeof(float);
-            const auto requireBank=[&](const std::string&name,std::size_t bytes)->void* {
-                auto*pointer=workspace->getBuffer(name);
-                if(!pointer||workspace->getBufferSize(name)<bytes)throw std::logic_error("Two-term CUDA Q8 invocation lacks an admitted named activation bank");
+            if (!exportNativeVNNIMatrixDesc(weights))
+                throw std::logic_error("Prepared two-term CUDA Q8 source export failed");
+            (void)requireQ8ResidualNativeMatrix(weights, rows.physicalRows(), n, k);
+            TransferEngine::requireDeviceInput(const_cast<TensorBase *>(input), target, stream);
+            TransferEngine::requireDeviceOutput(output, target, stream);
+            const auto values = static_cast<std::size_t>(rows.physicalRows()) * k,
+                       scales = values / 32 * sizeof(float);
+            const auto requireBank = [&](const std::string &name, std::size_t bytes) -> void * {
+                auto *pointer = workspace->getBuffer(name);
+                if (!pointer || workspace->getBufferSize(name) < bytes)
+                    throw std::logic_error(
+                        "Two-term CUDA Q8 invocation lacks an admitted named activation bank");
                 return pointer;
             };
-            cudaQ8ResidualCorrectedProjection({weights,rows,Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal,static_cast<const float*>(input->gpu_data_ptr()),static_cast<float*>(output->gpu_data_ptr()),
-                static_cast<signed char*>(requireBank(kGPUProjectionPrimaryQ8,values)),
-                static_cast<signed char*>(requireBank(kGPUProjectionResidualQ8,values)),
-                static_cast<float*>(requireBank(kGPUProjectionPrimaryQ8Scales,scales)),
-                static_cast<float*>(requireBank(kGPUProjectionResidualQ8Scales,scales))},stream);
-            publishCUDATensorWrite(*output,cuda_device_id_,stream);
+            cudaQ8ResidualCorrectedProjection(
+                {weights, rows, Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal,
+                 static_cast<const float *>(input->gpu_data_ptr()),
+                 static_cast<float *>(output->gpu_data_ptr()),
+                 static_cast<signed char *>(requireBank(kGPUProjectionPrimaryQ8, values)),
+                 static_cast<signed char *>(requireBank(kGPUProjectionResidualQ8, values)),
+                 static_cast<float *>(requireBank(kGPUProjectionPrimaryQ8Scales, scales)),
+                 static_cast<float *>(requireBank(kGPUProjectionResidualQ8Scales, scales))},
+                stream, impl_->residual_iq_tables);
+            publishCUDATensorWrite(*output, cuda_device_id_, stream);
         }
 
         bool CUDAQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)

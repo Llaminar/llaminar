@@ -167,14 +167,14 @@ namespace llaminar2::cpu::native_vnni
         /** @copydoc ITensorGemm::q8ResidualCorrectionWorkspaceRequirements */
         WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const override {
             cpu::native_vnni::validateCPUQ8ResidualSource(packed_,m,n,k);
-            if(activation_rotation_)throw std::invalid_argument("Two-term Q8 cannot silently change a rotated source contract");
+            if(activation_rotation_)throw std::invalid_argument("Two-term quantized activation cannot silently change a rotated source contract");
             return cpuQ8ResidualCorrectionWorkspaceRequirements(m,n,k);
         }
         /** @copydoc ITensorGemm::multiply_q8_residual_corrected */
         void multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,DeviceRowRange rows,
             int n,int k,DeviceWorkspaceManager*workspace) override {
             cpu::native_vnni::validateCPUQ8ResidualSource(packed_,rows.physicalRows(),n,k);
-            if(activation_rotation_)throw std::invalid_argument("Two-term Q8 requires its unrotated prepared source");
+            if(activation_rotation_)throw std::invalid_argument("Two-term quantized activation requires its unrotated prepared source");
             if(!input||!output||input->native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
                 !input->isHostValid()||!output->isHostValid())
                 throw std::invalid_argument("Two-term CPU Q8 requires prepared host-owned FP32 tensors");

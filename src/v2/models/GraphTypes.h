@@ -117,7 +117,7 @@ namespace llaminar2
         std::shared_ptr<const Qwen4ExpConfig> flash_next;
 
         /// Frozen HC-up activation arithmetic; ordinary models never consume it.
-        QuantizedActivationOperandPrecision qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
         /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
         QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
         /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.

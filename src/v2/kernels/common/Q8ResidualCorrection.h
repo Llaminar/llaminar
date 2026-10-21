@@ -40,6 +40,42 @@ inline void validateQ8ResidualCorrectionGeometry(int m,int n,int k) {
     static_cast<std::size_t>(m)>std::numeric_limits<std::size_t>::max()/sizeof(float)/static_cast<unsigned>(k))
   throw std::invalid_argument("Two-term Q8 requires positive output width and complete32-reduction native blocks and representable storage");
 }
+/**
+ * @brief Authenticate an original quantized format without changing its prepared bytes.
+ * @param format Original GGUF format, resolved by the canonical NativeVNNI catalog.
+ * @param m Positive physical activation-row capacity.
+ * @param n Actual participant-local output width.
+ * @param k Complete prepared K32 reduction width.
+ * @return Immutable original source metadata, including asymmetric and superblock identity.
+ * @throws std::invalid_argument For an uncataloged source or invalid matrix geometry.
+ * @note Prepared source slices can end at native K32 boundaries even when their
+ * original source uses K256 blocks. The source loader owns that original block
+ * validation; this operation must not reject a legal already-prepared slice.
+ */
+inline const NativeVnniFormatInfo &requireQ8ResidualSourceFormat(
+ std::string_view format,int m,int n,int k) {
+ validateQ8ResidualCorrectionGeometry(m,n,k);
+ const auto *source=native_vnni_formats::forQuantType(format);
+ if(!source)throw std::invalid_argument("Two-term Q8 requires a cataloged original native quantized weight format");
+ return *source;
+}
+/**
+ * @brief Authenticate the original provenance retained by a prepared engine.
+ * @param identity Original codebook, source-block family and explicit presence.
+ * @param m Positive physical activation-row capacity.
+ * @param n Actual participant-local output width.
+ * @param k Complete prepared K32 reduction width.
+ * @return Canonical source metadata; physical decoder validation remains backend-owned.
+ * @throws std::invalid_argument For missing/foreign provenance or invalid geometry.
+ */
+inline const NativeVnniFormatInfo &requireQ8ResidualSourceFormat(
+ NativeVnniSourceIdentity identity,int m,int n,int k) {
+ validateQ8ResidualCorrectionGeometry(m,n,k);
+ const auto *source=identity.present ? native_vnni_formats::forSourceIdentity(
+  identity.codebook_id,identity.is_superblock) : nullptr;
+ if(!source)throw std::invalid_argument("Two-term Q8 requires complete original native weight provenance");
+ return *source;
+}
 /** @brief Reject tensors smaller than the immutable admitted physical operation.
  * @param m Physical row capacity, independent of the current live count.
  * @param n Native output width.

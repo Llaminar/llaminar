@@ -1312,6 +1312,21 @@ projections. Both retain FP32 accumulation and recurrent-state arithmetic.
 Full floating GDN policies cannot be combined with the QFN QKV or GDN-output
 `two_term_q8` diagnostics, which require original native quantized operands.
 
+### QFN hyperconnection activation correction
+
+`LLAMINAR_QFN_HC_UP_ACTIVATION=single_q8|two_term_q8` selects the
+activation approximation for quantized HC-up projections. The default is
+`two_term_q8`; select `single_q8` explicitly to use one activation term.
+TwoTerm quantizes
+both the primary activation and its residual, applies each to the same original
+prepared weights, and adds the two completed results. Every canonical NativeVNNI
+source format retains its original weight values, codebook, scales and minima;
+no weight requantization is introduced. CPU, CUDA and ROCm use the same policy.
+Original FP32, FP16 and BF16 HC weights retain their native floating operation
+and do not reserve Q8 correction buffers. The policy is fixed before admission,
+participates in graph and prefix-cache identity, and does not change HC-down,
+GDN, attention-output or expert arithmetic.
+
 ### Router arithmetic diagnostics
 
 Qwen Flash Next (`qwen4exp`) defaults to FP16 router weights and hidden
@@ -1526,7 +1541,7 @@ activation operand precision for original main-decoder GDN mixed-QKV
 projections. The default remains `single_q8`. This setup-only setting is
 independent of the HC-up, GDN-output and FA-output activation selectors and
 of `LLAMINAR_GDN_PROJECTION_ARITHMETIC`. The explicit `two_term_q8` arm
-requires the complete unchanged original native Q8_0 matrix, one request's
+requires the complete unchanged original native quantized matrix, one request's
 authenticated query rows and the existing prepared-weight/workspace owners;
 partial dense TP and converted GDN weight representations are rejected.
 It does not select FA, predictor, Z, alpha or beta arithmetic. This diagnostic

@@ -768,13 +768,17 @@ size_t metadataCUDAQFNResidualWorkspaceBytes(
         const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding, full_terminal);
         if (!shape.valid())
             throw std::invalid_argument("QFN correction metadata admission requires complete native projection geometry");
-        // Reuse semantic/source validation before asking the generic kernel
-        // factory for only the names absent from the ordinary projection BOM.
-        (void)Qwen4ExpProjectionWorkspace::requirements(geometry.device,
+        // Project the residual names from the actual source-owned contract.
+        // Floating HC sources declare no Q8 banks; recomputing an unconditional
+        // residual reserve here would disagree with their real graph operation.
+        const auto complete=Qwen4ExpProjectionWorkspace::requirements(geometry.device,
             geometry.qfn_hc_up_activation, geometry.qfn_gdn_output_activation, true, role, tensor.name, tensor.quant_type,
             rows, shape.output_columns, shape.input_columns, geometry.qfn_fa_output_activation, profile.mainLayerCount(), geometry.qfn_gdn_qkv_activation, &profile);
-        additional.merge(gpuQ8ResidualCorrectionAdditionalWorkspaceRequirements(
-            rows, shape.output_columns, shape.input_columns));
+        WorkspaceRequirements residual;
+        for(const auto &bank:complete.buffers)
+            if(bank.name==kGPUProjectionResidualQ8 || bank.name==kGPUProjectionResidualQ8Scales)
+                residual.buffers.push_back(bank);
+        additional.merge(residual);
     }
     return additional.total_bytes_with_alignment();
 }

@@ -260,7 +260,7 @@ struct DevicePlanConfig
     bool runtime_device_policy_available = false;
 
     /// Setup-frozen arithmetic that changes named HC-up activation scratch only.
-    QuantizedActivationOperandPrecision qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
     /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
     QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
     /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.

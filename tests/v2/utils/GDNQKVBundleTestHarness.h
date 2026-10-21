@@ -3,8 +3,10 @@
  * @brief Four-distinct-source GDN stage regression over real prepared engines.
  *
  * Synthetic native Q8_0 QKV/Z and original F32 alpha/beta reproduce the source
- * formats of QFN (controls use its existing FP16 preparation). This component
- * uses the established test-only weight-pool allocation boundary; its single
+ * formats of QFN (controls use its existing FP16 preparation). A tiny mixed
+ * Q4_0-QKV/Q8_0-Z case also proves the expanded source contract without replacing
+ * those original-format controls. This component uses the established test-only
+ * weight-pool allocation boundary; its single
  * named workspace is admitted exactly by PMA. It does not certify model
  * admission, semantic query provenance or a full generation policy. Serial
  * submissions are diagnostic byte oracles, never a production implementation.
@@ -70,19 +72,26 @@ public:
      * @param stream Exact non-default native stream; null only for CPU.
      * @param k Original input width in complete native32 blocks.
      * @param columns QKV/Z/alpha/beta native output widths.
+     * @param qkv_format Original QKV source; Q4_0 is the mixed native control.
      */
     GDNQKVBundleFixture(DeviceId device, IDeviceContext &context,
         IWorkerGPUContext *worker, void *stream, int k,
-        std::array<int, 4> columns)
+        std::array<int, 4> columns, TensorType qkv_format = TensorType::Q8_0)
         : device_(device), context_(context), worker_(worker), stream_(stream),
           k_(k), columns_(columns), store_(ModelContextId{41971})
     {
+        requireGDNBundle(qkv_format == TensorType::Q8_0 || qkv_format == TensorType::Q4_0,
+            "Bundle fixture requires its authored QKV source format");
         if (device_.is_cpu() && !hasCPUBackend()) initCPUBackend(-1);
         backend_ = getBackendFor(device_);
         requireGDNBundle(backend_ && (device_.is_cpu() ? !worker_ && !stream_ : worker_ && stream_),
             "Bundle requires its actual backend/worker/exact stream");
-        originals_[0] = TestTensorFactory::createQ8_0Random(
-            {size_t(columns_[0]), size_t(k_)}, 419710);
+        if (qkv_format == TensorType::Q4_0)
+            originals_[0] = TestTensorFactory::createQ4_0Random(
+                {size_t(columns_[0]), size_t(k_)}, 419710);
+        else
+            originals_[0] = TestTensorFactory::createQ8_0Random(
+                {size_t(columns_[0]), size_t(k_)}, 419710);
         originals_[1] = TestTensorFactory::createQ8_0Random(
             {size_t(columns_[1]), size_t(k_)}, 419711);
         for (size_t i : {2u, 3u})
@@ -124,16 +133,19 @@ public:
         }
         for (size_t i = 0; i < 4; ++i)
         {
-            requireGDNBundle(originals_[i]->native_type() == (i < 2 ? TensorType::Q8_0 : TensorType::FP32) &&
-                weights_[i]->native_type() == (i < 2 ? TensorType::Q8_0 : TensorType::FP16),
+            const auto expected_type = i == 0 ? qkv_format : i == 1 ? TensorType::Q8_0 : TensorType::FP32;
+            requireGDNBundle(originals_[i]->native_type() == expected_type &&
+                weights_[i]->native_type() == (i < 2 ? expected_type : TensorType::FP16),
                 "Source format or default floating preparation changed");
             if (i < 2)
             {
                 NativeVnniSourceIdentity source;
-                requireGDNBundle(kernels_[i]->exportNativeVNNISourceIdentity(source) && source.present &&
-                    !source.is_superblock && source.codebook_id == native_vnni_formats::Q8_0.codebook_id &&
-                    source_bytes_[i].size() == size_t(columns_[i]) * (k_ / 32) * sizeof(Q8_0Block),
-                    "Original GGUF type8 must retain native execution codebook19; no weight conversion");
+                const auto *expected_source = native_vnni_formats::forQuantType(tensorTypeName(expected_type));
+                const size_t block_bytes = expected_type == TensorType::Q4_0 ? sizeof(Q4_0Block) : sizeof(Q8_0Block);
+                requireGDNBundle(expected_source && kernels_[i]->exportNativeVNNISourceIdentity(source) &&
+                    source.present && !source.is_superblock && source.codebook_id == expected_source->codebook_id &&
+                    source_bytes_[i].size() == size_t(columns_[i]) * (k_ / 32) * block_bytes,
+                    "Original quantized source must retain its exact native prepared provenance");
             }
             else
                 requireGDNBundle(kernels_[i]->floatingActivationOperandPrecision() == FloatingActivationOperandPrecision::FP16RNE,
@@ -625,9 +637,19 @@ private:
         bad = base; bad.qkv_row_range = DeviceRowRange::deviceCounted(15,
             static_cast<const int32_t *>(foreign_count.raw_data()));
         EXPECT_THROW({ GDNProjectionStage rejected(bad); }, std::invalid_argument);
-        Q4_0Tensor wrong_qkv(std::vector<size_t>{size_t(columns_[0]), size_t(k_)},
-            std::vector<uint8_t>(size_t(columns_[0]) * (k_ / 32) * sizeof(Q4_0Block)));
-        bad = base; bad.w_qkv = &wrong_qkv;
+        // Floating weights are not a quantized QKV source, even though alpha
+        // and beta intentionally keep their independent floating engines.
+        auto floating_qkv = TestTensorFactory::createFP32Zeros({size_t(columns_[0]), size_t(k_)});
+        bad = base; bad.w_qkv = floating_qkv.get();
+        EXPECT_THROW({ GDNProjectionStage rejected(bad); }, std::invalid_argument);
+        INT32Tensor integer_qkv(std::vector<size_t>{size_t(columns_[0]), size_t(k_)});
+        bad = base; bad.w_qkv = &integer_qkv;
+        EXPECT_THROW({ GDNProjectionStage rejected(bad); }, std::invalid_argument);
+        Q4_0Tensor wrong_shape_qkv(std::vector<size_t>{size_t(columns_[0]), size_t(k_ + 32)},
+            std::vector<uint8_t>(size_t(columns_[0]) * (k_ / 32 + 1) * sizeof(Q4_0Block)));
+        bad = base; bad.w_qkv = &wrong_shape_qkv;
+        EXPECT_THROW({ GDNProjectionStage rejected(bad); }, std::invalid_argument);
+        bad = base; bad.k -= 1;
         EXPECT_THROW({ GDNProjectionStage rejected(bad); }, std::invalid_argument);
         bad = base; bad.n_b += 1;
         EXPECT_THROW({ GDNProjectionStage rejected(bad); }, std::invalid_argument);
@@ -659,6 +681,13 @@ private:
             };
             EXPECT_THROW(attempt(), std::invalid_argument);
         };
+        // Q4_0 is now a supported source. A well-shaped foreign Q4_0
+        // tensor may pass construction, but cannot borrow this bundle's
+        // original prepared handle/engine, including when both types match.
+        Q4_0Tensor foreign_qkv(std::vector<size_t>{size_t(columns_[0]), size_t(k_)},
+            std::vector<uint8_t>(size_t(columns_[0]) * (k_ / 32) * sizeof(Q4_0Block)));
+        bad = base; bad.w_qkv = &foreign_qkv;
+        rejects_binding(bad);
         bad = base; bad.prepared_store = nullptr;
         rejects_binding(bad);
         bad = base; bad.prepared_ref_qkv = refs_[1];

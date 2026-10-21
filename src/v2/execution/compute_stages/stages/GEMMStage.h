@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <array>
+#include "utils/PerfStatsCollector.h"
+
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/DeviceRequestRowRanges.h"
 #include "kernels/common/Q8ResidualCorrection.h"
@@ -215,6 +218,21 @@ namespace llaminar2
         // registry maps), so raw pointers are safe here.
         ITensorGemm *cached_gemm_ = nullptr;
         bool cache_resolved_ = false;
+
+        /** @brief Actual selected API, independent of a caller's verifier request flag. */
+        enum class HCUpSubmissionOperation { Ordinary, DecodeEquivalent, FusedSwiGLU, ResidualCorrected };
+        /** @brief Bind original HC metadata once, independently of collection.
+         * @throws std::invalid_argument For foreign immutable source or policy.
+         * @details No device count is read. Keys own no mutable counter state.
+         */
+        void initializeHCUpSubmissionIdentities();
+        /** @brief Count one successful host submission with setup-bound metadata.
+         * @param columns Actual output width, authenticated against setup geometry.
+         * @param operation Actual API that succeeded, never inferred from request flags.
+         * @details CPU team zero observes once; GPU replay does not call execute.
+         */
+        void recordHCUpSubmission(int columns, HCUpSubmissionOperation operation);
+        std::array<std::optional<PerfStatsCollector::CounterIdentity>, 4> hc_submission_identities_;
 
         bool executeDecodeEquivalentVerifierPrefill(
             const TensorBase *A_base,

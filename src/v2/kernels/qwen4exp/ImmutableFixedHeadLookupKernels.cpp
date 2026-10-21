@@ -5,13 +5,38 @@
  * These checks never dereference device payload or live counters. Placement,
  * physical admission and source lifetime remain with their existing owners.
  * Native capacity is distinct from the validated per-replay transport extent.
+ * This kernel boundary selects only the explicitly requested compiled backend;
+ * disabled selections fail before native preparation, with no substitution.
  */
 #include "ImmutableFixedHeadLookupKernels.h"
 #include <array>
 #include <limits>
+#include <utility>
 
 namespace llaminar2::qwen4exp
 {
+std::unique_ptr<IImmutableFixedHeadLookupKernels> createImmutableFixedHeadLookupKernels(
+    DeviceId device,ImmutableFixedHeadLookupPlan plan)
+{
+    if(device.is_cuda())
+    {
+#ifdef HAVE_CUDA
+        return createCUDAImmutableFixedHeadLookupKernels(std::move(plan));
+#else
+        throw std::invalid_argument("Fixed-head lookup CUDA backend is not compiled");
+#endif
+    }
+    if(device.is_rocm())
+    {
+#ifdef HAVE_ROCM
+        return createROCmImmutableFixedHeadLookupKernels(std::move(plan));
+#else
+        throw std::invalid_argument("Fixed-head lookup ROCm backend is not compiled");
+#endif
+    }
+    throw std::invalid_argument("Fixed-head lookup requires an explicit CUDA or ROCm participant");
+}
+
 ImmutableFixedHeadLookupPlan ImmutableFixedHeadLookupPlan::bind(ImmutableResidentTableRangeView table,
     NgramHashPolicy policy,int participants,int participant)
 {

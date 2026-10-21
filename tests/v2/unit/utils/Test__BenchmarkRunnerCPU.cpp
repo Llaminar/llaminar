@@ -3017,6 +3017,7 @@ namespace
                                 const char *device, PerfStatsCollector::Tags tags)
         {
             PerfStatRecord record;
+            record.kind = PerfStatRecord::Kind::Counter;
             record.domain = domain;
             record.name = name;
             record.phase = phase;
@@ -3054,6 +3055,18 @@ namespace
             counter("kernel", "rocm_moe_decode_equivalent_runtime_m_router_calls", "capture", "rocm:1",
                 {{"seq_len", "4"}, {"route", "grouped_decode_equivalent_fp16"}}),
         };
+        // Synthetic passive records test projection only; no backend execution is claimed.
+        for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+            for (const char *policy : {"single_q8", "two_term_q8"})
+                records.push_back(counter("kernel", "hc_up_projection_submissions", "submission", device.toString().c_str(),
+                    {{"operand_precision", policy}, {"canonical_name", "blk.2.hc_ffn_up.weight"},
+                     {"weight_role", "HyperConnectionProjection"}, {"source_format", "Q8_0"},
+                     {"operation", std::string(policy)=="single_q8"?"ordinary":"q8_residual_corrected"},
+                     {"observation", "host_execute_or_capture"}, {"m", "64"}, {"n", "10240"}, {"k", "320"},
+                     {"row_binding", std::string(policy)=="single_q8"?"fully_active":"counted_prefix"},
+                     {"count_capacity", "64"}, {"first_physical_row", "0"},
+                     {"physical_rows", "64"}, {"row_schema_version", "2"},
+                     {"repeats_per_row", "1"}, {"verifier_requested", "false"}}));
         records.front().count = 2;
         records.front().value = 4.0;
         return records;
@@ -3083,6 +3096,7 @@ TEST(Test__BenchmarkRunnerCPU, RetainsSetupArithmeticObservationSeparatelyFromMe
     {
         emitArithmeticSetupFixture(expected);
         PerfStatsCollector::addCounter("kernel", "gdn_projection_route.unrelated", 99.0);
+        PerfStatsCollector::addCounter("kernel", "hc_up_projection_submissions.unrelated", 103.0);
         PerfStatsCollector::addCounter("kernel", "unrelated_setup_counter", 101.0);
     });
     OrchestrationConfig config;
@@ -3098,7 +3112,8 @@ TEST(Test__BenchmarkRunnerCPU, RetainsSetupArithmeticObservationSeparatelyFromMe
     {
         const auto &records = result.setup_warmup_arithmetic.records;
         const auto found = std::find_if(records.begin(), records.end(), [&](const auto &record)
-        { return record.domain == wanted.domain && record.name == wanted.name; });
+        { return record.domain == wanted.domain && record.name == wanted.name &&
+                 record.device == wanted.device && record.phase == wanted.phase && record.tags == wanted.tags; });
         ASSERT_NE(found, records.end()) << wanted.domain << '.' << wanted.name;
         EXPECT_EQ(found->kind, PerfStatRecord::Kind::Counter);
         EXPECT_EQ(found->phase, wanted.phase);

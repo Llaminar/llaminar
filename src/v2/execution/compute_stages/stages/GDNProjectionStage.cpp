@@ -225,10 +225,11 @@ namespace llaminar2
                 params_.input->cols() != static_cast<size_t>(params_.k) ||
                 params_.input->rows() < static_cast<size_t>(params_.m) ||
                 params_.output_qkv->native_type() != TensorType::FP32 ||
-                params_.w_qkv->native_type() != TensorType::Q8_0 ||
                 params_.w_qkv->rows() != static_cast<size_t>(params_.n_qkv) ||
                 params_.w_qkv->cols() != static_cast<size_t>(params_.k) || !params_.qkv_row_range)
-                throw std::invalid_argument("GDN TwoTermQ8 QKV requires distinct FP32 operands, original Q8_0 weights and original query rows");
+                throw std::invalid_argument("GDN TwoTermQ8 QKV requires distinct FP32 operands, original native quantized weights and original query rows");
+            (void)requireQ8ResidualSourceFormat(tensorTypeName(params_.w_qkv->native_type()),
+                params_.m,params_.n_qkv,params_.k);
             validateQ8ResidualTensorCapacities(params_.m, params_.n_qkv, params_.k,
                 params_.input->numel(), params_.output_qkv->numel());
             const std::array<const ITensor *, 4> weights{
@@ -279,9 +280,13 @@ namespace llaminar2
             !engine || (params_.gemm_qkv && params_.gemm_qkv != engine))
             throw std::invalid_argument("GDN corrected QKV prepared source/ref/engine mismatch");
         NativeVnniSourceIdentity source;
-        if (!engine->exportNativeVNNISourceIdentity(source) || !source.present || source.is_superblock ||
-            source.codebook_id != native_vnni_formats::Q8_0.codebook_id)
-            throw std::invalid_argument("GDN corrected QKV requires unchanged prepared native Q8_0 source provenance");
+        if (!engine->exportNativeVNNISourceIdentity(source))
+            throw std::invalid_argument("GDN corrected QKV requires unchanged original prepared source provenance");
+        const auto &prepared_source=requireQ8ResidualSourceFormat(source,params_.m,params_.n_qkv,params_.k);
+        const auto &original_source=requireQ8ResidualSourceFormat(
+            tensorTypeName(params_.w_qkv->native_type()),params_.m,params_.n_qkv,params_.k);
+        if(&prepared_source!=&original_source)
+            throw std::invalid_argument("GDN corrected QKV prepared provenance differs from its original tensor format");
         // Exact prepared N/K and native planes are additionally authenticated
         // by the backend's setup requirement query and correction entrypoint.
         // Do not construct temporary workspace declarations during execute.

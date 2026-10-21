@@ -9,6 +9,7 @@
  */
 #include "QwenGraphBase.h"
 #include "../qwen4exp/Qwen4ExpConfig.h"
+#include "../qwen4exp/Qwen4ExpHCUpArithmetic.h"
 #include <stdexcept>
 #include <utility>
 
@@ -38,6 +39,19 @@ Qwen4ExpHyperconnectionReadWeights readWeights(
     return {Qwen4ExpImmutableWeightBinding(*weights.norm->tensor),
             Qwen4ExpPreparedProjection(*weights.down, *store, device),
             Qwen4ExpPreparedProjection(*weights.up, *store, device)};
+}
+
+/**
+ * @brief Select query-scoped correction from one actual immutable HC-up source.
+ * @param config Frozen model-level quantized activation policy.
+ * @param up Authenticated prepared source consumed by the same graph builder.
+ * @return Whether this source executes the two-term quantized operation.
+ * @throws std::invalid_argument For unsupported source or invalid policy metadata.
+ */
+bool usesHCUpCorrection(const GraphConfig &config,const Qwen4ExpPreparedProjection &up)
+{
+    return resolveQwen4ExpHCUpArithmetic(config.qfn_hc_up_activation,
+        tensorTypeName(up.tensor()->native_type()))==Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8;
 }
 
 /** @brief Keep projection scratch distinct from both original and normalized branches. */
@@ -174,6 +188,7 @@ Qwen4ExpHyperconnectionBuilder::BlockRead QwenGraphBase::addBranchBlockRead(
     const auto &weights = attention ? binding.attention : binding.ffn;
     if (!weights.inject || !prepared_weight_store_)
         throw std::invalid_argument("Flash Next block mixer requires its paired injection projection");
+    const auto prepared_read=readWeights(weights,prepared_weight_store_,device);
     const std::string role = attention ? "attn" : "ffn";
     // The existing main path keeps its original primitive/projection policy.
     // Predictor rows instead arrive explicitly from MTPForwardInput, and every
@@ -186,10 +201,10 @@ Qwen4ExpHyperconnectionBuilder::BlockRead QwenGraphBase::addBranchBlockRead(
                     forward_input_construction_->sequence_lengths_device : nullptr) : std::nullopt));
     if (predictor)
         context.arithmetic = Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
-    else if (context.upOperandPrecision == QuantizedActivationOperandPrecision::TwoTermQ8)
+    else if (usesHCUpCorrection(config_,prepared_read.up))
         context.upProjectionRows = singleRequestProjectionQueryRows(rows, device);
     return Qwen4ExpHyperconnectionBuilder::appendRead(graph, context,
-        {readWeights(weights, prepared_weight_store_, device),
+        {prepared_read,
          Qwen4ExpPreparedProjection(*weights.inject, *prepared_weight_store_, device)},
         readBuffers(buffers, buffers.current_hidden, buffers.idFor(BufferId::HIDDEN_STATE),
                     buffers.normalized, buffers.idFor(BufferId::NORMALIZED)), {});
@@ -215,16 +230,16 @@ void QwenGraphBase::addBranchAttentionReadOnly(ComputeGraph &graph,
     if(!predictor && forward_input_construction_)applyForwardGraphConstructionIntent(graph,*forward_input_construction_);
     if (predictor && (predictor->rows().device()!=device || predictor->rows().tokens().physicalRows()!=rows))
         throw std::invalid_argument("Dense0 KV-only HC read must retain its original rows and participant");
+    const auto prepared_read=readWeights(predictor ? predictor->weights().fa_block.flash_next.attention :
+        layerWeightBindingsForGraph(layer_idx).flash_next.attention,prepared_weight_store_,device);
     auto context=mixerContext(config_, mpi_ctx_.get(), prefix + "hc_attn_", prefix + "attn_norm",
         predictor ? predictor->rows().primitives() : modelExtensionRows(rows,device),device,
         predictor ? std::optional{predictor->rows().tokens()} : std::nullopt);
     if (predictor) context.arithmetic=Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
-    else if (context.upOperandPrecision == QuantizedActivationOperandPrecision::TwoTermQ8)
+    else if (usesHCUpCorrection(config_,prepared_read.up))
         context.upProjectionRows = singleRequestProjectionQueryRows(rows, device);
     Qwen4ExpHyperconnectionBuilder::appendFinalRead(graph,context,
-        readWeights(predictor ? predictor->weights().fa_block.flash_next.attention :
-                               layerWeightBindingsForGraph(layer_idx).flash_next.attention,
-                    prepared_weight_store_, device),
+        prepared_read,
         readBuffers(buffers, buffers.current_hidden, buffers.idFor(BufferId::HIDDEN_STATE),
                     buffers.normalized, buffers.idFor(BufferId::NORMALIZED)), {});
 }
@@ -234,15 +249,16 @@ std::string QwenGraphBase::addBranchHeadRead(ComputeGraph &graph, TensorBase *hi
     int rows, DeviceId device, BufferId input_buffer_id)
 {
     if(forward_input_construction_)applyForwardGraphConstructionIntent(graph,*forward_input_construction_);
+    const auto prepared_read=readWeights(modelHyperConnectionHeadBindings(),prepared_weight_store_,device);
     auto context = mixerContext(config_, mpi_ctx_.get(), "hc_head_", "final_norm",
         modelExtensionRows(rows,device),device,
         config_.usesMTPGroupedDecodeEquivalentRows() ?
             projectionVerifierRows(device,rows,1,forward_input_construction_ ?
                 forward_input_construction_->sequence_lengths_device : nullptr) : std::nullopt);
-    if (context.upOperandPrecision == QuantizedActivationOperandPrecision::TwoTermQ8)
+    if (usesHCUpCorrection(config_,prepared_read.up))
         context.upProjectionRows = singleRequestProjectionQueryRows(rows, device);
     return Qwen4ExpHyperconnectionBuilder::appendFinalRead(graph, context,
-        readWeights(modelHyperConnectionHeadBindings(), prepared_weight_store_, device),
+        prepared_read,
         readBuffers(buffers_.layer_buffers, hidden, input_buffer_id,
                     normalized_out, BufferId::NORMALIZED),
         dependency.empty() ? std::vector<std::string>{} : std::vector<std::string>{dependency});

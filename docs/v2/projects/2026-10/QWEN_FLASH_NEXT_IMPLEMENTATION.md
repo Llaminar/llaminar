@@ -5,14 +5,20 @@ The architectural research is in
 [QWEN38_FLASH_NEXT_INFERENCE_RESEARCH.md](QWEN38_FLASH_NEXT_INFERENCE_RESEARCH.md).
 This document records implementation evidence; it does not replace live source contracts.
 
-The next feature-branch checkpoint freezes the installed five-profile HC-up
-TwoTerm accuracy candidate, after fresh complete Unit/production preflight and
-the combined broad, held-out and diagnostic-boundary corpus. The 769-test
-Unit/native preparation pass and subsequent 759-test Unit/paired-adapter pass
-are green. This checkpoint does not promote arithmetic defaults or qualify
-performance. The unfinished all-expert intermediate sharding and additional
-pipeline cases remain private drafts for the next slice. Local receipts and
-corpus payloads stay outside the source commit.
+The feature branch currently checkpoints the five paired HC-up TwoTerm
+accuracy profiles at `be08b63d`. The next slice promotes that accepted policy
+to the QFN HC-up default and extends correction to all 21 original quantized
+source formats on CPU, CUDA and ROCm. Focused correctness and architecture-wide
+spill checks pass; complete prerequisites, current-source model accuracy and
+component/counter cost measurements remain in progress. The first complete
+Unit attempt exposed stale fixtures that rejected formats now supported; their
+repairs retain source, ownership and geometry rejection coverage.
+
+Matched Release model measurements on the previous explicit TwoTerm policy
+are recorded below. Their trade-off was accepted before default promotion.
+Additional MPI2 mixed-resource cases and the unfinished all-expert intermediate
+sharding/pipeline cases remain separate work. Local receipts and corpus
+payloads stay outside the source commit.
 
 The distributed ngram and runtime hot-row cache design is recorded in
 [QFN distributed and adaptive ngram storage](QFN_NGRAM_TIERED_STORAGE_PLAN.md).
@@ -2856,3 +2862,131 @@ the five installed HC-up TwoTerm paired accuracy profiles and checkpoint the
 green slice. Additional within-expert sharding and PP work remains in separate
 uninstalled drafts and must not delay that checkpoint. HC-up and other
 production defaults remain unchanged; matched Release timing is pending.
+
+#### HC-up default and all-format correction, 2026-10-21
+
+The next checkpoint, `be08b63d`, passed the complete model-free prerequisite
+transaction (2,404 passes, 29 hardware skips, no failures) and the five paired
+short/held-out accuracy cells. The explicit HC-up TwoTerm control improved mean
+prefill and decode KL on every cell; the existing numerical limits were kept.
+Its broader accuracy report remains `accuracy-checkpoint57` under the ignored
+QFN parity-results directory.
+
+Matched Release ABBA runs on that unchanged source completed all twelve native
+lifecycles with identical 256-token generated sequences. Each job used 512
+actual prompt tokens, one warmup, three measurements, greedy sampling and MTP
+off. GPU-assisted cells used eight static GPU experts per layer and retained
+the other experts on CPU; these are not all-GPU throughput measurements.
+
+| Configuration | Single / TwoTerm prefill tok/s | Single / TwoTerm decode tok/s |
+|---|---:|---:|
+| CPU, mmap ngrams | 85.140 / 82.806 | 5.052 / 5.127 |
+| CUDA + CPU, static eight GPU experts | 145.522 / 145.968 | 13.655 / 13.823 |
+| ROCm + CPU, static eight GPU experts | 132.036 / 131.796 | 12.080 / 11.885 |
+
+These are pooled medians of six measurements per policy. CPU decode varied
+between successive process pairs, so its positive median delta is not evidence
+of a dependable speedup. The complete paired samples, native retirement checks
+and passive resource observations are in
+`hc-default58-model-abba-r2/comparison.json`. The user accepted this measured
+performance/accuracy trade-off and requested TwoTerm support for every required
+source format before promotion.
+
+The implementation now stages a source-owned HC-up policy: all 21 canonical
+NativeVNNI quantized formats apply two independently quantized activation banks
+to the same original prepared weights. Floating FP32/FP16/BF16 sources retain
+their native floating operation and reserve no residual-Q8 buffers. Generic
+GEMM, HC-down and the independent GDN/attention/router defaults remain separate.
+The HC-up default is set to TwoTerm in setup, graph and planning configuration;
+an explicit `single_q8` opt-out retains its original distinct cache identity.
+
+CPU reuses the existing original-format grouped microkernels. CUDA and ROCm
+share the canonical integer decoder and block contribution expressions; their
+cooperative tiles keep independent increasing-K primary/residual sums and one
+final addition. Existing Q8 kernel bodies are preserved. Cold IQ-table binding
+publishes one immutable generation-bound view safely across concurrent setup
+queries, without first-execute initialization or capture-time locking.
+
+The first all-architecture build found a CUDA IQ1_M register spill. A narrower
+32-column cooperative tile halves its live output accumulators while retaining
+the original arithmetic and two-CTA launch bound. CUDA SM80/86/89/90 and HIP
+gfx906 correction objects now pass the unchanged spill guard. This compile
+result does not certify native correctness or performance.
+
+Focused validation covers independent FP64 source/prepared oracles,
+primary/residual bank contents, serial/grouped byte identity, inactive poisoned
+rows, retained full/small/empty/full replay, all original formats, real AVX2 and
+AVX512 execution, positive CPU team sizes, and M512/M1024/M2048. Pure planning
+and real floating-graph regressions also guard the discovered Q8-only consumer
+checks and unnecessary floating-source residual reservation.
+
+The first focused all-format transaction passed **17/17 registrations** in
+67.4 seconds with clean driver diagnostics. A subsequent transaction passed
+**15/15 full-backend checks and 17/17 genuine CPU-only AVX2 checks** in 76.8
+seconds, also with clean driver diagnostics. These include the existing
+GDN/attention residual paths, current default/cache/workspace policies, all
+positive CPU worker counts through 28, grouped geometry crossover boundaries,
+and actual CPU-cold Q5_1 promotion to the GPU's expanded asymmetric layout.
+The latter executes the explicit generic correction API after the real transfer
+and prepared-store publication; it does not change expert precision defaults.
+Evidence is retained in the ignored `/tmp/qfn-focused59-allformats-r1` and
+`/tmp/qfn-focused59-postbatch-r1` directories.
+
+The genuine CPU-only rebuild exposed an unconditional GPU lookup-factory link
+dependency. Backend selection now belongs to the common kernel factory, whose
+compiled backend cases reject unavailable selections precisely. The existing
+`ImmutableFixedHeadLookupContract` preflight entry covers that boundary; both
+the rebuilt CPU-only binary and full-backend fixture pass.
+
+HC-up submission observations now bind immutable counter identities during
+setup and share the existing PerfStats epoch/record authority. They describe
+successful host submissions or capture calls, not GPU replay counts or device
+live rows. Request-bank and prefix-count ownership remain distinct. Focused
+checks prove reset/filter behavior, actual source format, floating-source
+selection, request holes and one observation per CPU workshare submission.
+Separate Release enabled/disabled timing remains pending.
+
+Complete Unit and production preflight, separate Release timing/resource
+evidence and the five current-source paired accuracy cells remain required
+before this slice is checkpointed. CUDA CUPTI attachments remain suspended
+after the previously recorded driver assertion; static resource evidence and
+native graph/event observations cannot establish achieved occupancy or hardware
+memory efficiency. The CPU counter access probe also fails under this host's
+`perf_event_paranoid=4`; no host policy was changed. Unprofiled physical-core
+timing and compiled ISA inspection do not supply CPU IPC/cache-miss measurements.
+No image, long-context or retained-MTP qualification is
+implied by the earlier short accuracy and Release ABBA results.
+
+
+#### Complete failure inventory and fixture repair, 2026-10-21
+
+The first current-tree Unit run completed all 754 registrations: 750 passed
+and four failed. The separate diagnostic continuation then completed all
+1,698 Integration preflight registrations: 1,657 passed, 29 lacked their
+required accelerator count, and 12 failed. No test was omitted to obtain that
+inventory. The pause interrupted its parent/monitoring wrappers while CTest
+continued; the surviving native process was observed to normal retirement.
+The original pre-midpoint and resumed remaining-lifetime driver windows were
+clean, but this interrupted diagnostic is explicitly not a prerequisite receipt.
+Evidence is retained under `preflight59-failure-inventory/`, including the
+original failed owner windows and `resumed-diagnostic-result.json`.
+
+Every collected failure maps to an obsolete test expectation: HC row-authority
+fixtures used floating weights that now intentionally remain floating; GDN
+and workspace fixtures rejected newly supported original quantized formats;
+and the target inventory omitted the now-supported CPU performance executable.
+The prepared fixes now use real prepared quantized HC weights and sufficient
+arena capacity, accept every canonical quantized format in metadata tests,
+and retain floating/unknown-format, geometry, source/ref/engine and row-owner
+rejections. The mixed Q4-QKV/Q8-Z positive bundle and all-format HC row binding
+have explicit production-preflight registrations. No arithmetic or numerical
+threshold was changed by this repair batch. Focused rebuilt tests and a fresh
+canonical complete prerequisite transaction remain required.
+
+The repaired focused transaction passes all **16/16 full-backend** and
+**14/14 genuine CPU-only AVX2** registrations in 40.2 seconds, with a clean
+driver window. It includes the four previously failing Unit registrations,
+the affected host aliases, both exact GPU GDN bundle aliases and both new
+focused registrations. The old source-identity and no-write rejection tests
+remain intact. Evidence is `/tmp/qfn-focused60-fixture-repairs-r1/`.
+The complete refreshed gate is tracked separately as checkpoint60.

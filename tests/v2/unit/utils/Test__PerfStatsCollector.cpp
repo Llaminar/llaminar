@@ -1574,3 +1574,28 @@ TEST(Test__PerfStatsCollector, FlushFromEnvWritesMultipleFilteredDomainsForMTPGr
     std::filesystem::remove(json_path);
     std::filesystem::remove(csv_path);
 }
+
+/** @test Bound dimensions survive reset without retaining an old accumulator or publishing at setup. */
+TEST(PerfStatsCollector, BoundCounterIdentityUsesCurrentEpochAndCollectionPolicy)
+{
+    ScopedEnv enabled("LLAMINAR_PERF_STATS_JSON", "-");
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel");
+    PerfStatsCollector::reset();
+    const auto key = PerfStatsCollector::bindCounter("kernel", "bound_identity", "submission", "cpu:0", {{"operation", "ordinary"}});
+    EXPECT_TRUE(PerfStatsCollector::snapshot().empty());
+    PerfStatsCollector::addCounter(key);
+    PerfStatsCollector::addCounter(key, 2.0);
+    auto rows=PerfStatsCollector::snapshot();
+    ASSERT_EQ(rows.size(),1u); EXPECT_EQ(rows[0].count,2u); EXPECT_DOUBLE_EQ(rows[0].value,3.0);
+    PerfStatsCollector::reset();
+    EXPECT_TRUE(PerfStatsCollector::snapshot().empty());
+    PerfStatsCollector::addCounter(key);
+    rows=PerfStatsCollector::snapshot();
+    ASSERT_EQ(rows.size(),1u); EXPECT_EQ(rows[0].count,1u); EXPECT_DOUBLE_EQ(rows[0].value,1.0);
+    {
+        ScopedEnv disabled("LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        PerfStatsCollector::addCounter(key);
+    }
+    rows=PerfStatsCollector::snapshot(); ASSERT_EQ(rows.size(),1u); EXPECT_EQ(rows[0].count,1u);
+    PerfStatsCollector::reset();
+}

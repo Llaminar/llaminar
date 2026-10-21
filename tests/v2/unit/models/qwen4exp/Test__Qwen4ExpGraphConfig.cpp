@@ -36,7 +36,12 @@ TEST(Qwen4ExpGraphConfig, HCUpActivationPolicyIsFrozenForPlanningAndReplay)
     EXPECT_EQ(ordinary.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
     const auto copied = candidate;
     EXPECT_EQ(copied.qfn_hc_up_activation, QuantizedActivationOperandPrecision::TwoTermQ8);
-    EXPECT_EQ(GraphConfig{}.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    setup.qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
+    GraphConfig default_graph;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false), default_graph);
+    EXPECT_EQ(default_graph.qfn_hc_up_activation, candidate.qfn_hc_up_activation);
+    EXPECT_NE(default_graph.qfn_hc_up_activation, ordinary.qfn_hc_up_activation);
+    EXPECT_EQ(GraphConfig{}.qfn_hc_up_activation, kDefaultQwen4ExpHCUpActivation);
 }
 
 TEST(Qwen4ExpTerminalWeights, NativeHeadInventoryAndFrozenBindingsReplaceOrdinaryNorm)

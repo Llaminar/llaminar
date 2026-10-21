@@ -80,7 +80,8 @@ namespace
 TEST(Test__DeterministicMode, FlashNextHCUpActivationPolicyIsExplicit)
 {
     ScopedEnv defaults({{"LLAMINAR_QFN_HC_UP_ACTIVATION", nullptr}});
-    EXPECT_EQ(GemmConfig{}.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    EXPECT_EQ(GemmConfig{}.qfn_hc_up_activation, kDefaultQwen4ExpHCUpActivation);
+    EXPECT_EQ(GemmConfig{}.qfn_hc_up_activation, parseQuantizedActivationOperandPrecision("two_term_q8"));
     const auto gdn = debugEnv().gemm.gdn_projection_arithmetic;
     const auto router = debugEnv().gemm.moe_router_arithmetic;
     for (const auto policy : {QuantizedActivationOperandPrecision::SingleQ8,
@@ -94,7 +95,7 @@ TEST(Test__DeterministicMode, FlashNextHCUpActivationPolicyIsExplicit)
         EXPECT_EQ(debugEnv().gemm.gdn_projection_arithmetic, gdn);
         EXPECT_EQ(debugEnv().gemm.moe_router_arithmetic, router);
     }
-    EXPECT_EQ(debugEnv().gemm.qfn_hc_up_activation, QuantizedActivationOperandPrecision::SingleQ8);
+    EXPECT_EQ(debugEnv().gemm.qfn_hc_up_activation, kDefaultQwen4ExpHCUpActivation);
     for (const auto invalid : {"", "auto", "native", "fp16", "q8", "two_q8", "TWO_TERM_Q8", "two_term_q8 "})
         EXPECT_THROW(parseQuantizedActivationOperandPrecision(invalid), std::invalid_argument);
     EXPECT_THROW(quantizedActivationOperandPrecisionName(

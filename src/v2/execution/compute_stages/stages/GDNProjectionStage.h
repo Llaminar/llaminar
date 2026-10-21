@@ -109,7 +109,7 @@ namespace llaminar2
             /**
              * @brief Independent arithmetic for original prepared QKV only.
              * SingleQ8 preserves the existing complete bundle. TwoTermQ8 uses
-             * the same immutable Q8_0 weights and the existing correction API,
+             * the same immutable native quantized weights and the existing correction API,
              * then submits Z/alpha/beta with their original policies. Its
              * residual/primary banks share this stage's admitted workspace;
              * QKV completes on the parent stream before siblings reuse them.

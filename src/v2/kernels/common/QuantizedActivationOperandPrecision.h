@@ -15,6 +15,9 @@ namespace llaminar2
     /** @brief Projection activation policy; SingleQ8 retains existing arithmetic. */
     enum class QuantizedActivationOperandPrecision { SingleQ8, TwoTermQ8 };
 
+    /** @brief QFN HC-up default only; generic GEMM and other projections retain their own policy. */
+    inline constexpr auto kDefaultQwen4ExpHCUpActivation = QuantizedActivationOperandPrecision::TwoTermQ8;
+
     /**
      * @brief Serialize an activation policy for configuration and cache metadata.
      * @param precision Immutable graph-owned arithmetic selection.

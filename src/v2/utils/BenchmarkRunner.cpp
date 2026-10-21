@@ -543,6 +543,7 @@ namespace llaminar2
 
         static const std::vector<PerfStatsCollector::RecordFamily> families{
             {"kernel", "gdn_projection_route"},
+            {"kernel", "hc_up_projection_submissions"},
             {"weight_loading", "gdn_projection_arithmetic_prepared_weight"},
             {"weight_loading", "moe_router_arithmetic_prepared_weight"},
             {"kernel", "cpu_moe_fp16_operand_router_calls"},

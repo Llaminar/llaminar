@@ -1,7 +1,10 @@
 # QFN numerical qualification and matched performance plan
 
-Status: short-context absolute pilot passed for HC-up TwoTerm; canonical
-integration and matched performance pending, 2026-10-21.
+Status: the five canonical short-context HC-up TwoTerm profiles and matched
+CPU/single-GPU-plus-CPU Release measurements passed at the prior checkpoint.
+Default promotion and all-format correction are undergoing fresh qualification,
+2026-10-21. The larger topology and timed-context performance matrix remains
+open; the historical pilot observations below retain their original scope.
 This plan records obligations, not additional advertised runtime support.
 Measurements remain in [the implementation project](QWEN_FLASH_NEXT_IMPLEMENTATION.md).
 
@@ -212,6 +215,129 @@ Preserve VRAM > RAM > SSD priority and lowest-priority ngram VRAM admission.
 A zero-cache control does not prove positive-capacity promotion or eviction.
 Verify actual grants, traffic, hot-row movement and reset for each supported
 placement; avoid an invalid Cartesian product of mode names and topologies.
+
+
+### Additional requested device and ngram cells
+
+The following three accuracy/performance pairs are required additions to the
+matrix. They preserve every topology-family obligation above. Participant
+counts specify requested physical resources; they do not choose a PP split,
+TP domain, expert partition or transport, and they do not establish support.
+Compile each agreed composition through the original
+`ModelParityTopologyDefinition` → `ModelParityCase` authority before attaching
+its paired workload. Do not create a parallel topology list in a runner or
+infer a supported six-device mixed-vendor TP group from the device count.
+
+| Requested participants | Required runtime ngram residency | Initial composition candidate, pending admission |
+|---|---|---|
+| Two CUDA GPUs and two CPU participants | RAM | CUDA TP2 continuation with both original CPU participants in expert domains. |
+| Two CUDA GPUs and four ROCm GPUs | Full GPU VRAM | ROCm TP4 continuation, CUDA expert-only domain, and fixed-head sharded VRAM ngrams on the actual ROCm TP4 lookup cohort. |
+| Two CUDA GPUs, four ROCm GPUs and two CPU participants | RAM | ROCm TP4 continuation, CUDA expert-only domain and both original CPU participants in expert domains. |
+
+The initial economical candidates use explicit named same-layer expert-overlay
+domains, with all 48 layers' dense/shared/router and PLE work on the sole
+continuation cohort. They require an explicit `Apportioned` expert policy:
+all 512 original expert IDs per layer are covered exactly once across the
+actual expert participants, rather than replicated or intermediate-dimension
+sharded. These are proposed compositions, not installed or qualified cells.
+Positive CPU work/quota, physical endpoint binding, cross-domain movement and
+observer/MPI domain proof remain required. Initial cells use StaticOrdinal with
+MTP off; existing cells, runtime defaults and policy axes are unchanged.
+A later PP composition with ROCm
+TP4 and CUDA TP2 is a separate candidate; do not substitute it for these pairs.
+The current fixed-head sharded path rejects partial-layer/PP token-producer
+handoff, so the first six-GPU candidate keeps the full continuation and lookup
+on ROCm TP4. Its lookup layout must use that sole actual PLE consumer cohort;
+GPU count alone does not authorize a mixed-vendor fixed-head collective.
+
+All three initial cells use two node-local MPI ranks with explicit original
+owner maps. Each homogeneous NCCL/RCCL group remains rank-local to its actual
+owner; cross-domain dispatch/return uses the existing sparse transport.
+
+| Requested cell | MPI rank 0 | MPI rank 1 |
+|---|---|---|
+| CUDA2 + CPU2 / RAM | CUDA0,1 continuation and first CPU socket's expert endpoint | Second CPU socket's expert endpoint |
+| CUDA2 + ROCm4 / GPU ngrams | ROCm0..3 continuation, no CPU expert endpoint | CUDA0,1 expert-only domain, no CPU expert endpoint |
+| CUDA2 + ROCm4 + CPU2 / RAM | ROCm0..3 continuation and first CPU socket's expert endpoint | CUDA0,1 expert-only domain and second CPU socket's expert endpoint |
+
+The existing `ExpertOnlyFollower` prepares and retains rank 1's actual local
+expert endpoints. Merely putting a foreign GPU domain beside the continuation
+on rank 0 does not create that follower: the same-rank foreign-GPU execution
+guard remains. Current observer guards reject MPI2 and require a narrow actual
+owner/path extension before these cells can qualify. This is a proposed use of
+existing machinery, with admission, capture and retirement still unproved.
+
+The accepted initial tier parameters below are explicit first benchmark
+intent, not capacity estimates, measured optima, planner defaults or reservations.
+Caps apply to each layer's tier across its participants, not independently to
+each GPU. Final coverage is uncapped within that tier's actual admitted resources.
+
+| Requested cell | Priority and per-layer expert-count caps |
+|---|---|
+| CUDA2 + CPU2 / RAM | CUDA priority 0, cap 256; CPU priority 10 completes the remainder with equal socket weights. |
+| CUDA2 + ROCm4 / GPU ngrams | ROCm priority 0, cap 320; CUDA priority 10 completes the remainder; no CPU expert tier. |
+| CUDA2 + ROCm4 + CPU2 / RAM | ROCm priority 0, cap 320; CUDA priority 10, cap 128; CPU priority 20 completes the remainder with equal socket weights. |
+
+Use the existing public tier caps/weights and canonical source-aware PMA
+admission. A cap is an upper bound, not an admitted grant. Bind the actual
+per-layer expert IDs, quotas, source/prepared owners and complete nonoverlapping
+512-expert coverage into paired identity. Lower admitted nonfinal quotas leave
+more work for the declared final tier or cause rejection; they never authorize
+an added CPU tier in the GPU-only cell, reduced coverage or changed storage.
+Require positive admitted ownership on the requested GPU groups and both CPU
+sockets where present. Controlled focused routing must prove actual CPU work;
+do not alter frozen teacher histories to force panel routes through those owners.
+
+Each CPU endpoint belongs to one observed physical socket. Validate the actual
+NUMA endpoint, distinct physical-core worker sets, rank mapping and memory
+affinity before admission; CPU ordinal and MPI rank order do not establish
+socket identity. Generic local CPU device labels cannot stand in for two socket
+owners. RAM cells retain one host ngram table owner on rank 0, where the sole
+continuation/PLE consumers live; rank 1's expert-only preparation must not
+materialize another table. Cross-NUMA access and imported/shared mappings retain
+the original storage owner and exact PMA contribution. Two CPU participants are
+not merely two host launch threads or RAM-service labels.
+
+For each new cell:
+
+- Prove cold original-source/PMA admission, exact participant and stage/domain
+  membership, source-format geometry, actual expert coverage and projection
+  placement, and every graph/workspace/transport owner. A metadata declaration
+  or aggregate VRAM count is not materialization evidence. Record a precise
+  capacity rejection or missing implementation instead of substituting a
+  smaller topology, changed tier policy or another storage tier.
+- Bind RAM or GPU residency to the original concrete ngram plan. The full-GPU
+  row needs GPU-only compute/expert placement, an explicit supported
+  replication/sharding/ownership layout, and actual per-device bytes and lookup
+  traffic. A CPU expert tier cannot substitute for failed GPU capacity.
+  Do not presume pooled storage is implemented, replicate a table that does
+  not fit, spill live lookup data to
+  host RAM/SSD, or report a zero-cache/adaptive-source control as full residency.
+  Original file/source backing and setup metadata do not authorize runtime
+  host lookup. Admission must include the requested timed context and KV,
+  not just a short-context smoke.
+- Extend the actual observer/path proof to the agreed composition; the current
+  CPU, single-GPU-plus-CPU, three-stage CPU-tail and ROCm TP4 proofs do not
+  authenticate these new shapes. Preserve complete captured homogeneous
+  execution, declared heterogeneous boundaries, live-only communication,
+  publication, reset and retirement. Add the focused typed inventory/admission
+  and production-preflight regressions for any missing guard or implementation.
+- Use the same original GGUF/predictor binding, effective public configuration,
+  all six arithmetic selectors, topology/NUMA mapping and ngram layout for the
+  canonical accuracy and Release benchmark projections. Score the frozen
+  prompt-balanced corpus with phase/offset mean KL, top-1, literal mean top-5,
+  probability/tail diagnostics and exact reset proof; retain full 48-layer/stage
+  history replay for diagnosis. Timed-context accuracy remains required. Do not
+  change thresholds, suppress failed rows or infer numerical green from cold
+  admission or preflight. Attach real approved workload/calibration references
+  through the existing paired-workload interface when available.
+
+These are requested Llaminar mixed-resource cells. The pinned fork's safe
+CUDA/ROCm coexistence and corresponding mixed-vendor execution remain unproved;
+its four-MI50 TP4 and TP2×PP2 profiles are distinct comparison instances. Keep a
+new cell's standalone accuracy/performance result separate from a matched fork
+claim until original devices, work ownership, residency, tokens, context, KV,
+precision and timing scope have an applicable, demonstrated counterpart.
 
 ## Functional and performance execution
 

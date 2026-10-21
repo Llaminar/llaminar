@@ -101,7 +101,7 @@ struct WorkspaceMemoryGeometry
     attention::AttentionVisibilityPolicy attention_visibility =
         attention::AttentionVisibilityPolicy::General; ///< Model schema's immutable visibility.
     /// Frozen QFN HC-up arithmetic, shared with exact stage workspace declarations.
-    QuantizedActivationOperandPrecision qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
     /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
     QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
     /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.

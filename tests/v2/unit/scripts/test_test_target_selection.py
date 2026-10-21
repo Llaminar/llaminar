@@ -123,10 +123,10 @@ endforeach()
         for performance_only in (False, True):
             for cuda, rocm in ((False, False), (True, False), (False, True), (True, True)):
                 with self.subTest(performance_only=performance_only, cuda=cuda, rocm=rocm):
-                    expected = ["v2_perf_qwen_sparse_selection"]
+                    expected = ["v2_perf_qwen_sparse_selection",
+                                "v2_perf_q8_residual_prepared_projection"]
                     if cuda or rocm:
-                        expected += ["v2_perf_q8_residual_prepared_projection",
-                                     "v2_perf_immutable_adaptive_lookup"]
+                        expected += ["v2_perf_immutable_adaptive_lookup"]
                     if cuda:
                         expected.append("v2_perf_cuda_qwen_sparse_selection")
                     if rocm:
