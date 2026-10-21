@@ -1,10 +1,10 @@
 # QFN tuning dashboard
 
-Updated: 2026-10-21 20:54 UTC.
+Updated: 2026-10-21 21:59 UTC.
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.
 
-**Priority:** the next focused win is **four-MI50 decode against Castagna Veloce's 42.959 tok/s**, while preserving the prefill lead and numerical acceptance. The four policy pairs below have been exercised: retain `TensorParallel + GateUpOwnedDownColumns` as the fastest numerically green pair and tune its compact-intermediate import next. TP4 names the participant count, not either policy pair. Other topology tuning is parked until this focused pass is settled; then resume A before novel compositions and remaining families in B–D.
+**Priority:** the next focused win is **four-MI50 decode against Castagna Veloce's 42.959 tok/s**, while preserving the prefill lead and numerical acceptance. The four policy pairs below have been exercised: retain `TensorParallel + GateUpOwnedDownColumns` as the fastest numerically green pair. The requested [CPU ngram investigation](QFN_NGRAM_CPU_PATH_INVESTIGATION.md#measured-follow-up-host-worker-placement-2026-10-21) found all four lookup-service workers sharing one physical core. Candidate69 fixes that placement with green regressions and unchanged logits; paired throughput is effectively unchanged. Test the prepared compact-intermediate import candidate next. TP4 names the participant count, not either policy pair. Other topology tuning is parked until this focused pass is settled; then resume A before novel compositions and remaining families in B–D.
 
 Current evidence: all five admitted rows passed checkpoint60 accuracy. **A1–A4 now have uninstrumented Llaminar observations; A4 is ahead of Castagna in both phases, while A1 decode and A2 prefill remain behind their selected references.** A3 is ahead of the recorded upstream samples, whose decode variance remains unresolved, but A2 and A3 both remain below Strata's approved approximate-policy decode reference. Strata's full-routing and default-tail7 controls are complete for A2/A3. Complete checkpoint60 Unit/production preflight and all five model accuracy cells passed, with clean drivers, unchanged runtime metadata, exact reset replay and normal native retirement. The qualified source is committed and pushed to `feat/qwen-flash-next` as `6c06e8efe`; its commit hook authenticated all 2,454 prerequisite registrations without rerunning them.
 
@@ -12,11 +12,11 @@ Accuracy legend: **🟢 GREEN** = all required numerical groups and execution/re
 
 ## A. Implemented and admitted — baseline and tune first
 
-`G60` names the last complete qualification checkpoint. `L62` names the original uninstrumented Llaminar Release measurements. `L66†` adds the measured GPU-control affinity improvement to the phase-aware transfer candidate; its complete Unit suite, focused checks and Release accuracy passed, with complete production preflight pending. `L64†` remains the earlier transfer-scheduling checkpoint. A4 passes both phase comparisons on the declared short workload; A3's reference variance remains open. Historical `R58†` values remain in the evidence discussion and do not populate current measured rows.
+`G60` names the last complete qualification checkpoint. `L62` names the original uninstrumented Llaminar Release measurements. `L69†` adds the lookup-worker placement correctness fix; its complete Unit suite, focused checks and Release accuracy passed, with effectively unchanged paired throughput and complete production preflight pending. `L66†` remains the earlier measured GPU-control affinity improvement. `L64†` remains the earlier transfer-scheduling checkpoint. A4 passes both phase comparisons on the declared short workload; A3's reference variance remains open. Historical `R58†` values remain in the evidence discussion and do not populate current measured rows.
 
 | ID | Topology / actual work placement | Ngrams | Reference engine | Accuracy | Llaminar prefill | Reference prefill | Strata prefill | Llaminar decode | Reference decode | Strata decode | Next action |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts | RAM | Castagna | [🟢 GREEN G60][a1]; L66† Release accuracy green | 784.382 L66† | 467.821 F62§ | — | 33.376 L66† | 42.959 F62§ | — | Affinity66 adds 5.41% decode with 0.68% higher prefill. Tune compact imports next; full preflight remains pending. |
+| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts | RAM | Castagna | [🟢 GREEN G60][a1]; L69† Release accuracy green | 785.182 L69† | 467.821 F62§ | — | 33.238 L69† | 42.959 F62§ | — | Lookup-worker placement fixed; paired throughput effectively unchanged. Test compact imports next; full preflight remains pending. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |
@@ -28,7 +28,7 @@ Use the exact policy names in subsequent four-GPU records. The dense-compute pol
 
 | ID | Dense-compute policy | Expert policy | QFN accuracy | Llaminar prefill | Castagna prefill | Llaminar decode | Castagna decode | Status |
 |---|---|---|---|---:|---:|---:|---:|---|
-| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L66† Release required groups | 784.382 | 467.821 | 33.376 | 42.959 | Current admitted pair; paired transfer-scheduling and affinity comparisons passed. |
+| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L69† Release required groups | 785.182 | 467.821 | 33.238 | 42.959 | Current admitted pair; lookup-worker placement corrected with unchanged logits and effectively unchanged throughput. |
 | A1.1 | `TensorParallel` | `Apportioned` | 🟢 L64† Release required groups | 561.867 | 467.821 | 30.515 | 42.959 | Accuracy, corrected SnapshotAdmission and timing passed; slower than current A1 in both phases. |
 | A1.2 | `PrefillTensorParallelDecodeReplicated` | `GateUpOwnedDownColumns` | 🔴 L65† Release short decode row KL | — | 467.821 | — | 42.959 | Admission and native execution passed; one forced decode row KL 1.119 exceeds the unchanged 1.0 ceiling. Diagnose before promotion. Timing pending. |
 | A1.3 | `PrefillTensorParallelDecodeReplicated` | `Apportioned` | 🟢 L65† Release required groups | 382.757 | 467.821 | 30.761 | 42.959 | Retained **Ornith** arrangement; admission, accuracy and timing passed, but both phases are slower than the current A1 control and Castagna. |
@@ -88,6 +88,14 @@ The [actual Castagna CUDA build](../../../../parity-results/qwen-flash-next/cast
 `U62⚠` ([A3 upstream result](../../../../parity-results/qwen-flash-next/a3-baseline62-upstream-cuda-cpu28-mmap/result.json)) completed operationally with normal exit0, clean driver and unchanged source/runtime identities. Median prefill was **129.0201624** and decode **13.0586671** tok/s. The three measured prefill rates were **129.4207 / 129.0202 / 127.6413**, range **127.6413–129.4207**; decode was **17.4166 / 13.0587 / 12.2933**, range **12.2933–17.4166**. **Decode variance review is pending; no stable win is claimed**, and the older instrumented R58 Llaminar rates are not a fresh paired measurement. Placement evidence combines source-declared `cpu-moe`/cache0 with actual props, OS and NVML observations; the **full tensor map remains UNKNOWN**. Default-verbosity model-buffer logs were unavailable, and props does not expose tensor ownership. Incidental GPU contexts are not compute-placement proof. Preserve the intended whole-CPU-expert versus Llaminar 8-GPU/504-CPU and lazy-mmap versus adaptive-zero-cache distinctions without treating source intent as full native tensor-placement authentication.
 
 **A5's exact reference is unavailable in these pins/builds.** The requested ordered placement is CUDA0 layers `[0,8)`, ROCm0 `[8,20)`, then CPU NUMA0 `[20,48)`. Both pinned parsers reject CPU entries in `--device` ([Castagna](https://github.com/benpeterson40/castagna-veloce/blob/3483d462715d61f21ed5877836be35a724446359/common/arg.cpp#L1128), [upstream](https://github.com/ggml-org/llama.cpp/blob/0a1ef309cdbb9f2024f58a38fb4c42352c5db569/common/arg.cpp#L1134)). Their layer allocators expose a CPU **prefix** followed by a GPU suffix, not this CPU tail ([Castagna](https://github.com/benpeterson40/castagna-veloce/blob/3483d462715d61f21ed5877836be35a724446359/src/llama-model.cpp#L1693), [upstream](https://github.com/ggml-org/llama.cpp/blob/0a1ef309cdbb9f2024f58a38fb4c42352c5db569/src/llama-model.cpp#L1670)). CPU tensor overrides only select weight buffers; KV and recurrent state still follow `model.dev_layer` ([KV owner](https://github.com/ggml-org/llama.cpp/blob/0a1ef309cdbb9f2024f58a38fb4c42352c5db569/src/llama-kv-cache.cpp#L216), [recurrent owner](https://github.com/ggml-org/llama.cpp/blob/0a1ef309cdbb9f2024f58a38fb4c42352c5db569/src/llama-memory-recurrent.cpp#L87)). Existing artifacts also enable only HIP or only CUDA; a mixed-runtime process is not established. This is a reference interface/build limitation, not hardware unavailability, numerical failure or a Llaminar win. Do not substitute a CPU prefix, whole-expert offload or another topology. This A5-specific finding does not decide support for the separate B–D rows.
+
+## Candidate69: lookup-worker placement
+
+The [CPU ngram investigation](QFN_NGRAM_CPU_PATH_INVESTIGATION.md) identified four real lookup workers restricted to one physical core. Construction now uses the existing admitted OpenMP partition and restores the caller exactly. Both CUDA/ROCm bound negative controls reproduced the old defect, both unbound controls passed, and all eight focused registrations passed after the fix. The four worker-affinity regressions are explicitly in production preflight. Complete Unit passed **754/754**; the frozen Release numerical panel passed with all **185 retained logit rows byte-identical to L66**. This is a placement correctness fix, not a measured speed win. Complete current-source production preflight remains pending.
+
+The [unprofiled A/B/B/A comparison](../../../../parity-results/qwen-flash-next/ngram69-abba-comparison.json) retained all twelve samples, six per runtime. Control medians are **784.599102 prefill / 33.326504 decode tok/s**; candidate medians are **785.181665 / 33.237744**, or **+0.07425% / −0.26634%**. Control ranges are **784.229200–785.816661 / 33.285583–33.402426**; candidate ranges are **784.420225–786.116590 / 33.226563–33.389609**. The ranges overlap. All twelve 256-token sequences match; every arm passed driver, resource, source/runtime and normal-retirement checks. The workload remains A1: four MI50s, 28 physical NUMA1 host workers, RAM ngrams, N512/D256/M512/C4096, greedy seed42, MTP/prefix cache/PerfStats off, one warmup and three measured requests per process. Decode counts 255 tokens after prefill. No precision, table-locking, source-validation, polling or transport policy changed.
+
+The next candidate combines independent compact packet imports into one GPU kernel per layer, preserving live bytes and arithmetic. It is prepared but has no compiled, functional, profile or speed result yet.
 
 ## Additional Strata reference — full routing and default approximation
 
@@ -278,6 +286,24 @@ repair, focused fixture fixes and explicit policy-comparison regressions.
 **A1.2 remains numerically red; full current-source production preflight remains
 pending.** The private compact-import and scheduler-ticket experiments are not
 part of this checkpoint.
+
+## CPU ngram follow-up
+
+The [N68 host diagnostic](../../../../parity-results/qwen-flash-next/ngram68-host-service-diagnostic-global/result.json)
+used the unchanged archived L66 runtime and passed driver, retirement and
+source/runtime checks. Actual worker TIDs joined to passive scheduler masks
+prove that all four RAM lookup services share physical core 28 (`{28,84}`),
+despite the earlier GPU-control placement repair. The trace accounts for every
+live gather, including explicit prefill preparation; measured decode gathers
+have a 45.006 µs median and 146.648 µs p95 under instrumentation. These timings
+do not isolate the model critical path and do not enter the throughput table.
+
+The next candidate changes only construction-time eligibility of these I/O
+workers using the existing OpenMP partition authority. Polling, metadata
+authentication, table locking, native bytes and inference arithmetic remain
+fixed. Actual worker/lifecycle regressions and uninstrumented paired timing
+must pass before accepting it. See the [investigation follow-up](QFN_NGRAM_CPU_PATH_INVESTIGATION.md#measured-follow-up-host-worker-placement-2026-10-21)
+for component timings, counts and the rejected initial probe attachment.
 
 ## Remaining qualification work
 

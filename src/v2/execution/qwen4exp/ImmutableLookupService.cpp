@@ -10,6 +10,7 @@
  */
 #include "kernels/qwen4exp/AdaptiveLookupPreparedStorage.h"
 #include "ImmutableLookupService.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -319,6 +320,10 @@ std::shared_ptr<ImmutableLookupService> ImmutableLookupService::create(std::shar
         throw std::runtime_error("Immutable lookup mapped allocation differs from its admitted physical extent");
     auto backing=std::make_shared<ImmutableLookupChannelBacking>(ImmutableLookupChannelBacking{
         std::move(physical),std::move(mapped),layout,nextTableId()});
+    // Only this independently scheduled native-row I/O owner inherits the
+    // admitted OpenMP partition. Restore the creator before returning; generic
+    // retained workers and CPU expert compute placement remain unchanged.
+    const ScopedOpenMPPartitionAffinity io_worker_affinity;
     return std::shared_ptr<ImmutableLookupService>(
         new ImmutableLookupService(std::move(table), std::move(backing), std::move(memory)));
 }

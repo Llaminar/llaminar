@@ -8,8 +8,10 @@
  * without replacing pointers or recapturing, checking inactive-byte guards,
  * every candidate rejection boundary, EOS context and chronological nine-row
  * history. Resource inspection rejects hidden copies, callbacks or local spills.
+ * Real RAM/mmap service-worker affinity is observed by exact-inode libc delegation.
  */
 #include <gtest/gtest.h>
+#include "utils/ImmutableLookupWorkerAffinityObservation.h"
 #include "backends/BackendManager.h"
 #include "backends/ExplicitGPUStream.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -701,11 +703,15 @@ struct LookupAdmissionStream
     ~LookupAdmissionStream() noexcept
     {if(!backend.synchronizeStream(stream,device.ordinal))std::terminate();backend.destroyStream(stream,device.ordinal);}
 };
+/** @brief Select optional actual-service placement observation without changing protocol work. */
+enum class LookupWorkerPlacementProof { Disabled, ActualOwnedWorker };
 /** @brief Prove a real captured CPU-storage boundary without exposing model tokens to its worker.
  * @param device Exact native participant. @param adaptive Existing bounded RAM/SSD provider arm.
  * @param frontier Whether the real external-arena RequireReadyBytes frontier is tested before/after admission.
+ * @param placement Whether the actual retained service worker's placement is observed.
  */
-void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontier=LookupFrontierProof::ExistingProtocol)
+void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontier=LookupFrontierProof::ExistingProtocol,
+    LookupWorkerPlacementProof placement=LookupWorkerPlacementProof::Disabled)
 {
     auto *backend=getBackendFor(device);
     if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"Requested GPU backend unavailable";
@@ -744,7 +750,11 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
             auto table=adaptive?HostImmutableRowProvider::fromAdaptiveCache(CpuAdaptiveImmutableRowCache::create(file.source(),*cache,memory)):
                 HostImmutableRowProvider::fromWholeTable(std::make_unique<ImmutableRowTable>(
                     file.source(),policy, DeviceId::cpu(),memory,ImmutableRowTableHostPlacement::taskPolicy()));
+            std::unique_ptr<immutable_lookup_affinity_test::Probe> affinity;
+            if (placement == LookupWorkerPlacementProof::ActualOwnedWorker)
+                affinity = std::make_unique<immutable_lookup_affinity_test::Probe>(file.fd);
             auto service=ImmutableLookupService::create(table,layout,std::array{device},memory,DeviceId::cpu());
+            if (affinity) affinity->created();
             LookupAdmissionStream admissionStream(*backend,device);
             auto protocolOwner=std::make_shared<INT32Tensor>(std::vector<std::size_t>{16});
             auto &stateTensor=*protocolOwner;
@@ -863,6 +873,7 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
                 const auto actual=storage.download(output,maxIds*width);
                 boundary->awaitTerminal();
                 const auto observation=boundary->terminalObservation();
+                if (affinity) affinity->verify();
                 EXPECT_EQ(stage->graphCaptureVariantSignature(),captured_identity);
                 EXPECT_EQ(boundary->captureIdentity(),protocol_identity);
                 EXPECT_EQ(protocolOwner->gpu_data_ptr(),state);
@@ -1046,4 +1057,16 @@ TEST(Qwen4ExpDevicePrimitives, ROCmProtocolAdmissionPublication)
 TEST(Qwen4ExpDevicePrimitives, ROCmAdaptiveRAMSSDLookup) { proveLookup(DeviceId::rocm(0),true); }
 /** @test HIP loads one admitted original table and captures its complete backend-neutral lookup stage. */
 TEST(Qwen4ExpDevicePrimitives, ROCmResidentOwnerStage) { proveResidentOwnerStage(DeviceId::rocm(0)); }
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Actual CUDA RAM/mmap service retains admitted affinity across captured generations. */
+TEST(Qwen4ExpDevicePrimitives, CUDAOwnedLookupWorkerAffinity)
+{ proveLookup(DeviceId::cuda(0), false, LookupFrontierProof::ExistingProtocol, LookupWorkerPlacementProof::ActualOwnedWorker); }
+#endif
+#ifdef HAVE_ROCM
+/** @test Actual ROCm RAM/mmap service retains admitted affinity across captured generations. */
+TEST(Qwen4ExpDevicePrimitives, ROCmOwnedLookupWorkerAffinity)
+{ proveLookup(DeviceId::rocm(0), false, LookupFrontierProof::ExistingProtocol, LookupWorkerPlacementProof::ActualOwnedWorker); }
+
 #endif

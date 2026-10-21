@@ -30461,6 +30461,38 @@ endif()
 # Retain/rerun existing HTTPServiceThreadAffinity{,Unbound}; its semantic alias
 # now uses the same shared RAII implementation rather than a second algorithm.
 
+# Observe the actual retained RAM/mmap lookup worker during captured native
+# generations. Binding modes run in separate processes so OpenMP initializes
+# from each declared policy; no test rebinding of the service child is allowed.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_qwen4exp_device_primitives)
+    target_link_libraries(v2_test_qwen4exp_device_primitives PRIVATE ${CMAKE_DL_LIBS})
+    foreach(_lookup_backend CUDA ROCm)
+        if((_lookup_backend STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
+           (_lookup_backend STREQUAL "ROCm" AND NOT HAVE_ROCM))
+            continue()
+        endif()
+        string(TOLOWER "${_lookup_backend}" _lookup_lock)
+        foreach(_lookup_binding close false)
+            if(_lookup_binding STREQUAL "close")
+                set(_lookup_label Bound)
+            else()
+                set(_lookup_label Unbound)
+            endif()
+            add_v2_test(V2_Integration_ImmutableLookupWorkerAffinity_${_lookup_backend}_${_lookup_label}
+                COMMAND ${CMAKE_COMMAND} -E env
+                    OMP_PROC_BIND=${_lookup_binding} OMP_PLACES=cores OMP_NUM_THREADS=2 OMP_DYNAMIC=false
+                    $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=Qwen4ExpDevicePrimitives.${_lookup_backend}OwnedLookupWorkerAffinity
+                LABELS "V2;Integration;ProductionTestPreflight;${_lookup_backend};Qwen4Exp;Storage;Threading;Capture;ByteExact;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120 RESOURCE_LOCK "${_lookup_lock}_gpu_0")
+            if(TEST V2_Integration_ImmutableLookupWorkerAffinity_${_lookup_backend}_${_lookup_label})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                    V2_Integration_ImmutableLookupWorkerAffinity_${_lookup_backend}_${_lookup_label})
+            endif()
+        endforeach()
+    endforeach()
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR
