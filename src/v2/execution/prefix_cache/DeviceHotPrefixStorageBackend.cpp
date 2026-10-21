@@ -38,12 +38,13 @@ namespace llaminar2
          */
         size_t devicePayloadBytes(const PrefixBlockHandle &handle)
         {
-            const std::array<size_t, 5> sections = {
+            const std::array<size_t, 6> sections = {
                 handle.kvBytes(),
                 handle.hybridBytes(),
                 handle.layout.mtpKVBytes(),
                 handle.terminalHiddenBytes(),
                 handle.terminalLogitsBytes(),
+                handle.layout.modelAuxiliaryBytes(),
             };
             size_t total = 0u;
             for (const size_t bytes : sections)
@@ -81,8 +82,11 @@ namespace llaminar2
             {
                 for (const auto &readiness : latest_slot_readiness)
                 {
-                    if (readiness)
-                        (void)readiness->waitOnHost();
+                    if (readiness && !readiness->waitOnHost())
+                    {
+                        LOG_ERROR("[DeviceHotPrefixStorageBackend] unsafe final backing retirement: unpublished or failed producer event");
+                        std::terminate();
+                    }
                 }
                 if (backend && allocation && device.is_gpu())
                     backend->free(allocation, device.gpu_ordinal());
@@ -349,6 +353,7 @@ namespace llaminar2
             bind_section(out.terminalHiddenBytes());
         out.device_terminal_logits_allocation =
             bind_section(out.terminalLogitsBytes());
+        out.device_model_auxiliary_allocation = bind_section(out.layout.modelAuxiliaryBytes());
         if (offset != payload_bytes || offset > impl_->slot_bytes)
             return fail("device-hot section aliases exceed their arena slot");
 

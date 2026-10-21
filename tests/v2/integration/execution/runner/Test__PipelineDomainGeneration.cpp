@@ -147,7 +147,9 @@ protected:
             mtp.depth_policy.min_samples = 1;
             mtp.depth_policy.cooldown_steps = 0;
         }
-        OrdinaryGraphEvidence evidence("generation,forward_graph,mtp");
+        OrdinaryGraphEvidence evidence("generation,forward_graph,mtp,transfer");
+        ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("transfer"))
+            << "Zero-copy evidence requires the transfer collection domain";
         std::vector<std::vector<GlobalDeviceAddress>> members(2);
         std::vector<std::unique_ptr<LocalTPContext>> contexts(2);
         std::vector<DevicePlanConfig> inputs;
@@ -374,6 +376,12 @@ protected:
                     value += record.value;
             return value;
         };
+        // Canonical native receive banks are the model's hidden owner. Actual
+        // captured prefill/condition/verifier/decode must never invoke a second
+        // external tensor copy at either domain, including request resets.
+        for (const char *name : {"activation_copy_host_bytes", "activation_copy_d2d_bytes",
+                 "activation_copy_peer_bytes", "activation_copy_d2h_bytes", "activation_copy_h2d_bytes"})
+            EXPECT_EQ(sum("transfer", name), 0.0) << name;
         EXPECT_EQ(sum("forward_graph", "segmented_plan_segments"), 2);
         EXPECT_EQ(sum("forward_graph", "segmented_graph_capture_segments"), 2);
         EXPECT_GT(sum("forward_graph", "segmented_replay_segments", "prefill"), 0);

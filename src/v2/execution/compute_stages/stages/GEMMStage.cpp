@@ -9,6 +9,7 @@
  */
 
 #include "GEMMStage.h"
+#include "kernels/common/FloatingProjectionRows.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
@@ -27,6 +28,13 @@ namespace llaminar2
     WorkspaceRequirements GEMMStage::getWorkspaceRequirements(int m, int n, int k) const
     {
         const int rows = std::max({1, m, params_.m});
+        if(params_.quantized_operand_precision==QuantizedActivationOperandPrecision::TwoTermQ8) {
+            auto *kernel=const_cast<GEMMStage*>(this)->getKernelAsWorkspaceConsumer();
+            auto *gemm=dynamic_cast<ITensorGemm*>(kernel);
+            if(!gemm)throw std::logic_error("Two-term Q8 requires an actual prepared tensor GEMM");
+            const int columns=params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size());
+            return gemm->q8ResidualCorrectionWorkspaceRequirements(rows,columns,params_.k);
+        }
         auto requirements = IWorkspaceConsumerStage::getWorkspaceRequirements(rows, n, k);
         // Execution selects the transform from the gate operand. The legacy
         // diagnostic flag is not an independent source of operation intent.
@@ -206,6 +214,10 @@ namespace llaminar2
             errors << "Invalid dimensions (m=" << m << ", n=" << n << ", k=" << k << "). ";
         }
 
+        if(request_rows && (!force_decode_equivalent_verifier_prefill || verifier_row_range || request_rows->physicalRows()!=m ||
+            gate_input || do_swiglu || bias || bias_tensor || bias_required || !output_range.empty() || alpha!=1.0f || beta!=0.0f))
+            errors << "Counted floating requests require explicit decode-equivalent arithmetic, exact rows, no prefix/bias/fusion, alpha1 beta0. ";
+
         // Check bias requirement
         if (bias_required)
         {
@@ -231,6 +243,77 @@ namespace llaminar2
     GEMMStage::GEMMStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        if(params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8&&
+            params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::TwoTermQ8)
+            throw std::invalid_argument("GEMM activation operand precision is invalid");
+        if(params_.request_rows) {
+            params_.validate();
+            if(params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8)
+                throw std::invalid_argument("Counted floating request rows do not support TwoTermQ8 activation arithmetic");
+            if(params_.A->native_type()!=TensorType::FP32 || params_.C->native_type()!=TensorType::FP32 ||
+                (params_.B->native_type()!=TensorType::FP32 && params_.B->native_type()!=TensorType::FP16 &&
+                 params_.B->native_type()!=TensorType::BF16))
+                throw std::invalid_argument("Counted projection requires native floating weights and FP32 rows/output");
+            if(!validateMatrixExtent(dynamic_cast<const TensorBase *>(params_.A),"counted input A",params_.m,params_.k) ||
+                !validateMatrixExtent(dynamic_cast<const TensorBase *>(params_.C),"counted output C",params_.m,params_.n))
+                throw std::invalid_argument("Counted floating projection exceeds admitted source/output matrix");
+        }
+        if(params_.quantized_operand_precision==QuantizedActivationOperandPrecision::TwoTermQ8) {
+            validateQ8ResidualCorrectionGeometry(params_.m,params_.n,params_.k);
+            if(!params_.A||!params_.B||!params_.C||params_.A==params_.C||params_.gate_input||params_.bias||params_.bias_tensor||
+                params_.alpha!=1.f||params_.beta!=0.f||params_.A->native_type()!=TensorType::FP32||
+                params_.C->native_type()!=TensorType::FP32||params_.B->native_type()!=TensorType::Q8_0)
+                throw std::invalid_argument("Two-term Q8 requires a plain prepared native Q8_0 projection with distinct FP32 operands");
+            validateQ8ResidualTensorCapacities(params_.m,params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size()),
+                params_.k,params_.A->numel(),params_.C->numel());
+            const auto*input=dynamic_cast<const TensorBase*>(params_.A);
+            const auto*output=dynamic_cast<const TensorBase*>(params_.C);
+            // Construction can precede arena materialization. Validate any
+            // already prepared addresses now; the operation repeats this check
+            // against the eventual exact pointers before its first launch.
+            const bool hostPrepared=params_.device_id.is_cpu()&&input&&output&&input->isHostValid()&&output->isHostValid();
+            const void*inputPointer=hostPrepared?input->data():params_.device_id.is_gpu()?params_.A->gpu_data_ptr():nullptr;
+            const void*outputPointer=hostPrepared?output->data():params_.device_id.is_gpu()?params_.C->gpu_data_ptr():nullptr;
+            if(inputPointer&&outputPointer) {
+                const auto outputWidth=params_.output_range.empty()?params_.n:static_cast<int>(params_.output_range.size());
+                const std::array writes{Q8ResidualStorageSpan{outputPointer,static_cast<std::size_t>(params_.m)*outputWidth*sizeof(float),alignof(float)}};
+                const std::array reads{Q8ResidualStorageSpan{inputPointer,static_cast<std::size_t>(params_.m)*params_.k*sizeof(float),alignof(float)}};
+                validateQ8ResidualStorage(writes,reads);
+            }
+        }
+    }
+
+    uint64_t GEMMStage::graphCaptureVariantSignature() const
+    {
+        if(params_.quantized_operand_precision==QuantizedActivationOperandPrecision::SingleQ8 &&
+           !params_.verifier_row_range && !params_.request_rows)return 0;
+        // Preserve the qualified HC quantizer/scalars, then identify one sealed
+        // row alternative. Count pointer/geometry are immutable recording data;
+        // execution-owned count values never enter graph identity.
+        uint64_t signature=0x5138524553320002ULL;
+        const auto mix=[&](uint64_t value){signature^=value+0x9e3779b97f4a7c15ULL+(signature<<6)+(signature>>2);};
+        const auto backend=params_.device_id.type;
+        const auto quantizer=backend==DeviceType::CPU?Q8ResidualQuantizerPolicy::CPUHalfAfterQuantization:
+            backend==DeviceType::CUDA?Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal:Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal;
+        mix(static_cast<uint64_t>(params_.quantized_operand_precision));
+        mix(static_cast<uint64_t>(quantizer));mix(static_cast<uint64_t>(backend));mix(params_.device_id.ordinal);
+        mix(params_.m);mix(params_.n);mix(params_.k);mix(params_.output_range.start);mix(params_.output_range.end);
+        mix(reinterpret_cast<std::uintptr_t>(params_.A));mix(reinterpret_cast<std::uintptr_t>(params_.B));
+        mix(reinterpret_cast<std::uintptr_t>(params_.C));mix(params_.force_decode_equivalent_verifier_prefill);
+        if(params_.request_rows) {
+            mix(2);mix(FloatingProjectionRows::requestRecordingIdentity(*params_.request_rows));
+        } else {
+            mix(params_.verifier_row_range ? 1 : 0);
+            const auto rows=params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m));
+            const auto row_identity = rows.captureIdentity();
+            mix(reinterpret_cast<std::uintptr_t>(row_identity.count));
+            mix(row_identity.count_capacity);
+            mix(row_identity.first_physical_row);
+            mix(row_identity.physical_rows);
+            mix(row_identity.repeats_per_row);
+            mix(row_identity.schema_version);
+        }
+        return signature?signature:1;
     }
 
     void GEMMStage::clearCachedGemmStream()
@@ -269,6 +352,16 @@ namespace llaminar2
         {
             if (error) *error = "GEMMStage PreparedWeightRef is not present in PreparedWeightStore";
             return false;
+        }
+        if(params_.request_rows) {
+            try {
+                auto *engine=resolvePreparedGemmForStage("counted floating validation",params_,!params_.output_range.empty());
+                if(!engine)throw std::invalid_argument("Counted floating projection has no prepared engine");
+                auto mode=engine->beginFloatingRequestRowsScope(*params_.request_rows);
+            } catch(const std::exception &exception) {
+                if(error)*error=exception.what();
+                return false;
+            }
         }
         return true;
     }
@@ -387,6 +480,17 @@ namespace llaminar2
             return false;
         }
 
+        if(params_.quantized_operand_precision==QuantizedActivationOperandPrecision::TwoTermQ8) {
+            if(params_.gate_input||params_.bias_tensor||params_.bias||params_.alpha!=1.f||params_.beta!=0.f)
+                throw std::logic_error("Two-term Q8 projection requires plain alpha1,beta0 without gate/bias epilogues");
+            bindStageStream(gemm);
+            gemm->multiply_q8_residual_corrected(A_extent,C_extent,
+                params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m)),effective_n,params_.k,getWorkspace());
+            publishStageOutput(C_extent);
+            traceOutput("C",params_.C);
+            return true;
+        }
+
         // Thread GPU stream for graph capture
         bindStageStream(gemm);
 
@@ -394,7 +498,8 @@ namespace llaminar2
                                                 << " for weight ITensor*=" << static_cast<const void *>(params_.B)
                                                 << " TensorBase*=" << static_cast<const void *>(B_base));
 
-        if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
+        if (params_.request_rows || (params_.force_decode_equivalent_verifier_prefill &&
+            (params_.m > 1 || params_.verifier_row_range.has_value())))
         {
             auto *A_base = requireTensorBase(params_.A, "input A");
             auto *C_base = asTensorBase(params_.C, "output C");
@@ -485,7 +590,9 @@ namespace llaminar2
 
         // Nested tensor adapters inherit this geometry while retaining their
         // backend-specific serial arithmetic policy. No device count is read here.
-        auto verifier_rows = gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
+        auto verifier_rows = params_.request_rows
+            ? gemm->beginFloatingRequestRowsScope(*params_.request_rows)
+            : gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
         bool success = false;
         if (params_.gate_input)
         {
@@ -636,6 +743,7 @@ namespace llaminar2
         info.addScalar("beta", params_.beta);
         info.addScalarBool("transpose_B", params_.transpose_B);
         info.addScalarBool("do_swiglu", params_.do_swiglu);
+        info.addScalarInt("quantized_operand_precision",static_cast<int>(params_.quantized_operand_precision));
         info.addScalarInt("device_id", params_.device_id.toKernelDeviceIndex());
 
         return info;

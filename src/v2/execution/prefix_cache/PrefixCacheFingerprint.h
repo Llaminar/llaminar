@@ -11,6 +11,7 @@
 #include "execution/config/RuntimeConfig.h"
 #include "config/GDNProjectionArithmeticPolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
+#include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -67,6 +68,26 @@ namespace llaminar2
         GDNProjectionArithmetic gdn,
         MoERouterArithmetic router,
         CUDARouterPrefillArithmetic cuda_prefill = CUDARouterPrefillArithmetic::FP32);
+
+    /**
+     * @brief Distinguish Flash Next activation policies before prefix payload I/O.
+     * @param fields Runtime compatibility fields owned by the prefix builder.
+     * @param hc_up Frozen graph HC-up activation arithmetic.
+     * @param gdn_output Independent frozen GDN-output policy; default preserves historical fields.
+     * @param fa_output Independent main-only FA correction; default preserves prior identities.
+     * @param gdn_qkv Independent original-main GDN-QKV policy; default preserves existing fingerprints.
+     * @throws std::invalid_argument For duplicate authority or an invalid enum.
+     *
+     * The revision authenticates the residual subtraction, each backend's
+     * native primary quantizer, and the independent fixed-order dot folds.
+     * Ordinary models do not append this model-specific compatibility field.
+     */
+    void appendQwen4ExpArithmeticFingerprintFields(
+        std::vector<PrefixFingerprintField> &fields,
+        QuantizedActivationOperandPrecision hc_up,
+        QuantizedActivationOperandPrecision gdn_output = QuantizedActivationOperandPrecision::SingleQ8,
+        QuantizedActivationOperandPrecision fa_output = QuantizedActivationOperandPrecision::SingleQ8,
+        QuantizedActivationOperandPrecision gdn_qkv = QuantizedActivationOperandPrecision::SingleQ8);
 
     /** @brief One fingerprint and the exact placement observation it describes. */
     struct PrefixCacheFingerprintResult

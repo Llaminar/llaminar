@@ -10,6 +10,7 @@
 
 #pragma once
 #include "kernels/FloatingActivationOperandPrecision.h"
+#include "kernels/common/Q8ResidualCorrection.h"
 
 #include "../backends/ExplicitGPUStream.h"
 #include "../utils/MPIContext.h"
@@ -434,8 +435,10 @@ namespace llaminar2
             /** @brief Bind optional physical/live geometry for this recording scope. */
             explicit VerifierKernelModeScope(
                 std::optional<DeviceRowRange> rows = std::nullopt)
-                : previous_rows_(current_rows_), previous_active_(current_active_)
+                : previous_rows_(current_rows_), previous_requests_(current_requests_), previous_active_(current_active_)
             {
+                if(rows && current_requests_)
+                    throw std::invalid_argument("GEMM prefix/request selections cannot overlap");
                 current_active_ = true;
                 if (rows)
                     current_rows_ = rows;
@@ -445,6 +448,7 @@ namespace llaminar2
             virtual ~VerifierKernelModeScope()
             {
                 current_rows_ = previous_rows_;
+                current_requests_ = previous_requests_;
                 current_active_ = previous_active_;
             }
 
@@ -472,17 +476,74 @@ namespace llaminar2
              */
             [[nodiscard]] static const DeviceRowRange *rowsFor(int physical_rows)
             {
+                if(current_requests_)
+                    throw std::logic_error("Request-local holes cannot be consumed as DeviceRowRange");
+                return prefixForFloating(physical_rows);
+            }
+
+            /** @brief Explicit prefix alternative for updated floating request-aware launchers only. */
+            [[nodiscard]] static const DeviceRowRange *prefixForFloating(int physical_rows)
+            {
                 if (current_rows_ && current_rows_->physicalRows() != physical_rows)
                     throw std::logic_error("Verifier launch row geometry disagrees with physical matrix");
                 return current_rows_ ? &*current_rows_ : nullptr;
             }
 
+            /** @brief Borrow request geometry for an updated floating launcher; never read counts here. */
+            [[nodiscard]] static const DeviceRequestRowRanges *requestsFor(int physical_rows)
+            {
+                if(current_requests_ && current_requests_->physicalRows()!=physical_rows)
+                    throw std::logic_error("Floating request geometry disagrees with physical matrix");
+                return current_requests_ ? &*current_requests_ : nullptr;
+            }
+
+        protected:
+            /** @brief Bind only the separate floating request scope, rejecting inherited prefixes. */
+            explicit VerifierKernelModeScope(DeviceRequestRowRanges requests)
+                : VerifierKernelModeScope(std::nullopt)
+            {
+                if(current_rows_)
+                    throw std::invalid_argument("GEMM prefix/request selections cannot overlap");
+                current_requests_=requests;
+            }
+
         private:
             std::optional<DeviceRowRange> previous_rows_; ///< Enclosing recording metadata.
+            std::optional<DeviceRequestRowRanges> previous_requests_; ///< Enclosing immutable floating request geometry.
             bool previous_active_; ///< Enclosing arithmetic contract on this recorder.
             inline static thread_local std::optional<DeviceRowRange> current_rows_;
+            inline static thread_local std::optional<DeviceRequestRowRanges> current_requests_;
             inline static thread_local bool current_active_ = false;
         };
+
+    private:
+        /** @brief Sealed request token; only explicitly implementing GEMM engines can create one. */
+        struct FloatingRequestKernelModeScope final : VerifierKernelModeScope
+        {
+            friend class ITensorGemm;
+        private:
+            explicit FloatingRequestKernelModeScope(DeviceRequestRowRanges rows)
+                : VerifierKernelModeScope(rows) {}
+        };
+    protected:
+        /** @brief Create immutable thread-local metadata after a floating engine validates its policy. */
+        static std::unique_ptr<VerifierKernelModeScope> makeFloatingRequestRowsScope(DeviceRequestRowRanges rows)
+        { return std::unique_ptr<VerifierKernelModeScope>(new FloatingRequestKernelModeScope(rows)); }
+    public:
+        /**
+         * @brief Enter counted request-major floating projection arithmetic.
+         * @param rows Canonical borrowed request lengths and admitted physical stride.
+         * @return Scope inherited by nested floating adapters; destruction restores prior metadata.
+         * @throws std::logic_error For engines without this explicit implementation.
+         *
+         * This is a distinct API from DeviceRowRange. Quantized/unmodified engines
+         * cannot silently interpret request-local holes as a contiguous prefix.
+         */
+        virtual std::unique_ptr<VerifierKernelModeScope> beginFloatingRequestRowsScope(DeviceRequestRowRanges rows)
+        {
+            (void)rows;
+            throw std::logic_error("Prepared GEMM does not implement counted floating request projections");
+        }
 
         /**
          * @brief RAII token for replicated-output arithmetic equivalence.
@@ -1694,6 +1755,30 @@ namespace llaminar2
          * @return Number of input features this kernel expects, or 0 if unknown
          */
         virtual int get_k() const { return 0; }
+        /** @brief Declare explicit two-term Q8 scratch against this actual prepared source.
+         * @param m Physical maximum rows retained by the stage.
+         * @param n Exact prepared output width.
+         * @param k Exact prepared reduction width.
+         * @return Named instance-owned scratch, contributed to the canonical PMA BOM.
+         * @throws std::logic_error If this selected backend/source lacks the operation.
+         */
+        virtual WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const
+        { (void)m;(void)n;(void)k;throw std::logic_error("Selected prepared GEMM does not implement two-term Q8 arithmetic"); }
+        /** @brief Evaluate independent primary/residual Q8 integer dots and add once.
+         * @param input Prepared native FP32 source; no placement repair is permitted.
+         * @param output Prepared distinct native FP32 destination.
+         * @param rows Explicit physical/live geometry on its execution owner.
+         * @param n Exact prepared output width.
+         * @param k Exact prepared reduction width.
+         * @param workspace Participant-owned already-admitted activation banks.
+         * @throws std::logic_error For an unavailable explicitly selected implementation.
+         */
+        virtual void multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,
+            DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace)
+        { (void)input;(void)output;(void)rows;(void)n;(void)k;(void)workspace;
+          throw std::logic_error("Selected prepared GEMM does not implement two-term Q8 arithmetic"); }
+
+
     };
 
     // Note: TensorBase alias already declared at top of file

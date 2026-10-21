@@ -1475,6 +1475,50 @@ namespace llaminar2
             }
         }
 
+        WorkspaceRequirements CUDAQuantisedGemmKernel::q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const
+        {
+            validateQ8ResidualCorrectionGeometry(m,n,k);
+            NativeVnniSourceIdentity source;
+            if(!weights_converted()||!impl_||!exportNativeVNNISourceIdentity(source)||source.codebook_id!=native_vnni_formats::Q8_0.codebook_id||source.is_superblock||
+                impl_->native_codebook_id!=native_vnni_formats::Q8_0.codebook_id||impl_->native_blocks_per_row!=static_cast<unsigned>(k/32)||
+                !impl_->d_weights_native_vnni||!impl_->d_weights_native_scales||impl_->d_weights_native_mins||impl_->d_weights_native_emins||
+                (impl_->native_allocation_format.payload_bytes_per_block&&impl_->native_allocation_format.payload_bytes_per_block!=native_vnni_formats::Q8_0.payload_bytes)||
+                impl_->native_allocation_format.has_mins||impl_->native_allocation_format.has_emins||
+                n!=static_cast<int>(N_)||k!=static_cast<int>(K_))
+                throw std::invalid_argument("Two-term CUDA Q8 requires an already prepared exact Q8_0 source and geometry");
+            return gpuQ8ResidualCorrectionWorkspaceRequirements(m,n,k);
+        }
+
+        void CUDAQuantisedGemmKernel::multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,
+            DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace)
+        {
+            validateQ8ResidualCorrectionGeometry(rows.physicalRows(),n,k);
+            const DeviceId target=DeviceId::cuda(cuda_device_id_);
+            if(!workspace||workspace->device()!=target||!input||!output||input==output||
+                input->native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||output->isMapped()||
+                n!=static_cast<int>(N_)||k!=static_cast<int>(K_)||!weights_converted())
+                throw std::invalid_argument("Two-term CUDA Q8 requires prepared FP32 tensor operands, exact participant workspace and immutable native weights");
+            validateQ8ResidualTensorCapacities(rows.physicalRows(),n,k,input->numel(),output->numel());
+            void*stream=gpu_stream_;
+            if(!stream)throw std::invalid_argument("Two-term CUDA Q8 requires its exact producer stream");
+            TransferEngine::requireDeviceInput(const_cast<TensorBase*>(input),target,stream);
+            TransferEngine::requireDeviceOutput(output,target,stream);
+            DeviceNativeVNNIMatrixDesc weights;
+            if(!exportNativeVNNIMatrixDesc(weights))throw std::logic_error("Prepared two-term CUDA Q8 source export failed");
+            const auto values=static_cast<std::size_t>(rows.physicalRows())*k,scales=values/32*sizeof(float);
+            const auto requireBank=[&](const std::string&name,std::size_t bytes)->void* {
+                auto*pointer=workspace->getBuffer(name);
+                if(!pointer||workspace->getBufferSize(name)<bytes)throw std::logic_error("Two-term CUDA Q8 invocation lacks an admitted named activation bank");
+                return pointer;
+            };
+            cudaQ8ResidualCorrectedProjection({weights,rows,Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal,static_cast<const float*>(input->gpu_data_ptr()),static_cast<float*>(output->gpu_data_ptr()),
+                static_cast<signed char*>(requireBank(kGPUProjectionPrimaryQ8,values)),
+                static_cast<signed char*>(requireBank(kGPUProjectionResidualQ8,values)),
+                static_cast<float*>(requireBank(kGPUProjectionPrimaryQ8Scales,scales)),
+                static_cast<float*>(requireBank(kGPUProjectionResidualQ8Scales,scales))},stream);
+            publishCUDATensorWrite(*output,cuda_device_id_,stream);
+        }
+
         bool CUDAQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)
         {
             out = {};

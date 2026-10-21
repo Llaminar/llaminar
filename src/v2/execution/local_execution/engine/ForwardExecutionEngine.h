@@ -342,8 +342,8 @@ namespace llaminar2
          *
          * For PP non-embedding stages, the previous stage's output (external hidden)
          * must be copied to the local working buffer before graph execution. During
-         * cache MISS this happens inline in graph build; during cache HIT the engine
-         * must redo this copy using the stored PPCopyInfo.
+         * cache MISS and HIT this is resolved from the current host boundary.
+         * Live extents are never stored in retained graph state.
          */
         struct PPCopyInfo
         {
@@ -354,7 +354,7 @@ namespace llaminar2
             bool needs_copy = false;
         };
 
-        /** Resolve PP copy info for the given input (after a cache-miss build). */
+        /** Resolve exact PP metadata for this invocation, before any copy or graph build. */
         virtual PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const = 0;
 
         /** Check if MoE dynamic rebalancing is active for this forward domain. */
@@ -907,6 +907,7 @@ namespace llaminar2
             void *stream = nullptr;
             size_t stage_count = 0;
             size_t captured_node_count = 0;
+            std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary; ///< Retained immutable I/O declaration, independent of ticket scheduling.
 
             explicit operator bool() const noexcept
             {
@@ -933,6 +934,13 @@ namespace llaminar2
             size_t source_capture_unit_count = 0; ///< Native child templates represented by the plan.
             bool segmented = false; ///< True only for host-sequenced heterogeneous replay.
             bool composed_parent = false; ///< True when one device parent owns all source units.
+            const ComputeGraph *graph_owner = nullptr; ///< Exact cache-owned graph, never a lifetime extension.
+            uint64_t topology_generation = 0; ///< Canonical graph generation at export.
+            uint64_t workspace_generation = 0; ///< Existing arena/workspace preparation generation.
+            uint64_t capture_variant_signature = 0; ///< Complete immutable stage launch-policy identity.
+            uint64_t capture_generation = 0; ///< Existing cache lifetime materialization generation.
+            /** @return Exact immutable owner/geometry match; no count or tensor data is observed. */
+            bool operator==(const RetainedDecodeGraphView &) const = default;
 
             explicit operator bool() const noexcept
             {
@@ -1428,6 +1436,7 @@ namespace llaminar2
          * @param host Participant-local execution and publication services.
          * @param signature Canonical cache identity, including verifier/condition role.
          * @param start Start of this forward's host timing interval.
+         * @param pp_submission Whether this same invocation already consumed its host PP boundary.
          * @return True after the requested materialization or execution succeeds.
          */
         bool executeCacheHit(
@@ -1436,7 +1445,8 @@ namespace llaminar2
             ForwardGraphCache &cache,
             IForwardExecutionHost &host,
             const ForwardGraphSignature &signature,
-            std::chrono::high_resolution_clock::time_point start);
+            std::chrono::high_resolution_clock::time_point start,
+            HostPipelineBoundarySubmission pp_submission = HostPipelineBoundarySubmission::Current);
 
         /**
          * @brief Capture and instantiate one cached GPU graph without execution.

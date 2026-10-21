@@ -5,10 +5,14 @@
  * Mock engines exercise registration and model-context publication without
  * initializing drivers. Projection tests prevent full-expert callers from
  * borrowing or retiring fixed output slices under an ambiguous logical key.
+ * Static source fixtures invoke actual frozen matrix lowering and retain real
+ * disjoint CPU source roots; all declared GPU identities remain metadata only.
  */
 #include <gtest/gtest.h>
 #include "loaders/ExpertGemmRegistry.h"
+#include "loaders/PreparedWeightStore.h"
 #include "tensors/TensorKernels.h"
+#include "../../utils/TestTensorFactory.h"
 
 #include <array>
 #include <thread>
@@ -803,5 +807,369 @@ TEST(ExpertProjectionPreparedIdentity, RejectsWholeExpertAndNeighbourSliceAdopti
         auto other = std::make_shared<MockGemm>(3);
         EXPECT_THROW(registry.registerEngineForParticipant("compute", device, 2, 0, 0, 0,
             Role::DOWN, other.get(), other, identity), std::invalid_argument);
+    }
+}
+
+
+namespace
+{
+    /** @brief Geometry-aware mock: no device initialization, allocation or arithmetic. */
+    class StaticSourceGemm final : public MockGemm
+    {
+    public:
+        /** @brief Preserve actual local matrix dimensions for registration validation. */
+        StaticSourceGemm(int n, int k, const void *data) : MockGemm(55), n_(n), k_(k), data_(data) {}
+        int get_n() const override { return n_; }
+        int get_k() const override { return k_; }
+        /** @brief Real CPU-backed metadata descriptor; no fabricated device address or device operation. */
+        bool exportContiguousFloatingPointWeights(ContiguousFloatingPointWeightDescriptor &out) const override
+        {
+            out = {data_, TensorType::FP32, n_, k_, size_t(n_) * size_t(k_) * sizeof(float)};
+            return out.valid();
+        }
+    private:
+        int n_;
+        int k_;
+        const void *data_;
+    };
+
+    /** @brief Build original compact CPU tensors, then invoke actual frozen native-view lowering. */
+    std::vector<WeightBinding> staticSources(DeviceId target, int experts = 512,
+        int participant = 0, std::vector<MoEExpertProjectionOwnership::IntermediateInterval> intervals =
+            {{0,4},{4,4},{8,4},{12,8}}, bool native_q8 = false)
+    {
+        const auto ownership = MoEExpertProjectionOwnership::withinExpertIntermediateSlices(
+            {experts,native_q8 ? 32 : 8,native_q8 ? 128 : 20}, participant, std::move(intervals));
+        const InferenceStrategy strategy{.model_id=ModelContextId{55}};
+        ModelWeightSetBuilder builder(strategy);
+        for (const auto role : {llaminar2::WeightRole::MoEExpertGate,
+                               llaminar2::WeightRole::MoEExpertUp, llaminar2::WeightRole::MoEExpertDown})
+        {
+            const auto projection = ownership.projection(role);
+            const std::string suffix = role == llaminar2::WeightRole::MoEExpertGate ? "gate"
+                : role == llaminar2::WeightRole::MoEExpertUp ? "up" : "down";
+            WeightBinding parent;
+            parent.binding_id = 100 + static_cast<unsigned>(role);
+            parent.identity = makeSourceWeightIdentity("blk.7.ffn_" + suffix + "_exps.weight", strategy.model_id, parent.binding_id);
+            parent.identity.role = role;
+            parent.identity.derivation = WeightDerivationKind::ExpertSlice;
+            parent.identity.layer = 7;
+            parent.identity.overlay_domain = "static_original";
+            parent.identity.overlay_participant_world_rank = 0;
+            parent.identity.overlay_participant_index = participant;
+            parent.identity.tp_rank_or_device_index = participant;
+            parent.projection_ownership = ownership;
+            const std::vector<size_t> shape{size_t(projection.columns), size_t(projection.rows), size_t(experts)};
+            if (native_q8)
+            {
+                const size_t blocks = size_t(projection.columns / 32) * size_t(projection.rows) * size_t(experts);
+                parent.tensor_owner = std::make_shared<Q8_0Tensor>(shape, std::vector<uint8_t>(blocks * sizeof(Q8_0Block), 0));
+            }
+            else
+            {
+                parent.tensor_owner = llaminar2::test::TestTensorFactory::createFP32Zeros(shape);
+            }
+            parent.tensor = parent.tensor_owner.get();
+            parent.slice.source_rows = size_t(projection.source_columns);
+            parent.slice.source_cols = size_t(projection.source_rows);
+            parent.slice.row_start = size_t(projection.first_column);
+            parent.slice.row_count = size_t(projection.columns);
+            parent.slice.col_start = size_t(projection.first_row);
+            parent.slice.col_count = size_t(projection.rows);
+            parent.slice.expert_count = size_t(experts);
+            parent.slice.inner_is_presliced = true;
+            parent.residency.home_device = target;
+            parent.residency.resident_device = target;
+            parent.residency.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
+            builder.addBinding(std::move(parent));
+        }
+        const FrozenModelWeightSet original(strategy, builder.freezeBindings(), PhysicalMemoryOwner::RoutedExpertWeights);
+        const auto projected = original.projectedExpertMatrices();
+        return projected.bindings();
+    }
+
+    /** @brief Publish geometry-aware mock handles through the actual static registry API. */
+    void registerStaticSources(ExpertGemmRegistry &registry, std::span<const WeightBinding> sources)
+    {
+        for (const auto &source : sources)
+        {
+            auto engine = std::make_shared<StaticSourceGemm>(int(source.tensor->shape()[0]), int(source.tensor->shape()[1]), source.tensor->raw_data());
+            registry.registerStaticProjection(source, engine.get(), engine);
+        }
+    }
+}
+
+TEST(StaticProjectionPreparedSource, AllOriginalExpertsAndIndependentOwnerLifetime)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        ExpertGemmRegistry registry;
+        auto sources = staticSources(device);
+        const auto scope = ExpertGemmRegistry::staticProjectionScope(sources.front());
+        const auto projection = *sources.front().projection_ownership;
+        EXPECT_FALSE(registry.acquireStaticProjectionLayer(scope, projection, sources));
+        auto unscoped = std::make_shared<StaticSourceGemm>(4,8,sources.front().tensor->raw_data());
+        EXPECT_THROW(registry.registerEngineForParticipant(scope.domain_name, device, 0, 0, 7, 0, Role::GATE,
+            unscoped.get(), unscoped, projection), std::invalid_argument);
+        EXPECT_EQ(registry.size(), 0u);
+        registerStaticSources(registry, sources);
+        EXPECT_EQ(registry.size(), 512u * 3);
+        EXPECT_FALSE(registry.hasCompleteLayer(device, 7, 512));
+        EXPECT_EQ(registry.getEngine(device, 7, 511, Role::DOWN), nullptr);
+        EXPECT_EQ(registry.getEngineForDomain(scope.domain_name, device, 7, 511, Role::DOWN, projection), nullptr);
+        EXPECT_THROW((void)registry.getEngineForParticipant(scope.domain_name, device, 0, 0, 7, 511, Role::DOWN, projection), std::logic_error);
+        auto acquired = registry.acquireStaticProjectionLayer(scope, projection, sources);
+        ASSERT_TRUE(acquired);
+        ASSERT_EQ(acquired->experts.size(), 512u);
+        EXPECT_TRUE(acquired->experts[511].complete());
+        EXPECT_EQ(acquired->experts[511].gate->get_n(), 4);
+        EXPECT_EQ(acquired->experts[511].gate->get_k(), 8);
+        EXPECT_EQ(acquired->experts[511].down->get_n(), 8);
+        EXPECT_EQ(acquired->experts[511].down->get_k(), 4);
+        std::weak_ptr<ITensorGemm> engine = acquired->experts[511].down;
+        std::weak_ptr<TensorBase> original = sources.front().projection_source_owner;
+        const auto other_device = device.is_cuda() ? DeviceId::cuda(1) : DeviceId::rocm(1);
+        auto other_sources = staticSources(other_device);
+        const auto other_scope = ExpertGemmRegistry::staticProjectionScope(other_sources.front());
+        registerStaticSources(registry, other_sources);
+        auto other = registry.acquireStaticProjectionLayer(other_scope, projection, other_sources);
+        ASSERT_TRUE(other);
+        std::weak_ptr<ITensorGemm> other_engine = other->experts[511].down;
+        std::weak_ptr<TensorBase> other_original = other_sources.front().projection_source_owner;
+        EXPECT_NE(other->experts[511].down.get(), acquired->experts[511].down.get());
+        EXPECT_NE(other_original.lock().get(), original.lock().get());
+        sources.clear();
+        other_sources.clear();
+        registry.clear();
+        EXPECT_FALSE(engine.expired());
+        EXPECT_FALSE(original.expired());
+        EXPECT_FALSE(other_engine.expired());
+        acquired.reset();
+        EXPECT_TRUE(engine.expired());
+        EXPECT_TRUE(original.expired());
+        EXPECT_FALSE(other_original.expired());
+        EXPECT_FALSE(other_engine.expired());
+        other.reset();
+        EXPECT_TRUE(other_original.expired());
+        EXPECT_TRUE(other_engine.expired());
+    }
+}
+
+TEST(StaticProjectionPreparedSource, RejectsForeignScopeAndEqualLocalDifferentGlobalPartition)
+{
+    ExpertGemmRegistry registry;
+    auto sources = staticSources(DeviceId::rocm(1), 3);
+    const auto scope = ExpertGemmRegistry::staticProjectionScope(sources.front());
+    const auto original = *sources.front().projection_ownership;
+    registerStaticSources(registry, sources);
+    const auto other = MoEExpertProjectionOwnership::withinExpertIntermediateSlices(
+        original.geometry(), 0, {{0,4},{4,2},{6,6},{12,8}});
+    EXPECT_EQ(original.projection(llaminar2::WeightRole::MoEExpertDown).columns,
+              other.projection(llaminar2::WeightRole::MoEExpertDown).columns);
+    auto foreign = sources;
+    for (auto &source : foreign) source.projection_ownership = other;
+    EXPECT_THROW((void)registry.acquireStaticProjectionLayer(scope, other, foreign), std::logic_error);
+    for (int mutation=0; mutation<5; ++mutation)
+    {
+        foreign = sources;
+        for (auto &source : foreign)
+        {
+            if (mutation==0) source.identity.overlay_domain = "foreign";
+            else if (mutation==1) source.identity.overlay_participant_world_rank = 1;
+            else if (mutation==2) source.identity.overlay_participant_index = 1;
+            else if (mutation==3) source.identity.model_id.value = 56;
+            else
+            {
+                source.residency.home_device = DeviceId::rocm(2);
+                source.residency.resident_device = DeviceId::rocm(2);
+                source.prepared->device = DeviceId::rocm(2);
+            }
+        }
+        if (mutation==3)
+        {
+            for (auto &source : foreign) source.prepared->model_id.value = 56;
+            EXPECT_THROW((void)registry.acquireStaticProjectionLayer(scope, original, foreign), std::logic_error);
+        }
+        else
+        {
+            EXPECT_THROW((void)registry.acquireStaticProjectionLayer(scope, original, foreign), std::invalid_argument);
+        }
+    }
+    auto absent = scope;
+    absent.domain_name = "not_this_domain";
+    foreign = sources;
+    for (auto &source : foreign) source.identity.overlay_domain = absent.domain_name;
+    EXPECT_FALSE(registry.acquireStaticProjectionLayer(absent, original, foreign));
+}
+
+TEST(StaticProjectionPreparedSource, RejectsDuplicateMissingHighExpertAndPartialPublication)
+{
+    ExpertGemmRegistry registry;
+    auto sources = staticSources(DeviceId::cuda(0));
+    const auto scope = ExpertGemmRegistry::staticProjectionScope(sources.front());
+    const auto projection = *sources.front().projection_ownership;
+    auto missing = sources;
+    missing.pop_back(); // Actual last original down source is expert511.
+    EXPECT_THROW((void)registry.acquireStaticProjectionLayer(scope, projection, missing), std::invalid_argument);
+    auto duplicate = sources;
+    duplicate.back() = duplicate[duplicate.size()-2];
+    EXPECT_THROW((void)registry.acquireStaticProjectionLayer(scope, projection, duplicate), std::invalid_argument);
+    registerStaticSources(registry, missing);
+    EXPECT_THROW((void)registry.acquireStaticProjectionLayer(scope, projection, sources), std::logic_error);
+    const auto &last = sources.back();
+    auto engine = std::make_shared<StaticSourceGemm>(8,4,last.tensor->raw_data());
+    registry.registerStaticProjection(last, engine.get(), engine);
+    EXPECT_TRUE(registry.acquireStaticProjectionLayer(scope, projection, sources));
+    EXPECT_THROW(registry.registerStaticProjection(last, engine.get(), engine), std::logic_error);
+    EXPECT_EQ(registry.size(), 512u*3);
+}
+
+TEST(StaticProjectionPreparedSource, RejectsMalformedSourceAndStaleOwnerWithoutMutation)
+{
+    ExpertGemmRegistry registry;
+    auto sources = staticSources(DeviceId::rocm(0), 3);
+    const auto scope = ExpertGemmRegistry::staticProjectionScope(sources.front());
+    const auto projection = *sources.front().projection_ownership;
+    for (int mutation=0; mutation<7; ++mutation)
+    {
+        auto source = sources.front();
+        auto engine = std::make_shared<StaticSourceGemm>(4,8,source.tensor->raw_data());
+        switch (mutation)
+        {
+        case 0: source.identity.overlay_domain.clear(); break;
+        case 1: source.projection_source_owner.reset(); break;
+        case 2: source.slice.col_start=1; break;
+        case 3: source.identity.expert=3; break;
+        case 4: source.prepared->binding_id ^= 1; break;
+        case 5: source.tensor_owner=llaminar2::test::TestTensorFactory::createFP32Zeros({4,8}); source.tensor=source.tensor_owner.get(); break;
+        case 6: engine=std::make_shared<StaticSourceGemm>(8,4,source.tensor->raw_data()); break;
+        }
+        EXPECT_THROW(registry.registerStaticProjection(source, engine.get(), engine), std::invalid_argument) << mutation;
+        EXPECT_EQ(registry.size(), 0u);
+    }
+    registerStaticSources(registry, sources);
+    auto stale = sources;
+    stale.front().tensor_owner = std::shared_ptr<TensorBase>(stale.front().tensor, [](TensorBase *) {});
+    EXPECT_THROW((void)registry.acquireStaticProjectionLayer(scope, projection, stale), std::logic_error);
+    stale = sources;
+    stale.front().projection_source_owner = std::shared_ptr<TensorBase>(stale.front().projection_source_owner.get(), [](TensorBase *) {});
+    EXPECT_THROW((void)registry.acquireStaticProjectionLayer(scope, projection, stale), std::logic_error);
+    EXPECT_TRUE(registry.acquireStaticProjectionLayer(scope, projection, sources));
+}
+
+TEST(StaticProjectionPreparedSource, UnequalPositivePartitionsKeepOriginalParticipants)
+{
+    for (const int participants : {2,4,8})
+    {
+        std::vector<MoEExpertProjectionOwnership::IntermediateInterval> intervals;
+        int origin=0;
+        for (int p=0; p<participants; ++p)
+        {
+            const int width = p+1==participants ? 20-origin : 1;
+            intervals.push_back({origin,width});
+            origin+=width;
+        }
+        for (int participant=0; participant<participants; ++participant)
+        {
+            ExpertGemmRegistry registry;
+            const auto sources=staticSources(DeviceId::cuda(participant),3,participant,intervals);
+            const auto scope=ExpertGemmRegistry::staticProjectionScope(sources.front());
+            const auto projection=*sources.front().projection_ownership;
+            registerStaticSources(registry,sources);
+            const auto layer=registry.acquireStaticProjectionLayer(scope,projection,sources);
+            ASSERT_TRUE(layer);
+            EXPECT_EQ(layer->scope.participant_index,participant);
+            EXPECT_EQ(layer->projection.intermediateIntervals().size(),size_t(participants));
+            EXPECT_EQ(layer->experts[2].gate->get_n(),intervals[size_t(participant)].columns);
+            EXPECT_EQ(layer->experts[2].down->get_k(),intervals[size_t(participant)].columns);
+        }
+    }
+}
+
+
+TEST(StaticProjectionPreparedSource, PreparedStoreCannotAdoptAnotherOriginalRoot)
+{
+    const auto sources = staticSources(DeviceId::cuda(0), 3);
+    const auto &original = sources.front();
+    PreparedWeightStore store(ModelContextId{55});
+    // Metadata-only registration exercises adoption identity without a native
+    // handle/backend; executable geometry is tested separately by this suite.
+    store.registerPreparedForTest(original, original.prepared->kind, original.prepared->device);
+    auto foreign = original;
+    foreign.projection_source_owner = std::shared_ptr<TensorBase>(original.projection_source_owner.get(), [](TensorBase *) {});
+    EXPECT_THROW((void)store.adoptPreparedGemmForBinding(foreign, original.prepared->device), std::runtime_error);
+    auto same = original;
+    EXPECT_TRUE(store.adoptPreparedGemmForBinding(same, original.prepared->device));
+    EXPECT_EQ(same.tensor, original.tensor);
+    EXPECT_EQ(same.projection_source_owner, original.projection_source_owner);
+}
+
+
+namespace
+{
+    /** @brief Actual native-source metadata mock with real CPU backing, never a fabricated GPU pointer. */
+    class StaticNativeSourceGemm final : public MockGemm
+    {
+    public:
+        /** @brief Borrow source storage only for descriptor validation; registry separately owns that source. */
+        explicit StaticNativeSourceGemm(const WeightBinding &source, int width_error=0, int codebook_error=0)
+            : MockGemm(56), data_(static_cast<const uint8_t *>(source.tensor->raw_data())),
+              n_(int(source.tensor->shape()[0])), k_(int(source.tensor->shape()[1])+width_error)
+        {
+            const auto *format=dynamic_cast<const IINT8Unpackable *>(source.tensor)->vnniFormatInfo();
+            original_={uint8_t(format->codebook_id+codebook_error),format->is_superblock,true};
+        }
+        /** @brief Native path deliberately retains generic get_n/get_k==0, as actual GPU quantized engines do. */
+        bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+        {
+            out={};
+            out.payload=data_;
+            out.scales=&scale_;
+            out.n=n_;
+            out.k=k_;
+            out.blocks_per_row=uint32_t(k_/32);
+            out.codebook_id=original_.codebook_id;
+            out.source_codebook_id=original_.codebook_id;
+            out.source_is_superblock=uint8_t(original_.is_superblock);
+            out.source_identity_present=1;
+            return out.valid();
+        }
+        bool exportNativeVNNISourceIdentity(NativeVnniSourceIdentity &out) const override
+        {
+            out=original_;
+            return true;
+        }
+    private:
+        const uint8_t *data_;
+        int n_;
+        int k_;
+        uint16_t scale_=0;
+        NativeVnniSourceIdentity original_;
+    };
+}
+
+TEST(StaticProjectionPreparedSource, NativeDescriptorOwnsGeometryAndOriginalCodebook)
+{
+    for (const auto device : {DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        ExpertGemmRegistry registry;
+        const auto sources=staticSources(device,3,0,{{0,32},{32,32},{64,32},{96,32}},true);
+        const auto scope=ExpertGemmRegistry::staticProjectionScope(sources.front());
+        const auto projection=*sources.front().projection_ownership;
+        auto wrong_width=std::make_shared<StaticNativeSourceGemm>(sources.front(),32,0);
+        EXPECT_THROW(registry.registerStaticProjection(sources.front(),wrong_width.get(),wrong_width),std::invalid_argument);
+        auto wrong_original=std::make_shared<StaticNativeSourceGemm>(sources.front(),0,1);
+        EXPECT_THROW(registry.registerStaticProjection(sources.front(),wrong_original.get(),wrong_original),std::invalid_argument);
+        EXPECT_EQ(registry.size(),0u);
+        for (const auto &source:sources)
+        {
+            auto engine=std::make_shared<StaticNativeSourceGemm>(source);
+            EXPECT_EQ(engine->get_n(),0);
+            registry.registerStaticProjection(source,engine.get(),engine);
+        }
+        const auto layer=registry.acquireStaticProjectionLayer(scope,projection,sources);
+        ASSERT_TRUE(layer);
+        EXPECT_EQ(layer->experts.size(),3u);
+        EXPECT_EQ(layer->sources.front().tensor->native_type(),TensorType::Q8_0);
     }
 }

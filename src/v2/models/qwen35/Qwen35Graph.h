@@ -237,6 +237,17 @@ namespace llaminar2
         std::string gdnWorkspaceRoleNamespace() const;
 
     private:
+    protected:
+        /**
+         * @brief Select the exact frozen sidecar depth using the existing explicit replication policy.
+         * @param depth_idx Learned predictor depth identity.
+         * @param bindings Primary prepared source; retained when replication is not selected.
+         * @return Primary or existing admitted full binding, never a tensor-shaped substitute.
+         * @throws std::runtime_error For an absent or duplicate selected replica.
+         */
+        const MTPDepthWeightBindings &mtpBindingsForPolicy(int depth_idx, const MTPDepthWeightBindings &bindings) const;
+
+    private:
         /**
          * @brief RAII owner for one recursive MTP graph-construction context.
          *
@@ -297,35 +308,132 @@ namespace llaminar2
             const std::string &stage_prefix_override = {},
             bool layer_idx_is_cache_local = false);
 
+    protected:
         /**
-         * @brief Build the exact shifted-MTP K/V cache-publication sidecar.
-         *
-         * This graph deliberately excludes Q projection, query gating, query
-         * normalization, attention, FFN/MoE, and vocabulary projection. It emits
-         * only the transforms required to derive and append the MTP K/V bytes
-         * from terminal hidden rows and shifted draft tokens.
-         *
-         * @return A graph terminating at the MTP KV append node, or an empty
-         *         graph when required state is absent.
+         * @brief Reuse the canonical FA body with an explicit immutable source/cache/reader.
+         * @param identity Sealed real source, native cache index and dense/selected policy.
+         * @param predictor Explicit QFN predictor residual construction, or nullptr for unchanged main/inline wiring.
+         * @param stage_prefix_override Existing snapshot prefix, empty selects the sealed identity prefix.
+         * @return The same participant-local FA chain with caller-admitted residual destinations.
+         * @throws std::invalid_argument For contradictory predictor source, rows, participant or roles.
          */
-        ComputeGraph buildMTPFAKVCacheAppendGraph(
-            const LayerWeights &layer,
-            ActivationBuffers &buffers,
-            int layer_idx,
-            int seq_len,
-            int batch_size,
-            IKVCache *kv_cache,
-            const int *position_ids,
-            const void *position_ids_device,
-            const int32_t *sequence_lengths_device,
-            DeviceId device,
-            const std::string &stage_prefix_override = {},
-            bool layer_idx_is_cache_local = false,
-            int first_seq_idx = 0);
+        ComputeGraph buildFAAttentionGraphForLayer(
+            const LayerWeights &layer, ActivationBuffers &buffers,
+            const FullAttentionLayerIdentity &identity, int seq_len, int batch_size,
+            IKVCache *kv_cache, const int *position_ids, const void *position_ids_device,
+            DeviceId device, const std::vector<int> *sequence_lengths,
+            const int32_t *sequence_lengths_device, const std::string &stage_prefix_override,
+            const Qwen4ExpPredictorResidualBinding *predictor);
+
+        /**
+         * @brief Reuse the KV-only body with explicit source48/cache0 and counted HC input.
+         * @param identity Checked dense predictor source/cache policy.
+         * @param predictor Explicit frozen predictor HC weights and original token rows.
+         * @param first_seq_idx Exact existing request cache slot; initial Dense0 supports slot0 only.
+         * @return Native K/V append producer, without Q, attention, FFN, head or auxiliary state.
+         * @throws std::invalid_argument For contradictory source/count/cache geometry.
+         */
+        ComputeGraph buildMTPFAKVCacheAppendGraphForLayer(
+            const LayerWeights &layer, ActivationBuffers &buffers,
+            const FullAttentionLayerIdentity &identity, int seq_len, int batch_size,
+            IKVCache *kv_cache, const int *position_ids, const void *position_ids_device,
+            const int32_t *sequence_lengths_device, DeviceId device,
+            const std::string &stage_prefix_override, int first_seq_idx,
+            const Qwen4ExpPredictorResidualBinding *predictor);
 
         // =====================================================================
         // GDN Attention Sub-Graph Building
         // =====================================================================
+
+    protected:
+        /**
+         * @brief Compose the real GDN Stage6 output projection from frozen source and query ownership.
+         * @param graph Participant-local graph receiving the projection node.
+         * @param prefix Original layer prefix, independent of arithmetic selection.
+         * @param buffers Existing GDN output/input and projection output arena bindings.
+         * @param weight Original immutable output matrix (or existing baseline optional operand).
+         * @param binding Source-authenticated prepared-weight binding for that exact matrix.
+         * @param seq_len Physical query rows per request in this graph.
+         * @param batch_size Number of independent request prefixes.
+         * @param device Exact projection/prepared-weight/count owner.
+         * @param lengths Original grouped verifier count; never an ordinary query substitute.
+         * @param dependency Gated norm producer of the existing GDN output tensor.
+         * @return The actual GEMMStage node name, retaining original source and query pointers.
+         * @throws std::exception Before node insertion for unsupported explicit TwoTerm source or query ownership.
+         */
+        std::string addGDNOutputProjection(ComputeGraph &graph, const std::string &prefix,
+            ActivationBuffers &buffers, TensorBase *weight, const WeightBinding *binding,
+            int seq_len, int batch_size, DeviceId device, const int32_t *lengths,
+            const std::string &dependency);
+
+        /**
+         * @brief Compose actual main FA Stage5 from frozen original source/query authority.
+         * @param graph Participant graph receiving the projection after its real output gate.
+         * @param prefix Existing original layer node namespace.
+         * @param buffers Canonical original attention output and projection result owners.
+         * @param weight Original immutable Q8_0 matrix for explicit correction.
+         * @param binding Exact prepared source binding; no source copy or new preparation.
+         * @param source_layer Original global main layer, independent of PP-local cache indices.
+         * @param seq_len Physical token-query rows per request.
+         * @param batch_size Independent request count, one for explicit correction.
+         * @param device Actual projection/source/count participant.
+         * @param lengths Original formal verifier count, checked against complete input.
+         * @param dependency Actual sigmoid-output-gate producer.
+         * @return Actual existing GEMMStage node name and arithmetic/capture identity.
+         * @throws std::exception Before insertion for unsupported source/query geometry.
+         */
+        std::string addFAOutputProjection(ComputeGraph &graph, const std::string &prefix,
+            ActivationBuffers &buffers, TensorBase *weight, const WeightBinding *binding,
+            int source_layer, int seq_len, int batch_size, DeviceId device,
+            const int32_t *lengths, const std::string &dependency);
+
+        /**
+         * @brief Authenticate only the selected original main GDN-QKV source and original query rows.
+         * @param weight Original unchanged native Q8_0 source matrix.
+         * @param binding Actual full-source immutable prepared binding.
+         * @param source_layer Original model-global main layer coordinate.
+         * @param seq_len Physical query rows per request.
+         * @param batch_size Independent request count; correction supports R1.
+         * @param device Exact prepared-source/query participant.
+         * @param lengths Original formal native query-count argument.
+         * @return No QKV-only override for SingleQ8, otherwise canonical complete source-owned query geometry.
+         * @throws std::exception Before node insertion for foreign/unprepared/partial source or invalid query authority.
+         */
+        std::optional<DeviceRowRange> gdnQKVProjectionRows(TensorBase *weight,
+            const WeightBinding *binding, int source_layer, int seq_len, int batch_size,
+            DeviceId device, const int32_t *lengths) const;
+
+    private:
+        /**
+         * @brief Resolve only the explicit GDN correction's complete input and query contract.
+         * @param weight Original output matrix; selected operations require unchanged native Q8_0.
+         * @param binding Actual immutable full-source binding in the prepared store.
+         * @param seq_len Physical query rows per request.
+         * @param batch_size Independent request count.
+         * @param device Exact source, query and graph participant.
+         * @param lengths Grouped verifier's original count owner.
+         * @return Existing baseline rows or exact selected prefill/verifier/compact query geometry.
+         * @throws std::exception For missing/unprepared/foreign source, padded query or unsupported request geometry.
+         */
+        std::optional<DeviceRowRange> gdnOutputProjectionRows(TensorBase *weight,
+            const WeightBinding *binding, int seq_len, int batch_size,
+            DeviceId device, const int32_t *lengths) const;
+
+        /**
+         * @brief Authenticate main-only FA output source, prepared interval and original query.
+         * @param weight Original output matrix; no mirror or converted format is accepted.
+         * @param binding Canonical immutable source and existing prepared store identity.
+         * @param source_layer Original model-global main coordinate, not a stage/cache index.
+         * @param seq_len Physical token-query rows.
+         * @param batch_size Independent request count.
+         * @param device Actual participant for source and query authority.
+         * @param lengths Original formal verifier count, never inferred from KV length.
+         * @return Baseline descriptor or the canonical selected single-request query range.
+         * @throws std::exception Before node insertion for unsupported explicit invocation.
+         */
+        std::optional<DeviceRowRange> faOutputProjectionRows(TensorBase *weight,
+            const WeightBinding *binding, int source_layer, int seq_len, int batch_size,
+            DeviceId device, const int32_t *lengths) const;
 
         bool gdnLiveStateAllGatherAvailable(int total_tokens, DeviceId device) const;
 

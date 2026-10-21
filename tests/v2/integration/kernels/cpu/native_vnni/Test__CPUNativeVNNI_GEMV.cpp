@@ -5582,4 +5582,206 @@ namespace
         }
     }
 
+
+    /** @test Every native format accepts M1 on the real grouped APIs and retains serial-row bytes through M3. */
+    TEST_F(CPUNativeVNNIGemvTest, MTP_M1ProjectionAndSwiGLUAllFormatsAreSerialByteExact)
+    {
+        constexpr int K = 256, N = 64;
+        for (const int workers : {1, 3})
+        {
+            ScopedOMPThreadCount team(workers);
+            for (const auto &format : ALL_FORMATS)
+            for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative,
+                                      CPUProjectionNumericalPolicy::GPUAlignedExpert})
+            {
+                SCOPED_TRACE(format.name + "/workers=" + std::to_string(workers) +
+                    "/policy=" + std::to_string(static_cast<int>(policy)));
+                auto weights = createWeightsForFormat(format.name, N, K);
+                ASSERT_NE(weights, nullptr);
+                CPUNativeVNNIGemmKernel kernel(weights.get(), 0, -1, policy);
+                ASSERT_TRUE(kernel.isValid());
+                CPUProjectionTestWorkspace workspace(3, K, cpuProjectionTestRequirements(3, {&kernel}));
+                for (const int M : {1, 2, 3})
+                {
+                    SCOPED_TRACE("M=" + std::to_string(M));
+                    auto input = TestTensorFactory::createFP32Random(
+                        {static_cast<size_t>(M), size_t{K}}, -0.7f, 0.7f, 7141 + M);
+                    auto gate = TestTensorFactory::createFP32Random(
+                        {static_cast<size_t>(M), size_t{K}}, -0.6f, 0.6f, 8151 + M);
+                    ASSERT_NE(input, nullptr);
+                    ASSERT_NE(gate, nullptr);
+                    FP32Tensor grouped({static_cast<size_t>(M), size_t{N}});
+                    FP32Tensor second({static_cast<size_t>(M), size_t{N}});
+                    FP32Tensor swiglu({static_cast<size_t>(M), size_t{N}});
+                    std::vector<float> serial(static_cast<size_t>(M) * N);
+                    std::vector<float> serial_swiglu(static_cast<size_t>(M) * N);
+                    for (int row = 0; row < M; ++row)
+                    {
+                        FP32Tensor input_row({1, K}), gate_row({1, K}), output_row({1, N}), swiglu_row({1, N});
+                        std::memcpy(input_row.mutable_data(), input->data() + static_cast<size_t>(row) * K, K * sizeof(float));
+                        std::memcpy(gate_row.mutable_data(), gate->data() + static_cast<size_t>(row) * K, K * sizeof(float));
+                        ASSERT_TRUE(kernel.multiply_tensor(&input_row, &output_row, 1, N, K,
+                            true, 1.0f, 0.0f, nullptr, nullptr, -1, workspace.get()));
+                        ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(&gate_row, &input_row, &swiglu_row,
+                            1, N, K, 1.0f, 0.0f, workspace.get()));
+                        std::memcpy(serial.data() + static_cast<size_t>(row) * N, output_row.data(), N * sizeof(float));
+                        std::memcpy(serial_swiglu.data() + static_cast<size_t>(row) * N, swiglu_row.data(), N * sizeof(float));
+                    }
+                    // The one-descriptor HC path and genuine fused descriptor
+                    // path both retain their existing kernels at every M.
+                    for (const int projections : {1, 2})
+                    {
+                        std::vector<ITensorGemm::TensorProjectionDesc> descriptors{
+                            {&kernel, &grouped, N, nullptr, "original_projection"}};
+                        if (projections == 2)
+                            descriptors.emplace_back(&kernel, &second, N, nullptr, "second_projection");
+                        auto scope = kernel.beginVerifierDecodeEquivalentScope(DeviceRowRange::fullyActive(M));
+                        ASSERT_TRUE(kernel.multiply_fused_verifier_rows_decode_equivalent(
+                            input.get(), descriptors, M, K, nullptr, workspace.get()));
+                        EXPECT_EQ(std::memcmp(grouped.data(), serial.data(), serial.size() * sizeof(float)), 0);
+                        if (projections == 2)
+                        {
+                            EXPECT_EQ(std::memcmp(second.data(), serial.data(), serial.size() * sizeof(float)), 0);
+                        }
+                    }
+                    ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                        gate.get(), input.get(), &swiglu, M, N, K, 1.0f, 0.0f, workspace.get()));
+                    EXPECT_EQ(std::memcmp(swiglu.data(), serial_swiglu.data(), serial_swiglu.size() * sizeof(float)), 0);
+
+                    // This public verifier entry does not widen the inner
+                    // multi-row policy inventory. The actual M1 primitive is
+                    // selected before that table, whose own guard stays strict.
+                    if (M == 1)
+                    {
+                        std::vector<Q8_1Block> q8(K / 32);
+                        quantize_activations_to_q8_1(input->data(), q8.data(), 1, K, K / 32, policy);
+                        const std::vector<float> before_inner(grouped.data(), grouped.data() + grouped.numel());
+                        EXPECT_THROW(gemm_native_vnni_preq_decode_equivalent_rows(
+                            kernel.packedWeights(), q8.data(), grouped.mutable_data(), {}, 1, N), std::invalid_argument);
+                        EXPECT_EQ(std::memcmp(grouped.data(), before_inner.data(), before_inner.size() * sizeof(float)), 0);
+                    }
+
+                    // Physical M0/-1 is invalid on CPU. Rejection precedes any
+                    // output or admitted workspace access, even with a valid engine.
+                    const std::vector<float> before(grouped.data(), grouped.data() + grouped.numel());
+                    const std::vector<float> before_swiglu(swiglu.data(), swiglu.data() + swiglu.numel());
+                    std::vector<ITensorGemm::TensorProjectionDesc> descriptor{
+                        {&kernel, &grouped, N, nullptr, "invalid_physical_rows"}};
+                    for (const int invalid : {0, -1})
+                    {
+                        EXPECT_FALSE(kernel.multiply_fused_verifier_rows_decode_equivalent(
+                            input.get(), descriptor, invalid, K, nullptr, nullptr));
+                        EXPECT_FALSE(kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                            gate.get(), input.get(), &swiglu, invalid, N, K, 1.0f, 0.0f, nullptr));
+                        EXPECT_EQ(std::memcmp(grouped.data(), before.data(), before.size() * sizeof(float)), 0);
+                        EXPECT_EQ(std::memcmp(swiglu.data(), before_swiglu.data(), before_swiglu.size() * sizeof(float)), 0);
+                    }
+                }
+            }
+        }
+    }
+
+
+    /** @test Complete grouped descriptor validation rejects malformed extents before any bank/output mutation. */
+    TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierProjectionRejectsMalformedExtentsBeforeWrites)
+    {
+        ScopedOMPThreadCount team(1);
+        constexpr int K = 256, N = 64;
+        auto weights = createWeightsForFormat("Q8_0", N, K);
+        auto foreign_weights = createWeightsForFormat("Q8_0", N, 2 * K);
+        ASSERT_NE(weights, nullptr);
+        ASSERT_NE(foreign_weights, nullptr);
+        CPUNativeVNNIGemmKernel kernel(weights.get()), foreign(foreign_weights.get());
+        ASSERT_TRUE(kernel.isValid());
+        ASSERT_TRUE(foreign.isValid());
+        enum class InvalidExtent { Input, AnchorK, ProjectionN, ProjectionK, Output, Bias };
+        for (const int M : {1, 3})
+        {
+            // Every short logical view retains a larger actual parent. Even a
+            // deliberately omitted guard therefore stays within allocated RAM;
+            // the test detects invalid writes instead of relying on UB/crashes.
+            auto input_root = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M) * 2 * K});
+            auto bias_root = std::make_shared<FP32Tensor>(std::vector<size_t>{N + 1});
+            std::array<std::shared_ptr<FP32Tensor>, 2> output_roots{
+                std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M) * (N + 1)}),
+                std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M) * (N + 1)})};
+            for (size_t i = 0; i < input_root->numel(); ++i)
+                input_root->mutable_data()[i] = static_cast<float>(static_cast<int>(i % 23) - 11) / 32.0f;
+            std::fill_n(bias_root->mutable_data(), bias_root->numel(), 0.25f);
+            const auto input = input_root->create_view({static_cast<size_t>(M), size_t{K}});
+            const auto short_input = input_root->create_view({static_cast<size_t>(M) * K - 1});
+            const auto bias = bias_root->create_view({N});
+            const auto short_bias = bias_root->create_view({N - 1});
+            ASSERT_TRUE(input);
+            ASSERT_TRUE(short_input);
+            ASSERT_TRUE(bias);
+            ASSERT_TRUE(short_bias);
+            std::array<std::shared_ptr<TensorBase>, 2> output, short_output;
+            for (size_t i = 0; i < output.size(); ++i)
+            {
+                output[i] = output_roots[i]->create_view({static_cast<size_t>(M), size_t{N}});
+                short_output[i] = output_roots[i]->create_view({static_cast<size_t>(M) * N - 1});
+                ASSERT_TRUE(output[i]);
+                ASSERT_TRUE(short_output[i]);
+            }
+            CPUProjectionTestWorkspace workspace(M, 2 * K, cpuProjectionTestRequirements(M, {&kernel, &foreign}));
+            auto q8 = CPUInvocationWorkspace::available<Q8_1Block>(workspace.get(), kCPUProjectionQ8);
+            ASSERT_FALSE(q8.empty());
+            const std::vector<float> original_input(input_root->data(), input_root->data() + input_root->numel());
+            const std::vector<float> original_bias(bias_root->data(), bias_root->data() + bias_root->numel());
+            for (const int projections : {1, 2})
+            for (int invalid_index = 0; invalid_index < projections; ++invalid_index)
+            for (const auto invalid : {InvalidExtent::Input, InvalidExtent::AnchorK, InvalidExtent::ProjectionN,
+                                      InvalidExtent::ProjectionK, InvalidExtent::Output, InvalidExtent::Bias})
+            {
+                SCOPED_TRACE("M=" + std::to_string(M) + "/projections=" + std::to_string(projections) +
+                    "/index=" + std::to_string(invalid_index) + "/invalid=" + std::to_string(static_cast<int>(invalid)));
+                std::array<std::vector<float>, 2> before;
+                for (size_t i = 0; i < output.size(); ++i)
+                {
+                    std::fill_n(output_roots[i]->mutable_data(), output_roots[i]->numel(), -37.0f - static_cast<float>(i));
+                    before[i].assign(output_roots[i]->data(), output_roots[i]->data() + output_roots[i]->numel());
+                }
+                std::memset(q8.data(), 0xa7, q8.size_bytes());
+                std::vector<uint8_t> before_q8(q8.size_bytes());
+                std::memcpy(before_q8.data(), q8.data(), q8.size_bytes());
+                std::vector<ITensorGemm::TensorProjectionDesc> descriptors;
+                for (int i = 0; i < projections; ++i)
+                    descriptors.emplace_back(&kernel, output[i].get(), N, bias.get(), "checked_projection");
+                const TensorBase *actual_input = input.get();
+                int actual_k = K;
+                switch (invalid)
+                {
+                case InvalidExtent::Input: actual_input = short_input.get(); break;
+                case InvalidExtent::AnchorK: actual_k = K - 32; break;
+                case InvalidExtent::ProjectionN: descriptors[invalid_index].n = N - 1; break;
+                case InvalidExtent::ProjectionK: descriptors[invalid_index].kernel = &foreign; break;
+                case InvalidExtent::Output: descriptors[invalid_index].output = short_output[invalid_index].get(); break;
+                case InvalidExtent::Bias: descriptors[invalid_index].bias = short_bias.get(); break;
+                }
+                EXPECT_FALSE(kernel.multiply_fused_verifier_rows_decode_equivalent(
+                    actual_input, descriptors, M, actual_k, nullptr, workspace.get()));
+                for (size_t i = 0; i < output.size(); ++i)
+                    EXPECT_EQ(std::memcmp(output_roots[i]->data(), before[i].data(), before[i].size() * sizeof(float)), 0);
+                EXPECT_EQ(std::memcmp(q8.data(), before_q8.data(), before_q8.size()), 0);
+                EXPECT_EQ(std::memcmp(input_root->data(), original_input.data(), original_input.size() * sizeof(float)), 0);
+                EXPECT_EQ(std::memcmp(bias_root->data(), original_bias.data(), original_bias.size() * sizeof(float)), 0);
+            }
+            std::vector<ITensorGemm::TensorProjectionDesc> valid{
+                {&kernel, output[0].get(), N, bias.get(), "valid_projection0"},
+                {&kernel, output[1].get(), N, bias.get(), "valid_projection1"}};
+            ASSERT_TRUE(kernel.multiply_fused_verifier_rows_decode_equivalent(
+                input.get(), valid, M, K, nullptr, workspace.get()));
+            for (int row = 0; row < M; ++row)
+            {
+                FP32Tensor input_row({1, K}), serial({1, N});
+                std::memcpy(input_row.mutable_data(), input->data() + static_cast<size_t>(row) * K, K * sizeof(float));
+                ASSERT_TRUE(kernel.multiply_tensor(&input_row, &serial, 1, N, K,
+                    true, 1.0f, 0.0f, bias.get(), nullptr, -1, workspace.get()));
+                for (const auto &destination : output)
+                    EXPECT_EQ(std::memcmp(destination->data() + static_cast<size_t>(row) * N, serial.data(), N * sizeof(float)), 0);
+            }
+        }
+    }
+
 } // anonymous namespace

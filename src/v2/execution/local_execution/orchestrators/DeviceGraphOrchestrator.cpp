@@ -13,71 +13,77 @@
  * it cannot manufacture another pipeline or lazily discover TP domains.
  */
 
-#include "execution/moe/DeviceMoERebalancePerfStats.h"
 #include "DeviceGraphOrchestrator.h"
-#include "PipelineForwardGraphEdges.h"
-#include "MTPSidecarStreamBinding.h"
-#include "execution/mtp/DeviceGenerationGraphProgram.h"
-#include "../../config/HybridPrecisionConfig.h"
-#include "../../config/InferenceMode.h"
-#include "../../../loaders/WeightManager.h"
-#include "../../../loaders/WeightPlacementMap.h"
-#include "../../../loaders/IWeightManager.h"
-#include "../../../loaders/IWeightPlacementMap.h"
-#include "../../../config/TensorParallelConfig.h"
-#include "../../../collective/ILocalTPContext.h" // createLocalTPContext()
-#include "../../../collective/BackendRouter.h"   // GlobalBackendRouter for PP copy
-#include "../../../collective/CollectiveTimeoutPolicy.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../backends/GPUDeviceContextPool.h"
-#include "../graph/GraphCaptureGuard.h"
-#include "../graph/DeviceGraphCaptureController.h"
-#include "../graph/DeviceExecutionTimeline.h"
-#include "../engine/PrefillBucketUtils.h"
-#include "../engine/ForwardGraphEntryOrdering.h"
-#include "../../../utils/Logger.h"
-#include "../../../utils/DebugEnv.h"
-#include "../../../utils/MPIContext.h"
-#include "../../../utils/PerfStatsCollector.h"
-#include "../../../utils/VramBillOfMaterials.h"
-#include "../../../planning/ActivationBufferSizing.h"
-#include "../../../planning/PhysicalMemoryAuthority.h"
-#include "../../../tensors/TensorFactory.h"
-#include "../../../tensors/TensorClasses.h"
-#include "../../../tensors/GpuTensorView.h"
-#include "../../../kernels/cpu/CPUKVCache.h"
-#include "../../../kernels/KernelFactory.h"
+#include "../../../collective/BackendRouter.h" // GlobalBackendRouter for PP copy
+#include "../../../collective/CollectiveTimeoutPolicy.h"
+#include "../../../collective/ILocalTPContext.h" // createLocalTPContext()
+#include "../../../config/TensorParallelConfig.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../kernels/HybridKVCacheConfig.h"
 #include "../../../kernels/IHybridKVCache.h"
-#include "../../compute_stages/stages/MoEExpertComputeStage.h"
-#include "../../compute_stages/stages/MoERoutingStage.h"
-#include "../../compute_stages/stages/MoEDeviceRebalanceStage.h"
-#include "../../compute_stages/stages/MoEOverlayTicketPublishStage.h"
+#include "../../../kernels/KernelFactory.h"
+#include "../../../kernels/common/SamplingMath.h"
+#include "../../../kernels/cpu/CPUKVCache.h"
+#include "../../../kernels/cpu/sampling/CPUSamplerPrimitives.h"
+#include "../../../loaders/IWeightManager.h"
+#include "../../../loaders/IWeightPlacementMap.h"
+#include "../../../loaders/PreparedWeightStore.h"
+#include "../../../loaders/WeightManager.h"
+#include "../../../loaders/WeightPlacementMap.h"
+#include "../../../loaders/WeightPlan.h"
+#include "../../../models/qwen35moe/Qwen35MoEGraph.h"
+#include "../../../planning/ActivationBufferSizing.h"
+#include "../../../planning/PhysicalMemoryAuthority.h"
+#include "../../../tensors/GpuTensorView.h"
+#include "../../../tensors/TensorClasses.h"
+#include "../../../tensors/TensorFactory.h"
+#include "../../../utils/DebugEnv.h"
+#include "../../../utils/Logger.h"
+#include "../../../utils/MPIContext.h"
+#include "../../../utils/PerfStatsCollector.h"
+#include "../../../utils/Sampler.h" // LogitPenalty
+#include "../../../utils/VramBillOfMaterials.h"
 #include "../../compute_stages/stages/AllGatherStage.h"
-#include "../../mtp/MTPCheckpointPolicy.h"
-#include "../../mtp/MTPDeviceGenerationPolicy.h"
-#include "../../mtp/MTPServingForwardCaptureGeometry.h"
-#include "../../mtp/MTPVerifierPolicy.h"
-#include "../../mtp/MTPSpecKVPublisher.h"
-#include "../../mtp/MTPSpecStatePublisher.h"
-#include "../../moe/ExpertWeightTransfer.h"
+#include "../../compute_stages/stages/MoEDeviceRebalanceStage.h"
+#include "../../compute_stages/stages/MoEExpertComputeStage.h"
+#include "../../compute_stages/stages/MoEOverlayTicketPublishStage.h"
+#include "../../compute_stages/stages/MoERoutingStage.h"
+#include "../../compute_stages/stages/RoPEStage.h"
+#include "../../config/HybridPrecisionConfig.h"
+#include "../../config/InferenceMode.h"
 #include "../../moe/ExpertWeightPayloadProvider.h"
+#include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/GpuExpertTransferStagingPool.h"
 #include "../../moe/MoEGroupedVerifierHistogramBoundarySet.h"
 #include "../../moe/MoEOverlayInferenceTransactionService.h"
 #include "../../moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
-#include "../../moe/MoEOverlayRetainedParentComposer.h"
 #include "../../moe/MoEOverlayResidencyAuthority.h"
-#include "../../../loaders/PreparedWeightStore.h"
-#include "../../../loaders/WeightPlan.h"
-#include "../../../backends/BackendManager.h"
-#include "../../../interfaces/IWorkspaceConsumer.h"
-#include "../../../kernels/common/SamplingMath.h"
-#include "../../../kernels/cpu/sampling/CPUSamplerPrimitives.h"
-#include "../../../models/qwen35moe/Qwen35MoEGraph.h"
-#include "../../compute_stages/stages/RoPEStage.h"
+#include "../../moe/MoEOverlayRetainedParentComposer.h"
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/RoutedExpertOwnerAssignment.h"
-#include "../../../utils/Sampler.h" // LogitPenalty
+#include "../../mtp/MTPCheckpointPolicy.h"
+#include "../../mtp/MTPDeviceGenerationPolicy.h"
+#include "../../mtp/MTPServingForwardCaptureGeometry.h"
+#include "../../mtp/MTPSpecKVPublisher.h"
+#include "../../mtp/MTPSpecStatePublisher.h"
+#include "../../mtp/MTPVerifierPolicy.h"
+#include "../../prefix_cache/PrefixArchiveCheckpointReadiness.h"
+#include "../../prefix_cache/PrefixArchivePublicationScope.h"
+#include "../../prefix_cache/PrefixAuxiliaryStateIO.h"
+#include "../../prefix_cache/ResidualRowGeometry.h"
+#include "../engine/ForwardGraphEntryOrdering.h"
+#include "../engine/PrefillBucketUtils.h"
+#include "../graph/DeviceExecutionTimeline.h"
+#include "../graph/DeviceGraphCaptureController.h"
+#include "../graph/GraphCaptureGuard.h"
+#include "../graph/RequestInputPositionAdmission.h"
+#include "../graph/SchemaFactoryRegistry.h"
+#include "MTPSidecarStreamBinding.h"
+#include "PipelineForwardGraphEdges.h"
+#include "execution/moe/DeviceMoERebalancePerfStats.h"
+#include "execution/mtp/DeviceGenerationGraphProgram.h"
 #include "execution/prefix_cache/BlockHash.h"
 #include "execution/prefix_cache/DeviceHotPrefixStorageBackend.h"
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
@@ -85,23 +91,27 @@
 #include "execution/prefix_cache/PrefixCacheStateProbe.h"
 #include "execution/prefix_cache/PrefixStateCache.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
-#include "utils/Sha256.h"
+#include "kernels/qwen4exp/QwenAdaptiveTerminalCounters.h"
+#include "kernels/qwen4exp/QwenFixedHeadTerminalCounters.h"
+#include "kernels/qwen4exp/QwenSparseTerminalCounters.h"
+#include "models/qwen4exp/Qwen4ExpConfig.h"
 #include "transfer/MappedTransferProgressEpoch.h"
 #include "transfer/TransferEngine.h"
-#include <chrono>
+#include "utils/Sha256.h"
 #include <algorithm>
-#include <cstdio>
-#include <map>
 #include <array>
 #include <cctype>
-#include <cstddef>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iomanip>
 #include <initializer_list>
+#include <iomanip>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -3387,6 +3397,7 @@ namespace llaminar2
                 return false;
             }
 
+            layout.mtp_origin=mtp_cache.stateOwnership().shifted_origin;
             layout.mtp_layers = mtp_layout.fa_layers;
             layout.mtp_local_kv_heads = mtp_layout.local_kv_heads;
             layout.mtp_kv_head_start = mtp_layout.kv_head_start;
@@ -3398,12 +3409,14 @@ namespace llaminar2
             layout.bytes_per_mtp_layer_v = mtp_layout.bytes_per_fa_layer_v;
             layout.mtp_kv_bytes = mtp_layout.faKVBytes();
             layout.includes_mtp_state = layout.mtp_kv_bytes > 0;
+            layout.mtp_auxiliary=mtp_layout.main_auxiliary;
             return layout.includes_mtp_state;
         }
 
         void copyMTPPayloadLayoutFields(const PrefixPayloadLayout &src,
                                         PrefixPayloadLayout &dst)
         {
+            dst.mtp_origin=src.mtp_origin;
             dst.mtp_layers = src.mtp_layers;
             dst.mtp_local_kv_heads = src.mtp_local_kv_heads;
             dst.mtp_kv_head_start = src.mtp_kv_head_start;
@@ -3415,6 +3428,7 @@ namespace llaminar2
             dst.bytes_per_mtp_layer_v = src.bytes_per_mtp_layer_v;
             dst.mtp_kv_bytes = src.mtp_kv_bytes;
             dst.includes_mtp_state = src.includes_mtp_state;
+            dst.mtp_auxiliary = src.mtp_auxiliary;
         }
 
         bool samePrefixPayloadShape(const PrefixPayloadLayout &lhs,
@@ -3427,19 +3441,12 @@ namespace llaminar2
                    lhs.totalBytes() == rhs.totalBytes();
         }
 
-        int mtpTokenStartForPrefixBlock(const PrefixCacheKey &key)
-        {
-            return key.token_start == 0 ? 0 : key.token_start - 1;
-        }
-
-        int mtpTokenCountForPrefixBlock(const PrefixCacheKey &key)
-        {
-            if (key.token_count <= 0)
-            {
-                return 0;
-            }
-            return key.token_start == 0 ? std::max(0, key.token_count - 1) : key.token_count;
-        }
+        /** @return Exact model-owned cache ordinal for one immutable logical main block. */
+        int mtpTokenStartForPrefixBlock(const PrefixCacheKey &key,MTPShiftedCacheOrigin origin)
+        { return mtpShiftedBlockRange(key.token_start,key.token_count,origin).first; }
+        /** @return Live shifted rows, including QFN's visible token-zero seed. */
+        int mtpTokenCountForPrefixBlock(const PrefixCacheKey &key,MTPShiftedCacheOrigin origin)
+        { return mtpShiftedBlockRange(key.token_start,key.token_count,origin).count; }
 
         /**
          * @brief Allocate pure VRAM storage with orchestrator-lifetime ownership.
@@ -3542,7 +3549,10 @@ namespace llaminar2
                 return true;
             }
 
-            const int token_count = mtpTokenCountForPrefixBlock(key);
+            requireMTPShiftedCacheOrigin(mtp_cache.stateOwnership().shifted_origin,handle->layout.mtp_origin);
+            if(device_hot_handle)
+                requireMTPShiftedCacheOrigin(mtp_cache.stateOwnership().shifted_origin,device_hot_handle->layout.mtp_origin);
+            const int token_count = mtpTokenCountForPrefixBlock(key,mtp_cache.stateOwnership().shifted_origin);
             if (token_count == 0)
             {
                 return true;
@@ -3568,7 +3578,7 @@ namespace llaminar2
                 IKVCache::KVCacheLogicalBlockDescriptor desc;
                 desc.layer = global_layer;
                 desc.seq_idx = seq_idx;
-                desc.logical_token_start = mtpTokenStartForPrefixBlock(key);
+                desc.logical_token_start = mtpTokenStartForPrefixBlock(key,mtp_cache.stateOwnership().shifted_origin);
                 desc.token_count = token_count;
                 desc.stream = stream;
                 const auto payload_layout =
@@ -3651,7 +3661,8 @@ namespace llaminar2
                 return true;
             }
 
-            const int token_count = mtpTokenCountForPrefixBlock(handle.key);
+            requireMTPShiftedCacheOrigin(mtp_cache.stateOwnership().shifted_origin,handle.layout.mtp_origin);
+            const int token_count = mtpTokenCountForPrefixBlock(handle.key,mtp_cache.stateOwnership().shifted_origin);
             if (token_count == 0)
             {
                 return true;
@@ -3689,7 +3700,7 @@ namespace llaminar2
                 IKVCache::KVCacheLogicalBlockDescriptor desc;
                 desc.layer = global_layer;
                 desc.seq_idx = seq_idx;
-                desc.logical_token_start = mtpTokenStartForPrefixBlock(handle.key);
+                desc.logical_token_start = mtpTokenStartForPrefixBlock(handle.key,mtp_cache.stateOwnership().shifted_origin);
                 desc.token_count = token_count;
                 desc.stream = stream;
                 const auto payload_layout =
@@ -3927,6 +3938,7 @@ namespace llaminar2
         PrefixPayloadLayout hybridOnlyCheckpointLayout(const PrefixPayloadLayout &layout)
         {
             PrefixPayloadLayout hybrid_layout = layout;
+            hybrid_layout.main_auxiliary={};hybrid_layout.mtp_auxiliary={};
             hybrid_layout.fa_layers = 0;
             hybrid_layout.local_kv_heads = 0;
             hybrid_layout.kv_head_start = 0;
@@ -4667,6 +4679,7 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "DeviceGraphOrchestrator requires named, non-null injected TP contexts");
 
+        graph_builder_->bindStorageMemoryAuthority(physical_memory_authority_);
         graph_builder_->setCPUCurrentBatchLLEPPhysicalExecutor(this);
 
         configureExecutor();
@@ -5033,7 +5046,7 @@ namespace llaminar2
              * identities.  Retire that parent first so no surviving native
              * executable names a child while the child family is destroyed.
              */
-            mtp_device_generation_loop_graph_.release();
+            releaseRetainedStorageGenerationTopology();
 
             if (forward_engine_)
                 forward_engine_->discardAllCachedGraphs();
@@ -6086,11 +6099,21 @@ namespace llaminar2
                 missing.emplace_back("token_embd.weight");
             }
             if ((requires_full_replicated_dense ||
-                 requires_mirrored_mtp_head) &&
-                owns_lm_head_stage &&
-                !weight_bindings.final_norm)
+                 requires_mirrored_mtp_head) && owns_lm_head_stage)
             {
-                missing.emplace_back("output_norm.weight");
+                // Auxiliary planning already uses this model-owned inventory.
+                // Validate that same contract here: a branch-residual terminal
+                // mixer cannot be replaced by an ordinary final-norm binding.
+                const auto schema = SchemaFactoryRegistry::getFactory(
+                    graph_builder_->architectureName());
+                for (const char *name : schema->terminalInputWeightNames())
+                {
+                    const auto *binding = optionalGlobalBinding(*weight_set, name);
+                    if (!binding || !binding->tensor)
+                    {
+                        missing.emplace_back(name);
+                    }
+                }
             }
             if ((requires_full_replicated_dense ||
                  requires_mirrored_mtp_head) &&
@@ -6648,7 +6671,7 @@ namespace llaminar2
             if (!arena_->registerBuffer(
                     BufferId::PREFIX_TERMINAL_HIDDEN,
                     terminal_hidden_row_capacity,
-                    static_cast<size_t>(config.d_model),
+                    static_cast<size_t>(config.residualWidth()),
                     "FP32",
                     state_.device_id))
             {
@@ -7886,7 +7909,7 @@ namespace llaminar2
                             response_device_ordinal);
                 });
 
-            mtp_device_generation_loop_graph_.release();
+            releaseRetainedStorageGenerationTopology();
             void *raw_loop_stream =
                 backend->createStream(state_.device_id.gpu_ordinal());
             if (!raw_loop_stream)
@@ -7916,14 +7939,14 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to create the persistent device-generation graph owner on "
                           << state_.device_id.toString() << ": "
                           << exception.what());
-                mtp_device_generation_loop_graph_.release();
+                releaseRetainedStorageGenerationTopology();
                 return false;
             }
             if (!mtp_device_generation_loop_graph_.capture)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] GPU context returned no device-generation graph owner on "
                           << state_.device_id.toString());
-                mtp_device_generation_loop_graph_.release();
+                releaseRetainedStorageGenerationTopology();
                 return false;
             }
             PerfStatsCollector::addCounter(
@@ -7949,7 +7972,7 @@ namespace llaminar2
             device_generation_dispatch_ticket_ready_event_.reset();
             device_generation_terminal_host_ready_event_.reset();
             stochastic_outcome_response_bridge_stream_.reset();
-            mtp_device_generation_loop_graph_.release();
+            releaseRetainedStorageGenerationTopology();
         }
 
         /*
@@ -8102,6 +8125,7 @@ namespace llaminar2
             cache->bindStateOwnership({
                 .role = IKVCache::StateRole::MTPShiftedSidecar,
                 .mtp_depth = depth,
+                .shifted_origin = graph_builder_->config().mtpShiftedCacheOrigin(),
             });
             logKVCacheBom(("mtp_depth_" + std::to_string(depth)).c_str(),
                           device,
@@ -8630,9 +8654,29 @@ namespace llaminar2
         if (external_hidden_state_input_)
         {
             effective_input.external_hidden_state = external_hidden_state_input_;
+            // setHiddenState is the explicit host-owned segmented boundary.
+            // Seal its current live rows before bucket planning changes capacity.
+            effective_input.host_pipeline_activation_rows = HostPipelineActivationRows::admitted(
+                external_hidden_state_input_, input.device, input.batch_size,
+                input.real_seq_len > 0 ? input.real_seq_len : input.seq_len);
             LOG_DEBUG("[DeviceGraphOrchestrator] Using external hidden state input: "
                       << external_hidden_state_input_->numel() << " elements");
             external_hidden_state_input_ = nullptr; // single-use semantics
+        }
+
+        if(!executableForwardSubmissionIntent(effective_input.graph_submission_intent))
+            throw std::invalid_argument("DGO cannot submit a workspace declaration or unknown forward intent");
+        if(effective_input.device.is_gpu() && effective_input.batch_size==1 &&
+            effective_input.execution_role==ForwardExecutionRole::MainInference &&
+            effective_input.execution_phase==ForwardExecutionPhase::Prefill && !effective_input.device_prefill_chunk &&
+            (effective_input.device_request_query || (effective_input.token_ids_device==request_token_ids_dev_ &&
+                effective_input.position_ids_device==request_position_ids_dev_ && effective_input.sequence_lengths_device==request_sequence_lengths_dev_)))
+        {
+            const auto original=DeviceRequestQueryBinding::fromArena(*arena_,effective_input.device);
+            if(effective_input.device_request_query && effective_input.device_request_query->captureIdentity()!=original.captureIdentity())
+                throw std::invalid_argument("DGO prefill received a foreign original-request query binding");
+            effective_input.device_request_query=original;
+            requireDeviceRequestQueryOwnsInput(effective_input);
         }
 
         // Ensure engine is initialized with current config
@@ -14291,7 +14335,23 @@ namespace llaminar2
     GraphBuildResult DeviceGraphOrchestrator::buildForwardGraph(
         const ForwardInput &input)
     {
+        if(input.graph_submission_intent!=ForwardGraphSubmissionIntent::WorkspaceDeclaration &&
+            !executableForwardSubmissionIntent(input.graph_submission_intent))
+            throw std::invalid_argument("DGO has an unknown forward graph construction intent");
         ForwardInput build_input = input;
+        if(build_input.graph_submission_intent!=ForwardGraphSubmissionIntent::WorkspaceDeclaration &&
+            build_input.device.is_gpu() && build_input.batch_size==1 &&
+            build_input.execution_role==ForwardExecutionRole::MainInference &&
+            build_input.execution_phase==ForwardExecutionPhase::Prefill && !build_input.device_prefill_chunk &&
+            (build_input.device_request_query || (build_input.token_ids_device==request_token_ids_dev_ &&
+                build_input.position_ids_device==request_position_ids_dev_ && build_input.sequence_lengths_device==request_sequence_lengths_dev_)))
+        {
+            const auto original=DeviceRequestQueryBinding::fromArena(*arena_,build_input.device);
+            if(build_input.device_request_query && build_input.device_request_query->captureIdentity()!=original.captureIdentity())
+                throw std::invalid_argument("DGO prefill received a foreign original-request query binding");
+            build_input.device_request_query=original;
+            requireDeviceRequestQueryOwnsInput(build_input);
+        }
         if (build_input.device.is_gpu())
         {
             if (!build_input.device_state_publication_stream)
@@ -14307,12 +14367,15 @@ namespace llaminar2
                     "non-null device-state publication stream");
             }
         }
+        if(graph_builder_ && graph_builder_->config().ngram_replicated_ple_cohort)
+            build_input.replicated_ple_query=fixedHeadPLEQuery(build_input);
         auto session = buildGraph().forInput(build_input);
 
         auto finalize = [&](GraphBuildResult result) -> GraphBuildResult
         {
             if (!result)
                 return result;
+            applyForwardGraphConstructionIntent(result.graph(),build_input);
 
             std::string cadence_error;
             if (!appendHostedDeviceMoEDecodeCommitBoundary(
@@ -14554,8 +14617,18 @@ namespace llaminar2
             input.external_hidden_state == working_buffer)
             return info;
 
-        size_t copy_elems = static_cast<size_t>(
-            input.batch_size * input.seq_len * cfg.d_model);
+        if (input.batch_size <= 0 || input.seq_len <= 0 ||
+            input.batch_size > std::numeric_limits<int>::max() / input.seq_len)
+            throw std::invalid_argument("PP residual copy requires positive representable request rows");
+        const auto rows = requireHostPipelineActivationRows(
+            input.host_pipeline_activation_rows, input.external_hidden_state,
+            cfg.default_device, input.batch_size, input.seq_len,
+            input.graph_submission_intent == ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch
+                ? HostPipelineBoundaryExecution::MaterializeOnly : HostPipelineBoundaryExecution::Execute);
+        const ResidualRowGeometry residual_rows(cfg.residualWidth());
+        const auto live_bytes = residual_rows.bytesForRows(input.external_hidden_state->shape(), rows);
+        (void)residual_rows.bytesForRows(working_buffer->shape(), rows);
+        const auto copy_elems = live_bytes / sizeof(float);
 
         if (mode.isHybridQ16())
         {
@@ -14564,7 +14637,7 @@ namespace llaminar2
         }
         else
         {
-            info.copy_bytes = copy_elems * sizeof(float);
+            info.copy_bytes = live_bytes;
         }
 
         info.external_hidden = input.external_hidden_state;
@@ -16427,6 +16500,11 @@ namespace llaminar2
                             ? IKVCache::StateRole::PipelineShard
                             : IKVCache::StateRole::CommittedMain,
             });
+            // Model state must exist before prefix-layout and rollback-capacity
+            // admission inspect this cache. The graph builder binds only its
+            // declared arena views; the cache remains the lifecycle authority.
+            graph_builder_->initializeCacheAuxiliaryState(*state_.kv_cache,
+                device.is_gpu() ? explicitGPUStreamForOperation("cache_auxiliary_setup_publication") : nullptr);
             logKVCacheBom("main", device, state_.kv_cache.get(), batch_size);
         }
 
@@ -17038,21 +17116,18 @@ namespace llaminar2
 
         /*
          * The first decode arrives only after prompt prefill, so its cache
-         * identity is the history-bearing serial variant. Production serial
-         * decode currently admits its committed token through the cache-owned
-         * host row and derives position from the stable device KV counter. The
-         * setup sentinel follows that exact authority split; executeCacheMiss()
-         * copies the temporary token into ForwardGraphCache-owned storage before
-         * graph construction. The sentinel position is never executed, but makes
-         * decode_has_history true while native capture records the production
-         * position pointer.
+         * identity is the history-bearing serial variant. External token rows
+         * enter REQUEST_TOKEN_IDS once; every native consumer, including PLE
+         * and embedding, retains that same bank. The captured root derives
+         * position from the canonical device KV count. Setup binds permanent
+         * pointers and a history-bearing scalar without publishing live tokens.
          * Request state remains untouched because MaterializeWithoutLaunch
          * captures and instantiates without running the live-state prelude or
          * any model arithmetic.
          */
         if (plan.main_decode_graph !=
                 ServingMainDecodeGraphKind::HistoryBearingSerial ||
-            !request_position_ids_dev_)
+            (!request_token_ids_dev_ || !request_position_ids_dev_))
         {
             LOG_ERROR(
                 "[DeviceGraphOrchestrator] Serving graph setup is missing "
@@ -17061,10 +17136,9 @@ namespace llaminar2
             return false;
         }
 
-        int setup_decode_token = 0;
         ForwardInput decode_input;
-        decode_input.token_ids = &setup_decode_token;
-        decode_input.token_ids_device = nullptr;
+        decode_input.token_ids = nullptr;
+        decode_input.token_ids_device = request_token_ids_dev_;
         decode_input.position_ids = nullptr;
         decode_input.position_ids_device = request_position_ids_dev_;
         decode_input.device_decode_position = DeviceDecodePositionBinding{
@@ -17149,7 +17223,7 @@ namespace llaminar2
             std::string error;
             if (!materializeOrdinaryGenerationForward(
                     device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
-                    &error))
+                    ordinaryForwardRetentionKind(), &error))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Serving graph setup could not retain "
                           "its device-resident ordinary forward: " << error);
@@ -18671,8 +18745,8 @@ namespace llaminar2
         }
 
         /*
-         * External prompt data crosses into the GPU once as a single admission
-         * transaction. From this point onward, embedding, RoPE, recurrent
+         * External prompt or teacher-forced token rows cross into the GPU once
+         * as a single admission transaction. From this point onward, embedding, RoPE, recurrent
          * stages, and shifted-MTP publication all consume the same persistent
          * arena rows. Grouped verifiers and live request-batch decode already
          * arrive with their own device-owned token/position sources and must
@@ -18681,22 +18755,27 @@ namespace llaminar2
         const void *effective_token_ids_device = token_ids_device;
         const bool uses_request_input_bank =
             state_.device_id.is_gpu() &&
-            (new_phase == InferencePhase::PREFILL ||
-             restored_prefix_mtp_decode_bridge) &&
             (execution_role == ForwardExecutionRole::MainInference ||
              restored_prefix_mtp_decode_bridge) &&
             !effective_token_ids_device;
         if (uses_request_input_bank)
         {
+            std::optional<DeviceDecodePositionBinding> admitted_decode_position;
+            if(materialize_serial_decode_position_from_device_kv)
+                admitted_decode_position=DeviceDecodePositionBinding{
+                    .backend=getBackendFor(state_.device_id),
+                    .cached_tokens=state_.kv_cache->deviceSequenceCachedTokenCountPtr(0),
+                    .position=static_cast<int32_t *>(request_position_ids_dev_)};
             if (!admitRequestInputsOnDevice(
                     tokens,
-                    position_ids.data(),
+                    admitted_decode_position ? nullptr : position_ids.data(),
                     request_real_lengths,
                     total_tokens,
                     batch_size,
-                    seq_len))
+                    seq_len,
+                    admitted_decode_position))
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Main prefill could not admit its complete request input");
+                LOG_ERROR("[DeviceGraphOrchestrator] Main forward could not admit its complete request input");
                 return std::nullopt;
             }
             effective_token_ids_device = request_token_ids_dev_;
@@ -19478,7 +19557,7 @@ namespace llaminar2
                 uses_request_input_bank
                     ? (restored_prefix_mtp_decode_bridge
                            ? "restored_prefix_mtp_decode_bridge"
-                           : "main_prefill_transaction")
+                           : new_phase==InferencePhase::DECODE ? "main_decode_transaction" : "main_prefill_transaction")
                     : "serial_decode_position_transaction");
         }
 
@@ -20083,6 +20162,9 @@ namespace llaminar2
         input.external_hidden_state = pipeline_hidden_input;
         if (consumes_pipeline_hidden)
         {
+            if (!pipeline_forward_edges_)
+                input.host_pipeline_activation_rows = HostPipelineActivationRows::admitted(
+                    pipeline_hidden_input, input.device, input.batch_size, seq_len);
             // The graph input now owns this stable pointer for the complete
             // one-chunk transaction; preserve ordinary setHiddenState()
             // single-use semantics for the next pipeline boundary.
@@ -20280,14 +20362,14 @@ namespace llaminar2
             state_.prefix_terminal_hidden != arena_owner ||
             state_.prefix_terminal_hidden->rows() <
                 static_cast<size_t>(required_rows) ||
-            state_.prefix_terminal_hidden->cols() <
-                static_cast<size_t>(state_.d_model) ||
+            state_.prefix_terminal_hidden->cols() !=
+                static_cast<size_t>(graph_builder_->config().residualWidth()) ||
             state_.prefix_terminal_hidden->isMapped() ||
             !storage_ready)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP terminal-hidden archive was not installed as a capacity-complete immutable arena owner before graph construction"
                       << " required_rows=" << required_rows
-                      << " d_model=" << state_.d_model
+                      << " d_model=" << graph_builder_->config().residualWidth()
                       << " device=" << state_.device_id.toString());
             return false;
         }
@@ -20322,13 +20404,16 @@ namespace llaminar2
             return false;
         }
 
-        if (state_.d_model <= 0)
+        if (graph_builder_->config().residualWidth() <= 0)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden row with invalid d_model="
-                      << state_.d_model);
+                      << graph_builder_->config().residualWidth());
             return false;
         }
 
+        const ResidualRowGeometry residual_rows(graph_builder_->config().residualWidth());
+        residual_rows.validate(input->shape());
+        residual_rows.validate(output->shape());
         const size_t hidden_rows = input->rows();
         if (hidden_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
@@ -20360,7 +20445,7 @@ namespace llaminar2
             cache.output != output ||
             cache.device != state_.device_id ||
             cache.seq_capacity != seq_capacity ||
-            cache.d_model != state_.d_model;
+            cache.d_model != graph_builder_->config().residualWidth();
 
         if (rebuild)
         {
@@ -20369,7 +20454,7 @@ namespace llaminar2
             params.input = input;
             params.output = output;
             params.seq_len = seq_capacity;
-            params.d_model = state_.d_model;
+            params.d_model = graph_builder_->config().residualWidth();
             params.selected_row_idx = row_idx;
             params.input_buffer_id = input_buffer_id;
             params.output_buffer_id = output_buffer_id;
@@ -20397,7 +20482,7 @@ namespace llaminar2
             cache.device = state_.device_id;
             cache.workspace_generation = 0;
             cache.seq_capacity = seq_capacity;
-            cache.d_model = state_.d_model;
+            cache.d_model = graph_builder_->config().residualWidth();
             cache.valid = true;
         }
 
@@ -20457,7 +20542,7 @@ namespace llaminar2
     {
         if (!state_.device_id.is_gpu() || !state_.hidden ||
             !state_.prefix_terminal_hidden || selected_row_count <= 0 ||
-            state_.d_model <= 0)
+            graph_builder_->config().residualWidth() <= 0)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot materialize a GPU terminal-hidden rows-select graph from incomplete model bindings");
             return false;
@@ -20479,6 +20564,9 @@ namespace llaminar2
             return false;
         }
 
+        const ResidualRowGeometry residual_rows(graph_builder_->config().residualWidth());
+        residual_rows.validate(state_.hidden->shape());
+        residual_rows.validate(state_.prefix_terminal_hidden->shape());
         const size_t hidden_rows = state_.hidden->rows();
         if (hidden_rows == 0 ||
             hidden_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -20620,7 +20708,7 @@ namespace llaminar2
             cache.device == state_.device_id &&
             cache.workspace_generation == generation &&
             cache.seq_capacity == seq_capacity &&
-            cache.d_model == state_.d_model &&
+            cache.d_model == graph_builder_->config().residualWidth() &&
             cache.selected_row_count == selected_row_count &&
             cache.fixed_contiguous_row_start == fixed_contiguous_row_start &&
             cache.request_row_stride == 0 &&
@@ -20636,6 +20724,7 @@ namespace llaminar2
             cache.shifted_cached_tokens_device ==
                 shifted_cached_tokens_device &&
             cache.request_index == request_index &&
+            cache.shifted_origin == graph_builder_->config().mtpShiftedCacheOrigin() &&
             cache.row_index_source == row_index_source &&
             cache.row_buffer_name == stable_row_buffer &&
             cache.external_device_row_indices ==
@@ -20645,10 +20734,11 @@ namespace llaminar2
 
         HiddenStateRowsSelectStage::Params params;
         params.device_id = state_.device_id;
+        params.shifted_cache_origin=graph_builder_->config().mtpShiftedCacheOrigin();
         params.input = state_.hidden.get();
         params.output = state_.prefix_terminal_hidden.get();
         params.seq_len = seq_capacity;
-        params.d_model = state_.d_model;
+        params.d_model = graph_builder_->config().residualWidth();
         params.selected_row_count = selected_row_count;
         params.selected_row_indices.resize(
             static_cast<size_t>(selected_row_count));
@@ -20735,7 +20825,7 @@ namespace llaminar2
         cache.device = state_.device_id;
         cache.workspace_generation = generation;
         cache.seq_capacity = seq_capacity;
-        cache.d_model = state_.d_model;
+        cache.d_model = graph_builder_->config().residualWidth();
         cache.selected_row_count = selected_row_count;
         cache.fixed_contiguous_row_start = fixed_contiguous_row_start;
         cache.request_row_stride = 0;
@@ -20745,6 +20835,7 @@ namespace llaminar2
         cache.request_row_stride_device = request_row_stride_device;
         cache.main_cached_tokens_device = main_cached_tokens_device;
         cache.shifted_cached_tokens_device = shifted_cached_tokens_device;
+        cache.shifted_origin=graph_builder_->config().mtpShiftedCacheOrigin();
         cache.request_index = request_index;
         cache.row_buffer_name = stable_row_buffer;
         cache.external_device_row_indices =
@@ -21006,13 +21097,16 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden rows without input/output buffer");
             return false;
         }
-        if (state_.d_model <= 0)
+        if (graph_builder_->config().residualWidth() <= 0)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden rows with invalid d_model="
-                      << state_.d_model);
+                      << graph_builder_->config().residualWidth());
             return false;
         }
 
+        const ResidualRowGeometry residual_rows(graph_builder_->config().residualWidth());
+        residual_rows.validate(input->shape());
+        residual_rows.validate(output->shape());
         const size_t hidden_rows = input->rows();
         if (hidden_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
@@ -21063,7 +21157,7 @@ namespace llaminar2
             cache.device == state_.device_id &&
             cache.workspace_generation == current_workspace_generation &&
             cache.seq_capacity == seq_capacity &&
-            cache.d_model == state_.d_model &&
+            cache.d_model == graph_builder_->config().residualWidth() &&
             cache.selected_row_count == row_count &&
             cache.fixed_contiguous_row_start == row_start &&
             cache.row_index_source ==
@@ -21131,13 +21225,16 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden rows without input/output buffer");
             return false;
         }
-        if (state_.d_model <= 0)
+        if (graph_builder_->config().residualWidth() <= 0)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden rows with invalid d_model="
-                      << state_.d_model);
+                      << graph_builder_->config().residualWidth());
             return false;
         }
 
+        const ResidualRowGeometry residual_rows(graph_builder_->config().residualWidth());
+        residual_rows.validate(input->shape());
+        residual_rows.validate(output->shape());
         const size_t hidden_rows = input->rows();
         if (hidden_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
@@ -21178,7 +21275,7 @@ namespace llaminar2
             cache.output != output ||
             cache.device != state_.device_id ||
             cache.seq_capacity != seq_capacity ||
-            cache.d_model != state_.d_model ||
+            cache.d_model != graph_builder_->config().residualWidth() ||
             cache.selected_row_count != static_cast<int>(selected_rows.size());
 
         if (rebuild)
@@ -21188,7 +21285,7 @@ namespace llaminar2
             params.input = input;
             params.output = output;
             params.seq_len = seq_capacity;
-            params.d_model = state_.d_model;
+            params.d_model = graph_builder_->config().residualWidth();
             params.selected_row_count = static_cast<int>(selected_rows.size());
             params.selected_row_indices = selected_rows;
             params.input_buffer_id = input_buffer_id;
@@ -21217,7 +21314,7 @@ namespace llaminar2
             cache.device = state_.device_id;
             cache.workspace_generation = 0;
             cache.seq_capacity = seq_capacity;
-            cache.d_model = state_.d_model;
+            cache.d_model = graph_builder_->config().residualWidth();
             cache.selected_row_count = static_cast<int>(selected_rows.size());
             cache.row_buffer_name = params.workspace_buffer_name;
             cache.fixed_contiguous_row_start = 0;
@@ -21291,13 +21388,16 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot select device-metadata MTP hidden rows without input/output buffer");
             return false;
         }
-        if (state_.d_model <= 0)
+        if (graph_builder_->config().residualWidth() <= 0)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot select device-metadata MTP hidden rows with invalid d_model="
-                      << state_.d_model);
+                      << graph_builder_->config().residualWidth());
             return false;
         }
 
+        const ResidualRowGeometry residual_rows(graph_builder_->config().residualWidth());
+        residual_rows.validate(input->shape());
+        residual_rows.validate(output->shape());
         const size_t hidden_rows = input->rows();
         if (hidden_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
@@ -21321,7 +21421,7 @@ namespace llaminar2
             cache.input != input || cache.output != output ||
             cache.device != state_.device_id ||
             cache.seq_capacity != seq_capacity ||
-            cache.d_model != state_.d_model ||
+            cache.d_model != graph_builder_->config().residualWidth() ||
             cache.selected_row_count != row_count ||
             cache.row_index_source !=
                 HiddenStateRowsSelectStage::DeviceRowIndexSource::
@@ -21829,6 +21929,7 @@ namespace llaminar2
             cache.request_row_stride_device != request_row_stride_dev_ ||
             cache.main_cached_tokens_device != main_count ||
             cache.shifted_cached_tokens_device != shifted_count ||
+            cache.shifted_origin != graph_builder_->config().mtpShiftedCacheOrigin() ||
             cache.seq_capacity < total_rows)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Shifted-prefill hidden publication reached execution without current pre-materialized bindings: request="
@@ -22283,7 +22384,8 @@ namespace llaminar2
         const PrefixBlockHandle &handle,
         void *stream,
         const char *consumer_name,
-        bool publish_mailbox)
+        bool publish_mailbox,
+        int destination_row)
     {
         auto fail = [&](const std::string &reason) -> bool
         {
@@ -22314,12 +22416,14 @@ namespace llaminar2
         {
             return fail("terminal_hidden_buffer_unavailable");
         }
-        if (!state_.prefix_terminal_hidden ||
-            handle.layout.terminal_hidden_bytes >
-                state_.prefix_terminal_hidden->size_bytes())
+        const ResidualRowGeometry residual_rows(graph_builder_->config().residualWidth());
+        if (!state_.prefix_terminal_hidden || destination_row < 0 ||
+            handle.layout.terminal_hidden_bytes != residual_rows.rowBytes())
         {
-            return fail("terminal_hidden_payload_exceeds_destination");
+            return fail("terminal_hidden_payload_differs_from_complete_residual_row");
         }
+        const auto destination_offset = residual_rows.elementOffset(
+            state_.prefix_terminal_hidden->shape(), static_cast<size_t>(destination_row)) * sizeof(float);
 
         if (publish_mailbox &&
             !beginMTPTerminalHiddenMailboxWrite(
@@ -22352,6 +22456,7 @@ namespace llaminar2
                 return fail(
                     "gpu_live_checkpoint_requires_device_terminal_hidden");
             }
+            destination = static_cast<std::byte *>(destination) + destination_offset;
             if (!backend->deviceCopyAsync(
                     destination,
                     source,
@@ -22376,6 +22481,7 @@ namespace llaminar2
                 return fail(
                     "cpu_live_checkpoint_requires_host_terminal_hidden");
             }
+            destination = static_cast<std::byte *>(destination) + destination_offset;
             std::memcpy(destination, handle.terminal_hidden, bytes);
             TransferEngine::publishHostWrite(
                 state_.prefix_terminal_hidden.get());
@@ -22443,6 +22549,8 @@ namespace llaminar2
 
         if (!snapshot.valid || snapshot.cached_tokens <= 0)
             return fail("invalid_or_empty_checkpoint");
+        if(snapshot.mtp_shifted_origin!=graph_builder_->config().mtpShiftedCacheOrigin())
+            return fail("checkpoint_shifted_origin_mismatch");
         if (!waitForSnapshotReady(
                 snapshot,
                 stream,
@@ -24815,7 +24923,8 @@ namespace llaminar2
             built = DeviceGenerationGraphProgram::native(
                 *loop.capture, graph_control,
                 DeviceControlledLoopProgram{
-                    .iteration = mtp_device_generation_loop_fragment_scratch_},
+                    .iteration = mtp_device_generation_loop_fragment_scratch_,
+                    .terminal=retainedStorageTerminalFragments()},
                 construction_error);
         }
         else
@@ -24839,7 +24948,7 @@ namespace llaminar2
             built = DeviceGenerationGraphProgram::ticketPublisher(
                 *loop.capture, context, *backend, state_.device_id, graph_control,
                 maintenance_due_device, device_generation_storage_.dispatch_tickets_device,
-                construction_error);
+                construction_error,retained_storage_boundary_.get());
         }
         if (!built)
         {
@@ -27445,6 +27554,10 @@ namespace llaminar2
         if (!tokens || seq_len <= 0)
             return false;
 
+        requireMTPShiftedHostPrefill(graph_builder_->config().mtpShiftedCacheOrigin(),
+            position_offset,seq_len,batch_size,
+            request_lengths ? std::optional(std::span<const int>(*request_lengths)) : std::nullopt,
+            position_ids ? std::optional(std::span<const int>(*position_ids)) : std::nullopt);
         const int logical_seq_len =
             request_lengths && !request_lengths->empty()
                 ? std::clamp(request_lengths->front(), 1, seq_len)
@@ -27566,6 +27679,22 @@ namespace llaminar2
             return true;
         }
 
+        const auto origin=graph_builder_->config().mtpShiftedCacheOrigin();
+        if(origin==MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero) {
+            const int cached=state_.mtp_kv_caches[0]->get_cached_tokens(0,0);
+            if(previous_tokens==0) {
+                if(cached!=0)throw std::invalid_argument("QFN initial bootstrap requires a reset empty shifted cache");
+                if(!publishCPUVisibleZeroHiddenMTPBootstrap())return false;
+                if(!executeMTPDepth0(tokens[0],state_.prefix_terminal_hidden.get(),0,
+                    "qfn_visible_zero_hidden_bootstrap",true,BufferId::PREFIX_TERMINAL_HIDDEN,false))return false;
+            } else {
+                if(cached!=previous_tokens)
+                    throw std::invalid_argument("QFN resumed prefix must retain its visible seed and exact shifted frontier");
+                if(!state_.prefix_terminal_hidden || !state_.mtp_terminal_hidden_publication.current())
+                    throw std::invalid_argument("QFN resumed prefix requires its exact published prior4H hidden row before append");
+            }
+        }
+
         if (previous_tokens > 0 &&
             state_.prefix_terminal_hidden &&
             state_.mtp_terminal_hidden_publication.current())
@@ -27674,6 +27803,29 @@ namespace llaminar2
              {"segment_rows", std::to_string(logical_seq_len)},
              {"physical_rows", std::to_string(seq_len)}});
 
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::publishCPUVisibleZeroHiddenMTPBootstrap()
+    {
+        if (!state_.device_id.is_cpu() || !graph_builder_ ||
+            !graph_builder_->config().mtp.enabled ||
+            graph_builder_->config().mtpShiftedCacheOrigin() !=
+                MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero)
+            throw std::invalid_argument("Visible zero-hidden MTP bootstrap requires its original CPU model policy");
+        if (!ensureMTPTerminalHiddenBuffer())
+            return false;
+        if (state_.prefix_terminal_hidden->native_type() != TensorType::FP32)
+            throw std::invalid_argument("Visible zero-hidden MTP bootstrap requires the original FP32 mailbox");
+        const auto bytes = ResidualRowGeometry(graph_builder_->config().residualWidth()).rowBytes();
+        // This is the existing original arena mailbox, not normalized head
+        // output or another transaction's source. Spare rows remain untouched.
+        // Invalidate before the first write; publish the typed producer only
+        // after TransferEngine has published the completed host mutation.
+        state_.mtp_terminal_hidden_publication.invalidate();
+        std::memset(state_.prefix_terminal_hidden->raw_mutable_data(), 0, bytes);
+        TransferEngine::publishHostWrite(state_.prefix_terminal_hidden.get());
+        state_.mtp_terminal_hidden_publication.publishVisibleZeroHiddenBootstrap();
         return true;
     }
 
@@ -32110,6 +32262,8 @@ namespace llaminar2
             return "unsampled_logits_initialization";
         case DeviceResidentLogicalStatePublicationKind::OrdinaryGenerationTerminal:
             return "ordinary_generation_terminal";
+        case DeviceResidentLogicalStatePublicationKind::ForwardOnlyTerminal:
+            return "forward_only_terminal";
         }
         return "unknown";
     }
@@ -32734,6 +32888,45 @@ namespace llaminar2
              {"same_stream", boolTag(same_stream)}});
         *publication_generation = mailbox.publication_generation;
         *admission_lock = std::move(read_admission);
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::publishPipelineFollowerLogicalRowWriteCompletion(
+        void *producer_stream)
+    {
+        if (!state_.device_id.is_gpu() || !producer_stream ||
+            !pp_stage_config_ || pp_stage_config_->has_lm_head ||
+            device_generation_storage_.active_request_count != 1 ||
+            !device_resident_logical_sequence_state_storage_.validFor(1))
+            return false;
+        auto *backend = getBackendFor(state_.device_id);
+        if (!backend || !device_resident_logical_sequence_state_ready_event_)
+            return false;
+        std::unique_lock<std::shared_mutex> admission_lock(
+            device_resident_logical_state_admission_sync_->admission_mutex);
+        if (!pending_device_resident_logical_state_writer_.valid() ||
+            pending_device_resident_logical_state_writer_.stream != producer_stream)
+            return false;
+
+        // The received token is a physical write to the original arena bank.
+        // Its other logical fields are not produced by this follower. Publish
+        // only the actual writer event; never expose a full outcome mailbox.
+        TransferEngine::publishDeviceWrite(
+            arena_->getTensor(BufferId::MTP_LOGICAL_SEQUENCE_STATE),
+            state_.device_id, producer_stream);
+        if (!backend->recordEvent(device_resident_logical_sequence_state_ready_event_.get(),
+                state_.device_id.gpu_ordinal(), producer_stream))
+            return false;
+        device_resident_logical_state_access_epoch_.begin(
+            producer_stream, device_resident_logical_sequence_state_ready_event_,
+            ++device_resident_logical_state_publication_generation_);
+        device_resident_logical_sequence_state_mailbox_.clear();
+        device_resident_logical_sequence_state_storage_.retirePublication();
+        pending_device_resident_logical_state_writer_.clear();
+        PerfStatsCollector::addCounterWithSequence(
+            "mtp", "device_resident_logical_state_partial_write_completions", 1.0,
+            {device_resident_logical_state_publication_generation_}, perfPhaseName(),
+            state_.device_id.toString(), {{"owner", "pipeline_follower"}, {"semantic_mailbox", "absent"}});
         return true;
     }
 
@@ -35933,7 +36126,7 @@ namespace llaminar2
         }
 
         const int expected_cached_tokens =
-            std::max(0, position_offset - 1 + already_appended_tokens);
+            mtpShiftedAppendBoundaryRows(position_offset,already_appended_tokens,cache->stateOwnership().shifted_origin);
         if (!prepareShiftedMTPKVCommitBoundary(
                 *cache,
                 /*depth=*/0,
@@ -36892,7 +37085,7 @@ namespace llaminar2
         }
 
         const int expected_cached_tokens =
-            std::max(0, position_offset - 1 + resident_shifted_kv_tokens);
+            mtpShiftedAppendBoundaryRows(position_offset,resident_shifted_kv_tokens,cache->stateOwnership().shifted_origin);
         /*
          * This is a storage-safety question, not a request-policy decision.
          * A retained runner may admit a wider request after reset, so preserve
@@ -37593,6 +37786,35 @@ namespace llaminar2
                       << device_generation_storage_.response_token_stride
                       << " control_stride="
                       << device_generation_storage_.control_stride);
+            return false;
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::resetAndPublishDeviceForwardStatusOnStream(
+        void *producer_stream,const char *reason)
+    {
+        using Policy=sampling_math::DeviceGenerationForwardFailurePolicy;
+        if (!state_.device_id.is_gpu()) return true;
+        if (!graph_builder_) return false;
+        const auto policy=graph_builder_->deviceGenerationForwardFailurePolicy();
+        if (policy==Policy::ResetAtResponseAdmission) return true;
+        if (policy!=Policy::PreserveUntilRequestReset || !producer_stream ||
+            device_generation_storage_.active_request_count!=0 ||
+            !device_generation_state_ready_.handoff.inactive() ||
+            !device_generation_storage_.validFor(device_generation_storage_.request_capacity))
+            return false;
+        auto *backend=getBackendFor(state_.device_id);
+        const auto bytes=static_cast<std::size_t>(device_generation_storage_.request_capacity)*
+            static_cast<std::size_t>(device_generation_storage_.control_stride)*sizeof(int);
+        if (!backend || !backend->memset(device_generation_storage_.control_device,0,bytes,
+                state_.device_id.gpu_ordinal(),producer_stream) ||
+            !publishPreparedArenaGraphInput(BufferId::MTP_GENERATION_CONTROL,
+                device_generation_storage_.control_device,producer_stream,state_.device_id,
+                "request_forward_status_reset"))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Request forward-status reset failed reason="
+                <<(reason?reason:"unknown")<<" device="<<state_.device_id.toString());
             return false;
         }
         return true;
@@ -41324,6 +41546,12 @@ namespace llaminar2
     {
         if (!state_.device_id.is_gpu())
             return true;
+        // Immutable storage is admitted before the first real prefill, then
+        // remains armed through the complete device-owned generation policy.
+        // Setup-only graph materialization neither starts I/O nor launches it.
+        if(input.graph_submission_intent!=ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch&&
+            input.execution_role==ForwardExecutionRole::MainInference&&
+            !beginRetainedStorageAdmission(execution_stream))return false;
         if (pending_device_resident_logical_state_forward_read_.valid())
         {
             LOG_ERROR(
@@ -41333,6 +41561,11 @@ namespace llaminar2
 
         const bool request_consumers_started_before_prelude =
             request_input_reuse_ready_.consumers_started;
+        const bool request_token_admission_pending_before_prelude =
+            request_input_admission_ready_.valid &&
+            request_input_admission_ready_.token_count==1 &&
+            request_input_admission_ready_.request_count==1 &&
+            input.token_ids_device==request_token_ids_dev_;
         const auto epoch_submission_policy =
             moeOverlayForwardEpochSubmissionPolicy(
                 static_cast<bool>(moe_overlay_epoch_execution_binding_),
@@ -41664,9 +41897,10 @@ namespace llaminar2
                     /*token_count=*/1,
                     /*request_count=*/1);
             }
-            else if (input.state_transaction !=
-                     ForwardStateTransaction::
-                         RestoredPrefixMTPDecodeBridge)
+            else if (!(request_token_admission_pending_before_prelude &&
+                       !request_input_admission_ready_.valid &&
+                       input.token_ids_device==request_token_ids_dev_) &&
+                     input.state_transaction != ForwardStateTransaction::RestoredPrefixMTPDecodeBridge)
             {
                 LOG_ERROR(
                     "[DeviceGraphOrchestrator] Serial decode unexpectedly "
@@ -45740,7 +45974,10 @@ namespace llaminar2
         };
         appendProjectionArithmeticFingerprintFields(
             material.runtime, debugEnv().gemm.gdn_projection_arithmetic,
-            debugEnv().gemm.moe_router_arithmetic, debugEnv().gemm.cuda_moe_router_prefill);
+            resolveMoERouterArithmetic(debugEnv().gemm.moe_router_arithmetic, graph_builder_->architectureName()),
+            debugEnv().gemm.cuda_moe_router_prefill);
+        if (config.flash_next)
+            appendQwen4ExpArithmeticFingerprintFields(material.runtime, config.qfn_hc_up_activation, config.qfn_gdn_output_activation, config.qfn_fa_output_activation, config.qfn_gdn_qkv_activation);
         material.topology = {
             {"first_layer_index", std::to_string(prefix_layout_.first_layer_index)},
             {"total_layers", std::to_string(prefix_layout_.total_layers)},
@@ -46021,7 +46258,7 @@ namespace llaminar2
         if (!handle->payload_readiness->prepare(
                 std::move(event),
                 state_.device_id,
-                producer_stream))
+                producer_stream, *backend))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to prepare prefix archive readiness event"
                       << " producer="
@@ -46156,6 +46393,23 @@ namespace llaminar2
         {
             return fail("GPU backend is unavailable", &prepared);
         }
+        PrefixArchivePublicationScope promotion_completion([&](PrefixArchiveCompletion) {
+            if (!prepared.payload_readiness || !prepared.payload_readiness->prepared())
+                return true;
+            const bool result = recordPrefixArchivePayloadReady(
+                &prepared, producer_stream, "restore_prefix_device_hot_promotion");
+            // Publication precedes LRU installation, which may itself fail.
+            // Keep both DMA endpoints through the same existing event on every exit.
+            PendingPrefixPayloadUse pending;
+            pending.completion_event = std::shared_ptr<void>(
+                prepared.payload_readiness, prepared.payload_readiness->event());
+            pending.retained_payload_sources.push_back(
+                PrefixPayloadReadLease::wholeArchive(lower_tier_handle));
+            pending.retained_payload_sources.push_back(
+                PrefixPayloadReadLease::wholeArchive(prepared));
+            pending_prefix_payload_uses_.push_back(std::move(pending));
+            return result;
+        });
         if (!preparePrefixArchivePayloadReady(
                 &prepared,
                 producer_stream,
@@ -46214,6 +46468,10 @@ namespace llaminar2
                 lower_tier_handle.mtp_payload,
                 lower_tier_handle.layout.mtpKVBytes());
 
+        if(uploaded && lower_tier_handle.layout.modelAuxiliaryBytes())
+            uploaded=upload_section("model_auxiliary",prepared.deviceModelAuxiliaryData(),
+                lower_tier_handle.model_auxiliary_payload,lower_tier_handle.layout.modelAuxiliaryBytes());
+
         if (uploaded && lower_tier_handle.has_hybrid_state)
         {
             uploaded = upload_section(
@@ -46244,13 +46502,7 @@ namespace llaminar2
                         &prepared);
         }
 
-        if (!recordPrefixArchivePayloadReady(
-                &prepared,
-                producer_stream,
-                "restore_prefix_device_hot_promotion"))
-        {
-            return fail("promotion readiness publication failed", &prepared);
-        }
+        promotion_completion.commit();
         if (!prefix_cache_->installDeviceHotCopy(
                 prepared,
                 /*repromotion=*/true))
@@ -46422,7 +46674,7 @@ namespace llaminar2
             use_local_terminal_logits ? state_.logits_local.get() : state_.logits.get();
         const size_t terminal_hidden_bytes =
             owns_terminal_state && config.mtp.enabled && terminal_state_enabled && state_.d_model > 0
-                ? static_cast<size_t>(state_.d_model) * sizeof(float)
+                ? static_cast<size_t>(state_.hidden->shape().back()) * sizeof(float)
                 : 0;
         const size_t terminal_logits_bytes =
             !terminal_state_enabled || !owns_terminal_state
@@ -46453,6 +46705,9 @@ namespace llaminar2
             }
         }
 
+        applyPrefixAuxiliaryLayout(prefix_layout_,*state_.kv_cache,
+            state_.mtp_kv_caches.empty()?nullptr:state_.mtp_kv_caches[0].get(),0,0,block_size,block_size,true);
+
         if (!prefix_layout_.hasRestorableMainState())
         {
             disablePrefixCacheForRunner("main cache does not expose a complete attention/recurrent payload layout");
@@ -46463,7 +46718,8 @@ namespace llaminar2
             disablePrefixCacheForRunner("GPU prefix archive staging allocation failed");
             return false;
         }
-        const size_t block_bytes = prefix_layout_.totalBytes();
+        const size_t block_bytes = prefixPayloadCapacityLayout(prefix_layout_, *state_.kv_cache,
+            state_.mtp_kv_caches.empty() ? nullptr : state_.mtp_kv_caches[0].get()).totalBytes();
         if (block_bytes == 0 || prefix_config.ram_budget_bytes < block_bytes)
         {
             disablePrefixCacheForRunner("RAM budget cannot hold one complete prefix block");
@@ -46637,6 +46893,9 @@ namespace llaminar2
             prefix_layout_.terminal_hidden_bytes,
             prefix_layout_.terminal_logits_bytes);
         copyMTPPayloadLayoutFields(prefix_layout_, live_layout);
+        applyPrefixAuxiliaryLayout(live_layout,*state_.kv_cache,
+            state_.mtp_kv_caches.empty()?nullptr:state_.mtp_kv_caches[0].get(),0,0,
+            live_layout.block_size,live_layout.block_size,true);
 
         if (samePrefixPayloadShape(live_layout, prefix_layout_))
         {
@@ -47108,6 +47367,30 @@ namespace llaminar2
             }
         }
 
+        PrefixArchivePublicationScope restore_completion([&](PrefixArchiveCompletion) {
+            if (!state_.device_id.is_gpu())
+                return true;
+            std::vector<PrefixPayloadReadLease> retained_restore_sources =
+                std::move(retained_promotion_sources);
+            for (size_t index = 0; index < restore_blocks.size(); ++index)
+            {
+                const size_t archived_bytes = restore_blocks[index].total_bytes;
+                retained_restore_sources.push_back(index + 1u == restore_blocks.size()
+                    ? PrefixPayloadReadLease::wholeArchive(std::move(restore_blocks[index]))
+                    : PrefixPayloadReadLease::sequenceRows(std::move(restore_blocks[index])));
+                if (index + 1u != restore_blocks.size())
+                {
+                    PerfStatsCollector::addCounter("prefix_cache", "restore_sequence_read_leases",
+                        1.0, "restore", state_.device_id.toString());
+                    PerfStatsCollector::addCounter("prefix_cache", "restore_unread_section_owner_bytes_excluded",
+                        static_cast<double>(archived_bytes - retained_restore_sources.back().retainedBytes()),
+                        "restore", state_.device_id.toString());
+                }
+            }
+            return recordLivePrefixMutationReady(
+                stream, "populate_prefix_cache", std::move(retained_restore_sources));
+        });
+
         if (restore_model_runtime_state)
         {
             if (prefixCacheTraceEnabled())
@@ -47299,6 +47582,10 @@ namespace llaminar2
                         live_v.size());
                 }
             }
+
+            importPrefixAuxiliaryState(*state_.kv_cache,seq_idx,PrefixAuxiliaryLane::Main,handle,stream);
+            if(handle.layout.includes_mtp_state && !state_.mtp_kv_caches.empty())
+                importPrefixAuxiliaryState(*state_.mtp_kv_caches[0],seq_idx,PrefixAuxiliaryLane::ShiftedMTP,handle,stream);
 
             if (device_hot)
             {
@@ -47520,32 +47807,7 @@ namespace llaminar2
          * sources. Retain exactly those storage owners through the mutation
          * event so unused recurrent images can retire under RAM pressure.
          */
-        std::vector<PrefixPayloadReadLease> retained_restore_sources = std::move(retained_promotion_sources);
-        if (state_.device_id.is_gpu())
-        {
-            for (size_t index = 0; index < restore_blocks.size(); ++index)
-            {
-                const size_t archived_bytes = restore_blocks[index].total_bytes;
-                retained_restore_sources.push_back(index + 1u == restore_blocks.size()
-                    ? PrefixPayloadReadLease::wholeArchive(std::move(restore_blocks[index]))
-                    : PrefixPayloadReadLease::sequenceRows(std::move(restore_blocks[index])));
-                if (index + 1u != restore_blocks.size())
-                {
-                    PerfStatsCollector::addCounter("prefix_cache", "restore_sequence_read_leases",
-                        1.0, "restore", state_.device_id.toString());
-                    PerfStatsCollector::addCounter("prefix_cache", "restore_unread_section_owner_bytes_excluded",
-                        static_cast<double>(archived_bytes - retained_restore_sources.back().retainedBytes()),
-                        "restore", state_.device_id.toString());
-                }
-            }
-        }
-        if (!recordLivePrefixMutationReady(
-                stream,
-                "populate_prefix_cache",
-                std::move(retained_restore_sources)))
-        {
-            return fail("could not record live-state readiness");
-        }
+        restore_completion.commit();
         PerfStatsCollector::addCounterWithSequence(
             "prefix_cache",
             "populate_restores",
@@ -48124,6 +48386,10 @@ namespace llaminar2
                 block_layout.includes_terminal_logits = false;
             }
 
+            applyPrefixAuxiliaryLayout(block_layout,*state_.kv_cache,
+                state_.mtp_kv_caches.empty()?nullptr:state_.mtp_kv_caches[0].get(),0,
+                key.token_start,key.token_count,key.token_start+key.token_count,terminal_block);
+
             std::shared_ptr<std::vector<uint8_t>> model_runtime_state;
             if (terminal_block && graph_builder_)
             {
@@ -48220,6 +48486,14 @@ namespace llaminar2
                      {"policy", "non_blocking_bounded_arena"}});
             }
 
+            PrefixArchivePublicationScope ram_completion([&](PrefixArchiveCompletion) {
+                return !state_.device_id.is_gpu() || !handle.payload_readiness || !handle.payload_readiness->prepared() ||
+                    recordPrefixArchivePayloadReady(&handle,stream,"harvest_prefix_block");
+            });
+            PrefixArchivePublicationScope hot_completion([&](PrefixArchiveCompletion) {
+                return !state_.device_id.is_gpu() || !device_hot_handle.payload_readiness || !device_hot_handle.payload_readiness->prepared() ||
+                    recordPrefixArchivePayloadReady(&device_hot_handle,stream,"harvest_prefix_device_hot_block");
+            });
             /*
              * Event allocation must precede the first asynchronous payload
              * operation. Once a D2H or D2D copy is accepted, both handles own
@@ -48397,6 +48671,17 @@ namespace llaminar2
                     {
                         LOG_ERROR("[DeviceGraphOrchestrator] Prefix harvest failed: MTP payload export failed");
                     }
+                }
+            }
+
+            if(ok) {
+                exportPrefixAuxiliaryState(*state_.kv_cache,0,PrefixAuxiliaryLane::Main,handle,stream);
+                if(device_hot_handle.valid())
+                    exportPrefixAuxiliaryState(*state_.kv_cache,0,PrefixAuxiliaryLane::Main,device_hot_handle,stream);
+                if(block_layout.includes_mtp_state && !state_.mtp_kv_caches.empty()) {
+                    exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],0,PrefixAuxiliaryLane::ShiftedMTP,handle,stream);
+                    if(device_hot_handle.valid())
+                        exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],0,PrefixAuxiliaryLane::ShiftedMTP,device_hot_handle,stream);
                 }
             }
 
@@ -48641,28 +48926,8 @@ namespace llaminar2
                     {{"prompt_token_count", std::to_string(prompt_token_count)}});
             }
 
-            if (state_.device_id.is_gpu())
-            {
-                /*
-                 * Record both preflighted events even after a partial copy
-                 * submission failure. Their allocation owners may otherwise
-                 * retire while an earlier accepted copy is still in flight.
-                 * The record helper hard-fails if the backend cannot preserve
-                 * this ownership edge; it never substitutes a stream sync.
-                 */
-                const bool ram_ready =
-                    recordPrefixArchivePayloadReady(
-                        &handle,
-                        stream,
-                        "harvest_prefix_block");
-                const bool device_hot_ready =
-                    !device_hot_handle.valid() ||
-                    recordPrefixArchivePayloadReady(
-                        &device_hot_handle,
-                        stream,
-                        "harvest_prefix_device_hot_block");
-                ok = ok && ram_ready && device_hot_ready;
-            }
+            ram_completion.commit();
+            hot_completion.commit();
 
             if (!ok ||
                 !prefix_cache_->insert(
@@ -48761,8 +49026,14 @@ namespace llaminar2
     PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixState(int seq_idx) const
     {
         PrefixStateSnapshot snapshot;
+        bool submitted_async_device_payload = false;
         auto fail = [&](const std::string &reason) -> PrefixStateSnapshot
         {
+            if (state_.device_id.is_gpu() && submitted_async_device_payload)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Full snapshot failed after asynchronous payload submission: " << reason);
+                std::terminate();
+            }
             PerfStatsCollector::addCounter(
                 "mtp",
                 "live_prefix_payload_capture_failures",
@@ -48796,6 +49067,94 @@ namespace llaminar2
             return fail("live_state_observation_wait_failed");
         }
 
+        if (state_.device_id.is_gpu()) retirePendingPrefixPayloadUses(false);
+
+        // Full snapshots are diagnostic archive transactions, unlike small
+        // logical rollback. Borrow exactly the compact auxiliary section from
+        // the canonical RAM tier and retain its physical owner in the snapshot.
+        auto allocate_auxiliary_archive = [&](const IKVCache &cache, PrefixBlockHandle &handle) -> bool
+        {
+            applyPrefixAuxiliaryLayout(handle.layout, cache, nullptr, seq_idx,
+                handle.key.token_start, handle.key.token_count,
+                handle.key.token_start + handle.key.token_count, true);
+            handle.total_bytes = handle.layout.totalBytes();
+            if (handle.layout.modelAuxiliaryBytes() == 0) return true;
+            if (!prefix_ram_backend_)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Full model auxiliary snapshot requires an admitted prefix RAM archive authority");
+                return false;
+            }
+            PrefixPayloadLayout section;
+            section.fa_layers = handle.layout.fa_layers;
+            section.main_auxiliary = handle.layout.main_auxiliary;
+            std::string error;
+            auto archive = prefix_ram_backend_->allocateWithDiagnostics(handle.key, section, &error);
+            if (!archive.valid())
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Full model auxiliary snapshot archive rejected: " << error);
+                return false;
+            }
+            // Retire the transient index entry immediately; the retained
+            // section owner keeps PMA bytes/pinned arena ranges unavailable
+            // until all snapshot aliases have released them.
+            if (!prefix_ram_backend_->release(archive))
+                throw std::logic_error("full auxiliary archive lost its canonical RAM allocation identity");
+            handle.payload_readiness = std::move(archive.payload_readiness);
+            handle.ram_section_memory_leases[static_cast<size_t>(PrefixPayloadSection::ModelAuxiliary)] =
+                std::move(archive.ram_section_memory_leases[static_cast<size_t>(PrefixPayloadSection::ModelAuxiliary)]);
+            handle.model_auxiliary_storage = std::move(archive.model_auxiliary_storage);
+            handle.pinned_model_auxiliary_storage = std::move(archive.pinned_model_auxiliary_storage);
+            handle.model_auxiliary_payload = archive.model_auxiliary_payload;
+            return true;
+        };
+
+        // Auxiliary-only shifted caches have no recurrent slot event. Diagnostic
+        // full archives prepare that event before copies through the same archive
+        // authority; ordinary retained logical checkpoints remain unchanged.
+        auto prepare_handle = [&](PrefixBlockHandle &handle, const char *producer) {
+            if (!state_.device_id.is_gpu() || handle.layout.modelAuxiliaryBytes() == 0)
+                return true;
+            auto *backend = getBackendFor(state_.device_id);
+            return backend && preparePrefixArchiveCheckpointReadiness(
+                handle, state_.device_id, stream, *backend, [&] {
+                    return preparePrefixArchivePayloadReady(&handle, stream, producer);
+                });
+        };
+
+        auto complete_handle = [&](PrefixBlockHandle &handle, PrefixArchiveCompletion) {
+            if (!state_.device_id.is_gpu())
+                return true;
+            const auto event = handle.live_checkpoint_ready_event;
+            if (!event)
+            {
+                // Existing synchronous KV-only exports have no queued auxiliary/GDN payload.
+                return handle.layout.modelAuxiliaryBytes() == 0 &&
+                    !handle.device_hybrid_allocation && !handle.device_terminal_hidden_allocation;
+            }
+            if (handle.payload_readiness && handle.payload_readiness->prepared())
+            {
+                if (!recordPrefixArchivePayloadReady(
+                        &handle, stream, "capture_live_prefix_state_section"))
+                    return false;
+            }
+            else
+            {
+                auto *backend = getBackendFor(state_.device_id);
+                if (!backend || !backend->recordEvent(
+                        event.get(), state_.device_id.ordinal, stream))
+                    return false;
+            }
+            // Every completed handle remains event-owned if a later handle
+            // throws before aggregate snapshot publication. Reap through the
+            // existing pending-use authority, never through a second ledger.
+            PendingPrefixPayloadUse pending;
+            pending.completion_event = event;
+            pending.retained_payload_sources.push_back(
+                PrefixPayloadReadLease::wholeArchive(handle));
+            pending_prefix_payload_uses_.push_back(std::move(pending));
+            return true;
+        };
+
         int cached_tokens = -1;
         if (state_.device_id.is_gpu())
         {
@@ -48824,6 +49183,7 @@ namespace llaminar2
         snapshot.valid = true;
         snapshot.provenance = PrefixStateProvenance::PayloadCheckpoint;
         snapshot.cached_tokens = cached_tokens;
+        snapshot.mtp_shifted_origin=graph_builder_->config().mtpShiftedCacheOrigin();
         bool queued_async_device_checkpoint_payload = false;
         if (cached_tokens > 0)
         {
@@ -48835,7 +49195,7 @@ namespace llaminar2
                 state_.d_model > 0)
             {
                 live_terminal_hidden_bytes =
-                    static_cast<size_t>(state_.d_model) * sizeof(float);
+                    ResidualRowGeometry(graph_builder_->config().residualWidth()).rowBytes();
             }
 
             PrefixPayloadLayout layout = buildDensePrefixPayloadLayout(
@@ -48857,6 +49217,8 @@ namespace llaminar2
                     handle.layout.hybrid_device_state_bytes;
             }
             handle.total_bytes = handle.layout.totalBytes();
+            if (!allocate_auxiliary_archive(*state_.kv_cache, handle))
+                return fail("main_auxiliary_archive_authority_unavailable");
 
             const size_t kv_bytes = layout.faKVBytes();
             if (kv_bytes == 0)
@@ -48869,6 +49231,12 @@ namespace llaminar2
             {
                 return fail("main_checkpoint_storage_unavailable");
             }
+
+            if (!prepare_handle(handle, "capture_live_prefix_state_main"))
+                return fail("full_auxiliary_archive_requires_exact_ready_authority");
+            PrefixArchivePublicationScope main_completion([&](PrefixArchiveCompletion reason) {
+                return complete_handle(handle, reason);
+            });
 
             for (int local_layer = 0; local_layer < layout.fa_layers; ++local_layer)
             {
@@ -48915,10 +49283,13 @@ namespace llaminar2
                     IBackend *backend = getBackendFor(state_.device_id);
                     const void *source =
                         state_.prefix_terminal_hidden
-                            ? state_.prefix_terminal_hidden->gpu_data_ptr()
+                            ? static_cast<const std::byte *>(state_.prefix_terminal_hidden->gpu_data_ptr()) +
+                                  ResidualRowGeometry(graph_builder_->config().residualWidth()).elementOffset(
+                                      state_.prefix_terminal_hidden->shape(), seq_idx) * sizeof(float)
                             : nullptr;
                     void *destination =
                         handle.deviceTerminalHiddenData();
+                    submitted_async_device_payload = true;
                     if (!backend ||
                         !source ||
                         !destination ||
@@ -48937,7 +49308,9 @@ namespace llaminar2
                 else
                 {
                     const void *source =
-                        state_.prefix_terminal_hidden->raw_data();
+                        static_cast<const std::byte *>(state_.prefix_terminal_hidden->raw_data()) +
+                        ResidualRowGeometry(graph_builder_->config().residualWidth()).elementOffset(
+                            state_.prefix_terminal_hidden->shape(), seq_idx) * sizeof(float);
                     if (!source || !handle.terminal_hidden)
                     {
                         return fail(
@@ -48951,6 +49324,10 @@ namespace llaminar2
                 handle.has_terminal_hidden = true;
             }
 
+            submitted_async_device_payload |= state_.device_id.is_gpu() && handle.layout.modelAuxiliaryBytes() > 0;
+            exportPrefixAuxiliaryState(*state_.kv_cache, seq_idx, PrefixAuxiliaryLane::Main, handle, stream);
+            queued_async_device_checkpoint_payload |= state_.device_id.is_gpu() && handle.layout.modelAuxiliaryBytes() > 0;
+            main_completion.commit();
             snapshot.blocks.push_back(std::move(handle));
         }
 
@@ -48995,6 +49372,8 @@ namespace llaminar2
             handle.key.token_count = mtp_cached_tokens;
             handle.layout = layout;
             handle.total_bytes = layout.totalBytes();
+            if (!allocate_auxiliary_archive(*cache, handle))
+                return fail("shifted_auxiliary_archive_authority_unavailable_depth_" + std::to_string(depth));
 
             const size_t kv_bytes = layout.faKVBytes();
             if (kv_bytes == 0)
@@ -49005,6 +49384,14 @@ namespace llaminar2
             }
             handle.kv_storage = std::make_shared<std::vector<uint8_t>>(kv_bytes, 0);
             handle.kv_payload = handle.kv_storage->data();
+
+            if (!ensureLiveCheckpointStorage(handle))
+                return fail("shifted_checkpoint_storage_unavailable_depth_" + std::to_string(depth));
+            if (!prepare_handle(handle, "capture_live_prefix_state_shifted"))
+                return fail("shifted_auxiliary_archive_requires_exact_ready_authority");
+            PrefixArchivePublicationScope mtp_completion([&](PrefixArchiveCompletion reason) {
+                return complete_handle(handle, reason);
+            });
 
             for (int local_layer = 0; local_layer < layout.fa_layers; ++local_layer)
             {
@@ -49036,6 +49423,10 @@ namespace llaminar2
                 }
             }
 
+            submitted_async_device_payload |= state_.device_id.is_gpu() && handle.layout.modelAuxiliaryBytes() > 0;
+            exportPrefixAuxiliaryState(*cache, seq_idx, PrefixAuxiliaryLane::Main, handle, stream);
+            queued_async_device_checkpoint_payload |= state_.device_id.is_gpu() && handle.layout.modelAuxiliaryBytes() > 0;
+            mtp_completion.commit();
             snapshot.mtp_blocks.push_back(std::move(handle));
         }
 
@@ -49129,6 +49520,7 @@ namespace llaminar2
 
         live_checkpoint_storage_pool_initialized_ = false;
         live_checkpoint_storage_pool_.clear();
+        host_auxiliary_checkpoint_pool_ = HostCacheAuxiliaryCheckpointPool{};
         live_device_sequence_state_storage_pool_.clear();
         mtp_publication_main_kv_base_checkpoints_.clear();
         mtp_publication_main_kv_base_checkpoints_ready_ = false;
@@ -49144,7 +49536,7 @@ namespace llaminar2
             main_layout,
             /*device_only=*/state_.device_id.is_gpu());
         main_layout.terminal_hidden_bytes =
-            static_cast<size_t>(state_.d_model) * sizeof(float);
+            ResidualRowGeometry(graph_builder_->config().residualWidth()).rowBytes();
         main_layout.includes_terminal_hidden = true;
         payload_layouts_per_checkpoint.push_back(main_layout);
 
@@ -49287,7 +49679,7 @@ namespace llaminar2
                     .cache_depth = -1,
                     .sequence_index = sequence_index,
                     .metadata_layer_count = static_cast<int>(
-                        publication_checkpoint_bytes /
+                        state_.kv_cache->deviceSequenceStateMetadataBytes() /
                         (sizeof(int32_t) * 2u)),
                     .bytes = publication_checkpoint_bytes,
                     .device = state_.device_id,
@@ -49308,6 +49700,35 @@ namespace llaminar2
                     std::move(checkpoint));
             }
         }
+        if (!state_.device_id.is_gpu())
+        {
+            // CPU accepted tails have one authority too. Reserve the same
+            // concurrent checkpoint sets as recurrent state; compressed pools
+            // remain append-only and are hidden by restored logical frontiers.
+            auto reserve_auxiliary = [&](const IKVCache &cache) -> bool
+            {
+                const auto *owner = cache.auxiliaryState();
+                if (!owner) return true;
+                size_t bytes = 0;
+                for (int sequence = 0; sequence < state_.batch_size; ++sequence)
+                    bytes = std::max(bytes, owner->checkpointCapacity(sequence));
+                if (bytes == 0) return true;
+                for (size_t checkpoint = 0; checkpoint < kMTPConcurrentLiveCheckpointSets; ++checkpoint)
+                {
+                    std::shared_ptr<void> lease;
+                    if (!claimPhysicalAllocation(state_.device_id,
+                            PhysicalMemoryOwner::RecurrentCheckpointState, bytes,
+                            "CPU accepted auxiliary rollback", &lease)) return false;
+                    host_auxiliary_checkpoint_pool_.add(*owner, std::move(lease),
+                        std::make_shared<std::vector<uint8_t>>(bytes));
+                }
+                return true;
+            };
+            if (!reserve_auxiliary(*state_.kv_cache)) return false;
+            for (const auto &cache : state_.mtp_kv_caches)
+                if (cache && !reserve_auxiliary(*cache)) return false;
+        }
+        host_auxiliary_checkpoint_pool_.seal();
         live_checkpoint_storage_pool_initialized_ = true;
 
         size_t checkpoint_hybrid_host_bytes = 0;
@@ -49377,7 +49798,7 @@ namespace llaminar2
                 .cache_depth = cache_depth,
                 .sequence_index = sequence_index,
                 .metadata_layer_count = static_cast<int>(
-                    required_bytes / (sizeof(int32_t) * 2u)),
+                    cache.deviceSequenceStateMetadataBytes() / (sizeof(int32_t) * 2u)),
                 .bytes = required_bytes,
                 .device = state_.device_id,
                 .physical_memory_lease = slot.physical_memory_lease,
@@ -49876,6 +50297,7 @@ namespace llaminar2
         snapshot.logical_checkpoint = true;
         snapshot.provenance = PrefixStateProvenance::LogicalCheckpoint;
         snapshot.cached_tokens = cached_tokens;
+        snapshot.mtp_shifted_origin=graph_builder_->config().mtpShiftedCacheOrigin();
         snapshot.mtp_cached_tokens.assign(state_.mtp_kv_caches.size(), -1);
         for (size_t depth = 0; depth < shifted_checkpoint_plans.size(); ++depth)
         {
@@ -49960,6 +50382,21 @@ namespace llaminar2
             queued_async_device_checkpoint_payload = true;
         }
 
+        if (!state_.device_id.is_gpu())
+        {
+            auto capture_auxiliary = [&](int depth, const IKVCache &cache)
+            {
+                if (const auto *owner = cache.auxiliaryState();
+                    owner && owner->checkpointCapacity(seq_idx) > 0)
+                    snapshot.host_auxiliary_checkpoints.push_back(
+                        host_auxiliary_checkpoint_pool_.capture(depth, seq_idx, *owner));
+            };
+            capture_auxiliary(-1, *state_.kv_cache);
+            for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
+                if (state_.mtp_kv_caches[depth])
+                    capture_auxiliary(static_cast<int>(depth), *state_.mtp_kv_caches[depth]);
+        }
+
         PrefixPayloadLayout main_layout;
         if (cached_tokens > 0)
         {
@@ -49989,7 +50426,7 @@ namespace llaminar2
             state_.d_model > 0)
         {
             live_terminal_hidden_bytes =
-                static_cast<size_t>(state_.d_model) * sizeof(float);
+                ResidualRowGeometry(graph_builder_->config().residualWidth()).rowBytes();
         }
         else if (mtp_terminal_hidden_checkpoint_enabled &&
                  !state_.device_id.is_gpu() &&
@@ -50012,12 +50449,12 @@ namespace llaminar2
             if (hidden_rows_fp32 &&
                 hidden_rows > terminal_row &&
                 hidden_shape.size() >= 2 &&
-                hidden_shape[1] >= static_cast<size_t>(state_.d_model))
+                hidden_shape[1] == static_cast<size_t>(graph_builder_->config().residualWidth()))
             {
                 live_terminal_hidden_source =
-                    hidden_rows_fp32 + terminal_row * static_cast<size_t>(state_.d_model);
+                    hidden_rows_fp32 + ResidualRowGeometry(graph_builder_->config().residualWidth()).elementOffset(hidden_shape, terminal_row);
                 live_terminal_hidden_bytes =
-                    static_cast<size_t>(state_.d_model) * sizeof(float);
+                    ResidualRowGeometry(graph_builder_->config().residualWidth()).rowBytes();
             }
         }
 
@@ -50102,7 +50539,9 @@ namespace llaminar2
                     IBackend *backend = getBackendFor(state_.device_id);
                     const void *hidden_source =
                         state_.prefix_terminal_hidden
-                            ? state_.prefix_terminal_hidden->gpu_data_ptr()
+                            ? static_cast<const std::byte *>(state_.prefix_terminal_hidden->gpu_data_ptr()) +
+                                  ResidualRowGeometry(graph_builder_->config().residualWidth()).elementOffset(
+                                      state_.prefix_terminal_hidden->shape(), seq_idx) * sizeof(float)
                             : nullptr;
                     void *hidden_destination =
                         handle.deviceTerminalHiddenData();
@@ -50127,7 +50566,9 @@ namespace llaminar2
                         live_terminal_hidden_source
                             ? static_cast<const void *>(
                                   live_terminal_hidden_source)
-                            : state_.prefix_terminal_hidden->raw_data();
+                            : static_cast<const std::byte *>(state_.prefix_terminal_hidden->raw_data()) +
+                        ResidualRowGeometry(graph_builder_->config().residualWidth()).elementOffset(
+                            state_.prefix_terminal_hidden->shape(), seq_idx) * sizeof(float);
                     if (!hidden_source || !handle.terminal_hidden)
                     {
                         return fail(
@@ -50272,6 +50713,13 @@ namespace llaminar2
                         " max_seq_len=" + std::to_string(state_.kv_cache->max_seq_len()));
         }
 
+        if (!validMTPShiftedCacheOrigin(snapshot.mtp_shifted_origin) ||
+            (!state_.mtp_kv_caches.empty() &&
+             snapshot.mtp_shifted_origin != graph_builder_->config().mtpShiftedCacheOrigin()))
+        {
+            return fail("snapshot shifted-cache origin differs from authenticated model ownership");
+        }
+
         void *stream = explicitGPUStreamForOperation("restoreLivePrefixState");
         if (state_.device_id.is_gpu() && !stream)
         {
@@ -50317,6 +50765,26 @@ namespace llaminar2
             return fail("could not preflight live-state readiness event");
         }
 
+        PrefixArchivePublicationScope restore_completion([&](PrefixArchiveCompletion) {
+            if (!state_.device_id.is_gpu())
+                return true;
+            std::vector<PrefixPayloadReadLease> sources;
+            std::vector<std::shared_ptr<void>> device_sources;
+            for (const auto &source : snapshot.blocks)
+                sources.push_back(PrefixPayloadReadLease::wholeArchive(source));
+            for (const auto &source : snapshot.mtp_blocks)
+                sources.push_back(PrefixPayloadReadLease::wholeArchive(source));
+            for (const auto &source : snapshot.device_sequence_state_checkpoints)
+                device_sources.push_back(source.storage);
+            const char *producer = snapshot.logical_checkpoint
+                ? "restore_logical_checkpoint"
+                : snapshot.cached_tokens == 0
+                    ? "restore_payload_checkpoint_zero"
+                    : "restore_payload_checkpoint";
+            return recordLivePrefixMutationReady(
+                stream, producer, std::move(sources), std::move(device_sources));
+        });
+
         /*
          * Restoring KV/GDN/position state invalidates any previously current
          * terminal-hidden sidecar input unless this snapshot explicitly
@@ -50331,6 +50799,33 @@ namespace llaminar2
 
         if (snapshot.logical_checkpoint)
         {
+            // Validate the complete CPU endpoint map before truncating any
+            // cache. A logical token rollback cannot reconstruct lexical or
+            // incomplete-pool history, including an accepted zero-token state.
+            std::vector<const HostCacheAuxiliaryCheckpoint *> host_auxiliary(
+                state_.mtp_kv_caches.size() + 1, nullptr);
+            if (state_.device_id.is_gpu() && !snapshot.host_auxiliary_checkpoints.empty())
+                return fail("GPU logical checkpoint unexpectedly carries CPU auxiliary state");
+            for (const auto &checkpoint : snapshot.host_auxiliary_checkpoints)
+            {
+                const int index = checkpoint.cache_depth + 1;
+                if (index < 0 || index >= static_cast<int>(host_auxiliary.size()) || host_auxiliary[index])
+                    return fail("CPU logical checkpoint has an invalid or duplicate auxiliary cache depth");
+                IKVCache *cache = index == 0 ? state_.kv_cache.get() : state_.mtp_kv_caches[index - 1].get();
+                if (!cache || !cache->auxiliaryState())
+                    return fail("CPU logical checkpoint carries auxiliary state for a missing owner");
+                checkpoint.validate(*cache->auxiliaryState(), seq_idx);
+                host_auxiliary[index] = &checkpoint;
+            }
+            if (!state_.device_id.is_gpu())
+                for (size_t index = 0; index < host_auxiliary.size(); ++index)
+                {
+                    const IKVCache *cache = index == 0 ? state_.kv_cache.get() : state_.mtp_kv_caches[index - 1].get();
+                    const auto *owner = cache ? cache->auxiliaryState() : nullptr;
+                    const bool required = owner && owner->checkpointCapacity(seq_idx) > 0;
+                    if (required != bool(host_auxiliary[index]))
+                        return fail("CPU logical checkpoint is missing its exact accepted auxiliary endpoint");
+                }
             if (snapshot.blocks.size() > 1)
             {
                 return fail("logical checkpoint contains more than one hybrid payload block");
@@ -50613,7 +51108,8 @@ namespace llaminar2
                             *hybrid_handle,
                             stream,
                             "restore_logical_checkpoint",
-                            /*publish_mailbox=*/false))
+                            /*publish_mailbox=*/false,
+                            /*destination_row=*/seq_idx))
                     {
                         return fail(
                             "logical checkpoint terminal hidden restore failed");
@@ -50720,37 +51216,19 @@ namespace llaminar2
                 }
             }
 
+            for (size_t index = 0; index < host_auxiliary.size(); ++index)
+                if (host_auxiliary[index])
+                {
+                    IKVCache &cache = index == 0 ? *state_.kv_cache : *state_.mtp_kv_caches[index - 1];
+                    host_auxiliary[index]->restore(*cache.auxiliaryState(), seq_idx);
+                }
+
             state_.positions[seq_idx] = snapshot.cached_tokens;
             state_.sequence_lengths[seq_idx] = snapshot.cached_tokens;
             handleLivePrefixReplayStateAfterMutation(
                 LivePrefixMutationReason::PrefixRestore,
                 "restore_logical_checkpoint");
-            std::vector<PrefixPayloadReadLease> retained_snapshot_sources;
-            std::vector<std::shared_ptr<void>>
-                retained_device_sequence_sources;
-            if (state_.device_id.is_gpu())
-            {
-                for (const auto &source : snapshot.blocks)
-                    retained_snapshot_sources.push_back(PrefixPayloadReadLease::wholeArchive(source));
-                for (const auto &source : snapshot.mtp_blocks)
-                    retained_snapshot_sources.push_back(PrefixPayloadReadLease::wholeArchive(source));
-                retained_device_sequence_sources.reserve(
-                    snapshot.device_sequence_state_checkpoints.size());
-                for (const DeviceKVSequenceStateCheckpoint &checkpoint :
-                     snapshot.device_sequence_state_checkpoints)
-                {
-                    retained_device_sequence_sources.push_back(
-                        checkpoint.storage);
-                }
-            }
-            if (!recordLivePrefixMutationReady(
-                    stream,
-                    "restore_logical_checkpoint",
-                    std::move(retained_snapshot_sources),
-                    std::move(retained_device_sequence_sources)))
-            {
-                return fail("logical checkpoint restore could not record live-state readiness");
-            }
+            restore_completion.commit();
             submitted_async_device_mutation = false;
             if (!recordRestoredDeviceResidentMTPTransaction(
                     stream,
@@ -50802,17 +51280,19 @@ namespace llaminar2
             {
                 return fail("zero-token payload checkpoint GDN reset failed");
             }
+            auto reset_auxiliary = [&](IKVCache &cache)
+            {
+                if (auto *owner = cache.auxiliaryState())
+                    owner->reset({cache.first_layer_index(), cache.n_layers(), seq_idx, 1}, stream);
+            };
+            reset_auxiliary(*state_.kv_cache);
+            for (auto &cache : state_.mtp_kv_caches) if (cache) reset_auxiliary(*cache);
             state_.positions[seq_idx] = 0;
             state_.sequence_lengths[seq_idx] = 0;
             handleLivePrefixReplayStateAfterMutation(
                 LivePrefixMutationReason::PrefixRestore,
                 "restore_payload_checkpoint_zero");
-            if (!recordLivePrefixMutationReady(
-                    stream,
-                    "restore_payload_checkpoint_zero"))
-            {
-                return fail("zero-token payload checkpoint restore could not record live-state readiness");
-            }
+            restore_completion.commit();
             submitted_async_device_mutation = false;
             if (!recordRestoredDeviceResidentMTPTransaction(
                     stream,
@@ -50866,6 +51346,7 @@ namespace llaminar2
                                 " tokens=" + std::to_string(handle.key.token_count));
                 }
             }
+            importPrefixAuxiliaryState(*state_.kv_cache, seq_idx, PrefixAuxiliaryLane::Main, handle, stream);
         }
 
         if (!snapshot.blocks.empty() &&
@@ -50890,7 +51371,8 @@ namespace llaminar2
                         terminal_handle,
                         stream,
                         "restore_payload_checkpoint",
-                        /*publish_mailbox=*/false))
+                        /*publish_mailbox=*/false,
+                        /*destination_row=*/seq_idx))
                 {
                     return fail(
                         "payload checkpoint terminal hidden restore failed");
@@ -50953,6 +51435,7 @@ namespace llaminar2
                                 " tokens=" + std::to_string(handle.key.token_count));
                 }
             }
+            importPrefixAuxiliaryState(*cache, seq_idx, PrefixAuxiliaryLane::Main, handle, stream);
         }
 
         state_.positions[seq_idx] = snapshot.cached_tokens;
@@ -50960,21 +51443,7 @@ namespace llaminar2
         handleLivePrefixReplayStateAfterMutation(
             LivePrefixMutationReason::PrefixRestore,
             "restore_payload_checkpoint");
-        std::vector<PrefixPayloadReadLease> retained_snapshot_sources;
-        if (state_.device_id.is_gpu())
-        {
-            for (const auto &source : snapshot.blocks)
-                retained_snapshot_sources.push_back(PrefixPayloadReadLease::wholeArchive(source));
-            for (const auto &source : snapshot.mtp_blocks)
-                retained_snapshot_sources.push_back(PrefixPayloadReadLease::wholeArchive(source));
-        }
-        if (!recordLivePrefixMutationReady(
-                stream,
-                "restore_payload_checkpoint",
-                std::move(retained_snapshot_sources)))
-        {
-            return fail("payload checkpoint restore could not record live-state readiness");
-        }
+        restore_completion.commit();
         submitted_async_device_mutation = false;
         if (!recordRestoredDeviceResidentMTPTransaction(
                 stream,
@@ -51039,9 +51508,10 @@ namespace llaminar2
             {
                 continue;
             }
-            const int shifted_count = std::max(
-                0,
-                cached_tokens - static_cast<int>(depth) - 1);
+            const int shifted_count=mtpShiftedPrefixRows(cached_tokens,cache->stateOwnership().shifted_origin,static_cast<int>(depth));
+            if(shifted_count<0 || (cache->stateOwnership().shifted_origin==MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero &&
+                shifted_count>cache->max_seq_len()))
+                throw std::invalid_argument("QFN prefix truncate must fit its exact model-owned cache origin/depth/capacity");
             const int bounded_count = std::min(shifted_count, cache->max_seq_len());
             if (!cache->truncateSequence(seq_idx, bounded_count, stream))
             {
@@ -51691,6 +52161,19 @@ namespace llaminar2
                 "beginDeviceResidentGeneration"))
             return false;
 
+        const auto forward_failure_policy=graph_builder_->deviceGenerationForwardFailurePolicy();
+        using ForwardFailurePolicy=sampling_math::DeviceGenerationForwardFailurePolicy;
+        if (forward_failure_policy!=ForwardFailurePolicy::ResetAtResponseAdmission &&
+            forward_failure_policy!=ForwardFailurePolicy::PreserveUntilRequestReset)
+            return false;
+        // The native initializer must observe the last real prefill/forward's
+        // error writes before deciding admission. This is an event join only;
+        // prefix hits with no new forward have no publication to join.
+        if (forward_failure_policy==ForwardFailurePolicy::PreserveUntilRequestReset &&
+            !waitForForwardGraphOutputReady(stream,DeviceTimelineRole::DeviceGenerationController,
+                ForwardGraphOutputKind::Any,"forward_failure_response_admission"))
+            return false;
+
         // Prefix-hit admission may have no new prompt-input upload. Publish
         // the same immutable request controls here as at ordinary prefill;
         // the existing session epoch makes this once-only for either route.
@@ -51827,7 +52310,8 @@ namespace llaminar2
                 {.kind = request.kind,
                  .session_epoch = session_epoch_,
                  .workspace_generation = generation,
-                 .prior_tickets = device_generation_storage_.dispatch_tickets_device}) ||
+                 .prior_tickets = device_generation_storage_.dispatch_tickets_device,
+                 .forward_failure_policy = forward_failure_policy}) ||
             !backend->enqueueInitializeDeviceGenerationDispatchTicket(
                 session_epoch_,
                 generation,
@@ -51837,6 +52321,7 @@ namespace llaminar2
                 device_generation_storage_.dispatch_tickets_device,
                 state_.device_id.gpu_ordinal(),
                 stream) ||
+            !beginRetainedStorageAdmission(stream) ||
             !publishDeviceGenerationStateReady(
                 stream,
                 request.request_count,
@@ -52207,11 +52692,7 @@ namespace llaminar2
                         std::terminate();
                     }
                 }
-                else if (loop.ordinary_composition &&
-                         (*loop.ordinary_composition ==
-                              OrdinaryGenerationComposition::ExpertOverlay ||
-                          *loop.ordinary_composition ==
-                              OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail))
+                else if (loop.ordinary_hosted_forward)
                 {
                     /*
                      * ExpertOverlay deliberately has no monolithic local
@@ -52835,6 +53316,21 @@ namespace llaminar2
         return true;
     }
 
+    std::span<int> DeviceGraphOrchestrator::deviceGenerationTerminalHostControls(
+        int request_count)
+    {
+        if (request_count <= 0 || !device_generation_terminal_host_scratch_ ||
+            !device_generation_terminal_host_scratch_->meta ||
+            !device_generation_terminal_host_scratch_->canServe(
+                request_count,
+                device_generation_storage_.response_token_stride,
+                device_generation_storage_.control_stride))
+            return {};
+        return {device_generation_terminal_host_scratch_->meta,
+                static_cast<size_t>(request_count) *
+                    static_cast<size_t>(device_generation_storage_.control_stride)};
+    }
+
     bool DeviceGraphOrchestrator::finishDeviceResidentGeneration(
         DeviceGenerationTerminalResult *out_result)
     {
@@ -52961,6 +53457,8 @@ namespace llaminar2
                 return false;
             }
         }
+
+        awaitRetainedStorageTerminal();
 
         /*
          * The first speculative transaction is retained in arena-owned device
@@ -53331,6 +53829,27 @@ namespace llaminar2
         int total_depth_updates = 0;
         int total_depth_promotions = 0;
         int total_depth_demotions = 0;
+        std::vector<qwen4exp::QwenSparseCounterTotals> qsa_terminal_totals;
+        qsa_terminal_totals.reserve(request_count);
+        std::vector<qwen4exp::QwenFixedHeadCounterTotals> fixed_head_terminal_totals;
+        fixed_head_terminal_totals.reserve(request_count);
+        std::vector<qwen4exp::QwenAdaptiveCounterTotals> adaptive_terminal_totals;
+        adaptive_terminal_totals.reserve(request_count);
+        const auto placement = graph_builder_ ? graph_builder_->config().ngram_table_placement : nullptr;
+        const bool adaptive_lookup =
+            placement && placement->isGPUAdaptive() &&
+            std::find(placement->consumers().begin(), placement->consumers().end(),
+                      PhysicalMemoryAllocatorIdentity{placement->worldRank(), state_.device_id}) !=
+                placement->consumers().end();
+        const auto adaptive_row_bytes = adaptive_lookup ? placement->extent().rowBytes() : 0;
+        const auto adaptive_maximum_ids = adaptive_lookup ? placement->gpuAdaptiveMaximumLiveRows() : 0;
+        const bool fixed_head_lookup=graph_builder_ && graph_builder_->config().ngram_table_placement &&
+            graph_builder_->config().ngram_table_placement->isFixedHeadShards();
+        const auto fixed_row_bytes=fixed_head_lookup && graph_builder_->config().flash_next
+            ? graph_builder_->config().flash_next->ngrams().row_bytes : 0;
+        const auto fixed_participants=fixed_head_lookup
+            ? graph_builder_->config().ngram_table_placement->consumers().size() : 0;
+        if(fixed_head_lookup && (!fixed_row_bytes || (fixed_participants!=2 && fixed_participants!=4 && fixed_participants!=8)))return false;
         for (int request_index = 0;
              request_index < request_count;
              ++request_index)
@@ -53470,6 +53989,31 @@ namespace llaminar2
                           << " demotions=" << depth_demotions);
                 return false;
             }
+
+            qwen4exp::QwenSparseCounterTotals qsa_actual;
+            if(!qwen4exp::readQwenSparseTerminalCounters(control,kDeviceGenerationControlCount,qsa_actual))return false;
+            qsa_terminal_totals.push_back(qsa_actual);
+            qwen4exp::QwenFixedHeadNativeSendTotals fixed_native_sends;
+            if(!qwen4exp::readQwenFixedHeadNativeSendCounters(control,kDeviceGenerationControlCount,fixed_native_sends))return false;
+            qwen4exp::QwenFixedHeadCounterTotals fixed_actual;
+            if(fixed_head_lookup) {
+                if(!qwen4exp::projectQwenFixedHeadTerminalContributions(fixed_native_sends,
+                    static_cast<int>(fixed_participants),fixed_row_bytes,fixed_actual) || fixed_actual.failures)return false;
+            } else if(fixed_native_sends!=qwen4exp::QwenFixedHeadNativeSendTotals{})return false;
+            fixed_head_terminal_totals.push_back(fixed_actual);
+            qwen4exp::QwenAdaptiveCounterTotals adaptive_actual;
+            if (!qwen4exp::readQwenAdaptiveCounters(control, kDeviceGenerationControlCount, adaptive_actual))
+                return false;
+            if (adaptive_lookup)
+            {
+                if (!qwen4exp::validQwenAdaptiveCounters(adaptive_actual, adaptive_row_bytes,
+                                                         adaptive_maximum_ids) ||
+                    adaptive_actual.failed_frames)
+                    return false;
+            }
+            else if (adaptive_actual != qwen4exp::QwenAdaptiveCounterTotals{})
+                return false;
+            adaptive_terminal_totals.push_back(adaptive_actual);
 
             DeviceGenerationTerminalRequestResult request_result;
             request_result.remaining_token_count = remaining_count;
@@ -53618,6 +54162,54 @@ namespace llaminar2
         active_device_generation_admission_.reset();
         last_device_generation_dispatch_ticket_.reset();
         *out_result = std::move(parsed);
+        // These words arrive in the existing immutable terminal controller copy.
+        // Emit only after every request and complete-parent retirement succeeded.
+        const char* qsa_metric_names[]{"verifier_prior_header_bytes","verifier_prior_payload_bytes",
+            "verifier_candidate_payload_bytes","verifier_accepted_payload_bytes"};
+        for(std::size_t request=0;request<qsa_terminal_totals.size();++request) {
+            const auto& total=qsa_terminal_totals[request];
+            const std::uint64_t values[]{total.prior_header,total.prior_payload,total.candidate_payload,total.accepted_payload};
+            for(int metric=0;metric<4;++metric)
+                PerfStatsCollector::addCounterWithSequence("qsa",qsa_metric_names[metric],static_cast<double>(values[metric]),
+                    {values[metric]},"decode",state_.device_id.toString(),{{"request",std::to_string(request)},
+                    {"authority","terminal_device_generation_control"}});
+        }
+        // The same complete terminal copy contains these observations. Every
+        // pair remains device-owned until all request/parent validation and
+        // retirement above succeeded; no per-stage/per-token readback occurs.
+        if(fixed_head_lookup) {
+            constexpr const char *names[]{"fixed_head_lookup_calls","fixed_head_live_ids","fixed_head_native_bytes",
+                "fixed_head_failures","fixed_head_header_native_bytes","fixed_head_payload_native_bytes"};
+            for(std::size_t request=0;request<fixed_head_terminal_totals.size();++request) {
+                const auto &total=fixed_head_terminal_totals[request];
+                const std::uint64_t values[]{total.calls,total.live_ids,total.native_bytes,total.failures,total.header_bytes,total.payload_bytes};
+                for(int metric=0;metric<6;++metric)
+                    PerfStatsCollector::addCounterWithSequence("immutable_lookup",names[metric],static_cast<double>(values[metric]),
+                        {values[metric]},"generation_terminal",state_.device_id.toString(),{{"request",std::to_string(request)},
+                            {"storage","vram"},{"transport","native_fixed_head"},{"authority","terminal_device_generation_control"}});
+            }
+        }
+        // Publish only the actual owner's terminal words after the same complete
+        // parent validation/retirement; source-worker statistics never infer GPU hits.
+        if (adaptive_lookup)
+        {
+            constexpr const char *names[]{
+                "adaptive_lookup_calls",    "adaptive_completed_live_ids", "adaptive_cache_hit_rows",
+                "adaptive_cache_miss_rows", "adaptive_source_rows",        "adaptive_source_native_bytes",
+                "adaptive_promotions",      "adaptive_evictions",          "adaptive_failed_frames"};
+            for (std::size_t request = 0; request < adaptive_terminal_totals.size(); ++request)
+            {
+                const auto values = qwen4exp::adaptiveCounterValues(adaptive_terminal_totals[request]);
+                for (unsigned metric = 0; metric < 9; ++metric)
+                    PerfStatsCollector::addCounterWithSequence(
+                        "immutable_lookup", names[metric], static_cast<double>(values[metric]),
+                        {values[metric]}, "generation_terminal", state_.device_id.toString(),
+                        {{"request", std::to_string(request)},
+                         {"storage", "vram"},
+                         {"transport", "adaptive_subordinate"},
+                         {"authority", "terminal_device_generation_control"}});
+            }
+        }
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_terminal_response_bridges",
@@ -53891,6 +54483,18 @@ namespace llaminar2
             last_device_generation_dispatch_ticket_.reset();
             hosted_device_generation_cursor_.reset();
             mtp_device_generation_loop_graph_.hosted_advance.reset();
+        }
+        // Standalone prefill can own live immutable I/O without ever launching
+        // a complete generation parent. Retire that interval after every old
+        // producer joined reset, before clearing caches or advancing the epoch.
+        try
+        {
+            retireRetainedStorageForRequestReset(reset_stream);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Immutable storage request terminal retirement failed: " << error.what());
+            return false;
         }
         PerfStatsCollector::addCounter(
             "request_reset",
@@ -54239,7 +54843,8 @@ namespace llaminar2
         std::span<const int> request_real_lengths,
         int total_tokens,
         int request_count,
-        int padded_seq_len)
+        int padded_seq_len,
+        std::optional<DeviceDecodePositionBinding> decode_position)
     {
         static_assert(
             sizeof(int) == sizeof(int32_t),
@@ -54247,11 +54852,10 @@ namespace llaminar2
 
         if (!state_.device_id.is_gpu() ||
             !tokens ||
-            !position_ids ||
             total_tokens <= 0 ||
             request_count <= 0 ||
             padded_seq_len <= 0 ||
-            total_tokens != request_count * padded_seq_len ||
+            std::int64_t(total_tokens) != std::int64_t(request_count) * padded_seq_len ||
             total_tokens > request_input_row_capacity_ ||
             request_count > request_sequence_lengths_capacity_ ||
             request_real_lengths.size() !=
@@ -54276,6 +54880,17 @@ namespace llaminar2
                       << " request_capacity=" << request_sequence_lengths_capacity_);
             return false;
         }
+        IBackend *backend=getBackendFor(state_.device_id);
+        std::optional<RequestInputPositionAdmission> position_admission;
+        try {
+            position_admission=RequestInputPositionAdmission::bind(position_ids,decode_position,backend,
+                state_.kv_cache ? state_.kv_cache->deviceSequenceCachedTokenCountPtr(0) : nullptr,
+                static_cast<int32_t *>(request_position_ids_dev_),total_tokens,request_count,padded_seq_len);
+        } catch(const std::invalid_argument &error) {
+            LOG_ERROR("[DeviceGraphOrchestrator] Request-input position authority rejected: "<<error.what());
+            return false;
+        }
+        const char *const admission_phase=decode_position ? "decode" : "prefill";
         if (request_input_admission_ready_.valid)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] A new request attempted to overwrite unconsumed GPU admission state");
@@ -54306,7 +54921,6 @@ namespace llaminar2
 
         void *stream =
             explicitGPUStreamForOperation("admitRequestInputsOnDevice");
-        IBackend *backend = getBackendFor(state_.device_id);
         if (!stream || !backend)
             return false;
         if (!waitForPendingRequestStateReset(
@@ -54346,7 +54960,7 @@ namespace llaminar2
                 "request_admission",
                 "device_input_reuse_waits",
                 1.0,
-                "prefill",
+                admission_phase,
                 state_.device_id.toString(),
                 {{"same_stream", boolTag(reuse.producer_stream == stream)},
                  {"ordering", "consumer_release_event"}});
@@ -54358,9 +54972,8 @@ namespace llaminar2
             sizeof(int32_t) * static_cast<size_t>(total_tokens);
         const size_t unused_request_rows =
             static_cast<size_t>(request_input_row_capacity_ - total_tokens);
-        const size_t padding_tokens = std::min(
-            unused_request_rows,
-            request_padding_token_ids_host_.size());
+        const size_t padding_tokens = position_admission->allowsBucketPadding() ? std::min(
+            unused_request_rows,request_padding_token_ids_host_.size()) : 0;
         const size_t padding_bytes =
             sizeof(int32_t) * padding_tokens;
         const size_t geometry_bytes =
@@ -54412,11 +55025,8 @@ namespace llaminar2
                 request_token_ids_dev_,
                 tokens,
                 row_bytes) ||
-            !enqueue_admission_member(
-                "positions",
-                request_position_ids_dev_,
-                position_ids,
-                row_bytes) ||
+            (position_admission->uploadsPositions() && !enqueue_admission_member(
+                "positions",request_position_ids_dev_,position_ids,row_bytes)) ||
             !enqueue_admission_member(
                 "batch_geometry",
                 request_batch_geometry_dev_,
@@ -54428,8 +55038,9 @@ namespace llaminar2
         }
         /*
          * The raw transfer backend owns bytes, while BufferArena owns graph
-         * coherence. Publish all three members of the admission transaction on
+         * coherence. Publish only the members admission actually authored on
          * the exact transfer stream before exposing its readiness event. A
+         * scalar decode root owns its position output and publishes it later. A
          * consumer may never infer authority merely from a non-null GPU pointer.
          */
         if (!publishPreparedArenaGraphInput(
@@ -54438,12 +55049,9 @@ namespace llaminar2
                 stream,
                 state_.device_id,
                 "request_input_admission") ||
-            !publishPreparedArenaGraphInput(
-                BufferId::REQUEST_POSITION_IDS,
-                request_position_ids_dev_,
-                stream,
-                state_.device_id,
-                "request_input_admission") ||
+            (position_admission->uploadsPositions() && !publishPreparedArenaGraphInput(
+                BufferId::REQUEST_POSITION_IDS,request_position_ids_dev_,stream,state_.device_id,
+                "request_input_admission")) ||
             !publishPreparedArenaGraphInput(
                 BufferId::REQUEST_BATCH_GEOMETRY,
                 request_batch_geometry_dev_,
@@ -54485,11 +55093,17 @@ namespace llaminar2
         request_input_admission_ready_.token_count = total_tokens;
         request_input_admission_ready_.request_count = request_count;
         request_sequence_lengths_active_count_ = request_count;
+        for(const auto &[name,bytes]:std::array<std::pair<const char *,size_t>,3>{{
+                {"device_input_token_bytes",row_bytes},
+                {"device_input_position_bytes",position_admission->uploadsPositions()?row_bytes:0},
+                {"device_input_padding_bytes",padding_bytes}}})
+            PerfStatsCollector::addCounter("request_admission",name,static_cast<double>(bytes),
+                admission_phase,state_.device_id.toString(),{{"owner","arena_request_inputs"}});
         PerfStatsCollector::addCounter(
             "request_admission",
             "device_owned_input_rows",
             static_cast<double>(total_tokens),
-            "prefill",
+            admission_phase,
             state_.device_id.toString(),
             {{"requests", std::to_string(request_count)},
              {"owner", "arena_request_inputs"},
@@ -54502,7 +55116,7 @@ namespace llaminar2
                 "mtp",
                 "request_batch_prefill_device_position_admissions",
                 static_cast<double>(request_count),
-                "prefill",
+                admission_phase,
                 state_.device_id.toString(),
                 {{"owner", "request_length_admission"},
                  {"ordering", "event_wait"}});
@@ -61997,6 +62611,7 @@ namespace llaminar2
         setBuffers(model_buffers);
 
         ForwardInput input;
+        input.graph_submission_intent=ForwardGraphSubmissionIntent::WorkspaceDeclaration;
         input.token_ids = token_ids.data();
         input.position_ids = position_ids.data();
         input.batch_size = batch_size;
@@ -62028,6 +62643,14 @@ namespace llaminar2
             return false;
         }
         input.device_state_publication_stream = publication_stream;
+        if(state_.device_id.is_gpu()) {
+            if(!request_token_ids_dev_ || !request_position_ids_dev_ || total_tokens>request_input_row_capacity_) {
+                LOG_ERROR("[DGO] GPU workspace manifest requires its admitted native request input owners");
+                return false;
+            }
+            input.token_ids=nullptr;input.token_ids_device=request_token_ids_dev_;
+            input.position_ids=nullptr;input.position_ids_device=request_position_ids_dev_;
+        }
 
         ForwardInput initial_declaration_input = input;
         if (!bindMTPMainTerminalHiddenTransaction(
@@ -62192,6 +62815,8 @@ namespace llaminar2
                     LOG_ERROR("[DGO] Maximum GPU prefill workspace-family declaration requires persistent token, position, and request-length owners");
                     return false;
                 }
+                maximum_prefill_input.token_ids = nullptr;
+                maximum_prefill_input.position_ids = nullptr;
                 maximum_prefill_input.token_ids_device =
                     request_token_ids_dev_;
                 maximum_prefill_input.position_ids_device =
@@ -62257,9 +62882,8 @@ namespace llaminar2
                 0);
 
             ForwardInput bucket_input = input;
-            bucket_input.token_ids = bucket_tokens.data();
-            bucket_input.position_ids =
-                bucket_positions.data();
+            bucket_input.token_ids = nullptr;
+            bucket_input.position_ids = nullptr;
             bucket_input.seq_len = bucket_seq_len;
             bucket_input.execution_phase =
                 ForwardExecutionPhase::Prefill;
@@ -63769,8 +64393,8 @@ namespace llaminar2
          * policy adoption and can make the fluent session silently construct a
          * graph for different semantics than its ForwardInput requested.
          */
-        ComputeGraph graph =
-            graph_builder->buildForwardGraph(prepared_input, output);
+        orchestrator_.prepareRetainedStorageBinding();
+        ComputeGraph graph=graph_builder->buildForwardGraph(prepared_input,output);
 
         if (graph.size() == 0)
         {
@@ -63805,6 +64429,7 @@ namespace llaminar2
 
         const auto &stage = pp_stage_.value();
         ForwardOutput output;
+        orchestrator_.prepareRetainedStorageBinding();
         ComputeGraph graph = graph_builder->buildPartialForwardGraph(
             prepared_input, output,
             stage.first_layer, stage.last_layer,

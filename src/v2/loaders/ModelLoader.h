@@ -8,6 +8,7 @@
  *  - Core quantization formats (F32, F16, Q4_0, Q6_K, Q8_0, IQ4_NL)
  *  - Simple tensor loading API for pipeline integration
  *  - Device-aware tensor creation (CPU, CUDA, ROCm)
+ *  - Exact native 3D expert K-block/N-row projection into retained compact storage
  *  - INT8 dequantization mode (for AVX512-VNNI / CUDA INT8 GEMM)
  *
  * Simplified from V1 ModelLoader (3870 lines) to focus on:
@@ -27,6 +28,7 @@
 #include "IModelLoader.h" // Interface
 #include "MmapRegion.h"   // RAII mmap wrapper for zero-copy loading
 #include "ModelPayloadAccessPattern.h"
+#include "SharedPredictorGGUFSource.h"
 #include "../backends/DeviceId.h"
 #include "../execution/config/RuntimeConfig.h" // for WeightPrecision
 #include "../tensors/TensorFactory.h"          // for owned_factory_
@@ -35,6 +37,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -44,6 +47,7 @@ namespace llaminar2
     // Forward declarations
     class TensorBase;
     class IMPIContext;
+    class Qwen4ExpSidecarManifest;
 
     // =============================================================================
     // GGUF TYPE DEFINITIONS
@@ -120,12 +124,21 @@ namespace llaminar2
         std::vector<uint8_t> data;
         uint64_t array_length = 0; // For ARRAY type, stores number of elements
 
+        /// Exact on-disk element subtype; absent for scalar values.
+        std::optional<GGUFValueType> array_element_type;
+
         // String array storage (for tokenizer vocabulary, merges, etc.)
         std::vector<std::string> string_array_value;
 
         // Typed accessors
         uint32_t asUInt32() const;
         uint64_t asUInt64() const;
+        /** @brief Read an integer scalar exactly; reject negative, malformed, or non-integer values. */
+        uint64_t asUInt64Checked() const;
+        /** @brief Widen an integer array exactly; reject negative elements and malformed payloads. */
+        std::vector<uint64_t> asUInt64Array() const;
+        /** @brief Read signed integer elements exactly; reject unsigned values above INT64_MAX. */
+        std::vector<int64_t> asInt64Array() const;
         float asFloat32() const;
         std::string asString() const;
         uint64_t asArrayLength() const { return array_length; }
@@ -220,7 +233,8 @@ namespace llaminar2
          * @param factory TensorFactory for NUMA-aware tensor creation (optional)
          */
         explicit ModelLoader(TensorFactory *factory = nullptr);
-        ~ModelLoader() override = default;
+        /** @brief Retire predictor/target file resources before their shared tensor factory. */
+        ~ModelLoader() override;
 
         /**
          * @brief Enable or disable mmap-based file loading
@@ -290,6 +304,8 @@ namespace llaminar2
          */
         std::shared_ptr<MmapRegion> getMmapRegion(const GGUFTensorInfo *info) const
         {
+            if (predictor_loader_ && info && predictor_loader_->hasTensor(info->name))
+                return predictor_loader_->getMmapRegion(info);
             if (!mmap_region_)
                 return nullptr;
             if (model_.split_count > 1 && info->split_idx > 0)
@@ -306,6 +322,31 @@ namespace llaminar2
          * @return true if successful, false on error
          */
         bool loadModel(const std::string &file_path);
+
+        /**
+         * @brief Authenticate and bind one explicit shared predictor before any tensor materialization.
+         * @param source User-selected GGUF path; its original directory remains separate.
+         * @param materialization Explicit active or metadata-only source usage, sealed with the identity.
+         * @throws std::logic_error If already bound, unloaded, or payload loading has begun.
+         * @throws std::invalid_argument If exact source metadata/roles are incompatible.
+         */
+        void bindSharedPredictor(const SharedPredictorGGUFSource &source, SharedPredictorMaterialization materialization);
+
+        /** @brief Permanently seal metadata-time source selection before weight admission/preparation. */
+        void sealTensorSources() override;
+
+        /** @return Ordered complete main shard set followed by the explicitly selected predictor shards. */
+        std::vector<std::string> artifactPaths() const;
+
+        /** @return Exact separate predictor directory, or nullptr for a main-only model. */
+        const GGUFModel *ggufPredictorDirectory() const noexcept override;
+
+        /** @return Sealed active/inactive preparation policy for the admitted source. */
+        SharedPredictorMaterialization predictorMaterialization() const noexcept { return predictor_materialization_; }
+
+        /** @return Authenticated predictor policies/native source manifest, or nullptr. */
+        const Qwen4ExpSidecarManifest *predictorManifest() const noexcept override;
+
 
         /**
          * @brief Initialize a minimal valid model structure for testing
@@ -342,6 +383,12 @@ namespace llaminar2
          * @brief Get parsed model metadata
          */
         const GGUFModel &getModel() const { return model_; }
+
+        /** @return Original immutable tensor descriptor from its physical artifact, or nullptr. */
+        const GGUFTensorInfo *tensorInfo(const std::string &name) const;
+
+        /** @brief Return the exact immutable source directory without materialization. */
+        const GGUFModel *ggufDirectory() const noexcept override { return &model_; }
 
         /**
          * @brief Load tensor from GGUF file with new weight precision API
@@ -439,13 +486,21 @@ namespace llaminar2
             DeviceId device = DeviceId::cpu(),
             WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
 
+        /** @copydoc IModelLoader::loadTensorExpertProjectionSlice */
+        std::shared_ptr<TensorBase> loadTensorExpertProjectionSlice(
+            const std::string &tensor_name, const WeightSliceSpec &slice,
+            DeviceId device = DeviceId::cpu(),
+            WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
+
         // =========================================================================
         // IModelLoader - Metadata Accessors
         // =========================================================================
 
         std::vector<std::string> tensorNames() const override;
+        /** @return Main inventory plus consumed predictor roles; dense exported indexers remain discoverable only. */
+        std::vector<std::string> materializationNames() const override;
         std::string architecture() const override { return model_.architecture; }
-        size_t tensorCount() const override { return model_.tensors.size(); }
+        size_t tensorCount() const override;
         size_t totalBytes() const override;
 
         int getInt(const std::string &key, int default_val = 0) const override;
@@ -480,6 +535,7 @@ namespace llaminar2
 
         void releaseMmapRegions() override
         {
+            if (predictor_loader_) predictor_loader_->releaseMmapRegions();
             if (mmap_region_)
             {
                 LOG_DEBUG("[ModelLoader] Releasing mmap region ("
@@ -500,7 +556,7 @@ namespace llaminar2
 
         size_t adviseMmapDontneed() override
         {
-            size_t total = 0;
+            size_t total = predictor_loader_ ? predictor_loader_->adviseMmapDontneed() : 0;
             if (mmap_region_)
             {
                 total += mmap_region_->adviseDontneed();
@@ -519,6 +575,19 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Share original expert selection storage and copying with exact projection slices.
+         * @param tensor_name Original sealed source tensor.
+         * @param expert_ids Sorted unique original expert slots, never participant ownership.
+         * @param projection Null only for the existing complete-expert API; otherwise explicit full-source coordinates.
+         * @param device Existing target placement.
+         * @param weight_precision Original caller precision; projection slices require NATIVE.
+         * @return The sole final owned native storage, with no hidden parent materialization.
+         */
+        std::shared_ptr<TensorBase> loadTensorExpertSelectionImpl(
+            const std::string &tensor_name, const std::vector<size_t> &expert_ids,
+            const WeightSliceSpec *projection, DeviceId device, WeightPrecision weight_precision);
+
         // Tensor factory (created internally if not provided)
         TensorFactory *factory_;
         std::unique_ptr<TensorFactory> owned_factory_; // Owned factory if created internally
@@ -569,6 +638,21 @@ namespace llaminar2
         bool readValue(T &value);
         bool readString(std::string &str);
         bool readArray(GGUFValue &value);
+
+        /**
+         * @brief Seal the source set and select the original owner for a native tensor operation.
+         * @return Predictor loader only for its authenticated original names; nullptr means main.
+         *
+         * Binding and sealing share one lock, so a materialization cannot race source replacement.
+         */
+        ModelLoader *sealAndSelectTensorSource(const std::string &name);
+
+        // Source binding is a metadata-only startup transaction. Both loaders share factory_.
+        mutable std::mutex source_mutex_;
+        bool tensor_sources_sealed_ = false;
+        SharedPredictorMaterialization predictor_materialization_ = SharedPredictorMaterialization::Inactive;
+        std::unique_ptr<ModelLoader> predictor_loader_;
+        std::unique_ptr<Qwen4ExpSidecarManifest> predictor_manifest_;
 
         // State
         bool loaded_ = false;

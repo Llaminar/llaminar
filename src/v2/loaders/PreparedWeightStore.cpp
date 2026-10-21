@@ -177,7 +177,16 @@ namespace llaminar2
             const WeightBinding &stored,
             const WeightBinding &requested)
         {
-            if (!stored.tensor || !requested.tensor)
+            if (!stored.tensor || !requested.tensor ||
+                stored.projection_ownership != requested.projection_ownership)
+                return false;
+            // Static source views are affine to the original compact parent,
+            // including its real control block. Shape-equal borrowed pointers
+            // cannot replace that source lifetime during prepared adoption.
+            if (stored.projection_ownership &&
+                (stored.projection_source_owner != requested.projection_source_owner ||
+                 stored.projection_source_owner.owner_before(requested.projection_source_owner) ||
+                 requested.projection_source_owner.owner_before(stored.projection_source_owner)))
                 return false;
             if (stored.tensor->shape() != requested.tensor->shape())
                 return false;

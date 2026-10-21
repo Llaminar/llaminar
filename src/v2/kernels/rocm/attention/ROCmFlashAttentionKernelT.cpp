@@ -14,6 +14,7 @@
  * @author David Sanftenberg
  */
 
+#include "kernels/attention/AttentionHeadMapping.h"
 #include "ROCmFlashAttentionKernelT.h"
 #include "ROCmFlashAttentionLaunchPolicy.h"
 #include "../../../backends/IWorkerGPUContext.h"
@@ -913,10 +914,11 @@ namespace llaminar2
                 return false;
             }
 
-            // GQA validation
-            if (n_heads % n_kv_heads != 0)
+            // Replicated KV uses the original global Q origin/ratio. Local
+            // divisibility is required only for independently sharded KV.
+            if (!attention::isValidHeadMapping({n_heads,n_kv_heads,head_start,gqa_n_rep}))
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] n_heads must be divisible by n_kv_heads");
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] invalid local or replicated GQA head mapping");
                 return false;
             }
 

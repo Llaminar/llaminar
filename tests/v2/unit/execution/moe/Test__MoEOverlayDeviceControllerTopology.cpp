@@ -391,17 +391,29 @@ namespace llaminar2::test
     {
         const auto topology = resolve(
             cudaContinuationPlan(), std::vector<int>{9, 9});
+        // The enlarged ABI must admit both the former overflow and its exact limit.
+        for (const auto experts : {257u, moe_runtime_abi::kMaxExperts})
+        {
+            const auto layout = MoEOverlayNodeLocalDeviceControllerFabric::planLayout(
+                topology, 48u, experts, 1u);
+            ASSERT_TRUE(layout.valid());
+            EXPECT_EQ(layout.header.num_experts, experts);
+        }
         EXPECT_THROW(
             (void)MoEOverlayNodeLocalDeviceControllerFabric::planLayout(
-                topology, 0u, 256u, 1u),
+                topology, 48u, 0u, 1u),
             std::invalid_argument);
         EXPECT_THROW(
             (void)MoEOverlayNodeLocalDeviceControllerFabric::planLayout(
-                topology, 48u, 257u, 1u),
+                topology, 0u, moe_runtime_abi::kMaxExperts, 1u),
             std::invalid_argument);
         EXPECT_THROW(
             (void)MoEOverlayNodeLocalDeviceControllerFabric::planLayout(
-                topology, 48u, 256u, 0u),
+                topology, 48u, moe_runtime_abi::kMaxExperts + 1u, 1u),
+            std::invalid_argument);
+        EXPECT_THROW(
+            (void)MoEOverlayNodeLocalDeviceControllerFabric::planLayout(
+                topology, 48u, moe_runtime_abi::kMaxExperts, 0u),
             std::invalid_argument);
     }
 

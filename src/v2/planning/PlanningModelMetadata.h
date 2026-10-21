@@ -10,6 +10,7 @@
 #pragma once
 
 #include "planning/ModelMemoryProfile.h"
+#include "loaders/SharedPredictorGGUFSource.h"
 #include "planning/PlanningModelSample.h"
 #include <functional>
 #include <memory>
@@ -69,7 +70,8 @@ namespace llaminar2
     {
     public:
         /** @brief Parse one real GGUF (including split metadata), failing on invalid input. */
-        explicit PlanningModelSource(const std::string &model_path);
+        explicit PlanningModelSource(const std::string &model_path,
+            const std::optional<SharedPredictorGGUFSource> &predictor = {});
         /** @brief Retire the metadata loader before its factory and MPI context. */
         ~PlanningModelSource();
         /** @brief Move stable ownership without relocating a loader's borrowed factory. */
@@ -82,6 +84,8 @@ namespace llaminar2
         const ModelLoader &loader() const;
         /** @return Exact source-path intent used to authenticate a candidate's model. */
         const std::string &path() const;
+        /** @return Exact optional separate predictor selection authenticated with the target. */
+        const std::optional<SharedPredictorGGUFSource> &predictorSource() const;
 
         /**
          * @brief Resolve one source matrix without reading any weight bytes.
@@ -118,7 +122,8 @@ namespace llaminar2
      * @param model_path GGUF path, including its ordinary split-file convention.
      * @return Complete descriptor; unreadable or invalid GGUF is a hard error.
      */
-    PlanningModelMetadata readPlanningModelMetadata(const std::string &model_path);
+    PlanningModelMetadata readPlanningModelMetadata(const std::string &model_path,
+        const std::optional<SharedPredictorGGUFSource> &predictor = {});
 
     struct GGUFModel;
     /**

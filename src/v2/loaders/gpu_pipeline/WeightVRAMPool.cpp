@@ -499,8 +499,8 @@ namespace llaminar2
                 backend_->setDevice(device_id_);
                 if (!backend_->synchronize(device_id_))
                 {
-                    LOG_WARN("WeightVRAMPool: device synchronize failed before releasing temporary staging on device "
-                             << device_id_);
+                    throw std::runtime_error(
+                        "WeightVRAMPool: setup drain failed; temporary staging and its admission remain live");
                 }
                 backend_->free(d_staging_base_, device_id_);
             }

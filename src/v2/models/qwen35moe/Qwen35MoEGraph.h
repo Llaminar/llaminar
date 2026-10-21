@@ -145,6 +145,20 @@ namespace llaminar2
             const int32_t *sequence_lengths_device = nullptr,
             const int32_t *absolute_position_ids_device = nullptr) override;
 
+        /**
+         * @brief Compose the existing routed body with immutable source/workload and HC destinations.
+         * @param identity Exact frozen source and predictor depth, independent of cache ordinal.
+         * @param predictor QFN predictor HC/rows/write targets, or nullptr for unchanged main/inline behavior.
+         * @return Existing routed graph using one canonical implementation.
+         * @throws std::invalid_argument For a mismatched source, participant, count or predictor policy.
+         */
+        ComputeGraph buildFFNGraphForLayer(
+            const LayerWeights &layer, ActivationBuffers &buffers,
+            const LayerGraphSourceIdentity &identity, int seq_len, int batch_size,
+            DeviceId device, void *device_state_publication_stream,
+            const int32_t *sequence_lengths_device, const int32_t *absolute_position_ids_device,
+            const Qwen4ExpPredictorResidualBinding *predictor);
+
         ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
             DeviceId device) override;
 

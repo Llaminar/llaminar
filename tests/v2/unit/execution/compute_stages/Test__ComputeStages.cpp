@@ -591,7 +591,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
  * discovered these persistent maintenance buffers while constructing the
  * serial graph family.  Keep the model geometry, transfer-directory capacity,
  * and Q4_K_XL wire stride explicit here so a later lifecycle refactor cannot
- * silently drop any portion of the 10.5 MB physical claim again.
+ * silently drop any typed scratch or compact payload allocation again.
  */
 TEST_F(ComputeStagesTest,
        MoEDeviceRebalanceWorkspaceContract_CoversQwen35DynamicProductionGeometry)
@@ -626,12 +626,21 @@ TEST_F(ComputeStagesTest,
     const auto requirements =
         DeviceMoERebalanceWorkspaceContract::requirements(binding);
     ASSERT_EQ(requirements.buffers.size(), 21u);
+    const auto *placement_scratch = requirements.find(
+        "moe_rebalance_placement_plan_scratch_qwen35_dynamic_production_geometry");
+    ASSERT_NE(placement_scratch, nullptr);
+    EXPECT_EQ(placement_scratch->size_bytes, sizeof(DeviceMoEPlacementBank));
+    EXPECT_EQ(placement_scratch->size_bytes, moe_runtime_abi::kPlacementBankBytes);
+    WorkspaceRequirements placement_only;
+    placement_only.buffers.push_back(*placement_scratch);
+    // Other buffers retain the exact admitted 256-expert/live-one-slot geometry.
+    // Only the RCU placement generation has the ABI-wide expert capacity.
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::logicalBytes(binding),
-        12412280u);
+        12348264u + moe_runtime_abi::kPlacementBankBytes);
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::allocationBytes(binding),
-        12413696u);
+        12349440u + placement_only.total_bytes_with_alignment());
     EXPECT_EQ(
         requirements.total_bytes_with_alignment(),
         DeviceMoERebalanceWorkspaceContract::allocationBytes(binding));

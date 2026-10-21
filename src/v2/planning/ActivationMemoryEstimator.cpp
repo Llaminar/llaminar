@@ -12,6 +12,9 @@
 #include "execution/mtp/GenerationRequestSeeds.h"
 #include "execution/mtp/MTPTerminalGatherGeometry.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
+#include "models/qwen4exp/Qwen4ExpBufferLayout.h"
+#include "models/qwen35moe/Qwen35MoESchema.h"
+#include "execution/local_execution/graph/GraphResolver.h"
 
 #include <algorithm>
 #include <limits>
@@ -46,6 +49,38 @@ size_t checkedMultiply(size_t left, size_t right, std::string_view contribution)
             std::string(contribution));
     }
     return left * right;
+}
+
+/** @brief One checked QFN resolver projection shared by base and concrete tier estimates. */
+std::pair<GraphResolverConfig, Qwen4ExpBufferDimensions> qwenLookupGeometry(
+    const ModelMemoryProfile &profile, const ActivationGraphMemoryGeometry &geometry, DeviceId device)
+{
+    if (!profile.flash_next || geometry.batch_size <= 0 || geometry.resident_graph_rows <= 0 ||
+        geometry.mtp_target_query_rows <= 0)
+        throw std::invalid_argument("QFN lookup geometry requires exact metadata and positive admitted rows");
+    if (geometry.context_tokens <= 0)
+        throw std::invalid_argument("Flash Next activation admission requires explicit runtime context capacity");
+    const auto flattened = checkedMultiply(static_cast<std::size_t>(geometry.batch_size),
+        static_cast<std::size_t>(geometry.resident_graph_rows), "Flash Next flattened graph rows");
+    if (flattened > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::overflow_error("Flash Next flattened graph rows exceed resolver capacity");
+    GraphResolverConfig resolver;
+    resolver.seq_len = static_cast<int>(flattened);
+    resolver.d_model = profile.d_model;
+    resolver.local_n_heads = geometry.local_n_heads;
+    resolver.default_device = device;
+    resolver.custom_formulas["mtp_kv_prefill_rows"] = std::max(flattened, static_cast<std::size_t>(geometry.mtp_target_query_rows));
+    resolver.custom_formulas["mtp_target_query_rows"] = static_cast<std::size_t>(geometry.mtp_target_query_rows);
+    const Qwen4ExpBufferDimensions dimensions{
+        .main_layers = profile.n_layers, .first_layer = geometry.first_layer,
+        .layer_count = (geometry.last_layer < 0 ? profile.n_layers - 1 : geometry.last_layer) - geometry.first_layer + 1,
+        .compute_width = profile.d_model, .context_tokens = geometry.context_tokens,
+        .request_capacity = geometry.generation_request_capacity,
+        .flattened_rows = static_cast<int>(flattened), .local_query_heads = geometry.local_n_heads,
+        .retained_mtp_candidate_rows = geometry.retained_mtp_candidate_rows,
+        .device = device, .ngram_lookup = geometry.ngram_lookup,
+        .ngram_fixed_head_participants = geometry.ngram_fixed_head_participants};
+    return {std::move(resolver), dimensions};
 }
 
 /** @brief Return bytes for one FP32 row bank with checked arithmetic. */
@@ -489,7 +524,23 @@ size_t ActivationMemoryEstimator::estimate(
                 mtp_prefill_rows, moe_columns, "MoE graph arena"),
             "MoE graph arena");
     }
+    if (profile.flash_next)
+    {
+        const auto [resolver, dimensions] = qwenLookupGeometry(profile, geometry, device);
+        const Qwen35MoESchemaFactory common_factory;
+        bytes = checkedAdd(bytes, qwen4ExpArenaExtensionBytes(common_factory.createSchema(), resolver,
+            *profile.flash_next, dimensions), "Flash Next declared arena/state extensions");
+    }
     return bytes;
+}
+
+std::size_t ActivationMemoryEstimator::immutableLookupArenaBytes(const ModelMemoryProfile &profile,
+    const ActivationGraphMemoryGeometry &geometry, DeviceId device)
+{
+    if (!geometry.ngram_lookup)
+        throw std::invalid_argument("Ngram execution contract is required for lookup arena candidate projection");
+    const auto [resolver, dimensions] = qwenLookupGeometry(profile, geometry, device);
+    return qwen4ExpLookupArenaBytes(resolver, *profile.flash_next, dimensions);
 }
 
 } // namespace llaminar2

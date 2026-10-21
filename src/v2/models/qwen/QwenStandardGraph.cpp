@@ -187,7 +187,7 @@ namespace llaminar2
 
         // Stage 4: KV cache + Attention
         std::string attn_node = addKVCacheAndAttention(
-            graph, prefix, buffers, layer_idx,
+            graph, prefix, buffers, layer, mainAttentionIdentity(layer_idx, kv_cache),
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
             kv_cache, position_ids, position_ids_device,
             sequence_lengths_device,

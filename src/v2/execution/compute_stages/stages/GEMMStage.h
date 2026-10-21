@@ -6,6 +6,8 @@
 #pragma once
 
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/DeviceRequestRowRanges.h"
+#include "kernels/common/Q8ResidualCorrection.h"
 
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
@@ -136,6 +138,8 @@ namespace llaminar2
             bool force_decode_equivalent_verifier_prefill = false;
             /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
             std::optional<DeviceRowRange> verifier_row_range;
+            /// Independent floating request prefixes; requires explicit decode-equivalent arithmetic and excludes verifier_row_range.
+            std::optional<DeviceRequestRowRanges> request_rows;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution
@@ -153,6 +157,8 @@ namespace llaminar2
              * Lifetime managed by DeviceGraphOrchestrator.
              */
             PreparedWeightStore *prepared_store = nullptr;
+            /// Explicit immutable operand precision; existing model defaults retain SingleQ8.
+            QuantizedActivationOperandPrecision quantized_operand_precision=QuantizedActivationOperandPrecision::SingleQ8;
         };
 
         explicit GEMMStage(Params params);
@@ -167,6 +173,14 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         bool requiresAllreduce() const override { return params_.needs_allreduce; }
+        /** @brief Include the explicit arithmetic/quantizer and static row geometry in capture identity.
+         * Uncounted SingleQ8 stages keep their established zero variant. Explicit
+         * prefix/request selections and TwoTermQ8 hash complete immutable row
+         * metadata and arithmetic policy; count values are never host-observed.
+         * The executor's existing prepared-weight/workspace identity remains the
+         * sole authority for those generations and embedded allocation addresses.
+         */
+        uint64_t graphCaptureVariantSignature() const override;
         void resetSessionState() override;
         void resetSessionStatePreservingCapturedReplay() override;
         void resetSessionStatePreservingLazyInitialization() override;

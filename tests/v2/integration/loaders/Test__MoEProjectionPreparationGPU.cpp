@@ -8,13 +8,17 @@
  * complete down-matrix allocation may substitute for source-side slicing.
  * Captured projection arithmetic is covered by MoEProjectionBoundary; this
  * test closes production materialization, prepared lifetime, and captured route
- * publication for the exact gate/up-only movable payload.
+ * publication for the exact gate/up-only movable payload. Static F-shard
+ * preparation additionally authenticates original native rectangles, participant
+ * keys, store/registry/pool lifetimes and explicit-stream scalar GEMMs without
+ * advertising an unimplemented serving topology.
  */
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
+#include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "interfaces/IWorkspaceConsumer.h"
@@ -24,6 +28,9 @@
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "loaders/MoEExpertSourceView.h"
 #include "loaders/WeightManager.h"
+#include "loaders/PreparedWeightStore.h"
+#include "kernels/cuda/gemm/CUDAFloatingPointGemmWorkspaceContract.h"
+#include "kernels/rocm/gemm/ROCmFloatingPointGemmWorkspaceContract.h"
 #include "loaders/WeightMetadataRegistry.h"
 #include "mocks/MockModelLoader.h"
 #include "mocks/MockMPIContext.h"
@@ -38,6 +45,8 @@
 #include <array>
 #include <cstring>
 #include <numeric>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -594,13 +603,373 @@ void prove(DeviceId first)
     }
 }
 
+/**
+ * @brief Declare static F ownership at the existing real-loader boundary.
+ * @param ownership Complete original F partition, never inferred from device count.
+ * @param device Actual preparation endpoint; index/rank remain explicit source fields.
+ * @return Original all-E gate/up/down requirements under one routed-weight owner.
+ */
+WeightPlan staticProjectionPlan(const MoEExpertProjectionOwnership &ownership, DeviceId device)
+{
+    WeightPlan plan(InferenceStrategy{.model_id = ModelContextId{8155}},
+        PhysicalMemoryOwner::RoutedExpertWeights);
+    for (size_t role = 0; role < kRoles.size(); ++role)
+    {
+        WeightRequirement request;
+        request.canonical_name = kNames[role];
+        request.role = kRoles[role];
+        request.derivation = WeightDerivationKind::ExpertSlice;
+        request.layer = 0;
+        request.lookup_device = DeviceId::cpu();
+        request.target_device = device;
+        request.bypass_tensor_parallel = true;
+        request.tp_rank_or_device_index = ownership.participant();
+        request.overlay_domain = "static_native_source";
+        request.overlay_participant_world_rank = 0;
+        request.overlay_participant_index = ownership.participant();
+        request.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
+        request.projection_ownership = ownership;
+        plan.add(std::move(request));
+    }
+    return plan;
+}
+
+/**
+ * @brief Compare actual compact native rows to independent original GGUF payloads.
+ * @param binding Actual loader-produced 2D view with original E/N/K coordinates.
+ * @param original Independent full [E*N,K] tensor used to write the tiny GGUF.
+ * @param source_type Exact original GGUF codebook, including superblock encoding.
+ *
+ * Gate/up cut N and down cuts K. Comparison walks original rows/blocks rather
+ * than treating a strided original down rectangle as a flat byte interval.
+ */
+void expectStaticSourceBytes(const WeightBinding &binding, const TensorBase &original,
+    GGUFTensorType source_type)
+{
+    const auto shape = binding.projection_ownership->projection(binding.identity.role);
+    GGUFTensorInfo info;
+    info.type = source_type;
+    // Floating GGUF types report zero quantization-block size: their physical
+    // source unit is one scalar. Quantized codebooks retain their native block.
+    const size_t block = std::max<size_t>(info.getBlockSize(), 1u);
+    const size_t block_bytes = info.getTypeSize();
+    ASSERT_GT(block, 0u);
+    ASSERT_EQ(shape.source_columns % block, 0u);
+    ASSERT_EQ(shape.first_column % block, 0u);
+    ASSERT_EQ(shape.columns % block, 0u);
+    const size_t original_row = size_t(shape.source_columns) / block * block_bytes;
+    const size_t local_row = size_t(shape.columns) / block * block_bytes;
+    ASSERT_EQ(binding.tensor->size_bytes(), size_t(shape.rows) * local_row);
+    const auto *source = static_cast<const uint8_t *>(original.raw_data());
+    const auto *actual = static_cast<const uint8_t *>(binding.tensor->raw_data());
+    ASSERT_NE(source, nullptr);
+    ASSERT_NE(actual, nullptr);
+    for (int row = 0; row < shape.rows; ++row)
+    {
+        const size_t offset = (size_t(binding.identity.expert) * shape.source_rows +
+            shape.first_row + row) * original_row + size_t(shape.first_column) / block * block_bytes;
+        ASSERT_LE(offset + local_row, original.size_bytes());
+        EXPECT_EQ(std::memcmp(actual + size_t(row) * local_row, source + offset, local_row), 0);
+    }
+}
+
+/** @return Exact existing floating scratch declaration for mutually exclusive test GEMMs. */
+WorkspaceRequirements staticFloatingWorkspace(DeviceId device,
+    const MoEExpertProjectionOwnership &ownership)
+{
+    WorkspaceRequirements requirements;
+    for (const auto role : kRoles)
+    {
+        const auto shape = ownership.projection(role);
+        if (device.is_cuda())
+            requirements.merge(cuda::floating_gemm_workspace::projectionRequirements(
+                3, shape.rows, shape.columns, FloatingActivationOperandPrecision::Native));
+        else
+            requirements.merge(rocm::floating_gemm_workspace::projectionRequirements(
+                3, shape.columns, FloatingActivationOperandPrecision::Native));
+    }
+    return requirements;
+}
+
+/**
+ * @brief Execute an acquired FP32 engine after registry/store/loader retirement.
+ *
+ * Exactly represented source weights and one-hot rows make each result one
+ * original scalar, avoiding a tolerance that could hide a source-axis mistake.
+ * The actual kernel's scratch must fit the original named workspace declaration;
+ * test coherence and terminal observation use this endpoint's non-default stream.
+ */
+void proveStaticScalarGemm(const ExpertGemmRegistry::StaticProjectionLayer &layer,
+    const std::shared_ptr<PhysicalMemoryAuthority> &authority)
+{
+    const auto device = layer.scope.device;
+    const auto requirements = staticFloatingWorkspace(device, layer.projection);
+    DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment(), authority);
+    ASSERT_TRUE(workspace.allocate(requirements));
+    ScopedGPUStream stream(device);
+    ASSERT_NE(stream.get(), nullptr);
+    for (const int expert : {0, layer.projection.geometry().experts - 1})
+        for (const size_t role : {size_t{0}, size_t{2}})
+        {
+            const auto &binding = layer.sources[size_t(expert) * 3 + role];
+            const auto shape = layer.projection.projection(kRoles[role]);
+            auto engine = role == 0 ? layer.experts[expert].gate : layer.experts[expert].down;
+            ASSERT_NE(engine, nullptr);
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(engine.get());
+            ASSERT_NE(consumer, nullptr);
+            EXPECT_THROW(engine->setGPUStream(nullptr), std::invalid_argument);
+            engine->setGPUStream(stream.get());
+            consumer->bindWorkspace(&workspace);
+            for (const int rows : {1, 3})
+            {
+                auto input = TestTensorFactory::createFP32({size_t(rows), size_t(shape.columns)});
+                auto output = TestTensorFactory::createFP32({size_t(rows), size_t(shape.rows)});
+                float *stimulus = input->mutable_data();
+                std::fill_n(stimulus, size_t(rows) * shape.columns, 0.f);
+                for (int row = 0; row < rows; ++row)
+                    stimulus[size_t(row) * shape.columns + (17 * row) % shape.columns] = 1.f;
+                ASSERT_TRUE(with_gpu_coherence(device, {input.get()}, {output.get()}, stream.get(), [&]
+                {
+                    return engine->multiply_tensor(input.get(), output.get(), rows, shape.rows, shape.columns);
+                }));
+                const float *actual = output->data();
+                const float *source = binding.tensor->data();
+                for (int row = 0; row < rows; ++row)
+                    for (int n = 0; n < shape.rows; ++n)
+                        EXPECT_EQ(actual[size_t(row) * shape.rows + n],
+                            source[size_t(n) * shape.columns + (17 * row) % shape.columns]);
+            }
+            consumer->unbindWorkspace();
+            engine->clearGPUStreamBinding();
+        }
+}
+
+/**
+ * @brief Real all-format static preparation with original N/K/E cuts and retirement.
+ *
+ * The existing tiny GGUF owns E8/H256/F768. Explicit unequal F256/F512 intervals
+ * test output-row gate/up and input-column down slicing without another TP
+ * quotient. No serving TensorSharded capability is advertised by preparation.
+ */
+void proveStaticPreparation(DeviceId first)
+{
+    auto *backend = getBackendFor(first);
+    ASSERT_NE(backend, nullptr);
+    ASSERT_GE(backend->deviceCount(), 2);
+    constexpr MoEExpertProjectionOwnership::Geometry geometry{8, 256, 768};
+    const std::vector<MoEExpertProjectionOwnership::IntermediateInterval> intervals{{0,256},{256,512}};
+    for (const auto &format : formats())
+    {
+        SCOPED_TRACE(format.name);
+        PlanningGGUFFixture file(true, false, PlanningGGUFFixture::sourceType(format.type), 768);
+        const auto complete = MoEExpertProjectionOwnership::completeExperts(geometry);
+        std::array<std::shared_ptr<TensorBase>, 3> original;
+        for (size_t role = 0; role < kRoles.size(); ++role)
+        {
+            const auto shape = complete.projection(kRoles[role]);
+            original[role] = format.create({size_t(geometry.experts * shape.rows), size_t(shape.columns)}, 5500 + role);
+            if (format.type == TensorType::FP32)
+            {
+                float *weights = original[role]->mutable_data();
+                for (size_t index = 0; index < size_t(geometry.experts * shape.rows) * shape.columns; ++index)
+                    weights[index] = float(int(index % 17) - 8) / 16.f;
+            }
+            file.writePayload(kNames[role], 0, {static_cast<const uint8_t *>(original[role]->raw_data()),
+                original[role]->size_bytes()});
+        }
+        for (const int participant : {0, 1})
+        {
+            const auto device = first.is_cuda() ? DeviceId::cuda(participant) : DeviceId::rocm(participant);
+            const auto ownership = MoEExpertProjectionOwnership::withinExpertIntermediateSlices(
+                geometry, participant, intervals);
+            std::optional<ExpertGemmRegistry::StaticProjectionLayer> retained;
+            std::weak_ptr<ITensorGemm> weak_engine;
+            std::weak_ptr<TensorBase> weak_source;
+            size_t planned_bytes = 0;
+            std::shared_ptr<PhysicalMemoryAuthority> authority;
+            {
+                MockMPIContext mpi;
+                TensorFactory factory(mpi);
+                ModelLoader loader(&factory);
+                ASSERT_TRUE(loader.loadModel(file.path()));
+                WeightManager manager(loader);
+                auto store = std::make_shared<PreparedWeightStore>(ModelContextId{8155});
+                manager.setPreparedWeightStore(store);
+                const auto parents = manager.materialize(staticProjectionPlan(ownership, device));
+                const auto frozen = parents.projectedExpertMatrices();
+                ASSERT_EQ(frozen.bindings().size(), size_t(geometry.experts * 3));
+                size_t max_raw = 0;
+                for (size_t role = 0; role < kRoles.size(); ++role)
+                {
+                    const auto shape = ownership.projection(kRoles[role]);
+                    planned_bytes += size_t(geometry.experts) * resolveExpertPreparedProjectionMemoryGeometry(
+                        shape.rows, shape.columns, format.identity,
+                        GPUPreparedWeightPoolLayout::SourceNative).gpu_live_bytes;
+                    max_raw = std::max(max_raw, parents.bindings()[role].tensor->size_bytes());
+                }
+                const PhysicalMemoryResource resource{.world_rank = 0, .device = device,
+                    .total_bytes = 256u << 20, .admission_available_bytes = 256u << 20};
+                const PhysicalMemoryResource host{.world_rank = 0, .device = DeviceId::cpu(),
+                    .total_bytes = 256u << 20, .admission_available_bytes = 256u << 20};
+                const auto staging = resolveGPUWeightLoadMemoryGeometry(max_raw, configuredGPUWeightLoadMemoryPolicy());
+                PhysicalMemoryPlanBuilder builder;
+                builder.add(resource, PhysicalMemoryOwner::RoutedExpertWeights, planned_bytes)
+                    .add(resource, PhysicalMemoryOwner::WeightLoadStaging, staging.staging_bytes)
+                    .add(host, PhysicalMemoryOwner::WeightLoadStaging, staging.host_staging_bytes);
+                if (format.type == TensorType::FP32)
+                    builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace,
+                        staticFloatingWorkspace(device, ownership).total_bytes_with_alignment());
+                authority = std::make_shared<PhysicalMemoryAuthority>(
+                    std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+                manager.installPhysicalMemoryAuthority(authority);
+                EXPECT_THROW((void)manager.prepareWeightsForDevice(parents, device), std::invalid_argument);
+                ASSERT_TRUE(manager.prepareWeightsForDevice(frozen, device));
+                const auto scope = ExpertGemmRegistry::staticProjectionScope(frozen.bindings().front());
+                retained = manager.expertGemmRegistry().acquireStaticProjectionLayer(scope, ownership, frozen.bindings());
+                ASSERT_TRUE(retained);
+                ASSERT_EQ(retained->experts.size(), size_t(geometry.experts));
+                ScopedGPUStream observation_stream(device);
+                std::array<GpuPreparedGemm, 3> oracles;
+                std::array<std::shared_ptr<TensorBase>, 3> oracle_sources;
+                if (!format.identity.isFloating())
+                    for (size_t role = 0; role < kRoles.size(); ++role)
+                    {
+                        const auto shape = ownership.projection(kRoles[role]);
+                        oracle_sources[role] = parents.bindings()[role].tensor->create_view(
+                            {size_t(geometry.experts * shape.rows), size_t(shape.columns)}, 0);
+                        // Independent whole compact-parent repack is test oracle
+                        // storage, not charged to the candidate weight ledger.
+                        oracles[role] = makeGpuPreparedGemm(oracle_sources[role].get(), device);
+                    }
+                for (const auto &binding : frozen.bindings())
+                {
+                    const size_t role = binding.identity.role == kRoles[0] ? 0 : binding.identity.role == kRoles[1] ? 1 : 2;
+                    expectStaticSourceBytes(binding, *original[role], PlanningGGUFFixture::sourceType(format.type));
+                    const auto ref = store->preparedRefForBinding(binding.binding_id, device);
+                    ASSERT_TRUE(ref);
+                    EXPECT_EQ(ref->device, device);
+                    auto *engine = store->gemmKernel(*ref);
+                    ASSERT_NE(engine, nullptr);
+                    const auto &triplet = retained->experts[binding.identity.expert];
+                    EXPECT_EQ(engine, (role == 0 ? triplet.gate : role == 1 ? triplet.up : triplet.down).get());
+                    const auto shape = ownership.projection(binding.identity.role);
+                    if (format.identity.isFloating())
+                    {
+                        ContiguousFloatingPointWeightDescriptor descriptor;
+                        ASSERT_TRUE(engine->exportContiguousFloatingPointWeights(descriptor));
+                        EXPECT_EQ(descriptor.type, format.type);
+                        EXPECT_EQ(descriptor.n, shape.rows);
+                        EXPECT_EQ(descriptor.k, shape.columns);
+                        const auto actual = download(device, observation_stream.get(), descriptor.data, descriptor.bytes);
+                        ASSERT_TRUE(backend->synchronizeStream(observation_stream.get(), device.ordinal));
+                        EXPECT_EQ(actual, std::vector<uint8_t>(static_cast<const uint8_t *>(binding.tensor->raw_data()),
+                                static_cast<const uint8_t *>(binding.tensor->raw_data()) + binding.tensor->size_bytes()));
+                    }
+                    else
+                    {
+                        DeviceNativeVNNIMatrixDesc descriptor;
+                        ASSERT_TRUE(engine->exportNativeVNNIMatrixDesc(descriptor));
+                        EXPECT_EQ(descriptor.n, shape.rows);
+                        EXPECT_EQ(descriptor.k, shape.columns);
+                        EXPECT_TRUE(descriptor.source_identity_present);
+                        EXPECT_EQ(descriptor.source_codebook_id, format.identity.native_vnni.codebook_id);
+                        EXPECT_EQ(descriptor.source_is_superblock, format.identity.native_vnni.is_superblock);
+                        DeviceNativeVNNIMatrixDesc oracle;
+                        ASSERT_TRUE(oracles[role].kernel->exportNativeVNNIMatrixDesc(oracle));
+                        auto expected = shape;
+                        expected.source_rows = geometry.experts * shape.rows;
+                        expected.source_columns = shape.columns;
+                        expected.first_row = binding.identity.expert * shape.rows;
+                        const auto *metadata = native_vnni_formats::forQuantType(format.name);
+                        ASSERT_NE(metadata, nullptr);
+                        expectPlane(device, observation_stream.get(), descriptor.payload, oracle.payload,
+                            metadata->payload_bytes, expected);
+                        expectPlane(device, observation_stream.get(), descriptor.scales, oracle.scales,
+                            sizeof(uint16_t), expected);
+                        if (metadata->is_asymmetric)
+                            expectPlane(device, observation_stream.get(), descriptor.mins, oracle.mins,
+                                sizeof(uint16_t), expected);
+                        if (metadata->has_emins)
+                            expectPlane(device, observation_stream.get(), descriptor.emins, oracle.emins,
+                                sizeof(uint32_t), expected);
+                        ASSERT_TRUE(backend->synchronizeStream(observation_stream.get(), device.ordinal));
+                    }
+                }
+                auto foreign_scope = scope;
+                foreign_scope.participant_world_rank = 1;
+                EXPECT_THROW((void)manager.expertGemmRegistry().acquireStaticProjectionLayer(
+                    foreign_scope, ownership, frozen.bindings()), std::invalid_argument);
+                auto wrong_sources = frozen.bindings();
+                wrong_sources.front().tensor_owner = wrong_sources[1].tensor_owner;
+                wrong_sources.front().tensor = wrong_sources.front().tensor_owner.get();
+                EXPECT_THROW((void)manager.expertGemmRegistry().acquireStaticProjectionLayer(
+                    scope, ownership, wrong_sources), std::invalid_argument);
+                if (participant == 0)
+                {
+                    const auto other = MoEExpertProjectionOwnership::withinExpertIntermediateSlices(
+                        geometry, 0, {{0,256},{256,256},{512,256}});
+                    EXPECT_EQ(other.projection(kRoles[0]), ownership.projection(kRoles[0]));
+                    EXPECT_THROW((void)manager.expertGemmRegistry().acquireStaticProjectionLayer(
+                        scope, other, frozen.bindings()), std::invalid_argument);
+                }
+                EXPECT_EQ(manager.expertGemmRegistry().getEngine(device, 0, 0, Role::GATE), nullptr);
+                auto *first_engine = retained->experts[0].gate.get();
+                ASSERT_TRUE(manager.prepareWeightsForDevice(frozen, device));
+                EXPECT_EQ(manager.expertGemmRegistry().acquireStaticProjectionLayer(
+                    scope, ownership, frozen.bindings())->experts[0].gate.get(), first_engine);
+                weak_engine = retained->experts.back().down;
+                weak_source = retained->sources.front().projection_source_owner;
+                manager.expertGemmRegistry().clear();
+                store->clear();
+            }
+            EXPECT_FALSE(weak_engine.expired());
+            EXPECT_FALSE(weak_source.expired());
+            bool found = false;
+            for (const auto &line : authority->rankAttestation())
+                if (line.identity.device == device && line.owner == PhysicalMemoryOwner::RoutedExpertWeights)
+                {
+                    found = true;
+                    EXPECT_EQ(line.materialized_new_bytes, planned_bytes);
+                }
+            EXPECT_TRUE(found);
+            if (format.type == TensorType::FP32) proveStaticScalarGemm(*retained, authority);
+            retained.reset();
+            EXPECT_TRUE(weak_engine.expired());
+            EXPECT_TRUE(weak_source.expired());
+            for (const auto &line : authority->rankAttestation()) EXPECT_EQ(line.materialized_new_bytes, 0u);
+        }
+        // A native superblock cannot be cut at K128. Exercise both real source
+        // I/O paths; rejection is before GPU preparation, never a wider source.
+        GGUFTensorInfo info;
+        info.type = PlanningGGUFFixture::sourceType(format.type);
+        if (info.getBlockSize() == 256)
+            for (const bool mapped : {false, true})
+            {
+                MockMPIContext mpi;
+                TensorFactory factory(mpi);
+                ModelLoader loader(&factory);
+                loader.setUseMmap(mapped);
+                ASSERT_TRUE(loader.loadModel(file.path()));
+                WeightManager manager(loader);
+                const auto invalid = MoEExpertProjectionOwnership::withinExpertIntermediateSlices(
+                    geometry, 0, {{0,128},{128,640}});
+                EXPECT_THROW((void)manager.materialize(staticProjectionPlan(invalid, first)), std::invalid_argument);
+                EXPECT_EQ(manager.expertGemmRegistry().size(), 0u);
+            }
+    }
+}
+
 #ifdef HAVE_CUDA
 /** @test All model expert formats retain exact CUDA planes and allocation bounds. */
 TEST(MoEProjectionPreparationGPU, CUDA) { prove(DeviceId::cuda(0)); }
+/** @test Actual CUDA static original-source preparation and acquired GEMM retirement. */
+TEST(StaticExpertProjectionPreparationGPU, CUDA) { proveStaticPreparation(DeviceId::cuda(0)); }
 #endif
 #ifdef HAVE_ROCM
 /** @test ROCm consumes the same source ownership and canonical memory geometry. */
 TEST(MoEProjectionPreparationGPU, ROCm) { prove(DeviceId::rocm(0)); }
+/** @test Actual ROCm static preparation uses the identical original N/K/E contract. */
+TEST(StaticExpertProjectionPreparationGPU, ROCm) { proveStaticPreparation(DeviceId::rocm(0)); }
 #endif
 } // namespace
 } // namespace llaminar2::test

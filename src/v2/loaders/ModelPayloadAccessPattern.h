@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "WeightIdentity.h"
+
 namespace llaminar2
 {
 
@@ -29,6 +31,27 @@ namespace llaminar2
         /** Only explicitly selected tensor or expert slices are materialized. */
         SparseSelection,
     };
+
+    /**
+     * @brief Resolve source mapping density from its immutable semantic ownership.
+     * @param requested Consumer's existing dense, staging or selected access policy.
+     * @param role One source role authenticated by the parsed tensor inventory.
+     * @return Selected mapping for a separately owned row table; otherwise requested.
+     *
+     * A CPU graph may retain ordinary borrowed weights while its GGUF also
+     * contains a separately admitted RAM or bounded-mmap row table. Prefaulting
+     * that entire source would materialize the table before its physical owner
+     * exists. Both early startup prepopulation and the low-level loader fold
+     * this same resolver over their exact inventories before touching payloads.
+     */
+    [[nodiscard]] constexpr ModelPayloadAccessPattern resolveModelPayloadAccessPattern(
+        ModelPayloadAccessPattern requested, WeightRole role) noexcept
+    {
+        return requested == ModelPayloadAccessPattern::DenseCpuResident &&
+                       role == WeightRole::ImmutableRowTable
+                   ? ModelPayloadAccessPattern::SparseSelection
+                   : requested;
+    }
 
     /**
      * @brief Return a stable diagnostic name for a payload access pattern.

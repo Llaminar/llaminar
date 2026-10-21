@@ -11,6 +11,7 @@
  * replicated weight views do not become extra channel owners.
  */
 #include "planning/RankMemoryPlanInputs.h"
+#include "utils/DebugEnv.h"
 #include "planning/ActivationBufferSizing.h"
 #include "backends/DeviceAddressAdapter.h"
 #include "config/BackendSelector.h"
@@ -92,6 +93,29 @@ namespace llaminar2
         }
     }
 
+    ImmutableRowTableTPTopology immutableRowTableTPTopology(
+        const ModelMemoryProfile &profile,const RankExecutionPlan &plan)
+    {
+        const auto &ngram=plan.runtime.ngram_table_policy;
+        ngram.validate();
+        if(ngram.isFixedHeadSharded())
+        {
+            const auto &devices=plan.local_tp_devices;
+            if(!profile.flash_next || !plan.usesLocalTP() || !plan.local_pp_devices.empty() ||
+               plan.usesGlobalTP() || plan.prev_rank || plan.next_rank ||
+               plan.first_layer!=0 || (plan.last_layer>=0 && plan.last_layer!=profile.mainLayerCount()-1) ||
+               !plan.has_embedding || !plan.has_lm_head ||
+               (devices.size()!=2 && devices.size()!=4 && devices.size()!=8))
+                throw std::invalid_argument("FixedHeadSharded requires full-main rank-local homogeneous GPU TP degree2/4/8, without PP/global TP");
+            const auto type=devices.front().device_type;
+            for(const auto &d:devices)
+                if(!d.toLocalDeviceId().is_gpu() || d.device_type!=type || d.hostname!=plan.primary_device.hostname)
+                    throw std::invalid_argument("FixedHeadSharded has a foreign, CPU, or mixed-backend TP participant");
+        }
+        return ngram.isFixedHeadSharded()?ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal:
+            ImmutableRowTableTPTopology::None;
+    }
+
     std::vector<DevicePlanConfig> buildRankMemoryPlanInputs(
         const RankMemoryPlanInputRequest &request)
     {
@@ -100,6 +124,8 @@ namespace llaminar2
         if (request.snapshot_capacity && !request.snapshot_capacity->valid())
             throw std::invalid_argument("Memory BOM snapshot policy has no capacity");
         const auto &profile = request.model;
+        const auto &ngram=request.plan.runtime.ngram_table_policy;
+        const auto ngram_topology=immutableRowTableTPTopology(profile,request.plan);
         /** @brief Physical observation used to fill a typed DevicePlanConfig. */
         struct DevicePlanningInventory
         {
@@ -139,6 +165,18 @@ namespace llaminar2
             DevicePlanConfig cfg;
             cfg.world_rank = current_rank;
             cfg.device = device;
+            cfg.qfn_hc_up_activation = profile.flash_next
+                ? debugEnv().gemm.qfn_hc_up_activation
+                : QuantizedActivationOperandPrecision::SingleQ8;
+            cfg.qfn_gdn_output_activation = profile.flash_next
+                ? debugEnv().gemm.qfn_gdn_output_activation
+                : QuantizedActivationOperandPrecision::SingleQ8;
+            cfg.qfn_fa_output_activation = profile.flash_next
+                ? debugEnv().gemm.qfn_fa_output_activation
+                : QuantizedActivationOperandPrecision::SingleQ8;
+            cfg.qfn_gdn_qkv_activation = profile.flash_next
+                ? debugEnv().gemm.qfn_gdn_qkv_activation
+                : QuantizedActivationOperandPrecision::SingleQ8;
             cfg.device_total_bytes = inventory.total_bytes;
             cfg.device_free_bytes = PhysicalMemoryAuthority::admissionCapacity(inventory.free_bytes,
                 device.is_cpu() ? request.max_cpu_memory_bytes : request.max_gpu_memory_bytes);
@@ -153,7 +191,7 @@ namespace llaminar2
             cfg.shard_index = shard_index;
             cfg.total_shards = total_shards;
             cfg.first_layer = request.plan.first_layer;
-            cfg.last_layer = request.plan.last_layer;
+            cfg.last_layer = ngram.isFixedHeadSharded()?profile.mainLayerCount()-1:request.plan.last_layer;
             cfg.owns_embedding = request.plan.has_embedding;
             cfg.batch_size = request.plan.runtime.batch_size;
             cfg.generation_request_capacity =
@@ -202,6 +240,7 @@ namespace llaminar2
                     .host_bytes =
                         request.weight_load_geometry->host_staging_bytes,
                 };
+                cfg.ordinary_weight_load_geometry = request.weight_load_geometry;
             }
 
 
@@ -219,8 +258,11 @@ namespace llaminar2
                     PrefixCacheStorageMode::Device;
             if (device.is_gpu() &&
                 (owns_host_prefix_tier ||
-                 cfg.weight_load_staging.host_bytes != 0u))
+                 cfg.weight_load_staging.host_bytes != 0u || profile.flash_next.has_value()))
             {
+                // DeviceId::cpu() is the rank-local allocator used by runtime
+                // owners. NUMA affinity may be unbound or a sparse physical ID;
+                // it does not create a different CPU allocator ordinal.
                 const DevicePlanningInventory host =
                     inventoryForDevice(DeviceId::cpu());
                 cfg.associated_host_memory = PhysicalMemoryResource{
@@ -376,6 +418,8 @@ namespace llaminar2
                     request.plan.local_tp_devices,
                     request.plan.local_tp_weights);
                 cfg.local_tp_backend = resolved_backend;
+                if(ngram.isFixedHeadSharded())
+                    cfg.ngram_tp_topology=ngram_topology;
                 device_configs.push_back(std::move(cfg));
             }
         }
@@ -417,17 +461,39 @@ namespace llaminar2
                 if (!cfg.device.is_gpu())
                     continue;
                 cfg.captured_serving_graphs = graph_inventory;
+                if (cfg.graph_snapshot_memory.valid())
+                {
+                    const auto arenas = ServingSnapshotArenaInventory::ordinary(
+                        !graph_inventory.prefill_bucket_rows.empty(),
+                        graph_inventory.mtp_graph_owners.retainsGraphCapacity(),
+                        graph_inventory.mtp_graph_owners.sidecarGraphSlots(),
+                        graph_inventory.mtp_graph_owners.retainsGraphCapacity()
+                            ? graph_inventory.mtp_graph_owners.requestCapacity() : 0u);
+                    cfg.graph_snapshot_memory.serving_arenas = arenas;
+                    cfg.graph_snapshot_memory.retained_main_forward_arena_count = arenas.mainOwners();
+                    cfg.graph_snapshot_memory.retained_forward_arena_count = arenas.allOwners();
+                }
                 if (cfg.graph_snapshot_memory.effective_kv)
                 {
                     // A per-executable bound also covers dedicated decode and
                     // sidecar arenas. Shared prefill/verifier alternatives can
                     // consume less, but cannot exceed this declared inventory.
                     cfg.graph_snapshot_memory.effective_kv->retained_arena_count =
-                        graph_inventory.prefill_bucket_rows.size() +
-                        graph_inventory.fixed_executable_count +
-                        graph_inventory.mtp_graph_owners.sidecarGraphSlots();
+                        cfg.graph_snapshot_memory.retained_forward_arena_count;
                 }
             }
+        }
+        if (profile.flash_next)
+        {
+            const auto layer = static_cast<int>(profile.flash_next->ple_decoder_layer);
+            for (auto &cfg : device_configs)
+                if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+                    cfg.first_layer <= layer && (cfg.last_layer < 0 || cfg.last_layer >= layer))
+                {
+                    cfg.ngram_execution_policy = request.plan.runtime.ngram_table_policy;
+                    cfg.ngram_host_placement = ImmutableRowTableHostPlacement::fromObservedNUMANode(request.plan.numa_node);
+                    cfg.ngram_table_placement = request.plan.runtime.ngram_table_placement;
+                }
         }
         return device_configs;
     }

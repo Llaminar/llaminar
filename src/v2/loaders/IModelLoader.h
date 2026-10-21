@@ -7,6 +7,10 @@
  * 2. In-memory test models
  * 3. Different model formats (GGUF, SafeTensors, etc.)
  *
+ * Native expert projections explicitly name original GGUF K/N/E coordinates;
+ * loaders without that exact source operation reject instead of loading a full
+ * parent and pretending its physical row stride matches a narrower matrix.
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
@@ -21,12 +25,16 @@
 #include <optional>
 #include <cstdint>
 #include <cstddef>
+#include <stdexcept>
 
 namespace llaminar2
 {
 
     // Forward declaration - TensorBase is the base tensor type
     class TensorBase;
+    struct GGUFModel;
+    struct WeightSliceSpec;
+    class Qwen4ExpSidecarManifest;
 
     /**
      * @brief Abstract interface for model loading operations
@@ -158,6 +166,25 @@ namespace llaminar2
         }
 
         /**
+         * @brief Load one exact original-format projection rectangle for selected experts.
+         * @param name Original 3D GGUF tensor name.
+         * @param slice Complete original GGUF [K,N,E] coordinates: row fields are K,
+         *        column fields are N, expert fields identify original E slots.
+         * @param device Existing loader placement, without any admission grant.
+         * @param weight_precision Must be NATIVE; slicing cannot requantize source blocks.
+         * @return Compact [localK,localN,selectedE] native tensor with original block bytes.
+         * @throws std::exception For invalid/alignment-incompatible geometry or an unsupported loader.
+         */
+        virtual std::shared_ptr<TensorBase> loadTensorExpertProjectionSlice(
+            const std::string &name, const WeightSliceSpec &slice,
+            DeviceId device = DeviceId::cpu(),
+            WeightPrecision weight_precision = WeightPrecision::NATIVE)
+        {
+            (void)name; (void)slice; (void)device; (void)weight_precision;
+            throw std::logic_error("This loader does not implement original native expert projection slicing");
+        }
+
+        /**
          * @brief Load an explicit ordered selection of expert IDs.
          *
          * The returned tensor's slowest dimension follows @p expert_ids exactly.
@@ -227,6 +254,29 @@ namespace llaminar2
          * @return Architecture string (e.g., "qwen2", "llama", "gpt2")
          */
         virtual std::string architecture() const = 0;
+
+        /**
+         * @brief Expose an immutable GGUF directory without loading tensor payloads.
+         * @return Exact scalar/array subtypes and split tensor coordinates, or null
+         *         for a loader whose source format is not GGUF.
+         *
+         * Architectures with exact integer-array contracts must reject a missing
+         * directory instead of reconstructing it through lossy scalar getters.
+         * The loader owns this metadata for its full lifetime.
+         */
+        virtual const GGUFModel *ggufDirectory() const noexcept { return nullptr; }
+
+        /** @return Original explicitly selected predictor directory, without synthetic metadata merging. */
+        virtual const GGUFModel *ggufPredictorDirectory() const noexcept { return nullptr; }
+
+        /** @return Authenticated source/policy manifest for a shared predictor, or nullptr. */
+        virtual const Qwen4ExpSidecarManifest *predictorManifest() const noexcept { return nullptr; }
+
+        /** @return Graph-consumed source names eligible for ordinary preload; raw directory discovery stays exact. */
+        virtual std::vector<std::string> materializationNames() const { return tensorNames(); }
+
+        /** @brief Freeze file-backed source identities when a weight owner is created; in-memory mocks need no action. */
+        virtual void sealTensorSources() {}
 
         /**
          * @brief Get total number of tensors in the model

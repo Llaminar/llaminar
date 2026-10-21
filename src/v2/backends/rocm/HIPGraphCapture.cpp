@@ -13,6 +13,9 @@
  * compilation; replay never walks or edits the retained dependency graph.
  * Setup-only kernel inspection distinguishes registered host stubs from
  * admitted module handles and retains each representation's typed resource APIs.
+ * Expected registry misses belong only to their inspection query: inspection
+ * rejects pre-existing HIP errors and consumes its own precise module probe miss
+ * before resolving resources, leaving genuine query/launch failures observable.
  */
 
 #ifdef HAVE_ROCM
@@ -576,6 +579,10 @@ namespace llaminar2
          * handle specifically on hipErrorInvalidSymbol from its host registry.
          * Mirror that distinction for an already admitted node. Other errors
          * never authorize casting a failed host lookup to a module function.
+         * The caller first proves the thread's incoming HIP error is clean.
+         * Consume only this query's exact expected registry miss immediately;
+         * successful module queries do not clear HIP's sticky last-error slot.
+         * All unexpected failures remain fatal and retain their error state.
          */
         bool resolveHIPGraphKernel(
             const void *raw, const std::string &path,
@@ -591,6 +598,22 @@ namespace llaminar2
             if (status != hipErrorInvalidSymbol)
             {
                 error = "hipFuncGetAttributes failed at " + path + ": " + hipGetErrorString(status);
+                return false;
+            }
+            const hipError_t probe_error = hipPeekAtLastError();
+            if (probe_error != hipErrorInvalidSymbol)
+            {
+                error = "HIP graph module probe error ownership changed at " + path +
+                    ": " + hipGetErrorString(probe_error);
+                return false;
+            }
+            // The thread-local error belongs to this immediately preceding
+            // failed host-registry query, not to any kernel submission.
+            const hipError_t consumed_probe_error = hipGetLastError();
+            if (consumed_probe_error != hipErrorInvalidSymbol)
+            {
+                error = "HIP graph module probe consumption changed at " + path +
+                    ": " + hipGetErrorString(consumed_probe_error);
                 return false;
             }
             const auto module = reinterpret_cast<hipFunction_t>(const_cast<void *>(raw));
@@ -1528,11 +1551,21 @@ namespace llaminar2
         std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
         std::string *error) const
     {
-        if (!activateOwner("inspectKernelNodes"))
-            return false;
         kernel_nodes.clear();
         if (error)
             error->clear();
+        // A successful metadata probe must never consume an earlier launch or
+        // API error. Peek before any inspection API can replace its ownership.
+        const hipError_t incoming_error = hipPeekAtLastError();
+        if (incoming_error != hipSuccess)
+        {
+            if (error)
+                *error = std::string("HIP graph inspection rejected pre-existing error: ") +
+                    hipGetErrorString(incoming_error);
+            return false;
+        }
+        if (!activateOwner("inspectKernelNodes"))
+            return false;
         if (graph_ == nullptr)
         {
             if (error)

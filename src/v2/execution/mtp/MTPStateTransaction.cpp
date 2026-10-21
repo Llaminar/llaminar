@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -269,9 +270,21 @@ namespace llaminar2
         return {false, std::move(reason)};
     }
 
-    int expectedShiftedMTPTokens(int logical_tokens)
+    int mtpShiftedAppendPosition(int shifted_rows,MTPShiftedCacheOrigin origin)
     {
-        return std::max(0, logical_tokens - 1);
+        const int offset=mtpShiftedPrefixOffset(origin);
+        if(shifted_rows<0 || offset<0)
+            throw std::invalid_argument("Shifted append position requires a nonnegative checkpoint count and valid model origin");
+        if(shifted_rows>std::numeric_limits<int>::max()-offset)
+            throw std::overflow_error("Shifted append position exceeds the logical coordinate range");
+        return shifted_rows+offset;
+    }
+
+    int expectedShiftedMTPTokens(int logical_tokens, MTPShiftedCacheOrigin origin)
+    {
+        const int rows=mtpShiftedPrefixRows(logical_tokens,origin);
+        if(rows<0)throw std::invalid_argument("MTP prefix requires valid model-owned origin and nonnegative count");
+        return rows;
     }
 
     MTPVisibleStateCommitPlan planMTPVisibleStateCommit(
@@ -328,22 +341,25 @@ namespace llaminar2
 
     MTPShiftedReplayRowPlan planMTPShiftedReplayRow(
         int main_cached_tokens,
-        int shifted_cached_tokens)
+        int shifted_cached_tokens, MTPShiftedCacheOrigin origin)
     {
-        if (main_cached_tokens < 0 || shifted_cached_tokens < 0)
+        if (main_cached_tokens < 0 || shifted_cached_tokens < 0 || !validMTPShiftedCacheOrigin(origin))
         {
             return {
                 .ok = false,
                 .reason = "main and shifted cached-token counts must be nonnegative"};
         }
-        if (shifted_cached_tokens == main_cached_tokens)
+        const bool visible=origin==MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero;
+        if ((!visible && shifted_cached_tokens==main_cached_tokens) ||
+            (visible && main_cached_tokens<std::numeric_limits<int>::max() && shifted_cached_tokens==main_cached_tokens+1))
         {
             return {
                 .ok = true,
                 .action = MTPShiftedReplayRowAction::ReuseResidentRow,
                 .append_position_offset = -1};
         }
-        if (shifted_cached_tokens + 1 == main_cached_tokens)
+        if ((visible && shifted_cached_tokens==main_cached_tokens) ||
+            (!visible && main_cached_tokens>0 && shifted_cached_tokens==main_cached_tokens-1))
         {
             return {
                 .ok = true,
@@ -352,7 +368,7 @@ namespace llaminar2
         }
 
         std::ostringstream reason;
-        reason << "shifted MTP replay state must equal main state or trail by one"
+        reason << "shifted MTP replay state differs from model-owned append/reuse coordinates"
                << ": main=" << main_cached_tokens
                << " shifted=" << shifted_cached_tokens;
         return {
@@ -360,7 +376,7 @@ namespace llaminar2
             .reason = reason.str()};
     }
 
-    PrefixStateSnapshot makeLogicalMTPVerifierBaseSnapshot(int cached_tokens)
+    PrefixStateSnapshot makeLogicalMTPVerifierBaseSnapshot(int cached_tokens,MTPShiftedCacheOrigin origin)
     {
         PrefixStateSnapshot snapshot;
         if (cached_tokens < 0)
@@ -375,7 +391,8 @@ namespace llaminar2
         snapshot.logical_checkpoint = true;
         snapshot.provenance = PrefixStateProvenance::LogicalCheckpoint;
         snapshot.cached_tokens = cached_tokens;
-        snapshot.mtp_cached_tokens = {expectedShiftedMTPTokens(cached_tokens)};
+        snapshot.mtp_shifted_origin=origin;
+        snapshot.mtp_cached_tokens = {expectedShiftedMTPTokens(cached_tokens,origin)};
         return snapshot;
     }
 
@@ -383,6 +400,8 @@ namespace llaminar2
         const MTPDecodeStateStamp &state,
         const MTPCommitValidationOptions &options)
     {
+        if (!validMTPShiftedCacheOrigin(state.shifted_origin))
+            return MTPStateValidationResult::failure("state has unknown shifted-cache source convention");
         if (!state.valid)
             return MTPStateValidationResult::failure("state is invalid");
         if (state.logical_tokens < 0 ||
@@ -401,7 +420,7 @@ namespace llaminar2
             return MTPStateValidationResult::failure("decode position does not match logical token count");
         }
         if (options.require_shifted_mtp_kv &&
-            state.shifted_mtp_kv_tokens != expectedShiftedMTPTokens(state.logical_tokens))
+            state.shifted_mtp_kv_tokens != expectedShiftedMTPTokens(state.logical_tokens,state.shifted_origin))
         {
             return MTPStateValidationResult::failure("shifted MTP KV token count does not match logical token count");
         }
@@ -427,6 +446,9 @@ namespace llaminar2
         PrefixStateProvenance verifier_source,
         const MTPCommitValidationOptions &options)
     {
+        if (base.shifted_origin!=committed.shifted_origin)
+            return MTPStateValidationResult::failure("atomic MTP commit cannot change its frozen cache-origin source contract");
+
         if (emitted_tokens <= 0)
             return MTPStateValidationResult::failure("atomic MTP commit emitted no tokens");
         MTPCommitValidationOptions base_options = options;

@@ -69,6 +69,7 @@
 #include "../../utils/TestTensorFactory.h"
 #include "../../utils/PreparedWeightTestHarness.h"
 #include "../../utils/CPUProjectionTestWorkspace.h"
+#include "../../utils/GDNQKVBundleTestHarness.h"
 
 using namespace llaminar2;
 using ::testing::_;
@@ -6962,4 +6963,14 @@ TEST(Test__GDNKernels, CPUMergedGDNUnequalRequestBatchMatchesSerialDecodeBytes)
                                policy->second == "request_bank_snapshot_copy");
     }
     EXPECT_TRUE(publication_counter);
+}
+
+/** @brief Real CPU four-source stage, tiny head-consistent geometry, no GPU startup. */
+TEST(Test__GDNKernels, Projection_QKVTwoTermFourDistinctSourcesSmallCPU)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    auto context = makeCPUContext();
+    test::GDNQKVBundleFixture fixture(DeviceId::cpu(), *context, nullptr, nullptr,
+        64, {128, 64, 2, 2});
+    fixture.prove();
 }

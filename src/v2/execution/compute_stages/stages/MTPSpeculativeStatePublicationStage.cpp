@@ -449,7 +449,8 @@ namespace llaminar2
                          stream,
                          params_.shifted_target_cached_tokens_device,
                          params_.shifted_accepted_state_counts_device,
-                         params_.publication_ok_flags_device))
+                         params_.publication_ok_flags_device,
+                         params_.shifted_kv_caches[depth]->stateOwnership().shifted_origin))
             {
                 LOG_ERROR("[MTPSpeculativeStatePublicationStage] Shifted publication metadata derivation failed at depth "
                           << depth);

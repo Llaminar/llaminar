@@ -26,6 +26,61 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /** @brief Project final per-rank table inputs from already frozen graph geometry.
+         * @param profile Complete original source directory and immutable model metadata.
+         * @param ranks Compiled execution ranks carrying the lossless requested policy.
+         * @param devices Winning higher-priority participant inputs, never a new row candidate.
+         * @return At most one canonical table request per rank with actual PLE consumers.
+         */
+        std::vector<ImmutableRowTableAdmissionRequest> candidateTableRequests(
+            const ModelMemoryProfile &profile,const std::vector<RankExecutionPlan> &ranks,
+            const std::vector<DevicePlanConfig> &devices)
+        {
+            std::vector<ImmutableRowTableAdmissionRequest> requests;
+            for(const auto &rank:ranks)
+            {
+                std::vector<DevicePlanConfig> local;
+                for(const auto &device:devices)if(device.world_rank==rank.rank)local.push_back(device);
+                const std::vector<std::vector<DevicePlanConfig>> groups{std::move(local)};
+                const auto upload=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
+                auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,
+                    rank.runtime.ngram_table_policy,groups,upload,ImmutableRowTableHostPlacement::fromObservedNUMANode(rank.numa_node));
+                if(request)requests.push_back(std::move(*request));
+            }
+            return requests;
+        }
+
+        /** @brief Publish the same sealed placement into its compiled rank and exact consumers.
+         * @param placements Final canonical selections from this candidate's sole certificate.
+         * @param ranks Mutable setup publication into returned runtime configurations.
+         * @param devices Frozen participant geometry; only placement metadata is added.
+         * @throws std::logic_error For a placement without its compiled rank or consumer.
+         */
+        void publishCandidateTables(
+            const std::vector<std::shared_ptr<const ResolvedImmutableRowTablePlacement>> &placements,
+            std::vector<RankExecutionPlan> &ranks,std::vector<DevicePlanConfig> &devices)
+        {
+            for(const auto &placement:placements)
+            {
+                const auto rank=std::find_if(ranks.begin(),ranks.end(),[&](const auto &r) {
+                    return placement && r.rank==placement->worldRank();
+                });
+                if(rank==ranks.end())throw std::logic_error("Final candidate table has no exact compiled rank");
+                rank->runtime.ngram_table_placement=placement;
+                for(const auto &consumer:placement->consumers())
+                {
+                    bool found=false;
+                    for(auto &device:devices)
+                        if(device.world_rank==consumer.world_rank && device.device==consumer.device)
+                        {device.ngram_table_placement=placement;found=true;}
+                    if(!found)throw std::logic_error("Final candidate table has no exact compiled PLE consumer");
+                }
+            }
+        }
+    }
+
     OrchestrationCandidateMemoryPolicy OrchestrationCandidateMemoryPolicy::fromStartup()
     {
         const auto &env = debugEnv();
@@ -79,7 +134,7 @@ namespace llaminar2
         AutomaticOrchestrationCandidate candidate, const PlanningModelSource &source,
         const OrchestrationCandidateMemoryPolicy &policy)
     {
-        if (candidate.config.model_path != source.path())
+        if (candidate.config.model_path != source.path() || candidate.config.shared_predictor != source.predictorSource())
             throw std::invalid_argument("Candidate model path does not name the retained planning source");
         if (!std::holds_alternative<ApplyOrchestrationRequest>(resolveOrchestrationIntent(candidate.config)))
             throw std::invalid_argument("Candidate admission requires explicit placement, not a second automatic search");
@@ -163,7 +218,18 @@ namespace llaminar2
             // do not duplicate its interpretation of an unset activation row cap.
             auto memory = MemoryPlanner::planLargestFittingResidentGraphRows(profile, devices,
                 normalizePrefillGraphBuckets(policy.prefill_bucket_rows));
-            auto certificate = std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(memory.memory_plan.admit());
+            // Rows are frozen before the lowest-priority table is considered.
+            // A final table failure escapes directly; it cannot rerun this search.
+            auto final_plan=memory.memory_plan.physicalPlan();
+            std::vector<std::shared_ptr<const ResolvedImmutableRowTablePlacement>> placements;
+            for(const auto &request:candidateTableRequests(profile,ranks,memory.device_inputs))
+            {
+                auto selected=ImmutableRowTablePlacementPlanner::select(request,final_plan);
+                placements.push_back(std::move(selected.placement));
+                final_plan=std::move(selected.physical_plan);
+            }
+            auto certificate=std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(final_plan);
+            publishCandidateTables(placements,ranks,memory.device_inputs);
             if (memory.resident_graph_rows <= 0)
                 throw std::logic_error("Candidate admission returned no executable graph rows");
             for (auto &rank : ranks) rank.runtime.resident_graph_rows = memory.resident_graph_rows;
@@ -186,13 +252,16 @@ namespace llaminar2
             retainsMTPGraphCapacity(mtp) ? MoEOverlayMTPGraphFamilyPolicy::RetainModelSidecars : MoEOverlayMTPGraphFamilyPolicy::MainOnly,
             1, std::max(decode_rows, std::max(1, runtime.moe_routed_prefill.overlay_segment_rows)),
             decode_rows, std::max(1, runtime.batch_size), resolveMTPRetainedDraftCapacity(mtp));
-        const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(loader.getModel(), family.routedLayerCapacity(), profile.expert_count);
+        const auto manifest = buildMoEOverlayLayerWeightManifestFromLoader(loader, family.routedLayerCapacity(), profile.expert_count);
         const auto capacity_policy = resolveMoEOverlayCapacityAdmissionPolicy(
             overlay_plan, config, inventory.world_size, family.routedLayerCapacity(), profile.expert_count);
         const auto rows = segmentedPrefillGraphRowCandidates(policy.prefill_bucket_rows,
             runtime.max_seq_len, runtime.moe_routed_prefill.overlay_segment_rows);
         if (rows.empty()) throw std::invalid_argument("Candidate overlay has no captured-prefill row choices");
         std::string last_capacity_error;
+        std::optional<MoEOverlayCapacityDraft> selected_draft;
+        std::vector<MoEOverlayLocalCapacityPlannerResult> selected_local;
+        std::vector<int> selected_segments;
         for (const int candidate_rows : rows)
         {
             try
@@ -215,41 +284,53 @@ namespace llaminar2
                     segments.push_back(inputs.prefill_segment_rows);
                     budgets.insert(budgets.end(), local.back().physical_budgets.begin(), local.back().physical_budgets.end());
                 }
-                auto capacity = MoEOverlayCapacityAdmission::resolveCapacity(
-                    overlay_plan, profile.expert_count, manifest, budgets, capacity_policy);
-                for (size_t index = 0; index < ranks.size(); ++index)
-                {
-                    ranks[index].runtime.resident_graph_rows = local[index].resident_graph_rows;
-                    ranks[index].runtime.moe_routed_prefill.overlay_segment_rows = segments[index];
-                }
-                /*
-                 * Auto's capacity result proves and ranks this topology at
-                 * discovery time; it is not a user-authored fixed quota.
-                 * Backend contexts and rank-local graph resources are created
-                 * after that observation. Persisting every last estimated
-                 * expert slot as FixedPerLayer would turn a small, legitimate
-                 * change in free VRAM into a startup failure even though the
-                 * same automatic policy fits with one fewer resident expert.
-                 * Preserve auto quota intent in the apply document. The live
-                 * runner resolves its complete BOM against its refreshed
-                 * PhysicalMemoryAuthority observation before allocating any
-                 * expert, without changing topology or movement policy.
-                 */
-                std::vector<DevicePlanConfig> devices;
-                for (auto &rank : local)
-                    devices.insert(devices.end(), std::make_move_iterator(rank.device_inputs.begin()),
-                        std::make_move_iterator(rank.device_inputs.end()));
-                auto certificate = capacity.physical_memory_admission;
-                return {std::move(candidate), std::move(ranks), std::move(devices), std::move(certificate),
-                    std::make_shared<const MoEOverlayResolvedCapacityPlan>(std::move(capacity))};
+                auto draft=MoEOverlayCapacityAdmission::resolveCapacityDraft(
+                    overlay_plan,profile.expert_count,manifest,budgets,capacity_policy);
+                selected_draft.emplace(std::move(draft));
+                selected_local=std::move(local);
+                selected_segments=std::move(segments);
+                break;
             }
             catch (const PhysicalMemoryCapacityExhausted &error)
             {
-                // This is a legal shape search, not recovery from invalid
-                // lowering. No other exception can select a smaller graph.
-                last_capacity_error = error.what();
+                // Only the higher-priority row/quota draft may choose a smaller shape.
+                last_capacity_error=error.what();
             }
         }
-        throw PhysicalMemoryCapacityExhausted("No complete ExpertOverlay candidate graph fits: " + last_capacity_error);
+        if(!selected_draft)
+            throw PhysicalMemoryCapacityExhausted("No complete ExpertOverlay candidate graph fits: " + last_capacity_error);
+        for(size_t index=0;index<ranks.size();++index)
+        {
+            ranks[index].runtime.resident_graph_rows=selected_local[index].resident_graph_rows;
+            ranks[index].runtime.moe_routed_prefill.overlay_segment_rows=selected_segments[index];
+        }
+        std::vector<DevicePlanConfig> devices;
+        for(auto &rank:selected_local)
+            devices.insert(devices.end(),std::make_move_iterator(rank.device_inputs.begin()),
+                std::make_move_iterator(rank.device_inputs.end()));
+        // This extension is outside every row/quota catch. No incomplete PMA
+        // certificate exists and a table rejection cannot change the frozen draft.
+        const auto requests=candidateTableRequests(profile,ranks,devices);
+        auto capacities=selected_draft->admit(requests);
+        if(capacities.size()!=1u)
+            throw std::logic_error("Candidate overlay final admission lost its exact stage");
+        auto capacity=std::move(capacities.front());
+        publishCandidateTables(capacity.ngram_table_placements,ranks,devices);
+        /*
+         * Auto's capacity result proves and ranks this topology at
+         * discovery time; it is not a user-authored fixed quota.
+         * Backend contexts and rank-local graph resources are created
+         * after that observation. Persisting every last estimated
+         * expert slot as FixedPerLayer would turn a small, legitimate
+         * change in free VRAM into a startup failure even though the
+         * same automatic policy fits with one fewer resident expert.
+         * Preserve auto quota intent in the apply document. The live
+         * runner resolves its complete BOM against its refreshed
+         * PhysicalMemoryAuthority observation before allocating any
+         * expert, without changing topology or movement policy.
+         */
+        auto certificate=capacity.physical_memory_admission;
+        return {std::move(candidate),std::move(ranks),std::move(devices),std::move(certificate),
+            std::make_shared<const MoEOverlayResolvedCapacityPlan>(std::move(capacity))};
     }
 }

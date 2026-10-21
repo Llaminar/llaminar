@@ -12,6 +12,11 @@
 
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
+#include "planning/RankMemoryPlanInputs.h"
+#include "loaders/ImmutableRowTable.h"
+#include "planning/PlanningModelMetadata.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "utils/DebugEnv.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
@@ -3508,4 +3513,224 @@ TEST(Test__MemoryPlanner, AttentionOperandCodecClassificationIsStrict)
         EXPECT_EQ(KVCacheMemoryEstimator::attentionExecutionFormat(name), TensorType::FP16) << name;
     EXPECT_THROW(KVCacheMemoryEstimator::attentionExecutionFormat("fp16-extra"), std::invalid_argument);
     EXPECT_THROW(KVCacheMemoryEstimator::attentionExecutionFormat(""), std::invalid_argument);
+}
+
+/** @test Hosted storage shares one exact host owner while every actual GPU binds the sealed tier. */
+TEST(Test__MemoryPlanner, NgramStorageHasOneExactHostOwnerAcrossGpuParticipants)
+{
+    // The shared config fixture intentionally has no learned FA/GDN matrices.
+    // Full activation admission is source-inventory driven, so supply this
+    // synthetic model's complete projection geometry before comparing the
+    // frozen base plus concrete lookup delta with the full resolved plan.
+    auto directory=test::qwen4MetadataFixture(false);
+    const auto projection=[&](const char *name,std::uint64_t rows,std::uint64_t columns) {
+        directory.tensors.push_back({.name=name,.dimensions={rows,columns},.type=GGUFTensorType::F16});
+    };
+    projection("blk.3.attn_q.weight",6144,2560);
+    projection("blk.3.attn_gate.weight",6144,2560);
+    projection("blk.0.attn_qkv.weight",10240,2560);
+    projection("blk.0.ssm_out.weight",2560,6144);
+    projection("blk.0.ssm_alpha.weight",48,2560);
+    projection("blk.0.ssm_beta.weight",48,2560);
+    const auto profile = ModelMemoryProfile::fromGGUF(directory);
+    DevicePlanConfig first;
+    first.world_rank = 0; first.device = DeviceId::cuda(0); first.device_compute_units = 82;
+    first.device_total_bytes = 64ull << 30; first.device_free_bytes = 60ull << 30;
+    first.max_seq_len = 64;
+    first.associated_host_memory = PhysicalMemoryResource{
+        .world_rank = 0, .device = DeviceId{DeviceType::CPU,1}, .total_bytes = 128ull << 30,
+        .admission_available_bytes = 120ull << 30};
+    auto second = first; second.device = DeviceId::rocm(0);
+    const std::vector<std::vector<DevicePlanConfig>> groups{{first,second}};
+    const auto baseline = MemoryPlanner::plan(profile, groups.front());
+    const auto input = MemoryPlanner::immutableRowTablePlacementInput(profile,groups,*first.associated_host_memory);
+    const auto modes = MemoryPlanner::immutableRowTableModeContributions(profile,groups,{});
+    for (const auto requested : {ImmutableRowStoragePreference::RAM,ImmutableRowStoragePreference::MemoryMapped})
+    {
+        const auto selected=ImmutableRowTablePlacementPlanner::select({requested,65536,3},input,baseline.physicalPlan(),modes);
+        first.ngram_table_placement=selected.placement;second.ngram_table_placement=selected.placement;
+        const auto plan=MemoryPlanner::plan(profile,{first,second});
+        const auto *host=plan.physicalPlan().find({0,DeviceId{DeviceType::CPU,1}});
+        ASSERT_NE(host,nullptr);
+        EXPECT_EQ(host->bytes(PhysicalMemoryOwner::ImmutableTableStorage),
+            ImmutableRowTable::physicalBytesForNativeExtent(profile.flash_next->ple_table_native_bytes,
+                selected.placement->storagePolicy()));
+        const auto selected_mismatch=selected.physical_plan.requiredFootprintMismatch(plan.physicalPlan());
+        const auto resolved_mismatch=plan.physicalPlan().requiredFootprintMismatch(selected.physical_plan);
+        EXPECT_FALSE(selected_mismatch.has_value())<<selected_mismatch.value_or("");
+        EXPECT_FALSE(resolved_mismatch.has_value())<<resolved_mismatch.value_or("");
+        for (const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+        {
+            const auto *actual=plan.physicalPlan().find({0,device});
+            const auto *prior=baseline.physicalPlan().find({0,device});
+            ASSERT_NE(actual,nullptr);ASSERT_NE(prior,nullptr);
+            EXPECT_EQ(actual->bytes(PhysicalMemoryOwner::ImmutableTableStorage),0u);
+            EXPECT_EQ(actual->bytes(PhysicalMemoryOwner::PrimaryModelWeights),prior->bytes(PhysicalMemoryOwner::PrimaryModelWeights));
+        }
+    }
+}
+
+
+/** @test Final table admission derives one frozen host and rejects missing or conflicting owners. */
+TEST(Test__MemoryPlanner, NgramFinalHostComesFromActualConsumerInputs)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto &profile = source.metadata().memoryProfile();
+    const ImmutableRowTablePolicy policy{ImmutableRowStoragePreference::RAM, 65536, 3};
+    DevicePlanConfig first;
+    first.ngram_execution_policy = policy;
+    first.world_rank = 2;
+    first.device = DeviceId::cuda(0);
+    first.device_compute_units = 64;
+    first.max_seq_len = 64;
+    first.device_total_bytes = first.device_free_bytes = 64ull << 30;
+    first.associated_host_memory = PhysicalMemoryResource{
+        2, DeviceId::cpu(), 128ull << 30, 120ull << 30};
+    auto second = first;
+    second.device = DeviceId::rocm(1);
+    auto expert = first;
+    expert.device = DeviceId{DeviceType::CPU, 7};
+    expert.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    expert.associated_host_memory.reset();
+    std::vector<std::vector<DevicePlanConfig>> groups{{first, second, expert}};
+    const auto request = MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy());
+    ASSERT_TRUE(request);
+    EXPECT_EQ(request->input.host().world_rank, 2);
+    EXPECT_EQ(request->input.host().device, DeviceId::cpu());
+    EXPECT_EQ(request->input.consumers().size(), 2u);
+    EXPECT_TRUE(request->input.hostPlacement().usesTaskPolicy());
+    const auto bound = MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},
+        ImmutableRowTableHostPlacement::fromObservedNUMANode(3));
+    ASSERT_TRUE(bound);
+    EXPECT_EQ(bound->input.host().device, DeviceId::cpu());
+    EXPECT_EQ(bound->input.hostPlacement(), ImmutableRowTableHostPlacement::onNode(3));
+
+    groups[0][1].associated_host_memory.reset();
+    EXPECT_THROW((void)MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()),
+        std::invalid_argument);
+    groups[0][1] = second;
+    groups[0][1].associated_host_memory->device = DeviceId{DeviceType::CPU, 3};
+    EXPECT_THROW((void)MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()),
+        std::invalid_argument);
+    groups[0][1] = second;
+    groups[0][1].associated_host_memory->world_rank = 9;
+    EXPECT_THROW((void)MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()),
+        std::invalid_argument);
+    groups[0][1] = second;
+    groups[0][1].associated_host_memory->total_bytes += 4096;
+    EXPECT_THROW((void)MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()),
+        std::invalid_argument);
+
+    // A CPU continuation already is its host owner; an expert-only CPU does
+    // not select storage for a PLE consumer and cannot supply a missing host.
+    first.device = DeviceId::cpu();
+    first.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    first.device_compute_units = 8;
+    first.associated_host_memory.reset();
+    groups = {{first, expert}};
+    const auto cpu = MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy());
+    ASSERT_TRUE(cpu);
+    EXPECT_EQ(cpu->input.host().device, first.device);
+    EXPECT_FALSE(cpu->input.permitsVRAM());
+    groups = {{expert}};
+    EXPECT_FALSE(MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, groups, {},ImmutableRowTableHostPlacement::taskPolicy()));
+}
+
+/** @test Each consumer authenticates its own original upload tuple, including unequal mixed GPUs. */
+TEST(Test__MemoryPlanner, NgramVRAMEligibilityUsesEachOriginalUploadGeometry)
+{
+    const auto profile=ModelMemoryProfile::fromGGUF(test::qwen4MetadataFixture(false));
+    DevicePlanConfig first;
+    first.world_rank=0;first.device=DeviceId::cuda(0);first.max_seq_len=64;first.device_total_bytes=64ull<<30;
+    first.device_free_bytes=60ull<<30;first.associated_host_memory=PhysicalMemoryResource{0,DeviceId::cpu(),128ull<<30,120ull<<30};
+    const auto row=static_cast<std::size_t>(profile.flash_next->ple_table_row_bytes);
+    const auto wide=resolveGPUWeightLoadMemoryGeometry(row+4096,{.staging_stream_count=1,.staging_budget_bytes=4096});
+    first.ordinary_weight_load_geometry=wide;
+    first.weight_load_staging={wide.staging_bytes,wide.host_staging_bytes};
+    auto second=first;second.device=DeviceId::rocm(1);
+    const auto other=resolveGPUWeightLoadMemoryGeometry(row+8192,{.staging_stream_count=2,.staging_budget_bytes=8192});
+    second.ordinary_weight_load_geometry=other;
+    second.weight_load_staging={other.staging_bytes,other.host_staging_bytes};
+    auto expert_only=first;
+    expert_only.device=DeviceId{DeviceType::CPU,2};
+    expert_only.execution_role=DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    expert_only.weight_load_staging={};expert_only.ordinary_weight_load_geometry.reset();
+    std::vector<std::vector<DevicePlanConfig>> groups{{first,second,expert_only}};
+    const auto placement_input=MemoryPlanner::immutableRowTablePlacementInput(profile,groups,*first.associated_host_memory);
+    EXPECT_TRUE(placement_input.permitsVRAM());
+    EXPECT_EQ(placement_input.consumers().size(),2u);
+    const auto bindings=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
+    ASSERT_EQ(bindings.size(),2u);
+    EXPECT_TRUE(MemoryPlanner::immutableRowTableModeContributions(profile,groups,bindings).vram);
+    EXPECT_FALSE(MemoryPlanner::immutableRowTableModeContributions(profile,groups,{}).vram);
+    ASSERT_GT(row,1u);
+    const auto narrow=resolveGPUWeightLoadMemoryGeometry(row-1,{.staging_stream_count=1,.staging_budget_bytes=0});
+    groups.front()[1].ordinary_weight_load_geometry=narrow;
+    groups.front()[1].weight_load_staging={narrow.staging_bytes,narrow.host_staging_bytes};
+    EXPECT_FALSE(MemoryPlanner::immutableRowTableModeContributions(profile,groups,
+        MemoryPlanner::immutableRowTableUploadBindings(profile,groups)).vram);
+    auto foreign=bindings;foreign.front().consumer.device=DeviceId::cuda(7);
+    EXPECT_THROW(MemoryPlanner::immutableRowTableModeContributions(profile,groups,foreign),std::invalid_argument);
+}
+
+/** @test Each original native PP participant prices one additional complete no-sampling parent. */
+TEST(Test__MemoryPlanner, NativePipelineForwardOnlyParentHasNamedPhysicalBOM)
+{
+    constexpr size_t GiB = 1024ULL * 1024ULL * 1024ULL;
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        auto profile = createTestProfile();
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.device_compute_units = 82;
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ULL * GiB;
+        cfg.max_seq_len = 4096;
+        cfg.activation_seq_len = 64;
+        cfg.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory({64}, {});
+        const auto ordinary = MemoryPlanner::plan(profile, {cfg});
+        cfg.local_pipeline_backend = device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        const auto pipeline = MemoryPlanner::plan(profile, {cfg});
+        ASSERT_EQ(ordinary.devices.size(), 1u);
+        ASSERT_EQ(pipeline.devices.size(), 1u);
+        EXPECT_EQ(pipeline.devices.front().captured_graph_bytes() - ordinary.devices.front().captured_graph_bytes(),
+            estimateCapturedGraphExecutableBytes(device, CapturedGraphExecutableInventory{
+                .model_graph_identity_count = 0u,
+                .model_graph_topology_variant_count = 0u,
+                .auxiliary_executable_count = OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount()}));
+    }
+}
+
+/** @test The production closed PP projection prices the parent only on actual singleton native domains. */
+TEST(Test__MemoryPlanner, ForwardOnlyBOMFollowsOriginalNativePipelineProjection)
+{
+    for (const auto type : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int topology : {0, 1, 2}) // singleton homogeneous, nested TP, mixed vendor
+    {
+        RankExecutionPlan parent;
+        parent.rank = 0;
+        const auto first = GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, 0));
+        const auto second_type = topology == 2 ? (type == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA) : type;
+        const auto second = GlobalDeviceAddress::fromLocalDeviceId(DeviceId(second_type, topology == 2 ? 0 : 1));
+        parent.local_pp_devices = {first, second};
+        parent.local_pp_layer_boundaries = {0, 2, 4};
+        if (topology == 1)
+            parent.local_pp_stage_tp_info = {{.devices = {first,
+                GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, 2))}},
+                {.devices = {second, GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, 3))}}};
+        DevicePlanConfig cfg;
+        cfg.world_rank = 0;
+        cfg.device = first.toLocalDeviceId();
+        cfg.first_layer = 0;
+        cfg.last_layer = 1;
+        cfg.execution_role = DeviceExecutionMemoryRole::ContinuationGraph;
+        cfg.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
+            .device = DeviceId::cpu(), .total_bytes = 4096, .admission_available_bytes = 4096};
+        PipelineStageTransferMemory::forStage(parent, 0).bind(cfg);
+        EXPECT_EQ(cfg.local_pipeline_backend.has_value(), topology == 0);
+        if (topology == 0)
+        {
+            EXPECT_EQ(*cfg.local_pipeline_backend, type == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        }
+    }
 }

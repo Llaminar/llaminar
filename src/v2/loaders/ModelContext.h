@@ -4,6 +4,9 @@
  *
  * Wraps GGUF model metadata and provides convenient access for pipelines.
  * Eliminates need for pipelines to hardcode architecture parameters.
+ * Immutable native tables retain one rank-owned host service or one original
+ * source-format bank per actual GPU consumer. Participant setup authenticates
+ * one source/PMA generation; graph families borrow Ready owners without reload.
  *
  * @author David Sanftenberg
  */
@@ -14,11 +17,21 @@
 #include "WeightManager.h"
 #include "WeightPlacementMap.h"
 #include "ModelContextConfig.h"
+#include "ImmutableRowTable.h"
+#include "HostImmutableRowProvider.h"
+#include "ResidentImmutableRowTable.h"
+#include "AdaptiveImmutableLookupRootStorage.h"
+#include <map>
+#include <span>
+#include <condition_variable>
+#include <exception>
+#include <thread>
 #include "../interfaces/IModelContext.h"
 #include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace llaminar2
@@ -143,9 +156,8 @@ namespace llaminar2
         /** @brief Return the complete ordered GGUF shard set loaded by this context. */
         std::vector<std::string> artifactPaths() const override
         {
-            const auto &paths = loader_.getModel().split_paths;
-            return paths.empty() ? std::vector<std::string>{model_path_}
-                                 : paths;
+            const auto paths = loader_.artifactPaths();
+            return paths.empty() ? std::vector<std::string>{model_path_} : paths;
         }
 
         /**
@@ -162,6 +174,60 @@ namespace llaminar2
          * @brief Get ModelLoader interface for tensor loading
          */
         std::shared_ptr<IModelLoader> loader() override { return loader_interface_; }
+
+        /** @brief Return the single admitted rank-owned native row service, if present. */
+        std::shared_ptr<HostImmutableRowProvider> hostImmutableRowProvider() const override;
+        /** @return Exact immutable declaration shared by preparing/Ready participants; completeness is explicit. */
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> resolvedImmutableRowTablePlacement() const override;
+
+
+        /** @brief Borrow one original-format whole/range GPU owner; every graph family shares its exact storage. */
+        std::shared_ptr<const ResidentImmutableRowTable> residentImmutableRowTable(DeviceId device) const override;
+        /** @brief Borrow the source-owned adaptive boundary; original roots and live claims survive the last graph borrow. */
+        std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> adaptiveImmutableLookupBoundary(DeviceId device) const override;
+        /** @brief Exact live immutable-bank bytes for the existing model-retention owner row. */
+        std::size_t residentImmutableRowTableBytes(DeviceId device) const override;
+
+        /**
+         * @brief Materialize the sealed rank placement after ordinary weight-load staging drains.
+         * @param placement Concrete policy/source extent and exact admitted allocator set.
+         * @param authority Existing canonical rank PMA; replacement is forbidden.
+         * @param uploads Exact per-GPU setup streams and original released-slot receipts; empty for host storage.
+         * @param transfers Sole public allocation/copy/event authority.
+         * All upload identities validate before allocation, then this convenience
+         * entry point delegates to the same participant preparation primitive.
+         */
+        void prepareImmutableRowTable(const ResolvedImmutableRowTablePlacement &placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority,
+            std::span<const ImmutableRowTableDevicePreparation> uploads,
+            const TransferEngine &transfers);
+
+        /**
+         * @brief Materialize one actual PLE participant after its ordinary loader drains.
+         * @param placement One shared sealed rank placement/source generation.
+         * @param authority Same canonical rank PMA retained by every participant.
+         * @param consumer Exact actual PLE graph resource from placement.consumers().
+         * @param upload Required for a fresh whole/range native writer; absent for host or already-Ready owners.
+         * @param transfers Sole native allocation/copy/event authority.
+         * @param adaptive_setup Fresh adaptive metadata setup on the exact worker stream; absent for Ready reuse.
+         * Distinct GPU writes proceed outside the shared mutex. Duplicate setup
+         * callers join the original owner; recursive setup and every failure
+         * fail closed. A sibling failure prevents all late Ready publication.
+         */
+        void prepareImmutableRowTableForConsumer(const ResolvedImmutableRowTablePlacement &placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId consumer,
+            const std::optional<ImmutableRowTableDevicePreparation> &upload,
+            const TransferEngine &transfers,
+            const std::optional<AdaptiveImmutableLookupDevicePreparation> &adaptive_setup=std::nullopt);
+
+        /** @brief Require every exact planned allocator Ready before orchestration publishes inference-ready.
+         * @param placement Original sealed placement, compared by complete immutable value.
+         * @param authority Same canonical rank PMA, never a recreated certificate.
+         * No allocation, source read, synchronization or partial-owner inference occurs.
+         */
+        void requireImmutableRowTablePlacementComplete(const ResolvedImmutableRowTablePlacement &placement,
+            const std::shared_ptr<PhysicalMemoryAuthority> &authority) const;
+
 
         /**
          * @brief Get concrete ModelLoader for internal use
@@ -275,6 +341,40 @@ namespace llaminar2
         std::unique_ptr<TensorFactory> owned_test_factory_; // For createForTesting() only - must be declared BEFORE loader_!
         ModelLoader loader_;
         std::shared_ptr<WeightManager> weight_manager_;
+        /** @brief Extract actual immutable source coordinates from the model-owned directory. */
+        ImmutableRowTableSource immutableRowTableSource() const;
+        /**
+         * @brief Materialize one checked GPU/subordinate source through the existing setup state machine.
+         * @param placement Sole resolved layout and original request ceilings.
+         * @param authority Existing canonical PMA; duplicate authorities reject before publication.
+         * @param source Original loader-authenticated file/tensor extent.
+         * @param consumer Exact one GPU PLE endpoint.
+         * @param setup Ordinary explicit stream, required only for a fresh domain.
+         * @throws std::exception On partial preparation; no fallback or second source owner is published.
+         */
+        void prepareGPUAdaptiveImmutableLookup(const ResolvedImmutableRowTablePlacement &placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority,const ImmutableRowTableSource &source,DeviceId consumer,
+            const std::optional<AdaptiveImmutableLookupDevicePreparation> &setup);
+        /** @brief Legal setup-only owner states; no inference progress is mirrored here. */
+        enum class ImmutableRowPreparationState { Preparing, Ready, Failed };
+        /** @brief One bounded setup owner, named by the actual physical allocator. */
+        struct ImmutableRowPreparation
+        {
+            ImmutableRowPreparationState state;
+            std::thread::id preparing_thread;
+        };
+        mutable std::mutex immutable_row_table_mutex_;
+        std::condition_variable immutable_row_table_ready_;
+        std::map<DeviceId, ImmutableRowPreparation> immutable_row_table_preparations_;
+        std::optional<ImmutableRowTableSource> immutable_row_table_source_;
+        std::optional<ImmutableRowFileIdentity> immutable_row_table_file_identity_;
+        std::exception_ptr immutable_row_table_preparation_failure_;
+
+        std::shared_ptr<HostImmutableRowProvider> host_row_provider_;
+        std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> adaptive_lookup_boundary_; ///< One source domain; graph variants share the same original roots.
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> immutable_row_table_placement_;
+        std::map<DeviceId, std::shared_ptr<const ResidentImmutableRowTable>> resident_row_tables_;
+        std::shared_ptr<PhysicalMemoryAuthority> immutable_row_table_authority_;
 
         // Interface wrapper for loader (since loader_ is stored by value, not as shared_ptr)
         std::shared_ptr<IModelLoader> loader_interface_;

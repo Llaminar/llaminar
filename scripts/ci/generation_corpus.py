@@ -26,7 +26,7 @@ from generation_regression_http import (
     MTPPolicy, generation_profile, serial_workload_identity, validate_partial_prompt,
 )
 from generation_tokens import GenerationWorkload, TokenTrace, compare_tokens
-from model_parity_inventory import InventoryScope
+from model_parity_inventory import InventoryScope, model_source_fields, map_predictor_source
 from production_artifacts import digest
 
 
@@ -78,7 +78,8 @@ def portable_inventory(inventory: dict, model_sources: dict) -> list[dict]:
         if (not isinstance(config, dict) or type(config.get("model_parity_schema")) is not int
                 or config["model_parity_schema"] != 1 or not isinstance(files, list) or not files
                 or any(not isinstance(path, str) or not path for path in files)
-                or len(set(files)) != len(files) or config.get("model") not in files):
+                or len(set(files)) != len(files) or any(path not in files
+                    for path in model_source_fields(config).values())):
             raise ValueError("canonical corpus cell omitted its full configuration or model shards")
         generation_profile(config)
         InventoryScope.ALL.accepts(config)
@@ -97,7 +98,10 @@ def portable_inventory(inventory: dict, model_sources: dict) -> list[dict]:
             raise ValueError("canonical model shard filenames are ambiguous across mounts")
         declared_files.update(files)
         normalized = copy.deepcopy(row)
+        normalized["configuration"] = map_predictor_source(config, lambda path: descriptors[path]["filename"])
         normalized["configuration"]["model"] = descriptors[config["model"]]
+        if "shared_predictor" in config:
+            normalized["configuration"]["shared_predictor"] = descriptors[config["shared_predictor"]]
         normalized["model_files"] = sorted(descriptors.values(), key=lambda item: item["filename"])
         result.append(normalized)
     if set(model_sources) != declared_files:

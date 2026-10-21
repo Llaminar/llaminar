@@ -2467,7 +2467,13 @@ namespace llaminar2
         }
     }
 
-    /** @test Setup probes must not interpret source matrices owned by another stage. */
+    /**
+     * @test Setup probes must not interpret source matrices owned by another stage.
+     *
+     * A singleton CPU stage has no movable expert destination even under Dynamic
+     * maintenance. Its exact BOM therefore excludes the host routing-evidence
+     * mirror; supplying one must fail before any admission transaction.
+     */
     TEST(MoEOverlayLocalCapacityPlanner, PipelineCPUSetupUsesOwnedSourceIntervalAllFormats)
     {
         std::vector<std::string> formats{"F16", "BF16", "F32"};
@@ -2512,13 +2518,9 @@ namespace llaminar2
                 .model_profile = &profile, .rank_plan = &rank, .overlay_plan = &overlay,
                 .rank_inventory = &inventory, .rank_execution_kind = OverlayRankExecutionKind::ContinuationAuthority,
                 .resident_graph_rows = 8,
-                .host_demand_memory = MoEOverlayHostDemandMemoryPlan(MoEOverlayHostDemandGeometry{
-                    .num_layers = 1, .num_experts = profile.expert_count, .top_k = profile.expert_used_count,
-                    .initial_window_rows = rank.runtime.moe_rebalance.window_size,
-                    .maximum_window_rows = rank.runtime.moe_rebalance.max_window_size,
-                    .maximum_invocation_rows = 8}),
                 .graph_family = family};
             const auto complete = MoEOverlayLocalCapacityPlanner::plan(input);
+            EXPECT_FALSE(complete.host_demand_memory.has_value());
             // Deliberately unreadable neighboring source descriptors prove the
             // child never interprets them. Keep their global directory entries
             // and geometry; truncating the parent profile would hide the bug.
@@ -2526,6 +2528,7 @@ namespace llaminar2
                 if (tensor.layer_index != 1) tensor.quant_type = "FOREIGN_STAGE_DESCRIPTOR";
             std::optional<MoEOverlayLocalCapacityPlannerResult> isolated;
             ASSERT_NO_THROW(isolated.emplace(MoEOverlayLocalCapacityPlanner::plan(input)));
+            EXPECT_FALSE(isolated->host_demand_memory.has_value());
             ASSERT_EQ(complete.physical_budgets.size(), isolated->physical_budgets.size());
             for (size_t index = 0; index < complete.physical_budgets.size(); ++index)
                 EXPECT_EQ(complete.physical_budgets[index].fixedBytes(), isolated->physical_budgets[index].fixedBytes());
@@ -2542,6 +2545,14 @@ namespace llaminar2
             rank.last_layer = 2;
             EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
             rank.last_layer = 1;
+            // Even an exact one-layer mirror is forbidden for a singleton;
+            // geometry correctness does not authorize unnecessary storage.
+            input.host_demand_memory.emplace(MoEOverlayHostDemandGeometry{
+                .num_layers = 1, .num_experts = profile.expert_count, .top_k = profile.expert_used_count,
+                .initial_window_rows = rank.runtime.moe_rebalance.window_size,
+                .maximum_window_rows = rank.runtime.moe_rebalance.max_window_size,
+                .maximum_invocation_rows = 8});
+            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(input), std::invalid_argument);
             input.host_demand_memory.emplace(MoEOverlayHostDemandGeometry{
                 .num_layers = 3, .num_experts = profile.expert_count, .top_k = profile.expert_used_count,
                 .initial_window_rows = rank.runtime.moe_rebalance.window_size,
@@ -3707,5 +3718,92 @@ namespace llaminar2
         auto foreign = owned;
         for (auto &entry : foreign) entry.layer_idx -= 32;
         EXPECT_THROW((void)MoEOverlayCapacityAdmission::buildResolverInput(plan, 2, foreign, budgets, {}), std::invalid_argument);
+    }
+    /** @test A frozen quota draft owns metadata and cannot retry fewer experts after a table rejection. */
+    TEST(MoEOverlayCapacityResolver, FinalNgramAdmissionCannotReopenFrozenQuotaSearch)
+    {
+        const auto make_draft=[] {
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts=4;
+            input.layer_weight_manifest=manifest(1,native_vnni_formats::Q4_K);
+            const auto footprints=MoEOverlayCapacityResolver::preparedFootprints(input.layer_weight_manifest);
+            const auto bound=boundBudget(0,exactBudget("gpu",DeviceId::cuda(0),footprints,{4},1));
+            input.physical_budgets.emplace_back("gpu",bound.certificate());
+            input.tiers={tier(0,"gpu-only",0,true,MoEOverlayLiveQuotaMode::Automatic,{participant(0,"gpu")})};
+            return MoEOverlayCapacityResolver::resolvePipelineDraft(std::span(&input,1u));
+        };
+        // All borrowed resolver inputs have retired before final admission.
+        const auto draft=make_draft();
+        ASSERT_EQ(draft.stageCount(),1u);
+        const auto before=draft.physicalPlan().summary();
+        const auto frozen=draft.admit();
+        ASSERT_EQ(frozen.size(),1u);ASSERT_NE(frozen.front().tier(0),nullptr);
+        const auto frozen_quotas=frozen.front().tier(0)->live_experts_per_layer;
+        const auto frozen_copies=frozen.front().tier(0)->participant_live_copies;
+        EXPECT_EQ(frozen_quotas,(std::vector<int>{4}));
+        const auto *gpu=draft.physicalPlan().find({0,DeviceId::cuda(0)});
+        ASSERT_NE(gpu,nullptr);
+        const PhysicalMemoryResource host{0,DeviceId{DeviceType::CPU,1},1u<<30,1u<<30};
+        const std::array consumers{gpu->resource()};
+        const auto extent=ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0),1024,4096);
+        const auto input=ImmutableRowTablePlacementInput::forConsumers(extent,host,consumers);
+        const ImmutableRowTableModeContributions eligible{.vram=PhysicalMemoryPlan{}};
+        const std::array explicit_request{ImmutableRowTableAdmissionRequest{
+            {ImmutableRowStoragePreference::VRAM,65536,1},input,eligible}};
+        // Final placement reports canonical capacity exhaustion. Its caller
+        // finalizes outside the row/quota catch; this immutable draft cannot
+        // mutate or reopen its already selected expert ownership.
+        EXPECT_THROW((void)draft.admit(explicit_request),PhysicalMemoryCapacityExhausted);
+        EXPECT_EQ(draft.physicalPlan().summary(),before);
+        const auto after_rejection=draft.admit();
+        ASSERT_EQ(after_rejection.size(),1u);ASSERT_NE(after_rejection.front().tier(0),nullptr);
+        EXPECT_EQ(after_rejection.front().tier(0)->live_experts_per_layer,frozen_quotas);
+        EXPECT_EQ(after_rejection.front().tier(0)->participant_live_copies,frozen_copies);
+        EXPECT_EQ(after_rejection.front().physical_memory_admission->plan().summary(),before);
+        const std::array automatic{ImmutableRowTableAdmissionRequest{
+            {ImmutableRowStoragePreference::Automatic,65536,1},input,eligible}};
+        const auto admitted=draft.admit(automatic);
+        ASSERT_EQ(admitted.size(),1u);
+        EXPECT_EQ(admitted.front().tier(0)->live_experts_per_layer,frozen_quotas);
+        EXPECT_EQ(admitted.front().tier(0)->participant_live_copies,frozen_copies);
+        EXPECT_EQ(draft.physicalPlan().summary(),before);
+        ASSERT_EQ(admitted.front().ngram_table_placements.size(),1u);
+        EXPECT_EQ(admitted.front().ngram_table_placements.front()->storage(),ImmutableRowStorage::RAM);
+        EXPECT_EQ(admitted.front().physical_memory_admission->plan().find({0,DeviceId::cuda(0)})->
+            bytes(PhysicalMemoryOwner::RoutedExpertWeights),gpu->bytes(PhysicalMemoryOwner::RoutedExpertWeights));
+    }
+
+    /** @test Disjoint stages share one deferred physical plan and one final table/certificate. */
+    TEST(MoEOverlayCapacityResolver, PipelineDraftFinalizesOneRankTableWithoutRecomputingStageQuotas)
+    {
+        auto manifests=manifest(2,native_vnni_formats::Q4_K);
+        const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({manifests.front()});
+        const auto raw=exactBudget("gpu",DeviceId::cuda(0),footprint,{4},1);
+        const auto capacity=raw.usableBudgetBytes()*2u;
+        const auto bound=boundBudget(0,physicalBudget("gpu",DeviceId::cuda(0),capacity,113,257));
+        std::vector<MoEOverlayCapacityResolverInput> inputs(2);
+        for(std::size_t i=0;i<inputs.size();++i)
+        {
+            auto &input=inputs[i];input.num_experts=4;input.layer_weight_manifest={manifests[i]};
+            input.physical_budgets.emplace_back("gpu",bound.certificate());
+            input.tiers={tier(0,"owned",0,true,MoEOverlayLiveQuotaMode::Automatic,{participant(0,"gpu")})};
+        }
+        const auto draft=MoEOverlayCapacityResolver::resolvePipelineDraft(inputs);
+        inputs.clear(); // immutable publication must not retain input/tier pointers.
+        const auto *gpu=draft.physicalPlan().find({0,DeviceId::cuda(0)});
+        ASSERT_NE(gpu,nullptr);
+        const PhysicalMemoryResource host{0,DeviceId::cpu(),1u<<30,1u<<30};
+        const std::array consumers{gpu->resource()};
+        const auto source=ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0),1024,4096);
+        const std::array requests{ImmutableRowTableAdmissionRequest{
+            {ImmutableRowStoragePreference::RAM,65536,1},
+            ImmutableRowTablePlacementInput::forConsumers(source,host,consumers),{}}};
+        const auto result=draft.admit(requests);
+        ASSERT_EQ(result.size(),2u);
+        EXPECT_EQ(result[0].physical_memory_admission,result[1].physical_memory_admission);
+        for(const auto &stage:result)
+            EXPECT_EQ(stage.tier(0)->live_experts_per_layer,(std::vector<int>{4}));
+        EXPECT_EQ(result[0].physical_memory_admission->plan().find({0,DeviceId::cpu()})->
+            bytes(PhysicalMemoryOwner::ImmutableTableStorage),source.nativeBytes());
     }
 } // namespace llaminar2

@@ -115,11 +115,13 @@ public:
     void validatePublication(const MTPSpeculativeStatePublicationStage::Params &params) const;
     /** @brief Select the forward invocations whose native activation edges live in this graph.
      * @param input Immutable invocation policy; row count alone never selects a role.
-     * @return True for prefill/MTP, or ordinary decode at a heterogeneous boundary.
-     * Homogeneous ordinary decode retains the edges in its complete generation
-     * parent. A heterogeneous domain instead encloses its complete local forward
-     * here; its transaction composer must not add a second set of edges. */
-    [[nodiscard]] bool encloses(const ForwardInput &input) const noexcept;
+     * @return True for prefill/MTP and complete ordinary scalar invocations.
+     * @throws std::invalid_argument for an unknown ownership policy or a parent
+     *         claim outside exact setup-only native ordinary decode.
+     * A resident native generation child explicitly delegates activation edges
+     * to its complete parent. Request-admitted history forwards enclose their
+     * own edges; heterogeneous domains always retain their existing enclosure. */
+    [[nodiscard]] bool encloses(const ForwardInput &input) const;
     /** @brief Enclose one local prefill, condition or verifier DAG in native collectives.
      * @param graph Participant-local model DAG before executor preparation.
      * @param input Exact physical row geometry and local buffer bindings.

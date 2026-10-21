@@ -2,7 +2,7 @@
  * @file Test__ROCmMoEKernelResources.cpp
  * @brief Prevent compiler scratch from returning to small MoE route grouping.
  *
- * The kernel always launches one 256-thread workgroup. An implicit 1024-thread
+ * The kernel launches one 256/512-thread workgroup for its expert domain. An implicit 1024-thread
  * compiler bound previously forced 14 VGPR spills and 64 private bytes per
  * thread. Inspect all four actual loaded specializations. Symbol-enabled HIP
  * compilation may retain a printf ABI frame, so compare with a minimal compiled
@@ -27,6 +27,7 @@ namespace llaminar2::test
             std::size_t diagnostic_frame = 0;
             ASSERT_TRUE(rocmMoEDiagnosticFrameBytes(diagnostic_frame));
             RecordProperty("diagnostic_frame_bytes", static_cast<int>(diagnostic_frame));
+            for (const int experts : {256, 512})
             for (const auto variant : {
                      ROCmRuntimeGroupVariant::RouterRoutes,
                      ROCmRuntimeGroupVariant::AssignedRoutes,
@@ -34,11 +35,11 @@ namespace llaminar2::test
                      ROCmRuntimeGroupVariant::AssignedCompletePlan})
             {
                 SCOPED_TRACE(static_cast<int>(variant));
-                const auto resources = queryROCmRuntimeGroupResources(variant);
+                const auto resources = queryROCmRuntimeGroupResources(variant, experts);
                 ASSERT_TRUE(resources.has_value()) << "HIP resource query failed";
                 EXPECT_EQ(resources->private_bytes_per_thread, diagnostic_frame);
-                EXPECT_EQ(resources->launch_threads, 256);
-                EXPECT_EQ(resources->maximum_threads_per_block, resources->launch_threads);
+                EXPECT_EQ(resources->launch_threads, experts);
+                EXPECT_EQ(resources->maximum_threads_per_block, 512);
                 EXPECT_GT(resources->registers_per_thread, 0);
                 EXPECT_GT(resources->resident_blocks_per_multiprocessor, 0);
                 RecordProperty("registers_" + std::to_string(static_cast<int>(variant)),
@@ -47,7 +48,7 @@ namespace llaminar2::test
                                resources->resident_blocks_per_multiprocessor);
             }
             EXPECT_FALSE(queryROCmRuntimeGroupResources(
-                static_cast<ROCmRuntimeGroupVariant>(-1)).has_value());
+                static_cast<ROCmRuntimeGroupVariant>(-1), 512).has_value());
         });
     }
 }

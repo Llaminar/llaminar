@@ -20,6 +20,7 @@ namespace llaminar2
 {
 class IBackend;
 class IWorkerGPUContext;
+class IRetainedGraphStorageBoundary;
 
 /** @brief Borrowed complete controller geometry and immutable admitted algorithm. */
 struct DeviceGenerationGraphControl
@@ -89,6 +90,7 @@ public:
         const DeviceGenerationGraphControl &control,
         const uint32_t *maintenance_due,
         sampling_math::DeviceGenerationDispatchTicket *tickets,
-        std::string &error);
+        std::string &error,
+        IRetainedGraphStorageBoundary *storage_boundary=nullptr);
 };
 } // namespace llaminar2

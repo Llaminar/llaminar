@@ -92,8 +92,8 @@ namespace llaminar2
 
         bool isEmbeddingTensor(const std::string &name)
         {
-            return name.find("token_embd") != std::string::npos ||
-                   name.find("embed_tokens") != std::string::npos;
+            return name == "token_embd.weight" || name == "embed_tokens.weight" ||
+                   name == "model.embed_tokens.weight";
         }
 
         bool isLMHeadTensor(const std::string &name)
@@ -447,6 +447,9 @@ namespace llaminar2
         // head sharding when it differs from embedding sharding.
         const auto accumulate = [&](const TensorSizeInfo &t, bool count_native)
         {
+            // Native ngram capacity belongs to one CPU row-store owner, never
+            // to each participant's prepared matrix/embedding representation.
+            if (inferWeightRole(t.name) == WeightRole::ImmutableRowTable) return;
             // Filter by PP layer range
             if (t.layer_index >= 0)
             {

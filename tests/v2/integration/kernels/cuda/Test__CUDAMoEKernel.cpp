@@ -68,6 +68,8 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -76,6 +78,16 @@
 #include <vector>
 
 #ifdef HAVE_CUDA
+extern "C" bool cudaMoE_materialize_runtime_floating_descriptor_tables(
+    const void *runtime,
+    llaminar2::DeviceMoEFloatingMatrixDesc *gate_descs,
+    llaminar2::DeviceMoEFloatingMatrixDesc *up_descs,
+    llaminar2::DeviceMoEFloatingMatrixDesc *down_descs,
+    int num_experts,
+    llaminar2::DeviceMoEWeightFormat expected_format,
+    int device_idx,
+    void *stream);
+
 extern "C" bool cudaMoE_query_row_major_grid(
     unsigned int column_blocks,
     int logical_rows,
@@ -1977,6 +1989,13 @@ namespace
     class Test__CUDAMoEKernel : public ::testing::Test
     {
     protected:
+        /**
+         * @brief Verify real packed grouped decode for every retained runtime descriptor.
+         * @tparam num_experts Logical descriptor capacity; only two source packs are allocated.
+         */
+        template <int num_experts>
+        void proveRuntimeDecodeGraphReplayCompleteDescriptors();
+
         void SetUp() override
         {
 #ifndef HAVE_CUDA
@@ -20502,32 +20521,42 @@ TEST_F(Test__CUDAMoEKernel, UploadGroupedDescriptorTablesAcceptValidCudaDescript
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRuntimeBank)
+namespace
 {
-#ifndef HAVE_CUDA
-    GTEST_SKIP() << "CUDA support not compiled";
-#else
+#ifdef HAVE_CUDA
+/**
+ * @brief Prove retained publication covers all logical experts independently of launch width.
+ * @tparam num_experts Admitted logical expert count, including the 256-lane boundary.
+ *
+ * Metadata-only descriptor addresses are never dereferenced. Poisoned output
+ * roots expose omitted writes without launching invalid expert arithmetic.
+ */
+template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain()
+{
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
+    using llaminar2::DeviceMoELayerRuntime;
+    using llaminar2::DeviceNativeVNNIMatrixDesc;
+    using llaminar2::DeviceMoEExpertFlags;
+    using llaminar2::toMoEExpertFlags;
+    using llaminar2::isGraphCaptureActive;
 
-    constexpr int num_experts = 4;
     constexpr int top_k = 2;
     constexpr int d_model = 64;
     constexpr int intermediate = 96;
     constexpr uint32_t active_epoch = 17;
 
-    llaminar2::DeviceMoELayerRuntime host_runtime =
-        makeAllLocalRuntime(num_experts, top_k, active_epoch);
+    DeviceMoELayerRuntime host_runtime = makeAllLocalRuntime(num_experts, top_k, active_epoch);
     host_runtime.active_bank = 1;
     host_runtime.active_epoch = active_epoch;
 
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> expected_gate(num_experts);
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> expected_up(num_experts);
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> expected_down(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> expected_gate(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> expected_up(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> expected_down(num_experts);
 
     for (int expert = 0; expert < num_experts; ++expert)
     {
-        const uintptr_t inactive_base = 0x52000000u + static_cast<uintptr_t>(expert) * 0x10000u;
+        const uintptr_t inactive_base = 0x53000000u + static_cast<uintptr_t>(expert) * 0x10000u;
         host_runtime.banks[0].experts[expert].gate =
             makePrefillRuntimeDesc(inactive_base + 0x1000u, intermediate, d_model, 4);
         host_runtime.banks[0].experts[expert].up =
@@ -20535,103 +20564,145 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRun
         host_runtime.banks[0].experts[expert].down =
             makePrefillRuntimeDesc(inactive_base + 0x3000u, d_model, intermediate, 6);
 
-        const uintptr_t active_base = 0x72000000u + static_cast<uintptr_t>(expert) * 0x10000u;
-        expected_gate[static_cast<size_t>(expert)] =
-            makePrefillRuntimeDesc(active_base + 0x1000u, intermediate, d_model,
-                                   static_cast<uint8_t>(7 + expert));
-        expected_up[static_cast<size_t>(expert)] =
-            makePrefillRuntimeDesc(active_base + 0x2000u, intermediate, d_model,
-                                   static_cast<uint8_t>(11 + expert));
-        expected_down[static_cast<size_t>(expert)] =
-            makePrefillRuntimeDesc(active_base + 0x3000u, d_model, intermediate,
-                                   static_cast<uint8_t>(15 + expert));
+        const uintptr_t active_base = 0x73000000u + static_cast<uintptr_t>(expert) * 0x10000u;
+        expected_gate[static_cast<size_t>(expert)] = makePrefillRuntimeDesc(
+            active_base + 0x1000u, intermediate, d_model, static_cast<uint8_t>(0));
+        expected_up[static_cast<size_t>(expert)] = makePrefillRuntimeDesc(
+            active_base + 0x2000u, intermediate, d_model, static_cast<uint8_t>(0));
+        expected_down[static_cast<size_t>(expert)] = makePrefillRuntimeDesc(
+            active_base + 0x3000u, d_model, intermediate, static_cast<uint8_t>(0));
 
         auto &active_desc = host_runtime.banks[1].experts[expert];
         active_desc.logical_expert_id = expert;
         active_desc.owner_participant = 0;
         active_desc.local_slot = expert;
-        active_desc.flags = llaminar2::toMoEExpertFlags(
-            llaminar2::DeviceMoEExpertFlags::Valid |
-            llaminar2::DeviceMoEExpertFlags::Resident |
-            llaminar2::DeviceMoEExpertFlags::LocalCompute);
+        active_desc.flags =
+            toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
+                             DeviceMoEExpertFlags::LocalCompute);
         active_desc.gate = expected_gate[static_cast<size_t>(expert)];
         active_desc.up = expected_up[static_cast<size_t>(expert)];
         active_desc.down = expected_down[static_cast<size_t>(expert)];
     }
 
-    CudaAllocation device_runtime(sizeof(llaminar2::DeviceMoELayerRuntime));
-    CudaAllocation device_gate(num_experts * sizeof(llaminar2::DeviceNativeVNNIMatrixDesc));
-    CudaAllocation device_up(num_experts * sizeof(llaminar2::DeviceNativeVNNIMatrixDesc));
-    CudaAllocation device_down(num_experts * sizeof(llaminar2::DeviceNativeVNNIMatrixDesc));
-    CudaAllocation device_counts(num_experts * sizeof(int32_t));
-    CudaAllocation device_active(num_experts * sizeof(int32_t));
-    const std::array<int32_t, num_experts> expert_counts = {0, 2, 0, 1};
-    const std::array<int32_t, num_experts> expected_active = {1, 3, -1, -1};
-    host_runtime.expert_counts = static_cast<int32_t *>(device_counts.get());
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
 
-    ASSERT_EQ(cudaMemcpyAsync(device_counts.get(), expert_counts.data(),
-                              sizeof(expert_counts), cudaMemcpyHostToDevice, stream_),
-              cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(device_runtime.get(), &host_runtime, sizeof(host_runtime),
-                              cudaMemcpyHostToDevice, stream_),
-              cudaSuccess);
-    ASSERT_TRUE(cudaMoE_materialize_runtime_prefill_descriptor_tables(
-        device_runtime.get(),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_gate.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_up.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_down.get()),
-        num_experts,
-        0,
-        stream_));
-    ASSERT_TRUE(cudaMoE_materialize_runtime_prefill_plan(
-        device_runtime.get(),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_gate.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_up.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_down.get()),
-        static_cast<int *>(device_active.get()),
-        num_experts,
-        num_experts,
-        0,
-        stream_));
-    EXPECT_FALSE(cudaMoE_materialize_runtime_prefill_plan(
-        device_runtime.get(),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_gate.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_up.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_down.get()),
-        static_cast<int *>(device_active.get()),
-        num_experts,
-        num_experts,
-        0,
-        nullptr));
-    EXPECT_FALSE(cudaMoE_materialize_runtime_prefill_descriptor_tables(
-        device_runtime.get(),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_gate.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_up.get()),
-        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(device_down.get()),
-        num_experts,
-        0,
-        nullptr));
-
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> actual_gate(num_experts);
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> actual_up(num_experts);
-    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> actual_down(num_experts);
+    DeviceMoELayerRuntime *device_runtime = nullptr;
+    DeviceNativeVNNIMatrixDesc *device_gate = nullptr;
+    DeviceNativeVNNIMatrixDesc *device_up = nullptr;
+    DeviceNativeVNNIMatrixDesc *device_down = nullptr;
+    int32_t *device_counts = nullptr;
+    int32_t *device_active = nullptr;
+    std::vector<DeviceNativeVNNIMatrixDesc> actual_gate(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> actual_up(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> actual_down(num_experts);
     std::array<int32_t, num_experts> actual_active{};
-    ASSERT_EQ(cudaMemcpyAsync(actual_gate.data(), device_gate.get(),
-                              actual_gate.size() * sizeof(llaminar2::DeviceNativeVNNIMatrixDesc),
-                              cudaMemcpyDeviceToHost, stream_),
+    std::array<int32_t, num_experts> expert_counts{};
+    std::array<int32_t, num_experts> expected_active{};
+    expected_active.fill(-1);
+    const std::vector<int> chosen =
+        num_experts == 512 ? std::vector<int>{255, 256, 257, 370, 511} : std::vector<int>{1, 3};
+    for (std::size_t i = 0; i < chosen.size(); ++i)
+    {
+        expert_counts[chosen[i]] = static_cast<int>(i) + 1;
+        expected_active[i] = chosen[i];
+    }
+    auto replayCounts = expert_counts;
+    auto replayExpected = expected_active;
+    std::optional<ScopedCudaTestGraph> publicationGraph;
+    /** @brief Fence submissions before graph, borrowed host arrays and native slots retire. */
+    struct Retirement
+    {
+        cudaStream_t stream;
+        std::optional<ScopedCudaTestGraph> &graph;
+        std::array<void **, 6> roots;
+        ~Retirement() noexcept
+        {
+            if (isGraphCaptureActive())
+                graph.reset();
+            if (cudaStreamSynchronize(stream) != cudaSuccess)
+                std::terminate();
+            graph.reset();
+            for (auto **root : roots)
+            {
+                if (*root && cudaFree(*root) != cudaSuccess)
+                    std::terminate();
+            }
+            if (cudaStreamDestroy(stream) != cudaSuccess)
+                std::terminate();
+        }
+    } retirement{
+        stream,
+        publicationGraph,
+        {reinterpret_cast<void **>(&device_runtime), reinterpret_cast<void **>(&device_gate),
+         reinterpret_cast<void **>(&device_up), reinterpret_cast<void **>(&device_down),
+         reinterpret_cast<void **>(&device_counts), reinterpret_cast<void **>(&device_active)}};
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)),
               cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(actual_up.data(), device_up.get(),
-                              actual_up.size() * sizeof(llaminar2::DeviceNativeVNNIMatrixDesc),
-                              cudaMemcpyDeviceToHost, stream_),
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_gate),
+                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
               cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(actual_down.data(), device_down.get(),
-                              actual_down.size() * sizeof(llaminar2::DeviceNativeVNNIMatrixDesc),
-                              cudaMemcpyDeviceToHost, stream_),
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_up),
+                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
               cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(actual_active.data(), device_active.get(),
-                              sizeof(actual_active), cudaMemcpyDeviceToHost, stream_),
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_down),
+                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
               cudaSuccess);
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_counts), num_experts * sizeof(int32_t)),
+              cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_active), num_experts * sizeof(int32_t)),
+              cudaSuccess);
+    host_runtime.expert_counts = device_counts;
+
+    ASSERT_EQ(cudaMemcpyAsync(device_counts, expert_counts.data(), sizeof(expert_counts),
+                             cudaMemcpyHostToDevice, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(device_runtime, &host_runtime, sizeof(host_runtime),
+                             cudaMemcpyHostToDevice, stream),
+              cudaSuccess);
+    publicationGraph.emplace(stream, "complete runtime descriptor publication only");
+    ASSERT_TRUE(cudaMoE_materialize_runtime_prefill_descriptor_tables(
+        device_runtime, device_gate, device_up, device_down, num_experts, 0, stream));
+    ASSERT_TRUE(cudaMoE_materialize_runtime_prefill_plan(device_runtime, device_gate, device_up,
+                                                        device_down, device_active, num_experts,
+                                                        num_experts, 0, stream));
+    ASSERT_TRUE(publicationGraph->finishAndInstantiate());
+    // Poison all admitted slots before replay. The capture must overwrite every
+    // descriptor/list byte; the negative control never launches expert compute.
+    ASSERT_EQ(
+        cudaMemsetAsync(device_gate, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemsetAsync(device_up, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemsetAsync(device_down, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(device_active, 0xa5, num_experts * sizeof(int32_t), stream),
+              cudaSuccess);
+    ASSERT_TRUE(publicationGraph->launch());
+    EXPECT_FALSE(cudaMoE_materialize_runtime_prefill_plan(device_runtime, device_gate, device_up,
+                                                         device_down, device_active, num_experts,
+                                                         num_experts, 0, nullptr));
+    EXPECT_FALSE(cudaMoE_materialize_runtime_prefill_descriptor_tables(
+        device_runtime, device_gate, device_up, device_down, num_experts, 0, nullptr));
+
+    ASSERT_EQ(cudaMemcpyAsync(actual_gate.data(), device_gate,
+                             actual_gate.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(actual_up.data(), device_up,
+                             actual_up.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(actual_down.data(), device_down,
+                             actual_down.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(actual_active.data(), device_active, sizeof(actual_active),
+                             cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
     EXPECT_EQ(actual_active, expected_active);
 
     for (int expert = 0; expert < num_experts; ++expert)
@@ -20644,8 +20715,222 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRun
         expectSameNativeVNNIDesc(actual_down[static_cast<size_t>(expert)],
                                  expected_down[static_cast<size_t>(expert)]);
     }
+
+    for (int phase : {0, 1, 2, 3, 0})
+    {
+        replayCounts.fill(0);
+        replayExpected.fill(-1);
+        if (phase == 0)
+        {
+            replayCounts = expert_counts;
+            replayExpected = expected_active;
+        }
+        else if (phase == 1)
+        {
+            replayCounts.fill(1);
+            std::iota(replayExpected.begin(), replayExpected.end(), 0);
+        }
+        else if (phase == 3)
+        {
+            replayCounts[num_experts - 1] = 1;
+            replayExpected[0] = num_experts - 1;
+        }
+        ASSERT_EQ(cudaMemcpyAsync(device_counts, replayCounts.data(), sizeof(replayCounts),
+                                 cudaMemcpyHostToDevice, stream),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemsetAsync(device_active, 0xa5, sizeof(actual_active), stream), cudaSuccess);
+        ASSERT_TRUE(publicationGraph->launch());
+        ASSERT_EQ(cudaMemcpyAsync(actual_active.data(), device_active, sizeof(actual_active),
+                                 cudaMemcpyDeviceToHost, stream),
+                  cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(actual_active, replayExpected);
+    }
+}
+
+/** @test Preserve the existing four-expert active-bank publication control. */
+
 #endif
 }
+
+TEST_F(Test__CUDAMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRuntimeBank)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    proveRuntimeDescriptorPublicationCompleteDomain<4>();
+#endif
+}
+
+/** @test A retained publisher overwrites all 512 descriptors and the live list. */
+TEST_F(Test__CUDAMoEKernel, RuntimeDescriptorPublication512ExpertsCapturedOverwrite)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    proveRuntimeDescriptorPublicationCompleteDomain<512>();
+#endif
+}
+
+/** @test Admitted descriptor domains cover partial chunks on either side of 256 lanes. */
+TEST_F(Test__CUDAMoEKernel, RuntimeDescriptorPublicationExpertDomainBoundaries)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    proveRuntimeDescriptorPublicationCompleteDomain<255>();
+    proveRuntimeDescriptorPublicationCompleteDomain<256>();
+    proveRuntimeDescriptorPublicationCompleteDomain<257>();
+    proveRuntimeDescriptorPublicationCompleteDomain<511>();
+#endif
+}
+
+/**
+ * @test Every floating descriptor family overwrites its complete512-expert
+ * table under captured placement changes, including all-remote zeroing.
+ * Descriptor payload addresses are metadata witnesses only and never dereferenced.
+ */
+TEST_F(Test__CUDAMoEKernel, RuntimeFloatingDescriptorPublication512ExpertsCapturedOverwrite)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+    using llaminar2::DeviceMoELayerRuntime;
+    using llaminar2::DeviceNativeVNNIMatrixDesc;
+    using llaminar2::DeviceMoEExpertFlags;
+    using llaminar2::DeviceMoEWeightFormat;
+    using llaminar2::DeviceMoEFloatingMatrixDesc;
+    using llaminar2::toMoEExpertFlags;
+    using llaminar2::isGraphCaptureActive;
+
+    constexpr int experts = 512;
+    for (const auto format :
+         {DeviceMoEWeightFormat::FP32, DeviceMoEWeightFormat::FP16, DeviceMoEWeightFormat::BF16})
+    {
+        SCOPED_TRACE(static_cast<int>(format));
+        auto runtime = makeAllLocalRuntime(experts, 1, 19);
+        runtime.active_bank = 1;
+        runtime.participant_count = 1;
+        for (int bank = 0; bank < 2; ++bank)
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                auto &d = runtime.banks[bank].experts[expert];
+                d.logical_expert_id = expert;
+                d.owner_participant = 0;
+                d.local_slot = expert;
+                d.flags =
+                    toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
+                                     DeviceMoEExpertFlags::LocalCompute);
+                d.weight_format = format;
+                const auto address = std::uintptr_t{0x43000000} +
+                                     static_cast<std::uintptr_t>(bank) * 0x1000000 +
+                                     static_cast<std::uintptr_t>(expert) * 0x1000;
+                d.floating_gate = {reinterpret_cast<const void *>(address + 0x100), 96, 64};
+                d.floating_up = {reinterpret_cast<const void *>(address + 0x200), 96, 64};
+                d.floating_down = {reinterpret_cast<const void *>(address + 0x300), 64, 96};
+            }
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+        DeviceMoELayerRuntime *nativeRuntime = nullptr;
+        DeviceMoEFloatingMatrixDesc *gate = nullptr, *up = nullptr, *down = nullptr;
+        std::array<std::vector<DeviceMoEFloatingMatrixDesc>, 3> actual;
+        for (auto &v : actual)
+            v.resize(experts);
+        std::optional<ScopedCudaTestGraph> graph;
+        /** @brief Fence exact submission before graph, host backing and native table retirement. */
+        struct Retirement
+        {
+            cudaStream_t stream;
+            std::optional<ScopedCudaTestGraph> &graph;
+            std::array<void **, 4> roots;
+            ~Retirement() noexcept
+            {
+                if (isGraphCaptureActive())
+                    graph.reset();
+                if (cudaStreamSynchronize(stream) != cudaSuccess)
+                    std::terminate();
+                graph.reset();
+                for (auto **p : roots)
+                {
+                    if (*p && cudaFree(*p) != cudaSuccess)
+                        std::terminate();
+                }
+                if (cudaStreamDestroy(stream) != cudaSuccess)
+                    std::terminate();
+            }
+        } retirement{stream,
+                     graph,
+                     {reinterpret_cast<void **>(&nativeRuntime), reinterpret_cast<void **>(&gate),
+                      reinterpret_cast<void **>(&up), reinterpret_cast<void **>(&down)}};
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&nativeRuntime), sizeof(runtime)),
+                  cudaSuccess);
+        for (auto **p : {&gate, &up, &down})
+        {
+            ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(p),
+                                experts * sizeof(DeviceMoEFloatingMatrixDesc)),
+                      cudaSuccess);
+        }
+        graph.emplace(stream, "floating complete-domain descriptor publication only");
+        ASSERT_TRUE(cudaMoE_materialize_runtime_floating_descriptor_tables(
+            nativeRuntime, gate, up, down, experts, format, 0, stream));
+        ASSERT_TRUE(graph->finishAndInstantiate());
+        for (int phase = 0; phase < 4; ++phase)
+        {
+            SCOPED_TRACE(phase);
+            runtime.active_bank = phase % 2;
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                const bool ready =
+                    phase == 0 || phase == 3 ||
+                    (phase == 1 && (expert == 255 || expert == 256 || expert == 257 ||
+                                    expert == 370 || expert == 511));
+                runtime.banks[runtime.active_bank].local_compute_mask[expert] = ready ? 1u : 0u;
+                runtime.banks[runtime.active_bank].resident_participant_mask[expert] =
+                    ready ? 1u : 0u;
+            }
+            ASSERT_EQ(cudaMemcpyAsync(nativeRuntime, &runtime, sizeof(runtime),
+                                     cudaMemcpyHostToDevice, stream),
+                      cudaSuccess);
+            for (auto *p : {gate, up, down})
+            {
+                ASSERT_EQ(
+                    cudaMemsetAsync(p, 0xa5, experts * sizeof(DeviceMoEFloatingMatrixDesc), stream),
+                    cudaSuccess);
+            }
+            ASSERT_TRUE(graph->launch());
+            const std::array<const DeviceMoEFloatingMatrixDesc *, 3> roots{gate, up, down};
+            for (std::size_t role = 0; role < roots.size(); ++role)
+            {
+                ASSERT_EQ(cudaMemcpyAsync(actual[role].data(), roots[role],
+                                         experts * sizeof(DeviceMoEFloatingMatrixDesc),
+                                         cudaMemcpyDeviceToHost, stream),
+                          cudaSuccess);
+            }
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                SCOPED_TRACE(expert);
+                const auto &bank = runtime.banks[runtime.active_bank];
+                const auto &d = bank.experts[expert];
+                const bool ready = bank.local_compute_mask[expert] != 0;
+                const std::array<DeviceMoEFloatingMatrixDesc, 3> expected{
+                    ready ? d.floating_gate : DeviceMoEFloatingMatrixDesc{},
+                    ready ? d.floating_up : DeviceMoEFloatingMatrixDesc{},
+                    ready ? d.floating_down : DeviceMoEFloatingMatrixDesc{}};
+                for (std::size_t role = 0; role < 3; ++role)
+                {
+                    EXPECT_EQ(actual[role][expert].data, expected[role].data);
+                    EXPECT_EQ(actual[role][expert].n, expected[role].n);
+                    EXPECT_EQ(actual[role][expert].k, expected[role].k);
+                }
+            }
+        }
+    }
+#endif
+}
+
 
 TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveExpertGrid)
 {
@@ -22164,7 +22449,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpe
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutTableRefresh)
+template <int num_experts>
+void Test__CUDAMoEKernel::proveRuntimeDecodeGraphReplayCompleteDescriptors()
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -22172,7 +22458,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
 
-    constexpr int num_experts = 2;
+    constexpr int physical_weights = 2;
     constexpr int top_k = 1;
     constexpr int d_model = 512;
     constexpr int intermediate = 256;
@@ -22180,8 +22466,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
 
     std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
     std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
-    owned_weights.reserve(static_cast<size_t>(num_experts * 3));
-    prepared_weights.reserve(static_cast<size_t>(num_experts * 3));
+    owned_weights.reserve(static_cast<size_t>(physical_weights * 3));
+    prepared_weights.reserve(static_cast<size_t>(physical_weights * 3));
 
     auto add_prepared_desc = [&](int rows, int cols, int seed, const char *role)
     {
@@ -22219,12 +22505,30 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
         add_prepared_desc(d_model, intermediate, 6301, "down"),
     };
 
-    const std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> stale_gate_descs = {
-        gate_descs[0], gate_descs[0]};
-    const std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> stale_up_descs = {
-        up_descs[0], up_descs[0]};
-    const std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> stale_down_descs = {
-        down_descs[0], down_descs[0]};
+    for (int expert = 2; expert < num_experts; ++expert)
+    {
+        gate_descs[expert] = gate_descs[1];
+        up_descs[expert] = up_descs[1];
+        down_descs[expert] = down_descs[1];
+    }
+    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> stale_gate_descs{};
+    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> stale_up_descs{};
+    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> stale_down_descs{};
+    stale_gate_descs.fill(gate_descs[0]);
+    stale_up_descs.fill(up_descs[0]);
+    stale_down_descs.fill(down_descs[0]);
+
+    // The logical table owns 512 descriptor slots but only two distinguishable
+    // physical source packs. Admit the exact real grouped-decode workspace.
+    auto *consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(cuda_kernel_);
+    ASSERT_NE(consumer, nullptr);
+    const auto requirements = llaminar2::MoEWorkspaceBuffers::cudaMoE(
+        1, d_model, intermediate, num_experts, top_k);
+    consumer->unbindWorkspace();
+    workspace_ = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+        device, requirements.total_bytes_with_alignment());
+    ASSERT_TRUE(workspace_->allocate(requirements));
+    consumer->bindWorkspace(workspace_.get());
 
     const int stale_gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
         stale_gate_descs.data(), stale_up_descs.data(), num_experts, d_model, intermediate);
@@ -22329,50 +22633,110 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
     const auto runtime_stale = make_runtime(gate_descs[0], up_descs[0], down_descs[0]);
     const auto runtime_fresh = make_runtime(gate_descs[1], up_descs[1], down_descs[1]);
 
-    llaminar2::DeviceMoELayerRuntime *device_runtime = nullptr;
-    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(llaminar2::DeviceMoELayerRuntime)),
-              cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(device_runtime, &runtime_stale, sizeof(runtime_stale),
-                              cudaMemcpyHostToDevice, stream_),
-              cudaSuccess);
-
+    auto replay_runtime = runtime_fresh;
+    std::vector<float> runtime_values(static_cast<size_t>(d_model));
+    CudaAllocation runtime_owner(sizeof(llaminar2::DeviceMoELayerRuntime));
+    auto *device_runtime = static_cast<llaminar2::DeviceMoELayerRuntime *>(runtime_owner.get());
     auto runtime_output = makeZeros({d_model});
-    llaminar2::TransferEngine::prepareDeviceOutput(
-        runtime_output.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(runtime_output.get(), device, stream_);
+    int stage_identity = 0;
+    std::optional<llaminar2::GraphCaptureDependencyLedger> ledger;
+    std::optional<ScopedCudaTestGraph> graph;
+    /** @brief Drain submitted work before original weights, host values and graph roots retire. */
+    struct ReplayRetirement
+    {
+        cudaStream_t stream;
+        std::optional<ScopedCudaTestGraph> &graph;
+        ~ReplayRetirement() noexcept
+        {
+            if (llaminar2::isGraphCaptureActive())
+                graph.reset();
+            if (cudaStreamSynchronize(stream) != cudaSuccess)
+                std::terminate();
+            graph.reset();
+        }
+    } retirement{stream_, graph};
+    ASSERT_EQ(cudaMemcpyAsync(device_runtime, &runtime_stale, sizeof(runtime_stale),
+                              cudaMemcpyHostToDevice, stream_), cudaSuccess);
     ASSERT_TRUE(cuda_kernel_->groupedExpertDecodeFromRuntime(
         device_runtime, hidden.get(), stale_gateup_table, stale_down_table, top_k,
         runtime_output.get(), d_model, intermediate,
         llaminar2::MoEDecodeDescriptorSource::RuntimePlacementTable));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    ScopedCudaTestGraph graph(
-        stream_,
-        "runtime descriptor-table replay capture");
-    const bool captured = cuda_kernel_->groupedExpertDecodeFromRuntime(
-        device_runtime, hidden.get(), stale_gateup_table, stale_down_table, top_k,
-        runtime_output.get(), d_model, intermediate,
-        llaminar2::MoEDecodeDescriptorSource::RuntimePlacementTable);
-    EXPECT_TRUE(captured);
-    ASSERT_TRUE(graph.finishAndInstantiate());
-    ASSERT_EQ(cudaMemcpyAsync(device_runtime, &runtime_fresh, sizeof(runtime_fresh),
-                              cudaMemcpyHostToDevice, stream_),
-              cudaSuccess);
-    ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_output.get()}));
+    ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(hidden.get(), device, stream_));
+    std::vector<llaminar2::GraphCaptureDependencyLedger::StagePlan> capture_stages = {{
+        .stage_identity = &stage_identity,
+        .stage_name = "runtime_descriptor_grouped_decode",
+        .external_inputs = {hidden->transferStorageOwner()},
+        .outputs = {runtime_output->transferStorageOwner()},
+    }};
+    ledger.emplace(
+        device, stream_, std::move(capture_stages), "cuda_runtime_descriptor_grouped_decode");
+    graph.emplace(stream_, "runtime descriptor-table replay capture", 0, &*ledger);
+    bool captured = false;
+    {
+        llaminar2::ScopedGraphCaptureStage stage_scope(&stage_identity);
+        captured = cuda_kernel_->groupedExpertDecodeFromRuntime(
+            device_runtime, hidden.get(), stale_gateup_table, stale_down_table, top_k,
+            runtime_output.get(), d_model, intermediate,
+            llaminar2::MoEDecodeDescriptorSource::RuntimePlacementTable);
+        stage_scope.complete();
+    }
+    ASSERT_TRUE(captured);
+    ASSERT_TRUE(graph->finishAndInstantiate());
+
+    const std::vector<int> selected = num_experts == 512
+        ? std::vector<int>{255, 256, 257, 370, 511, 256, 255} : std::vector<int>{1};
+    for (const int expert : selected)
+    {
+        SCOPED_TRACE(expert);
+        replay_runtime = runtime_fresh;
+        replay_runtime.topk_expert_ids[0] = expert;
+        ASSERT_EQ(cudaMemcpyAsync(device_runtime, &replay_runtime, sizeof(replay_runtime),
+                                  cudaMemcpyHostToDevice, stream_), cudaSuccess);
+        // The retained graph must overwrite the already admitted table banks;
+        // immutable upload tables deliberately point at the wrong source pack.
+        for (const char *name : {
+                 llaminar2::MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                 llaminar2::MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                 llaminar2::MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE})
+        {
+            auto *pointer = workspace_->getBuffer(name);
+            ASSERT_NE(pointer, nullptr);
+            ASSERT_EQ(cudaMemsetAsync(pointer, 0xa5, workspace_->getBufferSize(name), stream_),
+                      cudaSuccess);
+        }
+        ASSERT_TRUE(graph->launchAndPublishOutputs({runtime_output.get()}));
+        ASSERT_EQ(cudaMemcpyAsync(runtime_values.data(), runtime_output->gpu_data_ptr(),
+                                  runtime_values.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        expectVectorsClose(runtime_values, fresh_values,
+                           0.9999, 0.006, /*row_width=*/d_model,
+                           /*min_row_cosine=*/0.9998,
+                           /*max_row_relative_l2=*/0.008,
+                           /*max_row_kl=*/1.0e-4);
+        EXPECT_GT(relativeL2Error(runtime_values.data(), stale_values.data(), runtime_values.size()), 0.01)
+            << "graph replay followed the stale descriptor table instead of device runtime descriptors";
+    }
+    // Retire capture while its dependency ledger is still alive. The guard also
+    // handles an assertion or exception before this explicit successful close.
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-
-    const std::vector<float> runtime_values(
-        runtime_output->data(),
-        runtime_output->data() + runtime_output->numel());
-    expectVectorsClose(runtime_values, fresh_values,
-                       0.9999, 0.006, /*row_width=*/d_model,
-                       /*min_row_cosine=*/0.9998,
-                       /*max_row_relative_l2=*/0.008,
-                       /*max_row_kl=*/1.0e-4);
-    EXPECT_GT(relativeL2Error(runtime_values.data(), stale_values.data(), runtime_values.size()), 0.01)
-        << "graph replay followed the stale descriptor table instead of device runtime descriptors";
-
-    ASSERT_EQ(cudaFree(device_runtime), cudaSuccess);
+    graph.reset();
 #endif
+}
+
+
+TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutTableRefresh)
+{
+    proveRuntimeDecodeGraphReplayCompleteDescriptors<2>();
+}
+
+/** @test Upper-half logical experts execute through a retained production decode graph. */
+TEST_F(Test__CUDAMoEKernel, RuntimeDecode512ExpertsCapturedUpperHalfDescriptors)
+{
+    proveRuntimeDecodeGraphReplayCompleteDescriptors<512>();
 }
 
 TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture)
@@ -27420,6 +27784,128 @@ TEST_F(Test__CUDAMoEKernel, FP16RouterOperandsSerialGroupedAndLiveCaptured)
                 }
             }
         }
+    }
+#endif
+}
+
+/**
+ * @brief Captured controller must rank expert511 with256 physical workers.
+ *
+ * Replay high-half, low-half, empty and high-half histories through one graph.
+ * Every setup publishes independent input state; no expected plan is repaired
+ * by the host. Dirty plan bytes outside the authenticated command prefix must
+ * survive, proving expert capacity does not become a live command extent.
+ */
+TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCaptured512ExpertHighHalfAndDirtyReplay)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    using namespace llaminar2;
+    if (!hasCudaDevice()) GTEST_SKIP() << "No CUDA device available";
+    constexpr uint32_t experts = moe_runtime_abi::kMaxExperts;
+    constexpr uint32_t planCapacity = 8u;
+    static_assert(experts > 256u);
+    DeviceMoERuntimeTable::Config tableConfig;
+    tableConfig.device_id = DeviceId::cuda(0);
+    tableConfig.num_layers = 1;
+    tableConfig.num_experts = experts;
+    tableConfig.top_k = 2;
+    tableConfig.mirror_to_device = true;
+    DeviceMoERuntimeTable runtimeTable(tableConfig);
+    auto update = makeParticipantOneBaseUpdate(1);
+    const auto prototype = update.experts[0];
+    update.expert_count = experts;
+    update.experts.assign(experts, prototype);
+    update.local_compute_mask.assign(experts, 0u);
+    update.replica_role.assign(experts, static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+    update.resident_participant_mask.assign(experts, 0b001u);
+    for (uint32_t expert = 0; expert < experts; ++expert)
+        update.experts[expert].logical_expert_id = expert;
+    ASSERT_TRUE(runtimeTable.prepareInactiveBank(0, update));
+    ASSERT_TRUE(runtimeTable.flipActiveBank(0, update.epoch, stream_));
+    DeviceMoELayerRuntime prior{};
+    ASSERT_EQ(cudaMemcpyAsync(&prior, runtimeTable.deviceLayerState(0), sizeof(prior),
+                              cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = experts;
+    config.top_k = 2;
+    config.participant_id = 1;
+    config.participant_count = 3;
+    config.window_size_tokens = 1;
+    config.max_hot_replicas_per_participant = 1;
+    config.flags = static_cast<uint32_t>(DeviceMoERebalanceFlags::HotReplicaCache) |
+                   static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals) |
+                   static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+    const auto control = makeControllerDueOnNextBoundary(config);
+    std::vector<uint64_t> gathered(config.participant_count * experts, 0u);
+    CudaAllocation histStorage(gathered.size() * sizeof(uint64_t));
+    CudaAllocation statusStorage(sizeof(DeviceMoERebalanceStatus));
+    CudaAllocation planStorage(planCapacity * sizeof(DeviceMoERebalancePlanEntry));
+    CudaAllocation countStorage(sizeof(uint32_t));
+    CudaAllocation headerStorage(sizeof(DeviceMoERebalanceCommandBufferHeader));
+    CudaAllocation waveStorage(sizeof(DeviceMoERebalanceWaveState));
+    CudaAllocation controlStorage(sizeof(control));
+    auto *hist = static_cast<uint64_t *>(histStorage.get());
+    auto *status = static_cast<DeviceMoERebalanceStatus *>(statusStorage.get());
+    auto *plan = static_cast<DeviceMoERebalancePlanEntry *>(planStorage.get());
+    auto *count = static_cast<uint32_t *>(countStorage.get());
+    auto *header = static_cast<DeviceMoERebalanceCommandBufferHeader *>(headerStorage.get());
+    auto *wave = static_cast<DeviceMoERebalanceWaveState *>(waveStorage.get());
+    auto *deviceControl = static_cast<DeviceMoERebalanceGraphControllerState *>(controlStorage.get());
+    ScopedCudaTestGraph graph(stream_, "512-expert controller high-half replay");
+    ASSERT_TRUE(cuda_kernel_->runDeviceRebalanceController(
+        launchContext(), runtimeTable.deviceLayerState(0), hist, status, config,
+        plan, count, planCapacity, 1u, header, wave, deviceControl));
+    ASSERT_TRUE(graph.finishAndInstantiate());
+
+    for (const int winner : {static_cast<int>(experts - 1u), 0, -1,
+                             static_cast<int>(experts - 1u)})
+    {
+        SCOPED_TRACE(winner);
+        std::fill(gathered.begin(), gathered.end(), 0u);
+        if (winner >= 0) gathered[winner] = 8u;
+        ASSERT_EQ(cudaMemcpyAsync(runtimeTable.deviceLayerState(0), &prior, sizeof(prior),
+                                  cudaMemcpyHostToDevice, stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(hist, gathered.data(), gathered.size() * sizeof(uint64_t),
+                                  cudaMemcpyHostToDevice, stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(deviceControl, &control, sizeof(control),
+                                  cudaMemcpyHostToDevice, stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemsetAsync(plan, 0xa5, planCapacity * sizeof(*plan), stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemsetAsync(status, 0xa5, sizeof(*status), stream_), cudaSuccess);
+        ASSERT_TRUE(graph.launch());
+        uint32_t live = UINT32_MAX;
+        DeviceMoERebalanceCommandBufferHeader observedHeader;
+        DeviceMoERebalanceStatus observedStatus;
+        std::array<DeviceMoERebalancePlanEntry, planCapacity> observedPlan;
+        ASSERT_EQ(cudaMemcpyAsync(&live, count, sizeof(live), cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(&observedHeader, header, sizeof(observedHeader), cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(&observedStatus, status, sizeof(observedStatus), cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(observedPlan.data(), plan, sizeof(observedPlan), cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        const uint32_t expected = winner >= 0 ? 1u : 0u;
+        ASSERT_EQ(live, expected);
+        EXPECT_EQ(observedHeader.command_count, expected);
+        EXPECT_EQ(observedHeader.command_capacity, planCapacity);
+        EXPECT_EQ(observedStatus.planned_arrivals, expected);
+        EXPECT_EQ(observedStatus.payload_bucket_requested_slots, expected);
+        EXPECT_EQ(observedStatus.payload_source_participant_mask, expected ? 0b001u : 0u);
+        EXPECT_EQ(observedStatus.payload_destination_participant_mask, expected ? 0b010u : 0u);
+        if (expected)
+        {
+            EXPECT_EQ(observedPlan[0].expert, static_cast<uint32_t>(winner));
+            EXPECT_EQ(observedPlan[0].op, static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival));
+            EXPECT_EQ(observedPlan[0].source_participant, 0u);
+            EXPECT_EQ(observedPlan[0].destination_participant, 1u);
+            EXPECT_EQ(observedPlan[0].destination_slot, 0u);
+            EXPECT_EQ(observedPlan[0].payload_slot, 0u);
+        }
+        const auto *bytes = reinterpret_cast<const uint8_t *>(observedPlan.data());
+        for (size_t i = expected * sizeof(*plan); i < sizeof(observedPlan); ++i)
+            ASSERT_EQ(bytes[i], 0xa5u) << "inactive command byte=" << i;
     }
 #endif
 }

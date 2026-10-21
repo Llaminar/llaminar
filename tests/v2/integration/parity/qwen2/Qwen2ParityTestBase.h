@@ -103,11 +103,6 @@ namespace llaminar2::test::parity::qwen2
 #endif
     }
 
-    inline bool isPcieBarAvailable()
-    {
-        return getCudaDeviceCount() > 0 && getRocmDeviceCount() > 0;
-    }
-
     // =============================================================================
     // Qwen2-Specific Hardware Availability Check (extends base check)
     // =============================================================================
@@ -133,28 +128,8 @@ namespace llaminar2::test::parity::qwen2
         if (cfg.is_local_pp() && cfg.is_hybrid_pp_tp())
             effective_collective = cfg.tp_collective;
 
-        switch (effective_collective)
-        {
-        case Collective::NCCL:
-            if (!isNcclAvailable())
-                return "NCCL not available";
-            break;
-        case Collective::RCCL:
-            if (!isRcclAvailable())
-                return "RCCL not available";
-            break;
-        case Collective::HETEROGENEOUS:
-            if (!isPcieBarAvailable())
-                return "HETEROGENEOUS requires both CUDA and ROCm devices";
-            break;
-        case Collective::MPI:
-        case Collective::HOST:
-        case Collective::None:
-            // These are always available
-            break;
-        }
-
-        return std::nullopt;
+        return parityCollectiveCapabilityFailure(
+            effective_collective, isNcclAvailable(), isRcclAvailable());
     }
 
     // =============================================================================
@@ -805,6 +780,7 @@ namespace llaminar2::test::parity::qwen2
             config_.early_layers_count = thresholds.early_layers_count;
             config_.min_early_layers_passed = thresholds.min_early_layers_passed;
             config_.kl_threshold = thresholds.kl_threshold;
+            config_.final_logit_mean_kl = thresholds.final_logit_mean_kl;
             config_.prefill_kl_threshold = thresholds.prefill_kl_threshold;
             config_.mtp_kl_threshold = thresholds.mtp_kl_threshold;
             config_.excluded_stages = thresholds.excluded_stages;
@@ -910,7 +886,7 @@ namespace llaminar2::test::parity::qwen2
              * prepared payloads the bounded context must own.
              */
             std::ostringstream key;
-            key << config_.model_path
+            key << config_.model_path << parityPredictorIdentity(config_.shared_predictor)
                 << "|strategy=" << static_cast<int>(strategy)
                 << "|parallelism=" << static_cast<int>(cfg().parallelism)
                 << "|collective=" << static_cast<int>(cfg().collective)
@@ -932,6 +908,25 @@ namespace llaminar2::test::parity::qwen2
             key << "|pp_weights=";
             for (const float weight : cfg().pp_weights)
                 key << std::setprecision(9) << weight << ',';
+            if constexpr (requires(const Derived &fixture)
+                          { fixture.modelParityCase().ngram_table_policy; })
+            {
+                // Native tables are model-owned physical storage. Changing an
+                // admitted RAM/mmap policy must retire the previous authority,
+                // even when ordinary prepared weights and topology are equal.
+                const auto &policy = static_cast<const Derived *>(this)
+                                         ->modelParityCase().ngram_table_policy;
+                if (policy)
+                    key << "|ngram_storage=" << static_cast<int>(policy->storage)
+                        << "|ngram_window_bytes=" << policy->window_bytes
+                        << "|ngram_window_count=" << policy->window_count;
+                if(policy && policy->isHostAdaptive())
+                {
+                    const auto &a=policy->host_adaptive;
+                    key << "|ngram_adaptive=" << a.maximum_cache_rows << ',' << a.cache_physical_byte_limit << ','
+                        << a.policy.aging_accesses << ',' << a.policy.protected_numerator << ',' << a.policy.protected_denominator;
+                }
+            }
             if (cfg().moe_routed_expert_plan)
             {
                 const auto &plan = *cfg().moe_routed_expert_plan;
@@ -1044,6 +1039,7 @@ namespace llaminar2::test::parity::qwen2
             // Per-test overrides (from TestConfig)
             if (!cfg().model_path.empty())
                 config_.model_path = cfg().model_path;
+            config_.shared_predictor = cfg().shared_predictor;
             if (!cfg().snapshot_dir.empty())
                 config_.snapshot_dir = cfg().snapshot_dir;
             if (!cfg().prompt.empty())
@@ -1428,16 +1424,22 @@ namespace llaminar2::test::parity::qwen2
             }
         }
 
-        /** @brief Install deterministic greedy sampling on the active production runner. */
-        void installProductionParitySampling()
+        /** @return The single canonical deterministic greedy law used by numerical and public-generation proofs. */
+        static SamplingParams productionParitySamplingParams()
         {
-            ASSERT_NE(orch_runner_.get(), nullptr);
             SamplingParams greedy;
             greedy.temperature = 0.0f;
             greedy.top_k = 1;
             greedy.top_p = 1.0f;
             greedy.seed = 1;
-            orch_runner_->setSamplingParams(greedy);
+            return greedy;
+        }
+
+        /** @brief Install deterministic greedy sampling on the active production runner. */
+        void installProductionParitySampling()
+        {
+            ASSERT_NE(orch_runner_.get(), nullptr);
+            orch_runner_->setSamplingParams(productionParitySamplingParams());
         }
 
         /**

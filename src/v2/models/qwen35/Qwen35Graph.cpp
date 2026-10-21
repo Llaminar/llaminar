@@ -12,16 +12,19 @@
 #include "Qwen35Graph.h"
 #include "../../config/GDNHeadAssignment.h"
 #include "Qwen35Schema.h"
+#include "../qwen4exp/Qwen4ExpProjectionWorkspace.h"
 #include "../../collective/ILocalTPContext.h"
 #include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/local_execution/graph/GraphBuildUtils.h"
 #include "../../kernels/HybridKVCacheConfig.h"
 #include "../../kernels/IHybridKVCache.h"
 #include "../../kernels/KernelFactory.h"
+#include "../../loaders/PreparedWeightStore.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/Assertions.h"
 #include "../../utils/Logger.h"
 
+#include "../qwen4exp/Qwen4ExpConfig.h"
 #include <algorithm>
 #include <iterator>
 #include <limits>
@@ -321,6 +324,12 @@ namespace llaminar2
         const MTPForwardInput &input,
         MTPForwardOutput &output)
     {
+        return buildMTPGraph(depth_idx, toLegacyMTPDepthWeights(mtpBindingsForPolicy(depth_idx, bindings)), input, output);
+    }
+
+    const MTPDepthWeightBindings &Qwen35Graph::mtpBindingsForPolicy(
+        int depth_idx, const MTPDepthWeightBindings &bindings) const
+    {
         const MTPDepthWeightBindings *effective_bindings = &bindings;
         if (config_.mtpUsesReplicatedDenseSidecarBinding())
         {
@@ -369,11 +378,7 @@ namespace llaminar2
             effective_bindings = &*match;
         }
 
-        return buildMTPGraph(
-            depth_idx,
-            toLegacyMTPDepthWeights(*effective_bindings),
-            input,
-            output);
+        return *effective_bindings;
     }
 
     ComputeGraph Qwen35Graph::buildMTPGraph(
@@ -692,20 +697,14 @@ namespace llaminar2
         {
             const std::string sidecar_stage_prefix =
                 "MTP" + std::to_string(depth_idx) + "_";
-            ComputeGraph kv_append = buildMTPFAKVCacheAppendGraph(
-                weights.fa_block,
-                mtp_buffers,
-                /*layer_idx=*/0,
-                input.seq_len,
-                input.batch_size,
-                input.kv_cache,
-                input.position_ids,
-                input.position_ids_device,
-                input.sequence_lengths_device,
-                device,
-                sidecar_stage_prefix,
-                /*layer_idx_is_cache_local=*/true,
-                input.first_sequence_index);
+            const int inline_source=weights.source_layer_index>=0
+                ? weights.source_layer_index : std::max(0,config_.n_layers-1);
+            const auto inline_identity=FullAttentionLayerIdentity::inlinePredictor(
+                LayerGraphSourceIdentity::inlinePredictor(inline_source,depth_idx));
+            ComputeGraph kv_append=buildMTPFAKVCacheAppendGraphForLayer(
+                weights.fa_block,mtp_buffers,inline_identity,input.seq_len,input.batch_size,
+                input.kv_cache,input.position_ids,input.position_ids_device,input.sequence_lengths_device,
+                device,sidecar_stage_prefix,input.first_sequence_index,nullptr);
             if (kv_append.size() == 0)
                 return ComputeGraph{};
 
@@ -717,20 +716,15 @@ namespace llaminar2
 
         const std::string sidecar_stage_prefix =
             "MTP" + std::to_string(depth_idx) + "_";
-        ComputeGraph attention = buildFAAttentionGraph(
-            weights.fa_block,
-            mtp_buffers,
-            /*layer_idx=*/0,
-            input.seq_len,
-            input.batch_size,
-            input.kv_cache,
-            input.position_ids,
-            input.position_ids_device,
-            device,
-            input.sequence_lengths,
-            /*sequence_lengths_device=*/nullptr,
-            sidecar_stage_prefix,
-            /*layer_idx_is_cache_local=*/true);
+        const int inline_source = weights.source_layer_index >= 0
+            ? weights.source_layer_index : std::max(0, config_.n_layers - 1);
+        const auto inline_attention = FullAttentionLayerIdentity::inlinePredictor(
+            LayerGraphSourceIdentity::inlinePredictor(inline_source, depth_idx));
+        ComputeGraph attention = buildFAAttentionGraphForLayer(
+            weights.fa_block, mtp_buffers, inline_attention, input.seq_len, input.batch_size,
+            input.kv_cache, input.position_ids, input.position_ids_device, device,
+            input.sequence_lengths, /*sequence_lengths_device=*/nullptr,
+            sidecar_stage_prefix, /*predictor=*/nullptr);
         if (attention.size() == 0)
             return ComputeGraph{};
 
@@ -913,6 +907,167 @@ namespace llaminar2
         return {};
     }
 
+    std::optional<DeviceRowRange> Qwen35Graph::gdnQKVProjectionRows(
+        TensorBase *weight, const WeightBinding *binding, int source_layer, int seq_len,
+        int batch_size, DeviceId device, const int32_t *lengths) const
+    {
+        if (!config_.flash_next || config_.qfn_gdn_qkv_activation == QuantizedActivationOperandPrecision::SingleQ8)
+            return std::nullopt;
+        const auto precision = Qwen4ExpProjectionWorkspace::gdnQKVPrecision(
+            config_.qfn_gdn_qkv_activation, true, binding ? binding->identity.role : WeightRole::Other,
+            binding ? binding->identity.canonical_name : std::string_view{}, config_.flash_next.get());
+        if (precision != QuantizedActivationOperandPrecision::TwoTermQ8 || !binding || !binding->immutable ||
+            !weight || binding->tensor != weight || weight->native_type() != TensorType::Q8_0 ||
+            binding->identity.layer != source_layer ||
+            binding->identity.canonical_name != "blk." + std::to_string(source_layer) + ".attn_qkv.weight" ||
+            binding->floating_operand_precision != FloatingActivationOperandPrecision::Native)
+            throw std::invalid_argument("QFN GDN-QKV TwoTermQ8 requires its immutable original main GDN native Q8_0 binding");
+        Qwen4ExpProjectionWorkspace::validateGDNQKVInvocation(precision, true, binding->identity.role,
+            binding->identity.canonical_name, config_.flash_next.get(), batch_size, binding->slice);
+        if (weight->shape().size() != 2 || weight->shape()[0] != binding->slice.source_rows ||
+            weight->shape()[1] != binding->slice.source_cols)
+            throw std::invalid_argument("QFN GDN-QKV TwoTermQ8 must retain the whole original mixed-QKV matrix");
+        const auto prepared = preparedRefForGraphWeight(binding, device);
+        const auto stored = prepared_weight_store_ && prepared
+            ? prepared_weight_store_->binding(*prepared) : std::nullopt;
+        if (!stored || !stored->immutable || stored->tensor != weight || stored->binding_id != binding->binding_id ||
+            !(stored->identity == binding->identity) || stored->identity.canonical_name != binding->identity.canonical_name ||
+            stored->identity.role != WeightRole::FusedQKV || stored->identity.layer != source_layer ||
+            stored->floating_operand_precision != FloatingActivationOperandPrecision::Native)
+            throw std::invalid_argument("QFN GDN-QKV TwoTermQ8 requires its exact prepared source/store/device binding");
+        const auto &saved = stored->slice;
+        const bool whole_record = !saved.source_rows && !saved.source_cols && !saved.row_start && !saved.row_count &&
+            !saved.col_start && !saved.col_count && !saved.expert_start && !saved.expert_count &&
+            saved.expert_ids.empty() && !saved.inner_is_presliced;
+        if (!whole_record)
+            Qwen4ExpProjectionWorkspace::validateGDNQKVInvocation(precision, true, stored->identity.role,
+                stored->identity.canonical_name, config_.flash_next.get(), batch_size, saved);
+        if (device.is_gpu() && modelForwardInput().sequence_lengths_device != lengths)
+            throw std::invalid_argument("QFN GDN-QKV formal count differs from the original forward query owner");
+        const auto rows = singleRequestProjectionQueryRows(seq_len, device);
+        const auto common = projectionVerifierRows(device, seq_len, batch_size, lengths);
+        if (common && common->captureIdentity() != rows.captureIdentity())
+            throw std::invalid_argument("QFN GDN-QKV query rows disagree with the common original verifier authority");
+        return rows;
+    }
+
+    std::optional<DeviceRowRange> Qwen35Graph::gdnOutputProjectionRows(
+        TensorBase *weight, const WeightBinding *binding, int seq_len, int batch_size,
+        DeviceId device, const int32_t *lengths) const
+    {
+        const auto baseline = projectionVerifierRows(device, seq_len, batch_size, lengths);
+        if (!config_.flash_next ||
+            config_.qfn_gdn_output_activation == QuantizedActivationOperandPrecision::SingleQ8)
+            return baseline;
+        const auto precision = Qwen4ExpProjectionWorkspace::gdnOutputPrecision(
+            config_.qfn_gdn_output_activation, true,
+            binding ? binding->identity.role : WeightRole::Other,
+            binding ? binding->identity.canonical_name : std::string_view{});
+        if (precision != QuantizedActivationOperandPrecision::TwoTermQ8 || !binding ||
+            !binding->immutable || binding->tensor != weight || !weight ||
+            weight->native_type() != TensorType::Q8_0)
+            throw std::invalid_argument("QFN GDN-output TwoTermQ8 requires its immutable original native Q8_0 source binding");
+        Qwen4ExpProjectionWorkspace::validateGDNOutputInvocation(precision, true,
+            binding->identity.role, binding->identity.canonical_name, batch_size, binding->slice);
+        if (weight->shape().size() != 2 || weight->shape()[0] != binding->slice.source_rows ||
+            weight->shape()[1] != binding->slice.source_cols ||
+            weight->shape()[0] != static_cast<std::size_t>(config_.d_model) ||
+            weight->shape()[1] != static_cast<std::size_t>(config_.gdn.inner_size))
+            throw std::invalid_argument("QFN GDN-output TwoTermQ8 binding does not retain its complete original matrix shape");
+        if (!prepared_weight_store_ || !preparedRefForGraphWeight(binding, device))
+            throw std::invalid_argument("QFN GDN-output TwoTermQ8 requires its exact existing prepared-store source on the projection device");
+        // Source/prepared validation above remains specific to this operation.
+        // Query ownership is shared with HC so ordinary/grouped/scalar and CPU
+        // contracts cannot drift into two independent row-resolution policies.
+        if (device.is_gpu() && modelForwardInput().sequence_lengths_device != lengths)
+            throw std::invalid_argument("QFN GDN-output TwoTermQ8 formal count differs from its original forward input");
+        return singleRequestProjectionQueryRows(seq_len, device);
+    }
+
+    std::string Qwen35Graph::addGDNOutputProjection(ComputeGraph &graph,
+        const std::string &prefix, ActivationBuffers &buffers, TensorBase *weight,
+        const WeightBinding *binding, int seq_len, int batch_size, DeviceId device,
+        const int32_t *lengths, const std::string &dependency)
+    {
+        if(forward_input_construction_)applyForwardGraphConstructionIntent(graph,*forward_input_construction_);
+        const auto rows = gdnOutputProjectionRows(weight, binding, seq_len, batch_size, device, lengths);
+        const auto precision = Qwen4ExpProjectionWorkspace::gdnOutputPrecision(
+            config_.qfn_gdn_output_activation, config_.flash_next != nullptr,
+            binding ? binding->identity.role : WeightRole::Other,
+            binding ? binding->identity.canonical_name : std::string_view{});
+        return addWoProjection(graph, prefix, buffers, weight, binding,
+            seq_len * batch_size, device, dependency, "gdn_out_proj", rows,
+            Qwen4ExpProjectionArithmetic::Ordinary, precision);
+    }
+
+    std::optional<DeviceRowRange> Qwen35Graph::faOutputProjectionRows(
+        TensorBase *weight, const WeightBinding *binding, int source_layer, int seq_len,
+        int batch_size, DeviceId device, const int32_t *lengths) const
+    {
+        const auto baseline = projectionVerifierRows(device, seq_len, batch_size, lengths);
+        if (!config_.flash_next ||
+            config_.qfn_fa_output_activation == QuantizedActivationOperandPrecision::SingleQ8)
+            return baseline;
+        const int main_layers = static_cast<int>(config_.flash_next->mainLayers());
+        const auto precision = Qwen4ExpProjectionWorkspace::faOutputPrecision(
+            config_.qfn_fa_output_activation, true,
+            binding ? binding->identity.role : WeightRole::Other,
+            binding ? binding->identity.canonical_name : std::string_view{}, main_layers);
+        if (precision != QuantizedActivationOperandPrecision::TwoTermQ8 || !binding ||
+            !binding->immutable || binding->tensor != weight || !weight ||
+            source_layer < 0 || source_layer >= main_layers ||
+            binding->identity.layer != source_layer ||
+            binding->identity.canonical_name != "blk." + std::to_string(source_layer) + ".attn_output.weight" ||
+            weight->native_type() != TensorType::Q8_0)
+            throw std::invalid_argument("QFN FA-output TwoTermQ8 requires its immutable original main Q8_0 source binding");
+        Qwen4ExpProjectionWorkspace::validateFAOutputInvocation(precision, true,
+            binding->identity.role, binding->identity.canonical_name, main_layers, batch_size, binding->slice);
+        const auto original_k = static_cast<std::size_t>(config_.n_heads) * static_cast<std::size_t>(config_.head_dim);
+        if (weight->shape().size() != 2 || weight->shape()[0] != binding->slice.source_rows ||
+            weight->shape()[1] != binding->slice.source_cols ||
+            weight->shape()[0] != static_cast<std::size_t>(config_.d_model) || weight->shape()[1] != original_k)
+            throw std::invalid_argument("QFN FA-output TwoTermQ8 requires the complete original global-query output matrix");
+        const auto prepared = preparedRefForGraphWeight(binding, device);
+        const auto stored = prepared_weight_store_ && prepared
+            ? prepared_weight_store_->binding(*prepared) : std::nullopt;
+        if (!stored || !stored->immutable || stored->tensor != weight ||
+            stored->identity.model_id != binding->identity.model_id ||
+            stored->identity.canonical_name != binding->identity.canonical_name ||
+            stored->identity.role != binding->identity.role || stored->identity.layer != source_layer)
+            throw std::invalid_argument("QFN FA-output TwoTermQ8 requires its exact existing prepared source on the projection device");
+        // An all-zero store slice is the existing canonical whole-source record.
+        // Other stored intervals must independently authenticate complete source ownership.
+        const auto &saved = stored->slice;
+        const bool whole_record = !saved.source_rows && !saved.source_cols && !saved.row_start &&
+            !saved.row_count && !saved.col_start && !saved.col_count && !saved.expert_start &&
+            !saved.expert_count && saved.expert_ids.empty() && !saved.inner_is_presliced;
+        if (!whole_record)
+            Qwen4ExpProjectionWorkspace::validateFAOutputInvocation(precision, true,
+                stored->identity.role, stored->identity.canonical_name, main_layers, batch_size, saved);
+        if (device.is_gpu() && modelForwardInput().sequence_lengths_device != lengths)
+            throw std::invalid_argument("QFN FA-output TwoTermQ8 formal count differs from its original forward input");
+        return singleRequestProjectionQueryRows(seq_len, device);
+    }
+
+    std::string Qwen35Graph::addFAOutputProjection(ComputeGraph &graph,
+        const std::string &prefix, ActivationBuffers &buffers, TensorBase *weight,
+        const WeightBinding *binding, int source_layer, int seq_len, int batch_size,
+        DeviceId device, const int32_t *lengths, const std::string &dependency)
+    {
+        if (forward_input_construction_)
+            applyForwardGraphConstructionIntent(graph, *forward_input_construction_);
+        const auto rows = faOutputProjectionRows(weight, binding, source_layer, seq_len,
+            batch_size, device, lengths);
+        const auto precision = Qwen4ExpProjectionWorkspace::faOutputPrecision(
+            config_.qfn_fa_output_activation, config_.flash_next != nullptr,
+            binding ? binding->identity.role : WeightRole::Other,
+            binding ? binding->identity.canonical_name : std::string_view{},
+            config_.flash_next ? static_cast<int>(config_.flash_next->mainLayers()) : 0);
+        return addWoProjection(graph, prefix, buffers, weight, binding,
+            seq_len * batch_size, device, dependency, "wo_proj", rows,
+            Qwen4ExpProjectionArithmetic::Ordinary, precision);
+    }
+
     ComputeGraph Qwen35Graph::buildGDNAttentionGraph(
         const LayerWeights &layer,
         ActivationBuffers &buffers,
@@ -982,6 +1137,14 @@ namespace llaminar2
                                                         << " TP-local during replicated dense decode "
                                                            "until GDN live-state allgather is available");
         }
+
+        // Resolve the complete selected source/query contract before constructing
+        // any GDN nodes. Stage6 repeats this metadata-only check at its own
+        // composition boundary; neither pass dereferences a native live count.
+        (void)gdnOutputProjectionRows(gdn_layer->ssm_out, layer_bindings.ssm_out,
+            seq_len, batch_size, device, sequence_lengths_device);
+        const auto qkv_projection_rows = gdnQKVProjectionRows(gdn_layer->attn_qkv, layer_bindings.attn_qkv,
+            layer_idx, seq_len, batch_size, device, sequence_lengths_device);
 
         // Get GDN state from hybrid KV cache
         auto *hybrid_cache = dynamic_cast<IHybridKVCache *>(kv_cache);
@@ -1097,7 +1260,7 @@ namespace llaminar2
         // Stage 1: Pre-attention RMSNorm
         // =====================================================================
         // GDN layers don't check HybridQ16 (always use fused when not first layer)
-        addPreAttentionNorm(graph, prefix, buffers, gdn_layer->attn_norm,
+        auto residual_read = addPreAttentionNorm(graph, prefix, buffers, gdn_layer->attn_norm,
                             total_tokens, layer_idx, device, /*check_hybrid_q16=*/false);
         const std::string gdn_attention_norm_ready =
             maybeAddGDNDiagnosticCheckpoint(
@@ -1145,6 +1308,13 @@ namespace llaminar2
             force_decode_equivalent_gdn_verifier_prefill;
         proj_params.verifier_row_range = projectionVerifierRows(
             device, seq_len, batch_size, sequence_lengths_device);
+
+        proj_params.qkv_operand_precision = Qwen4ExpProjectionWorkspace::gdnQKVPrecision(
+            config_.qfn_gdn_qkv_activation, config_.flash_next != nullptr,
+            layer_bindings.attn_qkv ? layer_bindings.attn_qkv->identity.role : WeightRole::Other,
+            layer_bindings.attn_qkv ? layer_bindings.attn_qkv->identity.canonical_name : std::string_view{},
+            config_.flash_next.get());
+        proj_params.qkv_row_range = qkv_projection_rows;
 
         proj_params.input_buffer_id = BufferId::NORMALIZED;
         proj_params.output_qkv_buffer_id = BufferId::GDN_QKV;
@@ -1432,7 +1602,8 @@ namespace llaminar2
         gnorm_params.feature_dim = value_dim;
         gnorm_params.norm_dim = d_v;   // Per-head normalization over d_v (128)
                                        // PyTorch reshapes to [B*T, n_heads, d_v] before norm
-        gnorm_params.gate_silu = true; // GDN uses SiLU(Z) as gate
+        gnorm_params.gate_activation = config_.flash_next
+            ? GatedNormActivation::Sigmoid : GatedNormActivation::SiLU;
         gnorm_params.input_buffer_id = BufferId::ATTN_OUTPUT;
         gnorm_params.gate_buffer_id = BufferId::GDN_Z;
         gnorm_params.output_buffer_id = BufferId::ATTN_OUTPUT;
@@ -1457,12 +1628,9 @@ namespace llaminar2
         // =====================================================================
         // Stage 6: Local output projection, observation, then TP reconstruction
         // =====================================================================
-        const std::string local_projection_node = addWoProjection(
+        const std::string local_projection_node = addGDNOutputProjection(
             graph, prefix, buffers, gdn_layer->ssm_out, layer_bindings.ssm_out,
-            total_tokens, device,
-            gated_norm_ready,
-            "gdn_out_proj",
-            projectionVerifierRows(device, seq_len, batch_size, sequence_lengths_device));
+            seq_len, batch_size, device, sequence_lengths_device, gated_norm_ready);
         const std::string local_projection_ready =
             maybeAddGDNDiagnosticCheckpoint(
                 graph,
@@ -1495,6 +1663,9 @@ namespace llaminar2
         replicated_attention_state_graph_active_ =
             saved_replicated_attention_state_graph_active;
 
+        if (residual_read)
+            terminal_node = addBranchBlockWrite(graph, std::move(*residual_read), buffers, terminal_node);
+
         // NOTE: GDN layers do NOT apply a sigmoid output gate after out_proj.
         // The Z projection is consumed entirely by GatedRMSNorm (SiLU gating).
         // Only FA layers use a sigmoid output gate (embedded in Q projection).
@@ -1524,21 +1695,32 @@ namespace llaminar2
     //   5. Wo GEMM on gated attention output
     // =========================================================================
 
-    ComputeGraph Qwen35Graph::buildMTPFAKVCacheAppendGraph(
-        const LayerWeights &layer,
-        ActivationBuffers &buffers,
-        int layer_idx,
-        int seq_len,
-        int batch_size,
-        IKVCache *kv_cache,
-        const int *position_ids,
-        const void *position_ids_device,
-        const int32_t *sequence_lengths_device,
-        DeviceId device,
-        const std::string &stage_prefix_override,
-        bool layer_idx_is_cache_local,
-        int first_seq_idx)
+    ComputeGraph Qwen35Graph::buildMTPFAKVCacheAppendGraphForLayer(
+        const LayerWeights &layer, ActivationBuffers &buffers,
+        const FullAttentionLayerIdentity &identity, int seq_len, int batch_size,
+        IKVCache *kv_cache, const int *position_ids, const void *position_ids_device,
+        const int32_t *sequence_lengths_device, DeviceId device,
+        const std::string &stage_prefix_override, int first_seq_idx,
+        const Qwen4ExpPredictorResidualBinding *predictor)
     {
+        const int layer_idx=identity.source().sourceLayer();
+        if (seq_len<=0 || batch_size<=0 || batch_size>std::numeric_limits<int>::max()/seq_len)
+            throw std::invalid_argument("KV-only graph requires positive representable query rows");
+        if ((identity.source().sourcePolicy()==GraphLayerSourcePolicy::Qwen4ExpSharedPredictor)!=(predictor!=nullptr))
+            throw std::invalid_argument("Shared QFN KV-only identity requires explicit frozen HC/count construction");
+        if (predictor) {
+            predictor->requireInvocation(Qwen4ExpPredictorInvocation::ShiftedPrefill);
+            Qwen4ExpPredictorResidualBinding::requireFrozenSource(identity.source(),predictor->weights());
+            predictor->requireLayerSource(layer);
+            predictor->rows().requireCompactCPUQuery();
+            if (!kv_cache || kv_cache->n_kv_heads()!=predictor->layout().kvHeads() ||
+                kv_cache->kv_head_start()!=predictor->layout().kvHeadStart())
+                throw std::invalid_argument("Dense0 predictor cache must own its exact admitted local KV heads and global origin");
+            if (identity.consumer()!=GraphAttentionConsumer::Dense || batch_size!=1 || first_seq_idx!=0 ||
+                predictor->rows().device()!=device || predictor->rows().tokens().physicalRows()!=seq_len ||
+                (device.is_gpu() && predictor->rows().tokens().countOwner()!=sequence_lengths_device))
+                throw std::invalid_argument("Dense0 KV-only requires exact original rows/count and cache0/slot0");
+        }
         ComputeGraph graph;
         if (!kv_cache)
         {
@@ -1547,15 +1729,19 @@ namespace llaminar2
         }
 
         std::string prefix = stage_prefix_override.empty()
-                                 ? "layer" + std::to_string(layer_idx) + "_"
+                                 ? identity.source().prefix()
                                  : stage_prefix_override;
         const int total_tokens = batch_size * seq_len;
-        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+        LayerWeightBindings layer_bindings = predictor ? predictor->weights().fa_block
+                                                       : layerWeightBindingsForGraph(layer_idx);
         const WeightBinding *wk_binding = layer.wk_binding ? layer.wk_binding : layer_bindings.wk;
         const WeightBinding *wv_binding = layer.wv_binding ? layer.wv_binding : layer_bindings.wv;
 
-        addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm,
-                            total_tokens, layer_idx, device);
+        if (predictor)
+            addBranchAttentionReadOnly(graph,prefix,buffers,layer_idx,total_tokens,device,predictor);
+        else
+            addPreAttentionNorm(graph,prefix,buffers,layer.attn_norm,total_tokens,layer_idx,device,
+                /*check_hybrid_q16=*/true,identity.source().workload());
 
         if (!buffers.normalized || !buffers.K || !buffers.V ||
             !layer.wk || !layer.wv)
@@ -1570,7 +1756,7 @@ namespace llaminar2
         const bool force_decode_equivalent_kv_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
-            config_.usesMTPGroupedDecodeEquivalentRows();
+            (predictor || config_.usesMTPGroupedDecodeEquivalentRows());
 
         const std::string kv_projection = prefix + "kv_proj";
         graph.addNode(kv_projection,
@@ -1592,6 +1778,7 @@ namespace llaminar2
                           .output_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
                           .force_decode_equivalent_verifier_prefill =
                               force_decode_equivalent_kv_prefill,
+                          .verifier_row_range = predictor ? std::optional{predictor->rows().tokens()} : std::nullopt,
                           .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
                           .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
                           .prepared_store = prepared_weight_store_,
@@ -1599,7 +1786,7 @@ namespace llaminar2
                       device);
         graph.addDependency(kv_projection, prefix + "attn_norm");
 
-        const int local_n_kv_heads = resolveLocalHeadCounts().second;
+        const int local_n_kv_heads = predictor ? predictor->layout().kvHeads() : resolveLocalHeadCounts().second;
         const attention::AttentionExecutionPolicy attention_policy =
             resolveAttentionExecutionPolicy(device, kv_cache != nullptr);
         const std::string key_terminal = addKeyCachePublicationTransforms(
@@ -1619,7 +1806,7 @@ namespace llaminar2
             graph,
             prefix,
             buffers,
-            layer_idx,
+            identity.source().cacheLayer(),
             seq_len,
             batch_size,
             kv_cache,
@@ -1628,8 +1815,9 @@ namespace llaminar2
             attention_policy,
             key_terminal,
             {key_terminal},
-            layer_idx_is_cache_local,
-            first_seq_idx);
+            /*layer_idx_is_cache_local=*/true,
+            first_seq_idx,
+            predictor ? &predictor->layout() : nullptr);
         graph.setTerminalNode(kv_append);
         return graph;
     }
@@ -1649,16 +1837,55 @@ namespace llaminar2
         const std::string &stage_prefix_override,
         bool layer_idx_is_cache_local)
     {
+        if (layer_idx_is_cache_local)
+            throw std::invalid_argument("Cache-local predictor FA requires an explicit physical source/cache identity");
+        return buildFAAttentionGraphForLayer(layer, buffers,
+            mainAttentionIdentity(layer_idx, kv_cache), seq_len, batch_size, kv_cache,
+            position_ids, position_ids_device, device, sequence_lengths,
+            sequence_lengths_device, stage_prefix_override, nullptr);
+    }
+
+    ComputeGraph Qwen35Graph::buildFAAttentionGraphForLayer(
+        const LayerWeights &layer, ActivationBuffers &buffers,
+        const FullAttentionLayerIdentity &identity, int seq_len, int batch_size,
+        IKVCache *kv_cache, const int *position_ids, const void *position_ids_device,
+        DeviceId device, const std::vector<int> *sequence_lengths,
+        const int32_t *sequence_lengths_device, const std::string &stage_prefix_override,
+        const Qwen4ExpPredictorResidualBinding *predictor)
+    {
+        const int layer_idx = identity.source().sourceLayer();
+        if (seq_len <= 0 || batch_size <= 0 || batch_size > std::numeric_limits<int>::max() / seq_len)
+            throw std::invalid_argument("FA graph requires positive representable query geometry");
+        if ((identity.source().sourcePolicy() == GraphLayerSourcePolicy::Qwen4ExpSharedPredictor) != (predictor != nullptr))
+            throw std::invalid_argument("Shared QFN FA identity requires its explicit frozen residual construction");
+        if (predictor) {
+            predictor->requireInvocation(Qwen4ExpPredictorInvocation::Draft);
+            Qwen4ExpPredictorResidualBinding::requireFrozenSource(identity.source(), predictor->weights());
+            predictor->requireLayerSource(layer);
+            predictor->rows().requireCompactCPUQuery();
+            if (!kv_cache || kv_cache->n_kv_heads()!=predictor->layout().kvHeads() ||
+                kv_cache->kv_head_start()!=predictor->layout().kvHeadStart())
+                throw std::invalid_argument("Dense0 predictor cache must own its exact admitted local KV heads and global origin");
+            if (identity.consumer() != GraphAttentionConsumer::Dense || batch_size != 1 ||
+                predictor->rows().tokens().physicalRows() != seq_len || predictor->rows().device() != device ||
+                predictor->rows().tokens().countOwner() != sequence_lengths_device && device.is_gpu())
+                throw std::invalid_argument("Dense0 FA must retain the exact original rows/count/device and dense cache0 reader");
+        }
         ComputeGraph graph;
         std::string prefix = stage_prefix_override.empty()
-                                 ? "layer" + std::to_string(layer_idx) + "_"
+                                 ? identity.source().prefix()
                                  : stage_prefix_override;
         int total_tokens = batch_size * seq_len;
-        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+        LayerWeightBindings layer_bindings = predictor ? predictor->weights().fa_block
+                                                       : layerWeightBindingsForGraph(layer_idx);
         const WeightBinding *wq_binding = layer.wq_binding ? layer.wq_binding : layer_bindings.wq;
         const WeightBinding *wk_binding = layer.wk_binding ? layer.wk_binding : layer_bindings.wk;
         const WeightBinding *wv_binding = layer.wv_binding ? layer.wv_binding : layer_bindings.wv;
         const WeightBinding *wo_binding = layer.wo_binding ? layer.wo_binding : layer_bindings.wo;
+        // Reject unsupported explicit source/query ownership before any FA node.
+        if (!predictor)
+            (void)faOutputProjectionRows(layer.wo, wo_binding, layer_idx, seq_len,
+                batch_size, device, sequence_lengths_device);
 
         LOG_TRACE("[Qwen35Graph::buildFAAttentionGraph] layer=" << layer_idx
                                                                 << " seq_len=" << seq_len << " batch_size=" << batch_size
@@ -1667,8 +1894,11 @@ namespace llaminar2
         // =================================================================
         // Stage 1: Pre-attention RMSNorm (same as Qwen2)
         // =================================================================
-        addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm,
-                            total_tokens, layer_idx, device);
+        auto residual_read = predictor
+            ? std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead>{addBranchBlockRead(
+                graph, prefix, buffers, layer_idx, total_tokens, device, ResidualBlock::Attention, predictor)}
+            : addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm, total_tokens, layer_idx, device,
+                /*check_hybrid_q16=*/true, identity.source().workload());
 
         // =================================================================
         // Stage 2: Q/K/V projections — Q outputs to fa_q_raw (2× width)
@@ -1696,7 +1926,7 @@ namespace llaminar2
             const bool force_decode_equivalent_qkv_verifier_prefill =
                 (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
                 total_tokens > 1 &&
-                config_.usesMTPGroupedDecodeEquivalentRows();
+                (predictor || config_.usesMTPGroupedDecodeEquivalentRows());
 
             LOG_TRACE("[Qwen35Graph FA] Layer " << layer_idx << " QKV dims: q_n=" << q_n
                                                 << " k_n=" << k_n << " v_n=" << v_n);
@@ -1725,7 +1955,7 @@ namespace llaminar2
                               .output_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                               .output_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
                               .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
-                              .verifier_row_range = projectionVerifierRows(
+                              .verifier_row_range = predictor ? std::optional{predictor->rows().tokens()} : projectionVerifierRows(
                                   device, seq_len, batch_size, sequence_lengths_device),
                               .prepared_ref_q = preparedRefForGraphWeight(wq_binding, device),
                               .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
@@ -1739,7 +1969,9 @@ namespace llaminar2
         // =================================================================
         // Stage 2.5: QGateSplit — deinterleave fa_q_raw → Q + fa_gate
         // =================================================================
-        auto [local_n_heads, local_n_kv_heads] = resolveLocalHeadCounts();
+        auto [local_n_heads, local_n_kv_heads] = predictor
+            ? std::pair{predictor->layout().queryHeads(),predictor->layout().kvHeads()}
+            : resolveLocalHeadCounts();
         {
             graph.addNode(prefix + "q_gate_split",
                           ComputeStageFactory::createQGateSplit({
@@ -1807,13 +2039,12 @@ namespace llaminar2
         // Stage 4: KV cache + attention compute
         // =================================================================
         std::string attn_node = addKVCacheAndAttention(
-            graph, prefix, buffers, layer_idx,
+            graph, prefix, buffers, layer, identity,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
             kv_cache, position_ids, position_ids_device,
             sequence_lengths_device,
             device, has_qkv_proj, attention_policy, rope_node,
-            cache_source_dependencies,
-            layer_idx_is_cache_local);
+            cache_source_dependencies, predictor ? &predictor->layout() : nullptr);
 
         // =================================================================
         // Stage 4.5: Sigmoid output gate — attn_output *= sigmoid(fa_gate)
@@ -1841,14 +2072,24 @@ namespace llaminar2
         // =================================================================
         // Stage 5: publish the local Wo partial, then reconstruct TP output.
         // =================================================================
-        const std::string wo_projection = addWoProjection(
-            graph, prefix, buffers, layer.wo, wo_binding,
-            total_tokens, device,
-            prefix + "attn_output_gate", "wo_proj",
-            projectionVerifierRows(device, seq_len, batch_size, sequence_lengths_device));
+        // Predictor Dense0 retains its own explicit residual/query arithmetic.
+        // Main FA consumes only its original source and the canonical live query.
+        const std::string wo_projection = predictor
+            ? addWoProjection(graph, prefix, buffers, layer.wo, wo_binding,
+                total_tokens, device, prefix + "attn_output_gate", "wo_proj",
+                std::optional{predictor->rows().tokens()}, Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier)
+            : addFAOutputProjection(graph, prefix, buffers, layer.wo, wo_binding,
+                layer_idx, seq_len, batch_size, device, sequence_lengths_device,
+                prefix + "attn_output_gate");
         std::string terminal = addWoAllreduce(
             graph, prefix, buffers, layer.wo,
-            total_tokens, layer_idx, device, wo_projection);
+            total_tokens, layer_idx, device, wo_projection, "wo_allreduce",
+            predictor ? &predictor->layout() : nullptr,
+            predictor ? std::optional{predictor->rows().tokens()} : std::nullopt);
+
+        if (residual_read)
+            terminal = addBranchBlockWrite(graph, std::move(*residual_read), buffers, terminal,
+                predictor ? &predictor->attentionOutput() : nullptr);
 
         graph.setTerminalNode(terminal);
 

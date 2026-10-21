@@ -121,17 +121,15 @@ namespace llaminar::v2::kernels
             const auto *source = unpackable ? unpackable->vnniFormatInfo() : nullptr;
             if (!source || k % 32 != 0)
                 throw std::invalid_argument("GPU weight-pool GEMM requires a supported complete NativeVNNI matrix");
+            const auto allocation = gpuPreparedWeightPoolAllocation(*source, layout);
             const auto reusable = layout == GPUPreparedWeightPoolLayout::MigrationReusable
-                ? reusableDeviceVnniAllocationFormat(*source) : NativeVnniReusableDeviceAllocationFormat{};
-            const auto allocation = layout == GPUPreparedWeightPoolLayout::MigrationReusable
-                ? reusable : NativeVnniReusableDeviceAllocationFormat{
-                    static_cast<uint8_t>(source->payload_bytes), canonicalDeviceVnniFormat(*source).is_asymmetric, source->has_emins};
+                ? allocation : NativeVnniReusableDeviceAllocationFormat{};
             const auto blocks_per_row = static_cast<size_t>(k / 32);
             const auto offset_blocks = product(row_offset, blocks_per_row);
             const auto length_blocks = product(static_cast<size_t>(n), blocks_per_row);
-            // Both offsets and bounds use the allocation union. Preserve every
-            // reserved metadata pointer even when the initial format does not
-            // read it: later migration may publish a representation that does.
+            // Offsets and bounds use the exact admitted layout. A reusable
+            // slot retains metadata planes for future migration; an immutable
+            // slot contains only the original source's canonical planes.
             auto *payload = static_cast<uint8_t *>(region(slot->d_native_vnni_payload, slot->payload_bytes,
                 product(offset_blocks, allocation.payload_bytes_per_block), product(length_blocks, allocation.payload_bytes_per_block),
                 slot_name, "quantized payload"));

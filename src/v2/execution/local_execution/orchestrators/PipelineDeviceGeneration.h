@@ -38,7 +38,7 @@ public:
      * @param stages Stable participant runners, in layer order, tail last.
      * @throws std::invalid_argument for incomplete or unsupported composition. */
     explicit PipelineDeviceGeneration(std::span<const std::unique_ptr<IInferenceRunner>> stages);
-    /** @brief Join workers; stage graphs must already be retired by their owners. */
+    /** @brief Join accepted one-shot work before releasing its borrowed native recordings. */
     ~PipelineDeviceGeneration();
     /** @brief Freeze native prefill edges and prepare all stage graph families.
      * @param plan Canonical bucket family shared by every participant.
@@ -86,6 +86,12 @@ public:
      * @param error Receives the first participant's publication diagnostic.
      * @return Whether every captured commit was submitted, without host outcome reads. */
     bool publishMTPOutcome(const DeviceSpeculativePublicationRequest &request, std::string *error);
+    /** @brief Consume one original tail mailbox through a complete no-sampling PP transaction.
+     * @param logical_state Current immutable tail-owned request-zero mailbox.
+     * @param request_index Only the scalar request-zero lane is admitted.
+     * @return Whether every original participant committed exactly one model row.
+     * Homogeneous singleton native PP only; unsupported domains fail before admission. */
+    bool advanceOrdinaryCondition(const DeviceResidentLogicalSequenceStateHandle &logical_state, int request_index);
     /** @brief Admit the tail's policy and each follower's local event handoff. */
     bool begin(const DeviceGenerationAdmissionRequest &request);
     /** @brief Compile or reuse all complete parents before submitting any work. */
@@ -99,6 +105,17 @@ public:
     bool active() const noexcept { return phase_ != Phase::Idle; }
 
 private:
+    /** @brief Enclosing owner orders parent retirement before its original PP stages. */
+    friend class RankOrchestrator;
+    /**
+     * @brief Retire one-shot parents and setup workers while borrowed DGO owners remain alive.
+     * @details Idempotent exclusive teardown. Every accepted outstanding parent
+     * joins its original exact terminal event before its executable is destroyed.
+     * The collective, forward edges and original stage graph owners remain intact;
+     * normal reverse member destruction releases them in their established order.
+     * Only Rank destruction and this owner's destructor may call this boundary.
+     */
+    void retireForwardOnlyBeforeStageRelease() noexcept;
     /** @brief Frozen layer-domain role; its runner remains the TP authority. */
     struct Domain
     {
@@ -161,6 +178,15 @@ private:
      * Every follower is submitted before the next ticket is observed. The host
      * neither samples tokens nor inspects mutable model/cache state. */
     bool launchHostedTransactions();
+    /** @brief One separately priced complete parent per singleton participant. */
+    struct ForwardOnlyFamily;
+    /** @brief Freeze source recordings, native edges and no-sampling publication at setup. */
+    bool prepareForwardOnlyFamily();
+    /** @brief Authenticate all original identities before request admission or submission. */
+    bool forwardOnlyFamilyCurrent() const;
+    /** @brief Observe only fixed terminal control/KV metadata and retire the actual admission. */
+    bool finishForwardOnly();
+    std::unique_ptr<ForwardOnlyFamily> forward_only_;
     std::vector<DeviceGraphOrchestrator *> stages_;
     std::vector<Domain> domains_;
     std::vector<Boundary> boundaries_;

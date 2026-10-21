@@ -57,7 +57,43 @@ namespace llaminar2
         Norm,
         Bias,
         Other,
+        /** Immutable native rows owned by a lookup store, never an ordinary embedding/GEMM. */
+        ImmutableRowTable,
+        /** HC read/write/final-mixer low-rank projections at trunk/compute widths. */
+        HyperConnectionProjection,
+        /** Converter-authenticated final FP32 branch-normalization gains. */
+        HyperConnectionNorm,
+        /** Sparse indexer Q/K projections, distinct from core attention Q/K. */
+        SparseIndexerProjection,
+        /** Sparse indexer final FP32 normalization gains. */
+        SparseIndexerNorm,
+        /** PLE key/value projections after the immutable live-row gather. */
+        PerLayerEmbeddingProjection,
+        /** PLE key/query/convolution final FP32 normalization gains. */
+        PerLayerEmbeddingNorm,
+        /** Immutable FP32 dilated depthwise convolution taps. */
+        PerLayerEmbeddingConvolution,
+        /** Predictor embedding/hidden mixing projection. */
+        PredictorProjection,
     };
+
+    /** @brief Whether a Qwen4 immutable scalar/operator weight must materialize as FP32. */
+    inline bool isImmutableFP32WeightRole(WeightRole role) noexcept
+    {
+        return role == WeightRole::HyperConnectionNorm ||
+               role == WeightRole::SparseIndexerNorm ||
+               role == WeightRole::PerLayerEmbeddingNorm ||
+               role == WeightRole::PerLayerEmbeddingConvolution;
+    }
+
+    /** @brief Whether a Qwen4 projection has an explicit prepared-GEMM owner. */
+    inline bool isFlashNextProjectionRole(WeightRole role) noexcept
+    {
+        return role == WeightRole::HyperConnectionProjection ||
+               role == WeightRole::SparseIndexerProjection ||
+               role == WeightRole::PerLayerEmbeddingProjection ||
+               role == WeightRole::PredictorProjection;
+    }
 
     inline bool isRoutedExpertRole(WeightRole role)
     {

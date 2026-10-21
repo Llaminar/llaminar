@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include "config/TPPPValidator.h"
 #include <unordered_set>
+#include <algorithm>
 
 namespace llaminar2::test
 {
@@ -394,6 +395,49 @@ namespace llaminar2::test
         auto result = TPPPValidator::validate(config_, model_);
 
         EXPECT_FALSE(result.valid);
+    }
+
+    /** @test A named rank-local domain uses the same replicated-KV assignment as ordinary LocalTP. */
+    TEST_F(Test__TPPPValidator, NamedRankLocalQwenTP2TP4TP8UsesActualReplicatedKVAssignment)
+    {
+        model_.n_heads_ = 24;
+        model_.n_kv_heads_ = 2;
+        model_.n_layers_ = 48;
+        config_.tp_scope = TPScope::RANK_LOCAL;
+        config_.pp_degree = 1;
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+            for (const int degree : {2, 4, 8})
+                for (const bool reversed : {false, true})
+                {
+                    config_.tp_degree = degree;
+                    DomainDefinition domain;
+                    domain.name = "original_continuation";
+                    domain.scope = TPScope::RANK_LOCAL;
+                    domain.owner_rank = 0;
+                    domain.backend = backend == DeviceType::CUDA
+                        ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+                    for (int ordinal = 0; ordinal < degree; ++ordinal)
+                        domain.devices.push_back(backend == DeviceType::CUDA
+                            ? GlobalDeviceAddress::cuda(ordinal) : GlobalDeviceAddress::rocm(ordinal));
+                    if (reversed) std::reverse(domain.devices.begin(), domain.devices.end());
+                    domain.weights.assign(degree, 1.0f / degree);
+                    config_.domain_definitions = {domain};
+                    const auto valid = TPPPValidator::validate(config_, model_);
+                    EXPECT_TRUE(valid.valid) << valid.toString();
+                    // A named-only nonlocal domain still has its original
+                    // uniform-KV divisibility contract. This is not a blanket bypass.
+                    if (degree > 2)
+                    {
+                        config_.domain_definitions.front().scope = TPScope::NODE_LOCAL;
+                        EXPECT_FALSE(TPPPValidator::validate(config_, model_).valid);
+                    }
+                    // Actual rank-local assignment validation must still reject
+                    // a participant assigned no query/FFN/vocabulary work.
+                    config_.domain_definitions = {domain};
+                    config_.domain_definitions.front().weights.assign(degree, 0.0f);
+                    config_.domain_definitions.front().weights.front() = 1.0f;
+                    EXPECT_FALSE(TPPPValidator::validate(config_, model_).valid);
+                }
     }
 
     // =========================================================================

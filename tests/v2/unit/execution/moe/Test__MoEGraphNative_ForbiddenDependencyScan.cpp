@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -56,6 +57,21 @@ namespace llaminar2::test
             }
 
             return fs::current_path();
+        }
+
+        /**
+         * @brief Ignore formatting while retaining every source predicate token.
+         * @param source Source fragment containing an architectural invariant.
+         * @return Fragment with only whitespace removed; operators and indices remain exact.
+         */
+        std::string withoutWhitespace(std::string_view source)
+        {
+            std::string result;
+            result.reserve(source.size());
+            for (const unsigned char value : source)
+                if (!std::isspace(value))
+                    result.push_back(static_cast<char>(value));
+            return result;
         }
 
         std::string readFile(const fs::path &path)
@@ -172,6 +188,87 @@ namespace llaminar2::test
             }
 
             return {};
+        }
+
+        /**
+         * @brief Require each committed-boundary launch inside its own topology authority.
+         * @param body Complete maybeApplyMoERebalance method, without following methods.
+         * @return True for exactly one authenticated pipeline and one native-stage launch.
+         *
+         * Pipeline ownership precedes the standalone branch lexically. Neither
+         * the first call in the method nor their relative branch order proves
+         * authority; each launch must retain its own complete typed gate.
+         */
+        bool hasTopologyOwnedDecodeMaintenance(const std::string &body)
+        {
+            constexpr std::string_view launch = "runner_->maybeApplyDecodeBoundaryMaintenance(";
+            const auto pipeline = withoutWhitespace(braceBalancedDeclarationRegion(
+                body, "if (moe_pipeline_prepared_plan_)"));
+            const auto native = withoutWhitespace(braceBalancedDeclarationRegion(
+                body, "if (usesNativeGpuStageMoEOverlayAuthority())"));
+            if (countOccurrences(body, std::string(launch)) != 2u ||
+                countOccurrences(pipeline, std::string(launch)) != 1u ||
+                countOccurrences(native, std::string(launch)) != 1u)
+                return false;
+            const auto pipeline_launch = pipeline.find(
+                "returnrunner_&&runner_->maybeApplyDecodeBoundaryMaintenance(committed_tokens);");
+            const auto native_launch = native.find(
+                "runner_->maybeApplyDecodeBoundaryMaintenance(committed_tokens)");
+            if (pipeline_launch == std::string::npos || native_launch == std::string::npos)
+                return false;
+            for (const auto predicate : {
+                "config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Dynamic",
+                "moe_pipeline_stage_bindings_.size()!=moe_pipeline_prepared_plan_->stages().size()",
+                "constboolall_no_peer=std::all_of(",
+                "binding&&binding->owners().authority->noPeerResidency().has_value()",
+                "if(all_no_peer)returntrue;"})
+            {
+                const auto gate = pipeline.find(predicate);
+                if (gate == std::string::npos || gate >= pipeline_launch)
+                    return false;
+            }
+            for (const auto predicate : {
+                "config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Dynamic",
+                "runner_->moeOverlayAuthorityExecution()!=MoEOverlayAuthorityExecutionKind::DeviceResident"})
+            {
+                const auto gate = native.find(predicate);
+                if (gate == std::string::npos || gate >= native_launch)
+                    return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Follow frozen descriptor geometry through checked disjoint arena placement.
+         * @param body Complete bindGraphSnapshotArena method, without recording methods.
+         * @return True only for checked relative layout, absolute slot base and full cursor advance.
+         *
+         * Authored metadata may require eight-byte alignment after a four-byte
+         * legacy output. The shared geometry helper owns that arithmetic; a
+         * local variable name cannot substitute for this complete data flow.
+         */
+        bool hasCheckedSnapshotSlotPlacement(const std::string &body)
+        {
+            const auto compact = withoutWhitespace(body);
+            const auto layout = compact.find("constautolayout=snapshotStorageLayout({copy.byte_size,");
+            const auto geometry = compact.find(
+                "std::holds_alternative<std::monostate>(copy.semantic_extent)?std::nullopt:std::optional(copy.semantic_copy.geometry)");
+            const auto validation = compact.find(
+                "if(copy.storage_bytes!=layout.storage_bytes||copy.metadata_offset_bytes!=layout.metadata_offset_bytes)");
+            const auto slot = compact.find("constautoslot=placeSnapshotStorageSlot(required_bytes,layout);");
+            const auto offset = compact.find("copy.storage_offset_bytes=slot.offset_bytes;");
+            const auto end = compact.find("required_bytes=slot.end_bytes;");
+            if (layout == std::string::npos || geometry == std::string::npos ||
+                validation == std::string::npos || slot == std::string::npos ||
+                offset == std::string::npos || end == std::string::npos ||
+                !(layout < geometry && geometry < validation && validation < slot && slot < offset && offset < end))
+                return false;
+            const auto invalid = braceBalancedDeclarationRegion(compact,
+                "if(copy.storage_bytes!=layout.storage_bytes||copy.metadata_offset_bytes!=layout.metadata_offset_bytes)");
+            return invalid.find("returnfalse;") != std::string::npos &&
+                countOccurrences(compact, "placeSnapshotStorageSlot(") == 1u &&
+                countOccurrences(compact, "copy.storage_offset_bytes=") == 1u &&
+                countOccurrences(compact, "required_bytes=slot.end_bytes;") == 1u;
         }
 
         std::vector<fs::path> graphNativeFiles(const fs::path &root)
@@ -664,7 +761,20 @@ namespace llaminar2::test
                     << " must synchronize the cooperative controller block.";
                 EXPECT_NE(contents.find("kDeviceMoEMaxExperts"), std::string::npos)
                     << relative_path
-                    << " should launch one lane per expert for the bounded MoE domain.";
+                    << " must retain the complete logical expert domain independently of the physical CTA size.";
+                const auto controller_tokens = withoutWhitespace(contents);
+                EXPECT_NE(controller_tokens.find(
+                              "for(uint32_tcandidate_lane=lane;"
+                              "candidate_lane<static_cast<uint32_t>(kDeviceMoEMaxExperts);"
+                              "candidate_lane+=blockDim.x)"),
+                          std::string::npos)
+                    << relative_path
+                    << " must publish every expert through disjoint physical-worker stripes.";
+                EXPECT_NE(controller_tokens.find(
+                              "shared_candidate_experts[candidate_lane]=candidate_expert;"),
+                          std::string::npos)
+                    << relative_path
+                    << " ranking leaves must keep logical expert identity above the first CTA stripe.";
                 EXPECT_EQ(launch_body.find("device_rebalance_controller_kernel<<<1, 1"),
                           std::string::npos)
                     << relative_path
@@ -788,6 +898,17 @@ namespace llaminar2::test
         }
     }
 
+    /** @brief Formatting tolerance must retain the strict live-capacity and owner predicates. */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, CompactSlotPredicateRejectsCapacityAndOwnerMutations)
+    {
+        constexpr std::string_view expected =
+            "counts[source_participant]<payload_slot_capacity";
+        EXPECT_EQ(withoutWhitespace("counts[\n source_participant] < payload_slot_capacity"), expected);
+        EXPECT_NE(withoutWhitespace("counts[source_participant] <= payload_slot_capacity"), expected);
+        EXPECT_NE(withoutWhitespace("counts[destination_participant] < payload_slot_capacity"), expected);
+        EXPECT_NE(withoutWhitespace("counts[source_participant] < directory_capacity"), expected);
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DeviceRebalanceCandidateRankingRespectsCompactPayloadSlots)
     {
         const fs::path root = findRepoRoot();
@@ -820,13 +941,16 @@ namespace llaminar2::test
             EXPECT_LT(root_source_slot_gate, root_value)
                 << relative_path
                 << " root-domain transfer candidates must check source payload-slot capacity before ranking.";
-            EXPECT_NE(root_ranking.find("shared_destination_transfer_slot_counts[\n"
-                                        "                                                destination_choice.destination_participant] < payload_slot_capacity"),
+            const auto root_predicates = withoutWhitespace(root_ranking);
+            EXPECT_NE(root_predicates.find(
+                          "shared_destination_transfer_slot_counts["
+                          "destination_choice.destination_participant]<payload_slot_capacity"),
                       std::string::npos)
                 << relative_path
                 << " root-domain ranking must use per-destination transfer-slot counts.";
-            EXPECT_NE(root_ranking.find("shared_source_payload_slot_counts[\n"
-                                        "                                                static_cast<uint32_t>(source_participant)] < payload_slot_capacity"),
+            EXPECT_NE(root_predicates.find(
+                          "shared_source_payload_slot_counts["
+                          "static_cast<uint32_t>(source_participant)]<payload_slot_capacity"),
                       std::string::npos)
                 << relative_path
                 << " root-domain ranking must use dense per-source payload-slot counts.";
@@ -5737,17 +5861,8 @@ namespace llaminar2::test
         const std::string maintenance_boundary_body = runner.substr(
             maintenance_boundary_start,
             maintenance_boundary_end - maintenance_boundary_start);
-        const size_t device_authority_selection =
-            maintenance_boundary_body.find(
-                "usesNativeGpuStageMoEOverlayAuthority()");
-        const size_t device_maintenance_launch =
-            maintenance_boundary_body.find(
-                "runner_->maybeApplyDecodeBoundaryMaintenance(");
-        ASSERT_NE(device_authority_selection, std::string::npos);
-        ASSERT_NE(device_maintenance_launch, std::string::npos)
-            << "The topology-selected captured authority must own the ordinary "
-               "committed-boundary launch.";
-        EXPECT_LT(device_authority_selection, device_maintenance_launch);
+        EXPECT_TRUE(hasTopologyOwnedDecodeMaintenance(maintenance_boundary_body))
+            << "Each pipeline or native-stage committed launch must retain its own complete topology authority.";
         EXPECT_NE(
             maintenance_boundary_body.find(
                 "device_generation_embedded_moe_maintenance_pending_ack_"),
@@ -8076,6 +8191,8 @@ namespace llaminar2::test
         const fs::path backend_path = root / "src/v2/backends/IBackend.h";
         const fs::path sampling_path =
             root / "src/v2/kernels/common/SamplingMath.h";
+        const fs::path control_layout_path =
+            root / "src/v2/kernels/common/DeviceGenerationControlLayout.h";
         const fs::path cuda_path =
             root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu";
         const fs::path rocm_path =
@@ -8095,6 +8212,7 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(qwen_graph_path)) << qwen_graph_path;
         ASSERT_TRUE(fs::exists(backend_path)) << backend_path;
         ASSERT_TRUE(fs::exists(sampling_path)) << sampling_path;
+        ASSERT_TRUE(fs::exists(control_layout_path)) << control_layout_path;
         ASSERT_TRUE(fs::exists(cuda_path)) << cuda_path;
         ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
         ASSERT_TRUE(fs::exists(e2e_path)) << e2e_path;
@@ -8111,6 +8229,7 @@ namespace llaminar2::test
         const std::string qwen_graph = readFile(qwen_graph_path);
         const std::string backend = readFile(backend_path);
         const std::string sampling = readFile(sampling_path);
+        const std::string control_layout = readFile(control_layout_path);
         const std::string cuda = readFile(cuda_path);
         const std::string rocm = readFile(rocm_path);
         const std::string e2e = readFile(e2e_path);
@@ -8211,12 +8330,14 @@ namespace llaminar2::test
                 "enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl"),
             std::string::npos)
             << "Both GPU backends need one explicit-stream publication contract";
+        EXPECT_NE(sampling.find("#include \"DeviceGenerationControlLayout.h\""),
+            std::string::npos) << "Sampling must consume the one canonical controller layout";
         EXPECT_NE(
-            sampling.find(
+            control_layout.find(
                 "kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount"),
             std::string::npos);
         EXPECT_NE(
-            sampling.find(
+            control_layout.find(
                 "kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount"),
             std::string::npos);
         EXPECT_NE(e2e.find(
@@ -10185,15 +10306,19 @@ namespace llaminar2::test
             full_build_start,
             partial_build_start - full_build_start);
 
-        EXPECT_NE(
-            full_build.find(
-                "graph_builder->buildForwardGraph(prepared_input, output)"),
-            std::string::npos)
+        const auto full_build_tokens = withoutWhitespace(full_build);
+        const auto prepare_storage = full_build_tokens.find(
+            "orchestrator_.prepareRetainedStorageBinding();");
+        const auto public_build = full_build_tokens.find(
+            "graph_builder->buildForwardGraph(prepared_input,output)");
+        ASSERT_NE(prepare_storage, std::string::npos);
+        ASSERT_NE(public_build, std::string::npos)
             << "The fluent full-graph session must enter through the public "
                "virtual builder contract so typed topology policies are adopted.";
+        EXPECT_LT(prepare_storage, public_build)
+            << "Retained storage must be bound before model graph construction.";
         EXPECT_EQ(
-            full_build.find(
-                "graph_builder->buildFullForwardGraph(prepared_input, output)"),
+            full_build_tokens.find("graph_builder->buildFullForwardGraph("),
             std::string::npos)
             << "Calling the model-internal full builder directly bypasses "
                "policy scopes such as prefix-runtime device rehydration.";
@@ -10604,9 +10729,9 @@ namespace llaminar2::test
                       "allocateOnDevice(arena_device, setup_stream)"),
                   std::string::npos)
             << "The snapshot destination must be materialized in VRAM before capture.";
-        EXPECT_NE(arena_bind_body.find("storage_offset_bytes = aligned_offset"),
-                  std::string::npos)
-            << "Every immutable checkpoint needs an explicit disjoint arena offset.";
+        EXPECT_TRUE(hasCheckedSnapshotSlotPlacement(arena_bind_body))
+            << "Every immutable checkpoint must use its frozen descriptor geometry, checked absolute alignment, "
+               "disjoint slot offset and complete next-slot cursor.";
         EXPECT_EQ(arena_bind_body.find("for (auto &copy"),
                   arena_bind_body.rfind("for (auto &copy"))
             << "One descriptor loop must size slots before one arena allocation.";
@@ -10623,6 +10748,86 @@ namespace llaminar2::test
                       "storage_arena->ensureOnHost(producer_stream)"),
                   std::string::npos)
             << "The complete device arena must be downloaded once before callbacks read subranges.";
+    }
+
+    /** @test The real two-owner boundary passes; missing, detached or unowned launch gates fail. */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         CommittedDecodeMaintenanceSourceGuardRejectsForeignAndMissingAuthority)
+    {
+        const auto source = readFile(findRepoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
+        const auto body = braceBalancedDeclarationRegion(source,
+            "bool OrchestrationRunner::maybeApplyMoERebalance(");
+        ASSERT_FALSE(body.empty());
+        ASSERT_TRUE(hasTopologyOwnedDecodeMaintenance(body));
+        // Either lexical order is legitimate when each branch owns its gate.
+        // In particular, the former first-occurrence check rejects pipeline-first.
+        const auto pipeline = braceBalancedDeclarationRegion(body, "if (moe_pipeline_prepared_plan_)");
+        const auto native = braceBalancedDeclarationRegion(body, "if (usesNativeGpuStageMoEOverlayAuthority())");
+        EXPECT_TRUE(hasTopologyOwnedDecodeMaintenance(pipeline + "\n" + native));
+        EXPECT_TRUE(hasTopologyOwnedDecodeMaintenance(native + "\n" + pipeline));
+        struct MutationTarget
+        {
+            const char *branch;
+            const char *predicate;
+        };
+        constexpr MutationTarget mutations[] = {
+            {"if (moe_pipeline_prepared_plan_)", "if (moe_pipeline_prepared_plan_)"},
+            {"if (usesNativeGpuStageMoEOverlayAuthority())", "if (usesNativeGpuStageMoEOverlayAuthority())"},
+            {"if (usesNativeGpuStageMoEOverlayAuthority())", "runner_->moeOverlayAuthorityExecution()"},
+            {"if (moe_pipeline_prepared_plan_)", "binding->owners().authority->noPeerResidency().has_value()"},
+        };
+        for (const auto &mutation : mutations)
+        {
+            // The earlier embedded-maintenance acknowledgement repeats the
+            // device-authority predicate. Mutate the launch-owning branch,
+            // otherwise that unrelated check leaves the intended gate intact.
+            auto invalid = body;
+            const auto branch = invalid.find(mutation.branch);
+            ASSERT_NE(branch, std::string::npos) << mutation.branch;
+            const auto at = invalid.find(mutation.predicate, branch);
+            ASSERT_NE(at, std::string::npos) << mutation.predicate;
+            invalid.replace(at, std::string(mutation.predicate).size(), "foreign_authority");
+            EXPECT_FALSE(hasTopologyOwnedDecodeMaintenance(invalid)) << mutation.predicate;
+        }
+        EXPECT_FALSE(hasTopologyOwnedDecodeMaintenance(
+            "runner_->maybeApplyDecodeBoundaryMaintenance(committed_tokens);\n" + body));
+        auto invalid = body;
+        const auto argument = invalid.find("committed_tokens);",
+            invalid.find("runner_->maybeApplyDecodeBoundaryMaintenance("));
+        ASSERT_NE(argument, std::string::npos);
+        invalid.replace(argument, std::string("committed_tokens").size(), "1");
+        EXPECT_FALSE(hasTopologyOwnedDecodeMaintenance(invalid));
+    }
+
+    /** @test The real slot chain passes; old four-byte or detached cursor/geometry mutations fail. */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         SnapshotSlotSourceGuardRejectsLegacyAlignmentAndBrokenCursor)
+    {
+        const auto source = readFile(findRepoRoot() / "src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp");
+        const auto body = braceBalancedDeclarationRegion(source,
+            "bool DeviceGraphExecutor::bindGraphSnapshotArena(");
+        ASSERT_FALSE(body.empty());
+        ASSERT_TRUE(hasCheckedSnapshotSlotPlacement(body));
+        for (const auto token : {"copy.semantic_copy.geometry", "copy.storage_bytes != layout.storage_bytes",
+            "copy.metadata_offset_bytes != layout.metadata_offset_bytes", "slot.offset_bytes", "slot.end_bytes"})
+        {
+            auto invalid = body;const auto at = invalid.find(token);
+            ASSERT_NE(at, std::string::npos) << token;
+            invalid.replace(at, std::string(token).size(), "0");
+            EXPECT_FALSE(hasCheckedSnapshotSlotPlacement(invalid)) << token;
+        }
+        auto old_alignment = body;
+        const auto at = old_alignment.find("placeSnapshotStorageSlot(required_bytes, layout)");
+        ASSERT_NE(at, std::string::npos);
+        old_alignment.replace(at, std::string("placeSnapshotStorageSlot(required_bytes, layout)").size(),
+            "SnapshotStorageSlot{(required_bytes + 3) / 4 * 4, required_bytes + layout.storage_bytes}");
+        EXPECT_FALSE(hasCheckedSnapshotSlotPlacement(old_alignment));
+        auto no_rejection = body;
+        const auto validation = no_rejection.find("if (copy.storage_bytes != layout.storage_bytes");
+        const auto rejection = no_rejection.find("return false;", validation);
+        ASSERT_NE(rejection, std::string::npos);
+        no_rejection.replace(rejection, std::string("return false;").size(), "continue;");
+        EXPECT_FALSE(hasCheckedSnapshotSlotPlacement(no_rejection));
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
@@ -11436,6 +11641,29 @@ namespace llaminar2::test
                 continue;
             }
             const auto relative = fs::relative(entry.path(), root);
+            if (relative == "src/v2/tools/ModelKLDCanary.cpp")
+            {
+                // This standalone diagnostic consumes completed path/publication
+                // records to reject an incomplete observation. It never owns
+                // model progress. Keep the exception confined to its two
+                // observation functions, not the execution loop or core.
+                std::string non_observer_source = contents;
+                for (const auto signature : {
+                         "json requireQFNPath(",
+                         "std::uint64_t qfnTPHostPublications()"})
+                {
+                    const auto observer = braceBalancedDeclarationRegion(
+                        non_observer_source, signature);
+                    ASSERT_FALSE(observer.empty()) << signature;
+                    non_observer_source.erase(
+                        non_observer_source.find(observer), observer.size());
+                }
+                EXPECT_EQ(
+                    non_observer_source.find("PerfStatsCollector::snapshot"),
+                    std::string::npos)
+                    << "Passive numerical observations cannot schedule inference";
+                continue;
+            }
             EXPECT_TRUE(
                 relative == "src/v2/utils/BenchmarkRunner.cpp" ||
                 relative == "src/v2/utils/PerfStatsCollector.cpp")

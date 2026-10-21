@@ -20,6 +20,7 @@
  * - __expf → expf (HIP math)
  */
 
+#include "../../common/GatedNormActivation.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <algorithm>
@@ -1887,6 +1888,11 @@ __global__ void rocm_short_conv1d_batched_state_update_kernel(
 //   Register-caches input values to avoid re-reading from global memory.
 // =========================================================================
 
+/** @brief Normalize one immutable group without bounded private input arrays.
+ * @details Cache the first value in a scalar register, covering native128-wide
+ * heads completely. Larger groups reread later coalesced elements after the
+ * identical reduction, retaining arithmetic while removing a hidden width cap.
+ */
 __global__ void rocm_gated_rmsnorm_kernel(
     const float *__restrict__ input,
     const float *__restrict__ gate,
@@ -1899,7 +1905,7 @@ __global__ void rocm_gated_rmsnorm_kernel(
     int gamma_period,
     float eps,
     bool subtract_one,
-    bool gate_silu)
+    llaminar2::GatedNormActivation gate_activation)
 {
     // One block per (seq_position, group) pair
     const int work_idx = blockIdx.x;
@@ -1912,14 +1918,12 @@ __global__ void rocm_gated_rmsnorm_kernel(
     const int block_size = blockDim.x;
 
     // Pass 1: Each thread handles its slice of norm_dim, accumulate sum_sq
-    constexpr int kMaxPerThread = 8; // handles norm_dim up to 8*256=2048
-    float local_vals[kMaxPerThread];
-    int local_count = 0;
+    float first_value = 0.0f;
 
     float sum_sq = 0.0f;
     for (int j = tid; j < norm_dim; j += block_size) {
         float v = input[offset + j];
-        local_vals[local_count++] = v;
+        if(j==tid) first_value=v;
         sum_sq += v * v;
     }
 
@@ -1946,15 +1950,16 @@ __global__ void rocm_gated_rmsnorm_kernel(
     float inv_rms = rsqrtf(warp_sums[0] / (float)norm_dim + eps);
 
     // Pass 2: Normalize with register-cached values
-    int idx = 0;
     for (int j = tid; j < norm_dim; j += block_size) {
-        float normalized = local_vals[idx++] * inv_rms;
+        float normalized = (j==tid?first_value:input[offset+j]) * inv_rms;
         int gamma_idx = j % gamma_period;
         float gamma_eff = subtract_one ? (1.0f + gamma[gamma_idx]) : gamma[gamma_idx];
         float gate_val = gate[offset + j];
         float gate_act;
-        if (gate_silu)
+        if (gate_activation == llaminar2::GatedNormActivation::SiLU)
             gate_act = gate_val / (1.0f + expf(-gate_val));
+        else if (gate_activation == llaminar2::GatedNormActivation::Sigmoid)
+            gate_act = 1.0f / (1.0f + expf(-gate_val));
         else
             gate_act = gate_val;
         output[offset + j] = normalized * gamma_eff * gate_act;
@@ -3309,9 +3314,12 @@ bool rocmGDN_gated_rmsnorm(
     const float *input, const float *gate, const float *gamma,
     float *output,
     int seq_len, int d_model, int norm_dim, int gamma_period,
-    float eps, bool subtract_one, bool gate_silu,
+    float eps, bool subtract_one, llaminar2::GatedNormActivation gate_activation,
     int device_idx, void *stream)
 {
+        if (!stream || !llaminar2::validGatedNormActivation(gate_activation))
+            return false; // Exact-stream and immutable-policy contracts are mandatory.
+
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
     int n_groups = d_model / norm_dim;
@@ -3327,7 +3335,7 @@ bool rocmGDN_gated_rmsnorm(
         dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
         input, gate, gamma, output,
         total_work, n_groups, norm_dim, d_model, gamma_period,
-        eps, subtract_one, gate_silu);
+        eps, subtract_one, gate_activation);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {

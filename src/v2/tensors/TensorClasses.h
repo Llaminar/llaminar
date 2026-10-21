@@ -699,6 +699,11 @@ namespace llaminar2
 
     class TensorBase : public virtual ITensor, public std::enable_shared_from_this<TensorBase>
     {
+        friend class FP32StorageReshape; ///< Arena-only FP32 shape metadata delegates to its root.
+        friend class NativeAllGatherStage; ///< Capture-only seal authenticates arena transport-count storage.
+        friend class Qwen4ExpPreparedStorage; ///< Stage metadata seals canonical native storage before capture.
+        friend class DeviceGenerationControlBinding; ///< Read-only borrow authenticates canonical controller storage/backend.
+        friend class DeviceRequestQueryBinding; ///< Read-only query borrow authenticates original ingress allocator/backend/runtime.
         friend class TensorSlice;                                         // Allow TensorSlice to access protected byte_size()/raw_host_data_ptr()
         friend class TransferEngine;                                      // Allow TransferEngine to access coherence state and pointers
         friend class PreparedWeightStore;                                 // Allow the model-owned store to publish prepared representations
@@ -1039,7 +1044,7 @@ namespace llaminar2
         virtual const void *gpu_data_ptr() const;
 
         /// @deprecated Use hostValid() or coherenceState() instead. Will be removed.
-        bool isOnCPU() const { return ::llaminar2::isHostValid(coherence_state_); }
+        bool isOnCPU() const { return ::llaminar2::isHostValid(coherenceState()); }
 
         /// @deprecated Use deviceValid() or coherenceState() instead. Will be removed.
         bool isDeviceValid() const
@@ -2591,6 +2596,7 @@ namespace llaminar2
         size_t byte_size() const override { return element_count() * sizeof(float); }
 
     private:
+        friend class FP32StorageReshape; ///< Construct shape metadata without another allocation.
         /** Tag selecting shape-only construction before mapped allocation. */
         struct MappedStorageConstructionTag final
         {
@@ -3288,6 +3294,13 @@ namespace llaminar2
         size_t byte_size() const override { return element_count() * sizeof(int8_t); }
 
     private:
+        friend class AdaptiveImmutableLookupRootStorage;
+        /** @brief Private setup-only construction without a transient host mirror. */
+        struct DeviceOnlyStorageTag final {};
+        /** @brief Source-owned PMA root factory alone supplies this checked GPU-only constructor. */
+        INT8Tensor(const std::vector<size_t> &shape, DeviceId device, DeviceOnlyStorageTag);
+        bool device_only_ = false; ///< Root has no native host bytes or diagnostic dequantized mirror.
+
         std::vector<size_t> shape_;
         DeviceId device_ = DeviceId::cpu();
         AlignedVector<int8_t> host_int8_data_;        // 64-byte aligned for SIMD operations
@@ -3451,6 +3464,13 @@ namespace llaminar2
         size_t byte_size() const override { return element_count() * sizeof(int32_t); }
 
     private:
+        friend class AdaptiveImmutableLookupRootStorage;
+        /** @brief Private setup-only construction without a transient host mirror. */
+        struct DeviceOnlyStorageTag final {};
+        /** @brief Source-owned PMA root factory alone supplies this checked GPU-only constructor. */
+        INT32Tensor(const std::vector<size_t> &shape, DeviceId device, DeviceOnlyStorageTag);
+        bool device_only_ = false; ///< Root has no native host bytes or diagnostic dequantized mirror.
+
         std::vector<size_t> shape_;
         DeviceId device_ = DeviceId::cpu();
         AlignedVector<int32_t> host_int32_data_; // 64-byte aligned for SIMD operations

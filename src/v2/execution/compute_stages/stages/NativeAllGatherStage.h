@@ -13,9 +13,11 @@
 
 #include "CapturedAllGatherStage.h"
 #include "../StageParamsBase.h"
+#include "execution/mtp/DeviceGenerationCollectiveReceipt.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "memory/BufferId.h"
 #include "collective/NativeCollectiveRows.h"
+#include "tensors/TensorClasses.h"
 
 #include <optional>
 #include <string>
@@ -24,6 +26,8 @@
 namespace llaminar2
 {
     class ILocalTPContext;
+    class TensorBase;
+    class IBackend;
 
     /**
      * @brief Exact-stream native allgather with explicit input/output ownership.
@@ -36,6 +40,23 @@ namespace llaminar2
     class NativeAllGatherStage final : public CapturedAllGatherStage
     {
     public:
+        /**
+         * @brief Arena-owned transport prefix resolved after ordinary materialization.
+         *
+         * The scalar is produced by a graph node, not sampled by the host. A
+         * canonical INT32 root and byte offset keep owner/event authority visible
+         * while its cold device pointer does not yet exist. This transport count
+         * cannot replace an original request/history count.
+         */
+        struct ArenaRows
+        {
+            TensorBase *owner = nullptr; ///< Existing canonical arena root; enclosing graph retains it.
+            BufferId buffer = BufferId::_COUNT; ///< Exact count producer/consumer role.
+            std::size_t byte_offset = 0; ///< Aligned scalar offset inside owner.
+            int capacity = 0; ///< Positive admitted physical rows, independent of live value.
+            std::size_t bytes_per_row = 0; ///< Exact native bytes per live row.
+        };
+
         /** @brief Immutable graph declaration; both buffers must be arena-bound. */
         struct Params
         {
@@ -48,7 +69,9 @@ namespace llaminar2
             std::string stage_name; ///< Stable graph/diagnostic identity.
             std::optional<BufferId> input_buffer_id;
             std::optional<BufferId> output_buffer_id;
-            std::optional<NativeCollectiveRows> live_rows; ///< INT8 row geometry; never allocation padding.
+            std::optional<NativeCollectiveRows> live_rows; ///< Raw immutable row declaration; excludes arena_rows.
+            std::optional<ArenaRows> arena_rows; ///< Cold arena count declaration; excludes live_rows.
+            std::optional<DeviceGenerationCollectiveReceipt> payload_receipt; ///< Typed original control-row observation; requires arena_rows.
         };
         static_assert(StageParamsRequired<Params>);
 
@@ -59,6 +82,29 @@ namespace llaminar2
          * @throws std::overflow_error when receive/traffic extents cannot be represented.
          */
         explicit NativeAllGatherStage(Params params);
+
+        /**
+         * @brief Seal an already prepared arena count, without allocating or reading it.
+         * @param ctx Exact participant context owning the operation.
+         * @param stream Explicit upcoming graph stream.
+         * @return True after the immutable physical count identity is sealed.
+         * @throws std::logic_error For preparation during capture or changed sealed storage.
+         * @throws std::invalid_argument For missing/foreign/unprepared count storage.
+         */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        /** @return Only arena-count declarations require setup before native recording. */
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        { return params_.arena_rows ? GraphLaunchPreparationPolicy::CaptureOnly : GraphLaunchPreparationPolicy::None; }
+        /** @return Cold declarations remain eligible for ordinary executor preparation. */
+        bool supportsGraphCaptureAfterLaunchPreparation() const override
+        { return supportsLazyPrefillGraphCapturePreflight(); }
+        /** @return Membership/compiled backend eligibility, independent of cold count storage. */
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
+        /** @return Counted banks clip padded rows; fixed byte messages retain their existing contract. */
+        bool supportsPaddedPrefillRealLengthContract() const override
+        { return params_.arena_rows.has_value() || params_.live_rows.has_value(); }
+        /** @return Complete immutable declaration; sealed storage drift is fatal. */
+        std::uint64_t graphCaptureVariantSignature() const override;
 
         /**
          * @brief Enqueue the sole native byte collective and publish its exact stream.
@@ -87,7 +133,9 @@ namespace llaminar2
         /** @return The same immutable arena owners used by ordinary native execution. */
         CapturedAllGatherBuffers exchangeBuffers() const override
         { return {params_.local_input, params_.rank_major_output,
-            *params_.input_buffer_id, *params_.output_buffer_id}; }
+            *params_.input_buffer_id, *params_.output_buffer_id,
+            params_.arena_rows ? params_.arena_rows->owner : nullptr,
+            params_.payload_receipt ? params_.payload_receipt->owner() : nullptr}; }
         /** @brief Enqueue unchanged NCCL/RCCL bytes on an authenticated fork.
          * @param input Exact source/event acquisition produced by TransferEngine.
          * @return Native collective enqueue success; publication belongs to the join.
@@ -124,6 +172,12 @@ namespace llaminar2
         void validateMembership() const;
         /** @brief Check declared capacity; no backend allocation or transfer is permitted. */
         void validateBuffers() const;
+        /** @brief Validate count declaration and any existing physical scalar extent. */
+        void validateCountDeclaration() const;
+        /** @brief Reject missing/stale prepared count owner, pointer, device or runtime generation. */
+        void validateCountSeal() const;
+        /** @return Sealed counted geometry; never read scalar contents or substitute another authority. */
+        NativeCollectiveRows arenaRows() const;
         /** @brief Submit exact bytes; the caller owns input acquisition and output publication. */
         bool enqueueOnStream(void *stream) const;
 
@@ -131,5 +185,14 @@ namespace llaminar2
         const std::vector<GlobalDeviceAddress> members_;
         std::size_t receive_bytes_ = 0;
         std::size_t traffic_bytes_ = 0;
+        /** @brief Capture-only metadata; no live count value is cached here. */
+        struct CountSeal
+        {
+            const void *base;
+            std::size_t owner_bytes;
+            IBackend *backend;
+            std::uint64_t runtime_generation;
+        };
+        std::optional<CountSeal> count_seal_; ///< Immutable after first preparation; ordinary reset never rebinds it.
     };
 } // namespace llaminar2

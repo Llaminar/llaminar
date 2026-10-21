@@ -2182,6 +2182,32 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
+    qwen4exp::QwenSparseKV ROCmRingKVCache<Precision>::acquireSparseAttentionNativeView(
+        int layer, int sequence, const attention::AttentionDeviceParams *rows,
+        attention::AttentionKeyCachePolicy policy, void *stream)
+    {
+        requireGPUExecutionStream(stream,"ROCmRingKVCache::acquireSparseAttentionNativeView");
+        if (layer < 0 || layer >= n_layers_ || sequence < 0 || sequence >= batch_size_ ||
+            head_dim_ != 256 || local_n_kv_heads_ < 1 || local_n_kv_heads_ > 2 || !rows)
+            throw std::invalid_argument("ROCm selected KV view requires D256 native storage and canonical per-row device params");
+        constexpr TensorType codec = [] {
+            if constexpr (Precision == ActivationPrecision::FP16) return TensorType::FP16;
+            if constexpr (Precision == ActivationPrecision::BF16) return TensorType::BF16;
+            if constexpr (Precision == ActivationPrecision::Q8_1) return TensorType::Q8_1;
+            return TensorType::FP32;
+        }();
+        const auto &entry = entries_[layer][sequence];
+        const std::size_t head_bytes = (Precision == ActivationPrecision::Q8_1 ? 8 : 256) * sizeof(DataT);
+        qwen4exp::QwenSparseNativeBank key{.data=entry.d_K,
+            .token_stride_bytes=static_cast<std::size_t>(kv_storage_dim_)*sizeof(DataT),
+            .head_stride_bytes=head_bytes,.codec=codec};
+        auto value = key;
+        value.data = entry.d_V;
+        return {.keys=key,.values=value,.addressing=qwen4exp::QwenSparseKVAddressing::RowParameters,
+                .row_parameters=rows,.key_policy=policy};
+    }
+
+    template <ActivationPrecision Precision>
     std::optional<IKVCache::DeviceReadStorage>
     ROCmRingKVCache<Precision>::describeDeviceReadStorage(
         const DeviceReadStorageRequest &request) const

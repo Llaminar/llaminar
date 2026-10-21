@@ -1,4 +1,5 @@
 #pragma once
+#include "MTPShiftedCacheOrigin.h"
 
 #include "MTPSpecStateContract.h"
 
@@ -41,6 +42,6 @@ namespace llaminar2
      */
     int computeMTPShiftedKVTargetCachedTokens(
         const MTPSpecStepPlan &plan,
-        int mtp_depth);
+        int mtp_depth, MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly);
 
 } // namespace llaminar2

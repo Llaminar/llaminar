@@ -6,7 +6,9 @@
  * builders, compute stages and migration share one family/geometry validator.
  * Whole experts require all three projections. Projection-partitioned domains
  * publish an explicitly typed movable gate/up pair and keep fixed down slices
- * outside that placement lifecycle. Rejection never partially mutates a bank.
+ * outside that placement lifecycle. Static within-expert F geometry is not a
+ * complete movable pair and rejects before querying any prepared engine.
+ * Rejection never partially mutates a bank.
  */
 
 #pragma once
@@ -173,7 +175,10 @@ namespace llaminar2
         const MoEExpertProjectionOwnership &ownership,
         DeviceMoEExpertDescriptor &output) noexcept
     {
-        if (ownership.movableProjections() != DeviceMoEProjectionSet::GateUp)
+        // A static input/output rectangle is not a complete movable pair.
+        // Reject before the checked throwing query inside this noexcept validator.
+        if (!ownership.hasMovableProjectionSet() ||
+            ownership.movableProjections() != DeviceMoEProjectionSet::GateUp)
             return false;
         const auto geometry = ownership.geometry();
         return moe_descriptor_detail::exportMovableWeights(gate, up, nullptr,

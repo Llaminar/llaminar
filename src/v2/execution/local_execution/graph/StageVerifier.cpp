@@ -13,6 +13,8 @@
 
 #include "../../../tensors/TensorVerification.h"
 #include "../../../tensors/GPUTensorVerification.h"
+#include "../../../snapshots/SnapshotSemanticObservation.h"
+#include <limits>
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
@@ -56,7 +58,9 @@ namespace llaminar2
             const verification::VerificationConfig &config)
         {
             std::ostringstream reason;
-            bool passed = true;
+            bool passed = !gpu_result.invalid_extent;
+            if (!passed)
+                reason << "invalid acquired output extent";
 
             if (config.check_nan && gpu_result.has_nan)
             {
@@ -70,7 +74,7 @@ namespace llaminar2
                 passed = false;
                 reason << "contains " << gpu_result.inf_count << " Inf values";
             }
-            if (config.check_all_zero && gpu_result.appears_zero)
+            if (config.check_all_zero && gpu_result.total_checked != 0 && gpu_result.appears_zero)
             {
                 if (!passed)
                     reason << "; ";
@@ -90,14 +94,58 @@ namespace llaminar2
         }
 
         /**
-         * Validate one stage buffer without changing its residency authority.
+         * @brief Bind an output's authored contiguous axis to its original count owner.
+         * @param buffer Original dump declaration; input buffers retain physical geometry.
+         * @param gpu Whether the payload's authoritative storage is native GPU memory.
+         * @param device Exact stage/metadata device, never inferred from a count value.
+         * @return Call-only borrow, valid until this validation transaction retires.
+         * @throws std::logic_error for missing/foreign/malformed frontier ownership.
+         */
+        template <typename Buffer>
+        [[nodiscard]] TensorValidationExtent validationExtent(
+            const Buffer &buffer, bool gpu, DeviceId device)
+        {
+            TensorValidationExtent result{
+                {SnapshotContiguousRowKind::Physical, buffer.rows}, buffer.cols, nullptr};
+            if constexpr (requires { buffer.semantic_extent; })
+            {
+                SnapshotInt32Binding binding;
+                std::size_t words = 1;
+                if (const auto *tokens = std::get_if<SnapshotTokenRows>(&buffer.semantic_extent))
+                {
+                    result.geometry.kind = SnapshotContiguousRowKind::TokenRows;
+                    binding = tokens->liveRows;
+                }
+                else if (const auto *state = std::get_if<SnapshotStatePrefixRows>(&buffer.semantic_extent))
+                {
+                    result.geometry.kind = SnapshotContiguousRowKind::StatePrefixRows;
+                    result.geometry.sourceCapacity = state->sourceCapacity;
+                    result.geometry.sourceRowsPerStateRow = state->sourceRowsPerStateRow;
+                    binding = state->frontier;
+                    words = 2;
+                    if (!binding.tensor)
+                        throw std::logic_error("State-prefix validation requires its original frontier owner");
+                }
+                else if (!std::holds_alternative<std::monostate>(buffer.semantic_extent))
+                    throw std::logic_error("Floating validation requires a contiguous authored output axis");
+                if (gpu && binding.tensor && !binding.tensor->isDeviceValid())
+                    throw std::logic_error("Output frontier has no authoritative native storage");
+                if (!gpu && binding.tensor && binding.tensor->isDeviceValid() &&
+                    binding.tensor->current_device() && binding.tensor->current_device()->is_gpu())
+                    throw std::logic_error("CPU validation cannot consume a GPU-owned frontier");
+                result.frontier = snapshotCountPointer(binding, words, gpu, device);
+            }
+            return result;
+        }
+
+        /**
+         * @brief Validate only authored output rows without changing residency authority.
          *
-         * GPU tensors are scanned in place on the exact stage stream. A missing
-         * validator, stream, current device, or device pointer is an
-         * infrastructure failure and is reported as a failed verification; the
-         * caller never attempts to repair it by materializing the tensor on the
-         * host. Non-floating formats have no NaN/Inf semantics and retain the
-         * same explicit no-op validation contract as verifyRawBuffer().
+         * Static bounds and original owners are checked even when the acquired
+         * extent is empty. GPU counts are read only by the existing initializer
+         * on the exact stage stream; the sole compact result distinguishes an
+         * authentic empty observation from malformed native metadata. Integer
+         * formats keep their existing no-NaN/Inf validation policy.
          */
         template <typename Buffer>
         [[nodiscard]] BufferValidation validateBuffer(
@@ -105,79 +153,89 @@ namespace llaminar2
             IComputeStage &stage,
             const verification::VerificationConfig &config)
         {
-            const size_t numel = buffer.rows * buffer.cols;
-            if (numel == 0)
-                return {verification::VerificationResult::ok(), false};
-
-            ITensor *tensor = buffer.tensor;
-            if (tensor && tensor->isDeviceValid())
+            bool gpu = false;
+            try
             {
-                const auto device = tensor->current_device();
-                if (!device || !device->is_gpu())
+                if (buffer.cols && buffer.rows > std::numeric_limits<size_t>::max() / buffer.cols)
+                    throw std::logic_error("Stage buffer element extent overflows");
+                const size_t numel = buffer.rows * buffer.cols;
+                if (!numel)
                 {
-                    return {verification::VerificationResult::fail(
-                                bufferName(buffer.name),
-                                "device-valid tensor has no owning GPU device"),
-                            true};
+                    if constexpr (requires { buffer.semantic_extent; })
+                    {
+                        if (!std::holds_alternative<std::monostate>(buffer.semantic_extent))
+                            throw std::logic_error("Authored output omits its positive physical capacity");
+                    }
+                    return {verification::VerificationResult::ok(), false};
                 }
-
-                if (*device != stage.device())
-                {
-                    return {verification::VerificationResult::fail(
-                                bufferName(buffer.name),
-                                "authoritative tensor device " + device->to_string() +
-                                    " does not match stage device " + stage.device().to_string()),
-                            true};
-                }
-
+                ITensor *tensor = buffer.tensor;
+                gpu = tensor && tensor->isDeviceValid();
+                const auto device = gpu ? tensor->current_device() : std::optional<DeviceId>{};
+                if (gpu && (!device || !device->is_gpu() || *device != stage.device()))
+                    throw std::logic_error("Authoritative tensor device does not match its stage device");
                 const auto data_type = gpuValidationDataType(buffer.dtype);
                 if (!data_type)
-                    return {verification::VerificationResult::ok(), true};
-
-                const void *device_ptr = tensor->gpu_data_ptr();
-                if (!device_ptr)
+                    return {verification::VerificationResult::ok(), gpu};
+                if (!buffer.element_size || numel > std::numeric_limits<size_t>::max() / buffer.element_size)
+                    throw std::logic_error("Stage buffer byte extent overflows");
+                const auto bytes = numel * buffer.element_size;
+                const auto expected_width = *data_type == TensorValidationDataType::FP32 ? 4U : 2U;
+                if (buffer.element_size != expected_width || buffer.tensor_byte_offset % expected_width ||
+                    (buffer.byte_size && bytes > buffer.byte_size))
+                    throw std::logic_error("Stage floating subview has inconsistent scalar/byte geometry");
+                if (tensor && (buffer.tensor_byte_offset > tensor->size_bytes() ||
+                    bytes > tensor->size_bytes() - buffer.tensor_byte_offset))
+                    throw std::logic_error("Stage floating subview exceeds its original tensor owner");
+                if (gpu)
                 {
-                    return {verification::VerificationResult::fail(
-                                bufferName(buffer.name),
-                                "device-valid tensor exposes a null device pointer"),
-                            true};
-                }
-
-                ITensorValidator *validator = getTensorValidator(device->type, device->ordinal);
-                if (!validator)
-                {
-                    return {verification::VerificationResult::fail(
-                                bufferName(buffer.name),
-                                "no device validator is installed for " + device->to_string()),
-                            true};
-                }
-
-                try
-                {
-                    const auto gpu_result = validator->validate(
-                        device_ptr,
-                        numel,
-                        *data_type,
+                    const auto *base = static_cast<const std::byte *>(tensor->gpu_data_ptr());
+                    if (!base)
+                        throw std::logic_error("Device-valid tensor exposes a null device pointer");
+                    const auto extent = validationExtent(buffer, true, *device);
+                    auto *validator = getTensorValidator(device->type, device->ordinal);
+                    if (!validator)
+                        throw std::logic_error("No device validator is installed for " + device->to_string());
+                    const auto result = validator->validateObserved(
+                        base + buffer.tensor_byte_offset, extent, *data_type,
                         ExplicitGPUStream{stage.gpuStream()});
-                    return {gpuResultToVerification(buffer.name, gpu_result, config), true};
+                    return {gpuResultToVerification(buffer.name, result, config), true};
                 }
-                catch (const std::exception &error)
+                const auto extent = validationExtent(buffer, false, stage.device());
+                const bool authored = extent.geometry.kind != SnapshotContiguousRowKind::Physical;
+                const void *data = buffer.data;
+                if (authored)
                 {
-                    return {verification::VerificationResult::fail(
-                                bufferName(buffer.name),
-                                std::string("device validation failed fatally: ") + error.what()),
-                            true};
+                    if (!tensor || !tensor->isHostValid() || stage.device().is_gpu())
+                        throw std::logic_error("Authored CPU output requires its original host-owned payload");
+                    const auto *base = static_cast<const std::byte *>(tensor->raw_data());
+                    if (!base)
+                        throw std::logic_error("Authored CPU output exposes a null host pointer");
+                    data = base + buffer.tensor_byte_offset;
                 }
+                if (!data)
+                    throw std::logic_error("Stage buffer exposes a null payload pointer");
+                std::int32_t prior = 0, live = 0;
+                auto geometry = extent.geometry;
+                if (geometry.kind == SnapshotContiguousRowKind::StatePrefixRows)
+                {
+                    prior = extent.frontier[0];
+                    live = extent.frontier[1];
+                }
+                else if (geometry.kind == SnapshotContiguousRowKind::TokenRows && extent.frontier)
+                    live = extent.frontier[0];
+                else
+                    geometry.kind = SnapshotContiguousRowKind::Physical;
+                const auto observed = resolveSnapshotContiguousRows(geometry, prior, live);
+                if (!observed.valid)
+                    throw std::logic_error("Invalid acquired output extent");
+                return {verification::verifyRawBuffer(data, observed.rows, buffer.cols,
+                    bufferName(buffer.name), buffer.dtype, config), false};
             }
-
-            return {verification::verifyRawBuffer(
-                        buffer.data,
-                        buffer.rows,
-                        buffer.cols,
-                        bufferName(buffer.name),
-                        buffer.dtype,
-                        config),
-                    false};
+            catch (const std::exception &error)
+            {
+                return {verification::VerificationResult::fail(bufferName(buffer.name),
+                    std::string("Buffer validation failed fatally: ") + error.what()), gpu};
+            }
         }
     } // namespace
 

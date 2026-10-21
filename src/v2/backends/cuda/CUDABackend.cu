@@ -2592,7 +2592,7 @@ namespace llaminar2
         int *out_accepted_state_counts,
         int *out_ok,
         int device_idx,
-        void *stream);
+        void *stream, llaminar2::MTPShiftedCacheOrigin origin);
     extern "C" bool cudaOps_prepare_speculative_shifted_kv_tokens(
         const int *meta,
         int meta_stride,
@@ -4994,14 +4994,14 @@ namespace llaminar2
         void *stream,
         void *out_target_cached_tokens_device,
         void *out_accepted_state_counts_device,
-        void *out_ok_device)
+        void *out_ok_device, MTPShiftedCacheOrigin origin)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !base_cached_tokens_device ||
             !main_target_cached_tokens_device ||
             !main_publication_ok_device ||
             request_count <= 0 ||
-            mtp_depth < 0 ||
+            mtpShiftedPrefixOffset(origin,mtp_depth)<0 ||
             !stream ||
             !out_target_cached_tokens_device ||
             !out_accepted_state_counts_device ||
@@ -5021,7 +5021,7 @@ namespace llaminar2
             static_cast<int *>(out_accepted_state_counts_device),
             static_cast<int *>(out_ok_device),
             device_id,
-            stream);
+            stream,origin);
     }
 
     bool CUDABackend::enqueuePrepareSpeculativeShiftedKVTokens(

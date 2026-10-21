@@ -58,12 +58,16 @@ MoEProjectionArenaGeometry MoEProjectionArenaGeometry::resolve(
         profile.expert_used_count <= 0 || profile.expert_used_count > profile.expert_count)
         throw std::invalid_argument("MoE projection arena requires complete, divisible native-domain geometry");
 
-    std::vector<bool> seen(static_cast<std::size_t>(profile.n_layers), false);
+    // QFN declares main blocks separately from its trailing predictor; older
+    // families include predictors in n_layers. The canonical projection also
+    // checks malformed counts before either indexing or sizing the arena.
+    const int layers = profile.totalLayerCount();
+    std::vector<bool> seen(static_cast<std::size_t>(layers), false);
     std::size_t packet_words = 0;
     for (const auto &tensor : profile.tensors)
     {
         if (inferWeightRole(tensor.name) != WeightRole::MoEExpertDown) continue;
-        if (tensor.layer_index < 0 || tensor.layer_index >= profile.n_layers || seen[tensor.layer_index] ||
+        if (tensor.layer_index < 0 || tensor.layer_index >= layers || seen[tensor.layer_index] ||
             tensor.K == 0 || tensor.K > std::numeric_limits<std::uint32_t>::max() ||
             tensor.elements != multiply(multiply(profile.d_model, tensor.K), profile.expert_count))
             throw std::invalid_argument("MoE projection arena has missing/duplicate or malformed down geometry");

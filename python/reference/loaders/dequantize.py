@@ -1208,6 +1208,33 @@ def dequantize_f32(data: bytes, n_elements: int) -> np.ndarray:
     return np.frombuffer(data, dtype=np.float32, count=n_elements)
 
 
+def dequantize_iq4_nl(data: bytes, n_elements: int) -> np.ndarray:
+    """Decode native 32-element IQ4_NL blocks, preserving GGML half-block order.
+
+    Each block contains an FP16 scale followed by sixteen bytes whose low
+    nibbles describe elements 0..15 and high nibbles describe 16..31. The
+    canonical project codebook is shared with IQ4_XS, never approximated.
+    """
+    if n_elements % 32 or len(data) != n_elements // 32 * 18:
+        raise ValueError("IQ4_NL requires complete, exact 32-element blocks")
+    blocks = np.frombuffer(data, dtype=np.uint8).reshape(-1, 18)
+    scale = np.frombuffer(blocks[:, :2].copy().tobytes(), dtype='<f2').astype(np.float32)
+    codes = np.concatenate((blocks[:, 2:] & 15, blocks[:, 2:] >> 4), axis=1)
+    return (scale[:, None] * _load_iq4nl_values()[codes]).reshape(-1)
+
+
+def dequantize_q5_1(data: bytes, n_elements: int) -> np.ndarray:
+    """Decode affine Q5_1 blocks using GGML's low-half/high-half nibble order."""
+    if n_elements % 32 or len(data) != n_elements // 32 * 24:
+        raise ValueError("Q5_1 requires complete, exact 32-element blocks")
+    blocks = np.frombuffer(data, dtype=np.uint8).reshape(-1, 24)
+    dm = np.frombuffer(blocks[:, :4].copy().tobytes(), dtype='<f2').astype(np.float32).reshape(-1, 2)
+    high = np.unpackbits(blocks[:, 4:8], axis=1, bitorder='little')
+    low = np.concatenate((blocks[:, 8:] & 15, blocks[:, 8:] >> 4), axis=1)
+    codes = low | (high << 4)
+    return (dm[:, :1] * codes.astype(np.float32) + dm[:, 1:]).reshape(-1)
+
+
 def dequantize(data: bytes, tensor_type: GGUFTensorType, shape: Tuple[int, ...]) -> np.ndarray:
     """
     Dequantize tensor data based on its type.
@@ -1244,6 +1271,10 @@ def dequantize(data: bytes, tensor_type: GGUFTensorType, shape: Tuple[int, ...])
         result = dequantize_q4_1(data, n_elements)
     elif tensor_type == GGUFTensorType.Q5_0:
         result = dequantize_q5_0(data, n_elements)
+    elif tensor_type == GGUFTensorType.Q5_1:
+        result = dequantize_q5_1(data, n_elements)
+    elif tensor_type == GGUFTensorType.IQ4_NL:
+        result = dequantize_iq4_nl(data, n_elements)
     elif tensor_type == GGUFTensorType.Q8_0:
         result = dequantize_q8_0(data, n_elements)
     elif tensor_type == GGUFTensorType.Q6_K:
@@ -1285,6 +1316,22 @@ def get_quantization_info(tensor_type: GGUFTensorType) -> dict:
         - name: Human-readable name
     """
     info_map = {
+        GGUFTensorType.Q5_K: {
+            'block_size': 256, 'block_bytes': 176,
+            'bits_per_weight': 5.5, 'name': 'Q5_K (5-bit K-quantization)',
+        },
+        GGUFTensorType.Q4_K: {
+            'block_size': 256, 'block_bytes': 144,
+            'bits_per_weight': 4.5, 'name': 'Q4_K (4-bit K-quantization)',
+        },
+        GGUFTensorType.IQ4_NL: {
+            'block_size': 32, 'block_bytes': 18,
+            'bits_per_weight': 4.5, 'name': 'IQ4_NL (nonlinear 4-bit)',
+        },
+        GGUFTensorType.Q5_1: {
+            'block_size': 32, 'block_bytes': 24,
+            'bits_per_weight': 6, 'name': 'Q5_1 (affine 5-bit)',
+        },
         GGUFTensorType.F32: {
             'block_size': 1,
             'block_bytes': 4,

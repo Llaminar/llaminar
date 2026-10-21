@@ -287,7 +287,7 @@ private:
         checked(cudaGetLastError());
         checked(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
         kernel<<<dim3((n+7)/8,(m+RowsPerCTA-1)/RowsPerCTA,2),256,0,stream>>>(
-            aa.data,bb.data,cc.data,m,n,k, llaminar2::DeviceRowRange::fullyActive(m));
+            aa.data,bb.data,cc.data,m,n,k, llaminar2::FloatingProjectionRows::bind(m,nullptr,nullptr));
         const auto launch_status = cudaGetLastError();
         checked(cudaStreamEndCapture(stream,&graph));
         checked(launch_status);

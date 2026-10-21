@@ -213,6 +213,7 @@ namespace llaminar2
         Disabled = 0,
         DeviceTransferDirectory,
         PhysicalResidencyFabric,
+        NoPeer, ///< Dynamic is retained; singleton geometry owns no movement storage.
     };
 
     /** @return Stable diagnostic name for one migration storage lifecycle. */
@@ -223,6 +224,8 @@ namespace llaminar2
         {
         case MoEOverlayMigrationStorageKind::Disabled:
             return "disabled";
+        case MoEOverlayMigrationStorageKind::NoPeer:
+            return "no_peer";
         case MoEOverlayMigrationStorageKind::DeviceTransferDirectory:
             return "device_transfer_directory";
         case MoEOverlayMigrationStorageKind::PhysicalResidencyFabric:
@@ -296,8 +299,7 @@ namespace llaminar2
         /** @return Whether runtime movement owns any physical storage. */
         [[nodiscard]] constexpr bool migrationEnabled() const noexcept
         {
-            return migration_storage !=
-                   MoEOverlayMigrationStorageKind::Disabled;
+            return usesDeviceTransferDirectory() || usesPhysicalResidencyFabric();
         }
 
         /** @return Whether graph-owned homogeneous GPU directories are selected. */
@@ -473,6 +475,28 @@ namespace llaminar2
          */
         [[nodiscard]] static std::vector<MoEOverlayResolvedCapacityPlan>
         resolvePipelineCapacity(std::span<const MoEOverlayStageCapacityRequest> stages);
+        /**
+         * @brief Freeze replica/quota decisions without granting materialization.
+         * @param stages Complete authored requests for the higher-priority search.
+         * @return Owned draft, to be admitted once after graph rows and ngram storage are fixed.
+         * @throws MoEOverlayCapacityExhausted For higher-priority capacity pressure only.
+         */
+        static MoEOverlayCapacityDraft resolvePipelineCapacityDraft(
+            std::span<const MoEOverlayStageCapacityRequest> stages);
+        /**
+         * @brief Freeze a standalone overlay's higher-priority quotas and replica grant.
+         * @param plan Exact hardware-bound overlay topology.
+         * @param num_experts Complete model expert count.
+         * @param layer_weight_manifest Original authenticated projection manifest.
+         * @param physical_budgets Complete fixed PMA contributions.
+         * @param policy Exact migration/directory policy.
+         * @return Unadmitted draft, with no table preference participating in quota decisions.
+         */
+        static MoEOverlayCapacityDraft resolveCapacityDraft(
+            const MoERoutedExpertPlacementPlan &plan,int num_experts,
+            const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
+            const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
+            const MoEOverlayCapacityAdmissionPolicy &policy = {});
 
         /**
          * @brief Resolve capacity and install its exact quotas into a plan copy.

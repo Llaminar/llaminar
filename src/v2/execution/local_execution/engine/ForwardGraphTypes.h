@@ -273,8 +273,11 @@ namespace llaminar2
         ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows; ///< Position geometry captured by this graph.
         const int32_t *device_sequence_lengths = nullptr; ///< Exact borrowed row-count owner embedded by captured stages.
         std::optional<DeviceDecodePositionBinding> device_decode_position; ///< Exact scalar KV snapshot topology and borrowed addresses.
+        uint64_t device_request_query_capture_identity = 0; ///< Exact original arena request ingress/count geometry.
         uint64_t device_prefill_chunk_capture_identity = 0; ///< Non-zero when a captured device chunk materializer precedes model roots.
         const void *pipeline_forward_edges = nullptr; ///< Frozen transport/participant/bank owner; exact graph identity.
+        ForwardPipelineActivationOwnership pipeline_activation_ownership =
+            ForwardPipelineActivationOwnership::ForwardGraph; ///< Exact transport owner, independent of submission intent.
         uint64_t shifted_mtp_prefill_capture_identity = 0; ///< Non-zero only when this capture embeds shifted MTP KV prefill.
         uint64_t mtp_main_terminal_hidden_capture_identity = 0; ///< Non-zero when main decode publishes its MTP terminal row in-graph.
         bool standard_path = true;
@@ -329,9 +332,11 @@ namespace llaminar2
                    position_policy == other.position_policy &&
                    device_sequence_lengths == other.device_sequence_lengths &&
                    device_decode_position == other.device_decode_position &&
+                   device_request_query_capture_identity == other.device_request_query_capture_identity &&
                    device_prefill_chunk_capture_identity ==
                        other.device_prefill_chunk_capture_identity &&
                    pipeline_forward_edges == other.pipeline_forward_edges &&
+                   pipeline_activation_ownership == other.pipeline_activation_ownership &&
                    shifted_mtp_prefill_capture_identity ==
                        other.shifted_mtp_prefill_capture_identity &&
                    mtp_main_terminal_hidden_capture_identity ==
@@ -436,6 +441,7 @@ namespace llaminar2
             h ^= (std::hash<uint8_t>{}(static_cast<uint8_t>(sig.position_policy)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<const int32_t *>{}(sig.device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(sig.device_request_query_capture_identity) + 0x9e3779b9 + (h << 6) + (h >> 2));
             if (sig.device_decode_position)
             {
                 const auto &binding = *sig.device_decode_position;
@@ -448,6 +454,8 @@ namespace llaminar2
                       sig.device_prefill_chunk_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<const void *>{}(sig.pipeline_forward_edges) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<int>{}(static_cast<int>(sig.pipeline_activation_ownership)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(
                       sig.shifted_mtp_prefill_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
@@ -747,17 +755,6 @@ namespace llaminar2
         // Stable buffers — stages point to these, contents updated each step
         std::vector<int> token_ids;    ///< Persistent decode token storage
         std::vector<int> position_ids; ///< Persistent decode position IDs
-
-        // PP hidden state copy — for non-embedding PP stages, the external
-        // hidden state must be copied to the working buffer on every forward.
-        // During graph build (cache MISS) this copy happens inline in
-        // QwenStandardGraph::buildPartialForwardGraph(). On cache HIT we must redo
-        // the copy here because the graph build code is not re-executed.
-        TensorBase *pp_external_hidden_state = nullptr; ///< Source (stage N-1 output)
-        TensorBase *pp_working_buffer = nullptr;        ///< Destination (local residual/hidden)
-        size_t pp_copy_bytes = 0;
-        DeviceId pp_device;
-        bool pp_needs_copy = false;
 
         // Pre-computed collective stage names for fast decode intercept
         std::unordered_set<std::string> collective_nodes;
@@ -1116,10 +1113,6 @@ namespace llaminar2
             gpu_ctx = nullptr;
             phase3_active = false;
             graph_replay_live_state_epoch = 0;
-            pp_external_hidden_state = nullptr;
-            pp_working_buffer = nullptr;
-            pp_copy_bytes = 0;
-            pp_needs_copy = false;
         }
     };
 

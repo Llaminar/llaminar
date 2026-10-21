@@ -1515,4 +1515,143 @@ namespace llaminar2::test
             (std::vector<int>{1}));
     }
 
+    /** @test Typed overlay domains publish one complete named inventory with or without duplicate authored names. */
+    TEST(Test__MoEExpertOverlayRuntimePlan, AuthoredTypedDomainsResolveWithoutDuplicatedNamedDeclarations)
+    {
+        for (const bool duplicate_named : {false, true})
+        {
+            auto requested = layoutAPlan();
+            OrchestrationConfig config = OrchestrationConfig::defaults();
+            config.moe_routed_expert_plan = requested;
+            if (duplicate_named)
+                for (const auto &domain : requested->domains)
+                    config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(
+                        domain.toExecutionDomainDefinition()));
+            ASSERT_EQ(config.domain_definitions.size(), duplicate_named ? 2u : 0u);
+            const auto authored = config.executionDomainDefinitions();
+            ASSERT_EQ(authored.size(), 2u);
+            const auto resolved = std::make_shared<MoERoutedExpertPlacementPlan>(*requested);
+            ASSERT_TRUE(installResolvedMoEExpertOverlayPlan(config, resolved,
+                MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains).empty());
+            ASSERT_EQ(config.domain_definitions.size(), authored.size());
+            const auto installed = config.executionDomainDefinitions();
+            ASSERT_EQ(installed.size(), authored.size());
+            for (size_t index = 0; index < authored.size(); ++index)
+            {
+                const auto named = config.domain_definitions[index].toExecutionDomainDefinition();
+                EXPECT_EQ(named.toString(), authored[index].toString());
+                EXPECT_EQ(named.participants, authored[index].participants);
+                EXPECT_EQ(named.ranks, authored[index].ranks);
+                EXPECT_EQ(named.owner_rank, authored[index].owner_rank);
+                EXPECT_EQ(installed[index].toString(), authored[index].toString());
+            }
+            // Canonical installation must still reject a changed exact participant,
+            // with neither the requested plan nor published inventory replaced.
+            for (int mutation = 0; mutation < 5; ++mutation)
+            {
+                SCOPED_TRACE(mutation);
+                auto foreign = std::make_shared<MoERoutedExpertPlacementPlan>(*resolved);
+                switch (mutation)
+                {
+                case 0: foreign->domains.front().participants.front().device_ordinal = 7; break;
+                case 1: foreign->domains.front().owner_rank = 7; break;
+                case 2: foreign->domains.back().world_ranks.back() = 7; break;
+                case 3: foreign->domains.front().routed_compute_policy = RoutedExpertComputePolicy::Apportioned; break;
+                case 4: foreign->domains.pop_back(); break;
+                }
+                const auto before = config.domain_definitions.front().toExecutionDomainDefinition().toString();
+                EXPECT_FALSE(installResolvedMoEExpertOverlayPlan(config, foreign,
+                    MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains).empty());
+                EXPECT_EQ(config.moe_routed_expert_plan, resolved);
+                EXPECT_EQ(config.domain_definitions.front().toExecutionDomainDefinition().toString(), before);
+            }
+        }
+    }
+
+    /** @test Singleton GPU+CPU raw AUTO is only a compatibility projection; exact effective SINGLE stays authoritative. */
+    TEST(Test__MoEExpertOverlayRuntimePlan, SingletonOverlayKeepsCanonicalScopeAcrossLegacyNamedProjection)
+    {
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            SCOPED_TRACE(static_cast<int>(backend));
+            auto requested = std::make_shared<MoERoutedExpertPlacementPlan>();
+            requested->enabled = true;
+            requested->topology = RoutedExpertPlacementTopology::TieredOverlay;
+            requested->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+            auto gpu = cudaSingleDomain("gpu_continuation");
+            gpu.owner_rank = 0;
+            if (backend == DeviceType::ROCm)
+            {
+                gpu.participants = {GlobalDeviceAddress::rocm(0)};
+                gpu.backend = CollectiveBackendType::RCCL;
+            }
+            auto cpu = cpuSingleFallbackDomain("cpu_capacity", 0);
+            cpu.world_ranks.clear();
+            cpu.backend = CollectiveBackendType::HOST;
+            for (auto *domain : {&gpu, &cpu})
+            {
+                domain->routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+                domain->routed_decode_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+                domain->routed_prefill_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+            }
+            requested->domains = {gpu, cpu};
+            requested->continuation_domain = gpu.name;
+            requested->base_model_domain = gpu.name;
+            requested->shared_expert_domain = gpu.name;
+            requested->continuation_domain_spec.domain = gpu.name;
+            requested->continuation_domain_spec.logical_root_participant = 0;
+            requested->continuation_domain_spec.setDensePolicy(DenseParallelPolicy::Replicated);
+            requested->owner_order = RoutedExpertOwnerOrder::Ordinal;
+            requested->routed_tiers = {tier("hot", gpu.name, 0), tier("cold", cpu.name, 10, true)};
+            OrchestrationConfig authored = OrchestrationConfig::defaults();
+            authored.moe_routed_expert_plan = requested;
+            ASSERT_TRUE(authored.domain_definitions.empty());
+            const auto intent = authored.executionDomainDefinitions();
+            ASSERT_EQ(intent.size(), 2u);
+            auto published = authored;
+            // SINGLE domains need the binder's one-entry rank map even though
+            // the authored declaration may omit it. Exercise that real metadata
+            // boundary instead of treating an unbound copy as resolved state.
+            const auto bound = bindMoEExpertOverlayPlanToClusterInventory(
+                *requested, syntheticTwoSocketInventory(0, 0));
+            ASSERT_NE(bound, nullptr);
+            const auto installation_errors = installResolvedMoEExpertOverlayPlan(published, bound,
+                MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains);
+            ASSERT_TRUE(installation_errors.empty()) << ::testing::PrintToString(installation_errors);
+            const auto effective = published.executionDomainDefinitions();
+            ASSERT_EQ(published.domain_definitions.size(), 2u);
+            ASSERT_EQ(effective.size(), 2u);
+            for (size_t index = 0; index < intent.size(); ++index)
+            {
+                const auto raw = published.domain_definitions[index].toExecutionDomainDefinition();
+                const auto expected = bound->domains[index].toExecutionDomainDefinition();
+                EXPECT_EQ(raw.scope, ExecutionDomainScope::AUTO);
+                EXPECT_EQ(intent[index].scope, ExecutionDomainScope::SINGLE);
+                EXPECT_EQ(effective[index].scope, ExecutionDomainScope::SINGLE);
+                EXPECT_EQ(expected.ranks, (std::vector<int>{0}));
+                EXPECT_EQ(effective[index].toString(), expected.toString());
+                EXPECT_EQ(effective[index].participants, expected.participants);
+                EXPECT_EQ(effective[index].ranks, expected.ranks);
+                EXPECT_EQ(effective[index].owner_rank, intent[index].owner_rank);
+                EXPECT_EQ(raw.toString(), DomainDefinition::fromExecutionDomainDefinition(expected)
+                    .toExecutionDomainDefinition().toString());
+                // A different effective scope remains forbidden even though
+                // the raw compatibility representation legitimately says AUTO.
+                auto foreign = std::make_shared<MoERoutedExpertPlacementPlan>(*bound);
+                foreign->domains[index].scope = ExecutionDomainScope::RANK_LOCAL;
+                // A rank-local domain has no cross-rank participant map. Keep
+                // the negative internally valid so rejection proves unchanged
+                // authored scope, rather than incomplete hardware ownership.
+                foreign->domains[index].world_ranks.clear();
+                auto attempted = authored;
+                const auto scope_errors = installResolvedMoEExpertOverlayPlan(attempted, foreign,
+                    MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains);
+                ASSERT_EQ(scope_errors.size(), 1u) << ::testing::PrintToString(scope_errors);
+                EXPECT_NE(scope_errors.front().find("changed non-location intent"), std::string::npos);
+                EXPECT_EQ(attempted.moe_routed_expert_plan, requested);
+                EXPECT_TRUE(attempted.domain_definitions.empty());
+            }
+        }
+    }
+
 } // namespace llaminar2::test

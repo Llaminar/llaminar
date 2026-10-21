@@ -261,6 +261,9 @@ def summarize(results_root: Path, artifact_name: str) -> tuple[str, int, int]:
         if prefill_rows:
             out.append("#### Prefill")
             out.append("")
+            out.append("Final-position mean KL, argmax match rate (Top-1), and set intersection/5 (Top-5); "
+                       "top-K candidate probabilities are not agreement metrics.")
+            out.append("")
             out.append(
                 "| Test | Cosine | KL Div | Top-1 | Top-5 | Layers Pass | Status | CSV |"
             )
@@ -272,6 +275,7 @@ def summarize(results_root: Path, artifact_name: str) -> tuple[str, int, int]:
 
         # Decode table (aggregated across steps)
         decode_rows: list[str] = []
+        per_step_rows: list[str] = []
         for tdir in test_dirs:
             steps = read_csv(tdir / "decode_steps.csv")
             if not steps:
@@ -281,6 +285,17 @@ def summarize(results_root: Path, artifact_name: str) -> tuple[str, int, int]:
             total += 1
             if status == "❌":
                 failed += 1
+            # Preserve every original step and its verdict. Mean KL averages
+            # positions inside this row, never another decode step; top5 is
+            # mean intersection/5, not reference-top1-in-top5 recall.
+            for step in steps:
+                per_step_rows.append(
+                    f"| `{tdir.name}` | {step.get('step', '-')} "
+                    f"| {fmt_float(step.get('kl_divergence'), 6)} "
+                    f"| {fmt_float(step.get('top1_overlap'), 4)} "
+                    f"| {fmt_float(step.get('top5_overlap'), 4)} "
+                    f"| {fmt_pass(step.get('passed'))} | `{csv_rel}` |"
+                )
             decode_rows.append(
                 f"| `{tdir.name}` "
                 f"| {len(steps)} "
@@ -291,6 +306,19 @@ def summarize(results_root: Path, artifact_name: str) -> tuple[str, int, int]:
                 f"| {status} "
                 f"| `{csv_rel}` |"
             )
+
+        if per_step_rows:
+            out.append("#### Final logits at each decode step")
+            out.append("")
+            out.append("Mean KL is KL(reference || actual) averaged over positions at that step. "
+                       "Top-1 is mean argmax agreement; Top-5 is mean set intersection/5. "
+                       "These are distinct from reference-top1-in-topK recall. "
+                       "No averaging or maximum across steps defines this table's verdicts.")
+            out.append("")
+            out.append("| Test | Step | Mean KL | Mean Top-1 agreement | Mean Top-5 agreement | Status | CSV |")
+            out.append("|------|-----:|--------:|---------------------:|---------------------:|:------:|-----|")
+            out.extend(per_step_rows)
+            out.append("")
 
         if decode_rows:
             out.append("#### Decode (averaged across steps)")
@@ -303,6 +331,7 @@ def summarize(results_root: Path, artifact_name: str) -> tuple[str, int, int]:
             )
             out.extend(decode_rows)
             out.append("")
+
 
     if not out:
         return (f"_No parity CSV summaries found under `{results_root}`._\n", 0, 0)

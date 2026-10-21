@@ -11,6 +11,7 @@
 #include "DeviceGraphOrchestrator.h"
 #include "execution/compute_stages/stages/MoEDeviceRebalanceStage.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
+#include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/NativeMoEMovementRequestIdentity.h"
 #include "execution/moe/NativeMoEMovementPerfStats.h"
 #include "utils/PerfStatsCollector.h"
@@ -44,6 +45,24 @@ namespace llaminar2
 
     MoEOptimizationStatus DeviceGraphOrchestrator::moeOptimizationStatus() const
     {
+        if (graph_builder_)
+        {
+            const auto &moe = graph_builder_->config().moe;
+            if (moe.expert_overlay_residency_authority)
+            {
+                const auto &proof = moe.expert_overlay_residency_authority->noPeerResidency();
+                if (proof)
+                {
+                    if (!moe.routed_expert_plan || native_moe_movement_archive_ || nativeMoEMovementOwnerStage())
+                        throw std::logic_error("No-peer route ownership conflicts with a movement publication owner");
+                    proof->requireDestination(state_.device_id, moe.routed_expert_plan->first_model_layer,
+                        static_cast<int>(moe.routed_expert_plan->placements.size()), moe.num_experts);
+                    if (proof->authorityExecution() != moe.authority_execution)
+                        throw std::logic_error("No-peer route ownership changed its authority locus");
+                    return proof->status();
+                }
+            }
+        }
         if (!nativeMoEMovementOwnerStage() && !native_moe_movement_archive_)
             return {};
         return {.authority = MoEOptimizationAuthority::Device,

@@ -7,7 +7,8 @@ must be excluded with them, including startup device ownership, while admitted t
 every requirement and CMake must still reject invalid features. Native HTTP
 affinity registrations follow the same selection and preserve their exact
 OpenMP startup policy. These probes configure tiny CPU-only projects; they
-never build or run an inference or test executable.
+never build or run an inference or test executable. QFN performance declarations
+also remain available in Release without admitting functional test binaries.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import unittest
 
 MODULE = Path(__file__).resolve().parents[2] / "cmake/V2TestTargetSelection.cmake"
 HTTP_REGISTRATION = MODULE.with_name("V2HttpServiceThreadAffinityTests.cmake")
+QFN_PERFORMANCE = MODULE.with_name("V2Qwen4ExpPerformanceTargets.cmake")
 
 
 class TestTargetSelection(unittest.TestCase):
@@ -115,6 +117,53 @@ endforeach()
                     extra=f"v2_test_device_scope({target} FullInventory)")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(target, result.stderr)
+
+    def test_qfn_performance_targets_survive_release_selection(self):
+        """Native timing targets retain the same backend inventory in both builds."""
+        for performance_only in (False, True):
+            for cuda, rocm in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(performance_only=performance_only, cuda=cuda, rocm=rocm):
+                    expected = ["v2_perf_qwen_sparse_selection"]
+                    if cuda or rocm:
+                        expected += ["v2_perf_q8_residual_prepared_projection",
+                                     "v2_perf_immutable_adaptive_lookup"]
+                    if cuda:
+                        expected.append("v2_perf_cuda_qwen_sparse_selection")
+                    if rocm:
+                        expected.append("v2_perf_rocm_qwen_sparse_selection")
+                    extra = f"""
+enable_testing()
+set(HAVE_CUDA {"ON" if cuda else "OFF"})
+set(HAVE_ROCM {"ON" if rocm else "OFF"})
+add_library(llaminar2_core INTERFACE)
+add_library(GTest::gtest INTERFACE IMPORTED)
+add_library(GTest::gtest_main INTERFACE IMPORTED)
+include("{QFN_PERFORMANCE.as_posix()}")
+include("{QFN_PERFORMANCE.as_posix()}")
+get_property(all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+list(FILTER all_targets INCLUDE REGEX "^v2_perf_")
+list(REMOVE_ITEM all_targets v2_perf_contract)
+set(expected {" ".join(expected)})
+list(SORT all_targets)
+list(SORT expected)
+if(NOT all_targets STREQUAL expected)
+    message(FATAL_ERROR "Lost QFN performance targets: ${{all_targets}}; expected ${{expected}}")
+endif()
+foreach(target IN LISTS expected)
+    get_target_property(sources ${{target}} SOURCES)
+    foreach(source IN LISTS sources)
+        if(NOT EXISTS "${{source}}")
+            message(FATAL_ERROR "Missing performance source: ${{source}}")
+        endif()
+    endforeach()
+endforeach()
+get_property(tests DIRECTORY PROPERTY TESTS)
+if(tests)
+    message(FATAL_ERROR "Performance declarations added automatic tests: ${{tests}}")
+endif()
+"""
+                    result = self.configure(performance_only, extra=extra)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def configure_http_registration(self, performance_only: bool, *, declare_target: bool = True):
         """Generate actual production registrations without a compiler or device.

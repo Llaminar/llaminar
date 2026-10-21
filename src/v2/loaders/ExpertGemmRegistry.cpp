@@ -5,9 +5,13 @@
  * Physical projection layout is part of prepared identity, not mutable expert
  * placement. A caller requesting a whole expert cannot borrow a down slice;
  * partition-aware callers must authenticate the original source and interval.
+ * Static F shards retain the exact original frozen view and never publish an
+ * unscoped alias; complete acquisition authenticates all original E triplets.
  */
 
 #include "ExpertGemmRegistry.h"
+#include "tensors/TensorKernels.h"
+#include "tensors/TensorClasses.h"
 
 #include <algorithm>
 #include <functional>
@@ -16,9 +20,190 @@
 #include <shared_mutex>
 #include <tuple>
 #include <stdexcept>
+#include <limits>
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        /** @return Registry role for a semantic original projection, rejecting all other tensors. */
+        ExpertGemmRegistry::WeightRole staticRegistryRole(llaminar2::WeightRole role)
+        {
+            if (role == llaminar2::WeightRole::MoEExpertGate) return ExpertGemmRegistry::WeightRole::GATE;
+            if (role == llaminar2::WeightRole::MoEExpertUp) return ExpertGemmRegistry::WeightRole::UP;
+            if (role == llaminar2::WeightRole::MoEExpertDown) return ExpertGemmRegistry::WeightRole::DOWN;
+            throw std::invalid_argument("Static expert source has a foreign semantic role");
+        }
+
+        /** @brief Check the exact native matrix/source rectangle before reading or publishing an engine. */
+        void validateStaticMatrix(const WeightBinding &source, bool require_source_bytes = false)
+        {
+            (void)ExpertGemmRegistry::staticProjectionScope(source);
+            (void)staticRegistryRole(source.identity.role);
+            const auto &ownership = *source.projection_ownership;
+            const auto projection = ownership.projection(source.identity.role);
+            const auto &slice = source.slice;
+            const int expert = source.identity.expert;
+            if (!source.projection_source_owner ||
+                source.projection_source_owner->shape() != std::vector<size_t>{size_t(projection.columns), size_t(projection.rows), size_t(ownership.geometry().experts)} ||
+                source.projection_source_owner->native_type() != source.tensor->native_type() ||
+                source.binding_id == 0 || source.identity.instance_id != source.binding_id ||
+                source.identity.model_id.value == 0 || !source.identity.source_instance_id || !source.prepared ||
+                source.floating_operand_precision != FloatingActivationOperandPrecision::Native ||
+                inferWeightRole(source.identity.canonical_name) != source.identity.role ||
+                inferWeightLayer(source.identity.canonical_name) != source.identity.layer ||
+                source.prepared->kind != (source.prepared->device.is_cuda()
+                    ? PreparedWeightKind::CudaInt8PackedGemm : PreparedWeightKind::RocmInt8PackedGemm) ||
+                source.prepared->model_id.value != source.identity.model_id.value ||
+                source.prepared->binding_id != source.binding_id ||
+                expert < 0 || expert >= ownership.geometry().experts ||
+                source.tensor->shape() != std::vector<size_t>{size_t(projection.rows), size_t(projection.columns)} ||
+                source.identity.derivation != WeightDerivationKind::ExpertSlice ||
+                slice.source_rows != size_t(projection.source_rows) ||
+                slice.source_cols != size_t(projection.source_columns) ||
+                slice.row_start != size_t(projection.first_row) || slice.row_count != size_t(projection.rows) ||
+                slice.col_start != size_t(projection.first_column) || slice.col_count != size_t(projection.columns) ||
+                slice.expert_start != size_t(expert) || slice.expert_count != 1 ||
+                slice.expert_ids != std::vector<int>{expert} || !slice.inner_is_presliced)
+                throw std::invalid_argument("Static expert matrix lost its exact original source/rectangle identity");
+            const size_t bytes = source.tensor->size_bytes();
+            if (source.projection_source_owner->size_bytes() % size_t(ownership.geometry().experts) ||
+                bytes != source.projection_source_owner->size_bytes() / size_t(ownership.geometry().experts))
+                throw std::invalid_argument("Static expert source has a different native byte extent");
+            const auto parent_address = reinterpret_cast<uintptr_t>(source.projection_source_owner->raw_data());
+            const auto matrix_address = reinterpret_cast<uintptr_t>(source.tensor->raw_data());
+            const size_t offset = size_t(expert) * bytes; // Bounded by the actual parent byte extent above.
+            if (require_source_bytes && (!parent_address || !matrix_address ||
+                source.projection_source_owner->is_raw_data_released()))
+                throw std::invalid_argument("Static expert registration requires original native source bytes");
+            if (!source.projection_source_owner->is_raw_data_released() && (parent_address || matrix_address) &&
+                (!parent_address || offset > std::numeric_limits<uintptr_t>::max() - parent_address ||
+                 matrix_address != parent_address + offset))
+                throw std::invalid_argument("Static expert view does not address its actual original source slot");
+        }
+    }
+
+    ExpertGemmRegistry::ParticipantLayerScope ExpertGemmRegistry::staticProjectionScope(const WeightBinding &source)
+    {
+        const auto device = source.residency.resident_device.value_or(source.residency.home_device);
+        if (!source.immutable || !source.tensor || source.tensor_owner.get() != source.tensor ||
+            !source.projection_ownership || source.projection_ownership->hasMovableProjectionSet() ||
+            !device.is_gpu() || source.identity.overlay_domain.empty() ||
+            source.identity.overlay_participant_world_rank < 0 || source.identity.layer < 0 ||
+            source.identity.overlay_participant_index != source.projection_ownership->participant() ||
+            source.identity.tp_rank_or_device_index != source.projection_ownership->participant() ||
+            (source.prepared && source.prepared->device != device))
+            throw std::invalid_argument("Static expert GPU preparation requires its declared original participant scope and owned source");
+        return {source.identity.overlay_domain, device, source.identity.overlay_participant_world_rank,
+                source.identity.overlay_participant_index, source.identity.layer};
+    }
+
+    void ExpertGemmRegistry::registerStaticProjection(const WeightBinding &source, ITensorGemm *engine,
+                                                      std::shared_ptr<ITensorGemm> owner)
+    {
+        validateStaticMatrix(source, true);
+        const auto scope = staticProjectionScope(source);
+        if (!engine || owner.get() != engine || !engine->weights_converted())
+            throw std::invalid_argument("Static expert prepared engine has foreign lifetime or unfinished preparation");
+        const int n = int(source.tensor->shape()[0]);
+        const int k = int(source.tensor->shape()[1]);
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(source.tensor);
+        const auto *native = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        if (native)
+        {
+            DeviceNativeVNNIMatrixDesc descriptor;
+            NativeVnniSourceIdentity original;
+            if (!engine->exportNativeVNNIMatrixDesc(descriptor) || !descriptor.valid() ||
+                descriptor.n != n || descriptor.k != k || descriptor.blocks_per_row != uint32_t(k / 32) ||
+                !descriptor.source_identity_present || descriptor.source_codebook_id != native->codebook_id ||
+                bool(descriptor.source_is_superblock) != native->is_superblock ||
+                !engine->exportNativeVNNISourceIdentity(original) || !original.present ||
+                original.codebook_id != native->codebook_id || original.is_superblock != native->is_superblock)
+                throw std::invalid_argument("Static expert prepared native descriptor lost original geometry/codebook");
+        }
+        else
+        {
+            ContiguousFloatingPointWeightDescriptor descriptor;
+            if (!engine->exportContiguousFloatingPointWeights(descriptor) || !descriptor.valid() ||
+                descriptor.n != n || descriptor.k != k || descriptor.type != source.tensor->native_type())
+                throw std::invalid_argument("Static expert prepared floating descriptor lost original geometry/format");
+        }
+        const auto role = staticRegistryRole(source.identity.role);
+        auto retained = std::make_shared<const WeightBinding>(source);
+        Key key{scope.domain_name, scope.device, scope.layer, source.identity.expert, role,
+                scope.participant_world_rank, scope.participant_index};
+        std::unique_lock lock(mutex_);
+        if (engines_.contains(key))
+            throw std::logic_error("Static expert participant key was already published");
+        engines_.emplace(std::move(key), Entry{engine, std::move(owner), source.projection_ownership, std::move(retained)});
+    }
+
+    std::optional<ExpertGemmRegistry::StaticProjectionLayer> ExpertGemmRegistry::acquireStaticProjectionLayer(
+        const ParticipantLayerScope &scope, const MoEExpertProjectionOwnership &projection,
+        std::span<const WeightBinding> sources) const
+    {
+        if (size_t(projection.geometry().experts) > std::numeric_limits<size_t>::max() / 3 ||
+            projection.hasMovableProjectionSet() || scope.participant_index != projection.participant() ||
+            scope.domain_name.empty() || !scope.device.is_gpu() || scope.layer < 0 || scope.participant_world_rank < 0 ||
+            sources.size() != size_t(projection.geometry().experts) * 3)
+            throw std::invalid_argument("Static expert acquisition requires the exact complete participant source declaration");
+        std::vector<const WeightBinding *> ordered(sources.size(), nullptr);
+        for (const auto &source : sources)
+        {
+            validateStaticMatrix(source);
+            if (staticProjectionScope(source) != scope || source.projection_ownership != projection ||
+                source.identity.model_id.value != sources.front().identity.model_id.value)
+                throw std::invalid_argument("Static expert acquisition has a foreign domain/participant/partition");
+            const auto index = size_t(source.identity.expert) * 3 + size_t(staticRegistryRole(source.identity.role));
+            if (ordered[index]) throw std::invalid_argument("Static expert acquisition repeats an original expert role");
+            ordered[index] = &source;
+        }
+        std::vector<const Entry *> registered(ordered.size(), nullptr);
+        size_t present = 0;
+        std::shared_lock lock(mutex_);
+        for (size_t index = 0; index < ordered.size(); ++index)
+        {
+            if (!ordered[index]) throw std::invalid_argument("Static expert acquisition omits an original expert role");
+            const auto &source = *ordered[index];
+            Key key{scope.domain_name, scope.device, scope.layer, int(index / 3), WeightRole(index % 3),
+                    scope.participant_world_rank, scope.participant_index};
+            const auto found = engines_.find(key);
+            if (found == engines_.end()) continue;
+            const auto &entry = found->second;
+            if (!entry.static_source || entry.projection_ownership != projection || !entry.engine ||
+                entry.ownership.get() != entry.engine || entry.static_source->binding_id != source.binding_id ||
+                entry.static_source->identity.model_id.value != source.identity.model_id.value ||
+                entry.static_source->identity.source_instance_id != source.identity.source_instance_id ||
+                entry.static_source->tensor != source.tensor ||
+                entry.static_source->tensor_owner.owner_before(source.tensor_owner) ||
+                source.tensor_owner.owner_before(entry.static_source->tensor_owner) ||
+                entry.static_source->projection_source_owner != source.projection_source_owner ||
+                entry.static_source->projection_source_owner.owner_before(source.projection_source_owner) ||
+                source.projection_source_owner.owner_before(entry.static_source->projection_source_owner))
+                throw std::logic_error("Static expert acquisition found a stale source or another prepared partition");
+            registered[index] = &entry;
+            ++present;
+        }
+        if (!present) return std::nullopt;
+        if (present != ordered.size())
+            throw std::logic_error("Static expert participant registry is partially published; model preparation failed");
+        StaticProjectionLayer result{scope, projection, {}, {}};
+        result.experts.resize(size_t(projection.geometry().experts));
+        result.sources.reserve(sources.size());
+        for (size_t index = 0; index < registered.size(); ++index)
+        {
+            const auto &entry = *registered[index];
+            auto &expert = result.experts[index / 3];
+            expert.scope = scope;
+            expert.expert = int(index / 3);
+            if (index % 3 == 0) expert.gate = entry.ownership;
+            else if (index % 3 == 1) expert.up = entry.ownership;
+            else expert.down = entry.ownership;
+            result.sources.push_back(*entry.static_source);
+        }
+        return result;
+    }
 
     bool ExpertGemmRegistry::Key::operator==(const Key &other) const
     {
@@ -64,6 +249,8 @@ namespace llaminar2
                                                           ITensorGemm *engine, std::shared_ptr<ITensorGemm> ownership,
                                                           std::optional<MoEExpertProjectionOwnership> projection)
     {
+        if (projection && !projection->hasMovableProjectionSet())
+            throw std::invalid_argument("Static original projection registration requires its frozen source API");
         if (projection && (!device.is_gpu() || domain_name.empty() || !engine || layer < 0 ||
             static_cast<unsigned>(role) > static_cast<unsigned>(WeightRole::DOWN) ||
             ownership.get() != engine || expert < 0 || expert >= projection->geometry().experts ||
@@ -74,7 +261,7 @@ namespace llaminar2
         key.participant_world_rank = participant_world_rank;
         key.participant_index = participant_index;
         const auto previous = engines_.find(key);
-        if (previous != engines_.end() && previous->second.projection_ownership != projection)
+        if (previous != engines_.end() && (previous->second.static_source || previous->second.projection_ownership != projection))
             throw std::logic_error("Prepared expert registration cannot change projection layout: " + domain_name);
         engines_[key] = Entry{engine, std::move(ownership), std::move(projection)};
     }
@@ -131,6 +318,8 @@ namespace llaminar2
         auto it = engines_.find(key);
         if (it == engines_.end())
             return nullptr;
+        if (it->second.static_source)
+            throw std::logic_error("Static expert matrices require complete source-authenticated layer acquisition");
         if (it->second.projection_ownership != projection)
             throw std::logic_error("Prepared expert lookup disagrees with projection identity: " + domain_name);
         return it->second.engine;
@@ -181,6 +370,8 @@ namespace llaminar2
         {
             return nullptr;
         }
+        if (found->second.static_source)
+            throw std::logic_error("Static expert matrices require complete source-authenticated layer acquisition");
         if (found->second.projection_ownership != projection)
             throw std::logic_error("Prepared expert lifetime disagrees with projection identity: " + domain_name);
         return found->second.ownership;

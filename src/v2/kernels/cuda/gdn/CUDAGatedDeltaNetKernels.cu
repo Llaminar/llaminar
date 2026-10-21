@@ -22,6 +22,7 @@
  * arithmetic. Persistent state is loaded/committed once per captured launch.
  */
 
+#include "../../common/GatedNormActivation.h"
 #include "../ops/CUDAHelpers.cuh"
 #include "../../../utils/DebugEnv.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
@@ -1493,7 +1494,7 @@ namespace
     // GatedRMSNorm Kernel
     //
     // output[i] = RMSNorm(input, gamma)[i] * gate_act[i]
-    // where gate_act = SiLU(gate) when gate_silu=true, else gate_act = gate
+    // where the declared activation is Identity, SiLU or sigmoid, after normalization
     //
     // V2: Cooperative block design — one block per (seq, group) pair.
     // Threads within a block cooperate on the norm_dim reduction via warp shuffle.
@@ -1501,6 +1502,12 @@ namespace
     // 20 threads at decode time.
     // =========================================================================
 
+    /** @brief Normalize one immutable group and apply its declared gate activation.
+     * @details A single scalar retains each lane's first value, covering the
+     * model's 128-wide groups without private arrays. Wider groups reread their
+     * later coalesced elements after the fixed reduction; arithmetic is unchanged
+     * and no runtime-indexed local array imposes a hidden maximum group width.
+     */
     __global__ void cuda_gated_rmsnorm_kernel(
         const float *__restrict__ input,
         const float *__restrict__ gate,
@@ -1513,7 +1520,7 @@ namespace
         int gamma_period, // gamma cycling period
         float eps,
         bool subtract_one,
-        bool gate_silu)
+        llaminar2::GatedNormActivation gate_activation)
     {
         int work_idx = blockIdx.x;
         if (work_idx >= total_work)
@@ -1526,9 +1533,9 @@ namespace
         int g = work_idx % n_groups;
         int offset = t * d_model + g * norm_dim;
 
-        // ── Pass 1: Cooperative sum-of-squares via register caching + warp shuffle ──
-        constexpr int kMaxPerThread = 16;
-        float local_vals[kMaxPerThread];
+        // One actual scalar stays in registers; dynamic arrays can become
+        // private-memory traffic even when the common group has one value/lane.
+        float first_value = 0.0f;
         int elems_per_thread = (norm_dim + block_size - 1) / block_size;
 
         float sum_sq = 0.0f;
@@ -1541,8 +1548,8 @@ namespace
                 v = input[offset + j];
                 sum_sq += v * v;
             }
-            if (e < kMaxPerThread)
-                local_vals[e] = v;
+            if (e == 0)
+                first_value = v;
         }
 
         // Warp-level reduction (32-wide warps)
@@ -1573,13 +1580,15 @@ namespace
             int j = tid + e * block_size;
             if (j < norm_dim)
             {
-                float normalized = local_vals[e] * inv_rms;
+                float normalized = (e == 0 ? first_value : input[offset + j]) * inv_rms;
                 int gamma_idx = j % gamma_period;
                 float gamma_eff = subtract_one ? (1.0f + gamma[gamma_idx]) : gamma[gamma_idx];
                 float gate_val = gate[offset + j];
                 float gate_act;
-                if (gate_silu)
-                    gate_act = gate_val / (1.0f + expf(-gate_val)); // SiLU
+                if (gate_activation == llaminar2::GatedNormActivation::SiLU)
+                    gate_act = gate_val / (1.0f + expf(-gate_val));
+                else if (gate_activation == llaminar2::GatedNormActivation::Sigmoid)
+                    gate_act = 1.0f / (1.0f + expf(-gate_val));
                 else
                     gate_act = gate_val;
                 output[offset + j] = normalized * gamma_eff * gate_act;
@@ -2743,9 +2752,12 @@ extern "C"
         const float *input, const float *gate, const float *gamma,
         float *output,
         int seq_len, int d_model, int norm_dim, int gamma_period,
-        float eps, bool subtract_one, bool gate_silu,
+        float eps, bool subtract_one, llaminar2::GatedNormActivation gate_activation,
         int device_idx, void *stream)
     {
+        if (!stream || !llaminar2::validGatedNormActivation(gate_activation))
+            return false; // Exact-stream and immutable-policy contracts are mandatory.
+
         cudaSetDevice(device_idx);
 
         int n_groups = d_model / norm_dim;
@@ -2756,7 +2768,7 @@ extern "C"
         cuda_gated_rmsnorm_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
             input, gate, gamma, output,
             total_work, n_groups, norm_dim, d_model, gamma_period,
-            eps, subtract_one, gate_silu);
+            eps, subtract_one, gate_activation);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)

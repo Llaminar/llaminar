@@ -40,7 +40,7 @@ import uuid
 
 import docker_paths
 from azure_cross_host_resources import DEFAULT_TUNNEL_SUBNET
-from model_parity_inventory import InventoryScope, cross_host_scenarios
+from model_parity_inventory import InventoryScope, cross_host_scenarios, model_source_fields, map_predictor_source
 from generation_corpus import ApprovedGenerationCorpus
 from run_model_parity_generation import validate_regression_report
 from production_artifacts import digest, image_identity, model_identities, ratchet, validate_image_e2e, validate_manifest, validate_prerequisites, write_json
@@ -492,6 +492,7 @@ def remap_manifest(document: dict, models: Path) -> dict:
         # prevents this join from escaping the caller's admitted model mount.
         return str(models / relative)
     for row in result["cells"]:
+        row["configuration"] = map_predictor_source(row["configuration"], translate)
         row["configuration"]["model"] = translate(row["configuration"]["model"])
         row["model_files"] = [translate(path) for path in row["model_files"]]
     return result
@@ -524,7 +525,8 @@ def e2e_projection(inventory: dict, revision: str) -> dict:
                 or config["model_parity_schema"] != 1 or not isinstance(config.get("id"), str)
                 or not config["id"] or not isinstance(files, list) or not files
                 or any(not isinstance(path, str) or not path for path in files)
-                or len(set(files)) != len(files) or config.get("model") not in files):
+                or len(set(files)) != len(files) or any(path not in files
+                    for path in model_source_fields(config).values())):
             raise ValueError("full inventory omitted a valid configuration or model-file declaration")
         InventoryScope.ALL.accepts(config)
         if row["case"] in cases or config["id"] in identities:

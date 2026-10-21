@@ -11,6 +11,8 @@
  * - Backend selection: NCCL, RCCL, or HOST based on device types
  * - Pipeline stages retain independent, checked expert-runtime bindings;
  *   only TP siblings within one stage share a residency authority.
+ * - A resident input publication preserves the preceding result; a main-row
+ *   advance retires it and republishes only explicitly requested host logits.
  *
  * Design philosophy:
  * - Extends IRankOrchestrator (which extends IInferenceRunner)
@@ -72,6 +74,7 @@
 // Forward declaration for fromPlan() factory method
 namespace llaminar2
 {
+    class ResolvedImmutableRowTablePlacement;
     class ReusableExecutionWorkspaceRegistry;
     class MoEOverlayNodeLocalRouteExchange;
     struct RankExecutionPlan;
@@ -274,6 +277,8 @@ namespace llaminar2
 
             /// Prefix-state cache feature gates and storage limits.
             PrefixCacheRuntimeConfig prefix_cache;
+            ImmutableRowTablePolicy ngram_table_policy; ///< Rank-owned native PLE storage policy.
+            std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement; ///< Exact PMA-selected rank placement.
 
             /// Multi-token prediction feature gates and verification mode.
             MTPRuntimeConfig mtp;
@@ -528,14 +533,16 @@ namespace llaminar2
             const Config &config,
             std::unique_ptr<ILocalTPContext> tp_ctx = nullptr);
 
-        /// Destructor
+        /** @brief Retire composed PP parents before their borrowed participant owners. */
         ~RankOrchestrator() override;
 
-        // Non-copyable, movable
+        // Native callbacks and borrowed topology retain this owner's address.
+        // Move unique_ptr ownership; replacing a live rank by member-wise moves
+        // would retire transport before its original participant graphs.
         RankOrchestrator(const RankOrchestrator &) = delete;
         RankOrchestrator &operator=(const RankOrchestrator &) = delete;
-        RankOrchestrator(RankOrchestrator &&) noexcept;
-        RankOrchestrator &operator=(RankOrchestrator &&) noexcept;
+        RankOrchestrator(RankOrchestrator &&) = delete;
+        RankOrchestrator &operator=(RankOrchestrator &&) = delete;
 
         // =====================================================================
         // IInferenceRunner Interface (from IRankOrchestrator)
@@ -1611,6 +1618,8 @@ namespace llaminar2
             const std::string &domain_id) const override;
         MoEOverlayAuthorityExecutionKind
         moeOverlayAuthorityExecution() const override;
+        /** @copydoc IInferenceRunner::requireMoEPipelineRuntimeOwnership */
+        void requireMoEPipelineRuntimeOwnership(MoEPipelineOwnershipValidation frontier) const override;
         bool deviceResidentMoEOverlayMaintenanceReady() const override;
 
         struct MoEExpertMaskSnapshot
@@ -2037,11 +2046,17 @@ namespace llaminar2
          * abort NCCL/RCCL communicators after a fatal cancellation.
          */
         std::unique_ptr<ILocalTPContext> tp_ctx_;
+        std::shared_ptr<const class Qwen4ExpReplicatedPLECohort> replicated_ple_cohort_; ///< Source/cohort metadata; actual Rank request and child authorities remain unchanged.
+        /** @return Actual full-main DGO child order for immutable local rollback provenance. */
+        std::vector<const IInferenceRunner *> fixedHeadPLEPrefixOwners() const;
 
         /// LOCAL PP context for inter-stage transfers (PP mode)
         std::unique_ptr<ILocalPPContext> pp_ctx_;
 
-        /** Native pipeline collective owner outlives every participant graph.
+        /** Native pipeline collective/edges outlive every participant graph.
+         * The rank destructor first retires the separately composed parents while
+         * their borrowed DGO events/streams are alive. Reverse member destruction
+         * then releases participant graphs before this remaining transport owner.
          * Only the tail owns generation; followers own their layer state. */
         std::unique_ptr<PipelineDeviceGeneration> pp_device_generation_;
 
@@ -2452,6 +2467,13 @@ namespace llaminar2
                 IInferenceRunner &,
                 const DeviceResidentLogicalSequenceStateHandle &)> &child_operation);
 
+        /** @brief Distinguish a pending input from an operation that replaces main logits. */
+        enum class LocalTPConditionEffect
+        {
+            PublishInput,
+            ForwardMainRow,
+        };
+
         /**
          * @brief Dispatch one scalar main-condition transition to every TP child.
          *
@@ -2459,9 +2481,17 @@ namespace llaminar2
          * can select that child's target slot or resident mailbox. The helper owns
          * worker-pool entry, profiler context propagation, timeout handling, and
          * exception propagation; it never serializes participants or request state.
+         * A main-row advance invalidates old host output before any participant
+         * mutates it, then gathers one row only when host decode observation was
+         * explicitly enabled. Input-only publication preserves the preceding row.
+         * @param operation_name Diagnostic identity, never a policy selector.
+         * @param effect Typed distinction between input publication and model execution.
+         * @param child_operation Concurrent participant operation with its local index.
+         * @return True after every participant and any requested result publication complete.
          */
         bool dispatchLocalTPMTPMainCondition(
             const char *operation_name,
+            LocalTPConditionEffect effect,
             const std::function<bool(IInferenceRunner &, size_t)> &child_operation);
 
         /**

@@ -29,6 +29,7 @@
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <gtest/gtest.h>
 #include <map>
+#include <set>
 
 namespace llaminar2::test
 {
@@ -558,6 +559,13 @@ TEST_P(MoEPipelinePreparedPlanTest, ReusesRetainedCapacityAcrossActiveMTPModes)
         config.mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
         config.mtp.draft_tokens = std::max(1, depth);
         const auto current = ResolvedRankOrchestration::resolve(config, source.metadata(), input.membership.inventory(), builder, 0);
+        auto runtime = current.rankPlan().runtime;
+        prepared->admission()->publishRuntimeCapacity(runtime);
+        EXPECT_EQ(runtime.mtp.enabled, current.rankPlan().runtime.mtp.enabled);
+        EXPECT_EQ(runtime.mtp.draft_tokens, current.rankPlan().runtime.mtp.draft_tokens);
+        EXPECT_EQ(runtime.mtp.depth_policy.mode, current.rankPlan().runtime.mtp.depth_policy.mode);
+        EXPECT_EQ(runtime.mtp.graph_capacity_draft_tokens, 15);
+        EXPECT_EQ(runtime.resident_graph_rows, prepared->admission()->rankPlan().runtime.resident_graph_rows);
         const auto bindings = prepared->createRuntimeBindings(model->concreteLoader(), memory, MPIContextFactory::self(), current);
         ASSERT_EQ(bindings.size(), 2u);
         EXPECT_EQ(bindings[1]->owners().residency->endpoint(0)->numLayers(), 2);
@@ -567,6 +575,29 @@ TEST_P(MoEPipelinePreparedPlanTest, ReusesRetainedCapacityAcrossActiveMTPModes)
 
 INSTANTIATE_TEST_SUITE_P(DeviceCounts, MoEPipelinePreparedPlanTest, ::testing::Values(4, 8),
     [](const auto &info) { return "Devices" + std::to_string(info.param); });
+
+/** @test Correction scratch cannot borrow an authority admitted for single-bank activations. */
+TEST(PreparedWeightAuthorityIdentity, Qwen4ExpHCUpWorkspaceSelectionSeparatesRetainedAuthority)
+{
+    auto &setup = mutableDebugEnv().gemm;
+    struct Restore
+    {
+        GemmConfig &setup;
+        QuantizedActivationOperandPrecision previous;
+        ~Restore() { setup.qfn_hc_up_activation = previous; }
+    } restore{setup, setup.qfn_hc_up_activation};
+    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+    plan->enabled = true;
+    OrchestrationConfig config;
+    setup.qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    const auto ordinary = routedWeightAuthorityRequestIdentity(plan, config);
+    setup.qfn_hc_up_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
+    const auto corrected = routedWeightAuthorityRequestIdentity(plan, config);
+    EXPECT_NE(ordinary, corrected);
+    EXPECT_EQ(corrected, routedWeightAuthorityRequestIdentity(plan, config));
+    setup.qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    EXPECT_EQ(ordinary, routedWeightAuthorityRequestIdentity(plan, config));
+}
 
 /** @test Dense and MoE model reuse share the exact retained MTP weight-ownership gate. */
 TEST(PreparedWeightAuthorityIdentity, MTPReuseRequiresPredictorAndHeadPlacement)
@@ -656,6 +687,11 @@ TEST(MoEOverlayResidencySetup, ModelWideModesRetireDemandClaimsAndFailedConstruc
                     const auto plan = MoERoutedExpertPlacementPlanner::plan(bound, metadata).planned_plan;
                     const auto storage = resolveMoEOverlayCapacityAdmissionPolicy(plan, admitted.config(), 1, metadata.num_layers, 8);
                     const bool host_dynamic = backend == DeviceType::CPU && mode == MoERebalanceRuntimeMode::Dynamic;
+                    // Host Dynamic alone does not authorize demand storage:
+                    // a singleton has no peer to move an expert to. Preserve
+                    // the production NoPeer policy instead of inventing a bank.
+                    const bool needs_host_demand = host_dynamic &&
+                        storage.migration_storage != MoEOverlayMigrationStorageKind::NoPeer;
                     if (host_dynamic)
                     {
                         // Discovery returns a topology-wide certificate. Live
@@ -682,6 +718,7 @@ TEST(MoEOverlayResidencySetup, ModelWideModesRetireDemandClaimsAndFailedConstruc
                             rank.runtime.resident_graph_rows);
                         capacity.host_demand_memory = inputs.local_capacity.host_demand_memory;
                     }
+                    EXPECT_EQ(capacity.host_demand_memory.has_value(), needs_host_demand);
                     const auto memory = std::make_shared<PhysicalMemoryAuthority>(capacity.physical_memory_admission, 0);
                     const auto before = memory->rankAttestationSummary();
                     {
@@ -696,18 +733,29 @@ TEST(MoEOverlayResidencySetup, ModelWideModesRetireDemandClaimsAndFailedConstruc
                             EXPECT_EQ(setup.histogram()->endModelLayer(), metadata.num_layers);
                             EXPECT_EQ(setup.histogram()->config().token_boundary_layer_idx, 1);
                         }
-                        EXPECT_EQ(memory->rankAttestationSummary() != before, host_dynamic);
+                        EXPECT_EQ(memory->rankAttestationSummary() != before, needs_host_demand);
                     }
                     EXPECT_EQ(memory->rankAttestationSummary(), before);
                     if (host_dynamic)
                     {
                         auto no_demand = capacity;
                         no_demand.host_demand_memory.reset();
-                        EXPECT_THROW((void)MoEOverlayResidencySetup::create({
-                            .plan = plan, .metadata = metadata, .loader = source.loader(), .rebalance = config.moe_rebalance,
-                            .storage_policy = storage, .capacity = no_demand, .memory = memory}), std::logic_error);
-                        // The histogram claims its banks before the authority rejects
-                        // invalid growth. Exception unwinding must retire those bytes.
+                        if (needs_host_demand)
+                        {
+                            EXPECT_THROW((void)MoEOverlayResidencySetup::create({
+                                .plan = plan, .metadata = metadata, .loader = source.loader(), .rebalance = config.moe_rebalance,
+                                .storage_policy = storage, .capacity = no_demand, .memory = memory}), std::logic_error);
+                        }
+                        else
+                        {
+                            ASSERT_EQ(storage.migration_storage, MoEOverlayMigrationStorageKind::NoPeer);
+                            EXPECT_NO_THROW((void)MoEOverlayResidencySetup::create({
+                                .plan = plan, .metadata = metadata, .loader = source.loader(), .rebalance = config.moe_rebalance,
+                                .storage_policy = storage, .capacity = no_demand, .memory = memory}));
+                            EXPECT_EQ(memory->rankAttestationSummary(), before);
+                        }
+                        // Invalid maintenance still fails with exactly the same
+                        // ledger state, including a no-bank singleton setup.
                         auto invalid = config.moe_rebalance;
                         invalid.window_growth_factor = 0;
                         EXPECT_THROW((void)MoEOverlayResidencySetup::create({
@@ -721,3 +769,106 @@ TEST(MoEOverlayResidencySetup, ModelWideModesRetireDemandClaimsAndFailedConstruc
         }
 }
 }
+
+namespace llaminar2::test
+{
+/** @test A larger GDN residual bank cannot reuse an authority admitted only for HC or ordinary activations. */
+TEST(PreparedWeightAuthorityIdentity, Qwen4ExpGDNOutputWorkspaceSelectionSeparatesRetainedAuthority)
+{
+    auto &setup = mutableDebugEnv().gemm;
+    struct Restore
+    {
+        GemmConfig &setup;
+        QuantizedActivationOperandPrecision hc, gdn;
+        ~Restore() { setup.qfn_hc_up_activation = hc; setup.qfn_gdn_output_activation = gdn; }
+    } restore{setup, setup.qfn_hc_up_activation, setup.qfn_gdn_output_activation};
+    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+    plan->enabled = true;
+    OrchestrationConfig config;
+    std::set<std::string> identities;
+    for (const auto hc : {QuantizedActivationOperandPrecision::SingleQ8, QuantizedActivationOperandPrecision::TwoTermQ8})
+    for (const auto gdn : {QuantizedActivationOperandPrecision::SingleQ8, QuantizedActivationOperandPrecision::TwoTermQ8})
+    {
+        setup.qfn_hc_up_activation = hc;
+        setup.qfn_gdn_output_activation = gdn;
+        const auto identity = routedWeightAuthorityRequestIdentity(plan, config);
+        EXPECT_TRUE(identities.insert(identity).second);
+        EXPECT_EQ(identity, routedWeightAuthorityRequestIdentity(plan, config));
+    }
+    EXPECT_EQ(identities.size(), 4u);
+}
+
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Retained PMA/prepared authority cannot hide an explicit distribution change behind the same VRAM tier. */
+TEST(PreparedWeightAuthorityIdentity, FixedHeadNgramDistributionSeparatesRetainedRequestAuthority)
+{
+    auto plan=std::make_shared<MoERoutedExpertPlacementPlan>();plan->enabled=true;
+    OrchestrationConfig c;c.ngram_table_policy={ImmutableRowStoragePreference::VRAM};
+    const auto replicated=routedWeightAuthorityRequestIdentity(plan,c);
+    c.ngram_table_policy.distribution=ImmutableRowTableDistribution::FixedHeadSharded;
+    const auto sharded=routedWeightAuthorityRequestIdentity(plan,c);
+    EXPECT_NE(replicated,sharded);EXPECT_EQ(sharded,routedWeightAuthorityRequestIdentity(plan,c));
+    c.ngram_table_policy.distribution=ImmutableRowTableDistribution::Replicated;
+    EXPECT_EQ(replicated,routedWeightAuthorityRequestIdentity(plan,c));
+}
+}
+
+namespace llaminar2::test {
+/** @test Retained capacity identity freezes all independent projection policies in both directions. */
+TEST(PreparedWeightAuthorityIdentity, Qwen4ExpFAOutputWorkspaceSelectionSeparatesRetainedAuthority)
+{
+    auto &setup = mutableDebugEnv().gemm;
+    struct Restore
+    {
+        GemmConfig &setup;
+        QuantizedActivationOperandPrecision hc, gdn, fa;
+        ~Restore() { setup.qfn_hc_up_activation = hc; setup.qfn_gdn_output_activation = gdn; setup.qfn_fa_output_activation = fa; }
+    } restore{setup, setup.qfn_hc_up_activation, setup.qfn_gdn_output_activation, setup.qfn_fa_output_activation};
+    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+    plan->enabled = true;
+    OrchestrationConfig config;
+    std::set<std::string> identities;
+    for (const auto hc : {QuantizedActivationOperandPrecision::SingleQ8, QuantizedActivationOperandPrecision::TwoTermQ8})
+    for (const auto gdn : {QuantizedActivationOperandPrecision::SingleQ8, QuantizedActivationOperandPrecision::TwoTermQ8})
+    for (const auto fa : {QuantizedActivationOperandPrecision::SingleQ8, QuantizedActivationOperandPrecision::TwoTermQ8})
+    {
+        setup.qfn_hc_up_activation = hc;
+        setup.qfn_gdn_output_activation = gdn;
+        setup.qfn_fa_output_activation = fa;
+        const auto identity = routedWeightAuthorityRequestIdentity(plan, config);
+        EXPECT_TRUE(identities.insert(identity).second);
+        EXPECT_EQ(identity, routedWeightAuthorityRequestIdentity(plan, config));
+    }
+    EXPECT_EQ(identities.size(), 8u);
+}
+
+}
+
+namespace llaminar2::test
+{
+/** @test QKV activation scratch separates existing retained capacity authority, without inventing a routed owner. */
+TEST(PreparedWeightAuthorityIdentity, Qwen4ExpGDNQKVSelectionSeparatesRetainedAuthority)
+{
+    auto &setup = mutableDebugEnv().gemm;
+    struct Restore
+    {
+        GemmConfig &setup;
+        QuantizedActivationOperandPrecision previous;
+        ~Restore() { setup.qfn_gdn_qkv_activation = previous; }
+    } restore{setup, setup.qfn_gdn_qkv_activation};
+    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+    plan->enabled = true;
+    OrchestrationConfig config;
+    setup.qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    const auto ordinary = routedWeightAuthorityRequestIdentity(plan, config);
+    setup.qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
+    const auto corrected = routedWeightAuthorityRequestIdentity(plan, config);
+    EXPECT_NE(ordinary, corrected);
+    EXPECT_EQ(corrected, routedWeightAuthorityRequestIdentity(plan, config));
+    EXPECT_TRUE(routedWeightAuthorityRequestIdentity(nullptr, config).empty());
+    setup.qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    EXPECT_EQ(ordinary, routedWeightAuthorityRequestIdentity(plan, config));
+}
+} // namespace llaminar2::test

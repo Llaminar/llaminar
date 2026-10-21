@@ -20,6 +20,7 @@
  */
 
 #pragma once
+#include "snapshots/SnapshotInfo.h"
 
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "../../backends/DeviceId.h"
@@ -1058,6 +1059,9 @@ namespace llaminar2
          * @return Pointer to snapshot data (FP32), or nullptr if key doesn't exist
          */
         virtual const float *getSnapshot(const std::string &key, size_t &out_size) const = 0;
+
+        /** @brief Retrieve a lifetime-retained typed diagnostic publication when available. */
+        virtual SnapshotInfo getSnapshotWithShape(const std::string &key) const { return {}; }
 
         /**
          * @brief Get list of all captured snapshot keys

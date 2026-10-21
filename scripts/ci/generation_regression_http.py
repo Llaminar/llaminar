@@ -134,6 +134,7 @@ def serial_workload_identity(record: dict) -> dict:
     """
     profile = generation_profile(record)
     return {"control_id": profile["serial_control_id"], "model": record["model"],
+            **({"shared_predictor": record["shared_predictor"]} if "shared_predictor" in record else {}),
             "context_length": record["runtime"]["context_length"],
             "max_tokens": profile["max_tokens"],
             "minimum_completion_tokens": profile["minimum_completion_tokens"],

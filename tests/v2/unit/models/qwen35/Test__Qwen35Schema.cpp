@@ -2007,3 +2007,23 @@ TEST(Test__IGraphBuilder_ResetState, DefaultImplementation_IsNoOp)
     Qwen35Graph graph(config, nullptr);
     EXPECT_NO_THROW(graph.resetState());
 }
+
+/** @test A QFN-only diagnostic selection cannot change ordinary Qwen GDN projection arithmetic. */
+TEST_F(Qwen35GraphBuildTest, QFNOutputPolicyCannotAlterOrdinaryGDNGraph)
+{
+    config_.qfn_gdn_output_activation = QuantizedActivationOperandPrecision::TwoTermQ8;
+    ASSERT_EQ(config_.flash_next, nullptr);
+    Qwen35Graph builder(config_, nullptr);
+    auto graph = builder.buildAttentionGraph(layer_, buffers_, 0, 2, 1,
+        stub_cache_.get(), nullptr, DeviceId::cpu());
+    const auto *output = graph.getNode("layer0_gdn_out_proj");
+    ASSERT_NE(output, nullptr);
+    const auto *stage = dynamic_cast<const GEMMStage *>(output->stage.get());
+    ASSERT_NE(stage, nullptr);
+    EXPECT_EQ(stage->getParams().quantized_operand_precision, QuantizedActivationOperandPrecision::SingleQ8);
+    EXPECT_EQ(stage->getParams().B, ssm_out_weight_.get());
+    EXPECT_EQ(stage->getParams().k, config_.gdn.inner_size);
+    EXPECT_EQ(stage->getParams().n, config_.d_model);
+    EXPECT_EQ(stage->getParams().alpha, 1.0f);
+    EXPECT_EQ(stage->getParams().beta, 0.0f);
+}

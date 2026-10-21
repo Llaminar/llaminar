@@ -18,6 +18,8 @@
  */
 
 #pragma once
+#include "gpu_pipeline/ReleasedWeightLoadStaging.h"
+#include <map>
 
 #include "ExpertGemmRegistry.h"
 #include "IModelLoader.h"
@@ -287,6 +289,13 @@ namespace llaminar2
          * @param layer_filter Optional filter for specific layers
          * @return true if all GEMM weights were loaded successfully
          */
+        /** @brief Borrow a drained ordinary-loader slot for setup-only native table upload.
+         * @param device Exact GPU already prepared by this weight manager.
+         * @return Original slot/authority receipt, never newly resolved geometry.
+         * @throws std::logic_error If preparation did not publish released staging.
+         */
+        [[nodiscard]] ReleasedWeightLoadStaging releasedWeightLoadStaging(DeviceId device) const;
+
         bool packGemmWeightsViaPipeline(
             DeviceId target_device,
             std::function<bool(const std::string &)> layer_filter = nullptr,
@@ -1673,6 +1682,9 @@ namespace llaminar2
 
         /** Exact weak ownership of every finalized GPU weight pool. */
         PreparedDeviceAllocationLedger prepared_device_allocations_;
+        /** Released setup geometry only; these receipts own no live allocation/capacity ledger. */
+        std::map<DeviceId, ReleasedWeightLoadStaging> released_weight_load_staging_;
+
 
         // =========================================================================
         // Phase 2: Per-weight/device readiness tickets and TP-safe reclaim eligibility

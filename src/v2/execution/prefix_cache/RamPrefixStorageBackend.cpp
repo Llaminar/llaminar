@@ -111,10 +111,10 @@ namespace llaminar2
     {
         for (const auto &owner : {handle.pinned_kv_storage, handle.pinned_hybrid_storage,
                                  handle.pinned_mtp_storage, handle.pinned_terminal_hidden_storage,
-                                 handle.pinned_terminal_logits_storage})
+                                 handle.pinned_terminal_logits_storage, handle.pinned_model_auxiliary_storage})
             if (owner) return owner;
         for (const auto &owner : {handle.kv_storage, handle.hybrid_storage, handle.mtp_storage,
-                                 handle.terminal_hidden_storage, handle.terminal_logits_storage})
+                                 handle.terminal_hidden_storage, handle.terminal_logits_storage, handle.model_auxiliary_storage})
             if (owner) return std::static_pointer_cast<void>(owner);
         return {};
     }
@@ -260,7 +260,7 @@ namespace llaminar2
             // physically materialized subset observable and follows every
             // copied RAM handle until its backing sections are truly freed.
             if (!producer_device_.is_gpu())
-                for (size_t section = 0; section < 5u; ++section)
+                for (size_t section = 0; section < 6u; ++section)
                     handle.ram_section_memory_leases[section] = claimHostAllocation(
                         allocation->sections()[section]);
         }
@@ -274,11 +274,11 @@ namespace llaminar2
                         std::to_string(reservation_.capacityBytes()));
         }
 
-        std::array<std::shared_ptr<void>, 5> arena_sections;
+        std::array<std::shared_ptr<void>, 6> arena_sections;
         if (producer_device_.is_gpu())
         {
             handle.payload_readiness = std::make_shared<PrefixPayloadReadiness>();
-            auto sections = arena_->acquireSections(allocation->sections().first(5u),
+            auto sections = arena_->acquireSections(allocation->sections().first(6u),
                 handle.payload_readiness);
             if (sections.empty())
                 return fail("physical RAM prefix arena ranges busy or fragmented: requested=" +
@@ -321,7 +321,14 @@ namespace llaminar2
                 &handle.terminal_logits_storage,
                 &handle.pinned_terminal_logits_storage,
                 &handle.terminal_logits,
-                arena_sections[4]))
+                arena_sections[4]) ||
+            !allocateSection(
+                layout.modelAuxiliaryBytes(),
+                SectionWriteCoverage::Complete,
+                &handle.model_auxiliary_storage,
+                &handle.pinned_model_auxiliary_storage,
+                &handle.model_auxiliary_payload,
+                arena_sections[5]))
         {
             return fail("RAM prefix payload backing allocation failed for " +
                         producer_device_.toString() +

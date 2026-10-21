@@ -100,7 +100,40 @@ namespace llaminar2::moe_runtime_abi
     }
 
     /** Maximum expert geometry shared by the host and GPU runtime views. */
-    inline constexpr std::size_t kHistogramMaxExperts = 256;
+    inline constexpr std::uint32_t kMaxExperts = 512u;
+
+    /** ABI generation for graph-resident records; old captured addresses are incompatible. */
+    inline constexpr std::uint32_t kRuntimeLayoutVersion = 2u;
+
+    /**
+     * @brief Integer grouping assigns one lane to each live expert.
+     * @param experts Positive admitted expert count, at most kMaxExperts.
+     * @return A complete 256/512-lane block, or zero for invalid geometry.
+     */
+    [[nodiscard]] LLAMINAR_MOE_RUNTIME_HD constexpr std::uint32_t
+    expertGroupingThreads(std::uint32_t experts) noexcept
+    {
+        return experts == 0u || experts > kMaxExperts ? 0u
+             : experts <= 256u ? 256u : 512u;
+    }
+
+    /**
+     * @brief Keep ROCm serial and grouped routing on the same reduction tree.
+     * @param experts Positive admitted expert count, at most kMaxExperts.
+     * @return Populated wave64 lanes, capped at the canonical 256 partitions.
+     *
+     * Above 256 experts each lane accumulates its stride-256 terms. Expanding
+     * the block instead would change arithmetic order relative to grouped rows.
+     */
+    [[nodiscard]] LLAMINAR_MOE_RUNTIME_HD constexpr std::uint32_t
+    wave64RouterThreads(std::uint32_t experts) noexcept
+    {
+        return experts == 0u || experts > kMaxExperts ? 0u
+             : experts > 256u ? 256u : ((experts + 63u) / 64u) * 64u;
+    }
+
+    /** Histogram storage uses the same logical expert ceiling as placement. */
+    inline constexpr std::size_t kHistogramMaxExperts = kMaxExperts;
 
     /**
      * @brief One persistent, device-owned routing-evidence generation.
@@ -127,7 +160,7 @@ namespace llaminar2::moe_runtime_abi
                   kHistogramBankBytes);
 
     /*
-     * Each of the two 256-expert placement banks owns a complete union-like
+     * Each of the two 512-expert placement banks owns a complete union-like
      * descriptor record: three NativeVNNI views plus three compact contiguous
      * floating views and one format discriminator.  Both families retain
      * stable addresses because a captured runtime table may be republished by
@@ -135,36 +168,36 @@ namespace llaminar2::moe_runtime_abi
      * Keeping these reviewed constants beside that rationale makes any future
      * descriptor expansion fail every host/device ABI assertion together.
      */
-    /** Bytes in one complete 256-expert placement generation. */
-    inline constexpr std::size_t kPlacementBankBytes = 64016;
+    /** Bytes in one complete 512-expert placement generation. */
+    inline constexpr std::size_t kPlacementBankBytes = 128016;
     /** Offset of the overlay-wide sparse-packet target array inside a bank. */
-    inline constexpr std::size_t kOverlayRouteParticipantOffset = 62976;
+    inline constexpr std::size_t kOverlayRouteParticipantOffset = 125952;
 
-    inline constexpr std::size_t kLayerRuntimeBytes = 140776;
+    inline constexpr std::size_t kLayerRuntimeBytes = 281064;
     /** First device-local decode execution counter in the inline ABI. */
-    inline constexpr std::size_t kDecodeLocalHistogramOffset = 130224;
+    inline constexpr std::size_t kDecodeLocalHistogramOffset = 260272;
     /** First device-local ordinary-prefill execution counter. */
-    inline constexpr std::size_t kPrefillLocalHistogramOffset = 134320;
+    inline constexpr std::size_t kPrefillLocalHistogramOffset = 268464;
     /** First device-local grouped-verifier execution counter. */
-    inline constexpr std::size_t kGroupedVerifierLocalHistogramOffset = 138416;
-    inline constexpr std::size_t kRouteParticipantIdsOffset = 140560;
-    inline constexpr std::size_t kDeferredVerifierExpertIdsOffset = 140568;
-    inline constexpr std::size_t kDeferredVerifierParticipantIdsOffset = 140576;
-    inline constexpr std::size_t kExpertCountsOffset = 140584;
-    inline constexpr std::size_t kDeferredVerifierRouteCapacityOffset = 140712;
-    inline constexpr std::size_t kParticipantIdOffset = 140716;
-    inline constexpr std::size_t kParticipantCountOffset = 140720;
-    inline constexpr std::size_t kCurrentBatchLLEPMovementObservedOffset = 140724;
+    inline constexpr std::size_t kGroupedVerifierLocalHistogramOffset = 276656;
+    inline constexpr std::size_t kRouteParticipantIdsOffset = 280848;
+    inline constexpr std::size_t kDeferredVerifierExpertIdsOffset = 280856;
+    inline constexpr std::size_t kDeferredVerifierParticipantIdsOffset = 280864;
+    inline constexpr std::size_t kExpertCountsOffset = 280872;
+    inline constexpr std::size_t kDeferredVerifierRouteCapacityOffset = 281000;
+    inline constexpr std::size_t kParticipantIdOffset = 281004;
+    inline constexpr std::size_t kParticipantCountOffset = 281008;
+    inline constexpr std::size_t kCurrentBatchLLEPMovementObservedOffset = 281012;
     inline constexpr std::size_t
-        kCurrentBatchLLEPNonOwnerAssignmentObservedOffset = 140728;
+        kCurrentBatchLLEPNonOwnerAssignmentObservedOffset = 281016;
     inline constexpr std::size_t
-        kCurrentBatchLLEPTransientBankActiveOffset = 140732;
-    inline constexpr std::size_t kRuntimeHistogramBanksOffset = 140736;
-    inline constexpr std::size_t kRuntimeHistogramActiveBankOffset = 140744;
-    inline constexpr std::size_t kOverlayEpochTicketOffset = 140752;
-    inline constexpr std::size_t kOverlayPlacementBanksOffset = 140760;
+        kCurrentBatchLLEPTransientBankActiveOffset = 281020;
+    inline constexpr std::size_t kRuntimeHistogramBanksOffset = 281024;
+    inline constexpr std::size_t kRuntimeHistogramActiveBankOffset = 281032;
+    inline constexpr std::size_t kOverlayEpochTicketOffset = 281040;
+    inline constexpr std::size_t kOverlayPlacementBanksOffset = 281048;
     /** Failure-only provenance for the last device epoch-boundary operation. */
-    inline constexpr std::size_t kOverlayEpochStatusOffset = 140768;
+    inline constexpr std::size_t kOverlayEpochStatusOffset = 281056;
 
     static_assert(sizeof(void *) == 8,
                   "DeviceMoELayerRuntime ABI requires 64-bit pointers");

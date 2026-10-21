@@ -70,6 +70,7 @@
 #pragma once
 
 #include "memory/CPUWeightStoragePlacement.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "FloatingActivationOperandPrecision.h"
 
 #include "../backends/DeviceType.h"            // Shared DeviceType enum
@@ -85,6 +86,7 @@
 // Forward declarations
 namespace llaminar2
 {
+    namespace qwen4exp { class IQwen4ExpKernels; class IQwenSparseAttentionKernels; }
     // KVCache types
     class IKVCache;
     class ICPUKVCache;
@@ -136,13 +138,6 @@ namespace llaminar2
     class PhysicalMemoryAuthority;
     class LoadOrchestrator;
     struct HybridKVCacheConfig;
-
-    /** @brief Physical pool stride, distinct from the initial execution codebook. */
-    enum class GPUPreparedWeightPoolLayout
-    {
-        SourceNative, ///< Pool contains the initial source's prepared representation.
-        MigrationReusable, ///< Each slot reserves the canonical initial/migrated union.
-    };
 
     enum class TensorType; // Forward declare from Tensors.h
 
@@ -870,6 +865,23 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorShortConvolution> createShortConvolution(
                     DeviceType dev_type, int device_ordinal = -1);
+
+                /**
+                 * @brief Construct Flash Next residual/PLE primitives for one explicit device.
+                 * @param device Participant selected by the model graph's placement policy.
+                 * @return Stateless native implementation; never substitutes another backend.
+                 * @throws std::invalid_argument For an invalid or uncompiled device backend.
+                 */
+                static std::unique_ptr<llaminar2::qwen4exp::IQwen4ExpKernels>
+                createQwen4Exp(::llaminar2::DeviceId device);
+
+                /**
+                 * @brief Bind sparse indexer/attention kernels to one graph participant.
+                 * @param device Exact CPU, CUDA or ROCm execution participant.
+                 * @return Native implementation; unsupported backends fail immediately.
+                 */
+                static std::unique_ptr<llaminar2::qwen4exp::IQwenSparseAttentionKernels>
+                createQwenSparseAttention(::llaminar2::DeviceId device);
 
                 /**
                  * @brief Create GatedDeltaNet kernel for GDN layers

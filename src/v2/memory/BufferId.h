@@ -177,6 +177,54 @@ namespace llaminar2
         MOE_PROJECTION_LOCAL_COLUMNS, ///< Folded participant output columns
         MOE_PROJECTION_GATHERED_COLUMNS, ///< Participant-major down columns before row assembly
 
+        // Flash Next role-separated activations. Persistent model history is
+        // declared separately from transaction scratch and never aliases it.
+        QFN_EMBEDDING_ROWS, ///< H-wide vocabulary lookup before branch expansion.
+        QFN_HC_NORMALIZED, ///< Four independently normalized branches, retained through block write.
+        QFN_HC_DOWN, ///< Low-rank read projection, followed by in-place /4 and SiLU.
+        QFN_HC_READ_LOGITS, ///< Per-element four-branch read gates.
+        QFN_HC_WRITE_LOGITS, ///< Four scalar branch injection gates per token.
+        QFN_NGRAM_ROW_IDS, ///< Packed INT64 lookup coordinates in aligned INT32 arena storage.
+        QFN_NGRAM_NATIVE_ROWS, ///< Compact source-native selected rows, never the whole table.
+        QFN_NGRAM_LOOKUP_STATE, ///< Retained GPU publication/acknowledgment cursors, one storage lane.
+        QFN_NGRAM_SHARD_LOCAL_HEADER, ///< Exact two-INT32 fixed-head validation progress header.
+        QFN_NGRAM_SHARD_HEADERS, ///< Ordered P*two-INT32 native header receive bank.
+        QFN_NGRAM_SHARD_TRANSPORT_ROWS, ///< Consensus-owned transport count; never original query authority.
+        QFN_NGRAM_SHARD_LOCAL_NATIVE, ///< Compact native selected-head packet, allocation only word-rounded.
+        QFN_NGRAM_SHARD_GATHERED_NATIVE, ///< Rank-major native packet bank, exact unpadded rank stride.
+        QFN_PLE_EMBEDDING, ///< Concatenated sixteen decoded n-gram rows, width H.
+        QFN_PLE_KEY, ///< Expanded key projection and in-place branch normalization.
+        QFN_PLE_VALUE, ///< Shared H-wide learned value projection.
+        QFN_PLE_QUERY, ///< Branch-normalized residual used by the PLE gate.
+        QFN_PLE_GATED, ///< Gated value retained until convolution and residual publication.
+        QFN_PLE_NORMALIZED, ///< Candidate normalized convolution input, including rejected MTP rows.
+        QFN_PLE_TOKEN_HISTORY, ///< Accepted raw token suffix banks, independent of EOS generation stops.
+        QFN_PLE_CONV_HISTORY, ///< Accepted dilated convolution history banks.
+        QFN_QSA_QUERY, ///< Four indexer query projections per token, replicated across TP heads.
+        QFN_QSA_RAW_KEY, ///< Raw indexer keys before pooling, normalization and RoPE.
+        QFN_QSA_PREPARED_QUERY, ///< Normalized/rotated compressed-indexer query scratch.
+        QFN_QSA_SCORES, ///< Complete-pool scores for actual candidate rows.
+        QFN_QSA_SELECTED, ///< Sorted selected logical token indices plus causal incomplete tail.
+        QFN_QSA_SELECTED_COUNT, ///< Exact selected-token count for every candidate row.
+        QFN_QSA_PARTIALS, ///< Fixed-order GPU attention partitions, shared sequentially across layers.
+        QFN_QSA_OBSERVATIONS, ///< Actual native selected-key/value read counters.
+        QFN_QSA_REPLAY, ///< Execution-owned immutable transaction base per request/layer.
+        QFN_QSA_POOLED_KEYS, ///< Accepted complete indexer pools and overwriteable candidate suffix.
+        QFN_QSA_PARTIAL_KEYS, ///< Accepted incomplete raw pool banks.
+
+        QFN_QSA_CANDIDATE_RAW_KEYS, ///< Retained MTP target keys by local sparse layer and flattened verifier row.
+        QFN_QSA_CANDIDATE_COPY_BYTES, ///< Native UINT64 live candidate bytes by sparse layer/request (two INT32 words).
+
+        QFN_PLE_TRANSACTION_LIVE, ///< Immutable verifier transaction live request prefixes.
+        QFN_PLE_RETAINED_TOKENS, ///< Intentional retained verifier token candidates.
+        QFN_PLE_RETAINED_NORMALIZED, ///< Intentional retained normalized convolution candidates.
+        QFN_PLE_TRANSACTION_COPY_BYTES, ///< Exact snapshot and retained native payload observations.
+        QFN_PLE_PRIOR_TOKEN_HISTORY, ///< Dedicated immutable verifier original token suffixes.
+        QFN_PLE_PRIOR_CONV_HISTORY, ///< Dedicated immutable verifier original nine-row convolution suffixes.
+        QFN_QSA_TRANSACTION_PRIOR, ///< Packed immutable original replay and up to three raw tail rows per sparse layer/request.
+        QFN_QSA_TRANSACTION_PRIOR_TRAFFIC, ///< Native required metadata bytes and actual live original-tail payload bytes.
+        QFN_NGRAM_ADAPTIVE_CACHE, ///< Original model-owned optional native slots and directory/policy metadata.
+        QFN_NGRAM_ADAPTIVE_FRAME, ///< Original mandatory single-inflight native work frame, including zero-slot mode.
         _COUNT ///< Sentinel – must be last
     };
 
@@ -447,6 +495,50 @@ namespace llaminar2
             return "FA_GATE";
         case BufferId::FA_Q_RAW:
             return "FA_Q_RAW";
+        case BufferId::QFN_EMBEDDING_ROWS: return "QFN_EMBEDDING_ROWS";
+        case BufferId::QFN_HC_NORMALIZED: return "QFN_HC_NORMALIZED";
+        case BufferId::QFN_HC_DOWN: return "QFN_HC_DOWN";
+        case BufferId::QFN_HC_READ_LOGITS: return "QFN_HC_READ_LOGITS";
+        case BufferId::QFN_HC_WRITE_LOGITS: return "QFN_HC_WRITE_LOGITS";
+        case BufferId::QFN_NGRAM_ROW_IDS: return "QFN_NGRAM_ROW_IDS";
+        case BufferId::QFN_NGRAM_NATIVE_ROWS: return "QFN_NGRAM_NATIVE_ROWS";
+        case BufferId::QFN_NGRAM_LOOKUP_STATE: return "QFN_NGRAM_LOOKUP_STATE";
+        case BufferId::QFN_NGRAM_ADAPTIVE_CACHE: return "QFN_NGRAM_ADAPTIVE_CACHE";
+        case BufferId::QFN_NGRAM_ADAPTIVE_FRAME: return "QFN_NGRAM_ADAPTIVE_FRAME";
+        case BufferId::QFN_NGRAM_SHARD_LOCAL_HEADER: return "QFN_NGRAM_SHARD_LOCAL_HEADER";
+        case BufferId::QFN_NGRAM_SHARD_HEADERS: return "QFN_NGRAM_SHARD_HEADERS";
+        case BufferId::QFN_NGRAM_SHARD_TRANSPORT_ROWS: return "QFN_NGRAM_SHARD_TRANSPORT_ROWS";
+        case BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE: return "QFN_NGRAM_SHARD_LOCAL_NATIVE";
+        case BufferId::QFN_NGRAM_SHARD_GATHERED_NATIVE: return "QFN_NGRAM_SHARD_GATHERED_NATIVE";
+        case BufferId::QFN_PLE_EMBEDDING: return "QFN_PLE_EMBEDDING";
+        case BufferId::QFN_PLE_KEY: return "QFN_PLE_KEY";
+        case BufferId::QFN_PLE_VALUE: return "QFN_PLE_VALUE";
+        case BufferId::QFN_PLE_QUERY: return "QFN_PLE_QUERY";
+        case BufferId::QFN_PLE_GATED: return "QFN_PLE_GATED";
+        case BufferId::QFN_PLE_NORMALIZED: return "QFN_PLE_NORMALIZED";
+        case BufferId::QFN_PLE_TOKEN_HISTORY: return "QFN_PLE_TOKEN_HISTORY";
+        case BufferId::QFN_PLE_CONV_HISTORY: return "QFN_PLE_CONV_HISTORY";
+        case BufferId::QFN_QSA_QUERY: return "QFN_QSA_QUERY";
+        case BufferId::QFN_QSA_CANDIDATE_RAW_KEYS: return "QFN_QSA_CANDIDATE_RAW_KEYS";
+        case BufferId::QFN_QSA_CANDIDATE_COPY_BYTES: return "QFN_QSA_CANDIDATE_COPY_BYTES";
+        case BufferId::QFN_QSA_TRANSACTION_PRIOR: return "QFN_QSA_TRANSACTION_PRIOR";
+        case BufferId::QFN_QSA_TRANSACTION_PRIOR_TRAFFIC: return "QFN_QSA_TRANSACTION_PRIOR_TRAFFIC";
+        case BufferId::QFN_QSA_RAW_KEY: return "QFN_QSA_RAW_KEY";
+        case BufferId::QFN_QSA_PREPARED_QUERY: return "QFN_QSA_PREPARED_QUERY";
+        case BufferId::QFN_QSA_SCORES: return "QFN_QSA_SCORES";
+        case BufferId::QFN_QSA_SELECTED: return "QFN_QSA_SELECTED";
+        case BufferId::QFN_QSA_SELECTED_COUNT: return "QFN_QSA_SELECTED_COUNT";
+        case BufferId::QFN_QSA_PARTIALS: return "QFN_QSA_PARTIALS";
+        case BufferId::QFN_QSA_OBSERVATIONS: return "QFN_QSA_OBSERVATIONS";
+        case BufferId::QFN_QSA_REPLAY: return "QFN_QSA_REPLAY";
+        case BufferId::QFN_QSA_POOLED_KEYS: return "QFN_QSA_POOLED_KEYS";
+        case BufferId::QFN_QSA_PARTIAL_KEYS: return "QFN_QSA_PARTIAL_KEYS";
+        case BufferId::QFN_PLE_TRANSACTION_LIVE: return "QFN_PLE_TRANSACTION_LIVE";
+        case BufferId::QFN_PLE_RETAINED_TOKENS: return "QFN_PLE_RETAINED_TOKENS";
+        case BufferId::QFN_PLE_RETAINED_NORMALIZED: return "QFN_PLE_RETAINED_NORMALIZED";
+        case BufferId::QFN_PLE_TRANSACTION_COPY_BYTES: return "QFN_PLE_TRANSACTION_COPY_BYTES";
+        case BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY: return "QFN_PLE_PRIOR_TOKEN_HISTORY";
+        case BufferId::QFN_PLE_PRIOR_CONV_HISTORY: return "QFN_PLE_PRIOR_CONV_HISTORY";
         case BufferId::_COUNT:
             return "_COUNT";
         }

@@ -1075,7 +1075,8 @@ namespace llaminar2
             config.moe_rebalance,
             config.prefix_cache,
             config.mtp,
-            config.tp_allreduce_precision_override);
+            config.tp_allreduce_precision_override,
+            config.ngram_table_policy);
         plan.runtime.routed_expert_owner_order =
             config.routed_expert_owner_order;
 
@@ -1351,7 +1352,8 @@ namespace llaminar2
             config.moe_rebalance,
             config.prefix_cache,
             config.mtp,
-            config.tp_allreduce_precision_override);
+            config.tp_allreduce_precision_override,
+            config.ngram_table_policy);
         plan.runtime.routed_expert_owner_order =
             config.routed_expert_owner_order;
 

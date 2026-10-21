@@ -15,13 +15,84 @@
 #include "utils/DebugEnv.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "../../utils/PlanningGGUFFixture.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../../utils/ServingGGUFFixturePayload.h"
 #include <gtest/gtest.h>
 #include <cstring>
+#include <cmath>
 #include <limits>
 #include <nlohmann/json.hpp>
 
 using namespace llaminar2;
 namespace { std::vector<GGUFTensorType> sourceFormats(); }
+
+/** @test Serving fixture source data is nondegenerate without relaxing verification. */
+TEST(PlanningModelSample, FullAttentionServingPayloadIsFiniteNativeAndPreservesDirectory)
+{
+    for (const auto format : {GGUFTensorType::F32, GGUFTensorType::Q4_0})
+    {
+        test::PlanningGGUFFixture fixture(true, false, format, 256, std::nullopt, 8,
+            test::PlanningGGUFFixture::Geometry::FullAttentionGraph, 3);
+        ModelLoader before;
+        before.setUseMmap(false);
+        ASSERT_TRUE(before.loadModel(fixture.path()));
+        const auto original = before.getModel();
+        std::ifstream sparse(fixture.path(), std::ios::binary);
+        const auto *embedding = original.findTensor("token_embd.weight");
+        ASSERT_NE(embedding, nullptr);
+        float zero = 1;
+        sparse.seekg(original.data_offset + embedding->offset);
+        sparse.read(reinterpret_cast<char *>(&zero), sizeof(zero));
+        ASSERT_EQ(zero, 0.0F); // Old setup-only source is the negative control.
+        test::populateServingGGUFFixture(fixture);
+        ModelLoader after;
+        after.setUseMmap(false);
+        ASSERT_TRUE(after.loadModel(fixture.path()));
+        const auto &model = after.getModel();
+        ASSERT_EQ(model.tensors.size(), original.tensors.size());
+        ASSERT_EQ(model.data_offset, original.data_offset);
+        std::ifstream stream(fixture.path(), std::ios::binary);
+        stream.exceptions(std::ios::badbit | std::ios::failbit);
+        for (std::size_t index = 0; index < model.tensors.size(); ++index)
+        {
+            const auto &tensor = model.tensors[index];
+            const auto &old = original.tensors[index];
+            EXPECT_EQ(tensor.name, old.name);
+            EXPECT_EQ(tensor.dimensions, old.dimensions);
+            EXPECT_EQ(tensor.type, old.type);
+            EXPECT_EQ(tensor.offset, old.offset);
+            EXPECT_EQ(tensor.size_bytes, old.size_bytes);
+            stream.seekg(model.data_offset + tensor.offset);
+            if (tensor.type == GGUFTensorType::F32)
+            {
+                std::vector<float> values(tensor.size_bytes / sizeof(float));
+                stream.read(reinterpret_cast<char *>(values.data()), tensor.size_bytes);
+                ASSERT_FALSE(values.empty());
+                ASSERT_TRUE(std::all_of(values.begin(), values.end(), [](float value) {
+                    return std::isfinite(value) && value > 0.0F && value <= 1.0F;
+                })) << tensor.name;
+                if (tensor.name.find("norm.weight") != std::string::npos)
+                    EXPECT_TRUE(std::all_of(values.begin(), values.end(), [](float value) { return value == 1.0F; }));
+            }
+            else
+            {
+                std::vector<Q4_0Block> blocks(tensor.size_bytes / sizeof(Q4_0Block));
+                ASSERT_FALSE(blocks.empty());
+                stream.read(reinterpret_cast<char *>(blocks.data()), tensor.size_bytes);
+                ASSERT_TRUE(std::all_of(blocks.begin(), blocks.end(), [](const auto &block) {
+                    const float scale = fp16_to_fp32(block.d);
+                    return std::isfinite(scale) && scale > 0.0F &&
+                        std::all_of(std::begin(block.qs), std::end(block.qs), [scale](auto byte) {
+                            return scale * (int(byte & 15) - 8) > 0.0F &&
+                                scale * (int(byte >> 4) - 8) > 0.0F;
+                        });
+                })) << tensor.name;
+            }
+        }
+    }
+    test::PlanningGGUFFixture unsupported(true, false, GGUFTensorType::Q5_0);
+    EXPECT_THROW(test::populateServingGGUFFixture(unsupported), std::invalid_argument);
+}
 
 TEST(PlanningModelSample, ExpertSampleWirePreservesEveryNativeFormatWithoutFiles)
 {
@@ -442,4 +513,48 @@ TEST(PlanningModelSample, GDNOperandArithmeticIsSealedInSampleIdentity)
     wire["gdn_arithmetic"] = "fp16";
     wire["matrix"]["name"] = "blk.0.ffn_gate.weight";
     EXPECT_THROW(decode(wire), std::invalid_argument);
+}
+
+/** @brief Source resolution seals the concrete router mode before wire publication or later environment changes. */
+TEST(PlanningModelSample, QFNRouterDefaultIsResolvedBeforeWirePublication)
+{
+    struct Restore final
+    {
+        MoERouterArithmetic previous = debugEnv().gemm.moe_router_arithmetic;
+        /** @brief Restore the process selection after every assertion/unwind path. */
+        ~Restore() { mutableDebugEnv().gemm.moe_router_arithmetic = previous; }
+    } restore;
+    test::Qwen4ExpPlanningGGUFFixture qfn_fixture;
+    test::PlanningGGUFFixture other_fixture(true);
+    PlanningModelSource qfn(qfn_fixture.path()), other(other_fixture.path());
+    ASSERT_EQ(qfn.metadata().memoryProfile().architecture, "qwen4exp");
+    ASSERT_EQ(other.metadata().memoryProfile().architecture, "qwen35moe");
+    const PlanningModelSampleRequest request{"blk.0.ffn_gate_inp.weight", PlanningWholeMatrix{}};
+    mutableDebugEnv().gemm.moe_router_arithmetic = MoERouterArithmetic::ModelDefault;
+    const auto default_qfn = PlanningMatrixSamplePlan::resolve(qfn, request);
+    const auto default_other = PlanningMatrixSamplePlan::resolve(other, request);
+    const auto qfn_bytes = default_qfn.serialize();
+    EXPECT_EQ(nlohmann::json::parse(qfn_bytes)["router_arithmetic"], "fp16");
+    EXPECT_EQ(nlohmann::json::parse(default_other.serialize())["router_arithmetic"], "native");
+    EXPECT_EQ(default_qfn.executionType(), TensorType::FP16);
+    EXPECT_EQ(default_qfn.operandPrecision(), FloatingActivationOperandPrecision::FP16RNE);
+    EXPECT_EQ(default_other.executionType(), TensorType::FP32);
+    EXPECT_EQ(default_other.operandPrecision(), FloatingActivationOperandPrecision::Native);
+    mutableDebugEnv().gemm.moe_router_arithmetic = MoERouterArithmetic::Native;
+    const auto native_qfn = PlanningMatrixSamplePlan::resolve(qfn, request);
+    EXPECT_EQ(nlohmann::json::parse(native_qfn.serialize())["router_arithmetic"], "native");
+    EXPECT_EQ(native_qfn.executionType(), TensorType::FP32);
+    EXPECT_NE(native_qfn.serialize(), qfn_bytes);
+    EXPECT_EQ(PlanningMatrixSamplePlan::resolve(other, request).serialize(), default_other.serialize());
+    const auto received = PlanningMatrixSamplePlan::deserialize(qfn_bytes);
+    EXPECT_EQ(received.serialize(), qfn_bytes);
+    EXPECT_EQ(received.executionType(), TensorType::FP16);
+    EXPECT_EQ(received.operandPrecision(), FloatingActivationOperandPrecision::FP16RNE);
+    mutableDebugEnv().gemm.moe_router_arithmetic = MoERouterArithmetic::FP16;
+    EXPECT_EQ(PlanningMatrixSamplePlan::resolve(qfn, request).serialize(), qfn_bytes);
+    auto unresolved = nlohmann::json::parse(qfn_bytes);
+    unresolved["router_arithmetic"] = "model_default";
+    const auto text = unresolved.dump();
+    EXPECT_THROW(PlanningMatrixSamplePlan::deserialize(std::vector<uint8_t>(text.begin(), text.end())),
+                 std::invalid_argument);
 }

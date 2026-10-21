@@ -1146,6 +1146,233 @@ namespace llaminar2::test
 
     } // namespace
 
+    /**
+     * @brief Require real singleton overlay graphs to bind native prepared operations.
+     * @param device Explicit backend selected by the focused integration alias.
+     *
+     * The tiny descriptor engines are construction witnesses, never arithmetic
+     * substitutes. Actual serving capture/replay is separately exercised by
+     * MoENoPeerHostTail and singleton MoEPipelineWeightPreparation fixtures.
+     */
+    void assertSingleParticipantNativeOverlayLowering(DeviceId device)
+    {
+        for (const auto mode : {MoERebalanceRuntimeMode::Off,
+                                MoERebalanceRuntimeMode::Observe,
+                                MoERebalanceRuntimeMode::Dynamic})
+        {
+            SCOPED_TRACE(::testing::Message() << device.to_string() << '/' << int(mode));
+            auto plan = makeLocalTPApportionedHotPlan();
+            plan->topology = RoutedExpertPlacementTopology::SingleDomain;
+            plan->authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+            auto &domain = plan->domains.front();
+            domain.scope = ExecutionDomainScope::SINGLE;
+            domain.backend = device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+            domain.participants = {GlobalDeviceAddress::fromLocalDeviceId(device)};
+            validateMoERoutedExpertPlacementPlanOrThrow(*plan,
+                {.layer_count = 1, .routed_expert_count = kNumExperts});
+            const auto owners = MoEExpertOwnerMap::build(*plan);
+            DecodeExpertHistogramConfig histogram_config;
+            histogram_config.num_layers = 1;
+            histogram_config.num_experts = kNumExperts;
+            histogram_config.top_k = kTopK;
+            histogram_config.window_size = 64;
+            histogram_config.sockets = {device};
+            histogram_config.ownership = owners.layeredOwnership(1, kNumExperts);
+            auto histogram = std::make_shared<DecodeExpertHistogram>(std::move(histogram_config));
+            // Only Dynamic maintenance admits an economy catalog. Match the
+            // production residency setup policy for Off/Observe as well as
+            // Dynamic, retaining the exact TestExpertGemm source manifest.
+            std::shared_ptr<const MoEOverlayEconomyCalibrationLayerCatalog> economy_catalog;
+            if (mode == MoERebalanceRuntimeMode::Dynamic)
+            {
+                const auto expert_format = ExpertWeightFormat::nativeVnni({
+                    .codebook_id = 4, .is_superblock = false, .present = true});
+                economy_catalog = std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(
+                    std::vector<MoEOverlayLayerWeightManifest>{{
+                        .layer_idx = 0,
+                        .projections = {{
+                            {.projection = ExpertTierWeightProjection::Gate,
+                             .N = kIntermediate, .K = kDModel, .format = expert_format},
+                            {.projection = ExpertTierWeightProjection::Up,
+                             .N = kIntermediate, .K = kDModel, .format = expert_format},
+                            {.projection = ExpertTierWeightProjection::Down,
+                             .N = kDModel, .K = kIntermediate, .format = expert_format},
+                        }},
+                    }});
+            }
+            auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
+                MoEOverlayResidencyAuthority::Config{
+                    .initial_plan = *plan,
+                    .model_metadata = {.num_layers = 1, .num_experts = kNumExperts,
+                        .d_model = kDModel, .routed_intermediate_size = kIntermediate},
+                    .maintenance_mode = mode, .histogram = histogram.get(),
+                    .economy_layer_catalog = economy_catalog,
+                    .perf_device = device.to_string()});
+            EXPECT_EQ(authority->economyLayerCatalog(), economy_catalog);
+            EXPECT_EQ(static_cast<bool>(authority->economyLayerCatalog()),
+                mode == MoERebalanceRuntimeMode::Dynamic);
+            ASSERT_TRUE(authority->noPeerResidency());
+            const auto snapshot = authority->snapshot();
+            auto residency = std::make_shared<MoEOverlayParticipantResidencyRegistry>(
+                MoEOverlayParticipantResidencyRegistry::Config{
+                    .owner_map = snapshot->owner_map, .local_participant_ids = {0},
+                    .num_layers = 1, .num_experts = kNumExperts, .initial_epoch = snapshot->epoch});
+            auto config = makeConfig(plan, 1);
+            config.default_device = device;
+            config.moe.rebalance_config.mode = mode;
+            config.moe.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+            config.moe.durable_residency_authority = MoEDurableResidencyAuthorityKind::ExpertOverlayRCU;
+            config.moe.expert_overlay_residency_authority = authority;
+            config.moe.expert_overlay_participant_residency = residency;
+            config.moe.decode_histogram = mode == MoERebalanceRuntimeMode::Off ? nullptr : histogram.get();
+            ASSERT_EQ(config.tp_ctx, nullptr);
+            auto model = ModelContext::createForTesting("test.gguf", nullptr, 1, true);
+            ASSERT_NE(model->concreteWeightManager(), nullptr);
+            auto &registry = model->concreteWeightManager()->expertGemmRegistry();
+            // Domain lookup and canonical RCU retention must name the same
+            // prepared source, not independently constructed equal-shape mocks.
+            registerCompleteDeviceExpertLayer(registry, device, 0);
+            const auto *participant = owners.participantForId(0);
+            ASSERT_NE(participant, nullptr);
+            ASSERT_TRUE(participant->world_rank_known);
+            for (int expert_id = 0; expert_id < kNumExperts; ++expert_id)
+                for (const auto role : {ExpertRole::GATE, ExpertRole::UP, ExpertRole::DOWN})
+                {
+                    ASSERT_TRUE(registry.aliasEngineForDomainFromDevice(
+                        participant->domain_name, device, 0, expert_id, role));
+                    ASSERT_TRUE(registry.aliasEngineForParticipantFromDevice(
+                        participant->domain_name, device, participant->world_rank,
+                        participant->domain_participant_index, 0, expert_id, role));
+                }
+            TensorArena weights;
+            auto layer = makeLayerWeights(weights);
+            // Production overlays retire raw expert parents after the registry seal.
+            layer.moe_gate_exps = layer.moe_up_exps = layer.moe_down_exps = nullptr;
+            Qwen35MoEGraph builder(model, nullptr, config);
+            ScopedDevicePublicationStream publication(device);
+            // Cold ordinary prefill precedes M1; the canonical epoch bank must
+            // already be usable rather than relying on a prior decode build.
+            for (const int rows : {kSeqLen, 1, kSeqLen})
+            {
+                TensorArena activations;
+                auto buffers = makeActivationBuffers(activations, rows);
+                const auto *live = publication.publishRowCount(rows);
+                auto graph = builder.buildFFNGraph(layer, buffers, 0, rows, 1,
+                    device, publication.get(), live);
+                EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_EXPERT_DISPATCH), 0u);
+                EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_DISPATCH), 0u);
+                EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_RETURN_REDUCE), 0u);
+                EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_LOCAL_EXPERT), 0u);
+                EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ALLREDUCE), 0u);
+                EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ROOTED_COLLECTIVE), 0u);
+                EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_DEVICE_REBALANCE), 0u);
+                const auto *expert = expertComputeStage(graph, "layer0_moe_expert_ffn_overlay_fast");
+                ASSERT_NE(expert, nullptr);
+                EXPECT_EQ(expert->routedExpertRowExecutionPolicyForTesting(),
+                    RoutedExpertRowExecutionPolicy::FullyReplicatedLocal);
+                EXPECT_EQ(expert->replicaParticipantForTesting(), 0);
+                EXPECT_FALSE(expert->hasPrefillLLEPTPContextForTesting());
+                const auto *runtime = expert->moeRuntimeTableForTesting();
+                ASSERT_NE(runtime, nullptr);
+                EXPECT_FALSE(runtime->decodeRuntimePublicationRequired(0));
+                EXPECT_EQ(runtime->hostLayerState(0).active_epoch, snapshot->epoch);
+                EXPECT_THROW((void)expert->nativePreparedExpertObservationForTesting(-1), std::out_of_range);
+                EXPECT_THROW((void)expert->nativePreparedExpertObservationForTesting(kNumExperts), std::out_of_range);
+                EXPECT_TRUE(residency->allInitialBanksReady());
+                const auto retained_bank = residency->endpoint(0)->acquire(snapshot->epoch);
+                ASSERT_NE(retained_bank, nullptr);
+                const auto &retained = retained_bank->layerForModelLayer(0).experts;
+                ASSERT_EQ(retained.size(), kNumExperts);
+                for (int expert_id = 0; expert_id < kNumExperts; ++expert_id)
+                {
+                    const auto source = expert->nativePreparedExpertObservationForTesting(expert_id);
+                    EXPECT_EQ(source.resolution, MoEExpertWeightResolutionPolicy::PreparedRegistryOnly);
+                    EXPECT_EQ(source.participant_count, 1);
+                    EXPECT_EQ(source.live_rows, live);
+                    EXPECT_FALSE(source.has_raw_parents);
+                    EXPECT_TRUE(source.explicit_owner_metadata);
+                    EXPECT_EQ(source.gate,
+                        registry.getEngineForDomain("hot_domain", device, 0, expert_id, ExpertRole::GATE));
+                    EXPECT_EQ(source.gate, retained[expert_id].gate().get());
+                    EXPECT_EQ(source.up, retained[expert_id].up().get());
+                    EXPECT_EQ(source.down, retained[expert_id].down().get());
+                    EXPECT_EQ(retained[expert_id].gate().get(), registry.getEngine(device, 0, expert_id, ExpertRole::GATE));
+                    EXPECT_EQ(retained[expert_id].up().get(), registry.getEngine(device, 0, expert_id, ExpertRole::UP));
+                    EXPECT_EQ(retained[expert_id].down().get(), registry.getEngine(device, 0, expert_id, ExpertRole::DOWN));
+                }
+                EXPECT_TRUE(hasDependency(graph, "layer0_moe_expert_ffn_overlay_fast", "layer0_moe_routing"));
+                EXPECT_TRUE(expert->supportsGraphCaptureAfterLaunchPreparation());
+                for (const auto &name : graph.getExecutionOrder())
+                {
+                    const auto *node = graph.getNode(name);
+                    ASSERT_NE(node, nullptr);
+                    EXPECT_EQ(node->device, device);
+                    EXPECT_FALSE(node->stage->isManualGraphBoundary());
+                }
+            }
+            // Missing prepared native engines cannot revive the host-ticket
+            // lowering or the retired raw expert parents.
+            auto empty_model = ModelContext::createForTesting("test.gguf", nullptr, 1, true);
+            Qwen35MoEGraph missing_builder(empty_model, nullptr, config);
+            TensorArena missing_activations;
+            auto missing_buffers = makeActivationBuffers(missing_activations);
+            EXPECT_THROW((void)missing_builder.buildFFNGraph(layer, missing_buffers, 0, kSeqLen, 1,
+                device, publication.get()), std::runtime_error);
+            // Declaration copies are allowed; changed producer/participant
+            // identities must fail before creating any runtime table or node.
+            for (const int defect : {0, 1, 2, 3})
+            {
+                auto invalid = config;
+                invalid.moe.routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(*plan);
+                auto &changed = *invalid.moe.routed_expert_plan;
+                if (defect == 0) invalid.moe.expert_overlay_residency_authority.reset();
+                if (defect == 1)
+                {
+                    changed.domains.front().name = "foreign_domain";
+                    changed.routed_tiers.front().domain = changed.continuation_domain =
+                        changed.base_model_domain = changed.shared_expert_domain = "foreign_domain";
+                    changed.continuation_domain_spec.domain = "foreign_domain";
+                }
+                if (defect == 2)
+                    changed.domains.front().participants.front() =
+                        GlobalDeviceAddress::fromLocalDeviceId(device, "foreign-node", 0);
+                if (defect == 3)
+                    changed.domains.front().routed_compute_policy = RoutedExpertComputePolicy::Replicated;
+                Qwen35MoEGraph invalid_builder(model, nullptr, invalid);
+                TensorArena invalid_activations;
+                auto invalid_buffers = makeActivationBuffers(invalid_activations);
+                EXPECT_THROW((void)invalid_builder.buildFFNGraph(layer, invalid_buffers, 0, kSeqLen, 1,
+                    device, publication.get()), std::logic_error);
+            }
+            // A graph cannot borrow this proof on another physical endpoint.
+            auto foreign = config;
+            foreign.default_device = device.is_cuda() ? DeviceId::cuda(1) : DeviceId::rocm(1);
+            foreign.moe.routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(*plan);
+            foreign.moe.routed_expert_plan->domains.front().participants.front() =
+                GlobalDeviceAddress::fromLocalDeviceId(foreign.default_device);
+            Qwen35MoEGraph foreign_builder(model, nullptr, foreign);
+            TensorArena invalid_activations;
+            auto invalid_buffers = makeActivationBuffers(invalid_activations);
+            EXPECT_THROW((void)foreign_builder.buildFFNGraph(layer, invalid_buffers, 0, kSeqLen, 1,
+                foreign.default_device, publication.get()), std::logic_error);
+        }
+    }
+
+#ifdef HAVE_CUDA
+    /** @test CUDA singleton native overlay binds prepared prefill and decode operations. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering, SingleParticipantOverlayUsesNativePreparedCUDA)
+    {
+        assertSingleParticipantNativeOverlayLowering(DeviceId::cuda(0));
+    }
+#endif
+#ifdef HAVE_ROCM
+    /** @test ROCm singleton native overlay binds prepared prefill and decode operations. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering, SingleParticipantOverlayUsesNativePreparedROCm)
+    {
+        assertSingleParticipantNativeOverlayLowering(DeviceId::rocm(0));
+    }
+#endif
+
     TEST(Test__Qwen35MoEGraphNativeProductionLowering, TieredOverlayDefaultsToGraphNativeSparseStages)
     {
         auto plan = makeProductionStylePlan();
@@ -2439,10 +2666,13 @@ namespace llaminar2::test
         config1.tp_device_idx = 1;
 
         LoweringMTPDirectory directory;
-        auto model_ctx = ModelContext::createForTesting(
-            directory.path(), nullptr, kMTPSourceLayer + 1, /*with_weight_manager=*/true);
+        // Load the real directory before WeightManager seals its source.
+        // createForTesting(with_weight_manager=true) installs/seals a synthetic
+        // directory, so replacing it afterwards would invalidate weight owners.
+        auto model_ctx = ModelContext::create(directory.path(), nullptr);
         ASSERT_NE(model_ctx, nullptr);
-        ASSERT_TRUE(model_ctx->concreteLoader().loadModel(directory.path()));
+        ASSERT_EQ(model_ctx->architecture(), "qwen35moe");
+        ASSERT_EQ(model_ctx->totalBlockCount(), kMTPSourceLayer + 1);
         ASSERT_NE(model_ctx->concreteWeightManager(), nullptr);
         auto &registry =
             model_ctx->concreteWeightManager()->expertGemmRegistry();
@@ -3633,6 +3863,32 @@ namespace llaminar2::test
             shared_gate_stage1->coherencePolicy(),
             CoherencePolicy::NONE)
             << "A non-root observer must have no tensor ownership";
+    }
+
+    /**
+     * @test File-backed lowering metadata is loaded before its immutable weight owner.
+     *
+     * No native execution or model payload is required. The production context
+     * factory must preserve the real main/NextN source, then seal it before the
+     * prepared-expert registry can be observed. Even same-file reload is illegal
+     * after that seal and must leave the authenticated directory unchanged.
+     */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         FileBackedDirectoryLoadsBeforeWeightManagerSealsSource)
+    {
+        LoweringMTPDirectory directory;
+        auto model_ctx=ModelContext::create(directory.path(),nullptr);
+        ASSERT_NE(model_ctx,nullptr);
+        ASSERT_NE(model_ctx->concreteWeightManager(),nullptr);
+        EXPECT_EQ(model_ctx->architecture(),"qwen35moe");
+        EXPECT_EQ(model_ctx->totalBlockCount(),2);
+        EXPECT_EQ(model_ctx->path(),directory.path());
+        EXPECT_EQ(model_ctx->artifactPaths(),std::vector<std::string>{directory.path()});
+        const auto *source=model_ctx->concreteLoader().tensorInfo("blk.1.nextn.eh_proj.weight");
+        ASSERT_NE(source,nullptr);
+        EXPECT_THROW((void)model_ctx->concreteLoader().loadModel(directory.path()),std::logic_error);
+        EXPECT_EQ(model_ctx->concreteLoader().tensorInfo("blk.1.nextn.eh_proj.weight"),source);
+        EXPECT_EQ(model_ctx->totalBlockCount(),2);
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,

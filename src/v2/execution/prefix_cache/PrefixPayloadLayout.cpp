@@ -7,12 +7,81 @@
  * main or shifted attention instead requires a contiguous block sequence.
  */
 #include "execution/prefix_cache/PrefixPayloadLayout.h"
+#include "execution/qwen4exp/Qwen4ExpAuxiliaryState.h"
 
 #include "kernels/IHybridKVCache.h"
 #include "kernels/IKVCache.h"
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /** @brief Check exact section arithmetic before allocation or serialized extent publication. */
+        size_t addBytes(size_t left, size_t right)
+        {
+            if (right > std::numeric_limits<size_t>::max() - left)
+                throw std::overflow_error("prefix auxiliary section extent overflow");
+            return left + right;
+        }
+    }
+
+    size_t PrefixAuxiliaryPayloadLayout::blockBytes(int attention_layers) const
+    {
+        if (attention_layers < 0 || (!kind && (bytes_per_attention_layer || endpoint_bytes || includes_endpoint)) ||
+            (kind && *kind != CacheAuxiliaryStateKind::QwenFlashNext))
+            throw std::invalid_argument("prefix auxiliary section requires its exact supported model identity");
+        if (attention_layers != 0 && bytes_per_attention_layer >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(attention_layers))
+            throw std::overflow_error("prefix auxiliary block extent overflow");
+        return static_cast<size_t>(attention_layers) * bytes_per_attention_layer;
+    }
+
+    size_t PrefixPayloadLayout::modelAuxiliaryBytes() const
+    {
+        const auto blocks = addBytes(main_auxiliary.blockBytes(fa_layers), mtp_auxiliary.blockBytes(mtp_layers));
+        return addBytes(addBytes(blocks, main_auxiliary.endpointBytes()), mtp_auxiliary.endpointBytes());
+    }
+
+    void applyPrefixAuxiliaryLayout(PrefixPayloadLayout &layout, const IKVCache &main_cache,
+        const IKVCache *mtp_cache, int sequence, int first_token, int token_count,
+        int logical_prefix, bool include_endpoint)
+    {
+        if (sequence < 0 || first_token < 0 || token_count < 0 || logical_prefix < first_token ||
+            token_count > logical_prefix - first_token)
+            throw std::invalid_argument("prefix auxiliary range lies outside immutable logical prefix");
+        const auto project = [&](const IKVCache &cache, int attention_layers, int begin, int count, int frontier)
+        {
+            PrefixAuxiliaryPayloadLayout result;
+            const auto *owner = cache.auxiliaryState();
+            if (!owner) return result;
+            if (owner->device() != layout.device)
+                throw std::invalid_argument("prefix auxiliary state belongs to another physical participant");
+            result.kind = owner->kind();
+            for (int index = 0; index < attention_layers; ++index)
+            {
+                const int layer = prefixFALayerForIndex(cache, index);
+                if (layer < 0) throw std::invalid_argument("prefix auxiliary FA ordinal lacks exact global layer identity");
+                const auto bytes = owner->blockArchiveBytes({layer, sequence, begin, count});
+                if (index != 0 && bytes != result.bytes_per_attention_layer)
+                    throw std::invalid_argument("prefix auxiliary pool layer strides differ within one archive");
+                result.bytes_per_attention_layer = bytes;
+            }
+            result.endpoint_bytes = owner->endpointArchiveBytes(sequence, frontier);
+            result.includes_endpoint = include_endpoint;
+            (void)result.blockBytes(attention_layers);
+            return result;
+        };
+        layout.main_auxiliary = project(main_cache, layout.fa_layers, first_token, token_count, logical_prefix);
+        if(mtp_cache)layout.mtp_origin=mtp_cache->stateOwnership().shifted_origin;
+        const auto shifted=mtpShiftedBlockRange(first_token,token_count,layout.mtp_origin);
+        layout.mtp_auxiliary = mtp_cache ? project(*mtp_cache,layout.mtp_layers,
+            shifted.first,shifted.count,mtpShiftedPrefixRows(logical_prefix,layout.mtp_origin)) : PrefixAuxiliaryPayloadLayout{};
+        (void)layout.modelAuxiliaryBytes();
+    }
+
     int prefixFALayerForIndex(const IKVCache &kv_cache, int fa_index)
     {
         if (fa_index < 0 || fa_index >= kv_cache.n_layers())
@@ -86,26 +155,28 @@ namespace llaminar2
         size_t total = faKVBytes();
         if (includes_hybrid_state)
         {
-            total += hybrid_state_bytes;
+            total = addBytes(total, hybrid_state_bytes);
         }
         if (includes_mtp_state)
         {
-            total += mtpKVBytes();
+            total = addBytes(total, mtpKVBytes());
         }
         if (includes_terminal_hidden)
         {
-            total += terminal_hidden_bytes;
+            total = addBytes(total, terminal_hidden_bytes);
         }
         if (includes_terminal_logits)
         {
-            total += terminal_logits_bytes;
+            total = addBytes(total, terminal_logits_bytes);
         }
-        return total;
+        return addBytes(total, modelAuxiliaryBytes());
     }
 
     bool PrefixPayloadLayout::compatiblePayloadShape(const PrefixPayloadLayout &other) const
     {
-        return block_size == other.block_size &&
+        return main_auxiliary.kind == other.main_auxiliary.kind &&
+               mtp_auxiliary.kind == other.mtp_auxiliary.kind &&
+               block_size == other.block_size &&
                first_layer_index == other.first_layer_index &&
                total_layers == other.total_layers &&
                fa_layers == other.fa_layers &&
@@ -121,6 +192,7 @@ namespace llaminar2
                hybrid_host_state_bytes == other.hybrid_host_state_bytes &&
                hybrid_device_state_bytes == other.hybrid_device_state_bytes &&
                hybrid_state_bytes == other.hybrid_state_bytes &&
+               mtp_origin == other.mtp_origin &&
                mtp_layers == other.mtp_layers &&
                mtp_local_kv_heads == other.mtp_local_kv_heads &&
                mtp_kv_head_start == other.mtp_kv_head_start &&
@@ -177,7 +249,85 @@ namespace llaminar2
         layout.terminal_logits_bytes = terminal_logits_bytes;
         layout.includes_terminal_hidden = terminal_hidden_bytes > 0;
         layout.includes_terminal_logits = terminal_logits_bytes > 0;
+        if (kv_cache.auxiliaryState())
+            applyPrefixAuxiliaryLayout(layout, kv_cache, nullptr, 0, 0, block_size, block_size, true);
         return layout;
+    }
+
+    PrefixPayloadLayout qwen4ExpPrefixCapacityLayout(const PrefixPayloadLayout &base,
+        qwen4exp::Qwen4ExpArchiveGeometry main, qwen4exp::Qwen4ExpArchiveGeometry mtp,
+        int context_tokens)
+    {
+        using Geometry = qwen4exp::Qwen4ExpArchiveGeometry;
+        if (base.block_size <= 0 || context_tokens <= 0 || base.fa_layers < 0 || base.mtp_layers < 0 ||
+            static_cast<size_t>(base.fa_layers) != main.sparse_layers ||
+            (!mtp.empty() && static_cast<size_t>(base.mtp_layers) != mtp.sparse_layers) || mtp.ple_channels)
+            throw std::invalid_argument("QFN prefix capacity requires exact cache-local sparse/lexical ownership");
+        // Dense shifted attention retains ordinary KV with no model auxiliary
+        // owner. Empty auxiliary geometry says nothing about that KV extent;
+        // its existing base.mtp_layers/mtp_kv_bytes remain fully charged. Every
+        // nonempty QSA owner still matches the complete cache-local layer bank.
+        const auto project = [](Geometry geometry, size_t first, size_t count, size_t prefix)
+        {
+            PrefixAuxiliaryPayloadLayout result;
+            if (geometry.empty()) return result;
+            result.kind = CacheAuxiliaryStateKind::QwenFlashNext;
+            result.bytes_per_attention_layer = Geometry::blockBytes(first, count);
+            result.endpoint_bytes = geometry.endpointBytes(prefix);
+            result.includes_endpoint = true;
+            return result;
+        };
+        PrefixPayloadLayout maximum = base;
+        maximum.main_auxiliary = {};
+        maximum.mtp_auxiliary = {};
+        auto maximum_bytes = maximum.totalBytes();
+        const size_t block = base.block_size, context = context_tokens;
+        // The earliest positive block for each start residue admits at least
+        // as many rows as any later representative. For a fixed end residue,
+        // the greatest legal count maximizes completed pool rows. This bounds
+        // the exact search to20 candidates instead of walking the context.
+        for (size_t ordinal = 0; ordinal <= Geometry::CompressionRatio; ++ordinal)
+        {
+            const size_t first = Geometry::multiply(ordinal, block);
+            if (first >= context) break;
+            const size_t limit = std::min(block, context - first);
+            for (size_t residue = 0; residue < Geometry::CompressionRatio; ++residue)
+            {
+                const size_t distance = (first + limit + Geometry::CompressionRatio - residue) % Geometry::CompressionRatio;
+                if (distance >= limit) continue;
+                const size_t count = limit - distance, prefix = first + count;
+                PrefixPayloadLayout candidate = base;
+                candidate.main_auxiliary = project(main, first, count, prefix);
+                const auto shifted=mtpShiftedBlockRange(static_cast<int>(first),static_cast<int>(count),base.mtp_origin);
+                candidate.mtp_auxiliary=project(mtp,shifted.first,shifted.count,shifted.end);
+                const auto bytes = candidate.totalBytes();
+                if (bytes > maximum_bytes)
+                {
+                    maximum = std::move(candidate);
+                    maximum_bytes = bytes;
+                }
+            }
+        }
+        return maximum;
+    }
+
+    PrefixPayloadLayout prefixPayloadCapacityLayout(const PrefixPayloadLayout &base,
+        const IKVCache &main, const IKVCache *mtp)
+    {
+        const auto project = [](const IKVCache &cache)
+        {
+            const auto *owner = cache.auxiliaryState();
+            if (!owner) return qwen4exp::Qwen4ExpArchiveGeometry{};
+            const auto *qfn = dynamic_cast<const Qwen4ExpAuxiliaryState *>(owner);
+            if (!qfn || owner->kind() != CacheAuxiliaryStateKind::QwenFlashNext)
+                throw std::invalid_argument("prefix capacity owner lacks an exact typed archive geometry");
+            return qfn->archiveGeometry(0);
+        };
+        if (!main.auxiliaryState() && (!mtp || !mtp->auxiliaryState())) return base;
+        if (mtp && mtp->max_seq_len() < mtpShiftedPrefixRows(main.max_seq_len(),mtp->stateOwnership().shifted_origin))
+            throw std::invalid_argument("shifted prefix capacity is smaller than the admitted main horizon");
+        return qwen4ExpPrefixCapacityLayout(base, project(main),
+            mtp ? project(*mtp) : qwen4exp::Qwen4ExpArchiveGeometry{}, main.max_seq_len());
     }
 
 } // namespace llaminar2

@@ -67,6 +67,115 @@ class InventoryTests(unittest.TestCase):
         exported = inventory.export_manifest(full, "revision", inventory.InventoryScope.ALL)
         self.assertEqual(exported, self.document)
 
+    def test_explicit_predictor_is_required_in_manifest_even_for_mtp_off(self):
+        """The optional second source is not discarded by inactive MTP policy."""
+        source = self.document["cells"][0]
+        source["configuration"]["shared_predictor"] = "/models/predictor.gguf"
+        source["configuration"]["runtime"] = {"generation": {"mtp_policy": "off"}}
+        with self.assertRaisesRegex(ValueError, "declared GGUF source"):
+            self.discover(inventory.InventoryScope.ALL)
+        source["model_files"].append("/models/predictor.gguf")
+        selected = self.discover(inventory.InventoryScope.ALL)
+        self.assertEqual(selected[0][0].model_files,
+                         ("/models/model.gguf", "/models/predictor.gguf"))
+        self.assertEqual(inventory.export_manifest(selected, "revision", inventory.InventoryScope.ALL),
+                         self.document)
+
+    def test_malformed_explicit_predictor_cannot_enter_inventory(self):
+        """Absence is legacy behavior; a present source must be a nonempty path."""
+        for invalid in (None, "", 7, [], {}):
+            self.document["cells"][0]["configuration"]["shared_predictor"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "explicit GGUF source"):
+                self.discover(inventory.InventoryScope.ALL)
+
+    def test_live_discovery_retains_predictor_and_both_split_sources(self):
+        """Join explicit source roles to the existing exact GGUF staging authority."""
+        root = Path(self.temporary.name)
+        main = root / "main-00001-of-00002.gguf"
+        main_second = root / "main-00002-of-00002.gguf"
+        draft = root / "draft.gguf"
+        unrelated = root / "unrelated.gguf"
+        for path in (main, main_second, draft, unrelated):
+            path.write_bytes(b"source fixture")
+        main_alias, draft_alias = root / "main-alias.gguf", root / "draft-alias.gguf"
+        main_alias.symlink_to(main)
+        draft_alias.symlink_to(draft)
+        self.args.manifest = None
+        self.args.build_dir = Path("/build")
+        binary = "/build/v2_integration_parity_model_matrix"
+        record = row("opaque", False)["configuration"] | {
+            "model": str(main_alias), "shared_predictor": str(draft_alias)}
+        campaign = inventory.parity.CampaignCell("campaign", inventory.parity.CampaignGroup("CPU", "ALL"),
+            command=(binary,), gtest_cases=("Suite.ProductionParity/opaque",),
+            model_files=(str(main), str(draft), str(unrelated)), working_directory=str(root))
+        def list_binary(command, **kwargs):
+            Path(command[2].removeprefix("--gtest_output=json:")).write_text(json.dumps(
+                {"testsuites": [{"name": "Suite", "testsuite": [{"name": "ProductionParity/opaque",
+                    "value_param": json.dumps(record)}]}]}))
+        with patch.object(inventory.parity, "discover_campaigns", return_value=[campaign]), \
+             patch.object(inventory.subprocess, "run", side_effect=list_binary):
+            selected = inventory.discover(self.args, inventory.InventoryScope.ALL)
+        self.assertEqual(set(selected[0][0].model_files), {str(main), str(main_second), str(draft)})
+        self.assertEqual(selected[0][2]["model"], str(main))
+        self.assertEqual(selected[0][2]["shared_predictor"], str(draft))
+        campaign = inventory.dataclasses.replace(campaign, model_files=(str(main), str(unrelated)))
+        with patch.object(inventory.parity, "discover_campaigns", return_value=[campaign]), \
+             patch.object(inventory.subprocess, "run", side_effect=list_binary):
+            with self.assertRaisesRegex(ValueError, "shared_predictor is not in the canonical GGUF manifest"):
+                inventory.discover(self.args, inventory.InventoryScope.ALL)
+
+    def test_predictor_mount_mapping_updates_only_explicit_source_and_argv(self):
+        """Staging rewrites the declared artifact without changing inference policy."""
+        record = row("mapped", False)["configuration"]
+        record["shared_predictor"] = "/models/predictor.gguf"
+        record["runtime"] = {"server_args": ["--no-mtp", "--mtp-model", "/models/predictor.gguf"]}
+        record["runtime"]["generation"] = {"body": {"args": ["--mtp-model", "user data"]}}
+        record["benchmark"] = {"args": ["--mtp-model", "/models/predictor.gguf", "--no-mtp"]}
+        original = copy.deepcopy(record)
+        mapped = inventory.map_predictor_source(record, lambda path: "/staged/" + Path(path).name)
+        self.assertEqual(record, original)
+        self.assertEqual(mapped["model"], record["model"])
+        self.assertEqual(mapped["shared_predictor"], "/staged/predictor.gguf")
+        self.assertEqual(mapped["runtime"]["server_args"], ["--no-mtp", "--mtp-model", "/staged/predictor.gguf"])
+        self.assertEqual(mapped["benchmark"]["args"], ["--mtp-model", "/staged/predictor.gguf", "--no-mtp"])
+        self.assertEqual(inventory.map_predictor_source(row("old", False)["configuration"],
+                         lambda path: self.fail("absent source must not invoke remapping")),
+                         row("old", False)["configuration"])
+
+    def test_foreign_or_duplicate_predictor_arguments_are_rejected(self):
+        """A CLI argument cannot override the immutable source record."""
+        record = row("source", False)["configuration"] | {"shared_predictor": "/models/predictor.gguf"}
+        for args in (["--mtp-model", "/models/foreign.gguf"], ["--mtp-model"], [],
+                     ["--mtp-model", "/models/predictor.gguf", "--mtp-model", "/models/predictor.gguf"]):
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, "foreign shared predictor"):
+                inventory.map_predictor_source(record | {"runtime": {"server_args": args}}, str)
+        del record["shared_predictor"]
+        with self.assertRaisesRegex(ValueError, "undeclared shared predictor"):
+            inventory.map_predictor_source(record | {"runtime": {"server_args": ["--mtp-model", "/models/foreign.gguf"]}}, str)
+
+    def test_diagnostic_benchmark_predictor_source_remains_owned_and_uncertified(self):
+        """The separate diagnostic argv obeys the same explicit source boundary."""
+        record = row("diagnostic", False)["configuration"] | {
+            "shared_predictor": "/models/predictor.gguf",
+            "diagnostic_benchmark": {"schema": 1, "policy": "diagnostic_declared",
+                "certification_eligible": False,
+                "args": ["--mtp-model", "/models/predictor.gguf", "--no-mtp"]}}
+        original = copy.deepcopy(record)
+        mapped = inventory.map_predictor_source(record, lambda value: "/staged/" + Path(value).name)
+        self.assertEqual(record, original)
+        self.assertIsNone(mapped["e2e"])
+        self.assertFalse(mapped["diagnostic_benchmark"]["certification_eligible"])
+        self.assertEqual(mapped["diagnostic_benchmark"]["args"],
+                         ["--mtp-model", "/staged/predictor.gguf", "--no-mtp"])
+        for args in (["--mtp-model", "/models/foreign.gguf"], [],
+                     ["--mtp-model", "/models/predictor.gguf", "--mtp-model", "/models/predictor.gguf"]):
+            malformed = record | {"diagnostic_benchmark": {"args": args}}
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, "foreign shared predictor"):
+                inventory.map_predictor_source(malformed, str)
+        del record["shared_predictor"]
+        with self.assertRaisesRegex(ValueError, "undeclared shared predictor"):
+            inventory.map_predictor_source(record, str)
+
     def test_tagged_manifest_cannot_claim_full_generation_coverage(self):
         self.document["scope"] = "e2e"
         self.document["cells"] = [row("tagged", True)]
@@ -253,6 +362,89 @@ class InventoryTests(unittest.TestCase):
              patch.object(inventory.subprocess, "run", side_effect=list_binary):
             with self.assertRaisesRegex(ValueError, "unregistered=.*untagged"):
                 inventory.discover(self.args, inventory.InventoryScope.ALL)
+
+
+class ExactLiveSelectionTests(unittest.TestCase):
+    """Pure authored listings prove selection economy and complete chosen ownership."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.model = Path(self.temporary.name) / "model.gguf"
+        self.model.touch()
+        self.args = argparse.Namespace(manifest=None, build_dir=Path("/build"),
+            source_revision="revision", backend=".*", campaign=".*", cell="Suite.ProductionParity/wanted")
+        self.binary = "/build/v2_integration_parity_selected_matrix"
+        self.other = "/build/v2_integration_parity_unrelated_matrix"
+        self.cases = ("Suite.ProductionParity/wanted", "Suite.ProductionParity/sibling")
+        self.campaigns = [self.campaign("selected", self.binary, self.cases),
+                          self.campaign("unrelated", self.other, ("Suite.ProductionParity/other",))]
+        self.listings = {self.binary: self.cases, self.other: ("Suite.ProductionParity/other",)}
+        self.launched = []
+
+    def campaign(self, name, binary, cases):
+        """Retain real campaign value objects, never executable fixture processes."""
+        return inventory.parity.CampaignCell(name, inventory.parity.CampaignGroup("CPU", "ALL"),
+            command=(binary,), gtest_cases=cases, model_files=(str(self.model),),
+            working_directory=self.temporary.name)
+
+    def discover(self):
+        """Stub process creation; production discovery performs every join and rejection."""
+        def listing(command, **kwargs):
+            self.launched.append(command[0])
+            records = [{"name": exact.removeprefix("Suite."),
+                "value_param": json.dumps(row(exact, False)["configuration"] | {"model": str(self.model)})}
+                for exact in self.listings[command[0]]]
+            Path(command[2].removeprefix("--gtest_output=json:")).write_text(json.dumps(
+                {"testsuites": [{"name": "Suite", "testsuite": records}]}))
+        with patch.object(inventory.parity, "discover_campaigns", return_value=self.campaigns), \
+             patch.object(inventory.parity, "selected_model_files", return_value=[self.model]), \
+             patch.object(inventory.subprocess, "run", side_effect=listing):
+            return inventory.discover(self.args, inventory.InventoryScope.ALL)
+
+    def test_exact_cell_never_lists_unrelated_binary(self):
+        self.assertEqual([exact for _, exact, _ in self.discover()], [self.cases[0]])
+        self.assertEqual(self.launched, [self.binary])
+
+    def test_chosen_binary_missing_unselected_sibling_still_rejects(self):
+        self.listings[self.binary] = self.cases[:1]
+        with self.assertRaisesRegex(ValueError, "missing_from_binary=.*sibling"):
+            self.discover()
+        self.assertEqual(self.launched, [self.binary])
+
+    def test_chosen_binary_unregistered_unselected_sibling_still_rejects(self):
+        self.campaigns[0] = self.campaign("selected", self.binary, self.cases[:1])
+        with self.assertRaisesRegex(ValueError, "unregistered=.*sibling"):
+            self.discover()
+        self.assertEqual(self.launched, [self.binary])
+
+    def test_unknown_exact_cell_launches_nothing_and_fails(self):
+        self.args.cell = "Suite.ProductionParity/unknown"
+        with self.assertRaisesRegex(ValueError, "no all canonical cells"):
+            self.discover()
+        self.assertEqual(self.launched, [])
+
+    def test_broad_cell_selector_lists_every_eligible_binary(self):
+        self.args.cell = ".*"
+        self.assertEqual(len(self.discover()), 3)
+        self.assertEqual(self.launched, [self.binary, self.other])
+
+    def test_narrow_selector_does_not_hide_unrelated_registered_duplicate(self):
+        self.campaigns.append(self.campaign("duplicate", self.other, ("Suite.ProductionParity/other",)))
+        with self.assertRaisesRegex(ValueError, "duplicate canonical CTest cell"):
+            self.discover()
+        self.assertEqual(self.launched, [])
+
+    def test_narrow_selector_rejects_cross_binary_duplicate_before_launch(self):
+        self.campaigns.append(self.campaign("duplicate", self.other, self.cases[:1]))
+        with self.assertRaisesRegex(ValueError, "duplicate canonical CTest cell"):
+            self.discover()
+        self.assertEqual(self.launched, [])
+
+    def test_duplicate_within_single_campaign_rejects_before_launch(self):
+        self.campaigns[0] = self.campaign("selected", self.binary, self.cases + self.cases[:1])
+        with self.assertRaisesRegex(ValueError, "duplicate canonical CTest cell"):
+            self.discover()
+        self.assertEqual(self.launched, [])
 
 
 if __name__ == "__main__":

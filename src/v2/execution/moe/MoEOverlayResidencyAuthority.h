@@ -19,6 +19,7 @@
 #include "MoEExpertOwnerMap.h"
 #include "MoELayeredExpertOwnership.h"
 #include "MoEOptimizationStatus.h"
+#include "MoEOverlayNoPeerResidency.h"
 #include "MoERoutedExpertPlacementPlanner.h"
 
 #include <atomic>
@@ -1109,6 +1110,22 @@ namespace llaminar2
             std::span<uint32_t> owner_participants_out,
             std::string *error = nullptr);
 
+        /**
+         * @brief Authenticate the immutable no-peer identity against its original epoch.
+         * @return Setup proof, with no host copy of GPU route state.
+         * @throws std::logic_error if a replacement owner-map generation invalidated the proof.
+         *
+         * Only the canonical host authority's publication identity is read. A
+         * no-peer GPU graph has no movement writer; native table pointers and
+         * workspace generations remain authenticated by ordinary graph seals.
+         */
+        [[nodiscard]] const std::optional<MoEOverlayNoPeerResidency> &noPeerResidency() const
+        {
+            if (no_peer_residency_ && snapshot().get() != initial_snapshot_.get())
+                throw std::logic_error("No-peer ownership proof cannot survive a replacement residency generation");
+            return no_peer_residency_;
+        }
+
         /** @brief Read the current immutable snapshot outside ticket execution. */
         std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot() const;
 
@@ -1543,6 +1560,7 @@ namespace llaminar2
             const MoEOverlayResidencyTransaction &transaction);
 
         Config config_;
+        std::optional<MoEOverlayNoPeerResidency> no_peer_residency_;
         MoERoutedExpertPlacementPlan planning_template_;
         /** Initial short cadence restored whenever a proposal selects movement. */
         int initial_histogram_window_tokens_ = 0;

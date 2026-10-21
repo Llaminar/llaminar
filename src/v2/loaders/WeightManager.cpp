@@ -12,8 +12,12 @@
  * never call these paths, allocate replacement payloads, or repair residency
  * by synchronizing an execution stream.
  * A participant's completed upload does not end another participant's source
- * lifetime. Frozen host policies survive preparation and the complete graph
- * lifecycle owns reclamation of shared model bytes.
+ * lifetime. Static expert source requests materialize exact original N/K
+ * rectangles from their frozen ownership; they cannot fall back to a full parent.
+ * Frozen host policies survive preparation and the complete graph
+ * lifecycle owns reclamation of shared model bytes. Static original F shards
+ * enter this same pool/staging pipeline only through complete declared frozen
+ * participant sources; they never publish whole-expert or overlay aliases.
  *
  * @author David Sanftenberg
  */
@@ -172,6 +176,24 @@ namespace llaminar2
             for (const int expert_id : requirement.slice.expert_ids)
                 mixInt(expert_id);
 
+            if (requirement.projection_ownership)
+            {
+                // Extend only explicit new requests: old binding hashes stay
+                // byte-for-byte unchanged. Shape equality omits peer intervals.
+                mixString("original_native_expert_projection_v1");
+                const auto &ownership = *requirement.projection_ownership;
+                const auto geometry = ownership.geometry();
+                mixInt(geometry.experts);
+                mixInt(geometry.model_columns);
+                mixInt(geometry.intermediate_columns);
+                mixInt(ownership.participant());
+                mixInt(ownership.participants());
+                for (const auto interval : ownership.intermediateIntervals())
+                {
+                    mixInt(interval.first_column);
+                    mixInt(interval.columns);
+                }
+            }
             return hash == 0 ? 1 : hash;
         }
 
@@ -273,6 +295,8 @@ namespace llaminar2
 
         bool isDeclaredGemmRole(WeightRole role)
         {
+            if (isFlashNextProjectionRole(role)) return true;
+            if (isImmutableFP32WeightRole(role) || role == WeightRole::ImmutableRowTable) return false;
             switch (role)
             {
             case WeightRole::LMHead:
@@ -301,6 +325,15 @@ namespace llaminar2
             case WeightRole::Norm:
             case WeightRole::Bias:
             case WeightRole::Other:
+            case WeightRole::ImmutableRowTable:
+            case WeightRole::HyperConnectionProjection:
+            case WeightRole::HyperConnectionNorm:
+            case WeightRole::SparseIndexerProjection:
+            case WeightRole::SparseIndexerNorm:
+            case WeightRole::PerLayerEmbeddingProjection:
+            case WeightRole::PerLayerEmbeddingNorm:
+            case WeightRole::PerLayerEmbeddingConvolution:
+            case WeightRole::PredictorProjection:
                 return false;
             }
             return false;
@@ -329,6 +362,33 @@ namespace llaminar2
                    (binding.prepared.has_value() && binding.prepared->device == device);
         }
 
+        /**
+         * @brief Authenticate explicit static preparation before any backend or allocation.
+         * @param frozen Exact owned source or projected GEMM bindings.
+         * @param device Preparation participant being entered.
+         * @param include_expert_jobs Whether this invocation actually prepares expert handles.
+         *
+         * Static GPU matrices require the declared original participant scope
+         * and source root. They cannot enter overlay or unscoped preparation.
+         */
+        void validateStaticProjectionPreparation(const FrozenModelWeightSet &frozen, DeviceId device,
+                                                   bool include_expert_jobs = true)
+        {
+            for (const auto &binding : frozen.bindings())
+            {
+                if (!binding.projection_ownership || !bindingTargetsDevice(binding, device))
+                    continue;
+                if (device.is_gpu())
+                {
+                    (void)ExpertGemmRegistry::staticProjectionScope(binding);
+                    if (!include_expert_jobs || !binding.projection_source_owner)
+                        throw std::invalid_argument("Static GPU preparation requires its original source owner and explicit expert work");
+                }
+                if (!binding.tensor || binding.tensor->shape().size() != 2)
+                    throw std::invalid_argument("Static expert GEMM preparation requires projectedExpertMatrices, not a 3D source parent");
+            }
+        }
+
         bool shouldPrepareFrozenGemmBinding(
             const WeightManager &manager,
             const WeightBinding &binding,
@@ -339,7 +399,9 @@ namespace llaminar2
                 return false;
             if (!binding.tensor || binding.tensor->shape().size() != 2)
                 return false;
-            if (binding.identity.role == WeightRole::Embedding ||
+            if (isImmutableFP32WeightRole(binding.identity.role) ||
+                binding.identity.role == WeightRole::ImmutableRowTable ||
+                binding.identity.role == WeightRole::Embedding ||
                 binding.identity.role == WeightRole::OutputNorm ||
                 binding.identity.role == WeightRole::GDNSsmParam ||
                 binding.identity.role == WeightRole::MoERouter ||
@@ -692,6 +754,8 @@ namespace llaminar2
           weight_metadata_(std::make_shared<WeightMetadataRegistry>()),
           mmap_reclaim_lifecycle_([this]() { return performMmapReclaim(); })
     {
+        // Source identity is immutable before any native, prepared, or prefix owner observes it.
+        loader_.sealTensorSources();
         int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
 
         if (rank == 0)
@@ -970,6 +1034,9 @@ namespace llaminar2
 
     bool WeightManager::isGemmWeight(const std::string &name) const
     {
+        const auto role = inferWeightRole(name);
+        if (role == WeightRole::ImmutableRowTable || isImmutableFP32WeightRole(role)) return false;
+        if (isFlashNextProjectionRole(role)) return true;
         if (!has_sharding_config_)
         {
             throw std::runtime_error(
@@ -984,7 +1051,8 @@ namespace llaminar2
         // Phase 1: Simple replication - each rank loads independently
         // No MPI coordination needed
 
-        auto tensor = loader_.loadTensor(name, device, weight_precision_);
+        auto tensor = loader_.loadTensor(name, device,
+            isImmutableFP32WeightRole(inferWeightRole(name)) ? WeightPrecision::CONVERT_TO_FP32 : weight_precision_);
         if (!tensor)
         {
             // LOG_DEBUG, not LOG_ERROR: returning nullptr is a valid result for optional weights.
@@ -1501,7 +1569,8 @@ namespace llaminar2
                 size_t end = start + slice_elements;
 
                 // Load full 1D tensor first (biases are small, ~3KB)
-                auto full_tensor = loader_.loadTensor(name, device, WeightPrecision::NATIVE);
+                auto full_tensor = loader_.loadTensor(name, device,
+                    isImmutableFP32WeightRole(inferWeightRole(name)) ? WeightPrecision::CONVERT_TO_FP32 : WeightPrecision::NATIVE);
                 if (!full_tensor)
                 {
                     throw std::runtime_error("[WeightManager] Rank " + std::to_string(rank) +
@@ -2139,6 +2208,15 @@ namespace llaminar2
                    .countOwnedEnginesForDeviceAcrossScopes(device);
     }
 
+    ReleasedWeightLoadStaging WeightManager::releasedWeightLoadStaging(DeviceId device) const
+    {
+        std::lock_guard<std::mutex> lock(physical_memory_authority_mutex_);
+        const auto found = released_weight_load_staging_.find(device);
+        if (found == released_weight_load_staging_.end())
+            throw std::logic_error("Resident native table has no drained ordinary weight-loader slot");
+        return found->second;
+    }
+
     size_t WeightManager::retainedPreparedDeviceBytes(
         DeviceId device) const
     {
@@ -2223,7 +2301,24 @@ namespace llaminar2
                                                : requirement.source_name;
             const DeviceId lookup_device = requirement.lookup_device.value_or(requirement.target_device);
             std::shared_ptr<TensorBase> tensor;
-            if (requirement.derivation == WeightDerivationKind::ExpertSlice &&
+            if (requirement.projection_ownership)
+            {
+                if (weight_precision_ != WeightPrecision::NATIVE)
+                    throw std::invalid_argument("Static expert projection requires original native weights, without conversion");
+                tensor = loader_.loadTensorExpertProjectionSlice(
+                    load_name, requirement.slice, lookup_device, WeightPrecision::NATIVE);
+                const std::vector<size_t> expected{requirement.slice.row_count,
+                    requirement.slice.col_count, requirement.slice.expert_count};
+                if (!tensor || tensor->shape() != expected)
+                    throw std::runtime_error("Static expert projection did not materialize its exact compact original source: " + load_name);
+                auto compact = requirement.slice;
+                compact.inner_is_presliced = true;
+                registerDerivedMetadata(requirement.canonical_name, tensor,
+                    WeightDerivationKind::ExpertSlice, compact, lookup_device);
+                // Do not enter getWeightForDevice on any failed explicit source
+                // request: that generic path could materialize the full parent.
+            }
+            else if (requirement.derivation == WeightDerivationKind::ExpertSlice &&
                 !requirement.slice.expert_ids.empty())
             {
                 /*
@@ -2337,6 +2432,7 @@ namespace llaminar2
             binding.identity.overlay_participant_world_rank = requirement.overlay_participant_world_rank;
 
             binding.slice = requirement.slice;
+            binding.projection_ownership = requirement.projection_ownership;
             binding.residency.home_device = requirement.target_device;
             binding.residency.resident_device = requirement.target_device;
             binding.residency.host_policy = requirement.host_policy;
@@ -2439,7 +2535,7 @@ namespace llaminar2
                      {"prepared_bytes", std::to_string(tensor->size_bytes())}});
             }
             if (binding.identity.role == WeightRole::MoERouter &&
-                debugEnv().gemm.moe_router_arithmetic == MoERouterArithmetic::FP16)
+                resolveMoERouterArithmetic(debugEnv().gemm.moe_router_arithmetic, loader_.architecture()) == MoERouterArithmetic::FP16)
             {
                 if (tensor->native_type() != TensorType::FP16)
                     throw std::runtime_error("Router half setup failed to materialize " + requirement.canonical_name);
@@ -3202,6 +3298,9 @@ namespace llaminar2
         DeviceId device,
         int layer_idx)
     {
+        if (inferWeightRole(name) == WeightRole::ImmutableRowTable)
+            throw std::invalid_argument("[WeightManager] " + name +
+                " requires its typed ImmutableRowTable store owner; ordinary weight materialization is forbidden");
         std::unique_lock<std::mutex> lock(cache_mutex_);
 
         // For LAYER_PARTITIONED strategy, filter out weights not in our layer range
@@ -3469,7 +3568,7 @@ namespace llaminar2
         // materialize/cache per-device tensors on demand.
         if (weight_names.empty())
         {
-            weight_names = loader_.tensorNames();
+            weight_names = loader_.materializationNames();
             seeded_from_loader = true;
 
             if (weight_names.empty())
@@ -3511,6 +3610,9 @@ namespace llaminar2
 
             for (const auto &name : weight_names)
             {
+                // A lookup store retains native rows under its own admitted
+                // lifetime. Ordinary preload must never upload this table.
+                if (inferWeightRole(name) == WeightRole::ImmutableRowTable) continue;
                 // Respect PP layer filtering semantics during seeded preload.
                 if (strategy_ == WeightDistributionStrategy::LAYER_PARTITIONED && has_layer_range_)
                 {
@@ -3606,6 +3708,7 @@ namespace llaminar2
         DeviceId device,
         bool include_expert_jobs)
     {
+        validateStaticProjectionPreparation(frozen_weights, device, include_expert_jobs);
         const PhysicalMemoryOwner persistent_owner =
             frozen_weights.physicalMemoryOwner();
         LOG_DEBUG("[WeightManager] prepareWeightsForDevice(" << device.to_string()
@@ -5329,6 +5432,8 @@ namespace llaminar2
         std::optional<size_t> staging_budget_bytes_override,
         PhysicalMemoryOwner persistent_owner)
     {
+        if (frozen_weights)
+            validateStaticProjectionPreparation(*frozen_weights, target_device, include_expert_jobs);
         using namespace llaminar::v2::kernels;
         using Clock = std::chrono::high_resolution_clock;
         const auto start = Clock::now();
@@ -5357,6 +5462,8 @@ namespace llaminar2
             {
                 for (const auto &binding : frozen_weights->bindings())
                 {
+                    if (binding.projection_ownership)
+                        continue; // Static matrices enter only participant-scoped expert jobs below.
                     if (!shouldPrepareFrozenGemmBinding(*this, binding, target_device, include_expert_jobs))
                     {
                         if (bindingTargetsDevice(binding, target_device) &&
@@ -5501,6 +5608,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> view;
             /** Complete source/partition identity, never inferred from the smaller physical N. */
             std::optional<MoEExpertProjectionOwnership> projection_ownership;
+            std::optional<WeightBinding> static_source = std::nullopt; ///< Exact marked view; no domain/device alias is published.
         };
         std::vector<MoEExpertJob> moe_jobs;
         size_t moe_jobs_already_satisfied = 0;
@@ -5513,6 +5621,61 @@ namespace llaminar2
             std::vector<int> expected_experts;
         };
         std::vector<MoEParentTensorRecord> moe_parent_tensors;
+
+        // Static F shards are already exact original 2D views. The frozen
+        // declarations supply scope and complete partition; no overlay request
+        // or quotient over E/P is manufactured. Validate all 3E before planning
+        // any physical storage or starting an upload.
+        struct StaticLayerSources
+        {
+            ExpertGemmRegistry::ParticipantLayerScope scope;
+            MoEExpertProjectionOwnership projection;
+            std::vector<WeightBinding> sources;
+        };
+        std::vector<StaticLayerSources> static_layers;
+        if (frozen_weights && include_expert_jobs)
+        {
+            for (const auto &binding : frozen_weights->bindings())
+            {
+                if (!binding.projection_ownership || !bindingTargetsDevice(binding, target_device)) continue;
+                if (overlay_preparation_plan)
+                    throw std::invalid_argument("Static original F sources cannot enter an overlay preparation plan");
+                if (layer_filter && !layer_filter(binding.identity.canonical_name))
+                    throw std::invalid_argument("Static source declarations must be filtered as complete participant layers");
+                const auto scope = ExpertGemmRegistry::staticProjectionScope(binding);
+                auto found = std::find_if(static_layers.begin(), static_layers.end(), [&](const auto &layer) {
+                    return layer.scope == scope;
+                });
+                if (found == static_layers.end())
+                {
+                    static_layers.push_back({scope, *binding.projection_ownership, {}});
+                    found = static_layers.end() - 1;
+                }
+                found->sources.push_back(binding);
+            }
+            for (const auto &layer : static_layers)
+            {
+                const auto existing = expert_gemm_registry_.acquireStaticProjectionLayer(
+                    layer.scope, layer.projection, layer.sources);
+                if (existing)
+                {
+                    moe_jobs_already_satisfied += layer.sources.size();
+                    continue;
+                }
+                for (const auto &source : layer.sources)
+                {
+                    const auto role = source.identity.role == WeightRole::MoEExpertGate ? ExpertGemmRegistry::WeightRole::GATE
+                        : source.identity.role == WeightRole::MoEExpertUp ? ExpertGemmRegistry::WeightRole::UP : ExpertGemmRegistry::WeightRole::DOWN;
+                    const auto slot = "static_" + registrySlotComponent(layer.scope.domain_name) + "_rank" +
+                        std::to_string(layer.scope.participant_world_rank) + "_p" + std::to_string(layer.scope.participant_index) +
+                        "_binding" + std::to_string(source.binding_id);
+                    moe_jobs.push_back({layer.scope.layer, source.identity.expert, role, slot,
+                        layer.scope.domain_name, {}, -1, layer.scope.participant_world_rank, layer.scope.participant_index,
+                        source.projection_source_owner.get(), source.projection_source_owner,
+                        source.tensor_owner, source.projection_ownership, source});
+                }
+            }
+        }
 
         if (include_expert_jobs)
         {
@@ -5578,8 +5741,8 @@ namespace llaminar2
             {
                 for (const auto &binding : frozen_weights->bindings())
                 {
-                    if (!binding.tensor)
-                        continue;
+                    if (!binding.tensor || binding.projection_ownership)
+                        continue; // Static matrices were consumed above, never reinterpreted as 3D parents.
                     const bool resident_on_target =
                         binding.prepared.has_value()
                             ? binding.prepared->device == target_device
@@ -5588,6 +5751,10 @@ namespace llaminar2
                                    : binding.residency.home_device == target_device);
                     if (!resident_on_target)
                         continue;
+                    if (isRoutedExpertRole(binding.identity.role) && std::any_of(static_layers.begin(), static_layers.end(), [&](const auto &layer) {
+                            return layer.scope.layer == binding.identity.layer;
+                        }))
+                        throw std::invalid_argument("Static participant source cannot be mixed with ordinary/overlay expert parents in one layer");
 
                     add_moe_parent(binding.identity.canonical_name,
                                    binding.tensor_owner,
@@ -6265,6 +6432,14 @@ namespace llaminar2
             size_t missing_experts = 0;
             for (const auto &moe_job : moe_jobs)
             {
+                if (moe_job.static_source)
+                {
+                    // Complete static layers were already acquired before jobs
+                    // were emitted. A new job with retired source is a fatal
+                    // missing preparation, never an unscoped adoption.
+                    ++missing_experts;
+                    continue;
+                }
                 if (moe_job.domain_name.empty())
                     continue;
 
@@ -6514,7 +6689,7 @@ namespace llaminar2
         };
 
         auto register_pipeline_gemm = [&](const DenseGemmJob &dense_job,
-                                          std::unique_ptr<ITensorGemm> kernel) -> bool
+                                          std::shared_ptr<ITensorGemm> kernel) -> bool
         {
             const std::string &name = dense_job.name;
             TensorBase *tensor = dense_job.tensor;
@@ -6528,7 +6703,7 @@ namespace llaminar2
                                                                                                 : KernelFactory::GemmPreparationKind::CPU_PACKED)
                                                                    : KernelFactory::GemmPreparationKind::FLOATING_POINT;
 
-            auto owned_kernel = std::shared_ptr<ITensorGemm>(std::move(kernel));
+            auto owned_kernel = std::move(kernel);
             auto prepared_weights = std::make_shared<KernelFactory::PreparedGemmWeights>();
             prepared_weights->kind = resolved_kind;
             prepared_weights->owned_kernel = owned_kernel;
@@ -6616,7 +6791,7 @@ namespace llaminar2
 
             if (kernel)
             {
-                if (register_pipeline_gemm(dense_job, std::move(kernel)))
+                if (register_pipeline_gemm(dense_job, std::shared_ptr<ITensorGemm>(std::move(kernel))))
                 {
                     markPrepState(name, target_device, WeightPrepState::UPLOADED_DEVICE, true,
                                   "GPU pipeline: loaded + registered");
@@ -6664,7 +6839,14 @@ namespace llaminar2
             if (kernel)
             {
                 ITensorGemm *raw_ptr = kernel.get();
-                if (!mj.domain_name.empty())
+                if (mj.static_source)
+                {
+                    const DenseGemmJob declared{mj.slot_name, mj.view.get(), mj.view, mj.static_source};
+                    if (!register_pipeline_gemm(declared, kernel))
+                        throw std::runtime_error("Static expert prepared-store publication failed");
+                    expert_gemm_registry_.registerStaticProjection(*mj.static_source, raw_ptr, std::move(kernel));
+                }
+                else if (!mj.domain_name.empty())
                 {
                     expert_gemm_registry_.registerEngineForParticipant(
                         mj.domain_name,
@@ -6684,6 +6866,16 @@ namespace llaminar2
                 }
                 ++moe_registered;
             }
+        }
+
+        for (const auto &layer : static_layers)
+        {
+            const auto prepared = expert_gemm_registry_.acquireStaticProjectionLayer(
+                layer.scope, layer.projection, layer.sources);
+            if (!prepared) throw std::runtime_error("Static participant preparation omitted an original expert role");
+            for (const auto &source : layer.sources)
+                markPrepState(source.identity.canonical_name, target_device, WeightPrepState::READY, true,
+                              "GPU static original projection source prepared");
         }
 
         // Mark 3D MoE parent tensors ready only after their exact layer/role has
@@ -6774,6 +6966,16 @@ namespace llaminar2
         // The VRAM pool is kept alive by the GEMM kernels' lifetime_owner_ shared_ptrs,
         // but the staging buffers (pinned ring) are no longer needed.
         orchestrator->finalize();
+        {
+            std::lock_guard<std::mutex> lock(physical_memory_authority_mutex_);
+            const auto released=orchestrator->releasedWeightLoadStaging(target_device.ordinal);
+            const auto prior=released_weight_load_staging_.find(target_device);
+            // Several ordinary preparation families may finish in any order.
+            // Retain their largest actual resolved slot, never a late smaller
+            // family's cap or a new size derived from the complete table.
+            if (prior == released_weight_load_staging_.end() || prior->second.slotBytes() < released.slotBytes())
+                released_weight_load_staging_.insert_or_assign(target_device,released);
+        }
 
         /*
          * Publish only the finalized persistent region. The registry retains a
@@ -7966,7 +8168,8 @@ namespace llaminar2
         std::shared_ptr<TensorBase> packed;
         if (dimensions.size() == 1)
         {
-            auto full = loader_.loadTensor(name, device, WeightPrecision::NATIVE);
+            auto full = loader_.loadTensor(name, device,
+                    isImmutableFP32WeightRole(inferWeightRole(name)) ? WeightPrecision::CONVERT_TO_FP32 : WeightPrecision::NATIVE);
             if (!full)
                 throw std::runtime_error("[WeightManager] Failed to load GDN scalar tensor: " + name);
             auto *source = dynamic_cast<FP32Tensor *>(full.get());
@@ -8183,7 +8386,8 @@ namespace llaminar2
         }
 
         // Load full tensor and slice in memory (biases are small)
-        auto full_tensor = loader_.loadTensor(name, device, WeightPrecision::NATIVE);
+        auto full_tensor = loader_.loadTensor(name, device,
+                    isImmutableFP32WeightRole(inferWeightRole(name)) ? WeightPrecision::CONVERT_TO_FP32 : WeightPrecision::NATIVE);
         if (!full_tensor)
         {
             throw std::runtime_error("[WeightManager] Failed to load 1D tensor: " + name);

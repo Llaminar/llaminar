@@ -12,6 +12,7 @@
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "execution/prefix_cache/PrefixHostArena.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "../../mocks/MockBackend.h"
 
 #include <algorithm>
 #include <array>
@@ -352,10 +353,11 @@ TEST(Test__RamPrefixStorageBackend, ArenaRejectsPayloadExtentOverflow)
 TEST(Test__RamPrefixStorageBackend, ArenaUnpublishedProducerFailsClosed)
 {
     EXPECT_DEATH({
+        llaminar2::test::MockBackend backend(DeviceType::CUDA);
         auto arena = makeArena(32u);
         auto readiness = std::make_shared<PrefixPayloadReadiness>();
         auto event = std::make_shared<uint8_t>(0u);
-        (void)readiness->prepare(event, DeviceId::cuda(0), reinterpret_cast<void *>(uintptr_t{1}));
+        (void)readiness->prepare(event, DeviceId::cuda(0), reinterpret_cast<void *>(uintptr_t{1}), backend);
         auto range = arena->acquire(32u, readiness);
         range.reset();
         arena.reset();
@@ -614,6 +616,7 @@ TEST(Test__RamPrefixStorageBackend,
  */
 TEST(Test__RamPrefixStorageBackend, PayloadReadinessRequiresPreparationBeforePublication)
 {
+    llaminar2::test::MockBackend backend(DeviceType::CUDA);
     PrefixPayloadReadiness readiness;
     auto event_owner = std::make_shared<uint8_t>(0u);
     void *stream = reinterpret_cast<void *>(static_cast<uintptr_t>(0x1234u));
@@ -629,7 +632,7 @@ TEST(Test__RamPrefixStorageBackend, PayloadReadinessRequiresPreparationBeforePub
     ASSERT_TRUE(readiness.prepare(
         std::static_pointer_cast<void>(event_owner),
         DeviceId::cuda(0),
-        stream));
+        stream, backend));
     EXPECT_TRUE(readiness.prepared());
     EXPECT_FALSE(readiness.published());
     EXPECT_EQ(readiness.event(), event_owner.get());
@@ -641,10 +644,56 @@ TEST(Test__RamPrefixStorageBackend, PayloadReadinessRequiresPreparationBeforePub
     EXPECT_FALSE(readiness.prepare(
         std::static_pointer_cast<void>(event_owner),
         DeviceId::cuda(0),
-        stream))
+        stream, backend))
         << "A handle has exactly one producer event and stream.";
     ASSERT_TRUE(readiness.publishRecorded());
     EXPECT_TRUE(readiness.published());
     EXPECT_FALSE(readiness.publishRecorded())
         << "Publishing one recorded event twice would hide lifecycle misuse.";
+}
+
+/** @test Compact model sections preserve pool offsets when endpoint read sets are omitted. */
+TEST(Test__RamPrefixStorageBackend, FlashNextAuxiliarySectionsHaveExactLiveOwnership)
+{
+    auto layout = makeLayout();
+    layout.mtp_layers = 1;
+    layout.main_auxiliary = {CacheAuxiliaryStateKind::QwenFlashNext, 8, 12, true};
+    layout.mtp_auxiliary = {CacheAuxiliaryStateKind::QwenFlashNext, 4, 16, true};
+    RamPrefixStorageBackend backend(256u);
+    auto handle = backend.allocate(keyFor(0), layout);
+    ASSERT_TRUE(handle.valid());
+    ASSERT_TRUE(handle.model_auxiliary_storage);
+    ASSERT_EQ(handle.model_auxiliary_storage->size(), 40u);
+    EXPECT_EQ(handle.mainAuxiliaryBlockData(0), handle.model_auxiliary_payload);
+    EXPECT_EQ(handle.mtpAuxiliaryBlockData(0), handle.model_auxiliary_storage->data() + 8);
+    EXPECT_EQ(handle.mainAuxiliaryEndpointData(), handle.model_auxiliary_storage->data() + 12);
+    EXPECT_EQ(handle.mtpAuxiliaryEndpointData(), handle.model_auxiliary_storage->data() + 24);
+    EXPECT_EQ(handle.total_bytes, 72u);
+    auto rows = PrefixPayloadReadLease::sequenceRows(handle);
+    EXPECT_EQ(rows.source().layout.modelAuxiliaryBytes(), 12u);
+    EXPECT_EQ(rows.source().mtpAuxiliaryBlockData(0), handle.mtpAuxiliaryBlockData(0));
+    EXPECT_EQ(rows.source().mainAuxiliaryEndpointData(), nullptr);
+    EXPECT_EQ(rows.source().mtpAuxiliaryEndpointData(), nullptr);
+    EXPECT_EQ(handle.layout.modelAuxiliaryBytes(), 40u);
+    EXPECT_THROW(handle.mainAuxiliaryBlockData(1), std::out_of_range);
+    EXPECT_TRUE(backend.release(handle));
+}
+
+/** @test PLE-only and incomplete compression blocks retain endpoints without dummy pool bytes. */
+TEST(Test__RamPrefixStorageBackend, FlashNextAuxiliaryAllowsZeroPoolStrideAndChecksIdentity)
+{
+    auto layout = makeLayout();
+    layout.main_auxiliary = {CacheAuxiliaryStateKind::QwenFlashNext, 0, 20, true};
+    RamPrefixStorageBackend backend(256u);
+    auto handle = backend.allocate(keyFor(0), layout);
+    ASSERT_TRUE(handle.valid());
+    EXPECT_EQ(handle.mainAuxiliaryBlockData(0), nullptr);
+    EXPECT_EQ(handle.mainAuxiliaryEndpointData(), handle.model_auxiliary_payload);
+    EXPECT_EQ(handle.layout.modelAuxiliaryBytes(), 20u);
+    EXPECT_TRUE(backend.release(handle));
+    layout.main_auxiliary.kind.reset();
+    EXPECT_FALSE(backend.allocate(keyFor(1), layout).valid());
+    layout.main_auxiliary.kind = CacheAuxiliaryStateKind::QwenFlashNext;
+    layout.main_auxiliary.bytes_per_attention_layer = std::numeric_limits<size_t>::max();
+    EXPECT_FALSE(backend.allocate(keyFor(2), layout).valid());
 }

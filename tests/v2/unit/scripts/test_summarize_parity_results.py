@@ -134,5 +134,38 @@ class ParityResultSummaryTest(unittest.TestCase):
         self.assertIn("| ✅ |", markdown)
 
 
+class FinalLogitStepReportTest(unittest.TestCase):
+    """Synthetic recorded metrics exercise the real reporter, not a numerical oracle."""
+
+    def test_per_step_means_and_original_reds_are_not_averaged_away(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "results"
+            case = root / "source" / "same-model"
+            case.mkdir(parents=True)
+            (case / "decode_steps.csv").write_text(
+                "backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,passed\n"
+                "CPU,0,1,.01,1,.8,true\nCPU,1,1,.15,.5,.9,false\n", encoding="utf-8")
+            markdown, total, failed = summary.summarize(root, "original")
+        self.assertEqual((total, failed), (1, 1))
+        self.assertIn("Final logits at each decode step", markdown)
+        self.assertIn("| 0 | 0.010000 | 1.0000 | 0.8000 | ✅ |", markdown)
+        self.assertIn("| 1 | 0.150000 | 0.5000 | 0.9000 | ❌ |", markdown)
+        self.assertIn("set intersection/5", markdown)
+        self.assertIn("distinct from reference-top1-in-topK", markdown)
+
+    def test_historical_extra_steps_remain_visible_and_legacy_aggregate_is_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "results"
+            case = root / "source" / "historical"
+            case.mkdir(parents=True)
+            (case / "decode_steps.csv").write_text(
+                "backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,passed\n"
+                "Other,0,1,.01,1,1,true\nOther,1,1,.02,1,1,true\nOther,2,1,.7,0,.6,false\n", encoding="utf-8")
+            markdown, total, failed = summary.summarize(root, "original")
+        self.assertEqual((total, failed), (1, 1))
+        self.assertIn("Decode (averaged across steps)", markdown)
+        self.assertIn("| 2 | 0.700000 | 0.0000 | 0.6000 | ❌ |", markdown)
+
+
 if __name__ == "__main__":
     unittest.main()

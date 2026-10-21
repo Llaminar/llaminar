@@ -784,6 +784,53 @@ namespace
     }
 }
 
+/**
+ * @test CPU allocation identity is independent of whole-host or bound NUMA affinity.
+ *
+ * A rank's -1 affinity denotes an observed whole-host CPU resource, not an
+ * invalid process allocator. Binding NUMA3 likewise cannot invent CPU ordinal3.
+ * Exercise the actual model-aware compiler and complete BOM on every backend;
+ * no model payload or accelerator is loaded by these metadata fixtures.
+ */
+TEST(PlanningRequestCostModel, CPUAllocatorDoesNotUseNUMAAffinityAsDeviceOrdinal)
+{
+    PlanningGGUFFixture file(false, false, GGUFTensorType::F32);
+    PlanningModelSource source(file.path());
+    for (const int affinity : {-1, 3})
+        for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        {
+            SCOPED_TRACE(::testing::Message() << affinity << '/' << int(backend));
+            auto observed = requestInventory(false);
+            for (auto &rank : observed.ranks)
+            {
+                rank.cpu.numa_node = affinity;
+                rank.numa_nodes = affinity < 0 ? 1 : 4;
+                for (auto &socket : rank.cpu_socket_info) socket.numa_node = affinity < 0 ? 0 : affinity;
+            }
+            observed.buildNodeAggregations();
+            std::optional<AdmittedOrchestrationCandidate> admitted;
+            EXPECT_NO_THROW(admitted.emplace(requestCandidate(source, observed, backend,
+                OrchestrationStrategy::SingleDevice)));
+            if (!admitted) continue;
+            ASSERT_EQ(admitted->rankPlans().size(), 1u);
+            EXPECT_EQ(admitted->rankPlans().front().numa_node, affinity);
+            ASSERT_EQ(admitted->devicePlans().size(), 1u);
+            const auto &device = admitted->devicePlans().front();
+            if (backend == DeviceType::CPU)
+                EXPECT_EQ(device.device, DeviceId::cpu());
+            else
+            {
+                ASSERT_TRUE(device.associated_host_memory);
+                EXPECT_EQ(device.associated_host_memory->device, DeviceId::cpu());
+                EXPECT_EQ(device.associated_host_memory->world_rank, 0);
+            }
+            const auto &physical = admitted->physicalAdmission().plan();
+            EXPECT_NE(physical.find({0, DeviceId::cpu()}), nullptr);
+            if (affinity == 3)
+                EXPECT_EQ(physical.find({0, DeviceId{DeviceType::CPU, 3}}), nullptr);
+        }
+}
+
 TEST(PlanningRequestCostModel, SingleDeviceHasNoLinksAndLiveContextCostsMoreAcrossBackendsAndFormats)
 {
     const auto cluster = requestInventory(false);

@@ -13,6 +13,7 @@
 #include "../../loaders/IModelLoader.h"
 #include "../../loaders/ModelLoader.h"
 #include "planning/ModelMemoryProfile.h"
+#include "models/qwen4exp/Qwen4ExpSidecarManifest.h"
 
 #include <algorithm>
 #include <limits>
@@ -208,11 +209,51 @@ namespace llaminar2
             manifest.diagnostic = std::move(diagnostic);
             return manifest;
         }
+        /** @brief Discover the exact QFN roles, retaining source-declared dense or sparse predictor policy. */
+        template<class HasTensor>
+        MTPWeightManifest qwen4ExpManifest(const Qwen4ExpPredictorMetadata &policy, int main_layers,
+            const HasTensor &has_tensor)
+        {
+            if (main_layers <= 0 || !policy.validForMainLayers(static_cast<uint32_t>(main_layers)))
+                return unavailable("Qwen4Exp learned predictor has invalid source attention/norm policy");
+            auto names = makeNextNMoEDepth(0, static_cast<int>(policy.source_layer));
+            const std::string prefix = "blk." + std::to_string(policy.source_layer) + ".";
+            // HC gains and projections replace ordinary residual norm roles.
+            names.attn_norm.clear(); names.ffn_norm.clear();
+            names.final_norm = prefix + "nextn.hc_head_norm.weight";
+            for (const char *branch : {"attn", "ffn"})
+                for (const char *role : {"norm", "down", "up", "inject"})
+                    names.additional_required.push_back(prefix + "hc_" + branch + "_" + role + ".weight");
+            for (const char *role : {"down", "up"})
+                names.additional_required.push_back(prefix + "nextn.hc_head_" + role + ".weight");
+            if (policy.attention == Qwen4ExpPredictorAttention::Sparse)
+                for (const char *role : {"q_proj", "k_proj", "q_norm", "k_norm"})
+                    names.additional_required.push_back(prefix + "indexer." + role + ".weight");
+            MTPWeightManifest manifest;
+            manifest.depth = 1; manifest.flash_next = policy;
+            manifest.depths.push_back(std::move(names));
+            manifest.missing_required = missingFrom(has_tensor, manifest.depths.front().requiredNames());
+            manifest.available = manifest.missing_required.empty();
+            manifest.diagnostic = manifest.available
+                ? (policy.attention == Qwen4ExpPredictorAttention::Dense
+                    ? "using explicit Qwen4Exp dense GGUF predictor with per-branch hidden normalization"
+                    : "using explicit Qwen4Exp sparse GGUF predictor with per-branch hidden normalization")
+                : "Qwen4Exp predictor source is incomplete";
+            return manifest;
+        }
+
     } // namespace
 
     int mtpLearnedBlockCount(
         const IModelLoader &loader, const std::string &architecture, int block_count)
     {
+        if (architecture == "qwen4exp")
+        {
+            if (loader.predictorManifest()) return 1;
+            const auto *directory = loader.ggufDirectory();
+            if (!directory) throw std::invalid_argument("Qwen4Exp MTP counting requires its exact source directory");
+            return static_cast<int>(Qwen4ExpConfig(*directory).predictorLayers());
+        }
         return resolveLearnedBlockCount(architecture, block_count,
             [&](const std::string &key) { return loader.getUInt64(key, 0); },
             [&](const std::string &name) { return loader.hasTensor(name); });
@@ -277,6 +318,7 @@ namespace llaminar2
             shared_expert_gate_inp,
         };
 
+        names.insert(names.end(), additional_required.begin(), additional_required.end());
         names.erase(std::remove_if(names.begin(), names.end(),
                                    [](const std::string &name)
                                    { return name.empty(); }),
@@ -348,6 +390,13 @@ namespace llaminar2
         const std::string &architecture,
         int raw_layer_count)
     {
+        if (architecture == "qwen4exp")
+        {
+            if (const auto *manifest = loader.predictorManifest()) return static_cast<int>(manifest->sourceLayer());
+            const auto *directory = loader.ggufDirectory();
+            if (!directory) throw std::invalid_argument("Qwen4Exp main boundary requires its exact source directory");
+            return static_cast<int>(Qwen4ExpConfig(*directory).mainLayers());
+        }
         if (raw_layer_count <= 0)
             return raw_layer_count;
 
@@ -445,6 +494,19 @@ namespace llaminar2
         const IModelLoader &loader, const std::string &architecture,
         int base_layer_count, bool explicit_mtp)
     {
+        if (architecture == "qwen4exp")
+        {
+            if (const auto *manifest = loader.predictorManifest())
+                return qwen4ExpManifest(manifest->predictorMetadata(), static_cast<int>(manifest->sourceLayer()),
+                    [&](const std::string &name) { return loader.hasTensor(name); });
+            const auto *directory = loader.ggufDirectory();
+            if (!directory) return unavailable("Qwen4Exp MTP admission requires the exact source directory");
+            const Qwen4ExpConfig config(*directory);
+            if (!config.predictorLayers()) return unavailable("Qwen4Exp target has no learned predictor; pair --mtp-model or select --no-mtp");
+            return qwen4ExpManifest({config.mainLayers(), Qwen4ExpPredictorAttention::Sparse,
+                Qwen4ExpPredictorHiddenNorm::PerBranch, Qwen4ExpPredictorSource::Inline}, config.mainLayers(),
+                [&](const std::string &name) { return loader.hasTensor(name); });
+        }
         return discoverMTPManifestForDirectory(
             mtpLearnedBlockCount(loader, architecture, base_layer_count),
             base_layer_count, explicit_mtp,
@@ -454,6 +516,16 @@ namespace llaminar2
     MTPWeightManifest discoverMTPWeightManifest(const ModelMemoryProfile &profile,
                                              bool explicit_mtp)
     {
+        if (profile.architecture == "qwen4exp")
+        {
+            if (!profile.flash_next_predictor || !profile.flash_next || profile.mtp_layer_count != 1)
+                return unavailable("Qwen4Exp planning metadata has no authenticated learned predictor policy");
+            return qwen4ExpManifest(*profile.flash_next_predictor, profile.mainLayerCount(),
+                [&](const std::string &name) {
+                    return std::any_of(profile.tensors.begin(), profile.tensors.end(),
+                        [&](const auto &tensor) { return tensor.name == name; });
+                });
+        }
         return discoverMTPManifestForDirectory(profile.mtp_layer_count,
             profile.n_layers, explicit_mtp, [&](const std::string &name) {
                 return std::any_of(profile.tensors.begin(), profile.tensors.end(),

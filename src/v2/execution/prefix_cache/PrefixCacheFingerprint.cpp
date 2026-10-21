@@ -73,6 +73,42 @@ namespace llaminar2
         fields.push_back({"cuda_router_prefill_arithmetic", prefill_name});
     }
 
+    void appendQwen4ExpArithmeticFingerprintFields(
+        std::vector<PrefixFingerprintField> &fields,
+        QuantizedActivationOperandPrecision hc_up,
+        QuantizedActivationOperandPrecision gdn_output,
+        QuantizedActivationOperandPrecision fa_output,
+        QuantizedActivationOperandPrecision gdn_qkv)
+    {
+        const std::string name(quantizedActivationOperandPrecisionName(hc_up));
+        const std::string gdn_name(quantizedActivationOperandPrecisionName(gdn_output));
+        const std::string fa_name(quantizedActivationOperandPrecisionName(fa_output));
+        const std::string qkv_name(quantizedActivationOperandPrecisionName(gdn_qkv));
+        for (const auto &field : fields)
+            if (field.name == "qfn_hc_up_activation" || field.name == "qfn_hc_up_activation_revision" ||
+                field.name == "qfn_gdn_output_activation" || field.name == "qfn_gdn_output_activation_revision" ||
+                field.name == "qfn_fa_output_activation" || field.name == "qfn_fa_output_activation_revision" ||
+                field.name == "qfn_gdn_qkv_activation" || field.name == "qfn_gdn_qkv_activation_revision")
+                throw std::invalid_argument("Duplicate Flash Next projection arithmetic authority");
+        fields.push_back({"qfn_hc_up_activation", name});
+        fields.push_back({"qfn_hc_up_activation_revision", "native-primary-residual-folds-v2"});
+        if (gdn_output != QuantizedActivationOperandPrecision::SingleQ8)
+        {
+            fields.push_back({"qfn_gdn_output_activation", gdn_name});
+            fields.push_back({"qfn_gdn_output_activation_revision", "native-primary-residual-folds-v2"});
+        }
+        if (fa_output != QuantizedActivationOperandPrecision::SingleQ8)
+        {
+            fields.push_back({"qfn_fa_output_activation", fa_name});
+            fields.push_back({"qfn_fa_output_activation_revision", "main-native-primary-residual-folds-v1"});
+        }
+        if (gdn_qkv != QuantizedActivationOperandPrecision::SingleQ8)
+        {
+            fields.push_back({"qfn_gdn_qkv_activation", qkv_name});
+            fields.push_back({"qfn_gdn_qkv_activation_revision", "main-gdn-native-primary-residual-folds-v1"});
+        }
+    }
+
     uint64_t hashPrefixFingerprintFields(
         const std::string &part_name,
         const std::vector<PrefixFingerprintField> &fields)

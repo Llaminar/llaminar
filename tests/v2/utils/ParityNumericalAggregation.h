@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -782,6 +783,136 @@ namespace llaminar2::test::parity
     }
 
     /**
+     * @brief Exact reference payload window selected by the ordinary decode crop.
+     *
+     * This immutable diagnostic projection carries the actual element interval
+     * used for values. Its ID projection must use that same interval and prove
+     * full rows/column width; it cannot independently guess a trailing ID slice.
+     */
+    class RouteContributionReferenceWindow final
+    {
+    public:
+        /**
+         * @brief Bind the existing full/trailing payload selection at its actual crop site.
+         * @param original_elements Complete reference payload extent before cropping.
+         * @param first_element Actual begin offset used to copy that payload.
+         * @param selected_elements Actual copied extent, ending at the original end.
+         * @return Immutable interval tied to the existing value crop.
+         * @throws std::invalid_argument For empty, overflowing, nontrailing or out-of-bounds windows.
+         */
+        static RouteContributionReferenceWindow checked(std::size_t original_elements,
+            std::size_t first_element, std::size_t selected_elements)
+        {
+            if (!original_elements || !selected_elements || first_element > original_elements ||
+                selected_elements != original_elements - first_element)
+                throw std::invalid_argument("Route contribution reference window must match the actual full/trailing crop");
+            return {original_elements, first_element, selected_elements};
+        }
+
+        /**
+         * @brief Project original reference IDs through exactly the captured payload row window.
+         * @param ids Complete reference route IDs before selection.
+         * @param production_ids Number of IDs owning the selected native payload rows.
+         * @param selected_payload_elements Actual reference payload extent after cropping.
+         * @param top_k Original complete route width.
+         * @return Same-row reference ID subview, never a separately inferred crop.
+         * @throws std::invalid_argument For mismatched widths, extents or incomplete row intervals.
+         */
+        std::span<const float> projectIds(std::span<const float> ids, std::size_t production_ids,
+            std::size_t selected_payload_elements, std::size_t top_k) const
+        {
+            if (!top_k || ids.empty() || ids.size() % top_k || !production_ids || production_ids % top_k ||
+                original_ % ids.size() || selected_ != selected_payload_elements)
+                throw std::invalid_argument("Route contribution ID frame does not own the selected payload window");
+            const auto width = original_ / ids.size();
+            if (!width || first_ % width || selected_ % width || (first_ / width) % top_k ||
+                selected_ / width != production_ids || production_ids > ids.size() - first_ / width)
+                throw std::invalid_argument("Route contribution reference crop crosses an ID row or changes output width");
+            return ids.subspan(first_ / width, production_ids);
+        }
+    private:
+        /**
+         * @brief Retain only the already checked original payload interval.
+         * @param original Original complete element extent.
+         * @param first Actual selected begin offset. @param selected Selected element extent.
+         */
+        RouteContributionReferenceWindow(std::size_t original, std::size_t first, std::size_t selected)
+            : original_(original), first_(first), selected_(selected) {}
+        std::size_t original_, first_, selected_;
+    };
+
+    /** @brief Complete same-row expert correspondence, or a genuinely different route set. */
+    enum class RouteContributionAlignmentStatus { Aligned, DifferentExpertSets };
+
+    /** @brief Owned reference diagnostic rows; no production or reference snapshot is mutated. */
+    struct RouteContributionAlignment
+    {
+        RouteContributionAlignmentStatus status = RouteContributionAlignmentStatus::DifferentExpertSets;
+        std::vector<float> reference_in_production_order;
+    };
+
+    /**
+     * @brief Match weighted contribution blocks by original row and exact expert ID.
+     * @param production_ids Native row-major selected expert IDs, encoded as exact FP32 integers.
+     * @param reference_ids Independent row-major reference IDs for the same rows.
+     * @param reference_values Reference [row,route,output] blocks in its own slot order.
+     * @param production_elements Exact native contribution extent, not allocation capacity.
+     * @param top_k Complete original route width. @param num_experts Original expert-ID domain.
+     * @return Aligned immutable reference copy, or explicit unavailable correspondence for different sets.
+     * @throws std::invalid_argument For missing/incomplete geometry or duplicate/nonintegral/foreign IDs.
+     * @note Like compareRoutedExpertContribution, slots are found separately in each same-row ID list.
+     *       This full-bank diagnostic never crosses rows, changes routes, drops unmatched experts,
+     *       reconstructs expert arithmetic, or replaces the existing semantic expert sum.
+     */
+    inline RouteContributionAlignment alignRouteContributionReference(
+        std::span<const float> production_ids, std::span<const float> reference_ids,
+        std::span<const float> reference_values, std::size_t production_elements,
+        std::size_t top_k, std::size_t num_experts)
+    {
+        if (!top_k || !num_experts || top_k > num_experts || production_ids.empty() ||
+            production_ids.size() != reference_ids.size() || production_ids.size() % top_k ||
+            !production_elements || production_elements != reference_values.size() ||
+            production_elements % production_ids.size())
+            throw std::invalid_argument("Route contribution alignment requires complete same-row geometry");
+        // Validate the entire bank before reporting different sets: a malformed
+        // later row must not hide behind an earlier legitimate top-k change.
+        const auto valid_ids = [&](std::span<const float> ids) {
+            for (std::size_t i = 0; i < ids.size(); ++i)
+            {
+                const float id = ids[i];
+                if (!std::isfinite(id) || id < 0 || std::floor(id) != id ||
+                    static_cast<double>(id) >= static_cast<double>(num_experts))
+                    return false;
+                const auto begin = ids.begin() + static_cast<std::ptrdiff_t>((i / top_k) * top_k);
+                if (std::find(begin, ids.begin() + static_cast<std::ptrdiff_t>(i), id) !=
+                    ids.begin() + static_cast<std::ptrdiff_t>(i))
+                    return false;
+            }
+            return true;
+        };
+        if (!valid_ids(production_ids) || !valid_ids(reference_ids))
+            throw std::invalid_argument("Route contribution alignment rejects duplicate or invalid expert IDs");
+        std::vector<std::size_t> reference_slots(production_ids.size());
+        for (std::size_t i = 0; i < production_ids.size(); ++i)
+        {
+            const auto row = (i / top_k) * top_k;
+            const auto begin = reference_ids.begin() + static_cast<std::ptrdiff_t>(row);
+            const auto end = begin + static_cast<std::ptrdiff_t>(top_k);
+            const auto match = std::find(begin, end, production_ids[i]);
+            if (match == end)
+                return {}; // No fake aligned pass or intersection-only comparison.
+            reference_slots[i] = row + static_cast<std::size_t>(match - begin);
+        }
+        const auto width = production_elements / production_ids.size();
+        RouteContributionAlignment result{RouteContributionAlignmentStatus::Aligned,
+                                           std::vector<float>(production_elements)};
+        for (std::size_t i = 0; i < production_ids.size(); ++i)
+            std::copy_n(reference_values.begin() + static_cast<std::ptrdiff_t>(reference_slots[i] * width),
+                        width, result.reference_in_production_order.begin() + static_cast<std::ptrdiff_t>(i * width));
+        return result;
+    }
+
+    /**
      * @brief Return whether a stage belongs in a layer cosine aggregate.
      *
      * Routing indices and weights have dedicated set/sparse-vector metrics and
@@ -804,7 +935,8 @@ namespace llaminar2::test::parity
     {
         if (stage == "MOE_ROUTING_INDICES" ||
             stage == "MOE_ROUTING_WEIGHTS" ||
-            stage == "MOE_ROUTE_CONTRIBUTIONS")
+            stage == "MOE_ROUTE_CONTRIBUTIONS" ||
+            stage == "MOE_ROUTE_CONTRIBUTIONS_EXPERT_ALIGNED")
         {
             return false;
         }

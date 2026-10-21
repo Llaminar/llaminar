@@ -21,6 +21,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../kernels/attention/AttentionDeviceParams.h"
+#include "../../../kernels/attention/AttentionHeadMapping.h"
 #include "../../../kernels/attention/AttentionWorkspaceContract.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
@@ -1336,10 +1337,10 @@ namespace llaminar2
             return false;
         }
 
-        if (params_.n_heads % params_.n_kv_heads != 0)
+        if (!attention::isValidHeadMapping({params_.n_heads, params_.n_kv_heads,
+                params_.head_start, params_.gqa_n_rep}))
         {
-            LOG_ERROR("[AttentionComputeStage] n_heads (" << params_.n_heads
-                                                          << ") must be divisible by n_kv_heads (" << params_.n_kv_heads << ")");
+            LOG_ERROR("[AttentionComputeStage] Invalid local or original global GQA head mapping");
             return false;
         }
 

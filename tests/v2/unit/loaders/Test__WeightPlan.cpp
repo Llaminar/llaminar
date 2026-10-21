@@ -4,6 +4,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <string_view>
+#include <initializer_list>
 
 #include "loaders/WeightPlan.h"
 #include "loaders/WeightManager.h"
@@ -1233,7 +1235,7 @@ TEST(Test__GDNProjectionArithmetic, ExplicitPolicyRejectsUnknownValues)
 TEST(Test__GDNProjectionArithmetic, SourceAwareSelectionPreservesOtherOperators)
 {
     using Contract = PreparedWeightRepresentationContract;
-    for (const auto architecture : {"qwen35", "qwen35moe"})
+    for (const auto architecture : {"qwen35", "qwen35moe", "qwen4exp"})
     {
         for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight",
                                 "blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight", "blk.0.ssm_out.weight"})
@@ -1331,7 +1333,7 @@ TEST(Test__GDNProjectionArithmetic, ActualMaterializerPreservesOriginalValuesAnd
 TEST(Test__GDNProjectionArithmetic, HalfSourceAndOperandPolicyStayScoped)
 {
     using Contract = PreparedWeightRepresentationContract;
-    for (const auto architecture : {"qwen35", "qwen35moe"})
+    for (const auto architecture : {"qwen35", "qwen35moe", "qwen4exp"})
         for (const auto name : {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_alpha.weight",
                                "blk.0.ssm_beta.weight", "blk.0.ssm_out.weight"})
         {
@@ -1552,7 +1554,7 @@ TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaSelectsOnlyOriginalFloatingCont
 {
     using Contract = PreparedWeightRepresentationContract;
     constexpr auto mode = GDNProjectionArithmetic::FP16AlphaBeta;
-    for (const auto architecture : {"qwen35", "qwen35moe"})
+    for (const auto architecture : {"qwen35", "qwen35moe", "qwen4exp"})
         for (const auto name : {"blk.0.ssm_alpha.weight", "blk.12.ssm_beta.weight"})
         {
             const auto role = inferWeightRole(name);
@@ -1685,4 +1687,62 @@ TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaMaterializationLeavesWideQuanti
             EXPECT_EQ(words[i], canonicalPreparedHalfBits(source->data()[i]));
     }
     EXPECT_EQ(std::memcmp(wide->raw_data(), original.data(), original.size()), 0);
+}
+
+/** @test Explicit MoE alpha/beta precision includes the exact Flash Next source family. */
+TEST(Test__GDNProjectionArithmetic, FlashNextMoESelectivePolicyMatchesSourceContract)
+{
+    using Contract = PreparedWeightRepresentationContract;
+    EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::GDNAlphaBetaProjection,
+        "blk.0.ssm_alpha.weight", "qwen4exp", GDNProjectionArithmetic::FP16MoEAlphaBeta),
+        GDNProjectionArithmetic::FP16);
+    EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::GDNProjection,
+        "blk.0.attn_gate.weight", "qwen4exp", GDNProjectionArithmetic::FP16MoEAlphaBeta),
+        GDNProjectionArithmetic::Native);
+}
+
+/** @brief Only the registered QFN source schema changes its omitted router preparation default. */
+TEST(Test__MoERouterArithmetic, QFNDefaultPlanningAndMaterializationUseOneResolvedPolicy)
+{
+    using Contract = PreparedWeightRepresentationContract;
+    constexpr auto role = WeightRole::MoERouter;
+    constexpr auto name = "blk.0.ffn_gate_inp.weight";
+    constexpr auto gdn = kDefaultGDNProjectionArithmetic;
+    const auto omitted = MoERouterArithmetic::ModelDefault;
+    for (const auto architecture : {"qwen4exp", "qwen35moe", "qwen35", "llama"})
+    {
+        SCOPED_TRACE(architecture);
+        const auto expected = architecture == std::string_view("qwen4exp") ?
+            MoERouterArithmetic::FP16 : MoERouterArithmetic::Native;
+        for (const auto &[type, format] : std::initializer_list<std::pair<TensorType, const char *>>{
+                 {TensorType::FP32, "F32"}, {TensorType::FP16, "F16"},
+                 {TensorType::BF16, "BF16"}, {TensorType::Q8_0, "Q8_0"}})
+        {
+            SCOPED_TRACE(format);
+            EXPECT_EQ(Contract::resolve(role, type, name, architecture, gdn, omitted),
+                      Contract::resolve(role, type, name, architecture, gdn, expected));
+            EXPECT_EQ(Contract::resolve(role, format, name, architecture, gdn, omitted),
+                      Contract::resolve(role, type, name, architecture, gdn, expected));
+            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, gdn, omitted),
+                      expected == MoERouterArithmetic::FP16 ? FloatingActivationOperandPrecision::FP16RNE :
+                          FloatingActivationOperandPrecision::Native);
+            EXPECT_EQ(Contract::resolve(role, type, name, architecture, gdn, MoERouterArithmetic::Native),
+                      Contract::resolve(role, type));
+        }
+        for (const auto source : {"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                  "blk.0.ffn_down_exps.weight", "output.weight"})
+        {
+            const auto other_role = inferWeightRole(source);
+            EXPECT_EQ(Contract::resolve(other_role, TensorType::Q8_0, source, architecture, gdn, omitted),
+                      Contract::resolve(other_role, TensorType::Q8_0));
+            EXPECT_EQ(Contract::operandPrecision(other_role, source, architecture, gdn, omitted),
+                      FloatingActivationOperandPrecision::Native);
+        }
+    }
+    EXPECT_EQ(Contract::resolve(role, TensorType::FP32, name, "qwen4exp", gdn),
+              ModelPreparedWeightRepresentation::FP16);
+    EXPECT_EQ(Contract::operandPrecision(role, name, "qwen4exp", gdn),
+              FloatingActivationOperandPrecision::FP16RNE);
+    EXPECT_THROW(Contract::resolve(role, TensorType::FP32, name, "qwen4exp", gdn,
+                                  static_cast<MoERouterArithmetic>(255)), std::invalid_argument);
 }

@@ -2816,7 +2816,7 @@ namespace llaminar2
                       << " predicate_valid=" << predicate.valid());
             return false;
         }
-        if (!validateLoopEntry(*this, program.entry) ||
+        if (!validateLoopEntry(*this, program.entry) || !validateLoopEntry(*this, program.terminal) ||
             !validateLoopInitialization(*this, program.initialization))
             return false;
 
@@ -2989,6 +2989,9 @@ namespace llaminar2
         if (error != cudaSuccess)
             return fail("cudaGraphAddKernelNode(loop predicate)", error);
 
+        const auto terminal=appendLoopEntry(graph_,conditional_node,program.terminal);
+        if(!terminal.succeeded())return fail(terminal.operation,terminal.error);
+
         size_t count = 0;
         error = cudaGraphGetNodes(graph_, nullptr, &count);
         if (error != cudaSuccess)
@@ -3148,7 +3151,7 @@ namespace llaminar2
             LOG_ERROR("[CUDAGraphCapture] Selector/WHILE transaction has no selector-gated prefix groups");
             return false;
         }
-        if (!validateLoopEntry(*this, program.entry) ||
+        if (!validateLoopEntry(*this, program.entry) || !validateLoopEntry(*this, program.terminal) ||
             !validateLoopInitialization(*this, program.initialization))
             return false;
 
@@ -3468,6 +3471,9 @@ namespace llaminar2
             &predicate_params);
         if (error != cudaSuccess)
             return fail("cudaGraphAddKernelNode(loop predicate)", error);
+
+        const auto terminal=appendLoopEntry(graph_,while_node,program.terminal);
+        if(!terminal.succeeded())return fail(terminal.operation,terminal.error);
 
         size_t count = 0;
         error = cudaGraphGetNodes(graph_, nullptr, &count);

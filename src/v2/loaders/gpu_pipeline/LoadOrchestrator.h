@@ -14,6 +14,7 @@
 #include "loaders/gpu_pipeline/PinnedRingBuffer.h"
 #include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "loaders/gpu_pipeline/ReleasedWeightLoadStaging.h"
 
 #include <array>
 #include <memory>
@@ -82,6 +83,8 @@ namespace llaminar2
         struct DeviceContext
         {
             int device_id = -1;
+            size_t resolved_staging_slot_bytes = 0u; ///< Original bounded slot, retained after drain.
+            std::shared_ptr<const void> released_staging_identity; ///< Revoked by new allocation/release.
             std::unique_ptr<WeightVRAMPool> pool;
             std::unique_ptr<PinnedRingBuffer> pinned_ring;
             std::vector<WeightJob> pending_jobs;
@@ -192,6 +195,13 @@ namespace llaminar2
 
         /// Release temporary staging regions after loading completes.
         void finalize();
+
+        /** @brief Obtain exact ordinary-loader staging geometry only after its claims drain.
+         * @param device_id Exact managed GPU ordinal.
+         * @return Immutable receipt; no allocation or capacity decision is performed.
+         * @throws std::logic_error For absent/unfinalized staging or nonproduction ownership.
+         */
+        [[nodiscard]] ReleasedWeightLoadStaging releasedWeightLoadStaging(int device_id) const;
 
         /// Release all resources.
         void release();

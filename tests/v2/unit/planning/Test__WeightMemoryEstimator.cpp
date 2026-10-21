@@ -1466,3 +1466,28 @@ TEST(Test__WeightMemoryEstimator, SelectedResidencyRejectsModelGeometryDrift)
             wrong_denominator),
         std::invalid_argument);
 }
+
+/** @test Native row capacity never changes any participant's ordinary prepared-weight estimate. */
+TEST(Test__WeightMemoryEstimator, NgramTableIsExcludedFromEveryPreparedWeightBackend)
+{
+    auto profile = createSimpleProfile();
+    const auto baseline = profile;
+    TensorSizeInfo table;
+    table.name = "per_layer_token_embd.weight";
+    table.elements = 320001536ull * 160;
+    table.K = 160;
+    table.native_bytes = 320001536ull * 90;
+    table.quant_type = "IQ4_NL";
+    table.layer_index = -1;
+    profile.tensors.insert(profile.tensors.begin(), table);
+    profile.total_native_bytes += table.native_bytes;
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        const auto before = WeightMemoryEstimator::estimate(baseline, device);
+        const auto after = WeightMemoryEstimator::estimate(profile, device);
+        EXPECT_EQ(after.native_bytes, before.native_bytes);
+        EXPECT_EQ(after.device_bytes, before.device_bytes);
+        EXPECT_EQ(after.prepared_embedding_bytes, before.prepared_embedding_bytes);
+        EXPECT_EQ(after.lm_head_bytes, before.lm_head_bytes);
+    }
+}

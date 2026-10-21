@@ -48,6 +48,16 @@ namespace llaminar2
         using Base = CPURingKVCache<KPrecision, VPrecision>;
 
     public:
+        /** @copydoc IKVCache::acquireSparseAttentionNativeView */
+        qwen4exp::QwenSparseKV acquireSparseAttentionNativeView(
+            int layer, int sequence, const attention::AttentionDeviceParams *rows,
+            attention::AttentionKeyCachePolicy policy, void *stream) override
+        {
+            const int local = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (local < 0) throw std::invalid_argument("Selected KV read requires a full-attention hybrid layer");
+            return Base::acquireSparseAttentionNativeView(local,sequence,rows,policy,stream);
+        }
+
         // =====================================================================
         // Constructors
         // =====================================================================
@@ -101,6 +111,16 @@ namespace llaminar2
         int n_layers() const override { return total_layers_; }
         int num_layers() const override { return total_layers_; }
         int first_layer_index() const override { return first_layer_index_; }
+
+        /** @brief Invert the canonical FA storage map for auxiliary reset scopes. */
+        int modelLayerForAttentionStorage(int storageLayer) const override
+        {
+            for(int local=0;local<total_layers_;++local)
+                if(layer_map_.toKVIndex(local)==storageLayer)
+                    return first_layer_index_+local;
+            throw std::invalid_argument("hybrid auxiliary reset names an invalid FA storage row");
+        }
+
 
         // =====================================================================
         // IKVCache Overrides — Layer-Indexed Methods
@@ -251,8 +271,10 @@ namespace llaminar2
             {
                 const int gdn_idx =
                     layer_map_.toGDNIndex(normalizeLayerIndex(layer));
-                return gdn_idx >= 0 &&
-                       gdn_idx < static_cast<int>(gdn_states_.size());
+                if(gdn_idx<0 || gdn_idx>=static_cast<int>(gdn_states_.size()))return false;
+                if(auto *aux=this->auxiliaryState())aux->reset(
+                    {first_layer_index_+normalizeLayerIndex(layer),1,seq_idx,1},context.execution_stream);
+                return true;
             }
             return Base::resetLayerSequenceState(kv_idx, seq_idx, context);
         }
@@ -279,6 +301,8 @@ namespace llaminar2
             {
                 return false;
             }
+            if(auto *aux=this->auxiliaryState())aux->reset(
+                {first_layer_index_+normalizeLayerIndex(layer),1,0,this->request_capacity()},context.execution_stream);
             return true;
         }
 

@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include <cstdint>
 
@@ -219,7 +220,7 @@ namespace llaminar2::rocm
         int seq_capacity,
         int d_model,
         int selected_row_count,
-        void *stream);
+        void *stream, MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly);
 
     /**
      * @brief Prepare one request's graph-resident shifted-MTP prefill payload.
@@ -248,7 +249,8 @@ namespace llaminar2::rocm
         int captured_row_stride,
         int seq_capacity,
         int d_model,
-        void *stream);
+        void *stream,
+        MTPShiftedCacheOrigin origin = MTPShiftedCacheOrigin::SuccessorPairsOnly);
 
     /** @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]]. */
     bool launchMTPConcatFP32(

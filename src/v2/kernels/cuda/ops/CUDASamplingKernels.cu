@@ -5578,7 +5578,7 @@ cuda_derive_shifted_speculative_publication_metadata_from_primary_kernel(
     int mtp_depth,
     int *__restrict__ out_target_cached_tokens,
     int *__restrict__ out_accepted_state_counts,
-    int *__restrict__ out_ok)
+    int *__restrict__ out_ok, llaminar2::MTPShiftedCacheOrigin origin)
 {
     const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (request_index >= request_count)
@@ -5592,7 +5592,7 @@ cuda_derive_shifted_speculative_publication_metadata_from_primary_kernel(
         mtp_depth,
         out_target_cached_tokens ? out_target_cached_tokens + request_index : nullptr,
         out_accepted_state_counts ? out_accepted_state_counts + request_index : nullptr,
-        out_ok ? out_ok + request_index : nullptr);
+        out_ok ? out_ok + request_index : nullptr,origin);
 }
 
 /**
@@ -9176,7 +9176,7 @@ extern "C"
         int *out_accepted_state_counts,
         int *out_ok,
         int device_idx,
-        void *stream)
+        void *stream, llaminar2::MTPShiftedCacheOrigin origin)
     {
         if (!base_cached_tokens ||
             !main_target_cached_tokens ||
@@ -9186,7 +9186,7 @@ extern "C"
             !out_ok ||
             !stream ||
             request_count <= 0 ||
-            mtp_depth < 0)
+            llaminar2::mtpShiftedPrefixOffset(origin,mtp_depth)<0)
         {
             return false;
         }
@@ -9207,7 +9207,7 @@ extern "C"
             mtp_depth,
             out_target_cached_tokens,
             out_accepted_state_counts,
-            out_ok);
+            out_ok,origin);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)

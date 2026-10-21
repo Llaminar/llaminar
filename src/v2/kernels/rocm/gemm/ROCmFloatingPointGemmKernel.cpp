@@ -1247,7 +1247,7 @@ namespace llaminar2
                         ? rocmFp32_small_n_batched_projection(
                             d_batch_A_ptrs_, d_batch_B_ptrs_, d_batch_C_ptrs_,
                             m, seed.n, k, static_cast<int>(group_count),
-                            rocm_device_id_, gpu_stream_, VerifierKernelModeScope::rowsFor(m))
+                            rocm_device_id_, gpu_stream_, VerifierKernelModeScope::prefixForFloating(m), VerifierKernelModeScope::requestsFor(m))
                         : rocmFp32x16_batched_projection(
                             d_batch_A_ptrs_,
                             d_batch_B_ptrs_,
@@ -1259,7 +1259,7 @@ namespace llaminar2
                             weight_dtype,
                             rocm_device_id_,
                             gpu_stream_,
-                            VerifierKernelModeScope::rowsFor(m));
+                            VerifierKernelModeScope::prefixForFloating(m), VerifierKernelModeScope::requestsFor(m));
                     if (!launched)
                     {
                         LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection kernel failed"

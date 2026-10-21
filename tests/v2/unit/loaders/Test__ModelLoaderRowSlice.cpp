@@ -8,12 +8,24 @@
  * 3. Slice data matches corresponding rows from full tensor
  * 4. Edge cases are handled (first/last rank, uneven division)
  * 5. Non-contiguous expert selections preserve native bytes for every format
+ * 6. Explicit original K/N windows copy only native blocks into compact output
+ * 7. WeightManager retains complete static partition identity through native CPU preparation
+ * 8. Complete frozen static lowering preserves ordinary source bindings and rejects identity collisions
+ * 9. Real local-shard CPU kernels match the independent full-source CPU kernel
+ *    with zero activation outside the slice and exactly declared invocation scratch
  *
  * @author David Sanftenberg
  */
 
 #include <gtest/gtest.h>
 #include "loaders/ModelLoader.h"
+#include "loaders/WeightIdentity.h"
+#include "loaders/WeightManager.h"
+#include "loaders/PreparedWeightStore.h"
+#include "tensors/TensorKernels.h"
+#include "../../utils/QuantizedVerifierFormats.h"
+#include "../../utils/CPUProjectionTestWorkspace.h"
+#include "../../utils/PreparedWeightTestHarness.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
 #include "../../utils/TestModelHelper.h"
@@ -25,6 +37,7 @@
 #include <fstream>
 #include <cmath>
 #include <numeric>
+#include <limits>
 #include <omp.h>
 
 namespace llaminar2
@@ -296,6 +309,40 @@ namespace llaminar2
          * an incorrect source offset, packed order, or tensor-type conversion
          * immediately observable with a byte comparison.
          */
+        /** @brief Count actual native source calls while forwarding to the real GGUF loader. */
+        class ProjectionObservedLoader final : public ModelLoader
+        {
+        public:
+            using ModelLoader::ModelLoader;
+            int projection_calls = 0;
+            int whole_calls = 0;
+            int selection_calls = 0;
+            bool missing_projection = false;
+            /** @brief Forward the original exact reader, or inject one explicit missing result. */
+            std::shared_ptr<TensorBase> loadTensorExpertProjectionSlice(
+                const std::string &name, const WeightSliceSpec &slice, DeviceId device,
+                WeightPrecision precision) override
+            {
+                ++projection_calls;
+                return missing_projection ? nullptr :
+                    ModelLoader::loadTensorExpertProjectionSlice(name, slice, device, precision);
+            }
+            /** @brief Observe forbidden whole-parent substitution without altering legacy behavior. */
+            std::shared_ptr<TensorBase> loadTensor(const std::string &name, DeviceId device,
+                WeightPrecision precision) override
+            {
+                ++whole_calls;
+                return ModelLoader::loadTensor(name, device, precision);
+            }
+            /** @brief Preserve and count the existing complete-expert operation. */
+            std::shared_ptr<TensorBase> loadTensorExpertSelection(const std::string &name,
+                const std::vector<size_t> &experts, DeviceId device, WeightPrecision precision) override
+            {
+                ++selection_calls;
+                return ModelLoader::loadTensorExpertSelection(name, experts, device, precision);
+            }
+        };
+
         class ModelLoaderExpertSelectionTest
             : public ::testing::TestWithParam<GGUFTensorType>
         {
@@ -364,7 +411,7 @@ namespace llaminar2
                 writeScalar(stream, uint64_t{1});
                 writeScalar(stream, uint64_t{0});
 
-                writeString(stream, kTensorName);
+                writeString(stream, source_tensor_name_);
                 writeScalar(stream, uint32_t{3});
                 writeScalar(stream, static_cast<uint64_t>(columns_));
                 writeScalar(stream, static_cast<uint64_t>(kRowsPerExpert));
@@ -387,6 +434,106 @@ namespace llaminar2
                 ASSERT_TRUE(stream.good());
             }
 
+            /** @brief Rebuild only this tiny source with several native blocks per K row. */
+            void rebuildProjectionSource(bool mapped=true, std::string source_name=kTensorName)
+            {
+                loader_.reset();
+                source_tensor_name_=std::move(source_name);
+                GGUFTensorInfo info;info.type=GetParam();
+                const size_t unit=info.getBlockSize() ? info.getBlockSize() : 8u;
+                columns_=20u*unit;
+                bytes_per_expert_=kRowsPerExpert*(info.getBlockSize()
+                    ? columns_/info.getBlockSize()*info.getTypeSize() : columns_*info.getTypeSize());
+                source_bytes_.resize(kExpertCount*bytes_per_expert_);
+                for(size_t i=0;i<source_bytes_.size();++i)
+                    source_bytes_[i]=static_cast<uint8_t>((i+31u*(i/bytes_per_expert_+1u))%251u);
+                writeSyntheticModel(GetParam());
+                loader_=std::make_unique<ModelLoader>(factory_.get());
+                loader_->setUseMmap(mapped);
+                ASSERT_TRUE(loader_->loadModel(model_path_.string()));
+            }
+            /** @return Complete original-axis request; expert IDs are physical original E slots. */
+            WeightSliceSpec projection(size_t begin,size_t count,size_t firstN=0,size_t n=kRowsPerExpert) const
+            {
+                WeightSliceSpec slice;
+                slice.source_rows=columns_;slice.source_cols=kRowsPerExpert;
+                slice.row_start=begin;slice.row_count=count;slice.col_start=firstN;slice.col_count=n;
+                slice.expert_count=3;slice.expert_ids={0,2,4};return slice;
+            }
+            /** @brief Compare every output row to its exact original encoded block bytes. */
+            void expectProjectionBytes(const WeightSliceSpec &slice,const TensorBase &actual) const
+            {
+                GGUFTensorInfo info;info.type=GetParam();
+                const auto block=info.getBlockSize(),typeBytes=info.getTypeSize();
+                const auto rowBytes=block ? columns_/block*typeBytes : columns_*typeBytes;
+                const auto begin=block ? slice.row_start/block*typeBytes : slice.row_start*typeBytes;
+                const auto bytes=block ? slice.row_count/block*typeBytes : slice.row_count*typeBytes;
+                ASSERT_EQ(actual.native_type(),expectedTensorType(GetParam()));
+                ASSERT_EQ(actual.shape(),(std::vector<size_t>{slice.row_count,slice.col_count,slice.expert_count}));
+                ASSERT_EQ(actual.size_bytes(),bytes*slice.col_count*slice.expert_count);
+                const auto *data=static_cast<const uint8_t *>(actual.raw_data());ASSERT_NE(data,nullptr);
+                for(size_t e=0;e<slice.expert_count;++e)
+                for(size_t n=0;n<slice.col_count;++n)
+                    EXPECT_EQ(std::memcmp(data+(e*slice.col_count+n)*bytes,
+                        source_bytes_.data()+(slice.expert_ids.empty() ? slice.expert_start+e : size_t(slice.expert_ids[e]))*bytes_per_expert_+
+                        (slice.col_start+n)*rowBytes+begin,bytes),0);
+            }
+
+            /** @brief Attach instrumentation around the real native loader, without fake source data. */
+            ProjectionObservedLoader *observeProjectionSource(bool mapped)
+            {
+                loader_.reset();
+                auto observed=std::make_unique<ProjectionObservedLoader>(factory_.get());
+                observed->setUseMmap(mapped);
+                if (!observed->loadModel(model_path_.string()))
+                    throw std::runtime_error("Synthetic projection GGUF did not load");
+                auto *result=observed.get();
+                loader_=std::move(observed);
+                return result;
+            }
+
+            /** @brief Write finite original encoded weights using the existing canonical format creators. */
+            void rebuildFiniteProjectionSource()
+            {
+                rebuildProjectionSource(true,"blk.7.ffn_down_exps.weight");
+                loader_.reset();
+                const std::vector<size_t> shape{kRowsPerExpert*kExpertCount,columns_};
+                std::unique_ptr<TensorBase> weights;
+                for (const auto &format:quantizedVerifierFormats())
+                    if (format.tensor_type==expectedTensorType(GetParam()))
+                        weights=format.create(shape,73);
+                if (GetParam()==GGUFTensorType::F32)
+                    weights=TestTensorFactory::createFP32Random(shape,-.5f,.5f,73);
+                if (GetParam()==GGUFTensorType::F16)
+                    weights=TestTensorFactory::createFP16Random(shape,-.5f,.5f,73);
+                if (GetParam()==GGUFTensorType::BF16)
+                    weights=TestTensorFactory::createBF16Random(shape,-.5f,.5f,73);
+                if (!weights || weights->size_bytes()!=source_bytes_.size())
+                    throw std::runtime_error("Canonical native projection fixture has inconsistent source bytes");
+                const auto *bytes=static_cast<const uint8_t *>(weights->raw_data());
+                source_bytes_.assign(bytes,bytes+weights->size_bytes());
+                writeSyntheticModel(GetParam());
+            }
+
+            /** @return A startup request carrying only one immutable geometry authority. */
+            WeightRequirement projectionRequirement(const MoEExpertProjectionOwnership &ownership,
+                WeightRole role) const
+            {
+                WeightRequirement request;
+                request.canonical_name=source_tensor_name_;
+                request.role=role;
+                request.derivation=WeightDerivationKind::ExpertSlice;
+                request.layer=7;
+                request.lookup_device=DeviceId::cpu();
+                request.target_device=DeviceId::cpu();
+                request.bypass_tensor_parallel=true;
+                request.tp_rank_or_device_index=ownership.participant();
+                request.host_policy=WeightHostPolicy::RequiredForCPUExecution;
+                request.projection_ownership=ownership;
+                return request;
+            }
+
+            std::string source_tensor_name_=kTensorName;
             std::filesystem::path model_path_;
             std::shared_ptr<IMPIContext> mpi_ctx_;
             std::unique_ptr<TensorFactory> factory_;
@@ -547,6 +694,435 @@ namespace llaminar2
                 (void)loader_->loadTensorExpertSelection(
                     kTensorName, {0u, kExpertCount}),
                 std::invalid_argument);
+        }
+
+        /** @test Unequal general intervals preserve all native block metadata, including QFN640 cuts128/128/128/256. */
+        TEST_P(ModelLoaderExpertSelectionTest, NativeProjectionUnequalKIntervalsPreserveOriginalBytes)
+        {
+            for(bool mapped:{false,true})
+            {
+                rebuildProjectionSource(mapped);
+                GGUFTensorInfo info;info.type=GetParam();
+                const size_t unit=info.getBlockSize() ? info.getBlockSize() : 8u;
+                const std::array<size_t,5> cuts{0,4u*unit,8u*unit,12u*unit,20u*unit};
+                for(size_t i=0;i+1<cuts.size();++i)
+                {
+                    auto slice=projection(cuts[i],cuts[i+1]-cuts[i]);
+                    auto actual=loader_->loadTensorExpertProjectionSlice(kTensorName,slice);
+                    ASSERT_NE(actual,nullptr);expectProjectionBytes(slice,*actual);
+                    slice.expert_ids.clear();slice.expert_start=1;
+                    actual=loader_->loadTensorExpertProjectionSlice(kTensorName,slice);
+                    ASSERT_NE(actual,nullptr);expectProjectionBytes(slice,*actual);
+                }
+            }
+        }
+
+        /** @test N slicing and combined N/K slicing retain original sorted expert IDs without reading adjacent rows into output. */
+        TEST_P(ModelLoaderExpertSelectionTest, NativeProjectionRowsAndRectanglesPreserveOriginalBytes)
+        {
+            for(bool mapped:{false,true})
+            {
+                rebuildProjectionSource(mapped);
+                for(bool fullK:{false,true})
+                {
+                    const size_t begin=fullK ? 0 : columns_/5;
+                    const size_t count=fullK ? columns_ : columns_/5;
+                    auto slice=projection(begin,count,1,1);
+                    auto actual=loader_->loadTensorExpertProjectionSlice(kTensorName,slice);
+                    ASSERT_NE(actual,nullptr);expectProjectionBytes(slice,*actual);
+                }
+                auto rectangle=projection(columns_/5,columns_/5,1,1);
+                auto compact=loader_->loadTensorExpertProjectionSlice(kTensorName,rectangle);
+                ASSERT_NE(compact,nullptr);
+                auto full=projection(0,columns_);
+                auto actual=loader_->loadTensorExpertProjectionSlice(kTensorName,full);
+                auto previous=loader_->loadTensorExpertSelection(kTensorName,{0,2,4});
+                ASSERT_NE(actual,nullptr);ASSERT_NE(previous,nullptr);
+                ASSERT_EQ(actual->size_bytes(),previous->size_bytes());
+                EXPECT_EQ(std::memcmp(actual->raw_data(),previous->raw_data(),actual->size_bytes()),0);
+                loader_.reset();
+                expectProjectionBytes(rectangle,*compact);
+                expectProjectionBytes(full,*actual);
+                expectProjectionBytes(full,*previous);
+            }
+        }
+
+        /** @test Malformed source dimensions, bounds, identities and conversions reject rather than returning a different native slice. */
+        TEST_P(ModelLoaderExpertSelectionTest, NativeProjectionRejectsInvalidOriginalGeometry)
+        {
+            rebuildProjectionSource();
+            for(int mutation=0;mutation<18;++mutation)
+            {
+                auto slice=projection(columns_/5,columns_/5,1,1);
+                switch(mutation)
+                {
+                case 0: ++slice.source_rows;break;
+                case 1: ++slice.source_cols;break;
+                case 2: slice.row_count=0;break;
+                case 3: slice.col_count=0;break;
+                case 4: slice.row_start=columns_;break;
+                case 5: slice.col_start=kRowsPerExpert;break;
+                case 6: slice.expert_count=0;break;
+                case 7: slice.expert_ids={0,2,2};break;
+                case 8: slice.expert_ids={0,4,2};break;
+                case 9: slice.expert_ids={0,2,5};break;
+                case 10: slice.expert_ids={-1,2,4};break;
+                case 11: slice.inner_is_presliced=true;break;
+                case 12: slice.expert_ids.clear();slice.expert_start=kExpertCount;break;
+                case 13: slice.expert_count=2;break;
+                case 14: slice.row_start=std::numeric_limits<size_t>::max();break;
+                case 15: slice.row_count=std::numeric_limits<size_t>::max();break;
+                case 16: slice.col_start=std::numeric_limits<size_t>::max();break;
+                case 17: slice.col_count=std::numeric_limits<size_t>::max();break;
+                }
+                EXPECT_THROW((void)loader_->loadTensorExpertProjectionSlice(kTensorName,slice),std::invalid_argument)<<mutation;
+            }
+            const auto slice=projection(0,columns_);
+            EXPECT_THROW((void)loader_->loadTensorExpertProjectionSlice(kTensorName,slice,
+                DeviceId::cpu(),WeightPrecision::CONVERT_TO_FP32),std::invalid_argument);
+            GGUFTensorInfo info;info.type=GetParam();
+            if(info.getBlockSize()>1)
+            {
+                auto invalid=slice;invalid.row_start=1;invalid.row_count=columns_-1;
+                EXPECT_THROW((void)loader_->loadTensorExpertProjectionSlice(kTensorName,invalid),std::invalid_argument);
+                invalid=slice;--invalid.row_count;
+                EXPECT_THROW((void)loader_->loadTensorExpertProjectionSlice(kTensorName,invalid),std::invalid_argument);
+            }
+        }
+
+        /** @test The real materializer reads exact native rectangles, never a full parent or old selection. */
+        TEST_P(ModelLoaderExpertSelectionTest, NativeProjectionWeightManagerFreezesExactOriginalSource)
+        {
+            using Ownership=MoEExpertProjectionOwnership;
+            for (const bool mapped:{false,true})
+            for (const auto role:{WeightRole::MoEExpertGate,WeightRole::MoEExpertDown})
+            {
+                const bool down=role==WeightRole::MoEExpertDown;
+                rebuildProjectionSource(mapped,down ? "blk.7.ffn_down_exps.weight" : kTensorName);
+                auto *observed=observeProjectionSource(mapped);
+                WeightManager manager(*loader_,mpi_ctx_);
+                const int quantum=static_cast<int>(columns_/20);
+                for (const int participant:{1,3})
+                {
+                    const auto ownership=down
+                        ? Ownership::withinExpertIntermediateSlices({5,2,static_cast<int>(columns_)},participant,
+                            {{0,4*quantum},{4*quantum,4*quantum},{8*quantum,4*quantum},{12*quantum,8*quantum}})
+                        : Ownership::withinExpertIntermediateSlices({5,static_cast<int>(columns_),2},0,{{0,1},{1,1}});
+                    WeightPlan plan(InferenceStrategy{.model_id=ModelContextId{88}},PhysicalMemoryOwner::RoutedExpertWeights);
+                    plan.add(projectionRequirement(ownership,role));
+                    const auto &request=plan.requirements().front();
+                    EXPECT_FALSE(request.slice.inner_is_presliced);
+                    EXPECT_EQ(request.slice.expert_count,kExpertCount);
+                    const auto frozen=manager.materialize(plan);
+                    ASSERT_EQ(frozen.bindings().size(),1u);
+                    const auto &binding=frozen.bindings().front();
+                    ASSERT_NE(binding.tensor,nullptr);
+                    EXPECT_EQ(binding.projection_ownership,std::optional(ownership));
+                    EXPECT_TRUE(binding.slice.inner_is_presliced);
+                    expectProjectionBytes(request.slice,*binding.tensor);
+                    EXPECT_EQ(frozen.physicalMemoryOwner(),PhysicalMemoryOwner::RoutedExpertWeights);
+                    const auto matrices=frozen.projectedExpertMatrices();
+                    ASSERT_EQ(matrices.bindings().size(),kExpertCount);
+                    // A real ordinary CPU source remains in the SAME frozen
+                    // model; lowering must not replace its identity or lifetime.
+                    std::shared_ptr<TensorBase> ordinary_tensor = TestTensorFactory::createFP32({2});
+                    WeightBinding ordinary;
+                    ordinary.binding_id = 700;
+                    ordinary.identity = makeSourceWeightIdentity("blk.7.ffn_norm.weight", plan.strategy().model_id, 700);
+                    ordinary.tensor_owner = ordinary_tensor;
+                    ordinary.tensor = ordinary_tensor.get();
+                    ordinary.immutable = true;
+                    for (const bool ordinary_first : {false, true})
+                    {
+                        std::vector<WeightBinding> complete = ordinary_first
+                            ? std::vector<WeightBinding>{ordinary, binding}
+                            : std::vector<WeightBinding>{binding, ordinary};
+                        const FrozenModelWeightSet original(plan.strategy(), complete, frozen.physicalMemoryOwner());
+                        const auto lowered = original.projectedExpertMatrices();
+                        ASSERT_EQ(lowered.bindings().size(), kExpertCount + 1);
+                        const auto &retained = lowered.layer(7, "ffn_norm.weight");
+                        EXPECT_EQ(retained.binding_id, ordinary.binding_id);
+                        EXPECT_EQ(retained.identity, ordinary.identity);
+                        EXPECT_EQ(retained.tensor, ordinary.tensor);
+                        EXPECT_EQ(retained.tensor_owner, ordinary.tensor_owner);
+                        EXPECT_EQ(retained.prepared.has_value(), ordinary.prepared.has_value());
+                        EXPECT_EQ(retained.projection_source_owner, ordinary.projection_source_owner);
+                        EXPECT_FALSE(retained.projection_ownership.has_value());
+                        EXPECT_EQ(lowered.physicalMemoryOwner(), original.physicalMemoryOwner());
+                        EXPECT_EQ(lowered.strategy().model_id, original.strategy().model_id);
+                        EXPECT_THROW((void)lowered.projectedExpertMatrices(), std::invalid_argument);
+                        // Reusing a generated key as an original dense identity
+                        // must reject before publishing a partial lowered set.
+                        auto collision = ordinary;
+                        collision.binding_id = matrices.bindings().front().binding_id;
+                        collision.identity.instance_id = collision.binding_id;
+                        const FrozenModelWeightSet conflicting(plan.strategy(),
+                            ordinary_first ? std::vector<WeightBinding>{collision, binding}
+                                           : std::vector<WeightBinding>{binding, collision},
+                            frozen.physicalMemoryOwner());
+                        EXPECT_THROW((void)conflicting.projectedExpertMatrices(), std::logic_error);
+                    }
+                    const auto projection=ownership.projection(role);
+                    for (size_t expert=0;expert<kExpertCount;++expert)
+                    {
+                        const auto &matrix=matrices.bindings()[expert];
+                        EXPECT_EQ(matrix.tensor->shape(),(std::vector<size_t>{
+                            static_cast<size_t>(projection.rows),static_cast<size_t>(projection.columns)}));
+                        EXPECT_EQ(matrix.tensor->native_type(),expectedTensorType(GetParam()));
+                        EXPECT_EQ(matrix.identity.expert,static_cast<int>(expert));
+                        EXPECT_EQ(matrix.slice.source_rows,static_cast<size_t>(projection.source_rows));
+                        EXPECT_EQ(matrix.slice.source_cols,static_cast<size_t>(projection.source_columns));
+                        EXPECT_EQ(matrix.slice.row_start,static_cast<size_t>(projection.first_row));
+                        EXPECT_EQ(matrix.slice.col_start,static_cast<size_t>(projection.first_column));
+                        EXPECT_EQ(matrix.slice.expert_ids,(std::vector<int>{static_cast<int>(expert)}));
+                        EXPECT_EQ(matrix.projection_ownership,binding.projection_ownership);
+                    }
+                    // Composing an already normalized requirement keeps the same binding identity.
+                    WeightPlan copy(plan.strategy(),plan.physicalMemoryOwner());
+                    copy.add(request);
+                    EXPECT_EQ(manager.materialize(copy).bindings().front().binding_id,binding.binding_id);
+                }
+                EXPECT_EQ(observed->projection_calls,4);
+                EXPECT_EQ(observed->selection_calls,0);
+                EXPECT_EQ(observed->whole_calls,0);
+            }
+        }
+
+        /** @test Unsupported/missing explicit sources reject before a generic full-weight substitution. */
+        TEST_P(ModelLoaderExpertSelectionTest, NativeProjectionWeightManagerRejectsForeignOrMissingIntent)
+        {
+            using Ownership=MoEExpertProjectionOwnership;
+            rebuildProjectionSource(true,"blk.7.ffn_down_exps.weight");
+            auto *observed=observeProjectionSource(true);
+            const int quantum=static_cast<int>(columns_/20);
+            const auto ownership=Ownership::withinExpertIntermediateSlices({5,2,static_cast<int>(columns_)},1,
+                {{0,4*quantum},{4*quantum,4*quantum},{8*quantum,4*quantum},{12*quantum,8*quantum}});
+            for (int mutation=0;mutation<10;++mutation)
+            {
+                auto request=projectionRequirement(ownership,WeightRole::MoEExpertDown);
+                switch (mutation)
+                {
+                case 0: request.slice.row_start=1;break;
+                case 1: request.role=WeightRole::MoEExpertGate;break;
+                case 2: request.source_name=kTensorName;break;
+                case 3: request.layer=6;break;
+                case 4: request.bypass_tensor_parallel=false;break;
+                case 5: request.expected_prepared_kind=PreparedWeightKind::CpuPackedGemm;break;
+                case 6: request.overlay_participant_index=0;break;
+                case 7: request.projection_ownership=Ownership::completeExperts(ownership.geometry());break;
+                case 8: request.tp_rank_or_device_index=0;break;
+                case 9: request.canonical_name="blk.6.ffn_down_exps.weight";break;
+                }
+                WeightPlan plan;
+                EXPECT_THROW(plan.add(request),std::invalid_argument)<<mutation;
+            }
+            EXPECT_EQ(observed->projection_calls,0);
+            const FrozenModelWeightSet empty_source(InferenceStrategy{},{});
+            EXPECT_THROW((void)empty_source.projectedExpertMatrices(),std::invalid_argument);
+            WeightPlan plan;
+            plan.add(projectionRequirement(ownership,WeightRole::MoEExpertDown));
+            {
+                WeightManager conversion(*loader_,mpi_ctx_,nullptr,WeightDistributionStrategy::REPLICATED,
+                    WeightPrecision::CONVERT_TO_FP32);
+                EXPECT_THROW((void)conversion.materialize(plan),std::invalid_argument);
+            }
+            EXPECT_EQ(observed->projection_calls,0);
+            WeightManager manager(*loader_,mpi_ctx_);
+            observed->missing_projection=true;
+            EXPECT_THROW((void)manager.materialize(plan),std::runtime_error);
+            observed->missing_projection=false;
+            EXPECT_EQ(observed->projection_calls,1);
+            EXPECT_EQ(observed->whole_calls,0);
+            EXPECT_EQ(observed->selection_calls,0);
+            // The old complete-expert request still enters its original operation.
+            auto old=projectionRequirement(ownership,WeightRole::MoEExpertDown);
+            old.projection_ownership.reset();
+            old.slice=projection(0,columns_);
+            old.slice.inner_is_presliced=true;
+            WeightPlan old_plan;
+            old_plan.add(old);
+            EXPECT_EQ(manager.materialize(old_plan).bindings().front().tensor->shape(),
+                (std::vector<size_t>{columns_,kRowsPerExpert,3}));
+            EXPECT_EQ(observed->selection_calls,1);
+            EXPECT_EQ(observed->projection_calls,1);
+            EXPECT_EQ(observed->whole_calls,0);
+        }
+
+        /** @test Full partition participates in stable binding identity, even with identical local bytes. */
+        TEST_P(ModelLoaderExpertSelectionTest, NativeProjectionWeightManagerRetainsGlobalIdentityAndSourceLifetime)
+        {
+            using Ownership=MoEExpertProjectionOwnership;
+            rebuildProjectionSource(true,"blk.7.ffn_down_exps.weight");
+            observeProjectionSource(true);
+            const int unit=static_cast<int>(columns_/20);
+            const auto first=Ownership::withinExpertIntermediateSlices({5,2,static_cast<int>(columns_)},0,
+                {{0,4*unit},{4*unit,4*unit},{8*unit,4*unit},{12*unit,8*unit}});
+            const auto different_peers=Ownership::withinExpertIntermediateSlices(first.geometry(),0,
+                {{0,4*unit},{4*unit,2*unit},{6*unit,6*unit},{12*unit,8*unit}});
+            std::vector<WeightBinding> retained;
+            {
+                WeightManager manager(*loader_,mpi_ctx_);
+                WeightPlan a(InferenceStrategy{.model_id=ModelContextId{89}}),b(a.strategy());
+                a.add(projectionRequirement(first,WeightRole::MoEExpertDown));
+                b.add(projectionRequirement(different_peers,WeightRole::MoEExpertDown));
+                const auto source_a=manager.materialize(a);
+                const auto source_b=manager.materialize(b);
+                EXPECT_NE(source_a.bindings().front().binding_id,source_b.bindings().front().binding_id);
+                const auto matrices_a=source_a.projectedExpertMatrices();
+                const auto matrices_b=source_b.projectedExpertMatrices();
+                EXPECT_NE(matrices_a.bindings().front().binding_id,matrices_b.bindings().front().binding_id);
+                retained=matrices_a.bindings();
+            }
+            loader_.reset(); // The projected view owns the exact compact source independently.
+            ASSERT_EQ(retained.size(),kExpertCount);
+            GGUFTensorInfo info;info.type=GetParam();
+            const size_t row_bytes=info.getBlockSize() ? columns_/info.getBlockSize()*info.getTypeSize()
+                : columns_*info.getTypeSize();
+            const size_t local_bytes=row_bytes/5;
+            for (size_t expert=0;expert<retained.size();++expert)
+            for (size_t row=0;row<kRowsPerExpert;++row)
+            {
+                const auto *actual=static_cast<const uint8_t *>(retained[expert].tensor->raw_data())+row*local_bytes;
+                const auto *expected=source_bytes_.data()+expert*bytes_per_expert_+row*row_bytes;
+                EXPECT_EQ(std::memcmp(actual,expected,local_bytes),0);
+            }
+        }
+
+        /** @test Actual CPU preparation consumes the native local K/N and refuses foreign full-plan adoption. */
+        TEST_P(ModelLoaderExpertSelectionTest, NativeProjectionWeightManagerPreparesActualLocalCPUKernels)
+        {
+            using Ownership=MoEExpertProjectionOwnership;
+            rebuildFiniteProjectionSource();
+            auto *observed=observeProjectionSource(true);
+            WeightManager manager(*loader_,mpi_ctx_);
+            const int unit=static_cast<int>(columns_/20);
+            const auto ownership=Ownership::withinExpertIntermediateSlices({5,2,static_cast<int>(columns_)},0,
+                {{0,4*unit},{4*unit,4*unit},{8*unit,4*unit},{12*unit,8*unit}});
+            WeightPlan plan(InferenceStrategy{.model_id=ModelContextId{90}},PhysicalMemoryOwner::RoutedExpertWeights);
+            plan.add(projectionRequirement(ownership,WeightRole::MoEExpertDown));
+            const auto parents=manager.materialize(plan);
+            EXPECT_THROW((void)manager.prepareWeightsForDevice(parents,DeviceId::cpu()),std::invalid_argument);
+            const auto matrices=parents.projectedExpertMatrices();
+            EXPECT_THROW((void)matrices.projectedExpertMatrices(),std::invalid_argument);
+            PreparedWeightStore store(plan.strategy().model_id);
+            // A separate unsliced reader/preparation supplies the arithmetic
+            // oracle. The observed production reader below must still read
+            // only its exact compact rectangle. Native prepared codebooks can
+            // round effective scales differently from TensorBase::data(), so
+            // direct dequantization is not the CPU kernel's arithmetic oracle.
+            ModelLoader reference_loader(factory_.get());
+            ASSERT_TRUE(reference_loader.loadModel(model_path_.string()));
+            const auto reference_parent=reference_loader.loadTensor(source_tensor_name_);
+            ASSERT_NE(reference_parent,nullptr);
+            for (const auto &binding:matrices.bindings())
+            {
+                const auto before=std::vector<uint8_t>(static_cast<const uint8_t *>(binding.tensor->raw_data()),
+                    static_cast<const uint8_t *>(binding.tensor->raw_data())+binding.tensor->size_bytes());
+                const auto prepared=store.prepareGemm(binding,matrices.physicalMemoryOwner());
+                auto *kernel=store.gemmKernel(prepared);
+                ASSERT_NE(kernel,nullptr);
+                EXPECT_EQ(kernel->get_n(),2);
+                EXPECT_EQ(kernel->get_k(),4*unit);
+                for (const auto &format:quantizedVerifierFormats())
+                    if (format.tensor_type==binding.tensor->native_type())
+                    {
+                        NativeVnniSourceIdentity original;
+                        ASSERT_TRUE(kernel->exportNativeVNNISourceIdentity(original));
+                        EXPECT_TRUE(original.present);
+                        EXPECT_EQ(original.codebook_id,format.source_codebook_id);
+                        EXPECT_EQ(original.is_superblock,format.source_is_superblock);
+                    }
+                const auto full_matrix=reference_parent->create_view(
+                    {kRowsPerExpert,columns_},size_t(binding.identity.expert)*kRowsPerExpert*columns_);
+                auto oracle=makePreparedGemmFixture(full_matrix.get(),DeviceId::cpu(),source_tensor_name_);
+                auto *oracle_kernel=oracle.store->gemmKernel(oracle.ref);
+                ASSERT_NE(oracle_kernel,nullptr);
+                const auto requirements=cpuProjectionTestRequirements(3,{kernel,oracle_kernel});
+                // Floating kernels declare no external scratch. An empty
+                // declaration needs neither a physical resource nor an arena.
+                std::unique_ptr<CPUProjectionTestWorkspace> workspace;
+                if (requirements.total_bytes_with_alignment()!=0)
+                    workspace=std::make_unique<CPUProjectionTestWorkspace>(requirements);
+                auto *invocation=workspace ? workspace->get() : nullptr;
+                const auto projection=ownership.projection(WeightRole::MoEExpertDown);
+                for (const int rows : {1,3})
+                {
+                    auto input=TestTensorFactory::createFP32({size_t(rows),size_t(4*unit)});
+                    auto output=TestTensorFactory::createFP32({size_t(rows),size_t(2)});
+                    auto full_input=TestTensorFactory::createFP32({size_t(rows),columns_});
+                    auto reference=TestTensorFactory::createFP32({size_t(rows),size_t(2)});
+                    float *stimulus=input->mutable_data();
+                    std::fill_n(stimulus,size_t(rows)*4*unit,0.f);
+                    float *full_stimulus=full_input->mutable_data();
+                    std::fill_n(full_stimulus,size_t(rows)*columns_,0.f);
+                    for (int row=0;row<rows;++row)
+                    {
+                        const int column=row==0 ? 0 : row==1 ? 2*unit : 4*unit-1;
+                        ASSERT_GE(column,0);
+                        ASSERT_LT(column,projection.columns);
+                        // The amplitude represents exactly as Q8 scale1/code127
+                        // in both shapes, including the first/middle/last block.
+                        stimulus[size_t(row)*4*unit+column]=127.f;
+                        full_stimulus[size_t(row)*columns_+projection.first_column+column]=127.f;
+                    }
+                    ASSERT_TRUE(kernel->multiply_tensor(input.get(),output.get(),rows,2,4*unit,
+                        true,1.f,0.f,nullptr,mpi_ctx_.get(),-1,invocation));
+                    ASSERT_TRUE(oracle_kernel->multiply_tensor(full_input.get(),reference.get(),rows,2,columns_,
+                        true,1.f,0.f,nullptr,mpi_ctx_.get(),-1,invocation));
+                    for (int row=0;row<rows;++row)
+                        for (int n=0;n<2;++n)
+                            EXPECT_FLOAT_EQ(output->data()[size_t(row)*2+n],
+                                reference->data()[size_t(row)*2+n]);
+                }
+                EXPECT_EQ(std::memcmp(before.data(),binding.tensor->raw_data(),before.size()),0);
+                auto foreign=binding;
+                foreign.binding_id^=0x91838261;
+                foreign.prepared->binding_id=foreign.binding_id;
+                foreign.projection_ownership=Ownership::withinExpertIntermediateSlices(ownership.geometry(),0,
+                    {{0,4*unit},{4*unit,2*unit},{6*unit,6*unit},{12*unit,8*unit}});
+                EXPECT_FALSE(store.adoptPreparedGemmForBinding(foreign,DeviceId::cpu()));
+                auto same=binding;
+                same.binding_id^=0x4173921;
+                same.prepared->binding_id=same.binding_id;
+                EXPECT_TRUE(store.adoptPreparedGemmForBinding(same,DeviceId::cpu()));
+            }
+            EXPECT_EQ(observed->projection_calls,1);
+            EXPECT_EQ(observed->selection_calls,0);
+            EXPECT_EQ(observed->whole_calls,0);
+            for (const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+            {
+                auto request=projectionRequirement(ownership,WeightRole::MoEExpertDown);
+                request.target_device=device; // Lookup remains actual CPU source; no backend is constructed.
+                WeightPlan gpu_source_plan(plan.strategy(),plan.physicalMemoryOwner());
+                gpu_source_plan.add(request);
+                const auto gpu_source=manager.materialize(gpu_source_plan);
+                EXPECT_THROW((void)manager.prepareWeightsForDevice(gpu_source,device),std::logic_error);
+                const auto gpu_views=gpu_source.projectedExpertMatrices();
+                EXPECT_THROW((void)manager.prepareWeightsForDevice(gpu_views,device),std::logic_error);
+            }
+            EXPECT_EQ(observed->whole_calls,0);
+            EXPECT_EQ(observed->selection_calls,0);
+        }
+
+        /** @test K128 is illegal for original256-element source blocks, even when a typed F interval is positive. */
+        TEST_P(ModelLoaderExpertSelectionTest, StaticProjectionNativeSuperblockRejects128K)
+        {
+            GGUFTensorInfo info; info.type=GetParam();
+            if (info.getBlockSize()!=256u) return; // Original32-element and floating sources have another legal geometry.
+            for (const bool mapped : {false,true})
+            {
+                rebuildProjectionSource(mapped,"blk.7.ffn_down_exps.weight");
+                auto *observed=observeProjectionSource(mapped);
+                WeightManager manager(*loader_,mpi_ctx_);
+                const auto ownership=MoEExpertProjectionOwnership::withinExpertIntermediateSlices(
+                    {int(kExpertCount),int(kRowsPerExpert),int(columns_)},0,{{0,128},{128,int(columns_)-128}});
+                WeightPlan plan(InferenceStrategy{.model_id=ModelContextId{56}},PhysicalMemoryOwner::RoutedExpertWeights);
+                plan.add(projectionRequirement(ownership,WeightRole::MoEExpertDown));
+                EXPECT_THROW((void)manager.materialize(plan),std::invalid_argument);
+                EXPECT_EQ(observed->projection_calls,1);
+                EXPECT_EQ(observed->whole_calls,0);
+                EXPECT_EQ(observed->selection_calls,0);
+            }
         }
 
         INSTANTIATE_TEST_SUITE_P(

@@ -2666,9 +2666,10 @@ namespace llaminar2
                     params_.overlay_participant_residency->device() ||
                 params_.num_experts !=
                     params_.overlay_participant_residency->numExperts() ||
-                params_.layer_idx < 0 ||
-                params_.layer_idx >=
-                    params_.overlay_participant_residency->numLayers())
+                // Sparse packet/stage layers are model-global, whereas the
+                // endpoint retains only its compact owned PP interval.
+                params_.layer_idx < params_.overlay_participant_residency->firstModelLayer() ||
+                params_.layer_idx >= params_.overlay_participant_residency->endModelLayer())
             {
                 LOG_ERROR("[MoELocalExpertStage] Participant residency identity or geometry does not match the local stage");
                 return false;

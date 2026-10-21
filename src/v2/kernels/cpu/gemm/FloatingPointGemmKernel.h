@@ -20,6 +20,7 @@
  */
 
 #pragma once
+#include "kernels/common/FloatingProjectionRows.h"
 
 #include "memory/CPUWeightStoragePlacement.h"
 
@@ -145,7 +146,8 @@ namespace llaminar2
                                            bool transpose_B,
                                            float alpha = 1.0f,
                                            float beta = 0.0f,
-                                           const float *bias = nullptr)
+                                           const float *bias = nullptr,
+                                           const FloatingProjectionRows *selection = nullptr)
         {
             if (!A || !B || !C || M < 0 || N < 0 || K < 0)
             {
@@ -155,6 +157,11 @@ namespace llaminar2
                           << " C=" << static_cast<void *>(C)
                           << " M=" << M << " N=" << N << " K=" << K);
                 return false;
+            }
+
+            if(selection) {
+                if(selection->physicalRows()!=M)throw std::invalid_argument("Floating projection selection exceeds matrix rows");
+                selection->validateHostPublications();
             }
 
             /*
@@ -169,7 +176,7 @@ namespace llaminar2
              * recurrent-state drift in GDN/short-conv publication.
              */
             constexpr int kVerifierRowTile = 4;
-            const int row_tiles = (M + kVerifierRowTile - 1) / kVerifierRowTile;
+            const int row_tiles = selection ? selection->hostTiles(kVerifierRowTile) : (M + kVerifierRowTile - 1) / kVerifierRowTile;
             const int workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
             const int64_t scalar_tasks = static_cast<int64_t>(M) * N;
             const int64_t grouped_tasks = static_cast<int64_t>(row_tiles) * N;
@@ -186,9 +193,10 @@ namespace llaminar2
                     {
                         for (int col = 0; col < N; ++col)
                         {
-                            const int first_row = row_tile * kVerifierRowTile;
+                            const int first_row = selection ? selection->hostTileFirst(row_tile,kVerifierRowTile) : row_tile * kVerifierRowTile;
                             const int tile_rows =
-                                std::min(kVerifierRowTile, M - first_row);
+                                selection ? selection->hostTileRows(row_tile,kVerifierRowTile) : std::min(kVerifierRowTile, M - first_row);
+                            if(tile_rows==0)continue;
                             const float *b_row =
                                 B + static_cast<size_t>(col) * K;
                             float accumulators[kVerifierRowTile] = {};
@@ -286,6 +294,7 @@ namespace llaminar2
                 {
                     for (int col = 0; col < N; ++col)
                     {
+                        if(selection && !selection->hostRowIsActive(row))continue;
                         float acc = 0.0f;
                         const float *a_row = A + static_cast<size_t>(row) * K;
                         if (transpose_B)
@@ -449,7 +458,8 @@ namespace llaminar2
                                               bool transpose_B,
                                               DecodeFn decode,
                                               float alpha = 1.0f,
-                                              float beta = 0.0f)
+                                              float beta = 0.0f,
+                                              const FloatingProjectionRows *selection = nullptr)
         {
             if (!A || !B || !C || M < 0 || N < 0 || K < 0)
             {
@@ -461,6 +471,11 @@ namespace llaminar2
                 return false;
             }
 
+            if(selection) {
+                if(selection->physicalRows()!=M)throw std::invalid_argument("Floating projection selection exceeds matrix rows");
+                selection->validateHostPublications();
+            }
+
             /*
              * Match the homogeneous 16-bit primitive above: a fixed four-row
              * tile shares each decoded weight while preserving one independent
@@ -468,7 +483,7 @@ namespace llaminar2
              */
             constexpr int kVerifierRowTile = 4;
             const int row_tiles =
-                (M + kVerifierRowTile - 1) / kVerifierRowTile;
+                selection ? selection->hostTiles(kVerifierRowTile) : (M + kVerifierRowTile - 1) / kVerifierRowTile;
             auto work = [&]()
             {
 #pragma omp for collapse(2) schedule(static)
@@ -476,9 +491,10 @@ namespace llaminar2
                 {
                     for (int col = 0; col < N; ++col)
                     {
-                        const int first_row = row_tile * kVerifierRowTile;
+                        const int first_row = selection ? selection->hostTileFirst(row_tile,kVerifierRowTile) : row_tile * kVerifierRowTile;
                         const int tile_rows =
-                            std::min(kVerifierRowTile, M - first_row);
+                            selection ? selection->hostTileRows(row_tile,kVerifierRowTile) : std::min(kVerifierRowTile, M - first_row);
+                            if(tile_rows==0)continue;
                         float accumulators[kVerifierRowTile] = {};
                         for (int kk = 0; kk < K; ++kk)
                         {
@@ -516,7 +532,8 @@ namespace llaminar2
                                                 int K,
                                                 bool transpose_B,
                                                 float alpha = 1.0f,
-                                                float beta = 0.0f)
+                                                float beta = 0.0f,
+                                                const FloatingProjectionRows *selection = nullptr)
         {
             return run_fp32x16_skinny_matmul(
                 A, B, C, M, N, K, transpose_B,
@@ -525,7 +542,7 @@ namespace llaminar2
                     return fp16_to_fp32(value);
                 },
                 alpha,
-                beta);
+                beta, selection);
         }
 
         inline bool run_fp32xbf16_skinny_matmul(const float *A,
@@ -536,7 +553,8 @@ namespace llaminar2
                                                 int K,
                                                 bool transpose_B,
                                                 float alpha = 1.0f,
-                                                float beta = 0.0f)
+                                                float beta = 0.0f,
+                                                const FloatingProjectionRows *selection = nullptr)
         {
             return run_fp32x16_skinny_matmul(
                 A, B, C, M, N, K, transpose_B,
@@ -545,7 +563,7 @@ namespace llaminar2
                     return simd::bf16_to_fp32(value);
                 },
                 alpha,
-                beta);
+                beta, selection);
         }
 
         /**
@@ -3623,6 +3641,16 @@ namespace llaminar2
              * order as the M=1 decode GEMV.  This is intentionally not a hidden
              * serial row loop.
              */
+            /** @brief Bind request-local holes only for the source-preserving native floating primitives. */
+            std::unique_ptr<VerifierKernelModeScope> beginFloatingRequestRowsScope(DeviceRequestRowRanges rows) override
+            {
+                if(operand_precision_!=FloatingActivationOperandPrecision::Native ||
+                    numerical_policy_!=NumericalPolicy::BackendNative ||
+                    (weight_type_!=TensorType::FP32 && weight_type_!=TensorType::FP16 && weight_type_!=TensorType::BF16))
+                    throw std::invalid_argument("Counted CPU floating requests require native FP32/FP16/BF16 policy");
+                return makeFloatingRequestRowsScope(rows);
+            }
+
             bool multiply_fused_verifier_rows_decode_equivalent(
                 const TensorBase *input,
                 const std::vector<TensorProjectionDesc> &projections,
@@ -3652,6 +3680,12 @@ namespace llaminar2
                               << " projections=" << projections.size());
                     return false;
                 }
+
+                const auto *request_rows=VerifierKernelModeScope::requestsFor(m);
+                if(request_rows && input->native_type()!=TensorType::FP32)
+                    throw std::invalid_argument("Counted floating requests require FP32 activation rows");
+                const auto selection=FloatingProjectionRows::bind(m,VerifierKernelModeScope::prefixForFloating(m),request_rows);
+                selection.validateHostPublications();
 
                 const bool mixed_fp32_activation =
                     input->native_type() == TensorType::FP32 &&
@@ -3832,7 +3866,7 @@ namespace llaminar2
                                       /*transpose_B=*/true,
                                       /*alpha=*/1.0f,
                                       /*beta=*/0.0f,
-                                      bias_ptr);
+                                      bias_ptr, &selection);
                     }
                     else if (weight_type_ == TensorType::FP16)
                     {
@@ -3856,7 +3890,7 @@ namespace llaminar2
                                               m,
                                               proj.n,
                                               k,
-                                              /*transpose_B=*/true))
+                                              /*transpose_B=*/true,1.0f,0.0f,&selection))
                                  : run_fp16_skinny_matmul(
                                        input_fp16,
                                        weight_fp16->typed_data(),
@@ -3888,7 +3922,7 @@ namespace llaminar2
                                               m,
                                               proj.n,
                                               k,
-                                              /*transpose_B=*/true))
+                                              /*transpose_B=*/true,1.0f,0.0f,&selection))
                                  : run_bf16_skinny_matmul(
                                        input_bf16,
                                        weight_bf16->typed_data(),

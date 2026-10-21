@@ -42,6 +42,16 @@ namespace llaminar2
         case WeightRole::Norm: return "Norm";
         case WeightRole::Bias: return "Bias";
         case WeightRole::Other: return "Other";
+        case WeightRole::ImmutableRowTable: return "ImmutableRowTable";
+        case WeightRole::HyperConnectionProjection: return "HyperConnectionProjection";
+        case WeightRole::HyperConnectionNorm: return "HyperConnectionNorm";
+        case WeightRole::SparseIndexerProjection: return "SparseIndexerProjection";
+        case WeightRole::SparseIndexerNorm: return "SparseIndexerNorm";
+        case WeightRole::PerLayerEmbeddingProjection: return "PerLayerEmbeddingProjection";
+        case WeightRole::PerLayerEmbeddingNorm: return "PerLayerEmbeddingNorm";
+        case WeightRole::PerLayerEmbeddingConvolution: return "PerLayerEmbeddingConvolution";
+        case WeightRole::PredictorProjection: return "PredictorProjection";
+
         }
         return "Other";
     }
@@ -112,6 +122,38 @@ namespace llaminar2
      */
     WeightRole inferWeightRole(const std::string &name)
     {
+        if (name == "per_layer_token_embd.weight") return WeightRole::ImmutableRowTable;
+        // Model-owned canonical names are parsed before generic norm or
+        // attention matches. MTP's nested nextn component keeps its identity.
+        std::string stem = name;
+        if (stem.starts_with("blk."))
+        {
+            const auto dot = stem.find('.', 4);
+            if (dot != std::string::npos && dot > 4 &&
+                stem.find_first_not_of("0123456789", 4) == dot)
+                stem.erase(0, dot + 1);
+        }
+        if (stem == "hc_attn_down.weight" || stem == "hc_attn_up.weight" ||
+            stem == "hc_attn_inject.weight" || stem == "hc_ffn_down.weight" ||
+            stem == "hc_ffn_up.weight" || stem == "hc_ffn_inject.weight" ||
+            stem == "output_hc_down.weight" || stem == "output_hc_up.weight" ||
+            stem == "nextn.hc_head_down.weight" || stem == "nextn.hc_head_up.weight")
+            return WeightRole::HyperConnectionProjection;
+        if (stem == "hc_attn_norm.weight" || stem == "hc_ffn_norm.weight" ||
+            stem == "output_hc_norm.weight" || stem == "nextn.hc_head_norm.weight" ||
+            stem == "nextn.hnorm.weight")
+            return WeightRole::HyperConnectionNorm;
+        if (stem == "indexer.q_proj.weight" || stem == "indexer.k_proj.weight")
+            return WeightRole::SparseIndexerProjection;
+        if (stem == "indexer.q_norm.weight" || stem == "indexer.k_norm.weight")
+            return WeightRole::SparseIndexerNorm;
+        if (stem == "ple_key.weight" || stem == "ple_value.weight")
+            return WeightRole::PerLayerEmbeddingProjection;
+        if (stem == "ple_norm_key.weight" || stem == "ple_norm_query.weight" || stem == "ple_norm_conv.weight")
+            return WeightRole::PerLayerEmbeddingNorm;
+        if (stem == "ple_conv1d.weight")
+            return WeightRole::PerLayerEmbeddingConvolution;
+        if (stem == "nextn.eh_proj.weight") return WeightRole::PredictorProjection;
         if (name == "token_embd.weight") return WeightRole::Embedding;
         if (name == "output.weight") return WeightRole::LMHead;
         if (name == "output_norm.weight") return WeightRole::OutputNorm;

@@ -9,6 +9,7 @@
  */
 
 #pragma once
+#include "execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include "../IBackend.h"
 #include <memory>
@@ -706,7 +707,8 @@ namespace llaminar2
             void *stream,
             void *out_target_cached_tokens_device,
             void *out_accepted_state_counts_device,
-            void *out_ok_device) override;
+            void *out_ok_device,
+            MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly) override;
         bool enqueuePrepareSpeculativeShiftedKVTokens(
             const void *meta_device,
             int meta_stride,

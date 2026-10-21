@@ -1358,7 +1358,7 @@ namespace llaminar2
                                                          static_cast<int>(group_count),
                                                          cuda_device_id_,
                                                          gpu_stream_,
-                    VerifierKernelModeScope::rowsFor(m))
+                    VerifierKernelModeScope::prefixForFloating(m), VerifierKernelModeScope::requestsFor(m))
                                                    : cudaFp32x16_tiny_batched_projection(
                                                          d_A_array,
                                                          d_B_array,
@@ -1370,7 +1370,7 @@ namespace llaminar2
                                                          weight_dtype,
                                                          cuda_device_id_,
                                                          gpu_stream_,
-                    VerifierKernelModeScope::rowsFor(m));
+                    VerifierKernelModeScope::prefixForFloating(m), VerifierKernelModeScope::requestsFor(m));
                     if (!projection_ok)
                     {
                         LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection kernel failed"

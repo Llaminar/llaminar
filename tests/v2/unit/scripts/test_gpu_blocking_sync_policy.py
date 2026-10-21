@@ -150,6 +150,7 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
         allowance, = (
             entry for entry in ALLOWANCES
             if entry.path.endswith("/PipelineDeviceGeneration.cpp")
+            and entry.caller == "PipelineDeviceGeneration::finish"
         )
         self.assertEqual(allowance.caller, "PipelineDeviceGeneration::finish")
         self.assertEqual(allowance.kind, "backend_event")
@@ -168,6 +169,65 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
                 with temporary:
                     self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
 
+    def test_pipeline_forward_only_terminal_and_teardown_budgets_are_exact(self) -> None:
+        """Only the two named completion owners gain one exact event-wait site."""
+        path = "src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp"
+        allowances = {entry.caller: entry for entry in ALLOWANCES if entry.path == path}
+        self.assertEqual(set(allowances), {
+            "PipelineDeviceGeneration::finish", "PipelineDeviceGeneration::finishForwardOnly",
+            "PipelineDeviceGeneration::retireForwardOnlyBeforeStageRelease",
+        })
+        for name, category in (("finishForwardOnly", "host_result"),
+                               ("retireForwardOnlyBeforeStageRelease", "lifecycle")):
+            allowance = allowances["PipelineDeviceGeneration::" + name]
+            self.assertEqual((allowance.kind, allowance.count, allowance.category),
+                             ("backend_event", 1, category))
+            fixture = dataclasses.replace(allowance, path="src/v2/example.cpp")
+            for caller, count, accepted in (
+                (name, 1, True), (name, 2, False),
+                ("advanceOrdinaryCondition", 1, False), ("launch", 1, False),
+                ("prepareForwardOnlyFamily", 1, False), ("prefill", 1, False),
+                ("~PipelineDeviceGeneration", 1, False), ("~RankOrchestrator", 1, False),
+            ):
+                with self.subTest(boundary=name, caller=caller, count=count):
+                    temporary, root = self.make_repo(
+                        f"void PipelineDeviceGeneration::{caller}() {{"
+                        + "backend->waitForEvent(terminal, ordinal);" * count + "}"
+                    )
+                    with temporary:
+                        self.assertEqual(not validate(root, (fixture,)), accepted)
+
+    def test_pipeline_forward_only_event_budget_never_authorizes_device_or_stream_drain(self) -> None:
+        """A terminal event allowance cannot disguise a stronger blocking primitive."""
+        for caller in ("finishForwardOnly", "retireForwardOnlyBeforeStageRelease"):
+            allowance, = (entry for entry in ALLOWANCES
+                          if entry.caller == "PipelineDeviceGeneration::" + caller)
+            fixture = dataclasses.replace(allowance, path="src/v2/example.cpp")
+            for primitive in ("hipStreamSynchronize(stream);", "cudaDeviceSynchronize();",
+                              "backend->synchronize(ordinal);"):
+                with self.subTest(caller=caller, primitive=primitive):
+                    temporary, root = self.make_repo(
+                        f"void PipelineDeviceGeneration::{caller}() {{"
+                        + "backend->waitForEvent(terminal, ordinal);" + primitive + "}"
+                    )
+                    with temporary:
+                        self.assertTrue(validate(root, (fixture,)))
+
+    def test_pipeline_forward_only_raii_lambda_belongs_to_terminal_owner(self) -> None:
+        """A lexical error-path fence stays attributed to finishForwardOnly only."""
+        allowance, = (entry for entry in ALLOWANCES
+                      if entry.caller == "PipelineDeviceGeneration::finishForwardOnly")
+        fixture = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, accepted in (("finishForwardOnly", True), ("advanceOrdinaryCondition", False)):
+            with self.subTest(caller=caller):
+                temporary, root = self.make_repo(
+                    f"bool PipelineDeviceGeneration::{caller}() {{"
+                    "const auto retire = [&]() noexcept { backend->waitForEvent(terminal, ordinal); };"
+                    "retire(); return true; }"
+                )
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture,)), accepted)
+
     def test_synchronous_backend_wrapper_is_charged_to_its_caller(self) -> None:
         temporary, root = self.make_repo(
             """
@@ -181,6 +241,81 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
             self.assertEqual(len(failures), 1)
             self.assertIn("unapproved backend_sync_copy", failures[0])
             self.assertIn("hiddenRoundTrip", failures[0])
+
+    def test_hosted_reset_terminal_wait_cannot_escape_into_inference(self) -> None:
+        """The reset allowance covers one terminal event, never a token or stage wait."""
+        allowance, = (
+            entry for entry in ALLOWANCES
+            if entry.caller == "DeviceGraphOrchestrator::retireRetainedStorageForRequestReset"
+        )
+        self.assertEqual(allowance.category, "lifecycle")
+        self.assertEqual(allowance.kind, "backend_event")
+        self.assertEqual(allowance.count, 1)
+        fixture_allowance = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, count, accepted in (
+            ("retireRetainedStorageForRequestReset", 1, True),
+            ("retireRetainedStorageForRequestReset", 2, False),
+            ("beginRetainedStorageAdmission", 1, False),
+            ("launchOrdinaryGenerationForward", 1, False),
+            ("recordTerminalClose", 1, False),
+        ):
+            with self.subTest(caller=caller, count=count):
+                temporary, root = self.make_repo(
+                    f"void DeviceGraphOrchestrator::{caller}() {{"
+                    + "backend->waitForEvent(event, ordinal);" * count + "}"
+                )
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
+
+    def test_immutable_submission_owner_wait_cannot_escape_into_serving(self) -> None:
+        """One failed-submission/last-owner event never permits normal serving waits."""
+        allowance, = (
+            entry for entry in ALLOWANCES
+            if entry.caller == "retireImmutableLookupSubmissionOwner"
+        )
+        self.assertEqual(allowance.category, "lifecycle")
+        self.assertEqual(allowance.kind, "backend_event")
+        self.assertEqual(allowance.count, 1)
+        fixture_allowance = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, count, accepted in (
+            ("retireImmutableLookupSubmissionOwner", 1, True),
+            ("retireImmutableLookupSubmissionOwner", 2, False),
+            ("beginAdmission", 1, False),
+            ("gather", 1, False),
+            ("recordTerminalClose", 1, False),
+            ("prepareGraphLaunch", 1, False),
+        ):
+            with self.subTest(caller=caller, count=count):
+                temporary, root = self.make_repo(
+                    f"void {caller}() {{"
+                    + "backend.waitForEvent(event, ordinal);" * count + "}"
+                )
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
+
+    def test_selected_snapshot_wait_is_only_a_diagnostic_boundary(self) -> None:
+        """One diagnostic wait site cannot authorize waits in execution/capture."""
+        allowance, = (
+            entry for entry in ALLOWANCES
+            if entry.caller == "DeviceGraphExecutor::acquireGraphSnapshotArenaOnHost"
+        )
+        self.assertEqual(allowance.category, "diagnostic")
+        self.assertEqual(allowance.kind, "backend_event")
+        self.assertEqual(allowance.count, 1)
+        fixture_allowance = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, count, accepted in (
+            ("acquireGraphSnapshotArenaOnHost", 1, True),
+            ("acquireGraphSnapshotArenaOnHost", 2, False),
+            ("runStages", 1, False),
+            ("captureGraphSnapshotOutputs", 1, False),
+        ):
+            with self.subTest(caller=caller, count=count):
+                temporary, root = self.make_repo(
+                    f"void DeviceGraphExecutor::{caller}() {{"
+                    + "backend->waitForEvent(event, ordinal);" * count + "}"
+                )
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
 
     def test_asynchronous_backend_wrapper_is_not_rejected(self) -> None:
         temporary, root = self.make_repo(

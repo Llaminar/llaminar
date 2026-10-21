@@ -86,6 +86,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -192,6 +193,23 @@ extern "C" bool hipMoE_materialize_runtime_prefill_descriptor_tables(
     int num_experts,
     int device_idx,
     void *stream);
+
+/**
+ * @brief Publish the original floating descriptor family into exact admitted tables.
+ * @param runtime Actual immutable runtime placement bank selector.
+ * @param gate Full gate descriptor output, retained through replay.
+ * @param up Full up descriptor output, retained through replay.
+ * @param down Full down descriptor output, retained through replay.
+ * @param experts Complete original routed expert count.
+ * @param format Original floating source scalar discriminator.
+ * @param device Exact native endpoint ordinal.
+ * @param stream Exact non-default publication stream.
+ * @return Whether the checked production launch was submitted.
+ */
+extern "C" bool hipMoE_materialize_runtime_floating_descriptor_tables(
+    const void *runtime, llaminar2::DeviceMoEFloatingMatrixDesc *gate,
+    llaminar2::DeviceMoEFloatingMatrixDesc *up, llaminar2::DeviceMoEFloatingMatrixDesc *down,
+    int experts, llaminar2::DeviceMoEWeightFormat format, int device, void *stream);
 
 extern "C" bool hipMoE_materialize_runtime_prefill_plan(
     const void *runtime,
@@ -2525,11 +2543,14 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesRejectInvalidDescriptors)
               -1);
 }
 
-TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRuntimeBank)
+/**
+ * @brief Prove full original descriptor/list publication without expert payload execution.
+ * @tparam num_experts Complete source expert domain; block width remains256.
+ */
+template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain()
 {
     SKIP_IF_NO_ROCM();
 
-    constexpr int num_experts = 4;
     constexpr int top_k = 2;
     constexpr int d_model = 64;
     constexpr int intermediate = 96;
@@ -2554,24 +2575,20 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
             makePrefillRuntimeDesc(inactive_base + 0x3000u, d_model, intermediate, 6);
 
         const uintptr_t active_base = 0x73000000u + static_cast<uintptr_t>(expert) * 0x10000u;
-        expected_gate[static_cast<size_t>(expert)] =
-            makePrefillRuntimeDesc(active_base + 0x1000u, intermediate, d_model,
-                                   static_cast<uint8_t>(7 + expert));
-        expected_up[static_cast<size_t>(expert)] =
-            makePrefillRuntimeDesc(active_base + 0x2000u, intermediate, d_model,
-                                   static_cast<uint8_t>(11 + expert));
-        expected_down[static_cast<size_t>(expert)] =
-            makePrefillRuntimeDesc(active_base + 0x3000u, d_model, intermediate,
-                                   static_cast<uint8_t>(15 + expert));
+        expected_gate[static_cast<size_t>(expert)] = makePrefillRuntimeDesc(
+            active_base + 0x1000u, intermediate, d_model, static_cast<uint8_t>(0));
+        expected_up[static_cast<size_t>(expert)] = makePrefillRuntimeDesc(
+            active_base + 0x2000u, intermediate, d_model, static_cast<uint8_t>(0));
+        expected_down[static_cast<size_t>(expert)] = makePrefillRuntimeDesc(
+            active_base + 0x3000u, d_model, intermediate, static_cast<uint8_t>(0));
 
         auto &active_desc = host_runtime.banks[1].experts[expert];
         active_desc.logical_expert_id = expert;
         active_desc.owner_participant = 0;
         active_desc.local_slot = expert;
-        active_desc.flags = toMoEExpertFlags(
-            DeviceMoEExpertFlags::Valid |
-            DeviceMoEExpertFlags::Resident |
-            DeviceMoEExpertFlags::LocalCompute);
+        active_desc.flags =
+            toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
+                             DeviceMoEExpertFlags::LocalCompute);
         active_desc.gate = expected_gate[static_cast<size_t>(expert)];
         active_desc.up = expected_up[static_cast<size_t>(expert)];
         active_desc.down = expected_down[static_cast<size_t>(expert)];
@@ -2586,7 +2603,52 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
     DeviceNativeVNNIMatrixDesc *device_down = nullptr;
     int32_t *device_counts = nullptr;
     int32_t *device_active = nullptr;
-    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
+    std::vector<DeviceNativeVNNIMatrixDesc> actual_gate(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> actual_up(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> actual_down(num_experts);
+    std::array<int32_t, num_experts> actual_active{};
+    std::array<int32_t, num_experts> expert_counts{};
+    std::array<int32_t, num_experts> expected_active{};
+    expected_active.fill(-1);
+    const std::vector<int> chosen =
+        num_experts == 512 ? std::vector<int>{255, 256, 257, 370, 511} : std::vector<int>{1, 3};
+    for (std::size_t i = 0; i < chosen.size(); ++i)
+    {
+        expert_counts[chosen[i]] = static_cast<int>(i) + 1;
+        expected_active[i] = chosen[i];
+    }
+    auto replayCounts = expert_counts;
+    auto replayExpected = expected_active;
+    std::optional<ScopedHipTestGraph> publicationGraph;
+    /** @brief Fence submissions before graph, borrowed host arrays and native slots retire. */
+    struct Retirement
+    {
+        hipStream_t stream;
+        std::optional<ScopedHipTestGraph> &graph;
+        std::array<void **, 6> roots;
+        ~Retirement() noexcept
+        {
+            if (isGraphCaptureActive())
+                graph.reset();
+            if (hipStreamSynchronize(stream) != hipSuccess)
+                std::terminate();
+            graph.reset();
+            for (auto **root : roots)
+            {
+                if (*root && hipFree(*root) != hipSuccess)
+                    std::terminate();
+            }
+            if (hipStreamDestroy(stream) != hipSuccess)
+                std::terminate();
+        }
+    } retirement{
+        stream,
+        publicationGraph,
+        {reinterpret_cast<void **>(&device_runtime), reinterpret_cast<void **>(&device_gate),
+         reinterpret_cast<void **>(&device_up), reinterpret_cast<void **>(&device_down),
+         reinterpret_cast<void **>(&device_counts), reinterpret_cast<void **>(&device_active)}};
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)),
+              hipSuccess);
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_gate),
                         num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
               hipSuccess);
@@ -2596,63 +2658,45 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_down),
                         num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
               hipSuccess);
-    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_counts),
-                        num_experts * sizeof(int32_t)),
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_counts), num_experts * sizeof(int32_t)),
               hipSuccess);
-    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_active),
-                        num_experts * sizeof(int32_t)),
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_active), num_experts * sizeof(int32_t)),
               hipSuccess);
-    const std::array<int32_t, num_experts> expert_counts = {0, 2, 0, 1};
-    const std::array<int32_t, num_experts> expected_active = {1, 3, -1, -1};
     host_runtime.expert_counts = device_counts;
 
-    ASSERT_EQ(hipMemcpyAsync(device_counts, expert_counts.data(),
-                             sizeof(expert_counts), hipMemcpyHostToDevice, stream),
+    ASSERT_EQ(hipMemcpyAsync(device_counts, expert_counts.data(), sizeof(expert_counts),
+                             hipMemcpyHostToDevice, stream),
               hipSuccess);
     ASSERT_EQ(hipMemcpyAsync(device_runtime, &host_runtime, sizeof(host_runtime),
                              hipMemcpyHostToDevice, stream),
               hipSuccess);
+    publicationGraph.emplace(0, stream, "complete runtime descriptor publication only");
     ASSERT_TRUE(hipMoE_materialize_runtime_prefill_descriptor_tables(
-        device_runtime,
-        device_gate,
-        device_up,
-        device_down,
-        num_experts,
-        0,
-        stream));
-    ASSERT_TRUE(hipMoE_materialize_runtime_prefill_plan(
-        device_runtime,
-        device_gate,
-        device_up,
-        device_down,
-        device_active,
-        num_experts,
-        num_experts,
-        0,
-        stream));
-    EXPECT_FALSE(hipMoE_materialize_runtime_prefill_plan(
-        device_runtime,
-        device_gate,
-        device_up,
-        device_down,
-        device_active,
-        num_experts,
-        num_experts,
-        0,
-        nullptr));
+        device_runtime, device_gate, device_up, device_down, num_experts, 0, stream));
+    ASSERT_TRUE(hipMoE_materialize_runtime_prefill_plan(device_runtime, device_gate, device_up,
+                                                        device_down, device_active, num_experts,
+                                                        num_experts, 0, stream));
+    ASSERT_TRUE(publicationGraph->finishAndInstantiate());
+    // Poison all admitted slots before replay. The capture must overwrite every
+    // descriptor/list byte; the negative control never launches expert compute.
+    ASSERT_EQ(
+        hipMemsetAsync(device_gate, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemsetAsync(device_up, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemsetAsync(device_down, 0xa5, num_experts * sizeof(DeviceNativeVNNIMatrixDesc), stream),
+        hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(device_active, 0xa5, num_experts * sizeof(int32_t), stream),
+              hipSuccess);
+    ASSERT_TRUE(publicationGraph->launch());
+    EXPECT_FALSE(hipMoE_materialize_runtime_prefill_plan(device_runtime, device_gate, device_up,
+                                                         device_down, device_active, num_experts,
+                                                         num_experts, 0, nullptr));
     EXPECT_FALSE(hipMoE_materialize_runtime_prefill_descriptor_tables(
-        device_runtime,
-        device_gate,
-        device_up,
-        device_down,
-        num_experts,
-        0,
-        nullptr));
+        device_runtime, device_gate, device_up, device_down, num_experts, 0, nullptr));
 
-    std::vector<DeviceNativeVNNIMatrixDesc> actual_gate(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> actual_up(num_experts);
-    std::vector<DeviceNativeVNNIMatrixDesc> actual_down(num_experts);
-    std::array<int32_t, num_experts> actual_active{};
     ASSERT_EQ(hipMemcpyAsync(actual_gate.data(), device_gate,
                              actual_gate.size() * sizeof(DeviceNativeVNNIMatrixDesc),
                              hipMemcpyDeviceToHost, stream),
@@ -2665,8 +2709,8 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
                              actual_down.size() * sizeof(DeviceNativeVNNIMatrixDesc),
                              hipMemcpyDeviceToHost, stream),
               hipSuccess);
-    ASSERT_EQ(hipMemcpyAsync(actual_active.data(), device_active,
-                             sizeof(actual_active), hipMemcpyDeviceToHost, stream),
+    ASSERT_EQ(hipMemcpyAsync(actual_active.data(), device_active, sizeof(actual_active),
+                             hipMemcpyDeviceToHost, stream),
               hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     EXPECT_EQ(actual_active, expected_active);
@@ -2682,15 +2726,191 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRunti
                                  expected_down[static_cast<size_t>(expert)]);
     }
 
-    EXPECT_EQ(hipFree(device_active), hipSuccess);
-    EXPECT_EQ(hipFree(device_counts), hipSuccess);
-    EXPECT_EQ(hipFree(device_down), hipSuccess);
-    EXPECT_EQ(hipFree(device_up), hipSuccess);
-    EXPECT_EQ(hipFree(device_gate), hipSuccess);
-    EXPECT_EQ(hipFree(device_runtime), hipSuccess);
-    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+    for (int phase : {0, 1, 2, 3, 0})
+    {
+        replayCounts.fill(0);
+        replayExpected.fill(-1);
+        if (phase == 0)
+        {
+            replayCounts = expert_counts;
+            replayExpected = expected_active;
+        }
+        else if (phase == 1)
+        {
+            replayCounts.fill(1);
+            std::iota(replayExpected.begin(), replayExpected.end(), 0);
+        }
+        else if (phase == 3)
+        {
+            replayCounts[num_experts - 1] = 1;
+            replayExpected[0] = num_experts - 1;
+        }
+        ASSERT_EQ(hipMemcpyAsync(device_counts, replayCounts.data(), sizeof(replayCounts),
+                                 hipMemcpyHostToDevice, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(device_active, 0xa5, sizeof(actual_active), stream), hipSuccess);
+        ASSERT_TRUE(publicationGraph->launch());
+        ASSERT_EQ(hipMemcpyAsync(actual_active.data(), device_active, sizeof(actual_active),
+                                 hipMemcpyDeviceToHost, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        EXPECT_EQ(actual_active, replayExpected);
+    }
 }
 
+/** @test Preserve the existing four-expert active-bank publication control. */
+TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRuntimeBank)
+{
+    proveRuntimeDescriptorPublicationCompleteDomain<4>();
+}
+
+/** @test Safe old-code negative: poison remains above255 without complete publication. */
+TEST(Test__ROCmMoEKernel, RuntimeDescriptorPublication512ExpertsCapturedOverwrite)
+{
+    proveRuntimeDescriptorPublicationCompleteDomain<512>();
+}
+
+/** @test Complete publication remains total around the256-lane boundary and final partial chunk. */
+TEST(Test__ROCmMoEKernel, RuntimeDescriptorPublicationExpertDomainBoundaries)
+{
+    proveRuntimeDescriptorPublicationCompleteDomain<255>();
+    proveRuntimeDescriptorPublicationCompleteDomain<256>();
+    proveRuntimeDescriptorPublicationCompleteDomain<257>();
+    proveRuntimeDescriptorPublicationCompleteDomain<511>();
+}
+
+/**
+ * @test Every floating descriptor family overwrites its complete512-expert
+ * table under captured placement changes, including all-remote zeroing.
+ * Descriptor payload addresses are metadata witnesses only and never dereferenced.
+ */
+TEST(Test__ROCmMoEKernel, RuntimeFloatingDescriptorPublication512ExpertsCapturedOverwrite)
+{
+    SKIP_IF_NO_ROCM();
+    constexpr int experts = 512;
+    for (const auto format :
+         {DeviceMoEWeightFormat::FP32, DeviceMoEWeightFormat::FP16, DeviceMoEWeightFormat::BF16})
+    {
+        SCOPED_TRACE(static_cast<int>(format));
+        auto runtime = makeAllLocalRuntime(experts, 1, 19);
+        runtime.active_bank = 1;
+        runtime.participant_count = 1;
+        for (int bank = 0; bank < 2; ++bank)
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                auto &d = runtime.banks[bank].experts[expert];
+                d.logical_expert_id = expert;
+                d.owner_participant = 0;
+                d.local_slot = expert;
+                d.flags =
+                    toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
+                                     DeviceMoEExpertFlags::LocalCompute);
+                d.weight_format = format;
+                const auto address = std::uintptr_t{0x43000000} +
+                                     static_cast<std::uintptr_t>(bank) * 0x1000000 +
+                                     static_cast<std::uintptr_t>(expert) * 0x1000;
+                d.floating_gate = {reinterpret_cast<const void *>(address + 0x100), 96, 64};
+                d.floating_up = {reinterpret_cast<const void *>(address + 0x200), 96, 64};
+                d.floating_down = {reinterpret_cast<const void *>(address + 0x300), 64, 96};
+            }
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        DeviceMoELayerRuntime *nativeRuntime = nullptr;
+        DeviceMoEFloatingMatrixDesc *gate = nullptr, *up = nullptr, *down = nullptr;
+        std::array<std::vector<DeviceMoEFloatingMatrixDesc>, 3> actual;
+        for (auto &v : actual)
+            v.resize(experts);
+        std::optional<ScopedHipTestGraph> graph;
+        /** @brief Fence exact submission before graph, host backing and native table retirement. */
+        struct Retirement
+        {
+            hipStream_t stream;
+            std::optional<ScopedHipTestGraph> &graph;
+            std::array<void **, 4> roots;
+            ~Retirement() noexcept
+            {
+                if (isGraphCaptureActive())
+                    graph.reset();
+                if (hipStreamSynchronize(stream) != hipSuccess)
+                    std::terminate();
+                graph.reset();
+                for (auto **p : roots)
+                {
+                    if (*p && hipFree(*p) != hipSuccess)
+                        std::terminate();
+                }
+                if (hipStreamDestroy(stream) != hipSuccess)
+                    std::terminate();
+            }
+        } retirement{stream,
+                     graph,
+                     {reinterpret_cast<void **>(&nativeRuntime), reinterpret_cast<void **>(&gate),
+                      reinterpret_cast<void **>(&up), reinterpret_cast<void **>(&down)}};
+        ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&nativeRuntime), sizeof(runtime)),
+                  hipSuccess);
+        for (auto **p : {&gate, &up, &down})
+        {
+            ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(p),
+                                experts * sizeof(DeviceMoEFloatingMatrixDesc)),
+                      hipSuccess);
+        }
+        graph.emplace(0, stream, "floating complete-domain descriptor publication only");
+        ASSERT_TRUE(hipMoE_materialize_runtime_floating_descriptor_tables(
+            nativeRuntime, gate, up, down, experts, format, 0, stream));
+        ASSERT_TRUE(graph->finishAndInstantiate());
+        for (int phase = 0; phase < 4; ++phase)
+        {
+            SCOPED_TRACE(phase);
+            runtime.active_bank = phase % 2;
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                const bool ready =
+                    phase == 0 || phase == 3 ||
+                    (phase == 1 && (expert == 255 || expert == 256 || expert == 257 ||
+                                    expert == 370 || expert == 511));
+                runtime.banks[runtime.active_bank].local_compute_mask[expert] = ready ? 1u : 0u;
+                runtime.banks[runtime.active_bank].resident_participant_mask[expert] =
+                    ready ? 1u : 0u;
+            }
+            ASSERT_EQ(hipMemcpyAsync(nativeRuntime, &runtime, sizeof(runtime),
+                                     hipMemcpyHostToDevice, stream),
+                      hipSuccess);
+            for (auto *p : {gate, up, down})
+            {
+                ASSERT_EQ(
+                    hipMemsetAsync(p, 0xa5, experts * sizeof(DeviceMoEFloatingMatrixDesc), stream),
+                    hipSuccess);
+            }
+            ASSERT_TRUE(graph->launch());
+            const std::array<const DeviceMoEFloatingMatrixDesc *, 3> roots{gate, up, down};
+            for (std::size_t role = 0; role < roots.size(); ++role)
+            {
+                ASSERT_EQ(hipMemcpyAsync(actual[role].data(), roots[role],
+                                         experts * sizeof(DeviceMoEFloatingMatrixDesc),
+                                         hipMemcpyDeviceToHost, stream),
+                          hipSuccess);
+            }
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                SCOPED_TRACE(expert);
+                const auto &bank = runtime.banks[runtime.active_bank];
+                const auto &d = bank.experts[expert];
+                const bool ready = bank.local_compute_mask[expert] != 0;
+                const std::array<DeviceMoEFloatingMatrixDesc, 3> expected{
+                    ready ? d.floating_gate : DeviceMoEFloatingMatrixDesc{},
+                    ready ? d.floating_up : DeviceMoEFloatingMatrixDesc{},
+                    ready ? d.floating_down : DeviceMoEFloatingMatrixDesc{}};
+                for (std::size_t role = 0; role < 3; ++role)
+                {
+                    EXPECT_EQ(actual[role][expert].data, expected[role].data);
+                    EXPECT_EQ(actual[role][expert].n, expected[role].n);
+                    EXPECT_EQ(actual[role][expert].k, expected[role].k);
+                }
+            }
+        }
+    }
+}
 TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptAllNativeVNNICodebooks)
 {
     SKIP_IF_NO_ROCM();
@@ -19733,11 +19953,13 @@ TEST(Test__ROCmMoEKernel,
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
-TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutTableRefresh)
+/** @brief Prove retained runtime materialization through actual grouped native projections.
+ * @tparam num_experts Complete runtime table extent; physical weight packs stay bounded at two. */
+template <int num_experts> void proveRuntimeDecodeGraphReplayCompleteDescriptors()
 {
     SKIP_IF_NO_ROCM();
 
-    constexpr int num_experts = 2;
+    constexpr int physical_weights = 2;
     constexpr int top_k = 1;
     constexpr int d_model = 128;
     constexpr int intermediate = 128;
@@ -19748,13 +19970,9 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
 
     ROCmMoEKernel moe_kernel(0);
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
-    auto moe_workspace = bindDefaultMoEWorkspace(
-        moe_kernel,
-        /*max_seq_len=*/1,
-        d_model,
-        intermediate,
-        num_experts,
-        top_k);
+    auto moe_workspace =
+        bindDefaultMoEWorkspace(moe_kernel,
+                                /*max_seq_len=*/1, d_model, intermediate, num_experts, top_k);
 
     std::vector<std::unique_ptr<TensorBase>> gate_weight_tensors;
     std::vector<std::unique_ptr<TensorBase>> up_weight_tensors;
@@ -19769,13 +19987,9 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
     auto add_kernel = [&](std::vector<std::unique_ptr<TensorBase>> &weights,
                           std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> &packed,
                           std::vector<std::unique_ptr<rocm::ROCmQuantisedGemmKernel>> &kernels,
-                          int rows,
-                          int cols,
-                          int seed)
-    {
+                          int rows, int cols, int seed) {
         auto weight = TestTensorFactory::createQ4_0Random(
-            {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-            static_cast<unsigned>(seed));
+            {static_cast<size_t>(rows), static_cast<size_t>(cols)}, static_cast<unsigned>(seed));
         auto packed_weight = std::make_unique<rocm::ROCmPackedWeights>();
         EXPECT_TRUE(rocm::packWeightsToROCm(weight.get(), *packed_weight))
             << "packWeightsToROCm failed for seed " << seed;
@@ -19786,18 +20000,18 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
         kernels.push_back(std::move(kernel));
     };
 
-    for (int expert = 0; expert < num_experts; ++expert)
+    for (int expert = 0; expert < physical_weights; ++expert)
     {
-        add_kernel(gate_weight_tensors, gate_packed_weights, gate_kernels,
-                   intermediate, d_model, 9100 + expert);
-        add_kernel(up_weight_tensors, up_packed_weights, up_kernels,
-                   intermediate, d_model, 9200 + expert);
-        add_kernel(down_weight_tensors, down_packed_weights, down_kernels,
-                   d_model, intermediate, 9300 + expert);
+        add_kernel(gate_weight_tensors, gate_packed_weights, gate_kernels, intermediate, d_model,
+                   9100 + expert);
+        add_kernel(up_weight_tensors, up_packed_weights, up_kernels, intermediate, d_model,
+                   9200 + expert);
+        add_kernel(down_weight_tensors, down_packed_weights, down_kernels, d_model, intermediate,
+                   9300 + expert);
     }
 
     WorkspaceRequirements gemm_reqs;
-    for (int expert = 0; expert < num_experts; ++expert)
+    for (int expert = 0; expert < physical_weights; ++expert)
     {
         gemm_reqs.merge(gate_kernels[expert]->getWorkspaceRequirements(1, intermediate, d_model));
         gemm_reqs.merge(up_kernels[expert]->getWorkspaceRequirements(1, intermediate, d_model));
@@ -19805,7 +20019,7 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
     }
     auto gemm_workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024 * 1024);
     ASSERT_TRUE(gemm_workspace->allocate(gemm_reqs));
-    for (int expert = 0; expert < num_experts; ++expert)
+    for (int expert = 0; expert < physical_weights; ++expert)
     {
         gate_kernels[expert]->bindWorkspace(gemm_workspace.get());
         up_kernels[expert]->bindWorkspace(gemm_workspace.get());
@@ -19820,9 +20034,12 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
     std::array<DeviceNativeVNNIMatrixDesc, num_experts> down_descs = {};
     for (int expert = 0; expert < num_experts; ++expert)
     {
-        ASSERT_TRUE(gate_kernels[expert]->exportNativeVNNIMatrixDesc(gate_descs[expert]));
-        ASSERT_TRUE(up_kernels[expert]->exportNativeVNNIMatrixDesc(up_descs[expert]));
-        ASSERT_TRUE(down_kernels[expert]->exportNativeVNNIMatrixDesc(down_descs[expert]));
+        ASSERT_TRUE(gate_kernels[expert % physical_weights]->exportNativeVNNIMatrixDesc(
+            gate_descs[expert]));
+        ASSERT_TRUE(
+            up_kernels[expert % physical_weights]->exportNativeVNNIMatrixDesc(up_descs[expert]));
+        ASSERT_TRUE(down_kernels[expert % physical_weights]->exportNativeVNNIMatrixDesc(
+            down_descs[expert]));
         ASSERT_EQ(gate_descs[expert].n, intermediate);
         ASSERT_EQ(gate_descs[expert].k, d_model);
         ASSERT_EQ(up_descs[expert].n, intermediate);
@@ -19834,12 +20051,19 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
         ASSERT_EQ(down_descs[expert].codebook_id, 0);
     }
 
-    const std::array<DeviceNativeVNNIMatrixDesc, num_experts> stale_gate_descs = {
-        gate_descs[0], gate_descs[0]};
-    const std::array<DeviceNativeVNNIMatrixDesc, num_experts> stale_up_descs = {
-        up_descs[0], up_descs[0]};
-    const std::array<DeviceNativeVNNIMatrixDesc, num_experts> stale_down_descs = {
-        down_descs[0], down_descs[0]};
+    std::array<DeviceNativeVNNIMatrixDesc, num_experts> stale_gate_descs{}, stale_up_descs{},
+        stale_down_descs{};
+    stale_gate_descs.fill(gate_descs[0]);
+    stale_up_descs.fill(up_descs[0]);
+    stale_down_descs.fill(down_descs[0]);
+    // Every selected nonzero expert below deliberately uses the second real
+    // source; the stale immutable table retains the first, distinguishable one.
+    for (int expert = 1; expert < num_experts; ++expert)
+    {
+        gate_descs[expert] = gate_descs[1];
+        up_descs[expert] = up_descs[1];
+        down_descs[expert] = down_descs[1];
+    }
 
     const int stale_gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
         stale_gate_descs.data(), stale_up_descs.data(), num_experts, d_model, intermediate);
@@ -19854,14 +20078,13 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
         down_descs.data(), num_experts, d_model, intermediate);
     ASSERT_GE(fresh_down_table, 0);
 
-    auto hidden = TestTensorFactory::createFP32Random(
-        {1, static_cast<size_t>(d_model)}, -0.5f, 0.5f, 9411);
+    auto hidden =
+        TestTensorFactory::createFP32Random({1, static_cast<size_t>(d_model)}, -0.5f, 0.5f, 9411);
     ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
 
     constexpr int expert_ids[top_k] = {1};
     constexpr float expert_weights[top_k] = {1.0f};
-    auto run_table_reference = [&](int gateup_table, int down_table, ITensor *output)
-    {
+    auto run_table_reference = [&](int gateup_table, int down_table, ITensor *output) {
         auto gate = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
         auto up = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
         ASSERT_TRUE(gate->ensureOnDevice(device, stream));
@@ -19873,11 +20096,11 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
         std::array<ITensor *, top_k> up_outputs = {up.get()};
 
         ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromTable(
-            hidden.get(), expert_ids, gateup_table, top_k,
-            gate_outputs.data(), up_outputs.data(), d_model, intermediate));
+            hidden.get(), expert_ids, gateup_table, top_k, gate_outputs.data(), up_outputs.data(),
+            d_model, intermediate));
         ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromTable(
-            gate_outputs.data(), up_outputs.data(), expert_ids, expert_weights,
-            down_table, top_k, output, d_model, intermediate));
+            gate_outputs.data(), up_outputs.data(), expert_ids, expert_weights, down_table, top_k,
+            output, d_model, intermediate));
     };
 
     auto stale_reference = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
@@ -19886,13 +20109,14 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
     run_table_reference(fresh_gateup_table, fresh_down_table, fresh_reference.get());
     ASSERT_TRUE(stale_reference->ensureOnHost(stream));
     ASSERT_TRUE(fresh_reference->ensureOnHost(stream));
-    ASSERT_GT(relativeL2Error(stale_reference->data(), fresh_reference->data(), static_cast<size_t>(d_model)), 0.01)
+    ASSERT_GT(relativeL2Error(stale_reference->data(), fresh_reference->data(),
+                              static_cast<size_t>(d_model)),
+              0.01)
         << "descriptor-table A/B reference must be distinguishable for this regression";
 
     auto make_runtime = [&](const DeviceNativeVNNIMatrixDesc &gate,
                             const DeviceNativeVNNIMatrixDesc &up,
-                            const DeviceNativeVNNIMatrixDesc &down)
-    {
+                            const DeviceNativeVNNIMatrixDesc &down) {
         DeviceMoELayerRuntime runtime{};
         runtime.active_bank = 0;
         runtime.active_epoch = 1;
@@ -19914,10 +20138,9 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
             desc.logical_expert_id = expert;
             desc.owner_participant = 0;
             desc.local_slot = expert;
-            desc.flags = toMoEExpertFlags(
-                DeviceMoEExpertFlags::Valid |
-                DeviceMoEExpertFlags::Resident |
-                DeviceMoEExpertFlags::LocalCompute);
+            desc.flags =
+                toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
+                                 DeviceMoEExpertFlags::LocalCompute);
             desc.gate = expert == 0 ? gate_descs[0] : gate;
             desc.up = expert == 0 ? up_descs[0] : up;
             desc.down = expert == 0 ? down_descs[0] : down;
@@ -19927,14 +20150,41 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
 
     const auto runtime_stale = make_runtime(gate_descs[0], up_descs[0], down_descs[0]);
     const auto runtime_fresh = make_runtime(gate_descs[1], up_descs[1], down_descs[1]);
+    auto replay_runtime = runtime_fresh;
+    std::vector<float> runtime_output_host(static_cast<size_t>(d_model));
 
     DeviceMoELayerRuntime *device_runtime = nullptr;
-    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
-    ASSERT_EQ(hipMemcpyAsync(device_runtime, &runtime_stale, sizeof(runtime_stale),
-                             hipMemcpyHostToDevice, stream),
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)),
               hipSuccess);
+    /** @brief Retire possible partial upload before its borrowed immutable host bank disappears. */
+    struct InitialRuntimeUploadRetirement
+    {
+        hipStream_t stream;
+        ~InitialRuntimeUploadRetirement() noexcept
+        {
+            if (hipStreamSynchronize(stream) != hipSuccess)
+                std::terminate();
+        }
+    };
+    {
+        InitialRuntimeUploadRetirement retirement{stream};
+        ASSERT_EQ(hipMemcpyAsync(device_runtime, &runtime_stale, sizeof(runtime_stale),
+                                 hipMemcpyHostToDevice, stream),
+                  hipSuccess);
+    }
 
     auto runtime_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    /** @brief Fence diagnostic replay before original weights, tensors and host backing retire. */
+    struct ReplayRetirement
+    {
+        hipStream_t stream;
+        bool active = true;
+        ~ReplayRetirement() noexcept
+        {
+            if (active && !isGraphCaptureActive() && hipStreamSynchronize(stream) != hipSuccess)
+                std::terminate();
+        }
+    } replayRetirement{stream};
     ASSERT_TRUE(runtime_output->ensureOnDevice(device, stream));
     ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRuntime(
         device_runtime, hidden.get(), stale_gateup_table, stale_down_table, top_k,
@@ -19951,42 +20201,32 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
          * later tests.  Keep the descriptor pointer outside the tensor ledger:
          * it is stable graph topology whose contents are published separately.
          */
-        ASSERT_NO_THROW(
-            TransferEngine::requireDeviceInput(hidden.get(), device, stream));
+        ASSERT_NO_THROW(TransferEngine::requireDeviceInput(hidden.get(), device, stream));
         int runtime_decode_stage_identity = 0;
         std::vector<GraphCaptureDependencyLedger::StagePlan> capture_stages = {{
             .stage_identity = &runtime_decode_stage_identity,
             .stage_name = "runtime_descriptor_grouped_decode",
-            .external_inputs = {
-                hidden->transferStorageOwner(),
-            },
-            .outputs = {
-                runtime_output->transferStorageOwner(),
-            },
+            .external_inputs =
+                {
+                    hidden->transferStorageOwner(),
+                },
+            .outputs =
+                {
+                    runtime_output->transferStorageOwner(),
+                },
         }};
-        GraphCaptureDependencyLedger capture_ledger(
-            device,
-            stream,
-            std::move(capture_stages),
-            "rocm_runtime_descriptor_grouped_decode");
+        GraphCaptureDependencyLedger capture_ledger(device, stream, std::move(capture_stages),
+                                                    "rocm_runtime_descriptor_grouped_decode");
         ScopedHipTestGraph graph(
-            /*device_ordinal=*/0,
-            stream,
-            "runtime descriptor grouped decode capture",
+            /*device_ordinal=*/0, stream, "runtime descriptor grouped decode capture",
             &capture_ledger);
+        ReplayRetirement graphRetirement{stream};
         bool captured = false;
         {
-            ScopedGraphCaptureStage stage_scope(
-                &runtime_decode_stage_identity);
+            ScopedGraphCaptureStage stage_scope(&runtime_decode_stage_identity);
             captured = moe_kernel.groupedExpertDecodeFromRuntime(
-                device_runtime,
-                hidden.get(),
-                stale_gateup_table,
-                stale_down_table,
-                top_k,
-                runtime_output.get(),
-                d_model,
-                intermediate,
+                device_runtime, hidden.get(), stale_gateup_table, stale_down_table, top_k,
+                runtime_output.get(), d_model, intermediate,
                 MoEDecodeDescriptorSource::RuntimePlacementTable);
             stage_scope.complete();
         }
@@ -19998,47 +20238,64 @@ TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutT
          * replay.  If a kernel embedded the stale host table instead of
          * loading the active device bank, the two references below diverge.
          */
-        ASSERT_EQ(
-            hipMemcpyAsync(
-                device_runtime,
-                &runtime_fresh,
-                sizeof(runtime_fresh),
-                hipMemcpyHostToDevice,
-                stream),
-            hipSuccess);
-        ASSERT_TRUE(graph.launch());
-        TransferEngine::publishDeviceWrite(
-            runtime_output.get(), device, stream);
+        const std::vector<int> selected = num_experts == 512
+                                              ? std::vector<int>{255, 256, 257, 370, 511, 256, 255}
+                                              : std::vector<int>{1};
+        for (const int expert : selected)
+        {
+            SCOPED_TRACE(expert);
+            replay_runtime = runtime_fresh;
+            replay_runtime.topk_expert_ids[0] = expert;
+            ASSERT_EQ(hipMemcpyAsync(device_runtime, &replay_runtime, sizeof(replay_runtime),
+                                     hipMemcpyHostToDevice, stream),
+                      hipSuccess);
+            // Poison only the already admitted named runtime table banks. Capture
+            // embeds the same pointers; every replay must republish their values.
+            for (const char *name : {MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                                     MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
+                                     MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE})
+            {
+                auto *ptr = moe_workspace->getBuffer(name);
+                ASSERT_NE(ptr, nullptr);
+                ASSERT_EQ(hipMemsetAsync(ptr, 0xa5, moe_workspace->getBufferSize(name), stream),
+                          hipSuccess);
+            }
+            ASSERT_TRUE(graph.launch());
+            TransferEngine::publishDeviceWrite(runtime_output.get(), device, stream);
 
-        std::vector<float> runtime_output_host(
-            static_cast<size_t>(d_model));
-        ASSERT_EQ(
-            hipMemcpyAsync(
-                runtime_output_host.data(),
-                runtime_output->gpu_data_ptr(),
-                runtime_output_host.size() * sizeof(float),
-                hipMemcpyDeviceToHost,
-                stream),
-            hipSuccess);
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(runtime_output_host.data(), runtime_output->gpu_data_ptr(),
+                                     runtime_output_host.size() * sizeof(float),
+                                     hipMemcpyDeviceToHost, stream),
+                      hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        expectStrictVerifierSimilarity(
-            "ROCm graph-replayed runtime decode must follow device runtime descriptors",
-            runtime_output_host.data(),
-            fresh_reference->data(),
-            static_cast<size_t>(d_model),
-            static_cast<size_t>(d_model));
-        EXPECT_GT(
-            relativeL2Error(
-                runtime_output_host.data(),
-                stale_reference->data(),
-                static_cast<size_t>(d_model)),
-            0.01)
-            << "graph replay followed the stale descriptor table instead of device runtime descriptors";
+            expectStrictVerifierSimilarity(
+                "ROCm graph-replayed runtime decode must follow device runtime descriptors",
+                runtime_output_host.data(), fresh_reference->data(), static_cast<size_t>(d_model),
+                static_cast<size_t>(d_model));
+            EXPECT_GT(relativeL2Error(runtime_output_host.data(), stale_reference->data(),
+                                      static_cast<size_t>(d_model)),
+                      0.01)
+                << "graph replay followed the stale descriptor table instead of device runtime "
+                   "descriptors";
+        }
     }
 
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    replayRetirement.active = false;
     EXPECT_EQ(hipFree(device_runtime), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST(Test__ROCmMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutTableRefresh)
+{
+    proveRuntimeDecodeGraphReplayCompleteDescriptors<2>();
+}
+
+/** @test All512 runtime descriptors are reachable through retained production grouped decode. */
+TEST(Test__ROCmMoEKernel, RuntimeDecode512ExpertsCapturedUpperHalfDescriptors)
+{
+    proveRuntimeDecodeGraphReplayCompleteDescriptors<512>();
 }
 
 TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures)
@@ -28867,4 +29124,130 @@ TEST(Test__ROCmMoEKernel, PreparedHalfRouterCapturesWithoutEagerWarmup)
         }
         kernel.unbindWorkspace();
     }
+}
+
+/**
+ * @brief Captured controller must rank expert511 with256 physical workers.
+ *
+ * Replay high-half, low-half, empty and high-half histories through one graph.
+ * Every setup publishes independent input state; no expected plan is repaired
+ * by the host. Dirty plan bytes outside the authenticated command prefix must
+ * survive, proving expert capacity does not become a live command extent.
+ */
+TEST(Test__ROCmMoEKernel, DeviceRebalanceCaptured512ExpertHighHalfAndDirtyReplay)
+{
+    SKIP_IF_NO_ROCM();
+    hipStream_t stream_ = nullptr;
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    ASSERT_EQ(hipStreamCreate(&stream_), hipSuccess);
+    ROCmMoEKernel gpuKernel(0);
+    static_cast<llaminar2::IMoEKernel &>(gpuKernel).setGPUStream(stream_);
+    {
+    using namespace llaminar2;
+    constexpr uint32_t experts = moe_runtime_abi::kMaxExperts;
+    constexpr uint32_t planCapacity = 8u;
+    static_assert(experts > 256u);
+    DeviceMoERuntimeTable::Config tableConfig;
+    tableConfig.device_id = DeviceId::rocm(0);
+    tableConfig.num_layers = 1;
+    tableConfig.num_experts = experts;
+    tableConfig.top_k = 2;
+    tableConfig.mirror_to_device = true;
+    DeviceMoERuntimeTable runtimeTable(tableConfig);
+    auto update = makeParticipantOneBaseUpdate(1);
+    const auto prototype = update.experts[0];
+    update.expert_count = experts;
+    update.experts.assign(experts, prototype);
+    update.local_compute_mask.assign(experts, 0u);
+    update.replica_role.assign(experts, static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+    update.resident_participant_mask.assign(experts, 0b001u);
+    for (uint32_t expert = 0; expert < experts; ++expert)
+        update.experts[expert].logical_expert_id = expert;
+    ASSERT_TRUE(runtimeTable.prepareInactiveBank(0, update));
+    ASSERT_TRUE(runtimeTable.flipActiveBank(0, update.epoch, stream_));
+    DeviceMoELayerRuntime prior{};
+    ASSERT_EQ(hipMemcpyAsync(&prior, runtimeTable.deviceLayerState(0), sizeof(prior),
+                              hipMemcpyDeviceToHost, stream_), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = experts;
+    config.top_k = 2;
+    config.participant_id = 1;
+    config.participant_count = 3;
+    config.window_size_tokens = 1;
+    config.max_hot_replicas_per_participant = 1;
+    config.flags = static_cast<uint32_t>(DeviceMoERebalanceFlags::HotReplicaCache) |
+                   static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals) |
+                   static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+    const auto control = makeControllerDueOnNextBoundary(config);
+    std::vector<uint64_t> gathered(config.participant_count * experts, 0u);
+    HipAllocation histStorage(gathered.size() * sizeof(uint64_t));
+    HipAllocation statusStorage(sizeof(DeviceMoERebalanceStatus));
+    HipAllocation planStorage(planCapacity * sizeof(DeviceMoERebalancePlanEntry));
+    HipAllocation countStorage(sizeof(uint32_t));
+    HipAllocation headerStorage(sizeof(DeviceMoERebalanceCommandBufferHeader));
+    HipAllocation waveStorage(sizeof(DeviceMoERebalanceWaveState));
+    HipAllocation controlStorage(sizeof(control));
+    auto *hist = static_cast<uint64_t *>(histStorage.get());
+    auto *status = static_cast<DeviceMoERebalanceStatus *>(statusStorage.get());
+    auto *plan = static_cast<DeviceMoERebalancePlanEntry *>(planStorage.get());
+    auto *count = static_cast<uint32_t *>(countStorage.get());
+    auto *header = static_cast<DeviceMoERebalanceCommandBufferHeader *>(headerStorage.get());
+    auto *wave = static_cast<DeviceMoERebalanceWaveState *>(waveStorage.get());
+    auto *deviceControl = static_cast<DeviceMoERebalanceGraphControllerState *>(controlStorage.get());
+    ScopedHipTestGraph graph(0, stream_, "512-expert controller high-half replay");
+    ASSERT_TRUE(gpuKernel.runDeviceRebalanceController(
+        moeLaunchContext(stream_), runtimeTable.deviceLayerState(0), hist, status, config,
+        plan, count, planCapacity, 1u, header, wave, deviceControl));
+    ASSERT_TRUE(graph.finishAndInstantiate());
+
+    for (const int winner : {static_cast<int>(experts - 1u), 0, -1,
+                             static_cast<int>(experts - 1u)})
+    {
+        SCOPED_TRACE(winner);
+        std::fill(gathered.begin(), gathered.end(), 0u);
+        if (winner >= 0) gathered[winner] = 8u;
+        ASSERT_EQ(hipMemcpyAsync(runtimeTable.deviceLayerState(0), &prior, sizeof(prior),
+                                  hipMemcpyHostToDevice, stream_), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(hist, gathered.data(), gathered.size() * sizeof(uint64_t),
+                                  hipMemcpyHostToDevice, stream_), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(deviceControl, &control, sizeof(control),
+                                  hipMemcpyHostToDevice, stream_), hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(plan, 0xa5, planCapacity * sizeof(*plan), stream_), hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(status, 0xa5, sizeof(*status), stream_), hipSuccess);
+        ASSERT_TRUE(graph.launch());
+        uint32_t live = UINT32_MAX;
+        DeviceMoERebalanceCommandBufferHeader observedHeader;
+        DeviceMoERebalanceStatus observedStatus;
+        std::array<DeviceMoERebalancePlanEntry, planCapacity> observedPlan;
+        ASSERT_EQ(hipMemcpyAsync(&live, count, sizeof(live), hipMemcpyDeviceToHost, stream_), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(&observedHeader, header, sizeof(observedHeader), hipMemcpyDeviceToHost, stream_), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(&observedStatus, status, sizeof(observedStatus), hipMemcpyDeviceToHost, stream_), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(observedPlan.data(), plan, sizeof(observedPlan), hipMemcpyDeviceToHost, stream_), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+        const uint32_t expected = winner >= 0 ? 1u : 0u;
+        ASSERT_EQ(live, expected);
+        EXPECT_EQ(observedHeader.command_count, expected);
+        EXPECT_EQ(observedHeader.command_capacity, planCapacity);
+        EXPECT_EQ(observedStatus.planned_arrivals, expected);
+        EXPECT_EQ(observedStatus.payload_bucket_requested_slots, expected);
+        EXPECT_EQ(observedStatus.payload_source_participant_mask, expected ? 0b001u : 0u);
+        EXPECT_EQ(observedStatus.payload_destination_participant_mask, expected ? 0b010u : 0u);
+        if (expected)
+        {
+            EXPECT_EQ(observedPlan[0].expert, static_cast<uint32_t>(winner));
+            EXPECT_EQ(observedPlan[0].op, static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival));
+            EXPECT_EQ(observedPlan[0].source_participant, 0u);
+            EXPECT_EQ(observedPlan[0].destination_participant, 1u);
+            EXPECT_EQ(observedPlan[0].destination_slot, 0u);
+            EXPECT_EQ(observedPlan[0].payload_slot, 0u);
+        }
+        const auto *bytes = reinterpret_cast<const uint8_t *>(observedPlan.data());
+        for (size_t i = expected * sizeof(*plan); i < sizeof(observedPlan); ++i)
+            ASSERT_EQ(bytes[i], 0xa5u) << "inactive command byte=" << i;
+    }
+    }
+    ASSERT_EQ(hipStreamDestroy(stream_), hipSuccess);
 }

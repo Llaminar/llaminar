@@ -576,12 +576,13 @@ namespace llaminar2
                 return false;
             };
 
-            // Bind mmap pages to the target NUMA node before pre-faulting.
-            // This ensures all page-cache pages allocated for this mapping
-            // land on the correct NUMA node, avoiding cross-socket bandwidth
-            // penalties for memory-bandwidth-bound GEMV decode.
-            if (numa_bind &&
-                prefault_policy != PrefaultPolicy::DemandPaged)
+            // Authenticate the requested NUMA node and install its VMA policy
+            // for eager and demand-paged mappings alike. Clean file-backed
+            // reads still share Linux's page cache: their physical placement
+            // follows faulting-task/system policy and any existing cached pages,
+            // not a VMA-locality guarantee from mbind. Binding must not imply
+            // whole-file prefault or let an invalid node bypass validation.
+            if (numa_bind)
             {
                 if (numa_available() < 0)
                 {
@@ -637,7 +638,8 @@ namespace llaminar2
                 }
             }
 
-            if (numa_bind)
+            if (numa_bind &&
+                prefault_policy != PrefaultPolicy::DemandPaged)
             {
                 // Explicit parallel first-touch: OMP threads inherit the process's
                 // cpu-set binding (e.g. cores 28-55 for cpu:1), so page faults from
@@ -668,10 +670,10 @@ namespace llaminar2
             {
                 if (!eager_populate)
                 {
-                    // Demand-paged device staging and sparse expert selection
-                    // must not request whole-file prefault or prefetch. mbind,
-                    // when requested, still governs pages faulted by exact
-                    // selections without reading every unrelated tensor.
+                    // Demand-paged staging and selected source reads must not
+                    // request whole-file prefault or prefetch. VMA/node policy
+                    // validation does not certify shared file-cache placement
+                    // and never reads unselected tensor pages.
                     ::madvise(base, file_size, MADV_SEQUENTIAL);
                 }
                 else

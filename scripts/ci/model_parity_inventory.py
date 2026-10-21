@@ -164,6 +164,53 @@ class InventoryScope(str, Enum):
         return self == InventoryScope.ALL or record["e2e"] is not None
 
 
+def model_source_fields(record: dict) -> dict[str, str]:
+    """Read explicit GGUF source roles without guessing filenames or MTP mode."""
+    sources = {"model": record.get("model")}
+    if "shared_predictor" in record:
+        sources["shared_predictor"] = record["shared_predictor"]
+    if any(not isinstance(path, str) or not path for path in sources.values()):
+        raise ValueError("canonical cell has an invalid explicit GGUF source")
+    return sources
+
+
+def map_predictor_source(record: dict, transform) -> dict:
+    """Remap the explicit predictor and its typed argv without changing policies.
+
+    The caller supplies the admitted staging/mount/portable mapping. This
+    helper makes no source selection or allocation decision, and rejects a
+    foreign argument before a consumer can launch model materialization.
+    """
+    source = model_source_fields(record).get("shared_predictor")
+    result = json.loads(json.dumps(record))
+    # These are the producer-owned execution argv surfaces. Request bodies
+    # and user/tool JSON are data and must never be interpreted as CLI policy.
+    surfaces = [(result.get("runtime"), "server_args"),
+                (result.get("e2e"), "server_args"),
+                (result.get("benchmark"), "args"),
+                (result.get("diagnostic_benchmark"), "args")]
+    surfaces += [(scenario, "server_policy_args") for scenario in result.get("cross_host_e2e", [])]
+    for owner, key in surfaces:
+        if not isinstance(owner, dict) or key not in owner:
+            continue
+        args = owner[key]
+        if not isinstance(args, list):
+            raise ValueError("canonical execution argv must be a list")
+        positions = [i for i, item in enumerate(args) if item == "--mtp-model"]
+        if source is None:
+            if positions:
+                raise ValueError("canonical argv selected an undeclared shared predictor")
+        elif (len(positions) != 1 or positions[0] + 1 >= len(args)
+              or not isinstance(args[positions[0] + 1], str)
+              or Path(args[positions[0] + 1]).resolve() != Path(source).resolve()):
+            raise ValueError("canonical argv selected a foreign shared predictor")
+        else:
+            args[positions[0] + 1] = transform(source)
+    if source is not None:
+        result["shared_predictor"] = transform(source)
+    return result
+
+
 def parse_parameters(output: str) -> dict[str, dict]:
     """Read complete typed parameters; console output can truncate these values."""
     records = {}
@@ -175,6 +222,8 @@ def parse_parameters(output: str) -> dict[str, dict]:
             record = json.loads(test["value_param"])
             if record.get("model_parity_schema") != 1:
                 raise ValueError(f"unsupported parameter schema: {exact}")
+            if "shared_predictor" in record:
+                model_source_fields(record)
             InventoryScope.ALL.accepts(record)
             if exact in records:
                 raise ValueError(f"duplicate parameter: {exact}")
@@ -228,8 +277,9 @@ def discover(args: argparse.Namespace, scope: InventoryScope) -> list[tuple[pari
             record = row["configuration"]
             if record.get("model_parity_schema") != 1 or not declared.accepts(record):
                 raise ValueError(f"invalid configuration in {declared.value} manifest: {exact}")
-            if record.get("model") not in row.get("model_files", []):
-                raise ValueError(f"canonical manifest omitted the declared model: {exact}")
+            if any(path not in row.get("model_files", [])
+                   for path in model_source_fields(record).values()):
+                raise ValueError(f"canonical manifest omitted a declared GGUF source: {exact}")
             if (scope.accepts(record) and re.fullmatch(args.backend, row["backends"])
                     and re.fullmatch(args.campaign, row["campaign"])
                     and re.fullmatch(args.cell, exact)):
@@ -238,21 +288,27 @@ def discover(args: argparse.Namespace, scope: InventoryScope) -> list[tuple[pari
                     model_files=tuple(row["model_files"]))
                 selected.append((campaign, exact, record))
     else:
-        # Audit the complete registration for every binary we inspect. Applying
-        # selectors before this join would hide cells silently dropped by a
-        # broken CTest name parser, even when GoogleTest still contains them.
+        # CTest membership chooses which binaries can contain the requested
+        # cells. An exact diagnostic must not initialize unrelated matrices.
+        # Still audit the complete registration of each chosen binary below,
+        # including siblings excluded by the cell/backend/campaign selectors;
+        # otherwise a filtered diagnostic could conceal a dropped CTest case.
         registered = parity.discover_campaigns(args.build_dir)
         registered_by_binary = {}
+        registered_names = set()
         for campaign in registered:
             names = registered_by_binary.setdefault(matrix_binary(campaign), set())
-            if names.intersection(campaign.gtest_cases):
-                raise ValueError(f"duplicate canonical CTest cell in {campaign.name}")
-            names.update(campaign.gtest_cases)
+            for exact in campaign.gtest_cases:
+                if exact in registered_names:
+                    raise ValueError(f"duplicate canonical CTest cell in {campaign.name}: {exact}")
+                registered_names.add(exact)
+                names.add(exact)
         campaigns = [campaign for campaign in registered
                      if re.fullmatch(args.backend, campaign.group.backends)
-                     and re.fullmatch(args.campaign, campaign.name)]
+                     and re.fullmatch(args.campaign, campaign.name)
+                     and any(re.fullmatch(args.cell, exact)
+                             for exact in campaign.gtest_cases)]
         inventories = {}
-        seen = set()
         for campaign in campaigns:
             binary = matrix_binary(campaign)
             if binary not in inventories:
@@ -273,28 +329,26 @@ def discover(args: argparse.Namespace, scope: InventoryScope) -> list[tuple[pari
                                      f"unregistered={sorted(actual - expected)} "
                                      f"missing_from_binary={sorted(expected - actual)}")
             for exact in campaign.gtest_cases:
-                if exact in seen:
-                    raise ValueError(f"duplicate canonical CTest cell: {exact}")
-                seen.add(exact)
                 if exact not in inventories[binary]:
                     raise ValueError(f"stale CTest registration, rebuild {binary}: {exact}")
                 record = inventories[binary][exact]
                 if not scope.accepts(record) or not re.fullmatch(args.cell, exact):
                     continue
-                matches = [path for path in campaign.model_files if Path(record["model"]).samefile(path)]
-                if not matches:
-                    raise ValueError(f"model is not in the canonical GGUF manifest: {exact}")
-                # One aggregate can contain a fine-tune as well as its base
-                # model. Retain only this cell's model and complete split set.
-                model_campaign = dataclasses.replace(campaign, model_files=(matches[0],))
+                # Keep the target and explicit predictor together, including
+                # MTP-off controls. Both use the same admitted shard/identity
+                # authority; unrelated model families remain excluded.
+                source_matches = {}
+                for role, source in model_source_fields(record).items():
+                    matches = [path for path in campaign.model_files if Path(source).samefile(path)]
+                    if not matches:
+                        raise ValueError(f"{role} is not in the canonical GGUF manifest: {exact}")
+                    source_matches[role] = matches[0]
+                model_campaign = dataclasses.replace(campaign, model_files=tuple(source_matches.values()))
                 model_campaign = dataclasses.replace(model_campaign, model_files=tuple(
                     str(path) for path in parity.selected_model_files([model_campaign])))
-                # Shard expansion resolves symlinks. The model field must use
-                # that same spelling, or our exported manifest would reject its
-                # own model even though both paths name identical file bytes.
-                primary = next(path for path in model_campaign.model_files
-                               if Path(path).samefile(matches[0]))
-                record = {**record, "model": primary}
+                # Shard expansion resolves mount aliases for every source role.
+                record = {**record, **{role: next(path for path in model_campaign.model_files
+                          if Path(path).samefile(source)) for role, source in source_matches.items()}}
                 selected.append((model_campaign, exact, record))
     if not selected:
         raise ValueError(f"no {scope.value} canonical cells selected")

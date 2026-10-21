@@ -363,6 +363,8 @@ namespace llaminar2
         void disableSnapshotCapture() override;
         void clearSnapshots() override;
         const float *getSnapshot(const std::string &key, size_t &out_size) const override;
+        /** @brief Return the immutable typed snapshot; integer values never enter the float adapter. */
+        SnapshotInfo getSnapshotWithShape(const std::string &key) const override;
         std::vector<std::string> getSnapshotKeys() const override;
 
         // =====================================================================

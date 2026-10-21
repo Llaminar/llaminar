@@ -28,6 +28,7 @@
 #include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
 #include "execution/moe/MoEOverlayRetainedParentComposer.h"
 #include "memory/BufferArena.h"
+#include "memory/StageBufferContract.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
 #include "tensors/Tensors.h"
@@ -1398,6 +1399,153 @@ TEST(Test__PipelineForwardEdges, MTPForwardsEncloseEveryRootAndLeaf)
     }
 }
 
+/**
+ * @test Request-admitted scalar forwards own exact native activation edges.
+ *
+ * Restored-prefix continuation enters the same complete scalar forward as
+ * history decode. Its input token and local KV position stay participant-owned;
+ * no condition/verifier metadata broadcast or generation-parent edge is added.
+ */
+TEST(Test__PipelineForwardEdges, NativeHistoryScalarEnclosesExactActivationEdges)
+{
+    for (const bool cuda : {false, true})
+    {
+        llaminar2::test::MockLocalTPContext transport;
+        std::vector<GlobalDeviceAddress> devices;
+        for (int index = 0; index < 3; ++index)
+            devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                cuda ? DeviceId::cuda(index) : DeviceId::rocm(index)));
+        transport.setDevices(devices);
+        transport.setBackend(cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        FP32Tensor hidden({16, 32});
+        int32_t rows[3]{}; // Token, local cached count and immutable position snapshot.
+        auto *backend = reinterpret_cast<IBackend *>(rows);
+        for (int participant = 0; participant < 3; ++participant)
+        for (const auto intent : {ForwardGraphSubmissionIntent::Execute,
+                                 ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch})
+        {
+            const auto device = devices[participant].toLocalDeviceId();
+            PipelineForwardGraphEdges edges(transport, participant, hidden, 32);
+            ForwardInput input;
+            input.device=device; input.seq_len=1;
+            input.execution_role=ForwardExecutionRole::MainInference;
+            input.execution_phase=ForwardExecutionPhase::Decode;
+            input.graph_submission_intent=intent;
+            input.token_ids_device=rows;
+            input.position_ids_device=rows+2;
+            input.device_decode_position=DeviceDecodePositionBinding{backend,rows+1,rows+2};
+            input.external_hidden_state=participant ? &hidden : nullptr;
+            ASSERT_TRUE(edges.encloses(input));
+            ComputeGraph graph;
+            for (const auto *name : {"branch_a", "branch_b"})
+                graph.addNode(name,std::make_unique<llaminar2::testing::MockComputeStage>(),device);
+            ASSERT_NO_THROW(edges.append(graph,input));
+            EXPECT_EQ(graph.getNode("pipeline_mtp_rows"),nullptr);
+            if (participant)
+            {
+                const auto *receive=graph.getNode("pipeline_activation_receive");
+                ASSERT_NE(receive,nullptr);
+                EXPECT_EQ(receive->stage->estimatedMemoryBytes(),32u*sizeof(float));
+                // Use the executor's real frontier classifier: cold receive
+                // storage is an output, never stale external model input.
+                const auto receive_contract=receive->stage->bufferContract();
+                ASSERT_EQ(receive_contract.outputs.size(),1u);
+                EXPECT_EQ(receive_contract.outputs.front().id,BufferId::HIDDEN_STATE);
+                ASSERT_EQ(receive_contract.writesRequiringPrepare().size(),1u);
+                GraphArenaDependencyTracker frontier;
+                EXPECT_TRUE(frontier.observeStage(receive_contract).empty());
+                const auto norm_contract=StageBufferContract::build().addInput(BufferId::HIDDEN_STATE);
+                EXPECT_TRUE(frontier.observeStage(norm_contract).empty());
+                GraphArenaDependencyTracker omitted_receive;
+                EXPECT_EQ(omitted_receive.observeStage(norm_contract).size(),1u);
+                EXPECT_EQ(graph.getRootNodes(),std::vector<std::string>{"pipeline_activation_receive"});
+                for (const auto *name : {"branch_a","branch_b"})
+                    EXPECT_EQ(graph.getNode(name)->dependencies,std::vector<std::string>{"pipeline_activation_receive"});
+            }
+            else EXPECT_EQ(graph.getNode("pipeline_activation_receive"),nullptr);
+            if (participant<2)
+            {
+                const auto *send=graph.getNode("pipeline_activation_send");
+                ASSERT_NE(send,nullptr);
+                EXPECT_EQ(send->stage->estimatedMemoryBytes(),32u*sizeof(float));
+                auto dependencies=send->dependencies;
+                std::sort(dependencies.begin(),dependencies.end());
+                EXPECT_EQ(dependencies,(std::vector<std::string>{"branch_a","branch_b"}));
+                EXPECT_EQ(graph.getLeafNodes(),std::vector<std::string>{"pipeline_activation_send"});
+            }
+            else EXPECT_EQ(graph.getNode("pipeline_activation_send"),nullptr);
+        }
+    }
+}
+
+/** @test Only an exact setup-only native resident child can delegate activation edges. */
+TEST(Test__PipelineForwardEdges, NativeParentOwnershipCannotBypassHistoryReceive)
+{
+    for (const bool cuda : {false,true})
+    {
+        llaminar2::test::MockLocalTPContext transport;
+        const auto head=cuda?DeviceId::cuda(0):DeviceId::rocm(0);
+        const auto tail=cuda?DeviceId::cuda(1):DeviceId::rocm(1);
+        transport.setDevices({GlobalDeviceAddress::fromLocalDeviceId(head),GlobalDeviceAddress::fromLocalDeviceId(tail)});
+        transport.setBackend(cuda?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL);
+        FP32Tensor hidden({16,32});int32_t rows[3]{};
+        for (const int participant : {0,1})
+        {
+            PipelineForwardGraphEdges edges(transport,participant,hidden,32);
+            ForwardInput input;
+            input.device=participant?tail:head;input.seq_len=1;
+            input.execution_phase=ForwardExecutionPhase::Decode;
+            input.token_ids_device=rows;input.position_ids_device=rows+2;
+            input.device_decode_position=DeviceDecodePositionBinding{reinterpret_cast<IBackend *>(rows),rows+1,rows+2};
+            input.external_hidden_state=participant?&hidden:nullptr;
+            input.graph_submission_intent=ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            input.pipeline_activation_ownership=ForwardPipelineActivationOwnership::NativeGenerationParent;
+            EXPECT_FALSE(edges.encloses(input));
+            ComputeGraph graph;
+            graph.addNode("model",std::make_unique<llaminar2::testing::MockComputeStage>(),input.device);
+            EXPECT_THROW(edges.append(graph,input),std::invalid_argument);
+            EXPECT_EQ(graph.getRootNodes(),std::vector<std::string>{"model"});
+            EXPECT_EQ(graph.getLeafNodes(),std::vector<std::string>{"model"});
+            const auto reject=[&](auto change) {
+                auto invalid=input;change(invalid);
+                EXPECT_THROW((void)edges.encloses(invalid),std::invalid_argument);
+            };
+            reject([](auto &v){v.graph_submission_intent=ForwardGraphSubmissionIntent::Execute;});
+            reject([](auto &v){v.execution_role=ForwardExecutionRole::MTPCondition;});
+            reject([](auto &v){v.execution_phase=ForwardExecutionPhase::Prefill;});
+            reject([](auto &v){v.state_transaction=ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;});
+            reject([](auto &v){v.seq_len=2;});
+            reject([](auto &v){v.batch_size=2;});
+            reject([](auto &v){v.device_decode_position.reset();});
+            reject([&](auto &v){v.sequence_lengths_device=rows+1;});
+            reject([](auto &v){v.token_ids_device=nullptr;});
+            reject([](auto &v){v.position_ids_device=nullptr;});
+            reject([](auto &v){v.device_decode_position->backend=nullptr;});
+            reject([&](auto &v){v.device_decode_position->position=rows;});
+            reject([&](auto &v){v.token_ids=rows;});
+            reject([](auto &v){v.device_prefill_chunk.emplace();});
+            reject([](auto &v){v.pipeline_activation_ownership=static_cast<ForwardPipelineActivationOwnership>(255);});
+        }
+    }
+}
+
+/** @test Transport ownership and the original frozen edge owner are complete capture identity. */
+TEST(Test__ForwardGraphSignature, PipelineActivationOwnershipIsExactCaptureIdentity)
+{
+    int32_t identities[2]{};
+    ForwardGraphSignature invocation;
+    invocation.device=DeviceId::cuda(0);invocation.seq_len=invocation.batch_size=1;
+    invocation.decode=true;invocation.pipeline_forward_edges=identities;
+    auto parent=invocation;
+    parent.pipeline_activation_ownership=ForwardPipelineActivationOwnership::NativeGenerationParent;
+    EXPECT_NE(invocation,parent);
+    EXPECT_NE(ForwardGraphSignatureHash{}(invocation),ForwardGraphSignatureHash{}(parent));
+    auto foreign=parent;foreign.pipeline_forward_edges=identities+1;
+    EXPECT_NE(parent,foreign);
+    EXPECT_NE(ForwardGraphSignatureHash{}(parent),ForwardGraphSignatureHash{}(foreign));
+    EXPECT_EQ(parent,parent);
+}
+
 /** @test Only followers may own complete local pre-verifier rollback bindings. */
 TEST(Test__PipelineForwardEdges, FollowerCheckpointCannotBeMissingPartialOrTerminalOwned)
 {
@@ -2082,7 +2230,6 @@ TEST(Test__ForwardGraphCache, DefaultState)
     EXPECT_TRUE(cache.token_ids.empty());
     EXPECT_TRUE(cache.position_ids.empty());
     EXPECT_TRUE(cache.collective_nodes.empty());
-    EXPECT_FALSE(cache.pp_needs_copy);
     EXPECT_FALSE(cache.dynamic_param_stages_cached);
     EXPECT_FALSE(cache.gpu_stream_applied);
     EXPECT_FALSE(cache.phase3_active);
@@ -2167,8 +2314,6 @@ TEST(Test__ForwardGraphCache, InvalidateResetsAllFields)
     cache.token_ids = {1, 2, 3};
     cache.position_ids = {0, 1, 2};
     cache.collective_nodes = {"allreduce_0", "allreduce_1"};
-    cache.pp_needs_copy = true;
-    cache.pp_copy_bytes = 1024;
     cache.dynamic_param_stages_cached = true;
     cache.gpu_stream_applied = true;
     cache.phase3_active = true;
@@ -2182,8 +2327,6 @@ TEST(Test__ForwardGraphCache, InvalidateResetsAllFields)
     EXPECT_TRUE(cache.token_ids.empty());
     EXPECT_TRUE(cache.position_ids.empty());
     EXPECT_TRUE(cache.collective_nodes.empty());
-    EXPECT_FALSE(cache.pp_needs_copy);
-    EXPECT_EQ(cache.pp_copy_bytes, 0u);
     EXPECT_FALSE(cache.dynamic_param_stages_cached);
     EXPECT_FALSE(cache.gpu_stream_applied);
     EXPECT_FALSE(cache.phase3_active);

@@ -110,7 +110,7 @@ namespace llaminar2
         const auto *automatic = std::get_if<AutomaticOrchestrationRequest>(&intent);
         if (!automatic || !evaluate)
             throw std::invalid_argument("Automatic selection requires automatic intent and a cost evaluator");
-        if (request.model_path != source.path())
+        if (request.model_path != source.path() || request.shared_predictor != source.predictorSource())
             throw std::invalid_argument("Automatic selection model does not name its retained metadata source");
         workload.requireFitsContext(request.max_seq_len);
         if (automatic->options().workload && *automatic->options().workload != workload)

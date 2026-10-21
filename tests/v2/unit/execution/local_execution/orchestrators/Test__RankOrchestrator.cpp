@@ -14,6 +14,8 @@
  * publications independently of a model schema's default partial-sum layout.
  * Main host output capacity is checked independently of context length; the
  * all-position verifier owns a separate, explicitly requested output surface.
+ * Resident-condition regressions also prove that diagnostic host logits belong
+ * to the completed forward, while device-only execution performs no gather.
  */
 
 #include <gmock/gmock.h>
@@ -50,8 +52,24 @@
 #include <memory>
 #include <stdexcept>
 #include <utility>
+#include <type_traits>
 
 using namespace llaminar2;
+
+/** @test Native rank addresses stay stable while unique ownership remains transferable. */
+TEST(RankOrchestratorOwnershipContract, NativeOwnerHasStableAddress)
+{
+    static_assert(!std::is_copy_constructible_v<RankOrchestrator>);
+    static_assert(!std::is_copy_assignable_v<RankOrchestrator>);
+    static_assert(!std::is_move_constructible_v<RankOrchestrator>);
+    static_assert(!std::is_move_assignable_v<RankOrchestrator>);
+    static_assert(std::is_move_constructible_v<std::unique_ptr<RankOrchestrator>>);
+    static_assert(std::is_move_assignable_v<std::unique_ptr<RankOrchestrator>>);
+    EXPECT_FALSE(std::is_move_constructible_v<RankOrchestrator>);
+    EXPECT_FALSE(std::is_move_assignable_v<RankOrchestrator>);
+    EXPECT_TRUE(std::is_move_constructible_v<std::unique_ptr<RankOrchestrator>>);
+    EXPECT_TRUE(std::is_move_assignable_v<std::unique_ptr<RankOrchestrator>>);
+}
 
 struct ForwardMTPRendezvous
 {
@@ -10770,6 +10788,17 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         /** @brief Publish the declared sharded or replicated producer bytes. */
         void publishSnapshots(bool decode)
         {
+            std::vector<float> logits(8);
+            for (size_t column = 0; column < logits.size(); ++column)
+                logits[column] = float((decode ? advances * 100 : 0) + column + 1);
+            set_mock_logits(logits);
+            if (!replicated_)
+            {
+                const size_t width = logits.size() / degree_;
+                set_mock_logits_local(static_cast<int>(width),
+                    std::vector<float>(logits.begin() + participant_ * width,
+                                       logits.begin() + (participant_ + 1) * width));
+            }
             const bool replicas=decode&&replicated_;
             for (const auto &stage:stages_)
             {
@@ -10829,8 +10858,21 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t,int slot,MTPConditionForwardPurpose) override
         { return complete(ready_&&slot==0); }
+        /** @brief Count explicit host observations of a replicated vocabulary. */
+        const float *logits() const override
+        {
+            ++host_observations;
+            return MockDeviceGraphOrchestrator::logits();
+        }
+        /** @brief Count explicit host observations of an actual vocabulary shard. */
+        LogitsLocalInfo consumeLogitsLocalInfoForHostGather() override
+        {
+            ++host_observations;
+            return getLogitsLocalInfo();
+        }
         bool advance_ok=true;
         int advances=0;
+        mutable int host_observations=0;
     private:
         /** @brief Publish snapshots only when this real child transaction succeeds. */
         bool complete(bool valid)
@@ -10850,21 +10892,25 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
     for (const int degree:{2,4})
     for (const bool replicated:{false,true})
     for (const int route:{0,1,2,3,4})
+    for (const bool observe_decode:{false,true})
     {
         SCOPED_TRACE(::testing::Message()<<static_cast<int>(backend)<<"/TP"<<degree
-                     <<"/replicated="<<replicated<<"/route="<<route);
+                     <<"/replicated="<<replicated<<"/route="<<route
+                     <<"/observe_decode="<<observe_decode);
         RankOrchestrator::Config config;
         std::vector<std::unique_ptr<IInferenceRunner>> children;
         std::vector<Participant *> participants;
         for (int index=0;index<degree;++index)
         {
             auto child=std::make_unique<Participant>(stages,index,degree,replicated);
+            child->set_vocab_size(8);
             child->set_primary_device_id(backend==DeviceType::CUDA?DeviceId::cuda(index):DeviceId::rocm(index));
             participants.push_back(child.get());children.push_back(std::move(child));
             config.devices.push_back(backend==DeviceType::CUDA?GlobalDeviceAddress::cuda(index):GlobalDeviceAddress::rocm(index));
             config.weights.push_back(1.f/degree);
         }
         auto model=llaminar2::test::MockModelContext::createMinimal();
+        model->setVocabSize(8);
         model->setArchitecture("qwen35moe");model->setHeadCountKV(4);
         model->mockLoader().setIntParam("qwen35moe.ssm.group_count",4);
         model->mockLoader().setIntParam("qwen35moe.ssm.time_step_rank",8);
@@ -10877,7 +10923,21 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         MockLocalTPContext::Config tp;tp.devices=config.devices;tp.weights=config.weights;
         auto rank=RankOrchestrator::createForTest(model,std::move(children),
             std::make_unique<MockLocalTPContext>(tp),config);
-        rank->setSkipLogitsGatherPrefill(true);rank->setSkipLogitsGatherDecode(true);
+        rank->setSkipLogitsGatherPrefill(false);
+        rank->setSkipLogitsGatherDecode(!observe_decode);
+        const auto verify_logits = [&](int offset)
+        {
+            const float *logits = rank->logits();
+            ASSERT_NE(logits, nullptr);
+            for (int column = 0; column < 8; ++column)
+                EXPECT_FLOAT_EQ(logits[column], float(offset + column + 1));
+        };
+        const auto observation_count = [&]()
+        {
+            int count = 0;
+            for (const auto *child : participants) count += child->host_observations;
+            return count;
+        };
         const auto verify=[&](bool decode)
         {
             for (const auto &stage:stages)
@@ -10904,12 +10964,24 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         };
         const int token=42;
         for (auto *child:participants) child->publishSnapshots(false);
-        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);
+        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);verify_logits(0);
+        const int prefill_observations = observation_count();
         ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));
-        verify(false); // First forced token is pending; no main row was forwarded.
-        ASSERT_FALSE(advance(-1));verify(false);
+        verify(false);verify_logits(0); // Pending input has not forwarded a row.
+        ASSERT_FALSE(advance(-1));verify(false);verify_logits(0);
+        EXPECT_EQ(observation_count(), prefill_observations);
         for (auto *child:participants) EXPECT_EQ(child->advances,0);
         ASSERT_TRUE(advance(0));verify(true);
+        if (observe_decode)
+        {
+            verify_logits(100);
+            EXPECT_EQ(observation_count(), prefill_observations + (replicated ? 1 : degree));
+        }
+        else
+        {
+            EXPECT_THROW(rank->logits(), std::logic_error);
+            EXPECT_EQ(observation_count(), prefill_observations);
+        }
         for (auto *child:participants) EXPECT_EQ(child->advances,1);
         if (replicated)
         {
@@ -10922,10 +10994,26 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ResidentMainConditionPublishesDecodePh
         // Reset into explicit one-token prefill, then fail every actual child
         // advance: no successful completion means no new phase publication.
         for (auto *child:participants) child->publishSnapshots(false);
-        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);
-        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));verify(false);
+        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify(false);verify_logits(0);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));verify(false);verify_logits(0);
         for (auto *child:participants) child->advance_ok=false;
         EXPECT_FALSE(advance(0));verify(false);
+        EXPECT_THROW(rank->logits(), std::logic_error)
+            << "A failed participant transaction must retire the preceding host row";
+        // Partial success is equally terminal: a mixture of old and new shards
+        // cannot be published as one complete vocabulary.
+        for (auto *child:participants)
+        {
+            child->publishSnapshots(false);
+            child->advance_ok=true;
+        }
+        ASSERT_TRUE(rank->forwardPrefill(&token,1));verify_logits(0);
+        ASSERT_TRUE(rank->publishForcedDeviceResidentConditionToken(token,0));
+        participants.back()->advance_ok=false;
+        const int observations_before_failure=observation_count();
+        EXPECT_FALSE(advance(0));
+        EXPECT_THROW(rank->logits(), std::logic_error);
+        EXPECT_EQ(observation_count(), observations_before_failure);
     }
 }
 

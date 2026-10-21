@@ -23,6 +23,7 @@
  */
 
 #include "GDNRecurrenceStage.h"
+#include "kernels/common/CPURequestStateBankView.h"
 #include "GDNSpeculativeWorkspaceContract.h"
 #include "../../../kernels/IKVCache.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -467,6 +468,41 @@ namespace llaminar2
             .bytes = static_cast<size_t>(verifier_capture_state_size_bound_) *
                      sizeof(float),
         };
+    }
+
+    bool GDNRecurrenceStage::planCPUVerifierStateRestoreRows(const int *rows,int requests,
+        std::vector<CPUVerifierStateRestorePlan> &plans)
+    {
+        if(params_.device_id.is_gpu() || !rows || requests<=0 || requests!=params_.request_count ||
+            !hasVerifierStateCapture() || !ensureVerifierStateCaptureWorkspaceBound())return false;
+        if(requests==1)return IComputeStage::planCPUVerifierStateRestoreRows(rows,requests,plans);
+        auto *owner=dynamic_cast<ICPURequestStateBankView *>(params_.kernel);
+        if(!owner || !params_.recurrence_state)return false;
+        const auto bank=owner->cpuRequestStateBankView();
+        const auto *capture=cpuVerifierStateCaptureWorkspace();
+        const int stride=params_.request_seq_len;
+        if(!capture || stride<=0 || !bank.contains(requests,bank.stateElements) ||
+            verifier_capture_state_size_bound_<bank.stateElements ||
+            (params_.request_seq_lens_host && params_.request_seq_lens_host->size()!=std::size_t(requests)))return false;
+        // Only address metadata is borrowed from the current owner. No shared
+        // backend workspace is rebound, and every request is checked before
+        // the publisher can write any accepted state or clear capture bindings.
+        for(int request=0;request<requests;++request) {
+            const int row=rows[request];
+            const int live=params_.request_seq_lens_host ? (*params_.request_seq_lens_host)[request] : stride;
+            const auto first=std::int64_t(request)*stride;
+            if(live<0 || live>stride || (row>=0 && (row<first || row>=first+live || row>=verifier_capture_rows_bound_)))return false;
+            if(row<0)continue;
+            const auto bytes=std::size_t(bank.stateElements)*sizeof(float);
+            auto *destination=bank.storage.data()+std::size_t(request)*bank.stateElements;
+            const auto *selected=capture+std::size_t(row)*verifier_capture_state_size_bound_;
+            plans.push_back({.status=CPUVerifierStateRestorePlanStatus::Ready,
+                .destination=destination,.source=selected,.bytes=bytes});
+            if(request==0 && params_.recurrence_state!=destination)
+                plans.push_back({.status=CPUVerifierStateRestorePlanStatus::Ready,
+                    .destination=params_.recurrence_state,.source=selected,.bytes=bytes});
+        }
+        return true;
     }
 
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRow(int row, void *stream)

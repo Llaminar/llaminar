@@ -121,7 +121,7 @@ namespace
      */
     constexpr int kCanonicalMoEOutputTileColumns = 256;
     constexpr int kMaxExperts = 1024;
-    constexpr int kDeviceMoEMaxExperts = 256;
+    constexpr int kDeviceMoEMaxExperts = llaminar2::moe_runtime_abi::kMaxExperts;
     constexpr uint32_t kDeviceMoEMaxTransferSlots = 0x7fffffffu;
     constexpr int kDeviceMoESmallGroupMaxSlots = 64;
     /**
@@ -3730,6 +3730,15 @@ namespace
         }
     }
 
+    // Expert capacity is a logical reduction width, not a physical CTA size.
+    // Two fixed candidate stripes retain the 512-entry tree within the proven
+    // 256-thread register budget on every shipped CUDA architecture.
+    constexpr uint32_t kRebalanceControllerThreads = 256u;
+    // The unchanged first tree level needs one worker per leaf pair. If the
+    // expert ABI grows again, its comparison level must become strided too.
+    static_assert(kDeviceMoEMaxExperts / 2u <= kRebalanceControllerThreads);
+    static_assert((kDeviceMoEMaxExperts & (kDeviceMoEMaxExperts - 1u)) == 0u);
+
     /**
      * @brief Plan one captured device-owned rebalance transaction.
      *
@@ -3740,7 +3749,8 @@ namespace
      *         lifetime from the production LLEP kernel.
      */
     template <bool LeastLoadedAssignment>
-    __global__ void device_rebalance_controller_kernel(
+    __global__ __launch_bounds__(kRebalanceControllerThreads)
+    void device_rebalance_controller_kernel(
         DeviceMoELayerRuntimeView *runtime_layers,
         const unsigned long long *gathered_histograms,
         DeviceMoERebalanceStatusView *status,
@@ -5079,213 +5089,220 @@ namespace
                 if (shared_stop_rank != 0u)
                     break;
 
-                uint32_t candidate_expert = static_cast<uint32_t>(kDeviceMoEMaxExperts);
-                unsigned long long candidate_value = 0ULL;
-                unsigned long long candidate_count = 0ULL;
-                unsigned long long candidate_improvement = 0ULL;
-                uint32_t candidate_arrival_considered = 0u;
-                uint32_t candidate_arrival_below_floor = 0u;
-                if (lane < config.num_experts)
+                // Each thread publishes disjoint logical experts; the barrier
+                // remains outside both stripes and the 512-leaf tree is unchanged.
+                for (uint32_t candidate_lane = lane;
+                     candidate_lane < static_cast<uint32_t>(kDeviceMoEMaxExperts);
+                     candidate_lane += blockDim.x)
                 {
-                    bool already_selected = false;
-                    for (uint32_t i = 0; i < shared_selected_count; ++i)
+                    uint32_t candidate_expert = static_cast<uint32_t>(kDeviceMoEMaxExperts);
+                    unsigned long long candidate_value = 0ULL;
+                    unsigned long long candidate_count = 0ULL;
+                    unsigned long long candidate_improvement = 0ULL;
+                    uint32_t candidate_arrival_considered = 0u;
+                    uint32_t candidate_arrival_below_floor = 0u;
+                    if (candidate_lane < config.num_experts)
                     {
-                        if (shared_selected[i] == lane)
+                        bool already_selected = false;
+                        for (uint32_t i = 0; i < shared_selected_count; ++i)
                         {
-                            already_selected = true;
-                            break;
-                        }
-                    }
-                    if (!already_selected)
-                    {
-                        const DeviceMoEExpertDescriptorView &candidate_desc =
-                            next.experts[lane];
-                        uint32_t candidate_resident_mask =
-                            next.resident_participant_mask[lane] & valid_mask;
-                        const uint32_t candidate_physical_source_mask =
-                            shared_physical_source_resident_mask[lane] & valid_mask;
-                        const bool candidate_can_affect =
-                            domain_root_planning
-                                ? rebalance_candidate_can_affect_domain_compute(
-                                      candidate_desc,
-                                      candidate_resident_mask,
-                                      config,
-                                      plan_missing_arrivals)
-                                : rebalance_candidate_can_affect_local_compute(
-                                      candidate_desc,
-                                      candidate_resident_mask,
-                                      config,
-                                      participant_bit,
-                                      plan_missing_arrivals);
-                        if (candidate_can_affect)
-                        {
-                            const unsigned long long count =
-                                rebalance_global_count(gathered_histograms, config, window_index, lane);
-                            if (count > 0ULL)
+                            if (shared_selected[i] == candidate_lane)
                             {
-                                const bool candidate_local_resident =
-                                    (candidate_resident_mask & participant_bit) != 0u;
-                                const bool candidate_owner_local =
-                                    candidate_desc.owner_participant ==
-                                    static_cast<int32_t>(config.participant_id);
-                                if (domain_root_planning)
+                                already_selected = true;
+                                break;
+                            }
+                        }
+                        if (!already_selected)
+                        {
+                            const DeviceMoEExpertDescriptorView &candidate_desc =
+                                next.experts[candidate_lane];
+                            uint32_t candidate_resident_mask =
+                                next.resident_participant_mask[candidate_lane] & valid_mask;
+                            const uint32_t candidate_physical_source_mask =
+                                shared_physical_source_resident_mask[candidate_lane] & valid_mask;
+                            const bool candidate_can_affect =
+                                domain_root_planning
+                                    ? rebalance_candidate_can_affect_domain_compute(
+                                          candidate_desc,
+                                          candidate_resident_mask,
+                                          config,
+                                          plan_missing_arrivals)
+                                    : rebalance_candidate_can_affect_local_compute(
+                                          candidate_desc,
+                                          candidate_resident_mask,
+                                          config,
+                                          participant_bit,
+                                          plan_missing_arrivals);
+                            if (candidate_can_affect)
+                            {
+                                const unsigned long long count =
+                                    rebalance_global_count(gathered_histograms, config, window_index, candidate_lane);
+                                if (count > 0ULL)
                                 {
-                                    if (shared_required_load_spread_improvement != 0ULL &&
-                                        count < shared_required_load_spread_improvement)
+                                    const bool candidate_local_resident =
+                                        (candidate_resident_mask & participant_bit) != 0u;
+                                    const bool candidate_owner_local =
+                                        candidate_desc.owner_participant ==
+                                        static_cast<int32_t>(config.participant_id);
+                                    if (domain_root_planning)
                                     {
-                                        atomicAdd(&shared_count_bound_prunes, 1u);
-                                    }
-                                    else
-                                    {
-                                        const auto destination_choice =
-                                            llaminar2::moe_rebalance_policy::bestDynamicMissingResidentDestination(
-                                                shared_current_policy_load,
-                                                count,
-                                                candidate_resident_mask,
-                                                config.participant_count,
-                                                candidate_desc.owner_participant,
-                                                shared_destination_replica_counts,
-                                                max_local_replicas,
-                                                config.window_size_tokens,
-                                                config.min_load_spread_improvement,
-                                                config.min_load_spread_improvement_divisor);
-                                        candidate_arrival_considered = 1u;
-                                        candidate_improvement = destination_choice.delta.improvement;
-                                        const int source_participant =
-                                            destination_choice.valid
-                                                ? rebalance_first_resident_participant(
-                                                      candidate_physical_source_mask,
-                                                      config.participant_count,
-                                                      candidate_desc.owner_participant,
-                                                      static_cast<int>(destination_choice.destination_participant))
-                                                : -1;
-                                        const bool destination_has_transfer_slot =
-                                            destination_choice.valid &&
-                                            destination_choice.destination_participant < kDeviceMoEMaxParticipants &&
-                                            shared_destination_transfer_slot_counts[
-                                                destination_choice.destination_participant] < payload_slot_capacity;
-                                        const bool source_has_payload_slot =
-                                            source_participant >= 0 &&
-                                            static_cast<uint32_t>(source_participant) < kDeviceMoEMaxParticipants &&
-                                            shared_source_payload_slot_counts[
-                                                static_cast<uint32_t>(source_participant)] < payload_slot_capacity;
-                                        const bool source_is_physically_resident =
-                                            source_participant >= 0 &&
-                                            static_cast<uint32_t>(source_participant) < config.participant_count &&
-                                            (candidate_physical_source_mask &
-                                             runtime_participant_bit(source_participant)) != 0u;
-                                        const auto source_delta =
-                                            source_is_physically_resident
-                                                ? llaminar2::moe_rebalance_policy::evaluateAddingResidentDynamicSpread(
-                                                      shared_current_policy_load,
-                                                      count,
-                                                      candidate_resident_mask,
-                                                      destination_choice.proposed_resident_mask,
-                                                      config.participant_count,
-                                                      static_cast<uint32_t>(source_participant),
-                                                      destination_choice.destination_participant,
-                                                      config.window_size_tokens,
-                                                      config.min_load_spread_improvement,
-                                                      config.min_load_spread_improvement_divisor)
-                                                : llaminar2::moe_rebalance_policy::LoadSpreadDelta{};
-                                        candidate_improvement = source_delta.improvement;
-                                        if (destination_choice.valid &&
-                                            destination_has_transfer_slot &&
-                                            source_has_payload_slot &&
-                                            source_is_physically_resident &&
-                                            source_delta.meets_floor)
+                                        if (shared_required_load_spread_improvement != 0ULL &&
+                                            count < shared_required_load_spread_improvement)
                                         {
-                                            candidate_value = source_delta.improvement;
-                                            candidate_count = count;
-                                            candidate_expert = lane;
-                                        }
-                                        else if ((candidate_resident_mask & (candidate_resident_mask - 1u)) == 0u)
-                                        {
-                                            candidate_arrival_below_floor = 1u;
+                                            atomicAdd(&shared_count_bound_prunes, 1u);
                                         }
                                         else
                                         {
-                                            candidate_value = count;
-                                            candidate_count = count;
-                                            candidate_expert = lane;
-                                        }
-                                    }
-                                }
-                                else if (plan_missing_arrivals &&
-                                    !candidate_local_resident &&
-                                    !candidate_owner_local)
-                                {
-                                    if (shared_required_load_spread_improvement != 0ULL &&
-                                        count < shared_required_load_spread_improvement)
-                                    {
-                                        atomicAdd(&shared_count_bound_prunes, 1u);
-                                    }
-                                    else
-                                    {
-                                        const int source_participant =
-                                            rebalance_first_resident_participant(
-                                                candidate_resident_mask,
-                                                config.participant_count,
-                                                candidate_desc.owner_participant,
-                                                static_cast<int>(config.participant_id));
-                                        const uint32_t proposed_resident_mask =
-                                            (candidate_resident_mask | participant_bit) & valid_mask;
-	                                        const auto delta =
-	                                            source_participant >= 0
-	                                                ? llaminar2::moe_rebalance_policy::evaluateAddingResidentDynamicSpread(
-	                                                      shared_current_policy_load,
-	                                                      count,
-	                                                      candidate_resident_mask,
-	                                                      proposed_resident_mask,
-	                                                      config.participant_count,
-	                                                      static_cast<uint32_t>(source_participant),
-	                                                      config.participant_id,
-	                                                      config.window_size_tokens,
-	                                                      config.min_load_spread_improvement,
-	                                                      config.min_load_spread_improvement_divisor)
-	                                                : llaminar2::moe_rebalance_policy::LoadSpreadDelta{};
-                                        candidate_arrival_considered = 1u;
-                                        candidate_improvement = delta.improvement;
-                                        if (!delta.meets_floor)
-                                        {
-                                            candidate_arrival_below_floor = 1u;
-                                        }
-                                        else
-                                        {
+                                            const auto destination_choice =
+                                                llaminar2::moe_rebalance_policy::bestDynamicMissingResidentDestination(
+                                                    shared_current_policy_load,
+                                                    count,
+                                                    candidate_resident_mask,
+                                                    config.participant_count,
+                                                    candidate_desc.owner_participant,
+                                                    shared_destination_replica_counts,
+                                                    max_local_replicas,
+                                                    config.window_size_tokens,
+                                                    config.min_load_spread_improvement,
+                                                    config.min_load_spread_improvement_divisor);
+                                            candidate_arrival_considered = 1u;
+                                            candidate_improvement = destination_choice.delta.improvement;
+                                            const int source_participant =
+                                                destination_choice.valid
+                                                    ? rebalance_first_resident_participant(
+                                                          candidate_physical_source_mask,
+                                                          config.participant_count,
+                                                          candidate_desc.owner_participant,
+                                                          static_cast<int>(destination_choice.destination_participant))
+                                                    : -1;
+                                            const bool destination_has_transfer_slot =
+                                                destination_choice.valid &&
+                                                destination_choice.destination_participant < kDeviceMoEMaxParticipants &&
+                                                shared_destination_transfer_slot_counts[
+                                                    destination_choice.destination_participant] < payload_slot_capacity;
                                             const bool source_has_payload_slot =
                                                 source_participant >= 0 &&
                                                 static_cast<uint32_t>(source_participant) < kDeviceMoEMaxParticipants &&
                                                 shared_source_payload_slot_counts[
                                                     static_cast<uint32_t>(source_participant)] < payload_slot_capacity;
-                                            if (config.participant_id < kDeviceMoEMaxParticipants &&
-                                                shared_destination_transfer_slot_counts[config.participant_id] <
-                                                    payload_slot_capacity &&
-                                                source_has_payload_slot)
+                                            const bool source_is_physically_resident =
+                                                source_participant >= 0 &&
+                                                static_cast<uint32_t>(source_participant) < config.participant_count &&
+                                                (candidate_physical_source_mask &
+                                                 runtime_participant_bit(source_participant)) != 0u;
+                                            const auto source_delta =
+                                                source_is_physically_resident
+                                                    ? llaminar2::moe_rebalance_policy::evaluateAddingResidentDynamicSpread(
+                                                          shared_current_policy_load,
+                                                          count,
+                                                          candidate_resident_mask,
+                                                          destination_choice.proposed_resident_mask,
+                                                          config.participant_count,
+                                                          static_cast<uint32_t>(source_participant),
+                                                          destination_choice.destination_participant,
+                                                          config.window_size_tokens,
+                                                          config.min_load_spread_improvement,
+                                                          config.min_load_spread_improvement_divisor)
+                                                    : llaminar2::moe_rebalance_policy::LoadSpreadDelta{};
+                                            candidate_improvement = source_delta.improvement;
+                                            if (destination_choice.valid &&
+                                                destination_has_transfer_slot &&
+                                                source_has_payload_slot &&
+                                                source_is_physically_resident &&
+                                                source_delta.meets_floor)
                                             {
-                                                candidate_value = delta.improvement;
+                                                candidate_value = source_delta.improvement;
                                                 candidate_count = count;
-                                                candidate_expert = lane;
+                                                candidate_expert = candidate_lane;
+                                            }
+                                            else if ((candidate_resident_mask & (candidate_resident_mask - 1u)) == 0u)
+                                            {
+                                                candidate_arrival_below_floor = 1u;
+                                            }
+                                            else
+                                            {
+                                                candidate_value = count;
+                                                candidate_count = count;
+                                                candidate_expert = candidate_lane;
                                             }
                                         }
                                     }
-                                }
-                                else
-                                {
-                                    candidate_value = count;
-                                    candidate_count = count;
-                                    candidate_expert = lane;
+                                    else if (plan_missing_arrivals &&
+                                        !candidate_local_resident &&
+                                        !candidate_owner_local)
+                                    {
+                                        if (shared_required_load_spread_improvement != 0ULL &&
+                                            count < shared_required_load_spread_improvement)
+                                        {
+                                            atomicAdd(&shared_count_bound_prunes, 1u);
+                                        }
+                                        else
+                                        {
+                                            const int source_participant =
+                                                rebalance_first_resident_participant(
+                                                    candidate_resident_mask,
+                                                    config.participant_count,
+                                                    candidate_desc.owner_participant,
+                                                    static_cast<int>(config.participant_id));
+                                            const uint32_t proposed_resident_mask =
+                                                (candidate_resident_mask | participant_bit) & valid_mask;
+                                                const auto delta =
+                                                    source_participant >= 0
+                                                        ? llaminar2::moe_rebalance_policy::evaluateAddingResidentDynamicSpread(
+                                                              shared_current_policy_load,
+                                                              count,
+                                                              candidate_resident_mask,
+                                                              proposed_resident_mask,
+                                                              config.participant_count,
+                                                              static_cast<uint32_t>(source_participant),
+                                                              config.participant_id,
+                                                              config.window_size_tokens,
+                                                              config.min_load_spread_improvement,
+                                                              config.min_load_spread_improvement_divisor)
+                                                        : llaminar2::moe_rebalance_policy::LoadSpreadDelta{};
+                                            candidate_arrival_considered = 1u;
+                                            candidate_improvement = delta.improvement;
+                                            if (!delta.meets_floor)
+                                            {
+                                                candidate_arrival_below_floor = 1u;
+                                            }
+                                            else
+                                            {
+                                                const bool source_has_payload_slot =
+                                                    source_participant >= 0 &&
+                                                    static_cast<uint32_t>(source_participant) < kDeviceMoEMaxParticipants &&
+                                                    shared_source_payload_slot_counts[
+                                                        static_cast<uint32_t>(source_participant)] < payload_slot_capacity;
+                                                if (config.participant_id < kDeviceMoEMaxParticipants &&
+                                                    shared_destination_transfer_slot_counts[config.participant_id] <
+                                                        payload_slot_capacity &&
+                                                    source_has_payload_slot)
+                                                {
+                                                    candidate_value = delta.improvement;
+                                                    candidate_count = count;
+                                                    candidate_expert = candidate_lane;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    else
+                                    {
+                                        candidate_value = count;
+                                        candidate_count = count;
+                                        candidate_expert = candidate_lane;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                shared_candidate_values[lane] = candidate_value;
-                shared_candidate_counts[lane] = candidate_count;
-                shared_candidate_improvements[lane] = candidate_improvement;
-                shared_candidate_experts[lane] = candidate_expert;
-                shared_candidate_arrival_considered[lane] = candidate_arrival_considered;
-                shared_candidate_arrival_below_floor[lane] = candidate_arrival_below_floor;
+                    shared_candidate_values[candidate_lane] = candidate_value;
+                    shared_candidate_counts[candidate_lane] = candidate_count;
+                    shared_candidate_improvements[candidate_lane] = candidate_improvement;
+                    shared_candidate_experts[candidate_lane] = candidate_expert;
+                    shared_candidate_arrival_considered[candidate_lane] = candidate_arrival_considered;
+                    shared_candidate_arrival_below_floor[candidate_lane] = candidate_arrival_below_floor;
+                }
                 __syncthreads();
 
                 if (leader)
@@ -5918,47 +5935,19 @@ namespace
 
             uint32_t command_count =
                 plan_count ? ((*plan_count < plan_capacity) ? *plan_count : plan_capacity) : 0u;
-            uint32_t requested_by_source[kDeviceMoEMaxParticipants] = {};
-            uint32_t requested_payload_slots = 0u;
-            uint32_t payload_source_participant_mask = 0u;
-            uint32_t payload_destination_participant_mask = 0u;
-            uint64_t payload_edge_mask = 0ULL;
-            if (plan_entries)
+            llaminar2::moe_rebalance_policy::PayloadPlanDemand payload_demand;
+            for (uint32_t i = 0; plan_entries && i < command_count; ++i)
             {
-                for (uint32_t i = 0; i < command_count; ++i)
-                {
-                    const auto &plan = plan_entries[i];
-                    if (rebalance_plan_requires_payload(plan.op) &&
-                        plan.source_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                        plan.destination_participant < config.participant_count &&
-                        plan.destination_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                        plan.payload_slot != kDeviceMoEInvalidSlot)
-                    {
-                        const uint32_t requested = plan.payload_slot + 1u;
-                        if (requested_by_source[plan.source_participant] < requested)
-                            requested_by_source[plan.source_participant] = requested;
-                        payload_source_participant_mask |=
-                            llaminar2::moe_rebalance_policy::participantBit(
-                                plan.source_participant);
-                        payload_destination_participant_mask |=
-                            llaminar2::moe_rebalance_policy::participantBit(
-                                plan.destination_participant);
-                        payload_edge_mask |=
-                            llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
-                                plan.source_participant,
-                                plan.destination_participant,
-                                static_cast<uint32_t>(kDeviceMoEMaxParticipants));
-                    }
-                }
-                for (uint32_t participant = 0;
-                     participant < config.participant_count &&
-                     participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants);
-                     ++participant)
-                {
-                    if (requested_by_source[participant] > requested_payload_slots)
-                        requested_payload_slots = requested_by_source[participant];
-                }
+                const auto &plan = plan_entries[i];
+                llaminar2::moe_rebalance_policy::accumulatePayloadPlanDemand(
+                    payload_demand, plan.op, plan.source_participant,
+                    plan.destination_participant, plan.payload_slot,
+                    config.participant_count);
             }
+            uint32_t requested_payload_slots = payload_demand.requested_slots;
+            uint32_t payload_source_participant_mask = payload_demand.source_mask;
+            uint32_t payload_destination_participant_mask = payload_demand.destination_mask;
+            uint64_t payload_edge_mask = payload_demand.edge_mask;
             uint32_t payload_bucket_slots =
                 llaminar2::moe_rebalance_policy::payloadBucketSlots(
                     requested_payload_slots,
@@ -6910,44 +6899,19 @@ namespace
 
             uint32_t command_count =
                 plan_count ? ((*plan_count < plan_capacity) ? *plan_count : plan_capacity) : 0u;
-            uint32_t requested_by_source[kDeviceMoEMaxParticipants] = {};
-            uint32_t requested_payload_slots = 0u;
-            uint32_t payload_source_participant_mask = 0u;
-            uint32_t payload_destination_participant_mask = 0u;
-            uint64_t payload_edge_mask = 0ULL;
+            llaminar2::moe_rebalance_policy::PayloadPlanDemand payload_demand;
             for (uint32_t i = 0; plan_entries && i < command_count; ++i)
             {
                 const auto &plan = plan_entries[i];
-                if (rebalance_plan_requires_payload(plan.op) &&
-                    plan.source_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                    plan.destination_participant < config.participant_count &&
-                    plan.destination_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
-                    plan.payload_slot != kDeviceMoEInvalidSlot)
-                {
-                    const uint32_t requested = plan.payload_slot + 1u;
-                    if (requested_by_source[plan.source_participant] < requested)
-                        requested_by_source[plan.source_participant] = requested;
-                    payload_source_participant_mask |=
-                        llaminar2::moe_rebalance_policy::participantBit(
-                            plan.source_participant);
-                    payload_destination_participant_mask |=
-                        llaminar2::moe_rebalance_policy::participantBit(
-                            plan.destination_participant);
-                    payload_edge_mask |=
-                        llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
-                            plan.source_participant,
-                            plan.destination_participant,
-                            static_cast<uint32_t>(kDeviceMoEMaxParticipants));
-                }
+                llaminar2::moe_rebalance_policy::accumulatePayloadPlanDemand(
+                    payload_demand, plan.op, plan.source_participant,
+                    plan.destination_participant, plan.payload_slot,
+                    config.participant_count);
             }
-            for (uint32_t participant = 0;
-                 participant < config.participant_count &&
-                 participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants);
-                 ++participant)
-            {
-                if (requested_by_source[participant] > requested_payload_slots)
-                    requested_payload_slots = requested_by_source[participant];
-            }
+            uint32_t requested_payload_slots = payload_demand.requested_slots;
+            uint32_t payload_source_participant_mask = payload_demand.source_mask;
+            uint32_t payload_destination_participant_mask = payload_demand.destination_mask;
+            uint64_t payload_edge_mask = payload_demand.edge_mask;
             uint32_t payload_bucket_slots =
                 llaminar2::moe_rebalance_policy::payloadBucketSlots(
                     requested_payload_slots,
@@ -15470,9 +15434,10 @@ namespace
     /**
      * @brief Materialize descriptor tables and the stable local active list.
      *
-     * Every lane in the block must call this function. Descriptor publication
-     * reads one immutable placement-bank entry per expert, while active-list
-     * publication consumes the grouped counts produced earlier on the same
+     * Every lane in the block must call this function. Ascending block-sized
+     * chunks cover the complete expert domain even when it exceeds the launch
+     * width. Descriptor publication reads one immutable bank entry per expert,
+     * while active-list publication consumes grouped counts produced on the
      * stream or, in the fused small-M kernel, earlier in the same block. An
      * active expert without a ready local descriptor is a fatal lifecycle
      * violation because the immediately following grouped GEMM cannot execute
@@ -15559,76 +15524,88 @@ namespace
             return;
         }
 
-        const int expert = static_cast<int>(threadIdx.x);
         const DeviceMoEPlacementBankView &bank =
             runtime_placement_banks(runtime)[execution_bank];
         const uint32_t local_bit =
             runtime_participant_bit(static_cast<int>(runtime->participant_id));
-        const bool local_ready = publish_runtime_expert_descriptors_lane(
-            bank,
-            local_bit,
-            expert,
-            num_experts,
-            gate_descs,
-            up_descs,
-            down_descs,
-            expected_format,
-            expected_projections);
+        if (publish_active_experts)
+            initialize_active_expert_compaction(scratch.active_experts);
 
-        // Descriptor-only decode publication is complete at this point. This
-        // branch is uniform and cannot strand a lane at a collective barrier.
-        if (!publish_active_experts)
-            return;
-
-        const int count = expert < num_experts
-                              ? runtime->expert_counts[expert]
-                              : 0;
-        const bool is_active = count > 0;
-        if (threadIdx.x == 0)
-            scratch.first_invalid_expert = num_experts;
-        __syncthreads();
-        if (is_active && !local_ready)
-            atomicMin(&scratch.first_invalid_expert, expert);
-        __syncthreads();
-
-        if (scratch.first_invalid_expert < num_experts)
+        // The block width is a launch/resource choice, never the logical
+        // expert capacity. Keep compaction state across ascending chunks so
+        // later experts retain the same stable ordinal order as a serial scan.
+        for (int chunk = 0; chunk < num_experts;
+             chunk += static_cast<int>(blockDim.x))
         {
-            if (threadIdx.x == 0)
-            {
-                const int invalid_expert = scratch.first_invalid_expert;
-                const DeviceMoEExpertDescriptorView &desc =
-                    bank.experts[invalid_expert];
-                printf("runtime_prefill_active_expert_not_ready "
-                       "participant=%u expert=%d count=%d execution_bank=%u "
-                       "local_mask=%u resident_mask=%u local_bit=%u "
-                       "local_slot=%d logical=%d owner=%d\\n",
-                       runtime->participant_id,
-                       invalid_expert,
-                       runtime->expert_counts[invalid_expert],
-                       execution_bank,
-                       bank.local_compute_mask[invalid_expert],
-                       bank.resident_participant_mask[invalid_expert],
-                       local_bit,
-                       desc.local_slot,
-                       desc.logical_expert_id,
-                       desc.owner_participant);
-                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
-                    "runtime active expert is not locally resident and compute-ready");
-            }
-            return;
-        }
+            const int expert = chunk + static_cast<int>(threadIdx.x);
+            const bool local_ready = publish_runtime_expert_descriptors_lane(
+                bank,
+                local_bit,
+                expert,
+                num_experts,
+                gate_descs,
+                up_descs,
+                down_descs,
+                expected_format,
+                expected_projections);
 
-        initialize_active_expert_compaction(scratch.active_experts);
-        compact_active_expert_chunk(
-            is_active,
-            expert,
-            max_active_experts,
-            active_expert_ids,
-            scratch.active_experts);
-        pad_active_expert_list(
-            active_expert_ids,
-            max_active_experts,
-            scratch.active_experts);
+            // Descriptor-only decode still owes every later expert chunk. The
+            // branch is uniform and skips only active-list collective work.
+            if (!publish_active_experts)
+                continue;
+
+            const int count = expert < num_experts
+                                  ? runtime->expert_counts[expert]
+                                  : 0;
+            const bool is_active = count > 0;
+            if (threadIdx.x == 0)
+                scratch.first_invalid_expert = num_experts;
+            __syncthreads();
+            if (is_active && !local_ready)
+                atomicMin(&scratch.first_invalid_expert, expert);
+            __syncthreads();
+
+            if (scratch.first_invalid_expert < num_experts)
+            {
+                if (threadIdx.x == 0)
+                {
+                    const int invalid_expert = scratch.first_invalid_expert;
+                    const DeviceMoEExpertDescriptorView &desc =
+                        bank.experts[invalid_expert];
+                    printf("runtime_prefill_active_expert_not_ready "
+                           "participant=%u expert=%d count=%d execution_bank=%u "
+                           "local_mask=%u resident_mask=%u local_bit=%u "
+                           "local_slot=%d logical=%d owner=%d\\n",
+                           runtime->participant_id,
+                           invalid_expert,
+                           runtime->expert_counts[invalid_expert],
+                           execution_bank,
+                           bank.local_compute_mask[invalid_expert],
+                           bank.resident_participant_mask[invalid_expert],
+                           local_bit,
+                           desc.local_slot,
+                           desc.logical_expert_id,
+                           desc.owner_participant);
+                    FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                        "runtime active expert is not locally resident and compute-ready");
+                }
+                return;
+            }
+
+            compact_active_expert_chunk(
+                is_active,
+                expert,
+                max_active_experts,
+                active_expert_ids,
+                scratch.active_experts);
+        }
+        if (publish_active_experts)
+        {
+            pad_active_expert_list(
+                active_expert_ids,
+                max_active_experts,
+                scratch.active_experts);
+        }
     }
 
     /**
@@ -15705,7 +15682,7 @@ namespace
     /**
      * @brief Group a compact verifier route table in stable expert-major order.
      *
-     * The compact MTP path has at most 64 route slots and 256 experts. One
+     * The compact MTP path has at most 64 route slots and 512 experts. One
      * block therefore owns the complete grouping transaction. Each expert
      * thread counts its own routes and computes its exact exclusive offset;
      * each route thread then computes its stable rank among earlier routes to
@@ -15928,10 +15905,10 @@ namespace
      */
     struct RuntimeSmallGroupScanScratch
     {
-        int count_warp_totals[kActiveExpertWarpCount];
-        int count_warp_prefixes[kActiveExpertWarpCount];
-        int active_warp_totals[kActiveExpertWarpCount];
-        int active_warp_prefixes[kActiveExpertWarpCount];
+        int count_warp_totals[(kDeviceMoEMaxExperts / 32)];
+        int count_warp_prefixes[(kDeviceMoEMaxExperts / 32)];
+        int active_warp_totals[(kDeviceMoEMaxExperts / 32)];
+        int active_warp_prefixes[(kDeviceMoEMaxExperts / 32)];
         int total_active;
         int first_invalid_expert;
     };
@@ -15994,11 +15971,11 @@ namespace
         if (warp == 0)
         {
             const int warp_count =
-                lane < kActiveExpertWarpCount
+                lane < static_cast<int>(blockDim.x) / kWarpSize
                     ? scratch.count_warp_totals[lane]
                     : 0;
             const int warp_active =
-                ScanActive && lane < kActiveExpertWarpCount
+                ScanActive && lane < static_cast<int>(blockDim.x) / kWarpSize
                     ? scratch.active_warp_totals[lane]
                     : 0;
             int count_warp_inclusive = warp_count;
@@ -16023,7 +16000,7 @@ namespace
                 }
             }
 
-            if (lane < kActiveExpertWarpCount)
+            if (lane < static_cast<int>(blockDim.x) / kWarpSize)
             {
                 scratch.count_warp_prefixes[lane] =
                     count_warp_inclusive - warp_count;
@@ -16035,7 +16012,7 @@ namespace
             }
             if constexpr (ScanActive)
             {
-                if (lane == kActiveExpertWarpCount - 1)
+                if (lane == static_cast<int>(blockDim.x) / kWarpSize - 1)
                     scratch.total_active = active_warp_inclusive;
             }
         }
@@ -16110,7 +16087,7 @@ namespace
         const uint32_t execution_bank = runtime_execution_bank(runtime);
         const bool invalid_contract =
             !runtime || !original_to_grouped ||
-            blockDim.x != kThreads ||
+            blockDim.x != llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts) ||
             current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
             max_slots > kDeviceMoERuntimeSmallGroupMaxSlots ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
@@ -17816,47 +17793,49 @@ namespace
         int num_experts,
         llaminar2::DeviceMoEWeightFormat expected_format)
     {
-        const int expert = static_cast<int>(threadIdx.x);
         const uint32_t execution_bank = runtime_execution_bank(runtime);
         if (!runtime || !gate_descs || !up_descs || !down_descs ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
             execution_bank > 1u ||
             !llaminar2::deviceMoEWeightFormatIsFloating(expected_format))
         {
-            if (expert == 0)
+            if (threadIdx.x == 0)
             {
                 FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
                     "floating runtime descriptor publication has an invalid contract");
             }
             return;
         }
-        if (expert >= num_experts)
-            return;
-
         const DeviceMoEPlacementBankView &bank =
             runtime_placement_banks(runtime)[execution_bank];
-        const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
         const uint32_t local_bit =
             runtime_participant_bit(static_cast<int>(runtime->participant_id));
-        const bool local_ready =
-            bank.local_compute_mask[expert] != 0u &&
-            (bank.resident_participant_mask[expert] & local_bit) != 0u &&
-            desc.local_slot >= 0 &&
-            desc.weight_format == expected_format &&
-            desc.floating_gate.valid() &&
-            desc.floating_up.valid() &&
-            desc.floating_down.valid();
-        if (local_ready)
+        // Every admitted descriptor is overwritten on each replay, including
+        // remote entries and logical experts above the fixed launch width.
+        for (int expert = static_cast<int>(threadIdx.x); expert < num_experts;
+             expert += static_cast<int>(blockDim.x))
         {
-            gate_descs[expert] = desc.floating_gate;
-            up_descs[expert] = desc.floating_up;
-            down_descs[expert] = desc.floating_down;
-        }
-        else
-        {
-            gate_descs[expert] = llaminar2::DeviceMoEFloatingMatrixDesc{};
-            up_descs[expert] = llaminar2::DeviceMoEFloatingMatrixDesc{};
-            down_descs[expert] = llaminar2::DeviceMoEFloatingMatrixDesc{};
+            const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+            const bool local_ready =
+                bank.local_compute_mask[expert] != 0u &&
+                (bank.resident_participant_mask[expert] & local_bit) != 0u &&
+                desc.local_slot >= 0 &&
+                desc.weight_format == expected_format &&
+                desc.floating_gate.valid() &&
+                desc.floating_up.valid() &&
+                desc.floating_down.valid();
+            if (local_ready)
+            {
+                gate_descs[expert] = desc.floating_gate;
+                up_descs[expert] = desc.floating_up;
+                down_descs[expert] = desc.floating_down;
+            }
+            else
+            {
+                gate_descs[expert] = llaminar2::DeviceMoEFloatingMatrixDesc{};
+                up_descs[expert] = llaminar2::DeviceMoEFloatingMatrixDesc{};
+                down_descs[expert] = llaminar2::DeviceMoEFloatingMatrixDesc{};
+            }
         }
     }
 
@@ -21955,7 +21934,7 @@ extern "C"
             if (!finishLaunch("cudaMoE_device_rebalance_llep_preplan"))
                 return false;
             device_rebalance_controller_kernel<true><<<
-                1, kDeviceMoEMaxExperts, 0, static_cast<cudaStream_t>(stream)>>>(
+                1, kRebalanceControllerThreads, 0, static_cast<cudaStream_t>(stream)>>>(
                 static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
                 gathered_histograms,
                 static_cast<DeviceMoERebalanceStatusView *>(status),
@@ -21978,7 +21957,7 @@ extern "C"
             return finishLaunch("cudaMoE_device_rebalance_llep_controller");
         }
         device_rebalance_controller_kernel<false><<<
-            1, kDeviceMoEMaxExperts, 0, static_cast<cudaStream_t>(stream)>>>(
+            1, kRebalanceControllerThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
             gathered_histograms,
             static_cast<DeviceMoERebalanceStatusView *>(status),
@@ -22979,7 +22958,7 @@ extern "C"
         }
 
         cudaSetDevice(device_idx);
-        group_tokens_small_float_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        group_tokens_small_float_kernel<<<1, llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts), 0, static_cast<cudaStream_t>(stream)>>>(
             routing_indices, routing_weights, expert_counts, expert_offsets,
             grouped_token_indices, original_to_grouped, original_expert_ids, grouped_weights,
             active_expert_ids, total_slots, num_experts, top_k, max_active_experts);
@@ -23041,7 +23020,7 @@ extern "C"
         if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
         {
             prefill_group_small_runtime_kernel<true><<<
-                1, kThreads, 0, cuda_stream>>>(
+                1, llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts), 0, cuda_stream>>>(
                 runtime_view,
                 routing_indices,
                 routing_weights,
@@ -23142,7 +23121,7 @@ extern "C"
         if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
         {
             prefill_group_small_runtime_kernel<true, true><<<
-                1, kThreads, 0, cuda_stream>>>(
+                1, llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts), 0, cuda_stream>>>(
                 runtime_view,
                 routing_indices,
                 routing_weights,
@@ -23225,7 +23204,7 @@ extern "C"
         if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
         {
             prefill_group_small_runtime_kernel<false><<<
-                1, kThreads, 0, cuda_stream>>>(
+                1, llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts), 0, cuda_stream>>>(
                 runtime_view,
                 nullptr,
                 nullptr,
@@ -23320,7 +23299,7 @@ extern "C"
         if (max_slots <= kDeviceMoERuntimeSmallGroupMaxSlots)
         {
             prefill_group_small_runtime_kernel<false, true><<<
-                1, kThreads, 0, cuda_stream>>>(
+                1, llaminar2::moe_runtime_abi::expertGroupingThreads(num_experts), 0, cuda_stream>>>(
                 runtime_view,
                 /*routing_indices=*/nullptr,
                 /*routing_weights=*/nullptr,

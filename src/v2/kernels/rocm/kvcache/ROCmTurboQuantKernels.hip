@@ -49,6 +49,16 @@ namespace llaminar2
     static std::unordered_map<int, HIPRopeConstantGeneration>
         s_hip_rope_freqs_by_device;
 
+    /** @brief Bind immutable constant-memory tables before any graph capture. */
+    const float *hip_tq_native_centroids(int bits)
+    {
+        void *pointer = nullptr;
+        const auto status = bits == 4 ? hipGetSymbolAddress(&pointer,HIP_SYMBOL(d_TQ4_CENTROIDS_HIP)) :
+                            bits == 8 ? hipGetSymbolAddress(&pointer,HIP_SYMBOL(d_TQ8_CENTROIDS_HIP)) : hipErrorInvalidValue;
+        if (status != hipSuccess) throw std::invalid_argument("ROCm native TQ codebook resolution failed");
+        return static_cast<const float *>(pointer);
+    }
+
     bool hip_tq_upload_codebooks(hipStream_t stream)
     {
         if (!stream)

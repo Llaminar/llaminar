@@ -59,6 +59,8 @@ namespace llaminar2
         ExpertShadowSlots,        ///< Inactive RCU expert-arrival banks.
         RoutedExpertWeights,      ///< Live prepared routed experts.
         NativeExecutionContext,   ///< Driver-private storage retained until native context retirement.
+        ImmutableTableStorage,    ///< Native RAM row table or bounded SSD mapping residency.
+        ImmutableLookupStaging,   ///< Exact mapped request/native-row response and device lookup scratch.
         Count,                    ///< Sentinel; never a valid charge owner.
     };
 
@@ -110,6 +112,10 @@ namespace llaminar2
             return "routed_expert_weights";
         case PhysicalMemoryOwner::NativeExecutionContext:
             return "native_execution_context";
+        case PhysicalMemoryOwner::ImmutableTableStorage:
+            return "immutable_table_storage";
+        case PhysicalMemoryOwner::ImmutableLookupStaging:
+            return "immutable_lookup_staging";
         case PhysicalMemoryOwner::Count:
             break;
         }

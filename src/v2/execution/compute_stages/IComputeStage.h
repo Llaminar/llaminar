@@ -22,6 +22,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,6 +37,7 @@
 #include "../../utils/MPITopology.h"
 #include "../../memory/StageBufferContract.h"
 #include "../../snapshots/SnapshotRowPartition.h"
+#include "../../snapshots/SnapshotSemanticExtent.h"
 
 namespace llaminar2
 {
@@ -126,6 +128,10 @@ namespace llaminar2
         {
             return rows * cols * sizeof(int8_t);
         }
+        else if (std::strcmp(dtype, "INT64") == 0)
+        {
+            return rows * cols * sizeof(int64_t);
+        }
         else if (std::strcmp(dtype, "INT32") == 0)
         {
             return rows * cols * sizeof(int32_t);
@@ -155,6 +161,7 @@ namespace llaminar2
             size_t element_size = sizeof(float);
             size_t byte_size = 0;      ///< Total byte size for native format (0 = use rows*cols*element_size)
             ITensor *tensor = nullptr; ///< Optional tensor pointer for coherence management
+            size_t tensor_byte_offset = 0; ///< Exact admitted byte subview within tensor storage.
         };
 
         // Output buffers (written during execute)
@@ -169,6 +176,10 @@ namespace llaminar2
             size_t byte_size = 0;      ///< Total byte size for native format (0 = use rows*cols*element_size)
             ITensor *tensor = nullptr; ///< Optional tensor pointer for coherence management
             SnapshotRowLayout row_layout; ///< Explicit compact/observed row ownership, diagnostics only.
+            size_t tensor_byte_offset = 0; ///< Exact admitted byte subview retained after diagnostic publication.
+            SnapshotSemanticExtent semantic_extent; ///< Explicit authored axis; never infer cache geometry from token-shaped capacity.
+            const SnapshotObservedHeader *observed_header=nullptr; ///< Acquired diagnostic metadata, never a live device pointer.
+            std::span<const std::uint64_t> observed_row_offsets; ///< Acquired native selection counts encoded as exclusive offsets.
         };
 
         // Weight/parameter buffers (read-only during execute)
@@ -387,6 +398,25 @@ namespace llaminar2
         FUSED_RESIDUAL_NORM,
         FUSED_ADD_ALLREDUCE, ///< Fused residual-add + allreduce (MoE output combine + TP reduce)
 
+        // Qwen4Exp participant-local GR/PLE arithmetic and explicit history publication.
+        QWEN4EXP_BRANCH_RMS_NORM,
+        QWEN4EXP_RESIDUAL_EXPAND,
+        QWEN4EXP_RESIDUAL_DOWN,
+        QWEN4EXP_RESIDUAL_READ,
+        QWEN4EXP_RESIDUAL_WRITE,
+        QWEN4EXP_NGRAM_HASH,
+        QWEN4EXP_PLE_GATE,
+        QWEN4EXP_PLE_CONV,
+        QWEN4EXP_COMMIT_CONV_HISTORY,
+        QWEN4EXP_COMMIT_TOKEN_HISTORY,
+        QWEN4EXP_QSA_INDEXER,
+        QWEN4EXP_QSA_ATTENTION,
+        QWEN4EXP_QSA_COMMIT_PARTIAL,
+        QWEN4EXP_QSA_RETAIN_CANDIDATES,
+        QWEN4EXP_QSA_SNAPSHOT_PRIOR,
+        QWEN4EXP_NGRAM_LOOKUP,
+        QWEN4EXP_QSA_PREPARE_REPLAY,
+
         // GDN (Gated Delta Network) stages
         ATTENTION_OUTPUT_GATE, ///< Sigmoid gate on attention output
         GATED_RMS_NORM,        ///< RMSNorm with learned multiplicative gate
@@ -453,6 +483,9 @@ namespace llaminar2
         MOE_PROJECTION_PHASE,
         /** Explicit same-rank byte exchange with GPU-authored live extents. */
         DEVICE_COUNTED_ALLGATHER,
+        QWEN4EXP_PLE_SNAPSHOT_PRIOR, ///< Ordered immutable transaction prestate capture.
+        QWEN4EXP_PLE_RETAIN_CANDIDATES, ///< Live retention and accepted-prefix publication.
+        QWEN4EXP_BRANCH_CONCAT, ///< Token-owned Dense0 four-branch concatenation.
     };
 
     /**
@@ -745,14 +778,29 @@ namespace llaminar2
         Invalid,
     };
 
+    /** @brief Exact publication work, selected explicitly rather than inferred from missing snapshot bytes. */
+    enum class CPUVerifierStateRestorePlanKind : uint8_t
+    {
+        SnapshotCopy,
+        NativeAcceptedPrefixCommit,
+    };
+
+    /** @brief One live interval written by a validated native accepted-prefix publication. */
+    struct CPUVerifierStateRestoreDestination
+    {
+        void *data = nullptr;
+        size_t bytes = 0;
+    };
+
     /**
-     * @brief Immutable byte-copy plan for one CPU-owned verifier-state stage.
+     * @brief Immutable snapshot-copy or native-prefix plan for one CPU state stage.
      *
-     * `source` points at the selected post-verifier snapshot and `destination`
-     * points at that stage's live CPU state. Both allocations remain owned by
-     * the stage/workspace that produced the plan and must stay valid until the
-     * enclosing publication transaction finishes. Publication copies these
-     * bytes verbatim; it never replays recurrence math.
+     * SnapshotCopy exposes an already-computed source and live destination.
+     * NativeAcceptedPrefixCommit exposes exact stage-owned write intervals;
+     * its stage validates candidate indices before returning Ready. All sources,
+     * intervals and owners remain stable until publication completes. The
+     * publisher validates every plan before any mutation, then runs only the
+     * explicitly declared native prefix splice, never recurrence or row replay.
      */
     struct CPUVerifierStateRestorePlan
     {
@@ -761,12 +809,21 @@ namespace llaminar2
         void *destination = nullptr;
         const void *source = nullptr;
         size_t bytes = 0;
+        CPUVerifierStateRestorePlanKind kind = CPUVerifierStateRestorePlanKind::SnapshotCopy;
+        /** Exact writes of a native prefix splice, retained by the stage until publication completes.
+         * Empty is valid when an accepted QSA prefix ends on a complete four-token block.
+         * Planning validates candidate indices before returning Ready and never mutates live state.
+         */
+        std::span<const CPUVerifierStateRestoreDestination> native_destinations{};
 
-        /** @brief Return true when this plan describes a concrete byte copy. */
+        /** @brief Return true for a concrete snapshot copy or a validated native prefix commit. */
         [[nodiscard]] bool ready() const noexcept
         {
             return status == CPUVerifierStateRestorePlanStatus::Ready &&
-                   destination != nullptr && source != nullptr && bytes > 0;
+                   ((kind == CPUVerifierStateRestorePlanKind::SnapshotCopy &&
+                     destination != nullptr && source != nullptr && bytes > 0) ||
+                    (kind == CPUVerifierStateRestorePlanKind::NativeAcceptedPrefixCommit &&
+                     destination == nullptr && source == nullptr && bytes == 0));
         }
     };
 
@@ -1313,8 +1370,10 @@ namespace llaminar2
          * @brief Restore one host-selected verifier row per CPU request.
          *
          * `host_row_indices[request]` contains a flat verifier snapshot row;
-         * negative values leave that request's live state unchanged.  Native
-         * CPU grouped stages must restore the complete vector in one call so
+         * negative values select that request's original pre-transaction state.
+         * Legacy snapshot NoOp preserves it; immutable-prior stages may restore
+         * original bytes after an earlier publication. Native CPU grouped stages
+         * must restore the complete vector in one call so
          * scalar publication cannot overwrite one shared layer state or clear
          * capture bindings between requests.
          */
@@ -1333,14 +1392,21 @@ namespace llaminar2
          * @brief Plan a byte-exact single-request CPU state publication.
          *
          * The method validates @p row and exposes the already-computed snapshot
-         * span without mutating live state. The MTP publisher first gathers and
-         * validates plans from every captured stage, then copies all `Ready`
-         * spans in one persistent OpenMP region. This two-phase contract makes
+         * span, or an explicitly typed native accepted-prefix commit with exact
+         * live destination intervals, without mutating live state. The MTP
+         * publisher validates every plan and destination before writing any
+         * bytes, copies snapshot spans in one persistent OpenMP region, then
+         * invokes validated native prefix commits through the existing row hook.
+         * Native commits splice retained candidates and immutable prior history;
+         * they must never replay the model graph or recurrence arithmetic. This two-phase contract makes
          * malformed publication atomic and removes serial per-layer memory
          * bandwidth from the decode hot path.
          *
-         * A negative row is a valid `NoOp`: that request accepted no verifier
-         * row and retains its pre-transaction live state. GPU stages and CPU
+         * A negative row accepts no verifier row. Legacy snapshot stages may
+         * return NoOp; immutable-prior stages return Ready NativeAcceptedPrefixCommit
+         * when original prior bytes must be restored after a revised publication.
+         * Exact empty native write spans are valid for a live prefix ending on a
+         * complete pool or an empty request. GPU stages and CPU
          * stages without native snapshot spans return `Unsupported`; a required
          * captured CPU stage returning that status is a fatal publication
          * contract violation, not permission to call a slower path.
@@ -1626,6 +1692,29 @@ namespace llaminar2
         [[nodiscard]] StageGPUExecution gpuExecution() const
         {
             return StageGPUExecution(device_id_, requireGPUStream());
+        }
+
+        /**
+         * @brief Bind the explicit verifier-publication invocation without changing ordinary capture configuration.
+         *
+         * Existing retained-state hooks receive their canonical producer stream
+         * from the publication stage. It may differ from this stage's earlier
+         * verifier recording stream. The immutable token carries that exact
+         * invocation stream and this stage's declared device; no binding, graph
+         * identity or execution state is mutated, so independent recording calls
+         * cannot race through temporary stream replacement.
+         *
+         * @param stream Exact non-default stream supplied to the retained-state publication hook.
+         * @return One immutable execution authority for launch, dependencies and publication.
+         * @throws std::invalid_argument for CPU or non-retained-publication stages and default streams.
+         */
+        [[nodiscard]] StageGPUExecution gpuExecutionForVerifierPublication(void *stream) const
+        {
+            if (!device_id_.is_gpu() || !hasVerifierStateCapture() || !requiresVerifierStateCaptureForPublication() ||
+                reinterpret_cast<std::uintptr_t>(stream) <= 2)
+                throw std::invalid_argument(
+                    "Verifier publication requires a retained GPU stage and its exact non-default invocation stream");
+            return StageGPUExecution(device_id_, stream);
         }
 
         /**
@@ -2235,6 +2324,26 @@ namespace llaminar2
          */
         void validateMatmulShapes(const std::string &a_name, const ITensor *a,
                                   const std::string &b_name, const ITensor *b) const;
+
+        /**
+         * @brief Validate every CPU request and append immutable publication plans.
+         * @param rows Complete host-owned flat restore-row vector; negative rows preserve prestate.
+         * @param requests Exact canonical request count, unrelated to buffer capacity.
+         * @param plans Caller-owned transient metadata receiving existing typed plans.
+         * @return True only after all stage-owned request decisions are validated without mutation.
+         * @details Snapshot spans and native-prefix write intervals remain owned by the stage/kernel.
+         * No live state is copied or rebound here. The publisher admits every stage's plans before
+         * any copy, native commit, or capture-binding clear. Multi-request stages must explicitly
+         * implement their request ownership; a scalar-only stage cannot infer it from flat rows.
+         */
+        virtual bool planCPUVerifierStateRestoreRows(const int *rows,int requests,
+            std::vector<CPUVerifierStateRestorePlan> &plans)
+        {
+            if(!rows || requests!=1 || device().is_gpu())return false;
+            auto plan=planCPUVerifierStateRestoreRow(rows[0]);
+            if(!plan.ready() && plan.status!=CPUVerifierStateRestorePlanStatus::NoOp)return false;
+            plans.push_back(plan);return true;
+        }
 
     private:
         DeviceId device_id_;         ///< Authoritative device (set via constructor, no default)

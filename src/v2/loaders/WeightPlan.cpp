@@ -5,21 +5,40 @@
  * Device-qualified lookup deliberately scans the small graph-time binding
  * collection.  Graph construction is cold-path work, and this makes an
  * ambiguity a precise fatal diagnostic instead of an insertion-order-dependent
- * route to the wrong heterogeneous expert slice.
+ * route to the wrong heterogeneous expert slice. Explicit static expert
+ * projections derive original-axis slices from one immutable ownership value;
+ * compact matrix views retain that same source/policy through preparation.
+ * Static lowering preserves ordinary bindings in the same complete frozen set,
+ * so graph preparation retains one original persistent owner and source lifetime.
  */
 
 #include "WeightPlan.h"
 
 #include "WeightLifecycleTrace.h"
+#include "MoEExpertSourceView.h"
+#include "tensors/TensorClasses.h"
 #include "fort.hpp"
 
 #include <sstream>
 #include <utility>
+#include <set>
+#include <tuple>
 
 namespace llaminar2
 {
     namespace
     {
+        /** @return Exact source coordinates, including original expert order and compactness. */
+        bool sameSourceSlice(const WeightSliceSpec &a, const WeightSliceSpec &b)
+        {
+            const auto fields = [](const WeightSliceSpec &slice) {
+                return std::tie(slice.source_rows, slice.source_cols, slice.row_start, slice.row_count,
+                    slice.col_start, slice.col_count, slice.expert_start, slice.expert_count,
+                    slice.expert_ids, slice.inner_is_presliced);
+            };
+            return fields(a) == fields(b);
+        }
+
         std::string layerKey(int layer, const std::string &suffix)
         {
             return std::to_string(layer) + ":" + suffix;
@@ -69,6 +88,47 @@ namespace llaminar2
             requirement.layer = inferWeightLayer(requirement.canonical_name);
         if (requirement.expert < 0)
             requirement.expert = inferWeightExpert(requirement.canonical_name);
+        if (requirement.projection_ownership)
+        {
+            const auto &ownership = *requirement.projection_ownership;
+            const auto source_name = requirement.source_name.empty()
+                ? requirement.canonical_name : requirement.source_name;
+            if (ownership.hasMovableProjectionSet() || !isRoutedExpertRole(requirement.role) ||
+                inferWeightRole(source_name) != requirement.role ||
+                inferWeightRole(requirement.canonical_name) != requirement.role ||
+                inferWeightLayer(source_name) != requirement.layer ||
+                inferWeightLayer(requirement.canonical_name) != requirement.layer ||
+                requirement.tp_rank_or_device_index != ownership.participant() ||
+                !requirement.lookup_device.value_or(requirement.target_device).is_cpu() ||
+                requirement.derivation != WeightDerivationKind::ExpertSlice ||
+                requirement.expert >= 0 || !requirement.bypass_tensor_parallel ||
+                (requirement.expected_prepared_kind != PreparedWeightKind::None &&
+                 requirement.expected_prepared_kind != PreparedWeightKind::MoeExpertSlab) ||
+                (requirement.overlay_participant_index >= 0 &&
+                 requirement.overlay_participant_index != ownership.participant()))
+                throw std::invalid_argument("Static expert projection requires its exact original role/participant source request");
+            const auto projection = ownership.projection(requirement.role);
+            WeightSliceSpec original;
+            // The loader consumes original GGUF [K,N,E], not GEMM [N,K].
+            original.source_rows = static_cast<size_t>(projection.source_columns);
+            original.source_cols = static_cast<size_t>(projection.source_rows);
+            original.row_start = static_cast<size_t>(projection.first_column);
+            original.row_count = static_cast<size_t>(projection.columns);
+            original.col_start = static_cast<size_t>(projection.first_row);
+            original.col_count = static_cast<size_t>(projection.rows);
+            original.expert_count = static_cast<size_t>(ownership.geometry().experts);
+            original.expert_ids.reserve(original.expert_count);
+            for (int expert = 0; expert < ownership.geometry().experts; ++expert)
+                original.expert_ids.push_back(expert);
+            // An already normalized requirement may be composed into another
+            // plan, but contradictory caller coordinates are never substituted.
+            if (!sameSourceSlice(requirement.slice, WeightSliceSpec{}) &&
+                !sameSourceSlice(requirement.slice, original))
+                throw std::invalid_argument("Static expert source coordinates disagree with immutable projection ownership");
+            requirement.slice = std::move(original);
+            // This requests original source bytes. Only materialization may
+            // publish inner_is_presliced after the exact compact copy.
+        }
         requirements_.push_back(std::move(requirement));
     }
 
@@ -228,6 +288,93 @@ namespace llaminar2
             if (binding.prepared && binding.prepared->binding_id != binding.binding_id)
                 throw std::runtime_error("Prepared weight ref binding id mismatch: " + binding.identity.canonical_name);
         }
+    }
+
+    /** @copydoc FrozenModelWeightSet::projectedExpertMatrices */
+    FrozenModelWeightSet FrozenModelWeightSet::projectedExpertMatrices() const
+    {
+        validateForGraph();
+        if (bindings_.empty())
+            throw std::invalid_argument("Static expert projection cannot publish an empty source set");
+        ModelWeightSetBuilder builder(strategy_);
+        std::set<uint64_t> identifiers;
+        std::set<uint64_t> original_identifiers;
+        bool has_static_parent = false;
+        // Reserve preserved identities before expanding any parent: order must
+        // not decide whether a generated expert key aliases a dense binding.
+        for (const auto &binding : bindings_)
+        {
+            if (!binding.binding_id || !original_identifiers.insert(binding.binding_id).second)
+                throw std::invalid_argument("Static expert lowering requires distinct original binding identities");
+            if (binding.projection_ownership)
+                has_static_parent = true;
+            else
+                identifiers.insert(binding.binding_id);
+        }
+        if (!has_static_parent)
+            throw std::invalid_argument("Static expert lowering requires an original marked source parent");
+        for (const auto &parent : bindings_)
+        {
+            if (!parent.projection_ownership)
+            {
+                // This is the original frozen binding, not a reconstructed
+                // dense requirement or a second prepared-store publication.
+                builder.addBinding(parent);
+                continue;
+            }
+            if (parent.projection_ownership->hasMovableProjectionSet() ||
+                !parent.tensor || parent.tensor_owner.get() != parent.tensor ||
+                parent.tensor->shape().size() != 3 || !isRoutedExpertRole(parent.identity.role) ||
+                parent.identity.derivation != WeightDerivationKind::ExpertSlice || !parent.slice.inner_is_presliced)
+                throw std::invalid_argument("Projected expert matrices require owned compact static source bindings");
+            if (parent.tensor->is_raw_data_released() || !parent.tensor->raw_data())
+                throw std::runtime_error("Static expert source retired before its matrix bindings were created");
+            const auto &ownership = *parent.projection_ownership;
+            const MoEExpertSourceView source(parent.tensor->shape(), parent.slice);
+            if (source.experts().size() != static_cast<size_t>(ownership.geometry().experts))
+                throw std::invalid_argument("Static expert source must retain the complete original expert inventory");
+            for (int expert = 0; expert < ownership.geometry().experts; ++expert)
+            {
+                if (source.experts()[static_cast<size_t>(expert)] != expert)
+                    throw std::invalid_argument("Static expert source does not preserve original ordinal IDs");
+                const auto matrix = source.matrix(expert, parent.identity.role, &ownership);
+                auto view = parent.tensor->create_view({matrix.rows, matrix.columns}, matrix.element_offset);
+                if (!view || view->native_type() != parent.tensor->native_type() ||
+                    parent.tensor->size_bytes() % static_cast<size_t>(ownership.geometry().experts) ||
+                    view->size_bytes() != parent.tensor->size_bytes() / static_cast<size_t>(ownership.geometry().experts))
+                    throw std::runtime_error("Static expert matrix view lost its native source representation");
+                WeightBinding binding = parent;
+                binding.identity.canonical_name = parent.identity.canonical_name + "@expert" + std::to_string(expert);
+                // Parent identity already binds full source, participant and all
+                // F intervals. Domain-separated byte mixing adds the exact E slot.
+                uint64_t identifier = parent.binding_id ^ 1469598103934665603ull;
+                for (const unsigned char byte : binding.identity.canonical_name)
+                {
+                    identifier ^= byte;
+                    identifier *= 1099511628211ull;
+                }
+                if (!identifier) identifier = 1;
+                if (!identifiers.insert(identifier).second)
+                    throw std::logic_error("Static expert matrix binding identity collision");
+                binding.binding_id = identifier;
+                binding.identity.logical_id = stableWeightLogicalId(binding.identity.canonical_name);
+                binding.identity.source_instance_id = parent.identity.instance_id;
+                binding.identity.instance_id = identifier;
+                binding.identity.expert = expert;
+                binding.slice = matrix.source_identity;
+                binding.projection_source_owner = parent.tensor_owner; // Same actual source, not a copied inventory.
+                binding.tensor_owner = std::move(view); // Existing view retains its original shared source root.
+                binding.tensor = binding.tensor_owner.get();
+                const auto device = binding.residency.resident_device.value_or(binding.residency.home_device);
+                const auto kind = device.is_cuda() ? PreparedWeightKind::CudaInt8PackedGemm
+                    : device.is_rocm() ? PreparedWeightKind::RocmInt8PackedGemm : PreparedWeightKind::CpuPackedGemm;
+                binding.prepared = PreparedWeightRef{strategy_.model_id, identifier, kind, device};
+                builder.addBinding(std::move(binding));
+            }
+        }
+        FrozenModelWeightSet result(strategy_, builder.freezeBindings(), physical_memory_owner_);
+        result.validateForGraph();
+        return result;
     }
 
     std::string FrozenModelWeightSet::renderAuditTable() const

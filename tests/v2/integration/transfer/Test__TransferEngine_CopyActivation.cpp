@@ -1,6 +1,6 @@
 /**
  * @file Test__TransferEngine_CopyActivation.cpp
- * @brief Integration tests for TransferEngine::copyActivation() on real GPUs.
+ * @brief Exact-live host and native GPU activation copies at declared pipeline boundaries.
  *
  * copyActivation() performs a tensor→tensor copy INTO the destination tensor's
  * buffer on a target device, auto-selecting the optimal transport:
@@ -17,6 +17,8 @@
 
 #include <gtest/gtest.h>
 #include <atomic>
+#include <array>
+#include <cstring>
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
@@ -34,7 +36,11 @@
 #include "v2/collective/BackendRouter.h"
 #include "v2/transfer/TransferEngine.h"
 #include "v2/transfer/TransferMethod.h"
+#include "utils/KernelProfiler.h"
 #include "../../utils/ScopedGPUStream.h"
+#include "../execution/runner/PipelineGenerationTestSupport.h"
+#include "execution/local_execution/graph/HostPipelineActivationRows.h"
+#include "execution/prefix_cache/ResidualRowGeometry.h"
 
 using namespace llaminar2;
 
@@ -262,6 +268,115 @@ protected:
         {
             ASSERT_EQ(actual[byte], 0x3f)
                 << "Copied stale activation before its producer event at byte " << byte;
+        }
+    }
+
+    /**
+     * @brief Replay the real segmented ingress contract against captured native producers.
+     * @param source_device CPU or exact producing GPU.
+     * @param destination_device CPU or exact consuming GPU.
+     *
+     * The rank's existing transferActivation first moves only live rows onto
+     * the consumer. The production host-boundary helper then copies into its
+     * local graph bank. Counters are sampled before terminal diagnostics; poison
+     * suffixes prove no capacity write. No device live count is observed.
+     */
+    void proveHostBoundaryLiveExtent(DeviceId source_device, DeviceId destination_device)
+    {
+        initCPUBackend(-1);
+        llaminar2::test::OrdinaryGraphEvidence evidence("transfer");
+        ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("transfer"));
+        ASSERT_TRUE(TransferProfiler::isEnabled());
+        auto &transfers=TransferEngine::instance();
+        const auto submitted=[](const char *name) {
+            double bytes=0;
+            for (const auto &record:PerfStatsCollector::snapshot())
+                if (record.domain=="transfer" && record.name==name) bytes+=record.value;
+            return bytes;
+        };
+        for (int width:{2560,10240})
+        {
+            SCOPED_TRACE(width);
+            const ResidualRowGeometry geometry(width);
+            const std::vector<size_t> shape{16,static_cast<size_t>(width)};
+            auto source=std::make_unique<FP32Tensor>(shape);
+            auto destination=std::make_unique<FP32Tensor>(shape);
+            const auto capacity=geometry.bytesForRows(shape,16);
+            std::memset(source->mutable_data(),0x37,capacity);
+            std::memset(destination->mutable_data(),0xa5,capacity);
+            if (source_device.is_gpu()) ASSERT_TRUE(makeGpuResident(source.get(),source_device));
+            if (destination_device.is_gpu())
+            {
+                TransferEngine::allocateDeviceStorage(source.get(),destination_device);
+                ASSERT_TRUE(makeGpuResident(destination.get(),destination_device));
+            }
+            std::unique_ptr<IGPUGraphCapture> producer;
+            if (source_device.is_gpu())
+            {
+                auto &worker=GPUDeviceContextPool::instance().getContext(source_device);
+                worker.submitAndWait([&] {
+                    producer=worker.createGraphCapture(streamFor(source_device));
+                    ASSERT_TRUE(producer);
+                    ScopedBackendGraphCapture capture(worker,*producer,"host boundary activation producer");
+                    ASSERT_TRUE(capture.begin());
+                    ASSERT_TRUE(getBackendFor(source_device)->memset(source->gpu_data_ptr(),0x37,capacity,
+                        source_device.ordinal,streamFor(source_device)));
+                    capture.finish();ASSERT_TRUE(producer->instantiate());
+                });
+                ASSERT_FALSE(HasFatalFailure());
+            }
+            for (int rows:{8,3,0,1,0})
+            {
+                SCOPED_TRACE(rows);
+                if (source_device.is_gpu())
+                {
+                    GPUDeviceContextPool::instance().getContext(source_device).submitAndWait([&] {ASSERT_TRUE(producer->launch());});
+                    TransferEngine::publishDeviceWrite(source.get(),source_device,streamFor(source_device));
+                }
+                else std::memset(source->mutable_data(),0x37,capacity);
+                if (destination_device.is_gpu())
+                {
+                    ASSERT_TRUE(getBackendFor(destination_device)->memset(destination->gpu_data_ptr(),0xa5,capacity,
+                        destination_device.ordinal,streamFor(destination_device)));
+                    TransferEngine::publishDeviceWrite(destination.get(),destination_device,streamFor(destination_device));
+                    // Poison preparation is a test boundary, not live inference.
+                    // Complete it before a separate transfer stream may overwrite
+                    // this destination; sample submission counters only afterward.
+                    ASSERT_TRUE(destination->ensureOnHost());
+                }
+                else std::memset(destination->mutable_data(),0xa5,capacity);
+                std::array<double,7> before{};
+                const std::array<const char *,7> names{"activation_copy_host_bytes","activation_copy_d2d_bytes",
+                    "activation_copy_peer_bytes","activation_copy_d2h_bytes","activation_copy_h2d_bytes",
+                    "h2d_bytes","d2h_bytes"};
+                for(size_t i=0;i<names.size();++i)before[i]=submitted(names[i]);
+                const auto binding=HostPipelineActivationRows::admitted(source.get(),destination_device,1,rows);
+                const auto bytes=geometry.bytesForRows(shape,static_cast<size_t>(rows));
+                if(bytes) ASSERT_TRUE(transfers.transferActivation(source.get(),destination_device,bytes).success);
+                struct Info {bool needs_copy;size_t copy_bytes;};
+                consumeHostPipelineActivationBoundary(HostPipelineBoundaryExecution::Execute,
+                    HostPipelineBoundarySubmission::Current,
+                    [&] {return Info{true,geometry.bytesForRows(shape,requireHostPipelineActivationRows(
+                        binding,source.get(),destination_device,1,16))};},
+                    [&](const Info &info) {
+                        const auto result=transfers.copyActivation(source.get(),destination.get(),destination_device,info.copy_bytes);
+                        ASSERT_TRUE(result.success)<<result.error;
+                    });
+                // Root handoff already made the source local to the consumer:
+                // one CPU memcpy or one same-device DMA is the only ingress leg.
+                for(size_t i=0;i<names.size();++i)
+                {
+                    const bool local_copy=destination_device.is_cpu()?i==0:i==1;
+                    const bool root_h2d=i==5 && source_device.is_cpu() && destination_device.is_gpu();
+                    const bool root_d2h=i==6 && source_device.is_gpu() && destination_device.is_cpu();
+                    EXPECT_EQ(submitted(names[i])-before[i],
+                        local_copy || root_h2d || root_d2h ? static_cast<double>(bytes):0.0)<<names[i];
+                }
+                ASSERT_TRUE(destination->ensureOnHost());
+                const auto *actual=reinterpret_cast<const unsigned char *>(destination->data());
+                for(size_t byte=0;byte<capacity;++byte)
+                    ASSERT_EQ(actual[byte],byte<bytes?0x37:0xa5)<<"byte="<<byte;
+            }
         }
     }
 
@@ -519,3 +634,26 @@ TEST_F(Test__TransferEngine_CopyActivation, CrossVendor_ROCm_to_CUDA_HostStaged)
     EXPECT_TRUE(src->isDeviceAuthoritative(rocm_device_));
     EXPECT_TRUE(verifyPattern(dst.get()));
 }
+
+/** @test CPU segmented boundaries retain exact live rows across large/small/empty transactions. */
+TEST_F(Test__TransferEngine_CopyActivation, HostBoundaryLiveExtent_CPU)
+{ proveHostBoundaryLiveExtent(DeviceId::cpu(),DeviceId::cpu()); }
+#ifdef HAVE_CUDA
+/** @test Both CPU/CUDA boundary directions consume H and4H rows after native captured producers. */
+TEST_F(Test__TransferEngine_CopyActivation, HostBoundaryLiveExtent_CUDA)
+{
+    if (!cuda_available_) GTEST_SKIP()<<"No CUDA device available for host-boundary live extent";
+    proveHostBoundaryLiveExtent(DeviceId::cpu(),cuda_device_);
+    proveHostBoundaryLiveExtent(cuda_device_,DeviceId::cpu());
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test Both CPU/ROCm boundary directions consume H and4H rows after native captured producers. */
+TEST_F(Test__TransferEngine_CopyActivation, HostBoundaryLiveExtent_ROCm)
+{
+    if (!rocm_available_) GTEST_SKIP()<<"No ROCm device available for host-boundary live extent";
+    proveHostBoundaryLiveExtent(DeviceId::cpu(),rocm_device_);
+    proveHostBoundaryLiveExtent(rocm_device_,DeviceId::cpu());
+}
+
+#endif

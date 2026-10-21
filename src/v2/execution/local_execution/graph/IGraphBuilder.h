@@ -18,6 +18,10 @@
 
 #include "DeviceGraphExecutor.h"
 #include "DeviceDecodePositionBinding.h"
+#include "DeviceRequestQueryBinding.h"
+#include "models/qwen4exp/Qwen4ExpReplicatedPLEQuery.h"
+#include "../../../kernels/common/DeviceGenerationInitialization.h"
+#include "HostPipelineActivationRows.h"
 #include "GraphSchema.h"
 #include "GraphResolver.h"
 #include "../../../models/GraphTypes.h"
@@ -33,6 +37,7 @@
 
 namespace llaminar2
 {
+    class PhysicalMemoryAuthority;
     // Forward declarations
     class TensorBase;
     class ICPUKVCache;
@@ -542,6 +547,21 @@ namespace llaminar2
     {
         Execute = 0, ///< Submit one production forward transaction.
         MaterializeExecutableWithoutLaunch, ///< Setup-only capture/instantiation.
+        WorkspaceDeclaration, ///< Geometry/lifetime manifest only; never executable or capturable.
+    };
+
+    /**
+     * @brief Sole owner of pipeline activation edges for this captured forward.
+     *
+     * Request-admitted scalar/history forwards own their receive/send nodes.
+     * A resident ordinary forward may instead be prepared solely as a child
+     * of the complete native generation parent, which owns those same edges.
+     * Submission intent alone cannot choose between these two topologies.
+     */
+    enum class ForwardPipelineActivationOwnership : uint8_t
+    {
+        ForwardGraph = 0, ///< Complete invocation includes its own activation edges.
+        NativeGenerationParent, ///< Setup-only resident child; native parent imports the edges.
     };
 
     /**
@@ -580,6 +600,7 @@ namespace llaminar2
          * stale host shadow to re-enter graph construction.
          */
         const void *token_ids_device = nullptr;
+        std::optional<Qwen4ExpReplicatedPLEQuery> replicated_ple_query; ///< Actual DGO-issued immutable source projection for fixed-head PLE only.
         const int *position_ids = nullptr; ///< Host position IDs [batch_size * seq_len]
         /**
          * @brief Optional device-resident INT32 position IDs.
@@ -620,7 +641,9 @@ namespace llaminar2
         ForwardStateTransaction state_transaction =
             ForwardStateTransaction::Ordinary; ///< Typed persistent-state transition embedded by this graph.
         ForwardGraphSubmissionIntent graph_submission_intent =
-            ForwardGraphSubmissionIntent::Execute; ///< Whether this call executes or only seals native graph units.
+            ForwardGraphSubmissionIntent::Execute; ///< Execution, native executable materialization, or non-executable workspace declaration.
+        ForwardPipelineActivationOwnership pipeline_activation_ownership =
+            ForwardPipelineActivationOwnership::ForwardGraph; ///< Immutable owner of native activation transport.
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch
         /**
@@ -632,6 +655,10 @@ namespace llaminar2
          * when @ref token_offset is left at its default.
          */
         int position_offset = 0;
+        /** Exact per-invocation extent admitted by a host-owned segmented PP boundary.
+         * Device-native PP aliases its local hidden bank and leaves this empty.
+         * This is neither a mutable device-count shadow nor retained graph identity. */
+        std::optional<HostPipelineActivationRows> host_pipeline_activation_rows;
         int real_seq_len = 0;              ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
         int bucket_seq_len = 0;            ///< Fixed bucket length for graph shape (0 = seq_len)
         /**
@@ -783,6 +810,7 @@ namespace llaminar2
          * binding. The preparation stage is inserted by generic graph machinery
          * ahead of every model root, keeping model graph definitions declarative.
          */
+        std::optional<DeviceRequestQueryBinding> device_request_query; ///< Original canonical arena ingress, never a raw sequence-length permission.
         std::optional<DevicePrefillChunkGraphBinding> device_prefill_chunk;
 
         /// Batched input (alternative to token_ids)
@@ -811,6 +839,48 @@ namespace llaminar2
 
         virtual ~ForwardInput() = default;
     };
+
+    /**
+     * @brief Classify executable setup/runtime without touching any device/cache owner.
+     * @param intent Explicit caller submission policy.
+     * @return True only for Execute or MaterializeExecutableWithoutLaunch; unknown values are false.
+     */
+    [[nodiscard]] inline bool executableForwardSubmissionIntent(ForwardGraphSubmissionIntent intent) noexcept
+    {
+        return intent==ForwardGraphSubmissionIntent::Execute || intent==ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+    }
+
+    /**
+     * @brief Seal geometry-only construction; an executable caller cannot clear an existing declaration.
+     * @param graph Original topology whose purpose survives moves and merges.
+     * @param input Complete construction policy, separate from data readiness.
+     * @throws std::invalid_argument For an unknown construction intent.
+     */
+    inline void applyForwardGraphConstructionIntent(ComputeGraph &graph,const ForwardInput &input)
+    {
+        if(input.graph_submission_intent==ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            graph.markWorkspaceDeclaration();
+        else if(!executableForwardSubmissionIntent(input.graph_submission_intent))
+            throw std::invalid_argument("Unknown forward graph construction intent");
+    }
+
+    /**
+     * @brief Authenticate original request0 prefill without granting authority to arbitrary count pointers.
+     * @param input Exact token/position/length addresses and geometry consumed by the projection.
+     * @throws std::invalid_argument For missing, foreign, chunked or mis-scoped original ingress.
+     */
+    inline void requireDeviceRequestQueryOwnsInput(const ForwardInput &input)
+    {
+        if(!input.device_request_query || !input.device.is_gpu() || input.batch_size!=1 || input.seq_len<=0 ||
+            input.execution_role!=ForwardExecutionRole::MainInference || input.execution_phase!=ForwardExecutionPhase::Prefill ||
+            input.device_prefill_chunk || input.token_ids || input.position_ids || input.sequence_lengths ||
+            input.position_policy!=ForwardPositionPolicy::ExplicitRows ||
+            input.seq_len>input.device_request_query->rowCapacity() ||
+            input.token_ids_device!=input.device_request_query->tokens() || input.position_ids_device!=input.device_request_query->positions() ||
+            input.sequence_lengths_device!=input.device_request_query->lengths())
+            throw std::invalid_argument("Prefill query lost its original request token/position/geometry owner");
+        input.device_request_query->requireFor(input.device);
+    }
 
     /**
      * @brief Authenticate the prefill materializer's complete input ownership.
@@ -948,6 +1018,45 @@ namespace llaminar2
     {
     public:
         virtual ~IGraphBuilder() = default;
+
+        /**
+         * @brief Declare the lifetime of device forward failures before response admission.
+         * @return Immutable graph policy; default preserves existing response initialization.
+         * @details Native prefill failure producers retain their canonical controller
+         * error through ordinary, forward-only and speculative response admission.
+         * Their existing request-reset transaction is the sole clearing authority.
+         */
+        virtual sampling_math::DeviceGenerationForwardFailurePolicy deviceGenerationForwardFailurePolicy() const
+        { return sampling_math::DeviceGenerationForwardFailurePolicy::ResetAtResponseAdmission; }
+
+        /** @brief Resolve explicit immutable-table I/O for one GPU participant.
+         * @param device Exact participant; concurrent lanes require distinct owners.
+         * @return Stable setup-owned boundary, or empty without host-serviced immutable storage.
+         * @details The model attaches this same owner to every consuming graph
+         * variant. CPU-native lookup has no GPU/host boundary and returns empty.
+         */
+        virtual std::shared_ptr<IRetainedGraphStorageBoundary> retainedStorageBoundary(DeviceId device)
+        {(void)device;return {};}
+
+        /**
+         * @brief Inject the canonical admitted authority for an explicit immutable-storage boundary.
+         * @param authority The same rank authority already owning this participant's arena/cache.
+         * @details Model builders with no host-serviced storage retain no additional dependency.
+         * A consuming builder must reject rebinding after materialization.
+         */
+        virtual void bindStorageMemoryAuthority(std::shared_ptr<PhysicalMemoryAuthority> authority)
+        { (void)authority; }
+
+        /**
+         * @brief Attach model-specific retained state before cache admission or prefix layout queries.
+         * @param cache The canonical participant cache, after its role and arena are bound.
+         * @param publicationStream Exact setup stream on a GPU; null for host-owned CPU state.
+         * @details Builders borrow existing admitted arena storage. This setup
+         * operation neither allocates a second state bank nor changes graph
+         * topology. Later graph builders consume the cache-owned attachment.
+         */
+        virtual void initializeCacheAuxiliaryState(IKVCache &cache, void *publicationStream)
+        { (void)cache; (void)publicationStream; }
 
         // =====================================================================
         // Core Graph Building Methods

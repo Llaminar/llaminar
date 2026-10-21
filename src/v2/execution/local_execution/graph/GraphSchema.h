@@ -768,6 +768,20 @@ namespace llaminar2
         virtual std::vector<std::string> layerWeightSuffixes() const = 0;
 
         /**
+         * @brief Required global operands that transform the residual into the vocabulary-head input.
+         *
+         * Both eager loading and frozen weight planning consume this model-owned
+         * inventory. Ordinary architectures use a final norm; branch-residual
+         * architectures declare their mixer operands instead. The vocabulary
+         * projection and its explicit tied-weight policy are planned separately.
+         * @return Stable canonical GGUF names owned by the terminal PP participant.
+         */
+        virtual std::vector<const char *> terminalInputWeightNames() const
+        {
+            return {"output_norm.weight"};
+        }
+
+        /**
          * @brief Get the stop-thinking prompt for thinking budget enforcement
          *
          * When the thinking token budget is exhausted, this string is tokenized

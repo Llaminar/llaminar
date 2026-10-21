@@ -196,6 +196,14 @@ namespace llaminar2
 
             bool supports_fused_projection() const override { return true; }
 
+            /** @brief Bind independent live request rows only to native floating fixed-order kernels. */
+            std::unique_ptr<VerifierKernelModeScope> beginFloatingRequestRowsScope(DeviceRequestRowRanges rows) override
+            {
+                if(operand_precision_!=FloatingActivationOperandPrecision::Native)
+                    throw std::invalid_argument("Counted floating requests require native activation operands");
+                return makeFloatingRequestRowsScope(rows);
+            }
+
             bool multiply_fused_tensor(
                 const TensorBase *input,
                 const std::vector<TensorProjectionDesc> &projections,

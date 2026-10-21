@@ -8,6 +8,11 @@
  * groups retain serial-row reduction order and borrow device-owned live counts.
  * A failed group terminates the transaction without retrying already submitted
  * work. Arena bindings outlive every retained graph that consumes their scratch.
+ * An explicit QKV-only TwoTermQ8 selection invokes the existing prepared
+ * correction first on the parent stream, then the unchanged sibling groups.
+ * Original source selection and query-producer authority belong to the graph
+ * builder; this stage checks their exact tensor/ref/device/row bindings. It
+ * neither changes weights nor implements a second quantizer or reduction.
  */
 
 #include "GDNProjectionStage.h"
@@ -210,6 +215,150 @@ namespace llaminar2
     GDNProjectionStage::GDNProjectionStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        (void)quantizedActivationOperandPrecisionName(params_.qkv_operand_precision);
+        if (params_.qkv_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8)
+        {
+            validateQ8ResidualCorrectionGeometry(params_.m, params_.n_qkv, params_.k);
+            if (!params_.input || !params_.w_qkv || !params_.output_qkv ||
+                params_.input == params_.output_qkv ||
+                params_.input->native_type() != TensorType::FP32 ||
+                params_.input->cols() != static_cast<size_t>(params_.k) ||
+                params_.input->rows() < static_cast<size_t>(params_.m) ||
+                params_.output_qkv->native_type() != TensorType::FP32 ||
+                params_.w_qkv->native_type() != TensorType::Q8_0 ||
+                params_.w_qkv->rows() != static_cast<size_t>(params_.n_qkv) ||
+                params_.w_qkv->cols() != static_cast<size_t>(params_.k) || !params_.qkv_row_range)
+                throw std::invalid_argument("GDN TwoTermQ8 QKV requires distinct FP32 operands, original Q8_0 weights and original query rows");
+            validateQ8ResidualTensorCapacities(params_.m, params_.n_qkv, params_.k,
+                params_.input->numel(), params_.output_qkv->numel());
+            const std::array<const ITensor *, 4> weights{
+                params_.w_qkv, params_.w_z, params_.w_a, params_.w_b};
+            const std::array<const ITensor *, 4> outputs{
+                params_.output_qkv, params_.output_z, params_.output_a, params_.output_b};
+            const std::array columns{params_.n_qkv, params_.n_z, params_.n_a, params_.n_b};
+            for (size_t i = 0; i < weights.size(); ++i)
+            {
+                // Check the entire immutable bundle before corrected QKV can
+                // publish. A malformed later sibling must not leave an
+                // otherwise avoidable prefix of submitted projection work.
+                if (!weights[i] || !outputs[i] || columns[i] <= 0 ||
+                    outputs[i]->native_type() != TensorType::FP32 ||
+                    outputs[i]->rows() < static_cast<size_t>(params_.m) ||
+                    outputs[i]->cols() != static_cast<size_t>(columns[i]) ||
+                    weights[i]->rows() != static_cast<size_t>(columns[i]) ||
+                    weights[i]->cols() != static_cast<size_t>(params_.k))
+                    throw std::invalid_argument("GDN corrected bundle has a malformed original sibling shape/output");
+                validateQ8ResidualTensorCapacities(params_.m, columns[i], params_.k,
+                    params_.input->numel(), outputs[i]->numel());
+            }
+            const auto identity = params_.qkv_row_range->captureIdentity();
+            // Counted grouped GPU siblings must consume their own declared
+            // original verifier range. Never infer it from the QKV operand:
+            // without the common descriptor their existing scope is fully
+            // active. CPU compact rows intentionally have no common range.
+            if (params_.device_id.is_gpu() &&
+                params_.force_decode_equivalent_verifier_prefill && params_.m > 1 &&
+                identity.count && !params_.verifier_row_range)
+                throw std::invalid_argument("GDN counted GPU verifier QKV requires the original common verifier rows");
+            if (identity.physical_rows != params_.m || identity.count_capacity != params_.m ||
+                identity.first_physical_row != 0 || identity.repeats_per_row != 1 ||
+                (params_.verifier_row_range &&
+                 params_.verifier_row_range->captureIdentity() != identity))
+                throw std::invalid_argument("GDN corrected QKV requires its complete original query prefix and exact common verifier identity");
+        }
+    }
+
+    ITensorGemm *GDNProjectionStage::requireCorrectedQKVEngine() const
+    {
+        if (!params_.prepared_store || !params_.prepared_ref_qkv ||
+            params_.prepared_ref_qkv->device != params_.device_id)
+            throw std::invalid_argument("GDN corrected QKV requires its exact participant prepared store/ref");
+        const auto binding = params_.prepared_store->binding(*params_.prepared_ref_qkv);
+        auto *engine = params_.prepared_store->gemmKernel(*params_.prepared_ref_qkv);
+        if (!binding || !binding->immutable || binding->tensor != params_.w_qkv ||
+            !engine || (params_.gemm_qkv && params_.gemm_qkv != engine))
+            throw std::invalid_argument("GDN corrected QKV prepared source/ref/engine mismatch");
+        NativeVnniSourceIdentity source;
+        if (!engine->exportNativeVNNISourceIdentity(source) || !source.present || source.is_superblock ||
+            source.codebook_id != native_vnni_formats::Q8_0.codebook_id)
+            throw std::invalid_argument("GDN corrected QKV requires unchanged prepared native Q8_0 source provenance");
+        // Exact prepared N/K and native planes are additionally authenticated
+        // by the backend's setup requirement query and correction entrypoint.
+        // Do not construct temporary workspace declarations during execute.
+        return engine;
+    }
+
+    uint64_t GDNProjectionStage::graphCaptureVariantSignature() const
+    {
+        if (params_.qkv_operand_precision == QuantizedActivationOperandPrecision::SingleQ8)
+            return 0; // Preserve the existing default bundle recording contract.
+        uint64_t signature = 0x47444e514b560001ULL;
+        const auto mix = [&](uint64_t value)
+        {
+            signature ^= value + 0x9e3779b97f4a7c15ULL + (signature << 6) + (signature >> 2);
+        };
+        mix(static_cast<uint64_t>(params_.qkv_operand_precision));
+        mix(static_cast<uint64_t>(params_.device_id.type));
+        mix(params_.device_id.ordinal);
+        const auto quantizer = params_.device_id.is_cpu()
+            ? Q8ResidualQuantizerPolicy::CPUHalfAfterQuantization
+            : params_.device_id.type == DeviceType::CUDA
+                ? Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal
+                : Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal;
+        mix(static_cast<uint64_t>(quantizer));
+        mix(params_.m);
+        mix(params_.k);
+        mix(params_.n_qkv);
+        mix(params_.n_z);
+        mix(params_.n_a);
+        mix(params_.n_b);
+        mix(reinterpret_cast<std::uintptr_t>(params_.input));
+        mix(reinterpret_cast<std::uintptr_t>(params_.prepared_store));
+        const std::array<const ITensor *, 8> tensors{
+            params_.w_qkv, params_.w_z, params_.w_a, params_.w_b,
+            params_.output_qkv, params_.output_z, params_.output_a, params_.output_b};
+        for (const auto *tensor : tensors)
+            mix(reinterpret_cast<std::uintptr_t>(tensor));
+        const std::array refs{params_.prepared_ref_qkv, params_.prepared_ref_z,
+                              params_.prepared_ref_a, params_.prepared_ref_b};
+        for (const auto &ref : refs)
+        {
+            mix(ref.has_value());
+            if (ref)
+            {
+                mix(ref->model_id.value);
+                mix(ref->binding_id);
+                mix(static_cast<uint64_t>(ref->kind));
+                mix(static_cast<uint64_t>(ref->device.type));
+                mix(ref->device.ordinal);
+                // Resolve through the immutable store, never the lazy stage
+                // cache: prepareGraphLaunch cannot change this identity merely
+                // by filling cached GEMM pointers or binding a stream.
+                auto *engine = params_.prepared_store
+                    ? params_.prepared_store->gemmKernel(*ref) : nullptr;
+                mix(reinterpret_cast<std::uintptr_t>(engine));
+                if (engine)
+                    mix(static_cast<uint64_t>(engine->floatingActivationOperandPrecision()));
+            }
+        }
+        const auto mixRows = [&](const std::optional<DeviceRowRange> &rows)
+        {
+            mix(rows.has_value());
+            if (rows)
+            {
+                const auto identity = rows->captureIdentity();
+                mix(reinterpret_cast<std::uintptr_t>(identity.count));
+                mix(identity.count_capacity);
+                mix(identity.first_physical_row);
+                mix(identity.physical_rows);
+                mix(identity.repeats_per_row);
+                mix(identity.schema_version);
+            }
+        };
+        mix(params_.force_decode_equivalent_verifier_prefill);
+        mixRows(params_.verifier_row_range);
+        mixRows(params_.qkv_row_range);
+        return signature ? signature : 1;
     }
 
     void GDNProjectionStage::clearCachedGemmStreams()
@@ -253,6 +402,14 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
+        if (params_.qkv_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8)
+        {
+            std::string error;
+            if (!validatePreparedWeights(&error))
+                throw std::invalid_argument(error);
+            (void)requireCorrectedQKVEngine()->q8ResidualCorrectionWorkspaceRequirements(
+                params_.m, params_.n_qkv, params_.k);
+        }
 
         auto *gemm_qkv = resolveGemm(
             params_.w_qkv, params_.gemm_qkv, "w_qkv");
@@ -307,6 +464,13 @@ namespace llaminar2
                 return fail(std::string("missing PreparedWeightRef for ") + name);
             if (!params_.prepared_store->contains(ref.value()))
                 return fail(std::string("PreparedWeightStore does not contain ref for ") + name);
+            if (params_.qkv_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8)
+            {
+                const auto binding = params_.prepared_store->binding(*ref);
+                if (ref->device != params_.device_id || !binding || !binding->immutable ||
+                    binding->tensor != weight || !params_.prepared_store->gemmKernel(*ref))
+                    return fail(std::string("GDN corrected bundle lost its exact prepared source/device for ") + name);
+            }
             return true;
         };
 
@@ -319,6 +483,17 @@ namespace llaminar2
         if (!check("w_b", requireTensorBase(params_.w_b, "w_b"), params_.prepared_ref_b))
             return false;
 
+        if (params_.qkv_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8)
+        {
+            try
+            {
+                (void)requireCorrectedQKVEngine();
+            }
+            catch (const std::exception &exception)
+            {
+                return fail(exception.what());
+            }
+        }
         if (error)
             error->clear();
         return true;
@@ -383,6 +558,12 @@ namespace llaminar2
                                      {"output_b", params_.output_b}}))
             return false;
 
+        if (params_.qkv_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8)
+        {
+            std::string error;
+            if (!validatePreparedWeights(&error))
+                throw std::invalid_argument(error);
+        }
         const int M = params_.m;
         const int K = params_.k;
         auto *A_base = requireTensorBasePtr(params_.input, "input");
@@ -413,6 +594,16 @@ namespace llaminar2
             return false;
         }
 
+        if (params_.qkv_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8)
+        {
+            const std::array cached{gemm_qkv, gemm_z, gemm_a, gemm_b};
+            const std::array refs{params_.prepared_ref_qkv, params_.prepared_ref_z,
+                                  params_.prepared_ref_a, params_.prepared_ref_b};
+            for (size_t i = 0; i < cached.size(); ++i)
+                if (cached[i] != params_.prepared_store->gemmKernel(*refs[i]))
+                    throw std::invalid_argument("GDN corrected bundle has a foreign cached prepared engine");
+        }
+
         // Set GPU stream on all engines (no-op for CPU)
         bindStageStream(gemm_qkv);
         bindStageStream(gemm_z);
@@ -434,6 +625,21 @@ namespace llaminar2
             nativeVNNICodebook(gemm_a),
             nativeVNNICodebook(gemm_b)};
 
+        const bool corrected_qkv = params_.qkv_operand_precision ==
+            QuantizedActivationOperandPrecision::TwoTermQ8;
+        if (corrected_qkv)
+        {
+            auto *engine = requireCorrectedQKVEngine();
+            // Parent-stream QKV work precedes the siblings' existing fork
+            // frontier, so they cannot republish these admitted primary banks
+            // until the correction has consumed them. No host wait is added;
+            // sibling fused APIs retain their parent-stream event joins.
+            engine->multiply_q8_residual_corrected(A_base, C_qkv,
+                *params_.qkv_row_range, params_.n_qkv, K, bound_workspace_);
+            publishStageOutput(C_qkv);
+            recordGDNProjectionRoute("qkv_two_term_q8", M, K, projections, {0}, native_codebooks);
+        }
+
         if (params_.force_decode_equivalent_verifier_prefill && M > 1)
         {
             auto verifier_rows = gemm_qkv->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
@@ -449,6 +655,8 @@ namespace llaminar2
                 [&](const std::vector<ITensorGemm::TensorProjectionDesc> &all_projections) -> bool
             {
                 std::vector<bool> completed(all_projections.size(), false);
+                if (corrected_qkv)
+                    completed[0] = true;
 
                 for (size_t i = 0; i < all_projections.size(); ++i)
                 {
@@ -501,7 +709,7 @@ namespace llaminar2
                 return std::all_of(completed.begin(), completed.end(), [](bool done) { return done; });
             };
 
-            const bool homogeneous_projection_group =
+            const bool homogeneous_projection_group = !corrected_qkv &&
                 fusedProjectionCompatible(gemm_qkv, gemm_z, native_codebooks[0], native_codebooks[1]) &&
                 fusedProjectionCompatible(gemm_qkv, gemm_a, native_codebooks[0], native_codebooks[2]) &&
                 fusedProjectionCompatible(gemm_qkv, gemm_b, native_codebooks[0], native_codebooks[3]);
@@ -521,7 +729,7 @@ namespace llaminar2
                     M,
                     K,
                     projections,
-                    {0, 1, 2, 3},
+                    corrected_qkv ? std::vector<size_t>{1, 2, 3} : std::vector<size_t>{0, 1, 2, 3},
                     native_codebooks);
                 return true;
             }
@@ -533,7 +741,7 @@ namespace llaminar2
             return false;
         }
 
-        const bool homogeneous_projection_kernels =
+        const bool homogeneous_projection_kernels = !corrected_qkv &&
             fusedProjectionCompatible(gemm_qkv, gemm_z, native_codebooks[0], native_codebooks[1]) &&
             fusedProjectionCompatible(gemm_qkv, gemm_a, native_codebooks[0], native_codebooks[2]) &&
             fusedProjectionCompatible(gemm_qkv, gemm_b, native_codebooks[0], native_codebooks[3]);
@@ -560,6 +768,8 @@ namespace llaminar2
             LOG_TRACE("[GDNProjectionStage] Mixed projection GEMM kernels; trying supported fused subgroups");
 
             std::vector<bool> completed(projections.size(), false);
+            if (corrected_qkv)
+                completed[0] = true;
             auto runFusedSubgroups = [&](bool require_native_compatibility) -> bool
             {
                 for (size_t i = 0; i < projections.size(); ++i)
@@ -671,7 +881,14 @@ namespace llaminar2
         // Each GEMM: 2*M*N*K flops
         const size_t M = static_cast<size_t>(params_.m);
         const size_t K = static_cast<size_t>(params_.k);
-        return 2 * M * K * (params_.n_qkv + params_.n_z + params_.n_a + params_.n_b);
+        const size_t ordinary = 2 * M * K *
+            (params_.n_qkv + params_.n_z + params_.n_a + params_.n_b);
+        // Count the additional residual dot and final FP32 term addition.
+        // Quantization and fixed-fold instructions remain outside this
+        // conventional projection FLOP estimate, as on the default path.
+        return params_.qkv_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8
+            ? ordinary + 2 * M * K * params_.n_qkv + M * params_.n_qkv
+            : ordinary;
     }
 
     size_t GDNProjectionStage::estimatedMemoryBytes() const
@@ -852,7 +1069,11 @@ namespace llaminar2
         // leaves the Z, A, B kernels' buffers unallocated.
         auto *self = const_cast<GDNProjectionStage *>(this);
 
-        const int workspace_m = (m > 0) ? m : params_.m;
+        const int requested_m = (m > 0) ? m : params_.m;
+        // Family hints may enlarge shared banks, but cannot shrink this
+        // selected bundle below its actual physical projection capacity.
+        const int workspace_m = params_.qkv_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8
+            ? std::max(requested_m, params_.m) : requested_m;
         const int workspace_k = (k > 0) ? k : params_.k;
 
         WorkspaceRequirements combined;
@@ -880,6 +1101,12 @@ namespace llaminar2
         {
             anchor->appendFusedProjectionWorkspaceRequirements(
                 combined, workspace_m, fused_columns, workspace_k);
+        }
+        if (params_.qkv_operand_precision == QuantizedActivationOperandPrecision::TwoTermQ8)
+        {
+            auto *qkv = requireCorrectedQKVEngine();
+            combined.merge(qkv->q8ResidualCorrectionWorkspaceRequirements(
+                std::max(workspace_m, params_.m), params_.n_qkv, params_.k));
         }
         addCudaConcurrentDecodeGemvSideStreamWorkspace(
             combined, self->params_.device_id, workspace_m, /*projection_count=*/4);

@@ -33,6 +33,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace llaminar2;
 
@@ -199,6 +200,50 @@ TEST_F(Test__HIPGraphCapture, EmptyCaptureInstantiate)
         EXPECT_TRUE(capture->instantiate());
         EXPECT_TRUE(capture->hasExecutable());
         EXPECT_TRUE(capture->launch());
+    });
+}
+
+/**
+ * @test Kernel inspection rejects both ordinary and same-code prior errors.
+ *
+ * Both API-negative controls are safe host registry/argument queries. Their
+ * precise error is consumed only by this test after inspection has returned;
+ * no kernel, invalid device access or asynchronous failure is injected. The
+ * existing four-original-source GDN bundle separately covers real module-node
+ * resource inspection followed by corrected native launches.
+ */
+TEST_F(Test__HIPGraphCapture, InspectionPreservesPreExistingAPIError)
+{
+    ctx().submitAndWait([&] {
+        ASSERT_EQ(hipPeekAtLastError(), hipSuccess);
+        auto capture = ctx().createGraphCapture();
+        ASSERT_NE(capture, nullptr);
+        ASSERT_TRUE(capture->beginCapture());
+        ASSERT_TRUE(capture->endCapture());
+        for (bool same_code : {false, true})
+        {
+            hipFuncAttributes attributes{};
+            const int unregistered_host_symbol = 0;
+            const hipError_t injected = same_code
+                ? hipFuncGetAttributes(&attributes, &unregistered_host_symbol)
+                : hipFuncGetAttributes(nullptr, nullptr);
+            const hipError_t expected = same_code ? hipErrorInvalidSymbol : hipErrorInvalidValue;
+            std::vector<GPUGraphKernelNodeInfo> nodes;
+            std::string error;
+            const bool inspected = capture->inspectKernelNodes(nodes, &error);
+            // Retire this intentional error before any assertion can return.
+            const hipError_t retained = hipGetLastError();
+            EXPECT_EQ(injected, expected);
+            EXPECT_FALSE(inspected);
+            EXPECT_TRUE(nodes.empty());
+            EXPECT_NE(error.find("pre-existing error"), std::string::npos);
+            EXPECT_EQ(retained, expected);
+            EXPECT_EQ(hipPeekAtLastError(), hipSuccess);
+            EXPECT_TRUE(capture->inspectKernelNodes(nodes, &error));
+            EXPECT_TRUE(nodes.empty());
+            EXPECT_TRUE(error.empty());
+            EXPECT_EQ(hipPeekAtLastError(), hipSuccess);
+        }
     });
 }
 

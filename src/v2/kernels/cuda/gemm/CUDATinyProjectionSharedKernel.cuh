@@ -11,7 +11,7 @@
  */
 #pragma once
 
-#include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/FloatingProjectionRows.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -76,7 +76,7 @@ __device__ __forceinline__ float tinyProjectionWeight(Weight value)
 template<class Weight, int RowsPerCTA, class Activation = float>
 __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     const float *const *activations, const float *const *weights,
-    float *const *outputs, int m, int n, int k, DeviceRowRange row_range)
+    float *const *outputs, int m, int n, int k, FloatingProjectionRows row_range)
 {
     static_assert(RowsPerCTA == 2 || RowsPerCTA == 4 || RowsPerCTA == 8);
     constexpr int warp_width = 32;
@@ -91,9 +91,11 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     const int first_row = static_cast<int>(blockIdx.y) * RowsPerCTA;
     // Whole inactive CTAs retire before operand loads or barriers. Partial
     // tiles retain neutral lanes and the exact established reduction tree.
-    const int active_rows = row_range.activeRows();
-    if (first_row >= active_rows)
-        return;
+    unsigned int active_mask=0u;
+    #pragma unroll
+    for(int row=0;row<RowsPerCTA;++row)
+        if(row<m-first_row && row_range.rowIsActive(first_row+row))active_mask|=1u<<row;
+    if(active_mask==0u)return;
     const int first_column = static_cast<int>(blockIdx.x) * columns_per_cta;
     const Activation *a = reinterpret_cast<const Activation *>(activations[blockIdx.z]);
     const Weight *b = reinterpret_cast<const Weight *>(weights[blockIdx.z]);
@@ -110,7 +112,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
         // still stage neutral storage so every warp can obey the same barriers.
         #pragma unroll
         for (int row = 0; row < RowsPerCTA; ++row)
-            activation_tile[row][threadIdx.x] = first_row + row < active_rows && load_k < static_cast<unsigned int>(k)
+            activation_tile[row][threadIdx.x] = (active_mask & (1u<<row)) && load_k < static_cast<unsigned int>(k)
                 ? tinyProjectionWeight(a[static_cast<size_t>(first_row + row) * k + load_k]) : 0.0f;
         #pragma unroll
         for (int col = 0; col < columns_per_cta; ++col)
@@ -128,7 +130,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
                 const float weight = weight_tile[column][tile_k];
                 #pragma unroll
                 for (int row = 0; row < RowsPerCTA; ++row)
-                    partials[row][part] += activation_tile[row][tile_k] * weight;
+                    if(active_mask & (1u<<row))partials[row][part] += activation_tile[row][tile_k] * weight;
             }
         }
         __syncthreads();
@@ -137,6 +139,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     #pragma unroll
     for (int row = 0; row < RowsPerCTA; ++row)
     {
+        if(!(active_mask & (1u<<row)))continue;
         // Keep the same partial pairings as the legacy block reduction. Do not
         // collapse the eight accumulators or use an order-dependent atomic sum.
         #pragma unroll
@@ -150,7 +153,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
         #pragma unroll
         for (int stride = warp_width / 2; stride > 0; stride >>= 1)
             result += __shfl_down_sync(0xffffffffu, result, stride);
-        if (lane == 0 && first_row + row < active_rows && first_column + column < n)
+        if (lane == 0 && (active_mask & (1u<<row)) && first_column + column < n)
             c[static_cast<size_t>(first_row + row) * n + first_column + column] = result;
     }
 }

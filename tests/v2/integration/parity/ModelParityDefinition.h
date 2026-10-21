@@ -17,6 +17,7 @@
 
 #include "ParityTestBase.h"
 #include "ModelParityGenerationWorkload.h"
+#include "ModelParityPairedWorkload.h"
 #include "ModelParityCrossHostE2E.h"
 
 #include "backends/GlobalDeviceAddress.h"
@@ -43,6 +44,49 @@
 
 namespace llaminar2::test::parity
 {
+    /**
+     * @brief Stable requested-storage matrix identity, separate from resolved placement.
+     * @param preference Explicit typed requested axis, never inferred from a test name.
+     * @return Existing RAM/mmap suffixes or new distinct Automatic/VRAM suffixes.
+     * @throws std::invalid_argument For an unknown requested preference.
+     */
+    inline std::string ngramStorageTestName(ImmutableRowStoragePreference preference)
+    {
+        switch (preference)
+        {
+        case ImmutableRowStoragePreference::Automatic: return "NgramAuto_";
+        case ImmutableRowStoragePreference::VRAM: return "NgramVRAM_";
+        case ImmutableRowStoragePreference::RAM: return "NgramRAM_";
+        case ImmutableRowStoragePreference::MemoryMapped: return "NgramMmap_";
+        case ImmutableRowStoragePreference::HostAdaptiveRAMSSD: return "NgramHostAdaptiveRAMSSD_";
+        case ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD: return "NgramAdaptiveVRAMRAMSSD_";
+        }
+        throw std::invalid_argument("invalid model parity ngram storage preference");
+    }
+
+    /** @return Complete adaptive request identity, retaining every existing whole-tier name unchanged. */
+    inline std::string ngramStorageTestName(const ImmutableRowTablePolicy &policy)
+    {
+        policy.validate();const auto prefix=ngramStorageTestName(policy.storage);
+        if(policy.isFixedHeadSharded())return prefix+"FixedHeadSharded_";
+        if(policy.isGPUAdaptive())
+        {
+            const auto &g=policy.gpu_adaptive;const auto &h=g.host;
+            return prefix+"G"+std::to_string(g.maximum_gpu_cache_rows)+"_B"+std::to_string(g.gpu_cache_physical_byte_limit)+
+                "_A"+std::to_string(g.gpu_policy.aging_accesses)+"_P"+std::to_string(g.gpu_policy.protected_numerator)+
+                "of"+std::to_string(g.gpu_policy.protected_denominator)+"_H"+std::to_string(h.maximum_cache_rows)+
+                "_B"+std::to_string(h.cache_physical_byte_limit)+"_A"+std::to_string(h.policy.aging_accesses)+
+                "_P"+std::to_string(h.policy.protected_numerator)+"of"+std::to_string(h.policy.protected_denominator)+
+                "_W"+std::to_string(policy.window_bytes)+"_N"+std::to_string(policy.window_count)+"_";
+        }
+        if(!policy.isHostAdaptive())return prefix;
+        const auto &a=policy.host_adaptive;
+        return prefix+"C"+std::to_string(a.maximum_cache_rows)+"_B"+std::to_string(a.cache_physical_byte_limit)+
+            "_A"+std::to_string(a.policy.aging_accesses)+"_P"+std::to_string(a.policy.protected_numerator)+
+            "of"+std::to_string(a.policy.protected_denominator)+"_W"+std::to_string(policy.window_bytes)+
+            "_N"+std::to_string(policy.window_count)+"_";
+    }
+
     /** Deepest fixed/adaptive MTP draft policy in the canonical matrix. */
     inline constexpr int kModelParityRequiredMaximumMTPDepth = 15;
 
@@ -350,6 +394,8 @@ namespace llaminar2::test::parity
     {
         std::string test_id;             ///< Stable GoogleTest-safe model identifier.
         std::string model_path;          ///< Default real GGUF path or first split.
+        /** Optional second native source; absence retains main-only/inline-MTP identity. */
+        std::optional<SharedPredictorGGUFSource> shared_predictor;
         std::string reference_directory; ///< Authenticated reference pack.
         std::string prompt;              ///< Exact reference prompt, if overridden.
         std::vector<int> token_ids;       ///< Exact reference tokens, if pre-resolved.
@@ -492,6 +538,8 @@ namespace llaminar2::test::parity
     struct ModelParityFeatureMatrix
     {
         ModelParityAxisProfile mtp = ModelParityAxisProfile::Disabled;
+        /** Explicit native ngram modes; empty preserves models without row tables. */
+        std::vector<ImmutableRowTablePolicy> ngram_storage;
         /**
          * Matched Dynamic timing cohort for this exact model/topology.
          *
@@ -586,7 +634,9 @@ namespace llaminar2::test::parity
      * The containing definition owns model and topology. All remaining axes
      * are exact, typed matches: tags neither multiply nor prune parity cells.
      * An absent owner/movement pair selects non-overlay cells only. Expansion
-     * rejects a tag that matches no cell or overlaps another tag.
+     * rejects a tag that matches no cell, matches multiple cells or overlaps
+     * another tag. An explicit ngram profile compares the complete production
+     * request; an omitted profile is accepted only when selection is unambiguous.
      */
     struct ModelParityE2ESelection
     {
@@ -596,6 +646,12 @@ namespace llaminar2::test::parity
         std::optional<RoutedExpertOwnerOrder> owner_order;
         std::optional<ModelParityExpertMovement> movement;
         ModelParityPrefillGraphPolicy prefill_graph;
+        /**
+         * Exact production request profile, including windows, adaptive ceilings
+         * and replacement policy. Absence preserves legacy exact-one selection;
+         * it never resolves Automatic or chooses a default among storage axes.
+         */
+        std::optional<ImmutableRowTablePolicy> ngram_table_policy;
         ModelParityE2EProfile profile;
         /**
          * Remote variants use this cell's model/runtime policies and automatic
@@ -628,6 +684,8 @@ namespace llaminar2::test::parity
         std::vector<ModelParityE2ESelection> e2e_certifiable;
         /** One continuous regression workload shared by all policies and controls. */
         ModelParityGenerationWorkload generation_workload;
+        /** Optional source-bound accuracy/timing obligations, never an eligibility grant. */
+        std::optional<ModelParityPairedWorkload> paired_workload;
     };
 
     /** Placement and durable movement axes present only on ExpertOverlay. */
@@ -680,6 +738,8 @@ namespace llaminar2::test::parity
         BackendThresholds thresholds;
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
         KVCachePrecision kv_cache_precision = KVCachePrecision::FP16;
+        /** Exact row-store policy selected by this cell, absent for ordinary models. */
+        std::optional<ImmutableRowTablePolicy> ngram_table_policy;
         ModelParityMTP mtp = ModelParityMTP::Off;
         /** Explicit recursive aggregate floor; absent retains the global 0.99. */
         std::optional<float> mtp_recursive_aggregate_cosine_floor;
@@ -712,6 +772,8 @@ namespace llaminar2::test::parity
         std::vector<ModelParityRemoteCPUHosts> remote_cpu_overlays;
         /** Actual-output obligation, independent of the short deep-parity prompts. */
         ModelParityGenerationWorkload generation_workload;
+        /** Optional source-bound accuracy/timing obligations, never an eligibility grant. */
+        std::optional<ModelParityPairedWorkload> paired_workload;
 
         /** @return Whether this cell executes an MTP generation policy. */
         [[nodiscard]] constexpr bool mtpEnabled() const noexcept
@@ -843,6 +905,7 @@ namespace llaminar2::test::parity
             const std::string prefill_name =
                 prefill_graph.testNameFragment();
             return model.test_id + "_" + topology.test_id + "_" +
+                   (ngram_table_policy ? ngramStorageTestName(*ngram_table_policy) : std::string{}) +
                    (expert_overlay
                         ? expert_overlay->testName() + "_"
                         : std::string{}) +
@@ -872,6 +935,7 @@ namespace llaminar2::test::parity
             config.thresholds = thresholds;
             config.mpi_ranks = topology.mpi_ranks;
             config.model_path = model.model_path;
+            config.shared_predictor = model.shared_predictor;
             config.snapshot_dir = model.reference_directory;
             config.prompt = model.prompt;
             config.token_ids = model.token_ids;
@@ -902,6 +966,20 @@ namespace llaminar2::test::parity
                     config.devices.push_back(ParityDeviceType::ROCm);
                 else
                     config.devices.push_back(ParityDeviceType::CPU);
+            }
+
+            // Rank-local typed declarations have exact addresses. Keep that
+            // source authority through the legacy adapter instead of reducing
+            // sparse ordinals to counts of family entries. Cross-rank inventory
+            // binding keeps its existing owner-specific prerequisite contract.
+            if (!config.is_cross_rank())
+            {
+                std::vector<GlobalDeviceAddress> participants;
+                participants.reserve(topology.participants.size());
+                for (const auto &participant : topology.participants)
+                    participants.push_back(participant.address);
+                config.local_hardware_requirements =
+                    ParityHardwareRequirements::fromParticipants(participants);
             }
 
             if (expert_overlay)
@@ -970,6 +1048,7 @@ namespace llaminar2::test::parity
         {
             config.activation_precision = activationConfigValue();
             config.kv_cache_precision = kvCacheConfigValue();
+            if (ngram_table_policy) config.ngram_table_policy = *ngram_table_policy;
 
             // Prefix restore is a production invariant, not a generated axis.
             // The parity fixture resolves authenticated-prompt block geometry
@@ -1055,6 +1134,7 @@ namespace llaminar2::test::parity
         {
             OrchestrationConfig config = OrchestrationConfig::defaults();
             config.model_path = resolved_model_path;
+            config.shared_predictor = model.shared_predictor;
             config.max_seq_len = model.max_seq_len;
             config.batch_size = 1;
             config.device_mode = DeviceAssignmentMode::AUTO;
@@ -1427,7 +1507,8 @@ namespace llaminar2::test::parity
         [[nodiscard]] const TestConfig &getTestConfig() const
         {
             const std::string case_name = GetParam().testName();
-            if (!test_config_ || test_config_->name != case_name)
+            if (!test_config_ || test_config_->name != case_name ||
+                test_config_->shared_predictor != GetParam().model.shared_predictor)
                 test_config_ = GetParam().toTestConfig();
             return *test_config_;
         }
@@ -1488,6 +1569,23 @@ namespace llaminar2::test::parity
     {
         const auto &model = definition.model;
         const auto &topology = definition.topology;
+        if (definition.paired_workload)
+            definition.paired_workload->validate(model.model_path,
+                model.shared_predictor ? std::optional<std::string>(model.shared_predictor->path())
+                                       : std::nullopt);
+        std::vector<std::optional<ImmutableRowTablePolicy>> ngram_policies;
+        if (definition.features.ngram_storage.empty()) ngram_policies.emplace_back(std::nullopt);
+        else
+        {
+            std::set<std::string> storage_modes;
+            for (const auto &policy : definition.features.ngram_storage)
+            {
+                policy.validate();
+                if (!storage_modes.insert(ngramStorageTestName(policy)).second)
+                    throw std::invalid_argument("model parity ngram storage modes must be unique");
+                ngram_policies.emplace_back(policy);
+            }
+        }
         const auto is_test_identifier = [](const std::string &value)
         {
             return !value.empty() &&
@@ -1615,6 +1713,10 @@ namespace llaminar2::test::parity
                     "model parity prefill graph profiles must be unique");
             }
         }
+        if (definition.thresholds.final_logit_mean_kl &&
+            (!definition.thresholds.final_logit_mean_kl->valid() ||
+             definition.thresholds.final_logit_mean_kl->decode_steps != model.decode_steps))
+            throw std::invalid_argument("Final-logit policy requires finite positive budgets and the exact declared teacher trajectory");
         if (definition.features.mtp == ModelParityAxisProfile::Standard &&
             model.maximum_mtp_draft_depth <
                 kModelParityRequiredMaximumMTPDepth)
@@ -1989,6 +2091,7 @@ namespace llaminar2::test::parity
                     for (const auto &prefill_graph :
                          definition.features.prefill_graph)
                     {
+                        for (const auto &ngram_policy : ngram_policies)
                         for (const auto mtp : mtp_policies)
                         {
                             BackendThresholds thresholds =
@@ -2062,6 +2165,7 @@ namespace llaminar2::test::parity
                                 .thresholds = std::move(thresholds),
                                 .activation_precision = activation,
                                 .kv_cache_precision = kv_cache,
+                                .ngram_table_policy = ngram_policy,
                                 .mtp = mtp,
                                 .mtp_recursive_aggregate_cosine_floor =
                                     mtp_recursive_aggregate_cosine_floor,
@@ -2090,6 +2194,7 @@ namespace llaminar2::test::parity
                                 .tp_allreduce_precision_override =
                                     definition.tp_allreduce_precision_override,
                                 .generation_workload = definition.generation_workload,
+                                .paired_workload = definition.paired_workload,
                             };
                             if (!names.insert(test_case.testName()).second)
                             {
@@ -2106,6 +2211,7 @@ namespace llaminar2::test::parity
         for (const auto &selection : definition.e2e_certifiable)
         {
             const auto &profile = selection.profile;
+            if (selection.ngram_table_policy) selection.ngram_table_policy->validate();
             (void)modelParityE2EThinkingModesName(profile.thinking_modes);
             if (selection.owner_order.has_value() != selection.movement.has_value() ||
                 profile.context_length <= 0 || profile.minimum_prompt_tokens <= 0 ||
@@ -2138,6 +2244,7 @@ namespace llaminar2::test::parity
                 if (test_case.activation_precision != selection.activation ||
                     test_case.kv_cache_precision != selection.kv_cache ||
                     test_case.mtp != selection.mtp ||
+                    (selection.ngram_table_policy && test_case.ngram_table_policy != selection.ngram_table_policy) ||
                     test_case.prefill_graph != selection.prefill_graph ||
                     test_case.expert_overlay.has_value() != selection.owner_order.has_value())
                     continue;

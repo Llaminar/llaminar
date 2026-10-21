@@ -7,6 +7,8 @@
  * Expert operands use a single whole instance even when a tier has no initial
  * residency: the routing/capacity authority determines whether work is issued.
  * No inferred transfer path, physical allocation or execution timing lives here.
+ * Exact projection geometry carries both local N/K and the complete original
+ * participant partition; it grants no executable topology or movement mode.
  */
 #include "utils/DebugEnv.h"
 #include "planning/PlanningForwardWeightWork.h"
@@ -105,16 +107,17 @@ namespace llaminar2
             source->columns != static_cast<size_t>(projection.source_columns))
             throw std::invalid_argument("Expert work source disagrees with admitted projection ownership");
         // This is the preparation authority's interval, not a new TP quotient.
-        // Down keeps all intermediate columns and only partitions output rows.
-        return {static_cast<size_t>(projection.rows), source->columns, 1};
+        // Both original N and K windows belong to that immutable source value;
+        // an input shard must not be priced as the complete original K.
+        return {static_cast<size_t>(projection.rows), static_cast<size_t>(projection.columns), 1};
     }
 
     PlanningExpertWorkExpectation PlanningRoutedExpertWeightWork::projectionExpectation(
         WeightRole role, size_t token_rows) const
     {
         (void)projectionMatrix(role); // Authenticate the semantic source before pricing its population.
-        if (projection_ownership && projection_ownership->projection(role).residence ==
-                MoEProjectionResidence::ParticipantOutputSlice)
+        if (projection_ownership && projection_ownership->projection(role).residence !=
+                MoEProjectionResidence::ExpertOwner)
             return PlanningExpertExecutionShare(PlanningExpertExecution::ReplicatedExperts, expert_count)
                 .uniformExpectation(expert_count, routes_per_token, token_rows);
         return uniformExpectation(token_rows);

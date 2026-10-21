@@ -1,6 +1,6 @@
 /**
  * @file DeviceGraphOrchestratorGeneration.cpp
- * @brief Ordinary captured generation using the existing request/controller owner.
+ * @brief Ordinary captured generation and terminal request retirement using the existing request/controller owner.
  *
  * Prefill sampling consumes no KV row. Each subsequent retained transaction
  * consumes the pending device token, then publishes one response and its next
@@ -13,17 +13,116 @@
 #include "backends/BackendManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
+#include "execution/moe/MoEOverlayResidencyAuthority.h"
+#include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/mtp/DeviceGenerationGraphProgram.h"
 #include "utils/Logger.h"
+#include <exception>
+#include <stdexcept>
 
 namespace llaminar2
 {
+void DeviceGraphOrchestrator::prepareRetainedStorageBinding()
+{
+    const auto declared=graph_builder_?graph_builder_->retainedStorageBoundary(state_.device_id):nullptr;
+    if(retained_storage_boundary_&&declared!=retained_storage_boundary_)
+        throw std::logic_error("Immutable storage lane changed while captured generation retained its addresses");
+    retained_storage_boundary_=declared;
+    if(declared)
+    {
+        if(declared->device()!=state_.device_id)
+            throw std::logic_error("Immutable storage admission names another GPU participant");
+        declared->bindGenerationControl({device_generation_storage_.control_device+sampling_math::kDeviceGenerationControlOk,
+            device_generation_storage_.control_device+sampling_math::kDeviceGenerationControlErrorCode});
+    }
+}
+bool DeviceGraphOrchestrator::beginRetainedStorageAdmission(void *stream)
+{
+    prepareRetainedStorageBinding();
+    if(retained_storage_boundary_)retained_storage_boundary_->beginAdmission(session_epoch_,stream);
+    return true;
+}
+
+std::span<const DeviceControlledLoopEntryFragment> DeviceGraphOrchestrator::retainedStorageTerminalFragments()
+{
+    if(!retained_storage_boundary_)return {};
+    void *stream=mtp_device_generation_loop_graph_.stream.get();
+    if(!stream)throw std::logic_error("Immutable storage terminal requires its exact generation stream");
+    if(retained_storage_terminal_capture_&&retained_storage_terminal_capture_->executionStream()!=stream)
+        throw std::logic_error("Immutable storage terminal stream changed before retained graph retirement");
+    if(!retained_storage_terminal_capture_)
+    {
+        auto &worker=GPUDeviceContextPool::instance().getContext(state_.device_id);
+        retained_storage_terminal_capture_.bind(mtp_device_generation_loop_graph_.stream,worker.createGraphCapture(stream));
+        ScopedBackendGraphCapture recording(worker,*retained_storage_terminal_capture_.get(),"immutable_storage_generation_close");
+        if(!recording.begin())throw std::runtime_error("Immutable storage terminal recording failed");
+        retained_storage_boundary_->recordTerminalClose(stream);recording.finish();
+        if(!retained_storage_terminal_capture_->instantiate())
+            throw std::runtime_error("Immutable storage terminal executable materialization failed");
+        retained_storage_terminal_fragment_[0]={"immutable storage terminal close",retained_storage_terminal_capture_.get()};
+    }
+    return retained_storage_terminal_fragment_;
+}
+
+bool DeviceGraphOrchestrator::submitRetainedStorageTerminal()
+{
+    if(!retained_storage_boundary_)return true;
+    retained_storage_boundary_->requireArmedForLaunch();
+    if(!retained_storage_terminal_capture_||!retained_storage_terminal_capture_->hasExecutable())
+        throw std::logic_error("Hosted terminal ticket names an unprepared immutable storage close branch");
+    return retained_storage_terminal_capture_->launchOnStream(mtp_device_generation_loop_graph_.stream.get());
+}
+void DeviceGraphOrchestrator::releaseRetainedStorageGenerationTopology() noexcept
+{
+    mtp_device_generation_loop_graph_.release();
+    // The terminal owner retained the original stream while the parent and its
+    // child family retired. Its own recording now retires before the last stream.
+    retained_storage_terminal_fragment_={};
+    retained_storage_terminal_capture_.reset();
+}
+void DeviceGraphOrchestrator::retireRetainedStorageForRequestReset(void *stream)
+{
+    if(!retained_storage_boundary_ || !retained_storage_boundary_->hasActiveInterval())return;
+    auto *backend=getBackendFor(state_.device_id);
+    if(!state_.device_id.is_gpu() || !backend || !stream ||
+        reinterpret_cast<std::uintptr_t>(stream)<=2 || !device_generation_terminal_host_ready_event_)
+        throw std::logic_error("Immutable storage reset terminal requires its exact GPU stream and setup-owned terminal event");
+    // All prior forward/publication producers have joined this reset stream.
+    // A standalone prefill has no complete generation parent to publish close;
+    // this is its terminal request boundary, before protocol/session mutation.
+    // The DGO's request API owns this event exclusively: response observation
+    // and reset cannot overlap. Reusing it creates no new allocation or transfer.
+    // Do not requireHealthy here: a failed storage worker still owes its join.
+    retained_storage_boundary_->recordTerminalClose(stream);
+    PerfStatsCollector::addCounter("immutable_lookup","reset_terminal_closes",1.0,
+        "request_reset",state_.device_id.toString());
+    if(!backend->recordEvent(device_generation_terminal_host_ready_event_.get(),state_.device_id.ordinal,stream) ||
+        !backend->waitForEvent(device_generation_terminal_host_ready_event_.get(),state_.device_id.ordinal))
+        throw std::runtime_error("Immutable storage reset terminal event publication/completion failed");
+    // Service await authenticates the mapped close immediately. Only this exact
+    // terminal event (not a stream/device-wide sync) makes that publication safe
+    // to observe. No token, stage or retained-transaction boundary waits here.
+    PerfStatsCollector::addCounter("immutable_lookup","reset_terminal_waits",1.0,
+        "request_reset",state_.device_id.toString());
+    awaitRetainedStorageTerminal();
+}
+void DeviceGraphOrchestrator::awaitRetainedStorageTerminal()
+{
+    if(!retained_storage_boundary_)return;
+    std::exception_ptr failure;
+    try{retained_storage_boundary_->awaitTerminal();}catch(...){failure=std::current_exception();}
+    // Both successful and failed workers have joined before counters become
+    // observable. Recording adds no device read, transfer or synchronization.
+    try{retained_storage_perf_stats_.publish(retained_storage_boundary_->terminalObservation(),state_.device_id.toString());}
+    catch(...){if(!failure)throw;} // Preserve a more precise terminal-lifecycle failure when no joined observation exists.
+    if(failure)std::rethrow_exception(failure);
+}
+
 bool DeviceGraphOrchestrator::observeOrdinaryGenerationForwardCompletion(int64_t completed_invocations)
 {
     const auto &loop = mtp_device_generation_loop_graph_;
     std::string error;
-    if ((loop.ordinary_composition == OrdinaryGenerationComposition::ExpertOverlay ||
-         loop.ordinary_composition == OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail) &&
+    if (loop.ordinary_hosted_forward &&
         loop.execution_kind == MTPDeviceGenerationLoopGraphCache::ExecutionKind::HostedDispatchTicketPublisher)
     {
         /*
@@ -33,8 +132,10 @@ bool DeviceGraphOrchestrator::observeOrdinaryGenerationForwardCompletion(int64_t
          * cache entry survived; publishing composed-parent evidence here would
          * double-count work that did not execute inside a parent.
          */
-        if (!forward_engine_ || !loop.ordinary_forward_identity ||
-            !forward_engine_->retainedDecodeGraph(*loop.ordinary_forward_identity, &error))
+        const auto retained = forward_engine_ && loop.ordinary_forward_identity
+            ? forward_engine_->retainedDecodeGraph(*loop.ordinary_forward_identity, &error) : std::nullopt;
+        if (!retained || !loop.ordinary_hosted_forward ||
+            *retained != *loop.ordinary_hosted_forward || !loop.source_fragments.empty())
         {
             LOG_ERROR("Ordinary ExpertOverlay terminal lost its retained forward identity: " << error);
             return false;
@@ -51,18 +152,56 @@ bool DeviceGraphOrchestrator::observeOrdinaryGenerationForwardCompletion(int64_t
     return true;
 }
 
+OrdinaryForwardRetentionKind DeviceGraphOrchestrator::ordinaryForwardRetentionKind() const
+{
+    if (!graph_builder_)
+        throw std::logic_error("Ordinary forward retention requires its admitted graph builder");
+    const auto execution = deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology::FixedDepth);
+    const bool boundary = hasHeterogeneousCollectiveExecutionDomain() ||
+        static_cast<bool>(moe_overlay_inference_transaction_coordinator_);
+    OrdinaryForwardDomain domain = OrdinaryForwardDomain::ParticipantLocal;
+    if (boundary && graph_builder_ && graph_builder_->config().moe.routed_expert_plan &&
+        graph_builder_->config().moe.routed_expert_plan->usesExpertOverlayAuthority())
+    {
+        const auto &moe = graph_builder_->config().moe;
+        // The builder owns the admitted residency registry and its exact epoch
+        // arena. Placement snapshots may legitimately change during maintenance;
+        // they are not graph/export identity and are never read to select replay.
+        const auto declared = graph_builder_->deviceMoEOverlayEpochExecutionBinding(state_.device_id);
+        if (!moe.expert_overlay_residency_authority || !moe.expert_overlay_participant_residency ||
+            !declared || declared.arena != moe_overlay_epoch_execution_binding_.arena ||
+            declared.request_slot != moe_overlay_epoch_execution_binding_.request_slot ||
+            !moe_overlay_epoch_execution_binding_ ||
+            moe_overlay_epoch_execution_binding_.arena->deviceId() != state_.device_id ||
+            moe_overlay_epoch_execution_binding_.request_slot >=
+                moe_overlay_epoch_execution_binding_.arena->requestSlotCapacity())
+            throw std::logic_error("Hosted ordinary forward lacks its exact admitted overlay and epoch owner");
+        domain = OrdinaryForwardDomain::HostedExpertOverlay;
+    }
+    return resolveOrdinaryForwardRetention(execution, domain);
+}
+
 std::optional<DeviceGraphOrchestrator::OrdinaryGenerationForward>
 DeviceGraphOrchestrator::materializeOrdinaryGenerationForward(
-    const int32_t *condition, std::string *error)
+    const int32_t *condition, OrdinaryForwardRetentionKind retention, std::string *error)
 {
     const auto fail = [&](const std::string &reason) -> std::optional<OrdinaryGenerationForward> {
         if (error) *error = reason;
         return std::nullopt;
     };
+    // Resolve the requested ownership before preparing any model nodes. A
+    // failed native export never selects the hosted arm.
+    const auto admitted = ordinaryForwardRetentionKind();
+    if (retention == OrdinaryForwardRetentionKind::HostedExpertOverlay && retention != admitted)
+        return fail("Hosted ordinary forward is outside its admitted ExpertOverlay domain");
+    if (retention != OrdinaryForwardRetentionKind::NativeComposable &&
+        retention != OrdinaryForwardRetentionKind::HostedExpertOverlay)
+        return fail("Unknown ordinary forward retention kind");
     auto *const backend = getBackendFor(state_.device_id);
     void *const stream = mtp_device_generation_loop_graph_.stream.get();
-    if (!backend || !stream || !condition || !state_.kv_cache || !request_position_ids_dev_)
-        return fail("Resident ordinary forward requires an exact stream, token and owned KV position");
+    if (!backend || !stream || !condition || !state_.kv_cache || !request_position_ids_dev_ ||
+        condition != device_resident_logical_sequence_state_storage_.next_condition_tokens_device)
+        return fail("Resident ordinary forward requires its exact logical token owner, stream and owned KV position");
     // A receive writes directly into the participant's existing hidden bank.
     // This is deliberately a self-binding: the engine must not insert a host
     // handoff or copy/rebind the preceding participant's tensor during replay.
@@ -78,6 +217,8 @@ DeviceGraphOrchestrator::materializeOrdinaryGenerationForward(
     input.execution_role = ForwardExecutionRole::MainInference;
     input.execution_phase = ForwardExecutionPhase::Decode;
     input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+    if (pipeline_forward_edges_ && !pipeline_forward_edges_->hasHeterogeneousBoundary())
+        input.pipeline_activation_ownership = ForwardPipelineActivationOwnership::NativeGenerationParent;
     input.batch_size = input.seq_len = input.real_seq_len = 1;
     input.position_offset = input.token_offset = 1;
     input.device_state_publication_stream = stream;
@@ -94,9 +235,18 @@ DeviceGraphOrchestrator::materializeOrdinaryGenerationForward(
     if (!forward_engine_->execute(input, output, *this, &signature) || !signature)
         return fail("Ordinary resident-input forward could not materialize its exact identity");
     std::string detail;
+    if (retention == OrdinaryForwardRetentionKind::HostedExpertOverlay)
+    {
+        const auto forward = forward_engine_->retainedDecodeGraph(*signature, &detail);
+        if (!forward)
+            return fail("Ordinary hosted ExpertOverlay requires its complete retained body: " + detail);
+        PerfStatsCollector::addCounter("forward_graph", "ordinary_hosted_forward_exports", 1.0,
+            "graph_setup", state_.device_id.toString());
+        return OrdinaryGenerationForward{*forward, *signature};
+    }
     const auto forward = forward_engine_->deviceLoopGraphTemplate(*signature, &detail);
     if (!forward)
-        return fail("Ordinary generation requires a complete captured forward: " + detail);
+        return fail("Ordinary generation requires a complete native-composable forward: " + detail);
     return OrdinaryGenerationForward{*forward, *signature};
 }
 
@@ -118,10 +268,36 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         return false;
     };
     if (error) error->clear();
+    const bool native_no_peer_tail = composition == OrdinaryGenerationComposition::PipelineNoPeerOverlayTail;
+    const bool pipeline_tail = composition == OrdinaryGenerationComposition::PipelineTail || native_no_peer_tail;
     const bool expert_overlay = composition == OrdinaryGenerationComposition::ExpertOverlay ||
-        composition == OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail;
+        composition == OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail || native_no_peer_tail;
     const bool pipeline_domain_tail = composition == OrdinaryGenerationComposition::PipelineDomainTail ||
         composition == OrdinaryGenerationComposition::PipelineDomainExpertOverlayTail;
+    if (native_no_peer_tail)
+    {
+        if (!pp_stage_config_ || !graph_builder_ || !moe_overlay_epoch_execution_binding_ ||
+            moe_overlay_epoch_execution_binding_.arena->deviceId() != state_.device_id ||
+            moe_overlay_epoch_execution_binding_.request_slot >=
+                moe_overlay_epoch_execution_binding_.arena->requestSlotCapacity() ||
+            (pipeline_forward_edges_ && pipeline_forward_edges_->hasHeterogeneousBoundary()) ||
+            usesParticipantLocalDeviceMoERebalanceController())
+            return fail("Native no-peer pipeline tail has no exact epoch, scope or parent ownership");
+        const auto &config = graph_builder_->config();
+        const auto &authority = config.moe.expert_overlay_residency_authority;
+        if (!authority || config.pp_layer_offset != pp_stage_config_->first_layer ||
+            config.n_layers != pp_stage_config_->last_layer - pp_stage_config_->first_layer)
+            return fail("Native no-peer pipeline tail has no exact admitted model-layer authority");
+        try
+        {
+            MoEOverlayNoPeerResidency::requireNativePipelineTail(
+                authority->noPeerResidency(), *pp_stage_config_, state_.device_id, config.moe.num_experts);
+        }
+        catch (const std::exception &exception)
+        {
+            return fail(exception.what());
+        }
+    }
     // This compiler accepts a complete participant-local graph. A pipeline or
     // sparse boundary needs its explicit transfer/follower composition, not an
     // apparently successful loop around only this participant's model shard.
@@ -132,7 +308,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         !state_.kv_cache || !state_.logits || !request_position_ids_dev_ ||
         activeMainLogitsAreColumnParallel() ||
         (pp_stage_config_ && (!pp_stage_config_->has_lm_head ||
-            (!pp_stage_config_->has_embedding && composition != OrdinaryGenerationComposition::PipelineTail &&
+            (!pp_stage_config_->has_embedding && !pipeline_tail &&
              !pipeline_domain_tail))) ||
         (pipeline_domain_tail &&
             (!pipeline_forward_edges_ || !pipeline_forward_edges_->hasHeterogeneousBoundary())) ||
@@ -163,10 +339,18 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     if (!logical.validFor(1))
         return fail("Ordinary generation has no persistent logical frontier");
 
-    const auto prepared = materializeOrdinaryGenerationForward(logical.next_condition_tokens_device, error);
+    const auto retention = (pipeline_tail || !expert_overlay)
+        ? OrdinaryForwardRetentionKind::NativeComposable : ordinaryForwardRetentionKind();
+    const auto prepared = materializeOrdinaryGenerationForward(logical.next_condition_tokens_device, retention, error);
     if (!prepared) return false;
     const auto &signature = prepared->signature;
-    const auto &forward = prepared->graph;
+    const auto *native_forward = prepared->native();
+    const auto *hosted_forward = prepared->hosted();
+    const bool hosted_overlay = retention == OrdinaryForwardRetentionKind::HostedExpertOverlay;
+    if ((hosted_overlay && (!hosted || !expert_overlay || pipeline_tail)) ||
+        hosted_overlay != static_cast<bool>(hosted_forward) ||
+        (!hosted_overlay && !native_forward))
+        return fail("Ordinary generation export differs from its explicit native/hosted composition");
     std::string detail;
     const bool owns_maintenance =
         usesParticipantLocalDeviceMoERebalanceController();
@@ -228,7 +412,10 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         loop.ordinary_composition == composition &&
         loop.ordinary_maintenance_capture == maintenance_capture &&
         loop.ordinary_maintenance_due == maintenance_due &&
-        loop.source_fragments.size() == 1 && loop.source_fragments.front().capture == forward.capture)
+        (hosted_overlay
+            ? (loop.source_fragments.empty() && loop.ordinary_hosted_forward == *hosted_forward)
+            : (!loop.ordinary_hosted_forward && loop.source_fragments.size() == 1 &&
+               loop.source_fragments.front().capture == native_forward->capture)))
     {
         // Leading-row ownership is request data, not graph topology. CUDA
         // reads the admitted control word; HIP uses this immutable admission
@@ -278,43 +465,44 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
      * would both duplicate the lease and borrow an independently invalidated
      * boundary cache after a normal decode recapture.
      */
-    std::array<DeviceControlledLoopFragment, 3> iteration = {{
-        {.name = "ordinary_resident_forward", .capture = forward.capture},
-        {.name = "ordinary_decode_sample", .capture = loop.ordinary_children[Plan::decode_sampler].get()},
-        {}}};
-    if (owns_maintenance)
-    {
-        // The model's final routed layer publishes the serial commit clock.
-        // Maintenance consumes that due word only after the sampled response
-        // and the forward's captured epoch release have completed.
-        iteration[2] = {
-            .name = "ordinary_device_moe_maintenance",
-            .capture = maintenance_capture,
-            .execution = DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero,
-            .condition_word_device = maintenance_due};
-    }
-    if (composition == OrdinaryGenerationComposition::PipelineTail)
+    if (pipeline_tail)
     {
         // The rank installs activation/command edges around these recordings.
         // A local-only tail loop would advance KV without upstream layers.
     }
     else if (!hosted)
     {
+        std::array<DeviceControlledLoopFragment, 3> iteration = {{
+            {.name = "ordinary_resident_forward", .capture = native_forward->capture},
+            {.name = "ordinary_decode_sample", .capture = loop.ordinary_children[Plan::decode_sampler].get()},
+            {}}};
+        if (owns_maintenance)
+        {
+            // The model's final routed layer publishes the serial commit clock.
+            // Maintenance consumes that due word only after the sampled response
+            // and the forward's captured epoch release have completed.
+            iteration[2] = {
+                .name = "ordinary_device_moe_maintenance",
+                .capture = maintenance_capture,
+                .execution = DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero,
+                .condition_word_device = maintenance_due};
+        }
         if (!DeviceGenerationGraphProgram::native(*loop.capture, control,
                 {.initialization = initialization,
                  .iteration = std::span<const DeviceControlledLoopFragment>(
-                     iteration.data(), 2u + static_cast<size_t>(owns_maintenance))},
+                     iteration.data(), 2u + static_cast<size_t>(owns_maintenance)),
+                 .terminal=retainedStorageTerminalFragments()},
                 detail))
             return fail(detail);
     }
-    else if (expert_overlay)
+    else if (hosted_overlay)
     {
         std::string retained_error;
         if (!forward_engine_->retainedDecodeGraph(signature, &retained_error) ||
             !loop.ordinary_children[Plan::prefill_sampler]->instantiate() ||
             !loop.ordinary_children[Plan::decode_sampler]->instantiate() ||
             !DeviceGenerationGraphProgram::ticketPublisher(*loop.capture, context, *backend, state_.device_id,
-                control, maintenance_due, device_generation_storage_.dispatch_tickets_device, detail))
+                control, maintenance_due, device_generation_storage_.dispatch_tickets_device, detail,retained_storage_boundary_.get()))
         {
             return fail("Ordinary ExpertOverlay hosted graph compilation failed: " +
                         (retained_error.empty() ? detail : retained_error));
@@ -331,17 +519,17 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         auto &transaction = loop.ordinary_children[Plan::hosted_transaction];
         transaction = context.createGraphCapture(stream);
         const GPUOrderedTimelineStep steps[] = {
-            {.name = "ordinary_resident_forward", .capture = forward.capture},
+            {.name = "ordinary_resident_forward", .capture = native_forward->capture},
             {.name = "ordinary_decode_sample", .capture = loop.ordinary_children[Plan::decode_sampler].get()}};
         if (!transaction || !transaction->buildOrderedTimelineTransaction(steps) || !transaction->instantiate() ||
             !loop.ordinary_children[Plan::prefill_sampler]->instantiate() ||
             !DeviceGenerationGraphProgram::ticketPublisher(*loop.capture, context, *backend, state_.device_id,
-                control, maintenance_due, device_generation_storage_.dispatch_tickets_device, detail))
+                control, maintenance_due, device_generation_storage_.dispatch_tickets_device, detail,retained_storage_boundary_.get()))
             return fail("Ordinary hosted graph compilation failed: " + detail);
         loop.hosted_fragments.push_back({.name = "ordinary_complete_transaction",
             .kind = HostedDeviceGenerationFragment::Kind::CapturedLocal, .capture = transaction.get()});
     }
-    if (hosted && composition != OrdinaryGenerationComposition::PipelineTail)
+    if (hosted && !pipeline_tail)
     {
         if (owns_maintenance)
         {
@@ -360,8 +548,11 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     // seeds and frontier contents stay in their existing arena-owned banks.
     // Completion attribution belongs to the retained model forward, never to
     // the overlay lease child that happens to precede it in this composition.
-    loop.source_fragments.push_back(
-        {.name = "ordinary_resident_forward", .capture = forward.capture});
+    if (hosted_overlay)
+        loop.ordinary_hosted_forward = *hosted_forward;
+    else
+        loop.source_fragments.push_back(
+            {.name = "ordinary_resident_forward", .capture = native_forward->capture});
     loop.ordinary_sampling_identity = params;
     loop.ordinary_forward_identity = signature;
     loop.ordinary_composition = composition;
@@ -378,6 +569,9 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     loop.execution_kind = hosted ? MTPDeviceGenerationLoopGraphCache::ExecutionKind::HostedDispatchTicketPublisher
                                 : MTPDeviceGenerationLoopGraphCache::ExecutionKind::NativeConditionalParent;
     loop.valid = true;
+    if (native_no_peer_tail)
+        PerfStatsCollector::addCounter("generation", "ordinary_native_pipeline_nopeer_tail_materializations", 1.0,
+            "graph_setup", state_.device_id.toString());
     PerfStatsCollector::addCounter("generation", "ordinary_graph_materializations", 1.0,
         "graph_setup", state_.device_id.toString());
     return true;
@@ -436,6 +630,9 @@ bool DeviceGraphOrchestrator::replayHostedOrdinaryExpertOverlayTransaction(
         forward_engine_->retainedDecodeGraph(signature, &retained_error);
     if (!retained)
         return fail(retained_error);
+    if (!loop.ordinary_hosted_forward || *loop.ordinary_hosted_forward != *retained ||
+        !loop.source_fragments.empty() || ordinaryForwardRetentionKind() != OrdinaryForwardRetentionKind::HostedExpertOverlay)
+        return fail("Hosted ordinary ExpertOverlay retained owner changed before replay");
 
     MoEOverlayInferenceExecutionDescriptor descriptor{
         .graph_role = MoEOverlayInferenceGraphRole::MainDecode,

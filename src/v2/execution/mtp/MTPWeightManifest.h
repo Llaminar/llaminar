@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include "models/qwen4exp/Qwen4ExpPredictorPolicy.h"
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -65,6 +67,9 @@ namespace llaminar2
         std::string shared_expert_down;
         std::string shared_expert_gate_inp;
 
+        /** Exact architecture-specific HC/indexer/head operands beyond the common predictor roles. */
+        std::vector<std::string> additional_required;
+
         /** @return Nonempty mandatory roles, including routed/shared MoE parents. */
         std::vector<std::string> requiredNames() const;
     };
@@ -78,6 +83,9 @@ namespace llaminar2
         std::vector<MTPDepthWeightNames> depths;
         std::vector<std::string> missing_required;
         std::string diagnostic;
+
+        /** Explicit source attention/norm policy for a Flash Next predictor, never inferred from main selectors. */
+        std::optional<Qwen4ExpPredictorMetadata> flash_next;
 
         /** @return Sorted, duplicate-free source names for all learned blocks. */
         std::vector<std::string> requiredNames() const;

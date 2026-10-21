@@ -64,9 +64,11 @@ namespace llaminar2
          * @param config Orchestration config (parsed from CLI)
          * @param argc Argument count (for MPI self-launch)
          * @param argv Argument vector (for MPI self-launch)
+         * @param arguments Default frontend filtering or exact opaque-wrapper argv retention.
          * @return CONTINUE to proceed, or EXIT with an exit code
          */
-        BootstrapResult execute(const OrchestrationConfig &config, int argc, char *argv[]);
+        BootstrapResult execute(const OrchestrationConfig &config, int argc, char *argv[],
+                                MPIBootstrapArgumentPolicy arguments = MPIBootstrapArgumentPolicy::FilterLaunchArguments);
 
         /**
          * @brief Classify every typed topology surface before opening drivers.

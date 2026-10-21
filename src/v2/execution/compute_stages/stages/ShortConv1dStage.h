@@ -203,6 +203,9 @@ namespace llaminar2
          * recurrent layer only after the complete transaction validates.
          */
         CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override;
+        /** @brief Validate every CPU request and expose exact native snapshot-copy plans before mutation. */
+        bool planCPUVerifierStateRestoreRows(const int *rows,int requests,
+            std::vector<CPUVerifierStateRestorePlan> &plans) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
             const int *device_row_index,
             void *stream) override;

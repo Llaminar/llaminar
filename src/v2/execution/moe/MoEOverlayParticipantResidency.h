@@ -775,8 +775,9 @@ namespace llaminar2
          *
          * This checks scoped handles and projection metadata only. It performs
          * no device operation or payload read. Callers must select the immutable
-         * transfer-directory storage contract and retire its producers first;
-         * this method cannot certify recycled physical-fabric payload bytes.
+         * prepared-source contract (native transfer directory or authenticated
+         * NoPeer geometry) and retire its producers first; this method cannot
+         * certify recycled physical-fabric payload bytes.
          */
         [[nodiscard]] std::size_t verifyImmutablePreparedSources(const ExpertGemmRegistry &registry) const;
 

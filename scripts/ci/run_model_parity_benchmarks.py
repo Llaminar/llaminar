@@ -28,6 +28,7 @@ import uuid
 
 import docker_paths
 import run_model_parity_e2e as e2e
+from model_parity_inventory import map_predictor_source
 from production_artifacts import (digest, image_identity, positive, ratchet,
                                   validate_image_e2e, validate_manifest, write_json)
 
@@ -257,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
                 config = row["configuration"]
                 model = paths[Path(config["model"]).resolve()]
                 data = run_cell(runtime["id"] if binary is None else None,
-                                row["backends"], directory, model, config, workload,
+                                row["backends"], directory, model, map_predictor_source(config, lambda path: str(paths[Path(path).resolve()])), workload,
                                 diagnostic_binary=binary)
                 measured = validate_measurement(data, workload)
                 # Preserve the model filename/size, not machine-specific mount text.

@@ -26,8 +26,10 @@ namespace llaminar2
  */
 struct ActivationGraphMemoryGeometry
 {
+    std::optional<ImmutableRowLookupExecution> ngram_lookup; ///< Absent only for the unresolved higher-priority BOM.
     int batch_size = 1;             ///< Requests represented by the main graph.
     int resident_graph_rows = 1;    ///< Largest retained prefill bucket.
+    int context_tokens = 0;         ///< Explicit admitted per-request context; required for sparse state.
     int local_d_ff = 0;             ///< Participant-local dense FFN width.
     int local_n_heads = 0;          ///< Participant-local query head count.
     int local_n_kv_heads = 0;       ///< Participant-local KV head count.
@@ -43,15 +45,28 @@ struct ActivationGraphMemoryGeometry
     RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         ///< Frozen physical expert layout; determines which publication banks exist.
     int mtp_target_query_rows = 2;  ///< Flattened maximum verifier-row capacity.
+    int retained_mtp_candidate_rows = 0; ///< Explicit retained QSA target bank; zero when MTP capacity is absent.
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
     int generation_request_capacity = 1; ///< Retained sampler request rows, including disabled MTP capacity.
+    int ngram_fixed_head_participants = 0; ///< Source-declared native cohort P2/4/8; zero outside fixed-head lookup.
 };
 
 /** @brief Sizes stable activation owners used by captured inference graphs. */
 class ActivationMemoryEstimator
 {
 public:
+    /**
+     * @brief Price only tier-specific PLE arena roles using the canonical declaration inventory.
+     * @param profile Exact source metadata.
+     * @param geometry Frozen graph envelope with concrete ngram_lookup.
+     * @param device Actual graph participant.
+     * @return Incremental lookup scratch/protocol bytes absent from the unresolved base.
+     * @throws std::invalid_argument For absent tier or malformed Flash Next geometry.
+     */
+    static std::size_t immutableLookupArenaBytes(const ModelMemoryProfile &profile,
+        const ActivationGraphMemoryGeometry &geometry, DeviceId device);
+
     /**
      * @brief Estimate the common transformer BufferArena owner set.
      *

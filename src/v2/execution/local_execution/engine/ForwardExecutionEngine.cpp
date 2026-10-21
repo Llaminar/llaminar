@@ -1797,6 +1797,14 @@ namespace llaminar2
         IForwardExecutionHost &host,
         std::optional<ForwardGraphSignature> *materialized_signature)
     {
+        // Geometry manifests and unknown values cannot resolve a GPU context,
+        // consult an executable cache, resize workspace, or submit any graph.
+        if(!executableForwardSubmissionIntent(input.graph_submission_intent))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Workspace declaration or unknown submission intent is not executable");
+            return false;
+        }
+        if(input.device_request_query)requireDeviceRequestQueryOwnsInput(input);
         if (materialized_signature)
             materialized_signature->reset();
         last_executed_forward_graph_ = {};
@@ -1811,6 +1819,12 @@ namespace llaminar2
              input.position_policy != ForwardPositionPolicy::ExplicitRows))
         {
             LOG_ERROR("[ForwardExecutionEngine] Invalid graph-owned decode position binding");
+            return false;
+        }
+        if (input.pipeline_activation_ownership != ForwardPipelineActivationOwnership::ForwardGraph &&
+            (!config_.pipeline_forward_edges || config_.pipeline_forward_edges->encloses(input)))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Parent-owned activation input lacks its exact native pipeline setup owner");
             return false;
         }
         ScopedWorkerGPUContextResolver worker_resolver_scope(
@@ -2129,12 +2143,17 @@ namespace llaminar2
                 .position_policy = effective_input.position_policy,
                 .device_sequence_lengths = effective_input.sequence_lengths_device,
                 .device_decode_position = effective_input.device_decode_position,
+                .device_request_query_capture_identity = effective_input.device_request_query
+                    ? effective_input.device_request_query->captureIdentity() : uint64_t{0},
                 .device_prefill_chunk_capture_identity =
                     effective_input.device_prefill_chunk
                         ? effective_input.device_prefill_chunk->capture_identity
                         : uint64_t{0},
-                .pipeline_forward_edges = config_.pipeline_forward_edges && config_.pipeline_forward_edges->encloses(effective_input)
+                .pipeline_forward_edges = config_.pipeline_forward_edges &&
+                    (config_.pipeline_forward_edges->encloses(effective_input) ||
+                     effective_input.pipeline_activation_ownership == ForwardPipelineActivationOwnership::NativeGenerationParent)
                     ? config_.pipeline_forward_edges : nullptr,
+                .pipeline_activation_ownership = effective_input.pipeline_activation_ownership,
                 .shifted_mtp_prefill_capture_identity =
                     effective_input.shifted_mtp_prefill
                         ? effective_input.shifted_mtp_prefill->capture_identity
@@ -2544,6 +2563,7 @@ namespace llaminar2
         view.stream = template_view->stream;
         view.stage_count = template_view->stage_count;
         view.captured_node_count = template_view->captured_node_count;
+        view.storage_boundary=template_view->storage_boundary;
         return view;
     }
 
@@ -2632,6 +2652,11 @@ namespace llaminar2
         view.signature = signature;
         view.device = signature.device;
         view.stream = cache.segment_cache.capture_stream;
+        view.graph_owner = cache.graph.get();
+        view.topology_generation = cache.graph->topologyGeneration();
+        view.workspace_generation = cache.workspace_generation;
+        view.capture_variant_signature = cache.segment_cache.capture_variant_signature;
+        view.capture_generation = cache.segment_cache.successful_capture_count;
         const auto &parent_plan =
             cache.segment_cache.retained_composed_parent_replay;
         if (parent_plan.valid())
@@ -3199,7 +3224,8 @@ namespace llaminar2
         ForwardGraphCache &forward_cache,
         IForwardExecutionHost &host,
         const ForwardGraphSignature &signature,
-        std::chrono::high_resolution_clock::time_point start)
+        std::chrono::high_resolution_clock::time_point start,
+        HostPipelineBoundarySubmission pp_submission)
     {
         const bool is_decode = signature.decode;
         // ===== CACHE HIT: Reuse cached decode graph =====
@@ -3306,51 +3332,21 @@ namespace llaminar2
             }
         }
 
-        // PP hidden state copy: for non-embedding PP stages, copy the
-        // external hidden state (from previous PP stage) to the working
-        // buffer before executing the cached graph.
-        if (forward_cache.pp_needs_copy &&
-            forward_cache.pp_external_hidden_state &&
-            forward_cache.pp_working_buffer)
-        {
-            // PP hidden-state handoff. copyActivation picks the cheapest transport
-            // for the (source authoritative device -> pp_device) pair:
-            //   - same physical GPU   -> intra-VRAM device-to-device memcpy
-            //   - same-vendor diff GPU -> peer copy (NCCL/RCCL or peer DMA)
-            //   - cross-vendor / host  -> single host-staged bounce
-            // and leaves the destination DEVICE_AUTHORITATIVE on pp_device.
-            //
-            // In the steady-state heterogeneous CUDA->ROCm case the producing
-            // stage's transferActivation() has already moved the external hidden
-            // state onto pp_device (rocm:0), so this resolves to an intra-GPU D2D
-            // copy. This replaces the old data()/memcpy/ensureOnDevice host
-            // round-trip that cost ~30ms/token.
-            const bool pp_time = is_decode && debugEnv().tp_timing;
-            auto pp_t0 = pp_time ? Clock::now() : Clock::time_point{};
-
-            auto pp_result = TransferEngine::instance().copyActivation(
-                forward_cache.pp_external_hidden_state, forward_cache.pp_working_buffer,
-                forward_cache.pp_device, forward_cache.pp_copy_bytes);
-
-            // Fail loud: a failed hidden-state handoff corrupts the entire
-            // downstream pipeline stage, so there is no safe fallback.
-            if (!pp_result.success)
-            {
-                LOG_ERROR("[PP_COPY] copyActivation failed on "
-                          << forward_cache.pp_device << ": " << pp_result.error);
-                throw std::runtime_error("PP hidden-state copy failed: " + pp_result.error);
-            }
-
-            if (pp_time)
-            {
-                auto pp_t1 = Clock::now();
-                double total_us =
-                    std::chrono::duration<double, std::micro>(pp_t1 - pp_t0).count();
-                LOG_DEBUG("[PP_COPY] dev=" << forward_cache.pp_device << " method="
-                          << to_string(pp_result.method_used) << " total=" << total_us
-                          << "us bytes=" << forward_cache.pp_copy_bytes);
-            }
-        }
+        // The explicit host boundary owns this invocation's live rows. Resolve
+        // again on every replay; graph-cache capacity is never a transfer extent.
+        const auto current_pp_copy = host.resolvePPCopyInfo(input);
+        consumeHostPipelineActivationBoundary(
+            input.graph_submission_intent == ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch
+                ? HostPipelineBoundaryExecution::MaterializeOnly : HostPipelineBoundaryExecution::Execute,
+            pp_submission,
+            [&] { return current_pp_copy; },
+            [&](const auto &pp_copy) {
+                auto result = TransferEngine::instance().copyActivation(
+                    pp_copy.external_hidden, pp_copy.working_buffer,
+                    pp_copy.device, pp_copy.copy_bytes);
+                if (!result.success)
+                    throw std::runtime_error("PP hidden-state copy failed: " + result.error);
+            });
 
         if (profiling_setup)
         {
@@ -3528,7 +3524,8 @@ namespace llaminar2
                       << " applied_stream=" << forward_cache.applied_stream);
         }
 
-        if (forward_cache.pp_needs_copy && forward_cache.pp_working_buffer &&
+        if (current_pp_copy.needs_copy && current_pp_copy.copy_bytes > 0 &&
+            input.graph_submission_intent == ForwardGraphSubmissionIntent::Execute &&
             stream_device.is_gpu())
         {
             // Retained replay deliberately skips the full stage-input walk.
@@ -3537,7 +3534,7 @@ namespace llaminar2
             // stream; residency and cached pointer identity do not imply that
             // an asynchronous transfer has finished writing the bytes.
             TransferEngine::requireDeviceInput(
-                forward_cache.pp_working_buffer, stream_device,
+                current_pp_copy.working_buffer, stream_device,
                 dynamic_param_stream);
         }
 
@@ -5616,20 +5613,18 @@ namespace llaminar2
          * peer transport, or the explicitly designed heterogeneous host-staged
          * boundary and publishes destination authority as one operation.
          */
-        const auto initial_pp_copy = host.resolvePPCopyInfo(effective_input);
-        if (initial_pp_copy.needs_copy)
-        {
-            auto pp_result = TransferEngine::instance().copyActivation(
-                initial_pp_copy.external_hidden,
-                initial_pp_copy.working_buffer,
-                initial_pp_copy.device,
-                initial_pp_copy.copy_bytes);
-            if (!pp_result.success)
-            {
-                throw std::runtime_error(
-                    "Initial PP hidden-state copy failed: " + pp_result.error);
-            }
-        }
+        consumeHostPipelineActivationBoundary(
+            effective_input.graph_submission_intent == ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch
+                ? HostPipelineBoundaryExecution::MaterializeOnly : HostPipelineBoundaryExecution::Execute,
+            HostPipelineBoundarySubmission::Current,
+            [&] { return host.resolvePPCopyInfo(effective_input); },
+            [&](const auto &pp_copy) {
+                auto result = TransferEngine::instance().copyActivation(
+                    pp_copy.external_hidden, pp_copy.working_buffer,
+                    pp_copy.device, pp_copy.copy_bytes);
+                if (!result.success)
+                    throw std::runtime_error("Initial PP hidden-state copy failed: " + result.error);
+            });
 
         // Build forward graph via host callback
         GraphBuildResult build_result = host.buildForwardGraph(effective_input);
@@ -5964,36 +5959,21 @@ namespace llaminar2
             build_cache->moe_overlay_collective_runtime_stages_cached = true;
             build_cache->valid = true;
 
-            /*
-             * The initial PP handoff already ran before graph construction.
-             * Publish its immutable cache bindings now, but arm repetition only
-             * after first-use execution so that invocation does not copy the
-             * same activation twice.
-             */
-            if (initial_pp_copy.needs_copy)
-            {
-                build_cache->pp_external_hidden_state =
-                    initial_pp_copy.external_hidden;
-                build_cache->pp_working_buffer =
-                    initial_pp_copy.working_buffer;
-                build_cache->pp_copy_bytes = initial_pp_copy.copy_bytes;
-                build_cache->pp_device = initial_pp_copy.device;
-            }
-
+            // The current boundary was already consumed above, including the
+            // setup-only no-copy decision. First-use routing must not repeat it.
             const bool first_use_success = executeCacheHit(
                 effective_input,
                 output,
                 *build_cache,
                 host,
                 signature,
-                start);
+                start, HostPipelineBoundarySubmission::AlreadySubmitted);
             if (!first_use_success)
             {
                 build_cache->invalidate();
                 return false;
             }
 
-            build_cache->pp_needs_copy = initial_pp_copy.needs_copy;
             LOG_DEBUG(
                 "[ForwardExecutionEngine] Atomically materialized first-use "
                 "GPU graph [kind="
@@ -6332,21 +6312,7 @@ namespace llaminar2
             build_cache->valid = true;
             touchPrefillForwardCache(signature, *build_cache);
 
-            // Store PP hidden state copy info for cache HIT replay
-            if (initial_pp_copy.needs_copy)
-            {
-                build_cache->pp_external_hidden_state =
-                    initial_pp_copy.external_hidden;
-                build_cache->pp_working_buffer =
-                    initial_pp_copy.working_buffer;
-                build_cache->pp_copy_bytes = initial_pp_copy.copy_bytes;
-                build_cache->pp_device = initial_pp_copy.device;
-                build_cache->pp_needs_copy = true;
-
-                LOG_DEBUG("[ForwardExecutionEngine] Stored PP copy info: "
-                          << initial_pp_copy.copy_bytes << " bytes on "
-                          << initial_pp_copy.device.toString());
-            }
+            // PP live rows belong to each subsequent host boundary, not this cache.
 
             LOG_DEBUG("[ForwardExecutionEngine] Cached forward graph for signature "
                       << "[seq_len=" << signature.seq_len

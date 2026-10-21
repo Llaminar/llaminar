@@ -2038,3 +2038,64 @@ TEST(Test__DeviceGenerationController, InvalidAdmissionAndMaintenanceFailHard)
         control[kDeviceGenerationControlErrorCode],
         static_cast<int>(DeviceGenerationError::InvalidController));
 }
+
+namespace
+{
+/** @test Request-owned forward errors survive every response algorithm until explicit request reset. */
+TEST(Test__DeviceGenerationController, ForwardFailurePolicyPreservesPrefillErrorUntilRequestReset)
+{
+    using FailurePolicy=DeviceGenerationForwardFailurePolicy;
+    auto dynamic=DeviceGenerationPolicy::fixed(2);dynamic.mode=DeviceGenerationPolicyMode::Dynamic;
+    for(const auto policy:{DeviceGenerationPolicy::ordinary(),DeviceGenerationPolicy::forwardOnly(),
+        DeviceGenerationPolicy::fixed(1),DeviceGenerationPolicy::fixed(15),dynamic})
+    {
+        const DeviceGenerationInitialization initialization{
+            .forward_failure_policy=FailurePolicy::PreserveUntilRequestReset};
+        const int budget=policy.isForwardOnly()?0:32;
+        const auto leading=policy.isForwardOnly()?DeviceGenerationLeadingRowDisposition::AlreadyEmitted:
+            DeviceGenerationLeadingRowDisposition::PendingResponse;
+        ControlRow control{};
+        // This is the existing setup/reset state: no response is admitted, but
+        // the real prefill is allowed to publish into its native output.
+        ASSERT_EQ(control[kDeviceGenerationControlOk],0);
+        ASSERT_TRUE(initialize_device_generation_control(budget,32,policy,control.data(),leading,initialization));
+        EXPECT_EQ(control[kDeviceGenerationControlOk],1);
+        EXPECT_EQ(control[kDeviceGenerationControlErrorCode],0);
+        for(const auto error:{DeviceGenerationError::ImmutableStorageFailure,
+            DeviceGenerationError::InvalidController,DeviceGenerationError::InvalidInitialization})
+        {
+            control.fill(0);
+            ASSERT_FALSE(fail_device_generation_control(control.data(),error));
+            control[kDeviceGenerationControlTransactionCount]=71;
+            for(int admission=0;admission<3;++admission)
+            {
+                EXPECT_FALSE(initialize_device_generation_control(budget,32,policy,control.data(),leading,initialization));
+                EXPECT_EQ(control[kDeviceGenerationControlOk],0);
+                EXPECT_EQ(control[kDeviceGenerationControlRequestComplete],1);
+                EXPECT_EQ(control[kDeviceGenerationControlErrorCode],static_cast<int>(error));
+                EXPECT_EQ(control[kDeviceGenerationControlTransactionCount],71);
+            }
+            // Only the request-reset owner clears this existing allocation.
+            control.fill(0);
+            ASSERT_TRUE(initialize_device_generation_control(budget,32,policy,control.data(),leading,initialization));
+            EXPECT_EQ(control[kDeviceGenerationControlErrorCode],0);
+        }
+    }
+}
+/** @test Default response semantics remain unchanged and malformed policy is rejected. */
+TEST(Test__DeviceGenerationController, ForwardFailurePolicyKeepsLegacyAdmissionAndRejectsUnknownPolicy)
+{
+    ControlRow control{};
+    fail_device_generation_control(control.data(),DeviceGenerationError::ImmutableStorageFailure);
+    ASSERT_TRUE(initialize_device_generation_control(4,4,DeviceGenerationPolicy::ordinary(),control.data()));
+    EXPECT_EQ(control[kDeviceGenerationControlOk],1);
+    EXPECT_EQ(control[kDeviceGenerationControlErrorCode],0);
+    const DeviceGenerationInitialization unknown{
+        .forward_failure_policy=static_cast<DeviceGenerationForwardFailurePolicy>(17)};
+    EXPECT_FALSE(unknown.valid());
+    EXPECT_FALSE(initialize_device_generation_control(4,4,DeviceGenerationPolicy::ordinary(),control.data(),
+        DeviceGenerationLeadingRowDisposition::PendingResponse,unknown));
+    EXPECT_EQ(control[kDeviceGenerationControlOk],0);
+    EXPECT_EQ(control[kDeviceGenerationControlErrorCode],static_cast<int>(DeviceGenerationError::InvalidInitialization));
+}
+} // namespace

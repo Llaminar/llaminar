@@ -69,6 +69,13 @@ namespace llaminar2
         std::string detection_method;   ///< How MPI was detected
     };
 
+    /** @brief Original application argv ownership during an MPI self-launch. */
+    enum class MPIBootstrapArgumentPolicy
+    {
+        FilterLaunchArguments, ///< Existing frontends consume launcher-only flags.
+        PreserveOriginalArguments, ///< Opaque wrappers retain their exact parser/config contract.
+    };
+
     /**
      * @brief MPI bootstrap utilities
      *
@@ -136,12 +143,14 @@ namespace llaminar2
          * @param argv Original argv
          * @param config Launch configuration
          * @param topology CPU topology (for auto-detecting num_procs)
+         * @param arguments Whether original application flags remain exact after re-exec.
          * @return Vector of command-line arguments for execvp
          */
         static std::vector<std::string> buildMPIRunCommand(
             int argc, char *argv[],
             const MPILaunchConfig &config,
-            const CPUTopology &topology);
+            const CPUTopology &topology,
+            MPIBootstrapArgumentPolicy arguments = MPIBootstrapArgumentPolicy::FilterLaunchArguments);
 
         /**
          * @brief Self-launch via mpirun
@@ -153,11 +162,13 @@ namespace llaminar2
          * @param argv Original argv
          * @param config Launch configuration
          * @param topology CPU topology
+         * @param arguments Existing frontends filter launch flags; typed wrappers may retain them.
          * @return -1 on failure (exec failed)
          */
         static int selfLaunchMPI(int argc, char *argv[],
                                  const MPILaunchConfig &config,
-                                 const CPUTopology &topology);
+                                 const CPUTopology &topology,
+                                 MPIBootstrapArgumentPolicy arguments = MPIBootstrapArgumentPolicy::FilterLaunchArguments);
 
         /**
          * @brief Get default launch configuration based on topology

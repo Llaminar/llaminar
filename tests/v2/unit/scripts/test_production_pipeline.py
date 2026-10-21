@@ -1230,6 +1230,35 @@ class ApprovedGenerationCorpusTests(unittest.TestCase):
             corpus.expected(self.record())
         self.assertEqual(self.inventory["cells"][0]["configuration"]["model"], "/models/model.gguf")
 
+    def test_explicit_predictor_is_portable_but_a_different_predictor_is_not_a_serial_control(self):
+        """Corpus identity pins both artifact roles even when ordinary policy is off."""
+        inventory = copy.deepcopy(self.inventory)
+        sources = copy.deepcopy(self.sources)
+        sources["/models/predictor.gguf"] = [1, 5, 8192, 100, 200]
+        for row in inventory["cells"]:
+            row["configuration"]["shared_predictor"] = "/models/predictor.gguf"
+            row["configuration"]["runtime"]["server_args"] += ["--mtp-model", "/models/predictor.gguf"]
+            row["model_files"].append("/models/predictor.gguf")
+        expected = generation_corpus.portable_inventory(inventory, sources)
+        self.assertEqual(expected[0]["configuration"]["shared_predictor"],
+                         {"filename": "predictor.gguf", "bytes": 8192})
+        moved = pipeline.remap_manifest({**inventory, "cells": [
+            {**row, "configuration": {**row["configuration"],
+                "model": row["configuration"]["model"].replace("/models/", "/src/models/"),
+                "shared_predictor": "/src/models/predictor.gguf",
+                "runtime": {**row["configuration"]["runtime"], "server_args": ["opaque topology", "--mtp-model", "/src/models/predictor.gguf"]}},
+             "model_files": [path.replace("/models/", "/src/models/") for path in row["model_files"]]}
+            for row in inventory["cells"]]}, Path("/mounted/models"))
+        moved_sources = {path.replace("/models/", "/mounted/models/"): stat for path, stat in sources.items()}
+        self.assertEqual(generation_corpus.portable_inventory(moved, moved_sources), expected)
+        for row in inventory["cells"]:
+            row["model_files"].append("/models/foreign.gguf")
+        sources["/models/foreign.gguf"] = [1, 6, 8192, 100, 200]
+        inventory["cells"][1]["configuration"]["shared_predictor"] = "/models/foreign.gguf"
+        inventory["cells"][1]["configuration"]["runtime"]["server_args"][-1] = "/models/foreign.gguf"
+        with self.assertRaisesRegex(ValueError, "exact canonical serial control"):
+            generation_corpus.portable_inventory(inventory, sources)
+
     def test_same_model_filename_with_changed_shard_size_is_rejected(self):
         for path in self.sources:
             sources = copy.deepcopy(self.sources)
@@ -1957,6 +1986,25 @@ class PipelineInventoryTests(unittest.TestCase):
                 with self.subTest(filename=filename, shard=index), self.assertRaises(ValueError):
                     pipeline.remap_manifest(full, Path("/admitted/models"))
                 self.assertEqual(full, before)
+
+    def test_explicit_predictor_mount_and_argv_follow_the_same_declared_source(self):
+        """A second source is mounted and pinned independently of the main artifact."""
+        full = full_manifest()
+        row = full["cells"][1]
+        row["configuration"]["shared_predictor"] = "/src/models/predictor.gguf"
+        row["configuration"]["runtime"] = {"server_args": ["--no-mtp", "--mtp-model", "/src/models/predictor.gguf"]}
+        row["configuration"]["benchmark"]["args"] += ["--mtp-model", "/src/models/predictor.gguf"]
+        row["model_files"].append("/src/models/predictor.gguf")
+        before = copy.deepcopy(full)
+        translated = pipeline.remap_manifest(full, Path("/admitted/models"))
+        config = translated["cells"][1]["configuration"]
+        self.assertEqual(config["shared_predictor"], "/admitted/models/predictor.gguf")
+        self.assertEqual(config["runtime"]["server_args"], ["--no-mtp", "--mtp-model", "/admitted/models/predictor.gguf"])
+        self.assertIn(config["shared_predictor"], translated["cells"][1]["model_files"])
+        self.assertEqual(full, before)
+        translated["cells"][1]["model_files"].remove(config["shared_predictor"])
+        with self.assertRaisesRegex(ValueError, "model-file declaration"):
+            pipeline.e2e_projection(translated, "revision")
 
     def test_container_model_translation_requires_an_absolute_resolved_mount(self):
         """The caller supplies the admitted mount, never a working-directory alias."""

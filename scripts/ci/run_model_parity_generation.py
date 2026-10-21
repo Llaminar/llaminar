@@ -21,7 +21,7 @@ import time
 from generation_regression_http import MTPPolicy, admit_control, generation_profile, observation_traces, serial_workload_identity
 from generation_tokens import compare_tokens
 from generation_corpus import ApprovedGenerationCorpus
-from model_parity_inventory import InventoryScope, discover, source_revision
+from model_parity_inventory import InventoryScope, discover, source_revision, map_predictor_source
 from production_artifacts import digest, image_identity, model_identities, validate_prerequisites, write_json
 import run_model_parity_e2e as e2e
 import run_production_parity_campaigns as parity
@@ -254,7 +254,8 @@ def main(argv: list[str] | None = None) -> int:
                 directory = args.output / key
                 directory.mkdir()
                 write_json(directory / "configuration.json", record)
-                write_json(directory / "server-args.json", [*record["runtime"]["server_args"],
+                staged_record = map_predictor_source(record, lambda path: paths[Path(path).resolve()])
+                write_json(directory / "server-args.json", [*staged_record["runtime"]["server_args"],
                            "--context-length", str(record["runtime"]["context_length"])])
                 model = paths[Path(record["model"]).resolve()]
                 if any(ch in model + record["id"] for ch in "|\r\n"):

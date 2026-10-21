@@ -34,7 +34,7 @@
 
 namespace
 {
-    constexpr uint32_t kExpertBits = 9u;
+    constexpr uint32_t kExpertBits = llaminar2::moe_grouped_directory::kExpertBits;
     constexpr uint32_t kExpertMask = (uint32_t{1} << kExpertBits) - 1u;
     constexpr uint32_t kUnusedDirectoryEntry = UINT32_MAX;
     constexpr int kRows = llaminar2::cuda::moe::kGroupedImmaTileRows;
@@ -647,7 +647,7 @@ namespace
     /**
      * @brief Build a compact directory of populated 16-row expert tiles.
      *
-     * One 512-thread CTA performs a deterministic inclusive scan over expert
+     * One 1024-thread CTA performs a deterministic inclusive scan over expert
      * tile counts. The captured projection grid uses the conservative directory
      * capacity and exits on the explicit sentinel tail, so replay never needs a
      * host-visible live tile count.
@@ -689,7 +689,7 @@ namespace
             (count + kRows - 1) / kRows;
         __syncthreads();
 
-        for (int stride = 1; stride < kMaximumExperts; stride <<= 1)
+        for (int stride = 1; stride < static_cast<int>(blockDim.x); stride <<= 1)
         {
             const int addend = tid >= stride
                                    ? inclusive_tile_counts[tid - stride]
@@ -699,7 +699,7 @@ namespace
             __syncthreads();
         }
 
-        const int total_tiles = inclusive_tile_counts[kMaximumExperts - 1];
+        const int total_tiles = inclusive_tile_counts[blockDim.x - 1];
         if (total_tiles > directory_entries)
         {
             if (tid == 0)
@@ -2172,7 +2172,9 @@ extern "C" bool cudaMoEGroupedImma_buildDirectory(
     if (!d_group_counts || !d_directory || !stream ||
         num_experts <= 0 ||
         num_experts > llaminar2::cuda::moe::kGroupedImmaMaximumExperts ||
-        total_slots <= 0 || directory_entries <= 0 ||
+        total_slots <= 0 ||
+        static_cast<uint32_t>(total_slots) > llaminar2::moe_grouped_directory::kMaximumRows ||
+        directory_entries <= 0 ||
         static_cast<std::size_t>(directory_entries) <
             llaminar2::cuda::moe::groupedImmaDirectoryEntries(
                 static_cast<std::size_t>(total_slots),
@@ -2185,7 +2187,7 @@ extern "C" bool cudaMoEGroupedImma_buildDirectory(
 
     buildGroupedImmaDirectoryKernel<<<
         1,
-        llaminar2::cuda::moe::kGroupedImmaMaximumExperts,
+        llaminar2::moe_grouped_directory::directoryThreads(num_experts),
         0,
         static_cast<cudaStream_t>(stream)>>>(
         d_group_counts,

@@ -247,6 +247,70 @@ class GPUDriverWindowTests(unittest.TestCase):
                 driver.publish(root/'cell.driver-diagnostics.json',evidence)
                 with self.assertRaises(ValueError):driver.validate_evidence(root)
 
+    def test_publication_order_survives_nonmonotonic_kernel_timestamps(self):
+        """Concurrent printk records can arrive with an earlier timestamp.
+
+        Reproduce the one-microsecond reversal from native preflight, including
+        a reversal across reads. The exact retained cursor owns log ordering;
+        neither sorting records nor treating timestamps as sequence IDs is valid.
+        """
+        old = record('previous published record', timestamp=372277.717543)
+        first = record('concurrent earlier stamp', timestamp=372277.717542)
+        equal = record('distinct equal stamp', timestamp=372277.717542)
+        last = record('next-read earlier stamp', timestamp=372277.717541)
+        before = snapshot(old)
+        after = [snapshot(old, first, equal), snapshot(old, first, equal, last)]
+        self.assertEqual(driver.new_records(checkpoint(old), after[0]), (first, equal))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, evidence, passed = self.run_collector(root, before, after)
+            self.assertTrue(passed)
+            self.assertTrue(evidence['complete'])
+            self.assertEqual(evidence['new_record_count'], 3)
+            driver.publish(root / 'cell.driver-diagnostics.json', evidence)
+            driver.validate_evidence(root)
+            rows = [json.loads(line) for line in (root / evidence['journal']).read_text().splitlines()]
+            self.assertEqual([row['msg'] for row in rows if row['kind'] == 'record'],
+                             [first.msg, equal.msg, last.msg])
+
+    def test_earlier_timestamp_driver_fault_is_still_reported(self):
+        """No timestamp filter may discard a newly published driver warning."""
+        before = snapshot(record(timestamp=20.000003))
+        fault = record('amdgpu: ring gfx timeout', 'warn', timestamp=20.000002)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, evidence, passed = self.run_collector(
+                root, before, [before, snapshot(*before.records, fault)])
+            self.assertFalse(passed)
+            self.assertTrue(evidence['complete'])
+            self.assertEqual(evidence['finding_count'], 1)
+            self.assertEqual(evidence['findings'], [asdict(fault)])
+            # Replaying the journal must diagnose the fault even if an outer
+            # report incorrectly claims success; a timestamp reversal is not it.
+            with self.assertRaisesRegex(ValueError, 'GPU driver diagnostic'):
+                driver.inspect_journal(root, evidence)
+
+    def test_nonmonotonic_timestamps_do_not_admit_reordered_journal(self):
+        """Ordinals and the final exact cursor reject reorder independently."""
+        before = snapshot(record(timestamp=20.000003))
+        first = record('first publication', timestamp=20.000002)
+        second = record('second publication', timestamp=20.000001)
+        for renumber in (False, True):
+            with self.subTest(renumber=renumber), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, evidence, passed = self.run_collector(root, before,
+                    [before, snapshot(*before.records, first, second)])
+                self.assertTrue(passed)
+                path = root / evidence['journal']
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                rows[1], rows[2] = rows[2], rows[1]
+                if renumber:
+                    rows[1]['ordinal'], rows[2]['ordinal'] = 1, 2
+                path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                expected = 'mismatched driver journal closure' if renumber else 'reordered driver journal'
+                with self.assertRaisesRegex(ValueError, expected):
+                    driver.inspect_journal(root, evidence)
+
     def test_final_read_captures_teardown_fault_and_preserves_bounded_preview(self):
         """Keep every warning in the journal while retaining only 32 in memory."""
         before = snapshot(record())
@@ -306,7 +370,7 @@ class GPUDriverWindowTests(unittest.TestCase):
             with self.assertRaises(ValueError):driver.finish(state,report)
 
     def test_real_cli_and_shell_count_teardown_warnings(self):
-        """Run real owned background processes with only dmesg substituted."""
+        """Run real closure with earlier-stamped records and only dmesg replaced."""
         shell=(ROOT/'tests/v2/e2e/server/test_server_e2e.sh').read_text()
         functions='\n'.join(name+'() {'+shell.split(name+'() {',1)[1].split('\n}\n',1)[0]+'\n}'
                              for name in ('pass','fail','finish_driver_diagnostics'))
@@ -314,8 +378,9 @@ class GPUDriverWindowTests(unittest.TestCase):
             with self.subTest(warning=warning),tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);state=root/'cell.driver-checkpoint.json';report=root/'cell.driver-diagnostics.json'
                 current=root/'current.json';current.write_text(json.dumps({'dmesg':[asdict(record())]}))
-                ending=root/'ending.json';ending.write_text(json.dumps({'dmesg':[asdict(record())]+(
-                    [asdict(record(warning,timestamp=20))] if warning else [])}))
+                ending=root/'ending.json';ending.write_text(json.dumps({'dmesg':[asdict(record()),
+                    asdict(record('concurrent earlier stamp',timestamp=9.999999))]+(
+                    [asdict(record(warning,timestamp=9.999998))] if warning else [])}))
                 fake=root/'dmesg';fake.write_text('#!/bin/sh\nexec cat '+shlex.quote(str(current))+'\n');fake.chmod(0o755)
                 env={**driver.os.environ,'PATH':str(root)+':'+driver.os.environ['PATH']}
                 env.pop(driver.READER_CONTAINER_ENV,None)
@@ -325,12 +390,13 @@ class GPUDriverWindowTests(unittest.TestCase):
                     'pass "HTTP passed"\ncp "$4" "$5"\n'
                     'finish_driver_diagnostics cell "$2" "$3"\n'
                     '[ "$FAILED_TESTS" -eq 0 ]\n')
-                result=subprocess.run(['bash','-c',command,'guard-regression',str(ROOT/'tests/v2/e2e/server'),
+                result=subprocess.run(['bash','-c',command,'guard-regression',str(Path(driver.__file__).parent),
                     str(state),str(report),str(ending),str(current)],env=env,capture_output=True,text=True,timeout=10)
                 self.assertEqual(result.returncode,1 if warning else 0,result.stdout+result.stderr)
                 evidence=json.loads(report.read_text())
                 self.assertEqual(evidence['passed'],warning is None)
                 self.assertTrue(evidence['complete'])
+                self.assertEqual(evidence['new_record_count'], 1 if warning is None else 2)
                 self.assertFalse(driver.process_is_live(evidence['collector']))
                 self.assertEqual(json.loads(state.read_text())['state'],'closed')
                 if warning is None:driver.validate_evidence(root)

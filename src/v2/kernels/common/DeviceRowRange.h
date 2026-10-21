@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 
@@ -42,7 +43,7 @@ namespace llaminar2
         {
             if (capacity <= 0)
                 throw std::invalid_argument("DeviceRowRange requires positive capacity");
-            return DeviceRowRange(nullptr, capacity, 0, capacity);
+            return DeviceRowRange(nullptr, capacity, 0, capacity, 1);
         }
 
         /**
@@ -56,7 +57,7 @@ namespace llaminar2
         {
             if (capacity <= 0 || !count)
                 throw std::invalid_argument("DeviceRowRange requires a count owner and positive capacity");
-            return DeviceRowRange(count, capacity, 0, capacity);
+            return DeviceRowRange(count, capacity, 0, capacity, 1);
         }
 
         /**
@@ -69,7 +70,41 @@ namespace llaminar2
         {
             if (first < 0 || rows <= 0 || first > rows_ || rows > rows_ - first)
                 throw std::out_of_range("DeviceRowRange slice exceeds physical rows");
-            return DeviceRowRange(count_, capacity_, first_ + first, rows);
+            return DeviceRowRange(count_, capacity_, first_ + first, rows, repeat_);
+        }
+
+        /**
+         * @brief Repeat each logical row without creating another live-count authority.
+         * @param factor Positive immutable expansion, one preserving the original descriptor.
+         * @return Expanded physical tile borrowing exactly the original count pointer.
+         * @throws std::invalid_argument For a nonpositive factor.
+         * @throws std::overflow_error If physical capacity cannot fit the native INT32 contract.
+         */
+        [[nodiscard]] DeviceRowRange repeatEachRow(int factor) const
+        {
+            if (factor <= 0)
+                throw std::invalid_argument("DeviceRowRange repetition requires a positive factor");
+            if (factor > std::numeric_limits<int>::max() / capacity())
+                throw std::overflow_error("DeviceRowRange repeated capacity exceeds native INT32 rows");
+            return DeviceRowRange(count_, capacity_, first_ * factor, rows_ * factor, repeat_ * factor);
+        }
+
+        /** @brief Complete immutable capture identity, independent of mutable count contents. */
+        struct CaptureIdentity
+        {
+            const std::int32_t *count; ///< Original execution-owner scalar.
+            int count_capacity; ///< Maximum legal published logical count.
+            int first_physical_row; ///< Tile origin after immutable expansion.
+            int physical_rows; ///< Tile capacity.
+            int repeats_per_row; ///< Exact expansion policy; one is ordinary row arithmetic.
+            std::uint32_t schema_version = 2; ///< Explicit counted-row expansion identity version.
+            bool operator==(const CaptureIdentity &) const = default;
+        };
+
+        /** @return Every pointer/geometry/policy field embedded in the native row descriptor. */
+        [[nodiscard]] constexpr CaptureIdentity captureIdentity() const noexcept
+        {
+            return {count_, capacity_, first_, rows_, repeat_};
         }
 
         /** @return Fixed row stride for this tile's split-K scratch layout. */
@@ -78,8 +113,14 @@ namespace llaminar2
             return rows_;
         }
 
-        /** @return Original matrix capacity against which publications are checked. */
+        /** @return Whole-matrix physical capacity after immutable row expansion. */
         [[nodiscard]] LLAMINAR_ROW_RANGE_HD constexpr int capacity() const noexcept
+        {
+            return capacity_ * repeat_;
+        }
+
+        /** @return Original logical count bound, before immutable physical row expansion. */
+        [[nodiscard]] LLAMINAR_ROW_RANGE_HD constexpr int countCapacity() const noexcept
         {
             return capacity_;
         }
@@ -103,9 +144,10 @@ namespace llaminar2
         {
             if (published < 0 || published > capacity_)
                 return -1;
-            if (published <= first_)
+            const int physical_published = published * repeat_;
+            if (physical_published <= first_)
                 return 0;
-            const int available = published - first_;
+            const int available = physical_published - first_;
             return available < rows_ ? available : rows_;
         }
 
@@ -148,13 +190,14 @@ namespace llaminar2
     private:
         /** @brief Construct validated metadata; factories own all host checks. */
         constexpr DeviceRowRange(const std::int32_t *count, int capacity,
-                                 int first, int rows) noexcept
-            : count_(count), capacity_(capacity), first_(first), rows_(rows) {}
+                                 int first, int rows, int repeat) noexcept
+            : count_(count), capacity_(capacity), first_(first), rows_(rows), repeat_(repeat) {}
 
         const std::int32_t *count_; ///< Borrowed immutable address, not a host value.
-        int capacity_; ///< Original admitted matrix width.
-        int first_; ///< Tile offset in the original matrix.
+        int capacity_; ///< Original admitted logical count bound.
+        int first_; ///< Physical tile offset after immutable row expansion.
         int rows_; ///< Physical tile width retained across every replay.
+        int repeat_; ///< Immutable expansion factor; never another count scalar.
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceRowRange>);

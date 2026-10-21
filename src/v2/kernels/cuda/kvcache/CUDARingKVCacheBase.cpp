@@ -445,6 +445,7 @@ namespace llaminar2
                 onResetLayerSequenceState(layer, seq_idx);
         }
         wrap_warned_ = false;
+        if(auto *aux=auxiliaryState())aux->reset({0,2147483647,0,batch_size_},context.execution_stream);
         return true;
     }
 
@@ -470,6 +471,7 @@ namespace llaminar2
             append_count_sources_[static_cast<size_t>(
                 layer * batch_size_ + seq_idx)] = nullptr;
         }
+        if(auto *aux=auxiliaryState())aux->reset({0,2147483647,seq_idx,1},context.execution_stream);
         return true;
     }
 
@@ -501,6 +503,7 @@ namespace llaminar2
             return false;
         }
         onResetLayerSequenceState(layer, seq_idx);
+        if(auto *aux=auxiliaryState())aux->reset({modelLayerForAttentionStorage(layer),1,seq_idx,1},context.execution_stream);
         return true;
     }
 
@@ -546,6 +549,7 @@ namespace llaminar2
                 nullptr;
             onResetLayerSequenceState(layer, seq_idx);
         }
+        if(auto *aux=auxiliaryState())aux->reset({modelLayerForAttentionStorage(layer),1,0,batch_size_},context.execution_stream);
         return true;
     }
 
@@ -650,7 +654,11 @@ namespace llaminar2
     {
         if (!d_head_params_ || !d_count_params_)
             return 0;
-        return sequence_geometry_.checkpointBytes();
+        size_t auxiliaryBytes=0;
+        if(const auto *aux=auxiliaryState())
+            for(int sequence=0;sequence<batch_size_;++sequence)
+                auxiliaryBytes=std::max(auxiliaryBytes,aux->checkpointCapacity(sequence));
+        return sequence_geometry_.checkpointBytes()+auxiliaryBytes;
     }
 
     bool CUDARingKVCacheBase::captureDeviceSequenceStateCheckpoint(
@@ -695,6 +703,10 @@ namespace llaminar2
             *error =
                 "failed to enqueue CUDA device sequence-state checkpoint capture";
         }
+        if(enqueued)if(const auto *aux=auxiliaryState())
+            aux->captureCheckpoint(seq_idx,
+                {static_cast<std::byte *>(checkpoint_device)+sequence_geometry_.checkpointBytes(),
+                 checkpoint_bytes-sequence_geometry_.checkpointBytes(),CacheAuxiliaryMemoryDomain::Device},stream);
         return enqueued;
     }
 
@@ -749,6 +761,9 @@ namespace llaminar2
         {
             onResetLayerSequenceState(layer, seq_idx);
         }
+        if(auto *aux=auxiliaryState())aux->restoreCheckpoint(seq_idx,
+            {const_cast<std::byte *>(static_cast<const std::byte *>(checkpoint_device))+sequence_geometry_.checkpointBytes(),
+             checkpoint_bytes-sequence_geometry_.checkpointBytes(),CacheAuxiliaryMemoryDomain::Device},stream);
         return true;
     }
 

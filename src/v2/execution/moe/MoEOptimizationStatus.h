@@ -38,7 +38,7 @@ namespace llaminar2
     enum class MoEOptimizationLifecycleState : std::uint8_t
     {
         NotApplicable,    ///< The model does not use ExpertOverlay.
-        MovementDisabled, ///< ExpertOverlay is live under a non-moving policy.
+        MovementDisabled, ///< Movement cannot run under the policy or authenticated no-peer topology.
         LearningEconomy,  ///< Measured economy is not yet active in policy.
         Active,           ///< Measured economy is installed and movement may run.
         Drained,          ///< Admission is closed and terminal evidence is stable.
@@ -57,7 +57,7 @@ namespace llaminar2
     enum class MoEOptimizationActivityState : std::uint8_t
     {
         NotApplicable, ///< No ExpertOverlay optimization authority exists.
-        Dormant,       ///< Movement is disabled by the selected policy.
+        Dormant,       ///< Policy or an authenticated no-peer topology prevents movement.
         LearningEconomy, ///< Measured policy inputs are not yet installed.
         CollectingDemand, ///< No complete demand window or wave is admitted.
         ReconcilingDemand, ///< The owner is checking for queued demand/work.

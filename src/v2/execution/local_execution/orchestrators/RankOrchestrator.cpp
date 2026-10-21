@@ -20,9 +20,15 @@
  * materializing any child, preserving the authored TP-in-PP decomposition.
  * The outer PP family owns the shared weight lifecycle: nested participants
  * cannot release sources or publish graph completion for unfinished siblings.
+ * Resident condition forwards retire the preceding host result before fan-out.
+ * Only an explicitly enabled diagnostic observation republishes current logits;
+ * pending input publication and device-only sampling do not gather host rows.
  */
 
 #include "RankOrchestrator.h"
+#include "PipelineResidualWidth.h"
+#include "models/qwen4exp/Qwen4ExpReplicatedPLECohort.h"
+#include "models/qwen4exp/Qwen4ExpReplicatedPLEPrefixOrigin.h"
 
 #include "transfer/MappedTransferProgressEpoch.h"
 #include "LogitsGatherer.h"
@@ -56,6 +62,8 @@
 #include "../../../loaders/WeightManager.h"
 #include "../../../planning/CollectiveMemoryEstimator.h"
 #include "../../moe/MoEOverlayPipelineStageBinding.h"
+#include "../../moe/MoEOverlayResidencyAuthority.h"
+#include "../../moe/MoEOverlayParticipantResidency.h"
 #include "../graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config access
 #include "../../../tensors/TensorClasses.h"
 #include "../../../tensors/TensorFactory.h"
@@ -873,11 +881,14 @@ namespace llaminar2
         wireLocalTPMoERuntimeHistogramSyncs();
     }
 
-    RankOrchestrator::~RankOrchestrator() = default;
-
-    // Move operations
-    RankOrchestrator::RankOrchestrator(RankOrchestrator &&) noexcept = default;
-    RankOrchestrator &RankOrchestrator::operator=(RankOrchestrator &&) noexcept = default;
+    RankOrchestrator::~RankOrchestrator()
+    {
+        // Complete parents borrow the stages' events, streams, arenas and native
+        // child recordings. Retire them before any stage destructor, but retain
+        // the collective/edge owner until those original child graphs retire.
+        if (pp_device_generation_)
+            pp_device_generation_->retireForwardOnlyBeforeStageRelease();
+    }
 
     void RankOrchestrator::initializeRankMTPScratch()
     {
@@ -981,6 +992,34 @@ namespace llaminar2
         }
 
         const auto &devices = tp_ctx_->devices();
+        const bool fixed_consumer=config_.ngram_table_placement && config_.ngram_table_placement->isFixedHeadShards() &&
+            std::any_of(devices.begin(),devices.end(),[&](const auto &member){
+                const auto owner=PhysicalMemoryAllocatorIdentity{config_.ngram_table_placement->worldRank(),member.toLocalDeviceId()};
+                const auto &consumers=config_.ngram_table_placement->consumers();
+                return std::find(consumers.begin(),consumers.end(),owner)!=consumers.end();
+            });
+        if(fixed_consumer)
+        {
+            const auto loader=model_ctx_?model_ctx_->loader():nullptr;
+            if(!loader || !loader->ggufDirectory())
+                throw std::invalid_argument("Fixed-head PLE Rank requires original source metadata before child construction");
+            const auto context=std::dynamic_pointer_cast<ModelContext>(model_ctx_);
+            const auto memory=context && context->concreteWeightManager()
+                ? context->concreteWeightManager()->physicalMemoryAuthority() : nullptr;
+            if(!memory || memory->worldRank()!=config_.ngram_table_placement->worldRank())
+                throw std::invalid_argument("Fixed-head PLE requires its actual rank-local admitted memory authority");
+            const Qwen4ExpConfig source(*loader->ggufDirectory());
+            // The first serving slice uses this Rank's complete mirrored
+            // terminal sampler. A nonterminal PP(TP) group needs a distinct
+            // authoritative PP-token producer handoff, not a replication bit.
+            if(config_.nested_pp_stage_config &&
+                (!config_.nested_pp_stage_config->has_embedding || !config_.nested_pp_stage_config->has_lm_head ||
+                 config_.nested_pp_stage_config->first_layer!=0 ||
+                 config_.nested_pp_stage_config->last_layer!=static_cast<int>(source.mainLayers())))
+                throw std::invalid_argument("Fixed-head PLE currently requires full-main local TP; PP token producer handoff is not implemented");
+            replicated_ple_cohort_=std::shared_ptr<const Qwen4ExpReplicatedPLECohort>(
+                new Qwen4ExpReplicatedPLECohort(*tp_ctx_,*model_ctx_,config_.ngram_table_placement,source));
+        }
         device_runners_.reserve(devices.size());
 
         LOG_DEBUG("RankOrchestrator: Initializing " << devices.size() << " device runners");
@@ -1270,7 +1309,13 @@ namespace llaminar2
 
                 // Model head dimensions for FusedQKV sub-block slicing
                 const int embed_len = model_ctx_->embeddingLength();
-                const int head_dim = (n_heads > 0) ? (embed_len / n_heads) : 0;
+                // Flash Next attention expands H into 24 independent 256-wide
+                // heads. Its source key_length, never H/heads, owns slicing.
+                const bool explicit_head_geometry = model_ctx_->architecture() == "qwen4exp";
+                const int head_dim = explicit_head_geometry ? model_ctx_->keyLength()
+                    : (n_heads > 0 ? embed_len / n_heads : 0);
+                if (explicit_head_geometry && head_dim <= 0)
+                    throw std::invalid_argument("qwen4exp TP slicing requires explicit source attention.key_length");
                 if (n_heads > 0 && head_dim > 0)
                 {
                     wm_config.dimensions.n_heads = n_heads;
@@ -1620,6 +1665,9 @@ namespace llaminar2
                                                  runner_config.tp_allreduce_precision_override =
                                                      config_.tp_allreduce_precision_override;
                                                  runner_config.prefix_cache = config_.prefix_cache;
+                                                 runner_config.ngram_table_policy = config_.ngram_table_policy;
+                                                 runner_config.ngram_table_placement = config_.ngram_table_placement;
+                                                 runner_config.ngram_replicated_ple_cohort = replicated_ple_cohort_;
                                                  runner_config.mtp = config_.mtp;
                                                  runner_config.routed_expert_compute_policy = config_.routed_expert_compute_policy;
                                                  runner_config.routed_expert_owner_order = config_.routed_expert_owner_order;
@@ -1974,6 +2022,8 @@ namespace llaminar2
             runner_config.tp_allreduce_precision_override =
                 child_config.tp_allreduce_precision_override;
             runner_config.prefix_cache = child_config.prefix_cache;
+            runner_config.ngram_table_policy = child_config.ngram_table_policy;
+            runner_config.ngram_table_placement = child_config.ngram_table_placement;
             runner_config.mtp = child_config.mtp;
             runner_config.routed_expert_compute_policy = child_config.routed_expert_compute_policy;
             runner_config.routed_expert_owner_order = child_config.routed_expert_owner_order;
@@ -2069,8 +2119,11 @@ namespace llaminar2
         {
             pp_activation_contract_ = std::make_unique<PPActivationContract>();
 
-            const size_t embedding_dim = model_ctx_->embeddingLength();
-            const size_t max_seq_len = model_ctx_->contextLength();
+            const auto *producer = pp_stage_runners_.front()->getHiddenState();
+            if (!producer)
+                throw std::logic_error("Pipeline transfer contract requires its admitted producer residual");
+            const size_t embedding_dim = pipelineResidualWidth(producer->shape(), producer->native_type());
+            const size_t max_seq_len = producer->shape().front();
 
             for (size_t i = 0; i + 1 < config_.pp_stages.size(); ++i)
             {
@@ -3277,6 +3330,7 @@ namespace llaminar2
 
         const bool advanced = dispatchLocalTPMTPMainCondition(
             "advanceMTPMainConditionFromDeviceResidentLogicalState",
+            LocalTPConditionEffect::ForwardMainRow,
             [this, token_shadow, purpose, request_index](
                 IInferenceRunner &child,
                 size_t participant)
@@ -3348,6 +3402,7 @@ namespace llaminar2
 
         const bool advanced = dispatchLocalTPMTPMainCondition(
             "advanceMTPMainConditionFromDeviceTargetSample",
+            LocalTPConditionEffect::ForwardMainRow,
             [token_shadow, target_sample_slot, purpose](
                 IInferenceRunner &child,
                 size_t)
@@ -3389,9 +3444,32 @@ namespace llaminar2
     {
         if (pp_device_generation_)
         {
-            LOG_ERROR(
-                "[RankOrchestrator] Pipeline ordinary resident-condition control is not implemented");
-            return false;
+            // A prior prefill buffer is storage, never proof of this new row.
+            // Host observation remains optional and uses the original tail owner.
+            if (logits_gatherer_) logits_gatherer_->invalidate();
+            if (ownsMainForwardLogits() && !skip_logits_gather_decode_ &&
+                (!logits_gatherer_ || !logits_gatherer_->isAllocated()))
+            {
+                LOG_ERROR("Pipeline ordinary condition requested host logits without its retained observation owner");
+                return false;
+            }
+            if (!pp_device_generation_->advanceOrdinaryCondition(logical_state, request_index))
+                return false;
+            if (ownsMainForwardLogits() && !skip_logits_gather_decode_)
+            {
+                logits_gatherer_->copyFromStage(*pp_stage_runners_.back(), static_cast<size_t>(vocab_size()));
+                if (!logits_gatherer_->data()) return false;
+                PerfStatsCollector::addCounter("sampling", "rank_pipeline_condition_host_logits_publications",
+                    1.0, "decode", "rank", {{"rows", "1"},
+                        {"participants", std::to_string(pp_stage_runners_.size())},
+                        {"authority", "original_pipeline_tail"}});
+            }
+            ++current_position_;
+            for (int &length : current_sequence_lengths_) ++length;
+            current_padded_seq_len_ = 1;
+            last_logits_forward_phase_ = LogitsForwardPhase::Decode;
+            stats_dirty_ = true;
+            return true;
         }
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
@@ -3421,6 +3499,7 @@ namespace llaminar2
 
         const bool advanced = dispatchLocalTPMTPMainCondition(
             "advanceOrdinaryMainConditionFromDeviceResidentLogicalState",
+            LocalTPConditionEffect::ForwardMainRow,
             [this, token_shadow, request_index](
                 IInferenceRunner &child, size_t participant)
             {
@@ -3824,21 +3903,12 @@ namespace llaminar2
                         return false;
                     }
 
-                    /*
-                     * GPU children replay a fixed-width captured graph. Copy
-                     * the complete physical bucket so every downstream row is
-                     * initialized; only real_count is allowed to advance KV
-                     * and request state.
-                     */
-                    const std::size_t active_bytes =
-                        pp_activation_contract_
-                            ? pp_activation_contract_
-                                  ->transfer(static_cast<int>(stage - 1u))
-                                  .activeBytes(chunk.bucket_seq_len)
-                            : static_cast<std::size_t>(
-                                  chunk.bucket_seq_len) *
-                                  model_ctx_->embeddingLength() *
-                                  sizeof(float);
+                    // Only live producer rows cross the declared boundary.
+                    // Resident bucket capacity remains local allocation storage.
+                    if (!pp_activation_contract_)
+                        throw std::logic_error("Pipeline prefill lacks its admitted residual transfer contract");
+                    const std::size_t active_bytes = pipelinePrefillLiveBytes(
+                        pp_activation_contract_->transfer(static_cast<int>(stage - 1u)), chunk);
                     if (!pp_ctx_->transfer(
                             hidden,
                             static_cast<int>(stage - 1u),
@@ -4789,9 +4859,10 @@ namespace llaminar2
 
             // Transfer activations from previous stage to current stage
             // Only transfer the active region (seq_len tokens), not the full buffer
+            if (!pp_activation_contract_)
+                throw std::logic_error("Pipeline forward lacks its admitted residual transfer contract");
             const size_t active_bytes = pp_activation_contract_
-                                            ? pp_activation_contract_->transfer(static_cast<int>(stage_idx - 1)).activeBytes(seq_len)
-                                            : static_cast<size_t>(seq_len) * model_ctx_->embeddingLength() * sizeof(float);
+                ->transfer(static_cast<int>(stage_idx - 1)).activeBytes(seq_len);
 
             LOG_DEBUG("RankOrchestrator::forwardPP: Transferring hidden state from stage "
                       << (stage_idx - 1) << " to stage " << stage_idx
@@ -4811,16 +4882,16 @@ namespace llaminar2
             LOG_DEBUG("RankOrchestrator::forwardPP: Executing stage " << stage_idx);
 
             /*
-             * Non-head PP stages consume transferred hidden activations rather
-             * than embedding token ids. The final stage still needs the raw
-             * token ids when MTP is enabled so its shifted prefill cache can be
-             * populated for the sidecar. Passing tokens here does not make the
-             * stage re-run embedding; has_embedding=false keeps the graph on
-             * the hidden-state input path.
+             * This explicitly host-driven transaction owns immutable token
+             * ingress for every participant, just like the prefill scheduler.
+             * Intermediate GPUs must admit that live row into their own request
+             * bank for native token consumers; a hidden activation does not
+             * replace the token authority. has_embedding=false still selects
+             * the transferred activation and never repeats embedding. Native
+             * parent-owned decode takes the separate device-generation branch
+             * above and does not enter this host-I/O boundary.
              */
-            const int *stage_tokens =
-                curr_runner.get() == finalPPSidecarRunner() ? tokens : nullptr;
-            if (!execute_stage(*curr_runner, stage_tokens))
+            if (!execute_stage(*curr_runner, tokens))
             {
                 LOG_ERROR("RankOrchestrator::forwardPP: Stage " << stage_idx << " forward failed");
                 return false;
@@ -6621,6 +6692,7 @@ namespace llaminar2
 
     bool RankOrchestrator::dispatchLocalTPMTPMainCondition(
         const char *operation_name,
+        LocalTPConditionEffect effect,
         const std::function<bool(IInferenceRunner &, size_t)> &child_operation)
     {
         const std::string operation =
@@ -6635,6 +6707,9 @@ namespace llaminar2
 
         if (!child_operation)
             return fail("missing participant operation");
+        if (effect != LocalTPConditionEffect::PublishInput &&
+            effect != LocalTPConditionEffect::ForwardMainRow)
+            return fail("unknown main-condition effect");
         if (device_runners_.size() < 2)
             return fail("requires at least two local participants");
         for (size_t participant = 0;
@@ -6649,6 +6724,16 @@ namespace llaminar2
                     " is missing or is not GPU-backed");
             }
         }
+
+        // The retained buffer is storage, not proof that this transaction has
+        // published a value. Invalidate before fan-out, including partial
+        // failure; input-only publication has not consumed a model row.
+        if (effect == LocalTPConditionEffect::ForwardMainRow && logits_gatherer_)
+            logits_gatherer_->invalidate();
+        if (effect == LocalTPConditionEffect::ForwardMainRow &&
+            ownsMainForwardLogits() && !skip_logits_gather_decode_ &&
+            (!logits_gatherer_ || !logits_gatherer_->isAllocated()))
+            return fail("requested host decode observation has no retained output owner");
 
         if (!tp_worker_pool_)
         {
@@ -6735,6 +6820,24 @@ namespace llaminar2
                 << ": rethrowing participant exception from device "
                 << first_exception_device);
             std::rethrow_exception(first_exception);
+        }
+        if (all_success &&
+            effect == LocalTPConditionEffect::ForwardMainRow &&
+            ownsMainForwardLogits() && logits_gatherer_ &&
+            logits_gatherer_->needsGather(LogitsForwardPhase::Decode))
+        {
+            // Diagnostic host observation uses the original event-consuming
+            // gather API and exactly one live vocabulary row. Device-owned
+            // generation keeps decode gathering disabled and never copies here.
+            if (!logits_gatherer_->gather(device_runners_, 1, vocab_size()))
+                return fail("failed to publish current main-condition host logits");
+            PerfStatsCollector::addCounter(
+                "sampling",
+                "rank_resident_condition_host_logits_publications",
+                1.0, "decode", "rank",
+                {{"operation", operation},
+                 {"participants", std::to_string(device_runners_.size())},
+                 {"rows", "1"}});
         }
         if (all_success)
         {
@@ -11712,6 +11815,7 @@ namespace llaminar2
 
         const bool published = dispatchLocalTPMTPMainCondition(
             "publishForcedDeviceResidentConditionToken",
+            LocalTPConditionEffect::PublishInput,
             [token, target_sample_slot](
                 IInferenceRunner &child, size_t)
             {
@@ -12641,6 +12745,20 @@ namespace llaminar2
             LOG_ERROR("[RankOrchestrator] Device-generation parent preparation re-throwing primary exception from participant "
                       << first_exception_device);
             std::rethrow_exception(first_exception);
+        }
+        if(all_success && replicated_ple_cohort_)
+        {
+            // All child captures are complete, but NO participant has launched.
+            // Inspect actual source/sampler/publication declarations before the
+            // existing materialized-policy authority can admit any collective loop.
+            const auto *first=dynamic_cast<const DeviceGraphOrchestrator *>(participants.front().get());
+            if(!first)throw std::invalid_argument("Fixed-head PLE requires actual device-owned generation participants");
+            for(const auto &participant:participants)
+            {
+                const auto *child=dynamic_cast<const DeviceGraphOrchestrator *>(participant.get());
+                if(!child)throw std::invalid_argument("Fixed-head PLE participant has no actual DGO producer");
+                child->requireReplicatedPLEGenerationProducer(*first);
+            }
         }
         if (all_success)
         {
@@ -16994,6 +17112,22 @@ namespace llaminar2
         return true;
     }
 
+    std::vector<const IInferenceRunner *> RankOrchestrator::fixedHeadPLEPrefixOwners() const
+    {
+        if(!replicated_ple_cohort_ || !pp_stage_runners_.empty() ||
+            device_runners_.size()!=static_cast<std::size_t>(replicated_ple_cohort_->degree()))
+            throw std::invalid_argument("Fixed-head rollback requires its actual complete full-main Rank child set");
+        std::vector<const IInferenceRunner *> owners;owners.reserve(device_runners_.size());
+        for(std::size_t p=0;p<device_runners_.size();++p) {
+            const auto *runner=device_runners_[p].get();
+            if(!dynamic_cast<const DeviceGraphOrchestrator *>(runner))
+                throw std::invalid_argument("Fixed-head rollback requires actual device-owned child producers");
+            (void)replicated_ple_cohort_->requireParticipant(runner->primaryDeviceId(),static_cast<int>(p));
+            owners.push_back(runner);
+        }
+        return owners;
+    }
+
     PrefixStateSnapshot RankOrchestrator::captureLivePrefixState(int seq_idx) const
     {
         PrefixStateSnapshot aggregate;
@@ -17081,6 +17215,9 @@ namespace llaminar2
         aggregate.cached_tokens = common_tokens;
         aggregate.provenance = same_provenance ? common_provenance
                                                : PrefixStateProvenance::PayloadCheckpoint;
+        if(replicated_ple_cohort_)
+            aggregate.fixed_head_rollback_origin=std::shared_ptr<const Qwen4ExpReplicatedPLEPrefixOrigin>(
+                new Qwen4ExpReplicatedPLEPrefixOrigin(this,replicated_ple_cohort_,fixedHeadPLEPrefixOwners(),aggregate,seq_idx));
         return aggregate;
     }
 
@@ -17178,6 +17315,9 @@ namespace llaminar2
                                    : (all_logical
                                           ? PrefixStateProvenance::LogicalCheckpoint
                                           : PrefixStateProvenance::PayloadCheckpoint);
+        if(replicated_ple_cohort_)
+            aggregate.fixed_head_rollback_origin=std::shared_ptr<const Qwen4ExpReplicatedPLEPrefixOrigin>(
+                new Qwen4ExpReplicatedPLEPrefixOrigin(this,replicated_ple_cohort_,fixedHeadPLEPrefixOwners(),aggregate,request.sequence_index));
         return aggregate;
     }
 
@@ -17185,6 +17325,15 @@ namespace llaminar2
     {
         if (!snapshot.valid || snapshot.participant_snapshots.empty())
             return false;
+
+        // Validate the complete rollback origin before restoring child0.
+        // Portable prefix-cache imports use the existing coordinated lookup
+        // path, not this process-local live checkpoint interface.
+        if(replicated_ple_cohort_) {
+            if(!snapshot.fixed_head_rollback_origin)return false;
+            snapshot.fixed_head_rollback_origin->require(this,*replicated_ple_cohort_,
+                fixedHeadPLEPrefixOwners(),snapshot,seq_idx);
+        }
 
         size_t participant_index = 0;
         bool ok = true;
@@ -18186,6 +18335,21 @@ namespace llaminar2
             if (participant && !first_partition)
                 first_partition = std::move(participant);
         }
+        if (first_partition && first_partition.isInteger())
+        {
+            // Integer identities are replicated declarations, never numerical
+            // partial sums. Every participant must publish the exact same bits.
+            for (const auto &runner : device_runners_)
+            {
+                if (!runner) continue;
+                const auto replica = runner->getSnapshotWithShape(key);
+                if (!replica || !replica.isInteger() || replica.rows != first_partition.rows ||
+                    replica.cols != first_partition.cols || replica.size != first_partition.size ||
+                    !std::equal(replica.integerValues().begin(), replica.integerValues().end(),
+                                first_partition.integerValues().begin()))
+                    throw std::logic_error("integer snapshot replicas disagree or are incomplete: " + key);
+            }
+        }
         return first_partition;
     }
 
@@ -18216,6 +18380,8 @@ namespace llaminar2
                 auto snap = pp_stage_runners_[stage_idx]->getSnapshotWithShape(key);
                 if (!snap)
                     continue;
+                if (snap.isInteger())
+                    throw std::logic_error("integer snapshot requires typed getSnapshotWithShape: " + key);
 
                 // Found the owning stage - check if it's a TP domain (RankOrchestrator)
                 auto *inner_mdo = dynamic_cast<const RankOrchestrator *>(
@@ -18374,6 +18540,8 @@ namespace llaminar2
                 continue;
             }
 
+            if (snap.isInteger())
+                throw std::logic_error("integer snapshot requires typed getSnapshotWithShape: " + key);
             // Debug: log data pointer and first 4 values to verify each device has different data
             LOG_DEBUG("RankOrchestrator::getTPSnapshot: device " << i
                                                                  << " key=" << key << " ptr=" << static_cast<const void *>(snap.data)
@@ -18750,6 +18918,67 @@ namespace llaminar2
                 return controller;
         }
         return nullptr;
+    }
+
+    void RankOrchestrator::requireMoEPipelineRuntimeOwnership(
+        MoEPipelineOwnershipValidation frontier) const
+    {
+        if (frontier != MoEPipelineOwnershipValidation::OwnersBound &&
+            frontier != MoEPipelineOwnershipValidation::ServingMaterialized)
+            throw std::invalid_argument("MoE pipeline ownership validation has an unknown setup frontier");
+        if (pp_stage_runners_.empty() || !device_runners_.empty() ||
+            pp_stage_runners_.size() != config_.pp_stages.size())
+            throw std::logic_error("MoE pipeline lost its exact participant-local stage owners");
+        for (std::size_t index = 0; index < pp_stage_runners_.size(); ++index)
+        {
+            const auto &child = pp_stage_runners_[index];
+            const auto &stage = config_.pp_stages[index];
+            const auto &binding = stage.moe_runtime;
+            if (!child || !binding)
+                throw std::logic_error("MoE pipeline has a missing stage runtime owner");
+            binding->requireDestination({.first_layer = stage.first_layer, .last_layer = stage.last_layer,
+                    .has_embedding = stage.has_embedding, .has_lm_head = stage.has_lm_head},
+                stage.stage_devices, stage.tp_weights, stage.tp_backend, config_.moe_rebalance.mode);
+            if (const auto *domain = dynamic_cast<const IRankOrchestrator *>(child.get()))
+            {
+                if (domain->device_count() != static_cast<int>(stage.stage_devices.size()))
+                    throw std::logic_error("MoE pipeline child lost an admitted TP participant");
+                for (int member = 0; member < domain->device_count(); ++member)
+                    if (!domain->deviceRunner(member) || domain->deviceRunner(member)->primaryDeviceId() !=
+                        stage.stage_devices[static_cast<std::size_t>(member)].toLocalDeviceId())
+                        throw std::logic_error("MoE pipeline child has foreign ordered TP membership");
+            }
+            else if (stage.stage_devices.size() != 1u ||
+                child->primaryDeviceId() != stage.stage_devices.front().toLocalDeviceId())
+                throw std::logic_error("MoE pipeline child has a foreign single-participant identity");
+            if (child->moeOverlayAuthorityExecution() != binding->plan()->authority_execution)
+                throw std::logic_error("MoE pipeline child authority differs from its own admitted owner");
+            const auto &no_peer = binding->owners().authority->noPeerResidency();
+            if (no_peer)
+            {
+                const auto &metadata = binding->metadata();
+                no_peer->requireDestination(child->primaryDeviceId(), metadata.first_model_layer,
+                    metadata.num_layers, metadata.num_experts);
+                if (no_peer->authorityExecution() != binding->plan()->authority_execution)
+                    throw std::logic_error("MoE pipeline no-peer proof has a foreign authority locus");
+            }
+            else if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
+            {
+                // A genuinely movable host stage needs its own admitted host
+                // maintenance composition. A no-peer identity cannot certify it.
+                if (binding->plan()->authority_execution != MoEOverlayAuthorityExecutionKind::DeviceResident)
+                    throw std::logic_error("Movable host MoE pipeline stage has no admitted maintenance owner");
+                if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized &&
+                    !child->deviceResidentMoEOverlayMaintenanceReady())
+                    throw std::logic_error("Movable MoE pipeline stage has no complete native maintenance family");
+            }
+            if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized &&
+                !binding->owners().residency->allInitialBanksReady())
+                throw std::logic_error("MoE pipeline stage has incomplete physical prepared residency");
+        }
+        if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized &&
+            !validatePPGraphTransactionReady("MoE stage ownership certification"))
+            throw std::logic_error("MoE pipeline serving segments are not completely materialized");
     }
 
     MoEOverlayAuthorityExecutionKind

@@ -66,6 +66,49 @@ namespace llaminar2
             return {};
         }
 
+        /**
+         * @brief Name Flash Next values by their exact producing operation and output.
+         * @param name Unqualified graph node, retaining its layer or predictor namespace.
+         * @param output Named output; an empty name enumerates all possible semantic keys.
+         * @return No value for other operations, otherwise only this producer's keys.
+         *
+         * Indexer scratch and counters are not mathematical checkpoints. Naming
+         * its outputs separately prevents filtered capture from retaining the
+         * entire score workspace or publishing a pool as a query tensor.
+         */
+        std::optional<std::vector<std::string>> flashNextSnapshotOutputKeys(
+            const std::string &name, std::string_view output)
+        {
+            const auto one = [&](std::string_view suffix, std::string_view operand,
+                                 std::initializer_list<std::string_view> semantics)
+                -> std::optional<std::vector<std::string>>
+            {
+                if (!name.ends_with(suffix)) return std::nullopt;
+                std::vector<std::string> keys;
+                if (output.empty() || output == operand)
+                {
+                    const auto prefix = name.substr(0, name.size() - suffix.size());
+                    for (const auto semantic : semantics)
+                        keys.push_back(prefix + std::string(semantic));
+                }
+                return keys;
+            };
+            if (auto keys = one("_hc_attn_branch_norm", "output", {"_GR_NORM"})) return keys;
+            if (auto keys = one("_hc_attn_write", "output", {"_GR_WRITE", "_ATTENTION_RESIDUAL"})) return keys;
+            if (auto keys = one("_hc_ffn_write", "output", {"_FFN_RESIDUAL"})) return keys;
+            constexpr std::string_view indexer = "_qsa_indexer";
+            if (!name.ends_with(indexer)) return std::nullopt;
+            const auto prefix = name.substr(0, name.size() - indexer.size());
+            std::vector<std::string> keys;
+            for (const auto &[operand, semantic] : std::initializer_list<std::pair<std::string_view, std::string_view>>{
+                     {"prepared_query", "_QSA_INDEXER_QUERY"},
+                     {"pooled_keys", "_QSA_INDEXER_POOLED_KEYS"},
+                     {"selected", "_QSA_SELECTED_INDICES"}})
+                if (output.empty() || output == operand)
+                    keys.push_back(prefix + std::string(semantic));
+            return keys;
+        }
+
         /** @brief Exact graph grammar for the two residual-normalization producers. */
         enum class NormSnapshotKind { Attention, FeedForward };
 
@@ -118,6 +161,13 @@ namespace llaminar2
             const auto producer = normSnapshotProducer(name);
             if (!producer) return {};
             const auto normalized = SnapshotCapture::convertStageNameToSnapshotKey(name);
+            if (output == "branch_read")
+            {
+                std::vector<std::string> keys{normalized};
+                if (producer->kind == NormSnapshotKind::Attention)
+                    keys.push_back(producer->prefix + "_GR_READ");
+                return keys;
+            }
             if (output == "norm_output" || output == "output") return {normalized};
             if (output != "residual_out") return {};
             std::vector<std::string> keys{normalized + "_RESIDUAL_OUT"};
@@ -175,11 +225,14 @@ namespace llaminar2
             const StoredSnapshot &first,
             const size_t first_logical_rows) noexcept
         {
+            if(first.semantic_axis==SnapshotSemanticAxis::StatePrefixRows)
+                return PrefillSnapshotSequenceLayout::Terminal;
             constexpr std::string_view kRouteContributions =
                 "_MOE_ROUTE_CONTRIBUTIONS";
             if (hasSemanticSuffix(
                     semantic_key,
-                    kRouteContributions))
+                    kRouteContributions) || hasSemanticSuffix(semantic_key, "_MOE_LOCAL_ROUTE_CONTRIBUTIONS") ||
+                semantic_key.find("_MOE_OVERLAY_ROUTE_CONTRIBUTIONS_") != std::string::npos)
             {
                 return PrefillSnapshotSequenceLayout::PackedRouteRows;
             }
@@ -197,17 +250,13 @@ namespace llaminar2
         {
             constexpr std::string_view kRouteContributions =
                 "_MOE_ROUTE_CONTRIBUTIONS";
-            if (!hasSemanticSuffix(
-                    semantic_key,
-                    kRouteContributions))
-            {
-                return {};
-            }
-            return semantic_key.substr(
-                       0,
-                       semantic_key.size() -
-                       kRouteContributions.size()) +
-                   "_MOE_ROUTING_INDICES";
+            const auto target = semantic_key.find("_MOE_OVERLAY_ROUTE_CONTRIBUTIONS_");
+            if (target != std::string::npos)
+                return semantic_key.substr(0, target) + "_MOE_ROUTING_INDICES";
+            const std::string_view local = "_MOE_LOCAL_ROUTE_CONTRIBUTIONS";
+            const auto suffix = hasSemanticSuffix(semantic_key, local) ? local : kRouteContributions;
+            if (!hasSemanticSuffix(semantic_key, suffix)) return {};
+            return semantic_key.substr(0, semantic_key.size() - suffix.size()) + "_MOE_ROUTING_INDICES";
         }
 
         std::string snapshotContextPrefix(const std::string &context)
@@ -299,6 +348,20 @@ namespace llaminar2
 
             return prefix + "_MOE_OVERLAY_CUMULATIVE_" +
                    snapshotContextPrefix(participant);
+        }
+
+        /** @brief Name an exact per-target canonical route bank, never its reduced expert row. */
+        std::string overlayTicketRouteSnapshotKey(const std::string &stage_name)
+        {
+            for (const auto marker : {std::string_view("_moe_overlay_canonical_ticket_consume_"),
+                                      std::string_view("_moe_overlay_ticket_consume_")})
+            {
+                const auto position = stage_name.find(marker);
+                if (position != std::string::npos && position && position + marker.size() < stage_name.size())
+                    return stage_name.substr(0, position) + "_MOE_OVERLAY_ROUTE_CONTRIBUTIONS_" +
+                        snapshotContextPrefix(stage_name.substr(position + marker.size()));
+            }
+            return {};
         }
 
         /**
@@ -404,6 +467,17 @@ namespace llaminar2
 
         LOG_TRACE("[Snapshot] Callback invoked for stage: " << name
                                                             << " outputs.size=" << dump.outputs.size());
+
+        if (flashNextSnapshotOutputKeys(name, {}))
+        {
+            for (const auto &output : dump.outputs)
+            {
+                const auto keys = flashNextSnapshotOutputKeys(name, output.name ? output.name : "");
+                for (const auto &key : *keys)
+                    if (output.data) storeOutput(key, output);
+            }
+            return;
+        }
 
         if (const auto key = finalizedEmbeddingSnapshotKey(name); !key.empty())
         {
@@ -814,11 +888,12 @@ namespace llaminar2
                     storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
                     handled_named_output = true;
                 }
-                else if (output_name == "canonical_route_contributions" &&
-                         output.data)
+                else if ((output_name == "canonical_route_contributions" ||
+                          output_name == "local_canonical_route_contributions") && output.data)
                 {
                     storeOutput(
-                        prefix + "_MOE_ROUTE_CONTRIBUTIONS",
+                        prefix + (output_name == "local_canonical_route_contributions"
+                            ? "_MOE_LOCAL_ROUTE_CONTRIBUTIONS" : "_MOE_ROUTE_CONTRIBUTIONS"),
                         output);
                     handled_named_output = true;
                 }
@@ -874,6 +949,21 @@ namespace llaminar2
             return;
         }
 
+        // A canonical ticket publishes unweighted route slots [M*top_k,H].
+        // Only the later ordered reducer owns the mathematical [M,H] expert
+        // output. Keep the route bank available under its exact target key.
+        if (const auto key = overlayTicketRouteSnapshotKey(name); !key.empty())
+        {
+            bool canonical = false;
+            for (const auto &output : dump.outputs)
+                if (output.name && std::string_view(output.name) == "canonical_route_contributions")
+                {
+                    canonical = true;
+                    if (output.data) storeOutput(key, output);
+                }
+            if (canonical) return;
+        }
+
         /*
          * Preserve the real per-target accumulator before the generic mapping
          * below overwrites `layerN_MOE_EXPERT_OUTPUT` with the final target's
@@ -895,19 +985,7 @@ namespace llaminar2
         if (!dump.outputs.empty() && dump.outputs[0].data)
         {
             const auto &out = dump.outputs[0];
-            auto data = extractFp32FromOutput(out);
-            std::string key = convertStageNameToSnapshotKey(name);
-            LOG_DEBUG("[Snapshot] Storing key=" << key << " count=" << data.size());
-
-            if (data.size() >= 8 && key == "EMBEDDING")
-            {
-                LOG_DEBUG("[Snapshot] " << key << " first 8 values: "
-                                        << data[0] << "," << data[1] << "," << data[2] << "," << data[3] << ","
-                                        << data[4] << "," << data[5] << "," << data[6] << "," << data[7]);
-            }
-
-            if (!data.empty())
-                storeSnapshot(key, std::move(data), out.rows, out.cols);
+            storeOutput(convertStageNameToSnapshotKey(name), out);
         }
     }
 
@@ -1069,7 +1147,8 @@ namespace llaminar2
             }
 
             size_t total_rows = 0;
-            std::vector<float> joined;
+            SnapshotValues joined = first.data.isInteger()
+                ? SnapshotValues(std::vector<std::int64_t>{}) : SnapshotValues{};
             SnapshotOwnedRows joined_ownership;
             for (size_t chunk_index = 0;
                  chunk_index < chunks.size();
@@ -1103,6 +1182,7 @@ namespace llaminar2
                               piece.rows % rows_per_logical_row == 0;
                 if (!row_geometry_valid ||
                     piece.publication != first.publication ||
+                    piece.data.isInteger() != first.data.isInteger() ||
                     piece.cols != first.cols ||
                     piece.rows > std::numeric_limits<size_t>::max() / piece.cols ||
                     piece.data.size() != piece.rows * piece.cols ||
@@ -1149,11 +1229,7 @@ namespace llaminar2
                  * are row-major, so the first `logical_rows * top_k` rows are
                  * the only production contributions belonging to this chunk.
                  */
-                joined.insert(
-                    joined.end(),
-                    piece.data.begin(),
-                    piece.data.begin() +
-                        static_cast<std::ptrdiff_t>(live_elements));
+                joined.append(piece.data, live_elements);
             }
 
             storeSnapshot(
@@ -1262,10 +1338,7 @@ namespace llaminar2
             return data;
         }
 
-        // Unknown dtype — warn and try FP32 (may be garbage)
-        LOG_WARN("[extractFp32FromOutput] Unknown dtype '" << dtype_str << "', assuming FP32");
-        std::memcpy(data.data(), out.data, count * sizeof(float));
-        return data;
+        throw std::invalid_argument("snapshot dtype requires a supported typed extractor: " + dtype_str);
     }
 
     // =========================================================================
@@ -1330,6 +1403,14 @@ namespace llaminar2
         // TPSnapshot. This prevents graph-captured collective diagnostics from
         // overwriting the semantic stage snapshot used by parity tests.
         static const std::vector<std::pair<std::string, std::string>> suffix_map = {
+            // Flash Next semantic values precede generic projection/norm suffixes.
+            {"_hc_attn_branch_norm", "_GR_NORM"},
+            {"_hc_attn_write", "_GR_WRITE"},
+            {"_hc_ffn_write", "_FFN_RESIDUAL"},
+            {"_ple_hash", "_PLE_HASH_INDICES"},
+            {"_ple_gather", "_PLE_GATHER"},
+            {"_ple_gate", "_PLE_GATE"},
+            {"_ple_convolution", "_PLE_CONVOLUTION"},
             // MTP-prefixed embedding collectives retain the same canonical
             // post-reduction name as the unprefixed model graph.
             {"_embedding_allreduce", "_EMBEDDING_ALLREDUCED"},
@@ -1435,6 +1516,9 @@ namespace llaminar2
         if (const auto separator = stage_name.find("::"); separator != std::string::npos)
             return qualifySnapshotKeys(stage_name.substr(0, separator),
                 possibleKeysForStageName(stage_name.substr(separator + 2)));
+        if (stage_name.find("_moe_overlay_canonical_ticket_consume_") != std::string::npos)
+            return {overlayTicketRouteSnapshotKey(stage_name)};
+        if (auto keys = flashNextSnapshotOutputKeys(stage_name, {})) return *keys;
         if (const auto key = finalizedEmbeddingSnapshotKey(stage_name); !key.empty())
             return {key, key + "_ALLREDUCED"};
 
@@ -1562,6 +1646,11 @@ namespace llaminar2
             auto keys = normSnapshotOutputKeys(stage_name, "norm_output");
             const auto residual = normSnapshotOutputKeys(stage_name, "residual_out");
             keys.insert(keys.end(), residual.begin(), residual.end());
+            // The concrete descriptor decides whether this is a branch read;
+            // stage-name admission must also allow its additional checkpoint.
+            const auto branch = normSnapshotOutputKeys(stage_name, "branch_read");
+            for (const auto &key : branch)
+                if (std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
             return keys;
         }
         if (stage_name.find("_moe_ffn") != std::string::npos)
@@ -1576,7 +1665,8 @@ namespace llaminar2
         {
             const std::string prefix = prefixBefore("_moe_expert_ffn");
             return {prefix + "_MOE_EXPERT_OUTPUT",
-                    prefix + "_MOE_COMBINED_OUTPUT"};
+                    prefix + "_MOE_COMBINED_OUTPUT", prefix + "_MOE_ROUTE_CONTRIBUTIONS",
+                    prefix + "_MOE_LOCAL_ROUTE_CONTRIBUTIONS"};
         }
         if (stage_name.find("_moe_canonical_publication_finalize") !=
             std::string::npos)
@@ -1635,6 +1725,27 @@ namespace llaminar2
             return qualifySnapshotKeys(stage_name.substr(0, separator),
                 possibleKeysForStage(stage_name.substr(separator + 2), dump_info));
 
+        if (const auto route_key = overlayTicketRouteSnapshotKey(stage_name); !route_key.empty())
+        {
+            std::vector<std::string> keys;
+            for (const auto &output : dump_info.outputs)
+                if (output.name && std::string_view(output.name) == "canonical_route_contributions")
+                    keys.push_back(route_key);
+            if (!keys.empty()) return keys;
+        }
+
+        if (flashNextSnapshotOutputKeys(stage_name, {}))
+        {
+            std::vector<std::string> keys;
+            for (const auto &output : dump_info.outputs)
+            {
+                const auto actual = flashNextSnapshotOutputKeys(stage_name, output.name ? output.name : "");
+                for (const auto &key : *actual)
+                    if (std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+            }
+            return keys;
+        }
+
         if (stage_name.find("_moe_routing") != std::string::npos)
         {
             std::vector<std::string> keys;
@@ -1683,10 +1794,11 @@ namespace llaminar2
                     output.name ? output.name : "";
                 if (output_name == "combined_output")
                     keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
-                else if (output_name == "canonical_route_contributions")
+                else if (output_name == "canonical_route_contributions" ||
+                         output_name == "local_canonical_route_contributions")
                 {
-                    keys.push_back(
-                        prefix + "_MOE_ROUTE_CONTRIBUTIONS");
+                    keys.push_back(prefix + (output_name == "local_canonical_route_contributions"
+                        ? "_MOE_LOCAL_ROUTE_CONTRIBUTIONS" : "_MOE_ROUTE_CONTRIBUTIONS"));
                 }
                 else if (canonical_finalizer &&
                          output_name == "routed_output")
@@ -1785,11 +1897,12 @@ namespace llaminar2
 
     void SnapshotCapture::storeSnapshot(
         const std::string &key,
-        std::vector<float> data,
+        SnapshotValues data,
         size_t rows,
         size_t cols,
         SnapshotPublication publication,
-        SnapshotOwnedRows row_ownership)
+        SnapshotOwnedRows row_ownership,
+        SnapshotSemanticAxis semantic_axis)
     {
         snapshots_[key] = std::make_shared<const StoredSnapshot>(
             StoredSnapshot{
@@ -1798,29 +1911,46 @@ namespace llaminar2
                 .cols = cols,
                 .publication = publication,
                 .row_ownership = std::move(row_ownership),
+                .semantic_axis = semantic_axis,
             });
     }
 
     void SnapshotCapture::storeOutput(
         const std::string &key,
-        const StageDumpInfo::OutputBuffer &out,
+        const StageDumpInfo::OutputBuffer &source,
         SnapshotPublication publication)
     {
-        if (!out.data)
+        SnapshotSemanticObservation observation(source);
+        const auto &out=observation.view();
+        const auto axis=snapshotSemanticAxis(out.semantic_extent);
+        if (!out.data && out.rows!=0)
             return;
         if (std::holds_alternative<SnapshotCompactRows>(out.row_layout))
             throw std::logic_error("Compact snapshot rows must be observed before publication");
-        auto data = extractFp32FromOutput(out);
-        if (!data.empty())
+        SnapshotValues data;
+        if (out.dtype && std::strcmp(out.dtype, "INT64") == 0)
+        {
+            if (out.rows != 0 && out.cols > std::numeric_limits<size_t>::max() / out.rows)
+                throw std::overflow_error("integer snapshot shape overflows scalar capacity");
+            const auto count = out.rows * out.cols;
+            if (count > std::numeric_limits<size_t>::max() / sizeof(std::int64_t) ||
+                out.element_size != sizeof(std::int64_t) || out.byte_size < count * sizeof(std::int64_t))
+                throw std::invalid_argument("INT64 snapshot requires its complete exact-width byte extent");
+            std::vector<std::int64_t> integers(count);
+            if(count) std::memcpy(integers.data(), out.data, count * sizeof(std::int64_t));
+            data = SnapshotValues(std::move(integers));
+        }
+        else data = SnapshotValues(extractFp32FromOutput(out));
+        if (!data.empty() || (axis!=SnapshotSemanticAxis::Legacy && out.rows==0 && out.cols>0))
         {
             if (const auto *owned = std::get_if<SnapshotOwnedRows>(&out.row_layout))
             {
                 if (publication != SnapshotPublication::SchemaPartition)
                     throw std::logic_error("Conflicting explicit snapshot publication policies");
                 validateSnapshotOwnedRows(*owned, out.rows);
-                storeSnapshot(key, std::move(data), out.rows, out.cols, SnapshotPublication::RowPartition, *owned);
+                storeSnapshot(key, std::move(data), out.rows, out.cols, SnapshotPublication::RowPartition, *owned, axis);
             }
-            else storeSnapshot(key, std::move(data), out.rows, out.cols, publication);
+            else storeSnapshot(key, std::move(data), out.rows, out.cols, publication, {}, axis);
         }
     }
 

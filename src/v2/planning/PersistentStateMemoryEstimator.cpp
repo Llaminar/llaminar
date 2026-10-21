@@ -12,6 +12,7 @@
 #include "execution/mtp/MTPCheckpointPolicy.h"
 #include "kernels/HybridGDNStateGeometry.h"
 #include "kernels/DeviceSequenceStateGeometry.h"
+#include "kernels/qwen4exp/Qwen4ExpCheckpointGeometry.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
 
@@ -68,6 +69,9 @@ namespace llaminar2
             const ModelMemoryProfile &profile,
             int layer)
         {
+            if (profile.flash_next)
+                return profile.flashNextLayerKind(layer) == Qwen4ExpLayerKind::GDN
+                    ? LayerStorageKind::GDN : LayerStorageKind::FullAttention;
             if (layerHasTensor(profile, layer, ".attn_qkv.weight"))
                 return LayerStorageKind::GDN;
             if (layerHasTensor(profile, layer, ".attn_q.weight") ||
@@ -90,7 +94,7 @@ namespace llaminar2
     bool PersistentStateMemoryEstimator::isFullAttentionLayer(
         const ModelMemoryProfile &profile, int layer)
     {
-        if (layer < 0 || layer >= profile.n_layers)
+        if (layer < 0 || layer >= profile.totalLayerCount())
             throw std::invalid_argument("KV layer classification index is outside the model");
         return classifyLayer(profile, layer) == LayerStorageKind::FullAttention;
     }
@@ -122,7 +126,7 @@ namespace llaminar2
                     profile.full_attention_interval > 0
                 ? KVCacheFamily::Hybrid : KVCacheFamily::AttentionOnly;
         const int main_layer_count =
-            std::max(0, profile.n_layers - profile.mtp_layer_count);
+            profile.mainLayerCount();
         const int first_main_layer =
             std::clamp(first_layer, 0, main_layer_count);
         const int requested_last =
@@ -147,7 +151,7 @@ namespace llaminar2
         if (mtp_role == MTPStateRole::PredictorOwner)
         {
             for (int layer = main_layer_count;
-                 layer < profile.n_layers;
+                 layer < profile.totalLayerCount();
                  ++layer)
             {
                 if (!isFullAttentionLayer(profile, layer))
@@ -159,6 +163,14 @@ namespace llaminar2
                     ++result.mtp_full_attention_layers;
                 }
             }
+        }
+
+        if (profile.flash_next)
+        {
+            if (first_main_layer <= last_main_layer)
+                result.main_sparse_attention_layers = profile.flashNextSparseLayerCount(first_main_layer, last_main_layer);
+            if (mtp_role == MTPStateRole::PredictorOwner && main_layer_count < profile.totalLayerCount())
+                result.mtp_sparse_attention_layers = profile.flashNextSparseLayerCount(main_layer_count, profile.totalLayerCount() - 1);
         }
 
         /*
@@ -233,29 +245,62 @@ namespace llaminar2
                                      gdn_layers)
                                : geometry.localPayloadBytes(gdn_layers);
                 };
-            const size_t main_payload_bytes =
-                checkpointPayloadBytes(result.main_gdn_layers) +
-                static_cast<size_t>(std::max(0, profile.d_model)) *
-                    sizeof(float);
+            const size_t terminal_width = profile.flash_next
+                ? profile.flash_next->residual_width : static_cast<size_t>(std::max(0, profile.d_model));
+            const size_t main_payload_bytes = checkedAdd(
+                checkpointPayloadBytes(result.main_gdn_layers), terminal_width * sizeof(float),
+                "terminal residual checkpoint");
             const size_t shifted_payload_bytes =
                 checkpointPayloadBytes(result.mtp_gdn_layers);
             result.checkpoint_state_bytes =
                 kMTPConcurrentLiveCheckpointSets *
                 (main_payload_bytes + shifted_payload_bytes);
 
+            if (!device.is_gpu() && profile.flash_next)
+            {
+                const auto &qfn = *profile.flash_next;
+                const bool owns_ple = first_main_layer <= static_cast<int>(qfn.ple_decoder_layer) &&
+                    static_cast<int>(qfn.ple_decoder_layer) <= last_main_layer;
+                // The CPU rollback pool borrows the same number of admitted
+                // concurrent sets as GDN. Each set has one small accepted
+                // endpoint per concrete cache, independent of batch capacity.
+                const size_t auxiliary = checkedAdd(
+                    qwen4exp::Qwen4ExpCheckpointGeometry::capacity(result.main_sparse_attention_layers,
+                        owns_ple ? qfn.residual_width : 0),
+                    qwen4exp::Qwen4ExpCheckpointGeometry::capacity(result.mtp_sparse_attention_layers, 0),
+                    "CPU auxiliary checkpoint");
+                result.checkpoint_state_bytes = checkedAdd(result.checkpoint_state_bytes,
+                    kMTPConcurrentLiveCheckpointSets * auxiliary, "CPU auxiliary rollback sets");
+            }
+
             if (device.is_gpu())
             {
                 // Match each concrete cache's metadata shape, including the
                 // recurrent-only frontier. Absent predictor caches have no
                 // allocation and therefore contribute nothing.
-                const size_t main_metadata =
+                size_t main_metadata =
                     DeviceSequenceStateGeometry(
                         result.main_full_attention_layers).checkpointBytes();
-                const size_t shifted_metadata =
+                size_t shifted_metadata =
                     result.mtp_full_attention_layers + result.mtp_gdn_layers > 0
                         ? DeviceSequenceStateGeometry(
                               result.mtp_full_attention_layers).checkpointBytes()
                         : 0;
+                if (profile.flash_next)
+                {
+                    const auto &qfn = *profile.flash_next;
+                    const bool owns_ple = first_main_layer <= static_cast<int>(qfn.ple_decoder_layer) &&
+                        static_cast<int>(qfn.ple_decoder_layer) <= last_main_layer;
+                    // Cache-owned opaque snapshots append only raw tails and
+                    // lexical histories to canonical sequence metadata. Pool
+                    // capacity lives in the admitted activation inventory.
+                    main_metadata = checkedAdd(main_metadata,
+                        qwen4exp::Qwen4ExpCheckpointGeometry::capacity(result.main_sparse_attention_layers,
+                            owns_ple ? qfn.residual_width : 0), "main auxiliary checkpoint");
+                    shifted_metadata = checkedAdd(shifted_metadata,
+                        qwen4exp::Qwen4ExpCheckpointGeometry::capacity(result.mtp_sparse_attention_layers, 0),
+                        "shifted auxiliary checkpoint");
+                }
                 result.sequence_metadata_bytes =
                     kMTPConcurrentLiveCheckpointSets *
                         (main_metadata + shifted_metadata) +

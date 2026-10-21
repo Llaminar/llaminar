@@ -100,6 +100,14 @@ namespace llaminar2
 
         explicit LMHeadStage(Params params);
 
+        /**
+         * @return Exact source/prepared owner and arithmetic declaration for terminal composition.
+         * @note Setup callers compare immutable fields only; effective_last_row_idx is
+         * execution metadata and is not evidence of replicated values or source ownership.
+         */
+        const Params &getParams() const noexcept { return params_; }
+
+
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::LM_HEAD; }

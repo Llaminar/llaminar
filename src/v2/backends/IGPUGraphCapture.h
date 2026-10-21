@@ -299,6 +299,7 @@ namespace llaminar2
         std::span<const DeviceControlledLoopEntryFragment> entry;
         std::span<const DeviceControlledLoopFragment> initialization;
         std::span<const DeviceControlledLoopFragment> iteration;
+        std::span<const DeviceControlledLoopEntryFragment> terminal; ///< Unconditional once-only release after WHILE exits, including unhealthy/zero-iteration exits.
     };
 
     /**

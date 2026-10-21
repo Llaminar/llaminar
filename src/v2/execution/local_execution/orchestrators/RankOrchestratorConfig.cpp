@@ -233,6 +233,8 @@ namespace llaminar2
         config.tp_allreduce_precision_override =
             runtime.tp_allreduce_precision_override;
         config.prefix_cache = runtime.prefix_cache;
+        config.ngram_table_policy = runtime.ngram_table_policy;
+        config.ngram_table_placement = runtime.ngram_table_placement;
         config.mtp = runtime.mtp;
         config.routed_expert_compute_policy = runtime.routed_expert_compute_policy;
         config.routed_expert_owner_order =
@@ -300,6 +302,11 @@ namespace llaminar2
         return child;
     }
 
+    /**
+     * @brief Preserve one resolved plan's exact local TP and PP stage declarations.
+     * @param plan Authored participants, workshare, collective backend and runtime policy.
+     * @return Configuration whose child stages authenticate the same admitted declarations.
+     */
     RankOrchestrator::Config
     RankOrchestrator::Config::fromPlan(const RankExecutionPlan &plan)
     {
@@ -322,8 +329,10 @@ namespace llaminar2
                 stage_cfg.has_embedding = (i == 0);
                 stage_cfg.has_lm_head = (i == pp_devices.size() - 1);
 
-                // Use per-stage TP info if available (TP-in-PP composition)
-                if (i < stage_tp_info.size() && stage_tp_info[i].devices.size() > 1)
+                // A singleton continuation still has an authored collective
+                // and workshare declaration. Preserve it exactly so the child
+                // can authenticate the same stage runtime that admission sealed.
+                if (i < stage_tp_info.size() && !stage_tp_info[i].devices.empty())
                 {
                     stage_cfg.stage_devices = stage_tp_info[i].devices;
                     stage_cfg.tp_weights = stage_tp_info[i].tp_weights;

@@ -35,6 +35,9 @@
 #include "../../execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/compute_stages/stages/TPAllreduceStage.h"
+#include "../../execution/compute_stages/stages/AttentionConsumerBinding.h"
+#include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorResidualBinding.h"
+#include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
 #include "../../execution/local_execution/device/DeviceContext.h"
 #include "../../execution/config/ExecutionPolicy.h"
 #include "../../memory/BufferArena.h"
@@ -280,7 +283,7 @@ namespace llaminar2
         ComputeGraph buildLayerGraph(const LayerContext &ctx) override;
 
         int numLayers() const override { return config_.n_layers; }
-        int hiddenDim() const override { return config_.d_model; }
+        int hiddenDim() const override { return config_.residualWidth(); }
 
         bool isInitialized() const override
         {
@@ -354,6 +357,58 @@ namespace llaminar2
 
     protected:
         /**
+         * @brief Declare a model-specific layer input operation before attention/FFN.
+         * @param graph Complete participant-local forward graph being assembled.
+         * @param input Exact invocation token, row, position and cache authorities.
+         * @param layer Global decoder layer whose input is being prepared.
+         * @param device Exact compute participant.
+         * @param dependency Previous layer/embedding producer; empty for a PP ingress.
+         * @return Terminal input producer, or the unchanged dependency without an extension.
+         */
+        virtual std::string addModelLayerInput(ComputeGraph &graph,const ForwardInput &input,
+            int layer,DeviceId device,const std::string &dependency);
+
+        /**
+         * @brief Retain immutable input bindings only during declarative graph construction.
+         *
+         * Nested graph builders restore the outer input automatically. Stages
+         * copy their exact native pointer/geometry contracts; no runtime stage
+         * may retain this temporary ForwardInput or use it as a host shadow.
+         */
+        class ForwardInputConstructionScope final
+        {
+        public:
+            /** @brief Enter one model-forward graph construction interval. */
+            ForwardInputConstructionScope(QwenGraphBase &owner,const ForwardInput &input)
+                :owner_(owner),previous_(owner.forward_input_construction_)
+            { owner_.forward_input_construction_=&input; }
+            /** @brief Restore the exact enclosing construction binding, including on failure. */
+            ~ForwardInputConstructionScope(){owner_.forward_input_construction_=previous_;}
+            ForwardInputConstructionScope(const ForwardInputConstructionScope &)=delete;
+            ForwardInputConstructionScope &operator=(const ForwardInputConstructionScope &)=delete;
+        private:
+            QwenGraphBase &owner_;
+            const ForwardInput *previous_;
+        };
+        /** @brief Require the active complete invocation while lowering a model extension. */
+        const ForwardInput &modelForwardInput() const;
+        /** @brief Borrow an invocation's exact live row authority for model-specific primitives. */
+        Qwen4ExpStageRows modelExtensionRows(int capacity,DeviceId device) const;
+        /**
+         * @brief Preserve an authenticated single-request query authority for an explicit counted projection.
+         * @param capacity Exact physical token rows in the current complete forward invocation.
+         * @param device Exact primitive, count and projection participant.
+         * @return The existing original prefill/verifier/CPU host count or proven compact/scalar geometry.
+         * @throws std::invalid_argument Before graph insertion for padded/unowned rows, foreign role/device, or independent requests.
+         * @details The helper never reads a GPU count or substitutes cumulative KV lengths.
+         * It projects modelExtensionRows and the checked chunk/original-request ingress, adding no count owner.
+         * WorkspaceDeclaration alone may describe unready physical geometry; its containing graph
+         * is permanently non-executable and cannot enter the forward engine or native capture.
+         */
+        DeviceRowRange singleRequestProjectionQueryRows(int capacity, DeviceId device) const;
+
+
+        /**
          * @brief Borrow the device count for a grouped single-request verifier.
          * @param device Participant owning the activations and count.
          * @param seq_len Physical rows per request in the retained graph.
@@ -408,6 +463,7 @@ namespace llaminar2
         bool mtp_kv_cache_only_graph_active_ = false;
         bool prefix_runtime_rehydration_graph_active_ = false;
         std::optional<ForwardExecutionPhase> forward_execution_phase_;
+        const ForwardInput *forward_input_construction_=nullptr; ///< Construction-only scoped binding, never live model state.
         /// Borrowed only within a validated main-prefill graph construction scope.
         std::optional<DeviceRowRange> prefill_collective_rows_;
 
@@ -495,7 +551,14 @@ namespace llaminar2
         bool useReplicatedMTPSidecarDenseWeights() const;
         bool hasDecodeMirroredEmbeddingWeightSource() const;
         bool useDecodeMirroredEmbeddingWeights() const;
+        /** @brief Require the model-owned terminal transformation and full replicated vocabulary head. */
         bool hasMirroredMTPHeadWeightSource() const;
+        /**
+         * @brief Select the complete frozen terminal mixer from the active graph's weight authority.
+         * @return Primary or replicated norm/down/up bindings, never a mixture of sources.
+         * @throws std::runtime_error When the selected model-owned terminal operands are incomplete.
+         */
+        const HyperConnectionWeights<const WeightBinding *> &modelHyperConnectionHeadBindings() const;
         /**
          * @brief Return whether MTP owns a full terminal head per TP participant.
          *
@@ -567,6 +630,7 @@ namespace llaminar2
          * @param count Exact number of elements participating in the sum.
          * @param device Participant that owns @p buffer.
          * @param precision_override Optional caller-selected native precision.
+         * @param phase_override Explicit predictor phase; absent preserves existing main phase.
          * @return Complete immutable policy/precision plan for the stage.
          * @throws std::logic_error when a decode graph requiring canonical
          *         arithmetic has malformed geometry or an unsupported LocalTP
@@ -576,7 +640,8 @@ namespace llaminar2
             const TensorBase *buffer,
             size_t count,
             DeviceId device,
-            const std::optional<std::string> &precision_override) const;
+            const std::optional<std::string> &precision_override,
+            std::optional<ForwardExecutionPhase> phase_override = std::nullopt) const;
 
         /**
          * @brief Declarative source for the norm that feeds a final projection.
@@ -670,6 +735,8 @@ namespace llaminar2
          *         with the graph's local vocabulary width.
          */
         int serialEquivalentLMHeadPartitionWidth(bool column_parallel) const;
+        /** @brief Resolve mirrored-head arithmetic from explicit immutable source policy. */
+        int serialEquivalentLMHeadPartitionWidth(bool column_parallel, FinalHeadPolicy head_policy) const;
 
         /**
          * @brief Resolve the explicit collective completing a column-parallel head.
@@ -1001,6 +1068,7 @@ namespace llaminar2
          * @param sideband_workspace_bindings Same-stream control attachments.
          * @param precision_override Explicit graph arithmetic policy when required.
          * @param request_rows Optional independent request prefixes; never one ragged global prefix.
+         * @param phase_override Explicit predictor phase; prevents inheriting main prefill count/arithmetic.
          * @return Native or declared cross-rank collective stage, or null for single-device execution.
          * @throws std::invalid_argument When request banks conflict with the native stage contract.
          */
@@ -1014,7 +1082,8 @@ namespace llaminar2
             std::optional<BufferId> tensor_buffer_id = std::nullopt,
             std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings = {},
             std::optional<std::string> precision_override = std::nullopt,
-            std::optional<NativeAllreduceRequestRows> request_rows = std::nullopt) const;
+            std::optional<NativeAllreduceRequestRows> request_rows = std::nullopt,
+            std::optional<ForwardExecutionPhase> phase_override = std::nullopt) const;
 
         /**
          * @brief Create one FP32 allreduce for disjoint single-owner slots.
@@ -1080,11 +1149,25 @@ namespace llaminar2
         std::pair<int, int> resolveLocalHeadCounts() const;
 
         /**
-         * Add pre-attention RMSNorm (fused residual+norm or standalone).
+         * @brief Build the declared attention input mixer.
+         * Ordinary Qwen uses fused residual/RMSNorm. Flash Next retains the
+         * original and normalized branches until its paired block write.
+         * @param graph Participant-local graph receiving the norm producer.
+         * @param prefix Existing authored stage identity prefix.
+         * @param buffers Exact hidden, normalized and optional deferred-delta owners.
+         * @param norm_gamma Immutable learned normalization gain.
+         * @param total_tokens Physical rows of this invocation.
+         * @param layer_idx Physical weight source; main PP position only for main workloads.
+         * @param device Exact execution participant.
          * @param check_hybrid_q16 If true, skip fusion in HybridQ16 mode
-         * @return Node name (prefix + "attn_norm")
+         * @param workload Main decoder may consume the preceding deferred FFN
+         * delta; an MTP block consumes its complete FC-projected hidden state.
+         * The physical weight source index never establishes a delta producer.
+         * @return A single-use branch-write capability for Flash Next, or no
+         * capability for ordinary residual addition or a read-only KV probe.
+         * @throws std::invalid_argument For an invalid workload tag, before graph mutation.
          */
-        std::string addPreAttentionNorm(
+        std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> addPreAttentionNorm(
             ComputeGraph &graph,
             const std::string &prefix,
             ActivationBuffers &buffers,
@@ -1092,7 +1175,93 @@ namespace llaminar2
             int total_tokens,
             int layer_idx,
             DeviceId device,
-            bool check_hybrid_q16 = true);
+            bool check_hybrid_q16 = true,
+            GraphLayerWorkload workload = GraphLayerWorkload::MainDecoder);
+
+        /** @brief Semantic block whose read/write weights form one mixer. */
+        enum class ResidualBlock { Attention, FeedForward };
+
+        /**
+         * @brief Append one Flash Next input mixer using frozen prepared weights.
+         * @param graph Participant-local graph receiving the complete flat read chain.
+         * @param prefix Caller-owned layer/stage prefix.
+         * @param buffers Admitted trunk, compute and projection scratch buffers.
+         * @param layer_idx Global source layer, including explicit MTP scope.
+         * @param rows Physical query rows; no execution state is read by the host.
+         * @param device Exact executing participant.
+         * @param block Attention or FFN role selecting a paired weight bundle.
+         * @return Capability required to append the corresponding branch write.
+         */
+        Qwen4ExpHyperconnectionBuilder::BlockRead addBranchBlockRead(
+            ComputeGraph &graph, const std::string &prefix, ActivationBuffers &buffers,
+            int layer_idx, int rows, DeviceId device, ResidualBlock block,
+            const Qwen4ExpPredictorResidualBinding *predictor = nullptr);
+
+        /** @brief Read the attention mixer for a KV-only predictor probe without a branch write.
+         * @param graph Participant-local graph retaining the read operations.
+         * @param prefix Source layer/predictor stage prefix.
+         * @param buffers Admitted trunk, read scratch and H-wide output.
+         * @param layer_idx Frozen source layer identity.
+         * @param rows Physical query rows.
+         * @param device Exact execution participant.
+         */
+        void addBranchAttentionReadOnly(ComputeGraph &graph, const std::string &prefix,
+            ActivationBuffers &buffers, int layer_idx, int rows, DeviceId device,
+            const Qwen4ExpPredictorResidualBinding *predictor = nullptr);
+
+        /**
+         * @brief Publish a completed H-wide block into its retained 4H trunk.
+         * @param graph Same graph that produced the read capability.
+         * @param read Paired normalized/original state, consumed exactly once.
+         * @param buffers Admitted block output and injection scratch.
+         * @param dependency Final block/collective producer of ATTN_PROJ.
+         * @return Updated-trunk producer consumed by the following block.
+         */
+        std::string addBranchBlockWrite(ComputeGraph &graph,
+            Qwen4ExpHyperconnectionBuilder::BlockRead &&read,
+            ActivationBuffers &buffers, const std::string &dependency,
+            const Qwen4ExpPredictorTrunkTarget *predictor_output = nullptr);
+
+        /**
+         * @brief Build a terminal read without mutating the wider residual trunk.
+         * @param graph Participant-local graph.
+         * @param hidden Exact trunk input with caller-provided arena identity.
+         * @param normalized_out H-wide output consumed by the vocabulary projection.
+         * @param dependency Existing trunk producer, or empty at graph entry.
+         * @param rows Physical query rows.
+         * @param device Exact executing participant.
+         * @param input_buffer_id Identity backing hidden.
+         * @return Terminal H-wide read producer named final_norm.
+         */
+        std::string addBranchHeadRead(ComputeGraph &graph, TensorBase *hidden,
+            TensorBase *normalized_out, const std::string &dependency,
+            int rows, DeviceId device, BufferId input_buffer_id);
+
+        /**
+         * @brief Expand vocabulary-reconstructed H-wide embeddings into the trunk.
+         * @param graph Participant-local embedding graph after its optional allreduce.
+         * @param embedding H-wide lookup output owned by QFN_EMBEDDING_ROWS.
+         * @param trunk Distinct HIDDEN_STATE allocation with residualWidth columns.
+         * @param dependency Final lookup/collective producer.
+         * @param rows Physical input rows.
+         * @param device Exact executing participant.
+         * @return Expanded-trunk producer, or the unchanged dependency for ordinary Qwen.
+         */
+        std::string addEmbeddingTrunkExpansion(ComputeGraph &graph, TensorBase *embedding,
+            TensorBase *trunk, const std::string &dependency, int rows, DeviceId device);
+
+        /** @brief Return the admitted compute-width embedding destination.
+         * @param ordinary_trunk Ordinary Qwen lookup destination, unchanged when no branch expansion is declared.
+         * @return QFN_EMBEDDING_ROWS for a four-branch model; otherwise ordinary_trunk.
+         * @throws std::invalid_argument If a declared expansion lacks its admitted intermediate.
+         */
+        TensorBase *embeddingDestination(TensorBase *ordinary_trunk) const;
+
+        /** @brief Identity of the compute-width vocabulary lookup/allreduce output. */
+        BufferId embeddingBufferId() const noexcept
+        {
+            return config_.flash_next ? BufferId::QFN_EMBEDDING_ROWS : BufferId::HIDDEN_STATE;
+        }
 
         /**
          * Add per-head QK RMSNorm stages if norms are present.
@@ -1197,11 +1366,33 @@ namespace llaminar2
             const std::string &rope_dependency,
             const std::vector<std::string> &cache_source_dependencies = {},
             bool layer_idx_is_cache_local = false,
-            int first_seq_idx = 0);
+            int first_seq_idx = 0,
+            const Qwen4ExpPredictorProjectionLayout *predictor_layout = nullptr);
+
+        /**
+         * @brief Install a model-declared consumer before ordinary dense KV source selection.
+         * @param graph Existing participant-local graph after native cache append wiring.
+         * @param binding Actual layer weights, prepared inputs, native cache and producer edges.
+         * @return Specialized terminal node, or no value for the ordinary dense architecture.
+         * @details Flash Next must implement this hook; a missing sparse consumer is fatal.
+         */
+        virtual std::optional<std::string> addModelAttentionConsumer(
+            ComputeGraph &graph, const AttentionConsumerBinding &binding);
+
+        /**
+         * @brief Snapshot model-specific cache/request inputs before native append.
+         * @param graph Attention subgraph, with prepared projection producers already declared.
+         * @param binding Exact core inputs; nativeCacheReady is still empty at this boundary.
+         * @return Additional producer that native append must depend on, or empty without an extension.
+         * @details This is the only opportunity to consume the pre-append cache frontier.
+         */
+        virtual std::string addModelAttentionPreparation(
+            ComputeGraph &graph,const AttentionConsumerBinding &binding);
 
         /**
          * @brief Add KV cache append, attention compute, and optional gather stages.
          *
+         * @param consumer_weights Actual layer/MTP weights passed unchanged to a specialized reader.
          * @param layer_idx Global model layer id by default, or cache-local id
          *                  when @p layer_idx_is_cache_local is true.
          * @param layer_idx_is_cache_local Treat @p layer_idx as an already-local
@@ -1211,11 +1402,19 @@ namespace llaminar2
          * @param execution_policy Resolved publication/consumption contract.
          * @return Terminal attention node name
          */
+        /** @brief Resolve an unchanged main layer's existing public cache-index convention.
+         * @param source Exact main-model source layer.
+         * @param cache Existing native cache whose public API owns its layer map.
+         * @return Sealed main identity preserving current source, PP and reader policy.
+         */
+        FullAttentionLayerIdentity mainAttentionIdentity(int source, const IKVCache *cache) const;
+
         std::string addKVCacheAndAttention(
             ComputeGraph &graph,
             const std::string &prefix,
             ActivationBuffers &buffers,
-            int layer_idx,
+            const LayerWeights &consumer_weights,
+            const FullAttentionLayerIdentity &identity,
             int seq_len,
             int batch_size,
             int local_n_heads,
@@ -1229,7 +1428,7 @@ namespace llaminar2
             const attention::AttentionExecutionPolicy &execution_policy,
             const std::string &rope_dependency,
             const std::vector<std::string> &cache_source_dependencies = {},
-            bool layer_idx_is_cache_local = false);
+            const Qwen4ExpPredictorProjectionLayout *predictor_layout = nullptr);
 
         /**
          * @brief Add the participant-local attention output projection.
@@ -1250,6 +1449,8 @@ namespace llaminar2
          * @param dependency Node that publishes @c buffers.attn_output.
          * @param wo_node_suffix Stable suffix for the projection node.
          * @param verifier_rows Immutable physical/live verifier row geometry.
+         * @param arithmetic Explicit grouped projection reduction policy.
+         * @param activation_precision Frozen native Q8 operand policy; ordinary callers retain SingleQ8.
          * @return Projection node, or @p dependency when no weight exists.
          */
         std::string addWoProjection(
@@ -1262,7 +1463,9 @@ namespace llaminar2
             DeviceId device,
             const std::string &dependency,
             const std::string &wo_node_suffix = "wo_proj",
-            std::optional<DeviceRowRange> verifier_rows = std::nullopt);
+            std::optional<DeviceRowRange> verifier_rows = std::nullopt,
+            Qwen4ExpProjectionArithmetic arithmetic = Qwen4ExpProjectionArithmetic::Ordinary,
+            QuantizedActivationOperandPrecision activation_precision = QuantizedActivationOperandPrecision::SingleQ8);
 
         /**
          * @brief Reconstruct a row-parallel attention projection with TP sum.
@@ -1292,7 +1495,9 @@ namespace llaminar2
             int layer_idx,
             DeviceId device,
             const std::string &dependency,
-            const std::string &allreduce_node_suffix = "wo_allreduce");
+            const std::string &allreduce_node_suffix = "wo_allreduce",
+            const Qwen4ExpPredictorProjectionLayout *predictor_layout = nullptr,
+            std::optional<DeviceRowRange> predictor_rows = std::nullopt);
 
         /**
          * @brief Optionally retain exact embedding rows inside the forward DAG.

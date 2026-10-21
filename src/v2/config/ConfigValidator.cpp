@@ -226,6 +226,31 @@ namespace llaminar2
     {
         ConfigValidator v;
 
+        v.addRule({
+            .id = "shared-predictor-target-required",
+            .description = "A separate shared predictor requires an explicit target artifact",
+            .fix_hint = "Pair --mtp-model <GGUF> with --model <target GGUF>",
+            .applies = [](const OrchestrationConfig &c) { return c.shared_predictor.has_value(); },
+            .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
+            {
+                if (c.model_path.empty()) return "--mtp-model requires --model, including with --no-mtp";
+                return std::nullopt;
+            },
+        });
+
+        v.addRule({
+            .id = "ngram-storage-policy",
+            .description = "Requested ngram storage/distribution has a checked explicit arm and bounded mapping policy",
+            .fix_hint = "Use replicated storage, explicit single-GPU/R1 full-main gpu-adaptive-vram-ram-ssd with local CPU source, or VRAM fixed-head-sharded on homogeneous rank-local TP2/4/8; Auto remains replicated VRAM/RAM/mmap",
+            .applies = [](const OrchestrationConfig &) { return true; },
+            .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
+            {
+                try { c.ngram_table_policy.validate(); }
+                catch (const std::invalid_argument &error) { return error.what(); }
+                return std::nullopt;
+            },
+        });
+
         // YAML parsing already enforces this geometry. Typed callers and the
         // lossless plan codec must reach the same admission rule; zero is not
         // an automatic sentinel for the runtime's allocated context capacity.

@@ -5264,7 +5264,7 @@ namespace llaminar2
         }
 
         if (!runtime_ready && rocm_env.moe_router_wave_topk &&
-            num_experts <= 256 &&
+            num_experts <= static_cast<int>(kDeviceMoEMaxExperts) &&
             prepared_decode_resident_set_policy_ ==
                 RoutedExpertResidentSetPolicy::UniqueOwner)
         {
@@ -5289,7 +5289,7 @@ namespace llaminar2
             }
         }
 
-        if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= 256)
+        if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= static_cast<int>(kDeviceMoEMaxExperts))
         {
             runtime_ready = hipMoE_softmax_topk_decode_runtime_wave64(
                 d_route_logits_,
@@ -5559,7 +5559,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= 256)
+        if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= static_cast<int>(kDeviceMoEMaxExperts))
         {
             runtime_ready = hipMoE_softmax_topk_decode_runtime_wave64(
                 d_route_logits_,
@@ -10555,7 +10555,7 @@ namespace llaminar2
 
         const bool use_small_grouping =
             total_slots <= 64 &&
-            num_experts <= 256 &&
+            num_experts <= static_cast<int>(kDeviceMoEMaxExperts) &&
             top_k <= 16;
         if (use_small_grouping)
         {

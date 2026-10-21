@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include "DeviceType.h"
 #include "GenerationPenaltyHistory.h"
@@ -3353,13 +3354,15 @@ namespace llaminar2
             void *stream,
             void *out_target_cached_tokens_device,
             void *out_accepted_state_counts_device,
-            void *out_ok_device)
+            void *out_ok_device,
+            MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly)
         {
             (void)base_cached_tokens_device;
             (void)main_target_cached_tokens_device;
             (void)main_publication_ok_device;
             (void)request_count;
             (void)mtp_depth;
+            (void)origin;
             (void)device_id;
             (void)stream;
             (void)out_target_cached_tokens_device;

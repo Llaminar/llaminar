@@ -28,10 +28,14 @@
  */
 
 #pragma once
+#include "execution/mtp/OrdinaryForwardRetention.h"
+#include "../graph/RetainedStorageTerminalCapture.h"
+#include "../graph/RetainedStoragePerfStats.h"
 #include "execution/mtp/MTPMainForwardPolicy.h"
 
 #include "../graph/IGraphBuilder.h"
 #include "../../../backends/DeviceId.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "IInferenceRunner.h"
@@ -106,7 +110,7 @@ namespace llaminar2
      *
      * `PREFIX_TERMINAL_HIDDEN` has one stable arena address, but several legal
      * producers: a main forward, prefix restore, accepted-verifier publication,
-     * or checkpoint restore.  A boolean cannot distinguish those transitions
+     * checkpoint restore, or the explicit visible-zero-hidden bootstrap.  A boolean cannot distinguish those transitions
      * and previously let a sidecar reader infer its source from unrelated
      * `last_forward_*` geometry.  This type records the actual producer and a
      * monotonically increasing publication generation instead.
@@ -127,6 +131,7 @@ namespace llaminar2
             PrefixRestore,
             AcceptedVerifier,
             CheckpointRestore,
+            VisibleZeroHiddenBootstrap,
         };
 
         /** @brief Immutable identity of one current mailbox publication. */
@@ -166,6 +171,8 @@ namespace llaminar2
                 return "accepted_verifier";
             case Source::CheckpointRestore:
                 return "checkpoint_restore";
+            case Source::VisibleZeroHiddenBootstrap:
+                return "visible_zero_hidden_bootstrap";
             }
             return "invalid";
         }
@@ -199,6 +206,12 @@ namespace llaminar2
         void publishCheckpointRestore() noexcept
         {
             publish(Source::CheckpointRestore);
+        }
+
+        /** @brief Publish the model-defined token-zero CPU seed after its exact original mailbox host write. */
+        void publishVisibleZeroHiddenBootstrap() noexcept
+        {
+            publish(Source::VisibleZeroHiddenBootstrap);
         }
 
         /**
@@ -663,6 +676,16 @@ namespace llaminar2
         // existing event handoff; it never owns a second sampler/controller.
         friend class PipelineDeviceGeneration;
     public:
+        /**
+         * @brief Authenticate this materialized fixed-head producer against its actual Rank peer.
+         * @param canonical First actual participant of the same Rank-owned cohort.
+         * @throws std::exception Before launch for foreign request/seed/history owners,
+         * changed precision, incomplete terminal programs or absent original-source heads.
+         * @note Reads immutable declarations and existing retained graph owners only;
+         * it creates no request state, value-equality protocol or capture readiness flag.
+         */
+        void requireReplicatedPLEGenerationProducer(const DeviceGraphOrchestrator &canonical) const;
+
         // =========================================================================
         // Dependencies Struct for Interface-Based Construction (Testing Support)
         // =========================================================================
@@ -3496,6 +3519,11 @@ namespace llaminar2
          * executables. Their stages reset request metadata and rebind to
          * explicit streams before the next launch; state content changes behind
          * stable addresses are never treated as a reason to recapture.
+         *
+         * This public lifecycle boundary may be called sequentially for several
+         * participants on one host thread. It explicitly activates its owned
+         * GPU before resolving streams or retiring producers; the caller's
+         * ambient CUDA/HIP device is not the reset submission authority.
          */
         void resetInferenceState(const InferenceStateResetRequest &request) override
         {
@@ -3535,6 +3563,19 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "DeviceGraphOrchestrator::resetInferenceState does not yet implement "
                     "the requested hard reset boundary");
+            }
+            if (state_.device_id.is_gpu())
+            {
+                // Event APIs preserve the caller's ambient device. Establish
+                // this participant before any reset phase: raw retained-storage
+                // close kernels must run on the same device as the reset stream.
+                auto *backend = getBackendFor(state_.device_id);
+                if (!backend || !backend->setDevice(state_.device_id.ordinal))
+                {
+                    throw std::runtime_error(
+                        "DeviceGraphOrchestrator::resetInferenceState could not activate owning GPU " +
+                        state_.device_id.toString());
+                }
             }
             const char *reset_reason = request.reason ? request.reason : "request-boundary";
             const bool preserve_replay_safe_graphs = request.preserve_replay_safe_graphs;
@@ -3885,7 +3926,9 @@ namespace llaminar2
                  * verifier graph then consumes one explicit transitive event
                  * instead of trusting a host-side sampler mirror.
                  */
-                if (!zeroAndPublishGenerationSamplingInputsOnStream(
+                if (!resetAndPublishDeviceForwardStatusOnStream(
+                        reset_transaction.executionStream(),reset_reason) ||
+                    !zeroAndPublishGenerationSamplingInputsOnStream(
                         reset_transaction.executionStream(),
                         reset_reason))
                 {
@@ -4298,7 +4341,7 @@ namespace llaminar2
             if (!snap)
                 return {};
             return SnapshotInfo{
-                .data = snap->data.data(),
+                .data = snap->data.isInteger() ? nullptr : snap->data.data(),
                 .size = snap->data.size(),
                 .rows = snap->rows,
                 .cols = snap->cols,
@@ -4311,6 +4354,7 @@ namespace llaminar2
                 .lifetime_owner = snap,
                 .publication = snap->publication,
                 .row_ownership = snap->row_ownership,
+                .typed_values = snap->data.view(),
             };
         }
 
@@ -4442,6 +4486,8 @@ namespace llaminar2
     private:
         /** @brief Model-free integration peer for the installed main-prelude event contract. */
         friend struct DeviceGraphOrchestratorLiveStateTestAccess;
+        /** @brief Device-free peer of the actual CPU bootstrap producer and mailbox read lease. */
+        friend struct DeviceGraphOrchestratorMTPZeroHiddenTestAccess;
         // =========================================================================
         // Private Helpers
         // =========================================================================
@@ -4455,6 +4501,17 @@ namespace llaminar2
          * or pageable-stage these buffers on every MTP step.
          */
         struct PinnedHostScratch;
+
+        /**
+         * @brief Borrow the existing pinned terminal control destination without exposing its owner.
+         * @param request_count Positive live request rows bounded by setup-owned scratch capacity.
+         * @return Exact live control-row span, or empty when the existing scratch cannot serve it.
+         * @details The orchestrator retains this storage. The terminal bridge must join its
+         * exact copy event before reading the span or retiring the orchestrator. This
+         * helper allocates, transfers and synchronizes nothing; response-token capacity
+         * is checked but never returned as part of the control-only observation.
+         */
+        std::span<int> deviceGenerationTerminalHostControls(int request_count);
 
         /**
          * @brief Fixed pinned destination for the narrow HIP dispatch ticket.
@@ -5067,6 +5124,16 @@ namespace llaminar2
             const char *reason);
 
         /**
+         * @brief Clear only the request-lifetime forward/controller status after prior readers retire.
+         * @param producer_stream Exact already-joined request-reset stream.
+         * @param reason Stable reset-boundary diagnostic.
+         * @return True after selected status storage is cleared and event-published.
+         * @details Legacy graph policy is unchanged. Response payload/tickets are
+         * untouched; initialization of a later response window remains its own operation.
+         */
+        bool resetAndPublishDeviceForwardStatusOnStream(void *producer_stream,const char *reason);
+
+        /**
          * @brief Publish the core device-generation arena tensors as one edge.
          *
          * Every device-generation producer writes the response ledger,
@@ -5425,7 +5492,8 @@ namespace llaminar2
             const PrefixBlockHandle &handle,
             void *stream,
             const char *consumer_name,
-            bool publish_mailbox);
+            bool publish_mailbox,
+            int destination_row = 0);
 
         /** Consume the pending live-source checkpoint handoff before mutation. */
         bool waitForPendingLivePrefixCheckpointReady(
@@ -6662,6 +6730,8 @@ namespace llaminar2
             std::shared_ptr<void> ready_event;
         };
         mutable std::vector<LiveCheckpointStorageSlot> live_checkpoint_storage_pool_;
+        /** Preadmitted CPU-only accepted endpoint storage, separate from compact prefix archives. */
+        HostCacheAuxiliaryCheckpointPool host_auxiliary_checkpoint_pool_;
         /**
          * @brief Reusable VRAM slot for one cache's canonical sequence metadata.
          *
@@ -7802,6 +7872,7 @@ namespace llaminar2
             const int32_t *request_row_stride_device = nullptr;
             const int32_t *main_cached_tokens_device = nullptr;
             const int32_t *shifted_cached_tokens_device = nullptr;
+            MTPShiftedCacheOrigin shifted_origin=MTPShiftedCacheOrigin::SuccessorPairsOnly; ///< Immutable model origin embedded in this captured selector.
             int request_index = -1;
             std::string row_buffer_name;
             const int32_t *external_device_row_indices = nullptr;
@@ -7853,6 +7924,7 @@ namespace llaminar2
                 request_row_stride_device = nullptr;
                 main_cached_tokens_device = nullptr;
                 shifted_cached_tokens_device = nullptr;
+                shifted_origin=MTPShiftedCacheOrigin::SuccessorPairsOnly;
                 request_index = -1;
                 row_buffer_name.clear();
                 external_device_row_indices = nullptr;
@@ -8160,6 +8232,9 @@ namespace llaminar2
          * PipelineDomainExpertOverlayTail retains both contracts: frozen native
          * activation edges and semantic sparse replay with its request identity.
          * Pipeline placement never removes the terminal's maintenance owner.
+         * PipelineNoPeerOverlayTail imports the singleton overlay's complete
+         * native forward/lease and sampler into the rank-owned native PP parent;
+         * its sealed no-peer proof forbids a missing migration transaction.
          */
         enum class OrdinaryGenerationComposition : uint8_t
         {
@@ -8168,6 +8243,7 @@ namespace llaminar2
             PipelineDomainTail, ///< Boundary already enclosed in this complete local forward.
             ExpertOverlay,
             PipelineDomainExpertOverlayTail, ///< Captured PP edges plus sparse semantic replay authority.
+            PipelineNoPeerOverlayTail, ///< Native PP parent owns a proven singleton overlay tail.
         };
 
         /**
@@ -8211,6 +8287,8 @@ namespace llaminar2
             std::optional<OrdinaryGenerationSamplingStage::Params> ordinary_sampling_identity;
             /** Complete forward identity, not a last-executed diagnostic handle. */
             std::optional<ForwardGraphSignature> ordinary_forward_identity;
+            /** Complete hosted forward identity; absent for native source-fragment composition. */
+            std::optional<ForwardExecutionEngine::RetainedDecodeGraphView> ordinary_hosted_forward;
             /** Exact grouped verifier owned by a pipeline follower, never a sampler. */
             std::optional<ForwardGraphSignature> pipeline_verifier_identity;
             /** Exact ordinary ownership/lifecycle topology embedded in this parent. */
@@ -8292,6 +8370,7 @@ namespace llaminar2
                     child.reset();
                 ordinary_sampling_identity.reset();
                 ordinary_forward_identity.reset();
+                ordinary_hosted_forward.reset();
                 pipeline_verifier_identity.reset();
                 ordinary_composition.reset();
                 ordinary_maintenance_capture = nullptr;
@@ -9927,7 +10006,8 @@ namespace llaminar2
              * @brief Retire publication liveness without releasing arena rows.
              *
              * Arena storage persists for the orchestrator lifetime. Only true
-             * request/session boundaries retire the logical values it contains.
+             * request/session boundaries or a completed partial replacement retire
+             * the logical values it contains.
              */
             void retirePublication()
             {
@@ -9961,6 +10041,7 @@ namespace llaminar2
             MainBatchSampleInitialization,
             UnsampledLogitsInitialization,
             OrdinaryGenerationTerminal,
+            ForwardOnlyTerminal,
         };
 
         /// Return the stable diagnostic name for one typed publication operation.
@@ -10241,10 +10322,11 @@ namespace llaminar2
          * @brief In-flight replacement of the reusable logical-state rows.
          *
          * This is a fail-closed transaction. Once active, every reader is
-         * rejected until recordDeviceResidentLogicalSequenceStateMailbox()
-         * publishes the exact replacement stream/event edge. Any abandoned
-         * writer therefore stops inference instead of exposing partially
-         * overwritten rows.
+         * rejected until the exact replacement stream/event edge is published.
+         * A complete result publishes its mailbox; a pipeline follower's
+         * partial-write completion retires semantic liveness while retaining
+         * the physical access root. Any abandoned writer therefore stops
+         * inference instead of exposing partially overwritten rows.
          */
         struct PendingDeviceResidentLogicalStateWriter
         {
@@ -10648,6 +10730,35 @@ namespace llaminar2
          * ticket from an earlier session fail lifecycle authentication.
          */
         uint64_t session_epoch_ = 1;
+        std::shared_ptr<IRetainedGraphStorageBoundary> retained_storage_boundary_; ///< Exclusive immutable I/O lane surrounding complete generation.
+        RetainedStorageTerminalCapture retained_storage_terminal_capture_; ///< Native terminal release retaining its exact stream lifetime.
+        RetainedStoragePerfStats retained_storage_perf_stats_; ///< Fresh terminal I/O evidence without device reads.
+        std::array<DeviceControlledLoopEntryFragment,1> retained_storage_terminal_fragment_{}; ///< Borrowed only by native parent construction.
+        /** @brief Project this final graph invocation's actual canonical PLE token/count/cache producer.
+         * @param input Final engine-planned input after bucket/chunk geometry selection.
+         * @return Immutable binding borrowed by fixed-head graph construction only.
+         * @throws std::invalid_argument For foreign banks, roles, counts, device or cache.
+         */
+        Qwen4ExpReplicatedPLEQuery fixedHeadPLEQuery(const ForwardInput &input) const;
+        /** @brief Arm the declared immutable I/O lane before admission's ready event. */
+        bool beginRetainedStorageAdmission(void *stream);
+        /** @brief Resolve setup-owned lane and bind canonical control addresses before graph construction. */
+        void prepareRetainedStorageBinding();
+        /** @brief Resolve one setup-recorded close fragment after the complete native WHILE. */
+        std::span<const DeviceControlledLoopEntryFragment> retainedStorageTerminalFragments();
+        /** @brief Submit the pre-recorded terminal branch named by an authenticated hosted terminal ticket. */
+        bool submitRetainedStorageTerminal();
+        /** @brief Retire generation parent, terminal source and its borrowed stream in that order. */
+        void releaseRetainedStorageGenerationTopology() noexcept;
+        /** @brief Close an outstanding prefill/generation I/O interval before request-state mutation.
+         * @param stream Exact reset stream after all prior producers have joined it.
+         * @details Reuses the exclusive request lifecycle's setup-owned terminal event.
+         * Only an active interval records/waits a terminal event; an already joined
+         * generation or repeated reset performs no close, wait or statistics publication.
+         */
+        void retireRetainedStorageForRequestReset(void *stream);
+        /** @brief Join the declared I/O lane and publish only its fresh terminal counters. */
+        void awaitRetainedStorageTerminal();
         /**
          * Root-published generation consumed by graph-native sparse MoE stages.
          *
@@ -10870,6 +10981,14 @@ namespace llaminar2
             const ModelWeights &weights,
             const std::unordered_map<int, LayerWeights> &resolved_layers,
             int first_layer, int last_layer);
+
+        /**
+         * @brief Publish the QFN CPU visible token-zero seed into its original admitted 4H mailbox.
+         * @return True after exact first-row zeroing, host coherence publication and typed lease publication.
+         * @throws std::invalid_argument For a GPU, disabled or non-visible-bootstrap source.
+         * @note Validates ownership/geometry before invalidating the previous lease; no allocation, copy or GPU path.
+         */
+        bool publishCPUVisibleZeroHiddenMTPBootstrap();
 
         /**
          * @brief Validate the immutable terminal-hidden mailbox for MTP sidecar input.
@@ -11376,17 +11495,31 @@ namespace llaminar2
         /** @brief Exact borrowed forward recording and its complete cache identity. */
         struct OrdinaryGenerationForward
         {
-            ForwardExecutionEngine::DeviceLoopGraphTemplateView graph;
+            using Native = ForwardExecutionEngine::DeviceLoopGraphTemplateView;
+            using Hosted = ForwardExecutionEngine::RetainedDecodeGraphView;
+            std::variant<Native, Hosted> owner;
             ForwardGraphSignature signature;
+            /** @return Native child only when the exact export contract permits composition. */
+            const Native *native() const noexcept { return std::get_if<Native>(&owner); }
+            /** @return Complete hosted body only; its graph remains engine/cache-owned. */
+            const Hosted *hosted() const noexcept { return std::get_if<Hosted>(&owner); }
         };
 
         /** @brief Record one participant's resident-token forward without launching.
          * Non-head pipeline stages receive into their own stable hidden bank.
-         * @param condition Device token source, owned locally or received from the tail.
+         * @param condition Exact participant-local logical token mailbox.
+         * @param retention Explicit admitted hosted-body or native-child export.
          * @param error Receives the first invalid binding or capture diagnostic.
-         * @return Complete local recording, never a cross-device subgraph. */
+         * @return Complete local retained owner, never a cross-device subgraph.
+         * @throws std::logic_error For missing or divergent admitted overlay ownership. */
         std::optional<OrdinaryGenerationForward> materializeOrdinaryGenerationForward(
-            const int32_t *condition, std::string *error);
+            const int32_t *condition, OrdinaryForwardRetentionKind retention, std::string *error);
+
+        /** @brief Authenticate the immutable serving-domain export contract.
+         * @return Hosted only for a declared host-serviced ExpertOverlay body.
+         * @throws std::logic_error For a missing builder or divergent epoch owner.
+         * @throws std::invalid_argument For an unsupported execution/domain pair. */
+        OrdinaryForwardRetentionKind ordinaryForwardRetentionKind() const;
 
         /** @brief Prepare local ordinary generation, or only the tail's borrowed fragments.
          * Pipeline composition installs the complete collective-bearing parent.
@@ -11696,20 +11829,25 @@ namespace llaminar2
         /**
          * @brief Admit one external request into persistent GPU-owned input rows.
          *
-         * Token IDs, absolute positions, and real request lengths cross the
-         * host/device boundary together exactly once. The copies are queued on
+         * Token IDs and real request lengths cross the host/device boundary
+         * exactly once; explicit host positions join that same transaction.
+         * Scalar decode instead binds its existing captured canonical KV
+         * position root, so admission cannot upload or publish position rows.
+         * The selected copies are queued on
          * one explicit admission stream and publish a preallocated event; graph
          * execution waits for that event on its own stream without blocking the
          * host. Every prefill consumer, including shifted MTP publication, then
          * reads the same arena-owned rows.
          *
          * @param tokens Flattened request-major INT32 token rows.
-         * @param position_ids Flattened request-major absolute position rows.
+         * @param position_ids Host absolute rows; null for a canonical captured decode snapshot.
          * @param request_real_lengths Immutable logical token count for every
          *        physical request row.
          * @param total_tokens Physical number of token/position elements.
          * @param request_count Number of independent request rows.
          * @param padded_seq_len Physical width of each request row.
+         * @param decode_position Optional exact scalar KV-to-request-position captured root;
+         *        admission neither copies nor publishes positions when this is bound.
          * @return true after all copies and the readiness event are queued.
          */
         bool admitRequestInputsOnDevice(
@@ -11718,7 +11856,8 @@ namespace llaminar2
             std::span<const int> request_real_lengths,
             int total_tokens,
             int request_count,
-            int padded_seq_len);
+            int padded_seq_len,
+            std::optional<DeviceDecodePositionBinding> decode_position = std::nullopt);
 
         /**
          * @brief Publish request-constant MTP stop controls on an ordered stream.
@@ -11764,7 +11903,7 @@ namespace llaminar2
         /**
          * @brief Queue the current graph stream behind external request admission.
          *
-         * The event is consumed exactly once by the main prefill graph. Later
+         * The event is consumed exactly once by the main forward graph. Later
          * shifted-MTP sidecars inherit ordering from that graph's execution
          * provenance and terminal-hidden publication event.
          */
@@ -11910,6 +12049,17 @@ namespace llaminar2
             const char *consumer_name,
             uint64_t *publication_generation,
             std::shared_lock<std::shared_mutex> *admission_lock);
+
+        /**
+         * @brief Close a follower's partial condition-row write without publishing a logical outcome.
+         * @param producer_stream Exact stream of the accepted original pipeline parent.
+         * @return Whether the existing arena/event access root replaced the exclusive writer.
+         * @details Only a non-LM-head PP participant with an admitted one-row ForwardOnly operation
+         * may use this boundary. Its receive writes a condition field, not a complete
+         * logical result. The original access epoch protects physical reuse; semantic
+         * handles remain invalid. No state is downloaded and no host fence is added.
+         */
+        bool publishPipelineFollowerLogicalRowWriteCompletion(void *producer_stream);
 
         /**
          * @brief Queue a writer after every reader of the reusable state rows.

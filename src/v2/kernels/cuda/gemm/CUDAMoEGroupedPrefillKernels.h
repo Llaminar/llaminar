@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "../../common/MoEGroupedDirectory.h"
+
 #include "tensors/NativeVnniFormatInfo.h"
 
 #include "../../common/DeviceNativeVNNIMatrixDesc.h"
@@ -33,7 +35,8 @@ namespace llaminar2::cuda::moe
     inline constexpr int kGroupedImmaTileRows = 16;
 
     /** Maximum descriptor-table width encoded by one directory entry. */
-    inline constexpr int kGroupedImmaMaximumExperts = 512;
+    inline constexpr int kGroupedImmaMaximumExperts =
+        moe_grouped_directory::kMaximumExperts;
 
     /**
      * @brief Compiled output-column ownership for one grouped IMMA CTA.

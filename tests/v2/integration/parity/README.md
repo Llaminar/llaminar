@@ -86,6 +86,12 @@ The profile owns its HTTP workload/context budgets and a `planning` contract;
 it does not define a second topology. Rebuild the matrix executables after
 changing the typed export and regenerate manifests rather than editing JSON.
 
+When a definition has several ngram storage profiles, its E2E selection uses
+`ngram_table_policy` to match the complete production request: tier mode, mmap
+windows, adaptive capacity ceilings and replacement policy. Omitting this field
+retains exact-one selection; it cannot choose among RAM, mmap or adaptive cells.
+Missing, ambiguous and overlapping tags fail expansion before any model loads.
+
 Rank-local PP cells also project the canonical topology's domain sizes/backends
 and the model's main-layer count into that observation contract. Startup
 evidence must prove those actual TP groups and contiguous layer coverage; four
@@ -551,6 +557,87 @@ make a numerical allowance look like a different runtime configuration.
 Missing models, hardware, decode references, graph evidence, or snapshot
 publication are failures in a production campaign. Focused developer tests may
 still skip when their optional prerequisite is absent.
+
+### Frozen QFN histories and full-stage diagnosis
+
+The QFN accuracy panel uses immutable prompt IDs and a frozen continuation.
+For a history with `D` decode observations, its `D+1` teacher IDs describe
+the pending-token lifecycle: the first `D` are consumed; the final ID remains
+pending. A detailed replay must use these exact inputs, including when they
+differ from a new greedy continuation.
+
+The local fixed-history canary can collect observations without numerical
+acceptance, or evaluate an explicitly supplied policy. Initial acceptance uses
+`run_model_kld_canaries.py --absolute-pilot POLICY` with an explicit schema2
+corpus catalog and exactly one declared topology. This option is mutually
+exclusive with baseline, baseline-approval and calibration arguments. The
+`llaminar.model-kld-absolute-pilot.v1` document binds the exact corpus digest
+and assigns every backend/topology/context/phase group either a `required`
+or `diagnostic` role. Required groups supply every absolute mean, offset,
+row, tail, total-variation and agreement limit; diagnostic groups carry no
+limits. Missing or foreign groups fail before native admission.
+
+An initial pilot reports `REQUIRED_GROUPS_GREEN` or `REQUIRED_GROUPS_RED`.
+Its diagnostic groups remain unavailable, paired deltas remain null, and
+the result does not qualify the complete corpus, model, topology or image.
+Subsequent same-policy comparisons use the approved baseline and calibration
+route. Unscored collection remains `UNCALIBRATED`; command success alone is
+not numerical acceptance. The original short GTest's numerical failures and
+all structural, source, reset and MTP byte-equivalence requirements are retained.
+
+To bind this panel to existing canonical cases, configure the Integration build
+with `-DV2_QFN_LOCAL_PAIRED_BINDINGS=/absolute/path/bindings.json`. The option is
+empty by default and changes no ordinary case or production arithmetic policy.
+Its `llaminar.qfn-local-paired-profiles.v1` document contains the original corpus
+`source` and explicit `bindings`: each names an existing exact `ProductionParity`
+cell, its coverage role, all six arithmetic selectors, and path/SHA256 references
+to the catalog, workload, absolute pilot and benchmark documents. Unknown,
+duplicate and unused case IDs fail registration. Original GGUF identities use
+reference-issued file metadata; model payloads are not hashed.
+
+The configure helper freezes these small inputs into the existing QFN matrix
+binary and declares the inactive predictor dependency for selected cases.
+Build that matrix, the canary and both prerequisite targets, then obtain a
+fresh complete prerequisite receipt. Run
+`run_model_kld_canaries.py --binary BUILD/llaminar_model_kld_canary --paired-cell EXACT_CELL --corpus-root CORPUS --prerequisites-report RECEIPT --report NEW_OUTPUT/report.json`.
+The existing runner authenticates the declared documents and compares the
+canonical and observer configurations through the same public parser before
+model admission. It owns native execution, driver checks and retirement.
+These local source identities do not establish portable image/CI eligibility;
+the benchmark obligation remains `DECLARED_NOT_EXECUTED` until measured.
+
+Generate a full-stage reference for one existing history with
+`generate_qwen4exp_pipeline_snapshots.py --frozen-history MANIFEST --history-id ID`,
+the original `--model`, any declared inactive `--shared-predictor`, pinned
+`--tokenizer`, matching `--decode-steps`, and a fresh `--output` directory.
+The generator validates the frozen source and work before admission, captures
+all original layers/stages, rechecks identity after capture, and publishes
+metadata only after model retirement. Do not use the final-logit-only
+`--accuracy-panel` capture for layer-by-layer diagnosis.
+
+Compare the completed pack's final prefill LM-head row and every decode
+LM-head row against the existing frozen corpus before native replay. Keep both
+packs; a mismatch needs investigation rather than replacement of the oracle.
+Use the canonical campaign driver's `--history-replay` descriptor with the
+exact registered cell and fresh complete Unit/preflight prerequisites.
+The descriptor binds original sources, configuration, arithmetic, teacher
+IDs, reference metadata and physical prefill geometry. Nine logical rows in
+a serving M64 bucket differ from an exact-M9 diagnostic; keep the logical
+PyTorch prompt unchanged and record the native bucket and worker affinity.
+Retain every layer/stage and the six canonical numerical CSVs.
+
+Explicit replay also binds the positive `n_threads` request in the original
+configuration. The single-rank driver preserves the registered MPI launcher,
+transport arguments, binary and filter while exporting the requested workers
+with an unbound physical-core policy. It rejects extra affinity controls or an
+insufficient physical-core budget before admission. The fixture checks actual
+OpenMP settings and affinity, and records production CPU worker counters when
+the topology declares CPU compute. The driver verifies this evidence alongside
+the prefill geometry. GPU-only cells have no CPU router obligation.
+
+This projection applies only to an explicit history replay; ordinary campaigns
+retain their registered resource policy. Record the current CPU mask without
+claiming historical CPU-ID identity when an older observer did not publish it.
 
 ## Model-free prerequisite gates
 
@@ -1097,6 +1184,29 @@ cell substitutes another movement policy for it.
 
 ## Local verification
 
+### Final-logit acceptance and agreement metrics
+
+`BackendThresholds::final_logit_mean_kl` is an explicit model-owned policy.
+When selected, each requested main-model decode step must independently meet
+its KL limit, and prefill has its own limit. The trajectory must contain every
+declared step exactly once. Models that omit the policy retain their existing
+acceptance rules. Recursive MTP thresholds, serial/verifier byte equivalence,
+prefix restoration and production-path proofs remain independent.
+
+KL means `KL(reference || native)`, summed across vocabulary and averaged over
+the positions observed at that step. The current final-logit checkpoints
+compare the final prompt position and one position per teacher-forced decode
+step. Top-1 is the fraction of positions with matching argmax tokens. Top-5 is
+the mean intersection size of the two top-five sets divided by five; it is
+distinct from reference-top-token-in-top-K recall. The summary reports each
+original step and its verdict before the existing aggregate diagnostics.
+
+Final-logit acceptance retains every raw layer/stage comparison and its
+numerical verdict. Complete declared snapshot coverage, finite operands,
+matching extents, valid routing representations and exact integer identities
+are mandatory even when the final KL is small. Missing observations cannot
+be converted into an acceptable numerical difference.
+
 ### Route-conditioned MoE MTP equations
 
 A validated near-cutoff expert substitution has an explicit independent proof:
@@ -1177,3 +1287,17 @@ cmake --build build_v2_integration --parallel \
 Parity tests require Python with PyTorch/Transformers/NumPy, `cnpy`, ZLIB, the
 configured MPI runtime, and the relevant backend libraries. Integration builds
 must have pipeline snapshots enabled.
+
+Flash Next reference snapshots use the pinned Qwen4Exp implementation in
+`python/reference/qwen4exp.py`. `PLE_HASH_INDICES` is an exact INT64 checkpoint:
+its native `[M,32]` INT32 arena backing publishes `[M,16]` INT64 identities without
+conversion. The canonical NumPy v1 adapter authenticates scalar kind, endianness,
+shape, row order and complete payload extent before loading. Integer stages
+report `scalar_type=INT64` and `integer_mismatch_count` in stage CSV files; their
+floating metrics are empty and any identity or shape mismatch fails parity.
+Legacy float snapshot access rejects these integer publications. Optional raw
+snapshot export writes `.i64` payloads and records their dtype in the manifest.
+
+The PLE fusion boundaries are explicit: `PLE_GATE` contains the four gated
+shared-value branches (`[M,4H]`), and `PLE_CONVOLUTION` contains the updated trunk
+`trunk + gated + SiLU(depthwise_convolution)` (`[M,4H]`).

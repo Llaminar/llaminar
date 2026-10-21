@@ -27,6 +27,7 @@
 #include "execution/compute_stages/stages/AttentionComputeStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "execution/compute_stages/stages/LMHeadStage.h"
+#include "execution/compute_stages/stages/RMSNormStage.h"
 #include "execution/compute_stages/stages/RoPEStage.h"
 #include "execution/compute_stages/stages/ShortConv1dStage.h"
 #include "execution/compute_stages/stages/TPAllreduceStage.h"
@@ -657,6 +658,8 @@ namespace
     {
     public:
         using Qwen35MoEGraph::Qwen35MoEGraph;
+        /** @brief Construction-only access for invalid typed-workload rejection. */
+        using Qwen35MoEGraph::addPreAttentionNorm;
 
         HiddenStateRowSelectStage::Params
         mirroredCheckpointRowParamsForTesting(
@@ -2995,6 +2998,166 @@ TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierUsesMirroredGDNStateWhenHandoff
         resolveMTPMaxTargetQueryRows(config.mtp))
         << "Full mirrored recurrence post-row state is restored directly by "
            "accepted-state publication.";
+}
+
+/**
+ * @brief Public inline sidecars consume their FC output without a phantom FFN delta.
+ *
+ * A physical source beyond a participant's PP interval once selected the main
+ * stack fusion and made KV-only capture read unproduced MTP_ATTN_PROJ bytes.
+ * Build both actual sidecar variants and authenticate their producer contracts.
+ */
+TEST(Test__Qwen35MoEGraph, MTPAttentionConsumesCompleteFCResidualRegardlessOfSourceOrdinal)
+{
+    GraphConfig config = makeMoEConfig();
+    config.pp_layer_offset = 2;
+    config.n_layers = 2;
+    config.total_n_layers = 4;
+    config.max_seq_len = 8;
+    config.compute_all_position_logits = true;
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+
+    // Source identity selects immutable weights, never the presence of a
+    // preceding sidecar FFN producer. Include a source beyond the main range.
+    for (const int source : {0, 3, 4, 51})
+    for (const bool kv_only : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << "source=" << source << " kv_only=" << kv_only);
+        TensorArena arena;
+        ModelWeights model_weights;
+        model_weights.embedding_table = arena.fp32({static_cast<size_t>(config.vocab_size),
+                                                    static_cast<size_t>(config.d_model)});
+        model_weights.lm_head = arena.fp32({static_cast<size_t>(config.vocab_size),
+                                            static_cast<size_t>(config.d_model)});
+        model_weights.final_norm = arena.fp32({static_cast<size_t>(config.d_model)});
+
+        LayerWeights attention = makeFALayerWeights(arena, config);
+        LayerWeights dense = makeDenseFFNLayerWeights(arena, config);
+        attention.ffn_norm = dense.ffn_norm;
+        attention.gate_proj = dense.gate_proj;
+        attention.up_proj = dense.up_proj;
+        attention.down_proj = dense.down_proj;
+
+        MTPDepthWeights mtp_weights;
+        mtp_weights.depth_index = 0;
+        mtp_weights.source_layer_index = source;
+        mtp_weights.fc = arena.fp32({static_cast<size_t>(config.d_model),
+                                     static_cast<size_t>(config.d_model * 2)});
+        mtp_weights.pre_fc_norm_hidden = arena.fp32({static_cast<size_t>(config.d_model)});
+        mtp_weights.pre_fc_norm_embedding = arena.fp32({static_cast<size_t>(config.d_model)});
+        mtp_weights.final_norm = arena.fp32({static_cast<size_t>(config.d_model)});
+        mtp_weights.fa_block = attention;
+
+        MTPForwardOutput output;
+        output.embedding = arena.fp32({2, static_cast<size_t>(config.d_model)});
+        output.norm_hidden = arena.fp32({2, static_cast<size_t>(config.d_model)});
+        output.norm_embedding = arena.fp32({2, static_cast<size_t>(config.d_model)});
+        output.concat = arena.fp32({2, static_cast<size_t>(config.d_model * 2)});
+        output.projected = arena.fp32({2, static_cast<size_t>(config.d_model)});
+        output.hidden = arena.fp32({2, static_cast<size_t>(config.d_model)});
+        output.logits = arena.fp32({2, static_cast<size_t>(config.vocab_size)});
+        output.q = arena.fp32({2, static_cast<size_t>(config.n_heads * config.head_dim)});
+        output.k = arena.fp32({2, static_cast<size_t>(config.n_kv_heads * config.head_dim)});
+        output.v = arena.fp32({2, static_cast<size_t>(config.n_kv_heads * config.head_dim)});
+        output.q_raw = arena.fp32({2, static_cast<size_t>(config.n_heads * config.head_dim * 2)});
+        output.q_gate = arena.fp32({2, static_cast<size_t>(config.n_heads * config.head_dim)});
+        output.attn_output = arena.fp32({2, static_cast<size_t>(config.n_heads * config.head_dim)});
+        output.attn_proj = arena.fp32({2, static_cast<size_t>(config.d_model)});
+        output.gate = arena.fp32({2, static_cast<size_t>(config.d_ff)});
+        output.up = arena.fp32({2, static_cast<size_t>(config.d_ff)});
+        output.ffn_output = arena.fp32({2, static_cast<size_t>(config.d_ff)});
+
+        int draft_tokens[2] = {1, 2};
+        int position_ids[2] = {0, 1};
+        MTPForwardInput input;
+        input.draft_token_ids = draft_tokens;
+        input.terminal_hidden = arena.fp32({2, static_cast<size_t>(config.d_model)});
+        input.position_ids = position_ids;
+        input.batch_size = 1;
+        input.seq_len = kv_only ? 2 : 1;
+        input.kv_cache_only = kv_only;
+        input.device = DeviceId::cpu();
+        MockMPIContext mpi(0, 1);
+        CPURingKVCacheFP32 cache(mpi, /*n_layers=*/1, /*batch_size=*/1,
+            config.max_seq_len, config.n_kv_heads, config.head_dim, DeviceId::cpu());
+        input.kv_cache = &cache;
+
+        TestableQwen35MoEGraph graph_builder(config, nullptr);
+        graph_builder.setWeights(model_weights);
+        ComputeGraph graph = graph_builder.buildMTPGraph(
+            /*depth_idx=*/0, mtp_weights, input, output);
+
+        const auto *norm_node = graph.getNode("MTP0_attn_norm");
+        ASSERT_NE(norm_node, nullptr);
+        const auto *norm = dynamic_cast<const RMSNormStage *>(norm_node->stage.get());
+        ASSERT_NE(norm, nullptr) << "A standalone predictor has no deferred previous-FFN delta";
+        EXPECT_EQ(norm->getParams().input, output.projected);
+        EXPECT_EQ(norm->getParams().output, output.norm_hidden);
+        EXPECT_EQ(norm->getParams().gamma, attention.attn_norm);
+        EXPECT_EQ(norm->getParams().seq_len, input.seq_len);
+        EXPECT_TRUE(contractReads(norm->bufferContract(), BufferId::MTP_PROJECTED));
+        EXPECT_FALSE(contractReads(norm->bufferContract(), BufferId::MTP_ATTN_PROJ));
+        EXPECT_FALSE(contractWrites(norm->bufferContract(), BufferId::MTP_PROJECTED));
+        EXPECT_TRUE(contractWrites(norm->bufferContract(), BufferId::MTP_NORM_HIDDEN));
+        EXPECT_TRUE(hasDependency(graph, "MTP0_attn_norm", "mtp0_fc"));
+        const auto *fc = graph.getNode("mtp0_fc");
+        ASSERT_NE(fc, nullptr);
+        EXPECT_TRUE(contractWrites(fc->stage->bufferContract(), BufferId::MTP_PROJECTED));
+        if (kv_only)
+        {
+            // The only graph producer of ATTN_PROJ is absent in a KV probe. It
+            // must therefore never enter this graph's capture input frontier.
+            for (const auto &name : graph.getExecutionOrder())
+            {
+                const auto contract = graph.getNode(name)->stage->bufferContract();
+                EXPECT_FALSE(contractReads(contract, BufferId::MTP_ATTN_PROJ)) << name;
+                EXPECT_FALSE(contractWrites(contract, BufferId::MTP_ATTN_PROJ)) << name;
+            }
+            EXPECT_EQ(graph.getNode("MTP0_wo_proj"), nullptr);
+            const auto *append = graph.getNode("MTP0_kv_append");
+            ASSERT_NE(append, nullptr);
+            const auto *stage = dynamic_cast<const KVCacheAppendStage *>(append->stage.get());
+            ASSERT_NE(stage, nullptr);
+            EXPECT_EQ(stage->getParams().layer_idx, 0) << "Physical source ordinal must not change cache-local layer0";
+        }
+    }
+}
+
+/** @test Main layers retain their PP-boundary RMSNorm and internal deferred-FFN fusion. */
+TEST(Test__Qwen35MoEGraph, MainAttentionRetainsDeferredFFNResidualAfterPPBoundary)
+{
+    auto config = makeMoEConfig();
+    config.pp_layer_offset = 2;
+    config.n_layers = 2;
+    config.total_n_layers = 4;
+    TensorArena arena;
+    auto attention = makeFALayerWeights(arena, config);
+    TestableQwen35MoEGraph builder(config, nullptr);
+    for (const int layer : {2, 3})
+    {
+        auto buffers = makeFAActivationBuffers(arena, 1, config);
+        auto graph = builder.buildAttentionGraph(attention, buffers, layer, 1, 1,
+            nullptr, nullptr, DeviceId::cpu());
+        const auto *node = graph.getNode("layer" + std::to_string(layer) + "_attn_norm");
+        ASSERT_NE(node, nullptr);
+        EXPECT_EQ(node->stage->type(), layer == 2 ? ComputeStageType::RMS_NORM : ComputeStageType::FUSED_RESIDUAL_NORM);
+        EXPECT_EQ(contractReads(node->stage->bufferContract(), BufferId::ATTN_PROJ), layer != 2);
+        EXPECT_EQ(contractWrites(node->stage->bufferContract(), BufferId::HIDDEN_STATE), layer != 2);
+    }
+}
+/** @test Invalid workload is rejected before a stage or dependency is authored. */
+TEST(Test__Qwen35MoEGraph, PreAttentionRejectsInvalidWorkloadBeforeGraphMutation)
+{
+    auto config = makeMoEConfig();
+    TensorArena arena;
+    auto layer = makeFALayerWeights(arena, config);
+    auto buffers = makeFAActivationBuffers(arena, 1, config);
+    TestableQwen35MoEGraph builder(config, nullptr);
+    ComputeGraph graph;
+    EXPECT_THROW(builder.addPreAttentionNorm(graph, "invalid_", buffers, layer.attn_norm,
+        1, 1, DeviceId::cpu(), true, static_cast<GraphLayerWorkload>(255)), std::invalid_argument);
+    EXPECT_EQ(graph.size(), 0u);
 }
 
 /**

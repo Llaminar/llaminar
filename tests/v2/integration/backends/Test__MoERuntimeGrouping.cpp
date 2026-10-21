@@ -251,7 +251,7 @@ namespace llaminar2::test
             auto *stream = context.defaultStream();
             ASSERT_NE(backend, nullptr);
             ASSERT_NE(stream, nullptr);
-            for (int experts : {8, 17, 31, 32, 33, 63, 64, 65, 255, 256})
+            for (int experts : {8, 17, 31, 32, 33, 63, 64, 65, 255, 256, 257, 511, 512})
                 // Cross both the compact-kernel boundary (256 route slots)
                 // and partial wave/workgroup tails in the scalable scatter.
                 // Odd top-k also prevents row alignment hiding a lane bug.
@@ -261,7 +261,7 @@ namespace llaminar2::test
                          {33, 33, 8}, {63, 63, 8}, {64, 64, 8}, {65, 65, 8},
                          {129, 127, 8}, {512, 448, 8}, {512, 512, 8},
                          {2048, 2048, 8}, {257, 257, 1}, {65, 63, 7},
-                         {33, 33, 16}, {512, 33, 8}, {4096, 65, 7}})
+                         {33, 33, 16}, {16, 15, 10}, {32, 17, 10}, {512, 33, 8}, {4096, 65, 7}})
                 {
                     SCOPED_TRACE("experts=" + std::to_string(experts) +
                         " rows=" + std::to_string(rows) +

@@ -90,6 +90,17 @@ namespace llaminar2
 
         /** @return Parent PP geometry with the jointly admitted row envelope. */
         const RankExecutionPlan &rankPlan() const noexcept { return rank_plan_; }
+        /**
+         * @brief Publish the complete admission-selected runtime geometry together.
+         * @param runtime Current request runtime whose model/source authority has
+         * already been matched to this admission by the prepared-plan owner.
+         *
+         * Rows, expert segments and the resolved native table placement form one
+         * immutable setup decision. Preserve all active request policies: retained
+         * MTP capacity permits different enabled/depth choices on later requests.
+         * This operation neither allocates nor reopens any admission decision.
+         */
+        void publishRuntimeCapacity(RuntimeConfig &runtime) const noexcept;
         /** @return Immutable ordered stages; no borrowed setup references survive. */
         const std::vector<AdmittedMoEPipelineStage> &stages() const noexcept { return stages_; }
         /** @return Sole aggregate admission behind every stage's quota evidence. */

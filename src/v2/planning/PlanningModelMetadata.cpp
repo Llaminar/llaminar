@@ -14,6 +14,7 @@
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "loaders/ModelLoader.h"
+#include "loaders/WeightIdentity.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
 #include <array>
@@ -67,7 +68,7 @@ namespace llaminar2
     {
         const int layers = mainLayerCountExcludingMTP(
             loader, loader.architecture(), static_cast<int>(loader.blockCount()));
-        return PlanningModelMetadata(ModelMemoryProfile::fromGGUF(loader.getModel()), layers);
+        return PlanningModelMetadata(ModelMemoryProfile::fromLoader(loader), layers);
     }
 
     std::vector<uint8_t> PlanningModelMetadata::serialize() const
@@ -104,30 +105,35 @@ namespace llaminar2
     struct PlanningModelSource::Storage
     {
         std::string path;
+        std::optional<SharedPredictorGGUFSource> predictor;
         std::shared_ptr<IMPIContext> local_context;
         TensorFactory factory;
         ModelLoader loader;
         PlanningModelMetadata metadata;
 
         /** @brief Bind process-local metadata infrastructure before reading once. */
-        explicit Storage(const std::string &model_path)
-            : path(model_path), local_context(MPIContextFactory::self()), factory(*local_context),
-              loader(&factory), metadata(read(loader, model_path)) {}
+        Storage(const std::string &model_path, const std::optional<SharedPredictorGGUFSource> &predictor_source)
+            : path(model_path), predictor(predictor_source), local_context(MPIContextFactory::self()), factory(*local_context),
+              loader(&factory), metadata(read(loader, model_path, predictor)) {}
 
         /** @return Metadata from this exact loader, without touching weight payloads. */
-        static PlanningModelMetadata read(ModelLoader &loader, const std::string &path)
+        static PlanningModelMetadata read(ModelLoader &loader, const std::string &path,
+            const std::optional<SharedPredictorGGUFSource> &predictor)
         {
             loader.setUseMmap(false);
             if (!loader.loadModel(path))
                 throw std::runtime_error("Cannot read planning metadata from " + path);
+            if (predictor) loader.bindSharedPredictor(*predictor, SharedPredictorMaterialization::Active);
+            loader.sealTensorSources();
             return PlanningModelMetadata::fromLoader(loader);
         }
     };
 
-    PlanningModelSource::PlanningModelSource(const std::string &model_path)
+    PlanningModelSource::PlanningModelSource(const std::string &model_path,
+        const std::optional<SharedPredictorGGUFSource> &predictor)
     {
         if (model_path.empty()) throw std::invalid_argument("Planning requires a GGUF model path");
-        storage_ = std::make_unique<Storage>(model_path);
+        storage_ = std::make_unique<Storage>(model_path, predictor);
     }
     PlanningModelSource::~PlanningModelSource() = default;
     PlanningModelSource::PlanningModelSource(PlanningModelSource &&) noexcept = default;
@@ -150,9 +156,15 @@ namespace llaminar2
         return storage_->path;
     }
 
+    const std::optional<SharedPredictorGGUFSource> &PlanningModelSource::predictorSource() const
+    {
+        if (!storage_) throw std::logic_error("Planning model source was moved from");
+        return storage_->predictor;
+    }
+
     PlanningModelSampleGeometry PlanningModelSource::sampleGeometry(const PlanningModelSampleRequest &request) const
     {
-        const auto *info = loader().getModel().findTensor(request.tensor_name);
+        const auto *info = loader().tensorInfo(request.tensor_name);
         if (!info) throw std::invalid_argument("Planning sample tensor is absent: " + request.tensor_name);
         const bool expert = std::holds_alternative<PlanningExpertMatrix>(request.selection);
         if (info->dimensions.size() != (expert ? 3u : 2u))
@@ -290,7 +302,10 @@ namespace llaminar2
     {
         uint64_t maximum = 0;
         for (const auto &tensor : model.tensors)
+        {
+            if (inferWeightRole(tensor.name) == WeightRole::ImmutableRowTable) continue;
             maximum = std::max(maximum, tensor.size_bytes);
+        }
         if (maximum == 0)
             throw std::invalid_argument("GPU upload admission requires a nonempty GGUF tensor manifest");
         if (maximum > std::numeric_limits<size_t>::max())
@@ -298,9 +313,10 @@ namespace llaminar2
         return static_cast<size_t>(maximum);
     }
 
-    PlanningModelMetadata readPlanningModelMetadata(const std::string &model_path)
+    PlanningModelMetadata readPlanningModelMetadata(const std::string &model_path,
+        const std::optional<SharedPredictorGGUFSource> &predictor)
     {
-        return PlanningModelSource(model_path).metadata();
+        return PlanningModelSource(model_path, predictor).metadata();
     }
 
     PlanningModelMetadata exchangePlanningModelMetadata(

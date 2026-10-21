@@ -61,6 +61,9 @@ namespace llaminar2
         MTPDepthPolicyModelClass model_class = MTPDepthPolicyModelClass::Any;
         MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
 
+        /** @return Complete immutable learned-policy identity. */
+        bool operator==(const MTPLearnedDepthPolicyContext &) const = default;
+
         /** @return Whether every key is a supported value, even when disabled. */
         LLAMINAR_MTP_POLICY_HD bool valid() const
         {

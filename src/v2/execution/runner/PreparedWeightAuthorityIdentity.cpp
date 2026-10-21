@@ -172,6 +172,38 @@ namespace llaminar2
         append_optional_bytes(config.max_cpu_memory_mb);
         append_string(config.activation_precision);
         append_string(config.kv_cache_precision);
+        out << ";ngram=" << static_cast<int>(config.ngram_table_policy.storage) << ','
+            << config.ngram_table_policy.window_bytes << ',' << config.ngram_table_policy.window_count
+            << ",distribution=" << static_cast<int>(config.ngram_table_policy.distribution);
+        if(config.ngram_table_policy.isHostAdaptive())
+        {
+            const auto &a=config.ngram_table_policy.host_adaptive;
+            out << ",adaptive=" << a.maximum_cache_rows << ',' << a.cache_physical_byte_limit << ','
+                << a.policy.aging_accesses << ',' << a.policy.protected_numerator << ',' << a.policy.protected_denominator;
+        }
+        if(config.ngram_table_policy.isGPUAdaptive())
+        {
+            const auto &g=config.ngram_table_policy.gpu_adaptive;
+            out << ",gpu_adaptive=" << g.maximum_gpu_cache_rows << ',' << g.gpu_cache_physical_byte_limit << ','
+                << g.gpu_policy.aging_accesses << ',' << g.gpu_policy.protected_numerator << ',' << g.gpu_policy.protected_denominator
+                << ",subordinate=" << g.host.maximum_cache_rows << ',' << g.host.cache_physical_byte_limit << ','
+                << g.host.policy.aging_accesses << ',' << g.host.policy.protected_numerator << ',' << g.host.policy.protected_denominator;
+        }
+        // Explicit HC-up correction changes stage workspace capacity even
+        // though every prepared source weight byte remains identical. A
+        // retained capacity authority must reject that setup-policy change.
+        if (debugEnv().gemm.qfn_hc_up_activation != QuantizedActivationOperandPrecision::SingleQ8)
+            out << ";qfn_hc_up_activation="
+                << quantizedActivationOperandPrecisionName(debugEnv().gemm.qfn_hc_up_activation);
+        if (debugEnv().gemm.qfn_gdn_output_activation != QuantizedActivationOperandPrecision::SingleQ8)
+            out << ";qfn_gdn_output_activation="
+                << quantizedActivationOperandPrecisionName(debugEnv().gemm.qfn_gdn_output_activation);
+        if (debugEnv().gemm.qfn_fa_output_activation != QuantizedActivationOperandPrecision::SingleQ8)
+            out << ";qfn_fa_output_activation="
+                << quantizedActivationOperandPrecisionName(debugEnv().gemm.qfn_fa_output_activation);
+        if (debugEnv().gemm.qfn_gdn_qkv_activation != QuantizedActivationOperandPrecision::SingleQ8)
+            out << ";qfn_gdn_qkv_activation="
+                << quantizedActivationOperandPrecisionName(debugEnv().gemm.qfn_gdn_qkv_activation);
         return out.str();
     }
 

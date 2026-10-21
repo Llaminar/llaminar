@@ -27,6 +27,7 @@
 namespace llaminar2
 {
     struct GGUFModel;
+    class ModelLoader;
     class MoEOverlayMPIRemoteProjectionTransport;
     class MappedTransferProgressEpoch;
     class PhysicalMemoryAuthority;
@@ -93,6 +94,25 @@ namespace llaminar2
         const GGUFModel &model,
         int num_layers,
         int num_experts,
+        int first_model_layer = 0);
+
+    /**
+     * @brief Resolve expert metadata through the original model/predictor source authority.
+     *
+     * A shared predictor stays in its separate immutable artifact. Main and
+     * sidecar expert parents retain global layer IDs and native formats; this
+     * builder never merges directories, loads payloads or drops routed sidecars.
+     *
+     * @param loader Immutable source-aware loader owning main and optional predictor.
+     * @param num_layers Exact owned routed interval, including real routed sidecars.
+     * @param num_experts Exact source expert count on every owned layer.
+     * @param first_model_layer First global identity in the compact routed interval.
+     * @return The same strict native gate/up/down contract as the single-directory builder.
+     * @throws std::invalid_argument For missing, unsupported or incompatible source metadata.
+     */
+    [[nodiscard]] std::vector<MoEOverlayLayerWeightManifest>
+    buildMoEOverlayLayerWeightManifestFromLoader(
+        const ModelLoader &loader, int num_layers, int num_experts,
         int first_model_layer = 0);
 
     /** @brief Process-local evidence for the materialized residency fabric. */

@@ -34,6 +34,9 @@
  * @date January 2026
  */
 
+#include "planning/ImmutableRowTableAdmissionWire.h"
+#include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
+#include "loaders/ImmutableRowTable.h"
 #include "OrchestrationRunner.h"
 #include "planning/ResolvedRankOrchestration.h"
 #include "execution/runner/PreparedWeightAuthorityIdentity.h"
@@ -1453,7 +1456,7 @@ namespace llaminar2
             if (tokens >= 0)
                 return tokens;
 
-            return expectedShiftedMTPTokens(snapshot.cached_tokens);
+            return expectedShiftedMTPTokens(snapshot.cached_tokens,snapshot.mtp_shifted_origin);
         }
 
         MTPDecodeStateStamp makeMTPStateStamp(
@@ -1468,6 +1471,7 @@ namespace llaminar2
             stamp.logical_tokens = snapshot.cached_tokens;
             stamp.main_kv_tokens = snapshot.cached_tokens;
             stamp.shifted_mtp_kv_tokens = snapshotShiftedMTPTokens(snapshot);
+            stamp.shifted_origin=snapshot.mtp_shifted_origin;
             stamp.position = snapshot.cached_tokens;
             stamp.has_terminal_hidden = has_terminal_hidden;
             stamp.has_terminal_logits = has_terminal_logits;
@@ -2042,6 +2046,44 @@ namespace llaminar2
                     received, begin, end, rank, result);
             }
             return result;
+        }
+
+        /**
+         * @brief Gather immutable final PLE requests after the higher-priority row/quota search.
+         * @param local Zero or one exact request owned by this communicator rank.
+         * @param world Existing overlay startup communicator; no inference state is exchanged.
+         * @return Rank-ordered source/consumer/mode BOM requests for one final certificate.
+         * @throws std::exception For malformed framing, foreign identity or an oversized MPI extent.
+         */
+        std::vector<ImmutableRowTableAdmissionRequest> gatherOverlayImmutableTableRequests(
+            const std::vector<ImmutableRowTableAdmissionRequest> &local,
+            const std::shared_ptr<IMPIContext> &world,const ModelMemoryProfile &profile)
+        {
+            if(!world||world->world_size()<=1)return local;
+            const auto send=serializeImmutableRowTableAdmissionRequests(local);
+            if(send.size()>static_cast<std::size_t>(INT_MAX))
+                throw std::overflow_error("Ngram admission sender metadata exceeds MPI extent");
+            const int n=world->world_size(),send_count=static_cast<int>(send.size());
+            std::vector<int> counts(n),offsets(n);
+            world->allgather_bytes(&send_count,counts.data(),sizeof(send_count));
+            std::size_t total=0;
+            for(int rank=0;rank<n;++rank)
+            {
+                if(counts[rank]<0||total>static_cast<std::size_t>(INT_MAX)-static_cast<std::size_t>(counts[rank]))
+                    throw std::overflow_error("Ngram admission aggregate metadata exceeds MPI extent");
+                offsets[rank]=static_cast<int>(total);total+=static_cast<std::size_t>(counts[rank]);
+            }
+            std::vector<std::uint8_t> received(total);
+            world->allgatherv_bytes(send.data(),send_count,received.data(),counts.data(),offsets.data());
+            std::vector<ImmutableRowTableAdmissionRequest> requests;
+            for(int rank=0;rank<n;++rank)
+            {
+                const auto part=std::span<const std::uint8_t>(received).subspan(
+                    static_cast<std::size_t>(offsets[rank]),static_cast<std::size_t>(counts[rank]));
+                auto decoded=parseImmutableRowTableAdmissionRequests(part,rank,&profile);
+                requests.insert(requests.end(),std::make_move_iterator(decoded.begin()),std::make_move_iterator(decoded.end()));
+            }
+            return requests;
         }
 
         /**
@@ -2906,6 +2948,19 @@ namespace llaminar2
             {
                 return false;
             }
+
+            if (!run_phase("requireImmutableRowTablePlacementComplete", [&] {
+                    if (plan_.runtime.ngram_table_placement)
+                    {
+                        plan_.runtime.ngram_table_placement->requireRequestedPolicy(config_.ngram_table_policy);
+                        if (!model_ctx_ || !physical_memory_authority_)
+                            return setError("Ngram completion lost its admitted model or physical authority");
+                        model_ctx_->requireImmutableRowTablePlacementComplete(
+                            *plan_.runtime.ngram_table_placement, physical_memory_authority_);
+                    }
+                    return true;
+                }))
+                return false;
 
             /*
              * Capture one coherent owner-by-owner ledger view at the exact
@@ -8978,7 +9033,7 @@ namespace llaminar2
 
             transaction_base_cached_tokens = *base_position;
             verifier_base_checkpoint =
-                makeLogicalMTPVerifierBaseSnapshot(transaction_base_cached_tokens);
+                makeLogicalMTPVerifierBaseSnapshot(transaction_base_cached_tokens,architecture()=="qwen4exp" ? MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero : MTPShiftedCacheOrigin::SuccessorPairsOnly);
             PerfStatsCollector::addCounterWithSequence(
                 "mtp",
                 "live_prefix_checkpoint_skipped_direct_publication",
@@ -9110,7 +9165,8 @@ namespace llaminar2
                 base.cached_tokens + state_advanced_tokens;
             committed_stamp.main_kv_tokens = committed_stamp.logical_tokens;
             committed_stamp.shifted_mtp_kv_tokens =
-                expectedShiftedMTPTokens(committed_stamp.logical_tokens);
+                expectedShiftedMTPTokens(committed_stamp.logical_tokens,base.mtp_shifted_origin);
+            committed_stamp.shifted_origin=base.mtp_shifted_origin;
             committed_stamp.position = committed_stamp.logical_tokens;
             committed_stamp.has_terminal_hidden = true;
             committed_stamp.has_terminal_logits = has_terminal_logits;
@@ -9705,7 +9761,7 @@ namespace llaminar2
                 if (!verifier_base_position)
                     return fail_after_checkpoint(position_error);
                 verifier_base_checkpoint =
-                    makeLogicalMTPVerifierBaseSnapshot(*verifier_base_position);
+                    makeLogicalMTPVerifierBaseSnapshot(*verifier_base_position,architecture()=="qwen4exp" ? MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero : MTPShiftedCacheOrigin::SuccessorPairsOnly);
                 PerfStatsCollector::addCounterWithSequence(
                     "mtp",
                     "capture_verifier_base_prefix_state_skipped_all_position_publication",
@@ -10353,13 +10409,11 @@ namespace llaminar2
                  * head, so the precondition must be anchored to the snapshot
                  * that owns the terminal hidden row we are about to publish.
                  *
-                 * snapshotShiftedMTPTokens() returns the shifted sidecar count
-                 * represented by that checkpoint.  The sequential shifted-row
-                 * committer expects position_offset - 1 rows to be resident
-                 * when already_appended_tokens is zero, hence the +1 below.
+                 * CPU coordinates derive from the checkpoint's model-owned
+                 * origin: QFN includes token zero, while successor-only caches
+                 * omit it. GPU publication continues to consume only its
+                 * device-owned token/position transaction below.
                  */
-                const int base_sidecar_position =
-                    snapshotShiftedMTPTokens(verifier_base_checkpoint) + 1;
                 bool shifted_commit_ok = false;
                 {
                     PerfStatsCollector::ScopedTimer timer(
@@ -10421,6 +10475,9 @@ namespace llaminar2
                     }
                     else
                     {
+                        const int base_sidecar_position = mtpShiftedAppendPosition(
+                            snapshotShiftedMTPTokens(verifier_base_checkpoint),
+                            verifier_base_checkpoint.mtp_shifted_origin);
                         shifted_commit_ok =
                             runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
                                 first_token,
@@ -11905,7 +11962,8 @@ namespace llaminar2
                 const MTPShiftedReplayRowPlan shifted_plan =
                     planMTPShiftedReplayRow(
                         cache_counts.main,
-                        cache_counts.shifted);
+                        cache_counts.shifted,
+                        architecture()=="qwen4exp" ? MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero : MTPShiftedCacheOrigin::SuccessorPairsOnly);
                 if (!shifted_plan)
                 {
                     continuation_failure_detail =
@@ -13303,8 +13361,11 @@ namespace llaminar2
                      * reusable sidecars own one skipped shifted row; restored
                      * MoE/TP verifier-base paths own zero skipped verifier
                      * rows and must be anchored to the verifier-base cached
-                     * token count so the pre-commit expectation is
-                     * `verifier_base - 1`.
+                     * token count. The DGO projects that absolute condition
+                     * position using its cache's immutable model origin:
+                     * ordinary pre-commit is max(0,verifier_base-1), while
+                     * QFN retains its visible position-zero seed and expects
+                     * verifier_base before any additional resident rows.
                      */
                     const int shifted_commit_position_offset =
                         first_shifted_row_available_from_sidecar
@@ -16130,8 +16191,16 @@ namespace llaminar2
         {
             const auto &scope = admitted.at(i).topology().scope();
             const auto &metadata = prepared[i].metadata;
+            // The admitted continuation domain owns the participant identity
+            // for both singleton and TP stages. A singleton's rank projection
+            // deliberately has no local_tp_devices and cannot supply this view.
+            const auto &placement = *prepared[i].placement;
+            const auto continuation = std::find_if(placement.domains.begin(), placement.domains.end(),
+                [&](const auto &domain) { return domain.name == placement.effectiveBaseModelDomain(); });
+            if (continuation == placement.domains.end())
+                throw std::logic_error("Pipeline movement topology lost its admitted continuation domain");
             stages.push_back({MoEOptimizationStageIdentity{i, scope.first_layer, scope.last_layer,
-                metadata.first_model_layer + metadata.num_layers, admitted[i].rankPlan().local_tp_devices, scope.has_lm_head},
+                metadata.first_model_layer + metadata.num_layers, continuation->participants, scope.has_lm_head},
                 describeMoEOptimizationMovementTopology(prepared[i].placement.get())});
         }
         return composeMoEOptimizationMovementTopology(MoEOptimizationStages<MoEOptimizationMovementTopology>::seal(std::move(stages)));
@@ -16381,6 +16450,23 @@ namespace llaminar2
                  {"extra_mpi_command", "false"},
                  {"physical_follower", "host_byte_transport_only"}});
             return true;
+        }
+
+        if (moe_pipeline_prepared_plan_)
+        {
+            if (config_.moe_rebalance.mode != MoERebalanceRuntimeMode::Dynamic)
+                return true;
+            if (!runner_ || moe_pipeline_stage_bindings_.empty() ||
+                moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size())
+                return setError("MoE pipeline progress lost its complete stage ownership");
+            const bool all_no_peer = std::all_of(moe_pipeline_stage_bindings_.begin(),
+                moe_pipeline_stage_bindings_.end(), [](const auto &binding) {
+                    return binding && binding->owners().authority->noPeerResidency().has_value();
+                });
+            // All-zero topology work needs no participant fan-out, scheduler
+            // ticket, host mirror, or per-token evidence publication.
+            if (all_no_peer) return true;
+            return runner_ && runner_->maybeApplyDecodeBoundaryMaintenance(committed_tokens);
         }
 
         if (usesNativeGpuStageMoEOverlayAuthority())
@@ -17025,7 +17111,7 @@ namespace llaminar2
         try
         {
             planning_model_metadata_.emplace(exchangePlanningModelMetadata(mpi_ctx_, [&] {
-                return readPlanningModelMetadata(config_.model_path);
+                return readPlanningModelMetadata(config_.model_path, config_.shared_predictor);
             }));
         }
         catch (const std::exception &error)
@@ -17040,13 +17126,19 @@ namespace llaminar2
                 config_, *planning_model_metadata_, cluster_inventory_, *plan_builder_, rank);
             if (!resolved.pipelineStages().empty())
             {
-                // Each native GPU stage owns its own controller and native
-                // collective. A host maintenance composer is not substituted.
+                // Movement storage is not the authority locus. Singleton
+                // domains retain their host/device owner and Dynamic intent;
+                // a complete no-peer residency proof is sealed after quotas.
+                // Movable domains still require their real native controller.
                 for (const auto &stage : resolved.pipelineStages())
-                    if (MoEOverlayCapacityAdmission::selectMigrationStorage(
-                            *stage.config().moe_routed_expert_plan, MoERebalanceRuntimeMode::Dynamic) !=
-                        MoEOverlayMigrationStorageKind::DeviceTransferDirectory)
-                        return setError("Local MoE pipeline stages require native GPU controller domains");
+                {
+                    const auto storage = MoEOverlayCapacityAdmission::selectMigrationStorage(
+                        *stage.config().moe_routed_expert_plan, config_.moe_rebalance.mode);
+                    if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+                        storage != MoEOverlayMigrationStorageKind::NoPeer &&
+                        storage != MoEOverlayMigrationStorageKind::DeviceTransferDirectory)
+                        return setError("Movable local MoE pipeline stages require an admitted native maintenance domain");
+                }
                 moe_pipeline_topology_ = std::make_shared<const ResolvedRankOrchestration>(resolved);
                 requested_routed_weight_authority_identity_ = pipelineRoutedWeightAuthorityRequestIdentity(resolved);
             }
@@ -17219,6 +17311,9 @@ namespace llaminar2
         weight_config.mpi_ctx = mpi_ctx_;
         weight_config.weight_precision = WeightPrecision::NATIVE;
         weight_config.use_mmap = config_.use_mmap;
+        weight_config.shared_predictor = config_.shared_predictor;
+        weight_config.predictor_materialization = retainsMTPGraphCapacity(config_.mtp)
+            ? SharedPredictorMaterialization::Active : SharedPredictorMaterialization::Inactive;
 
         /*
          * A process-resident parity campaign may retain the immutable model and
@@ -17236,6 +17331,14 @@ namespace llaminar2
                     model_ctx_->path() + " != " + model_path);
             }
 
+            const auto retained_predictor = model_ctx_->loader()->ggufPredictorDirectory();
+            if (bool(retained_predictor) != config_.shared_predictor.has_value() ||
+                (retained_predictor && (retained_predictor->split_paths.empty() ||
+                    retained_predictor->split_paths.front() != config_.shared_predictor->path())))
+                return setError("Preloaded ModelContext shared predictor source does not match --mtp-model");
+
+            if (retained_predictor && model_ctx_->concreteLoader().predictorMaterialization() != weight_config.predictor_materialization)
+                return setError("Preloaded ModelContext shared predictor materialization policy does not match active MTP");
             const auto weight_manager = model_ctx_->concreteWeightManager();
             if (!weight_manager)
             {
@@ -17433,6 +17536,14 @@ namespace llaminar2
                 ModelPayloadAccessPattern::DenseCpuResident;
         }
 
+        // Resolve from authenticated planning metadata before either local or
+        // node-leader warmup. Low-level ModelLoader applies the same semantic
+        // resolver after parsing, so direct and orchestrated callers cannot
+        // accidentally pre-read a separately admitted immutable row table.
+        for (const auto &tensor : planningModelMetadata().memoryProfile().tensors)
+            weight_config.payload_access_pattern = resolveModelPayloadAccessPattern(
+                weight_config.payload_access_pattern, inferWeightRole(tensor.name));
+
         // Multi-rank page cache pre-population:
         // In multi-rank mode, each rank independently mmaps and first-touches the
         // same file. Without coordination, this creates N concurrent page fault
@@ -17574,8 +17685,8 @@ namespace llaminar2
                      ModelPayloadAccessPattern::SparseSelection)
         {
             LOG_DEBUG(
-                "Sparse ExpertOverlay weight loading: skipping whole-file "
-                "page-cache prepopulation; only selected expert slices will "
+                "Selected-source weight loading: skipping whole-file "
+                "page-cache prepopulation; only explicitly selected payloads will "
                 "fault source pages");
             PerfStatsCollector::addCounter(
                 "weight_loading",
@@ -17813,8 +17924,7 @@ namespace llaminar2
                     resolveMoERoutedExpertModelMetadataForModel(
                         *model_ctx_, mtp);
                 const auto layer_weight_manifest =
-                    buildMoEOverlayLayerWeightManifestFromGGUF(
-                        model_ctx_->concreteLoader().getModel(),
+                    buildMoEOverlayLayerWeightManifestFromLoader(model_ctx_->concreteLoader(),
                         metadata.num_layers,
                         metadata.num_experts);
                 const auto execution_plan =
@@ -17977,8 +18087,8 @@ namespace llaminar2
 
                 std::optional<MoEOverlayLocalCapacityPlannerResult>
                     selected_local_capacity;
-                std::optional<MoEOverlayResolvedCapacityPlan>
-                    selected_capacity;
+                std::optional<MoEOverlayCapacityDraft> selected_capacity_draft;
+                std::optional<MoEOverlayResolvedCapacityPlan> selected_capacity;
                 std::size_t selected_model_graph_identity_count = 0u;
                 int selected_prefill_segment_rows = 0;
                 std::string last_capacity_error;
@@ -18015,8 +18125,7 @@ namespace llaminar2
                         continue;
                     }
 
-                    std::optional<MoEOverlayResolvedCapacityPlan>
-                        candidate_capacity;
+                    std::optional<MoEOverlayCapacityDraft> candidate_capacity;
                     const auto complete_result = capacity_phase(
                         {static_cast<std::uint32_t>(candidate_rows), "overlay-candidate.complete-bom"}, [&]
                     {
@@ -18025,7 +18134,7 @@ namespace llaminar2
                                 local_candidate->capacity.physical_budgets,
                                 overlay_world);
                         candidate_capacity =
-                            MoEOverlayCapacityAdmission::resolveCapacity(
+                            MoEOverlayCapacityAdmission::resolveCapacityDraft(
                                 *config_.moe_routed_expert_plan,
                                 metadata.num_experts,
                                 layer_weight_manifest,
@@ -18045,7 +18154,7 @@ namespace llaminar2
                     }
 
                     selected_local_capacity = std::move(local_candidate->capacity);
-                    selected_capacity = std::move(candidate_capacity);
+                    selected_capacity_draft = std::move(candidate_capacity);
                     selected_model_graph_identity_count =
                         local_candidate->inputs.model_graph_identity_count;
                     selected_prefill_segment_rows =
@@ -18055,7 +18164,7 @@ namespace llaminar2
                     break;
                 }
 
-                if (!selected_local_capacity || !selected_capacity)
+                if (!selected_local_capacity || !selected_capacity_draft)
                 {
                     throw std::runtime_error(
                         "ExpertOverlay has no resident captured-prefill shape with complete expert coverage under the physical BOM" +
@@ -18063,6 +18172,29 @@ namespace llaminar2
                              ? std::string{}
                              : ": " + last_capacity_error));
                 }
+
+                std::vector<ImmutableRowTableAdmissionRequest> local_table_requests;
+                const auto table_inputs=capacity_phase({0,"overlay.final-ngram-local-inputs"},[&] {
+                    const std::vector<std::vector<DevicePlanConfig>> groups{selected_local_capacity->device_inputs};
+                    const auto upload=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
+                    const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,
+                        plan_.runtime.ngram_table_policy,groups,upload,ImmutableRowTableHostPlacement::fromObservedNUMANode(plan_.numa_node));
+                    if(request)local_table_requests.push_back(*request);
+                    return true;
+                });
+                if(!table_inputs.succeeded())
+                    throw std::runtime_error(table_inputs.diagnostic("Final ngram local metadata admission"));
+                const auto table_result=capacity_phase({0,"overlay.final-ngram-admission"},[&] {
+                    const auto complete_requests=gatherOverlayImmutableTableRequests(local_table_requests,overlay_world,profile);
+                    auto admitted=selected_capacity_draft->admit(complete_requests);
+                    if(admitted.size()!=1u)throw std::logic_error("Standalone overlay finalization lost its exact stage");
+                    selected_capacity=std::move(admitted.front());
+                    for(const auto &placement:selected_capacity->ngram_table_placements)
+                        if(placement->worldRank()==plan_.rank)plan_.runtime.ngram_table_placement=placement;
+                    return true;
+                });
+                if(!table_result.succeeded())
+                    throw std::runtime_error(table_result.diagnostic("Final ngram admission after frozen rows and quotas"));
 
                 if (selected_prefill_segment_rows <= 0)
                 {
@@ -18264,8 +18396,7 @@ namespace llaminar2
             }
             const auto &admission = *moe_pipeline_prepared_plan_->admission();
             physical_memory_admission_ = admission.physicalAdmission();
-            plan_.runtime.resident_graph_rows = admission.rankPlan().runtime.resident_graph_rows;
-            plan_.runtime.moe_routed_prefill.overlay_segment_rows = admission.rankPlan().runtime.moe_routed_prefill.overlay_segment_rows;
+            admission.publishRuntimeCapacity(plan_.runtime);
             if (!publishPhysicalMemoryAuthority()) return false;
             PerfStatsCollector::addCounter("moe_overlay_capacity", "pipeline_capacity_plan_installed", 1.0,
                 "model_setup", {}, {{"stages", std::to_string(admission.stages().size())},
@@ -18677,10 +18808,10 @@ namespace llaminar2
         };
         if (moe_pipeline_prepared_plan_)
         {
-            if (!runner_ || moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size() ||
-                !usesNativeGpuStageMoEOverlayAuthority() ||
-                runner_->moeOverlayAuthorityExecution() != MoEOverlayAuthorityExecutionKind::DeviceResident)
-                return setError("MoE pipeline maintenance lost its complete native stage ownership");
+            if (!runner_ || moe_pipeline_stage_bindings_.size() != moe_pipeline_prepared_plan_->stages().size())
+                return setError("MoE pipeline maintenance lost its complete stage ownership");
+            runner_->requireMoEPipelineRuntimeOwnership(
+                IInferenceRunner::MoEPipelineOwnershipValidation::OwnersBound);
             if (!run_maintenance_phase("finalizePipelinePreparedResidencyBanks", [&] {
                     const auto weights = model_ctx_->concreteWeightManager();
                     if (!weights) return setError("MoE pipeline has no prepared-engine registry");
@@ -18702,12 +18833,19 @@ namespace llaminar2
             if (!run_maintenance_phase("materializePipelineServingGraphs",
                     [&] { return materializeCurrentServingGraphFamilyVariantWithoutLaunch(); }))
                 return false;
-            if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
-                !runner_->deviceResidentMoEOverlayMaintenanceReady())
-                return setError("MoE pipeline did not materialize every native maintenance family");
+            runner_->requireMoEPipelineRuntimeOwnership(
+                IInferenceRunner::MoEPipelineOwnershipValidation::ServingMaterialized);
+            for (const auto &binding : moe_pipeline_stage_bindings_)
+                if (const auto &proof = binding->owners().authority->noPeerResidency(); proof)
+                    PerfStatsCollector::addCounter("moe_overlay_residency", "pipeline_no_peer_ownership_sealed", 1.0,
+                        "model_setup", proof->device().toString(),
+                        {{"first_layer", std::to_string(binding->metadata().first_model_layer)},
+                         {"authority_execution", toString(proof->authorityExecution())},
+                         {"maintenance_mode", moeRebalanceRuntimeModeToString(config_.moe_rebalance.mode)},
+                         {"migration_payload_bytes", "0"}, {"movement_collectives", "0"}});
             PerfStatsCollector::addCounter("moe_overlay_residency", "pipeline_maintenance_composed", 1.0,
                 "model_setup", {}, {{"stages", std::to_string(moe_pipeline_stage_bindings_.size())},
-                    {"authority_execution", "device_resident"}, {"host_maintenance_service", "false"}});
+                    {"authority_execution", "stage_owned"}, {"host_maintenance_service", "false"}});
             return true;
         }
         if (!moe_expert_overlay_residency_authority_)
@@ -18787,6 +18925,23 @@ namespace llaminar2
                 "ExpertOverlay authority maintenance mode disagrees with the frozen runtime configuration");
         }
 
+        if (const auto &proof = moe_expert_overlay_residency_authority_->noPeerResidency(); proof)
+        {
+            // The identity is frozen against every resident payload, not an
+            // unmaterialized capability. No movement service or fake controller
+            // is constructed for a topology with no alternative owner.
+            if (!run_maintenance_phase("sealNoPeerServingGraphs", [&] {
+                    return bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily();
+                }))
+                return false;
+            PerfStatsCollector::addCounter("moe_overlay_residency", "no_peer_ownership_sealed", 1.0,
+                "model_setup", proof->device().toString(),
+                {{"authority_execution", toString(proof->authorityExecution())},
+                 {"maintenance_mode", moeRebalanceRuntimeModeToString(config_.moe_rebalance.mode)},
+                 {"migration_payload_bytes", "0"}, {"movement_collectives", "0"}});
+            return true;
+        }
+
         std::vector<MoEOverlayParticipantLayerServiceTotals>
             prepared_cpu_service_measurements;
         if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
@@ -18855,8 +19010,7 @@ namespace llaminar2
                             "Mapped Dynamic controller disagrees with setup-time physical capacity admission");
                     }
                     auto layer_weight_manifest =
-                        buildMoEOverlayLayerWeightManifestFromGGUF(
-                            model_ctx_->concreteLoader().getModel(),
+                        buildMoEOverlayLayerWeightManifestFromLoader(model_ctx_->concreteLoader(),
                             metadata.num_layers,
                             metadata.num_experts);
                     const auto calibration_layer_catalog =
@@ -19358,8 +19512,7 @@ namespace llaminar2
             const auto economy_sources =
                 production_topology.economyActiveSources();
             auto layer_weight_manifest =
-                buildMoEOverlayLayerWeightManifestFromGGUF(
-                    model_ctx_->concreteLoader().getModel(),
+                buildMoEOverlayLayerWeightManifestFromLoader(model_ctx_->concreteLoader(),
                     metadata.num_layers,
                     metadata.num_experts);
             const auto calibration_layer_catalog =
@@ -20825,11 +20978,28 @@ namespace llaminar2
                 const size_t reusable_workspace_bytes =
                     reusable_execution_workspaces_->retainedPrimaryBytes(
                         device);
+                size_t immutable_table_bytes=model_ctx_->residentImmutableRowTableBytes(device);
+                size_t immutable_lookup_staging_bytes=0;
+                const auto placement=model_ctx_->resolvedImmutableRowTablePlacement();
+                const bool adaptive_owner=placement && placement->isGPUAdaptive() &&
+                    std::find(placement->consumers().begin(),placement->consumers().end(),
+                        PhysicalMemoryAllocatorIdentity{plan_.rank,device})!=placement->consumers().end();
+                if(adaptive_owner)
+                {
+                    const auto boundary=model_ctx_->adaptiveImmutableLookupBoundary(device);
+                    if(!boundary)throw std::invalid_argument("Adaptive retention has no original source boundary");
+                    const auto actual=boundary->rootStorage()->retainedOwnerObservation();
+                    if(actual.authority().get()!=physical_memory_authority_.get() || actual.allocator()!=PhysicalMemoryAllocatorIdentity{plan_.rank,device})
+                        throw std::invalid_argument("Adaptive retention must observe its exact original GPU/PMA root claims");
+                    immutable_table_bytes=actual.tableStorageBytes();
+                    immutable_lookup_staging_bytes=actual.lookupStagingBytes();
+                }
                 ModelDeviceMemoryRetention row{
                     .device = device,
                     .prepared_weight_bytes = prepared_weight_bytes,
-                    .reusable_workspace_bytes =
-                        reusable_workspace_bytes,
+                    .reusable_workspace_bytes = reusable_workspace_bytes,
+                    .immutable_table_bytes = immutable_table_bytes,
+                    .immutable_lookup_staging_bytes = immutable_lookup_staging_bytes,
                 };
                 /*
                  * A participant that owns only model weights is a complete
@@ -20837,7 +21007,7 @@ namespace llaminar2
                  * execute entirely from participant-local graph workspaces,
                  * leaving this runner's reusable primary-workspace registry
                  * empty.  ModelDeviceMemoryRetention deliberately models the
-                 * two disjoint allocation classes independently, so requiring
+                 * four disjoint allocation classes independently, so requiring
                  * both to be positive would invalidate a real weights-only
                  * owner and make the next collective admission asymmetric.
                  */
@@ -20851,7 +21021,8 @@ namespace llaminar2
                             ": prepared_weight_bytes=" +
                             std::to_string(prepared_weight_bytes) +
                             " reusable_workspace_bytes=" +
-                            std::to_string(reusable_workspace_bytes);
+                            std::to_string(reusable_workspace_bytes) +
+                            " immutable_table_bytes=" + std::to_string(immutable_table_bytes);
                     }
                     return false;
                 }
@@ -20863,6 +21034,7 @@ namespace llaminar2
                     << prepared_weight_bytes
                     << " reusable_workspace_bytes="
                     << reusable_workspace_bytes
+                    << " immutable_table_bytes=" << immutable_table_bytes
                     << " total_bytes=" << row.totalBytes());
             }
             return true;
@@ -21092,6 +21264,9 @@ namespace llaminar2
             }
             weight_manager->installPhysicalMemoryAuthority(
                 physical_memory_authority_);
+            // Ngram storage is selected in the final immutable plan. Materialization
+            // occurs at each participant factory after its ordinary upload drains;
+            // publishing PMA must not consume that lower-priority allocation early.
             return true;
         }
         catch (const std::exception &error)
@@ -21284,6 +21459,59 @@ namespace llaminar2
             .max_cpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CPU),
         });
 
+        const auto retained_table=imported_model_context_reuse_authority_
+            ? model_ctx_->resolvedImmutableRowTablePlacement() : nullptr;
+        if(retained_table)
+        {
+            if(!plan_.runtime.ngram_table_placement || *retained_table!=*plan_.runtime.ngram_table_placement)
+                throw std::invalid_argument("Retained model and execution plan have different resolved ngram placements");
+            for(auto &cfg:device_configs)
+                if(cfg.ngram_table_placement)
+                {
+                    const auto execution=retained_table->lookupForConsumer({cfg.world_rank,cfg.device});
+                    if(execution==ImmutableRowLookupExecution::AdaptiveGPUCache)
+                    {
+                        const auto boundary=model_ctx_->adaptiveImmutableLookupBoundary(cfg.device);
+                        if(!boundary)throw std::invalid_argument("Retained mixed ngrams lost their original source boundary");
+                        const auto gpu=boundary->rootStorage()->retainedOwnerObservation();
+                        const auto source=boundary->retainedSourceOwnerObservation();
+                        if(gpu.authority().get()!=physical_memory_authority_.get() || source.authority().get()!=physical_memory_authority_.get() ||
+                            gpu.allocator()!=PhysicalMemoryAllocatorIdentity{cfg.world_rank,cfg.device} ||
+                            source.allocator()!=retained_table->gpuAdaptiveLayout().sourceServices().front().allocator ||
+                            source.hostPlacement()!=retained_table->hostPlacement())
+                            throw std::invalid_argument("Retained mixed source/native roots changed exact allocator, locality or canonical authority");
+                        cfg.retained_immutable_table_bytes=gpu.tableStorageBytes();
+                        cfg.retained_immutable_lookup_staging_bytes=gpu.lookupStagingBytes();
+                        cfg.retained_immutable_source_table_bytes=source.tableStorageBytes();
+                        cfg.retained_immutable_source_lookup_staging_bytes=source.lookupStagingBytes();
+                        if(!cfg.retained_immutable_lookup_staging_bytes || !cfg.retained_immutable_source_lookup_staging_bytes ||
+                            !cfg.retained_immutable_source_table_bytes)
+                            throw std::invalid_argument("Retained mixed C0 still requires its complete original frame/source/channel leases");
+                    }
+                    else if(immutableRowLookupUsesNativeDeviceStorage(execution))
+                        cfg.retained_immutable_table_bytes=model_ctx_->residentImmutableRowTableBytes(cfg.device);
+                    else
+                    {
+                        const auto table=model_ctx_->hostImmutableRowProvider();
+                        if(!table)throw std::invalid_argument("Retained hosted ngrams lost their actual provider");
+                        const auto owner=table->retainedOwnerObservation();
+                        if(!retained_table->containsAllocator(owner.allocator()) || owner.hostPlacement()!=retained_table->hostPlacement() ||
+                            owner.authority().get()!=physical_memory_authority_.get())
+                            throw std::invalid_argument("Retained hosted ngram owner does not match its exact admitted placement/PMA");
+                        cfg.retained_immutable_table_bytes=owner.tableStorageBytes();
+                        cfg.retained_immutable_lookup_staging_bytes=owner.lookupStagingBytes();
+                    }
+                    if(execution!=ImmutableRowLookupExecution::AdaptiveGPUCache && !cfg.retained_immutable_table_bytes)
+                        throw std::invalid_argument("Retained ngram placement has no complete physical allocation");
+                    if(cfg.device.is_gpu())
+                    {
+                        if(plan_.runtime.resident_graph_rows<=0)
+                            throw std::invalid_argument("Retained ngram graph has no original frozen row capacity");
+                        cfg.activation_seq_len=plan_.runtime.resident_graph_rows;
+                    }
+                }
+        }
+
         // Retained credits require the existing live owner attestations. The
         // shared metadata builder cannot manufacture this lifecycle evidence.
         for (auto &cfg : device_configs)
@@ -21353,7 +21581,7 @@ namespace llaminar2
             });
 
         MemoryPlan plan;
-        if (has_resident_graph_participant &&
+        if (!retained_table && has_resident_graph_participant &&
             debugEnv().execution.gpu_graphs &&
             debugEnv().execution.prefill_graph_buckets)
         {
@@ -21367,6 +21595,7 @@ namespace llaminar2
             plan_.runtime.resident_graph_rows =
                 resident_plan.resident_graph_rows;
             plan = std::move(resident_plan.memory_plan);
+            device_configs=std::move(resident_plan.device_inputs);
 
             if (plan.fits())
             {
@@ -21397,6 +21626,23 @@ namespace llaminar2
             return setError(msg);
         }
 
+        PhysicalMemoryPlan final_plan=plan.physicalPlan();
+        if(!retained_table)
+        {
+            const std::vector<std::vector<DevicePlanConfig>> groups{device_configs};
+            const auto upload=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
+            const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,
+                plan_.runtime.ngram_table_policy,groups,upload,ImmutableRowTableHostPlacement::fromObservedNUMANode(plan_.numa_node));
+            if(request)
+            {
+                if(imported_model_context_reuse_authority_)
+                    throw std::invalid_argument("Retained model context has no exact complete ngram placement");
+                auto selected=ImmutableRowTablePlacementPlanner::select(*request,final_plan);
+                plan_.runtime.ngram_table_placement=std::move(selected.placement);
+                final_plan=std::move(selected.physical_plan);
+            }
+        }
+
         if (imported_model_context_reuse_authority_)
         {
             if (!physical_memory_admission_ ||
@@ -21410,7 +21656,7 @@ namespace llaminar2
             if (const auto mismatch =
                     physical_memory_admission_->plan()
                         .requiredFootprintMismatch(
-                            plan.physicalPlan()))
+                            final_plan))
             {
                 return setError(
                     "Prepared-model reuse exceeds its admitted physical-memory envelope: " +
@@ -21432,7 +21678,7 @@ namespace llaminar2
                 "Ordinary memory validation encountered an already-installed physical-memory authority");
         }
         physical_memory_admission_ = std::make_shared<
-            const PhysicalMemoryPlanAdmissionCertificate>(plan.admit());
+            const PhysicalMemoryPlanAdmissionCertificate>(final_plan);
         if (!publishPhysicalMemoryAuthority())
             return false;
 
@@ -24134,6 +24380,11 @@ namespace llaminar2
         }
         out_size = 0;
         return nullptr;
+    }
+
+    SnapshotInfo OrchestrationRunner::getSnapshotWithShape(const std::string &key) const
+    {
+        return runner_ ? runner_->getSnapshotWithShape(key) : SnapshotInfo{};
     }
 
     std::vector<std::string> OrchestrationRunner::getSnapshotKeys() const

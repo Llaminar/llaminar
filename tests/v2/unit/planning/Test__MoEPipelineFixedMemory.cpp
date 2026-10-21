@@ -117,7 +117,9 @@ namespace
                 auto overlay = std::make_shared<MoERoutedExpertPlacementPlan>();
                 overlay->enabled = true;
                 overlay->topology = RoutedExpertPlacementTopology::SingleDomain;
-                overlay->authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+                overlay->authority_execution = backend == DeviceType::CPU
+                    ? MoEOverlayAuthorityExecutionKind::HostResident
+                    : MoEOverlayAuthorityExecutionKind::DeviceResident;
                 overlay->first_model_layer = rank.first_layer;
                 overlay->base_model_domain = overlay->continuation_domain = overlay->shared_expert_domain = "child";
                 overlay->continuation_domain_spec.domain = "child";
@@ -126,7 +128,8 @@ namespace
                 domain.name = "child";
                 domain.scope = width == 1 ? ExecutionDomainScope::SINGLE : ExecutionDomainScope::RANK_LOCAL;
                 domain.owner_rank = 0;
-                domain.backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+                domain.backend = backend == DeviceType::CPU ? CollectiveBackendType::MPI
+                    : backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
                 domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
                 for (int member = 0; member < width; ++member)
                 {
@@ -135,8 +138,9 @@ namespace
                     domain.participants.push_back(address);
                     if (member == 0) rank.primary_device = address;
                     if (width > 1) rank.local_tp_devices.push_back(address);
-                    observed.gpus.push_back({.type = backend, .local_device_id = ordinal,
-                        .memory_bytes = 64ULL << 30, .free_memory_bytes = 64ULL << 30, .compute_units = 60});
+                    if (backend != DeviceType::CPU)
+                        observed.gpus.push_back({.type = backend, .local_device_id = ordinal,
+                            .memory_bytes = 64ULL << 30, .free_memory_bytes = 64ULL << 30, .compute_units = 60});
                 }
                 rank.local_tp_backend = domain.backend;
                 parent.local_pp_devices.push_back(rank.primary_device);
@@ -206,6 +210,45 @@ namespace
             return MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
         }
     };
+}
+
+/** @test No-peer CPU tails share real joint PMA admission without a demand mirror. */
+TEST(MoEPipelineFixedMemory, NoPeerHostTailRequiresNoRoutingEvidenceAllocation)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const bool mixed_gpu_prefix : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << int(backend) << '/' << mixed_gpu_prefix);
+            std::vector<StageGeometry> stages{{backend, 1}};
+            if (mixed_gpu_prefix)
+                stages.push_back({backend == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA, 1});
+            stages.push_back({DeviceType::CPU, 1});
+            Fixture fixture(stages);
+            const auto inputs = fixture.inputs();
+            for (const auto &input : inputs) EXPECT_FALSE(input.host_demand_memory);
+            const auto fixed = MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, inputs);
+            ASSERT_EQ(fixed.size(), stages.size());
+            for (const auto &stage : fixed) EXPECT_FALSE(stage.host_demand_memory);
+            const auto admitted = fixture.admit(fixed);
+            ASSERT_EQ(admitted.size(), stages.size());
+            ASSERT_TRUE(admitted.front().physical_memory_admission);
+            for (const auto &stage : admitted)
+                EXPECT_EQ(stage.physical_memory_admission, admitted.front().physical_memory_admission);
+            EXPECT_EQ(fixture.ranks.back().runtime.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+            EXPECT_EQ(fixture.configs.back().moe_routed_expert_plan->authority_execution,
+                MoEOverlayAuthorityExecutionKind::HostResident);
+
+            auto forbidden = inputs;
+            forbidden.back().host_demand_memory.emplace(MoEOverlayHostDemandGeometry{
+                .num_layers = fixture.families.back().routedLayerCapacity(),
+                .num_experts = fixture.model.expert_count, .top_k = fixture.model.expert_used_count,
+                .initial_window_rows = fixture.configs.back().moe_rebalance.window_size,
+                .maximum_window_rows = fixture.configs.back().moe_rebalance.max_window_size,
+                .maximum_invocation_rows = 32,
+                .publication = MoEOverlayDemandPublicationScope::ProcessLocal});
+            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::planPipeline(fixture.parent, forbidden),
+                std::invalid_argument);
+        }
 }
 
 /** @test The real fixed planner carries all caches and exactly the two channel leaders. */

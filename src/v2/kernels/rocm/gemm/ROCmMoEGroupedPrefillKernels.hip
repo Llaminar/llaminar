@@ -43,6 +43,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include "kernels/common/MoEGroupedDirectory.h"
 #include <hip/hip_fp16.h>
 #include <algorithm>
 #include <cstdint>
@@ -1170,15 +1171,16 @@ __device__ __forceinline__ float moe_prefill_dual_scale_subgroup_dot(
 namespace
 {
     /** Number of low bits reserved for an expert id in a packed work item. */
-    constexpr uint32_t kMoEPrefillExpertBits = 9u;
+    constexpr uint32_t kMoEPrefillExpertBits =
+        llaminar2::moe_grouped_directory::kExpertBits;
     /**
      * @brief Maximum descriptor-table width represented by the work directory.
      *
-     * Qwen 3.6 has 256 routed experts and one separate shared expert.  A
-     * verifier may economically publish those nine selected routes through one
-     * descriptor table, so the directory must admit expert id 256 rather than
-     * treating 256 as a hard table-size limit.  Nine id bits represent ids
-     * 0..511, hence 512 table entries without enlarging each packed work item.
+     * Flash Next has 512 routed experts and one separate shared expert.  A
+     * verifier may economically publish those eleven selected routes through one
+     * descriptor table, so the directory must admit expert id 512 rather than
+     * treating 512 as a hard table-size limit. Ten id bits represent ids
+     * 0..1023, hence 1024 table entries without enlarging each packed work item.
      */
     constexpr int kMoEPrefillMaxExperts =
         static_cast<int>(uint32_t{1} << kMoEPrefillExpertBits);
@@ -1253,7 +1255,7 @@ void moe_grouped_build_prefill_tile_directory_kernel(
 
     __shared__ int inclusive_tile_counts[kMoEPrefillMaxExperts];
     int count = tid < num_experts ? group_counts[tid] : 0;
-    if (count < 0)
+    if (count < 0 || static_cast<uint32_t>(count) > llaminar2::moe_grouped_directory::kMaximumRows)
     {
         if (tid < num_experts)
             moe_prefill_fail_fast_invalid_grouped_index();
@@ -1265,7 +1267,7 @@ void moe_grouped_build_prefill_tile_directory_kernel(
     // Hillis-Steele is deliberately used for this tiny 256-element directory:
     // its regular barriers are graph-capture friendly and much cheaper than a
     // lane-zero serial scan on gfx906.
-    for (int stride = 1; stride < kMoEPrefillMaxExperts; stride <<= 1)
+    for (int stride = 1; stride < static_cast<int>(blockDim.x); stride <<= 1)
     {
         const int addend = tid >= stride
                                ? inclusive_tile_counts[tid - stride]
@@ -1275,7 +1277,7 @@ void moe_grouped_build_prefill_tile_directory_kernel(
         __syncthreads();
     }
 
-    const int total_tiles = inclusive_tile_counts[kMoEPrefillMaxExperts - 1];
+    const int total_tiles = inclusive_tile_counts[blockDim.x - 1];
     if (total_tiles > max_directory_tiles)
     {
         if (tid == 0)
@@ -1380,7 +1382,7 @@ void moe_grouped_build_adaptive_prefill_tile_directory_kernel(
     __shared__ int inclusive_tile12_counts[kMoEPrefillMaxExperts];
     __shared__ int inclusive_tile16_counts[kMoEPrefillMaxExperts];
     int count = tid < num_experts ? group_counts[tid] : 0;
-    if (count < 0)
+    if (count < 0 || static_cast<uint32_t>(count) > llaminar2::moe_grouped_directory::kMaximumRows)
     {
         if (tid < num_experts)
             moe_prefill_fail_fast_invalid_grouped_index();
@@ -1398,7 +1400,7 @@ void moe_grouped_build_adaptive_prefill_tile_directory_kernel(
          */
         inclusive_tile12_counts[tid] = count > 0 && count != 16 ? 1 : 0;
         __syncthreads();
-        for (int stride = 1; stride < kMoEPrefillMaxExperts; stride <<= 1)
+        for (int stride = 1; stride < static_cast<int>(blockDim.x); stride <<= 1)
         {
             const int addend = tid >= stride
                                    ? inclusive_tile12_counts[tid - stride]
@@ -1408,7 +1410,7 @@ void moe_grouped_build_adaptive_prefill_tile_directory_kernel(
             __syncthreads();
         }
         gateup_all_active_counts_are_16 =
-            inclusive_tile12_counts[kMoEPrefillMaxExperts - 1] == 0;
+            inclusive_tile12_counts[blockDim.x - 1] == 0;
     }
 
     const int tile_rows = count > 0
@@ -1422,7 +1424,7 @@ void moe_grouped_build_adaptive_prefill_tile_directory_kernel(
     inclusive_tile16_counts[tid] = tile_rows == 16 ? expert_tiles : 0;
     __syncthreads();
 
-    for (int stride = 1; stride < kMoEPrefillMaxExperts; stride <<= 1)
+    for (int stride = 1; stride < static_cast<int>(blockDim.x); stride <<= 1)
     {
         const int tile12_addend = tid >= stride
                                       ? inclusive_tile12_counts[tid - stride]
@@ -1437,9 +1439,9 @@ void moe_grouped_build_adaptive_prefill_tile_directory_kernel(
     }
 
     const int total_tile12 =
-        inclusive_tile12_counts[kMoEPrefillMaxExperts - 1];
+        inclusive_tile12_counts[blockDim.x - 1];
     const int total_tile16 =
-        inclusive_tile16_counts[kMoEPrefillMaxExperts - 1];
+        inclusive_tile16_counts[blockDim.x - 1];
     if (total_tile12 > max_tile12_tiles || total_tile16 > max_tile16_tiles)
     {
         if (tid == 0)
@@ -3522,6 +3524,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     const bool executes_down = execution.executesDown();
     const int down_columns = execution.columnCount();
     if (num_experts <= 0 || num_experts > kMoEPrefillMaxExperts ||
+        static_cast<uint32_t>(total_slots) > llaminar2::moe_grouped_directory::kMaximumRows ||
         d_model <= 0 || intermediate <= 0 ||
         execution.modelColumns() != d_model ||
         total_slots <= 0 || top_k <= 0 || (total_slots % top_k) != 0 ||
@@ -3635,9 +3638,9 @@ bool rocmMoE_grouped_prefill_pipeline(
          * One thread owns one descriptor-table entry in the inclusive scan.
          * Launch the full representable width so inactive tail entries are
          * explicitly zero and the final scan element always contains the
-         * complete tile count, including expert id 256 and above.
+         * complete tile count, including expert id 512 and above.
          */
-        dim3 directory_block(kMoEPrefillMaxExperts);
+        dim3 directory_block(llaminar2::moe_grouped_directory::directoryThreads(num_experts));
         switch (tile_rows)
         {
         case 4:
@@ -3727,7 +3730,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         if (!view.valid())
             return {};
 
-        dim3 directory_block(kMoEPrefillMaxExperts);
+        dim3 directory_block(llaminar2::moe_grouped_directory::directoryThreads(num_experts));
         if (role == MoEPrefillProjectionRole::GateUp)
         {
             hipLaunchKernelGGL(

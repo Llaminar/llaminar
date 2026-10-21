@@ -11,6 +11,7 @@
  */
 
 #pragma once
+#include "snapshots/SnapshotInfo.h"
 
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "execution/prefix_cache/PrefixRestoreMetadata.h"
@@ -1137,40 +1138,6 @@ namespace llaminar2
         }
     };
 
-    /**
-     * @brief Lightweight view of a captured snapshot with 2D shape metadata
-     *
-     * Returned by getSnapshotWithShape() to provide shape information
-     * alongside the raw FP32 data pointer. The shape (rows, cols) comes
-     * from the stage's getDumpInfo() at capture time, so stages own their
-     * own dimension reporting. Production snapshot providers also attach a
-     * type-erased lifetime token: code that retains SnapshotInfo across a
-     * later graph callback, reset, or map replacement keeps the exact
-     * captured tensor alive through that token.
-     */
-    struct SnapshotInfo
-    {
-        const float *data = nullptr; ///< Pointer to immutable FP32 snapshot data.
-        size_t size = 0;             ///< Total element count (rows * cols)
-        size_t rows = 0;             ///< Logical rows (e.g. seq_len)
-        size_t cols = 0;             ///< Logical cols (e.g. hidden_dim, kv_dim, d_ff)
-
-        /**
-         * @brief Retains the publication backing data when the provider has ownership.
-         *
-         * SnapshotInfo remains a lightweight view, so this type-erased token
-         * avoids exposing SnapshotCapture storage through every runner
-         * interface. A null token is permitted for older mock/static providers
-         * whose runner itself owns the data for the caller's whole operation.
-         */
-        std::shared_ptr<const void> lifetime_owner;
-
-        /// Producer completeness belongs to these exact bytes, not to the key.
-        SnapshotPublication publication = SnapshotPublication::SchemaPartition;
-        SnapshotOwnedRows row_ownership; ///< Immutable observed row ownership; no inference authority.
-
-        explicit operator bool() const { return data != nullptr && size > 0; }
-    };
 
     /**
      * @brief Explicit reset contract for request-owned inference state.
@@ -5426,14 +5393,37 @@ namespace llaminar2
             return nullptr;
         }
 
+        /** @brief Exact setup frontier checked for independently owned PP stages. */
+        enum class MoEPipelineOwnershipValidation : std::uint8_t
+        {
+            OwnersBound, ///< Before prepared-bank finalization and graph materialization.
+            ServingMaterialized, ///< Every exact bank and native/host segment must be ready.
+        };
+
+        /**
+         * @brief Authenticate each PP stage against its own admitted authority.
+         * @param frontier Setup frontier, never an instruction to materialize or repair.
+         * @throws std::logic_error for a missing/foreign owner or required executable.
+         *
+         * A PP parent is not one overlay. CPU and GPU children may have different
+         * authority loci; TP siblings within a child must still agree. This
+         * validator observes setup identities only and does not read device state.
+         */
+        virtual void requireMoEPipelineRuntimeOwnership(MoEPipelineOwnershipValidation frontier) const
+        {
+            (void)frontier;
+            throw std::logic_error("MoE pipeline ownership validation requires a PP graph owner");
+        }
+
         /**
          * @brief Return where the sole ExpertOverlay authority executes.
          *
          * This is topology, not an optional capability bit. A runner that
          * participates in an ExpertOverlay graph returns the frozen selection
-         * carried by its graph configuration. Composite runners must require
-         * every participant to report the same selection; disagreement is an
-         * invalid graph family rather than permission to choose a fallback.
+         * carried by its graph configuration. TP composites require
+         * every sibling to report the same selection. Independent PP stages
+         * instead use requireMoEPipelineRuntimeOwnership(); a PP parent cannot
+         * collapse different stage authorities into one host/global owner.
          */
         virtual MoEOverlayAuthorityExecutionKind
         moeOverlayAuthorityExecution() const

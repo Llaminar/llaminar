@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include "GpuPreparedGemmHarness.h"
 #include "loaders/PreparedHalfWeights.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "QuantizedVerifierFormats.h"
 #include "ScopedGPUStream.h"
 #include "VerifierRowTestInventory.h"
@@ -60,7 +61,9 @@ namespace llaminar2::test
      * @param k Shared activation width.
      * @param columns QKV, Z, alpha and beta output widths.
      * @param cases Complete capture family retained over one workspace.
-     * @param control_precision Alpha/beta operands; native projections retain their codebooks.
+     * @param control_precision Alpha/beta operands; defaults retain native floating math.
+     * @param wide_precision Native original QKV/Z, or explicit half-RNE derivatives of their original decoder tiles.
+     * @param worker Actual worker for new retained captures; null only for existing legacy callers.
      */
     inline void runGDNProjectionCaptureCase(
         DeviceId device, IDeviceContext &context,
@@ -69,7 +72,9 @@ namespace llaminar2::test
         const QuantizedVerifierFormatCase &z_format,
         int k, std::array<int, 4> columns,
         std::span<const GDNProjectionCaptureRows> cases,
-        FloatingActivationOperandPrecision control_precision = FloatingActivationOperandPrecision::Native)
+        FloatingActivationOperandPrecision control_precision = FloatingActivationOperandPrecision::Native,
+        FloatingActivationOperandPrecision wide_precision = FloatingActivationOperandPrecision::Native,
+        IWorkerGPUContext *worker = nullptr)
     {
         ASSERT_FALSE(cases.empty());
         SCOPED_TRACE(::testing::Message() << qkv_format.label << "+"
@@ -89,18 +94,42 @@ namespace llaminar2::test
             {size_t(columns[2]), size_t(k)}, -0.125f, 0.125f, 98903);
         weights[3] = TestTensorFactory::createFP32Random(
             {size_t(columns[3]), size_t(k)}, -0.125f, 0.125f, 98904);
+        ASSERT_TRUE(wide_precision == FloatingActivationOperandPrecision::Native ||
+            wide_precision == FloatingActivationOperandPrecision::FP16RNE);
+        ASSERT_TRUE(wide_precision != FloatingActivationOperandPrecision::FP16RNE ||
+            control_precision == FloatingActivationOperandPrecision::FP16RNE);
+        const auto originals = weights;
+        if (wide_precision == FloatingActivationOperandPrecision::FP16RNE)
+            for (size_t i : {0u, 1u}) weights[i] = materializePreparedHalfWeights(*originals[i]);
         if (control_precision == FloatingActivationOperandPrecision::FP16RNE)
-            for (size_t i : {2u, 3u}) weights[i] = materializePreparedHalfWeights(*weights[i]);
+            for (size_t i : {2u, 3u}) weights[i] = materializePreparedHalfWeights(*originals[i]);
+        for (size_t i = 0; i < 4; ++i)
+        {
+            if ((i < 2 ? wide_precision : control_precision) != FloatingActivationOperandPrecision::FP16RNE)
+                continue;
+            ASSERT_NE(weights[i].get(), originals[i].get());
+            std::vector<float> decoded(originals[i]->numel());
+            originals[i]->to_fp32(decoded.data());
+            const auto *half = static_cast<const uint16_t *>(weights[i]->raw_data());
+            for (size_t j = 0; j < decoded.size(); ++j)
+                ASSERT_EQ(half[j], canonicalPreparedHalfBits(decoded[j]));
+        }
         const std::array<const char *, 4> names{"qkv", "z", "alpha", "beta"};
         std::array<GpuPreparedGemm, 4> prepared;
         std::array<std::unique_ptr<FP32Tensor>, 4> outputs;
         for (size_t i = 0; i < prepared.size(); ++i)
         {
             const std::string name = std::string("test.gdn.mixed.") + names[i];
-            prepared[i] = i < 2
+            const auto precision = i < 2 ? wide_precision : control_precision;
+            prepared[i] = i < 2 && precision == FloatingActivationOperandPrecision::Native
                 ? makeGpuPreparedGemm(weights[i].get(), device, name)
-                : makeGpuPreparedFloatingPointGemm(weights[i].get(), device, name, ModelContextId{9900}, control_precision);
+                : makeGpuPreparedFloatingPointGemm(weights[i].get(), device, name, ModelContextId{9900}, precision);
             ASSERT_NE(prepared[i].kernel, nullptr);
+            EXPECT_EQ(prepared[i].kernel->floatingActivationOperandPrecision(), precision);
+            if (precision == FloatingActivationOperandPrecision::FP16RNE)
+            {
+                ASSERT_EQ(weights[i]->native_type(), TensorType::FP16);
+            }
             outputs[i] = TestTensorFactory::createFP32Zeros(
                 {size_t(capacity), size_t(columns[i])});
             ASSERT_TRUE(outputs[i]->allocateOnDevice(device, stream));
@@ -131,8 +160,13 @@ namespace llaminar2::test
             stages.push_back(std::make_unique<GDNProjectionStage>(params));
             requirements.merge(stages.back()->getWorkspaceRequirements(row_case.rows, 0, k));
         }
-        DeviceWorkspaceManager workspace(device,
-            requirements.total_bytes_with_alignment() + 4096u);
+        const auto workspace_bytes = requirements.total_bytes_with_alignment();
+        PhysicalMemoryPlanBuilder memory_plan;
+        memory_plan.add({.world_rank = 0, .device = device, .total_bytes = workspace_bytes,
+            .admission_available_bytes = workspace_bytes}, PhysicalMemoryOwner::ExecutionWorkspace, workspace_bytes);
+        auto memory = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(memory_plan.build()), 0);
+        DeviceWorkspaceManager workspace(device, workspace_bytes, memory);
         ASSERT_TRUE(workspace.allocate(requirements));
         std::vector<std::unique_ptr<IGPUGraphCapture>> graphs;
         std::vector<std::array<std::vector<float>, 4>> expected(cases.size());
@@ -162,8 +196,13 @@ namespace llaminar2::test
             auto &stage = *stages[index];
             stage.bindWorkspace(&workspace);
             ASSERT_TRUE(stage.prepareGraphLaunch(&context, stream));
-            // Independent projection submission is only an untimed test oracle.
-            // Production execution below always captures the complete GDN stage.
+            // The oracle uses this SAME physical M and typed phase: ordinary
+            // rows use the ordinary per-matrix operation (including legal BLAS
+            // accumulation), never a serial-M1 assertion. Verifier rows use
+            // the serial-equivalent grouped contract. Fused ordinary half
+            // groups submit the same individual M/N/K operations after one
+            // exact half-A publication, so this checks grouping/retention bytes.
+            // Production execution below captures the complete GDN stage.
             for (size_t i = 0; i < prepared.size(); ++i)
             {
                 auto *kernel = prepared[i].kernel;
@@ -194,32 +233,37 @@ namespace llaminar2::test
                 {std::move(plan)}, "mixed native GDN projection regression");
             auto graph = graph_factory(stream);
             ASSERT_NE(graph, nullptr);
-            ScopedBackendGraphCapture transaction(*graph,
-                "mixed native GDN projection regression", &ledger);
-            ASSERT_TRUE(transaction.begin());
+            auto transaction = worker
+                ? std::make_unique<ScopedBackendGraphCapture>(*worker, *graph,
+                    "mixed native GDN projection regression", &ledger)
+                : std::make_unique<ScopedBackendGraphCapture>(*graph,
+                    "mixed native GDN projection regression", &ledger);
+            ASSERT_TRUE(transaction->begin());
             bool success = false;
             {
                 ScopedGraphCaptureStage scope(&stage);
                 success = stage.execute(&context);
                 if (success) scope.complete();
             }
-            transaction.finish();
+            transaction->finish();
             ASSERT_TRUE(success);
             ASSERT_TRUE(graph->instantiate());
             bool found_pair = false;
             for (const auto &record : PerfStatsCollector::snapshot({"kernel.gdn_projection_route"}))
             {
-                if (record.tags.at("names") == "qkv+z")
+                const bool full_half = wide_precision == FloatingActivationOperandPrecision::FP16RNE;
+                if (record.tags.at("names") == (full_half ? "qkv+z+alpha+beta" : "qkv+z"))
                 {
-                    EXPECT_EQ(record.tags.at("projections"), "2");
-                    EXPECT_EQ(record.tags.at("codebooks"),
+                    EXPECT_EQ(record.tags.at("projections"), full_half ? "4" : "2");
+                    EXPECT_EQ(record.tags.at("codebooks"), full_half ? "none+none+none+none" :
                         std::to_string(qkv_format.device_execution_codebook_id) + "+" +
                         std::to_string(z_format.device_execution_codebook_id));
                     found_pair = true;
                 }
             }
-            EXPECT_TRUE(found_pair) << "Native codebooks must retain one shared-quantization subgroup";
-            if (row_case.purpose == GDNProjectionRowsPurpose::Ordinary && row_case.rows > 16)
+            EXPECT_TRUE(found_pair) << "Actual prepared representation must own the complete compatible subgroup";
+            if (wide_precision == FloatingActivationOperandPrecision::Native &&
+                row_case.purpose == GDNProjectionRowsPurpose::Ordinary && row_case.rows > 16)
             {
                 const std::string counter = device.is_cuda()
                     ? "cuda_fused_projection_stream_pool_calls"

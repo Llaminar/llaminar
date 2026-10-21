@@ -29,6 +29,11 @@ namespace llaminar2
                               public IWorkspaceConsumer
     {
     public:
+        /** @copydoc IKVCache::acquireSparseAttentionNativeView */
+        qwen4exp::QwenSparseKV acquireSparseAttentionNativeView(
+            int layer, int sequence, const attention::AttentionDeviceParams *rows,
+            attention::AttentionKeyCachePolicy policy, void *stream) override;
+
         ROCmRingKVCacheTQ(int n_layers, int batch_size, int max_seq_len,
                           int n_kv_heads, int head_dim,
                           const TurboQuantContext *tq_ctx,
@@ -255,6 +260,7 @@ namespace llaminar2
         int kv_head_start_;    ///< First global head represented by local head zero.
         TurboQuantKVMode mode_; ///< Immutable storage policy resolved before capture.
 
+        const float *native_centroids_ = nullptr; ///< Construction-bound canonical device codebook.
         ROCmTurboQuantRotations rotations_;
 
         std::vector<std::vector<TQEntry>> entries_;

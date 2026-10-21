@@ -1102,20 +1102,23 @@ TEST(Test__CUDAHiddenStateRowSelectStage,
         GTEST_SKIP() << "No CUDA device available";
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 
+    for(const auto origin:{MTPShiftedCacheOrigin::SuccessorPairsOnly,MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero})
+    for(const int d_model:{32,10240}) {
+    SCOPED_TRACE(static_cast<int>(origin));
+    SCOPED_TRACE(d_model);
     const DeviceId device = DeviceId::cuda(0);
     constexpr int seq_capacity = 24;
-    constexpr int d_model = 32;
     constexpr int request_index = 1;
     constexpr int selected_row_count = 3;
     const int32_t initial_stride = 10;
     const std::vector<int32_t> initial_lengths{7, 8};
     const int32_t initial_main_count = 20;
-    const int32_t initial_shifted_count = 14;
+    const int32_t initial_shifted_count = 14+(origin==MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero?1:0);
     const std::vector<int> initial_rows{12, 13, 14};
     const int32_t replay_stride = 8;
     const std::vector<int32_t> replay_lengths{5, 6};
     const int32_t replay_main_count = 31;
-    const int32_t replay_shifted_count = 28;
+    const int32_t replay_shifted_count = 28+(origin==MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero?1:0);
     const std::vector<int> replay_rows{11, 12, 13};
 
     cudaStream_t stream = nullptr;
@@ -1190,6 +1193,7 @@ TEST(Test__CUDAHiddenStateRowSelectStage,
 
     HiddenStateRowsSelectStage::Params params;
     params.device_id = device;
+    params.shifted_cache_origin=origin;
     params.input = hidden.get();
     params.output = scratch.get();
     params.seq_len = seq_capacity;
@@ -1272,6 +1276,7 @@ TEST(Test__CUDAHiddenStateRowSelectStage,
     cudaFree(main_count_device);
     cudaFree(shifted_count_device);
     cudaStreamDestroy(stream);
+    }
 #endif
 }
 

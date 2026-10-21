@@ -13,6 +13,10 @@
 
 #include "InferenceRunnerFactory.h"
 #include "backends/HostMemoryCapacity.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "loaders/ResidentImmutableRowTable.h"
+#include "models/qwen4exp/Qwen4ExpConfig.h"
+#include "transfer/TransferEngine.h"
 #include "loaders/GPUHostLoadPreflight.h"
 #include "loaders/GPUVramPreflight.h"
 #include "EagerWeightValidator.h"
@@ -24,6 +28,7 @@
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../local_execution/graph/GraphBuilderRegistry.h"
 #include "../../models/IGraphConfigBuilder.h"
+#include "../../models/TerminalInputWeights.h"
 #include "../local_execution/graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config
 #include "../local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "../../loaders/ModelContext.h"
@@ -100,7 +105,7 @@ namespace llaminar2
             return true;
 
         const bool cpu_expert_family = graph_config.default_device.is_cpu() &&
-            architecture == "qwen35moe" && graph_config.moe.num_experts > 0;
+            (architecture == "qwen35moe" || architecture == "qwen4exp") && graph_config.moe.num_experts > 0;
         if (!cpu_expert_family && !graph_config.requiresEagerWorkspaceFamilyManifest())
             return true;
 
@@ -226,6 +231,68 @@ namespace llaminar2
             return weight_manager
                        ? weight_manager->physicalMemoryAuthority()
                        : nullptr;
+        }
+
+        /**
+         * @brief Materialize a participant's lowest-priority table after ordinary weight preparation.
+         * @param context Model lifetime owner shared across graph families and TP participants.
+         * @param graph Exact final participant geometry and concrete placement from admission.
+         *
+         * A fresh whole-source or fixed-range VRAM owner borrows the released ordinary-loader slot on an
+         * explicit setup stream. Each consumer has its own immutable bank;
+         * ModelContext joins duplicate setup calls and authenticates one source
+         * generation across copies. Reuse requires the same placement/PMA and
+         * performs no new allocation or payload transfer.
+         */
+        void prepareParticipantImmutableRowTable(
+            const std::shared_ptr<IModelContext> &context, const GraphConfig &graph)
+        {
+            if (!graph.flash_next) return;
+            const int ple = static_cast<int>(graph.flash_next->ngrams().decoder_layer);
+            if (ple < graph.pp_layer_offset || ple >= graph.pp_layer_offset + graph.n_layers) return;
+            const auto &placement = graph.ngram_table_placement;
+            if (!placement)
+                throw std::logic_error("PLE participant reached weight completion without admitted ngram placement");
+            const auto model = std::dynamic_pointer_cast<ModelContext>(context);
+            const auto memory = physicalMemoryAuthorityForModel(context);
+            if (!model || !memory || memory->worldRank() != placement->worldRank())
+                throw std::logic_error("PLE materialization requires its exact model and rank memory authority");
+            const DeviceId device = graph.default_device;
+            const auto execution = placement->lookupForConsumer({memory->worldRank(), device});
+            auto &transfers = TransferEngine::instance();
+            if(execution==ImmutableRowLookupExecution::AdaptiveGPUCache)
+            {
+                if(model->adaptiveImmutableLookupBoundary(device))
+                {
+                    model->prepareImmutableRowTableForConsumer(*placement,memory,device,std::nullopt,transfers);
+                    return;
+                }
+                auto &worker=GPUDeviceContextPool::instance().getContext(device);
+                worker.submitAndWait([&] {
+                    void *stream=worker.getOrCreateAuxiliaryStream("immutable_adaptive_lookup_metadata");
+                    if(!stream)throw std::runtime_error("Adaptive ngram setup has no exact worker-owned stream");
+                    model->prepareImmutableRowTableForConsumer(*placement,memory,device,std::nullopt,transfers,
+                        AdaptiveImmutableLookupDevicePreparation{device,stream});
+                });
+                return;
+            }
+            if (!immutableRowLookupUsesNativeDeviceStorage(execution) || model->residentImmutableRowTable(device))
+            {
+                model->prepareImmutableRowTableForConsumer(*placement, memory, device, std::nullopt, transfers);
+                return;
+            }
+            const auto weights = model->concreteWeightManager();
+            if (!weights)
+                throw std::logic_error("Resident ngram materialization lost its ordinary weight-loader authority");
+            const auto staging = weights->releasedWeightLoadStaging(device);
+            auto &worker = GPUDeviceContextPool::instance().getContext(device);
+            worker.submitAndWait([&] {
+                void *stream = worker.getOrCreateAuxiliaryStream("immutable_native_table_upload");
+                if (!stream)
+                    throw std::runtime_error("Resident ngram setup could not create its explicit upload stream");
+                model->prepareImmutableRowTableForConsumer(*placement, memory, device,
+                    ImmutableRowTableDevicePreparation{device, stream, staging}, transfers);
+            });
         }
 
         /**
@@ -1614,7 +1681,7 @@ namespace llaminar2
 
         WeightManagerConfig wm_config;
         wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
-        if (architecture == "qwen35moe")
+        if (architecture == "qwen35moe" || architecture == "qwen4exp")
         {
             for (auto &pattern : wm_config.sharding.patterns)
             {
@@ -2016,15 +2083,17 @@ namespace llaminar2
         if ((!sidecar_subset_only || options.include_replicated_terminal_head) &&
             (!pp_config || pp_config->has_lm_head))
         {
-            plan.add(makeSingleDeviceRequirement(
-                weight_mgr,
-                "output_norm.weight",
-                device,
-                true,
-                WeightRole::OutputNorm,
-                {},
-                WeightDerivationKind::Source,
-                lookup_device,
+            const auto schema = SchemaFactoryRegistry::getFactory(model_ctx.architecture());
+            for (const char *name : schema->terminalInputWeightNames())
+                plan.add(makeSingleDeviceRequirement(
+                    weight_mgr,
+                    name,
+                    device,
+                    true,
+                    inferWeightRole(name),
+                    {},
+                    WeightDerivationKind::Source,
+                    lookup_device,
                     tp_rank_or_device_index,
                     tp_domain,
                     pp_stage));
@@ -3009,6 +3078,9 @@ namespace llaminar2
         graph_config.tp_allreduce_precision_override =
             config.tp_allreduce_precision_override;
         graph_config.prefix_cache = config.prefix_cache;
+        graph_config.ngram_table_policy = config.ngram_table_policy;
+        graph_config.ngram_table_placement = config.ngram_table_placement;
+        graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
         LOG_DEBUG("[InferenceRunner] KV cache scale: K=" << graph_config.kv_cache_scale_k
                                                          << ", V=" << graph_config.kv_cache_scale_v);
@@ -3464,6 +3536,8 @@ namespace llaminar2
 
         LOG_DEBUG("[InferenceRunner] DeviceGraphOrchestrator created successfully");
 
+        prepareParticipantImmutableRowTable(model_ctx, graph_config);
+
         if (!materializeIndependentFactoryGraphFamily(
                 *orchestrator, config, graph_config, architecture))
             return nullptr;
@@ -3568,7 +3642,8 @@ namespace llaminar2
             global_weights.push_back("token_embd.weight");
         if (!pp_scope || pp_scope->has_lm_head)
         {
-            global_weights.push_back("output_norm.weight");
+            const auto terminal_weights = schema_factory->terminalInputWeightNames();
+            global_weights.insert(global_weights.end(), terminal_weights.begin(), terminal_weights.end());
             global_weights.push_back("output.weight");
         }
 
@@ -3823,7 +3898,7 @@ namespace llaminar2
 
         if (((!pp_scope || pp_scope->has_embedding) && !legacy_weights.embedding_table) ||
             ((!pp_scope || pp_scope->has_lm_head) &&
-             (!legacy_weights.final_norm || !legacy_weights.lm_head)))
+             (!hasRequiredTerminalInputWeights(graph_config, legacy_weights) || !legacy_weights.lm_head)))
         {
             LOG_ERROR("[InferenceRunner] Missing global weights");
             return false;
@@ -4111,6 +4186,9 @@ namespace llaminar2
         graph_config.tp_allreduce_precision_override =
             config.tp_allreduce_precision_override;
         graph_config.prefix_cache = config.prefix_cache;
+        graph_config.ngram_table_policy = config.ngram_table_policy;
+        graph_config.ngram_table_placement = config.ngram_table_placement;
+        graph_config.ngram_replicated_ple_cohort = config.ngram_replicated_ple_cohort;
         graph_config.mtp = config.mtp;
 
         // TurboQuant context for TQ4/TQ KV cache
@@ -4353,9 +4431,10 @@ namespace llaminar2
                 LOG_ERROR("[InferenceRunner] Frozen PP stage has_embedding=true but embedding missing");
                 return nullptr;
             }
-            if (pp_cfg.has_lm_head && (!legacy_weights.final_norm || !legacy_weights.lm_head))
+            if (pp_cfg.has_lm_head &&
+                (!hasRequiredTerminalInputWeights(graph_config, legacy_weights) || !legacy_weights.lm_head))
             {
-                LOG_ERROR("[InferenceRunner] Frozen PP stage has_lm_head=true but final_norm/lm_head missing");
+                LOG_ERROR("[InferenceRunner] Frozen PP stage has_lm_head=true but terminal input or vocabulary head weights are missing");
                 return nullptr;
             }
 
@@ -4569,7 +4648,8 @@ namespace llaminar2
                 auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
                 auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
-                if (!legacy_weights.embedding_table || !legacy_weights.final_norm || !legacy_weights.lm_head)
+                if (!legacy_weights.embedding_table ||
+                    !hasRequiredTerminalInputWeights(graph_config, legacy_weights) || !legacy_weights.lm_head)
                 {
                     LOG_ERROR("[InferenceRunner] Missing global weights from materialized LocalTP bindings");
                     return nullptr;
@@ -4732,7 +4812,8 @@ namespace llaminar2
                 // Full model: load all global weights
                 auto weights = config_builder->buildWeights(load_weight_for_runner);
 
-                if (!weights.embedding_table || !weights.final_norm || !weights.lm_head)
+                if (!weights.embedding_table ||
+                    !hasRequiredTerminalInputWeights(graph_config, weights) || !weights.lm_head)
                 {
                     LOG_ERROR("[InferenceRunner] Missing global weights from IModelContext");
                     return nullptr;
@@ -4775,6 +4856,8 @@ namespace llaminar2
                 orchestrator->initializePreparedWeightStore(device);
             }
         }
+
+        prepareParticipantImmutableRowTable(model_ctx, graph_config);
 
         if (!materializeIndependentFactoryGraphFamily(
                 *orchestrator, config, graph_config, architecture))

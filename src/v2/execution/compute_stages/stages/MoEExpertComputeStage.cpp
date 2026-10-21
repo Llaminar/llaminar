@@ -1416,6 +1416,17 @@ namespace llaminar2
          * both ownership regimes.
          */
         sparse_overlay_route_width_capacity_ = params_.top_k;
+        switch (params_.canonical_route_diagnostic_publication)
+        {
+        case MoECanonicalRouteDiagnosticPublication::CompleteBank:
+            break;
+        case MoECanonicalRouteDiagnosticPublication::ContinuationLocalBank:
+            if (!params_.canonical_route_contributions)
+                throw std::invalid_argument("Local canonical route diagnostics require their authored bank");
+            break;
+        default:
+            throw std::invalid_argument("Unknown canonical route diagnostic publication identity");
+        }
         if (params_.expert_weight_resolution_policy ==
                 MoEExpertWeightResolutionPolicy::PreparedRegistryOnly &&
             (params_.gate_exps || params_.up_exps || params_.down_exps))
@@ -9046,7 +9057,9 @@ namespace llaminar2
              * a stale alias from a previous request.
              */
             info.addOutput(
-                "canonical_route_contributions",
+                params_.canonical_route_diagnostic_publication ==
+                        MoECanonicalRouteDiagnosticPublication::ContinuationLocalBank
+                    ? "local_canonical_route_contributions" : "canonical_route_contributions",
                 params_.canonical_route_contributions,
                 static_cast<size_t>(params_.seq_len) *
                     static_cast<size_t>(params_.top_k),

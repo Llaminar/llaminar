@@ -497,7 +497,8 @@ namespace llaminar2
     }
 
     BootstrapResult MPIBootstrapPhase::execute(const OrchestrationConfig &config,
-                                               int argc, char *argv[])
+                                               int argc, char *argv[],
+                                               MPIBootstrapArgumentPolicy arguments)
     {
         const auto device_intent = installDeviceStartupIntent(config);
         const bool automatic_multi_rank_discovery =
@@ -526,7 +527,7 @@ namespace llaminar2
             if (config.mpi_dry_run)
             {
                 for (const auto &argument : MPIBootstrap::buildMPIRunCommand(
-                         argc, argv, launch, cpu_topology))
+                         argc, argv, launch, cpu_topology, arguments))
                     std::cout << argument << ' ';
                 std::cout << '\n';
                 return {BootstrapResult::Action::EXIT, 0};
@@ -534,7 +535,7 @@ namespace llaminar2
             // No unresolved auto plan can narrow the discovery namespace to
             // the launcher's NUMA-0 default. MPI starts the requested ranks;
             // their actual CPU/GPU inventory is gathered after initialization.
-            const int result = MPIBootstrap::selfLaunchMPI(argc, argv, launch, cpu_topology);
+            const int result = MPIBootstrap::selfLaunchMPI(argc, argv, launch, cpu_topology, arguments);
             return {BootstrapResult::Action::EXIT, result < 0 ? 1 : result};
         }
 
@@ -712,7 +713,7 @@ namespace llaminar2
         MPIBootstrap::printConfigurationSummary(cpu_topology, launch_config, mpi_env);
 
         // Self-launch via mpirun (replaces current process)
-        int result = MPIBootstrap::selfLaunchMPI(argc, argv, launch_config, cpu_topology);
+        int result = MPIBootstrap::selfLaunchMPI(argc, argv, launch_config, cpu_topology, arguments);
 
         // If we get here, exec failed
         LOG_ERROR("Failed to self-launch via mpirun");

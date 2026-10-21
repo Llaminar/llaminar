@@ -7,10 +7,17 @@
  * calls occur; these are policy/geometry proofs before physical admission.
  */
 #include "planning/RankMemoryPlanInputs.h"
+#include "planning/PlanningModelMetadata.h"
+#include "planning/KVCacheMemoryEstimator.h"
+#include "kernels/attention/AttentionHeadMapping.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "config/OrchestrationConfig.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <gtest/gtest.h>
 #include <limits>
+#include <algorithm>
+#include <vector>
 
 using namespace llaminar2;
 
@@ -206,9 +213,9 @@ TEST(RankMemoryPlanInputs, SnapshotInventoryCoversTheWholeRetainedFamily)
             ASSERT_TRUE(cfg.graph_snapshot_memory.effective_kv);
             EXPECT_EQ(cfg.graph_snapshot_memory.per_accelerator_bytes, 8192u);
             EXPECT_EQ(cfg.graph_snapshot_memory.effective_kv->retained_arena_count,
-                cfg.captured_serving_graphs.prefill_bucket_rows.size() +
-                cfg.captured_serving_graphs.fixed_executable_count +
-                cfg.captured_serving_graphs.mtp_graph_owners.sidecarGraphSlots());
+                cfg.graph_snapshot_memory.serving_arenas->allOwners());
+            EXPECT_EQ(cfg.graph_snapshot_memory.retained_main_forward_arena_count,
+                cfg.graph_snapshot_memory.serving_arenas->mainOwners());
         }
     }
 }
@@ -384,11 +391,105 @@ TEST(RankMemoryPlanInputs, NativePipelineMemoryIsNotTensorParallelScratch)
     }
 }
 
-TEST(RankMemoryPlanInputs, ImpossibleGQAShardCannotBecomeAnAdmissibleCandidate)
+/** @test One local query over replicated KV retains its exact global ownership and complete cache capacity. */
+TEST(RankMemoryPlanInputs, SingleQueryReplicatedKVShardRetainsExactOwnershipAndCapacity)
 {
-    Fixture fixture(DeviceType::CUDA, 8);
-    fixture.model.n_heads = 8; // Replicated two-head GQA needs at least two Q heads per shard.
-    EXPECT_THROW(buildRankMemoryPlanInputs(fixture.request()), std::invalid_argument);
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        for (const bool reversed : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << static_cast<int>(backend) << " reversed=" << reversed);
+            Fixture fixture(backend, 8);
+            fixture.model.n_heads = 8;
+            if (reversed)
+            {
+                std::reverse(fixture.plan.local_tp_devices.begin(), fixture.plan.local_tp_devices.end());
+                fixture.plan.primary_device = fixture.plan.local_tp_devices.front();
+            }
+            const auto configs = buildRankMemoryPlanInputs(fixture.request());
+            ASSERT_EQ(configs.size(), 8u);
+            const auto memory = MemoryPlanner::plan(fixture.model, configs);
+            ASSERT_TRUE(memory.fits());
+            EXPECT_NO_THROW((void)memory.admit());
+            /** @brief Independent logical cache requirements grouped by the actual allocator. */
+            struct ExpectedCacheOwner
+            {
+                PhysicalMemoryAllocatorIdentity identity;
+                size_t bytes = 0;
+                size_t participants = 0;
+            };
+            std::vector<ExpectedCacheOwner> expected_owners;
+            for (int participant = 0; participant < 8; ++participant)
+            {
+                const auto &cfg = configs[participant];
+                ASSERT_TRUE(cfg.tensor_parallel_assignment);
+                const auto &assignment = *cfg.tensor_parallel_assignment;
+                const auto device = fixture.plan.local_tp_devices[participant].toLocalDeviceId();
+                EXPECT_EQ(cfg.device, device);
+                EXPECT_EQ(assignment.device, device);
+                EXPECT_EQ(cfg.shard_index, participant);
+                EXPECT_EQ(assignment.local_rank, participant);
+                EXPECT_EQ(assignment.head_start, participant);
+                EXPECT_EQ(assignment.head_count, 1);
+                EXPECT_EQ(assignment.kv_head_start, 0);
+                EXPECT_EQ(assignment.kv_head_count, 2);
+                EXPECT_EQ(cfg.local_kv_heads, 2);
+                EXPECT_TRUE(attention::isValidHeadMapping({1, 2, participant, 4}));
+                const auto expected = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
+                    4, 1, 4096, 2, fixture.model.head_dim, cfg.kv_precision, device);
+                EXPECT_GT(expected, 0u);
+                const PhysicalMemoryAllocatorIdentity identity{cfg.world_rank, device};
+                auto owner = std::find_if(expected_owners.begin(), expected_owners.end(),
+                    [&](const auto &entry) { return entry.identity == identity; });
+                if (owner == expected_owners.end())
+                {
+                    expected_owners.push_back({identity, expected, 1});
+                }
+                else
+                {
+                    ASSERT_LE(expected, std::numeric_limits<size_t>::max() - owner->bytes);
+                    owner->bytes += expected;
+                    ++owner->participants;
+                }
+            }
+            // Logical CPU roles share the rank host allocator; GPU ordinals own distinct banks.
+            const size_t expected_owner_count = backend == DeviceType::CPU ? 1 : 8;
+            const size_t expected_participants_per_owner = backend == DeviceType::CPU ? 8 : 1;
+            ASSERT_EQ(expected_owners.size(), expected_owner_count);
+            EXPECT_EQ(std::count_if(memory.devices.begin(), memory.devices.end(),
+                [](const auto &entry) { return entry.kv_cache_bytes() > 0; }), expected_owner_count);
+            const auto &physical_resources = memory.physicalPlan().resources();
+            EXPECT_EQ(std::count_if(physical_resources.begin(), physical_resources.end(),
+                [](const auto &entry) { return entry.bytes(PhysicalMemoryOwner::KVCache) > 0; }),
+                expected_owner_count);
+            for (const auto &expected : expected_owners)
+            {
+                EXPECT_EQ(expected.participants, expected_participants_per_owner);
+                const auto planned = std::find_if(memory.devices.begin(), memory.devices.end(),
+                    [&](const auto &entry)
+                    {
+                        const auto &resource = entry.bom().resource();
+                        return resource.world_rank == expected.identity.world_rank &&
+                               resource.device == expected.identity.device;
+                    });
+                ASSERT_NE(planned, memory.devices.end());
+                EXPECT_EQ(planned->kv_cache_bytes(), expected.bytes);
+                const auto *owner = memory.physicalPlan().find(expected.identity);
+                ASSERT_NE(owner, nullptr);
+                EXPECT_EQ(owner->bytes(PhysicalMemoryOwner::KVCache), expected.bytes);
+            }
+        }
+}
+
+/** @test Fewer global queries than participants still leaves an invalid empty shard. */
+TEST(RankMemoryPlanInputs, EmptyQueryParticipantCannotBecomeAnAdmissibleCandidate)
+{
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    {
+        Fixture fixture(backend, 8);
+        fixture.model.n_heads = 4; // Integral global4/2 GQA still leaves four query-empty participants.
+        ASSERT_EQ(fixture.model.n_heads % fixture.model.n_kv_heads, 0);
+        EXPECT_THROW(buildRankMemoryPlanInputs(fixture.request()), std::invalid_argument);
+    }
 }
 
 /** @test Reverse vendor order and uneven TP domains assign channels only to actual leaders. */
@@ -469,5 +570,89 @@ TEST(RankMemoryPlanInputs, NativeVocabularyPublicationFollowsResolvedOwnership)
         earlier.plan.has_lm_head = false;
         for (const auto &cfg : buildRankMemoryPlanInputs(earlier.request()))
             EXPECT_EQ(cfg.terminalLogitsCollective(false), MTPTerminalLogitsCollective::None);
+    }
+}
+
+/** @test Requested Automatic never becomes unresolved runtime storage during base row planning. */
+TEST(RankMemoryPlanInputs, NgramStorageElectsOneRankOwnerAndKeepsExactUserPolicy)
+{
+    for (const auto backend : {DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
+        for (const int degree : {1,2})
+        {
+            Fixture fixture(backend,degree);
+            fixture.model.flash_next.emplace();fixture.model.flash_next->ple_decoder_layer=1;
+            fixture.plan.runtime.ngram_table_policy={ImmutableRowStoragePreference::MemoryMapped,131072,7};
+            const auto configs=buildRankMemoryPlanInputs(fixture.request());
+            for (const auto &cfg:configs)
+            {
+                EXPECT_FALSE(cfg.ngram_table_placement);
+                if (cfg.device.is_gpu()) ASSERT_TRUE(cfg.associated_host_memory);
+            }
+            EXPECT_EQ(fixture.plan.runtime.ngram_table_policy.storage,ImmutableRowStoragePreference::MemoryMapped);
+        }
+}
+
+
+/** @test Snapshot BOM lanes match the production signature reuse policy, including distinct decode inputs. */
+TEST(RankMemoryPlanInputs, SnapshotRolesMatchActualForwardSignatureSharing)
+{
+    using Class=DeviceGraphExecutor::GraphSnapshotArenaReuseClass;
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}) {
+        ForwardGraphSignature prefill;prefill.device=device;prefill.seq_len=9;
+        prefill.execution_role=ForwardExecutionRole::MainInference;
+        EXPECT_EQ(graphSnapshotArenaReusePolicyForSignature(prefill).reuse_class,Class::PrefillOrMTPVerifierAlternative);
+        auto history=prefill;history.decode=true;history.seq_len=1;
+        auto resident=history;
+        int32_t history_token=0,resident_token=0;
+        history.device_token_ids=&history_token;resident.device_token_ids=&resident_token;
+        EXPECT_FALSE(history==resident);
+        EXPECT_EQ(graphSnapshotArenaReusePolicyForSignature(history).reuse_class,Class::Dedicated);
+        EXPECT_EQ(graphSnapshotArenaReusePolicyForSignature(resident).reuse_class,Class::Dedicated);
+        auto verifier=prefill;verifier.execution_role=ForwardExecutionRole::GroupedMTPVerifier;
+        EXPECT_EQ(graphSnapshotArenaReusePolicyForSignature(verifier).reuse_class,
+            graphSnapshotArenaReusePolicyForSignature(prefill).reuse_class);
+        auto condition=history;condition.execution_role=ForwardExecutionRole::MTPCondition;
+        EXPECT_EQ(graphSnapshotArenaReusePolicyForSignature(condition).reuse_class,Class::MTPConditionAlternative);
+        const auto arenas=ServingSnapshotArenaInventory::ordinary(true,false,0,0);
+        EXPECT_EQ(arenas.mainOwners(),3u);
+    }
+}
+
+/** @test Canonical ordered TP declaration supplies provenance; sorted physical IDs cannot replace it. */
+TEST(RankMemoryPlanInputs, FixedHeadDistributionUsesActualDeclarationOrderAndRejectsOtherTopologies)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource source(file.path());
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(const int degree:{2,4,8})
+    {
+        Fixture f(backend,degree);f.model=source.metadata().memoryProfile();f.plan.last_layer=47;
+        f.plan.runtime.ngram_table_policy={ImmutableRowStoragePreference::VRAM};
+        f.plan.runtime.ngram_table_policy.distribution=ImmutableRowTableDistribution::FixedHeadSharded;
+        std::reverse(f.plan.local_tp_devices.begin(),f.plan.local_tp_devices.end());
+        f.plan.primary_device=f.plan.local_tp_devices.front();
+        const auto configs=buildRankMemoryPlanInputs(f.request());ASSERT_EQ(configs.size(),degree);
+        for(int p=0;p<degree;++p)
+        {
+            EXPECT_EQ(configs[p].device,f.plan.local_tp_devices[p].toLocalDeviceId());
+            EXPECT_EQ(configs[p].shard_index,p);
+            EXPECT_EQ(configs[p].ngram_tp_topology,ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal);
+        }
+        for(int failure=0;failure<9;++failure)
+        {
+            auto bad=f;
+            switch(failure)
+            {
+            case 0:bad.plan.local_pp_devices=bad.plan.local_tp_devices;break;
+            case 1:bad.plan.prev_rank=1;break;
+            case 2:bad.plan.first_layer=1;break;
+            case 3:bad.plan.has_embedding=false;break;
+            case 4:bad.plan.local_tp_devices[0]=GlobalDeviceAddress::cpu(0,"node");break;
+            case 5:bad.plan.local_tp_devices[0]=GlobalDeviceAddress::fromLocalDeviceId(
+                DeviceId(backend==DeviceType::CUDA?DeviceType::ROCm:DeviceType::CUDA,0),"node",0);break;
+            case 6:bad.plan.local_tp_devices.resize(1);break;
+            case 7:bad.plan.local_tp_devices[0].hostname="foreign-host";break;
+            case 8:bad.plan.runtime.ngram_table_policy.storage=ImmutableRowStoragePreference::Automatic;break;
+            }
+            EXPECT_THROW((void)buildRankMemoryPlanInputs(bad.request()),std::invalid_argument)<<failure;
+        }
     }
 }

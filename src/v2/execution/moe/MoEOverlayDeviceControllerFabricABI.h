@@ -11,6 +11,7 @@
 #pragma once
 
 #include "MoEOverlayDeviceControllerABI.h"
+#include "DeviceMoERuntimeABI.h"
 #include "DeviceMoEOverlayServiceTelemetry.h"
 
 #include <cstddef>
@@ -25,7 +26,7 @@ namespace llaminar2
 
     /** Version of every fixed-width fabric record in this header. */
     inline constexpr std::uint32_t kMoEOverlayDeviceControllerFabricVersion =
-        18u;
+        19u;
 
     /** Snapshot and durable history planes: decode, prefill, grouped verifier. */
     inline constexpr std::uint32_t
@@ -64,7 +65,7 @@ namespace llaminar2
 
     /** Maximum logical experts addressable in one mapped snapshot layer. */
     inline constexpr std::uint32_t
-        kMoEOverlayDeviceControllerFabricMaxExperts = 256u;
+        kMoEOverlayDeviceControllerFabricMaxExperts = moe_runtime_abi::kMaxExperts;
 
     /** Setup-only host lifecycle; inference never mutates this state. */
     enum class MoEOverlayDeviceControllerFabricSetupState : std::uint32_t

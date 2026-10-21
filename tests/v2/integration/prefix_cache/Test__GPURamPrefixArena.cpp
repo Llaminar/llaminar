@@ -131,7 +131,7 @@ namespace
         /** @brief Enqueue the retained producer and its real archive DMA behind an optional gate. */
         void produce(PrefixBlockHandle &handle, size_t lane, uint32_t generation = 0u)
         {
-            require(handle.payload_readiness->prepare(ready[lane], device, streams[lane]),
+            require(handle.payload_readiness->prepare(ready[lane], device, streams[lane], *backend),
                     "prepare exact archive edge");
             if (generation)
                 require(hold(lane, generation), "enqueue held producer frontier");

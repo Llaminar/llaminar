@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 #include "config/TensorParallelConfig.h"
+#include "kernels/attention/AttentionHeadMapping.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "tensors/ITensor.h"
@@ -341,18 +342,25 @@ namespace llaminar2
             EXPECT_EQ(config.worldSize(), 3);
             EXPECT_TRUE(config.validate()) << config.validationError();
 
-            // 14 heads / 3 with GQA alignment (n_kv_heads=2) → multiples of 2
-            // Expected: [6, 4, 4] (first device gets extra aligned chunk)
+            // Full replicated KV uses global14/2 grouping. Exact unequal
+            // local Q widths may be odd; their global intervals own the mapping.
             int total_heads = 0;
+            int odd_shards = 0;
             for (int i = 0; i < 3; ++i)
             {
                 const auto &a = config.forRank(i);
+                EXPECT_EQ(a.head_start, total_heads);
+                EXPECT_GE(a.head_count, 4);
+                EXPECT_LE(a.head_count, 5);
+                EXPECT_EQ(a.kv_head_start, 0);
+                EXPECT_EQ(a.kv_head_count, TEST_KV_HEADS);
+                EXPECT_TRUE(attention::isValidHeadMapping({a.head_count,
+                    a.kv_head_count, a.head_start, TEST_HEADS / TEST_KV_HEADS}));
                 total_heads += a.head_count;
-                EXPECT_EQ(a.head_count % TEST_KV_HEADS, 0)
-                    << "Rank " << i << " head_count=" << a.head_count
-                    << " must be divisible by n_kv_heads=" << TEST_KV_HEADS;
+                odd_shards += a.head_count % 2;
             }
             EXPECT_EQ(total_heads, TEST_HEADS);
+            EXPECT_EQ(odd_shards, 2);
         }
 
         TEST_F(Test__TensorParallelConfig_LocalTP, FromLocalTPContext_ThreeDevices_ProportionalSplit)

@@ -26,6 +26,9 @@
 #include "v2/utils/DebugEnv.h"
 #include "v2/utils/MPIContext.h"
 #include "kernels/attention/AttentionWorkspaceContract.h"
+#include "kernels/attention/AttentionHeadMapping.h"
+#include "config/TensorParallelConfig.h"
+#include <limits>
 #include <omp.h>
 
 #ifdef HAVE_CUDA
@@ -715,6 +718,109 @@ namespace
         for (size_t i = 0; i < total_q; ++i)
         {
             EXPECT_TRUE(std::isfinite(out_data[i])) << "Output[" << i << "] = " << out_data[i] << " should be finite";
+        }
+    }
+
+    /** @test The common guard accepts odd global mappings and rejects malformed bounds without integer overflow. */
+    TEST(AttentionHeadMapping, OriginalGlobalIntervalsAndMalformedBounds)
+    {
+        for (const int start : {0, 3, 6, 9, 12, 15, 18, 21})
+            EXPECT_TRUE(attention::isValidHeadMapping({3, 2, start, 12}));
+        // Unequal GQA partitions can straddle the global KV group boundary.
+        EXPECT_TRUE(attention::isValidHeadMapping({5, 2, 5, 7}));
+        EXPECT_TRUE(attention::isValidHeadMapping({4, 2, 0, 0}));
+        EXPECT_FALSE(attention::isValidHeadMapping({3, 2, 0, 0}));
+        EXPECT_FALSE(attention::isValidHeadMapping({3, 2, 22, 12}));
+        EXPECT_FALSE(attention::isValidHeadMapping({1, 2, 24, 12}));
+        EXPECT_FALSE(attention::isValidHeadMapping({3, 2, -1, 12}));
+        EXPECT_FALSE(attention::isValidHeadMapping({3, 2, 0, -1}));
+        EXPECT_FALSE(attention::isValidHeadMapping({0, 2, 0, 12}));
+        EXPECT_FALSE(attention::isValidHeadMapping({3, 0, 0, 12}));
+        constexpr int largest = std::numeric_limits<int>::max();
+        EXPECT_TRUE(attention::isValidHeadMapping({largest, 2, largest, largest}));
+        EXPECT_FALSE(attention::isValidHeadMapping({largest, 1, largest, largest}));
+    }
+
+    /** @test Actual CPU stages retain original24Q/2KV semantics for every TP2/4/8 interval and reverse order. */
+    TEST_F(Test__AttentionComputeStage, Execute_FP32_QwenReplicatedKVExactGlobalIntervals)
+    {
+        TensorFactory factory(mpi_ctx_);
+        constexpr int dimension = 256;
+        for (const int degree : {2, 4, 8})
+            for (const bool reversed : {false, true})
+            {
+                std::vector<DeviceId> order;
+                for (int participant = 0; participant < degree; ++participant)
+                    order.push_back(DeviceId::cuda(participant)); // Metadata only: execution below is CPU.
+                if (reversed) std::reverse(order.begin(), order.end());
+                const auto assignment = TensorParallelConfig::equalSplit(degree, 24, 2, 1024, 32000, order);
+                ASSERT_TRUE(assignment.validate()) << assignment.validationError();
+                for (const auto &local : assignment.assignments())
+                    for (const int rows : {1, 9})
+                    {
+                        SCOPED_TRACE(::testing::Message() << " degree=" << degree << " participant="
+                            << local.local_rank << " start=" << local.head_start << " rows=" << rows
+                            << " reversed=" << reversed);
+                        const int kv_rows = rows == 1 ? 7 : rows;
+                        const auto query_width = static_cast<std::size_t>(local.head_count * dimension);
+                        const auto kv_width = static_cast<std::size_t>(local.kv_head_count * dimension);
+                        auto query = factory.createFP32({static_cast<std::size_t>(rows), query_width}, device_id_);
+                        auto key = factory.createFP32({static_cast<std::size_t>(kv_rows), kv_width}, device_id_);
+                        auto value = factory.createFP32({static_cast<std::size_t>(kv_rows), kv_width}, device_id_);
+                        auto result = factory.createFP32({static_cast<std::size_t>(rows), query_width}, device_id_);
+                        std::fill_n(query->mutable_data(), query->numel(), 0.0f);
+                        std::fill_n(key->mutable_data(), key->numel(), 0.0f);
+                        std::fill_n(result->mutable_data(), result->numel(), -91.0f);
+                        // Constant, distinct original KV values make the oracle
+                        // independent of the production head-mapping function.
+                        for (int row = 0; row < kv_rows; ++row)
+                            for (int head = 0; head < local.kv_head_count; ++head)
+                                std::fill_n(value->mutable_data() + static_cast<std::size_t>(row) * kv_width
+                                    + head * dimension, dimension, static_cast<float>(local.kv_head_start + head + 1));
+                        AttentionComputeStage::Params params;
+                        params.Q = query.get(); params.K = key.get(); params.V = value.get();
+                        params.output = result.get(); params.seq_len = rows; params.kv_len = kv_rows;
+                        params.batch_size = 1; params.n_heads = local.head_count;
+                        params.n_kv_heads = local.kv_head_count; params.head_dim = dimension;
+                        params.head_start = local.head_start;
+                        params.gqa_n_rep = degree == 2 ? 0 : 12;
+                        params.causal = true; params.mpi_ctx = &mpi_ctx_; params.device_id = device_id_;
+                        AttentionComputeStage stage(params);
+                        ASSERT_TRUE(stage.execute(nullptr));
+                        for (int row = 0; row < rows; ++row)
+                            for (int head = 0; head < local.head_count; ++head)
+                                for (int d = 0; d < dimension; ++d)
+                                    EXPECT_NEAR(result->data()[static_cast<std::size_t>(row) * query_width + head * dimension + d],
+                                        static_cast<float>((local.head_start + head) / 12 + 1), 2e-5f);
+                    }
+            }
+    }
+
+    /** @test A missing global ratio or out-of-range original Q interval cannot publish CPU output. */
+    TEST_F(Test__AttentionComputeStage, Execute_FP32_ReplicatedKVRejectsMalformedMappingBeforeOutput)
+    {
+        TensorFactory factory(mpi_ctx_);
+        auto query = factory.createFP32({1, 3 * 256}, device_id_);
+        auto key = factory.createFP32({1, 2 * 256}, device_id_);
+        auto value = factory.createFP32({1, 2 * 256}, device_id_);
+        auto result = factory.createFP32({1, 3 * 256}, device_id_);
+        std::fill_n(query->mutable_data(), query->numel(), 0.0f);
+        std::fill_n(key->mutable_data(), key->numel(), 0.0f);
+        std::fill_n(value->mutable_data(), value->numel(), 1.0f);
+        for (const auto &mapping : std::vector<attention::HeadMappingGeometry>{{3, 2, 0, 0},
+                {3, 2, 22, 12}, {3, 2, -1, 12}, {3, 2, 0, -1}})
+        {
+            std::fill_n(result->mutable_data(), result->numel(), -91.0f);
+            AttentionComputeStage::Params params;
+            params.Q = query.get(); params.K = key.get(); params.V = value.get(); params.output = result.get();
+            params.batch_size = 1; params.seq_len = 1; params.kv_len = 1;
+            params.n_heads = mapping.local_query_heads; params.n_kv_heads = mapping.visible_kv_heads;
+            params.head_dim = 256; params.head_start = mapping.head_start; params.gqa_n_rep = mapping.replicated_gqa_n_rep;
+            params.causal = true; params.mpi_ctx = &mpi_ctx_; params.device_id = device_id_;
+            AttentionComputeStage stage(params);
+            EXPECT_FALSE(stage.execute(nullptr));
+            EXPECT_TRUE(std::all_of(result->data(), result->data() + result->numel(),
+                [](float v) { return v == -91.0f; }));
         }
     }
 

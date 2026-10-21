@@ -19,6 +19,7 @@
 #include "../StageParamsBase.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
+#include "../../../execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include <cstdint>
 #include <memory>
@@ -127,6 +128,7 @@ namespace llaminar2
             const int32_t *input_position_ids_device = nullptr; ///< Admitted absolute request positions.
             int32_t *shifted_token_ids_output_device = nullptr; ///< Packed depth-zero condition tokens.
             int32_t *shifted_position_ids_output_device = nullptr; ///< Packed positions paired with condition tokens.
+            MTPShiftedCacheOrigin shifted_cache_origin = MTPShiftedCacheOrigin::SuccessorPairsOnly; ///< Model-owned coordinate policy, fixed before capture.
             int32_t *shifted_append_lengths_output_device = nullptr; ///< One real shifted append width per request.
             TensorBase *terminal_hidden_archive = nullptr; ///< Persistent prior/next terminal row per request.
             std::vector<const int32_t *> main_cached_tokens_by_request; ///< Canonical main-KV count addresses.
@@ -140,6 +142,9 @@ namespace llaminar2
         ~HiddenStateRowsSelectStage() override;
 
         bool execute(IDeviceContext *ctx) override;
+        /** @return Immutable model-origin policy contribution to existing capture invalidation. */
+        uint64_t graphCaptureVariantSignature() const override
+        { return 0x4d54504f52494701ULL ^ static_cast<uint64_t>(params_.shifted_cache_origin); }
         ComputeStageType type() const override { return ComputeStageType::ROW_SELECT; }
         size_t estimatedFlops() const override { return 0; }
         size_t estimatedMemoryBytes() const override;

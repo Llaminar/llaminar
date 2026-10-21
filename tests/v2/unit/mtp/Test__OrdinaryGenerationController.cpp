@@ -12,8 +12,10 @@
 #include "execution/mtp/DeviceGenerationContract.h"
 #include "execution/mtp/OrdinaryGenerationGraphPlan.h"
 #include "kernels/common/GenerationLogicalState.h"
+#include "kernels/common/NativeCounter64.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <bit>
 #include <limits>
 
 namespace
@@ -433,7 +435,12 @@ TEST(OrdinaryGenerationController, HistoryAdmissionAndCommitAreExclusiveAndFailu
 
 TEST(OrdinaryGenerationController, PolicyIsExplicitAndSharesTheResidentStorageABI)
 {
-    static_assert(kDeviceGenerationControlCount == 52);
+    // QSA four pairs and fixed-head six pairs append observations; execution ordinals stay fixed.
+    static_assert(kDeviceGenerationControlInitialDraftDepth == 51);
+    static_assert(kDeviceGenerationControlQsaPriorHeaderBytesLow == 52);
+    static_assert(kDeviceGenerationControlQsaAcceptedPayloadBytesHigh == 59);
+    static_assert(kDeviceGenerationControlFixedHeadCallsLow == 60);
+    static_assert(kDeviceGenerationControlCount == 90);
     static_assert(sizeof(DeviceGenerationPolicy) == 15 * sizeof(int));
     EXPECT_FALSE(DeviceGenerationPolicy::fixed(0).valid());
     EXPECT_TRUE(DeviceGenerationPolicy::ordinary().valid());
@@ -664,9 +671,10 @@ TEST(OrdinaryGenerationController, TerminalContractRejectsForgedPolicyBudgetAndS
             i == 0 ? Source::PrefillLogits : Source::DecodeLogits, response.data(), 3, control.data()));
     ASSERT_EQ(validateDeviceGenerationTerminal(control, admission, 3, 0, 0),
         DeviceGenerationTerminalError::None);
-    // Every ABI word has a validity constraint in the ordinary terminal. The
-    // one legal nonzero movement row is separately authenticated by its source.
-    for (int index = 0; index < kDeviceGenerationControlCount; ++index)
+    // Execution words have signed validity constraints. The appended UINT64
+    // observation pairs are reporting only and permit every low/high bit pattern.
+    // The one legal nonzero movement row is authenticated by its source.
+    for (int index = 0; index < kDeviceGenerationControlQsaPriorHeaderBytesLow; ++index)
     {
         SCOPED_TRACE(index);
         for (int poison : {-1, std::numeric_limits<int>::max()})
@@ -686,6 +694,39 @@ TEST(OrdinaryGenerationController, TerminalContractRejectsForgedPolicyBudgetAndS
         DeviceGenerationTerminalError::None);
     EXPECT_EQ(validateDeviceGenerationTerminal(control, admission, 3, 0, 1),
         DeviceGenerationTerminalError::InvalidMovementEvidence);
+}
+
+/** @test Unsigned work observations cannot change execution-terminal admission. */
+TEST(OrdinaryGenerationController, TerminalContractSeparatesUnsignedWorkObservations)
+{
+    Control control{};
+    std::array<int32_t, 1> response{};
+    const DeviceGenerationAdmissionRequest admission{
+        .request_count = 1, .max_new_tokens = 1,
+        .depth_policy = DeviceGenerationPolicy::ordinary()};
+    ASSERT_TRUE(initialize_device_generation_control(1, 1, admission.depth_policy, control.data()));
+    ASSERT_TRUE(append_ordinary_sample_to_device_generation(
+        19, false, Source::PrefillLogits, response.data(), 1, control.data()));
+    const std::array<std::uint64_t, 7> totals{
+        0, 1, UINT32_MAX, UINT64_C(1) << 32,
+        UINT64_C(0x7fffffffffffffff), UINT64_C(1) << 63, UINT64_MAX};
+    for (int low : {kDeviceGenerationControlQsaPriorHeaderBytesLow,
+                    kDeviceGenerationControlQsaPriorPayloadBytesLow,
+                    kDeviceGenerationControlQsaCandidatePayloadBytesLow,
+                    kDeviceGenerationControlQsaAcceptedPayloadBytesLow})
+    for (const auto total : totals)
+    {
+        SCOPED_TRACE(::testing::Message() << "low=" << low << " total=" << total);
+        auto observed = control;
+        observed[low] = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(total));
+        observed[low + 1] = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(total >> 32));
+        EXPECT_EQ(llaminar2::readNativeCounter64(observed.data() + low), total);
+        EXPECT_EQ(validateDeviceGenerationTerminal(observed, admission, 1, 0, 0),
+            DeviceGenerationTerminalError::None);
+        observed[kDeviceGenerationControlResponseTokenCount] = -1;
+        EXPECT_NE(validateDeviceGenerationTerminal(observed, admission, 1, 0, 0),
+            DeviceGenerationTerminalError::None);
+    }
 }
 
 /** @test The shared terminal gate preserves fixed, observed and dynamic MTP. */
@@ -744,4 +785,39 @@ TEST(OrdinaryGenerationController, TerminalContractAuthenticatesEverySpeculative
             DeviceGenerationTerminalError::InvalidAlgorithmAccounting);
     }
 }
+}
+
+/** @test One-shot PP operation has an explicit owner and rejects sampled/partial accounting. */
+TEST(OrdinaryGenerationController, PipelineForwardOnlyAdmissionAndTerminalAreExact)
+{
+    using namespace llaminar2;
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(), 1u);
+    DeviceGenerationAdmissionRequest request{.request_count = 1, .max_new_tokens = 0,
+        .depth_policy = DeviceGenerationPolicy::forwardOnly(),
+        .initial_leading_row_disposition = DeviceGenerationLeadingRowDisposition::AlreadyEmitted};
+    ASSERT_TRUE(request.valid());
+    auto invalid = request;
+    invalid.max_new_tokens = 1;
+    EXPECT_FALSE(invalid.valid());
+    invalid = request;
+    invalid.kind = DeviceGenerationAdmissionKind::ContinueResponse;
+    EXPECT_FALSE(invalid.valid());
+    invalid = request;
+    invalid.initial_leading_row_disposition = DeviceGenerationLeadingRowDisposition::PendingResponse;
+    EXPECT_FALSE(invalid.valid());
+    Control control{};
+    ASSERT_TRUE(initialize_device_generation_control(0, 8, request.depth_policy, control.data(),
+        request.initial_leading_row_disposition));
+    EXPECT_NE(validateDeviceGenerationTerminal(control, request, 8, 0, 0), DeviceGenerationTerminalError::None);
+    ASSERT_TRUE(complete_device_generation_forward(control.data()));
+    EXPECT_EQ(validateDeviceGenerationTerminal(control, request, 8, 0, 0), DeviceGenerationTerminalError::None);
+    for (int defect = 0; defect < 4; ++defect)
+    {
+        auto corrupt = control;
+        if (defect == 0) corrupt[kDeviceGenerationControlResponseTokenCount] = 1;
+        if (defect == 1) corrupt[kDeviceGenerationControlPublishedStateCommitCount] = 0;
+        if (defect == 2) corrupt[kDeviceGenerationControlTransactionCount] = 2;
+        if (defect == 3) corrupt[kDeviceGenerationControlOk] = 0;
+        EXPECT_NE(validateDeviceGenerationTerminal(corrupt, request, 8, 0, 0), DeviceGenerationTerminalError::None);
+    }
 }

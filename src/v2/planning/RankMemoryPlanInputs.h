@@ -54,6 +54,16 @@ namespace llaminar2
         std::vector<PipelineBoundarySide> captured_boundaries_;
     };
 
+    /**
+     * @brief Authenticate explicit ngram distribution against the compiled rank declaration.
+     * @param profile Original model metadata; no payload or backend query.
+     * @param plan Exact rank TP/PP declaration in communicator order.
+     * @return None for replicated policy; the checked full-main local TP provenance otherwise.
+     * @throws std::invalid_argument For unsupported storage, source or topology before preparation.
+     */
+    [[nodiscard]] ImmutableRowTableTPTopology immutableRowTableTPTopology(
+        const ModelMemoryProfile &profile,const RankExecutionPlan &plan);
+
     /** @brief Immutable observations and execution policies for one rank BOM. */
     struct RankMemoryPlanInputRequest
     {

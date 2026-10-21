@@ -23,7 +23,7 @@ namespace llaminar2
         enum class QwenGenerationProfile
         {
             Instruct25Small, Instruct25, Qwen3, Qwen35Small, Qwen35,
-            Qwen36Dense, Qwen36MoE, Qwen38Dense,
+            Qwen36Dense, Qwen36MoE, Qwen38Dense, Qwen38FlashNext,
         };
 
         /** @brief Exact post-trained identity and its required GGUF architecture. */
@@ -63,6 +63,7 @@ namespace llaminar2
             {"qwen3.6-27b", "qwen35", QwenGenerationProfile::Qwen36Dense},
             {"qwen3.6-35b-a3b", "qwen35moe", QwenGenerationProfile::Qwen36MoE},
             {"qwen3.8-27b", "qwen35", QwenGenerationProfile::Qwen38Dense},
+            {"qwen3.8-flash-next", "qwen4exp", QwenGenerationProfile::Qwen38FlashNext},
         });
 
         /**
@@ -178,6 +179,7 @@ namespace llaminar2
                     break;
                 case QwenGenerationProfile::Qwen36Dense:
                 case QwenGenerationProfile::Qwen38Dense:
+                case QwenGenerationProfile::Qwen38FlashNext:
                     result.thinking_ = recommendation(1.0f, 0.95f, 0.0f);
                     result.non_thinking_ = recommendation(0.7f, 0.8f, 1.5f);
                     break;

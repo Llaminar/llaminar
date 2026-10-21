@@ -1019,7 +1019,7 @@ TEST(Test__GDNMathematicalCorrectness, GatedRMSNorm_ExplicitFeatureDimAllowsWide
 
 TEST(Test__GDNMathematicalCorrectness, GatedRMSNorm_PerHeadNormDim_WithSiLU)
 {
-    // Per-head norm_dim with gate_silu=true
+    // Per-head norm_dim with gate_activation=SiLU
     const int d_model = 8;
     const int norm_dim = 4;
 
@@ -1040,7 +1040,7 @@ TEST(Test__GDNMathematicalCorrectness, GatedRMSNorm_PerHeadNormDim_WithSiLU)
     params.eps = 1e-6f;
     params.seq_len = 1;
     params.norm_dim = norm_dim;
-    params.gate_silu = true;
+    params.gate_activation = GatedNormActivation::SiLU;
 
     auto ctx = makeCPUContext();
     GatedRMSNormStage stage(params);

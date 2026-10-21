@@ -6,11 +6,13 @@
  * points but share the same kernel requirement formulas. This keeps GGUF
  * preflight aware of routed-expert, recurrent, and dense graph-family pressure
  * before weights consume the memory that exact graph capture will need.
- * Main and replicated MTP attention contribute their actual participant
+ * Main and explicitly sharded/replicated MTP attention contribute their actual participant
  * geometries to one stable-name union, including full-context conversion banks.
  */
 
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "models/qwen4exp/Qwen4ExpPredictorProjectionGeometry.h"
+#include "models/qwen4exp/Qwen4ExpProjectionWorkspace.h"
 
 #include "config/GDNHeadAssignment.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
@@ -389,8 +391,7 @@ bool isTerminalProjectionWeight(std::string_view name)
 /** @brief Whether a matrix is an embedding lookup rather than a GEMM weight. */
 bool isEmbeddingWeight(std::string_view name)
 {
-    return name.find("token_embd") != std::string_view::npos ||
-           name.find("embed_tokens") != std::string_view::npos;
+    return inferWeightRole(std::string(name)) == WeightRole::Embedding;
 }
 
 /** @brief One exact interval on a schema-owned logical TP dimension. */
@@ -552,7 +553,26 @@ bool isRetainedMTPSidecarLayer(
 {
     return geometry.mtp_target_query_rows > 0 &&
            profile.mtp_layer_count > 0 && tensor.layer_index >= 0 &&
-           tensor.layer_index >= profile.n_layers - profile.mtp_layer_count;
+           tensor.layer_index >= profile.mainLayerCount();
+}
+
+/** @brief Resolve exact source-owned row use without pricing dormant/nonexecuted predictor operations. */
+int qwenPredictorProjectionRows(const TensorSizeInfo &tensor,const ModelMemoryProfile &profile,
+    const WorkspaceMemoryGeometry &geometry,int ordinary_rows,int shifted_prefill_rows)
+{
+    return Qwen4ExpPredictorProjectionGeometry::workspaceRows(ordinary_rows,shifted_prefill_rows,
+        inferWeightRole(tensor.name),tensor.name,tensor.layer_index,profile.mainLayerCount(),
+        profile.flash_next ? std::optional{profile.flash_next->residual_branches} : std::nullopt,
+        profile.flash_next_predictor);
+}
+/** @brief Preserve legacy model pricing while requiring explicit QFN shard/replica policy. */
+bool predictorIsReplicated(const ModelMemoryProfile &profile,const WorkspaceMemoryGeometry &geometry)
+{
+    if (!profile.flash_next) return true;
+    if (!profile.flash_next_predictor || !profile.flash_next_predictor->validForMainLayers(profile.mainLayerCount()))
+        throw std::invalid_argument("Active QFN predictor workspace requires its exact source/attention/norm policy");
+    return Qwen4ExpPredictorProjectionGeometry::requireLayout(geometry.mtp_dense_layout)==
+        MTPShiftedKVHeadLayout::FullModelPerParticipant;
 }
 
 /** @brief Whether the continuation graph materializes this matrix. */
@@ -561,6 +581,8 @@ bool workspaceOwnsTensor(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry)
 {
+    const auto role = inferWeightRole(tensor.name);
+    if (role == WeightRole::ImmutableRowTable || isImmutableFP32WeightRole(role)) return false;
     return tensor.layer_index < 0 ||
            (tensor.layer_index >= geometry.first_layer &&
             tensor.layer_index <= geometry.last_layer) ||
@@ -608,8 +630,8 @@ WorkspaceMatrixShape localWorkspaceMatrixShape(
         };
     }
 
-    const bool replicated_sidecar =
-        isRetainedMTPSidecarLayer(tensor, profile, geometry);
+    const bool replicated_sidecar = isRetainedMTPSidecarLayer(tensor,profile,geometry) &&
+        predictorIsReplicated(profile,geometry);
     if (geometry.total_shards > 1 && !replicated_sidecar &&
         !(force_full_terminal && isTerminalProjectionWeight(tensor.name)))
     {
@@ -699,6 +721,65 @@ WorkspaceMatrixShape localWorkspaceMatrixShape(
 }
 
 /**
+ * @brief Add the new residual banks to a metadata-only CUDA workspace BOM.
+ * @param profile Authenticated native sources and model-family geometry.
+ * @param geometry Frozen ownership, projection rows and arithmetic policy.
+ * @return The aligned union of residual-only names, or zero for exact runtime plans.
+ *
+ * The existing metadata-only dense envelope already owns ordinary primary Q8
+ * storage. It cannot describe these newly introduced residual names. Add their
+ * exact factory contribution once; live CUDA admission instead merges the full
+ * four-bank contract with its complete native projection inventory. Neither
+ * path queries a remote device or infers policy availability from a byte total.
+ */
+size_t metadataCUDAQFNResidualWorkspaceBytes(
+    const ModelMemoryProfile& profile, const WorkspaceMemoryGeometry& geometry)
+{
+    if (!geometry.device.is_cuda() || !profile.flash_next ||
+        (geometry.qfn_hc_up_activation == QuantizedActivationOperandPrecision::SingleQ8 &&
+         geometry.qfn_gdn_output_activation == QuantizedActivationOperandPrecision::SingleQ8 &&
+         geometry.qfn_fa_output_activation == QuantizedActivationOperandPrecision::SingleQ8 &&
+         geometry.qfn_gdn_qkv_activation == QuantizedActivationOperandPrecision::SingleQ8))
+        return 0u;
+#ifdef HAVE_CUDA
+    if (geometry.runtime_device_policy_available)
+        return 0u;
+#endif
+    const auto sharding = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
+    const int prefill_rows = checkedWorkspaceDimension(checkedMultiply(
+        static_cast<std::size_t>(std::max(1, geometry.batch_size)),
+        static_cast<std::size_t>(std::max(1, geometry.resident_graph_rows)),
+        "QFN correction metadata prefill rows"), "QFN correction metadata prefill rows");
+    const int terminal_rows = std::max(1, geometry.mtp_target_query_rows > 0
+        ? geometry.mtp_target_query_rows : geometry.batch_size);
+    const bool full_terminal = geometry.mtp_terminal_logits_layout ==
+        MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+    WorkspaceRequirements additional;
+    for (const auto& tensor : profile.tensors)
+    {
+        const auto role = inferWeightRole(tensor.name);
+        if (!workspaceOwnsTensor(tensor, profile, geometry) ||
+            !Qwen4ExpProjectionWorkspace::selected(geometry.qfn_hc_up_activation, geometry.qfn_gdn_output_activation,
+                true, role, tensor.name, geometry.qfn_fa_output_activation, profile.mainLayerCount(), geometry.qfn_gdn_qkv_activation, &profile))
+            continue;
+        const int rows = qwenPredictorProjectionRows(tensor, profile, geometry,
+            isTerminalProjectionWeight(tensor.name) || isRetainedMTPSidecarLayer(tensor, profile, geometry)
+                ? terminal_rows : prefill_rows, prefill_rows);
+        const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding, full_terminal);
+        if (!shape.valid())
+            throw std::invalid_argument("QFN correction metadata admission requires complete native projection geometry");
+        // Reuse semantic/source validation before asking the generic kernel
+        // factory for only the names absent from the ordinary projection BOM.
+        (void)Qwen4ExpProjectionWorkspace::requirements(geometry.device,
+            geometry.qfn_hc_up_activation, geometry.qfn_gdn_output_activation, true, role, tensor.name, tensor.quant_type,
+            rows, shape.output_columns, shape.input_columns, geometry.qfn_fa_output_activation, profile.mainLayerCount(), geometry.qfn_gdn_qkv_activation, &profile);
+        additional.merge(gpuQ8ResidualCorrectionAdditionalWorkspaceRequirements(
+            rows, shape.output_columns, shape.input_columns));
+    }
+    return additional.total_bytes_with_alignment();
+}
+
+/**
  * @brief Resolve the flattened token and route capacities of a sparse graph.
  * @param profile Source of the graph's routing multiplicity.
  * @param geometry Explicit compact family or ordinary batch/bucket geometry.
@@ -766,10 +847,14 @@ size_t exactCPUProjectionWorkspaceBytes(
                 geometry.mtp_terminal_logits_layout == MTPTerminalLogitsLayout::FullVocabularyPerParticipant);
             if (!shape.valid())
                 throw std::runtime_error("CPU Q8 admission requires complete projection geometry");
-            const int execution_rows = isTerminalProjectionWeight(tensor.name) ||
+            const int ordinary_rows = isTerminalProjectionWeight(tensor.name) ||
                 isRetainedMTPSidecarLayer(tensor, profile, geometry)
                 ? std::max({1, geometry.batch_size, geometry.mtp_target_query_rows}) : rows;
+            const int execution_rows=qwenPredictorProjectionRows(tensor,profile,geometry,ordinary_rows,rows);
             const auto serial_shape = localWorkspaceMatrixShape(tensor, profile, geometry, *sharding, false);
+            requirements.merge(Qwen4ExpProjectionWorkspace::requirements(geometry.device,
+                geometry.qfn_hc_up_activation,geometry.qfn_gdn_output_activation,profile.flash_next.has_value(),inferWeightRole(tensor.name),
+                tensor.name,tensor.quant_type,execution_rows,shape.output_columns,shape.input_columns, geometry.qfn_fa_output_activation, profile.mainLayerCount(), geometry.qfn_gdn_qkv_activation, &profile));
             requirements.merge(CPUProjectionWorkspaceContract::sourceNative(tensor.quant_type,
                 {.rows = isRoutedExpertWeight(tensor.name)
                      ? (compact_expert_rows > 0 ? compact_expert_rows
@@ -889,8 +974,8 @@ size_t exactROCmQuantizedGemmWorkspaceBytes(
         has_explicit_terminal = has_explicit_terminal || terminal;
         const bool mtp_sidecar = isRetainedMTPSidecarLayer(
             tensor, profile, geometry);
-        int projection_rows =
-            terminal || mtp_sidecar ? terminal_rows : prefill_rows;
+        int projection_rows=qwenPredictorProjectionRows(tensor,profile,geometry,
+            terminal || mtp_sidecar ? terminal_rows : prefill_rows,prefill_rows);
         // A continuation also retains the one-row-per-route expert endpoint.
         // Its prepared kernels share these stable names with direct execution;
         // admit the wider invocation before either graph publishes addresses.
@@ -911,6 +996,9 @@ size_t exactROCmQuantizedGemmWorkspaceBytes(
                 " input_columns=" +
                 std::to_string(shape.input_columns) +
                 " terminal=" + (terminal ? "true" : "false"));
+        requirements.merge(Qwen4ExpProjectionWorkspace::requirements(geometry.device,
+            geometry.qfn_hc_up_activation,geometry.qfn_gdn_output_activation,profile.flash_next.has_value(),inferWeightRole(tensor.name),
+            tensor.name,tensor.quant_type,projection_rows,shape.output_columns,shape.input_columns, geometry.qfn_fa_output_activation, profile.mainLayerCount(), geometry.qfn_gdn_qkv_activation, &profile));
         requirements.merge(
             rocm::quantized_gemm_workspace::projectionRequirements(
                 projection_rows,
@@ -1133,8 +1221,8 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
         has_explicit_terminal = has_explicit_terminal || terminal;
         const bool mtp_sidecar = isRetainedMTPSidecarLayer(
             tensor, profile, geometry);
-        int projection_rows =
-            terminal || mtp_sidecar ? terminal_rows : prefill_rows;
+        int projection_rows=qwenPredictorProjectionRows(tensor,profile,geometry,
+            terminal || mtp_sidecar ? terminal_rows : prefill_rows,prefill_rows);
         // CUDA and ROCm retain the same compact endpoint row ownership. Only
         // the requirement factory's device-specific dispatch policy differs.
         if (isRoutedExpertWeight(tensor.name))
@@ -1153,6 +1241,9 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
                 " input_columns=" +
                 std::to_string(shape.input_columns) +
                 " terminal=" + (terminal ? "true" : "false"));
+        requirements.merge(Qwen4ExpProjectionWorkspace::requirements(geometry.device,
+            geometry.qfn_hc_up_activation,geometry.qfn_gdn_output_activation,profile.flash_next.has_value(),inferWeightRole(tensor.name),
+            tensor.name,tensor.quant_type,projection_rows,shape.output_columns,shape.input_columns, geometry.qfn_fa_output_activation, profile.mainLayerCount(), geometry.qfn_gdn_qkv_activation, &profile));
         requirements.merge(
             cuda::quantized_gemm_workspace::projectionRequirements(
                 projection_rows,
@@ -1579,14 +1670,14 @@ bool hasFullAttentionLayer(
 }
 
 /**
- * @brief Describe the independently replicated learned MTP attention member.
+ * @brief Describe the independently owned learned MTP attention member.
  * @param profile Complete model metadata, including trailing learned blocks.
  * @param geometry Main participant and retained verifier declaration.
- * @return Full-head compact geometry, or no member when MTP is not retained.
+ * @return Exact admitted local/full-head compact geometry, or no member when MTP is not retained.
  *
- * Sharded main heads do not describe the learned predictor. Its compact query
- * width and complete request-major KV horizon are separate axes; neither may
- * inherit the main graph's prefill bucket or TP slices.
+ * The explicit QFN sidecar policy selects real TP-local or full replicated heads.
+ * Its compact query horizon remains separate from shifted-prefill projection
+ * capacity; no raw source shape selects a different placement.
  */
 std::optional<WorkspaceMemoryGeometry> retainedMTPAttentionGeometry(
     const ModelMemoryProfile& profile,
@@ -1594,6 +1685,7 @@ std::optional<WorkspaceMemoryGeometry> retainedMTPAttentionGeometry(
 {
     if (geometry.mtp_target_query_rows <= 0 || profile.mtp_layer_count <= 0)
         return std::nullopt;
+    const bool replicated=predictorIsReplicated(profile,geometry);
     return WorkspaceMemoryGeometry{
         .device = geometry.device,
         .device_compute_units = geometry.device_compute_units,
@@ -1602,12 +1694,14 @@ std::optional<WorkspaceMemoryGeometry> retainedMTPAttentionGeometry(
         .resident_graph_rows = geometry.mtp_target_query_rows,
         .max_context_rows = geometry.max_context_rows,
         .local_d_ff = profile.d_ff,
-        .local_query_heads = profile.n_heads,
-        .local_kv_heads = profile.n_kv_heads,
+        .local_query_head_start = replicated ? 0 : geometry.local_query_head_start,
+        .local_query_heads = replicated ? profile.n_heads : geometry.local_query_heads,
+        .local_kv_head_start = replicated ? 0 : geometry.local_kv_head_start,
+        .local_kv_heads = replicated ? profile.n_kv_heads : geometry.local_kv_heads,
         .local_vocab = profile.vocab_size,
-        .first_layer = profile.n_layers - profile.mtp_layer_count,
-        .last_layer = profile.n_layers - 1,
-        .total_shards = 1,
+        .first_layer = profile.mainLayerCount(),
+        .last_layer = profile.totalLayerCount() - 1,
+        .total_shards = replicated ? 1 : geometry.total_shards,
         .attention_kv_format = geometry.attention_kv_format,
         .attention_visibility = geometry.attention_visibility,
     };
@@ -1983,6 +2077,64 @@ size_t WorkspaceMemoryEstimator::estimate(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry)
 {
+    // Validate the selected source contract before adding any BOM contributions,
+    // including floating selected weights that ordinary quantized loops do not visit.
+    (void)Qwen4ExpProjectionWorkspace::selected(geometry.qfn_hc_up_activation, geometry.qfn_gdn_output_activation,
+        profile.flash_next.has_value(),WeightRole::Other,{}, geometry.qfn_fa_output_activation, profile.mainLayerCount(), geometry.qfn_gdn_qkv_activation, &profile);
+    for(const auto &tensor:profile.tensors)
+    {
+        if(!workspaceOwnsTensor(tensor,profile,geometry)||
+            !Qwen4ExpProjectionWorkspace::selected(geometry.qfn_hc_up_activation, geometry.qfn_gdn_output_activation,
+                profile.flash_next.has_value(),inferWeightRole(tensor.name),tensor.name, geometry.qfn_fa_output_activation, profile.mainLayerCount(), geometry.qfn_gdn_qkv_activation, &profile))continue;
+        if(!tensor.K||tensor.elements%tensor.K)
+            throw std::invalid_argument("QFN correction workspace requires an exact native matrix extent");
+        const auto sharding = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
+        const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding,
+            geometry.mtp_terminal_logits_layout == MTPTerminalLogitsLayout::FullVocabularyPerParticipant);
+        const WeightSliceSpec prepared_slice{
+            .source_rows = tensor.elements / tensor.K, .source_cols = tensor.K,
+            .row_count = static_cast<std::size_t>(shape.output_columns),
+            .col_count = static_cast<std::size_t>(shape.input_columns)};
+        Qwen4ExpProjectionWorkspace::validateGDNOutputInvocation(
+            geometry.qfn_gdn_output_activation, profile.flash_next.has_value(),
+            inferWeightRole(tensor.name), tensor.name, geometry.batch_size, prepared_slice);
+        Qwen4ExpProjectionWorkspace::validateFAOutputInvocation(
+            geometry.qfn_fa_output_activation, profile.flash_next.has_value(),
+            inferWeightRole(tensor.name), tensor.name, profile.mainLayerCount(),
+            geometry.batch_size, prepared_slice);
+        Qwen4ExpProjectionWorkspace::validateGDNQKVProfileInvocation(
+            geometry.qfn_gdn_qkv_activation, profile.flash_next.has_value(),
+            inferWeightRole(tensor.name), tensor.name, &profile,
+            geometry.batch_size, prepared_slice);
+        // Correction consumes the unchanged original Q8 decoder on both GDN
+        // projection boundaries. A floating derivative is a different typed
+        // implementation and must reject before admitting residual banks.
+        if ((Qwen4ExpProjectionWorkspace::gdnQKVProfilePrecision(geometry.qfn_gdn_qkv_activation,
+                 profile.flash_next.has_value(), inferWeightRole(tensor.name), tensor.name, &profile) ==
+                 QuantizedActivationOperandPrecision::TwoTermQ8 ||
+             Qwen4ExpProjectionWorkspace::gdnOutputPrecision(geometry.qfn_gdn_output_activation,
+                 profile.flash_next.has_value(), inferWeightRole(tensor.name), tensor.name) ==
+                 QuantizedActivationOperandPrecision::TwoTermQ8) &&
+            PreparedWeightRepresentationContract::resolve(inferWeightRole(tensor.name), tensor.quant_type,
+                tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic,
+                debugEnv().gemm.moe_router_arithmetic) != ModelPreparedWeightRepresentation::SourceNative)
+            throw std::invalid_argument("QFN GDN correction requires its unchanged original source-native representation: tensor=" +
+                tensor.name + " requested_gdn_arithmetic=" +
+                std::string(gdnProjectionArithmeticName(debugEnv().gemm.gdn_projection_arithmetic)));
+        if (Qwen4ExpProjectionWorkspace::faOutputPrecision(geometry.qfn_fa_output_activation,
+                profile.flash_next.has_value(), inferWeightRole(tensor.name), tensor.name,
+                profile.mainLayerCount()) == QuantizedActivationOperandPrecision::TwoTermQ8 &&
+            (tensor.elements / tensor.K != static_cast<std::size_t>(profile.d_model) ||
+             tensor.K != checkedMultiply(static_cast<std::size_t>(profile.n_heads),
+                 static_cast<std::size_t>(profile.head_dim), "QFN FA original global-query width")))
+            throw std::invalid_argument("QFN FA-output admission requires the original global-query output matrix");
+        (void)Qwen4ExpProjectionWorkspace::requirements(geometry.device,geometry.qfn_hc_up_activation,geometry.qfn_gdn_output_activation,true,
+            inferWeightRole(tensor.name),tensor.name,tensor.quant_type,1,
+            checkedWorkspaceDimension(tensor.elements/tensor.K,"QFN correction native output"),
+            checkedWorkspaceDimension(tensor.K,"QFN correction native input"), geometry.qfn_fa_output_activation, profile.mainLayerCount(), geometry.qfn_gdn_qkv_activation, &profile);
+    }
+    if (profile.flash_next && profile.mtp_layer_count>0 && geometry.mtp_target_query_rows>0)
+        (void)predictorIsReplicated(profile,geometry);
     const size_t legacy_dense_baseline_bytes = estimate(
         geometry.batch_size,
         geometry.resident_graph_rows,
@@ -2017,6 +2169,8 @@ size_t WorkspaceMemoryEstimator::estimate(
             : legacy_dense_baseline_bytes;
     size_t bytes = std::max(
         dense_baseline_bytes, exact_quantized_gemm_bytes);
+    bytes = checkedAdd(bytes, metadataCUDAQFNResidualWorkspaceBytes(profile, geometry),
+        "metadata-only CUDA QFN residual activation requirements");
     bytes = checkedAdd(bytes, exactCPUProjectionWorkspaceBytes(profile, geometry),
         "CPU invocation-owned projection requirements");
 

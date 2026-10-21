@@ -251,30 +251,181 @@ namespace llaminar2::test::parity
     }
 
     /**
-     * @brief Project an E2E candidate onto production-default benchmark policy.
-     * @param cell Tagged model/topology and semantic precision/MTP/movement axes.
-     * @return Arguments excluding executable, workload, model and context.
-     * @throws std::invalid_argument if the case is not eligible for E2E.
-     *
-     * Do not clone numerical/HTTP arguments and strip known stress flags: new
-     * stress knobs would silently leak into timing again. Only semantic intent
-     * is emitted here. Runtime defaults own depth initialization/adaptation,
-     * graph capacity, movement economics, transfer slots, prefix storage,
-     * collectives and prefill buckets. Explicit fixed-depth/static cases still
-     * retain those selected modes rather than being mislabeled as dynamic.
+     * @brief Preserve the selected immutable row-table policy in every runtime projection.
+     * @param cell Expanded typed model cell; absent policy leaves ordinary models unchanged.
+     * @return Exact explicit storage/window arguments, with no source-path or staging decision.
      */
-    inline std::vector<std::string> modelParityBenchmarkArguments(const ModelParityCase &cell)
+    inline std::vector<std::string> modelParityNgramStorageArguments(const ModelParityCase &cell)
     {
-        if (!cell.e2e_certification)
+        if (!cell.ngram_table_policy) return {};
+        const auto &policy = *cell.ngram_table_policy;
+        policy.validate();
+        const auto storage = [&]() -> const char * {
+            switch (policy.storage)
+            {
+            case ImmutableRowStoragePreference::Automatic: return "auto";
+            case ImmutableRowStoragePreference::VRAM: return "vram";
+            case ImmutableRowStoragePreference::RAM: return "ram";
+            case ImmutableRowStoragePreference::MemoryMapped: return "mmap";
+            case ImmutableRowStoragePreference::HostAdaptiveRAMSSD: return "host-adaptive-ram-ssd";
+            case ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD: return "gpu-adaptive-vram-ram-ssd";
+            }
+            throw std::invalid_argument("invalid model parity requested ngram storage");
+        }();
+        std::vector<std::string> arguments{"--ngram-storage", storage,
+                "--ngram-mmap-window-bytes", std::to_string(policy.window_bytes),
+                "--ngram-mmap-window-count", std::to_string(policy.window_count)};
+        if(policy.isFixedHeadSharded())
+            arguments.insert(arguments.end(),{"--ngram-distribution","fixed-head-sharded"});
+        if(policy.isHostAdaptive())
+        {
+            const auto &a=policy.host_adaptive;
+            arguments.insert(arguments.end(),{"--ngram-cache-max-rows",std::to_string(a.maximum_cache_rows),
+                "--ngram-cache-bytes",std::to_string(a.cache_physical_byte_limit),
+                "--ngram-cache-aging-accesses",std::to_string(a.policy.aging_accesses),
+                "--ngram-cache-protected-numerator",std::to_string(a.policy.protected_numerator),
+                "--ngram-cache-protected-denominator",std::to_string(a.policy.protected_denominator)});
+        }
+        if(policy.isGPUAdaptive())
+        {
+            const auto &g=policy.gpu_adaptive;const auto &h=g.host;
+            arguments.insert(arguments.end(),{
+                "--ngram-gpu-cache-max-rows",std::to_string(g.maximum_gpu_cache_rows),
+                "--ngram-gpu-cache-bytes",std::to_string(g.gpu_cache_physical_byte_limit),
+                "--ngram-gpu-cache-aging-accesses",std::to_string(g.gpu_policy.aging_accesses),
+                "--ngram-gpu-cache-protected-numerator",std::to_string(g.gpu_policy.protected_numerator),
+                "--ngram-gpu-cache-protected-denominator",std::to_string(g.gpu_policy.protected_denominator),
+                "--ngram-source-cache-max-rows",std::to_string(h.maximum_cache_rows),
+                "--ngram-source-cache-bytes",std::to_string(h.cache_physical_byte_limit),
+                "--ngram-source-cache-aging-accesses",std::to_string(h.policy.aging_accesses),
+                "--ngram-source-cache-protected-numerator",std::to_string(h.policy.protected_numerator),
+                "--ngram-source-cache-protected-denominator",std::to_string(h.policy.protected_denominator)});
+        }
+        return arguments;
+    }
+
+    namespace model_parity_runtime_detail
+    {
+        /**
+         * @brief Format the original cell's complete declared topology exactly once.
+         * @param cell Sole canonical topology/owner-order declaration.
+         * @param config Its caller-owned makeOrchestrationConfig result; no resolved/live state.
+         * @return Exact public placement argv, without workload or HTTP stress policy.
+         * @throws std::invalid_argument For a nondeclarative or nonrepresentable placement.
+         * @note Shared by server correctness and diagnostic benchmark exports. This
+         *       formatter does not choose participants, reduce quotas or own memory.
+         */
+        inline std::vector<std::string> declaredPlacementArguments(
+            const ModelParityCase &cell, const OrchestrationConfig &config)
+        {
+            std::vector<std::string> args;
+            const auto add = [&](const char *flag, const auto &value)
+            {
+                std::ostringstream out;
+                out << std::setprecision(9) << value;
+                args.insert(args.end(), {flag, out.str()});
+            };
+            if (cell.topology.isExpertOverlay())
+            {
+                const auto &plan = *config.moe_routed_expert_plan;
+                if (!plan.placements.empty() || !plan.initial_layer_order_overrides.empty() ||
+                    plan.continuation_domain_spec.logical_root_participant != 0)
+                    throw std::invalid_argument("model cell export requires declarative CLI-representable overlay placement");
+                add("--moe-routed-expert-placement", plan.topology == RoutedExpertPlacementTopology::SingleDomain
+                    ? "single-domain" : "tiered-overlay");
+                add("--moe-routed-expert-continuation-domain", plan.continuation_domain);
+                if (!plan.base_model_domain.empty()) add("--moe-routed-expert-base-model-domain", plan.base_model_domain);
+                if (!plan.shared_expert_domain.empty()) add("--moe-routed-expert-shared-domain", plan.shared_expert_domain);
+                add("--moe-continuation-dense-policy", denseParallelPolicyToString(plan.continuation_domain_spec.effectiveDensePolicy()));
+                add("--moe-routed-expert-owner-order", cell.expert_overlay->owner_order == RoutedExpertOwnerOrder::Ordinal ? "ordinal" : "random");
+                add("--moe-routed-expert-residency", cell.expert_overlay->movement == ModelParityExpertMovement::Static ? "static-by-id" : "rebalanced");
+                for (const auto &domain : plan.dense_domains)
+                    add("--define-domain", modelParityDomainArgument(domain));
+                for (const auto &domain : plan.domains)
+                    add("--moe-routed-expert-domain", modelParityDomainArgument(domain.toExecutionDomainDefinition()));
+                for (const auto &tier : plan.routed_tiers)
+                {
+                    if (tier.memory_budget_bytes % (1024 * 1024) != 0 || !tier.resolved_live_experts_per_layer.empty())
+                        throw std::invalid_argument("model cell tier budget must be declarative and exactly expressible in MiB");
+                    add("--moe-routed-expert-tier", tier.name + "@" + tier.domain +
+                        ";priority=" + std::to_string(tier.priority) +
+                        ";max-experts-per-layer=" + std::to_string(tier.max_experts_per_layer) +
+                        ";memory-mb=" + (tier.memory_budget_bytes ? std::to_string(tier.memory_budget_bytes / (1024 * 1024)) : "auto"));
+                }
+            }
+            else
+            {
+                if (cell.topology.kind == ModelParityTopologyKind::SingleDevice)
+                    add("--device", config.device_for_this_rank.value().toString());
+                if (!config.device_map.empty())
+                {
+                    std::string map;
+                    for (const auto &[rank, address] : config.device_map)
+                        map += (map.empty() ? "" : ",") + std::to_string(rank) + "=" + address.toString();
+                    add("--device-map", map);
+                }
+                if (!config.tp_devices.empty())
+                {
+                    std::string devices;
+                    for (const auto &address : config.tp_devices)
+                        devices += (devices.empty() ? "" : ",") + address.toString();
+                    add("--tp-devices", devices);
+                }
+                add("--tensor-parallelism-degree", config.tp_degree);
+                add("--tp-scope", tpScopeToString(config.tp_scope));
+                for (const auto &domain : config.domain_definitions)
+                    add("--define-domain", modelParityDomainArgument(domain.toExecutionDomainDefinition()));
+                for (const auto &stage : config.pp_stage_definitions)
+                    add("--pp-stage", std::to_string(stage.stage_id) + "=" + stage.domain_name + ":" +
+                        std::to_string(stage.first_layer) + "-" + std::to_string(stage.last_layer));
+            }
+            return args;
+        }
+
+        /** @brief Closed benchmark placement choice; neither arm implies certification. */
+        enum class BenchmarkPlacement { AutomaticProduction, DeclaredDiagnostic };
+    } // namespace model_parity_runtime_detail
+
+    /**
+     * @brief Share benchmark semantic intent without importing HTTP stress policy.
+     * @param cell Sole original model/precision/storage/MTP/placement declaration.
+     * @param placement Closed automatic-production or declared-diagnostic projection.
+     * @return Public argv without executable, model, workload or context.
+     * @throws std::invalid_argument For an unknown projection or nonexportable placement.
+     */
+    inline std::vector<std::string> modelParityBenchmarkSemanticArguments(
+        const ModelParityCase &cell, model_parity_runtime_detail::BenchmarkPlacement placement)
+    {
+        if (placement != model_parity_runtime_detail::BenchmarkPlacement::AutomaticProduction &&
+            placement != model_parity_runtime_detail::BenchmarkPlacement::DeclaredDiagnostic)
+            throw std::invalid_argument("invalid model parity benchmark placement projection");
+        if (placement == model_parity_runtime_detail::BenchmarkPlacement::AutomaticProduction &&
+            !cell.e2e_certification)
             throw std::invalid_argument("benchmark projection requires an E2E-tagged case");
         const auto config = cell.makeOrchestrationConfig(cell.model.model_path, 0);
         std::vector<std::string> args;
-        if (cell.topology.mpi_ranks > 1)
+        if (config.shared_predictor)
+            args.insert(args.end(), {"--mtp-model", config.shared_predictor->path()});
+        if (placement == model_parity_runtime_detail::BenchmarkPlacement::DeclaredDiagnostic ||
+            cell.topology.mpi_ranks > 1)
             args.insert(args.end(), {"--mpi-procs", std::to_string(cell.topology.mpi_ranks)});
         args.insert(args.end(), {"--activation-precision", config.activation_precision,
                                  "--kv-cache-precision", config.kv_cache_precision});
-        const auto placement = modelParityAutomaticPlacementArguments(cell);
-        args.insert(args.end(), placement.begin(), placement.end());
+        const auto ngram = modelParityNgramStorageArguments(cell);
+        args.insert(args.end(), ngram.begin(), ngram.end());
+        if (placement == model_parity_runtime_detail::BenchmarkPlacement::DeclaredDiagnostic)
+        {
+            args.insert(args.end(), {"--backend", collectiveBackendTypeToString(config.default_backend)});
+            if (!config.tp_allreduce_precision_override.empty())
+                args.insert(args.end(), {"--tp-allreduce-precision", config.tp_allreduce_precision_override});
+            const auto declared_args = model_parity_runtime_detail::declaredPlacementArguments(cell, config);
+            args.insert(args.end(), declared_args.begin(), declared_args.end());
+        }
+        else
+        {
+            const auto automatic_args = modelParityAutomaticPlacementArguments(cell);
+            args.insert(args.end(), automatic_args.begin(), automatic_args.end());
+        }
         if (cell.mtpEnabled())
         {
             args.insert(args.end(), {"--mtp", "--mtp-depth-policy",
@@ -293,6 +444,34 @@ namespace llaminar2::test::parity
             args.insert(args.end(), {"--moe-residency-maintenance", dynamic ? "dynamic" : "off"});
         }
         return args;
+    }
+
+    /**
+     * @brief Retain the existing E2E-only automatic production benchmark contract.
+     * @param cell Existing E2E-tagged canonical model case.
+     * @return Existing production-default semantic argv, without workload/model/context.
+     * @throws std::invalid_argument For an untagged case; diagnostics cannot grant a tag.
+     */
+    inline std::vector<std::string> modelParityBenchmarkArguments(const ModelParityCase &cell)
+    {
+        if (!cell.e2e_certification)
+            throw std::invalid_argument("benchmark projection requires an E2E-tagged case");
+        return modelParityBenchmarkSemanticArguments(
+            cell, model_parity_runtime_detail::BenchmarkPlacement::AutomaticProduction);
+    }
+
+    /**
+     * @brief Export a diagnostic benchmark preserving the original declared placement.
+     * @param cell Existing canonical case; no alternate topology or fake E2E profile.
+     * @return Semantic argv using exact declared domains/tiers/stages and production tuning.
+     * @throws std::invalid_argument For a nonrepresentable declared placement.
+     * @note No HTTP prefix/stress/economic thresholds are copied. This value is
+     *       explicitly noncertifying and cannot replace benchmark/e2e eligibility.
+     */
+    inline std::vector<std::string> modelParityDiagnosticBenchmarkArguments(const ModelParityCase &cell)
+    {
+        return modelParityBenchmarkSemanticArguments(
+            cell, model_parity_runtime_detail::BenchmarkPlacement::DeclaredDiagnostic);
     }
 
     /**
@@ -334,10 +513,13 @@ namespace llaminar2::test::parity
             out << std::setprecision(9) << value;
             args.insert(args.end(), {flag, out.str()});
         };
+        if (config.shared_predictor) add("--mtp-model", config.shared_predictor->path());
         if (declared || cell.topology.mpi_ranks > 1)
             add("--mpi-procs", cell.topology.mpi_ranks);
         add("--activation-precision", config.activation_precision);
         add("--kv-cache-precision", config.kv_cache_precision);
+        const auto ngram = modelParityNgramStorageArguments(cell);
+        args.insert(args.end(), ngram.begin(), ngram.end());
         if (declared) add("--backend", collectiveBackendTypeToString(config.default_backend));
         if (!config.tp_allreduce_precision_override.empty())
             add("--tp-allreduce-precision", config.tp_allreduce_precision_override);
@@ -360,59 +542,10 @@ namespace llaminar2::test::parity
             const auto constraints = modelParityAutomaticPlacementArguments(cell);
             args.insert(args.end(), constraints.begin(), constraints.end());
         }
-        else if (cell.topology.isExpertOverlay())
-        {
-            const auto &plan = *config.moe_routed_expert_plan;
-            if (!plan.placements.empty() || !plan.initial_layer_order_overrides.empty() ||
-                plan.continuation_domain_spec.logical_root_participant != 0)
-                throw std::invalid_argument("model cell export requires declarative CLI-representable overlay placement");
-            add("--moe-routed-expert-placement", plan.topology == RoutedExpertPlacementTopology::SingleDomain
-                ? "single-domain" : "tiered-overlay");
-            add("--moe-routed-expert-continuation-domain", plan.continuation_domain);
-            if (!plan.base_model_domain.empty()) add("--moe-routed-expert-base-model-domain", plan.base_model_domain);
-            if (!plan.shared_expert_domain.empty()) add("--moe-routed-expert-shared-domain", plan.shared_expert_domain);
-            add("--moe-continuation-dense-policy", denseParallelPolicyToString(plan.continuation_domain_spec.effectiveDensePolicy()));
-            add("--moe-routed-expert-owner-order", cell.expert_overlay->owner_order == RoutedExpertOwnerOrder::Ordinal ? "ordinal" : "random");
-            add("--moe-routed-expert-residency", cell.expert_overlay->movement == ModelParityExpertMovement::Static ? "static-by-id" : "rebalanced");
-            for (const auto &domain : plan.dense_domains)
-                add("--define-domain", modelParityDomainArgument(domain));
-            for (const auto &domain : plan.domains)
-                add("--moe-routed-expert-domain", modelParityDomainArgument(domain.toExecutionDomainDefinition()));
-            for (const auto &tier : plan.routed_tiers)
-            {
-                if (tier.memory_budget_bytes % (1024 * 1024) != 0 || !tier.resolved_live_experts_per_layer.empty())
-                    throw std::invalid_argument("model cell tier budget must be declarative and exactly expressible in MiB");
-                add("--moe-routed-expert-tier", tier.name + "@" + tier.domain +
-                    ";priority=" + std::to_string(tier.priority) +
-                    ";max-experts-per-layer=" + std::to_string(tier.max_experts_per_layer) +
-                    ";memory-mb=" + (tier.memory_budget_bytes ? std::to_string(tier.memory_budget_bytes / (1024 * 1024)) : "auto"));
-            }
-        }
         else
         {
-            if (cell.topology.kind == ModelParityTopologyKind::SingleDevice)
-                add("--device", config.device_for_this_rank.value().toString());
-            if (!config.device_map.empty())
-            {
-                std::string map;
-                for (const auto &[rank, address] : config.device_map)
-                    map += (map.empty() ? "" : ",") + std::to_string(rank) + "=" + address.toString();
-                add("--device-map", map);
-            }
-            if (!config.tp_devices.empty())
-            {
-                std::string devices;
-                for (const auto &address : config.tp_devices)
-                    devices += (devices.empty() ? "" : ",") + address.toString();
-                add("--tp-devices", devices);
-            }
-            add("--tensor-parallelism-degree", config.tp_degree);
-            add("--tp-scope", tpScopeToString(config.tp_scope));
-            for (const auto &domain : config.domain_definitions)
-                add("--define-domain", modelParityDomainArgument(domain.toExecutionDomainDefinition()));
-            for (const auto &stage : config.pp_stage_definitions)
-                add("--pp-stage", std::to_string(stage.stage_id) + "=" + stage.domain_name + ":" +
-                    std::to_string(stage.first_layer) + "-" + std::to_string(stage.last_layer));
+            const auto declared_args = model_parity_runtime_detail::declaredPlacementArguments(cell, config);
+            args.insert(args.end(), declared_args.begin(), declared_args.end());
         }
         // Off cells still retain the model's setup envelope, just as numerical
         // parity does. Dropping it here could change automatic expert capacity.
@@ -542,19 +675,87 @@ namespace llaminar2::test::parity
     }
 
     /**
+     * @brief Export complete diagnostic obligations using one existing argv owner.
+     * @param cell Original expanded case, whose profile was source-validated.
+     * @param out Discovery stream; no files, model or approval state are read.
+     * @note The typed accuracy policy exports obligations, never observed passes.
+     *       Both projections reference diagnostic_benchmark.args. There is no
+     *       second argv surface to drift or bypass inventory source remapping.
+     */
+    inline void writeModelParityPairedWorkload(const ModelParityCase &cell, std::ostream &out)
+    {
+        if (!cell.paired_workload) return;
+        const auto &pair = *cell.paired_workload;
+        pair.validate(cell.model.model_path,
+            cell.model.shared_predictor ? std::optional<std::string>(cell.model.shared_predictor->path())
+                                        : std::nullopt);
+        const auto document = [&](const ModelParityDocumentReference &reference)
+        {
+            out << "{\"path\":" << modelParityJsonString(reference.path)
+                << ",\"sha256\":" << modelParityJsonString(reference.sha256) << '}';
+        };
+        out << ",\"paired_workload\":{\"schema\":2,\"policy\":\"diagnostic_obligation\","
+               "\"certification_eligible\":false,\"role\":"
+            << modelParityJsonString(pair.role == ModelParityPairRole::Required ? "required" : "expanded")
+            << ",\"case_id\":" << modelParityJsonString(cell.testName())
+            << ",\"source_fields\":[\"model\"";
+        if (cell.model.shared_predictor) out << ",\"shared_predictor\"";
+        out << "],\"accuracy\":{\"arguments_from\":\"diagnostic_benchmark\",\"catalog\":";
+        document(pair.accuracy_catalog);
+        out << ",\"workload\":"; document(pair.accuracy_workload);
+        if (const auto *initial = std::get_if<ModelParityInitialAbsolutePilot>(&pair.accuracy_policy))
+        {
+            out << ",\"policy\":\"initial_absolute_pilot\",\"pilot\":";
+            document(initial->pilot);
+            out << ",\"approved_baseline\":false,\"calibrated\":false,\"whole_corpus_accepted\":false";
+        }
+        else
+        {
+            const auto &revision = std::get<ModelParityCalibratedRevision>(pair.accuracy_policy);
+            out << ",\"policy\":\"calibrated_revision\",\"baseline\":";
+            document(revision.baseline);
+            out << ",\"approval\":"; document(revision.approval);
+            out << ",\"calibration\":"; document(revision.calibration);
+        }
+        out << "},\"benchmark\":{\"policy\":\"diagnostic_declared\","
+               "\"arguments_from\":\"diagnostic_benchmark\",\"profile\":";
+        document(pair.benchmark_profile);
+        out << '}';
+        if (pair.qfn_arithmetic)
+        {
+            const auto &a = *pair.qfn_arithmetic;
+            out << ",\"arithmetic\":{\"gdn_projection\":" << modelParityJsonString(std::string(gdnProjectionArithmeticName(a.gdn_projection)))
+                << ",\"moe_router\":" << modelParityJsonString(std::string(moeRouterArithmeticName(a.moe_router)))
+                << ",\"hc_up\":" << modelParityJsonString(std::string(quantizedActivationOperandPrecisionName(a.hc_up)))
+                << ",\"gdn_output\":" << modelParityJsonString(std::string(quantizedActivationOperandPrecisionName(a.gdn_output)))
+                << ",\"fa_output\":" << modelParityJsonString(std::string(quantizedActivationOperandPrecisionName(a.fa_output)))
+                << ",\"gdn_qkv\":" << modelParityJsonString(std::string(quantizedActivationOperandPrecisionName(a.gdn_qkv))) << '}';
+        }
+        out << '}';
+    }
+
+    /**
      * @brief GoogleTest's ADL parameter printer is the discovery export boundary.
      * @param cell Typed parameter, also consumed by the numerical fixture.
      * @param out GoogleTest discovery stream; emits one complete JSON line.
      */
     inline void PrintTo(const ModelParityCase &cell, std::ostream *out)
     {
+        // Reject incomplete direct-constructed cases before writing partial JSON.
+        if (cell.paired_workload)
+            cell.paired_workload->validate(cell.model.model_path,
+                cell.model.shared_predictor ? std::optional<std::string>(cell.model.shared_predictor->path())
+                                            : std::nullopt);
         // Only the execution policy changes for the serial reference. Its
         // topology, precision, placement and retained MTP capacity stay fixed.
         auto control = cell;
         control.mtp = ModelParityMTP::Off;
         *out << "{\"model_parity_schema\":1,\"id\":" << modelParityJsonString(cell.testName())
              << ",\"model\":" << modelParityJsonString(cell.model.model_path)
-             << ",\"runtime\":{\"context_length\":" << cell.model.max_seq_len
+             << (cell.model.shared_predictor ? ",\"shared_predictor\":" +
+                 modelParityJsonString(cell.model.shared_predictor->path()) : std::string{});
+        writeModelParityPairedWorkload(cell, *out);
+        *out << ",\"runtime\":{\"context_length\":" << cell.model.max_seq_len
              << ",\"generation\":{\"max_tokens\":" << cell.generation_workload.maximumTokens()
              << ",\"minimum_completion_tokens\":" << cell.generation_workload.minimumTokens()
              << ",\"readiness_timeout_seconds\":" << cell.generation_workload.readinessSeconds()
@@ -605,6 +806,11 @@ namespace llaminar2::test::parity
         const auto args = modelParityServerArguments(cell);
         for (std::size_t i = 0; i < args.size(); ++i)
             *out << (i ? "," : "") << modelParityJsonString(args[i]);
+        *out << "]},\"diagnostic_benchmark\":{\"schema\":1,\"policy\":\"diagnostic_declared\",\"certification_eligible\":false,\"context_length\":"
+             << cell.model.max_seq_len << ",\"args\":[";
+        const auto diagnostic_args = modelParityDiagnosticBenchmarkArguments(cell);
+        for (std::size_t i = 0; i < diagnostic_args.size(); ++i)
+            *out << (i ? "," : "") << modelParityJsonString(diagnostic_args[i]);
         *out << "]},\"cross_host_e2e\":";
         writeModelParityCrossHostE2E(cell, *out);
         *out << ",\"e2e\":";

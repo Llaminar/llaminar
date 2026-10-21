@@ -43,6 +43,11 @@ namespace llaminar2
      * @return true when every upload was enqueued successfully.
      */
     [[nodiscard]] bool cuda_tq_upload_codebooks(cudaStream_t stream);
+    /** @brief Resolve a canonical device codebook during cache construction only.
+     * @param bits Native centroid width, either four or eight.
+     * @return Immutable module-owned device address; never a copied codebook.
+     */
+    const float *cuda_tq_native_centroids(int bits);
 
     // =========================================================================
     // Rotation Matrix Management

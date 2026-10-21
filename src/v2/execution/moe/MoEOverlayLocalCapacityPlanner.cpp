@@ -12,8 +12,10 @@
  */
 
 #include "MoEOverlayLocalCapacityPlanner.h"
+#include "utils/DebugEnv.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "MoEOverlayCPUServiceMeasurement.h"
+#include "MoEOverlayNoPeerResidency.h"
 #include "collective/LocalTPCollectiveInventory.h"
 
 #include "planning/ActivationBufferSizing.h"
@@ -245,8 +247,12 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay physical resource identity requires a bound rank and device");
         }
+        // DeviceId::toString intentionally renders every CPU as "CPU" for
+        // logs. Distributed budget identities must retain its exact NUMA
+        // ordinal, just like the typed rank/device allocator join key.
         return "overlay-rank=" + std::to_string(world_rank) +
-               ";device=" + device.toString();
+               ";device=" + device.toString() +
+               (device.is_cpu() ? ":" + std::to_string(device.ordinal) : "");
     }
 
     std::vector<MoEOverlayContinuationShard>
@@ -381,13 +387,23 @@ namespace llaminar2
             const auto &overlay_plan = *input.overlay_plan;
             const auto &inventory = *input.rank_inventory;
             const auto &family = input.graph_family;
+            // Preserve original routed sidecars even when the source's published
+            // block_count describes main layers only. The profile is the sole
+            // authority for the ordinary-inline versus separate-source contract.
+            const int main_layers = profile.mainLayerCount();
+            const int total_layers = profile.totalLayerCount();
             if (!family.valid() || family.first_model_layer != overlay_plan.first_model_layer ||
-                family.first_model_layer >= profile.n_layers ||
-                family.routedLayerCapacity() > profile.n_layers - family.first_model_layer)
+                family.first_model_layer >= main_layers ||
+                family.routedLayerCapacity() > total_layers - family.first_model_layer)
                 throw std::invalid_argument("ExpertOverlay fixed memory requires its exact retained routed graph interval");
+            // Match the storage-policy projection: a singleton stage cannot
+            // move an expert, so it has no transaction-demand bank. This is
+            // admission geometry only; runtime still seals complete residency.
+            // Every movable host authority retains its exact evidence owner.
             const bool needs_host_demand =
                 overlay_plan.authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&
-                rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic;
+                rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+                !MoEOverlayNoPeerResidency::hasNoPeerTopology(overlay_plan);
             if (needs_host_demand != input.host_demand_memory.has_value())
                 throw std::invalid_argument(
                     "ExpertOverlay host Dynamic capacity requires exactly its routing-evidence BOM; other authorities must not allocate a host mirror");
@@ -487,7 +503,10 @@ namespace llaminar2
             }
 
             const std::vector<int> no_routed_experts(
-                static_cast<std::size_t>(profile.n_layers), 0);
+                // Entries stay global-source indexed, including source48. Every
+                // routed parent receives an explicit zero residency in this fixed
+                // contribution; quotas charge its experts in the same PMA later.
+                static_cast<std::size_t>(total_layers), 0);
             const DenseParallelPolicy continuation_dense_policy =
                 overlay_plan.continuation_domain_spec.effectiveDensePolicy();
             const bool continuation_uses_dense_tp =
@@ -504,6 +523,18 @@ namespace llaminar2
                 DevicePlanConfig config;
                 config.world_rank = rank_plan.rank;
                 config.device = device;
+                config.qfn_hc_up_activation = profile.flash_next
+                    ? debugEnv().gemm.qfn_hc_up_activation
+                    : QuantizedActivationOperandPrecision::SingleQ8;
+                config.qfn_gdn_output_activation = profile.flash_next
+                    ? debugEnv().gemm.qfn_gdn_output_activation
+                    : QuantizedActivationOperandPrecision::SingleQ8;
+                config.qfn_fa_output_activation = profile.flash_next
+                    ? debugEnv().gemm.qfn_fa_output_activation
+                    : QuantizedActivationOperandPrecision::SingleQ8;
+                config.qfn_gdn_qkv_activation = profile.flash_next
+                    ? debugEnv().gemm.qfn_gdn_qkv_activation
+                    : QuantizedActivationOperandPrecision::SingleQ8;
                 config.device_total_bytes = total_bytes;
                 config.device_free_bytes = usableMemory(
                     available_bytes, device, input);
@@ -530,6 +561,7 @@ namespace llaminar2
                         .device_bytes = load_geometry.staging_bytes,
                         .host_bytes = load_geometry.host_staging_bytes,
                     };
+                    config.ordinary_weight_load_geometry = load_geometry;
                 }
                 config.device_compute_units =
                     inventoryComputeUnits(inventory, device);
@@ -547,15 +579,27 @@ namespace llaminar2
                 {
                     config.graph_snapshot_memory =
                         input.graph_snapshot_memory;
+                    if (config.graph_snapshot_memory.valid())
+                    {
+                        const auto &mtp = rank_plan.runtime.mtp;
+                        const MTPGraphOwnerPlan graph_owners(mtp);
+                        const auto arenas = ServingSnapshotArenaInventory::ordinary(
+                            true, graph_owners.retainsGraphCapacity(), graph_owners.sidecarGraphSlots(),
+                            graph_owners.retainsGraphCapacity() ? graph_owners.requestCapacity() : 0u);
+                        // PreparedInactive retains both lean and diagnostic executables,
+                        // but lean graphs contain no snapshot arena. One frozen
+                        // diagnostic namespace owns the role populations above.
+                        config.graph_snapshot_memory.serving_arenas = arenas;
+                        config.graph_snapshot_memory.retained_main_forward_arena_count = arenas.mainOwners();
+                        config.graph_snapshot_memory.retained_forward_arena_count = arenas.allOwners();
+                    }
                     if (config.graph_snapshot_memory.effective_kv)
                     {
                         // Segments import into retained forward parents. Charge
                         // those independent identities, never every segment or
                         // rank ticket, plus the separately retained sidecars.
-                        const auto &graphs = input.captured_graph_plan.resident_executables;
                         config.graph_snapshot_memory.effective_kv->retained_arena_count =
-                            graphs.model_graph_identity_count * graphs.model_graph_topology_variant_count +
-                            MTPGraphOwnerPlan(rank_plan.runtime.mtp).sidecarGraphSlots();
+                            config.graph_snapshot_memory.retained_forward_arena_count;
                     }
                 }
                 config.shard_index = shard_index;
@@ -619,8 +663,10 @@ namespace llaminar2
                         PrefixCacheStorageMode::Device;
                 if (device.is_gpu() &&
                     (owns_host_prefix_tier ||
-                     config.weight_load_staging.host_bytes != 0u))
+                     config.weight_load_staging.host_bytes != 0u || profile.flash_next.has_value()))
                 {
+                    // Match the actual rank-local host allocator. NUMA binding
+                    // controls placement, not DeviceId's CPU ordinal.
                     const auto [host_total, host_available] =
                         inventoryMemory(inventory, DeviceId::cpu());
                     config.associated_host_memory = PhysicalMemoryResource{
@@ -835,6 +881,20 @@ namespace llaminar2
                     DeviceExecutionMemoryRole::RoutedExpertParticipant));
             }
 
+            (void)immutableRowTableTPTopology(profile,rank_plan);
+            if(profile.flash_next)
+            {
+                const auto layer=static_cast<int>(profile.flash_next->ple_decoder_layer);
+                for(auto &config:configs)
+                    if(config.execution_role==DeviceExecutionMemoryRole::ContinuationGraph&&
+                        config.first_layer<=layer&&(config.last_layer<0||config.last_layer>=layer))
+                    {
+                        config.ngram_tp_topology=immutableRowTableTPTopology(profile,rank_plan);
+                        config.ngram_execution_policy=rank_plan.runtime.ngram_table_policy;
+                        config.ngram_host_placement=ImmutableRowTableHostPlacement::fromObservedNUMANode(rank_plan.numa_node);
+                        config.ngram_table_placement=rank_plan.runtime.ngram_table_placement;
+                    }
+            }
             return {.device_inputs = std::move(configs), .resource_devices = std::move(resource_devices),
                 .endpoint_devices = std::move(endpoint_devices), .activation_channel_plan = std::move(activation_channel_plan)};
         }

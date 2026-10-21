@@ -650,6 +650,60 @@ namespace llaminar2::moe_rebalance_policy
         return bit_index < 64u ? (1ULL << bit_index) : 0ULL;
     }
 
+    /**
+     * @brief Scalar wave demand and exact directed payload ownership masks.
+     *
+     * A wave pays the maximum source slot extent, rather than their sum. Keeping
+     * only that maximum avoids an addressable per-thread participant array in
+     * native controller kernels. Masks retain all syntactically valid owners,
+     * including inactive sources; only active sources contribute paid slots.
+     */
+    struct PayloadPlanDemand
+    {
+        uint32_t requested_slots = 0u; ///< Maximum active-source payload extent.
+        uint32_t source_mask = 0u; ///< Valid source owners, including inactive ones.
+        uint32_t destination_mask = 0u; ///< Valid active destination owners.
+        uint64_t edge_mask = 0ULL; ///< Directed source/destination ownership edges.
+    };
+
+    /**
+     * @brief Accumulate one controller plan without private participant storage.
+     * @param demand In/out scalar maximum and ownership masks for this wave.
+     * @param op Canonical plan opcode; only arrivals and transfers carry payload.
+     * @param source Source participant encoded by the immutable plan.
+     * @param destination Destination participant encoded by the immutable plan.
+     * @param payload_slot Source-local payload slot; UINT32_MAX denotes no slot.
+     * @param participant_count Active participant count for this controller.
+     *
+     * The former two-step reduction first took each source's maximum and then
+     * reduced only active sources. Max associativity permits the direct scalar
+     * reduction below, provided the active-source filter applies only to slots.
+     * Moving it into the validity predicate would change the ownership masks.
+     */
+    LLAMINAR_MOE_REBALANCE_HD void accumulatePayloadPlanDemand(
+        PayloadPlanDemand &demand,
+        uint32_t op,
+        uint32_t source,
+        uint32_t destination,
+        uint32_t payload_slot,
+        uint32_t participant_count) noexcept
+    {
+        if ((op != kPlanExpertPayloadArrival && op != kPlanOwnershipTransfer) ||
+            source >= kMaxPolicyParticipants ||
+            destination >= participant_count ||
+            destination >= kMaxPolicyParticipants ||
+            payload_slot == ~uint32_t{0})
+            return;
+
+        const uint32_t requested = payload_slot + 1u;
+        if (source < participant_count && demand.requested_slots < requested)
+            demand.requested_slots = requested;
+        demand.source_mask |= participantBit(source);
+        demand.destination_mask |= participantBit(destination);
+        demand.edge_mask |= directedParticipantEdgeBit(
+            source, destination, kMaxPolicyParticipants);
+    }
+
     LLAMINAR_MOE_REBALANCE_HD uint32_t validParticipantMask(uint32_t participant_count) noexcept
     {
         return (1u << participant_count) - 1u;

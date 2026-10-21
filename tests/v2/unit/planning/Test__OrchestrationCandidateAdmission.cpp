@@ -8,6 +8,8 @@
  */
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "planning/RankMemoryPlanInputs.h"
+#include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
+#include <set>
 #include "config/OrchestrationConfigDocument.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
@@ -216,7 +218,15 @@ TEST(OrchestrationCandidateAdmission, RemoteOverlayAdmitsEveryRankAndRetainsDept
             {
                 EXPECT_EQ(resolveMTPRetainedDraftCapacity(rank.runtime.mtp), 15);
                 EXPECT_GE(rank.runtime.resident_graph_rows, resolveMTPRetainedTargetQueryRows(rank.runtime.mtp));
-                EXPECT_NE(admitted.physicalAdmission().plan().find({rank.rank, DeviceId::cpu()}), nullptr);
+                // A remote CPU expert endpoint keeps its real NUMA ordinal;
+                // the root's ordinary loader can separately own CPU0 staging.
+                const auto &resources=admitted.physicalAdmission().plan().resources();
+                EXPECT_TRUE(std::any_of(resources.begin(),resources.end(),[&](const auto &bom) {
+                    return bom.resource().world_rank==rank.rank && bom.resource().device.is_cpu();
+                }));
+                for(const auto &device:admitted.devicePlans())
+                    if(device.world_rank==rank.rank && device.device.is_cpu())
+                        EXPECT_NE(admitted.physicalAdmission().plan().find({rank.rank,device.device}),nullptr);
             }
         }
     }
@@ -281,4 +291,20 @@ TEST(OrchestrationCandidateAdmission, PipelineAdmissionIncludesTheNonRootPhysica
             EXPECT_THROW((void)AdmittedOrchestrationCandidate::admit(std::move(value), source, policy()), PhysicalMemoryCapacityExhausted);
         });
     EXPECT_EQ(seen, 2);
+}
+
+/** @test Diagnostic budget keys preserve the same CPU NUMA identity as canonical typed PMA keys. */
+TEST(OrchestrationCandidateAdmission, BoundPhysicalBudgetIdentityPreservesCpuNumaOrdinal)
+{
+    std::set<std::string> identities;
+    for(const auto device:{DeviceId::cpu(),DeviceId{DeviceType::CPU,1},DeviceId{DeviceType::CPU,3},
+        DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        const auto identity=MoEOverlayLocalCapacityPlanner::physicalResourceId(0,device);
+        EXPECT_TRUE(identities.insert(identity).second)<<identity;
+        EXPECT_EQ(identity,MoEOverlayLocalCapacityPlanner::physicalResourceId(0,device));
+        EXPECT_NE(identity,MoEOverlayLocalCapacityPlanner::physicalResourceId(1,device));
+    }
+    EXPECT_THROW(MoEOverlayLocalCapacityPlanner::physicalResourceId(-1,DeviceId::cpu()),std::invalid_argument);
+    EXPECT_THROW(MoEOverlayLocalCapacityPlanner::physicalResourceId(0,DeviceId::invalid()),std::invalid_argument);
 }

@@ -174,7 +174,7 @@ TEST(GraphSnapshotRowLayout, CapturedPublicationPreservesOwnedRowsAcrossBackends
             ASSERT_EQ(snapshot->publication, SnapshotPublication::RowPartition);
             ASSERT_EQ(snapshot->rows, size_t(live));
             EXPECT_EQ(snapshot->cols, size_t(cols));
-            values[participant] = snapshot->data;
+            values[participant] = snapshot->data.floats();
             ownership[participant] = snapshot->row_ownership;
             EXPECT_EQ(std::memcmp(fixture.source.data(), physical.data(), physical.size()*sizeof(float)),0);
         }

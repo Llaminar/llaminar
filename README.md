@@ -224,6 +224,74 @@ You can add these options to the command when you need them:
 | Disable MTP on a GGUF with MTP weights | Add `--no-mtp` |
 | Connect from another machine | Change to `--host 0.0.0.0` and use the server's IP address |
 
+QFN can explicitly partition its original native table by head with
+`--ngram-storage vram --ngram-distribution fixed-head-sharded`. This requires
+full-main homogeneous rank-local GPU tensor parallelism of degree2,4,or8 in
+its declared communicator order. PP, CPU, mixed backends, cross-rank TP and
+hosted/adaptive storage are rejected before preparation. Native shard lengths
+follow original head offsets and may differ; PMA admits the complete fixed
+execution plus original native ranges after higher-priority owners are frozen.
+`--ngram-distribution replicated` remains the default, including whole-VRAM
+replication; Automatic never selects head sharding. This component is not a
+qualification claim for distributed serving.
+
+Models with native ngram tables select storage with `--ngram-storage auto`
+(the default), `vram`, `ram`, or `mmap`. Automatic admission first fixes model
+weights, expert placement, KV/context, graph rows, workspace and every other
+consumer, then chooses VRAM, RAM, or bounded SSD mmap from the remaining
+canonical memory plan. VRAM keeps one original native-format table on each GPU
+that executes PLE; a real CPU PLE consumer makes VRAM ineligible. RAM and mmap
+share one rank-local host table. Explicit choices must fit and never retry a
+cheaper mode. The mmap mode reads the original GGUF through bounded read-only
+file mappings; model-file staging is a separate source-storage policy.
+`--ngram-mmap-window-bytes` sets the page-aligned mapping extent (default 65,536
+bytes), and `--ngram-mmap-window-count` sets the maximum retained mappings
+(default 1,024). The resolved mode stays fixed after admission, including on an
+allocation or SSD-read failure.
+
+`--ngram-storage host-adaptive-ram-ssd` explicitly selects one CPU-owned native
+RAM cache over that bounded SSD source. It supports CPU lookup and the existing
+hosted GPU lookup service; it does not create GPU cache pools or change Automatic
+selection. Set both `--ngram-cache-max-rows` and `--ngram-cache-bytes` to bound the
+optional cache; the latter includes its native payload and all slot/index/policy
+metadata. Both default to zero, which is a valid SSD response service without
+RAM cache slots. Mandatory SSD windows, request metadata and lookup execution
+are admitted before expert quotas; optional slots use only the final complete
+PMA plan after other owners are fixed. Admission can resolve fewer slots than
+the requested ceilings without changing mode, model placement or graph rows.
+`--ngram-cache-aging-accesses` (65,536),
+`--ngram-cache-protected-numerator` (3), and
+`--ngram-cache-protected-denominator` (4) freeze the experimental policy: aged
+frequency controls admission and probation/protected logical recency controls
+eviction. These fields are valid only for this explicit mode. Native source
+identity and row bytes are preserved, and SSD/source failure is fatal. GPU
+adaptive residency, cross-rank cache sharding and adaptive no-SSD are not
+implemented by this host mode.
+
+`--ngram-storage gpu-adaptive-vram-ram-ssd` is the explicit experimental
+single-GPU native cache over a local subordinate CPU RAM/SSD source. Its initial
+scope is one full-main CUDA or ROCm continuation, request batch1, with local CPU
+source ownership; TP, PP, hybrid continuation, sharding and no-SSD reject. Auto
+and host-adaptive storage do not select it. Native component and full-model
+qualification of this new mode remain pending; declaration is not an economy
+or numerical certificate.
+
+Use `--ngram-gpu-cache-max-rows` / `--ngram-gpu-cache-bytes` for GPU payload plus
+metadata, and `--ngram-source-cache-max-rows` / `--ngram-source-cache-bytes` for
+the subordinate CPU cache. Both ceilings per cache default to zero, preserving
+the same explicit mode and mandatory SSD response path. Mandatory source,
+protocol and request scratch precede expert/KV grants; optional GPU slots then
+RAM slots fit only after higher priorities freeze. Positive requested limits
+are ceilings, not guaranteed reservations. Each prefix has independent
+`-aging-accesses`, `-protected-numerator`, and `-protected-denominator` options
+with defaults 65,536/3/4. Existing `--ngram-cache-*` options belong solely to the
+host-adaptive mode and cannot be mixed into this arm, regardless of flag order.
+YAML `ngram` keys are `storage`, `gpu_cache_max_rows`, `gpu_cache_bytes`,
+`gpu_aging_accesses`, `gpu_protected_numerator`, `gpu_protected_denominator`,
+`source_cache_max_rows`, `source_cache_bytes`, `source_aging_accesses`,
+`source_protected_numerator`, and `source_protected_denominator`; the unchanged
+`mmap_window_bytes` / `mmap_window_count` bound the original SSD service.
+
 MTP is enabled automatically when the GGUF includes complete learned MTP heads.
 Dynamic depth is the default and adapts how many tokens the model proposes and
 verifies at a time. `--no-mtp` supports ordinary decoding on the same GGUF across
@@ -1238,7 +1306,28 @@ operands to all GDN projections and `fp32` selects full floating operands.
 Router precision and Q8 expert GEMM stay unchanged. Planning, prepared engines
 and prefix-cache identity include the selected policy.
 
+For Qwen Flash Next, keep `fp16_moe_alpha_beta` when comparing router precision
+alone; selecting `fp16` additionally applies half operands to QKV, Z and output
+projections. Both retain FP32 accumulation and recurrent-state arithmetic.
+Full floating GDN policies cannot be combined with the QFN QKV or GDN-output
+`two_term_q8` diagnostics, which require original native quantized operands.
+
 ### Router arithmetic diagnostics
+
+Qwen Flash Next (`qwen4exp`) defaults to FP16 router weights and hidden
+operands with FP32 accumulation on CPU, CUDA and ROCm. Its GDN default remains
+native QKV, Z and output projections with FP16 alpha/beta controls. Other model
+families retain their existing native router default. Explicit
+`LLAMINAR_MOE_ROUTER_ARITHMETIC=native` restores the native router diagnostic;
+`fp16` and `native_hadamard32` remain explicit choices for every family. Planning,
+prepared weights, startup observations and prefix identity use the resolved
+policy, so omitted QFN routing and explicit `fp16` share the same identity.
+
+`LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16` selects FP16 weights and hidden operands
+with FP32 accumulation and routing reductions on CPU, CUDA and ROCm. It can
+be used independently or together with
+`LLAMINAR_GDN_PROJECTION_ARITHMETIC=fp16`. Quantized expert GEMMs still consume
+the original hidden state through their own Q8 activation preparation.
 
 For FP32 router source weights, the native CUDA policy uses FP32 routing in
 ordinary prefill and Q8 routing in decode and serial-equivalent verification.
@@ -1429,3 +1518,17 @@ Production inference currently supports FP32 model activations only.
 `--activation-precision fp32` is the default; other activation modes fail as
 unimplemented. KV-cache precision and model/expert weight formats are separate
 settings and retain their own supported formats.
+
+### QFN GDN QKV arithmetic diagnostic
+
+`LLAMINAR_QFN_GDN_QKV_ACTIVATION=single_q8|two_term_q8` selects the
+activation operand precision for original main-decoder GDN mixed-QKV
+projections. The default remains `single_q8`. This setup-only setting is
+independent of the HC-up, GDN-output and FA-output activation selectors and
+of `LLAMINAR_GDN_PROJECTION_ARITHMETIC`. The explicit `two_term_q8` arm
+requires the complete unchanged original native Q8_0 matrix, one request's
+authenticated query rows and the existing prepared-weight/workspace owners;
+partial dense TP and converted GDN weight representations are rejected.
+It does not select FA, predictor, Z, alpha or beta arithmetic. This diagnostic
+introduces no default or model-qualification promotion; focused backend and
+canonical numerical qualification remain required.

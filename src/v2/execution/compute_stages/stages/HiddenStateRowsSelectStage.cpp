@@ -293,6 +293,7 @@ namespace llaminar2
             DeviceRowIndexSource::ShiftedPrefillTransaction)
         {
             const bool valid_transaction =
+                validMTPShiftedCacheOrigin(params_.shifted_cache_origin) &&
                 params_.device_id.is_gpu() && params_.request_count > 0 &&
                 params_.seq_len % params_.request_count == 0 &&
                 selected_row_count_ == params_.seq_len &&
@@ -740,7 +741,7 @@ namespace llaminar2
                         row_stride,
                         params_.seq_len,
                         params_.d_model,
-                        gpuStream());
+                        gpuStream(),params_.shifted_cache_origin);
                 }
             }
             else if (shifted_prefill_progress)
@@ -756,7 +757,7 @@ namespace llaminar2
                     params_.seq_len,
                     params_.d_model,
                     selected_row_count_,
-                    gpuStream());
+                    gpuStream(),params_.shifted_cache_origin);
             }
             else if (request_terminal_rows)
             {
@@ -854,7 +855,7 @@ namespace llaminar2
                         row_stride,
                         params_.seq_len,
                         params_.d_model,
-                        gpuStream());
+                        gpuStream(),params_.shifted_cache_origin);
                 }
             }
             else if (shifted_prefill_progress)
@@ -870,7 +871,7 @@ namespace llaminar2
                     params_.seq_len,
                     params_.d_model,
                     selected_row_count_,
-                    gpuStream());
+                    gpuStream(),params_.shifted_cache_origin);
             }
             else if (request_terminal_rows)
             {

@@ -76,6 +76,18 @@ class PipelineStage(Enum):
     # === Extensibility ===
     CUSTOM = auto()                 # Custom stage for architecture-specific extensions
 
+    # Exact Qwen4Exp hyper-residual, sparse-selection and integer PLE checkpoints.
+    GR_NORM = auto()
+    GR_READ = auto()
+    GR_WRITE = auto()
+    QSA_INDEXER_QUERY = auto()
+    QSA_INDEXER_POOLED_KEYS = auto()
+    QSA_SELECTED_INDICES = auto()
+    PLE_HASH_INDICES = auto()
+    PLE_GATHER = auto()
+    PLE_GATE = auto()                 # Four gated shared values, flattened to the 4H trunk width
+    PLE_CONVOLUTION = auto()          # Fused residual + gated value + SiLU(depthwise convolution)
+
 
 # Mapping for string conversion (matches C++ stage_to_string)
 _STAGE_TO_STRING: Dict[PipelineStage, str] = {
@@ -120,6 +132,16 @@ _STAGE_TO_STRING: Dict[PipelineStage, str] = {
     PipelineStage.MOE_SHARED_GATE_OUTPUT: "MOE_SHARED_GATE_OUTPUT",
     PipelineStage.MOE_COMBINED_OUTPUT: "MOE_COMBINED_OUTPUT",
     PipelineStage.CUSTOM: "CUSTOM",
+    PipelineStage.GR_NORM: "GR_NORM",
+    PipelineStage.GR_READ: "GR_READ",
+    PipelineStage.GR_WRITE: "GR_WRITE",
+    PipelineStage.QSA_INDEXER_QUERY: "QSA_INDEXER_QUERY",
+    PipelineStage.QSA_INDEXER_POOLED_KEYS: "QSA_INDEXER_POOLED_KEYS",
+    PipelineStage.QSA_SELECTED_INDICES: "QSA_SELECTED_INDICES",
+    PipelineStage.PLE_HASH_INDICES: "PLE_HASH_INDICES",
+    PipelineStage.PLE_GATHER: "PLE_GATHER",
+    PipelineStage.PLE_GATE: "PLE_GATE",
+    PipelineStage.PLE_CONVOLUTION: "PLE_CONVOLUTION",
 }
 
 _STRING_TO_STAGE: Dict[str, PipelineStage] = {v: k for k, v in _STAGE_TO_STRING.items()}

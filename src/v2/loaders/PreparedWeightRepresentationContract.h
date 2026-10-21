@@ -57,7 +57,7 @@ namespace llaminar2
         [[nodiscard]] static constexpr bool isGDNProjectionSource(
             WeightRole role, std::string_view name, std::string_view architecture) noexcept
         {
-            if (architecture != "qwen35" && architecture != "qwen35moe") return false;
+            if (architecture != "qwen35" && architecture != "qwen35moe" && architecture != "qwen4exp") return false;
             if (!name.starts_with("blk.")) return false;
             const auto end = name.find('.', 4);
             if (end == std::string_view::npos || end == 4) return false;
@@ -89,7 +89,7 @@ namespace llaminar2
             if (!isGDNProjectionSource(role, name, architecture))
                 return GDNProjectionArithmetic::Native;
             if (requested == GDNProjectionArithmetic::FP16MoEAlphaBeta)
-                return architecture == "qwen35moe" && role == WeightRole::GDNAlphaBetaProjection ?
+                return (architecture == "qwen35moe" || architecture == "qwen4exp") && role == WeightRole::GDNAlphaBetaProjection ?
                     GDNProjectionArithmetic::FP16 : GDNProjectionArithmetic::Native;
             if (requested == GDNProjectionArithmetic::FP16AlphaBeta)
                 return role == WeightRole::GDNAlphaBetaProjection ?
@@ -110,8 +110,9 @@ namespace llaminar2
         [[nodiscard]] static constexpr ModelPreparedWeightRepresentation resolve(
             WeightRole role, TensorType source_type, std::string_view name,
             std::string_view architecture, GDNProjectionArithmetic arithmetic,
-            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::Native)
+            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::ModelDefault)
         {
+            router_arithmetic = resolveMoERouterArithmetic(router_arithmetic, architecture);
             if (role == WeightRole::MoERouter && router_arithmetic == MoERouterArithmetic::NativeHadamard32)
             {
                 // Rotation must precede the FIRST quantization. Dequantizing a
@@ -151,8 +152,9 @@ namespace llaminar2
         [[nodiscard]] static constexpr ModelPreparedWeightRepresentation resolve(
             WeightRole role, std::string_view source_format, std::string_view name,
             std::string_view architecture, GDNProjectionArithmetic arithmetic,
-            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::Native)
+            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::ModelDefault)
         {
+            router_arithmetic = resolveMoERouterArithmetic(router_arithmetic, architecture);
             if (role == WeightRole::MoERouter && router_arithmetic == MoERouterArithmetic::NativeHadamard32)
             {
                 // Rotation must precede the FIRST quantization. Dequantizing a
@@ -193,8 +195,9 @@ namespace llaminar2
         [[nodiscard]] static constexpr FloatingActivationOperandPrecision operandPrecision(
             WeightRole role, std::string_view name, std::string_view architecture,
             GDNProjectionArithmetic arithmetic,
-            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::Native) noexcept
+            MoERouterArithmetic router_arithmetic = MoERouterArithmetic::ModelDefault)
         {
+            router_arithmetic = resolveMoERouterArithmetic(router_arithmetic, architecture);
             if (role == WeightRole::MoERouter && router_arithmetic == MoERouterArithmetic::FP16)
                 return FloatingActivationOperandPrecision::FP16RNE;
             const auto effective = effectiveGDNArithmetic(role, name, architecture, arithmetic);

@@ -25,6 +25,11 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
     const auto &config = request.config;
     const auto &mtp = request.retained_mtp;
     const auto &family = request.graph_family;
+    // GGUF block_count includes inline predictors for ordinary exports, while
+    // Flash Next declares its main block_count and separate original sidecar.
+    // The profile owns that distinction; routed ownership must retain both.
+    const int main_layers = request.model.mainLayerCount();
+    const int total_layers = request.model.totalLayerCount();
     const int world_size = request.inventory.world_size;
     const auto *overlay = config.moe_routed_expert_plan.get();
     if (!overlay || !overlay->usesExpertOverlayAuthority() || resident_prefill_rows <= 0 ||
@@ -35,8 +40,8 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
         request.execution.currentRankPlan().world_rank != plan.rank ||
         request.capacity_policy.overlay_world_size != world_size ||
         !family.valid() || family.first_model_layer != overlay->first_model_layer ||
-        family.first_model_layer >= request.model.n_layers ||
-        family.routedLayerCapacity() > request.model.n_layers - family.first_model_layer ||
+        family.first_model_layer >= main_layers ||
+        family.routedLayerCapacity() > total_layers - family.first_model_layer ||
         request.model.expert_count <= 0 || plan.runtime.batch_size <= 0 ||
         request.model_graph_topology_variant_count == 0 ||
         (request.model_graph_topology_variant_count > 1 && !request.snapshot_capacity.valid()))
@@ -45,7 +50,6 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
     if (request.pipeline_stage)
     {
         const auto &scope = *request.pipeline_stage;
-        const int main_layers = request.model.n_layers - request.model.mtp_layer_count;
         if (!scope.isValid() || request.model.mtp_layer_count < 0 || main_layers <= 0 ||
             scope.last_layer > main_layers ||
             scope.has_embedding != (scope.first_layer == 0) ||
@@ -58,7 +62,7 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
             throw std::invalid_argument("ExpertOverlay pipeline memory scope differs from its child rank or retained graph family");
     }
     else if (family.first_model_layer != 0 ||
-             family.main_layer_count != request.model.n_layers - request.model.mtp_layer_count)
+             family.main_layer_count != main_layers)
         throw std::invalid_argument("ExpertOverlay partial memory projection requires its authored pipeline scope");
 
     if (request.capacity_policy.usesDeviceTransferDirectory() &&
@@ -102,7 +106,8 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
 
     std::optional<MoEOverlayHostDemandMemoryPlan> host_demand;
     if (overlay->authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&
-        config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
+        config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+        request.capacity_policy.migration_storage != MoEOverlayMigrationStorageKind::NoPeer)
     {
         // Request-major prefill and flattened verifier rows share one admitted
         // histogram ingress. Charge the maximum; never multiply verifier twice.

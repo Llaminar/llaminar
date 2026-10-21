@@ -18,6 +18,7 @@
  */
 
 #pragma once
+#include "../execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include "../execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "../execution/config/ExecutionPolicy.h"
@@ -35,6 +36,7 @@
 #include "../loaders/WeightPlan.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/ToolCallTypes.h"
+#include "qwen4exp/Qwen4ExpWeights.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -54,6 +56,8 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
+    class Qwen4ExpConfig;
+    class ResolvedImmutableRowTablePlacement;
     class IKVCache;
     class IMPIContext;
     class ITPContext;
@@ -108,6 +112,23 @@ namespace llaminar2
         int head_dim = 0;       ///< Dimension per head
         int d_ff = 0;           ///< FFN intermediate dimension
         int vocab_size = 0;     ///< Vocabulary size
+
+        /// Exact Flash Next metadata contract. Null denotes the ordinary single residual stream.
+        std::shared_ptr<const Qwen4ExpConfig> flash_next;
+
+        /// Frozen HC-up activation arithmetic; ordinary models never consume it.
+        QuantizedActivationOperandPrecision qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
+        QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.
+        QuantizedActivationOperandPrecision qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /// Frozen original-main GDN QKV correction; independent of Z, alpha/beta and output projection.
+        QuantizedActivationOperandPrecision qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+
+        /** @return Residual/PP transport width, independently of block compute width. */
+        [[nodiscard]] int residualWidth() const;
+        /** @return Vocabulary projection input width after the terminal model mixer. */
+        [[nodiscard]] int terminalHeadWidth() const;
 
         /// Pipeline Parallelism layer offset for KV cache indexing.
         /// When building graphs for PP stage [first_layer, last_layer), this offset
@@ -195,6 +216,10 @@ namespace llaminar2
 
         /// Prefix-state cache feature gates and storage limits.
         PrefixCacheRuntimeConfig prefix_cache;
+        ImmutableRowTablePolicy ngram_table_policy; ///< Rank-owned native PLE storage policy.
+        /** Concrete PMA-selected table placement. Owning PLE graphs reject an unresolved policy. */
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        std::shared_ptr<const class Qwen4ExpReplicatedPLECohort> ngram_replicated_ple_cohort; ///< Actual Rank-owned fixed-head producer composition; no live state.
 
         /// Multi-token prediction feature gates and verification mode.
         MTPRuntimeConfig mtp;
@@ -264,6 +289,10 @@ namespace llaminar2
             const bool mirrored = mtpTerminalHeadIsMirrored(mtp.terminal_head_policy);
             return lm_head_column_parallel && mirrored;
         }
+
+        /** @return Mandatory origin from exact model identity; callers cannot select another QFN convention. */
+        [[nodiscard]] MTPShiftedCacheOrigin mtpShiftedCacheOrigin() const noexcept
+        { return flash_next ? MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero : MTPShiftedCacheOrigin::SuccessorPairsOnly; }
 
         /**
          * @brief Return whether TP participants bind a complete MTP predictor block.
@@ -958,6 +987,7 @@ namespace llaminar2
      */
     struct LayerWeights
     {
+        Qwen4ExpLayerWeights<TensorBase *> flash_next; ///< Typed branch, indexer and PLE views.
         // Attention weights (Full Attention layers)
         TensorBase *wq = nullptr;        ///< Query projection
         TensorBase *wk = nullptr;        ///< Key projection
@@ -1023,6 +1053,7 @@ namespace llaminar2
      */
     struct LayerWeightBindings
     {
+        Qwen4ExpLayerWeights<const WeightBinding *> flash_next; ///< Frozen extension identities.
         // Attention weights (Full Attention layers)
         const WeightBinding *wq = nullptr;
         const WeightBinding *wk = nullptr;
@@ -1076,6 +1107,7 @@ namespace llaminar2
      */
     struct MTPDepthWeights
     {
+        HyperConnectionWeights<TensorBase *> hyper_connection_head; ///< Predictor's terminal branch mixer.
         int depth_index = 0;
         int source_layer_index = -1;
         bool nextn_block_layout = false;
@@ -1198,6 +1230,7 @@ namespace llaminar2
 
     struct MTPDepthWeightBindings
     {
+        HyperConnectionWeights<const WeightBinding *> hyper_connection_head;
         int depth_index = 0;
         int source_layer_index = -1;
         bool nextn_block_layout = false;
@@ -1226,6 +1259,7 @@ namespace llaminar2
     inline LayerWeights toLegacyLayerWeights(const LayerWeightBindings &bindings)
     {
         LayerWeights weights;
+        weights.flash_next = mapQwen4ExpLayerWeights(bindings.flash_next, legacyTensor);
         weights.wq = legacyTensor(bindings.wq);
         weights.wk = legacyTensor(bindings.wk);
         weights.wv = legacyTensor(bindings.wv);
@@ -1270,6 +1304,7 @@ namespace llaminar2
     inline MTPDepthWeights toLegacyMTPDepthWeights(const MTPDepthWeightBindings &bindings)
     {
         MTPDepthWeights weights;
+        weights.hyper_connection_head = mapHyperConnectionWeights(bindings.hyper_connection_head, legacyTensor);
         weights.depth_index = bindings.depth_index;
         weights.source_layer_index = bindings.source_layer_index;
         weights.nextn_block_layout = bindings.nextn_block_layout;
@@ -1298,6 +1333,7 @@ namespace llaminar2
      */
     struct ModelWeightBindings
     {
+        HyperConnectionWeights<const WeightBinding *> hyper_connection_head;
         const WeightBinding *embedding_table = nullptr;
         const WeightBinding *final_norm = nullptr;
         const WeightBinding *lm_head = nullptr;
@@ -1313,6 +1349,7 @@ namespace llaminar2
      */
     struct ModelWeights
     {
+        HyperConnectionWeights<TensorBase *> hyper_connection_head;
         TensorBase *embedding_table = nullptr; ///< [vocab_size, d_model]
         TensorBase *final_norm = nullptr;      ///< [d_model]
         TensorBase *lm_head = nullptr;         ///< [vocab_size, d_model]
@@ -1325,6 +1362,7 @@ namespace llaminar2
     inline ModelWeights toLegacyModelWeights(const ModelWeightBindings &bindings)
     {
         ModelWeights weights;
+        weights.hyper_connection_head = mapHyperConnectionWeights(bindings.hyper_connection_head, legacyTensor);
         weights.embedding_table = legacyTensor(bindings.embedding_table);
         weights.final_norm = legacyTensor(bindings.final_norm);
         weights.lm_head = legacyTensor(bindings.lm_head);
@@ -1389,6 +1427,8 @@ namespace llaminar2
         depth.pre_fc_norm_hidden = get("nextn.hnorm.weight");
         depth.pre_fc_norm_embedding = get("nextn.enorm.weight");
         depth.final_norm = get("nextn.shared_head_norm.weight");
+        depth.hyper_connection_head = loadHyperConnectionWeights(get, "nextn.hc_head_");
+        depth.fa_block.flash_next = loadQwen4ExpLayerWeights(get);
 
         depth.fa_block.wq = get("attn_q.weight");
         depth.fa_block.wk = get("attn_k.weight");
@@ -1476,6 +1516,9 @@ namespace llaminar2
         bindings.embedding_table = optionalGlobalBinding(weight_set, "token_embd.weight");
         bindings.final_norm = optionalGlobalBinding(weight_set, "output_norm.weight");
         bindings.lm_head = optionalGlobalBinding(weight_set, "output.weight");
+        bindings.hyper_connection_head = loadHyperConnectionWeights(
+            [&weight_set](const std::string &name) { return optionalGlobalBinding(weight_set, name); },
+            "output_hc_");
         bindings.mtp = makeMTPWeightBindings(weight_set);
         bindings.get_layer_weights = [&weight_set, preferred_device](int layer_idx)
         {
@@ -1524,6 +1567,7 @@ namespace llaminar2
             layer.shared_expert_up = get("ffn_up_shexp.weight");
             layer.shared_expert_down = get("ffn_down_shexp.weight");
             layer.shared_expert_gate_inp = get("ffn_gate_inp_shexp.weight");
+            layer.flash_next = loadQwen4ExpLayerWeights(get);
             return layer;
         };
         return bindings;

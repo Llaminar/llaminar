@@ -4,7 +4,9 @@
  * @author David Sanftenberg
  * @date December 2025
  *
- * Extracted from DeviceGraphExecutor.cpp.
+ * Extracted from DeviceGraphExecutor.cpp. Geometry-only workspace topologies
+ * carry a monotone execution purpose through moves/merges, so an allocator's
+ * declaration can never become a retained executable by losing its input tag.
  */
 
 #include "ComputeGraph.h"
@@ -442,6 +444,8 @@ namespace llaminar2
     void ComputeGraph::clear()
     {
         nodes_.clear();
+        storage_boundary_.reset();
+        purpose_=ExecutionPurpose::Executable;
         node_index_.clear();
         cached_order_.clear();
         cached_execution_stages_.clear();
@@ -487,6 +491,7 @@ namespace llaminar2
 
     ComputeGraph &ComputeGraph::merge(ComputeGraph &&other, const std::string &connect_from)
     {
+        if(other.isWorkspaceDeclaration())markWorkspaceDeclaration();
         if (other.nodes_.empty())
         {
             return *this;

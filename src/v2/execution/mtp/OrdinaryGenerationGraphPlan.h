@@ -23,6 +23,10 @@ struct OrdinaryGenerationGraphPlan
     static constexpr std::size_t hosted_transaction = 2;
     static constexpr std::size_t child_recordings = 3;
 
+    /** @return Complete scalar no-sampling transaction owners for a native singleton PP stage.
+     * Child model/transport recordings are imported, never independently instantiated. */
+    static constexpr std::size_t pipelineForwardOnlyExecutableCount() noexcept { return 1u; }
+
     /** @return Extra general executable owners beyond the existing forward/MTP BOM.
      *  @throws std::invalid_argument for a device without native GPU graphs. */
     static std::size_t additionalExecutableCount(DeviceId device, bool retained_mtp)

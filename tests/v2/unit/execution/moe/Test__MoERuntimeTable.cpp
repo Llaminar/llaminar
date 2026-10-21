@@ -7,6 +7,10 @@
  */
 
 #include "execution/moe/MoERuntimeTable.h"
+#include "utils/MPITags.h"
+#include "kernels/common/MoEGroupedDirectory.h"
+#include <algorithm>
+#include <vector>
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/DecodeExpertHistogram.h"
@@ -1345,6 +1349,78 @@ namespace llaminar2::test
             /*requested_payload_slots=*/2,
             /*min_router_spread_improvement_per_payload_slot=*/32,
             /*existing_hot_cache_active=*/true));
+    }
+
+    /** @test Every expert including 511 survives host placement publication and bank replay. */
+    TEST(Test__MoERuntimeTable, All512ExpertsRetainExactPlacementAndHistogramGeometry)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 512, 10);
+        auto update = updateForEpoch(1, 512);
+        update.participant_count = 2;
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+        auto &state = table.hostLayerState(0);
+        EXPECT_EQ(state.expert_count, 512u);
+        EXPECT_EQ(state.top_k, 10u);
+        for (int expert = 0; expert < 512; ++expert)
+        {
+            SCOPED_TRACE(expert);
+            EXPECT_EQ(state.banks[state.active_bank].experts[expert].logical_expert_id, expert);
+            EXPECT_EQ(state.banks[state.active_bank].experts[expert].gate.payload,
+                      update.experts[expert].gate.payload);
+        }
+        state.decode_histogram[511] = 17;
+        state.prefill_histogram[511] = 23;
+        state.grouped_verifier_histogram[511] = 31;
+        EXPECT_EQ(state.decode_histogram[511], 17u);
+        EXPECT_EQ(state.prefill_histogram[511], 23u);
+        EXPECT_EQ(state.grouped_verifier_histogram[511], 31u);
+        EXPECT_EQ(sizeof(DeviceMoEPlacementBank), moe_runtime_abi::kPlacementBankBytes);
+        EXPECT_EQ(sizeof(DeviceMoELayerRuntime), moe_runtime_abi::kLayerRuntimeBytes);
+        EXPECT_EQ(moe_runtime_abi::kRuntimeLayoutVersion, 2u);
+        EXPECT_THROW((void)MoERuntimeTable(DeviceId::cpu(), 1, 513, 10), std::invalid_argument);
+    }
+
+    /** @test Launch policy covers every expert count and keeps serial/grouped FP partitions fixed. */
+    TEST(Test__MoERuntimeTable, ExpertLaunchPolicyIsTotalThrough512AndSharedDirectory513)
+    {
+        for (uint32_t experts = 1; experts <= 512; ++experts)
+        {
+            const auto grouping = moe_runtime_abi::expertGroupingThreads(experts);
+            EXPECT_GE(grouping, experts);
+            EXPECT_EQ(grouping, experts <= 256 ? 256u : 512u);
+            const auto routing = moe_runtime_abi::wave64RouterThreads(experts);
+            EXPECT_EQ(routing % 64u, 0u);
+            EXPECT_LE(routing, 256u);
+            if (experts > 256) EXPECT_EQ(routing, 256u);
+        }
+        EXPECT_EQ(moe_runtime_abi::expertGroupingThreads(0), 0u);
+        EXPECT_EQ(moe_runtime_abi::expertGroupingThreads(513), 0u);
+        EXPECT_EQ(moe_runtime_abi::wave64RouterThreads(513), 0u);
+        EXPECT_EQ(moe_grouped_directory::directoryThreads(512), 512u);
+        EXPECT_EQ(moe_grouped_directory::directoryThreads(513), 1024u);
+        EXPECT_EQ(moe_grouped_directory::kExpertMask, 1023u);
+        const uint32_t packed = (uint32_t{262143} << moe_grouped_directory::kExpertBits) | 512u;
+        EXPECT_EQ(packed & moe_grouped_directory::kExpertMask, 512u);
+        EXPECT_EQ(packed >> moe_grouped_directory::kExpertBits, 262143u);
+    }
+
+    /** @test Expert IDs above 255 cannot collide with the following layer's MPI weight tags. */
+    TEST(Test__MoERuntimeTable, All512ExpertWeightTransferTagsAreUniqueAcrossLayers)
+    {
+        std::vector<int> size_tags, data_tags;
+        for (int layer = 0; layer < 64; ++layer)
+            for (int expert = 0; expert < 512; ++expert)
+            {
+                size_tags.push_back(mpi_tags::weightTransferSizeTag(layer, expert));
+                for (int projection = 0; projection < 3; ++projection)
+                    data_tags.push_back(mpi_tags::weightTransferDataTag(layer, expert, projection));
+            }
+        std::sort(size_tags.begin(), size_tags.end());
+        std::sort(data_tags.begin(), data_tags.end());
+        EXPECT_EQ(std::adjacent_find(size_tags.begin(), size_tags.end()), size_tags.end());
+        EXPECT_EQ(std::adjacent_find(data_tags.begin(), data_tags.end()), data_tags.end());
+        EXPECT_LT(size_tags.back(), data_tags.front());
     }
 
     TEST(Test__MoERuntimeTable, PrepareInactiveBankCopiesDescriptorsMasksAndReplicaRoles)

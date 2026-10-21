@@ -732,6 +732,10 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         SCOPED_TRACE(static_cast<std::uint32_t>(format.gguf_type));
         const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
             oneLayerExpertModel(format.gguf_type, 2, first), 1, 2, first);
+        ModelLoader source;
+        source.initializeTestModel();
+        const_cast<GGUFModel &>(source.getModel())=oneLayerExpertModel(format.gguf_type,2,first);
+        EXPECT_EQ(buildMoEOverlayLayerWeightManifestFromLoader(source,1,2,first),manifest);
         ASSERT_EQ(manifest.size(), 1u);
         ASSERT_TRUE(manifest.front().valid());
         EXPECT_EQ(manifest.front().layer_idx, first);
@@ -786,6 +790,10 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         SCOPED_TRACE(static_cast<std::uint32_t>(format.gguf_type));
         const auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(
             oneLayerExpertModel(format.gguf_type, 2, first), 1, 2, first);
+        ModelLoader source;
+        source.initializeTestModel();
+        const_cast<GGUFModel &>(source.getModel())=oneLayerExpertModel(format.gguf_type,2,first);
+        EXPECT_EQ(buildMoEOverlayLayerWeightManifestFromLoader(source,1,2,first),manifest);
         ASSERT_EQ(manifest.size(), 1u);
         ASSERT_TRUE(manifest.front().valid());
         EXPECT_EQ(manifest.front().layer_idx, first);

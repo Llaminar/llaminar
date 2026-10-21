@@ -29,6 +29,7 @@
 #pragma once
 
 #include "ComputeGraph.h"
+#include "../../../kernels/common/DiagnosticSnapshotCopy.h"
 #include "GraphCaptureGuard.h"
 #include "IGraphCaptureAuxiliaryBranch.h"
 #include "IGraphExecutor.h"
@@ -223,6 +224,7 @@ namespace llaminar2
     {
         // Device-free regression access to immutable capture/publication boundaries.
         friend struct GraphSnapshotRowLayoutTestAccess;
+        friend struct GraphSnapshotSemanticExtentTestAccess;
     public:
         /**
          * @brief One immutable, graph-owned GPU snapshot output descriptor.
@@ -246,6 +248,9 @@ namespace llaminar2
             const void *source_ptr = nullptr;
             /** Frozen ownership must survive replay before logical-row projection. */
             SnapshotRowLayout row_layout;
+            SnapshotSemanticExtent semantic_extent; ///< Frozen mathematical axis and native count identities.
+            DiagnosticSnapshotCopyArgs semantic_copy; ///< Prepared pointers; no execution-state mirror.
+            size_t metadata_offset_bytes=0; ///< Relative to this slot; payload retains admitted capacity.
             /**
              * True after launch preparation froze the complete source and
              * destination descriptor. The producer has not executed at that
@@ -382,6 +387,8 @@ namespace llaminar2
             uint64_t storage_allocation_count = 0;
             /** Successful whole-arena D2H acquisitions over this allocation. */
             uint64_t bulk_download_count = 0;
+            std::optional<DiagnosticSnapshotCopy> semantic_copier; ///< Setup-selected native diagnostic launcher.
+            uint64_t observed_download_bytes=0; ///< Exact metadata and authored payload bytes acquired.
             StorageState storage_state = StorageState::Empty;
             GraphSnapshotArenaReusePolicy storage_reuse_policy;
 
@@ -421,6 +428,7 @@ namespace llaminar2
                 filtered_stages.clear();
                 storage_required_bytes = 0;
                 bound_slot_count = 0;
+                semantic_copier.reset();
                 storage_state = StorageState::CollectingDescriptors;
             }
 
@@ -508,6 +516,8 @@ namespace llaminar2
                 bound_slot_count = 0;
                 storage_allocation_count = 0;
                 bulk_download_count = 0;
+                semantic_copier.reset();
+                observed_download_bytes=0;
                 storage_state = StorageState::Empty;
             }
         };
@@ -1510,6 +1520,7 @@ namespace llaminar2
                 void *stream = nullptr;
                 size_t stage_count = 0;
                 size_t captured_node_count = 0;
+                std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary; ///< Explicit I/O owner surrounding the complete parent.
             };
 
             /**

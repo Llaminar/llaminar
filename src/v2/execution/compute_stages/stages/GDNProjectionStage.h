@@ -15,6 +15,7 @@
 #pragma once
 
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/Q8ResidualCorrection.h"
 
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
@@ -104,14 +105,48 @@ namespace llaminar2
             bool force_decode_equivalent_verifier_prefill = false;
             /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
             std::optional<DeviceRowRange> verifier_row_range;
+
+            /**
+             * @brief Independent arithmetic for original prepared QKV only.
+             * SingleQ8 preserves the existing complete bundle. TwoTermQ8 uses
+             * the same immutable Q8_0 weights and the existing correction API,
+             * then submits Z/alpha/beta with their original policies. Its
+             * residual/primary banks share this stage's admitted workspace;
+             * QKV completes on the parent stream before siblings reuse them.
+             */
+            QuantizedActivationOperandPrecision qkv_operand_precision =
+                QuantizedActivationOperandPrecision::SingleQ8;
+
+            /**
+             * @brief Original single-request query prefix for selected QKV.
+             * Required for TwoTermQ8, including counted M1/live0. The graph
+             * builder authenticates the producer, retains its original count
+             * owner and orders it before this stage. Only the complete prefix
+             * is accepted; slices/repeats/foreign common verifier rows reject.
+             * This selection does not change ordinary sibling padding policy.
+             */
+            std::optional<DeviceRowRange> qkv_row_range;
         };
 
         static_assert(StageParamsRequired<Params>);
 
+        /**
+         * @brief Freeze one bundle and validate the selected QKV row/operand geometry.
+         * @param params Original tensors, prepared refs and immutable row policy.
+         * @throws std::invalid_argument For unsupported precision or malformed selected operands.
+         * Prepared-store and exact native engine checks occur before capture/execute.
+         */
         explicit GDNProjectionStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
+        /**
+         * @brief Identify selected arithmetic, all original bindings and borrowed row topology.
+         * @return Stable recording identity; mutable counts never enter this key.
+         * The executor additionally seals prepared storage, exact stage topology,
+         * device/runtime and workspace generation before any retained replay.
+         */
+        uint64_t graphCaptureVariantSignature() const override;
         ComputeStageType type() const override { return ComputeStageType::GDN_PROJECTION; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -147,6 +182,15 @@ namespace llaminar2
         ITensorGemm *resolveGemm(
             const ITensor *weight, ITensorGemm *&cached, const char *name);
         void clearCachedGemmStreams();
+
+        /**
+         * @brief Authenticate the store-owned selected QKV engine before publication.
+         * @return Exact prepared engine, without creating weights or workspace.
+         * @throws std::invalid_argument For missing/foreign refs or source/engine disagreement.
+         * The model graph separately authenticates the original main GDN source
+         * role and its whole dense interval from retained model metadata.
+         */
+        ITensorGemm *requireCorrectedQKVEngine() const;
 
         Params params_;
     };

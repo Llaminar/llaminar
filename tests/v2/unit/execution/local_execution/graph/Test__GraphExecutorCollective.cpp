@@ -7,6 +7,8 @@
  * 2. When collective_ctx is set, ALLREDUCE stages are intercepted
  * 3. When collective_ctx is set, ALLGATHER stages are intercepted
  * 4. When collective_ctx is nullptr, normal stage execution happens
+ * 5. Successful CPU runtime completion evidence is independent of profiling,
+ *    and never published by failed, empty, setup-only or filtered execution.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -29,9 +31,11 @@
 #include "config/TPDomain.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "tools/ModelKLDQFNContract.h"
 #include <cstdlib>
 #include <future>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -1046,4 +1050,144 @@ TEST_F(Test__GraphExecutorStreamBinding, MTPSidecarDeferredSamplingUsesCaptureSt
     sample_stream = reinterpret_cast<void *>(0xBADF00D);
     EXPECT_TRUE(mtp_sidecar::deferredSamplingStream(false, true, capture_stream, &sample_stream, &error));
     EXPECT_EQ(sample_stream, nullptr);
+}
+
+namespace
+{
+/** @brief Keep the real collector enabled while legacy stage profiling stays off. */
+class ScopedHostCompletionObservation final
+{
+public:
+    /** @param filter Exact requested telemetry domain; unrelated filters prove the producer guard. */
+    explicit ScopedHostCompletionObservation(const char *filter = "forward_graph")
+        : phase_(GraphExecutorStats::currentPhase()),
+          profile_("LLAMINAR_PROFILE_KERNELS","0"), legacy_("LLAMINAR_PROFILING","0"),
+          output_("LLAMINAR_PERF_STATS_JSON","/tmp/unused-host-completion-test.json"),
+          filter_("LLAMINAR_PERF_STATS_FILTER",filter)
+    {
+        PerfStatsCollector::reset();
+    }
+    /** @brief Restore phase/configuration and retire only this test's passive records. */
+    ~ScopedHostCompletionObservation()
+    {
+        GraphExecutorStats::setCurrentPhase(phase_);
+        PerfStatsCollector::reset();
+    }
+private:
+    ExecutionPhase phase_;
+    ScopedEnv profile_, legacy_, output_, filter_;
+};
+
+/** @brief Select the exact successful-completion family without inventing a path witness. */
+std::vector<PerfStatRecord> completedHostGraphs()
+{
+    std::vector<PerfStatRecord> result;
+    for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+    {
+        if (record.domain == "forward_graph" && record.name == "host_graph_completed_calls")
+            result.push_back(record);
+    }
+    return result;
+}
+} // namespace
+
+/** @test Real nonempty CPU passes publish both phases with profiling and facade totals disabled. */
+TEST(Test__GraphExecutorHostCompletion, ProfilingDisabledPublishesBothSuccessfulPhases)
+{
+    ScopedHostCompletionObservation observation;
+    ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("forward_graph"));
+    ASSERT_FALSE(debugEnv().profile.enabled);
+    ASSERT_FALSE(StageRunPolicy::fastDecode().profiling);
+    GraphExecutorConfig config;
+    config.enable_profiling = false;
+    DeviceGraphExecutor executor(config);
+    CPUDeviceContext context(DeviceId::cpu(),1);
+    auto first = std::make_unique<llaminar2::testing::MockComputeStage>();
+    auto second = std::make_unique<llaminar2::testing::MockComputeStage>();
+    auto *firstRaw = first.get();
+    auto *secondRaw = second.get();
+    ComputeGraph graph;
+    graph.addNode("first",std::move(first),DeviceId::cpu());
+    graph.addNode("second",std::move(second),DeviceId::cpu());
+    graph.addDependency("second","first");
+    const auto originalPhase = GraphExecutorStats::currentPhase();
+    for (const auto phase : {ExecutionPhase::PREFILL,ExecutionPhase::DECODE})
+    {
+        accuracy::ScopedQFNObservationPhase observedPhase(phase);
+        ASSERT_TRUE(executor.executeFastDecode(graph,&context));
+    }
+    EXPECT_EQ(GraphExecutorStats::currentPhase(),originalPhase);
+    EXPECT_EQ(firstRaw->executionCount(),2);
+    EXPECT_EQ(secondRaw->executionCount(),2);
+    EXPECT_EQ(executor.stats().total_stages_executed,0u);
+    const auto records = completedHostGraphs();
+    ASSERT_EQ(records.size(),2u);
+    std::set<std::string> phases;
+    for (const auto &record : records)
+    {
+        phases.insert(record.phase);
+        EXPECT_EQ(record.kind,PerfStatRecord::Kind::Counter);
+        EXPECT_EQ(record.device,context.deviceId().toString());
+        EXPECT_EQ(record.count,1u);
+        EXPECT_DOUBLE_EQ(record.value,1.0);
+        EXPECT_EQ(record.tags.at("source"),"device_graph_executor");
+        EXPECT_EQ(record.tags.at("authority"),"runtime_execution");
+        EXPECT_EQ(record.tags.at("stages"),"2");
+    }
+    EXPECT_EQ(phases,(std::set<std::string>{"prefill","decode"}));
+}
+
+/** @test Partial failure, exception, empty schedules and rejected setup never claim CPU completion. */
+TEST(Test__GraphExecutorHostCompletion, FailedEmptyAndSetupGraphsNeverPublish)
+{
+    ScopedHostCompletionObservation observation;
+    GraphExecutorConfig config;
+    config.enable_profiling = false;
+    DeviceGraphExecutor executor(config);
+    CPUDeviceContext context(DeviceId::cpu(),1);
+    accuracy::ScopedQFNObservationPhase observedPhase(ExecutionPhase::DECODE);
+    auto first = std::make_unique<llaminar2::testing::MockComputeStage>();
+    auto failure = std::make_unique<llaminar2::testing::MockComputeStage>();
+    auto *firstRaw = first.get();
+    auto *failureRaw = failure.get();
+    failure->setShouldSucceed(false);
+    ComputeGraph graph;
+    graph.addNode("first",std::move(first),DeviceId::cpu());
+    graph.addNode("failure",std::move(failure),DeviceId::cpu());
+    graph.addDependency("failure","first");
+    EXPECT_FALSE(executor.executeFastDecode(graph,&context));
+    EXPECT_EQ(firstRaw->executionCount(),1);
+    EXPECT_EQ(failureRaw->executionCount(),1);
+    EXPECT_TRUE(completedHostGraphs().empty());
+    auto throwing = std::make_unique<llaminar2::testing::MockComputeStage>();
+    throwing->setOnExecute([](IDeviceContext*) { throw std::runtime_error("authored CPU failure"); });
+    ComputeGraph exceptionGraph;
+    exceptionGraph.addNode("throwing",std::move(throwing),DeviceId::cpu());
+    EXPECT_THROW(executor.executeFastDecode(exceptionGraph,&context),std::runtime_error);
+    EXPECT_TRUE(completedHostGraphs().empty());
+    ComputeGraph empty;
+    EXPECT_TRUE(executor.executeFastDecode(empty,&context));
+    EXPECT_TRUE(completedHostGraphs().empty());
+    EXPECT_FALSE(executor.recordSetupGraphMaterialization(graph,&context));
+    EXPECT_TRUE(completedHostGraphs().empty());
+}
+
+/** @test An unrelated collection filter leaves actual CPU execution and profiling disabled. */
+TEST(Test__GraphExecutorHostCompletion, DisabledDomainNeverPublishes)
+{
+    ScopedHostCompletionObservation observation("unrelated_domain");
+    ASSERT_FALSE(PerfStatsCollector::isDomainEnabled("forward_graph"));
+    GraphExecutorConfig config;
+    config.enable_profiling = false;
+    DeviceGraphExecutor executor(config);
+    CPUDeviceContext context(DeviceId::cpu(),1);
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>();
+    auto *raw = stage.get();
+    ComputeGraph graph;
+    graph.addNode("real_cpu_pass",std::move(stage),DeviceId::cpu());
+    accuracy::ScopedQFNObservationPhase observedPhase(ExecutionPhase::PREFILL);
+    ASSERT_TRUE(executor.executeFastDecode(graph,&context));
+    EXPECT_EQ(raw->executionCount(),1);
+    EXPECT_EQ(executor.stats().total_stages_executed,0u);
+    EXPECT_TRUE(completedHostGraphs().empty());
 }

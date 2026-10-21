@@ -11,6 +11,7 @@
  */
 
 #include "MoEOverlayCapacityAdmission.h"
+#include "MoEOverlayNoPeerResidency.h"
 
 #include <algorithm>
 #include <limits>
@@ -186,6 +187,11 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Dynamic ExpertOverlay migration storage requires a normalized authority plan");
         }
+
+        // The frozen full-residency proof is sealed after quota resolution.
+        // Geometry already proves there is no second payload endpoint to price.
+        if (MoEOverlayNoPeerResidency::hasNoPeerTopology(plan))
+            return MoEOverlayMigrationStorageKind::NoPeer;
 
         if (plan.authority_execution !=
                 MoEOverlayAuthorityExecutionKind::DeviceResident ||
@@ -508,11 +514,15 @@ namespace llaminar2
              policy.migration_storage !=
                  MoEOverlayMigrationStorageKind::DeviceTransferDirectory &&
              policy.migration_storage !=
-                 MoEOverlayMigrationStorageKind::PhysicalResidencyFabric))
+                 MoEOverlayMigrationStorageKind::PhysicalResidencyFabric &&
+             policy.migration_storage != MoEOverlayMigrationStorageKind::NoPeer))
         {
             throw std::invalid_argument(
                 "ExpertOverlay capacity admission received an invalid migration storage policy");
         }
+        if (policy.migration_storage == MoEOverlayMigrationStorageKind::NoPeer &&
+            !MoEOverlayNoPeerResidency::hasNoPeerTopology(plan))
+            throw std::invalid_argument("No-peer admission cannot exempt a movable topology");
         if (policy.usesPhysicalResidencyFabric() &&
             (policy.shadow_slots_per_endpoint_layer == 0 ||
              policy.staging_capacity_bytes == 0 ||
@@ -857,6 +867,22 @@ namespace llaminar2
     MoEOverlayCapacityAdmission::resolvePipelineCapacity(
         std::span<const MoEOverlayStageCapacityRequest> stages)
     {
+        return resolvePipelineCapacityDraft(stages).admit();
+    }
+
+    MoEOverlayCapacityDraft MoEOverlayCapacityAdmission::resolveCapacityDraft(
+        const MoERoutedExpertPlacementPlan &plan,int num_experts,
+        const std::vector<MoEOverlayLayerWeightManifest> &manifest,
+        const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &budgets,
+        const MoEOverlayCapacityAdmissionPolicy &policy)
+    {
+        const MoEOverlayStageCapacityRequest stage{plan,num_experts,manifest,budgets,policy};
+        return resolvePipelineCapacityDraft(std::span(&stage,1u));
+    }
+
+    MoEOverlayCapacityDraft MoEOverlayCapacityAdmission::resolvePipelineCapacityDraft(
+        std::span<const MoEOverlayStageCapacityRequest> stages)
+    {
         if (stages.empty())
             throw std::invalid_argument("ExpertOverlay pipeline admission requires at least one stage");
 
@@ -916,13 +942,14 @@ namespace llaminar2
                 inputs.push_back(buildResolverInput(stage.plan, stage.num_experts,
                     stage.layer_weight_manifest, stage.physical_budgets, candidate));
             }
-            auto result = MoEOverlayCapacityResolver::resolvePipeline(inputs);
-            for (std::size_t index = 0; index < stages.size(); ++index)
-                if (stages[index].policy.usesDeviceTransferDirectory())
-                    result[index].replica_cache_capacity = stages[index].plan.replica_cache_capacity
+            auto result = MoEOverlayCapacityResolver::resolvePipelineDraft(inputs);
+            std::vector<std::optional<MoEOverlayReplicaCacheCapacity>> admitted(stages.size());
+            for (std::size_t index=0;index<stages.size();++index)
+                if(stages[index].policy.usesDeviceTransferDirectory())
+                    admitted[index]=stages[index].plan.replica_cache_capacity
                         ? stages[index].plan.replica_cache_capacity
-                        : std::optional<MoEOverlayReplicaCacheCapacity>{std::in_place, requested[index], grants[index]};
-            return result;
+                        : std::optional<MoEOverlayReplicaCacheCapacity>{std::in_place,requested[index],grants[index]};
+            return result.withReplicaGrants(admitted);
         };
 
         try

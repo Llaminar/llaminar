@@ -471,3 +471,314 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryGenerationRunsThroughPublicRequestBoun
         }
     });
 }
+
+/** @test Original pending teachers cross one complete sampler-free native PP parent.
+ * Real public forceDecodeToken consumes its previous teacher exactly once,
+ * preserves raw logits under penalties, and reuses both independent parent
+ * families across resets and transitions back to ordinary seeded generation.
+ * Foreign/stale mailboxes fail before any parent or KV mutation. */
+TEST_P(PipelineMTPStateOwnership, OrdinaryPipelineForwardOnlyPreservesPendingTeachers)
+{
+    if (GetParam() == "CPU") return; // GPU graph lifecycle; CPU owns host execution.
+    initCPUBackend(-1);
+    const auto first_device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+    auto *backend = getBackendFor(first_device);
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() < 2) GTEST_SKIP() << "Requires two " << GetParam() << " participants";
+    // The injected rank owns real DGOs but bypasses frontend transport setup.
+    // Install the same canonical router used by production prefill handoffs.
+    struct RouterLifetime
+    {
+        /** @brief Preserve any transport owner installed by the surrounding fixture. */
+        RouterLifetime() : owned(GlobalBackendRouter::get() == nullptr)
+        { if (owned) GlobalBackendRouter::initForTests(); }
+        /** @brief Release test-owned communicators only after all runner graphs. */
+        ~RouterLifetime() { if (owned) GlobalBackendRouter::shutdown(); }
+        bool owned;
+    } router;
+    OrdinaryGraphEvidence evidence("generation,forward_graph,sampling,mtp");
+    const auto logical_writes = [](DeviceId device) {
+        std::array<double, 2> counts{};
+        for (const auto &record : PerfStatsCollector::snapshot())
+        {
+            if (record.domain != "mtp" || record.device != device.toString()) continue;
+            if (record.name == "device_resident_logical_state_mailboxes" &&
+                record.tags.contains("publication_kind") && record.tags.at("publication_kind") == "forward_only_terminal")
+                counts[0] += record.value;
+            if (record.name == "device_resident_logical_state_partial_write_completions") counts[1] += record.value;
+        }
+        return counts;
+    };
+    const auto host_publications = [] {
+        double total = 0;
+        for (const auto &record : PerfStatsCollector::snapshot())
+            if (record.domain == "sampling" && record.name == "rank_pipeline_condition_host_logits_publications") total += record.value;
+        return total;
+    };
+    using namespace sampling_math;
+    // Two stages do not exercise an intermediate owner or an idle native
+    // capture participant. Admit each available topology rather than assuming
+    // that a head/tail proof also certifies the middle of a longer pipeline.
+    for (const int participant_count : {2, 4})
+    {
+        if (backend->deviceCount() < participant_count) continue;
+        for (const bool reverse : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << "participants=" << participant_count << " reverse=" << reverse);
+            const double prior_materializations = evidence.materializations("pipeline_forward_only_graph_materializations");
+            // Even this model-free transport proof uses the production memory BOM
+            // and one rank-wide ledger. No independent collective allocator may
+            // materialize fence words outside admission.
+            ModelMemoryProfile profile;
+            profile.architecture = "qwen35";
+            profile.n_layers = participant_count;
+            profile.d_model = profile.head_dim = profile.vocab_size = 32;
+            profile.d_ff = 64;
+            profile.n_heads = profile.n_kv_heads = 1;
+            profile.max_seq_len = 1024;
+            std::vector<DevicePlanConfig> memory_inputs;
+            for (int ordinal = 0; ordinal < participant_count; ++ordinal)
+            {
+                DevicePlanConfig input;
+                input.world_rank = 0;
+                input.device = GetParam() == "CUDA" ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal);
+                input.first_layer = input.last_layer = reverse ? participant_count - 1 - ordinal : ordinal;
+                input.device_total_bytes = input.device_free_bytes = 1ull << 30;
+                input.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
+                    .device = DeviceId::cpu(), .total_bytes = 1ull << 30, .admission_available_bytes = 1ull << 30};
+                input.device_compute_units = 128;
+                input.max_seq_len = input.activation_seq_len = 1024;
+                input.local_pipeline_backend = GetParam() == "CUDA" ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+                input.prefix_cache.enabled = true;
+                input.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+                input.prefix_cache.ram_budget_bytes = 4u << 20;
+                input.prefix_cache.device_budget_bytes = input.prefix_cache.disk_budget_bytes = 0;
+                input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory({256, 512}, {});
+                memory_inputs.push_back(input);
+            }
+            auto memory = std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(MemoryPlanner::plan(profile, memory_inputs).physicalPlan()), 0);
+            std::vector<std::shared_ptr<OrdinaryDGOGraph>> graphs;
+            std::vector<std::unique_ptr<IInferenceRunner>> owners;
+            std::vector<DeviceGraphOrchestrator *> stages(participant_count);
+            for (int i = 0; i < participant_count; ++i)
+            {
+                const int ordinal = reverse ? participant_count - 1 - i : i;
+                const auto device = GetParam() == "CUDA" ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal);
+                auto config = stateConfig(device);
+                config.n_layers = 1;
+                config.total_n_layers = participant_count;
+                config.pp_layer_offset = i;
+                config.layer_types.assign(participant_count, "full_attention");
+                config.max_seq_len = 1024;
+                config.kv_cache_precision = KVCachePrecision::FP16;
+                // This explicit model-free constructor has no file-backed model
+                // admission. Exercise the real RAM prefix tier; device-hot/disk
+                // admission belongs to the production-factory model tests.
+                config.prefix_cache.enabled = true;
+                config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+                config.prefix_cache.ram_budget_bytes = 4u << 20;
+                config.prefix_cache.device_budget_bytes = 0;
+                config.prefix_cache.disk_budget_bytes = 0;
+                auto graph = std::make_shared<OrdinaryDGOGraph>(config, i == 0, i + 1 == participant_count);
+                auto owner = DeviceGraphOrchestrator::createForTest({
+                    .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph,
+                    .physical_memory_authority = memory});
+                owner->setPPStageConfig({.first_layer = i, .last_layer = i + 1,
+                    .has_embedding = i == 0, .has_lm_head = i + 1 == participant_count});
+                auto &context = GPUDeviceContextPool::instance().getContext(device);
+                context.submitAndWait([&] {
+                    ASSERT_TRUE(graph->table.ensureOnDevice(device, context.defaultStream()));
+                    TransferEngine::publishDeviceWrite(&graph->table, device, context.defaultStream());
+                    ASSERT_TRUE(owner->initializeInferenceStateFromArena(1, 1024, device));
+                });
+                ASSERT_FALSE(HasFatalFailure());
+                stages[i] = owner.get();
+                graphs.push_back(std::move(graph));
+                owners.push_back(std::move(owner));
+            }
+            RankOrchestrator::Config rank_config;
+            rank_config.mode = RankOrchestrator::ParallelismMode::PP;
+            rank_config.max_seq_len = 1024;
+            for (int i = 0; i < participant_count; ++i)
+                rank_config.pp_stages.push_back({.first_layer = i, .last_layer = i + 1,
+                    .has_embedding = i == 0, .has_lm_head = i + 1 == participant_count,
+                    .stage_devices = {GlobalDeviceAddress::fromLocalDeviceId(stages[i]->primaryDeviceId())}});
+            auto model = MockModelContext::createMinimal();
+            model->setVocabSize(32);
+            auto rank = RankOrchestrator::createForTestWithPipelineStages(
+                std::move(model), std::move(owners), rank_config);
+            ASSERT_TRUE(rank->materializeServingGraphFamilyWithoutLaunch({
+                .prefill_bucket_rows = {256, 512}, .prefill_pad_token_id = 0,
+                .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial}));
+            for (auto *stage : stages)
+                EXPECT_EQ(memory->claimedBytes(stage->primaryDeviceId(), PhysicalMemoryOwner::LocalCollective,
+                    PhysicalMemoryMaterializationKind::NewAllocation), sizeof(int32_t));
+
+            EXPECT_EQ(evidence.materializations("pipeline_forward_only_graph_materializations"),
+                prior_materializations + participant_count);
+            auto *pipeline = rank.get();
+            OrchestrationConfig config;
+            config.max_seq_len = 1024;
+            config.prefill_max_bucket_size = 256;
+            config.prefix_cache.enabled = false;
+            config.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
+            RankExecutionPlan plan;
+            plan.primary_device = GlobalDeviceAddress::fromLocalDeviceId(stages.back()->primaryDeviceId());
+            plan.runtime.max_seq_len = 1024;
+            plan.runtime.resident_graph_rows = 512;
+            plan.runtime.prefix_cache = config.prefix_cache;
+            OrchestrationRunner runner(config, plan, std::move(rank));
+            std::optional<std::vector<int>> retained_builds;
+            for (int repeat = 0; repeat < 20; ++repeat)
+            {
+                SCOPED_TRACE(::testing::Message() << "request=" << repeat);
+                runner.clearCache();
+                SamplingParams law;
+                law.temperature = 1.0f;
+                law.top_k = 4;
+                law.seed = 1700 + repeat;
+                // Any sampler work changes the authored raw logits/history.
+                law.presence_penalty = 0.75f;
+                law.frequency_penalty = 0.25f;
+                law.repetition_penalty = 1.2f;
+                runner.setSamplingParams(law);
+                runner.setStopTokens({});
+                std::vector<int> prompt(256, repeat % 32);
+                ASSERT_TRUE(runner.prefill(prompt)) << runner.lastError();
+                const bool host_observation = repeat % 2 == 0;
+                pipeline->setSkipLogitsGatherDecode(!host_observation);
+                const double direct_publications = host_publications();
+                // The host scalar is deliberately invalid. Only the actual
+                // immutable device mailbox may supply this model input.
+                const int first_teacher = (repeat + 13) % 32;
+                ASSERT_TRUE(runner.forceDecodeToken(first_teacher).success());
+                const auto original = pipeline->deviceResidentLogicalSequenceState();
+                auto &tail_state = stages.back()->inferenceState();
+                const auto history = tail_state.extension_buffers.at(BufferId::MTP_GENERATED_TOKEN_COUNTS);
+                const auto sample = tail_state.extension_buffers.at(BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS);
+                const auto response = tail_state.extension_buffers.at(BufferId::MTP_GENERATION_RESPONSE_TOKENS);
+                std::array<int32_t, 32> history_before{}, history_after{};
+                const auto tail_device = stages.back()->primaryDeviceId();
+                void *const tail_stream = GPUDeviceContextPool::instance().getContext(tail_device).defaultStream();
+                const int32_t poison = std::numeric_limits<int32_t>::min();
+                ASSERT_TRUE(backend->hostToDevice(sample->gpu_data_ptr(), &poison, sizeof(poison), tail_device.ordinal, tail_stream));
+                ASSERT_TRUE(backend->hostToDevice(response->gpu_data_ptr(), &poison, sizeof(poison), tail_device.ordinal, tail_stream));
+                TransferEngine::publishDeviceWrite(sample.get(), tail_device, tail_stream);
+                TransferEngine::publishDeviceWrite(response.get(), tail_device, tail_stream);
+                ASSERT_TRUE(backend->deviceToHost(history_before.data(), history->gpu_data_ptr(),
+                    sizeof(history_before), tail_device.ordinal, tail_stream));
+                std::vector<std::array<double, 2>> writes_before;
+                for (auto *stage : stages) writes_before.push_back(logical_writes(stage->primaryDeviceId()));
+                ASSERT_TRUE(pipeline->advanceOrdinaryMainConditionFromDeviceResidentLogicalState(-123, original, 0));
+                for (size_t i = 0; i < stages.size(); ++i)
+                {
+                    const auto writes = logical_writes(stages[i]->primaryDeviceId());
+                    EXPECT_EQ(writes[0], writes_before[i][0] + (i + 1 == stages.size() ? 1 : 0));
+                    EXPECT_EQ(writes[1], writes_before[i][1] + (i + 1 == stages.size() ? 0 : 1));
+                    EXPECT_FALSE(stages[i]->deviceResidentLogicalSequenceState().coversRequest(0))
+                        << "Successful no-response transaction retires every consumed semantic mailbox";
+                }
+                std::array<float, 32> direct_logits{};
+                if (host_observation)
+                {
+                    const float *host = runner.lastLogits();
+                    ASSERT_NE(host, nullptr);
+                    std::copy_n(host, 32, direct_logits.begin());
+                }
+                else
+                {
+                    EXPECT_THROW(runner.lastLogits(), std::logic_error);
+                    // Explicit test-only read, not a production host observation.
+                    ASSERT_TRUE(backend->deviceToHost(direct_logits.data(), tail_state.logits->gpu_data_ptr(),
+                        sizeof(direct_logits), tail_device.ordinal, tail_stream));
+                }
+                EXPECT_EQ(host_publications(), direct_publications + (host_observation ? 1 : 0));
+                for (int token = 0; token < 32; ++token)
+                    EXPECT_EQ(direct_logits[token], (token - first_teacher - 1 + 32) % 32 < 4 ? 4.0f : -16.0f);
+                EXPECT_FALSE(pipeline->advanceOrdinaryMainConditionFromDeviceResidentLogicalState(-123, original, 0));
+                EXPECT_THROW(runner.lastLogits(), std::logic_error) << "Rejected transaction cannot expose old rank logits";
+                ASSERT_TRUE(backend->deviceToHost(history_after.data(), history->gpu_data_ptr(),
+                    sizeof(history_after), tail_device.ordinal, tail_stream));
+                EXPECT_EQ(history_after, history_before);
+                for (const auto &bank : {sample, response})
+                {
+                    int32_t actual = 0;
+                    ASSERT_TRUE(backend->deviceToHost(&actual, bank->gpu_data_ptr(), sizeof(actual), tail_device.ordinal, tail_stream));
+                    EXPECT_EQ(actual, poison) << "ForwardOnly may not touch sampler/response state";
+                }
+                // Retire the direct component request before exercising the
+                // public Pending sequence; its caller-owned ready handle was consumed.
+                runner.clearCache();
+                ASSERT_TRUE(runner.prefill(prompt)) << runner.lastError();
+                pipeline->setSkipLogitsGatherDecode(!host_observation);
+                const double forced_publications = host_publications();
+                const double before = evidence.materializations("pipeline_forward_only_completed_transactions");
+                DeviceResidentLogicalSequenceStateHandle stale;
+                for (int step = 0; step < 7; ++step)
+                {
+                    const int teacher = (repeat + 7 * (step + 1)) % 32;
+                    const auto result = runner.forceDecodeToken(teacher);
+                    ASSERT_TRUE(result.success()) << result.error;
+                    ASSERT_EQ(result.tokens, std::vector<int>({teacher}));
+                    EXPECT_EQ(result.returned_token_commit, ReturnedTokenCommitState::Pending);
+                    if (step > 0)
+                    {
+                        const int consumed_teacher = (repeat + 7 * step) % 32;
+                        std::array<float, 32> logits{};
+                        if (host_observation)
+                        {
+                            const float *host = runner.lastLogits();
+                            ASSERT_NE(host, nullptr);
+                            std::copy_n(host, 32, logits.begin());
+                        }
+                        else
+                        {
+                            EXPECT_THROW(runner.lastLogits(), std::logic_error);
+                            ASSERT_TRUE(backend->deviceToHost(logits.data(), tail_state.logits->gpu_data_ptr(),
+                                sizeof(logits), tail_device.ordinal, tail_stream));
+                        }
+                        for (int token = 0; token < 32; ++token)
+                            EXPECT_EQ(logits[token], (token - consumed_teacher - 1 + 32) % 32 < 4 ? 4.0f : -16.0f);
+                        EXPECT_FALSE(pipeline->advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
+                            -123, stale, 0)) << "Consumed mailbox cannot authorize another model row";
+                    }
+                    stale = pipeline->deviceResidentLogicalSequenceState();
+                    ASSERT_TRUE(stale.valid());
+                    EXPECT_FALSE(pipeline->advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
+                        -123, stale, 1)) << "Only actual request zero is admitted";
+                    auto foreign = stale;
+                    foreign.device = stages.front()->primaryDeviceId();
+                    EXPECT_FALSE(pipeline->advanceOrdinaryMainConditionFromDeviceResidentLogicalState(-123, foreign, 0));
+                }
+                EXPECT_EQ(evidence.materializations("pipeline_forward_only_completed_transactions"), before + 6);
+                EXPECT_EQ(host_publications(), forced_publications + (host_observation ? 6 : 0));
+                for (auto *stage : stages)
+                {
+                    // Diagnostic terminal observation only; no host value drives replay.
+                    int cached = -1;
+                    const auto device = stage->primaryDeviceId();
+                    ASSERT_TRUE(backend->deviceToHost(&cached,
+                        stage->inferenceState().kv_cache->deviceSequenceCachedTokenCountPtr(0), sizeof(cached),
+                        device.ordinal, GPUDeviceContextPool::instance().getContext(device).defaultStream()));
+                    EXPECT_EQ(cached, 262);
+                }
+                // A normal response still owns the existing sampler parent;
+                // switching operations must not replace or recapture either.
+                runner.setDecodeStepTokenBudget(1);
+                const auto generated = runner.decodeStep();
+                ASSERT_TRUE(generated.success()) << generated.error;
+                ASSERT_EQ(generated.tokens.size(), 1u);
+                const auto forced = runner.forceDecodeToken((repeat + 19) % 32);
+                ASSERT_TRUE(forced.success()) << forced.error;
+                EXPECT_EQ(forced.returned_token_commit, ReturnedTokenCommitState::Pending);
+                std::vector<int> builds;
+                for (const auto &graph : graphs) builds.push_back(graph->builds);
+                if (retained_builds) { EXPECT_EQ(builds, *retained_builds); }
+                retained_builds = builds;
+                EXPECT_EQ(evidence.materializations("pipeline_forward_only_graph_materializations"),
+                    prior_materializations + participant_count);
+            }
+        }
+    }
+}

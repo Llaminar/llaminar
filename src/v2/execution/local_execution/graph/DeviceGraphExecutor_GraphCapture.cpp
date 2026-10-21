@@ -426,7 +426,7 @@ namespace llaminar2
             }
             return DeviceLoopGraphTemplateView{.capture = retained_parent_capture.get(),
                 .stream = capture_stream, .stage_count = execution_order.size(),
-                .captured_node_count = retained_parent_capture->nodeCount()};
+                .captured_node_count = retained_parent_capture->nodeCount(),.storage_boundary=graph.retainedStorageBoundary()};
         }
         if (segments.size() != 1)
         {
@@ -475,6 +475,7 @@ namespace llaminar2
             .stream = capture_stream,
             .stage_count = segment.stage_names.size(),
             .captured_node_count = segment.capture->nodeCount(),
+            .storage_boundary=graph.retainedStorageBoundary(),
         };
     }
 
@@ -1663,6 +1664,7 @@ namespace llaminar2
         GraphCaptureRecordPurpose purpose,
         const char *context)
     {
+        graph.requireExecutable();
         const char *const capture_context =
             context && context[0] != '\0'
                 ? context
@@ -1950,6 +1952,7 @@ namespace llaminar2
         IGPUGraphCapture *capture,
         const char *context)
     {
+        graph.requireExecutable();
         return recordGraphCaptureBody(
             graph,
             ctx,
@@ -1963,6 +1966,7 @@ namespace llaminar2
                                                       std::span<ITensor *const> externally_visible_outputs,
                                                       const std::unordered_set<std::string> *collective_nodes)
     {
+        graph.requireExecutable();
         if (!capture)
         {
             LOG_ERROR("[DeviceGraphExecutor] GPU graph capture requires a non-null capture owner");
@@ -2142,6 +2146,9 @@ namespace llaminar2
         bool *used_graph_replay,
         GraphInitialSubmissionPolicy initial_submission)
     {
+        graph.requireExecutable();
+        if(graph.retainedStorageBoundary()&&(!policy.allow_fast_decode||!policy.allow_cached_graph_replay))
+            throw std::logic_error("Immutable storage graph requires complete cached native execution");
         if (used_graph_replay)
         {
             *used_graph_replay = false;
@@ -2247,6 +2254,7 @@ namespace llaminar2
                                                                GraphCaptureAuxiliaryBranchFactory
                                                                    auxiliary_branch_factory)
     {
+        graph.requireExecutable();
         if (!ctx || !gpu_stream || !gpu_ctx)
         {
             LOG_ERROR("[DeviceGraphExecutor] GPU graph capture/replay requires an exact device context, explicit stream, and live GPU worker context");
@@ -2264,6 +2272,13 @@ namespace llaminar2
         const bool materialize_without_launch =
             initial_submission ==
             GraphInitialSubmissionPolicy::MaterializeWithoutLaunch;
+
+        if(const auto &storage=graph.retainedStorageBoundary())
+        {
+            if(storage->device()!=ctx->deviceId()||plan_policy==GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation)
+                throw std::logic_error("Immutable storage requires its exact participant and a complete retained native parent");
+            if(!materialize_without_launch)storage->requireArmedForLaunch();
+        }
 
         /*
          * Create the persistent host lane before capture/materialization. It

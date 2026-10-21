@@ -61,6 +61,7 @@
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNITileConfig.h"
 #include "CPUNativeVNNIPrefillSchedule.h"
+#include "execution/moe/DeviceMoERuntimeABI.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
@@ -3719,6 +3720,7 @@ namespace llaminar2::cpu::native_vnni
     /**
      * @brief Dispatch a two-row non-nibble AVX-512 verifier chunk.
      */
+    template<bool SumPairs=false>
     inline void gemm_2row_non_nibble_chunk(
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -3860,14 +3862,14 @@ namespace llaminar2::cpu::native_vnni
             }
         }
 
-        _mm512_storeu_ps(C_row0, fp0_0);
-        _mm512_storeu_ps(C_row0 + 16, fp0_1);
-        _mm512_storeu_ps(C_row0 + 32, fp0_2);
-        _mm512_storeu_ps(C_row0 + 48, fp0_3);
-        _mm512_storeu_ps(C_row1, fp1_0);
-        _mm512_storeu_ps(C_row1 + 16, fp1_1);
-        _mm512_storeu_ps(C_row1 + 32, fp1_2);
-        _mm512_storeu_ps(C_row1 + 48, fp1_3);
+        if constexpr(SumPairs) _mm512_storeu_ps(C_row0,_mm512_add_ps(fp0_0,fp1_0)); else _mm512_storeu_ps(C_row0,fp0_0);
+        if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + 16,_mm512_add_ps(fp0_1,fp1_1)); else _mm512_storeu_ps(C_row0 + 16,fp0_1);
+        if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + 32,_mm512_add_ps(fp0_2,fp1_2)); else _mm512_storeu_ps(C_row0 + 32,fp0_2);
+        if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + 48,_mm512_add_ps(fp0_3,fp1_3)); else _mm512_storeu_ps(C_row0 + 48,fp0_3);
+        if constexpr(!SumPairs) _mm512_storeu_ps(C_row1,fp1_0);
+        if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + 16,fp1_1);
+        if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + 32,fp1_2);
+        if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + 48,fp1_3);
     }
 
     /**
@@ -4779,6 +4781,7 @@ namespace llaminar2::cpu::native_vnni
      * The kernel works on two 16-column subchunks at a time.  That gives useful
      * B reuse without the register pressure of a full 4-row x 64-column kernel.
      */
+    template<bool SumPairs=false>
     inline void gemm_4row_non_nibble_2z_chunk(
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -4936,14 +4939,14 @@ namespace llaminar2::cpu::native_vnni
                 }
             }
 
-            _mm512_storeu_ps(C_row0 + zbase * 16, fp0_0);
-            _mm512_storeu_ps(C_row0 + (zbase + 1) * 16, fp0_1);
-            _mm512_storeu_ps(C_row1 + zbase * 16, fp1_0);
-            _mm512_storeu_ps(C_row1 + (zbase + 1) * 16, fp1_1);
-            _mm512_storeu_ps(C_row2 + zbase * 16, fp2_0);
-            _mm512_storeu_ps(C_row2 + (zbase + 1) * 16, fp2_1);
-            _mm512_storeu_ps(C_row3 + zbase * 16, fp3_0);
-            _mm512_storeu_ps(C_row3 + (zbase + 1) * 16, fp3_1);
+            if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + zbase * 16,_mm512_add_ps(fp0_0,fp1_0)); else _mm512_storeu_ps(C_row0 + zbase * 16,fp0_0);
+            if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + (zbase + 1) * 16,_mm512_add_ps(fp0_1,fp1_1)); else _mm512_storeu_ps(C_row0 + (zbase + 1) * 16,fp0_1);
+            if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + zbase * 16,fp1_0);
+            if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + (zbase + 1) * 16,fp1_1);
+            if constexpr(SumPairs) _mm512_storeu_ps(C_row2 + zbase * 16,_mm512_add_ps(fp2_0,fp3_0)); else _mm512_storeu_ps(C_row2 + zbase * 16,fp2_0);
+            if constexpr(SumPairs) _mm512_storeu_ps(C_row2 + (zbase + 1) * 16,_mm512_add_ps(fp2_1,fp3_1)); else _mm512_storeu_ps(C_row2 + (zbase + 1) * 16,fp2_1);
+            if constexpr(!SumPairs) _mm512_storeu_ps(C_row3 + zbase * 16,fp3_0);
+            if constexpr(!SumPairs) _mm512_storeu_ps(C_row3 + (zbase + 1) * 16,fp3_1);
         }
     }
 
@@ -6420,7 +6423,8 @@ namespace llaminar2::cpu::native_vnni
      */
     struct NativeVNNIFusedRowsPlan
     {
-        static constexpr int capacity = 512; ///< Production descriptor capacity.
+        /** Gate/up pairs for every admitted routed expert and the shared expert. */
+        static constexpr int capacity = 2 * (moe_runtime_abi::kMaxExperts + 1);
         std::array<FusedVerifierRowsPlan, capacity> projections{}; ///< Ordered per-member plans.
         NativeVNNIFusedPartialRoute partial_route = NativeVNNIFusedPartialRoute::FullK;
         size_t partial_floats = 0; ///< Exact bank extent for the selected ownership route.
@@ -9193,7 +9197,7 @@ namespace llaminar2::cpu::native_vnni
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
-        constexpr int kMaxFusedDecodeProjections = 16;
+        constexpr int kMaxFusedDecodeProjections = NativeVNNIFusedRowsPlan::capacity;
         if (!A_q8 || !descs || num_descs <= 0 ||
             num_descs > kMaxFusedDecodeProjections)
             throw std::invalid_argument(
@@ -9284,7 +9288,7 @@ namespace llaminar2::cpu::native_vnni
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
-        constexpr int kMaxFusedMultiInputProjections = 512;
+        constexpr int kMaxFusedMultiInputProjections = NativeVNNIFusedRowsPlan::capacity;
         if (!descs || num_descs <= 0 ||
             num_descs > kMaxFusedMultiInputProjections)
             throw std::invalid_argument(

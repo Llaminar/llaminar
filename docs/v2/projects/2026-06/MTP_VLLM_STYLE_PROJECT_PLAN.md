@@ -1,5 +1,26 @@
 # vLLM-Style MTP Project Plan
 
+## 2026-10-20 QFN: CPU direct-emission checkpoint origin
+
+The real QFN CPU fixed-depth-1 parity cell now reaches generation, but its
+budget-limited direct-emission branch fails a shifted-KV boundary check:
+eleven resident rows are compared against a required twelve. That branch
+unconditionally adds one to the saved shifted count. QFN's visible token-zero
+bootstrap has offset zero; successor-pair-only models have offset one.
+
+The repair derives the CPU append coordinate from the immutable checkpoint's
+typed model origin. It does not synthesize missing KV rows or alter the
+device-owned GPU transaction. Focused regressions cover both origins, overflow,
+invalid tags, and the real CPU cache validator's missing-row and explicit
+speculative-discard behavior. Both have explicit ProductionTestPreflight
+registrations. Source is installed in QFN build46; build, focused execution
+and the original real-model rerun remain pending. The failed build45b artifacts
+are retained, including the absent transaction/verifier CSVs. This is a runtime
+failure, distinct from QFN's remaining numerical divergence.
+
+Evidence and current qualification are tracked in
+[the QFN implementation plan](../2026-10/QWEN_FLASH_NEXT_IMPLEMENTATION.md).
+
 ## 2026-10-09 r41: DRM memory units in the resource observer
 
 The first hybrid app launch stopped before sending any model request. The

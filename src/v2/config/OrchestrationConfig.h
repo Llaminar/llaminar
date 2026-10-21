@@ -32,6 +32,7 @@
 #include "CollectiveBackendType.h"
 #include "ExecutionDomainDefinition.h"
 #include "OrchestrationPlanningPolicy.h"
+#include "loaders/SharedPredictorGGUFSource.h"
 #include "execution/config/RuntimeConfig.h" // For FusedAttentionBackend
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
@@ -369,6 +370,8 @@ namespace llaminar2
         // =========================================================================
 
         std::string model_path; ///< Path to GGUF model file
+        /** Explicit optional shared predictor artifact; main metadata and globals remain authoritative. */
+        std::optional<SharedPredictorGGUFSource> shared_predictor;
         int max_seq_len = 4096; ///< Maximum sequence length
         /**
          * Explicit captured-prefill cap, distinct from KV context capacity.
@@ -506,6 +509,7 @@ namespace llaminar2
         // =========================================================================
 
         PrefixCacheRuntimeConfig prefix_cache; ///< Enabled bounded tiered prefix-state cache settings
+        ImmutableRowTablePolicy ngram_table_policy; ///< Requested native PLE storage preference and bounded mmap windows; resolved only by final PMA admission.
         /**
          * @brief GGUF-selected dynamic MTP with an explicit serial opt-out.
          *

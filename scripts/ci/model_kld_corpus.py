@@ -104,19 +104,18 @@ def physical_workers():
     require(cores,'No physical worker cores');return len(cores)
 
 
-def row_metrics(reference,candidate):
-    """Unchanged stable float64, temperature-one KL across the entire vocabulary."""
+def row_metrics(reference,candidate,*,vocabulary=None):
+    """Keep the historical row-scoring API through the shared FP64 authority.
+
+    Corpus callers already authenticate the original vocabulary in validate_case
+    and the exact memmap extent before selecting a row. This compatibility entry
+    retains that row-sized contract; new direct consumers must pass their own
+    independently authenticated vocabulary to full_vocabulary_metrics instead.
+    Legacy metric keys remain present; added diagnostics never change gates.
+    """
     import numpy as np
-    p=np.asarray(reference,dtype=np.float64);q=np.asarray(candidate,dtype=np.float64)
-    require(p.ndim==1 and p.size>=2 and p.shape==q.shape and np.isfinite(p).all() and np.isfinite(q).all(),'Invalid complete logit row')
-    def normalize(logits):
-        shifted=logits-np.max(logits)
-        return shifted-np.log(np.exp(shifted).sum())
-    lp,lq=normalize(p),normalize(q);probability=np.exp(lp)
-    divergence=float(np.dot(probability,lp-lq))
-    require(math.isfinite(divergence) and divergence>=-1e-12,'Invalid KL arithmetic')
-    return dict(kl_nats=max(0.,divergence),total_variation=float(np.abs(probability-np.exp(lq)).sum()/2),
-                top1_same=bool(np.argmax(p)==np.argmax(q)))
+    from full_vocabulary_metrics import full_vocabulary_metrics
+    return full_vocabulary_metrics(reference,candidate,vocabulary=int(np.asarray(reference).size) if vocabulary is None else vocabulary)
 
 
 def score_observation(corpus,report_path,*,model,backend):
@@ -143,7 +142,7 @@ def score_observation(corpus,report_path,*,model,backend):
     require(np.array_equal(arrays[0].view(np.uint32),arrays[2].view(np.uint32)),'Reset replay changed logit bytes')
     reference=np.memmap(item['reference_payload'],dtype=np.float32,mode='r',shape=(129,policy.vocabulary))
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(129,physical_workers())) as workers:
-        metrics=list(workers.map(lambda index:row_metrics(reference[index],arrays[1][index]),range(129)))
+        metrics=list(workers.map(lambda index:row_metrics(reference[index],arrays[1][index],vocabulary=policy.vocabulary),range(129)))
     rows=[dict(consumed_tokens=policy.prompt_tokens+i,**metric) for i,metric in enumerate(metrics)]
     unchanged(corpus['inputs']);unchanged(pins)
     return dict(evaluate_rows(rows,model=model,backend=backend),rows=rows,reset_byte_equal=True,

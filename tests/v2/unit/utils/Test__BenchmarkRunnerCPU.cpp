@@ -8,6 +8,8 @@
  * - GPU decode must fail hard when device sampling fails
  * - Exported hardware defaults and explicit policy intent match the runtime
  * - Serial and speculative benchmarks deliver the same requested sampling law
+ * - Result-owned setup arithmetic observations survive resets without entering measured counters
+ * - Exact tagged physical expert selections survive as setup metadata without warmup movement
  */
 
 #include <gtest/gtest.h>
@@ -3003,5 +3005,297 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
         << "Retaining one immutable kernel route must not retain the whole noisy domain";
     EXPECT_FALSE(has_record("mtp", "draft_steps"))
         << "Non-preserved warmup counters should still be cleared before measurement";
+    PerfStatsCollector::reset();
+}
+
+namespace
+{
+    /** @return Recognizable exact tagged producer records; no native execution is simulated or claimed. */
+    std::vector<PerfStatRecord> arithmeticSetupFixture()
+    {
+        const auto counter = [](const char *domain, const char *name, const char *phase,
+                                const char *device, PerfStatsCollector::Tags tags)
+        {
+            PerfStatRecord record;
+            record.domain = domain;
+            record.name = name;
+            record.phase = phase;
+            record.device = device;
+            record.tags = std::move(tags);
+            record.count = 1;
+            record.value = 1.0;
+            return record;
+        };
+        std::vector<PerfStatRecord> records{
+            counter("kernel", "gdn_projection_route", "capture", "rocm:1",
+                {{"route", "homogeneous_full"}, {"m", "512"}, {"k", "2560"},
+                 {"projections", "4"}, {"names", "qkv+z+alpha+beta"},
+                 {"n", "10240+6144+48+48"}, {"codebooks", "none+none+none+none"}}),
+            counter("weight_loading", "gdn_projection_arithmetic_prepared_weight", "materialize", "rocm:1",
+                {{"canonical_name", "blk.0.attn_qkv.weight"}, {"weight_role", "FusedQKV"},
+                 {"policy", "fp16"}, {"source_format", "Q8_0"}, {"prepared_format", "FP16"},
+                 {"source_path", "source_decoded_half_rne"}, {"source_bytes", "27852800"}, {"prepared_bytes", "52428800"}}),
+            counter("weight_loading", "moe_router_arithmetic_prepared_weight", "materialize", "cpu",
+                {{"canonical_name", "blk.0.ffn_gate_inp.weight"}, {"weight_role", "MoERouter"},
+                 {"policy", "fp16"}, {"source_format", "FP32"}, {"prepared_format", "FP16"},
+                 {"activation_operand", "half_rne"}, {"accumulation", "fp32"}}),
+            counter("kernel", "cpu_moe_fp16_operand_router_calls", "router", "cpu",
+                {{"rows", "9"}, {"hidden_operand", "half_rne"}, {"gate_weights", "fp16"},
+                 {"accumulation", "fp32"}, {"expert_q8_source", "original_fp32_hidden"}, {"reduction", "fixed_256_lane_tree"}}),
+            counter("kernel", "cpu_moe_grouped_router_calls", "verifier", "cpu",
+                {{"rows", "4"}, {"arithmetic_order", "serial_decode_per_row"}}),
+            counter("cuda_moe", "router_fp16_operands", "capture", "cuda:0", {{"operand", "half_rne"}}),
+            counter("cuda_moe", "router_fp16_owned_operands", "capture", "cuda:0", {{"owner", "original_gate"}}),
+            counter("cuda_moe", "router_fp16_grouped_operands", "capture", "cuda:0", {{"rows", "4"}}),
+            counter("kernel", "rocm_moe_router_fp16_operand_calls", "router", "rocm:1",
+                {{"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"}, {"route", "serial_fixed"}}),
+            counter("kernel", "rocm_moe_batch_invariant_prefill_router_calls", "moe", "rocm:1",
+                {{"seq_len", "512"}, {"route", "grouped_fp16"}}),
+            counter("kernel", "rocm_moe_decode_equivalent_runtime_m_router_calls", "capture", "rocm:1",
+                {{"seq_len", "4"}, {"route", "grouped_decode_equivalent_fp16"}}),
+        };
+        records.front().count = 2;
+        records.front().value = 4.0;
+        return records;
+    }
+
+    /** @brief Publish passive tagged records through the real collector from the mock setup callback. */
+    void emitArithmeticSetupFixture(const std::vector<PerfStatRecord> &records)
+    {
+        for (const auto &record : records)
+            for (std::uint64_t i = 0; i < record.count; ++i)
+                PerfStatsCollector::addCounter(record.domain, record.name,
+                    record.value / static_cast<double>(record.count), record.phase, record.device, record.tags);
+    }
+}
+
+/** @test The real runner owns exact setup records without leaking them into measured runtime counters. */
+TEST(Test__BenchmarkRunnerCPU, RetainsSetupArithmeticObservationSeparatelyFromMeasuredStats)
+{
+    ScopedEnv enabled("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "");
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    PerfStatsCollector::reset();
+    const auto expected = arithmeticSetupFixture();
+    auto runner = std::make_shared<MockCPUInferenceRunner>();
+    BenchmarkRunner benchmark(runner, createMockTokenizer());
+    benchmark.setPostWarmupCallback([&]()
+    {
+        emitArithmeticSetupFixture(expected);
+        PerfStatsCollector::addCounter("kernel", "gdn_projection_route.unrelated", 99.0);
+        PerfStatsCollector::addCounter("kernel", "unrelated_setup_counter", 101.0);
+    });
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 1;
+    config.temperature = 0.0f;
+    const auto result = benchmark.run(config);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    ASSERT_TRUE(result.setup_warmup_arithmetic.observed_before_measurement);
+    ASSERT_TRUE(result.setup_warmup_arithmetic.collection_enabled);
+    ASSERT_EQ(result.setup_warmup_arithmetic.records.size(), expected.size());
+    for (const auto &wanted : expected)
+    {
+        const auto &records = result.setup_warmup_arithmetic.records;
+        const auto found = std::find_if(records.begin(), records.end(), [&](const auto &record)
+        { return record.domain == wanted.domain && record.name == wanted.name; });
+        ASSERT_NE(found, records.end()) << wanted.domain << '.' << wanted.name;
+        EXPECT_EQ(found->kind, PerfStatRecord::Kind::Counter);
+        EXPECT_EQ(found->phase, wanted.phase);
+        EXPECT_EQ(found->device, wanted.device);
+        EXPECT_EQ(found->tags, wanted.tags);
+        EXPECT_EQ(found->count, wanted.count);
+        EXPECT_DOUBLE_EQ(found->value, wanted.value);
+    }
+    const auto doc = nlohmann::json::parse(benchmarkResultToJsonString(result));
+    const auto saved = doc.at("setup_warmup_arithmetic");
+    EXPECT_EQ(saved.at("scope"), "retained_process_setup_and_warmup_before_measured_reset");
+    EXPECT_EQ(saved.at("count_semantics"), "host_recording_or_submission_observations_not_graph_replays_or_tokens");
+    EXPECT_EQ(saved.at("records").size(), expected.size());
+    for (const auto &record : doc.at("perf_stats").at("records"))
+    {
+        const auto domain = record.at("domain").get<std::string>();
+        const auto name = record.at("name").get<std::string>();
+        EXPECT_FALSE(std::any_of(expected.begin(), expected.end(), [&](const auto &wanted)
+        { return domain == wanted.domain && name == wanted.name; }));
+        EXPECT_NE(name, "unrelated_setup_counter");
+    }
+    // Existing weight_loading setup retention is unchanged. Runtime kernel and
+    // router records still disappear at the measured reset, with no reinsertion.
+    for (const auto &record : PerfStatsCollector::snapshot({"kernel", "cuda_moe"}))
+    {
+        EXPECT_FALSE(std::any_of(expected.begin(), expected.end(), [&](const auto &wanted)
+        { return record.domain == wanted.domain && record.name == wanted.name; }));
+    }
+    PerfStatsCollector::reset();
+    PerfStatsCollector::addCounter("kernel", "gdn_projection_route", 999.0, "later", "cpu", {{"route", "different"}});
+    const auto later = nlohmann::json::parse(benchmarkResultToJsonString(result));
+    EXPECT_EQ(later.at("setup_warmup_arithmetic"), saved)
+        << "Serialization must use the result-owned value after the collector resets/changes";
+    PerfStatsCollector::reset();
+}
+
+/** @test Disabled collection reports an observed empty boundary rather than copying old retained setup records. */
+TEST(Test__BenchmarkRunnerCPU, DisabledSetupArithmeticObservationDoesNotCopyStaleRecords)
+{
+    ScopedEnv initially_enabled("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "");
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    PerfStatsCollector::reset();
+    PerfStatsCollector::addCounter("weight_loading", "gdn_projection_arithmetic_prepared_weight", 7.0,
+        "stale_setup", "cpu", {{"policy", "fp16"}});
+    {
+        ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "0");
+        ScopedEnv csv("LLAMINAR_PERF_STATS_CSV", "0");
+        ScopedEnv table("LLAMINAR_PERF_STATS_TABLE", "0");
+        ScopedEnv summary("LLAMINAR_PERF_STATS_SUMMARY", "0");
+        ScopedEnv legacy("LLAMINAR_PROFILING", "0");
+        ScopedEnv cpu_timing("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", "0");
+        ScopedEnv gpu_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", "0");
+        ScopedEnv gpu_stage("LLAMINAR_GPU_STAGE_TIMING", "0");
+        ScopedEnv gpu_detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0");
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+        ASSERT_FALSE(PerfStatsCollector::isEnabled());
+        ASSERT_FALSE(PerfStatsCollector::snapshot({"weight_loading"}).empty());
+        auto runner = std::make_shared<MockCPUInferenceRunner>();
+        BenchmarkRunner benchmark(runner, createMockTokenizer());
+        OrchestrationConfig config;
+        config.prompt = "Hello world";
+        config.n_predict = 1;
+        config.temperature = 0.0f;
+        const auto result = benchmark.run(config);
+        ASSERT_TRUE(result.success) << result.failure_reason;
+        EXPECT_TRUE(result.setup_warmup_arithmetic.observed_before_measurement);
+        EXPECT_FALSE(result.setup_warmup_arithmetic.collection_enabled);
+        EXPECT_TRUE(result.setup_warmup_arithmetic.records.empty());
+        const auto observation = nlohmann::json::parse(benchmarkResultToJsonString(result)).at("setup_warmup_arithmetic");
+        EXPECT_TRUE(observation.at("observed_before_measurement").get<bool>());
+        EXPECT_FALSE(observation.at("collection_enabled").get<bool>());
+        EXPECT_TRUE(observation.at("records").empty());
+    }
+    PerfStatsCollector::reset();
+}
+
+/** @test A preparation failure cannot masquerade as an observed setup/warmup boundary. */
+TEST(Test__BenchmarkRunnerCPU, IncompleteRunDoesNotClaimSetupArithmeticObservation)
+{
+    ScopedEnv enabled("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    PerfStatsCollector::addCounter("kernel", "gdn_projection_route", 1.0, "earlier_setup");
+    auto runner = std::make_shared<MockInferenceReadinessRunner>(InferenceReadinessState::Preparing);
+    BenchmarkRunner benchmark(runner, createMockTokenizer());
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 1;
+    const auto result = benchmark.run(config);
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.setup_warmup_arithmetic.observed_before_measurement);
+    EXPECT_TRUE(result.setup_warmup_arithmetic.records.empty());
+    EXPECT_EQ(runner->forwardCount(), 0);
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @test Preserve exact per-layer bank observations through the actual runner reset and JSON export.
+ *
+ * The device-free callback models only passive producer records, not physical
+ * admission or a native placement proof. Distinct layer/device/participant tags
+ * and values survive intact. An adjacent dotted family and unrelated placement
+ * and movement work must still disappear at the pre-measurement reset.
+ */
+TEST(Test__BenchmarkRunnerCPU, RetainsExactTaggedPhysicalPlacementSetupAcrossMeasuredReset)
+{
+    ScopedEnv enabled("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "");
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    PerfStatsCollector::reset();
+    std::vector<PerfStatRecord> expected;
+    for (const int layer : {0, 47})
+    {
+        for (const bool gpu : {true, false})
+        {
+            PerfStatRecord record;
+            record.domain = "moe_placement";
+            record.name = "routed_expert_weight_selection";
+            record.phase = "model_setup";
+            record.device = gpu ? "cuda:0" : "cpu:0";
+            record.tags = {{"layer", std::to_string(layer)},
+                           {"owner_order", "ordinal"},
+                           {"participant", gpu ? "0" : "1"},
+                           {"tier", gpu ? "0" : "1"},
+                           {"tier_participant_count", "1"},
+                           {"selection_layout", "contiguous"},
+                           {"frozen_owner_map_match", "true"},
+                           {"publication", "initial_epoch_bank"},
+                           {"layer_role", "main_transformer"}};
+            record.count = 1;
+            record.value = gpu ? 8.0 : 504.0;
+            expected.push_back(std::move(record));
+        }
+    }
+    auto runner = std::make_shared<MockCPUInferenceRunner>();
+    BenchmarkRunner benchmark(runner, createMockTokenizer());
+    benchmark.setPostWarmupCallback([&]()
+    {
+        emitArithmeticSetupFixture(expected);
+        PerfStatsCollector::addCounter("moe_placement", "routed_expert_weight_selection.unrelated", 91.0);
+        PerfStatsCollector::addCounter("moe_placement", "unrelated_runtime_placement", 92.0);
+        PerfStatsCollector::addCounter("moe_rebalance", "unrelated_warmup_movement", 93.0);
+    });
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 1;
+    config.temperature = 0.0f;
+    const auto result = benchmark.run(config);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    const auto retained = PerfStatsCollector::snapshot({"moe_placement"});
+    ASSERT_EQ(retained.size(), expected.size());
+    for (const auto &wanted : expected)
+    {
+        const auto found = std::find_if(retained.begin(), retained.end(), [&](const auto &record)
+        {
+            return record.device == wanted.device && record.tags == wanted.tags;
+        });
+        ASSERT_NE(found, retained.end());
+        EXPECT_EQ(found->kind, wanted.kind);
+        EXPECT_EQ(found->domain, wanted.domain);
+        EXPECT_EQ(found->name, wanted.name);
+        EXPECT_EQ(found->phase, wanted.phase);
+        EXPECT_EQ(found->count, wanted.count);
+        EXPECT_DOUBLE_EQ(found->value, wanted.value);
+    }
+    EXPECT_TRUE(PerfStatsCollector::snapshot({"moe_rebalance"}).empty());
+    const auto doc = nlohmann::json::parse(benchmarkResultToJsonString(result));
+    const auto &records = doc.at("perf_stats").at("records");
+    std::size_t serialized = 0;
+    for (const auto &record : records)
+    {
+        const auto name = record.at("name").get<std::string>();
+        EXPECT_NE(name, "routed_expert_weight_selection.unrelated");
+        EXPECT_NE(name, "unrelated_runtime_placement");
+        EXPECT_NE(name, "unrelated_warmup_movement");
+        if (record.at("domain") != "moe_placement")
+            continue;
+        ++serialized;
+        ASSERT_EQ(name, "routed_expert_weight_selection");
+        const auto tags = record.at("tags").get<PerfStatsCollector::Tags>();
+        const auto device = record.at("device").get<std::string>();
+        const auto wanted = std::find_if(expected.begin(), expected.end(), [&](const auto &entry)
+        {
+            return entry.device == device && entry.tags == tags;
+        });
+        ASSERT_NE(wanted, expected.end());
+        EXPECT_EQ(record.at("kind"), "counter");
+        EXPECT_EQ(record.at("phase"), wanted->phase);
+        EXPECT_EQ(record.at("count"), wanted->count);
+        EXPECT_EQ(record.at("value"), wanted->value);
+    }
+    EXPECT_EQ(serialized, expected.size())
+        << "The benchmark JSON must retain every actual tagged setup selection";
+    for (const auto &record : doc.at("setup_warmup_arithmetic").at("records"))
+    {
+        EXPECT_NE(record.at("domain"), "moe_placement")
+            << "Placement metadata must not broaden the arithmetic snapshot";
+    }
     PerfStatsCollector::reset();
 }

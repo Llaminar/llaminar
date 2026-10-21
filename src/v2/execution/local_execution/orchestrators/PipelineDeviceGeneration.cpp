@@ -5,9 +5,12 @@
  * Command fields borrow the existing request arena; followers never initialize
  * or inspect a response ledger. Their only overwritten words are health,
  * completion and the next input token, delivered by captured collectives.
- * Parent ownership and request-reset events stay with each DGO. The rank owns
- * communicator membership, setup fanout and one final response observation.
+ * Participant model graphs and request-reset events stay with each DGO. The
+ * rank owns communicator membership, setup fanout, composed ForwardOnly parents
+ * and one final response observation. Those parents retire while the DGO events
+ * are live; transport and edge owners remain until the child graphs retire.
  */
+#include "execution/qwen4exp/QwenSparseFollowerCounters.h"
 #include "PipelineDeviceGeneration.h"
 #include "PipelineForwardGraphEdges.h"
 #include "DeviceGraphOrchestrator.h"
@@ -78,7 +81,7 @@ PipelineDeviceGeneration::PipelineDeviceGeneration(
                 stage->deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology::FixedDepth) ==
                     DeviceGenerationExecutionPolicy::Unsupported ||
                 !unique.insert(stage->state_.device_id).second ||
-                (!stages_.empty() && stage->graph_builder_->config().d_model != stages_.front()->graph_builder_->config().d_model))
+                (!stages_.empty() && stage->graph_builder_->config().residualWidth() != stages_.front()->graph_builder_->config().residualWidth()))
                 throw std::invalid_argument("Pipeline generation requires distinct captured GPU members with exact layer-domain ownership");
             (void)PipelineNativeDomain(stage->state_.device_id, context, member);
             stages_.push_back(stage);
@@ -110,7 +113,459 @@ PipelineDeviceGeneration::PipelineDeviceGeneration(
     workers_->setFailureCallback([this] { abortParticipants(); });
 }
 
-PipelineDeviceGeneration::~PipelineDeviceGeneration() = default;
+/** @brief Immutable complete parents borrowing original per-device model owners.
+ * The boolean records host submission lifetime only, never device policy state.
+ * Parents retire before their borrowed transport/publication child recordings. */
+struct PipelineDeviceGeneration::ForwardOnlyFamily
+{
+    /** @brief Exact setup binding for one original singleton participant. */
+    struct Participant
+    {
+        DeviceId device = DeviceId::invalid();
+        uint64_t workspace = 0;
+        void *stream = nullptr;
+        const void *arena = nullptr;
+        const void *hidden = nullptr;
+        int width = 0;
+        const void *logits = nullptr;
+        const void *storage_boundary = nullptr;
+        const IGPUGraphCapture *storage_terminal = nullptr;
+        std::optional<DeviceGraphOrchestrator::OrdinaryGenerationForward> forward;
+        sampling_math::OrdinaryGenerationPublication publication;
+        std::array<std::unique_ptr<IGPUGraphCapture>, 5> children;
+        std::unique_ptr<IGPUGraphCapture> parent;
+        bool submitted = false;
+        bool terminal_copies_pending = false; ///< Host-backing lifetime only, never GPU policy.
+    };
+    std::vector<Participant> participants;
+
+    /** @brief Project exact arena-owned publisher bindings without reading device values. */
+    static sampling_math::OrdinaryGenerationPublication publicationFor(const DeviceGraphOrchestrator &stage)
+    {
+        using namespace sampling_math;
+        const auto &logical = stage.device_resident_logical_sequence_state_storage_;
+        return {.request_count = 1,
+            .sampled_tokens = static_cast<int32_t *>(stage.stochastic_target_sample_tokens_dev_),
+            .stop_tokens = {static_cast<const int32_t *>(stage.mtp_verifier_stop_tokens_dev_), kSpeculativeBatchMaxStopTokens, 0},
+            .source = OrdinaryGenerationSampleSource::DecodeLogits,
+            .response_tokens = stage.device_generation_storage_.response_tokens_device,
+            .response_token_stride = stage.device_generation_storage_.response_token_stride,
+            .control = stage.device_generation_storage_.control_device,
+            .control_stride = stage.device_generation_storage_.control_stride,
+            .frontier = {logical.target_cached_tokens_device, logical.next_condition_tokens_device,
+                logical.stopped_flags_device, logical.publication_ok_flags_device, 1, stage.state_.max_seq_len},
+            .history = {static_cast<int32_t *>(stage.mtp_generated_token_counts_dev_), stage.state_.vocab_size,
+                stage.state_.vocab_size, 1}};
+    }
+};
+
+bool PipelineDeviceGeneration::forwardOnlyFamilyCurrent() const
+{
+    if (transport_ != Transport::NativePipeline || !collective_ || !forward_only_ ||
+        forward_only_->participants.size() != stages_.size() || domains_.size() != stages_.size()) return false;
+    for (size_t i = 0; i < stages_.size(); ++i)
+    {
+        const auto &stage = *stages_[i];
+        const auto &part = forward_only_->participants[i];
+        std::string error;
+        if (domains_[i].count != 1 || part.device != stage.state_.device_id ||
+            part.workspace != stage.workspaceGeneration(stage.state_.device_id) ||
+            part.stream != stage.mtp_device_generation_loop_graph_.stream.get() ||
+            part.arena != stage.arena_.get() ||
+            part.hidden != stage.state_.hidden->gpu_data_ptr() ||
+            part.width != stage.graph_builder_->config().residualWidth() || part.width <= 0 ||
+            stage.state_.hidden->native_type() != TensorType::FP32 ||
+            static_cast<size_t>(part.width) > stage.state_.hidden->numel() ||
+            part.logits != stage.state_.logits->gpu_data_ptr() ||
+            part.storage_boundary != stage.retained_storage_boundary_.get() ||
+            part.storage_boundary != stage.graph_builder_->retainedStorageBoundary(stage.state_.device_id).get() ||
+            part.storage_terminal != stage.retained_storage_terminal_capture_.get() ||
+            part.publication != ForwardOnlyFamily::publicationFor(stage) ||
+            !part.parent || !part.parent->hasExecutable() || part.parent->executionStream() != part.stream || !part.forward || !part.forward->native() ||
+            !stage.forward_engine_ || !stage.forward_engine_->observeComposedForwardCompletion(
+                part.forward->signature, part.forward->native()->capture, 0, &error)) return false;
+    }
+    return true;
+}
+
+bool PipelineDeviceGeneration::prepareForwardOnlyFamily()
+{
+    // Cross-vendor and nested TP need their own complete transaction compiler.
+    // Never relabel them as a singleton native cohort or choose an eager path.
+    if (transport_ != Transport::NativePipeline) return true;
+    if (forward_only_) return forwardOnlyFamilyCurrent();
+    auto family = std::make_unique<ForwardOnlyFamily>();
+    family->participants.resize(stages_.size());
+    std::barrier boundary(static_cast<ptrdiff_t>(stages_.size()));
+    std::atomic<bool> failed{false};
+    workers_->dispatch([&, this](size_t index) {
+        auto &stage = *stages_[index];
+        auto &part = family->participants[index];
+        IWorkerGPUContext *context = nullptr;
+        // Every potentially rejecting setup operation is inside this boundary:
+        // one failed member must still arrive at every cohort capture barrier.
+        try {
+            context = &GPUDeviceContextPool::instance().getContext(stage.state_.device_id);
+            part.device = stage.state_.device_id;
+            part.workspace = stage.workspaceGeneration(part.device);
+            part.stream = stage.mtp_device_generation_loop_graph_.stream.get();
+            part.arena = stage.arena_.get();
+            part.hidden = stage.state_.hidden->gpu_data_ptr();
+            part.width = stage.graph_builder_->config().residualWidth();
+            part.logits = stage.state_.logits->gpu_data_ptr();
+            std::string error;
+            // Serving setup already retained this exact original resident-input body.
+            // Export does not launch it or admit a controller/sampler/request.
+            part.forward = stage.materializeOrdinaryGenerationForward(
+                stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
+                OrdinaryForwardRetentionKind::NativeComposable, &error);
+            part.publication = ForwardOnlyFamily::publicationFor(stage);
+            stage.prepareRetainedStorageBinding();
+            (void)stage.retainedStorageTerminalFragments();
+            part.storage_boundary = stage.retained_storage_boundary_.get();
+            part.storage_terminal = stage.retained_storage_terminal_capture_.get();
+            if (!part.workspace || !part.stream || !part.forward || !part.forward->native() ||
+                part.width <= 0 || stage.state_.hidden->native_type() != TensorType::FP32 ||
+                static_cast<size_t>(part.width) > stage.state_.hidden->numel() ||
+                !part.publication.valid()) failed = true;
+        } catch (const std::exception &failure) {
+            failed = true;
+            LOG_ERROR("Pipeline ForwardOnly source preparation failed: " << failure.what());
+        } catch (...) {
+            failed = true;
+            LOG_ERROR("Pipeline ForwardOnly source preparation failed with an unknown exception");
+        }
+        boundary.arrive_and_wait();
+        // Every participant enters every capture phase, even on setup failure.
+        // This is setup fanout only; no host token/row/control decides a replay.
+        const auto record = [&](std::unique_ptr<IGPUGraphCapture> &child, auto &&enqueue) {
+            std::optional<ScopedBackendGraphCapture> capture;
+            bool began = false;
+            try {
+                if (!failed.load() && context)
+                {
+                    child = context->createGraphCapture(part.stream);
+                    if (child) capture.emplace(*context, *child, "pipeline_forward_only_collective");
+                    began = capture && capture->begin();
+                }
+            } catch (const std::exception &failure) {
+                failed = true;
+                LOG_ERROR("Pipeline ForwardOnly capture admission failed: " << failure.what());
+            } catch (...) { failed = true; }
+            if (!began) failed = true;
+            boundary.arrive_and_wait();
+            const bool admitted = !failed.load();
+            boundary.arrive_and_wait();
+            try { if (admitted && !enqueue()) failed = true; }
+            catch (const std::exception &failure) {
+                failed = true;
+                collective_->requestAbort();
+                LOG_ERROR("Pipeline ForwardOnly recording failed: " << failure.what());
+            } catch (...) { failed = true; collective_->requestAbort(); }
+            boundary.arrive_and_wait();
+            try { if (began) capture->finish(); }
+            catch (const std::exception &failure) {
+                failed = true;
+                LOG_ERROR("Pipeline ForwardOnly recording retirement failed: " << failure.what());
+            } catch (...) { failed = true; }
+            boundary.arrive_and_wait();
+        };
+        using namespace sampling_math;
+        const auto exchange = [&](bool terminal) {
+            std::vector<LocalTPCollectiveSidebandBuffer> fields;
+            const auto add = [&](int32_t *field) {
+                fields.push_back({.kind = LocalTPCollectiveSidebandKind::Broadcast,
+                    .send_buffer = field, .recv_buffer = field, .element_count = 1,
+                    .dtype = CollectiveDataType::INT32, .root_device_index = static_cast<int>(stages_.size() - 1),
+                    .name = "pipeline_forward_only_command"});
+            };
+            add(stage.device_generation_storage_.control_device + kDeviceGenerationControlRequestComplete);
+            if (!terminal) add(stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device);
+            // Terminal must not overwrite a follower's own failed health word.
+            return collective_->collectiveSidebandSpanOnStream(fields, static_cast<int>(index),
+                part.stream, terminal ? "pipeline_forward_only_complete" : "pipeline_forward_only_input");
+        };
+        record(part.children[0], [&] { return exchange(false); });
+        for (size_t edge = 0; edge + 1 < stages_.size(); ++edge)
+        {
+            const bool sender = index == edge, receiver = index == edge + 1;
+            std::unique_ptr<IGPUGraphCapture> empty;
+            auto &child = sender ? part.children[2] : receiver ? part.children[1] : empty;
+            record(child, [&] {
+                if (!sender && !receiver) return true;
+                const CollectiveP2POp operation{
+                    .kind = sender ? CollectiveP2POpKind::Send : CollectiveP2POpKind::Recv,
+                    .send_buffer = sender ? stage.state_.hidden->gpu_data_ptr() : nullptr,
+                    .recv_buffer = receiver ? stage.state_.hidden->gpu_data_ptr() : nullptr,
+                    .count = static_cast<size_t>(part.width),
+                    .dtype = CollectiveDataType::FLOAT32, .peer = static_cast<int>(sender ? edge + 1 : edge)};
+                return collective_->groupedP2PRawOnStream({operation}, static_cast<int>(index), part.stream,
+                    "pipeline_forward_only_activation");
+            });
+        }
+        const bool tail = index + 1 == stages_.size();
+        record(part.children[3], [&] {
+            // The existing backend publisher branches on ForwardOnly before
+            // reading sampled_tokens, stop policy or history. No sampler node exists.
+            return !tail || getBackendFor(part.device)->enqueuePublishOrdinaryGenerationSample(
+                part.publication, part.device.ordinal, part.stream);
+        });
+        record(part.children[4], [&] { return exchange(true); });
+        if (failed.load()) return false;
+        std::vector<GPUOrderedTimelineStep> steps{{.name = "original tail condition", .capture = part.children[0].get()}};
+        if (index) steps.push_back({.name = "receive scalar activation", .capture = part.children[1].get()});
+        steps.push_back({.name = "original resident model", .capture = part.forward->native()->capture});
+        if (!tail) steps.push_back({.name = "send scalar activation", .capture = part.children[2].get()});
+        else steps.push_back({.name = "forward-only state commit", .capture = part.children[3].get()});
+        steps.push_back({.name = "tail completion", .capture = part.children[4].get()});
+        for (const auto &fragment : stage.retainedStorageTerminalFragments())
+            steps.push_back({.name = fragment.name, .capture = fragment.capture});
+        part.parent = context->createGraphCapture(part.stream);
+        if (!part.parent || !part.parent->buildOrderedTimelineTransaction(steps) || !part.parent->instantiate()) return false;
+        PerfStatsCollector::addCounter("generation", "pipeline_forward_only_graph_materializations", 1.0,
+            "graph_setup", part.device.toString(), {{"executable_owners", "1"}, {"sampler", "absent"}});
+        return true;
+    });
+    if (!collectPreparation(*workers_)) { abortParticipants(); return false; }
+    forward_only_ = std::move(family);
+    return forwardOnlyFamilyCurrent();
+}
+
+bool PipelineDeviceGeneration::advanceOrdinaryCondition(
+    const DeviceResidentLogicalSequenceStateHandle &logical_state, int request_index)
+{
+    auto &tail = *stages_.back();
+    if (transport_ != Transport::NativePipeline)
+    {
+        LOG_ERROR("Pipeline ForwardOnly requires a native singleton homogeneous cohort; captured-domain and nested TP composition are not admitted");
+        return false;
+    }
+    for (const auto *stage : stages_)
+        if (stage->usesParticipantLocalDeviceMoERebalanceController())
+        {
+            LOG_ERROR("Pipeline ForwardOnly does not admit a dynamic participant-local MoE maintenance policy");
+            return false;
+        }
+    if (phase_ != Phase::Idle || request_index != 0 || !forwardOnlyFamilyCurrent() ||
+        !logical_state.coversRequest(0) || logical_state.device != tail.state_.device_id ||
+        !tail.device_resident_logical_sequence_state_mailbox_.ownsHandle(logical_state, tail.live_replay_state_epoch_))
+        return false;
+    const DeviceGenerationAdmissionRequest admission{
+        .request_count = 1, .max_new_tokens = 0,
+        .depth_policy = sampling_math::DeviceGenerationPolicy::forwardOnly(),
+        .initial_leading_row_disposition = sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted};
+    if (!begin(admission)) return false;
+    phase_ = Phase::Failed;
+    // Join every old producer/observer before opening any replacement writer.
+    // Observation correctly rejects an unfinished writer, even on the same stream.
+    for (size_t i = 0; i < stages_.size(); ++i)
+    {
+        auto &stage = *stages_[i];
+        auto &part = forward_only_->participants[i];
+        if (!stage.consumeDeviceGenerationStateReady(part.stream, DeviceTimelineRole::DeviceGenerationController,
+                1, "pipeline_forward_only_parent") ||
+            !stage.waitForLiveInferenceStateReadyForObservation(part.stream,
+                "pipeline_forward_only_parent", DeviceTimelineRole::DeviceGenerationController) ||
+            !stage.prepareMoEOverlayEpochForInternalParent(part.stream, "pipeline_forward_only_parent")) return false;
+        if (stage.retained_storage_boundary_) stage.retained_storage_boundary_->requireArmedForLaunch();
+    }
+    // Submit every complete participant before observing any terminal result.
+    // Once native launch accepts work, publication failure is fatal, never retryable.
+    for (size_t i = 0; i < stages_.size(); ++i)
+    {
+        auto &stage = *stages_[i];
+        auto &part = forward_only_->participants[i];
+        try
+        {
+            // The exclusive row lease closes through the actual post-launch event
+            // before terminal observation, including a later failed terminal copy.
+            if (!stage.waitForDeviceResidentLogicalSequenceStateRowReuse(
+                    part.stream, "pipeline_forward_only_writer"))
+            {
+                LOG_ERROR("Pipeline ForwardOnly could not acquire its logical-row writer on " << part.device.toString());
+                abortParticipants();
+                std::terminate();
+            }
+            if (!part.parent->launchOnStream(part.stream))
+            {
+                LOG_ERROR("Pipeline ForwardOnly parent submission failed on " << part.device.toString());
+                abortParticipants();
+                std::terminate();
+            }
+            part.submitted = true;
+            // Only the tail's real publisher produces the complete logical
+            // frontier. A follower receives one condition field; its physical
+            // access root must close without inventing the remaining fields.
+            std::string publication_error;
+            const bool logical_write_published = i + 1 == stages_.size()
+                ? stage.recordDeviceResidentLogicalSequenceStateMailbox(1, part.stream,
+                    DeviceGraphOrchestrator::DeviceResidentLogicalStatePublicationKind::ForwardOnlyTerminal,
+                    &publication_error)
+                : stage.publishPipelineFollowerLogicalRowWriteCompletion(part.stream);
+            if (!logical_write_published)
+            {
+                LOG_ERROR("Pipeline ForwardOnly " << (i + 1 == stages_.size() ? "tail mailbox" : "follower write completion")
+                    << " publication failed on " << part.device.toString() << ": " << publication_error);
+                abortParticipants();
+                std::terminate();
+            }
+            if (!stage.publishDeviceGenerationStateReady(part.stream, 1, DeviceGenerationStatePublicationKind::Terminal))
+            {
+                LOG_ERROR("Pipeline ForwardOnly terminal event publication failed on " << part.device.toString());
+                abortParticipants();
+                std::terminate();
+            }
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("Pipeline ForwardOnly submission/publication failed on " << part.device.toString() << ": " << error.what());
+            abortParticipants();
+            std::terminate();
+        }
+        catch (...)
+        {
+            LOG_ERROR("Pipeline ForwardOnly submission/publication failed on " << part.device.toString() << " with an unknown exception");
+            abortParticipants();
+            std::terminate();
+        }
+    }
+    phase_ = Phase::Submitted;
+    return finishForwardOnly();
+}
+
+bool PipelineDeviceGeneration::finishForwardOnly()
+{
+    using namespace sampling_math;
+    if (phase_ != Phase::Submitted || !forwardOnlyFamilyCurrent()) return false;
+    phase_ = Phase::Failed;
+    auto &tail = *stages_.back();
+    std::vector<std::array<int, 3>> terminal(stages_.size());
+    int32_t published_cached_tokens = -1;
+    const auto host_controls = tail.deviceGenerationTerminalHostControls(1);
+    if (host_controls.size() < static_cast<size_t>(kDeviceGenerationControlCount)) return false;
+    // These fixed terminal observations are local host backing. Every accepted
+    // copy must retire before they leave scope, including false/throw exits.
+    // Existing terminal events own the fence; a failed record/wait is fatal,
+    // never permission to destroy storage with a possible native write in flight.
+    const auto retire_copies = [&]() noexcept {
+        try {
+            for (size_t i = 0; i < stages_.size(); ++i)
+            {
+                const auto &part = forward_only_->participants[i];
+                if (!part.terminal_copies_pending) continue;
+                auto &stage = *stages_[i];
+                auto *backend = getBackendFor(part.device);
+                if (!backend || !stage.device_generation_terminal_host_ready_event_ ||
+                    !backend->recordEvent(stage.device_generation_terminal_host_ready_event_.get(), part.device.ordinal, part.stream))
+                    std::terminate();
+            }
+            for (size_t i = 0; i < stages_.size(); ++i)
+            {
+                auto &part = forward_only_->participants[i];
+                if (!part.terminal_copies_pending) continue;
+                if (!getBackendFor(part.device)->waitForEvent(
+                        stages_[i]->device_generation_terminal_host_ready_event_.get(), part.device.ordinal))
+                    std::terminate();
+                part.terminal_copies_pending = false;
+            }
+        } catch (...) { std::terminate(); }
+    };
+    struct CopyRetirement
+    {
+        const decltype(retire_copies) &retire;
+        /** @brief Retain every accepted terminal-copy destination through its exact completion. */
+        ~CopyRetirement() noexcept { retire(); }
+    } copy_retirement{retire_copies};
+    for (size_t i = 0; i < stages_.size(); ++i)
+    {
+        auto &stage = *stages_[i];
+        const auto &part = forward_only_->participants[i];
+        auto *backend = getBackendFor(part.device);
+        if (!stage.consumeDeviceGenerationStateReady(part.stream, DeviceTimelineRole::HostResultBridge,
+                1, "pipeline_forward_only_terminal")) return false;
+        forward_only_->participants[i].terminal_copies_pending = true;
+        const std::array<const int *, 3> sources{
+            stage.state_.kv_cache->deviceSequenceCachedTokenCountPtr(0),
+            stage.device_generation_storage_.control_device + kDeviceGenerationControlOk,
+            stage.device_generation_storage_.control_device + kDeviceGenerationControlRequestComplete};
+        for (size_t field = 0; field < sources.size(); ++field)
+            if (!backend->deviceToHostOnStream(&terminal[i][field], sources[field], sizeof(int),
+                    part.device.ordinal, part.stream)) return false;
+        if (i + 1 == stages_.size())
+        {
+            // Fixed ABI metadata only. No response allocation capacity is data
+            // for a zero-response operation, and no token/logit readback drives it.
+            if (!backend->deviceToHostOnStream(&published_cached_tokens,
+                    stage.device_resident_logical_sequence_state_storage_.target_cached_tokens_device,
+                    sizeof(published_cached_tokens), part.device.ordinal, part.stream) ||
+                !backend->deviceToHostOnStream(host_controls.data(),
+                    stage.device_generation_storage_.control_device, sizeof(int) * kDeviceGenerationControlCount,
+                    part.device.ordinal, part.stream)) return false;
+        }
+    }
+    retire_copies();
+    for (auto *stage : stages_) stage->awaitRetainedStorageTerminal();
+    // Join every terminal event before reading another participant's host result.
+    for (const auto &local : terminal)
+        if (local[1] != 1 || local[2] != 1 || local[0] != terminal.back()[0]) return false;
+    if (published_cached_tokens != terminal.back()[0] || !tail.active_device_generation_admission_ ||
+        !tail.active_device_generation_admission_->depth_policy.isForwardOnly() ||
+        validateDeviceGenerationTerminal(std::span<const int, kDeviceGenerationControlCount>(
+            host_controls.data(), kDeviceGenerationControlCount),
+            *tail.active_device_generation_admission_, tail.device_generation_storage_.response_token_stride,
+            0, 0) != DeviceGenerationTerminalError::None) return false;
+    for (size_t i = 0; i < stages_.size(); ++i)
+    {
+        auto &stage = *stages_[i];
+        auto &part = forward_only_->participants[i];
+        std::string error;
+        if (!stage.forward_engine_->observeComposedForwardCompletion(part.forward->signature,
+                part.forward->native()->capture, 1, &error) ||
+            !stage.device_generation_state_ready_.handoff.retireAfterHostCompletion(1)) return false;
+        stage.device_generation_storage_.active_request_count = 0;
+        stage.active_device_generation_admission_.reset();
+        part.submitted = false;
+        stage.clearDeviceResidentLogicalSequenceStateMailbox();
+    }
+    auto &part = forward_only_->participants.back();
+    TransferEngine::publishDeviceWrite(tail.state_.logits.get(), tail.state_.device_id, part.stream);
+    ForwardOutput output;
+    output.logits = tail.state_.logits.get();
+    output.hidden = tail.state_.hidden.get();
+    output.execution = {.valid = true, .device = tail.state_.device_id, .stream = part.stream,
+        .execution_role = ForwardExecutionRole::MainInference, .is_decode = true,
+        .completion_scope = ForwardCompletionScope::ModelForwardOnly, .graph_seq_len = 1, .graph_batch_size = 1};
+    if (!tail.publishForwardGraphOutputReady(output)) return false;
+    PerfStatsCollector::addCounter("generation", "pipeline_forward_only_completed_transactions", 1.0,
+        "decode", "rank", {{"sampler", "absent"}, {"response_tokens", "0"}, {"model_commits", "1"}});
+    phase_ = Phase::Idle;
+    return true;
+}
+
+PipelineDeviceGeneration::~PipelineDeviceGeneration()
+{
+    retireForwardOnlyBeforeStageRelease();
+}
+
+void PipelineDeviceGeneration::retireForwardOnlyBeforeStageRelease() noexcept
+{
+    workers_.reset(); // Join any setup wave while every borrowed source/cohort is alive.
+    // This owner's complete parents borrow DGO recordings. An absorbing failure
+    // still owes the original published event before any parent can retire.
+    if (forward_only_)
+        for (size_t i = 0; i < stages_.size(); ++i)
+            if (forward_only_->participants[i].submitted)
+            {
+                auto &stage = *stages_[i];
+                auto *backend = getBackendFor(stage.state_.device_id);
+                // This operation's accepted parent publishes this exact event.
+                // General forward-output teardown alone does not cover it.
+                if (!backend || !stage.device_generation_state_ready_.event ||
+                    !backend->waitForEvent(stage.device_generation_state_ready_.event.get(), stage.state_.device_id.ordinal))
+                    std::terminate();
+            }
+    forward_only_.reset(); // Parents retire before their original collective and DGO recordings.
+}
 
 bool PipelineDeviceGeneration::isGPUStageSet(std::span<const std::unique_ptr<IInferenceRunner>> stages)
 {
@@ -154,7 +609,7 @@ void PipelineDeviceGeneration::prepareDomainBoundaries()
         const int admitted_rows = earlier.state_.activation_seq_len;
         if (admitted_rows <= 0 || later.state_.activation_seq_len != admitted_rows)
             throw std::logic_error("Captured pipeline boundary requires one common admitted activation capacity");
-        const auto geometry = PipelineTransferMemory::forRows(config.d_model,
+        const auto geometry = PipelineTransferMemory::forRows(config.residualWidth(),
             admitted_rows, std::max(1, resolveMTPRetainedTargetQueryRows(config.mtp)));
         auto &transfer = TransferEngine::instance();
         const auto create = [&](auto &source, auto &destination, size_t capacity) {
@@ -218,7 +673,7 @@ bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializ
             }
             if (transport_ == Transport::NativePipeline)
                 forward_edges_.push_back(std::make_unique<PipelineForwardGraphEdges>(*collective_,
-                    static_cast<int>(index), *stage.state_.hidden, stage.graph_builder_->config().d_model, follower));
+                    static_cast<int>(index), *stage.state_.hidden, stage.graph_builder_->config().residualWidth(), follower));
             else
                 forward_edges_.push_back(std::make_unique<PipelineForwardGraphEdges>(stage.state_.device_id,
                     PipelineForwardGraphEdges::CapturedDomain{
@@ -228,7 +683,7 @@ bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializ
                         .activation_out = domain_index < boundaries_.size() ? boundaries_[domain_index].activation : nullptr,
                         .metadata_in = domain_index < boundaries_.size() ? boundaries_[domain_index].metadata : nullptr,
                         .metadata_out = domain_index ? boundaries_[domain_index - 1].metadata : nullptr},
-                    *stage.arena_, stage.graph_builder_->config().d_model, follower));
+                    *stage.arena_, stage.graph_builder_->config().residualWidth(), follower));
             stage.pipeline_forward_edges_ = forward_edges_.back().get();
         }
     }
@@ -278,6 +733,7 @@ bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializ
         return static_cast<bool>(stage.pipeline_publication_transport_);
     });
     if (!collectPreparation(*workers_)) return false;
+    if (!prepareForwardOnlyFamily()) return false;
     phase_ = Phase::Idle;
     return true;
 }
@@ -428,6 +884,9 @@ bool PipelineDeviceGeneration::begin(const DeviceGenerationAdmissionRequest &req
             (collective_ && stage.state_.device_id != collective_->devices()[i].toLocalDeviceId()))
             throw std::logic_error("Pipeline generation stage ownership changed after collective admission");
         (void)PipelineNativeDomain(stage.state_.device_id, domain.context, int(i - domain.first));
+        if(!qwen4exp::QwenSparseWorkCounterRow{stage.device_generation_storage_.controlForRequest(0),
+                sampling_math::kDeviceGenerationControlCount}.valid())
+            throw std::logic_error("Pipeline follower reporting span lost its canonical controller owner/alignment");
     }
     // Partial admission must never re-enter an unrelated rank/TP path. Until
     // every participant succeeds, this owner remains in an absorbing failure
@@ -448,7 +907,32 @@ bool PipelineDeviceGeneration::begin(const DeviceGenerationAdmissionRequest &req
             !stage.waitForLiveInferenceStateReadyForObservation(stream,
                 "pipeline_follower_admission", DeviceTimelineRole::DeviceGenerationController))
             return false;
+        // Reporting is per response admission. Reset only the original four
+        // pairs after old readers/reset have retired; received command words
+        // remain owned by their existing arrival protocol.
+        auto* backend=getBackendFor(stage.state_.device_id);
+        if(!backend || !resetQwenSparseFollowerCounters(
+                {stage.device_generation_storage_.controlForRequest(0),sampling_math::kDeviceGenerationControlCount},
+                [&](void* span,std::size_t bytes){return backend->memset(span,0,bytes,stage.state_.device_id.ordinal,stream);}))
+            return false;
+        if (request.depth_policy.isForwardOnly())
+        {
+            // Unlike a response loop, the fixed one-shot does not overwrite
+            // follower health with a tail command. Initialize its own original
+            // control with the model-owned sticky-forward failure policy.
+            if (!backend->enqueueInitializeDeviceGeneration(1, 0, request.depth_policy,
+                    request.initial_leading_row_disposition,
+                    stage.device_generation_storage_.response_token_stride,
+                    stage.device_generation_storage_.response_tokens_device,
+                    stage.device_generation_storage_.control_stride,
+                    stage.device_generation_storage_.control_device, stage.state_.device_id.ordinal, stream,
+                    {.kind = request.kind, .session_epoch = stage.session_epoch_,
+                     .workspace_generation = stage.workspaceGeneration(stage.state_.device_id),
+                     .prior_tickets = stage.device_generation_storage_.dispatch_tickets_device,
+                     .forward_failure_policy = stage.graph_builder_->deviceGenerationForwardFailurePolicy()})) return false;
+        }
         stage.device_generation_storage_.active_request_count = 1;
+        if(!stage.beginRetainedStorageAdmission(stream))return false;
         // Do not reset the received command. Arrival unconditionally replaces
         // a previous terminal command before the first follower predicate.
         if (!stage.publishDeviceGenerationStateReady(stream, 1, DeviceGenerationStatePublicationKind::Admission))
@@ -469,23 +953,30 @@ bool PipelineDeviceGeneration::prepareParticipants(DeviceGenerationSamplingMode 
             if (transport_ == Transport::CapturedDomains)
                 return domains_.back().runner->materializeDeviceResidentGeneration(1, 0,
                     DeviceGenerationLoopTopology::FixedDepth, sampling);
-            const bool ready = stage.materializeOrdinaryDeviceGenerationLoopGraph(sampling, &error,
-                DeviceGraphOrchestrator::OrdinaryGenerationComposition::PipelineTail);
+            // Native PP owns the complete parent, including activation and
+            // command edges. The tail's overlay reader lease remains inside
+            // its retained forward; its no-peer proof is checked by the
+            // materializer before it records either sampler child.
+            const auto composition = stage.moe_overlay_epoch_execution_binding_
+                ? DeviceGraphOrchestrator::OrdinaryGenerationComposition::PipelineNoPeerOverlayTail
+                : DeviceGraphOrchestrator::OrdinaryGenerationComposition::PipelineTail;
+            const bool ready = stage.materializeOrdinaryDeviceGenerationLoopGraph(sampling, &error, composition);
             if (!ready) LOG_ERROR("Pipeline tail preparation failed: " << error);
             return ready;
         }
         const auto forward = stage.materializeOrdinaryGenerationForward(
-            stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device, &error);
-        if (!forward) { LOG_ERROR("Pipeline follower preparation failed: " << error); return false; }
+            stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
+            OrdinaryForwardRetentionKind::NativeComposable, &error);
+        if (!forward || !forward->native()) { LOG_ERROR("Pipeline follower requires a native-composable forward: " << error); return false; }
         auto &loop = stage.mtp_device_generation_loop_graph_;
         const auto generation = stage.workspaceGeneration(stage.state_.device_id);
         if (loop.valid && loop.workspace_generation == generation &&
             loop.ordinary_forward_identity == forward->signature && loop.source_fragments.size() == 1 &&
-            loop.source_fragments.front().capture == forward->graph.capture)
+            loop.source_fragments.front().capture == forward->native()->capture)
             return true;
         loop.invalidateGraph();
         loop.ordinary_forward_identity = forward->signature;
-        loop.source_fragments.push_back({"pipeline_local_forward", forward->graph.capture});
+        loop.source_fragments.push_back({"pipeline_local_forward", forward->native()->capture});
         loop.workspace_generation = generation;
         loop.request_count = 1;
         using Kind = DeviceGraphOrchestrator::MTPDeviceGenerationLoopGraphCache::ExecutionKind;
@@ -595,7 +1086,7 @@ bool PipelineDeviceGeneration::composeParticipants()
                     .kind = sender ? CollectiveP2POpKind::Send : CollectiveP2POpKind::Recv,
                     .send_buffer = sender ? stage.state_.hidden->gpu_data_ptr() : nullptr,
                     .recv_buffer = receiver ? stage.state_.hidden->gpu_data_ptr() : nullptr,
-                    .count = static_cast<size_t>(stage.graph_builder_->config().d_model),
+                    .count = static_cast<size_t>(stage.graph_builder_->config().residualWidth()),
                     .dtype = CollectiveDataType::FLOAT32,
                     .peer = static_cast<int>(sender ? edge + 1 : edge)};
                 return collective_->groupedP2PRawOnStream({operation}, static_cast<int>(index), stream,
@@ -614,6 +1105,7 @@ bool PipelineDeviceGeneration::composeParticipants()
         else body.push_back({"tail sampler", loop.ordinary_children[OrdinaryGenerationGraphPlan::decode_sampler].get()});
         if (hosted)
         {
+            (void)stage.retainedStorageTerminalFragments();
             std::vector<GPUOrderedTimelineStep> steps;
             for (const auto &fragment : body)
                 steps.push_back({.name = fragment.name, .capture = fragment.capture});
@@ -629,7 +1121,7 @@ bool PipelineDeviceGeneration::composeParticipants()
                 if (!loop.ordinary_children[OrdinaryGenerationGraphPlan::prefill_sampler]->instantiate() ||
                     !DeviceGenerationGraphProgram::ticketPublisher(*loop.capture, context,
                         *getBackendFor(stage.state_.device_id), stage.state_.device_id, control, nullptr,
-                        stage.device_generation_storage_.dispatch_tickets_device, detail))
+                        stage.device_generation_storage_.dispatch_tickets_device, detail,stage.retained_storage_boundary_.get()))
                 {
                     LOG_ERROR("Pipeline ticket publisher compilation failed: " << detail);
                     return false;
@@ -651,7 +1143,7 @@ bool PipelineDeviceGeneration::composeParticipants()
                     stage.device_generation_storage_.control_device + kDeviceGenerationControlNextLeadingCommittedOutputCount)}};
             const DeviceControlledLoopProgram program{.entry = entry,
                 .initialization = tail ? std::span<const DeviceControlledLoopFragment>(initial) : std::span<const DeviceControlledLoopFragment>{},
-                .iteration = body};
+                .iteration = body,.terminal=stage.retainedStorageTerminalFragments()};
             // A follower's predicate is a received command, NOT an independently
             // admitted generation controller. Only the tail has sampler fragments.
             const DeviceControlledLoopPredicate predicate{
@@ -773,7 +1265,7 @@ bool PipelineDeviceGeneration::launchHostedTransactions()
             // controller words. This also retires a one-token, zero-forward
             // request without reading a stale follower command.
             for (size_t i = 0; i + 1 < stages_.size(); ++i)
-                if (!stages_[i]->publishDeviceGenerationStateReady(
+                if (!stages_[i]->submitRetainedStorageTerminal()||!stages_[i]->publishDeviceGenerationStateReady(
                         stages_[i]->mtp_device_generation_loop_graph_.stream.get(), 1,
                         DeviceGenerationStatePublicationKind::Terminal)) return false;
             return true;
@@ -818,7 +1310,7 @@ bool PipelineDeviceGeneration::launchHostedDomainTransactions()
             !owner.submitHostScheduledDeviceGenerationAdvance(ticket)) return false;
         if (!ticket.complete) continue;
         for (size_t i = 0; i < terminalIndex(); ++i)
-            if (!stages_[i]->publishDeviceGenerationStateReady(stages_[i]->mtp_device_generation_loop_graph_.stream.get(),
+            if (!stages_[i]->submitRetainedStorageTerminal()||!stages_[i]->publishDeviceGenerationStateReady(stages_[i]->mtp_device_generation_loop_graph_.stream.get(),
                     1, DeviceGenerationStatePublicationKind::Terminal)) return false;
         return true;
     }
@@ -830,7 +1322,11 @@ bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
     if (phase_ != Phase::Submitted || !result) return false;
     phase_ = Phase::Failed;
     if (!domains_.back().runner->finishDeviceResidentGeneration(result)) return false;
-    std::vector<std::array<int, 3>> terminal(stages_.size());
+    struct TerminalObservation {
+        std::array<int,3> state{}; ///< Existing independent KV/health terminal evidence.
+        QwenSparseFollowerCounterObservation counters; ///< Exact final32B, never execution state.
+    };
+    std::vector<TerminalObservation> terminal(stages_.size());
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
@@ -848,8 +1344,17 @@ bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
         const size_t observed_fields = follower &&
             execution_policy_ == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions ? 1 : sources.size();
         for (size_t field = 0; field < observed_fields; ++field)
-            if (!backend->deviceToHostOnStream(&terminal[i][field], sources[field], sizeof(int),
+            if (!backend->deviceToHostOnStream(&terminal[i].state[field], sources[field], sizeof(int),
                     stage.state_.device_id.gpu_ordinal(), stream)) return false;
+        // Extend this participant's existing final observation, on the same
+        // terminal-ready stream/event. Tail/domain-tail counters are already
+        // projected by their DGO terminal bridge and must never be duplicated.
+        if(!observeQwenSparseFollowerCounters(
+                follower ? QwenSparseTerminalOwner::PipelineFollower : QwenSparseTerminalOwner::DeviceControllerTail,
+                {stage.device_generation_storage_.controlForRequest(0),sampling_math::kDeviceGenerationControlCount},
+                terminal[i].counters,[&](void* destination,const void* source,std::size_t bytes){
+                    return backend->deviceToHostOnStream(destination,source,bytes,stage.state_.device_id.ordinal,stream);}))
+            return false;
         if (!backend->recordEvent(stage.device_generation_terminal_host_ready_event_.get(),
                 stage.state_.device_id.gpu_ordinal(), stream)) return false;
     }
@@ -859,17 +1364,18 @@ bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
         const bool hosted_follower = !terminalParticipant(i) &&
             execution_policy_ == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions;
         if (!getBackendFor(stage.state_.device_id)->waitForEvent(stage.device_generation_terminal_host_ready_event_.get(),
-                stage.state_.device_id.gpu_ordinal()) || (!hosted_follower && (terminal[i][1] != 1 || terminal[i][2] != 1)))
+                stage.state_.device_id.gpu_ordinal()) || (!hosted_follower && (terminal[i].state[1] != 1 || terminal[i].state[2] != 1)))
             return false;
         if (!terminalParticipant(i))
         {
+            stage.awaitRetainedStorageTerminal();
             if (!stage.mtp_device_generation_loop_graph_.retireCompletedLaunch() ||
                 !stage.device_generation_state_ready_.handoff.retireAfterHostCompletion(1)) return false;
             stage.device_generation_storage_.active_request_count = 0;
         }
     }
     for (const auto &local : terminal)
-        if (local[0] != terminal.back()[0])
+        if (local.state[0] != terminal.back().state[0])
             throw std::runtime_error("Pipeline generation terminal KV positions disagree; no state repair is permitted");
     // The tail reported its own completed forwards through the ordinary DGO
     // terminal. Followers report only after the independent KV check above;
@@ -878,6 +1384,20 @@ bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
         if (stages_[i]->mtp_device_generation_loop_graph_.draft_depth == 0 &&
             !stages_[i]->observeOrdinaryGenerationForwardCompletion(
                 result->requests.front().published_state_commit_count)) return false;
+    // Every participant's complete event, health and canonical KV position is
+    // validated above before any new follower observation becomes PerfStats.
+    const char* names[]{"verifier_prior_header_bytes","verifier_prior_payload_bytes",
+        "verifier_candidate_payload_bytes","verifier_accepted_payload_bytes"};
+    for(std::size_t participant=0;participant<terminalIndex();++participant){
+        const auto total=terminal[participant].counters.totals();
+        const std::uint64_t bytes[]{total.prior_header,total.prior_payload,total.candidate_payload,total.accepted_payload};
+        for(int metric=0;metric<4;++metric)
+            PerfStatsCollector::addCounterWithSequence("qsa",names[metric],static_cast<double>(bytes[metric]),
+                {bytes[metric]},"decode",stages_[participant]->state_.device_id.toString(),
+                {{"authority","pipeline_follower_terminal"},{"request","0"}});
+        PerfStatsCollector::addCounter("qsa","verifier_follower_terminal_observation_bytes",32.0,"decode",
+            stages_[participant]->state_.device_id.toString(),{{"authority","pipeline_follower_terminal"}});
+    }
     PerfStatsCollector::addCounter("generation", "pipeline_terminal_responses", 1.0, "decode", "rank",
         {{"response_owner", "tail"}, {"validation", "independent_stage_kv_positions"}});
     phase_ = Phase::Idle;

@@ -187,7 +187,13 @@ namespace llaminar2
             throw std::overflow_error(
                 "Model device-memory retention BOM overflows size_t");
         }
-        return prepared_weight_bytes + reusable_workspace_bytes;
+        const auto subtotal = prepared_weight_bytes + reusable_workspace_bytes;
+        if (immutable_table_bytes > std::numeric_limits<size_t>::max() - subtotal)
+            throw std::overflow_error("Model immutable-table retention BOM overflows size_t");
+        const auto native=subtotal+immutable_table_bytes;
+        if(immutable_lookup_staging_bytes>std::numeric_limits<size_t>::max()-native)
+            throw std::overflow_error("Model adaptive staging retention BOM overflows size_t");
+        return native+immutable_lookup_staging_bytes;
     }
 
     bool ModelDeviceMemoryRetention::valid() const noexcept
@@ -200,7 +206,11 @@ namespace llaminar2
         {
             return false;
         }
-        return prepared_weight_bytes + reusable_workspace_bytes > 0u;
+        const auto subtotal = prepared_weight_bytes + reusable_workspace_bytes;
+        if(immutable_table_bytes>std::numeric_limits<size_t>::max()-subtotal)return false;
+        const auto native=subtotal+immutable_table_bytes;
+        return immutable_lookup_staging_bytes<=std::numeric_limits<size_t>::max()-native &&
+            native+immutable_lookup_staging_bytes>0u;
     }
 
     DeviceMemoryReclamationRequest
@@ -269,6 +279,8 @@ namespace llaminar2
             << " prepared_weight_bytes=" << retention.prepared_weight_bytes
             << " reusable_workspace_bytes="
             << retention.reusable_workspace_bytes
+            << " immutable_table_bytes=" << retention.immutable_table_bytes
+            << " immutable_lookup_staging_bytes=" << retention.immutable_lookup_staging_bytes
             << " expected_retired_bytes=" << expected
             << " canonical_active_allocations="
             << accounting.active_allocations
@@ -2417,32 +2429,37 @@ namespace llaminar2
     }
 
     DeviceTransferInputFork TransferEngine::recordDeviceInputFork(
-        ITensor *source,
-        DeviceId device,
-        void *producer_stream,
-        void *event) const
+        ITensor *source, DeviceId device, void *producer_stream, void *event) const
     {
-        if (!source || !device.is_gpu() || !producer_stream || !event)
-        {
-            throw std::invalid_argument(
-                "TransferEngine::recordDeviceInputFork requires a tensor, GPU, exact producer stream, and retained event");
-        }
+        if (!source)
+            throw std::invalid_argument("TransferEngine::recordDeviceInputFork requires a source");
+        return recordDeviceInputFork(DeviceTransferForkSources::single(*source), device, producer_stream, event);
+    }
 
+    DeviceTransferInputFork TransferEngine::recordDeviceInputFork(
+        const DeviceTransferForkSources &sources, DeviceId device, void *producer_stream, void *event) const
+    {
+        if (!device.is_gpu() || !producer_stream || !event)
+            throw std::invalid_argument("TransferEngine::recordDeviceInputFork requires GPU, exact producer stream, and retained event");
         TensorBase *const source_owner = requireTransferStorageOwner(
-            source,
-            "TransferEngine::recordDeviceInputFork");
-        /* Validate against the canonical graph stream before branching. The
-         * dependency ledger must never be asked to reinterpret an auxiliary
-         * stream as the tensor's producer. */
+            &sources.packet(), "TransferEngine::recordDeviceInputFork");
+        TensorBase *const companion_owner = sources.companion()
+            ? requireTransferStorageOwner(sources.companion(), "TransferEngine::recordDeviceInputFork companion") : nullptr;
+        TensorBase *const observation_owner = sources.observation()
+            ? requireTransferStorageOwner(sources.observation(), "TransferEngine::recordDeviceInputFork observation") : nullptr;
+        if (companion_owner == source_owner || (observation_owner &&
+                (!companion_owner || observation_owner == source_owner || observation_owner == companion_owner)))
+            throw std::invalid_argument("TransferEngine input fork operands must name distinct canonical owners");
+        // Every read (including the receipt's previous total) precedes the SAME event. Auxiliary consumers authenticate
+        // the bounded set from its acquired token instead of asking the capture
+        // ledger to reinterpret its canonical stream or importing another event.
         requireDeviceInput(source_owner, device, producer_stream);
+        if (companion_owner) requireDeviceInput(companion_owner, device, producer_stream);
+        if (observation_owner) requireDeviceInput(observation_owner, device, producer_stream);
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         if (!context.recordEventChecked(event, producer_stream))
-        {
-            throw std::runtime_error(
-                "TransferEngine::recordDeviceInputFork could not record the producer frontier");
-        }
-        return DeviceTransferInputFork(
-            source_owner, device, producer_stream, event);
+            throw std::runtime_error("TransferEngine::recordDeviceInputFork could not record the producer frontier");
+        return DeviceTransferInputFork(source_owner, companion_owner, observation_owner, device, producer_stream, event);
     }
 
     AcquiredDeviceTransferInput TransferEngine::acquireDeviceInputFork(
@@ -2463,6 +2480,8 @@ namespace llaminar2
         }
         return AcquiredDeviceTransferInput(
             publication.source_owner_,
+            publication.companion_owner_,
+            publication.observation_owner_,
             publication.device_,
             consumer_stream,
             publication.event_);
@@ -3204,6 +3223,21 @@ namespace llaminar2
     {
         static TransferEngine engine;
         return engine;
+    }
+
+    void TransferEngine::enqueueDiagnosticObservation(ITensor *source,size_t offset,
+        void *destination,size_t bytes,DeviceId device,void *stream)
+    {
+        if(!source||!device.is_gpu()||!stream||isGraphCaptureActive())
+            throw std::invalid_argument("Diagnostic observation requires an exact GPU stream outside capture");
+        if(offset>source->size_bytes()||bytes>source->size_bytes()-offset||(!destination&&bytes))
+            throw std::out_of_range("Diagnostic observation exceeds its retained source or destination");
+        if(!bytes) return;
+        requireDeviceInput(source,device,stream);
+        auto *backend=instance().resolveBackend(device);
+        if(!backend||!backend->deviceToHostOnStream(destination,
+            static_cast<const unsigned char *>(source->gpu_data_ptr())+offset,bytes,device.gpu_ordinal(),stream))
+            throw std::runtime_error("Diagnostic observation exact D2H enqueue failed");
     }
 
     void TransferEngine::prepareDeviceInput(
@@ -4002,6 +4036,9 @@ namespace llaminar2
             return TransferResult::fail(TransferMethod::NOOP,
                                         "activation copy exceeds tensor storage");
 
+        // Byte counters below describe successfully submitted physical legs,
+        // not requested capacity or eventual completion. A staged two-leg copy
+        // reports each accepted leg independently, including partial failure.
         // ----------------------------------------------------------------------
         // Host or mapped destination: a plain host-side copy is correct and
         // cheapest. Mapped memory shares host/device storage, so writing the
@@ -4015,6 +4052,9 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
                                             "null host pointer in copyActivation host path");
             std::memcpy(host_dst, host_src, bytes);
+            if (PerfStatsCollector::isDomainEnabled("transfer"))
+                PerfStatsCollector::addCounter("transfer", "activation_copy_host_bytes",
+                    static_cast<double>(bytes), "activation_copy", dst_device.toString());
             if (dst_device.is_gpu())
             {
                 /*
@@ -4086,6 +4126,9 @@ namespace llaminar2
                     destination_stream))
                 return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
                                             "deviceToDevice failed on " + dst_device.toString());
+            if (PerfStatsCollector::isDomainEnabled("transfer"))
+                PerfStatsCollector::addCounter("transfer", "activation_copy_d2d_bytes",
+                    static_cast<double>(bytes), "activation_copy", dst_device.toString());
             result = TransferResult::ok(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
             // Republish the unchanged source after its last read, extending
             // its storage lifetime through DMA without a host completion wait.
@@ -4117,6 +4160,9 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
                                             "peer copy failed " + src_device.toString() +
                                                 " -> " + dst_device.toString());
+            if (PerfStatsCollector::isDomainEnabled("transfer"))
+                PerfStatsCollector::addCounter("transfer", "activation_copy_peer_bytes",
+                    static_cast<double>(bytes), "activation_copy", dst_device.toString());
             result = TransferResult::ok(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
             publishDeviceWrite(src, src_device, source_stream);
         }
@@ -4148,6 +4194,9 @@ namespace llaminar2
                         source_stream))
                     return TransferResult::fail(TransferMethod::HOST_STAGED,
                                                 "D2H step failed in copyActivation");
+                if (PerfStatsCollector::isDomainEnabled("transfer"))
+                    PerfStatsCollector::addCounter("transfer", "activation_copy_d2h_bytes",
+                        static_cast<double>(bytes), "activation_copy", src_device.toString());
                 host_src = src_host;
             }
             else
@@ -4171,6 +4220,9 @@ namespace llaminar2
                     destination_stream))
                 return TransferResult::fail(TransferMethod::HOST_TO_DEVICE,
                                             "H2D step failed in copyActivation");
+            if (PerfStatsCollector::isDomainEnabled("transfer"))
+                PerfStatsCollector::addCounter("transfer", "activation_copy_h2d_bytes",
+                    static_cast<double>(bytes), "activation_copy", dst_device.toString());
             result = TransferResult::ok(src_on_gpu ? TransferMethod::HOST_STAGED
                                                    : TransferMethod::HOST_TO_DEVICE);
         }
@@ -4233,6 +4285,9 @@ namespace llaminar2
         if (!ok)
             return TransferResult::fail(req.method, "hostToDevice failed");
 
+        // execute() bypasses uploadFull(): this accepted physical leg owns
+        // the same production transfer evidence, exactly once at submission.
+        TransferProfiler::recordH2D(req.source.size_bytes);
         return TransferResult::ok(req.method);
     }
 
@@ -4259,6 +4314,9 @@ namespace llaminar2
         if (!ok)
             return TransferResult::fail(req.method, "deviceToHost failed");
 
+        // A later consumer's host data() access must not obscure whether the
+        // canonical activation handoff already downloaded only its live rows.
+        TransferProfiler::recordD2H(req.source.size_bytes);
         return TransferResult::ok(req.method);
     }
 
@@ -4341,6 +4399,10 @@ namespace llaminar2
         if (!d2h)
             return TransferResult::fail(req.method, "D2H step of host staged failed");
 
+        // Record each physical leg before attempting the next: a rejected
+        // destination leg cannot erase bytes already downloaded into staging.
+        TransferProfiler::recordD2H(req.source.size_bytes);
+
         // Step 2: H2D to target
         IBackend *dst_backend = resolveBackend(req.target_device);
         if (!dst_backend)
@@ -4356,6 +4418,7 @@ namespace llaminar2
         if (!h2d)
             return TransferResult::fail(req.method, "H2D step of host staged failed");
 
+        TransferProfiler::recordH2D(req.source.size_bytes);
         return TransferResult::ok(req.method);
     }
 

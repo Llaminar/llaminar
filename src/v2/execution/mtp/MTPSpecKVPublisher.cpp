@@ -62,23 +62,14 @@ namespace llaminar2
 
     int computeMTPShiftedKVTargetCachedTokens(
         const MTPSpecStepPlan &plan,
-        int mtp_depth)
+        int mtp_depth, MTPShiftedCacheOrigin origin)
     {
         if (mtp_depth < 0)
             return 0;
 
-        const int shift = mtp_depth + 1;
-        /*
-         * Shifted MTP KV is a cache-shape invariant, not a sidecar-reuse
-         * policy: once a transaction commits to main logical token count N,
-         * depth d must expose N - (d + 1) rows.  Paths that cannot safely
-         * publish the first shifted row must repair it before calling the
-         * publisher, or fail hard. GPU publication writes canonical device
-         * metadata directly; no host mirror is observed or adopted afterward.
-         * Host-side values in this plan describe the transaction being
-         * submitted, never a second authority over live cache state.
-         */
-        return std::max(0, plan.target_cached_tokens - shift);
+        const int rows=mtpShiftedPrefixRows(plan.target_cached_tokens,origin,mtp_depth);
+        if(rows<0)throw std::invalid_argument("MTP KV publication requires a valid frozen model origin and learned depth");
+        return rows;
     }
 
     MTPSpecKVPublicationResult publishAcceptedMTPSpecKVState(
@@ -131,7 +122,7 @@ namespace llaminar2
             const int shifted_tokens =
                 computeMTPShiftedKVTargetCachedTokens(
                     plan,
-                    static_cast<int>(depth));
+                    static_cast<int>(depth),cache->stateOwnership().shifted_origin);
             if (shifted_tokens > cache->max_seq_len())
             {
                 std::ostringstream msg;

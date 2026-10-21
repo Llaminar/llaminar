@@ -47,6 +47,9 @@ struct DeviceGenerationAdmissionRequest
      */
     std::optional<SamplingParams> ordinary_sampling;
 
+    /** @return Complete immutable request admission; no device-owned mutable values occur here. */
+    bool operator==(const DeviceGenerationAdmissionRequest &) const = default;
+
     /** @return Whether every immutable admission field is implemented and valid. */
     [[nodiscard]] bool valid() const noexcept
     {

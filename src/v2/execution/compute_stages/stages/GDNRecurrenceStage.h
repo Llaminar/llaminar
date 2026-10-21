@@ -258,6 +258,9 @@ namespace llaminar2
          * all independent recurrence matrices in one OpenMP team.
          */
         CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override;
+        /** @brief Validate every CPU request and expose exact native snapshot-copy plans before mutation. */
+        bool planCPUVerifierStateRestoreRows(const int *rows,int requests,
+            std::vector<CPUVerifierStateRestorePlan> &plans) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
             const int *device_row_index,
             void *stream) override;

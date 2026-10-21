@@ -5,6 +5,8 @@
  * All source codebooks and floating formats use the real schema/resolver. The
  * independent arithmetic checks every concurrent buffer, including the MTP
  * layer envelope, and ensures the old whole-expert bank is not also retained.
+ * QFN checks use canonical GGUF main/predictor projections and the actual graph
+ * registry injection, keeping compute-H expert output separate from HC residuals.
  */
 #include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "execution/local_execution/graph/GraphResolver.h"
@@ -14,6 +16,11 @@
 #include "planning/ActivationMemoryEstimator.h"
 #include "collective/DeviceCountedAllGather.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../models/qwen4exp/Qwen4ExpSidecarFixture.h"
+#include "../../mocks/MockLocalTPContext.h"
+#include "loaders/ModelContext.h"
+#include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <limits>
@@ -207,4 +214,154 @@ TEST(MoEProjectionArenaGeometry, RegisteredBuilderWaitsForSourceInjectionBeforeR
     config.moe.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
     ASSERT_NO_THROW(builder = GraphBuilderRegistry::create("qwen35moe", config, nullptr));
     EXPECT_NO_THROW(builder->getSchema());
+}
+
+namespace
+{
+    /**
+     * @brief Add complete original down directories without allocating tensor payloads.
+     * @param directory Original synthetic GGUF directory, before profile extraction.
+     * @param layers Number of original main/predictor source coordinates to populate.
+     */
+    void addQFNDownDirectory(GGUFModel &directory, int layers)
+    {
+        for (int layer = 0; layer < layers; ++layer)
+        {
+            GGUFTensorInfo tensor{
+                .name = "blk." + std::to_string(layer) + ".ffn_down_exps.weight",
+                .dimensions = {640, 2560, 512}, .type = GGUFTensorType::Q8_0};
+            test::Qwen4ExpSidecarFixture::sealBytes(tensor);
+            directory.tensors.push_back(std::move(tensor));
+        }
+    }
+
+    /**
+     * @brief Check all five original-source banks against independent QFN byte arithmetic.
+     * @param profile Actual canonical GGUF profile, not a hand-authored layer-count projection.
+     */
+    void expectQFNProjectionBanks(const ModelMemoryProfile &profile)
+    {
+        ASSERT_EQ(profile.d_model, 2560);
+        ASSERT_TRUE(profile.flash_next);
+        ASSERT_EQ(profile.flash_next->residual_width, 10240u);
+        for (const int degree : {2, 4, 8})
+        {
+            SCOPED_TRACE(::testing::Message() << "TP=" << degree);
+            const auto layout = MoEProjectionArenaGeometry::resolve(profile, degree);
+            // Per route: original route-ID word + 640 Q8 bytes + 20 FP32 scales.
+            constexpr std::size_t packet_words = 10u * (1u + 640u / 4u + 640u / 32u);
+            const std::array<std::size_t, 5> expected{
+                packet_words, packet_words * degree, 10u * 2560u / degree,
+                2560u / degree, 2560u};
+            std::size_t words = 0;
+            for (std::size_t index = 0; index < expected.size(); ++index)
+            {
+                EXPECT_EQ(layout.banks()[index].words_per_row, expected[index]);
+                words += expected[index];
+            }
+            for (const std::size_t rows : {1u, 9u, 15u, 512u})
+                EXPECT_EQ(layout.bytes(rows), rows * words * sizeof(std::uint32_t));
+        }
+    }
+}
+
+/** @test The canonical QFN main48-plus-inline-predictor projection retains original layer48. */
+TEST(MoEProjectionArenaGeometry, FlashNextInlinePredictorUsesCanonicalTotalLayerCount)
+{
+    auto directory = test::qwen4MetadataFixture(true);
+    addQFNDownDirectory(directory, 49);
+    const auto profile = ModelMemoryProfile::fromGGUF(directory);
+    ASSERT_EQ(profile.n_layers, 48);
+    ASSERT_EQ(profile.mainLayerCount(), 48);
+    ASSERT_EQ(profile.mtp_layer_count, 1);
+    ASSERT_EQ(profile.totalLayerCount(), 49);
+    ASSERT_EQ(profile.tensors.back().layer_index, 48);
+    ASSERT_EQ(profile.tensors.back().K, 640u);
+    expectQFNProjectionBanks(profile);
+
+    auto missing = profile;
+    missing.tensors.pop_back();
+    EXPECT_THROW(MoEProjectionArenaGeometry::resolve(missing, 4), std::invalid_argument);
+    auto duplicate = profile;
+    duplicate.tensors.push_back(profile.tensors.back());
+    EXPECT_THROW(MoEProjectionArenaGeometry::resolve(duplicate, 4), std::invalid_argument);
+    auto foreign = profile;
+    foreign.tensors.back().layer_index = profile.totalLayerCount();
+    EXPECT_THROW(MoEProjectionArenaGeometry::resolve(foreign, 4), std::invalid_argument);
+    auto malformed = profile;
+    ++malformed.tensors.back().elements;
+    EXPECT_THROW(MoEProjectionArenaGeometry::resolve(malformed, 4), std::invalid_argument);
+}
+
+/** @test Active sidecar planning and its main-only runtime graph resolve their own original source inventories. */
+TEST(MoEProjectionArenaGeometry, FlashNextSharedPredictorPlanningAndMainGraphInventoriesStayExact)
+{
+    test::Qwen4ExpSidecarFixture source;
+    addQFNDownDirectory(source.main, 48);
+    const auto planning = ModelMemoryProfile::fromGGUF(
+        source.main, source.predictor, SharedPredictorMaterialization::Active);
+    ASSERT_EQ(planning.mainLayerCount(), 48);
+    ASSERT_EQ(planning.totalLayerCount(), 49);
+    ASSERT_EQ(std::count_if(planning.tensors.begin(), planning.tensors.end(), [](const auto &tensor) {
+        return tensor.name == "blk.48.ffn_down_exps.weight";
+    }), 1);
+    expectQFNProjectionBanks(planning);
+
+    // bindProjectionArena uses the original MAIN directory, not fromLoader's
+    // authenticated but inactive sidecar metadata. Never require phantom down
+    // tensors or waive missing tensors in a complete active inventory.
+    const auto main = ModelMemoryProfile::fromGGUF(source.main);
+    ASSERT_EQ(main.totalLayerCount(), 48);
+    expectQFNProjectionBanks(main);
+    const auto inactive = ModelMemoryProfile::fromGGUF(
+        source.main, source.predictor, SharedPredictorMaterialization::Inactive);
+    ASSERT_EQ(inactive.totalLayerCount(), 49);
+    EXPECT_THROW(MoEProjectionArenaGeometry::resolve(inactive, 4), std::invalid_argument);
+}
+
+/** @test Actual registry/model-context injection resolves the main-only QFN schema without an inactive sidecar bank. */
+TEST(MoEProjectionArenaGeometry, FlashNextMainGraphBindsOriginalDirectoryBeforeSchemaResolution)
+{
+    test::Qwen4ExpPlanningGGUFFixture source;
+    auto context = ModelContext::createForTesting(source.path());
+    ASSERT_NE(context, nullptr);
+    context->concreteLoader().setUseMmap(false);
+    ASSERT_TRUE(context->concreteLoader().loadModel(source.path()));
+    // The tail owns original main layers24..47 and no PLE layer1. Its
+    // projection binding still validates the complete original main48 source;
+    // schema ownership must not invent an unrelated table placement in this
+    // metadata-only regression.
+    const auto original = ModelMemoryProfile::fromGGUF(context->model());
+    ASSERT_EQ(original.mainLayerCount(), 48);
+    ASSERT_EQ(original.totalLayerCount(), 48);
+    GraphConfig config;
+    config.pp_layer_offset = 24;
+    config.n_layers = 24;
+    config.default_device = DeviceId::rocm(0);
+    config.local_n_heads = 6;
+    config.local_n_kv_heads = 2;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(context->model(), config);
+    ASSERT_EQ(config.n_layers, 24);
+    ASSERT_EQ(config.pp_layer_offset, 24);
+    config.moe.routed_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+    test::MockLocalTPContext cohort;
+    cohort.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1),
+        GlobalDeviceAddress::rocm(2), GlobalDeviceAddress::rocm(3)});
+    cohort.setBackend(CollectiveBackendType::RCCL);
+    config.tp_ctx = &cohort;
+    auto builder = GraphBuilderRegistry::create("qwen4exp", config, nullptr);
+    ASSERT_NE(builder, nullptr);
+    EXPECT_THROW(builder->getSchema(), std::logic_error);
+    ASSERT_NO_THROW(builder->setModelContext(context));
+    const auto schema = builder->getSchema();
+    EXPECT_EQ(schema.layer_template_names.size(), 24u);
+    EXPECT_EQ(std::count_if(schema.layer_buffers.begin(), schema.layer_buffers.end(), [](const auto &bank) {
+        return bank.name == "moe_projection_route_columns";
+    }), 1);
+    EXPECT_EQ(std::count_if(schema.layer_buffers.begin(), schema.layer_buffers.end(), [](const auto &bank) {
+        return bank.name == "moe_canonical_route_contributions";
+    }), 0);
+    const auto resolver = builder->getResolverConfig(9);
+    EXPECT_EQ(resolver.custom_formulas.at("moe_projection_local_columns_words"), 640u);
+    EXPECT_EQ(resolver.custom_formulas.at("moe_projection_gathered_columns_words"), 2560u);
 }

@@ -168,11 +168,13 @@ TEST(PlanningModelMetadata, RetainedSourceDoesNotReopenOrRelocateItsLoader)
     EXPECT_THROW((void)moved.loader(), std::logic_error);
 }
 
-TEST(PlanningModelMetadata, UploadExtentUsesTheWholeDirectoryAndRejectsEmptyPayloads)
+TEST(PlanningModelMetadata, UploadExtentExcludesNativeRowTableAndRejectsEmptyPreparedInventory)
 {
     GGUFModel model;
     EXPECT_THROW((void)maximumGGUFTensorPayloadBytes(model), std::invalid_argument);
     model.tensors = {{.name = "first", .size_bytes = 123}, {.name = "largest", .size_bytes = 456},
         {.name = "last", .size_bytes = 10}};
+    EXPECT_EQ(maximumGGUFTensorPayloadBytes(model), 456u);
+    model.tensors.push_back({.name = "per_layer_token_embd.weight", .size_bytes = 320001536ull * 90});
     EXPECT_EQ(maximumGGUFTensorPayloadBytes(model), 456u);
 }

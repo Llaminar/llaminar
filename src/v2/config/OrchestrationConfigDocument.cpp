@@ -58,6 +58,8 @@ namespace
     ENUM(MoEHotExpertCacheConfig::Kind, VALUE(Percent), VALUE(Count), VALUE(Off))
     ENUM(MoERebalanceRuntimeMode, VALUE(Off), VALUE(Observe), VALUE(Dynamic))
     ENUM(PrefixCacheStorageMode, VALUE(Disabled), VALUE(Ram), VALUE(Device), VALUE(Tiered))
+    ENUM(ImmutableRowTableDistribution, VALUE(Replicated), VALUE(FixedHeadSharded))
+    ENUM(ImmutableRowStoragePreference, VALUE(Automatic), VALUE(VRAM), VALUE(RAM), VALUE(MemoryMapped), VALUE(HostAdaptiveRAMSSD), VALUE(AdaptiveVRAMRAMSSD))
     ENUM(PrefixCacheTerminalStateMode, VALUE(Off), VALUE(Auto), VALUE(Always))
     ENUM(PrefixCacheMoEPolicy, VALUE(Disabled), VALUE(PlacementFingerprint), VALUE(InvalidateOnRebalance))
     ENUM(MTPVerifyMode, VALUE(Greedy), VALUE(SpeculativeSampling))
@@ -133,6 +135,18 @@ namespace
     X(disk_budget_bytes) X(disk_dir) X(terminal_state) X(moe_policy)
     RECORD(PrefixCacheRuntimeConfig, enabled, MEMBERS)
 #undef MEMBERS
+#define MEMBERS(X) X(protected_numerator) X(protected_denominator)
+    RECORD(CpuImmutableRowCachePolicy, aging_accesses, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(cache_physical_byte_limit) X(policy)
+    RECORD(HostAdaptiveRAMSSDRequest, maximum_cache_rows, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(gpu_cache_physical_byte_limit) X(gpu_policy) X(host)
+    RECORD(AdaptiveVRAMRAMSSDRequest, maximum_gpu_cache_rows, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(window_bytes) X(window_count) X(host_adaptive) X(distribution) X(gpu_adaptive)
+    RECORD(ImmutableRowTablePolicy, storage, MEMBERS)
+#undef MEMBERS
 #define MEMBERS(X) X(backend) X(model_class) X(min_depth) X(max_depth) X(initial_depth) \
     X(window_size) X(min_samples) X(cooldown_steps) X(promote_consecutive_windows) \
     X(use_generated_policy) X(promote_full_accept_rate) X(demote_zero_accept_rate) X(demote_acceptance_rate)
@@ -173,7 +187,7 @@ namespace
     X(cpu_global_tp_all_local) X(device_map) X(device_map_numa_explicit) X(domain_definitions) \
     X(pp_stage_definitions) X(tp_degree) X(tp_scope) X(tp_devices) X(tp_weights) X(tp_local_degree) \
     X(tp_global_degree) X(pp_degree) X(pp_split) X(cpu_layers) X(cpu_layers_first) X(default_backend) \
-    X(config_file_path) X(topology_string) X(topology_file_path) X(topology_tree) X(model_path) \
+    X(config_file_path) X(topology_string) X(topology_file_path) X(topology_tree) X(model_path) X(shared_predictor) \
     X(max_seq_len) X(prefill_max_bucket_size) X(use_mmap) X(prompt) X(prompt_was_explicitly_provided) X(n_predict) X(batch_size) \
     X(n_threads) X(seed) X(temperature) X(top_k) X(top_p) X(deterministic) X(chat_mode) \
     X(single_shot_chat) X(system_prompt) X(chat_template_override) X(benchmark_mode) \
@@ -184,7 +198,7 @@ namespace
     X(max_cpu_memory_mb) X(moe_shared_experts_gpu) X(moe_sparse_experts_cpu) X(routed_expert_compute_policy) \
     X(routed_expert_owner_order) X(moe_hot_expert_cache) X(moe_routed_prefill) X(moe_rebalance) \
     X(moe_routed_expert_plan) X(activation_precision) X(kv_cache_precision) X(tp_allreduce_precision_override) \
-    X(prefix_cache) X(mtp_activation_policy) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
+    X(prefix_cache) X(ngram_table_policy) X(mtp_activation_policy) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
     X(cpu_compute_fraction) X(disable_gpu_tp) X(disable_cpu_tp) X(min_layers_per_domain)
     RECORD(OrchestrationConfig, planning_mode, MEMBERS)
 #undef MEMBERS
@@ -253,6 +267,7 @@ namespace
             return value;
         }
         else if constexpr (std::same_as<T, std::string>) return value;
+        else if constexpr (std::same_as<T, SharedPredictorGGUFSource>) return encode(value.path(), path);
         else if constexpr (std::same_as<T, ExecutionRankSelection>)
             return encode(value.discoveryRanks(), path);
         else if constexpr (std::same_as<T, OrchestrationPlanningWorkload>)
@@ -321,6 +336,8 @@ namespace
             if (!json.is_string()) invalid(path, "expected string");
             return json.get<std::string>();
         }
+        else if constexpr (std::same_as<T, SharedPredictorGGUFSource>)
+            return SharedPredictorGGUFSource(decode<std::string>(json, path));
         else if constexpr (std::same_as<T, ExecutionRankSelection>)
             return ExecutionRankSelection(decode<std::vector<int>>(json, path));
         else if constexpr (std::same_as<T, OrchestrationPlanningWorkload>)
@@ -381,6 +398,7 @@ namespace
 
 std::string serializeOrchestrationConfig(const OrchestrationConfig &config)
 {
+    config.ngram_table_policy.validate();
     // A tree string is just as unsupported as its parsed form. Do not emit a
     // document that quietly drops this execution intent on the receiving rank.
     if (!config.topology_string.empty() || !config.topology_file_path.empty())
@@ -416,6 +434,7 @@ OrchestrationConfig deserializeOrchestrationConfig(std::string_view document)
         OrchestrationConfig result;
         reader("configuration", result);
         reader.finish();
+        result.ngram_table_policy.validate();
         if (!result.topology_string.empty() || !result.topology_file_path.empty())
             invalid("$.configuration.topology", "recursive topology-tree execution is unimplemented");
         return result;

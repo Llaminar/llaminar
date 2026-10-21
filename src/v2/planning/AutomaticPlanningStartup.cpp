@@ -63,7 +63,7 @@ namespace llaminar2
         // avoiding any requirement for peers to mount the launcher's model path.
         std::optional<PlanningModelSource> source;
         const auto metadata = exchangePlanningModelMetadata(mpi, [&] {
-            source.emplace(shared.model_path);
+            source.emplace(shared.model_path, shared.shared_predictor);
             // Root authenticates learned weights before any hardware samples,
             // BOM search or rank selection. This fallible work stays inside the
             // metadata publication transaction so every discovery rank rejects

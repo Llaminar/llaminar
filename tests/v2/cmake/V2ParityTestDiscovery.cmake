@@ -112,7 +112,7 @@ if(NOT PRODUCTION_PERF_STATS_FILTER)
     # remains the sole runtime authority, while zero counters are meaningful
     # evidence for Static/no-MTP cells.
     set(PRODUCTION_PERF_STATS_FILTER
-        "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement")
+        "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement,immutable_lookup")
 endif()
 
 # Normalize the binary-owned model manifest once. Production campaigns expose

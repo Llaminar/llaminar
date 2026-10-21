@@ -30,6 +30,7 @@
  * @date January 2026
  */
 
+#include "../ReplicatedGQADirectGuardProof.h"
 #include <gtest/gtest.h>
 
 #include "tensors/Tensors.h"
@@ -7462,3 +7463,22 @@ TEST_F(Test__ROCmFlashAttentionParity, RegisterScoreShortPrefixesMatchUnoptimize
     }
 #endif
 }
+
+#ifdef HAVE_ROCM
+/** @test Direct FP32 admission retains exact global GQA mapping, not local divisibility. */
+TEST_F(Test__ROCmFlashAttentionParity, Qwen4ExpTP8DirectFP32ReplicatedHeadMapping)
+{
+    llaminar2::test::proveReplicatedGQADirectGuard<llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>>(DeviceId::rocm(0));
+}
+/** @test Actual captured attention stage retains odd local Q3 over the original full two-KV bank. */
+TEST_F(Test__ROCmFlashAttentionParity, Qwen4ExpTP8CapturedReplicatedHeadMapping)
+{
+    for(const int head_start:{0,3,6,9,12,15,18,21})
+        for(const int rows:{1,3})
+        {
+            runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+                mpi_ctx_,rows,5,3,2,256,"QFN TP8 Q3/fullKV2 original global mapping",ActivationPrecision::FP16,head_start,12);
+            if(::testing::Test::HasFatalFailure())return;
+        }
+}
+#endif

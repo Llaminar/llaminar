@@ -9,8 +9,13 @@
  * Long-prefix fixtures exercise real archive admission and participant lookup
  * with small host-owned payloads so historical checkpoint retention is tested
  * independently of model weights, accelerator availability, and generation.
+ * Auxiliary terminal fixtures exercise registered model-owned requirements at
+ * the actual installer, without model payloads, native graphs or GPU contexts.
+ * Host-RCU fixtures seal the same topology-derived execution authority required
+ * by production; unresolved or foreign authority cannot mint a no-peer proof.
  */
 
+#include "PrefixArchiveSourceContract.h"
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
 #include "backends/DeviceId.h"
@@ -32,6 +37,9 @@
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
+#include "models/qwen4exp/Qwen4ExpGraph.h"
+#include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
+#include "../../../models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include "loaders/WeightPlan.h"
 #include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
@@ -49,6 +57,7 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/HybridKVCacheConfig.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -1392,6 +1401,145 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseDecodeAllowsPPTerminalWitho
     EXPECT_NO_THROW(
         orchestrator.setDecodeReplicatedDenseWeightSet(
             std::make_unique<FrozenModelWeightSet>(strategy, decode_builder.freezeBindings())));
+}
+
+namespace
+{
+/**
+ * @brief Tiny host operands for the real auxiliary-set installer presence contract.
+ *
+ * These are not numerical model weights or full model geometry. Original typed
+ * QFN metadata still selects the actual registered graph/schema; no arena,
+ * source model or backend executable is materialized by these interface checks.
+ * Declare this owner before the orchestrator so all borrowed tensors outlive it.
+ */
+struct AuxiliaryTerminalWeights
+{
+    std::vector<std::unique_ptr<FP32Tensor>> operands;
+
+    /** @brief Freeze named original identities over tiny CPU-owned test tensors. */
+    std::unique_ptr<FrozenModelWeightSet> freeze(const std::vector<std::string> &names)
+    {
+        InferenceStrategy strategy;
+        strategy.model_id = ModelContextId{6169};
+        strategy.devices = {DeviceId::cpu()};
+        ModelWeightSetBuilder builder(strategy);
+        for (const auto &name : names)
+        {
+            operands.push_back(std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4}));
+            auto *tensor = operands.back().get();
+            WeightBinding binding;
+            binding.identity = makeSourceWeightIdentity(name, strategy.model_id, operands.size());
+            binding.tensor = tensor;
+            binding.slice.source_rows = tensor->rows();
+            binding.slice.source_cols = tensor->cols();
+            binding.slice.row_count = tensor->rows();
+            binding.slice.col_count = tensor->cols();
+            binding.residency.home_device = DeviceId::cpu();
+            binding.residency.resident_device = DeviceId::cpu();
+            builder.addBinding(std::move(binding));
+        }
+        return std::make_unique<FrozenModelWeightSet>(strategy, builder.freezeBindings());
+    }
+};
+
+/** @brief Select the real registered QFN metadata contract without loading any model. */
+GraphConfig auxiliaryQFNConfig(bool full_dense)
+{
+    GraphConfig config;
+    Qwen4ExpGraphConfigBuilder::populateFromDirectory(test::qwen4MetadataFixture(false), config);
+    config.default_device = DeviceId::cpu();
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = full_dense;
+    config.lm_head_column_parallel = !full_dense;
+    config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    return config;
+}
+} // namespace
+
+/** @brief Both actual head-only and full-dense auxiliary lanes accept QFN's HC terminal instead of output_norm. */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAuxiliaryTerminalContractUsesDeclaredQFNInputs)
+{
+    for (const bool full_dense : {false, true})
+    {
+        AuxiliaryTerminalWeights source;
+        auto graph = std::make_shared<Qwen4ExpGraph>(auxiliaryQFNConfig(full_dense), nullptr);
+        DeviceGraphOrchestrator orchestrator(graph, nullptr);
+        std::vector<std::string> names{
+            "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", "output.weight"};
+        if (full_dense)
+        {
+            names.push_back("token_embd.weight");
+        }
+        EXPECT_NO_THROW(orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze(names)));
+    }
+}
+
+/** @brief Every declared QFN HC operand and the independent vocabulary head remain mandatory. */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAuxiliaryTerminalContractRejectsEachMissingQFNInput)
+{
+    for (const std::string missing : {"output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", "output.weight"})
+    {
+        SCOPED_TRACE(missing);
+        AuxiliaryTerminalWeights source;
+        auto graph = std::make_shared<Qwen4ExpGraph>(auxiliaryQFNConfig(true), nullptr);
+        DeviceGraphOrchestrator orchestrator(graph, nullptr);
+        std::vector<std::string> names{"token_embd.weight", "output_norm.weight"};
+        for (const std::string name : {"output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", "output.weight"})
+        {
+            if (name != missing)
+            {
+                names.push_back(name);
+            }
+        }
+        try
+        {
+            orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze(names));
+            FAIL() << "Missing model-owned terminal operand was accepted";
+        }
+        catch (const std::runtime_error &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("missing " + missing), std::string::npos);
+        }
+    }
+}
+
+/** @brief Foreign HC globals never waive a non-QFN model's ordinary final norm. */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAuxiliaryTerminalContractOrdinaryNormRemainsRequired)
+{
+    AuxiliaryTerminalWeights source;
+    auto config = config_;
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    auto graph = std::make_shared<CapturingQwenStandardGraph>(config, nullptr);
+    DeviceGraphOrchestrator orchestrator(graph, nullptr);
+    std::vector<std::string> names{"token_embd.weight", "output.weight",
+        "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight"};
+    try
+    {
+        orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze(names));
+        FAIL() << "Ordinary final norm was waived by foreign HC weights";
+    }
+    catch (const std::runtime_error &error)
+    {
+        EXPECT_NE(std::string(error.what()).find("missing output_norm.weight"), std::string::npos);
+    }
+    names.push_back("output_norm.weight");
+    EXPECT_NO_THROW(orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze(names)));
+}
+
+/** @brief A PP participant without the terminal stage still owns no terminal requirement. */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAuxiliaryTerminalContractSkipsUnownedPPHead)
+{
+    AuxiliaryTerminalWeights source;
+    auto config = auxiliaryQFNConfig(true);
+    config.n_layers = 1;
+    config.pp_layer_offset = 1;
+    auto graph = std::make_shared<Qwen4ExpGraph>(config, nullptr);
+    DeviceGraphOrchestrator orchestrator(graph, nullptr);
+    orchestrator.setPPStageConfig(FactoryPPStageConfig{.first_layer = 1, .last_layer = 2,
+        .has_embedding = false, .has_lm_head = false});
+    EXPECT_NO_THROW(orchestrator.setDecodeReplicatedDenseWeightSet(source.freeze({"blk.1.attn_q.weight"})));
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAttentionStateUsesDecodeDenseGdnBindingsForGroupedDecode)
@@ -2912,8 +3060,10 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBo
         populate_body.find("state_.positions[seq_idx] = hit.cached_tokens");
     const auto mutation_boundary_pos =
         populate_body.find("handleLivePrefixReplayStateAfterMutation");
+    // The typed scope publishes on both success and unwind. Its callback is
+    // defined before imports; the normal commit must remain after mutation.
     const auto mutation_ready_pos =
-        populate_body.find("recordLivePrefixMutationReady", mutation_boundary_pos);
+        populate_body.find("restore_completion.commit();", mutation_boundary_pos);
 
     ASSERT_NE(wait_mutation_pos, std::string::npos);
     ASSERT_NE(wait_graph_pos, std::string::npos);
@@ -2939,6 +3089,9 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBo
     EXPECT_LT(import_hybrid_pos, update_position_pos);
     EXPECT_LT(update_position_pos, mutation_boundary_pos);
     EXPECT_LT(mutation_boundary_pos, mutation_ready_pos);
+    EXPECT_TRUE(test::hasOrderedPrefixArchivePublication(populate_body))
+        << "The typed callback must record readiness before it can be committed "
+           "after imports and the live-state mutation boundary.";
 }
 
 /**
@@ -3217,7 +3370,7 @@ TEST_F(
             topology_destruction_pos,
             move_constructor_pos - topology_destruction_pos);
     const auto parent_release = topology_destruction_body.find(
-        "mtp_device_generation_loop_graph_.release();");
+        "releaseRetainedStorageGenerationTopology();");
     const auto forward_release = topology_destruction_body.find(
         "forward_engine_->discardAllCachedGraphs();");
     const auto context_release = topology_destruction_body.find(
@@ -3229,6 +3382,34 @@ TEST_F(
         << "The complete generation parent must die before its borrowed child captures";
     EXPECT_LT(forward_release, context_release)
         << "Captured forward graphs must die before graph-creation contexts";
+
+    // The generation owner now also retains the immutable-storage terminal
+    // graph. Prove its helper still releases the complete parent before that
+    // borrowed terminal fragment and the terminal capture's final stream lease.
+    const auto generation_source = readSourceFileForDeviceGraphOrchestratorTest(
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp");
+    const auto retained_release_begin = generation_source.find(
+        "void DeviceGraphOrchestrator::releaseRetainedStorageGenerationTopology()");
+    const auto retained_release_end = generation_source.find(
+        "void DeviceGraphOrchestrator::awaitRetainedStorageTerminal()", retained_release_begin);
+    ASSERT_NE(retained_release_begin, std::string::npos);
+    ASSERT_NE(retained_release_end, std::string::npos);
+    auto retained_release_body = generation_source.substr(
+        retained_release_begin, retained_release_end - retained_release_begin);
+    std::erase_if(retained_release_body, [](unsigned char value) {
+        return std::isspace(value);
+    });
+    const auto native_parent_release = retained_release_body.find(
+        "mtp_device_generation_loop_graph_.release();");
+    const auto terminal_fragment_release = retained_release_body.find(
+        "retained_storage_terminal_fragment_={};");
+    const auto terminal_capture_release = retained_release_body.find(
+        "retained_storage_terminal_capture_.reset();");
+    ASSERT_NE(native_parent_release, std::string::npos);
+    ASSERT_NE(terminal_fragment_release, std::string::npos);
+    ASSERT_NE(terminal_capture_release, std::string::npos);
+    EXPECT_LT(native_parent_release, terminal_fragment_release);
+    EXPECT_LT(terminal_fragment_release, terminal_capture_release);
 
     for (const char *required_release : {
              "mtp_speculative_state_publication_graph_.invalidate();",
@@ -3734,6 +3915,7 @@ TEST_F(Test__DeviceGraphOrchestrator, GraphStableMoERuntimeMovementIsTrackedWith
            "model-runtime prefix payload, not encoded into the cache key.";
 }
 
+/** @test A resolved singleton CPU authority owns runtime epochs; unresolved/foreign setup is rejected. */
 TEST_F(Test__DeviceGraphOrchestrator, HostExpertOverlayRuntimeEpochComesFromSoleRCUAuthority)
 {
     MoERoutedExpertPlacementPlan plan;
@@ -3762,25 +3944,63 @@ TEST_F(Test__DeviceGraphOrchestrator, HostExpertOverlayRuntimeEpochComesFromSole
     tier.fallback = true;
     plan.routed_tiers = {std::move(tier)};
 
-    auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
-        MoEOverlayResidencyAuthority::Config{
-            .initial_plan = plan,
-            .model_metadata =
-                MoERoutedExpertModelMetadata{
-                    .num_layers = 2,
-                    .num_experts = 8,
-                    .d_model = 8,
-                    .routed_intermediate_size = 8,
-                    .shared_intermediate_size = 0,
-                    .has_shared_expert = false,
-                    .routed_quant_type = "F32",
-                    .shared_quant_type = "F32",
-                },
-            .maintenance_mode = MoERebalanceRuntimeMode::Off,
-            .perf_device = "CPU",
-        });
+    const MoERoutedExpertModelMetadata metadata{
+        .num_layers = 2,
+        .num_experts = 8,
+        .d_model = 8,
+        .routed_intermediate_size = 8,
+        .shared_intermediate_size = 0,
+        .has_shared_expert = false,
+        .routed_quant_type = "F32",
+        .shared_quant_type = "F32",
+        .main_inference_layer_count = 2,
+    };
+    // User input may be unresolved, but a constructed residency authority is a
+    // frozen setup object. Use the same canonical topology resolver as the
+    // production factory rather than installing a second hard-coded authority.
+    ASSERT_EQ(plan.authority_execution, MoEOverlayAuthorityExecutionKind::Unresolved);
+    plan.authority_execution = resolveMoEOverlayAuthorityExecutionKind(plan);
+    ASSERT_EQ(plan.authority_execution, MoEOverlayAuthorityExecutionKind::HostResident);
+    const auto make_authority = [&](const MoERoutedExpertPlacementPlan &candidate)
+    {
+        return std::make_shared<MoEOverlayResidencyAuthority>(
+            MoEOverlayResidencyAuthority::Config{
+                .initial_plan = candidate,
+                .model_metadata = metadata,
+                .maintenance_mode = MoERebalanceRuntimeMode::Off,
+                .perf_device = "CPU",
+            });
+    };
+    // These controls alter only the declared execution authority. Geometry,
+    // world-rank membership and every resident expert remain the same, so a
+    // failure cannot be attributed to an unrelated incomplete fixture field.
+    for (const auto &[execution, diagnostic] : {
+        std::pair{MoEOverlayAuthorityExecutionKind::Unresolved,
+            "No-peer residency requires the exact complete stage geometry"},
+        std::pair{MoEOverlayAuthorityExecutionKind::DeviceResident,
+            "does not match topology-required"}})
+    {
+        auto foreign = plan;
+        foreign.authority_execution = execution;
+        try
+        {
+            (void)make_authority(foreign);
+            FAIL() << "A CPU-only frozen plan must reject " << toString(execution);
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what()).find(diagnostic), std::string::npos) << error.what();
+        }
+    }
+    auto authority = make_authority(plan);
     ASSERT_TRUE(authority->snapshot());
     ASSERT_EQ(authority->snapshot()->epoch, 1u);
+    ASSERT_EQ(authority->snapshot()->placement_plan->authority_execution, plan.authority_execution);
+    ASSERT_TRUE(authority->noPeerResidency());
+    EXPECT_EQ(authority->noPeerResidency()->authorityExecution(), plan.authority_execution);
+    EXPECT_NO_THROW(authority->noPeerResidency()->requireDestination(DeviceId::cpu(), 0, 2, 8));
+    EXPECT_THROW(authority->noPeerResidency()->requireDestination(DeviceId::cpu(), 1, 2, 8), std::invalid_argument);
+    EXPECT_THROW(authority->noPeerResidency()->requireDestination(DeviceId::cpu(), 0, 2, 7), std::invalid_argument);
 
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.moe.routed_expert_plan =

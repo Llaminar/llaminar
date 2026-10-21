@@ -22,6 +22,7 @@
 #include "MoERoutedExpertPlacementPlan.h"
 #include "backends/DeviceId.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "planning/ImmutableRowTablePlacementPlanner.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 
 #include <cstddef>
@@ -393,6 +394,8 @@ namespace llaminar2
     struct MoEOverlayResolvedCapacityPlan
     {
         int num_experts = 0;
+        /** Concrete setup decisions for each rank that actually owns PLE. */
+        std::vector<std::shared_ptr<const ResolvedImmutableRowTablePlacement>> ngram_table_placements;
         /** Rank-local ingress geometry; reused with retained prepared-weight admission. */
         std::optional<MoEOverlayHostDemandMemoryPlan> host_demand_memory;
         /** Bounded native-directory cache grant, carried into retained plans. */
@@ -413,6 +416,43 @@ namespace llaminar2
             const std::string &resource_id) const noexcept;
     };
 
+    class MoEOverlayCapacityAdmission;
+    /**
+     * @brief Frozen higher-priority row/quota result, deliberately not allocatable.
+     *
+     * Row and replica searches retain this value. Only admit() creates the one
+     * final certificate after setup-only table selection has completed; table
+     * failures cannot be caught as another row/quota candidate rejection.
+     */
+    class MoEOverlayCapacityDraft final
+    {
+    public:
+        /** @return Complete immutable higher-priority PMA plan, without ngrams. */
+        const PhysicalMemoryPlan &physicalPlan() const noexcept;
+        /** @return Exact number of authored disjoint stages. */
+        std::size_t stageCount() const noexcept;
+        /**
+         * @brief Extend frozen owners and publish one final physical certificate.
+         * @param tables Setup-authenticated actual PLE requests, at most one per rank.
+         * @return Complete stage quota/resource views sharing the same final certificate.
+         * @throws std::invalid_argument For duplicate/foreign source or consumer identity.
+         * @throws std::runtime_error If explicit/Automatic table candidates cannot fit.
+         * @throws std::overflow_error If final canonical owner arithmetic overflows.
+         */
+        std::vector<MoEOverlayResolvedCapacityPlan> admit(
+            std::span<const ImmutableRowTableAdmissionRequest> tables = {}) const;
+    private:
+        friend class MoEOverlayCapacityResolver;
+        friend class MoEOverlayCapacityAdmission;
+        struct Impl;
+        /** @brief Only the quota resolver may seal owned publication metadata. */
+        explicit MoEOverlayCapacityDraft(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) {}
+        /** @brief Attach already-selected replica grants without re-running a quota decision. */
+        MoEOverlayCapacityDraft withReplicaGrants(
+            std::span<const std::optional<MoEOverlayReplicaCacheCapacity>> grants) const;
+        std::shared_ptr<const Impl> impl_;
+    };
+
     /**
      * @brief Resolve exact prepared-weight footprints and priority quotas.
      *
@@ -423,6 +463,15 @@ namespace llaminar2
     class MoEOverlayCapacityResolver final
     {
     public:
+        /**
+         * @brief Freeze exact higher-priority quotas without constructing a final certificate.
+         * @param stages Complete disjoint stage contributions and immutable quota policies.
+         * @return Owned immutable draft whose source input references do not escape this call.
+         * @throws MoEOverlayCapacityExhausted If higher-priority obligations cannot fit.
+         * @throws std::invalid_argument For malformed stage geometry or ownership.
+         */
+        static MoEOverlayCapacityDraft resolvePipelineDraft(
+            std::span<const MoEOverlayCapacityResolverInput> stages);
         /**
          * @brief Build one complete immutable capacity plan.
          * @param input Authenticated model manifest, physical BOM, and tiers.

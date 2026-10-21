@@ -7,6 +7,8 @@
  * Production arithmetic must retain its model-native layout; parity remaps a
  * copied diagnostic tensor at the comparison boundary only. Keeping the pure
  * mapping here makes every supported stage and row geometry unit-testable.
+ * Exact-GGUF references already publish native ordering, so their typed layout
+ * retains every diagnostic byte without applying the HF-only permutation.
  */
 
 #pragma once
@@ -14,12 +16,20 @@
 #include <cstddef>
 #include <cstring>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2::test::parity
 {
+    /** @brief Reference-owned snapshot order, independent of model head counts or MoE routing. */
+    enum class ParityGDNReferenceLayout
+    {
+        HuggingFaceGrouped, ///< Reference loader reversed GGUF value-head tiling into HF order.
+        NativeGGUF,        ///< Reference equations consume original GGUF rows and retain native tiling.
+    };
+
     /**
-     * @brief Model-derived head geometry required by the diagnostic mapping.
+     * @brief Model-derived head geometry and authenticated reference layout for diagnostic mapping.
      */
     struct ParityGDNHeadConfig
     {
@@ -27,10 +37,17 @@ namespace llaminar2::test::parity
         int n_v_heads = 0;
         int d_state = 0;
         bool is_moe = false;
+        ParityGDNReferenceLayout reference_layout = ParityGDNReferenceLayout::HuggingFaceGrouped;
 
-        /** @brief Return whether this model uses the unequal-head MoE layout. */
+        /** @brief Map only an HF-ordered reference; an already native oracle retains original bytes. */
         bool needsPermutation() const
         {
+            switch (reference_layout)
+            {
+            case ParityGDNReferenceLayout::NativeGGUF: return false;
+            case ParityGDNReferenceLayout::HuggingFaceGrouped: break;
+            default: throw std::invalid_argument("Unknown GDN reference snapshot layout");
+            }
             return is_moe && n_k_heads > 0 && n_v_heads > 0 && d_state > 0 &&
                    n_k_heads != n_v_heads && n_v_heads % n_k_heads == 0;
         }
@@ -43,7 +60,7 @@ namespace llaminar2::test::parity
     };
 
     /**
-     * @brief Map a copied production checkpoint into Hugging Face head order.
+     * @brief Map a copied production checkpoint only when its reference publishes HF head order.
      *
      * Full value-head stages are interpreted as
      * `[row, value_head, d_state]`. Alpha and beta are scalar per-head stages

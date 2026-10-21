@@ -8,6 +8,7 @@
  * Physical matrices and scratch never change shape when the count changes.
  */
 #pragma once
+#include "DeviceRequestRowRanges.h"
 
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/FixedHalfProjectionGroup.h"
@@ -26,6 +27,7 @@ extern "C"
      * @param device_id Owning backend device ordinal.
      * @param stream Exact non-null producer/consumer stream.
      * @param row_range Borrowed launch metadata, or null for fully active physical rows.
+     * @param request_rows Separate request-major holes; excludes row_range and is copied by value.
      * @return Whether validation and asynchronous submission succeeded.
      */
     bool cudaFp32_tiny_batched_projection(
@@ -38,7 +40,8 @@ extern "C"
         int batch_count,
         int device_id,
         void *stream,
-        const llaminar2::DeviceRowRange *row_range = nullptr);
+        const llaminar2::DeviceRowRange *row_range = nullptr,
+        const llaminar2::DeviceRequestRowRanges *request_rows = nullptr);
 
     /**
      * @brief Enqueue fixed-order floating projections.
@@ -53,6 +56,7 @@ extern "C"
      * @param device_id Owning backend device ordinal.
      * @param stream Exact non-null producer/consumer stream.
      * @param row_range Borrowed launch metadata, or null for fully active physical rows.
+     * @param request_rows Separate request-major holes; excludes row_range and is copied by value.
      * @return Whether validation and asynchronous submission succeeded.
      */
     bool cudaFp32x16_tiny_batched_projection(
@@ -66,7 +70,8 @@ extern "C"
         int weight_dtype,
         int device_id,
         void *stream,
-        const llaminar2::DeviceRowRange *row_range = nullptr);
+        const llaminar2::DeviceRowRange *row_range = nullptr,
+        const llaminar2::DeviceRequestRowRanges *request_rows = nullptr);
 
     /**
      * @brief Enqueue fixed-order SwiGLU/down arithmetic.
@@ -108,6 +113,7 @@ extern "C"
      * @param device_id Owning backend device ordinal.
      * @param stream Exact non-null producer/consumer stream.
      * @param row_range Borrowed launch metadata, or null for fully active physical rows.
+     * @param request_rows Separate request-major holes; excludes row_range and is copied by value.
      * @return Whether validation and asynchronous submission succeeded.
      */
     bool rocmFp32_small_n_batched_projection(
@@ -120,7 +126,8 @@ extern "C"
         int batch_count,
         int device_id,
         void *stream,
-        const llaminar2::DeviceRowRange *row_range = nullptr);
+        const llaminar2::DeviceRowRange *row_range = nullptr,
+        const llaminar2::DeviceRequestRowRanges *request_rows = nullptr);
 
     /**
      * @brief Enqueue fixed-order floating projections.
@@ -135,6 +142,7 @@ extern "C"
      * @param device_id Owning backend device ordinal.
      * @param stream Exact non-null producer/consumer stream.
      * @param row_range Borrowed launch metadata, or null for fully active physical rows.
+     * @param request_rows Separate request-major holes; excludes row_range and is copied by value.
      * @return Whether validation and asynchronous submission succeeded.
      */
     bool rocmFp32x16_batched_projection(
@@ -148,7 +156,8 @@ extern "C"
         int weight_dtype,
         int device_id,
         void *stream,
-        const llaminar2::DeviceRowRange *row_range = nullptr);
+        const llaminar2::DeviceRowRange *row_range = nullptr,
+        const llaminar2::DeviceRequestRowRanges *request_rows = nullptr);
 
     /**
      * @brief Enqueue fixed-order SwiGLU/down arithmetic.

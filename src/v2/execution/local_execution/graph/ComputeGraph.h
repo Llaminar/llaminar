@@ -13,6 +13,8 @@
 #include "../../compute_stages/ComputeStages.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../backends/GPUGraphMemoryContract.h"
+#include "IRetainedGraphStorageBoundary.h"
+#include <stdexcept>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -215,6 +217,37 @@ namespace llaminar2
         // Movable
         ComputeGraph(ComputeGraph &&) = default;
         ComputeGraph &operator=(ComputeGraph &&) = default;
+
+        /** @brief Execution permission belongs to graph topology, not current request data. */
+        enum class ExecutionPurpose { Executable, WorkspaceDeclaration };
+        /** @brief Permanently classify this topology as a geometry-only workspace declaration until clear(). */
+        void markWorkspaceDeclaration()
+        {
+            if(purpose_!=ExecutionPurpose::WorkspaceDeclaration){purpose_=ExecutionPurpose::WorkspaceDeclaration;noteTopologyMutation();}
+        }
+        /** @return Whether this graph is forbidden from every execution/capture path. */
+        bool isWorkspaceDeclaration() const noexcept {return purpose_==ExecutionPurpose::WorkspaceDeclaration;}
+        /** @brief Fail before context/cache/native access if geometry-only topology reaches execution. */
+        void requireExecutable() const
+        {
+            if(isWorkspaceDeclaration())throw std::invalid_argument("Workspace declaration graph is not executable or capturable");
+        }
+
+        /** @brief Declare one exclusive immutable-storage lane before graph capture.
+         * @param boundary Stable participant-local lifetime shared by serialized graph variants.
+         * @details Rebinding a declared lane is forbidden; concurrent graphs
+         * require distinct lanes. This declaration cannot submit model work.
+         */
+        void setRetainedStorageBoundary(std::shared_ptr<IRetainedGraphStorageBoundary> boundary)
+        {
+            if(!boundary||!boundary->device().is_gpu()||!boundary->captureIdentity()||
+                (storage_boundary_&&storage_boundary_!=boundary))
+                throw std::invalid_argument("ComputeGraph immutable storage boundary is invalid or was rebound");
+            if(!storage_boundary_){storage_boundary_=std::move(boundary);noteTopologyMutation();}
+        }
+        /** @brief Retain complete I/O lifetime when exporting this graph into a native parent. */
+        const std::shared_ptr<IRetainedGraphStorageBoundary> &retainedStorageBoundary() const noexcept
+        {return storage_boundary_;}
 
         /**
          * @brief Add a node to the graph
@@ -540,6 +573,8 @@ namespace llaminar2
         uint64_t topology_generation_ = 1;               ///< Monotonic captured-topology identity; zero is never published.
         GPUGraphExecutableClass executable_memory_class_ =
             GPUGraphExecutableClass::General; ///< Admission/capture shape, preserved across request reset.
+        ExecutionPurpose purpose_=ExecutionPurpose::Executable; ///< Monotone non-executable purpose; moves/merges preserve it.
+        std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary_; ///< Explicit retained native I/O lane.
     };
 
 } // namespace llaminar2

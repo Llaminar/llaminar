@@ -1,6 +1,15 @@
+/**
+ * @file ModelContextConfig.h
+ * @brief Metadata-time model source and rank-local weight ownership configuration.
+ *
+ * Optional predictor binding precedes WeightManager creation so every consumer
+ * observes one immutable source inventory and the original main global identities.
+ */
 #pragma once
 
 #include "ModelPayloadAccessPattern.h"
+#include "SharedPredictorGGUFSource.h"
+#include <optional>
 #include "WeightManager.h"
 #include "../utils/MPIContext.h"
 #include <memory>
@@ -40,6 +49,11 @@ namespace llaminar2
         int shard_index = 0;        // Which shard (0-indexed)
         int total_shards = 1;       // Total shards (1 = no sharding)
         float work_fraction = 1.0f; // For proportional TP
+
+        /** Exact user-selected shared predictor; absent means the original main-only source set. */
+        std::optional<SharedPredictorGGUFSource> shared_predictor;
+        /** Explicit usage resolved before the source set is sealed; absent source owns no predictor bytes. */
+        SharedPredictorMaterialization predictor_materialization = SharedPredictorMaterialization::Inactive;
 
         // Advanced Settings
         std::shared_ptr<WeightPlacementMap> placement_map;

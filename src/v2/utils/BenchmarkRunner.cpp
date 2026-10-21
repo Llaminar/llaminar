@@ -3,7 +3,10 @@
  * @brief Implementation of benchmark runner for prefill/decode performance
  *
  * Measures warmed production requests and exports tokens, runtime-path evidence,
- * and the runner-resolved configuration. Profiling remains separate from clean
+ * and the runner-resolved configuration. Result-owned setup arithmetic metadata
+ * remains distinct from measured counters. Exact per-layer physical expert
+ * selections survive as setup metadata without retaining runtime placement work.
+ * Profiling remains separate from clean
  * timing; hardware default selection belongs to execution planning, not here.
  * @author David Sanftenberg
  * @date 2025
@@ -457,6 +460,13 @@ namespace llaminar2
         };
     }
 
+    /**
+     * @brief Select measured diagnostics and exact retained immutable setup families for JSON.
+     * @return Existing runtime filters plus the original per-layer physical expert selections.
+     *
+     * Selection records survive the measured reset as setup observations; their
+     * submission counts never represent measured replays, tokens or movement.
+     */
     static const std::vector<std::string> &benchmarkPerfStatFilters()
     {
         static const std::vector<std::string> filters{
@@ -464,6 +474,7 @@ namespace llaminar2
             "memory",
             "moe_overlay",
             "moe_overlay_controller",
+            "moe_placement.routed_expert_weight_selection",
             "moe_rebalance",
             "tp_allreduce_bom",
             "tp_allreduce_runtime",
@@ -511,6 +522,71 @@ namespace llaminar2
             {"avg_us", avg_us},
             {"min_us", min_us},
             {"max_us", max_us}};
+    }
+
+    /**
+     * @brief Copy only exact existing arithmetic families before measured counters reset.
+     * @return Result-owned records from the passive host collector; no backend probe or transfer.
+     * @details The ledger may include retained process setup as well as warmup.
+     * Qualified collector filters also match dotted descendants, so exact
+     * domain/name matching below prevents an unrelated neighboring family from
+     * becoming arithmetic evidence. Disabled collection returns an explicit
+     * observed-but-empty snapshot, even if stale collector storage still exists.
+     */
+    static BenchmarkSetupArithmeticObservation benchmarkSetupArithmeticObservation()
+    {
+        BenchmarkSetupArithmeticObservation observation;
+        observation.observed_before_measurement = true;
+        observation.collection_enabled = PerfStatsCollector::isEnabled();
+        if (!observation.collection_enabled)
+            return observation;
+
+        static const std::vector<PerfStatsCollector::RecordFamily> families{
+            {"kernel", "gdn_projection_route"},
+            {"weight_loading", "gdn_projection_arithmetic_prepared_weight"},
+            {"weight_loading", "moe_router_arithmetic_prepared_weight"},
+            {"kernel", "cpu_moe_fp16_operand_router_calls"},
+            {"kernel", "cpu_moe_grouped_router_calls"},
+            {"cuda_moe", "router_fp16_operands"},
+            {"cuda_moe", "router_fp16_owned_operands"},
+            {"cuda_moe", "router_fp16_grouped_operands"},
+            {"kernel", "rocm_moe_router_fp16_operand_calls"},
+            {"kernel", "rocm_moe_batch_invariant_prefill_router_calls"},
+            {"kernel", "rocm_moe_decode_equivalent_runtime_m_router_calls"},
+        };
+        std::vector<std::string> filters;
+        filters.reserve(families.size());
+        for (const auto &family : families)
+            filters.push_back(family.domain + "." + family.name);
+        for (auto &record : PerfStatsCollector::snapshot(filters))
+        {
+            if (std::any_of(families.begin(), families.end(),
+                    [&](const PerfStatsCollector::RecordFamily &family)
+                    { return record.domain == family.domain && record.name == family.name; }))
+                observation.records.push_back(std::move(record));
+        }
+        return observation;
+    }
+
+    /**
+     * @brief Serialize only the saved result-owned setup/warmup observation.
+     * @param observation Value captured before reset, independent of the live collector.
+     * @return Separately scoped arithmetic metadata using the canonical PerfStatRecord serializer.
+     */
+    static nlohmann::json benchmarkSetupArithmeticToJson(
+        const BenchmarkSetupArithmeticObservation &observation)
+    {
+        nlohmann::json records = nlohmann::json::array();
+        for (const auto &record : observation.records)
+            records.push_back(perfStatRecordToJson(record));
+        return nlohmann::json{
+            {"schema", "llaminar.benchmark.setup_warmup_arithmetic.v1"},
+            {"scope", "retained_process_setup_and_warmup_before_measured_reset"},
+            {"count_semantics", "host_recording_or_submission_observations_not_graph_replays_or_tokens"},
+            {"observed_before_measurement", observation.observed_before_measurement},
+            {"collection_enabled", observation.collection_enabled},
+            {"records", std::move(records)},
+        };
     }
 
     static nlohmann::json benchmarkPerfStatsToJson()
@@ -905,6 +981,7 @@ namespace llaminar2
                                  {"padded_tokens", state.prefill_chunk_padded_tokens},
                                  {"failures", state.prefill_chunk_failures}}},
             {"prefill_graphs", prefillGraphSummaryToJson(state)},
+            {"setup_warmup_arithmetic", benchmarkSetupArithmeticToJson(result.setup_warmup_arithmetic)},
             {"perf_stats", benchmarkPerfStatsToJson()},
         };
 
@@ -2189,6 +2266,9 @@ namespace llaminar2
          * BOM evidence, however, and must survive so auto-capacity, shadow
          * width, and movement concurrency remain auditable beside throughput.
          */
+        // Passive host-only copies are result-owned; do not preserve these
+        // submission counts in the measured kernel/router work window.
+        result.setup_warmup_arithmetic = benchmarkSetupArithmeticObservation();
         PerfStatsCollector::resetPreserving(
             {"memory",
              "weight_loading",
@@ -2197,6 +2277,9 @@ namespace llaminar2
              "tp_allreduce_bom",
              "tp_rooted_collective_bom"},
             {
+                // Immutable per-layer physical bank selections are setup evidence;
+                // preserve this exact family, never unrelated placement/movement.
+                {"moe_placement", "routed_expert_weight_selection"},
                 {"forward_graph", "full_graph_plan_graphs"},
                 {"forward_graph", "graph_replay_plan_graphs"},
                 {"forward_graph", "full_graph_capture_executable_nodes"},

@@ -2170,7 +2170,7 @@ static_assert(
     sizeof(DeviceNativeVNNIMatrixDesc) == 56,
     "ROCm NativeVNNI descriptor must match the shared device ABI");
 
-constexpr int kDeviceMoEMaxExperts = 256;
+constexpr int kDeviceMoEMaxExperts = llaminar2::moe_runtime_abi::kMaxExperts;
 constexpr int kDeviceMoEMaxTopK = 16;
 constexpr uint32_t kDeviceMoEFlagValid = 1u << 0;
 constexpr uint32_t kDeviceMoEFlagResident = 1u << 1;

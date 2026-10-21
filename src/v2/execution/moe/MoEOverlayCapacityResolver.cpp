@@ -1046,21 +1046,33 @@ namespace llaminar2
 
         }
 
+        /** @brief Exact logical publication for one resource; no physical byte arithmetic. */
+        struct ResourcePublication
+        {
+            std::string name;
+            PhysicalMemoryAllocatorIdentity identity;
+            std::vector<int> live, shadows;
+        };
+        /** @brief Owned quota and copy metadata, safe after resolver inputs retire. */
+        struct StagePublication
+        {
+            int num_experts = 0;
+            std::vector<MoEOverlayPreparedExpertFootprint> layer_footprints;
+            std::vector<MoEOverlayResolvedTierCapacity> tiers;
+            std::vector<ResourcePublication> resources;
+            std::optional<MoEOverlayReplicaCacheCapacity> replica_cache_capacity;
+        };
         /**
-         * @brief Publish stage-local counts beside the sole aggregate byte authority.
+         * @brief Copy exact source-independent publication metadata before borrowed inputs expire.
          * @param stage Fully covered stage with exact compact participant quotas.
-         * @param authority Completed admission of all fixed and routed owners.
-         * @return Stage quota plan whose resource views retain that same certificate.
+         * @return Owned stage publication, without a final admission certificate.
          * @throws std::overflow_error if a diagnostic copy count exceeds int.
          */
-        [[nodiscard]] MoEOverlayResolvedCapacityPlan finishStage(
-            StageState &&stage,
-            const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &authority)
+        [[nodiscard]] StagePublication finishStageDraft(StageState &&stage)
         {
-            MoEOverlayResolvedCapacityPlan result;
+            StagePublication result;
             result.num_experts = stage.input->num_experts;
             result.layer_footprints = std::move(stage.footprints);
-            result.physical_memory_admission = authority;
             const auto layer_count = result.layer_footprints.size();
             for (const auto &budget : stage.input->physical_budgets)
             {
@@ -1083,9 +1095,9 @@ namespace llaminar2
                         }
                     }
                 const auto &resource = budget.certificate().bom().resource();
-                result.physical_resources.emplace_back(budget.resourceId(), authority,
+                result.resources.push_back({budget.resourceId(),
                     PhysicalMemoryAllocatorIdentity{resource.world_rank, resource.device},
-                    std::move(live), std::move(shadows));
+                    std::move(live), std::move(shadows)});
             }
             for (auto &tier : stage.tiers) result.tiers.push_back(std::move(tier.output));
             std::sort(result.tiers.begin(), result.tiers.end(),
@@ -1093,6 +1105,54 @@ namespace llaminar2
             return result;
         }
     } // namespace
+
+    struct MoEOverlayCapacityDraft::Impl
+    {
+        PhysicalMemoryPlan plan;
+        std::vector<StagePublication> stages;
+    };
+    const PhysicalMemoryPlan &MoEOverlayCapacityDraft::physicalPlan() const noexcept { return impl_->plan; }
+    std::size_t MoEOverlayCapacityDraft::stageCount() const noexcept { return impl_->stages.size(); }
+    MoEOverlayCapacityDraft MoEOverlayCapacityDraft::withReplicaGrants(
+        std::span<const std::optional<MoEOverlayReplicaCacheCapacity>> grants) const
+    {
+        if (grants.size() != stageCount())
+            throw std::invalid_argument("Replica publication differs from the frozen stage count");
+        auto next = std::make_shared<Impl>(*impl_);
+        for (std::size_t i=0; i<grants.size(); ++i) next->stages[i].replica_cache_capacity=grants[i];
+        return MoEOverlayCapacityDraft(std::move(next));
+    }
+    std::vector<MoEOverlayResolvedCapacityPlan> MoEOverlayCapacityDraft::admit(
+        std::span<const ImmutableRowTableAdmissionRequest> tables) const
+    {
+        auto complete = physicalPlan();
+        std::vector<std::shared_ptr<const ResolvedImmutableRowTablePlacement>> placements;
+        std::set<int> ranks;
+        for (const auto &request : tables)
+        {
+            if (!ranks.insert(request.input.host().world_rank).second)
+                throw std::invalid_argument("Final ngram admission contains duplicate rank authority");
+            auto selected=ImmutableRowTablePlacementPlanner::select(request,complete);
+            placements.push_back(std::move(selected.placement));
+            complete=std::move(selected.physical_plan);
+        }
+        const auto authority=std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(complete);
+        std::vector<MoEOverlayResolvedCapacityPlan> results;
+        for (const auto &stage:impl_->stages)
+        {
+            MoEOverlayResolvedCapacityPlan result;
+            result.num_experts=stage.num_experts;
+            result.layer_footprints=stage.layer_footprints;
+            result.tiers=stage.tiers;
+            result.replica_cache_capacity=stage.replica_cache_capacity;
+            result.ngram_table_placements=placements;
+            result.physical_memory_admission=authority;
+            for (const auto &resource:stage.resources)
+                result.physical_resources.emplace_back(resource.name,authority,resource.identity,resource.live,resource.shadows);
+            results.push_back(std::move(result));
+        }
+        return results;
+    }
 
     MoEOverlayResolvedCapacityPlan MoEOverlayCapacityResolver::resolve(
         const MoEOverlayCapacityResolverInput &input)
@@ -1102,6 +1162,12 @@ namespace llaminar2
     }
 
     std::vector<MoEOverlayResolvedCapacityPlan> MoEOverlayCapacityResolver::resolvePipeline(
+        std::span<const MoEOverlayCapacityResolverInput> inputs)
+    {
+        return resolvePipelineDraft(inputs).admit();
+    }
+
+    MoEOverlayCapacityDraft MoEOverlayCapacityResolver::resolvePipelineDraft(
         std::span<const MoEOverlayCapacityResolverInput> inputs)
     {
         if (inputs.empty())
@@ -1169,11 +1235,10 @@ namespace llaminar2
 
         PhysicalMemoryPlanBuilder completed;
         for (const auto &resource : resources) completed.add(resource.memory.build());
-        const auto authority = std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(completed.build());
-        std::vector<MoEOverlayResolvedCapacityPlan> results;
-        results.reserve(stages.size());
-        for (auto &stage : stages) results.push_back(finishStage(std::move(stage), authority));
-        return results;
+        auto draft=std::make_shared<MoEOverlayCapacityDraft::Impl>();
+        draft->plan=completed.build();
+        for (auto &stage:stages) draft->stages.push_back(finishStageDraft(std::move(stage)));
+        return MoEOverlayCapacityDraft(std::move(draft));
     }
 
     MoERoutedExpertPlacementPlan

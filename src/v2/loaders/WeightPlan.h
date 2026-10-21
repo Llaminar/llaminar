@@ -14,6 +14,7 @@
 #pragma once
 
 #include "WeightIdentity.h"
+#include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "WeightLifecycleTrace.h"
 #include "kernels/FloatingActivationOperandPrecision.h"
 #include "planning/PhysicalMemoryBOM.h"
@@ -62,6 +63,8 @@ namespace llaminar2
         bool immutable = false;
         FloatingActivationOperandPrecision floating_operand_precision =
             FloatingActivationOperandPrecision::Native; ///< Sealed before preparation; part of reuse identity.
+        std::optional<MoEExpertProjectionOwnership> projection_ownership; ///< Original static source partition; no topology permission.
+        std::shared_ptr<TensorBase> projection_source_owner = {}; ///< Original compact3D source root for exact native staging/coalescing.
     };
 
     struct WeightRequirement
@@ -86,6 +89,7 @@ namespace llaminar2
         WeightHostPolicy host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
         PreparedWeightKind expected_prepared_kind = PreparedWeightKind::None;
         WeightSliceSpec slice;
+        std::optional<MoEExpertProjectionOwnership> projection_ownership; ///< When present, the plan derives the sole original-axis slice.
     };
 
     struct InferenceStrategy
@@ -128,7 +132,13 @@ namespace llaminar2
         }
         /** @return Ordered requirements that will be materialized. */
         const std::vector<WeightRequirement> &requirements() const { return requirements_; }
-        /** @brief Normalize and append one declarative tensor requirement. */
+        /**
+         * @brief Normalize and append one declarative tensor requirement.
+         * @param requirement Original source/target intent. An explicit static projection
+         *        derives its original-axis all-expert slice from the retained ownership.
+         * @throws std::invalid_argument for a foreign role/source/participant, unsupported
+         *         parent preparation intent, or contradictory caller source coordinates.
+         */
         void add(WeightRequirement requirement);
         /** @return Number of declarative requirements. */
         size_t size() const { return requirements_.size(); }
@@ -217,6 +227,21 @@ namespace llaminar2
         std::vector<const WeightBinding *> forDevice(DeviceId device) const;
         /** @brief Verify immutable IDs and prepared-handle identity invariants. */
         void validateForGraph() const;
+        /**
+         * @brief Bind each original expert's compact 2D source without copying payloads.
+         * @return One complete frozen model: ordinary bindings remain unchanged,
+         *         while marked parents become participant-local GEMM views retaining their original 3D owner,
+         *         full source partition, per-expert identity and persistent memory owner.
+         * @throws std::exception for absent/ambiguous source geometry or unsupported layouts.
+         *
+         * Preserved ordinary IDs are reserved before expansion; generated keys
+         * cannot collide with them regardless of input order. At least one
+         * compact marked parent is required; an already lowered set is rejected.
+         * Startup-only source bindings, not graph/registry/topology admission.
+         * Source-native GPU packing additionally requires the original declared
+         * participant scope. Graph/topology integration remains separate.
+         */
+        FrozenModelWeightSet projectedExpertMatrices() const;
         /** @return A human-readable audit table for diagnostics and evidence. */
         std::string renderAuditTable() const;
 

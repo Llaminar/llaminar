@@ -13,6 +13,8 @@
 #include "app/MPIBootstrapPhase.h"
 #include "backends/ComputeBackend.h"
 #include "config/ExecutionDomainDefinition.h"
+#include "config/OrchestrationConfigParser.h"
+#include "config/OrchestrationConfigDocument.h"
 
 #include <gtest/gtest.h>
 
@@ -219,4 +221,102 @@ TEST(Test__MPIBootstrap, OverlayCpuShortSelectorsDriveBootstrapNumaSet)
             topology);
 
     EXPECT_EQ(nodes, (std::set<int>{0, 1}));
+}
+
+/** @test Opaque wrappers retain their complete original parser boundary after MPI re-exec. */
+TEST(Test__MPIBootstrap, ObserverOpaqueArgvRetainsOriginalSeparatorAndLaunchFlags)
+{
+    using namespace llaminar2;
+    std::vector<std::string> original = {"observer", "--workload", "/fixture/work load.json",
+        "--output", "/fixture/output", "--", "--model", "/synthetic/main.gguf",
+        "--mpi-procs", "1", "--device", "localhost:0:cpu:0", "--mpi-procs=1", "--mpi-dry-run"};
+    std::vector<char *> argv;
+    for (auto &value : original) argv.push_back(value.data());
+    MPILaunchConfig launch;
+    launch.num_procs = 1;
+    launch.cpu_set = "0-3"; // Authored launch metadata; no actual affinity/discovery.
+    launch.bind_to_socket = launch.map_by_socket = false;
+    const auto command = MPIBootstrap::buildMPIRunCommand(static_cast<int>(argv.size()), argv.data(), launch, {},
+        MPIBootstrapArgumentPolicy::PreserveOriginalArguments);
+    const auto binary = std::find(command.begin(), command.end(), "observer");
+    ASSERT_NE(binary, command.end());
+    EXPECT_EQ((std::vector<std::string>(binary, command.end())), original);
+    const auto rank_flag = std::find(command.begin(), binary, "-np");
+    ASSERT_NE(rank_flag, binary);
+    ASSERT_NE(rank_flag + 1, binary);
+    EXPECT_EQ(*(rank_flag + 1), "1");
+    const auto cpus = std::find(command.begin(), binary, "--cpu-set");
+    ASSERT_NE(cpus, binary);
+    ASSERT_NE(cpus + 1, binary);
+    EXPECT_EQ(*(cpus + 1), "0-3");
+}
+
+/** @test Existing callers keep the exact launch-flag consumption contract by default. */
+TEST(Test__MPIBootstrap, ObserverArgumentExtensionPreservesLegacyDefaultFiltering)
+{
+    using namespace llaminar2;
+    std::vector<std::string> original = {"observer", "--workload", "work.json", "--output", "out", "--",
+        "--mpi-procs", "1", "--mpi-procs=1", "--mpi-bootstrap", "--mpi-dry-run", "--device", "cpu:0"};
+    std::vector<char *> argv;
+    for (auto &value : original) argv.push_back(value.data());
+    const auto unchanged = MPIBootstrap::buildMPIRunCommand(static_cast<int>(argv.size()), argv.data(), {}, {});
+    EXPECT_EQ(unchanged, MPIBootstrap::buildMPIRunCommand(static_cast<int>(argv.size()), argv.data(), {}, {},
+        MPIBootstrapArgumentPolicy::FilterLaunchArguments));
+    const auto binary = std::find(unchanged.begin(), unchanged.end(), "observer");
+    ASSERT_NE(binary, unchanged.end());
+    EXPECT_EQ((std::vector<std::string>(binary, unchanged.end())),
+        (std::vector<std::string>{"observer", "--workload", "work.json", "--output", "out", "--", "--device", "cpu:0"}));
+    EXPECT_THROW((void)MPIBootstrap::buildMPIRunCommand(static_cast<int>(argv.size()), argv.data(), {}, {},
+        static_cast<MPIBootstrapArgumentPolicy>(99)), std::invalid_argument);
+}
+
+/** @test The actual public parser sees the same explicit CPU config after retained re-exec. */
+TEST(Test__MPIBootstrap, ObserverCPUConfigAndCanonicalIntentSurviveRetainedArgv)
+{
+    using namespace llaminar2;
+    std::vector<std::string> engine = {"observer", "--model", "/synthetic/nonexistent-qfn.gguf",
+        "--backend", "host", "--device", "localhost:0:cpu:0", "--mpi-procs", "1", "--no-mtp"};
+    std::vector<char *> engine_argv;
+    for (auto &value : engine) engine_argv.push_back(value.data());
+    const auto original = OrchestrationConfigParser{}.parseArgs(static_cast<int>(engine_argv.size()), engine_argv.data());
+    EXPECT_EQ(original.n_threads, -1);
+    EXPECT_EQ(original.mpi_procs, 1);
+    ASSERT_TRUE(original.device_for_this_rank);
+    EXPECT_TRUE(original.device_for_this_rank_numa_explicit);
+    EXPECT_EQ(original.device_for_this_rank->numa_node, 0);
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(original), BootstrapDeviceIntent::CpuOnly);
+    std::vector<std::string> wrapper = {"observer", "--workload", "fixture.json", "--output", "out", "--"};
+    wrapper.insert(wrapper.end(), engine.begin() + 1, engine.end());
+    std::vector<char *> wrapper_argv;
+    for (auto &value : wrapper) wrapper_argv.push_back(value.data());
+    MPILaunchConfig launch;
+    launch.num_procs = 1;
+    const auto command = MPIBootstrap::buildMPIRunCommand(static_cast<int>(wrapper_argv.size()), wrapper_argv.data(), launch, {},
+        MPIBootstrapArgumentPolicy::PreserveOriginalArguments);
+    const auto binary = std::find(command.begin(), command.end(), "observer");
+    ASSERT_NE(binary, command.end());
+    const auto separator = std::find(binary, command.end(), "--");
+    ASSERT_NE(separator, command.end());
+    std::vector<std::string> restored{*binary};
+    restored.insert(restored.end(), separator + 1, command.end());
+    std::vector<char *> restored_argv;
+    for (auto &value : restored) restored_argv.push_back(value.data());
+    const auto actual = OrchestrationConfigParser{}.parseArgs(static_cast<int>(restored_argv.size()), restored_argv.data());
+    EXPECT_EQ(serializeOrchestrationConfig(actual), serializeOrchestrationConfig(original));
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(actual), BootstrapDeviceIntent::CpuOnly);
+}
+
+/** @test A CPU continuation with a GPU domain cannot enter the CPU-only tool bootstrap. */
+TEST(Test__MPIBootstrap, ObserverCanonicalIntentIncludesNestedAcceleratorDeclarations)
+{
+    using namespace llaminar2;
+    auto config = OrchestrationConfig::defaults();
+    config.device_for_this_rank = GlobalDeviceAddress::cpu(0);
+    config.device_for_this_rank_numa_explicit = true;
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config), BootstrapDeviceIntent::CpuOnly);
+    config.domain_definitions.push_back(DomainDefinition::parse("compute=cuda:0;scope=rank_local;backend=nccl"));
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config), BootstrapDeviceIntent::Accelerator);
+    config.domain_definitions.clear();
+    config.domain_definitions.push_back(DomainDefinition::parse("compute=rocm:0;scope=rank_local;backend=rccl"));
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config), BootstrapDeviceIntent::Accelerator);
 }

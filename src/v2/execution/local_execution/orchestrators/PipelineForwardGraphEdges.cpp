@@ -224,15 +224,34 @@ PipelineForwardGraphEdges::PublicationOrder PipelineForwardGraphEdges::publicati
     return terminal() ? PublicationOrder::CommitThenExchange : PublicationOrder::ExchangeThenCommit;
 }
 
-bool PipelineForwardGraphEdges::encloses(const ForwardInput &input) const noexcept
+bool PipelineForwardGraphEdges::encloses(const ForwardInput &input) const
 {
+    switch (input.pipeline_activation_ownership)
+    {
+    case ForwardPipelineActivationOwnership::ForwardGraph:
+        break;
+    case ForwardPipelineActivationOwnership::NativeGenerationParent:
+        // Only a setup-only child may omit its local activation transport.
+        // An executing request/history invocation cannot bypass the receive.
+        if (domain_ || input.graph_submission_intent !=
+                ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch ||
+            input.execution_role != ForwardExecutionRole::MainInference ||
+            input.execution_phase != ForwardExecutionPhase::Decode ||
+            input.state_transaction != ForwardStateTransaction::Ordinary ||
+            !input.device_decode_position || input.sequence_lengths_device)
+            throw std::invalid_argument("Pipeline activation parent ownership requires an exact native resident setup child");
+        validateInput(input);
+        return false;
+    default:
+        throw std::invalid_argument("Unknown pipeline activation ownership");
+    }
     // Select from semantic ownership, never M or the request's global MTP flag.
     // Validation in append rejects contradictory fields instead of interpreting
     // an incomplete verifier as an ordinary graph with no activation receive.
     return input.device_prefill_chunk.has_value() ||
            input.execution_role == ForwardExecutionRole::GroupedMTPVerifier ||
            input.execution_role == ForwardExecutionRole::MTPCondition ||
-           (domain_ && input.execution_role == ForwardExecutionRole::MainInference &&
+           (input.execution_role == ForwardExecutionRole::MainInference &&
             input.execution_phase == ForwardExecutionPhase::Decode && input.token_ids_device &&
             input.device_decode_position.has_value());
 }
@@ -260,8 +279,16 @@ std::unique_ptr<PipelineMetadataExchange> PipelineForwardGraphEdges::metadataRow
     const bool verifier_bank = verifier_tokens && input.token_ids_device == verifier_tokens->gpu_data_ptr();
     if (kind == Kind::Verifier && !verifier_bank)
         throw std::invalid_argument("Pipeline verifier must use its original complete row bank");
-    banks.push_back(arenaBank(verifier_bank ? BufferId::MTP_VERIFIER_INPUT_TOKENS : BufferId::MTP_LOGICAL_SEQUENCE_STATE,
-        input.token_ids_device, layout.elements(0)));
+    // External scalar decode consumes the request admission bank; a resident
+    // controller consumes its logical mailbox. Both retain their original
+    // tensor authority. Only the NextToken family may bind the exact admitted
+    // token base; condition/verifier rows retain their existing complete banks.
+    const auto admitted_tokens = kind == Kind::NextToken
+        ? arena_->getSharedTensor(BufferId::REQUEST_TOKEN_IDS) : nullptr;
+    const bool admitted_bank = admitted_tokens && input.token_ids_device == admitted_tokens->gpu_data_ptr();
+    const auto token_owner = verifier_bank ? BufferId::MTP_VERIFIER_INPUT_TOKENS :
+        admitted_bank ? BufferId::REQUEST_TOKEN_IDS : BufferId::MTP_LOGICAL_SEQUENCE_STATE;
+    banks.push_back(arenaBank(token_owner, input.token_ids_device, layout.elements(0)));
     if (kind != Kind::NextToken)
     {
         banks.push_back(arenaBank(verifier_bank ? BufferId::MTP_VERIFIER_POSITION_IDS : BufferId::MTP_LOGICAL_SEQUENCE_STATE,
@@ -289,11 +316,13 @@ void PipelineForwardGraphEdges::validateInput(const ForwardInput &input) const
         input.state_transaction == ForwardStateTransaction::Ordinary;
     const bool prefix_bridge = input.state_transaction == ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
     const bool tail = terminal();
-    const bool ordinary = domain_ && input.execution_role == ForwardExecutionRole::MainInference &&
+    const bool ordinary = input.execution_role == ForwardExecutionRole::MainInference &&
         input.execution_phase == ForwardExecutionPhase::Decode && input.seq_len == 1 &&
         input.token_ids_device && input.position_ids_device && input.device_decode_position &&
         !input.device_prefill_chunk && !input.token_ids && !input.position_ids &&
         input.position_policy == ForwardPositionPolicy::ExplicitRows &&
+        input.device_decode_position->valid() &&
+        input.position_ids_device == input.device_decode_position->position &&
         input.state_transaction == ForwardStateTransaction::Ordinary;
     // Scalar conditions traverse the same layer pipeline as verification. Only
     // the terminal may append a shifted sidecar during a restored-prefix bridge;
@@ -324,6 +353,8 @@ void PipelineForwardGraphEdges::validateFollowerMTPInput(const ForwardInput &inp
 
 void PipelineForwardGraphEdges::append(ComputeGraph &graph, const ForwardInput &input) const
 {
+    if (!encloses(input))
+        throw std::invalid_argument("Native generation child cannot also own pipeline activation edges");
     validateInput(input);
     const bool verifier = input.execution_role == ForwardExecutionRole::GroupedMTPVerifier;
     const bool condition = input.execution_role == ForwardExecutionRole::MTPCondition;

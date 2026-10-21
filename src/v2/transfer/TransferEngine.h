@@ -32,6 +32,12 @@ namespace llaminar2
 {
     class TransferEngine;
     class PhysicalMemoryAuthority;
+    class ReleasedWeightLoadStaging;
+    class ImmutableNativeDeviceUpload;
+    class ImmutableNativeUploadStaging;
+    class ImmutableNativeDeviceRegion;
+    class ImmutableNativeDeviceRead;
+
     class CapturedTransferChannel;
     class CapturedTransferBinding;
     class WorkspaceBufferLease;
@@ -72,16 +78,20 @@ namespace llaminar2
         size_t prepared_weight_bytes = 0u;
         /** Sealed workspace backing; zero for a weights-only participant. */
         size_t reusable_workspace_bytes = 0u;
+        /** Source-native immutable row bank; zero for host-storage/no-PLE owners. */
+        size_t immutable_table_bytes = 0u;
+        /** Model-owned adaptive frame/protocol roots; distinct ImmutableLookupStaging leases. */
+        size_t immutable_lookup_staging_bytes = 0u;
 
         /**
-         * @return Checked total bytes owned across the two disjoint classes.
+         * @return Checked total bytes owned across the four disjoint classes.
          * @throws std::overflow_error when the BOM cannot be represented.
          */
         [[nodiscard]] size_t totalBytes() const;
 
         /**
          * @return Whether this names one GPU and a positive representable BOM.
-         * Either disjoint allocation class may be zero; their sum may not be.
+         * Any disjoint allocation class may be zero; their sum may not be.
          */
         [[nodiscard]] bool valid() const noexcept;
 
@@ -613,6 +623,41 @@ namespace llaminar2
     };
 
     /**
+     * @brief Bounded operands acquired by one existing producer event.
+     *
+     * A counted transfer reads its packet and one separately published scalar;
+     * an optional native receipt also reads/writes its original controller.
+     * Every declared operand must be ready on the canonical frontier BEFORE its event is recorded.
+     * This borrowed declaration owns no allocation, event, or execution value.
+     */
+    class DeviceTransferForkSources final
+    {
+    public:
+        /** @return Existing single-source declaration, without a companion. */
+        static DeviceTransferForkSources single(ITensor &packet) noexcept
+        { return DeviceTransferForkSources(packet, nullptr, nullptr); }
+        /** @return Packet plus one separately owned count/metadata operand. */
+        static DeviceTransferForkSources withCompanion(ITensor &packet, ITensor &companion) noexcept
+        { return DeviceTransferForkSources(packet, &companion, nullptr); }
+        /** @return Packet, count and original read/write observation owner acquired by one ready event. */
+        static DeviceTransferForkSources withCompanionAndObservation(ITensor &packet, ITensor &companion, ITensor &observation) noexcept
+        { return DeviceTransferForkSources(packet, &companion, &observation); }
+        /** @return Optional original observation owner, never an untracked pointer. */
+        ITensor *observation() const noexcept {return observation_;}
+        /** @return Packet declaration; TransferEngine resolves its canonical owner. */
+        ITensor &packet() const noexcept { return *packet_; }
+        /** @return Optional bounded companion, never an inferred count. */
+        ITensor *companion() const noexcept { return companion_; }
+    private:
+        /** @brief Freeze declarations; event authority is minted only by TransferEngine. */
+        DeviceTransferForkSources(ITensor &packet, ITensor *companion, ITensor *observation) noexcept
+            : packet_(&packet), companion_(companion), observation_(observation) {}
+        ITensor *packet_;
+        ITensor *companion_;
+        ITensor *observation_;
+    };
+
+    /**
      * @brief Unforgeable producer-event publication for one tensor input fork.
      *
      * TransferEngine creates this token only after validating the tensor on its
@@ -639,10 +684,14 @@ namespace llaminar2
         /** @brief Construct only after the exact producer event is accepted. */
         DeviceTransferInputFork(
             TensorBase *source_owner,
+            TensorBase *companion_owner,
+            TensorBase *observation_owner,
             DeviceId device,
             void *producer_stream,
             void *event) noexcept
             : source_owner_(source_owner),
+              companion_owner_(companion_owner),
+              observation_owner_(observation_owner),
               device_(device),
               producer_stream_(producer_stream),
               event_(event)
@@ -650,6 +699,8 @@ namespace llaminar2
         }
 
         TensorBase *source_owner_ = nullptr; ///< Canonical transfer-storage owner.
+        TensorBase *companion_owner_ = nullptr; ///< Optional second canonical owner acquired before the same event.
+        TensorBase *observation_owner_ = nullptr; ///< Optional read/write observation owner acquired by that event.
         DeviceId device_ = DeviceId::invalid(); ///< Exact producer GPU.
         void *producer_stream_ = nullptr; ///< Stream validated against tensor authority.
         void *event_ = nullptr; ///< Event recorded after the producer frontier.
@@ -682,6 +733,10 @@ namespace llaminar2
         /** @return Canonical storage owner whose producer frontier was acquired. */
         [[nodiscard]] TensorBase *sourceOwner() const noexcept { return source_owner_; }
 
+        /** @return Whether this canonical operand was acquired before the ready event. */
+        [[nodiscard]] bool includesSource(const TensorBase *owner) const noexcept
+        { return owner && (owner == source_owner_ || owner == companion_owner_ || owner == observation_owner_); }
+
         /** @return Exact endpoint on which the consumer acquired the producer event. */
         [[nodiscard]] DeviceId device() const noexcept { return device_; }
 
@@ -691,10 +746,14 @@ namespace llaminar2
         /** @brief Construct only after the backend accepts the event wait. */
         AcquiredDeviceTransferInput(
             TensorBase *source_owner,
+            TensorBase *companion_owner,
+            TensorBase *observation_owner,
             DeviceId device,
             void *consumer_stream,
             void *event) noexcept
             : source_owner_(source_owner),
+              companion_owner_(companion_owner),
+              observation_owner_(observation_owner),
               device_(device),
               consumer_stream_(consumer_stream),
               event_(event)
@@ -702,6 +761,8 @@ namespace llaminar2
         }
 
         TensorBase *source_owner_ = nullptr; ///< Canonical transfer-storage owner.
+        TensorBase *companion_owner_ = nullptr; ///< Optional second canonical owner acquired before the same event.
+        TensorBase *observation_owner_ = nullptr; ///< Optional read/write observation owner acquired by that event.
         DeviceId device_ = DeviceId::invalid(); ///< Exact source/consumer GPU.
         void *consumer_stream_ = nullptr; ///< Stream that acquired @ref event_.
         void *event_ = nullptr; ///< Producer frontier acquired by the stream.
@@ -1071,6 +1132,65 @@ namespace llaminar2
         /// (for testing with MockBackend).
         using BackendResolver = IBackend *(*)(DeviceId);
         explicit TransferEngine(BackendResolver resolver) : resolve_(resolver) {}
+
+        /** @brief Allocate original native bytes against the exact admitted immutable-table owner.
+         * @param memory Sole rank PMA; allocation claims precede native allocation.
+         * @param device Exact GPU, never inferred from a pointer.
+         * @param bytes Exact original native extent, with no transformed representation.
+         * @param row_bytes Original complete-native-row stride.
+         * @param stream Non-null setup stream; capture is forbidden.
+         * @return Move-only writer, exposing no device input pointer.
+         */
+        [[nodiscard]] ImmutableNativeDeviceUpload beginImmutableNativeDeviceUpload(
+            std::shared_ptr<PhysicalMemoryAuthority> memory, DeviceId device,
+            size_t bytes, size_t row_bytes, void *stream) const;
+
+        /** @brief Reuse one actual drained ordinary-loader pinned-slot allowance.
+         * @param receipt Original loader's immutable released-staging proof.
+         * @param memory Same rank PMA retained by that proof.
+         * @param device Original loader GPU and new upload destination.
+         * @param row_bytes Original row stride; one row must fit the existing slot.
+         * @return Bounded pinned storage plus its existing WeightLoadStaging claim.
+         */
+        [[nodiscard]] std::unique_ptr<ImmutableNativeUploadStaging> prepareImmutableNativeUploadStaging(
+            const ReleasedWeightLoadStaging &receipt,
+            std::shared_ptr<PhysicalMemoryAuthority> memory, DeviceId device, size_t row_bytes) const;
+
+        /** @brief Copy one exact native row chunk and drain its setup event before slot reuse.
+         * @param upload Sole writer; destination offset is its actual successful coverage.
+         * @param staging Reusable bounded pinned source, never table-sized by policy.
+         * @param bytes Positive complete-row live bytes, not allocation capacity.
+         * @param stream Exact original non-null setup stream.
+         * This intentional setup I/O boundary waits only for its own copy event;
+         * it cannot be called during capture or inference and never repacks bytes.
+         */
+        void uploadImmutableNativeChunk(ImmutableNativeDeviceUpload &upload,
+            const ImmutableNativeUploadStaging &staging, size_t bytes, void *stream) const;
+
+        /** @brief Publish complete exact-native storage after caller authenticates its final source.
+         * @param upload Fully covered, drained setup writer; gaps cannot be sealed.
+         * @return Shared immutable allocation retaining its PMA lease and producer event.
+         */
+        [[nodiscard]] std::shared_ptr<const ImmutableNativeDeviceRegion> sealImmutableNativeDeviceUpload(
+            ImmutableNativeDeviceUpload &&upload) const;
+
+        /** @brief Join the immutable setup producer before native capture; never allocate/copy.
+         * @param owner Complete immutable backing retained by the result.
+         * @param device Exact owning GPU.
+         * @param stream Non-null consumer stream; setup call outside capture only.
+         * @return Immutable exact-stream read authority.
+         */
+        [[nodiscard]] ImmutableNativeDeviceRead acquireImmutableNativeDeviceInput(
+            std::shared_ptr<const ImmutableNativeDeviceRegion> owner, DeviceId device, void *stream) const;
+
+        /** @brief Validate an existing exact-stream join without work or mutable state.
+         * @param read Setup-acquired immutable authority retained by the stage.
+         * @param device Exact captured GPU.
+         * @param stream Exact captured consumer stream.
+         * @throws std::logic_error For changed device, stream or runtime generation.
+         */
+        void requireImmutableNativeDeviceInput(const ImmutableNativeDeviceRead &read,
+            DeviceId device, void *stream) const;
 
         /**
          * @brief Trim unused GPU runtime caches and certify the memory delta.
@@ -1633,6 +1753,21 @@ namespace llaminar2
             void *event) const;
 
         /**
+         * @brief Acquire a packet and bounded companion before one ready event.
+         * @param sources Explicit one/two-operand declaration; canonical aliases are rejected.
+         * @param device Exact GPU owning both operands.
+         * @param producer_stream Canonical producer frontier for every operand.
+         * @param event Existing retained event; recorded only after every input validates.
+         * @return Fork authenticating both canonical owners, without hot allocation.
+         * @throws std::exception For missing, stale, foreign or not-ready operands before event record.
+         */
+        [[nodiscard]] DeviceTransferInputFork recordDeviceInputFork(
+            const DeviceTransferForkSources &sources,
+            DeviceId device,
+            void *producer_stream,
+            void *event) const;
+
+        /**
          * @brief Acquire a published tensor frontier on one auxiliary stream.
          *
          * The backend wait is enqueued without blocking the host. Successful
@@ -2107,6 +2242,17 @@ namespace llaminar2
         /// @return Submission result; device completion is carried by tensors.
         TransferResult copyActivation(TensorBase *src, TensorBase *dst,
                                       DeviceId dst_device, size_t bytes);
+
+        /** @brief Enqueue an exact diagnostic subrange without declaring the whole host mirror current.
+         * @param source Published GPU tensor retaining allocation and producer event.
+         * @param offset First source byte in that tensor.
+         * @param destination Diagnostic-only host storage, retained until the terminal event completes.
+         * @param bytes Authored payload or required metadata bytes; zero is a no-op.
+         * @param device Exact source participant.
+         * @param stream Exact observer stream, outside graph capture.
+         */
+        static void enqueueDiagnosticObservation(ITensor *source,size_t offset,void *destination,
+            size_t bytes,DeviceId device,void *stream);
 
         /// Full upload lifecycle: replaces TensorBase::ensureOnDevice() logic.
         /// Handles mapped storage, event dependencies, migration, allocation,

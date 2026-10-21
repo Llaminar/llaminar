@@ -5,6 +5,19 @@ This dashboard stays below 200 lines. Older measurements and investigations are
 preserved in [the October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md)
 and [the project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
 
+## QFN implementation frontier — 2026-10-20
+
+The QFN CPU fixed-depth-1 numerical cell reaches generation but fails the
+budget-limited direct-emission shifted-cache boundary: a generic `+1` is
+incorrect for QFN's token-zero bootstrap. Build46 installs a typed
+checkpoint-origin repair and two explicit model-free preflight regressions,
+including the actual CPU cache validator. Build and focused tests are in
+progress; the original real-model rerun is not yet qualified. GPU transaction
+ownership, default precision and numerical gates remain unchanged. See the
+[QFN plan](../2026-10/QWEN_FLASH_NEXT_IMPLEMENTATION.md) for the separate
+remaining all-layer numerical and multi-tier storage work. The historical
+hybrid measurements below are not QFN qualification.
+
 ## Completed evidence
 
 - The four homogeneous dense/MoE CUDA2/ROCm2 OpenCode app cells completed:

@@ -580,8 +580,12 @@ namespace llaminar2
         /**
          * @brief Validate named domain configurations
          *
-         * For each domain with proportional weights, validates that head assignment
-         * produces valid integer counts.
+         * Named rank-local domains reuse the canonical uneven-query and
+         * replicated-KV assignment. Other scopes retain uniform head and
+         * proportional-weight divisibility requirements.
+         * @param config Authored ordinary and named topology policy.
+         * @param model Original complete model geometry.
+         * @param result Receives precise assignment or divisibility failures.
          */
         static void validateNamedDomains(
             const OrchestrationConfig &config,
@@ -594,6 +598,18 @@ namespace llaminar2
             for (const auto &domain : config.domain_definitions)
             {
                 int domain_tp_degree = static_cast<int>(domain.devices.size());
+                if (domain.scope == TPScope::RANK_LOCAL)
+                {
+                    // Named rank-local TP uses the same uneven-query and
+                    // replicated-KV assignment as ordinary LocalTP. Uniform
+                    // cross-rank divisibility is not its admission contract.
+                    auto local = config;
+                    local.tp_scope = TPScope::RANK_LOCAL;
+                    local.tp_degree = domain_tp_degree;
+                    local.tp_weights = domain.weights;
+                    validateRankLocalTPAssignment(local, model, result);
+                    continue;
+                }
 
                 // Check head divisibility for this domain
                 if (n_kv_heads % domain_tp_degree != 0)

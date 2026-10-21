@@ -34,6 +34,11 @@ namespace llaminar2
      * @return true when every constant-memory copy was accepted by HIP.
      */
     [[nodiscard]] bool hip_tq_upload_codebooks(hipStream_t stream);
+    /** @brief Resolve a canonical device codebook during cache construction only.
+     * @param bits Native centroid width, either four or eight.
+     * @return Immutable module-owned device address; never a copied codebook.
+     */
+    const float *hip_tq_native_centroids(int bits);
 
     // =========================================================================
     // Rotation Matrix Management

@@ -25,11 +25,243 @@ SCRIPT = REPO_ROOT / "scripts" / "ci" / "run_production_parity_campaigns.py"
 TMPFS_SETUP_SCRIPT = (
     REPO_ROOT / "scripts" / "ci" / "setup_production_parity_tmpfs.sh"
 )
-SPEC = importlib.util.spec_from_file_location("production_parity_campaigns", SCRIPT)
-assert SPEC is not None and SPEC.loader is not None
-campaigns = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = campaigns
-SPEC.loader.exec_module(campaigns)
+def load_campaign_module(name: str):
+    """Match a script launch's sibling-import scope during explicit importlib loading.
+
+    exec_module does not prepend the script directory as Python's CLI does.
+    Supply that scope only while importing; restore the caller's search path
+    afterwards. Register the module before exec for dataclasses' normal lookup.
+    """
+    spec = importlib.util.spec_from_file_location(name, SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    with mock.patch.object(sys, "path", [str(SCRIPT.parent), *sys.path]):
+        spec.loader.exec_module(module)
+    return module
+
+
+campaigns = load_campaign_module("production_parity_campaigns")
+
+
+def production_parity_sources_without_typed_expansion(repo_root: Path) -> list[str]:
+    """Inspect compiled source/header ownership without crediting mere declarations.
+
+    Thin registrations may put their typed matrix factory in quoted local
+    headers or linked object libraries. Follow both boundaries once, restricting
+    header traversal to test-owned files. The canonical entrypoint declaration
+    itself is not evidence that a consumer actually expands its definition.
+    """
+    cmake_root = repo_root / "tests" / "v2"
+    parity_root = cmake_root / "integration" / "parity"
+    entrypoint = (parity_root / "ModelParityDefinition.h").resolve()
+    cmake = (cmake_root / "CMakeLists.txt").read_text(encoding="utf-8")
+    sources_by_target = {
+        target: {
+            (cmake_root / source).resolve()
+            for source in re.findall(r"(?<!\S)[\w./-]+\.cpp(?!\S)", body)
+        }
+        for target, body in re.findall(
+            r"add_(?:executable|library)\(\s*(\w+)\s+(.*?)\)",
+            cmake, re.DOTALL | re.IGNORECASE,
+        )
+    }
+    links_by_target: dict[str, set[str]] = {}
+    for target, body in re.findall(
+        r"target_link_libraries\(\s*(\w+)\s+(.*?)\)",
+        cmake, re.DOTALL | re.IGNORECASE,
+    ):
+        links_by_target.setdefault(target, set()).update(body.split())
+
+    def source_closure(target: str) -> set[Path]:
+        """Collect only compiled sources owned by this target's link closure."""
+        pending = [target]
+        seen: set[str] = set()
+        sources: set[Path] = set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            sources.update(sources_by_target.get(current, set()))
+            pending.extend(links_by_target.get(current, set()) - seen)
+        return sources
+
+    non_code = re.compile(
+        r'(?P<literal>"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
+        r'|(?P<comment>//[^\n]*|/\*.*?\*/)', re.DOTALL,
+    )
+    contents_by_path: dict[Path, str] = {}
+
+    def contents_for(path: Path) -> str:
+        """Read each shared source/header once without touching model payloads."""
+        if path not in contents_by_path:
+            contents_by_path[path] = path.read_text(encoding="utf-8")
+        return contents_by_path[path]
+
+    parts_by_path: dict[Path, tuple[str, tuple[Path, ...]]] = {}
+
+    def parts_for(path: Path) -> tuple[str, tuple[Path, ...]]:
+        """Parse each shared header once while retaining per-target ownership."""
+        if path not in parts_by_path:
+            contents = contents_for(path)
+            # Comments cannot invent an include edge. Preserve quoted strings
+            # here because they carry the actual local include target.
+            includes = non_code.sub(
+                lambda match: match.group(0) if match.lastgroup == "literal" else " ",
+                contents,
+            )
+            dependencies: list[Path] = []
+            for name in re.findall(r'^\s*#\s*include\s*"([^"\n]+)"', includes, re.MULTILINE):
+                included = (path.parent / name).resolve()
+                if included.is_relative_to(cmake_root.resolve()) and included.is_file():
+                    dependencies.append(included)
+            # Names in comments or strings do not constitute a typed call.
+            parts_by_path[path] = (non_code.sub(" ", contents), tuple(dependencies))
+        return parts_by_path[path]
+
+    def contract_for(sources: set[Path]) -> str:
+        """Follow quoted local includes; cycles and aliases cannot duplicate proof."""
+        pending = list(sources)
+        seen: set[Path] = set()
+        contracts: list[str] = []
+        while pending:
+            path = pending.pop().resolve()
+            if path in seen or path == entrypoint:
+                continue
+            seen.add(path)
+            contract, dependencies = parts_for(path)
+            pending.extend(dependencies)
+            contracts.append(contract)
+        return "\n".join(contracts)
+
+    contracts_by_target = {
+        target: contract_for(source_closure(target))
+        for target, sources in sources_by_target.items()
+        if any(parity_root in path.parents for path in sources)
+    }
+    offenders: list[str] = []
+    for source in sorted(parity_root.rglob("*.cpp")):
+        if "ProductionParity" not in contents_for(source):
+            continue
+        contracts = [
+            contracts_by_target[target]
+            for target, sources in sources_by_target.items()
+            if source.resolve() in sources
+        ]
+        if not any(
+            re.search(r"\bexpandModelParityDefinition\s*\(", contract)
+            for contract in contracts
+        ):
+            offenders.append(str(source.relative_to(repo_root)))
+    return offenders
+
+
+class CampaignModuleImportTests(unittest.TestCase):
+    """CLI and explicit importlib consumers use the actual sibling module."""
+
+    def test_importlib_loads_actual_history_sibling_without_leaking_search_path(self):
+        """A clean module cache and unrelated cwd cannot hide the original failure."""
+        with tempfile.TemporaryDirectory() as directory:
+            previous = Path.cwd()
+            isolated = [value for value in sys.path
+                        if Path(value or previous).resolve() != SCRIPT.parent.resolve()]
+            try:
+                os.chdir(directory)
+                with mock.patch.object(sys, "path", isolated), mock.patch.dict(sys.modules):
+                    sys.modules.pop("model_kld_history_replay", None)
+                    loaded = load_campaign_module("production_parity_campaigns_isolated_regression")
+                    sibling = sys.modules["model_kld_history_replay"]
+                    self.assertEqual(Path(sibling.__file__).resolve(), (SCRIPT.parent / "model_kld_history_replay.py").resolve())
+                    self.assertIs(loaded.prepare_history_replay, sibling.prepare_history_replay)
+                    self.assertEqual(loaded.HANDOFF_FIELDS, sibling.HANDOFF_FIELDS)
+                    self.assertEqual(sys.path, isolated)
+            finally:
+                os.chdir(previous)
+
+    def test_normal_script_cli_help_keeps_history_replay_option(self):
+        """The real CLI help imports normally, without discovery/model/backend work."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ)
+            environment.pop("PYTHONPATH", None)
+            result = subprocess.run([sys.executable, str(SCRIPT), "--help"], cwd=directory,
+                env=environment, text=True, capture_output=True, check=True)
+            self.assertIn("--history-replay", result.stdout)
+            self.assertNotIn("ModuleNotFoundError", result.stderr)
+
+
+class TypedMatrixSourceOwnershipTests(unittest.TestCase):
+    """Thin registrations retain typed ownership across headers/object boundaries."""
+
+    def check_sources(self, files: dict[str, str], *, linked: bool = False) -> list[str]:
+        """Inspect a private metadata-only CMake/source tree, without compilation."""
+        with tempfile.TemporaryDirectory(prefix="llaminar-parity-source-policy-") as raw:
+            root = Path(raw)
+            tests = root / "tests" / "v2"
+            parity = tests / "integration" / "parity"
+            parity.mkdir(parents=True)
+            (parity / "ModelParityDefinition.h").write_text(
+                "struct ModelParityDefinition {};\n"
+                "inline auto expandModelParityDefinition(const ModelParityDefinition &d) { return d; }\n",
+                encoding="utf-8",
+            )
+            cmake = "add_executable(fixture integration/parity/fixture.cpp)\n"
+            if "shared.cpp" in files:
+                cmake += "add_library(shared OBJECT integration/parity/shared.cpp)\n"
+                if linked:
+                    cmake += "target_link_libraries(fixture PRIVATE shared)\n"
+            (tests / "CMakeLists.txt").write_text(cmake, encoding="utf-8")
+            for name, contents in files.items():
+                (parity / name).write_text(contents, encoding="utf-8")
+            return production_parity_sources_without_typed_expansion(root)
+
+    def test_nested_header_wrapper_owns_actual_typed_expansion(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": '#include "base.h"\nTEST_P(Fixture, ProductionParity) {}\n',
+            "base.h": '#include "cases.h"\n',
+            "cases.h": '#include "ModelParityDefinition.h"\n'
+                'inline auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }), [])
+
+    def test_header_cycles_are_bounded_without_losing_the_expansion(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": '#include "base.h"\nTEST_P(Fixture, ProductionParity) {}\n',
+            "base.h": '#include "cases.h"\n',
+            "cases.h": '#include "base.h"\n#include "ModelParityDefinition.h"\n'
+                'inline auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }), [])
+
+    def test_canonical_type_header_alone_does_not_prove_expansion(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": '#include "ModelParityDefinition.h"\nTEST_P(Fixture, ProductionParity) {}\n',
+        }), ["tests/v2/integration/parity/fixture.cpp"])
+
+    def test_comments_and_strings_do_not_invent_typed_calls(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": 'TEST_P(Fixture, ProductionParity) {}\n'
+                '// ModelParityDefinition expandModelParityDefinition(d)\n'
+                'const char *diagnostic = "expandModelParityDefinition(d)";\n',
+        }), ["tests/v2/integration/parity/fixture.cpp"])
+
+    def test_commented_include_cannot_borrow_an_unused_factory(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": '/*\n#include "cases.h"\n*/\nTEST_P(Fixture, ProductionParity) {}\n',
+            "cases.h": 'inline auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }), ["tests/v2/integration/parity/fixture.cpp"])
+
+    def test_linked_object_source_can_own_the_typed_expansion(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": 'TEST_P(Fixture, ProductionParity) {}\n',
+            "shared.cpp": '#include "ModelParityDefinition.h"\n'
+                'auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }, linked=True), [])
+
+    def test_unlinked_source_cannot_rescue_a_fixed_fixture(self) -> None:
+        self.assertEqual(self.check_sources({
+            "fixture.cpp": 'TEST_P(Fixture, ProductionParity) {}\n',
+            "shared.cpp": '#include "ModelParityDefinition.h"\n'
+                'auto cases() { ModelParityDefinition d; return expandModelParityDefinition(d); }\n',
+        }), ["tests/v2/integration/parity/fixture.cpp"])
 
 
 class EmptyGTestGateTests(unittest.TestCase):
@@ -298,6 +530,36 @@ def unit_ctest_document(*names: str) -> str:
 
 
 class ProductionParityCampaignTest(unittest.TestCase):
+    def test_gpu_adaptive_complete_artifact_names_fit_without_request_identity_loss(self) -> None:
+        """The real writer projection accepts all four source-declared cells and both bodies.
+
+        These explicit source-profile values are an independent boundary oracle,
+        not another campaign inventory. The C++ canonical expansion regression
+        checks every actual parameter and the exact ASCII byte bound. No model,
+        subprocess or artifact directory is created here.
+        """
+        components = set()
+        for backend in ("CUDA", "ROCm"):
+            for rows, physical_bytes in ((0, 0), (64, 1048576)):
+                parameter = (
+                    f"Qwen38FlashNext_UDQ4KXL_{backend}0_CPU0_ExpertOverlay_GpuExperts8_"
+                    f"NgramAdaptiveVRAMRAMSSD_G{rows}_B{physical_bytes}_A65536_P3of4_"
+                    f"H{rows}_B{physical_bytes}_A65536_P3of4_W65536_N1024_"
+                    "Static_Ordinal_ActFP32_KVFP16_MTPOff"
+                )
+                for body in ("ProductionParity", "SnapshotAdmission"):
+                    exact = f"Qwen4ExpGPUAdaptive/Qwen4ExpMainParityTest.{body}/{parameter}"
+                    component = campaigns._gtest_artifact_directory_name(exact)
+                    self.assertLessEqual(len(component.encode("utf-8")), 255)
+                    self.assertIn(parameter, component)
+                    self.assertNotIn("/", component)
+                    self.assertNotIn(component, components)
+                    components.add(component)
+                    if rows:
+                        old = exact.replace("Qwen4ExpGPUAdaptive/", "Qwen4ExpGPUAdaptiveVRAMRAMSSD/", 1)
+                        self.assertGreater(len(campaigns._gtest_artifact_directory_name(old).encode("utf-8")), 255)
+        self.assertEqual(len(components), 8)
+
     @staticmethod
     def write_canonical_artifacts(directory: Path) -> None:
         """Materialize the smallest schema-valid campaign evidence fixture."""
@@ -310,6 +572,164 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     "value" for _ in next(campaigns.csv.reader([header]))
                 ) + "\n"
             (directory / filename).write_text(payload, encoding="utf-8")
+
+    @staticmethod
+    def typed_stage_fixture(decode: bool) -> list[list[str]]:
+        """Describe the writer layout independently of validator constants.
+
+        Integer diagnostics leave floating metrics empty. Failed canonical
+        comparisons remain distinct from successful route-conditioned proof.
+        """
+        distribution = (
+            "min,max,mean,stddev,kurtosis,skewness,p95,p99,outlier_frac,"
+            "dynamic_range,sparsity,zero_frac,nan_count,inf_count,elements"
+        ).split(",")
+        columns = ["backend"] + (["step"] if decode else []) + (
+            "layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,"
+            "error_entropy,is_routing,routing_overlap,routing_top1_match,"
+            "routing_weight_l1"
+        ).split(",")
+        columns += [prefix + field for prefix in ("llaminar_", "pytorch_")
+                    for field in distribution]
+        columns += (
+            "proof_authority,canonical_passed,route_conditioned_evaluated,"
+            "route_conditioned_passed,route_conditioned_cosine,"
+            "route_conditioned_rel_l2,route_conditioned_max_abs,"
+            "route_weights_max_error,hf_reconstruction_rel_l2,scalar_type,"
+            "integer_mismatch_count,passed"
+        ).split(",")
+        rows = [columns]
+        for scalar_type, stage, mismatches, authority, passed in (
+            ("INT64", "PLE_HASH_INDICES", "0", "canonical_hf", "1"),
+            ("INT32", "QSA_SELECTED_INDICES", "3", "canonical_hf", "0"),
+            ("FP32", "MOE_EXPERT_OUT", "", "route_conditioned_hf", "0"),
+        ):
+            row = dict.fromkeys(columns, "")
+            row.update(backend="CPU0", layer="1", stage=stage,
+                       scalar_type=scalar_type, integer_mismatch_count=mismatches,
+                       proof_authority=authority, canonical_passed=passed,
+                       route_conditioned_evaluated="0", passed=passed)
+            if decode:
+                row["step"] = "0"
+            if scalar_type == "FP32":
+                row.update(cosine="0.75", rel_l2="0.25",
+                           route_conditioned_evaluated="1",
+                           route_conditioned_passed="1",
+                           route_conditioned_cosine="0.9999")
+            rows.append([row[column] for column in columns])
+        return rows
+
+    def write_typed_stage_artifacts(self, directory: Path) -> None:
+        """Write independent stage schemas over other canonical fixtures."""
+        self.write_canonical_artifacts(directory)
+        for decode in (False, True):
+            name = "decode_stages.csv" if decode else "prefill_stages.csv"
+            with (directory / name).open("w", encoding="utf-8", newline="") as stream:
+                campaigns.csv.writer(stream).writerows(self.typed_stage_fixture(decode))
+
+    @staticmethod
+    def typed_stage_cell() -> campaigns.CampaignCell:
+        """Use a main-only cell without model or MTP execution."""
+        return campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=("MatrixSuite.ProductionParity/CPU_KV_FP16",),
+        )
+
+    def test_stage_schema_accepts_typed_integer_and_proof_authority_columns(self) -> None:
+        """Admit exact writer layouts with blank floating integer metrics."""
+        cell = self.typed_stage_cell()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+            self.write_typed_stage_artifacts(directory)
+            count, _, errors = campaigns.validate_campaign_artifacts(
+                cell, campaigns.time.time_ns(), revision_results_root=root)
+            self.assertEqual(errors, ())
+            self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS))
+            for decode in (False, True):
+                name = "decode_stages.csv" if decode else "prefill_stages.csv"
+                self.assertEqual(next(campaigns.csv.reader(
+                    [campaigns.REQUIRED_CSV_HEADERS[name]])),
+                    self.typed_stage_fixture(decode)[0])
+                self.assertTrue(campaigns._prior_artifact_file_has_evidence(
+                    directory / name, campaigns.REQUIRED_CSV_HEADERS[name],
+                    requires_data=True))
+
+    def test_stage_schema_rejects_unknown_missing_duplicate_or_reordered_columns(self) -> None:
+        """Reject legacy and invented typed/proof layouts without normalization."""
+        cell = self.typed_stage_cell()
+        for decode in (False, True):
+            for mutation in ("legacy", "unknown", "duplicate", "reorder", "proof"):
+                with self.subTest(decode=decode, mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+                    self.write_typed_stage_artifacts(directory)
+                    rows = self.typed_stage_fixture(decode)
+                    if mutation == "legacy":
+                        rows = [row[:-3] + row[-1:] for row in rows]
+                    elif mutation == "unknown":
+                        rows[0][-2] = "unrecognized_mismatch_count"
+                    elif mutation == "duplicate":
+                        rows[0][-2] = "scalar_type"
+                    elif mutation == "reorder":
+                        rows[0][-3], rows[0][-2] = rows[0][-2], rows[0][-3]
+                    else:
+                        rows[0][rows[0].index("proof_authority")] = "proof_source"
+                    name = "decode_stages.csv" if decode else "prefill_stages.csv"
+                    path = directory / name
+                    with path.open("w", encoding="utf-8", newline="") as stream:
+                        campaigns.csv.writer(stream).writerows(rows)
+                    count, _, errors = campaigns.validate_campaign_artifacts(
+                        cell, campaigns.time.time_ns(), revision_results_root=root)
+                    self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS) - 1)
+                    self.assertEqual(len(errors), 1)
+                    self.assertIn(name + " header does not match", errors[0])
+                    self.assertFalse(campaigns._prior_artifact_file_has_evidence(
+                        path, campaigns.REQUIRED_CSV_HEADERS[name], requires_data=True))
+
+    def test_stage_schema_rejects_malformed_typed_row_width(self) -> None:
+        """Keep exact row-width validation after admitting the typed fields."""
+        cell = self.typed_stage_cell()
+        for decode in (False, True):
+            with self.subTest(decode=decode), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+                self.write_typed_stage_artifacts(directory)
+                rows = self.typed_stage_fixture(decode)
+                rows[1].pop(-2)
+                name = "decode_stages.csv" if decode else "prefill_stages.csv"
+                with (directory / name).open("w", encoding="utf-8", newline="") as stream:
+                    campaigns.csv.writer(stream).writerows(rows)
+                _, _, errors = campaigns.validate_campaign_artifacts(
+                    cell, campaigns.time.time_ns(), revision_results_root=root)
+                self.assertEqual(len(errors), 1)
+                self.assertIn(name + " row 2 has the wrong column count", errors[0])
+
+    @mock.patch.object(campaigns, "_run_process", return_value=8)
+    def test_typed_stage_schema_keeps_failed_numerical_campaign(self, run_process: mock.Mock) -> None:
+        """Valid CSV evidence cannot override the numerical process failure."""
+        cell = self.typed_stage_cell()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+            self.write_typed_stage_artifacts(directory)
+            before = {path.name: path.read_bytes() for path in directory.iterdir()}
+            result = campaigns.run_campaign(Path("unused-build"), cell, 30.0,
+                                           artifact_results_root=root)
+            self.assertEqual(result.return_code, 8)
+            self.assertEqual(result.outcome, "completed")
+            self.assertTrue(result.artifact_contract_passed)
+            self.assertEqual(result.artifact_errors, ())
+            self.assertEqual(result.validated_artifact_file_count,
+                             len(campaigns.REQUIRED_CSV_HEADERS))
+            self.assertEqual(before, {path.name: path.read_bytes()
+                                      for path in directory.iterdir()})
+            self.assertEqual(run_process.call_count, 1)
+            ledger_path = root / "individual-green.json"
+            with self.assertRaisesRegex(ValueError, "refusing to record non-green"):
+                campaigns.record_individual_green(ledger_path, cell, result)
+            self.assertFalse(ledger_path.exists())
 
     def test_prefix_restore_schema_requires_cross_epoch_gdn_evidence(self) -> None:
         """Keep the validator synchronized with typed GDN state comparison."""
@@ -805,71 +1225,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
     ) -> None:
         """Every compiled fixture family must use the typed matrix expander."""
 
-        parity_root = REPO_ROOT / "tests" / "v2" / "integration" / "parity"
-        cmake_root = REPO_ROOT / "tests" / "v2"
-        cmake = (cmake_root / "CMakeLists.txt").read_text(encoding="utf-8")
-        # Compilation boundaries are not configuration authorities. Follow the
-        # declared object-library links so a thin registration can use a shared
-        # typed expander without copying it into every implementation shard.
-        sources_by_target = {
-            target: {
-                (cmake_root / source).resolve()
-                for source in re.findall(r"(?<!\S)[\w./-]+\.cpp(?!\S)", body)
-            }
-            for target, body in re.findall(
-                r"add_(?:executable|library)\(\s*(\w+)\s+(.*?)\)",
-                cmake, re.DOTALL | re.IGNORECASE,
-            )
-        }
-        links_by_target: dict[str, set[str]] = {}
-        for target, body in re.findall(
-            r"target_link_libraries\(\s*(\w+)\s+(.*?)\)",
-            cmake, re.DOTALL | re.IGNORECASE,
-        ):
-            links_by_target.setdefault(target, set()).update(body.split())
-
-        def source_closure(target: str) -> set[Path]:
-            """Collect declared source ownership, visiting shared objects once."""
-            pending = [target]
-            seen: set[str] = set()
-            sources: set[Path] = set()
-            while pending:
-                current = pending.pop()
-                if current in seen:
-                    continue
-                seen.add(current)
-                sources.update(sources_by_target.get(current, set()))
-                pending.extend(links_by_target.get(current, set()) - seen)
-            return sources
-
-        contents_by_path: dict[Path, str] = {}
-        def contents_for(path: Path) -> str:
-            """Read each shared source once, without interpreting model files."""
-            if path not in contents_by_path:
-                contents_by_path[path] = path.read_text(encoding="utf-8")
-            return contents_by_path[path]
-
-        contracts_by_target = {
-            target: "\n".join(contents_for(path) for path in source_closure(target))
-            for target in sources_by_target
-            if any(parity_root in path.parents for path in sources_by_target[target])
-        }
-        offenders: list[str] = []
-        for source in sorted(parity_root.rglob("*.cpp")):
-            contents = contents_for(source)
-            if "ProductionParity" not in contents:
-                continue
-            contracts = [
-                contracts_by_target[target]
-                for target, sources in sources_by_target.items()
-                if source.resolve() in sources
-            ]
-            if not any(
-                "ModelParityDefinition" in contract and
-                "expandModelParityDefinition" in contract
-                for contract in contracts
-            ):
-                offenders.append(str(source.relative_to(REPO_ROOT)))
+        offenders = production_parity_sources_without_typed_expansion(REPO_ROOT)
 
         self.assertEqual(
             offenders,

@@ -2368,6 +2368,8 @@ namespace llaminar2
             config_.model_metadata,
             nullptr);
 
+        no_peer_residency_ = MoEOverlayNoPeerResidency::seal(
+            *initial_snapshot->placement_plan, initial_snapshot->owner_map, config_.model_metadata);
         economy_state_ = buildEconomyState(config_, *initial_snapshot);
         if (economy_state_ && config_.histogram)
             config_.histogram->activatePrecertifiedOptimizationDemand();

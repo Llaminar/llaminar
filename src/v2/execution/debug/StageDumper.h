@@ -47,6 +47,8 @@
 
 #pragma once
 
+#include <cstddef>
+#include <stdexcept>
 #include "../compute_stages/ComputeStages.h"
 #include "../../utils/DebugEnv.h"
 #include "../../tensors/BlockStructures.h"
@@ -240,7 +242,13 @@ namespace llaminar2
             if (buffer.tensor)
             {
                 if (buffer.tensor->ensureOnHost())
-                    data = buffer.tensor->raw_data();
+                {
+                    if (buffer.tensor_byte_offset > buffer.tensor->size_bytes() ||
+                        buffer.byte_size > buffer.tensor->size_bytes() - buffer.tensor_byte_offset)
+                        throw std::runtime_error("Stage dump input byte view exceeds its tensor capacity");
+                    const auto *raw = static_cast<const std::byte *>(buffer.tensor->raw_data());
+                    data = raw ? raw + buffer.tensor_byte_offset : nullptr;
+                }
                 else
                     fprintf(stderr, "[STAGE_DUMP] Failed to sync input '%s' to host before dump\n",
                             buffer.name ? buffer.name : "<unnamed>");

@@ -5,12 +5,15 @@
  * Weight preparation publishes device-, domain-, or participant-scoped
  * engines here. Graph construction may borrow raw pointers for fixed model
  * lifetime execution, while epoch-indexed ExpertOverlay residency explicitly
- * acquires shared ownership so old banks survive concurrent migration.
+ * acquires shared ownership so old banks survive concurrent migration. Static
+ * within-expert matrices additionally retain exact frozen source identities and
+ * are available only through complete participant-scoped acquisition.
  */
 
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "WeightPlan.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 
 #include <memory>
@@ -80,6 +83,49 @@ namespace llaminar2
                 return gate != nullptr && up != nullptr && down != nullptr;
             }
         };
+
+        /** @brief One acquired static layer; exact source and GEMM owners survive registry retirement. */
+        struct StaticProjectionLayer
+        {
+            ParticipantLayerScope scope;
+            MoEExpertProjectionOwnership projection;
+            std::vector<ParticipantExpertBinding> experts; ///< Original ordinal E order, all three roles.
+            std::vector<WeightBinding> sources; ///< Original frozen views, in expert-major G/U/D order.
+        };
+
+        /**
+         * @brief Resolve an explicitly declared static source participant; never infer a domain.
+         * @param source Original marked immutable parent or matrix binding.
+         * @return Existing participant/layer key, including actual target device.
+         * @throws std::invalid_argument for absent/foreign scope or non-static source ownership.
+         */
+        [[nodiscard]] static ParticipantLayerScope staticProjectionScope(const WeightBinding &source);
+
+        /**
+         * @brief Register one original static matrix without publishing domain/device aliases.
+         * @param source Exact frozen native 2D source with original N/K/E coordinates and scope.
+         * @param engine Actual locally prepared engine, whose N/K must match the source contract.
+         * @param owner Exact shared engine owner retaining its canonical packed pool.
+         * @throws std::invalid_argument for invalid source, geometry or engine ownership.
+         * @throws std::logic_error for any duplicate key or replacement by another source.
+         */
+        void registerStaticProjection(const WeightBinding &source, ITensorGemm *engine,
+                                      std::shared_ptr<ITensorGemm> owner);
+
+        /**
+         * @brief Acquire exactly all E triplets using the original frozen source declarations.
+         * @param scope Explicit original domain/device/rank/participant/layer.
+         * @param projection Complete expected original F partition, not just local dimensions.
+         * @param sources Exact 3E frozen matrices, with one original G/U/D binding per expert.
+         * @return Owned complete layer, or nullopt when no engine has been registered.
+         * @throws std::invalid_argument for duplicate/incomplete/foreign source declarations.
+         * @throws std::logic_error for a stale source owner, different partition or partial published layer.
+         *
+         * No unscoped or overlay alias is consulted. A failed query publishes no partial result.
+         */
+        [[nodiscard]] std::optional<StaticProjectionLayer> acquireStaticProjectionLayer(
+            const ParticipantLayerScope &scope, const MoEExpertProjectionOwnership &projection,
+            std::span<const WeightBinding> sources) const;
 
         ExpertGemmRegistry() = default;
         ~ExpertGemmRegistry() = default;
@@ -162,7 +208,7 @@ namespace llaminar2
          * @param role Gate, up or down projection.
          * @param projection Expected source/partition identity; absent means a whole expert.
          * @return Borrowed handle, or null only when the key is absent.
-         * @throws std::logic_error if an existing key has another physical layout.
+         * @throws std::logic_error if an existing key has another physical layout or requires static full-source acquisition.
          */
         ITensorGemm *getEngineForDomain(const std::string &domain_name,
                         DeviceId device, int layer, int expert, WeightRole role,
@@ -209,7 +255,7 @@ namespace llaminar2
          * @param role Gate, up, or down projection.
          * @param projection Exact expected layout; absent requires a complete expert.
          * @return Exact engine lifetime, or null when absent or not owned.
-         * @throws std::logic_error if an existing key has a different layout.
+         * @throws std::logic_error if an existing key has a different layout or requires static full-source acquisition.
          */
         [[nodiscard]] std::shared_ptr<ITensorGemm>
         getEngineLifetimeForDomain(
@@ -231,7 +277,7 @@ namespace llaminar2
          * @param role Gate, up, or down projection.
          * @param projection Exact expected layout; absent requires a complete expert.
          * @return Exact engine lifetime, or null when absent or not owned.
-         * @throws std::logic_error if an existing key has a different layout.
+         * @throws std::logic_error if an existing key has a different layout or requires static full-source acquisition.
          */
         [[nodiscard]] std::shared_ptr<ITensorGemm>
         getEngineLifetimeForParticipant(
@@ -384,6 +430,7 @@ namespace llaminar2
             ITensorGemm *engine = nullptr;
             std::shared_ptr<ITensorGemm> ownership;
             std::optional<MoEExpertProjectionOwnership> projection_ownership;
+            std::shared_ptr<const WeightBinding> static_source = {}; ///< Exact original frozen source, absent for old modes.
         };
 
         mutable std::shared_mutex mutex_;

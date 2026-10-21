@@ -47,6 +47,12 @@ Individual fixup invocations may reuse a passed preflight report only while the
 Ninja build log and CTest registration remain older than that report. This
 amortizes the integration gate across unchanged exact cells without creating an
 unchecked skip path; any rebuild or reconfiguration invalidates the evidence.
+
+An explicit --history-replay FILE is a diagnostic projection for one exact QFN
+cell only. It binds original corpus/source/tokens and a regenerated full-stage
+pack before admission, preserving this driver's staging and prerequisite path.
+The fixture keeps its original topology, prefix checks, math limits and CSVs;
+a partial ambient locator or an LM-only reference cannot select another history.
 """
 
 from __future__ import annotations
@@ -68,7 +74,8 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from model_kld_history_replay import HANDOFF_FIELDS, prepare_history_replay
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -132,7 +139,8 @@ REQUIRED_CSV_HEADERS = {
         "pytorch_mean,pytorch_stddev,pytorch_kurtosis,pytorch_skewness,"
         "pytorch_p95,pytorch_p99,pytorch_outlier_frac,pytorch_dynamic_range,"
         "pytorch_sparsity,pytorch_zero_frac,pytorch_nan_count,"
-        "pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER + ",passed"
+        "pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER
+        + ",scalar_type,integer_mismatch_count,passed"
     ),
     "decode_steps.csv": (
         "backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,"
@@ -153,7 +161,8 @@ REQUIRED_CSV_HEADERS = {
         "pytorch_max,pytorch_mean,pytorch_stddev,pytorch_kurtosis,"
         "pytorch_skewness,pytorch_p95,pytorch_p99,pytorch_outlier_frac,"
         "pytorch_dynamic_range,pytorch_sparsity,pytorch_zero_frac,"
-        "pytorch_nan_count,pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER + ",passed"
+        "pytorch_nan_count,pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER
+        + ",scalar_type,integer_mismatch_count,passed"
     ),
     "prefix_restore.csv": (
         "backend,phase,cache_config_enabled,cache_ready,cache_bypassed,"
@@ -4477,6 +4486,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--history-replay",
+        type=_existing_file,
+        default=None,
+        metavar="FILE",
+        help=(
+            "diagnostic-only frozen QFN history descriptor for --exact-cell; "
+            "requires an already regenerated full-stage reference and preserves "
+            "the original topology, arithmetic, numerical contract and six CSVs"
+        ),
+    )
+    parser.add_argument(
         "--max-unseen-cells",
         type=_positive_integer,
         default=None,
@@ -4552,6 +4572,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         or "?" in arguments.exact_cell
     ):
         parser.error("--exact-cell requires one nonempty wildcard-free GTest identity")
+    if arguments.history_replay is not None and arguments.exact_cell is None:
+        parser.error("--history-replay requires one original --exact-cell")
+    if any(os.environ.get(key) for key in HANDOFF_FIELDS):
+        parser.error("history replay handoff is driver-owned; use explicit --history-replay FILE")
     arguments.prior_artifact_roots = tuple(
         dict.fromkeys(arguments.prior_artifact_roots)
     )
@@ -4914,7 +4938,16 @@ def run_focused_exact_cell(
     if args.exact_cell is None:
         raise ValueError("focused exact-cell execution requires an exact GTest case")
     owner = select_focused_exact_cell(selected, args.exact_cell)
+    history = None
+    if getattr(args, "history_replay", None) is not None:
+        declared_sources = tuple(member for model in owner.model_files
+                                 for member in _split_gguf_members(Path(model)))
+        history = prepare_history_replay(args.history_replay, args.exact_cell, declared_sources)
+        command, environment = history.launch(owner.command, _registered_environment(owner))
+        owner = replace(owner, command=command,
+                        environment=tuple(f"{key}={value}" for key, value in environment.items()))
     artifact_root = create_campaign_artifact_root(args.report)
+    history_environment = history.bind(artifact_root) if history is not None else {}
     started = time.monotonic()
     completion_deadline = started + args.completion_timeout_seconds
     preflight_return_code = 125
@@ -4986,9 +5019,20 @@ def run_focused_exact_cell(
                     environment_overrides={
                         MODEL_RAMDISK_ENV: str(staged_directory),
                         ARTIFACT_ROOT_ENV: str(artifact_root),
+                        **history_environment,
                     },
                     artifact_results_root=artifact_root,
                 )
+                if history is not None:
+                    try:
+                        history.verify_unchanged()
+                        history.require_binding(result.artifact_directories)
+                    except (OSError, ValueError, json.JSONDecodeError) as error:
+                        result = replace(result,
+                            return_code=result.return_code or 126,
+                            outcome="artifact_contract_failed",
+                            artifact_contract_passed=False,
+                            artifact_errors=result.artifact_errors + (f"Frozen history binding failed: {error}",))
                 exit_code = result.return_code
         except TimeoutError as error:
             model_staging_return_code = 124

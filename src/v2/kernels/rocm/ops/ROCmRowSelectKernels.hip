@@ -287,7 +287,7 @@ namespace llaminar2::rocm
             int request_index,
             int seq_capacity,
             int d_model,
-            int selected_row_count)
+            int selected_row_count, MTPShiftedCacheOrigin origin)
         {
             __shared__ int source_row_start;
             __shared__ int progress_valid;
@@ -299,7 +299,7 @@ namespace llaminar2::rocm
                 const int main_count = *main_cached_tokens;
                 const int shifted_count = *shifted_cached_tokens;
                 const int segment_base = main_count - request_length;
-                const int segment_row = shifted_count - segment_base;
+                const int segment_row = mtpShiftedInputHiddenRow(main_count,shifted_count,request_length,origin);
                 const int request_base = request_index * request_row_stride;
 
                 progress_valid =
@@ -357,16 +357,15 @@ namespace llaminar2::rocm
             int request_count,
             int captured_row_stride,
             int seq_capacity,
-            int d_model)
+            int d_model,
+            MTPShiftedCacheOrigin origin)
         {
             const int request_length = request_sequence_lengths[request_index];
             const int live_row_stride = *request_row_stride_device;
             const int main_count = *main_cached_tokens;
             const int shifted_count = *shifted_cached_tokens;
             const int segment_base = main_count - request_length;
-            const bool initial_segment = shifted_count == segment_base;
-            const bool continuation_bridge =
-                shifted_count >= 0 && shifted_count + 1 == segment_base;
+            const auto plan = mtpShiftedPrefillPlan(main_count,shifted_count,request_length,origin);
             const bool valid =
                 request_count > 0 && request_index >= 0 &&
                 request_index < request_count && captured_row_stride > 0 &&
@@ -376,14 +375,12 @@ namespace llaminar2::rocm
                 request_length > 0 &&
                 request_length <= live_row_stride &&
                 request_length <= captured_row_stride && segment_base >= 0 &&
-                (initial_segment || continuation_bridge) &&
+                plan.valid &&
                 request_count <= seq_capacity / captured_row_stride;
             if (!valid)
                 __builtin_trap();
 
-            const int append_length = continuation_bridge
-                                          ? request_length
-                                          : request_length - 1;
+            const int append_length = plan.append_rows;
             if (blockIdx.x == 0 && threadIdx.x == 0)
                 append_lengths_out[request_index] = append_length;
 
@@ -419,29 +416,22 @@ namespace llaminar2::rocm
                 int source_token_row = input_request_base;
                 if (real_row)
                 {
-                    if (continuation_bridge && output_row_in_request == 0)
-                    {
-                        source_hidden = terminal_hidden_archive +
-                            static_cast<size_t>(request_index) * d_model;
-                    }
-                    else
-                    {
-                        const int source_hidden_row =
-                            hidden_request_base + output_row_in_request -
-                            (continuation_bridge ? 1 : 0);
-                        source_hidden = input_hidden +
-                            static_cast<size_t>(source_hidden_row) * d_model;
-                    }
-                    source_token_row =
-                        input_request_base + output_row_in_request +
-                        (initial_segment ? 1 : 0);
+                    const int source_row=plan.hiddenRow(output_row_in_request);
+                    if(source_row==-1)
+                        source_hidden=terminal_hidden_archive+static_cast<size_t>(request_index)*d_model;
+                    else if(source_row>=0)
+                        source_hidden=input_hidden+static_cast<size_t>(hidden_request_base+source_row)*d_model;
+                    // source_row==-2 is the mandatory zero4H bootstrap. It is
+                    // authored directly into the admitted packed row, never a
+                    // separately allocated tensor or a host-uploaded mirror.
+                    source_token_row=input_request_base+output_row_in_request+plan.token_offset;
                 }
 
                 float *destination_hidden = packed_hidden_out +
                     static_cast<size_t>(output_row) * d_model;
                 if constexpr (RowsAreFloat4Aligned)
                 {
-                    const float4 hidden_value = real_row
+                    const float4 hidden_value = real_row && source_hidden
                         ? *reinterpret_cast<const float4 *>(
                               source_hidden + column)
                         : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -456,7 +446,7 @@ namespace llaminar2::rocm
                         const int scalar_column = column + lane;
                         if (scalar_column < d_model)
                         {
-                            destination_hidden[scalar_column] = real_row
+                            destination_hidden[scalar_column] = real_row && source_hidden
                                 ? source_hidden[scalar_column]
                                 : 0.0f;
                         }
@@ -932,9 +922,9 @@ namespace llaminar2::rocm
         int seq_capacity,
         int d_model,
         int selected_row_count,
-        void *stream)
+        void *stream, MTPShiftedCacheOrigin origin)
     {
-        if (!input || !output || !main_cached_tokens ||
+        if (!validMTPShiftedCacheOrigin(origin) || !input || !output || !main_cached_tokens ||
             !shifted_cached_tokens || !request_sequence_lengths ||
             !request_row_stride || !stream || request_index < 0 ||
             seq_capacity <= 0 || d_model <= 0 || selected_row_count <= 0 ||
@@ -974,7 +964,7 @@ namespace llaminar2::rocm
             request_index,
             seq_capacity,
             d_model,
-            selected_row_count);
+            selected_row_count,origin);
         const hipError_t launch_status = hipGetLastError();
         if (launch_status != hipSuccess)
         {
@@ -1006,9 +996,10 @@ namespace llaminar2::rocm
         int captured_row_stride,
         int seq_capacity,
         int d_model,
-        void *stream)
+        void *stream,
+        MTPShiftedCacheOrigin origin)
     {
-        if (!input_hidden || !terminal_hidden_archive || !packed_hidden_out ||
+        if (!validMTPShiftedCacheOrigin(origin) || !input_hidden || !terminal_hidden_archive || !packed_hidden_out ||
             !input_token_ids || !input_position_ids || !shifted_token_ids_out ||
             !shifted_position_ids_out || !append_lengths_out ||
             !main_cached_tokens || !shifted_cached_tokens ||
@@ -1075,7 +1066,7 @@ namespace llaminar2::rocm
                 request_count,
                 captured_row_stride,
                 seq_capacity,
-                d_model);
+                d_model, origin);
         };
         if (rows_are_float4_aligned)
             launch.template operator()<true>();

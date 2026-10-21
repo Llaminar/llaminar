@@ -1,6 +1,10 @@
 /**
  * @file TensorParallelConfig.cpp
- * @brief Implementation of tensor parallelism configuration
+ * @brief Exact proportional query, KV, FFN and vocabulary ownership.
+ *
+ * Replicated KV retains the full original bank and global GQA mapping; local
+ * query intervals stay integral without an artificial KV-count alignment.
+ * Model-specific GDN key-head boundary validation remains a separate guard.
  */
 
 #include "TensorParallelConfig.h"
@@ -375,10 +379,11 @@ namespace llaminar2
             kv_head_counts = distributeProportionally(n_kv_heads, normalized, 1);
         }
 
-        // When KV is replicated, Q heads must be distributed in multiples of
-        // n_kv_heads so the GQA ratio (n_heads/n_kv_heads) stays integral per device.
-        const int head_alignment = (kv_replicated && n_kv_heads > 1) ? n_kv_heads : 1;
-        std::vector<int> head_counts = distributeProportionally(n_heads, normalized, head_alignment);
+        // Replicated KV retains the original global GQA ratio and query-head
+        // offset. Local Q widths therefore need no KV-count alignment: imposing
+        // it turns QFN TP8's exact three-head intervals into nonintegral GDN
+        // partitions. GDN admission still independently rejects cut key heads.
+        std::vector<int> head_counts = distributeProportionally(n_heads, normalized, 1);
         std::vector<int> d_ff_counts = distributeProportionally(d_ff, normalized, 32); // 32-aligned
         std::vector<int> vocab_counts = distributeProportionally(vocab_size, normalized, 1);
 

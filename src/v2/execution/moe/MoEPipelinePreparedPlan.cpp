@@ -37,7 +37,7 @@ namespace llaminar2
                 metadata.num_experts != stage.capacity()->num_experts ||
                 stage.capacity()->physical_memory_admission != result->admission_->physicalAdmission())
                 throw std::invalid_argument("Prepared MoE pipeline metadata differs from its admitted source interval");
-            if (buildMoEOverlayLayerWeightManifestFromGGUF(model->concreteLoader().getModel(), metadata.num_layers,
+            if (buildMoEOverlayLayerWeightManifestFromLoader(model->concreteLoader(), metadata.num_layers,
                     metadata.num_experts, metadata.first_model_layer) != stage.weightManifest())
                 throw std::invalid_argument("Prepared MoE pipeline source projection geometry or format changed after admission");
             InferenceRunnerConfig config;

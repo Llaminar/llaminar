@@ -406,12 +406,23 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
         kernels/cuda/ops/CUDATPKVStateKernels.cu       # TP-local K/V state deinterleave for phase-split decode caches
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
+        kernels/cuda/attention/CUDAQwenSparseAttention.cu # Flash Next selected-index attention
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
         kernels/cuda/kvcache/CUDAAttentionKeyQ8Kernels.cu # Quadratic-companded attention-key cache codec
         kernels/cuda/kvcache/CUDATurboQuantKernels.cu  # TurboQuant quantize/dequant/RoPE GPU kernels
         kernels/cuda/kvcache/CUDARingKVCacheTQ.cu     # TurboQuant KV cache (TQ8-K/TQ4-V split)
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        kernels/cuda/gemm/CUDAQ8ResidualCorrection.cu # Explicit two-term native Q8 activation projection
+        kernels/cuda/qwen4exp/CUDAQwen4ExpKernels.cu # Flash Next residual and PLE primitives
+        kernels/cuda/qwen4exp/CUDADiagnosticSnapshotCopy.cu
+        kernels/cuda/qwen4exp/CUDAImmutableLookupKernels.cu
+        kernels/cuda/qwen4exp/CUDAImmutableAdaptiveLookupKernels.cu
+        kernels/cuda/qwen4exp/CUDAImmutableFixedHeadLookupKernels.cu
+        kernels/cuda/attention/CUDAQwenSparseReplay.cu
+        kernels/cuda/attention/CUDAQwen4ExpStateIO.cu
+        kernels/cuda/attention/CUDAQwen4ExpPLERetained.cu
+        kernels/cuda/attention/CUDAQwen4ExpBranchConcat.cu
         # MoE (Mixture of Experts) kernels
         kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
         kernels/cuda/moe/CUDARouterQ8Prefill.cu       # Exact block32 INT8 tensor-core router prefill
@@ -675,6 +686,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/moe/ROCmMoEGroupedIntermediateExchange.hip # lossless SwiGLU/scales exchange boundary
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
+        kernels/rocm/attention/ROCmQwenSparseAttention.hip # Flash Next selected-index attention
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
         kernels/rocm/kvcache/ROCmAttentionKeyQ8Kernels.hip    # Quadratic-companded attention-key cache codec
         kernels/rocm/kvcache/ROCmTurboQuantKernels.hip        # TurboQuant quantize/dequant/RoPE GPU kernels
@@ -692,6 +704,16 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmTPKVStateKernels.hip             # TP-local K/V state deinterleave for phase-split decode caches
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip        # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        kernels/rocm/gemm/ROCmQ8ResidualCorrection.hip # Explicit two-term native Q8 activation projection
+        kernels/rocm/qwen4exp/ROCmQwen4ExpKernels.hip # Flash Next residual and PLE primitives
+        kernels/rocm/qwen4exp/ROCmDiagnosticSnapshotCopy.hip
+        kernels/rocm/qwen4exp/ROCmImmutableLookupKernels.hip
+        kernels/rocm/qwen4exp/ROCmImmutableAdaptiveLookupKernels.hip
+        kernels/rocm/qwen4exp/ROCmImmutableFixedHeadLookupKernels.hip
+        kernels/rocm/attention/ROCmQwenSparseReplay.hip
+        kernels/rocm/attention/ROCmQwen4ExpStateIO.hip
+        kernels/rocm/attention/ROCmQwen4ExpPLERetained.hip
+        kernels/rocm/attention/ROCmQwen4ExpBranchConcat.hip
         kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
@@ -1670,6 +1692,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/model/LayerExecutor.cpp
     execution/local_execution/model/ModelExecutor.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorPLE.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorMovement.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPPublication.cpp
@@ -1692,6 +1715,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/device/WorkspaceAllocator.cpp
     # Unified transfer engine (explicit coherence state machine + centralized data movement)
     transfer/TransferEngine.cpp
+    transfer/ImmutableNativeDeviceStorage.cpp
     transfer/CapturedTransferChannel.cpp
     transfer/MappedTransferProgressEpoch.cpp
     # Tensor parallelism configuration (proportional sharding for heterogeneous TP)
@@ -1748,6 +1772,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/WorkspaceMemoryEstimator.cpp
     planning/PhysicalMemoryAuthority.cpp
     planning/MemoryPlanner.cpp
+    planning/ImmutableRowTablePlacementPlanner.cpp
+    planning/ImmutableRowTableAdmissionWire.cpp
     planning/PipelineTransferMemory.cpp
     planning/RankMemoryPlanInputs.cpp
     planning/MoEOverlayPlanningInputs.cpp
@@ -1817,6 +1843,15 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     app/modes/HttpPrefixCacheStats.cpp
     app/modes/CompletionMode.cpp
     loaders/ModelLoader.cpp
+    loaders/ImmutableRowTable.cpp
+    loaders/CpuAdaptiveImmutableRowCache.cpp
+    loaders/HostImmutableRowProvider.cpp
+    loaders/AdaptiveImmutableLookupRootStorage.cpp
+    loaders/ImmutableRowTablePolicy.cpp
+    loaders/ImmutableRowTableExtent.cpp
+    loaders/ImmutableRowTableLayoutGeometry.cpp
+    loaders/ResolvedImmutableRowTablePlacement.cpp
+    loaders/ResidentImmutableRowTable.cpp
     loaders/ModelContext.cpp
     models/ModelGenerationPolicy.cpp
     loaders/ModelContextConfig.cpp
@@ -1846,6 +1881,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Qwen2 model and graph configuration
     models/ModelRegistrations.cpp
     models/qwen/QwenGraphBase.cpp
+    models/qwen/QwenGraphBaseResidual.cpp
     models/qwen/QwenStandardGraph.cpp
     models/qwen/QwenStandardGraphConfigBuilder.cpp
     models/qwen/Qwen2BufferSpec.cpp
@@ -1855,8 +1891,52 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Qwen3.5 MoE (hybrid GDN + Full Attention + Mixture of Experts)
     models/qwen35moe/Qwen35MoEGraph.cpp
     models/qwen35moe/Qwen35MoEGraphConfigBuilder.cpp
+    # Qwen3.8 Flash Next: authenticated geometry and native residual/PLE primitives.
+    models/qwen4exp/Qwen4ExpConfig.cpp
+    models/qwen4exp/Qwen4ExpSidecarManifest.cpp
+    models/qwen4exp/Qwen4ExpGraph.cpp
+    models/qwen4exp/Qwen4ExpFixedHeadShards.cpp
+    models/qwen4exp/Qwen4ExpReplicatedPLECohort.cpp
+    models/qwen4exp/Qwen4ExpReplicatedPLEPrefixOrigin.cpp
+    models/qwen4exp/Qwen4ExpPredictorGraph.cpp
+    models/qwen4exp/Qwen4ExpGraphConfigBuilder.cpp
+    models/qwen4exp/Qwen4ExpBufferLayout.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPrimitiveStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpFixedHeadLookupStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPLERetainedStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpBranchConcatStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorResidualBinding.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorProjectionLayout.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorGlobalBindings.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorBuilder.cpp
+    execution/compute_stages/stages/qwen4exp/QwenSparseAttentionStage.cpp
+    execution/compute_stages/stages/qwen4exp/ImmutableLookupStage.cpp
+    execution/compute_stages/stages/qwen4exp/Qwen4ExpSparseAttentionBuilder.cpp
+    execution/qwen4exp/ImmutableLookupProtocol.cpp
+    execution/qwen4exp/ImmutableLookupService.cpp
+    execution/qwen4exp/ImmutableLookupExecutionBoundary.cpp
+    execution/qwen4exp/Qwen4ExpAuxiliaryState.cpp
+    execution/qwen4exp/ImmutableVerifierPrior.cpp
+    execution/prefix_cache/PrefixAuxiliaryStateIO.cpp
+    kernels/qwen4exp/QwenSparseReplay.cpp
+    kernels/qwen4exp/Qwen4ExpStateIO.cpp
+    kernels/qwen4exp/Qwen4ExpPLERetained.cpp
+    kernels/qwen4exp/Qwen4ExpBranchConcat.cpp
+    kernels/qwen4exp/Qwen4ExpPLERetainedDispatch.cpp
+    kernels/qwen4exp/Qwen4ExpKernels.cpp
+    kernels/common/DiagnosticSnapshotCopy.cpp
+    kernels/cpu/qwen4exp/CPUQwen4ExpKernels.cpp
+    kernels/cpu/qwen4exp/CPUImmutableLookupKernels.cpp
+    kernels/qwen4exp/ImmutableFixedHeadLookupKernels.cpp
+    kernels/qwen4exp/AdaptiveImmutableRowCacheGeometry.cpp
+    kernels/qwen4exp/ImmutableAdaptiveLookupKernels.cpp
+    kernels/qwen4exp/QwenSparseAttention.cpp
+    kernels/cpu/attention/CPUQwenSparseAttention.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
+    tensors/FP32ArenaReshape.cpp
     tensors/FP16Tensor.cpp
     tensors/BF16Tensor.cpp
     tensors/INT32Tensor.cpp

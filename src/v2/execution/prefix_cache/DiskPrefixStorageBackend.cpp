@@ -30,6 +30,9 @@
  * Unchanged payload identity, layout and flags reuse durable bytes with a small touch.
  * Lookup can reconcile a batch of participant hints against one committed
  * metadata snapshot without opening payloads or changing archive recency.
+ * Each cached index retains its metadata inode until refresh replaces that
+ * generation. Native read errors preserve the journal and fail the operation;
+ * they do not authorize the incomplete-append recovery truncation.
  */
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
@@ -66,8 +69,8 @@ namespace llaminar2
         constexpr std::array<char, 8> kArchiveMagic = {'L', 'L', 'K', 'V', 'C', '0', '0', '1'};
         constexpr std::array<char, 8> kRecordMagic = {'L', 'L', 'K', 'V', 'R', '0', '0', '1'};
         constexpr std::array<char, 8> kCommitMagic = {'L', 'L', 'K', 'V', 'D', 'O', 'N', 'E'};
-        constexpr uint32_t kArchiveVersion = 3;
-        constexpr uint32_t kRecordVersion = 3;
+        constexpr uint32_t kArchiveVersion = 5;
+        constexpr uint32_t kRecordVersion = 5;
         constexpr uint32_t kPutRecord = 1;
         constexpr uint32_t kDeleteRecord = 2;
         constexpr uint32_t kTouchRecord = 3;
@@ -77,12 +80,13 @@ namespace llaminar2
         constexpr uint64_t kMaximumMetadataBytes = 1024ull * 1024ull;
         constexpr uint64_t kMaximumRecordBytes =
             kRecordPreambleBytes + kMaximumMetadataBytes + kRecordFooterBytes;
-        constexpr std::array<const char *, 6> kSectionNames = {
+        constexpr std::array<const char *, 7> kSectionNames = {
             "kv",
             "hybrid",
             "mtp",
             "terminal_hidden",
             "terminal_logits",
+            "model_auxiliary",
             "model_runtime_state",
         };
 
@@ -118,7 +122,7 @@ namespace llaminar2
             }
             /** @return Borrowed descriptor; ownership stays with this handle. */
             int get() const { return value_; }
-            /** @return Transfer inode ownership to a selected hydration ticket. */
+            /** @return Transfer the descriptor to an index lease or hydration ticket. */
             int release() noexcept { return std::exchange(value_, -1); }
             /** @return Whether a native descriptor was successfully acquired. */
             explicit operator bool() const { return value_ >= 0; }
@@ -311,6 +315,26 @@ namespace llaminar2
             }
         }
 
+        /** @brief Serialize exact auxiliary shape without touching its payload. */
+        json auxiliaryLayoutToJson(const PrefixAuxiliaryPayloadLayout &layout)
+        {
+            return {{"kind", layout.kind ? static_cast<uint32_t>(*layout.kind) : 0u},
+                {"bytes_per_attention_layer", layout.bytes_per_attention_layer},
+                {"endpoint_bytes", layout.endpoint_bytes}, {"includes_endpoint", layout.includes_endpoint}};
+        }
+        /** @brief Decode an explicit versioned auxiliary descriptor; missing fields are invalid. */
+        PrefixAuxiliaryPayloadLayout auxiliaryLayoutFromJson(const json &value)
+        {
+            PrefixAuxiliaryPayloadLayout layout;
+            const auto kind = value.at("kind").get<uint32_t>();
+            if (kind != 0u) layout.kind = static_cast<CacheAuxiliaryStateKind>(kind);
+            layout.bytes_per_attention_layer = value.at("bytes_per_attention_layer").get<size_t>();
+            layout.endpoint_bytes = value.at("endpoint_bytes").get<size_t>();
+            layout.includes_endpoint = value.at("includes_endpoint").get<bool>();
+            (void)layout.blockBytes(1);
+            return layout;
+        }
+
         json layoutToJson(const PrefixPayloadLayout &layout)
         {
             return {
@@ -332,6 +356,7 @@ namespace llaminar2
                 {"hybrid_host_state_bytes", layout.hybrid_host_state_bytes},
                 {"hybrid_device_state_bytes", layout.hybrid_device_state_bytes},
                 {"hybrid_state_bytes", layout.hybrid_state_bytes},
+                {"mtp_origin", static_cast<uint8_t>(layout.mtp_origin)},
                 {"mtp_layers", layout.mtp_layers},
                 {"mtp_local_kv_heads", layout.mtp_local_kv_heads},
                 {"mtp_kv_head_start", layout.mtp_kv_head_start},
@@ -344,6 +369,8 @@ namespace llaminar2
                 {"mtp_kv_bytes", layout.mtp_kv_bytes},
                 {"terminal_hidden_bytes", layout.terminal_hidden_bytes},
                 {"terminal_logits_bytes", layout.terminal_logits_bytes},
+                {"main_auxiliary", auxiliaryLayoutToJson(layout.main_auxiliary)},
+                {"mtp_auxiliary", auxiliaryLayoutToJson(layout.mtp_auxiliary)},
                 {"includes_hybrid_state", layout.includes_hybrid_state},
                 {"includes_mtp_state", layout.includes_mtp_state},
                 {"includes_terminal_hidden", layout.includes_terminal_hidden},
@@ -384,6 +411,8 @@ namespace llaminar2
                     value.at("hybrid_device_state_bytes").get<size_t>();
                 layout->hybrid_state_bytes =
                     value.at("hybrid_state_bytes").get<size_t>();
+                layout->mtp_origin=static_cast<MTPShiftedCacheOrigin>(value.at("mtp_origin").get<uint8_t>());
+                if(!validMTPShiftedCacheOrigin(layout->mtp_origin))throw std::invalid_argument("Unknown archived predictor cache origin");
                 layout->mtp_layers = value.at("mtp_layers").get<int>();
                 layout->mtp_local_kv_heads =
                     value.at("mtp_local_kv_heads").get<int>();
@@ -405,6 +434,8 @@ namespace llaminar2
                     value.at("terminal_hidden_bytes").get<size_t>();
                 layout->terminal_logits_bytes =
                     value.at("terminal_logits_bytes").get<size_t>();
+                layout->main_auxiliary = auxiliaryLayoutFromJson(value.at("main_auxiliary"));
+                layout->mtp_auxiliary = auxiliaryLayoutFromJson(value.at("mtp_auxiliary"));
                 layout->includes_hybrid_state =
                     value.at("includes_hybrid_state").get<bool>();
                 layout->includes_mtp_state =
@@ -417,13 +448,13 @@ namespace llaminar2
                        layout->block_size > 0 &&
                        layout->totalBytes() > 0;
             }
-            catch (const json::exception &)
+            catch (const std::exception &)
             {
                 return false;
             }
         }
 
-        std::array<std::pair<const void *, size_t>, 6> payloadSections(
+        std::array<std::pair<const void *, size_t>, 7> payloadSections(
             const PrefixBlockHandle &handle)
         {
             const auto runtime_bytes =
@@ -436,6 +467,7 @@ namespace llaminar2
                 {handle.mtp_payload, handle.layout.mtpKVBytes()},
                 {handle.terminal_hidden, handle.terminalHiddenBytes()},
                 {handle.terminal_logits, handle.terminalLogitsBytes()},
+                {handle.model_auxiliary_payload, handle.layout.modelAuxiliaryBytes()},
                 {runtime_bytes > 0 ? handle.model_runtime_state_storage->data() : nullptr,
                  runtime_bytes},
             }};
@@ -446,6 +478,7 @@ namespace llaminar2
             const PrefixPayloadLayout &rhs)
         {
             return lhs.compatiblePayloadShape(rhs) &&
+                   lhs.main_auxiliary == rhs.main_auxiliary && lhs.mtp_auxiliary == rhs.mtp_auxiliary &&
                    lhs.includes_hybrid_state == rhs.includes_hybrid_state &&
                    lhs.includes_terminal_hidden == rhs.includes_terminal_hidden &&
                    lhs.includes_terminal_logits == rhs.includes_terminal_logits &&
@@ -535,7 +568,13 @@ namespace llaminar2
         };
     } // namespace
 
-    /** @brief Immutable native file lifetime shared by one lookup inode cohort. */
+    /**
+     * @brief Immutable native inode lifetime for an index or selected payload.
+     *
+     * A metadata index pins the inode addressed by its cached offsets; a
+     * hydration cohort pins the exact payload selected before a peer retires it.
+     * Each instance owns one descriptor, independent of the number of borrowers.
+     */
     class PrefixArchiveReadInode final
     {
     public:
@@ -589,7 +628,7 @@ namespace llaminar2
         std::shared_ptr<DiskPrefixStorageBackend> backend,
         PrefixBlockHandle handle,
         std::shared_ptr<PrefixArchiveReadInode> inode,
-        std::array<SectionSnapshot, 6> sections)
+        std::array<SectionSnapshot, 7> sections)
         : backend_(std::move(backend)),
           handle_(std::move(handle)),
           inode_(std::move(inode)),
@@ -1095,10 +1134,25 @@ namespace llaminar2
             return false;
         }
 
-        const bool archive_replaced =
-            archive_inode_ != 0 &&
-            (archive_device_ != static_cast<uint64_t>(state.st_dev) ||
-             archive_inode_ != static_cast<uint64_t>(state.st_ino));
+        const bool archive_replaced = archive_index_inode_ &&
+            (archive_index_inode_->device != static_cast<uint64_t>(state.st_dev) ||
+             archive_index_inode_->inode != static_cast<uint64_t>(state.st_ino));
+        auto index_inode = archive_index_inode_;
+        if (!index_inode || archive_replaced)
+        {
+            // Hold the actual generation while its index/offsets are cached.
+            // Closing every foreground fd allowed a peer's later replacement
+            // to recycle this inode number and masquerade as the old journal.
+            FileDescriptor retained(::fcntl(archive_fd, F_DUPFD_CLOEXEC, 0));
+            if (!retained)
+            {
+                if (error) *error = errnoMessage("failed to retain indexed prefix journal inode");
+                return false;
+            }
+            index_inode = std::make_shared<PrefixArchiveReadInode>(retained.get(),
+                static_cast<uint64_t>(state.st_dev), static_cast<uint64_t>(state.st_ino));
+            (void)retained.release(); // Transfer only after allocation succeeds.
+        }
         if (archive_replaced || scan_offset_ < kArchiveHeaderBytes || scan_offset_ > bytes)
         {
             records_.clear();
@@ -1107,8 +1161,7 @@ namespace llaminar2
             next_sequence_ = 1;
             scan_offset_ = kArchiveHeaderBytes;
         }
-        archive_device_ = static_cast<uint64_t>(state.st_dev);
-        archive_inode_ = static_cast<uint64_t>(state.st_ino);
+        archive_index_inode_ = std::move(index_inode);
 
         uint64_t valid_end = scan_offset_;
         if (!scanRecordsLocked(
@@ -1149,7 +1202,10 @@ namespace llaminar2
         {
             std::array<uint8_t, kRecordPreambleBytes> preamble{};
             if (!preadAll(archive_fd, preamble.data(), preamble.size(), cursor))
-                break;
+            {
+                if (error) *error = "failed or short native read of stat-bounded prefix record preamble at " + std::to_string(cursor);
+                return false;
+            }
             if (!std::equal(kRecordMagic.begin(), kRecordMagic.end(), preamble.begin()))
                 break;
 
@@ -1181,11 +1237,13 @@ namespace llaminar2
                     archive_fd,
                     metadata.data(),
                     metadata.size(),
-                    cursor + kRecordPreambleBytes) ||
-                metadataChecksum(metadata) != metadata_checksum)
+                    cursor + kRecordPreambleBytes))
             {
-                break;
+                if (error) *error = "failed or short native read of stat-bounded prefix record metadata at " + std::to_string(cursor + kRecordPreambleBytes);
+                return false;
             }
+            if (metadataChecksum(metadata) != metadata_checksum)
+                break;
 
             json parsed = json::parse(metadata, nullptr, false);
             if (parsed.is_discarded())
@@ -1196,8 +1254,12 @@ namespace llaminar2
 
             std::array<uint8_t, kRecordFooterBytes> footer{};
             const uint64_t footer_offset = cursor + record_bytes - kRecordFooterBytes;
-            if (!preadAll(archive_fd, footer.data(), footer.size(), footer_offset) ||
-                !std::equal(kCommitMagic.begin(), kCommitMagic.end(), footer.begin()) ||
+            if (!preadAll(archive_fd, footer.data(), footer.size(), footer_offset))
+            {
+                if (error) *error = "failed or short native read of stat-bounded prefix record footer at " + std::to_string(footer_offset);
+                return false;
+            }
+            if (!std::equal(kCommitMagic.begin(), kCommitMagic.end(), footer.begin()) ||
                 loadU64(footer.data() + 8) != recordCommitChecksum(
                     type,
                     sequence,
@@ -1295,11 +1357,11 @@ namespace llaminar2
                 try
                 {
                     const auto expected = PrefixPayloadAllocationPlan::archive(
-                        layout, record.sections[5].bytes);
+                        layout, record.sections[6].bytes);
                     for (size_t index = 0; index < kSectionCount; ++index)
                         if (record.sections[index].bytes != expected.sections()[index])
                             sections_valid = false;
-                    if (record.handle.has_model_runtime_state != (record.sections[5].bytes != 0u))
+                    if (record.handle.has_model_runtime_state != (record.sections[6].bytes != 0u))
                         sections_valid = false;
                 }
                 catch (const std::exception &)
@@ -1727,11 +1789,13 @@ namespace llaminar2
         record.handle.mtp_payload = nullptr;
         record.handle.terminal_hidden = nullptr;
         record.handle.terminal_logits = nullptr;
+        record.handle.model_auxiliary_payload = nullptr;
         record.handle.kv_storage.reset();
         record.handle.hybrid_storage.reset();
         record.handle.mtp_storage.reset();
         record.handle.terminal_hidden_storage.reset();
         record.handle.terminal_logits_storage.reset();
+        record.handle.model_auxiliary_storage.reset();
         record.handle.model_runtime_state_storage.reset();
         record.handle.ram_section_memory_leases = {};
         record.handle.ram_runtime_state_memory_lease.reset();
@@ -1741,6 +1805,7 @@ namespace llaminar2
         record.handle.pinned_mtp_storage.reset();
         record.handle.pinned_terminal_hidden_storage.reset();
         record.handle.pinned_terminal_logits_storage.reset();
+        record.handle.pinned_model_auxiliary_storage.reset();
         record.handle.device_kv_storage.reset();
         record.handle.device_hybrid_storage.reset();
         record.handle.device_mtp_storage.reset();
@@ -1751,6 +1816,7 @@ namespace llaminar2
         record.handle.device_mtp_allocation.reset();
         record.handle.device_terminal_hidden_allocation.reset();
         record.handle.device_terminal_logits_allocation.reset();
+        record.handle.device_model_auxiliary_allocation.reset();
         record.record_offset = static_cast<uint64_t>(record_offset);
         record.record_bytes = record_bytes;
         record.sequence = sequence;
@@ -1921,7 +1987,7 @@ namespace llaminar2
         const auto bytes = static_cast<uint64_t>(state.st_size);
         for (size_t index = 0; index < ticket.sections_.size(); ++index)
         {
-            if (read_set == PrefixPayloadReadSet::SequenceRows && index != 0u && index != 2u) continue;
+            if (read_set == PrefixPayloadReadSet::SequenceRows && index != 0u && index != 2u && index != 5u) continue;
             const auto &section = ticket.sections_[index];
             if (section.offset > bytes || section.bytes > bytes - section.offset)
             {
@@ -2012,7 +2078,7 @@ namespace llaminar2
         }
 
         const size_t runtime_bytes =
-            whole ? static_cast<size_t>(ticket.sections_[5].bytes) : 0u;
+            whole ? static_cast<size_t>(ticket.sections_[6].bytes) : 0u;
         if (runtime_bytes > 0)
         {
             auto runtime_state =
@@ -2039,12 +2105,13 @@ namespace llaminar2
             return false;
         }
 
-        const std::array<std::pair<void *, size_t>, 6> destinations = {{
+        const std::array<std::pair<void *, size_t>, 7> destinations = {{
             {out.kv_payload, out.kvBytes()},
             {out.hybrid_payload, out.hybridBytes()},
             {out.mtp_payload, out.layout.mtpKVBytes()},
             {out.terminal_hidden, out.terminalHiddenBytes()},
             {out.terminal_logits, out.terminalLogitsBytes()},
+            {out.model_auxiliary_payload, out.layout.modelAuxiliaryBytes()},
             {runtime_bytes > 0
                  ? out.model_runtime_state_storage->data()
                  : nullptr,
@@ -2052,11 +2119,13 @@ namespace llaminar2
         }};
         for (size_t index = 0; index < destinations.size(); ++index)
         {
-            if (!whole && index != 0u && index != 2u)
+            if (!whole && index != 0u && index != 2u && index != 5u)
                 continue;
             const auto &[destination, destination_bytes] = destinations[index];
             const auto &section = ticket.sections_[index];
-            if (section.bytes != destination_bytes ||
+            const bool projected_auxiliary = !whole && index == 5u;
+            const auto expected_stored = projected_auxiliary ? selected.layout.modelAuxiliaryBytes() : destination_bytes;
+            if (section.bytes != expected_stored || destination_bytes > section.bytes ||
                 (destination_bytes > 0 &&
                  (!destination ||
                   !preadAll(
@@ -2154,7 +2223,7 @@ namespace llaminar2
         }
 
         const size_t runtime_bytes =
-            static_cast<size_t>(record.sections[5].bytes);
+            static_cast<size_t>(record.sections[6].bytes);
         if (runtime_bytes > 0)
         {
             auto runtime_state =
@@ -2182,12 +2251,13 @@ namespace llaminar2
             return false;
         }
 
-        const std::array<std::pair<void *, size_t>, 6> destinations = {{
+        const std::array<std::pair<void *, size_t>, 7> destinations = {{
             {out.kv_payload, out.kvBytes()},
             {out.hybrid_payload, out.hybridBytes()},
             {out.mtp_payload, out.layout.mtpKVBytes()},
             {out.terminal_hidden, out.terminalHiddenBytes()},
             {out.terminal_logits, out.terminalLogitsBytes()},
+            {out.model_auxiliary_payload, out.layout.modelAuxiliaryBytes()},
             {runtime_bytes > 0 ? out.model_runtime_state_storage->data() : nullptr,
              runtime_bytes},
         }};
@@ -2442,8 +2512,8 @@ namespace llaminar2
                 snapshot.push_back(record);
             }
             copied_end = scan_offset_;
-            source_device = archive_device_;
-            source_inode = archive_inode_;
+            source_device = archive_index_inode_->device;
+            source_inode = archive_index_inode_->inode;
         }
 
         TemporaryArchive temporary(
@@ -2545,8 +2615,8 @@ namespace llaminar2
             if (!archive_lock.locked() || !current ||
                 !refreshIndexLocked(current.get(), error))
                 return CompactionOutcome::Failed;
-            if (archive_device_ != source_device || archive_inode_ != source_inode ||
-                scan_offset_ < copied_end)
+            if (!archive_index_inode_ || archive_index_inode_->device != source_device ||
+                archive_index_inode_->inode != source_inode || scan_offset_ < copied_end)
             {
                 if (error) *error = "prefix compaction source changed outside its writer lease";
                 return CompactionOutcome::Failed;

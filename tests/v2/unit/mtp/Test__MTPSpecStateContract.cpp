@@ -13,6 +13,8 @@
 #include "execution/mtp/MTPSpecStatePublisher.h"
 #include "execution/mtp/MTPSpecTransactionDriver.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -92,6 +94,21 @@ namespace
             batch_row_index_strides.push_back(row_index_stride);
             batch_streams.push_back(stream);
             return restore_ok_;
+        }
+
+        bool planCPUVerifierStateRestoreRows(const int *rows,int requests,
+            std::vector<CPUVerifierStateRestorePlan> &plans) override
+        {
+            if(!rows || requests<=0 || !captures_)return false;
+            // This legacy fixture has no immutable-prior restoration at zero.
+            // Model that policy explicitly; native prior fixtures return Ready.
+            if(std::none_of(rows,rows+requests,[](int row){return row>=0;})) {
+                plans.push_back({.status=CPUVerifierStateRestorePlanStatus::NoOp});return true;
+            }
+            if(!restore_ok_)return false;
+            plans.push_back({.status=CPUVerifierStateRestorePlanStatus::Ready,
+                .kind=CPUVerifierStateRestorePlanKind::NativeAcceptedPrefixCommit});
+            return true;
         }
 
         bool restoreVerifierStateCaptureRows(
@@ -258,6 +275,108 @@ namespace
         std::vector<uint8_t> live_;
         CPUVerifierStateRestorePlanStatus plan_status_ =
             CPUVerifierStateRestorePlanStatus::Unsupported;
+    };
+
+    /** @brief Two-token retained-candidate splice, deliberately without per-row snapshots. */
+    class FakeNativeCPUPrefixStage final : public IComputeStage
+    {
+    public:
+        explicit FakeNativeCPUPrefixStage(int *external = nullptr, bool empty = false)
+            : IComputeStage(DeviceId::cpu()), destination_(external ? external : live_), empty_(empty)
+        {
+            write_ = {destination_, 2 * sizeof(int)};
+        }
+        bool execute(IDeviceContext *) override { return true; }
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        bool supportsBackend(ComputeBackendType backend) const override
+        { return backend == ComputeBackendType::CPU; }
+        bool hasVerifierStateCapture() const override { return true; }
+        bool requiresVerifierStateCaptureForPublication() const override { return true; }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+        CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override
+        {
+            ++planned;
+            if (row < 0 || row >= 3) return {.status=CPUVerifierStateRestorePlanStatus::Invalid};
+            return {.status=CPUVerifierStateRestorePlanStatus::Ready,
+                .kind=CPUVerifierStateRestorePlanKind::NativeAcceptedPrefixCommit,
+                .native_destinations=empty_ ? std::span<const CPUVerifierStateRestoreDestination>{} :
+                    std::span<const CPUVerifierStateRestoreDestination>{&write_,1}};
+        }
+        bool restoreVerifierStateCaptureRow(int row, void *stream) override
+        {
+            if(stream || row<0 || row>=3) return false;
+            ++commits;
+            if(empty_)return true;
+            // Read both prior words before the first live write, matching native alias-safe publication.
+            const int prior[2]{destination_[0],destination_[1]};
+            const int candidates[3]{20,21,22};
+            const int accepted=row+1;
+            for(int index=0;index<2;++index) {
+                const int source=accepted-2+index;
+                destination_[index]=source<0 ? prior[source+2] : candidates[source];
+            }
+            return true;
+        }
+        void clearVerifierStateCaptureBindingAfterPublication() override { ++clears; }
+        int live_[2]{10,11};
+        int planned=0,commits=0,clears=0;
+    private:
+        int *destination_;
+        bool empty_;
+        CPUVerifierStateRestoreDestination write_;
+    };
+
+    /** @brief Three request-owned histories whose legacy commit deliberately exposes partial-mutation bugs. */
+    class FakeBatchedCPUPrefixStage final : public IComputeStage
+    {
+    public:
+        explicit FakeBatchedCPUPrefixStage(bool invalid=false,int *external=nullptr)
+            :IComputeStage(DeviceId::cpu()),invalid_(invalid),destination_(external?external:live.data()) {}
+        bool execute(IDeviceContext *)override{return true;}
+        ComputeStageType type()const override{return ComputeStageType::COPY;}
+        bool supportsBackend(ComputeBackendType b)const override{return b==ComputeBackendType::CPU;}
+        bool hasVerifierStateCapture()const override{return true;}
+        bool requiresVerifierStateCaptureForPublication()const override{return true;}
+        StageDumpInfo buildDumpInfoImpl()const override{return {};}
+        bool planCPUVerifierStateRestoreRows(const int *rows,int requests,
+            std::vector<CPUVerifierStateRestorePlan> &plans)override
+        {
+            ++planned;
+            if(invalid_ || !rows || requests!=3)return false;
+            int writes=0;
+            for(int request=0;request<requests;++request) {
+                if(rows[request]<0)continue;
+                const int count=rows[request]-request*4+1;
+                if(count<1 || count>3)return false;
+                destinations_[writes++]={destination_+request*2,2*sizeof(int)};
+            }
+            plans.push_back({.status=CPUVerifierStateRestorePlanStatus::Ready,
+                .kind=CPUVerifierStateRestorePlanKind::NativeAcceptedPrefixCommit,
+                .native_destinations={destinations_.data(),std::size_t(writes)}});
+            return true;
+        }
+        bool restoreVerifierStateCaptureRows(const int *rows,int requests,void *stream)override
+        {
+            ++commits;
+            if(invalid_ || !rows || requests!=3 || stream)return false;
+            for(int request=0;request<requests;++request) {
+                if(rows[request]<0)continue;
+                const int count=rows[request]-request*4+1;
+                if(count<1 || count>3)return false;
+                const int prior[2]{destination_[request*2],destination_[request*2+1]};
+                for(int d=0;d<2;++d) {
+                    const int candidate=count-2+d;
+                    destination_[request*2+d]=candidate<0?prior[candidate+2]:100*request+20+candidate;
+                }
+            }
+            return true;
+        }
+        void clearVerifierStateCaptureBindingAfterPublication()override{++clears;}
+        std::array<int,6> live{10,11,110,111,210,211};
+        int planned=0,commits=0,clears=0;
+    private:
+        bool invalid_;int *destination_;
+        std::array<CPUVerifierStateRestoreDestination,3> destinations_{};
     };
 
     MTPSpecDecodeMetadataShape shapeFor(int requests = 1, int draft_tokens = 3)
@@ -1151,14 +1270,14 @@ TEST(Test__MTPSpecStateContract, PublisherRestoresAcceptedRowOnCapturedStages)
     FakeVerifierStateStage captured0(/*captures=*/true);
     FakeVerifierStateStage skipped(/*captures=*/false);
     FakeVerifierStateStage captured1(/*captures=*/true);
-    int explicit_stream = 0;
+    void *const cpu_stream = nullptr;
 
     MTPSpecStatePublicationResult result =
         publishAcceptedMTPSpecState(
             publishPlan(/*accepted_count=*/2),
             {&captured0, &skipped, &captured1},
             DeviceId::cpu(),
-            &explicit_stream,
+            cpu_stream,
             /*require_captured_stage=*/true);
 
     ASSERT_TRUE(result.ok) << result.error;
@@ -1168,8 +1287,8 @@ TEST(Test__MTPSpecStateContract, PublisherRestoresAcceptedRowOnCapturedStages)
     EXPECT_THAT(captured0.restored_rows, ElementsAre(1));
     EXPECT_THAT(captured1.restored_rows, ElementsAre(1));
     EXPECT_TRUE(skipped.restored_rows.empty());
-    EXPECT_THAT(captured0.streams, ElementsAre(&explicit_stream));
-    EXPECT_THAT(captured1.streams, ElementsAre(&explicit_stream));
+    EXPECT_THAT(captured0.streams, ElementsAre(cpu_stream));
+    EXPECT_THAT(captured1.streams, ElementsAre(cpu_stream));
 }
 
 TEST(Test__MTPSpecStateContract, PublisherAllowsZeroAcceptedWithoutStageRestore)
@@ -1378,8 +1497,8 @@ TEST(Test__MTPSpecStateContract, PublisherFailsAtomicallyWhenStageRestoreFails)
             /*require_captured_stage=*/true);
 
     EXPECT_FALSE(result.ok);
-    EXPECT_THAT(result.error, HasSubstr("failed restoring verifier row 0"));
-    EXPECT_THAT(failed.restored_rows, ElementsAre(0));
+    EXPECT_THAT(result.error, HasSubstr("could not plan a native restore"));
+    EXPECT_TRUE(failed.restored_rows.empty());
 }
 
 TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRestoresCapturedStagesOnExplicitGpuStream)
@@ -1738,15 +1857,14 @@ TEST(Test__MTPSpecStateContract, PublisherReportsFirstFailedStageAndStops)
             /*require_captured_stage=*/true);
 
     EXPECT_FALSE(result.ok);
-    EXPECT_THAT(result.error, HasSubstr("failed restoring verifier row 2"));
+    EXPECT_THAT(result.error, HasSubstr("could not plan a native restore"));
     EXPECT_THAT(result.error, HasSubstr("index 1"));
-    EXPECT_THAT(captured0.restored_rows, ElementsAre(2));
-    EXPECT_THAT(failed1.restored_rows, ElementsAre(2));
+    EXPECT_TRUE(captured0.restored_rows.empty());
+    EXPECT_TRUE(failed1.restored_rows.empty());
     EXPECT_TRUE(skipped.restored_rows.empty());
     /*
-     * Publication is a fail-fast transaction.  Once a captured stage rejects
-     * the restore row, later stages must not observe a partial live-state
-     * mutation from an already-failed publication attempt.
+     * Every stage validates before the first publication write. A later
+     * invalid plan leaves earlier and later accepted owners unchanged.
      */
     EXPECT_TRUE(failed2.restored_rows.empty());
 }
@@ -1768,13 +1886,13 @@ TEST(Test__MTPSpecStateContract, GraphPublisherRestoresCapturedStagesInExecution
     graph.addDependency("skipped", "captured0");
     graph.addDependency("captured1", "skipped");
 
-    int explicit_stream = 0;
+    void *const cpu_stream = nullptr;
     MTPSpecStatePublicationResult result =
         publishAcceptedMTPSpecState(
             publishPlan(/*accepted_count=*/3),
             graph,
             DeviceId::cpu(),
-            &explicit_stream,
+            cpu_stream,
             /*require_captured_stage=*/true);
 
     ASSERT_TRUE(result.ok) << result.error;
@@ -1783,8 +1901,8 @@ TEST(Test__MTPSpecStateContract, GraphPublisherRestoresCapturedStagesInExecution
     EXPECT_THAT(captured0_ptr->restored_rows, ElementsAre(2));
     EXPECT_TRUE(skipped_ptr->restored_rows.empty());
     EXPECT_THAT(captured1_ptr->restored_rows, ElementsAre(2));
-    EXPECT_THAT(captured0_ptr->streams, ElementsAre(&explicit_stream));
-    EXPECT_THAT(captured1_ptr->streams, ElementsAre(&explicit_stream));
+    EXPECT_THAT(captured0_ptr->streams, ElementsAre(cpu_stream));
+    EXPECT_THAT(captured1_ptr->streams, ElementsAre(cpu_stream));
 }
 
 TEST(Test__MTPSpecStateContract, GraphPublisherRejectsMissingStage)
@@ -1803,4 +1921,100 @@ TEST(Test__MTPSpecStateContract, GraphPublisherRejectsMissingStage)
 
     EXPECT_FALSE(result.ok);
     EXPECT_THAT(result.error, HasSubstr("null stage at index"));
+}
+
+/** @brief Snapshot and candidate-prefix plans share one validation boundary without row replay. */
+TEST(Test__MTPSpecStateContract, CPUStatePublicationMixesSnapshotCopyAndNativeAcceptedPrefix)
+{
+    FakePlannedCPUVerifierStateStage snapshot(4096,19);
+    FakeNativeCPUPrefixStage prefix;
+    const int rows[1]{0};
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(
+        planBatch({participantPlan(0,1)}),rows,{&snapshot,&prefix},DeviceId::cpu(),nullptr,true);
+    ASSERT_TRUE(result.ok)<<result.error;
+    EXPECT_EQ(snapshot.live(),snapshot.expectedRow(0));
+    EXPECT_EQ(prefix.live_[0],11);EXPECT_EQ(prefix.live_[1],20);
+    EXPECT_EQ(prefix.planned,1);EXPECT_EQ(prefix.commits,1);EXPECT_EQ(prefix.clears,1);
+    EXPECT_EQ(result.restored_stage_count,2);
+}
+
+TEST(Test__MTPSpecStateContract, CPUStatePublicationRejectsLaterInvalidBeforeNativePrefixMutation)
+{
+    FakeNativeCPUPrefixStage prefix;
+    FakePlannedCPUVerifierStateStage invalid(64,3,CPUVerifierStateRestorePlanStatus::Invalid);
+    const int rows[1]{1};
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(
+        planBatch({participantPlan(0,2)}),rows,{&prefix,&invalid},DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);EXPECT_EQ(prefix.commits,0);EXPECT_EQ(prefix.clears,0);
+    EXPECT_EQ(prefix.live_[0],10);EXPECT_EQ(prefix.live_[1],11);
+}
+
+TEST(Test__MTPSpecStateContract, CPUStatePublicationRejectsOverlappingNativePrefixDestinations)
+{
+    int shared[2]{10,11};FakeNativeCPUPrefixStage first(shared),second(shared);
+    const int rows[1]{1};
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(
+        planBatch({participantPlan(0,2)}),rows,{&first,&second},DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);EXPECT_THAT(result.error,HasSubstr("overlapping native-prefix"));
+    EXPECT_EQ(first.commits,0);EXPECT_EQ(second.commits,0);
+    EXPECT_EQ(shared[0],10);EXPECT_EQ(shared[1],11);
+}
+
+TEST(Test__MTPSpecStateContract, CPUStatePublicationAcceptsEmptyNativeWriteSetAtPoolBoundary)
+{
+    FakeNativeCPUPrefixStage prefix(nullptr,true);const int rows[1]{1};
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(
+        planBatch({participantPlan(0,2)}),rows,{&prefix},DeviceId::cpu(),nullptr,true);
+    ASSERT_TRUE(result.ok)<<result.error;EXPECT_EQ(prefix.commits,1);EXPECT_EQ(prefix.clears,1);
+    EXPECT_EQ(prefix.live_[0],10);EXPECT_EQ(prefix.live_[1],11);
+}
+
+/** @test A malformed later request cannot expose a partially committed earlier request. */
+TEST(Test__MTPSpecStateContract, CPUBatchRejectsLaterRequestBeforeAnyStateMutation)
+{
+    FakeBatchedCPUPrefixStage stage;
+    const auto original=stage.live;const int rows[3]{0,4,11};
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(
+        planBatch({participantPlan(0,1),participantPlan(1,1),participantPlan(2,1)}),
+        rows,{&stage},DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);EXPECT_EQ(stage.live,original);
+    EXPECT_EQ(stage.commits,0);EXPECT_EQ(stage.clears,0);
+}
+/** @test A later stage failure preserves all histories and capture bindings in earlier stages. */
+TEST(Test__MTPSpecStateContract, CPUBatchRejectsLaterStageBeforeAnyStateMutation)
+{
+    FakeBatchedCPUPrefixStage first,later(true);const auto original=first.live;
+    const int rows[3]{0,5,8};
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(
+        planBatch({participantPlan(0,1),participantPlan(1,1),participantPlan(2,1)}),
+        rows,{&first,&later},DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);EXPECT_EQ(first.live,original);
+    EXPECT_EQ(first.commits,0);EXPECT_EQ(later.commits,0);
+    EXPECT_EQ(first.clears,0);EXPECT_EQ(later.clears,0);
+}
+/** @test Cross-stage physical aliasing is rejected before the first accepted byte changes. */
+TEST(Test__MTPSpecStateContract, CPUBatchRejectsOverlappingStageDestinationsBeforeMutation)
+{
+    FakeBatchedCPUPrefixStage first,second(false,first.live.data());const auto original=first.live;
+    const int rows[3]{0,-1,8};
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(
+        planBatch({participantPlan(0,1),participantPlan(1,0),participantPlan(2,1)}),
+        rows,{&first,&second},DeviceId::cpu(),nullptr,true);
+    EXPECT_FALSE(result.ok);EXPECT_EQ(first.live,original);
+    EXPECT_EQ(first.commits,0);EXPECT_EQ(second.commits,0);
+    EXPECT_EQ(first.clears,0);EXPECT_EQ(second.clears,0);
+}
+/** @test Valid request holes commit once per stage after complete planning, with untouched rejected history. */
+TEST(Test__MTPSpecStateContract, CPUBatchPublishesValidatedNativePrefixesAndPreservesRequestHoles)
+{
+    FakeBatchedCPUPrefixStage first,second;const int rows[3]{0,-1,9};
+    auto result=publishAcceptedMTPSpecStateFromVerifierRows(
+        planBatch({participantPlan(0,1),participantPlan(1,0),participantPlan(2,1)}),
+        rows,{&first,&second},DeviceId::cpu(),nullptr,true);
+    ASSERT_TRUE(result.ok)<<result.error;
+    const std::array<int,6> expected{11,20,110,111,220,221};
+    EXPECT_EQ(first.live,expected);EXPECT_EQ(second.live,expected);
+    EXPECT_EQ(first.planned,1);EXPECT_EQ(second.planned,1);
+    EXPECT_EQ(first.commits,1);EXPECT_EQ(second.commits,1);
+    EXPECT_EQ(first.clears,1);EXPECT_EQ(second.clears,1);
 }

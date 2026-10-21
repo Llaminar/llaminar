@@ -13,6 +13,8 @@
 #include "tensors/CoherenceState.h"
 #include "transfer/TransferEngine.h"
 #include "transfer/TransferMethod.h"
+#include "utils/KernelProfiler.h"
+#include "utils/PerfStatsCollector.h"
 
 // For execute tests
 #include "backends/DeviceId.h"
@@ -23,6 +25,9 @@
 #include "../../mocks/MockWorkerGPUContext.h"
 #include "../../utils/TestTensorFactory.h"
 
+#include <array>
+#include <optional>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -799,6 +804,12 @@ protected:
         };
     }
 
+    /** @brief Clear the borrowed resolver before the fixture releases its backend. */
+    void TearDown() override
+    {
+        s_mock_ = nullptr;
+    }
+
     // Static mock pointer for the resolver lambda
     static MockBackend *s_mock_;
     std::shared_ptr<MockBackend> mock_backend_;
@@ -806,6 +817,157 @@ protected:
 };
 
 MockBackend *Test__TransferEngine_Execute::s_mock_ = nullptr;
+
+namespace
+{
+    /** @brief Enable the existing transfer evidence authority for one device-free test. */
+    class ScopedExecuteTransferEvidence final
+    {
+    public:
+        /** @brief Save the process policy and select only physical transfer counters. */
+        ScopedExecuteTransferEvidence()
+        {
+            for (const char *key : {"LLAMINAR_PERF_STATS_SUMMARY", "LLAMINAR_PERF_STATS_FILTER"})
+            {
+                const char *previous = std::getenv(key);
+                previous_.emplace_back(key, previous ? std::optional<std::string>(previous) : std::nullopt);
+            }
+            setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+            setenv("LLAMINAR_PERF_STATS_FILTER", "transfer", 1);
+            PerfStatsCollector::reset();
+        }
+
+        /** @brief Restore the policy and clear observations on every assertion exit. */
+        ~ScopedExecuteTransferEvidence()
+        {
+            for (const auto &[key, previous] : previous_)
+                if (previous) setenv(key.c_str(), previous->c_str(), 1);
+                else unsetenv(key.c_str());
+            PerfStatsCollector::reset();
+        }
+
+        /** @return The actual existing profiler counter, never a requested extent. */
+        static double bytes(const char *name)
+        {
+            double result = 0;
+            for (const auto &record : PerfStatsCollector::snapshot({"transfer"}))
+                if (record.kind == PerfStatRecord::Kind::Counter && record.name == name)
+                    result += record.value;
+            return result;
+        }
+
+    private:
+        std::vector<std::pair<std::string, std::optional<std::string>>> previous_;
+    };
+
+    /** @brief Reject a selected physical leg before any backend copy is submitted. */
+    class ExecuteLegFailureBackend final : public MockBackend
+    {
+    public:
+        /** @brief Use host allocations without initializing any GPU backend. */
+        ExecuteLegFailureBackend() : MockBackend(DeviceType::CUDA) {}
+
+        /** @brief Reject an upload or delegate to the real mock memcpy and byte recorder. */
+        bool hostToDevice(void *dst, const void *src, size_t bytes, int device, void *stream) override
+        {
+            return !reject_upload && MockBackend::hostToDevice(dst, src, bytes, device, stream);
+        }
+
+        /** @brief Reject a download or delegate to the real mock memcpy and byte recorder. */
+        bool deviceToHost(void *dst, const void *src, size_t bytes, int device, void *stream) override
+        {
+            return !reject_download && MockBackend::deviceToHost(dst, src, bytes, device, stream);
+        }
+
+        bool reject_upload = false; ///< Reject before the upload submission.
+        bool reject_download = false; ///< Reject before the download submission.
+    };
+}
+
+/** @brief Exact live physical bytes are counted once for both logical GPU backends. */
+TEST_F(Test__TransferEngine_Execute, PhysicalByteEvidenceTracksLiveLegs)
+{
+    ScopedExecuteTransferEvidence evidence;
+    ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("transfer"));
+    ASSERT_TRUE(TransferProfiler::isEnabled());
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+    std::array<unsigned char, 64> host{};
+    auto release = [&](void *ptr) { mock_backend_->free(ptr, 0); };
+    std::unique_ptr<void, decltype(release)> source(mock_backend_->allocate(64, 0), release);
+    std::unique_ptr<void, decltype(release)> destination(mock_backend_->allocate(64, 0), release);
+    ASSERT_NE(source, nullptr);
+    ASSERT_NE(destination, nullptr);
+    for (DeviceId gpu : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        for (size_t live : {32u, 12u, 0u, 4u, 0u})
+        {
+            SCOPED_TRACE(gpu.toString());
+            SCOPED_TRACE(live);
+            for (auto method : {TransferMethod::HOST_TO_DEVICE, TransferMethod::DEVICE_TO_HOST,
+                                TransferMethod::HOST_STAGED, TransferMethod::NOOP})
+            {
+                const double h2d = evidence.bytes("h2d_bytes");
+                const double d2h = evidence.bytes("d2h_bytes");
+                TransferRequest request;
+                request.source.host_ptr = host.data();
+                request.source.device_ptr = source.get();
+                request.source.size_bytes = live;
+                request.source.device = gpu;
+                request.target_device = gpu.type == DeviceType::CUDA ? DeviceId::rocm(0) : DeviceId::cuda(0);
+                request.target_ptr = destination.get();
+                request.method = method;
+                // The canonical host boundary omits empty transfers entirely.
+                if (live != 0u) ASSERT_TRUE(engine.execute(request).success);
+                const bool upload = method == TransferMethod::HOST_TO_DEVICE || method == TransferMethod::HOST_STAGED;
+                const bool download = method == TransferMethod::DEVICE_TO_HOST || method == TransferMethod::HOST_STAGED;
+                EXPECT_EQ(evidence.bytes("h2d_bytes") - h2d, upload ? static_cast<double>(live) : 0.0);
+                EXPECT_EQ(evidence.bytes("d2h_bytes") - d2h, download ? static_cast<double>(live) : 0.0);
+            }
+        }
+    }
+}
+
+/** @brief Rejected legs count nothing; an earlier completed staging leg remains observable. */
+TEST_F(Test__TransferEngine_Execute, PhysicalByteEvidencePreservesPartialFailure)
+{
+    ScopedExecuteTransferEvidence evidence;
+    ExecuteLegFailureBackend backend;
+    s_mock_ = &backend;
+    TransferEngine engine(resolver_);
+    std::array<unsigned char, 64> host{};
+    auto release = [&](void *ptr) { backend.free(ptr, 0); };
+    std::unique_ptr<void, decltype(release)> source(backend.allocate(64, 0), release);
+    std::unique_ptr<void, decltype(release)> destination(backend.allocate(64, 0), release);
+    ASSERT_NE(source, nullptr);
+    ASSERT_NE(destination, nullptr);
+    TransferRequest request;
+    request.source.host_ptr = host.data();
+    request.source.device_ptr = source.get();
+    request.source.size_bytes = 12;
+    request.source.device = DeviceId::cuda(0);
+    request.target_device = DeviceId::rocm(0);
+    request.target_ptr = destination.get();
+    for (auto method : {TransferMethod::HOST_TO_DEVICE, TransferMethod::DEVICE_TO_HOST,
+                        TransferMethod::HOST_STAGED})
+    {
+        request.method = method;
+        backend.reject_upload = true;
+        backend.reject_download = true;
+        EXPECT_FALSE(engine.execute(request).success);
+        EXPECT_EQ(evidence.bytes("h2d_bytes"), 0.0);
+        EXPECT_EQ(evidence.bytes("d2h_bytes"), 0.0);
+    }
+    request.method = TransferMethod::HOST_STAGED;
+    backend.reject_download = false;
+    EXPECT_FALSE(engine.execute(request).success);
+    EXPECT_EQ(evidence.bytes("h2d_bytes"), 0.0);
+    EXPECT_EQ(evidence.bytes("d2h_bytes"), 12.0);
+    EXPECT_EQ(backend.getTransferStats().d2h_bytes, 12u);
+    EXPECT_EQ(backend.getTransferStats().h2d_bytes, 0u);
+    s_mock_ = mock_backend_.get();
+}
+
 
 TEST_F(Test__TransferEngine_Execute, HostToDevice_RecordsTransfer)
 {
@@ -2751,4 +2913,104 @@ TEST_F(Test__TransferEngine_EventFailure, UploadFull_EventWaitSuccess_Succeeds)
     // Should succeed without needing synchronize fallback
     EXPECT_TRUE(result.success);
     EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
+}
+
+/** @test Immutable source bytes are a third exact owner class, never prepared-weight alias slack. */
+TEST(Test__TransferEngine_Reclamation, ImmutableRowTableRetentionIsExactAndOverflowChecked)
+{
+    const ModelDeviceMemoryRetention immutable_only{.device=DeviceId::cuda(0),.immutable_table_bytes=384};
+    EXPECT_TRUE(immutable_only.valid()); EXPECT_EQ(immutable_only.totalBytes(),384u);
+    const ModelDeviceMemoryRetention mixed{.device=DeviceId::cuda(0),.prepared_weight_bytes=300,
+        .reusable_workspace_bytes=64,.immutable_table_bytes=20};
+    EXPECT_TRUE(mixed.valid()); EXPECT_EQ(mixed.totalBytes(),384u);
+    const ModelDeviceMemoryRetention overflow{.device=DeviceId::cuda(0),
+        .prepared_weight_bytes=std::numeric_limits<size_t>::max()-1,
+        .reusable_workspace_bytes=1,.immutable_table_bytes=1};
+    EXPECT_FALSE(overflow.valid()); EXPECT_THROW((void)overflow.totalBytes(),std::overflow_error);
+    ReclamationBackendSpy backend; backend.result=successfulRawReclamationResult();
+    reclamation_backend_spy=&backend; TransferEngine engine(&resolveReclamationBackend);
+    auto over=mixed; ++over.immutable_table_bytes;
+    EXPECT_THROW((void)engine.beginExclusiveModelRetirement(over),std::runtime_error);
+    auto ticket=engine.beginExclusiveModelRetirement(mixed);
+    EXPECT_EQ(ticket.expectedRetiredBytes(),384u);
+    EXPECT_NO_THROW((void)engine.completeExclusiveModelRetirement(std::move(ticket)));
+    EXPECT_EQ(backend.runtime_reset_calls,1);
+    reclamation_backend_spy=nullptr;
+}
+
+/** @brief One event must cover both a packet and its graph-authored row scalar. */
+TEST_F(Test__TransferEngine_Execute, InputForkAcquiresEveryBoundedSourceBeforeRecording) {
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+    FP32Tensor packet({8}, DeviceId::cpu());
+    INT32Tensor count({1}), foreign_count({1});
+    for (auto *tensor : std::array<TensorBase *,3>{&packet, &count, &foreign_count})
+        tensor->setBackendForTesting(mock_backend_.get());
+    const auto device = DeviceId::cuda(0);
+    auto *producer = reinterpret_cast<void *>(0x1070);
+    auto *consumer = reinterpret_cast<void *>(0x1080);
+    auto *ready = reinterpret_cast<void *>(0x1090);
+    for (auto *tensor : std::array<TensorBase *,3>{&packet, &count, &foreign_count})
+        TransferEngine::prepareDeviceOutput(tensor, device, producer);
+    TransferEngine::publishGraphOwnedDeviceWrite(&packet, device);
+    // Packet ready is insufficient: allocation alone is not count publication.
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,count), device, producer, ready), std::runtime_error);
+    // Existing callers retain their original single-source proof.
+    auto single = engine.acquireDeviceInputFork(engine.recordDeviceInputFork(&packet,device,producer,ready),consumer);
+    EXPECT_TRUE(single.includesSource(&packet));
+    EXPECT_FALSE(single.includesSource(&count));
+    TransferEngine::publishGraphOwnedDeviceWrite(&count, device);
+    const auto acquired = engine.acquireDeviceInputFork(engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,count),device,producer,ready),consumer);
+    EXPECT_TRUE(acquired.valid());
+    EXPECT_EQ(acquired.sourceOwner(), &packet);
+    EXPECT_EQ(acquired.consumerStream(), consumer);
+    EXPECT_TRUE(acquired.includesSource(&packet));
+    EXPECT_TRUE(acquired.includesSource(&count));
+    EXPECT_FALSE(acquired.includesSource(&foreign_count));
+    EXPECT_FALSE(acquired.includesSource(nullptr));
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,packet),device,producer,ready),std::invalid_argument);
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,count),device,nullptr,ready),std::invalid_argument);
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanion(packet,count),DeviceId::cuda(1),producer,ready),std::runtime_error);
+    // No movement is introduced by either fork: only existing event DAG edges.
+    const auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 0u);
+    EXPECT_EQ(stats.d2d_count, 0u);
+}
+
+/** @brief Native receipt mutation must acquire its existing controller before the packet's same event. */
+TEST_F(Test__TransferEngine_Execute, InputForkRequiresPublishedDistinctControllerObservation) {
+    s_mock_ = mock_backend_.get();TransferEngine engine(resolver_);
+    FP32Tensor packet({8},DeviceId::cpu());INT32Tensor count({1}),controller({72}),foreign({72});
+    const auto device=DeviceId::cuda(0);auto *producer=reinterpret_cast<void *>(0x2070);
+    auto *consumer=reinterpret_cast<void *>(0x2080);auto *ready=reinterpret_cast<void *>(0x2090);
+    for(auto *tensor:std::array<TensorBase *,4>{&packet,&count,&controller,&foreign}) {
+        tensor->setBackendForTesting(mock_backend_.get());TransferEngine::prepareDeviceOutput(tensor,device,producer);
+    }
+    for(auto *tensor:std::array<TensorBase *,3>{&packet,&count,&foreign})
+        TransferEngine::publishGraphOwnedDeviceWrite(tensor,device);
+    // Packet and count are ready; an allocated controller is not publication.
+    EXPECT_THROW((void)engine.recordDeviceInputFork(
+        DeviceTransferForkSources::withCompanionAndObservation(packet,count,controller),device,producer,ready),std::runtime_error);
+    TransferEngine::publishGraphOwnedDeviceWrite(&controller,device);
+    const auto acquire=[&](const auto &sources){return engine.acquireDeviceInputFork(
+        engine.recordDeviceInputFork(sources,device,producer,ready),consumer);};
+    const auto ordinary=acquire(DeviceTransferForkSources::withCompanion(packet,count));
+    EXPECT_FALSE(ordinary.includesSource(&controller));
+    const auto wrong=acquire(DeviceTransferForkSources::withCompanionAndObservation(packet,count,foreign));
+    EXPECT_FALSE(wrong.includesSource(&controller));EXPECT_TRUE(wrong.includesSource(&foreign));
+    const auto exact=acquire(DeviceTransferForkSources::withCompanionAndObservation(packet,count,controller));
+    EXPECT_TRUE(exact.includesSource(&packet));EXPECT_TRUE(exact.includesSource(&count));
+    EXPECT_TRUE(exact.includesSource(&controller));EXPECT_FALSE(exact.includesSource(&foreign));
+    EXPECT_EQ(exact.consumerStream(),consumer);
+    for(auto *alias:std::array<ITensor *,2>{&packet,&count})
+        EXPECT_THROW((void)engine.recordDeviceInputFork(
+            DeviceTransferForkSources::withCompanionAndObservation(packet,count,*alias),device,producer,ready),std::invalid_argument);
+    const auto stats=mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count,0u);EXPECT_EQ(stats.d2h_count,0u);EXPECT_EQ(stats.d2d_count,0u);
 }

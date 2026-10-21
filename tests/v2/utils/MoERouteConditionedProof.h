@@ -15,6 +15,7 @@
 #include <optional>
 #include <ostream>
 #include <span>
+#include <variant>
 
 namespace llaminar2::test::parity
 {
@@ -25,11 +26,24 @@ namespace llaminar2::test::parity
         float epsilon = 0;
     };
 
-    /** @brief One authenticated HF-input bank and its model-owned terminal norm. */
+    /** @brief Expert-only evidence; every model-specific suffix retains its canonical comparison. */
+    struct MoECanonicalComparisons {};
+
+    /** @brief Authenticated ordinary-RMS suffix, with its normalization carried only by this arm. */
+    struct MoEOrdinaryRMSReconstruction
+    {
+        MoEReferenceNormalization normalization;
+    };
+    using MoEReferenceSuffixContract =
+        std::variant<MoECanonicalComparisons, MoEOrdinaryRMSReconstruction>;
+
+    /** @brief Independent HF-input bank plus an explicit model-owned suffix contract. */
     struct MoEIndependentReference
     {
         std::vector<float> experts;
-        MoEReferenceNormalization normalization;
+        // Preserve existing ordinary families; missing RMS parameters remain a
+        // failed ordinary reconstruction, never an inferred expert-only mode.
+        MoEReferenceSuffixContract suffix = MoEOrdinaryRMSReconstruction{};
     };
 
     /** @brief The finite suffix of a routed sidecar equation; logits are not included. */

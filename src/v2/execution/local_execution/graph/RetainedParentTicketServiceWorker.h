@@ -51,7 +51,11 @@ namespace llaminar2
             }
         };
 
-        /** @brief Start the persistent worker in its idle state. */
+        /**
+         * @brief Initialize the complete idle state before starting its persistent thread.
+         * @details Thread creation occurs in the constructor body so no member
+         * declaration order can expose uninitialized lifecycle state to run().
+         */
         RetainedParentTicketServiceWorker();
 
         /**

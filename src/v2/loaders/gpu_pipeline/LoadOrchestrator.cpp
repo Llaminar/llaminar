@@ -305,6 +305,8 @@ namespace llaminar2
             };
             const auto geometry = resolveGPUWeightLoadMemoryGeometry(
                 admitted_source_bytes, exact_policy);
+            ctx.released_staging_identity.reset();
+            ctx.resolved_staging_slot_bytes = geometry.staging_slot_bytes;
             const size_t persistent_bytes =
                 alignGPUWeightLoadAllocation(planned_weight_bytes);
             const DeviceId device(
@@ -668,7 +670,22 @@ namespace llaminar2
                 ctx.pinned_ring->release();
             ctx.host_staging_lease.reset();
             ctx.device_staging_lease.reset();
+            if (memory_authority_ && ctx.resolved_staging_slot_bytes &&
+                !ctx.released_staging_identity)
+                ctx.released_staging_identity = std::make_shared<const unsigned char>(0);
         }
+    }
+
+    ReleasedWeightLoadStaging LoadOrchestrator::releasedWeightLoadStaging(int device_id) const
+    {
+        const auto *ctx = findDevice(device_id);
+        if (!memory_authority_ || !ctx || !ctx->resolved_staging_slot_bytes ||
+            !ctx->released_staging_identity || ctx->host_staging_lease ||
+            ctx->device_staging_lease || (ctx->pinned_ring && ctx->pinned_ring->isAllocated()) ||
+            !ctx->pool || ctx->pool->stagingSlotCount() != 0)
+            throw std::logic_error("Weight-loader staging receipt requires fully finalized production storage");
+        return ReleasedWeightLoadStaging(memory_authority_, managedDevice(device_id),
+            DeviceId::cpu(), ctx->resolved_staging_slot_bytes, ctx->released_staging_identity);
     }
 
     void LoadOrchestrator::release()
@@ -681,6 +698,7 @@ namespace llaminar2
     {
         for (auto &ctx : devices_)
         {
+            ctx.released_staging_identity.reset();
             if (ctx.pinned_ring)
                 ctx.pinned_ring->release();
             if (ctx.pool)

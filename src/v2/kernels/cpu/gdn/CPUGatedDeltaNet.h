@@ -19,13 +19,17 @@
 #include "../../../tensors/TensorKernels.h"
 
 #include <vector>
+#include "../../common/CPURequestStateBankView.h"
 
 namespace llaminar2
 {
 
-    class CPUGatedDeltaNet : public ITensorGatedDeltaNet
+    class CPUGatedDeltaNet : public ITensorGatedDeltaNet, public ICPURequestStateBankView
     {
     public:
+        /** @brief Borrow the kernel's sole native CPU request-bank allocation for publication planning. */
+        CPURequestStateBankView cpuRequestStateBankView()noexcept override
+        {return {request_state_bank_,request_state_capacity_,request_state_size_};}
         bool supportsPaddedPrefillRealLength() const override { return true; }
         bool supportsRequestLiveStateBank(int request_count, int state_size) const override
         {

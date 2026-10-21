@@ -10,6 +10,7 @@
 
 #include "backends/IBackend.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/local_execution/graph/IRetainedGraphStorageBoundary.h"
 
 namespace llaminar2
 {
@@ -65,6 +66,14 @@ bool DeviceGenerationGraphProgram::native(IGPUGraphCapture &destination,
     {
         error = "Generation graph requires a complete non-empty transaction";
         return false;
+    }
+    for (const auto &fragment : program.terminal)
+    {
+        if(!fragment.valid()||fragment.capture==&destination||fragment.capture->nodeCount()==0)
+        {
+            error="Generation graph terminal requires complete participant-local release fragments";
+            return false;
+        }
     }
     for (const auto &fragment : program.entry)
     {
@@ -134,7 +143,8 @@ bool DeviceGenerationGraphProgram::native(IGPUGraphCapture &destination,
 bool DeviceGenerationGraphProgram::ticketPublisher(IGPUGraphCapture &destination,
     IWorkerGPUContext &context, IBackend &backend, DeviceId device,
     const DeviceGenerationGraphControl &control, const uint32_t *maintenance_due,
-    sampling_math::DeviceGenerationDispatchTicket *tickets, std::string &error)
+    sampling_math::DeviceGenerationDispatchTicket *tickets, std::string &error,
+    IRetainedGraphStorageBoundary *storage_boundary)
 {
     if (!validateDestination(destination, control, error))
         return false;
@@ -158,6 +168,16 @@ bool DeviceGenerationGraphProgram::ticketPublisher(IGPUGraphCapture &destination
     const bool enqueued = backend.enqueuePublishDeviceGenerationDispatchTickets(
         control.rows, control.stride, control.requests, maintenance_due,
         tickets, device.gpu_ordinal(), destination.executionStream());
+    if(enqueued&&storage_boundary)
+    {
+        if(storage_boundary->device()!=device)
+            throw std::logic_error("Generation ticket publisher immutable storage belongs to another participant");
+        if(control.requests!=1)
+            throw std::logic_error("One immutable storage lane requires one admitted generation controller");
+        storage_boundary->recordTerminalClose(destination.executionStream(),
+            control.rows+sampling_math::kDeviceGenerationControlOk,
+            control.rows+sampling_math::kDeviceGenerationControlRequestComplete);
+    }
     // Close exactly once even when enqueue reports failure. The scope also
     // closes on an asynchronous-backend exception, preserving its diagnostic.
     recording.finish();

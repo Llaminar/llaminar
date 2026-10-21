@@ -101,7 +101,7 @@ namespace llaminar2
         Aborted,     ///< Capture closed or failed without a usable graph unit.
     };
 
-    inline constexpr uint32_t kDeviceMoEMaxExperts = 256;
+    inline constexpr uint32_t kDeviceMoEMaxExperts = moe_runtime_abi::kMaxExperts;
     /**
      * @brief Largest transfer-directory slot representable by the runtime ABI.
      *

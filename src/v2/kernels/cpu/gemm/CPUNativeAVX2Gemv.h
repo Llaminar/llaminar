@@ -572,6 +572,7 @@ namespace llaminar2::cpu::native_vnni
      * @brief AVX2 2-row INT8 pre-decoded GEMM microkernel for one 64-col chunk.
      */
     /** @brief Dispatch a two-row non-nibble AVX2 verifier chunk. */
+    template<bool SumPairs=false>
     inline void gemm_2row_non_nibble_chunk_avx2(
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -697,8 +698,9 @@ namespace llaminar2::cpu::native_vnni
                         packed.numerical_policy);
                 }
             }
-            _mm256_storeu_ps(C_row0 + segment * 8, fp0);
-            _mm256_storeu_ps(C_row1 + segment * 8, fp1);
+            if constexpr(SumPairs) _mm256_storeu_ps(C_row0 + segment * 8,_mm256_add_ps(fp0,fp1));
+            else { _mm256_storeu_ps(C_row0 + segment * 8, fp0);
+            _mm256_storeu_ps(C_row1 + segment * 8, fp1); }
         }
     }
 

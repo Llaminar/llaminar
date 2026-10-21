@@ -17,6 +17,13 @@
 
 namespace llaminar2
 {
+    void AdmittedMoEPipelineMemory::publishRuntimeCapacity(RuntimeConfig &runtime) const noexcept
+    {
+        runtime.resident_graph_rows = rank_plan_.runtime.resident_graph_rows;
+        runtime.moe_routed_prefill.overlay_segment_rows = rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows;
+        runtime.ngram_table_placement = rank_plan_.runtime.ngram_table_placement;
+    }
+
     AdmittedMoEPipelineMemory AdmittedMoEPipelineMemory::admit(
         const ResolvedRankOrchestration &topology, const PlanningModelMetadata &model,
         const ModelLoader &loader, const ClusterInventory &inventory,
@@ -54,8 +61,7 @@ namespace llaminar2
             const int routed_count = scope.has_lm_head
                 ? family.routedLayerCapacity() - scope.first_layer : scope.layerCount();
             stage.family_ = family.forRoutedLayerInterval(scope.first_layer, routed_count);
-            stage.manifest_ = buildMoEOverlayLayerWeightManifestFromGGUF(
-                loader.getModel(), routed_count, profile.expert_count, scope.first_layer);
+            stage.manifest_ = buildMoEOverlayLayerWeightManifestFromLoader(loader, routed_count, profile.expert_count, scope.first_layer);
             stage.storage_policy_ = resolveMoEOverlayCapacityAdmissionPolicy(
                 *child.config().moe_routed_expert_plan, child.config(), inventory.world_size,
                 routed_count, profile.expert_count);
@@ -67,6 +73,9 @@ namespace llaminar2
             parent.runtime.max_seq_len, parent.runtime.moe_routed_prefill.overlay_segment_rows);
         if (candidates.empty())
             throw std::invalid_argument("MoE pipeline admission has no captured-prefill row choices");
+        std::optional<MoEOverlayCapacityDraft> selected;
+        std::vector<MoEOverlayLocalCapacityPlannerResult> selected_fixed;
+        std::vector<int> selected_segments;
         std::string last_capacity_error;
         for (const int rows : candidates)
         {
@@ -97,7 +106,36 @@ namespace llaminar2
                         profile.expert_count, stage.manifest_, fixed[index].physical_budgets,
                         stage.storage_policy_});
                 }
-                auto capacities = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+                selected=MoEOverlayCapacityAdmission::resolvePipelineCapacityDraft(requests);
+                selected_fixed=std::move(fixed);
+                selected_segments=std::move(segments);
+                break;
+            }
+            catch (const PhysicalMemoryCapacityExhausted &error)
+            {
+                last_capacity_error = error.what();
+            }
+        }
+        if(!selected)
+            throw PhysicalMemoryCapacityExhausted("No complete MoE pipeline graph fits: "+last_capacity_error);
+        std::vector<std::vector<DevicePlanConfig>> groups;
+        for(const auto &stage:selected_fixed)groups.push_back(stage.device_inputs);
+        const auto upload=MemoryPlanner::immutableRowTableUploadBindings(profile,groups);
+        const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,parent.runtime.ngram_table_policy,
+            groups,upload,ImmutableRowTableHostPlacement::fromObservedNUMANode(parent.numa_node));
+        std::vector<ImmutableRowTableAdmissionRequest> requests;
+        if(request)requests.push_back(*request);
+        // Table rejection is outside the row and replica searches. No earlier
+        // physical authority exists, and this failure cannot choose fewer rows.
+        auto capacities=selected->admit(requests);
+        if(capacities.size()!=result.stages_.size())
+            throw std::logic_error("MoE pipeline finalization lost its exact stage count");
+        for(const auto &placement:capacities.front().ngram_table_placements)
+            if(placement->worldRank()==parent.rank)
+            {
+                result.rank_plan_.runtime.ngram_table_placement=placement;
+                for(auto &stage:result.stages_)stage.rank_plan_.runtime.ngram_table_placement=placement;
+            }
                 if (capacities.size() != result.stages_.size())
                     throw std::logic_error("MoE pipeline capacity did not publish every stage");
                 result.admission_ = capacities.front().physical_memory_admission;
@@ -106,25 +144,18 @@ namespace llaminar2
                 for (std::size_t index = 0; index < result.stages_.size(); ++index)
                 {
                     if (capacities[index].physical_memory_admission != result.admission_ ||
-                        fixed[index].resident_graph_rows != fixed.front().resident_graph_rows ||
-                        segments[index] != segments.front())
+                        selected_fixed[index].resident_graph_rows != selected_fixed.front().resident_graph_rows ||
+                        selected_segments[index] != selected_segments.front())
                         throw std::logic_error("MoE pipeline stages disagree on their aggregate admission or row envelope");
                     auto &stage = result.stages_[index];
-                    capacities[index].host_demand_memory = fixed[index].host_demand_memory;
+                    capacities[index].host_demand_memory = selected_fixed[index].host_demand_memory;
                     stage.capacity_ = std::make_shared<const MoEOverlayResolvedCapacityPlan>(std::move(capacities[index]));
-                    stage.devices_ = std::move(fixed[index].device_inputs);
-                    stage.rank_plan_.runtime.resident_graph_rows = fixed[index].resident_graph_rows;
-                    stage.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = segments[index];
+                    stage.devices_ = std::move(selected_fixed[index].device_inputs);
+                    stage.rank_plan_.runtime.resident_graph_rows = selected_fixed[index].resident_graph_rows;
+                    stage.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = selected_segments[index];
                 }
-                result.rank_plan_.runtime.resident_graph_rows = fixed.front().resident_graph_rows;
-                result.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = segments.front();
+                result.rank_plan_.runtime.resident_graph_rows = selected_fixed.front().resident_graph_rows;
+                result.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = selected_segments.front();
                 return result;
-            }
-            catch (const PhysicalMemoryCapacityExhausted &error)
-            {
-                last_capacity_error = error.what();
-            }
-        }
-        throw PhysicalMemoryCapacityExhausted("No complete MoE pipeline graph fits: " + last_capacity_error);
     }
 }

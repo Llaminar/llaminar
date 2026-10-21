@@ -24,6 +24,7 @@
 
 namespace llaminar2
 {
+    class IBackend;
     class TensorBase;
 
     /** @brief Exact immutable sections consumed by one prefix read. */
@@ -40,7 +41,7 @@ namespace llaminar2
     /** @brief Stable serialized section order shared by storage and its allocation BOM. */
     enum class PrefixPayloadSection : size_t
     {
-        AttentionRows, RecurrentState, ShiftedMTPRows, TerminalHidden, TerminalLogits, ModelRuntime
+        AttentionRows, RecurrentState, ShiftedMTPRows, TerminalHidden, TerminalLogits, ModelAuxiliary, ModelRuntime
     };
 
     /** @brief Immutable section geometry supplied to the admitted RAM placement authority. */
@@ -66,8 +67,8 @@ namespace llaminar2
         { return sections_.at(static_cast<size_t>(section)); }
     private:
         /** @brief Seal a checked section BOM before any storage admission or allocation. */
-        explicit PrefixPayloadAllocationPlan(std::array<size_t, 6> sections);
-        std::array<size_t, 6> sections_;
+        explicit PrefixPayloadAllocationPlan(std::array<size_t, 7> sections);
+        std::array<size_t, 7> sections_;
         size_t total_bytes_ = 0u;
     };
 
@@ -101,12 +102,13 @@ namespace llaminar2
          * @param ready_event Unrecorded backend event with shared destruction ownership.
          * @param producer_device GPU that owns the event.
          * @param producer_stream Explicit stream that will own every queued copy.
+         * @param producer_backend Exact owner of ready_event; must outlive this completion edge.
          * @return true when the completion contract is prepared.
          */
         bool prepare(
             std::shared_ptr<void> ready_event,
             DeviceId producer_device,
-            void *producer_stream);
+            void *producer_stream, IBackend &producer_backend);
 
         /**
          * @brief Publish a successfully recorded prepared event.
@@ -153,6 +155,7 @@ namespace llaminar2
         void *producerStream() const { return producer_stream_; }
 
     private:
+        IBackend *producer_backend_ = nullptr;
         std::shared_ptr<void> ready_event_;
         DeviceId producer_device_ = DeviceId::invalid();
         void *producer_stream_ = nullptr;
@@ -229,6 +232,7 @@ namespace llaminar2
         void *mtp_payload = nullptr;
         void *terminal_hidden = nullptr;
         void *terminal_logits = nullptr;
+        void *model_auxiliary_payload = nullptr; ///< Explicit compact QSA/PLE archive sections.
         size_t total_bytes = 0;
         bool has_hybrid_state = false;
         bool has_terminal_hidden = false;
@@ -249,7 +253,7 @@ namespace llaminar2
          * member destruction frees every allocation before returning its bytes
          * to the canonical memory ledger.
          */
-        std::array<std::shared_ptr<void>, 5> ram_section_memory_leases;
+        std::array<std::shared_ptr<void>, 6> ram_section_memory_leases;
         std::shared_ptr<void> ram_runtime_state_memory_lease;
 
         /**
@@ -268,6 +272,7 @@ namespace llaminar2
         std::shared_ptr<std::vector<uint8_t>> mtp_storage;
         std::shared_ptr<std::vector<uint8_t>> terminal_hidden_storage;
         std::shared_ptr<std::vector<uint8_t>> terminal_logits_storage;
+        std::shared_ptr<std::vector<uint8_t>> model_auxiliary_storage;
         std::shared_ptr<PrefixRuntimeStateStorage> model_runtime_state_storage;
 
         /**
@@ -283,6 +288,7 @@ namespace llaminar2
         std::shared_ptr<void> pinned_mtp_storage;
         std::shared_ptr<void> pinned_terminal_hidden_storage;
         std::shared_ptr<void> pinned_terminal_logits_storage;
+        std::shared_ptr<void> pinned_model_auxiliary_storage;
 
         /**
          * Completion state shared with every pinned owner above.
@@ -325,6 +331,10 @@ namespace llaminar2
         std::shared_ptr<void> device_mtp_allocation;
         std::shared_ptr<void> device_terminal_hidden_allocation;
         std::shared_ptr<void> device_terminal_logits_allocation;
+        std::shared_ptr<void> device_model_auxiliary_allocation;
+
+        /** @return Exact immutable publication metadata and retained owner identities, never payload equality. */
+        bool operator==(const PrefixBlockHandle &) const = default;
 
         bool valid() const { return key.valid() && total_bytes > 0; }
         size_t kvKBytes() const { return static_cast<size_t>(layout.fa_layers) * layout.bytes_per_fa_layer_k; }
@@ -380,6 +390,33 @@ namespace llaminar2
         /** @brief Return the archived terminal-logits row in VRAM. */
         void *deviceTerminalLogitsData();
         const void *deviceTerminalLogitsData() const;
+
+        /** @return Compact serialized main pool slice for one local FA ordinal; zero bytes returns nullptr. */
+        uint8_t *mainAuxiliaryBlockData(int local_fa);
+        const uint8_t *mainAuxiliaryBlockData(int local_fa) const;
+        /** @return Compact serialized predictor pool slice for one local FA ordinal. */
+        uint8_t *mtpAuxiliaryBlockData(int local_fa);
+        const uint8_t *mtpAuxiliaryBlockData(int local_fa) const;
+        /** @return Main compact endpoint section; absent from sequence-only reads. */
+        uint8_t *mainAuxiliaryEndpointData();
+        const uint8_t *mainAuxiliaryEndpointData() const;
+        /** @return Predictor compact endpoint section; absent from sequence-only reads. */
+        uint8_t *mtpAuxiliaryEndpointData();
+        const uint8_t *mtpAuxiliaryEndpointData() const;
+        /** @return Same compact main pool slice in device-hot storage. */
+        uint8_t *deviceMainAuxiliaryBlockData(int local_fa);
+        const uint8_t *deviceMainAuxiliaryBlockData(int local_fa) const;
+        /** @return Same compact predictor pool slice in device-hot storage. */
+        uint8_t *deviceMTPAuxiliaryBlockData(int local_fa);
+        const uint8_t *deviceMTPAuxiliaryBlockData(int local_fa) const;
+        /** @return Compact main endpoint section in device-hot storage. */
+        uint8_t *deviceMainAuxiliaryEndpointData();
+        const uint8_t *deviceMainAuxiliaryEndpointData() const;
+        /** @return Compact predictor endpoint section in device-hot storage. */
+        uint8_t *deviceMTPAuxiliaryEndpointData();
+        const uint8_t *deviceMTPAuxiliaryEndpointData() const;
+        /** @return Complete compact auxiliary storage base in device-hot tier. */
+        void *deviceModelAuxiliaryData() const { return device_model_auxiliary_allocation.get(); }
 
         /** @brief Queue archive readiness on a GPU restore stream. */
         bool waitForPayloadOnStream(void *consumer_stream) const

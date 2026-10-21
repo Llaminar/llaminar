@@ -13,6 +13,7 @@ Tests for GGUF file format parsing including:
 import unittest
 import tempfile
 import struct
+import numpy as np
 from pathlib import Path
 
 import sys
@@ -77,6 +78,46 @@ def _write_synthetic_split_shard(
         padding = (-handle.tell()) % GGUFParser.ALIGNMENT
         handle.write(b"\0" * padding)
         handle.write(struct.pack(f"<{len(tensor_values)}f", *tensor_values))
+
+
+class TestGGUFNativePayloadExtent(unittest.TestCase):
+    """Native views must end at codebook payloads, including the final expert."""
+
+    def test_q5_1_expert_stride_excludes_trailing_file_bytes(self):
+        """Q5_1's24-byte blocks retain original expert511 bytes without a guessed stride."""
+        from python.reference.generate_moe_route_conditioned_reference import expert_matrix
+
+        def block(scale, minimum):
+            codes = np.arange(32, dtype=np.uint8)
+            nibbles = codes[:16] % 16 | ((codes[16:] % 16) << 4)
+            return struct.pack('<eeI', scale, minimum, 0xffff0000) + nibbles.tobytes()
+
+        first, last = block(0.25, -2.0), block(0.5, 1.0)
+        payload = first * 511 + last
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'native-q5_1.gguf'
+            with path.open('wb') as handle:
+                handle.write(b'GGUF' + struct.pack('<IQQ', 3, 1, 0))
+                _write_gguf_string(handle, 'blk.0.ffn_gate_exps.weight')
+                handle.write(struct.pack('<IQQQIQ', 3, 32, 1, 512, int(GGUFTensorType.Q5_1), 0))
+                handle.write(b'\0' * ((-handle.tell()) % GGUFParser.ALIGNMENT))
+                handle.write(payload)
+                # Bytes outside the native tensor must never enlarge the expert stride.
+                handle.write(b'\xa5' * 65536)
+            with GGUFParser(path) as parser:
+                parser.parse()
+                tensor = parser.tensors[0]
+                self.assertEqual(tensor.shape, (512, 1, 32))
+                raw = parser.read_tensor_data(tensor)
+                try:
+                    self.assertEqual(len(raw), 512 * 24)
+                    self.assertEqual(bytes(raw), payload)
+                finally:
+                    raw.release()
+                np.testing.assert_array_equal(expert_matrix(parser, tensor, 0),
+                                              (np.arange(32, dtype=np.float32) * 0.25 - 2)[None, :])
+                np.testing.assert_array_equal(expert_matrix(parser, tensor, 511),
+                                              (np.arange(32, dtype=np.float32) * 0.5 + 1)[None, :])
 
 
 class TestGGUFSplitSet(unittest.TestCase):

@@ -80,6 +80,14 @@ namespace llaminar2::native_embedding
     LLAMINAR_NATIVE_EMBED_INLINE float half(std::uint16_t value)
     {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        // CUDA cvt.f32.f16 canonicalizes NaNs. Widen original exponent31 bits
+        // explicitly so signed infinities and every NaN sign/payload retain
+        // the same source identity as CPU decoding. Finite values keep the
+        // established intrinsic, including signed zeros and subnormals.
+        if ((value & 0x7c00u) == 0x7c00u)
+            return device_fp32_contract::floatFromBits(
+                (std::uint32_t(value & 0x8000u) << 16) | 0x7f800000u |
+                (std::uint32_t(value & 0x03ffu) << 13));
         return __half2float(*reinterpret_cast<const __half *>(&value));
 #else
         const std::uint32_t sign = std::uint32_t(value & 0x8000u) << 16;

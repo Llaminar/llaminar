@@ -68,6 +68,7 @@ namespace llaminar2
     class IROCmRingKVCache : public ROCmRingKVCacheBase
     {
     public:
+
         virtual ~IROCmRingKVCache();
 
         // =====================================================================
@@ -338,6 +339,10 @@ namespace llaminar2
     class ROCmRingKVCache : public IROCmRingKVCache, public IWorkspaceConsumer
     {
     public:
+        /** @copydoc IKVCache::acquireSparseAttentionNativeView */
+        qwen4exp::QwenSparseKV acquireSparseAttentionNativeView(
+            int layer, int sequence, const attention::AttentionDeviceParams *rows,
+            attention::AttentionKeyCachePolicy policy, void *stream) override;
         using DataT = typename detail::ROCmKVCacheType<Precision>::Type;
         using EntryT = ROCmRingKVEntry<Precision>;
 

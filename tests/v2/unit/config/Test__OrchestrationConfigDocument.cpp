@@ -337,7 +337,7 @@ TEST(OrchestrationConfigDocument, BadTypesEnumsOverflowAndDuplicateKeysFailAtInp
 {
     const Json base = Json::parse(serializeOrchestrationConfig(example(DeviceType::ROCm)));
     for (const auto &[path, value] : std::vector<std::pair<std::string, Json>>{
-             {"/schema_version", 1}, {"/schema_version", 2}, {"/schema_version", 3}, {"/schema_version", 4}, {"/schema_version", 6}, {"/schema_version", 5.0}, {"/kind", "memory-report"},
+             {"/schema_version", 1}, {"/schema_version", 2}, {"/schema_version", 3}, {"/schema_version", 4}, {"/schema_version", 5}, {"/schema_version", 6}, {"/schema_version", 7}, {"/schema_version", 8}, {"/schema_version", 9}, {"/schema_version", kOrchestrationConfigDocumentSchemaVersion+1}, {"/schema_version", static_cast<double>(kOrchestrationConfigDocumentSchemaVersion)}, {"/kind", "memory-report"},
              {"/configuration/mpi_procs", "3"}, {"/configuration/mpi_procs", 1ull << 32},
              {"/configuration/mtp/enabled", 1}, {"/configuration/mtp/draft_tokens", 1.5},
              {"/configuration/mtp/verify_mode", "invented"}, {"/configuration/mtp/verify_mode", 0},
@@ -461,5 +461,92 @@ TEST(OrchestrationConfigDocument, InvalidPrefillDocumentCannotPublishKernelPolic
         EXPECT_THROW(OrchestrationConfigParser{}.parseYamlString(serializeOrchestrationConfig(config)), std::invalid_argument);
         EXPECT_FALSE(debugEnv().gemm.deterministic);
         EXPECT_STREQ(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"), "64,256");
+    }
+}
+
+/** @test Native storage intent and exact large window counts round-trip without defaults. */
+TEST(OrchestrationConfigDocument, NgramStorageIsLosslessAndRequired)
+{
+    for (const auto mode : {ImmutableRowStoragePreference::Automatic, ImmutableRowStoragePreference::VRAM,
+                            ImmutableRowStoragePreference::RAM, ImmutableRowStoragePreference::MemoryMapped})
+    {
+        auto config = example(DeviceType::CPU);
+        config.ngram_table_policy = {mode, 131072, (1ull << 33) + 3};
+        const auto document = serializeOrchestrationConfig(config);
+        const auto decoded = deserializeOrchestrationConfig(document);
+        EXPECT_EQ(decoded.ngram_table_policy, config.ngram_table_policy);
+        auto missing = Json::parse(document);
+        missing["configuration"].erase("ngram_table_policy");
+        EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument);
+        auto invalid = Json::parse(document);
+        invalid["configuration"]["ngram_table_policy"]["window_count"] = 0;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(invalid.dump()), std::invalid_argument);
+        config.ngram_table_policy.storage = static_cast<ImmutableRowStoragePreference>(255);
+        EXPECT_THROW((void)serializeOrchestrationConfig(config), std::invalid_argument);
+    }
+}
+
+/** @test Documents preserve requested adaptive ceilings even when the final solve admits zero slots. */
+TEST(OrchestrationConfigDocument, NgramHostAdaptiveRamSsdExactDocumentAndMixedArmRejection)
+{
+    for(const std::uint64_t rows:{0u,37u})
+    {
+        auto c=example(DeviceType::CPU);c.ngram_table_policy={ImmutableRowStoragePreference::HostAdaptiveRAMSSD,131072,7};
+        c.ngram_table_policy.host_adaptive={rows,0,{.aging_accesses=97,.protected_numerator=2,.protected_denominator=5}};
+        const auto document=serializeOrchestrationConfig(c);const auto decoded=deserializeOrchestrationConfig(document);
+        EXPECT_EQ(decoded.ngram_table_policy,c.ngram_table_policy);
+        auto bad=Json::parse(document);bad["configuration"]["ngram_table_policy"].erase("host_adaptive");
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(document);bad["configuration"]["ngram_table_policy"]["host_adaptive"]["policy"]["aging_accesses"]=0;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(document);bad["configuration"]["ngram_table_policy"]["storage"]="RAM";
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    }
+}
+
+/** @test Explicit distribution is lossless, mandatory in schema9 and never inferred from VRAM. */
+TEST(Test__OrchestrationConfigDocument, FixedHeadDistributionRoundTripAndStrictArm)
+{
+    auto c=example(DeviceType::CUDA);c.ngram_table_policy={ImmutableRowStoragePreference::VRAM};
+    EXPECT_EQ(c.ngram_table_policy.distribution,ImmutableRowTableDistribution::Replicated);
+    c.ngram_table_policy.distribution=ImmutableRowTableDistribution::FixedHeadSharded;
+    const auto document=serializeOrchestrationConfig(c);
+    EXPECT_EQ(deserializeOrchestrationConfig(document).ngram_table_policy,c.ngram_table_policy);
+    auto bad=Json::parse(document);bad["configuration"]["ngram_table_policy"].erase("distribution");
+    EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    bad=Json::parse(document);bad["configuration"]["ngram_table_policy"]["distribution"]="unknown";
+    EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    bad=Json::parse(document);bad["schema_version"]=8;
+    EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+    for(const auto mode:{ImmutableRowStoragePreference::Automatic,ImmutableRowStoragePreference::RAM,
+        ImmutableRowStoragePreference::MemoryMapped,ImmutableRowStoragePreference::HostAdaptiveRAMSSD})
+    {
+        c.ngram_table_policy.storage=mode;
+        EXPECT_THROW((void)serializeOrchestrationConfig(c),std::invalid_argument);
+    }
+}
+
+/** @test The explicit mixed request survives lossless documents with every independent original ceiling/policy. */
+TEST(OrchestrationConfigDocument, GPUAdaptiveRequestIsLosslessWithoutEnteringAutomaticOrWholeTierModes)
+{
+    for(const std::uint64_t rows:{0u,64u})
+    {
+        auto c=example(DeviceType::CUDA);auto &p=c.ngram_table_policy;
+        p.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+        p.window_bytes=131072;p.window_count=7;
+        p.gpu_adaptive={rows,1u<<20,{.aging_accesses=97,.protected_numerator=2,.protected_denominator=5},
+            {rows,2u<<20,{.aging_accesses=113,.protected_numerator=1,.protected_denominator=3}}};
+        const auto text=serializeOrchestrationConfig(c);
+        EXPECT_EQ(deserializeOrchestrationConfig(text).ngram_table_policy,p);
+        auto bad=Json::parse(text);bad["configuration"]["ngram_table_policy"].erase("gpu_adaptive");
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(text);bad["configuration"]["ngram_table_policy"]["storage"]="MemoryMapped";
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(text);bad["configuration"]["ngram_table_policy"]["gpu_adaptive"]["gpu_policy"]["aging_accesses"]=0;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(text);bad["configuration"]["ngram_table_policy"]["gpu_adaptive"]["host"]["policy"]["protected_denominator"]=0;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
+        bad=Json::parse(text);bad["configuration"]["ngram_table_policy"]["distribution"]="FixedHeadSharded";
+        EXPECT_THROW((void)deserializeOrchestrationConfig(bad.dump()),std::invalid_argument);
     }
 }

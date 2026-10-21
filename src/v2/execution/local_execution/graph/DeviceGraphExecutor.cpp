@@ -16,6 +16,9 @@
  * @date December 2025
  */
 
+#include "snapshots/SnapshotNativeSource.h"
+#include "snapshots/SnapshotStorageLayout.h"
+#include "../../../snapshots/SnapshotSemanticObservation.h"
 #include "DeviceGraphExecutor.h"
 #include "RetainedParentTicketServiceWorker.h"
 #include "StageVerifier.h"
@@ -177,6 +180,7 @@ namespace llaminar2
                  ++output_index)
             {
                 auto &output = snapshot_info->outputs[output_index];
+                if(!std::holds_alternative<std::monostate>(output.semantic_extent)) continue;
                 if (const auto *compact_rows = std::get_if<SnapshotCompactRows>(&output.row_layout))
                 {
                     if (batch_size != 1 || compact_rows->capacity != static_cast<int>(physical_token_rows) ||
@@ -891,6 +895,9 @@ namespace llaminar2
 
     bool DeviceGraphExecutor::execute(ComputeGraph &graph, IDeviceContext *ctx)
     {
+        graph.requireExecutable();
+        if(graph.retainedStorageBoundary())
+            throw std::logic_error("Immutable storage graph cannot enter eager execution; retain its complete native parent");
         if (!ctx)
         {
             LOG_ERROR("[DeviceGraphExecutor] Null device context");
@@ -922,6 +929,7 @@ namespace llaminar2
 
     bool DeviceGraphExecutor::executeSequential(ComputeGraph &graph, IDeviceContext *ctx)
     {
+        graph.requireExecutable();
         return runStages(graph, ctx, StageRunPolicy::full());
     }
 
@@ -930,6 +938,7 @@ namespace llaminar2
         IDeviceContext *ctx,
         GraphSnapshotManifest &snapshot_manifest)
     {
+        graph.requireExecutable();
         if (!ctx)
         {
             LOG_ERROR("[DeviceGraphExecutor] Null device context");
@@ -967,6 +976,7 @@ namespace llaminar2
                                                 const std::unordered_set<std::string> *collective_nodes,
                                                 GraphSnapshotManifest *snapshot_manifest)
     {
+        graph.requireExecutable();
         StageRunPolicy policy = StageRunPolicy::fastDecode();
         /*
          * Eager fast decode has no captured D2D snapshot nodes.  When a parity
@@ -990,6 +1000,7 @@ namespace llaminar2
         const std::unordered_set<std::string> *collective_nodes,
         GraphSnapshotManifest *snapshot_manifest)
     {
+        graph.requireExecutable();
         if (!ctx || !ctx->isGPU())
         {
             LOG_ERROR(
@@ -1444,7 +1455,6 @@ namespace llaminar2
             return false;
         }
 
-        constexpr size_t kSlotAlignment = alignof(float);
         size_t required_bytes = 0;
         size_t slot_count = 0;
         DeviceId arena_device = DeviceId::invalid();
@@ -1487,25 +1497,34 @@ namespace llaminar2
                     return false;
                 }
 
-                if (required_bytes >
-                    std::numeric_limits<size_t>::max() -
-                        (kSlotAlignment - 1))
+                try
                 {
-                    LOG_ERROR("[DeviceGraphExecutor] Graph snapshot arena alignment overflow");
+                    // Reuse the prepared immutable copy geometry, never live
+                    // count contents. Relative metadata alignment also requires
+                    // an aligned slot base after an odd legacy FP32 payload.
+                    const auto layout = snapshotStorageLayout({
+                        copy.byte_size,
+                        std::holds_alternative<std::monostate>(copy.semantic_extent)
+                            ? std::nullopt
+                            : std::optional(copy.semantic_copy.geometry)});
+                    if (copy.storage_bytes != layout.storage_bytes ||
+                        copy.metadata_offset_bytes != layout.metadata_offset_bytes)
+                    {
+                        LOG_ERROR("[DeviceGraphExecutor] Snapshot descriptor storage changed before arena binding"
+                                  << " stage='" << stage_name << "' output='" << copy.name << "'");
+                        return false;
+                    }
+                    const auto slot = placeSnapshotStorageSlot(required_bytes, layout);
+                    copy.storage_offset_bytes = slot.offset_bytes;
+                    required_bytes = slot.end_bytes;
+                }
+                catch (const std::exception &error)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Graph snapshot arena layout rejected"
+                              << " stage='" << stage_name << "' output='" << copy.name
+                              << "': " << error.what());
                     return false;
                 }
-                const size_t aligned_offset =
-                    (required_bytes + kSlotAlignment - 1) &
-                    ~(kSlotAlignment - 1);
-                if (copy.storage_bytes >
-                    std::numeric_limits<size_t>::max() - aligned_offset)
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Graph snapshot arena size overflow at stage '"
-                              << stage_name << "' output '" << copy.name << "'");
-                    return false;
-                }
-                copy.storage_offset_bytes = aligned_offset;
-                required_bytes = aligned_offset + copy.storage_bytes;
                 ++slot_count;
             }
         }
@@ -2102,32 +2121,18 @@ namespace llaminar2
                 return false;
             }
 
-            auto *source = dynamic_cast<TensorBase *>(output.tensor);
-            const auto source_device = source ? source->current_device() : std::optional<DeviceId>{};
-            const void *source_ptr = output.tensor->gpu_data_ptr();
-            if ((source_device.has_value() && !source_device->is_gpu()) ||
-                !source_ptr)
+            const auto source=SnapshotNativeSource::bind(*output.tensor,target_device,
+                output.tensor_byte_offset,output_byte_size);
+            if(!source)
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
-                                                         << "' tensor-backed snapshot output '"
-                                                         << (output.name ? output.name : "<unnamed>")
-                                                         << "' has no stable GPU source during "
-                                                         << (record_device_copy ? "copy recording" : "snapshot preparation"));
+                          << "' tensor-backed snapshot output '" << output_name
+                          << "' lacks an in-bounds source on its exact native owner during "
+                          << (record_device_copy ? "copy recording" : "snapshot preparation"));
                 return false;
             }
-
-            const DeviceId copy_device =
-                (source_device.has_value() && source_device->is_gpu())
-                    ? *source_device
-                    : target_device;
-            if (!copy_device.is_gpu())
-            {
-                LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
-                                                         << "' snapshot output '"
-                                                         << (output.name ? output.name : "<unnamed>")
-                                                         << "' has no GPU source device");
-                return false;
-            }
+            const void* source_ptr=source->data();
+            const DeviceId copy_device=source->device();
 
             if (record_device_copy)
             {
@@ -2138,6 +2143,9 @@ namespace llaminar2
                  * describe different tensors. Fail at the recording boundary
                  * instead of silently reconciling the legacy live dump view.
                  */
+                auto nativeOutput=output;nativeOutput.data=source_ptr;
+                const auto nativeCopy=std::holds_alternative<std::monostate>(output.semantic_extent)
+                    ? DiagnosticSnapshotCopyArgs{} : snapshotCopyArgs(nativeOutput,nullptr,nullptr,true,copy_device);
                 const bool descriptor_matches =
                     copy.descriptor_finalized &&
                     copy.name == output_name &&
@@ -2148,7 +2156,11 @@ namespace llaminar2
                     copy.byte_size == output_byte_size &&
                     copy.device == copy_device &&
                     copy.source_ptr == source_ptr &&
-                    copy.row_layout == output.row_layout;
+                    copy.row_layout == output.row_layout &&
+                    copy.semantic_extent == output.semantic_extent &&
+                    copy.semantic_copy.frontier == nativeCopy.frontier &&
+                    copy.semantic_copy.liveRows == nativeCopy.liveRows &&
+                    copy.semantic_copy.counts == nativeCopy.counts;
                 if (!descriptor_matches)
                 {
                     LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
@@ -2182,13 +2194,22 @@ namespace llaminar2
                 copy.device = copy_device;
                 copy.source_ptr = source_ptr;
                 copy.row_layout = output.row_layout;
+                copy.semantic_extent = output.semantic_extent;
                 copy.descriptor_finalized = true;
-                const size_t storage_elements =
-                    std::max<size_t>(
-                        1,
-                        (copy.byte_size + sizeof(float) - 1) /
-                            sizeof(float));
-                copy.storage_bytes = storage_elements * sizeof(float);
+                const bool authored = !std::holds_alternative<std::monostate>(copy.semantic_extent);
+                if (authored)
+                {
+                    auto nativeOutput=output;nativeOutput.data=source_ptr;
+                    // Count tensors are already prepared by their stage contracts;
+                    // their native pointers become immutable capture identity.
+                    copy.semantic_copy=snapshotCopyArgs(nativeOutput,nullptr,nullptr,true,copy_device);
+                }
+                const auto layout = snapshotStorageLayout({copy.byte_size,
+                    authored ? std::optional(copy.semantic_copy.geometry) : std::nullopt});
+                copy.storage_bytes = layout.storage_bytes;
+                copy.metadata_offset_bytes = layout.metadata_offset_bytes;
+                if (authored && !snapshot_manifest.semantic_copier)
+                    snapshot_manifest.semantic_copier=DiagnosticSnapshotCopy::prepare(copy_device);
             }
 
             if (!record_device_copy)
@@ -2226,12 +2247,13 @@ namespace llaminar2
                 return false;
             }
 
-            if (!backend->deviceCopyAsync(
-                    dst_ptr,
-                    source_ptr,
-                    copy.byte_size,
-                    copy_device.gpu_ordinal(),
-                    producer_stream))
+            bool copySubmitted=true;
+            if(!std::holds_alternative<std::monostate>(copy.semantic_extent)) {
+                auto args=copy.semantic_copy;args.destination=dst_ptr;
+                args.metadata=reinterpret_cast<SnapshotObservedHeader *>(static_cast<std::byte *>(dst_ptr)+copy.metadata_offset_bytes);
+                snapshot_manifest.semantic_copier->capture(args,producer_stream);
+            } else copySubmitted=backend->deviceCopyAsync(dst_ptr,source_ptr,copy.byte_size,copy_device.gpu_ordinal(),producer_stream);
+            if (!copySubmitted)
             {
                 LOG_ERROR("[DeviceGraphExecutor] Graph snapshot D2D copy failed for stage '"
                           << node.name << "' output '" << copy.name << "' bytes="
@@ -2299,14 +2321,67 @@ namespace llaminar2
             snapshot_manifest.storage_device,
             producer_stream);
         const auto download_begin = std::chrono::steady_clock::now();
-        if (!snapshot_manifest.storage_arena->ensureOnHost(producer_stream))
+        size_t acquiredBytes=0;
+        if(snapshot_manifest.semantic_copier)
         {
-            LOG_ERROR("[DeviceGraphExecutor] Failed to bulk-download graph snapshot arena"
-                      << " device="
-                      << snapshot_manifest.storage_device.toString()
-                      << " bytes="
-                      << snapshot_manifest.storage_required_bytes);
-            return false;
+            // This is the explicit diagnostic terminal boundary. Counts are
+            // observed here only; no value is supplied back to inference.
+            auto *backend=getBackendFor(snapshot_manifest.storage_device);
+            if(!backend) throw std::logic_error("Diagnostic terminal has no exact source backend");
+            const int ordinal=snapshot_manifest.storage_device.gpu_ordinal();
+            auto *event=backend->createEvent(ordinal);
+            if(!event) throw std::runtime_error("Diagnostic terminal could not create its observation event");
+            struct EventOwner {
+                IBackend *backend;void *event;int ordinal;
+                ~EventOwner(){backend->destroyEvent(event,ordinal);}
+            } eventOwner{backend,event,ordinal};
+            auto finishPhase=[&] {
+                if(!backend->recordEvent(event,ordinal,producer_stream)||!backend->waitForEvent(event,ordinal))
+                    throw std::runtime_error("Diagnostic terminal count/payload publication failed");
+            };
+            auto *host=static_cast<std::byte *>(const_cast<void *>(snapshot_manifest.storage_arena->raw_data()));
+            auto acquire=[&](size_t offset,size_t bytes) {
+                if(!bytes) return;
+                TransferEngine::enqueueDiagnosticObservation(snapshot_manifest.storage_arena.get(),offset,
+                    host+offset,bytes,snapshot_manifest.storage_device,producer_stream);
+                acquiredBytes+=bytes;
+            };
+            // Required headers precede any count-derived payload transfer.
+            // Legacy slots retain their unchanged full mathematical extent;
+            // neither alignment holes nor typed dead capacity are downloaded.
+            for(const auto &[name,stage]:snapshot_manifest.stage_copies)for(const auto &copy:stage.outputs)
+                if(std::holds_alternative<std::monostate>(copy.semantic_extent)) acquire(copy.storage_offset_bytes,copy.byte_size);
+                else acquire(copy.storage_offset_bytes+copy.metadata_offset_bytes,sizeof(SnapshotObservedHeader));
+            finishPhase();
+            for(const auto &[name,stage]:snapshot_manifest.stage_copies)for(const auto &copy:stage.outputs)
+            {
+                if(std::holds_alternative<std::monostate>(copy.semantic_extent)) continue;
+                const auto *header=reinterpret_cast<const SnapshotObservedHeader *>(host+copy.storage_offset_bytes+copy.metadata_offset_bytes);
+                const auto shape=validateSnapshotObservedHeader(copy.semantic_extent,*header,copy.rows,copy.cols,copy.element_size);
+                if(shape.offsetBytes) acquire(copy.storage_offset_bytes+copy.metadata_offset_bytes+sizeof(*header),shape.offsetBytes);
+                else acquire(copy.storage_offset_bytes,shape.payloadBytes);
+            }
+            finishPhase();
+            bool selections=false;
+            for(const auto &[name,stage]:snapshot_manifest.stage_copies)for(const auto &copy:stage.outputs)
+            {
+                if(!std::holds_alternative<SnapshotCountedSelectionRows>(copy.semantic_extent)) continue;
+                selections=true;
+                const auto *header=reinterpret_cast<const SnapshotObservedHeader *>(host+copy.storage_offset_bytes+copy.metadata_offset_bytes);
+                const auto shape=validateSnapshotObservedHeader(copy.semantic_extent,*header,copy.rows,copy.cols,copy.element_size);
+                validateSnapshotSelectionOffsets({reinterpret_cast<const std::uint64_t *>(header+1),shape.rows+1},shape,copy.cols,copy.element_size);
+                acquire(copy.storage_offset_bytes,shape.payloadBytes);
+            }
+            if(selections) finishPhase();
+            snapshot_manifest.observed_download_bytes+=acquiredBytes;
+        }
+        else
+        {
+            if(!snapshot_manifest.storage_arena->ensureOnHost(producer_stream)) {
+                LOG_ERROR("[DeviceGraphExecutor] Failed to bulk-download legacy graph snapshot arena");
+                return false;
+            }
+            acquiredBytes=snapshot_manifest.storage_required_bytes;
         }
         const auto download_end = std::chrono::steady_clock::now();
         ++snapshot_manifest.bulk_download_count;
@@ -2319,7 +2394,7 @@ namespace llaminar2
         PerfStatsCollector::addCounter(
             "forward_graph",
             "snapshot_device_arena_bulk_download_bytes",
-            static_cast<double>(snapshot_manifest.storage_required_bytes),
+            static_cast<double>(acquiredBytes),
             "diagnostic",
             snapshot_manifest.storage_device.toString());
         PerfStatsCollector::recordTimingNs(
@@ -2430,6 +2505,12 @@ namespace llaminar2
              * replacing the offset pointer with the arena base address.
              */
             output.tensor = nullptr;
+            output.semantic_extent=copy.semantic_extent;
+            if(!std::holds_alternative<std::monostate>(copy.semantic_extent)) {
+                output.observed_header=reinterpret_cast<const SnapshotObservedHeader *>(arena_host_bytes+copy.storage_offset_bytes+copy.metadata_offset_bytes);
+                const auto shape=validateSnapshotObservedHeader(copy.semantic_extent,*output.observed_header,copy.rows,copy.cols,copy.element_size);
+                if(shape.offsetBytes) output.observed_row_offsets={reinterpret_cast<const std::uint64_t *>(output.observed_header+1),shape.rows+1};
+            }
             // A compact producer's physical rows acquire logical coordinates
             // only at terminal observation. Restore the exact frozen ownership
             // before projection; re-querying a live stage would break identity.
@@ -2961,6 +3042,7 @@ namespace llaminar2
         const std::unordered_set<std::string> *collective_nodes,
         GraphSnapshotManifest *snapshot_manifest)
     {
+        graph.requireExecutable();
         // Set GPU device once for the entire pass
         DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
 
@@ -3189,6 +3271,25 @@ namespace llaminar2
             if (!config_.enable_profiling)
                 stats_.total_stages_executed += schedule.size();
             stats_.total_flops += graph.totalEstimatedFlops();
+        }
+
+        // This is successful CPU runtime execution evidence, independent of
+        // optional profiling totals. Empty, failed and setup-only schedules
+        // never reach this publication. Keep tags bounded by graph geometry;
+        // counts describe completed C++ graph invocations, not tokens/stages.
+        if (ctx->deviceId().is_cpu() &&
+            policy.graph_recording_authority ==
+                StageRunPolicy::GraphRecordingAuthority::RuntimeExecution &&
+            PerfStatsCollector::isDomainEnabled("forward_graph"))
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph", "host_graph_completed_calls", 1.0,
+                executionPhasePerfName(GraphExecutorStats::currentPhase()),
+                ctx->deviceId().toString(),
+                PerfStatsCollector::Tags{
+                    {"source", "device_graph_executor"},
+                    {"authority", "runtime_execution"},
+                    {"stages", std::to_string(schedule.size())}});
         }
 
         // After first successful pass, all weight tensors are confirmed on-device.
@@ -4025,6 +4126,7 @@ namespace llaminar2
         ComputeGraph &graph,
         const std::unordered_map<DeviceId, IDeviceContext *> &contexts)
     {
+        graph.requireExecutable();
 
         if (contexts.empty())
         {
@@ -4105,6 +4207,7 @@ namespace llaminar2
         RetainedMultiDeviceExecutionPlan &plan,
         std::string *error)
     {
+        graph.requireExecutable();
         auto fail = [&](const std::string &reason)
         {
             plan.clear();
@@ -4286,6 +4389,7 @@ namespace llaminar2
         const RetainedMultiDeviceExecutionPlan &plan,
         std::string *error)
     {
+        if(plan.graph)plan.graph->requireExecutable();
         auto fail = [&](const std::string &reason)
         {
             if (error)

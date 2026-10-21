@@ -21,20 +21,23 @@
 #include "../tensors/FP16Utils.h"                       // fp16_to_fp32, bf16_to_fp32
 #include "../utils/Logger.h"
 #include "SnapshotPublication.h"
+#include "SnapshotValues.h"
+#include "SnapshotSemanticObservation.h"
 
 namespace llaminar2
 {
 
     /**
-     * @brief Internal storage for a captured snapshot with shape metadata
+     * @brief Typed immutable payload for a captured snapshot with shape metadata
      */
     struct StoredSnapshot
     {
-        std::vector<float> data;
+        SnapshotValues data;
         size_t rows = 0;
         size_t cols = 0;
         SnapshotPublication publication = SnapshotPublication::SchemaPartition;
         SnapshotOwnedRows row_ownership; ///< Meaningful only for RowPartition publications.
+        SnapshotSemanticAxis semantic_axis=SnapshotSemanticAxis::Legacy; ///< Explicit mathematical axis, independent of physical token geometry.
     };
 
     /**
@@ -284,7 +287,7 @@ namespace llaminar2
 
     private:
         /**
-         * @brief Publish one immutable FP32 snapshot while the capture lock is held.
+         * @brief Publish one immutable typed snapshot while the capture lock is held.
          *
          * Every write allocates a new immutable object instead of modifying an
          * existing vector in place.  Readers holding an older handle therefore
@@ -292,7 +295,7 @@ namespace llaminar2
          * by a later callback.
          *
          * @param key Semantic diagnostic key.
-         * @param data Fully materialized FP32 values.
+         * @param data Fully materialized FP32 values or exact INT64 identities.
          * @param rows Logical row count reported by the producing stage.
          * @param cols Logical column count reported by the producing stage.
          * @param publication Whether the producer already assembled the value.
@@ -300,11 +303,12 @@ namespace llaminar2
          */
         void storeSnapshot(
             const std::string &key,
-            std::vector<float> data,
+            SnapshotValues data,
             size_t rows,
             size_t cols,
             SnapshotPublication publication = SnapshotPublication::SchemaPartition,
-            SnapshotOwnedRows row_ownership = {});
+            SnapshotOwnedRows row_ownership = {},
+            SnapshotSemanticAxis semantic_axis = SnapshotSemanticAxis::Legacy);
 
         /**
          * @brief Extract and publish one stage output while the capture lock is held.

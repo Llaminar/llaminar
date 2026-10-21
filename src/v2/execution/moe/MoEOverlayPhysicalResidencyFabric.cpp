@@ -163,9 +163,19 @@ namespace llaminar2
         }
     }
 
-    std::vector<MoEOverlayLayerWeightManifest>
-    buildMoEOverlayLayerWeightManifestFromGGUF(
-        const GGUFModel &model,
+    /**
+     * @brief Validate one native source contract through its immutable descriptor resolver.
+     * @tparam Resolve Allocation-free descriptor resolver for the declared source authority.
+     * @param resolve Returns the original native descriptor or null for an absent name.
+     * @param num_layers Number of contiguous owned global layer identities.
+     * @param num_experts Exact expert count required in every source projection.
+     * @param first_model_layer First global source identity owned by this interval.
+     * @return Validated native projection contracts without reading tensor payloads.
+     * @throws std::invalid_argument For malformed intervals or incompatible metadata.
+     */
+    template<class Resolve>
+    static std::vector<MoEOverlayLayerWeightManifest> buildExpertSourceManifest(
+        const Resolve &resolve,
         int num_layers,
         int num_experts,
         int first_model_layer)
@@ -263,7 +273,7 @@ namespace llaminar2
                 const std::string name =
                     "blk." + std::to_string(layer_idx) + "." +
                     projections[role].suffix;
-                const GGUFTensorInfo *tensor = model.findTensor(name);
+                const GGUFTensorInfo *tensor = resolve(name);
                 const ExpertWeightFormat format =
                     tensor ? source_format(tensor->type)
                            : ExpertWeightFormat{};
@@ -307,6 +317,24 @@ namespace llaminar2
             result.push_back(std::move(layer));
         }
         return result;
+    }
+
+    std::vector<MoEOverlayLayerWeightManifest>
+    buildMoEOverlayLayerWeightManifestFromGGUF(const GGUFModel &model,
+        int num_layers, int num_experts, int first_model_layer)
+    {
+        return buildExpertSourceManifest([&model](const std::string &name) {
+            return model.findTensor(name);
+        }, num_layers, num_experts, first_model_layer);
+    }
+
+    std::vector<MoEOverlayLayerWeightManifest>
+    buildMoEOverlayLayerWeightManifestFromLoader(const ModelLoader &loader,
+        int num_layers, int num_experts, int first_model_layer)
+    {
+        return buildExpertSourceManifest([&loader](const std::string &name) {
+            return loader.tensorInfo(name);
+        }, num_layers, num_experts, first_model_layer);
     }
 
     namespace

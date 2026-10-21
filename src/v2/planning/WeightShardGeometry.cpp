@@ -6,8 +6,8 @@
  * and DeviceShardingAssignment as production loading. An input shard keeps N
  * intact and reduces K; an output shard does the converse. Expert apportionment
  * changes only the number of complete matrices. An explicit projection-ownership
- * contract may instead retain every expert's down output slice, without changing
- * K; that is never inferred from an ordinary TP fraction. Physical packing remains
+ * contract may instead retain every expert's exact output or compact input
+ * slice; that is never inferred from an ordinary TP fraction. Physical packing remains
  * owned by its existing format contracts and PhysicalMemoryAuthority admission.
  */
 #include "planning/WeightShardGeometry.h"
@@ -293,13 +293,15 @@ namespace llaminar2
         if (ownership.geometry().experts != profile_.expert_count)
             throw std::invalid_argument("Projection ownership expert axis disagrees with model metadata");
         // Explicit physical residency bypasses the schema's ordinary TP share.
-        // Then apply the *same* output interval that preparation materializes.
+        // Then apply the same exact N/K rectangle that preparation materializes.
+        // This pure geometry value grants no runtime or movement support.
         auto local = resolve(tensor, ownership.residentExperts(role, owned_experts));
         if (!local.matrix() || local.matrix()->rows != static_cast<size_t>(projection.source_rows) ||
             local.matrix()->columns != static_cast<size_t>(projection.source_columns))
             throw std::invalid_argument("Projection ownership source matrix disagrees with " + tensor.name);
         auto matrix = *local.matrix();
         matrix.rows = static_cast<size_t>(projection.rows);
+        matrix.columns = static_cast<size_t>(projection.columns);
         return {checkedProduct(checkedProduct(matrix.rows, matrix.columns), matrix.instances), matrix};
     }
 

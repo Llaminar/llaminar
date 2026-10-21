@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 #include "config/OrchestrationConfigParser.h"
+#include "config/OrchestrationConfigDocument.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "utils/DebugEnv.h"
 #include "planning/ActivationBufferSizing.h"
@@ -3084,4 +3085,219 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_RepeatedFlag_LastWriteWins)
     auto parser = createOrchestrationConfigParser();
     auto config = parser->parseArgs(args.argc(), args.argv());
     EXPECT_FLOAT_EQ(config.temperature, 0.9f);
+}
+
+/** @test Explicit row-store mode and exact bounded mapping geometry survive public parsing. */
+TEST(Test__OrchestrationConfigParser, NgramStorageCliAndYamlRetainTypedPolicy)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper args{"llaminar2", "--ngram-storage=mmap", "--ngram-mmap-window-bytes", "131072",
+                    "--ngram-mmap-window-count", "17"};
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.ngram_table_policy.storage, ImmutableRowStoragePreference::MemoryMapped);
+    EXPECT_EQ(config.ngram_table_policy.window_bytes, 131072u);
+    EXPECT_EQ(config.ngram_table_policy.window_count, 17u);
+    const auto yaml = parser.parseYamlString(
+        "ngram:\n  storage: mmap\n  mmap_window_bytes: 131072\n  mmap_window_count: 17\n");
+    EXPECT_EQ(yaml.ngram_table_policy, config.ngram_table_policy);
+    const auto flat = parser.parseYamlString(
+        "ngram_storage: mmap\nngram_mmap_window_bytes: 131072\nngram_mmap_window_count: 17\n");
+    EXPECT_EQ(flat.ngram_table_policy, config.ngram_table_policy);
+    ArgvHelper ram{"llaminar2", "--ngram-storage", "ram"};
+    EXPECT_EQ(parser.parseArgs(ram.argc(), ram.argv()).ngram_table_policy.storage, ImmutableRowStoragePreference::RAM);
+}
+
+/** @test Invalid modes, incomplete numbers and unbounded windows fail without substitution. */
+TEST(Test__OrchestrationConfigParser, NgramStorageRejectsUnknownAndUnboundedPolicy)
+{
+    OrchestrationConfigParser parser;
+    for (const auto *value : {"automatic", "ssd", "RAM", ""})
+    {
+        ArgvHelper args{"llaminar2", "--ngram-storage", value};
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    for (const auto *value : {"0", "-1", "4x", "18446744073709551616"})
+    {
+        ArgvHelper args{"llaminar2", "--ngram-mmap-window-count", value};
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    for (const auto *value : {"0", "1", "4097"})
+    {
+        ArgvHelper args{"llaminar2", "--ngram-storage", "mmap", "--ngram-mmap-window-bytes", value};
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    EXPECT_EQ(parser.parseYamlString("ngram:\n  storage: auto\n").ngram_table_policy.storage,
+              ImmutableRowStoragePreference::Automatic);
+    EXPECT_THROW(parser.parseYamlString("ngram:\n  mmap_window_count: 0\n"), std::invalid_argument);
+    EXPECT_THROW(parser.parseYamlString("ngram:\n  invented: 1\n"), std::invalid_argument);
+}
+
+/** @test All public preferences remain lossless; no capacity or runtime decision is made while parsing. */
+TEST(Test__OrchestrationConfigParser, NgramStoragePreferenceIsRequestedAndDefaultsAutomatic)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper defaults{"llaminar2"};
+    EXPECT_EQ(parser.parseArgs(defaults.argc(), defaults.argv()).ngram_table_policy.storage,
+              ImmutableRowStoragePreference::Automatic);
+    for (const auto &[text, preference] : std::vector<std::pair<std::string, ImmutableRowStoragePreference>>{
+        {"auto", ImmutableRowStoragePreference::Automatic}, {"vram", ImmutableRowStoragePreference::VRAM},
+        {"ram", ImmutableRowStoragePreference::RAM}, {"mmap", ImmutableRowStoragePreference::MemoryMapped}})
+    {
+        SCOPED_TRACE(text);
+        ArgvHelper args{"llaminar2", "--ngram-storage", text.c_str()};
+        EXPECT_EQ(parser.parseArgs(args.argc(), args.argv()).ngram_table_policy.storage, preference);
+        EXPECT_EQ(parser.parseYamlString("ngram:\n  storage: " + text + "\n").ngram_table_policy.storage, preference);
+    }
+}
+
+/** @test Adaptive RAM/SSD is explicit, bounded and lossless; original Auto remains unchanged. */
+TEST(Test__OrchestrationConfigParser, NgramHostAdaptiveRamSsdCliAndYamlRemainFirstClass)
+{
+    OrchestrationConfigParser parser;
+    for(const auto *rows:{"0","37"})
+    {
+        ArgvHelper args{"llaminar2","--ngram-storage","host-adaptive-ram-ssd","--ngram-cache-max-rows",rows,
+            "--ngram-cache-bytes","8192","--ngram-cache-aging-accesses","97",
+            "--ngram-cache-protected-numerator","2","--ngram-cache-protected-denominator","5",
+            "--ngram-mmap-window-bytes","131072","--ngram-mmap-window-count","7"};
+        const auto c=parser.parseArgs(args.argc(),args.argv());
+        EXPECT_TRUE(c.ngram_table_policy.isHostAdaptive());
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.maximum_cache_rows,std::stoull(rows));
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.cache_physical_byte_limit,8192u);
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.policy.aging_accesses,97u);
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.policy.protected_numerator,2u);
+        EXPECT_EQ(c.ngram_table_policy.host_adaptive.policy.protected_denominator,5u);
+        const auto yaml=parser.parseYamlString(std::string("ngram:\n  storage: host-adaptive-ram-ssd\n  ram_cache_max_rows: ")+rows+
+            "\n  ram_cache_bytes: 8192\n  aging_accesses: 97\n  protected_numerator: 2\n  protected_denominator: 5"
+            "\n  mmap_window_bytes: 131072\n  mmap_window_count: 7\n");
+        EXPECT_EQ(c.ngram_table_policy,yaml.ngram_table_policy);
+    }
+    ArgvHelper automatic{"llaminar2"};
+    EXPECT_EQ(parser.parseArgs(automatic.argc(),automatic.argv()).ngram_table_policy,ImmutableRowTablePolicy{});
+    ArgvHelper zero{"llaminar2","--ngram-storage","host-adaptive-ram-ssd"};
+    const auto zero_policy=parser.parseArgs(zero.argc(),zero.argv()).ngram_table_policy;
+    EXPECT_TRUE(zero_policy.isHostAdaptive());EXPECT_EQ(zero_policy.host_adaptive.maximum_cache_rows,0u);
+    EXPECT_EQ(zero_policy.host_adaptive.cache_physical_byte_limit,0u);
+}
+/** @test Mixed arms and malformed ceilings reject without selecting another storage tier. */
+TEST(Test__OrchestrationConfigParser, NgramHostAdaptiveRamSsdRejectsMixedAndInvalidRequests)
+{
+    OrchestrationConfigParser parser;
+    for(const auto *mode:{"auto","ram","mmap","vram"})
+    {
+        ArgvHelper mixed{"llaminar2","--ngram-storage",mode,"--ngram-cache-max-rows","1"};
+        EXPECT_THROW((void)parser.parseArgs(mixed.argc(),mixed.argv()),std::invalid_argument);
+    }
+    for(const auto *value:{"-1","4x","4294967295","18446744073709551616"})
+    {
+        ArgvHelper bad{"llaminar2","--ngram-storage","host-adaptive-ram-ssd","--ngram-cache-max-rows",value};
+        EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+    }
+    for(const auto *flag:{"--ngram-cache-aging-accesses","--ngram-cache-protected-denominator"})
+    {
+        ArgvHelper bad{"llaminar2","--ngram-storage","host-adaptive-ram-ssd",flag,"0"};
+        EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+    }
+    EXPECT_THROW((void)parser.parseYamlString("ngram:\n  storage: host-adaptive-ram-ssd\n  protected_numerator: 4\n  protected_denominator: 3\n"),std::invalid_argument);
+}
+
+/** @test CLI carries an explicit distribution independently of tier; Auto cannot enter it. */
+TEST(Test__OrchestrationConfigParser, FixedHeadDistributionRequiresExplicitVRAM)
+{
+    ArgvHelper args{"llaminar2","--ngram-storage","vram","--ngram-distribution","fixed-head-sharded"};
+    const auto c=OrchestrationConfigParser{}.parseArgs(args.argc(),args.argv());
+    EXPECT_EQ(c.ngram_table_policy.distribution,ImmutableRowTableDistribution::FixedHeadSharded);
+    EXPECT_EQ(c.ngram_table_policy.storage,ImmutableRowStoragePreference::VRAM);
+    ArgvHelper defaults{"llaminar2","--ngram-storage","vram"};
+    EXPECT_EQ(OrchestrationConfigParser{}.parseArgs(defaults.argc(),defaults.argv()).ngram_table_policy.distribution,
+        ImmutableRowTableDistribution::Replicated);
+    ArgvHelper automatic{"llaminar2","--ngram-distribution","fixed-head-sharded"};
+    EXPECT_THROW((void)OrchestrationConfigParser{}.parseArgs(automatic.argc(),automatic.argv()),std::invalid_argument);
+    ArgvHelper unknown{"llaminar2","--ngram-distribution","sharded"};
+    EXPECT_THROW((void)OrchestrationConfigParser{}.parseArgs(unknown.argc(),unknown.argv()),std::invalid_argument);
+}
+
+/** @test Disjoint GPU/subordinate fields round-trip through CLI/YAML/document without flag-order interpretation. */
+TEST(Test__OrchestrationConfigParser, NgramGPUAdaptiveVramRamSsdPreservesDisjointCeilingsAndPolicies)
+{
+    OrchestrationConfigParser parser;
+    for(const auto *rows:{"0","64"})
+    {
+        ArgvHelper args{"llaminar2","--ngram-gpu-cache-max-rows",rows,"--ngram-gpu-cache-bytes","1048576",
+            "--ngram-gpu-cache-aging-accesses","97","--ngram-gpu-cache-protected-numerator","2",
+            "--ngram-gpu-cache-protected-denominator","5","--ngram-source-cache-max-rows","32",
+            "--ngram-source-cache-bytes","65536","--ngram-source-cache-aging-accesses","113",
+            "--ngram-source-cache-protected-numerator","1","--ngram-source-cache-protected-denominator","3",
+            "--ngram-mmap-window-bytes","131072","--ngram-mmap-window-count","7",
+            "--ngram-storage","gpu-adaptive-vram-ram-ssd"};
+        const auto c=parser.parseArgs(args.argc(),args.argv());const auto &p=c.ngram_table_policy;
+        ASSERT_TRUE(p.isGPUAdaptive());EXPECT_EQ(p.host_adaptive,HostAdaptiveRAMSSDRequest{});
+        EXPECT_EQ(p.gpu_adaptive.maximum_gpu_cache_rows,std::stoull(rows));EXPECT_EQ(p.gpu_adaptive.gpu_cache_physical_byte_limit,1048576u);
+        EXPECT_EQ(p.gpu_adaptive.gpu_policy,(CpuImmutableRowCachePolicy{97,2,5}));
+        EXPECT_EQ(p.gpu_adaptive.host.maximum_cache_rows,32u);EXPECT_EQ(p.gpu_adaptive.host.cache_physical_byte_limit,65536u);
+        EXPECT_EQ(p.gpu_adaptive.host.policy,(CpuImmutableRowCachePolicy{113,1,3}));
+        const auto yaml=parser.parseYamlString(std::string("ngram:\n  storage: gpu-adaptive-vram-ram-ssd\n  gpu_cache_max_rows: ")+rows+
+            "\n  gpu_cache_bytes: 1048576\n  gpu_aging_accesses: 97\n  gpu_protected_numerator: 2\n  gpu_protected_denominator: 5\n"
+            "  source_cache_max_rows: 32\n  source_cache_bytes: 65536\n  source_aging_accesses: 113\n"
+            "  source_protected_numerator: 1\n  source_protected_denominator: 3\n  mmap_window_bytes: 131072\n  mmap_window_count: 7\n");
+        EXPECT_EQ(yaml.ngram_table_policy,p);
+        EXPECT_EQ(parser.parseYamlString(serializeOrchestrationConfig(c)).ngram_table_policy,p);
+    }
+    ArgvHelper zero{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd"};
+    const auto p=parser.parseArgs(zero.argc(),zero.argv()).ngram_table_policy;
+    EXPECT_TRUE(p.isGPUAdaptive());EXPECT_EQ(p.gpu_adaptive,AdaptiveVRAMRAMSSDRequest{});
+    ArgvHelper automatic{"llaminar2"};
+    EXPECT_EQ(parser.parseArgs(automatic.argc(),automatic.argv()).ngram_table_policy,ImmutableRowTablePolicy{});
+}
+/** @test Wrong/mixed arms, malformed limits and unknown policy cannot be repaired into another mode. */
+TEST(Test__OrchestrationConfigParser, NgramGPUAdaptiveVramRamSsdRejectsMixedInvalidAndWrongModeFields)
+{
+    OrchestrationConfigParser parser;
+    for(const auto *mode:{"auto","vram","ram","mmap","host-adaptive-ram-ssd"})
+    {
+        ArgvHelper mixed{"llaminar2","--ngram-storage",mode,"--ngram-gpu-cache-max-rows","1"};
+        EXPECT_THROW((void)parser.parseArgs(mixed.argc(),mixed.argv()),std::invalid_argument);
+        ArgvHelper source{"llaminar2","--ngram-source-cache-max-rows","1","--ngram-storage",mode};
+        EXPECT_THROW((void)parser.parseArgs(source.argc(),source.argv()),std::invalid_argument);
+    }
+    for(const auto *value:{"-1","4x","2147483648","18446744073709551616"})
+    {
+        ArgvHelper bad{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd","--ngram-gpu-cache-max-rows",value};
+        EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+    }
+    for(const auto *flag:{"--ngram-gpu-cache-bytes","--ngram-source-cache-bytes","--ngram-source-cache-max-rows"})
+    {
+        for(const auto *value:{"-1","12x","18446744073709551616"})
+        {
+            ArgvHelper bad{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd",flag,value};
+            EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+        }
+    }
+    ArgvHelper sourceLimit{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd","--ngram-source-cache-max-rows","4294967295"};
+    EXPECT_THROW((void)parser.parseArgs(sourceLimit.argc(),sourceLimit.argv()),std::invalid_argument);
+    for(const auto *flag:{"--ngram-gpu-cache-aging-accesses","--ngram-gpu-cache-protected-denominator",
+        "--ngram-source-cache-aging-accesses","--ngram-source-cache-protected-denominator"})
+    {
+        ArgvHelper bad{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd",flag,"0"};
+        EXPECT_THROW((void)parser.parseArgs(bad.argc(),bad.argv()),std::invalid_argument);
+    }
+    ArgvHelper hostFirst{"llaminar2","--ngram-cache-max-rows","1","--ngram-storage","gpu-adaptive-vram-ram-ssd"};
+    EXPECT_THROW((void)parser.parseArgs(hostFirst.argc(),hostFirst.argv()),std::invalid_argument);
+    ArgvHelper hostLast{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd","--ngram-cache-max-rows","1"};
+    EXPECT_THROW((void)parser.parseArgs(hostLast.argc(),hostLast.argv()),std::invalid_argument);
+    ArgvHelper shards{"llaminar2","--ngram-storage","gpu-adaptive-vram-ram-ssd","--ngram-distribution","fixed-head-sharded"};
+    EXPECT_THROW((void)parser.parseArgs(shards.argc(),shards.argv()),std::invalid_argument);
+    EXPECT_THROW((void)parser.parseYamlString("ngram:\n  storage: gpu-adaptive-vram-ram-ssd\n  gpu_protected_numerator: 5\n  gpu_protected_denominator: 4\n"),std::invalid_argument);
+    EXPECT_THROW((void)parser.parseYamlString("ngram:\n  storage: gpu-adaptive-vram-ram-ssd\n  source_protected_numerator: 5\n  source_protected_denominator: 4\n"),std::invalid_argument);
+    EXPECT_THROW((void)parser.parseYamlString("ngram:\n  storage: gpu-adaptive-vram-ram-ssd\n  gpu_cache_invented: 1\n"),std::invalid_argument);
+}
+/** @test Public help is generated from the same typed mode and disjoint option owners. */
+TEST(Test__OrchestrationConfigParser, NgramGPUAdaptiveVramRamSsdHelpNamesActualSettings)
+{
+    const auto help=OrchestrationConfigParser::getHelpText();
+    for(const auto *name:{"gpu-adaptive-vram-ram-ssd","--ngram-gpu-cache-max-rows","--ngram-gpu-cache-bytes",
+        "--ngram-gpu-cache-aging-accesses","--ngram-gpu-cache-protected-numerator","--ngram-gpu-cache-protected-denominator",
+        "--ngram-source-cache-max-rows","--ngram-source-cache-bytes","--ngram-source-cache-aging-accesses",
+        "--ngram-source-cache-protected-numerator","--ngram-source-cache-protected-denominator"})
+        EXPECT_NE(help.find(name),std::string::npos) << name;
 }

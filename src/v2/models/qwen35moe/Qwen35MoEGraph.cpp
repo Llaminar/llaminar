@@ -17,6 +17,7 @@
 #include "planning/ModelMemoryProfile.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEProjectionRuntimeBinding.h"
+#include "execution/moe/MoEOverlayNoPeerResidency.h"
 #include "execution/compute_stages/stages/MoEProjectionPipeline.h"
 #include "execution/compute_stages/stages/MoERoutingPipeline.h"
 #include "loaders/PreparedWeightStore.h"
@@ -4630,6 +4631,36 @@ namespace llaminar2
         const int32_t *sequence_lengths_device,
         const int32_t *absolute_position_ids_device)
     {
+        const auto identity = mtpGraphContextActive()
+            ? LayerGraphSourceIdentity::inlinePredictor(layer_idx, mtpGraphDepthIndex())
+            : mainAttentionIdentity(layer_idx, nullptr).source();
+        return buildFFNGraphForLayer(layer, buffers, identity, seq_len, batch_size,
+            device, device_state_publication_stream, sequence_lengths_device,
+            absolute_position_ids_device, nullptr);
+    }
+
+    ComputeGraph Qwen35MoEGraph::buildFFNGraphForLayer(
+        const LayerWeights &layer, ActivationBuffers &buffers,
+        const LayerGraphSourceIdentity &identity, int seq_len, int batch_size,
+        DeviceId device, void *device_state_publication_stream,
+        const int32_t *sequence_lengths_device, const int32_t *absolute_position_ids_device,
+        const Qwen4ExpPredictorResidualBinding *predictor)
+    {
+        const int layer_idx = identity.sourceLayer();
+        if (seq_len <= 0 || batch_size <= 0 || batch_size > std::numeric_limits<int>::max() / seq_len)
+            throw std::invalid_argument("FFN graph requires positive representable query geometry");
+        if ((identity.sourcePolicy() == GraphLayerSourcePolicy::Qwen4ExpSharedPredictor) != (predictor != nullptr))
+            throw std::invalid_argument("Shared QFN FFN identity requires its explicit frozen residual construction");
+        if (predictor) {
+            predictor->requireInvocation(Qwen4ExpPredictorInvocation::Draft);
+            Qwen4ExpPredictorResidualBinding::requireFrozenSource(identity, predictor->weights());
+            predictor->requireLayerSource(layer);
+            predictor->rows().requireCompactCPUQuery();
+            if (batch_size != 1 || predictor->rows().tokens().physicalRows() != seq_len ||
+                predictor->rows().device() != device ||
+                (device.is_gpu() && predictor->rows().tokens().countOwner() != sequence_lengths_device))
+                throw std::invalid_argument("Dense0 FFN must retain its exact original row/count/device owner");
+        }
         (void)projectionArena();
         if (device.is_gpu() && !device_state_publication_stream)
         {
@@ -4648,9 +4679,9 @@ namespace llaminar2
                 "durable residency authority binding");
         }
         ComputeGraph graph;
-        const bool mtp_sidecar_context = mtpGraphContextActive();
-        const int mtp_depth_idx = mtpGraphDepthIndex();
-        const std::string prefix = ffnGraphStagePrefix(layer_idx);
+        const bool mtp_sidecar_context = identity.workload() == GraphLayerWorkload::MTPDepth;
+        const int mtp_depth_idx = identity.predictorDepth().value_or(-1);
+        const std::string prefix = identity.prefix();
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
         /*
@@ -4817,7 +4848,8 @@ namespace llaminar2
                    config_.compute_all_position_logits &&
                    !mtp_sidecar_context;
         };
-        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+        LayerWeightBindings layer_bindings = predictor ? predictor->weights().fa_block
+                                                       : layerWeightBindingsForGraph(layer_idx);
 
         IMoERuntimeTable *moe_runtime_table = nullptr;
         const auto &rocm_env = debugEnv().rocm;
@@ -4910,7 +4942,61 @@ namespace llaminar2
             isPrefillApportionedDecodeReplicatedTier(
                 *overlay_plan,
                 *resolved_local_tp_replicated_tier);
+        // A singleton overlay is a complete local native computation, not a
+        // one-member collective. Authenticate the original immutable owner map
+        // before reusing the prepared local-expert lowering. GPU route state
+        // remains in the overlay epoch/runtime table; there is no host ticket.
+        const bool single_participant_overlay_local = [&]()
+        {
+            if (!device.is_gpu() || !use_expert_overlay || !overlay_plan ||
+                !MoEOverlayNoPeerResidency::hasNoPeerTopology(*overlay_plan))
+                return false;
+            const auto &authority = config_.moe.expert_overlay_residency_authority;
+            if (!authority || !authority->noPeerResidency())
+                throw std::logic_error("Qwen35 MoE singleton native lowering requires its sealed no-peer residency authority");
+            const auto &proof = *authority->noPeerResidency();
+            const auto snapshot = authority->snapshot();
+            if (!snapshot || !snapshot->valid())
+                throw std::logic_error("Qwen35 MoE singleton native lowering has no original residency snapshot");
+            const auto &original = *snapshot->placement_plan;
+            if (!MoEOverlayNoPeerResidency::hasNoPeerTopology(original))
+                throw std::logic_error("Qwen35 MoE singleton native lowering lost its original topology");
+            const auto &domain = overlay_plan->domains.front();
+            const auto &original_domain = original.domains.front();
+            if (domain.name != original_domain.name || domain.scope != original_domain.scope ||
+                domain.backend != original_domain.backend || domain.participants != original_domain.participants ||
+                domain.world_ranks != original_domain.world_ranks || domain.owner_rank != original_domain.owner_rank ||
+                domain.routed_compute_policy != original_domain.routed_compute_policy ||
+                domain.routed_phase_policy != original_domain.routed_phase_policy ||
+                domain.routed_decode_assignment_policy != original_domain.routed_decode_assignment_policy ||
+                domain.routed_prefill_assignment_policy != original_domain.routed_prefill_assignment_policy ||
+                domain.weights != original_domain.weights ||
+                overlay_plan->authority_execution != original.authority_execution ||
+                overlay_plan->residency_policy != original.residency_policy ||
+                overlay_plan->owner_order != original.owner_order ||
+                overlay_plan->routed_tiers.front().name != original.routed_tiers.front().name ||
+                overlay_plan->routed_tiers.front().domain != original.routed_tiers.front().domain ||
+                !std::equal(overlay_plan->placements.begin(), overlay_plan->placements.end(),
+                    original.placements.begin(), original.placements.end(), [](const auto &a, const auto &b)
+                    { return a.layer == b.layer && a.routed_expert_tier == b.routed_expert_tier; }))
+                throw std::logic_error("Qwen35 MoE singleton native lowering has foreign domain, participant or placement identity");
+            const auto &ownership = snapshot->layered_ownership;
+            proof.requireDestination(device, ownership.firstModelLayer(),
+                ownership.layerCount(), config_.moe.num_experts);
+            if (overlay_plan->first_model_layer != ownership.firstModelLayer() ||
+                overlay_plan->placements.size() != static_cast<std::size_t>(ownership.layerCount()) ||
+                layer_idx < ownership.firstModelLayer() ||
+                layer_idx - ownership.firstModelLayer() >= ownership.layerCount() ||
+                overlay_plan->continuation_domain != overlay_plan->routed_tiers.front().domain ||
+                overlay_plan->shared_expert_domain != overlay_plan->routed_tiers.front().domain ||
+                overlay_plan->domains.front().primaryWorldRank() != std::optional<int>{proof.worldRank()} ||
+                (config_.moe.overlay_mpi_ctx && config_.moe.overlay_mpi_ctx->rank() != proof.worldRank()) ||
+                proof.authorityExecution() != config_.moe.authority_execution)
+                throw std::logic_error("Qwen35 MoE singleton native lowering differs from its complete admitted stage ownership");
+            return true;
+        }();
         const bool resolved_fully_replicated_local_rows =
+            single_participant_overlay_local ||
             (resolved_local_tp_replicated_fast_candidate &&
              !phase_split_local_tp_apportioned_gpu_prefill) ||
             (!use_expert_overlay &&
@@ -5297,6 +5383,7 @@ namespace llaminar2
             local_tp_ctx->degree() > 1;
         const bool runtime_table_eligible =
             projection_arena_.has_value() || static_full_local_expert_ownership ||
+            single_participant_overlay_local ||
             masked_local_tp_overlay_decode_runtime_table ||
             captured_distributed_overlay_runtime_table ||
             full_local_tp_replicated_overlay_decode_runtime_table ||
@@ -5376,7 +5463,7 @@ namespace llaminar2
             {
                 if (!model_ctx_) throw std::logic_error("Projection transfer profile has no model metadata");
                 return DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(
-                    buildMoEOverlayLayerWeightManifestFromGGUF(model_ctx_->concreteLoader().getModel(),
+                    buildMoEOverlayLayerWeightManifestFromLoader(model_ctx_->concreteLoader(),
                         bound_runtime_table_layers, config_.moe.num_experts,
                         bound_runtime_first_layer), DeviceMoEProjectionSet::GateUp);
             }
@@ -7039,6 +7126,14 @@ namespace llaminar2
         // =====================================================================
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
         // =====================================================================
+        std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> residual_read;
+        if (config_.flash_next)
+        {
+            residual_read.emplace(addBranchBlockRead(graph, prefix, buffers,
+                layer_idx, total_tokens, device, ResidualBlock::FeedForward, predictor));
+            ffn_terminal = residual_read->terminal();
+        }
+        else
         {
             FusedResidualNormStage::Params fused_params;
             fused_params.device_id = device;
@@ -7306,7 +7401,7 @@ namespace llaminar2
         };
         const bool shared_expert_requires_tp_allreduce =
             has_shared_expert_branch && needsTPAllreduce() &&
-            denseTPAllreduceEnabledForCurrentGraph();
+            (predictor ? predictor->layout().sharedNeedsReduction() : denseTPAllreduceEnabledForCurrentGraph());
 
         /*
          * The grouped ROCm verifier has enough independent route work to make
@@ -7479,6 +7574,7 @@ namespace llaminar2
                         ? MoEDecodeDescriptorSource::RuntimePlacementTable
                         : MoEDecodeDescriptorSource::StaticDescriptorTable;
                 expert_params.runtime_decode_has_explicit_owner_metadata =
+                    single_participant_overlay_local ||
                     masked_local_tp_overlay_decode_runtime_table ||
                     captured_distributed_overlay_runtime_table ||
                     full_local_tp_replicated_overlay_decode_runtime_table ||
@@ -7806,10 +7902,13 @@ namespace llaminar2
             const bool can_combine_shared_verifier = false;
 
             const RoutedExpertTier *local_tp_fast_tier =
-                local_tp_apportioned_fast_candidate
-                    ? local_tp_apportioned_tier
-                    : local_tp_replicated_tier;
+                single_participant_overlay_local
+                    ? &overlay_plan->routed_tiers.front()
+                    : local_tp_apportioned_fast_candidate
+                          ? local_tp_apportioned_tier
+                          : local_tp_replicated_tier;
             const bool use_local_tp_routed_fast_path =
+                single_participant_overlay_local ||
                 local_tp_apportioned_fast_candidate ||
                 phase_split_local_tp_apportioned_gpu_prefill ||
                 local_tp_replicated_fast_candidate;
@@ -8125,7 +8224,26 @@ namespace llaminar2
                             current_batch_llep_apply_node);
                 }
 
-                if (moe_runtime_table &&
+                if (moe_runtime_table && single_participant_overlay_local)
+                {
+                    // Seed the canonical overlay bank even when the first cold
+                    // shape is prefill. Every descriptor is registry-owned and
+                    // the existing epoch ticket remains the replay authority.
+                    if (!initializeFullLocalDecodeRuntimeTable(
+                            moe_runtime_table, layer_idx, config_.moe.num_experts,
+                            config_.moe.top_k, config_.d_model, expert_intermediate,
+                            FullLocalDecodeRuntimePolicy::SingleParticipant,
+                            local_participant, /*participant_count=*/1, {},
+                            expert_params.prepared_gate_gemm,
+                            expert_params.prepared_up_gemm,
+                            expert_params.prepared_down_gemm,
+                            device_state_publication_stream,
+                            "singleton overlay native graph build"))
+                        throw std::runtime_error("Qwen35 MoE failed to initialize singleton overlay runtime placement");
+                    if (forceGroupedMoEVerifierPrefill(device))
+                        expert_params.use_runtime_row_grouping = true;
+                }
+                else if (moe_runtime_table &&
                     masked_local_tp_overlay_decode_runtime_table &&
                     expert_params.replica_set.num_replicated == 0)
                 {
@@ -8292,7 +8410,7 @@ namespace llaminar2
                      */
                     canonical_publication_lowering.policy =
                         device.is_rocm() &&
-                                !denseTPAllreduceEnabledForCurrentGraph()
+                                !(predictor ? predictor->layout().sharedNeedsReduction() : denseTPAllreduceEnabledForCurrentGraph())
                             ? MoEParticipantPublicationPolicy::
                                   CanonicalAllreduceRouteSlots
                             : MoEParticipantPublicationPolicy::
@@ -9173,6 +9291,8 @@ namespace llaminar2
                      * independent of transport topology. */
                     local_params.canonical_route_contributions =
                         canonical_route_contributions;
+                    local_params.canonical_route_diagnostic_publication =
+                        MoECanonicalRouteDiagnosticPublication::ContinuationLocalBank;
                     local_params.canonical_route_arithmetic =
                         MoECanonicalRouteArithmeticPolicy::
                             PreweightedContributionThenOrderedAdd;
@@ -13514,8 +13634,8 @@ namespace llaminar2
              */
             shared_params.disable_grouped_decode_shortcut =
                 mtp_sidecar_context &&
-                (config_.dense_tp_decode_replicated ||
-                 config_.mtpUsesReplicatedDenseSidecarBinding());
+                (predictor ? predictor->layout().policy()==MTPShiftedKVHeadLayout::FullModelPerParticipant :
+                    (config_.dense_tp_decode_replicated || config_.mtpUsesReplicatedDenseSidecarBinding()));
             shared_params.prepared_ref_gate = preparedRefForGraphWeight(
                 layer_bindings.shared_expert_gate, shared_device);
             shared_params.prepared_ref_up = preparedRefForGraphWeight(
@@ -13834,7 +13954,11 @@ namespace llaminar2
                         /*is_attention=*/false,
                         ar_name,
                         buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT),
-                        std::move(rebalance_sidebands));
+                        std::move(rebalance_sidebands), std::nullopt,
+                        predictor && shared_device.is_gpu() && predictor->rows().tokens().countOwner()
+                            ? std::optional{NativeAllreduceRequestRows(1,total_tokens,config_.d_model,predictor->rows().tokens().countOwner())}
+                            : std::nullopt,
+                        predictor ? std::optional{ForwardExecutionPhase::Decode} : std::nullopt);
                     if (projection_shared_overlap && !forwardPhaseAllowsDecodeTopology() &&
                         layer.shared_expert_gate_inp)
                     {
@@ -14130,7 +14254,12 @@ namespace llaminar2
         // Stage 6: Explicit residual (last layer only)
         // =====================================================================
         const bool skip_ffn_residual = (layer_idx < config_.pp_layer_offset + config_.n_layers - 1);
-        if (!skip_ffn_residual)
+        if (residual_read)
+        {
+            ffn_terminal = addBranchBlockWrite(graph, std::move(*residual_read), buffers, ffn_terminal,
+                predictor ? &predictor->ffnOutput() : nullptr);
+        }
+        else if (!skip_ffn_residual)
         {
             ResidualAddStage::Params res_params;
             res_params.device_id = device;

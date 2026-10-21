@@ -154,10 +154,6 @@ namespace llaminar2
                 "MTP spec-state publication received a negative verifier restore row");
         }
 
-        MTPSpecStatePublicationResult result;
-        result.ok = true;
-        result.request_id = plan.request_id;
-        result.accepted_count = plan.accepted_count;
         PerfStatsCollector::addCounter(
             "mtp",
             "spec_state_restore_row_requests",
@@ -169,6 +165,23 @@ namespace llaminar2
              {"draft_count", std::to_string(plan.draft_count)},
              {"restore_row", std::to_string(verifier_restore_row)},
              {"target_cached_tokens", std::to_string(plan.target_cached_tokens)}});
+
+        if(device.is_cpu())
+        {
+            // This CPU-owned scalar is one request-local decision vector. Keep
+            // legacy caller accounting while sharing all plan-before-write logic.
+            auto step=plan;step.request_index=0;
+            MTPSpecStepPlanBatch batch;batch.ok=true;batch.request_count=1;batch.steps.push_back(step);
+            auto published=publishAcceptedMTPSpecStateFromVerifierRows(batch,&verifier_restore_row,
+                state_stages,device,stream,require_captured_stage);
+            preserveLegacyPlanAccounting(published,plan);return published;
+        }
+
+        MTPSpecStatePublicationResult result;
+        result.ok = true;
+        result.request_id = plan.request_id;
+        result.accepted_count = plan.accepted_count;
+
 
         if (plan.accepted_count == 0)
         {
@@ -239,6 +252,8 @@ namespace llaminar2
                 plans,
                 "host-indexed batched MTP spec-state publication is CPU-only");
         }
+        if(stream)
+            return batchPublicationFailure(plans,"CPU accepted-state publication cannot use a GPU stream");
         if (!plans.ok || plans.request_count <= 0 ||
             static_cast<int>(plans.steps.size()) != plans.request_count)
         {
@@ -287,17 +302,14 @@ namespace llaminar2
             {{"request_count", std::to_string(plans.request_count)},
              {"publication_policy", "request_owned_grouped_restore"}});
 
-        if (!any_restore)
-        {
-            result.skipped_stage_count = static_cast<int>(state_stages.size());
-            return result;
-        }
+        // An all-negative decision is legacy snapshot NoOp, but a typed native
+        // prefix stage may need to restore original immutable prior bytes. Plan
+        // every stage before deciding whether any physical write is necessary.
 
-        if (plans.request_count == 1)
         {
             /*
-             * The overwhelmingly common server transaction owns one request
-             * and one independent live-state allocation per recurrent stage.
+             * Every request and stage contributes immutable plans against its
+             * sole accepted-state owner before any live byte can be changed.
              * Planning every copy first makes bad rows, stale workspaces, and
              * overlapping destinations fatal before any byte becomes live.
              * Once validated, one persistent OpenMP team fans the independent
@@ -307,6 +319,9 @@ namespace llaminar2
              */
             std::vector<CPUVerifierStateRestorePlan> restore_plans;
             restore_plans.reserve(state_stages.size());
+            std::vector<CPUVerifierStateRestoreDestination> live_destinations;
+            std::vector<IComputeStage *> native_prefix_stages;
+            std::vector<IComputeStage *> changed_stages;
             struct RestoreCopyChunk
             {
                 void *destination = nullptr;
@@ -329,7 +344,7 @@ namespace llaminar2
                     if (!stage)
                     {
                         std::ostringstream msg;
-                        msg << "single-request CPU MTP publication received null stage at index "
+                        msg << "CPU request-owned MTP publication received null stage at index "
                             << i;
                         return batchPublicationFailure(plans, msg.str());
                     }
@@ -339,67 +354,70 @@ namespace llaminar2
                             stage->requiresVerifierStateCaptureForPublication())
                         {
                             std::ostringstream msg;
-                            msg << "single-request CPU MTP publication required verifier capture for stage "
+                            msg << "CPU request-owned MTP publication required verifier capture for stage "
                                 << stage->name() << " at index " << i;
                             return batchPublicationFailure(plans, msg.str());
                         }
                         continue;
                     }
 
-                    CPUVerifierStateRestorePlan restore =
-                        stage->planCPUVerifierStateRestoreRow(restore_row);
-                    if (!restore.ready())
+                    const auto first_plan=restore_plans.size();
+                    if(!stage->planCPUVerifierStateRestoreRows(host_verifier_restore_rows,plans.request_count,restore_plans))
                     {
                         std::ostringstream msg;
-                        msg << "single-request CPU MTP publication could not plan a native restore for captured stage "
-                            << stage->name() << " at index " << i
-                            << " status=" << static_cast<int>(restore.status);
-                        return batchPublicationFailure(plans, msg.str());
-                    }
-
-                    const uintptr_t destination_begin =
-                        reinterpret_cast<uintptr_t>(restore.destination);
-                    const uintptr_t source_begin =
-                        reinterpret_cast<uintptr_t>(restore.source);
-                    if (restore.bytes >
-                            std::numeric_limits<uintptr_t>::max() - destination_begin ||
-                        restore.bytes >
-                            std::numeric_limits<uintptr_t>::max() - source_begin ||
-                        restore.bytes >
-                            std::numeric_limits<size_t>::max() - restore_bytes)
-                    {
-                        return batchPublicationFailure(
-                            plans,
-                            "single-request CPU MTP publication restore span overflowed its address domain");
-                    }
-                    const uintptr_t destination_end =
-                        destination_begin + restore.bytes;
-                    const uintptr_t source_end = source_begin + restore.bytes;
-                    if (destination_begin < source_end &&
-                        source_begin < destination_end)
-                    {
-                        std::ostringstream msg;
-                        msg << "single-request CPU MTP publication source aliases its live destination for stage "
+                        msg << "CPU request-owned MTP publication could not plan a native restore for captured stage "
                             << stage->name() << " at index " << i;
-                        return batchPublicationFailure(plans, msg.str());
+                        return batchPublicationFailure(plans,msg.str());
                     }
-                    for (const CPUVerifierStateRestorePlan &planned : restore_plans)
+                    bool native_commit=false,stage_work=false;
+                    for(std::size_t plan_index=first_plan;plan_index<restore_plans.size();++plan_index)
                     {
-                        const uintptr_t planned_begin =
-                            reinterpret_cast<uintptr_t>(planned.destination);
-                        const uintptr_t planned_end = planned_begin + planned.bytes;
-                        if (destination_begin < planned_end &&
-                            planned_begin < destination_end)
+                    const auto &restore=restore_plans[plan_index];
+                    if(restore.status==CPUVerifierStateRestorePlanStatus::NoOp)continue;
+                    if(!restore.ready())return batchPublicationFailure(plans,
+                        "CPU request-owned MTP publication returned an invalid immutable restore plan");
+
+                    const auto admit_destination = [&](CPUVerifierStateRestoreDestination span) {
+                        const uintptr_t begin = reinterpret_cast<uintptr_t>(span.data);
+                        if (!span.data || !span.bytes ||
+                            span.bytes > std::numeric_limits<uintptr_t>::max() - begin ||
+                            span.bytes > std::numeric_limits<size_t>::max() - restore_bytes)
+                            return false;
+                        for (const auto &planned : live_destinations)
                         {
-                            std::ostringstream msg;
-                            msg << "single-request CPU MTP publication found overlapping live-state destinations at stage "
-                                << stage->name() << " index " << i;
-                            return batchPublicationFailure(plans, msg.str());
+                            const uintptr_t planned_begin = reinterpret_cast<uintptr_t>(planned.data);
+                            if (begin < planned_begin + planned.bytes && planned_begin < begin + span.bytes)
+                                return false;
                         }
+                        live_destinations.push_back(span);
+                        restore_bytes += span.bytes;
+                        return true;
+                    };
+                    if (restore.kind == CPUVerifierStateRestorePlanKind::NativeAcceptedPrefixCommit)
+                    {
+                        for (const auto &span : restore.native_destinations)
+                            if (!admit_destination(span))
+                                return batchPublicationFailure(plans,
+                                    "CPU request-owned MTP publication has invalid or overlapping native-prefix live destinations");
+                        // A Ready native operation is still a publication when its
+                        // exact payload is empty; its own validated live predicate owns that case.
+                        native_commit=stage_work=true;
+                    }
+                    else
+                    {
+                        const uintptr_t destination_begin = reinterpret_cast<uintptr_t>(restore.destination);
+                        const uintptr_t source_begin = reinterpret_cast<uintptr_t>(restore.source);
+                        if (restore.bytes > std::numeric_limits<uintptr_t>::max() - source_begin ||
+                            (destination_begin < source_begin + restore.bytes && source_begin < destination_begin + restore.bytes) ||
+                            !admit_destination({restore.destination, restore.bytes}))
+                            return batchPublicationFailure(plans,
+                                "CPU request-owned MTP publication has invalid or overlapping snapshot live destinations");
+                        stage_work=true;
                     }
 
-                    restore_bytes += restore.bytes;
-                    restore_plans.push_back(restore);
+                    }
+                    if(native_commit)native_prefix_stages.push_back(stage);
+                    if(stage_work)changed_stages.push_back(stage);
                 }
 
                 restore_chunks.reserve(
@@ -407,6 +425,8 @@ namespace llaminar2
                     restore_plans.size());
                 for (const CPUVerifierStateRestorePlan &restore : restore_plans)
                 {
+                    if (restore.kind != CPUVerifierStateRestorePlanKind::SnapshotCopy)
+                        continue;
                     auto *destination = static_cast<std::byte *>(restore.destination);
                     const auto *source = static_cast<const std::byte *>(restore.source);
                     for (size_t offset = 0; offset < restore.bytes;
@@ -424,6 +444,11 @@ namespace llaminar2
                 }
             }
 
+            if(require_captured_stage && any_restore && changed_stages.empty())
+                return batchPublicationFailure(plans,
+                    "CPU request-owned MTP publication required a captured stage but planned no state write");
+
+            if(!restore_chunks.empty())
             {
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
@@ -447,6 +472,17 @@ namespace llaminar2
                 OMP_WORKSHARE_REGION(copy_restore_plans);
             }
 
+            /* Native prefix kernels own their worksharing policy. Calling them outside
+             * the copy team avoids entering OMP_SINGLE/collective worksharing from one
+             * worker, while retaining parallel channel copies for the PLE history.
+             * All candidate bounds and all live destinations were admitted above.
+             */
+            for (IComputeStage *stage : native_prefix_stages)
+                if (!(plans.request_count==1 ? stage->restoreVerifierStateCaptureRow(restore_row,stream) :
+                    stage->restoreVerifierStateCaptureRows(host_verifier_restore_rows,plans.request_count,stream)))
+                    return batchPublicationFailure(plans,
+                        "CPU request-owned MTP validated native-prefix commit failed");
+
             {
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
@@ -455,7 +491,7 @@ namespace llaminar2
                 for (size_t i = 0; i < state_stages.size(); ++i)
                 {
                     IComputeStage *stage = state_stages[i];
-                    if (stage->hasVerifierStateCapture())
+                    if (std::find(changed_stages.begin(),changed_stages.end(),stage)!=changed_stages.end())
                     {
                         ++result.restored_stage_count;
                         stage->clearVerifierStateCaptureBindingAfterPublication();
@@ -463,13 +499,6 @@ namespace llaminar2
                     }
                     ++result.skipped_stage_count;
                 }
-            }
-
-            if (require_captured_stage && result.restored_stage_count == 0)
-            {
-                return batchPublicationFailure(
-                    plans,
-                    "single-request CPU MTP publication required a captured stage but restored none");
             }
 
             PerfStatsCollector::addCounter(
@@ -481,54 +510,11 @@ namespace llaminar2
                 {{"restore_spans", std::to_string(restore_plans.size())},
                  {"restore_chunks", std::to_string(restore_chunks.size())},
                  {"copy_chunk_bytes", std::to_string(kRestoreCopyChunkBytes)},
-                 {"publication_policy", "validated_parallel_layer_copies"}});
+                 {"native_prefix_commits", std::to_string(native_prefix_stages.size())},
+                 {"publication_policy", "validated_snapshot_and_native_prefix_publication"}});
             return result;
         }
 
-        for (size_t i = 0; i < state_stages.size(); ++i)
-        {
-            IComputeStage *stage = state_stages[i];
-            if (!stage)
-            {
-                std::ostringstream msg;
-                msg << "host-indexed batched MTP spec-state publication received null stage at index "
-                    << i;
-                return batchPublicationFailure(plans, msg.str());
-            }
-            if (!stage->hasVerifierStateCapture())
-            {
-                if (require_captured_stage &&
-                    stage->requiresVerifierStateCaptureForPublication())
-                {
-                    std::ostringstream msg;
-                    msg << "host-indexed batched MTP spec-state publication required verifier capture for stage "
-                        << stage->name() << " at index " << i;
-                    return batchPublicationFailure(plans, msg.str());
-                }
-                ++result.skipped_stage_count;
-                continue;
-            }
-            if (!stage->restoreVerifierStateCaptureRows(
-                    host_verifier_restore_rows,
-                    plans.request_count,
-                    stream))
-            {
-                std::ostringstream msg;
-                msg << "host-indexed batched MTP spec-state publication failed grouped restore for stage "
-                    << stage->name() << " at index " << i;
-                return batchPublicationFailure(plans, msg.str());
-            }
-            ++result.restored_stage_count;
-            stage->clearVerifierStateCaptureBindingAfterPublication();
-        }
-
-        if (require_captured_stage && result.restored_stage_count == 0)
-        {
-            return batchPublicationFailure(
-                plans,
-                "host-indexed batched MTP spec-state publication required a captured stage but restored none");
-        }
-        return result;
     }
 
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(

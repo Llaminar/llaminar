@@ -1,6 +1,10 @@
 /**
  * @file RetainedParentTicketServiceWorker.cpp
  * @brief Lifecycle implementation for retained-parent CPU ticket service.
+ *
+ * Construction completes every lifecycle member before publishing this object
+ * to its persistent thread. Dispatch and retirement then transfer the borrowed
+ * invocation under the same mutex; teardown joins before any state is released.
  */
 
 #include "RetainedParentTicketServiceWorker.h"
@@ -13,8 +17,12 @@
 namespace llaminar2
 {
     RetainedParentTicketServiceWorker::RetainedParentTicketServiceWorker()
-        : worker_(&RetainedParentTicketServiceWorker::run, this)
     {
+        // A thread may enter run() before std::thread construction returns.
+        // Starting it in the body guarantees even members declared after
+        // worker_ are initialized. An early member-initializer launch could
+        // observe the previous lifetime's Stopping value in reused storage.
+        worker_ = std::thread(&RetainedParentTicketServiceWorker::run, this);
     }
 
     RetainedParentTicketServiceWorker::~RetainedParentTicketServiceWorker()

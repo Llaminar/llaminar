@@ -8,6 +8,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../execution/local_execution/orchestrators/PrefixArchiveSourceContract.h"
 
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/gemm/ROCmMoEProductionPrefillOverlayGenerated.inc"
@@ -257,11 +258,36 @@ namespace
         return stripped;
     }
 
+    /**
+     * @brief Find legacy placement calls while excluding the bool API declaration.
+     * @param source C++ source whose comments and literals are ignored.
+     * @return Whether any direct, qualified or member call remains.
+     * @details Exclude only the declared method name, never its body: a tensor
+     * override must not conceal a nested legacy call. This is the existing bool
+     * tensor API, so unrelated signatures remain rejected rather than guessed.
+     */
     bool hasExecutableEnsureOnDeviceCall(const std::string &source)
     {
+        if (source.find("ensureOnDevice") == std::string::npos)
+            return false;
         const auto executable_source = stripCommentsAndStringLiterals(source);
-        return executable_source.find("ensureOnDevice(") != std::string::npos ||
-               executable_source.find("ensureOnDevice (") != std::string::npos;
+        static const std::regex declaration(
+            R"(\bbool\s+(?:[A-Za-z_][A-Za-z_0-9]*\s*::\s*)*ensureOnDevice\s*\()");
+        static const std::regex invocation(R"(\bensureOnDevice\s*\()");
+        std::unordered_set<size_t> declarations;
+        for (auto match = std::sregex_iterator(executable_source.begin(), executable_source.end(), declaration);
+             match != std::sregex_iterator(); ++match)
+        {
+            declarations.insert(static_cast<size_t>(match->position()) +
+                match->str().find("ensureOnDevice"));
+        }
+        for (auto match = std::sregex_iterator(executable_source.begin(), executable_source.end(), invocation);
+             match != std::sregex_iterator(); ++match)
+        {
+            if (!declarations.contains(static_cast<size_t>(match->position())))
+                return true;
+        }
+        return false;
     }
 
     bool hasExecutableStageDeviceAllocationCall(const std::string &source)
@@ -1931,6 +1957,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GraphCaptureControllerLimitsStreamSyncT
         << "Completed replay timing intervals must be reclaimed with nonblocking event queries.";
 }
 
+/**
+ * @test The structural validator binding retains exact owner checks before dtype dispatch.
+ *
+ * The native observed-extent fixtures exercise foreign payload/count owners,
+ * integer dtype early returns, empty live rows and subviews. This source guard
+ * additionally prevents restoring an ambient-device validator lookup.
+ */
 TEST(Test__GpuWorkspaceAllocationPolicy, StageVerifierUsesTensorDeviceOrdinalForGpuValidators)
 {
     const auto source =
@@ -1938,12 +1971,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy, StageVerifierUsesTensorDeviceOrdinalFor
     const auto executable_source = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(source));
 
-    EXPECT_NE(executable_source.find("constautodevice=tensor->current_device();"),
-              std::string::npos)
+    const auto owner = executable_source.find(
+        "constautodevice=gpu?tensor->current_device():std::optional<DeviceId>{};");
+    const auto owner_check = executable_source.find(
+        "if(gpu&&(!device||!device->is_gpu()||*device!=stage.device()))");
+    const auto dtype_dispatch = executable_source.find(
+        "constautodata_type=gpuValidationDataType(buffer.dtype);");
+    ASSERT_NE(owner, std::string::npos)
         << "GPU validation must derive ownership from the exact tensor view";
-    EXPECT_NE(executable_source.find("if(*device!=stage.device())"),
-              std::string::npos)
+    ASSERT_NE(owner_check, std::string::npos)
         << "A backend-qualified tensor/stage mismatch must fail before launch";
+    ASSERT_NE(dtype_dispatch, std::string::npos);
+    EXPECT_LT(owner, owner_check);
+    EXPECT_LT(owner_check, dtype_dispatch)
+        << "Integer/quantized dtype early returns must retain native owner checks";
     EXPECT_NE(executable_source.find("getTensorValidator(device->type,device->ordinal)"),
               std::string::npos)
         << "Multi-GPU validation must fetch the validator for the tensor's actual "
@@ -5364,11 +5405,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LiveLogicalCheckpointsUseEventBackedSou
                   "seq_idx,false,false,stream)"),
               std::string::npos)
         << "Logical restore must import every shifted recurrent bank after truncation.";
-    EXPECT_NE(compact_restore.find(
-                  "for(constauto&source:snapshot.mtp_blocks)"
-                  "retained_snapshot_sources.push_back(PrefixPayloadReadLease::wholeArchive(source))"),
-              std::string::npos)
-        << "Restore publication must retain shifted checkpoint sources until the import stream completes.";
+    EXPECT_TRUE(llaminar2::test::hasPrefixCheckpointRestoreSourceRetention(restore_body))
+        << "The completion callback must retain main, shifted and opaque device checkpoint sources until the import stream completes.";
     EXPECT_NE(compact_capture.find("queued_async_device_checkpoint_payload"), std::string::npos);
     EXPECT_NE(compact_capture.find(
                   "constbooldevice_only_checkpoint=state_.device_id.is_gpu();"),
@@ -5520,7 +5558,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         "void clear_cache() override");
 
     const auto compact_restore = removeAsciiWhitespace(stripCommentsAndStringLiterals(restore_body));
-    const auto compact_restore_with_labels = removeAsciiWhitespace(restore_body);
     const auto compact_truncate = removeAsciiWhitespace(stripCommentsAndStringLiterals(truncate_body));
     const auto compact_sidecar = removeAsciiWhitespace(stripCommentsAndStringLiterals(sidecar_body));
     const auto compact_prepare = removeAsciiWhitespace(stripCommentsAndStringLiterals(prepare_body));
@@ -5727,26 +5764,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         "prepareLivePrefixMutationReadyEvent(",
         "state_.kv_cache->truncateSequence(",
         "A restore must preflight its completion event before submitting asynchronous payload reads.");
-    expectNeedleBefore(
-        compact_restore,
-        "handleLivePrefixReplayStateAfterMutation(",
-        "recordLivePrefixMutationReady(",
-        "Restore readiness must be recorded after the live-state epoch changes.");
-    expectNeedleBefore(
-        compact_restore_with_labels,
-        "recordLivePrefixMutationReady(stream,\"restore_logical_checkpoint\",std::move(retained_snapshot_sources),std::move(retained_device_sequence_sources))",
-        "recordRestoredDeviceResidentMTPTransaction(stream,\"restore_logical_checkpoint_shifted_kv\")",
-        "Logical restore must advance its shifted-cache transaction after recording the restore mutation.");
-    expectNeedleBefore(
-        compact_restore_with_labels,
-        "recordLivePrefixMutationReady(stream,\"restore_payload_checkpoint_zero\")",
-        "recordRestoredDeviceResidentMTPTransaction(stream,\"restore_payload_checkpoint_zero_shifted_kv\")",
-        "Zero-token restore must advance its shifted-cache transaction after recording the restore mutation.");
-    expectNeedleBefore(
-        compact_restore_with_labels,
-        "recordLivePrefixMutationReady(stream,\"restore_payload_checkpoint\",std::move(retained_snapshot_sources))",
-        "recordRestoredDeviceResidentMTPTransaction(stream,\"restore_payload_checkpoint_shifted_kv\")",
-        "Payload restore must advance its shifted-cache transaction after recording the restore mutation.");
+    EXPECT_TRUE(llaminar2::test::hasOrderedPrefixCheckpointRestorePublication(restore_body))
+        << "Every logical, zero-token and payload restore must mutate its live epoch, commit the typed completion callback, then publish its shifted-cache transaction.";
     expectNeedleBefore(
         compact_truncate,
         "joinPublishedLiveStateHandoffs(",
@@ -6246,6 +6265,80 @@ TEST(Test__GpuWorkspaceAllocationPolicy, TerminalDeviceGenerationBridgeIsSingleA
         << "Terminal validation must not add a tiny rank collective.";
 }
 
+namespace
+{
+    /**
+     * @brief Isolate one complete definition without borrowing following methods.
+     * @param source Complete production or adversarial source with preserved lexical context.
+     * @param signature Exact function prefix ending at its opening parameter parenthesis.
+     * @return The complete definition, or empty for a missing/declaration/malformed match.
+     * @details Strip the whole source before finding the executable signature so
+     * comments and quoted signatures cannot masquerade as definitions. Require
+     * matching parameter parentheses followed by the actual opening body brace;
+     * a forward declaration cannot borrow a later method's body. The target has
+     * no trailing qualifier, so any intervening executable token is rejected.
+     */
+    std::string generationPublicationDefinition(const std::string &source,
+                                               const std::string &signature)
+    {
+        if (signature.empty() || signature.back() != '(') return {};
+        const auto executable = stripCommentsAndStringLiterals(source);
+        if (executable.size() != source.size()) return {};
+        const auto begin = executable.find(signature);
+        if (begin == std::string::npos) return {};
+        const auto parameters = begin + signature.size() - 1;
+        size_t parameter_depth = 0;
+        size_t parameter_end = std::string::npos;
+        for (size_t pos = parameters; pos < executable.size(); ++pos)
+        {
+            const char token = executable[pos];
+            if (token == '(') ++parameter_depth;
+            else if (token == ')' && --parameter_depth == 0)
+            {
+                parameter_end = pos;
+                break;
+            }
+            else if (token == ';' || token == '{' || token == '}') return {};
+        }
+        if (parameter_end == std::string::npos) return {};
+        auto open = parameter_end + 1;
+        while (open < executable.size() &&
+               std::isspace(static_cast<unsigned char>(executable[open]))) ++open;
+        if (open == executable.size() || executable[open] != '{') return {};
+        size_t depth = 0;
+        for (size_t pos = open; pos < executable.size(); ++pos)
+        {
+            if (executable[pos] == '{') ++depth;
+            else if (executable[pos] == '}' && --depth == 0)
+                return source.substr(begin, pos - begin + 1);
+        }
+        return {};
+    }
+
+    /**
+     * @brief Authenticate the three exact setup writes and their arena publication.
+     * @param definition Only initializeAndPublishDeviceGenerationStorageOnStream.
+     * @return False for missing/foreign/duplicate writes or missing producer publication.
+     */
+    bool hasGenerationSetupArenaPublication(const std::string &definition)
+    {
+        const auto body = removeAsciiWhitespace(stripCommentsAndStringLiterals(definition));
+        if (countOccurrences(body, "backend->memset(") != 3 ||
+            countOccurrences(body, "publishDeviceGenerationArenaState(") != 1 ||
+            body.find("hostToDevice") != std::string::npos ||
+            body.find("synchronize") != std::string::npos)
+            return false;
+        for (const auto *write : {
+            "backend->memset(device_generation_storage_.response_tokens_device,0xFF,response_bytes,state_.device_id.gpu_ordinal(),producer_stream)",
+            "backend->memset(device_generation_storage_.control_device,0,control_bytes,state_.device_id.gpu_ordinal(),producer_stream)",
+            "backend->memset(device_generation_storage_.dispatch_tickets_device,0,dispatch_ticket_bytes,state_.device_id.gpu_ordinal(),producer_stream)"})
+            if (countOccurrences(body, write) != 1) return false;
+        const auto publication = body.find("publishDeviceGenerationArenaState(producer_stream,");
+        return publication != std::string::npos &&
+            body.rfind("backend->memset(") < publication;
+    }
+}
+
 /**
  * @brief Keep the generation ledger and graph frontier on one producer edge.
  *
@@ -6261,10 +6354,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto orchestrator = readFile(
         repoRoot() /
         "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
-    const auto setup = sliceBetween(
+    const auto setup = generationPublicationDefinition(
         orchestrator,
-        "bool DeviceGraphOrchestrator::initializeAndPublishDeviceGenerationStorageOnStream(",
-        "bool DeviceGraphOrchestrator::publishDeviceGenerationArenaState(");
+        "bool DeviceGraphOrchestrator::initializeAndPublishDeviceGenerationStorageOnStream(");
     const auto arena_publication = sliceBetween(
         orchestrator,
         "bool DeviceGraphOrchestrator::publishDeviceGenerationArenaState(",
@@ -6274,7 +6366,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         "bool DeviceGraphOrchestrator::publishDeviceGenerationStateReady(",
         "bool DeviceGraphOrchestrator::consumeDeviceGenerationStateReady(");
 
-    EXPECT_EQ(countOccurrences(setup, "backend->memset("), 3u)
+    ASSERT_FALSE(setup.empty());
+    EXPECT_TRUE(hasGenerationSetupArenaPublication(setup))
         << "Setup must initialize the response ledger, controller, and dispatch ticket directly on device.";
     EXPECT_NE(
         setup.find("publishDeviceGenerationArenaState("),
@@ -6307,6 +6400,66 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     ASSERT_NE(lifecycle_edge, std::string::npos);
     EXPECT_LT(arena_edge, lifecycle_edge)
         << "The private readiness token cannot outrun arena authority.";
+}
+
+/**
+ * @brief Prove definition isolation does not excuse missing or foreign authority.
+ * Adjacent reset helpers are legal; their writes/publications must neither count
+ * as setup work nor repair an omitted setup producer.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     DeviceGenerationPublicationDefinitionRejectsMissingAuthority)
+{
+    const auto source = readFile(repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const std::string signature =
+        "bool DeviceGraphOrchestrator::initializeAndPublishDeviceGenerationStorageOnStream(";
+    const auto setup = generationPublicationDefinition(source, signature);
+    ASSERT_TRUE(hasGenerationSetupArenaPublication(setup));
+    const auto replace = [](std::string text, const std::string &before,
+                            const std::string &after) {
+        const auto pos = text.find(before);
+        EXPECT_NE(pos, std::string::npos);
+        if (pos != std::string::npos) text.replace(pos, before.size(), after);
+        return text;
+    };
+    const auto missing = replace(setup, "publishDeviceGenerationArenaState(",
+                                 "publishUnrelatedState(");
+    EXPECT_FALSE(hasGenerationSetupArenaPublication(missing));
+    EXPECT_FALSE(hasGenerationSetupArenaPublication(generationPublicationDefinition(
+        missing + "\nbool adjacent() { publishDeviceGenerationArenaState(producer_stream, 0); }",
+        signature)));
+    EXPECT_FALSE(hasGenerationSetupArenaPublication(replace(setup,
+        "device_generation_storage_.control_device,",
+        "device_generation_storage_.response_tokens_device,")));
+    EXPECT_FALSE(hasGenerationSetupArenaPublication(replace(setup,
+        "dispatch_ticket_bytes,", "control_bytes,")));
+    EXPECT_FALSE(hasGenerationSetupArenaPublication(replace(setup,
+        "state_.device_id.gpu_ordinal(),", "foreign_device.gpu_ordinal(),")));
+    EXPECT_FALSE(hasGenerationSetupArenaPublication(replace(setup,
+        "producer_stream) ||", "foreign_stream) ||")));
+    EXPECT_EQ(generationPublicationDefinition(setup, signature), setup);
+    EXPECT_EQ(generationPublicationDefinition(setup +
+        "\nbool adjacent() { backend->memset(other, 0, bytes, device, stream); }", signature), setup);
+    const auto quoted_braces = replace(setup, "{",
+        "{ /* } */ const char *diagnostic_brace = \"}\";");
+    EXPECT_TRUE(hasGenerationSetupArenaPublication(
+        generationPublicationDefinition(quoted_braces, signature)));
+    EXPECT_TRUE(generationPublicationDefinition("bool other() {}", signature).empty());
+    EXPECT_TRUE(generationPublicationDefinition(setup.substr(0, setup.size() - 1), signature).empty());
+    const auto commented = "/* " + stripCommentsAndStringLiterals(setup) + " */\n";
+    EXPECT_TRUE(generationPublicationDefinition(commented + "bool adjacent() {}", signature).empty());
+    EXPECT_EQ(generationPublicationDefinition(commented + setup, signature), setup);
+    const auto quoted_signature = "const char *example = \"" + signature + "\";\n";
+    EXPECT_TRUE(generationPublicationDefinition(quoted_signature + "bool adjacent() {}", signature).empty());
+    EXPECT_EQ(generationPublicationDefinition(quoted_signature + setup, signature), setup);
+    const auto declaration = signature + "void *producer_stream, const char *reason);\n";
+    EXPECT_TRUE(generationPublicationDefinition(declaration + "bool adjacent() {}", signature).empty());
+    EXPECT_TRUE(generationPublicationDefinition(declaration + setup, signature).empty());
+    EXPECT_TRUE(generationPublicationDefinition(signature +
+        "void *producer_stream) unrelated_token { return true; }", signature).empty());
+    EXPECT_TRUE(generationPublicationDefinition(signature +
+        "void *producer_stream; bool adjacent() {}", signature).empty());
 }
 
 /**
@@ -10899,7 +11052,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "std::optional<const float *> DeviceGraphOrchestrator::forwardImpl(",
             "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(")));
     EXPECT_NE(main_forward.find(
-                  "admitRequestInputsOnDevice(tokens,position_ids.data(),request_real_lengths,total_tokens,batch_size,seq_len)"),
+                  "admitRequestInputsOnDevice(tokens,admitted_decode_position?nullptr:position_ids.data(),request_real_lengths,total_tokens,batch_size,seq_len,admitted_decode_position)"),
               std::string::npos)
         << "Ordinary GPU prefill must admit tokens, positions, and lengths as one transaction.";
     EXPECT_NE(main_forward.find(
@@ -11116,12 +11269,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPBudgetLimitedDirectEmitUsesCheckpoin
     const auto compact_direct_emit =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(direct_emit_body));
 
-    EXPECT_NE(compact_direct_emit.find(
-                  "constintbase_sidecar_position=snapshotShiftedMTPTokens(verifier_base_checkpoint)+1;"),
-              std::string::npos)
-        << "Budget-limited direct emit must anchor shifted-KV repair to the "
-           "verifier-base checkpoint, because prefix-cache restore can leave "
-           "the host runner position staged ahead of the shifted sidecar head.";
+    // CPU coordinate arithmetic is behaviorally covered by MTPShiftedCacheOrigin
+    // and the actual DGO cache-boundary regression. This source policy only
+    // forbids host state from replacing the resident GPU token transaction.
     EXPECT_NE(compact_direct_emit.find(
                   "commitMTPShiftedRowFromDeviceTargetSample(0,0,true)"),
               std::string::npos)
@@ -13690,6 +13840,42 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUFlashAttentionDecodeStateIsWorkspace
         readFile(repoRoot() / "src/v2/utils/DebugEnv.h");
     EXPECT_EQ(debug_env_source.find("LLAMINAR_CUBLAS_ATTN"), std::string::npos);
     EXPECT_EQ(debug_env_source.find("cuda_cublas_attn"), std::string::npos);
+}
+
+/** @test A placement override is a declaration; its body remains fully scanned. */
+TEST(Test__GpuWorkspaceAllocationPolicy, EnsureOnDeviceGuardDistinguishesDeclarations)
+{
+    for (const auto *source : {
+        "virtual bool ensureOnDevice(DeviceId, void* = nullptr) = 0;",
+        "bool ensureOnDevice(DeviceId d, void* s = nullptr) override { TransferEngine::prepareDeviceInput(root, d, s); return true; }",
+        "bool TensorBase::ensureOnDevice(DeviceId d, void* s) { return true; }",
+        "bool ns::Tensor::ensureOnDevice(DeviceId d, void* s) { return true; }",
+        "bool\nensureOnDevice /* declaration */ (DeviceId d) { return true; }",
+        "// tensor->ensureOnDevice(device);\nconst char* note = \"ensureOnDevice(device)\";",
+        "not_ensureOnDevice(device); ensureOnDeviceExtra(device);"})
+    {
+        SCOPED_TRACE(source);
+        EXPECT_FALSE(hasExecutableEnsureOnDeviceCall(source));
+    }
+}
+
+/** @test Definitions, spacing, qualifiers and comments cannot hide a legacy call. */
+TEST(Test__GpuWorkspaceAllocationPolicy, EnsureOnDeviceGuardDetectsCalls)
+{
+    for (const auto *source : {
+        "tensor->ensureOnDevice(device, stream);",
+        "tensor.ensureOnDevice (device, stream);",
+        "tensor-> /* split */ ensureOnDevice\n\t(device, stream);",
+        "return ensureOnDevice(device, stream);",
+        "return TensorBase::ensureOnDevice(device, stream);",
+        "bool ok = bool(ensureOnDevice(device, stream));",
+        "bool ensureOnDevice(DeviceId d, void* s) override { return root->ensureOnDevice(d, s); }",
+        "bool Tensor::ensureOnDevice(DeviceId d, void* s) { return ensureOnDevice(d, s); }",
+        "bool ensureOnDevice(DeviceId); tensor->ensureOnDevice(device);"})
+    {
+        SCOPED_TRACE(source);
+        EXPECT_TRUE(hasExecutableEnsureOnDeviceCall(source));
+    }
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, ProductionEnsureOnDeviceCallersStayExplicit)

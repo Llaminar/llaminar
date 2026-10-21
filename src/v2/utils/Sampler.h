@@ -117,6 +117,9 @@ namespace llaminar2
         int dry_penalty_last_n = -1;    ///< Token window to scan (-1 = full context, 0 = disabled)
         std::vector<std::string> dry_sequence_breakers = {"\n", ":", "\"", "*"}; ///< Reset repeat detection
 
+        /** @return Complete immutable request sampling law, including every penalty parameter. */
+        bool operator==(const SamplingParams &) const = default;
+
         /**
          * @brief Check if sampling is greedy (deterministic argmax)
          */

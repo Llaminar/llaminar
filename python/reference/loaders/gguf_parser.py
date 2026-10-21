@@ -544,6 +544,11 @@ class GGUFParser:
             block_size = 32
             n_blocks = (n_elements + block_size - 1) // block_size
             return n_blocks * 20
+        elif tensor_type == GGUFTensorType.Q5_1:
+            # Native Q5_1 stores two FP16 gains, four high-bit bytes and
+            # sixteen low-nibble bytes per32elements. A conservative F32 view
+            # corrupts per-expert source strides even when no payload is read.
+            return ((n_elements + 31) // 32) * 24
         elif tensor_type == GGUFTensorType.Q5_0:
             # Q5_0: 32 elements per block, 22 bytes per block
             block_size = 32

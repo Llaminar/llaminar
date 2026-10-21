@@ -15,8 +15,10 @@
 #include <cstdint>
 
 #include "DeviceGenerationInitialization.h"
+#include "DeviceGenerationControlLayout.h"
 #include "execution/config/MTPDepthDefaults.h"
 #include "execution/mtp/MTPDepthLearnedPolicy.h"
+#include "execution/mtp/MTPShiftedCacheOrigin.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -575,6 +577,9 @@ namespace llaminar2::sampling_math
         int demote_acceptance_rate_ppm = 550'000;
         MTPLearnedDepthPolicyContext learned;
 
+        /** @return Every immutable admission policy field, excluding all live controller state. */
+        bool operator==(const DeviceGenerationPolicy &) const = default;
+
         /**
          * @brief Construct a hard-pinned policy for tests and fixed-depth lanes.
          */
@@ -697,74 +702,8 @@ namespace llaminar2::sampling_math
      * CPU unit tests can exhaustively prove the same state machine without a GPU.
      * The response-token payload lives in a separate persistent arena row.
      */
-    enum DeviceGenerationControlIndex : int
-    {
-        kDeviceGenerationControlOk = 0,
-        kDeviceGenerationControlResponseTokenCount = 1,
-        kDeviceGenerationControlRemainingTokenCount = 2,
-        kDeviceGenerationControlModelStopped = 3,
-        kDeviceGenerationControlRequestComplete = 4,
-        kDeviceGenerationControlTransactionCount = 5,
-        kDeviceGenerationControlNextLeadingCommittedOutputCount = 6,
-        kDeviceGenerationControlTransactionCommitBudget = 7,
-        kDeviceGenerationControlAcceptedSpeculativeTokenCount = 8,
-        kDeviceGenerationControlRejectedTransactionCount = 9,
-        kDeviceGenerationControlConsumedVerifierRowCount = 10,
-        kDeviceGenerationControlErrorCode = 11,
-        /** Total main-graph state rows committed across every transaction. */
-        kDeviceGenerationControlPublishedStateCommitCount = 12,
-        /** Active SWITCH selector and number of speculative comparison rows. */
-        kDeviceGenerationControlCurrentDraftDepth = 13,
-        /** Logical verifier width, including the leading condition row. */
-        kDeviceGenerationControlActiveVerifierRowCount = 14,
-        kDeviceGenerationControlMinimumDraftDepth = 15,
-        kDeviceGenerationControlMaximumDraftDepth = 16,
-        kDeviceGenerationControlDepthPolicyMode = 17,
-        kDeviceGenerationControlDepthWindowSize = 18,
-        kDeviceGenerationControlDepthMinimumSamples = 19,
-        kDeviceGenerationControlDepthCooldownSteps = 20,
-        kDeviceGenerationControlDepthPromoteConsecutiveWindows = 21,
-        kDeviceGenerationControlDepthPromoteFullAcceptRatePPM = 22,
-        kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM = 23,
-        kDeviceGenerationControlDepthDemoteAcceptanceRatePPM = 24,
-        kDeviceGenerationControlDepthStepsSinceChange = 25,
-        kDeviceGenerationControlDepthPromotionStreak = 26,
-        kDeviceGenerationControlDepthWindowVerifierRuns = 27,
-        kDeviceGenerationControlDepthWindowAttemptedTokens = 28,
-        kDeviceGenerationControlDepthWindowAcceptedTokens = 29,
-        kDeviceGenerationControlDepthWindowRejectedTokens = 30,
-        kDeviceGenerationControlDepthWindowRollbacks = 31,
-        kDeviceGenerationControlDepthWindowFullAccepts = 32,
-        kDeviceGenerationControlDepthWindowZeroAccepts = 33,
-        kDeviceGenerationControlDepthWindowAcceptedPrefixSum = 34,
-        kDeviceGenerationControlDepthEvaluatedWindows = 35,
-        kDeviceGenerationControlDepthUpdates = 36,
-        kDeviceGenerationControlDepthPromotions = 37,
-        kDeviceGenerationControlDepthDemotions = 38,
-        kDeviceGenerationControlDepthLastRecommendedDepth = 39,
-        /** Sum of device-selected speculative widths across transactions. */
-        kDeviceGenerationControlAttemptedDraftTokenCount = 40,
-        /** Sum of logical verifier widths, including each condition row. */
-        kDeviceGenerationControlVerifierTokenCount = 41,
-        /** Device-selected draft width of the most recently committed transaction. */
-        kDeviceGenerationControlLastTransactionDraftDepth = 42,
-        /** Response tokens appended by the most recently committed transaction. */
-        kDeviceGenerationControlLastTransactionEmittedTokenCount = 43,
-        /** Number of MoE layers that moved current-batch LLEP payloads. */
-        kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount = 44,
-        /** Number of MoE layers that executed rows away from their static owner. */
-        kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount = 45,
-        /** Immutable learned policy keys; observations remain device-owned. */
-        kDeviceGenerationControlLearnedDepthEnabled = 46,
-        kDeviceGenerationControlLearnedDepthBackend = 47,
-        kDeviceGenerationControlLearnedDepthModelClass = 48,
-        kDeviceGenerationControlLearnedDepthVerifyMode = 49,
-        /** Proof that generated rules, including holds, controlled live windows. */
-        kDeviceGenerationControlLearnedDepthMatchedWindows = 50,
-        /** Immutable initial selector, authenticated across response windows. */
-        kDeviceGenerationControlInitialDraftDepth = 51,
-        kDeviceGenerationControlCount = 52,
-    };
+    // The lightweight layout is also consumed by native model-work counters.
+
 
     /**
      * @brief Response ownership of verifier row zero at controller admission.
@@ -853,6 +792,7 @@ namespace llaminar2::sampling_math
         InvalidOrdinaryTransition = 15,
         InvalidContinuation = 16,
         InvalidRequestSeed = 17, ///< A captured verifier consumed an unadmitted zero seed.
+        ImmutableStorageFailure = 18, ///< Captured immutable RAM/mmap row service failed authenticated native I/O.
     };
 
     /**
@@ -1208,6 +1148,15 @@ namespace llaminar2::sampling_math
         if (!control)
             return false;
 
+        // Prefill is a real native forward before response admission. Its
+        // first error belongs to the request, not the response window; only
+        // the ordered request reset may clear it under this explicit policy.
+        if (initialization.forward_failure_policy ==
+                DeviceGenerationForwardFailurePolicy::PreserveUntilRequestReset &&
+            control[kDeviceGenerationControlErrorCode] !=
+                static_cast<int>(DeviceGenerationError::None))
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidInitialization);
+
         const bool continuing = initialization.kind == DeviceGenerationAdmissionKind::ContinueResponse;
         if (continuing)
         {
@@ -1242,7 +1191,17 @@ namespace llaminar2::sampling_math
                 i == kDeviceGenerationControlDepthLastRecommendedDepth ||
                 (i >= kDeviceGenerationControlDepthStepsSinceChange &&
                  i <= kDeviceGenerationControlDepthWindowAcceptedPrefixSum);
-            if (!continuing || !learner_word)
+            // Fixed-head and adaptive PLE perform real native prefill before the first
+            // response admission. Its request-reset owner already cleared these
+            // observations. Keep that initial work once; continuation windows
+            // restart observations so prior terminal totals are never added twice.
+            const bool pre_response_lookup =
+                !continuing &&
+                initialization.forward_failure_policy ==
+                    DeviceGenerationForwardFailurePolicy::PreserveUntilRequestReset &&
+                i >= kDeviceGenerationControlFixedHeadCallsLow &&
+                i <= kDeviceGenerationControlAdaptiveFailedFramesHigh;
+            if ((!continuing || !learner_word) && !pre_response_lookup)
                 control[i] = 0;
         }
 
@@ -3340,10 +3299,11 @@ namespace llaminar2::sampling_math
      * prefixes.  This helper therefore accepts only the canonical primary
      * output: base count, committed target count, and publication validity.
      *
-     * Depth `d` is `d + 1` rows behind the main model.  The shifted target is
-     * `max(0, main_target - d - 1)`, while its accepted count is the delta from
-     * the correspondingly shifted pre-transaction base.  This preserves ring
-     * head movement at short prefixes without inventing a second commit limit.
+     * The frozen model origin defines the exact prefix offset. Ordinary depth
+     * `d` trails main by `d+1`; QFN depth0 retains the visible token-zero seed
+     * and therefore has offset0. The accepted count is the delta between the
+     * correspondingly projected primary endpoints. No second commit limit or
+     * device-count mirror participates.
      */
     LLAMINAR_SAMPLING_HD void
     derive_shifted_speculative_publication_metadata_from_primary(
@@ -3353,7 +3313,7 @@ namespace llaminar2::sampling_math
         int mtp_depth,
         int *out_target_cached_tokens,
         int *out_accepted_state_count,
-        int *out_ok)
+        int *out_ok, MTPShiftedCacheOrigin origin=MTPShiftedCacheOrigin::SuccessorPairsOnly)
     {
         if (out_target_cached_tokens)
             *out_target_cached_tokens = 0;
@@ -3362,13 +3322,13 @@ namespace llaminar2::sampling_math
         if (out_ok)
             *out_ok = 0;
 
-        if (mtp_depth < 0 ||
+        if (mtpShiftedPrefixOffset(origin,mtp_depth)<0 ||
             base_cached_tokens < 0 ||
             main_target_cached_tokens < base_cached_tokens ||
             main_publication_ok == 0)
             return;
 
-        const int shift = mtp_depth + 1;
+        const int shift = mtpShiftedPrefixOffset(origin,mtp_depth);
         const int base_shifted =
             base_cached_tokens > shift ? base_cached_tokens - shift : 0;
         const int target_shifted =

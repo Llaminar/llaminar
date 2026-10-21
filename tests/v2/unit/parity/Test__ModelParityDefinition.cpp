@@ -21,6 +21,7 @@
 #include "integration/parity/qwen36/Qwen36ModelParityDefinitions.h"
 #include "integration/parity/qwen36/Ornith15ModelParityDefinitions.h"
 #include "integration/parity/qwen38/Qwen38ModelParityDefinitions.h"
+#include "integration/parity/qwen4exp/Qwen4ExpModelParityDefinitions.h"
 #include "config/OrchestrationConfigParser.h"
 
 #include "config/OrchestrationConfig.h"
@@ -2944,4 +2945,307 @@ namespace llaminar2::test::parity
         }
     }
 
+    /** @test Ngram modes multiply only explicitly opted-in real-model definitions. */
+    TEST(ModelParityDefinition, FlashNextNgramAxisIsTypedAndIndependent)
+    {
+        auto definition = qwen4exp::qwen4ExpMainParityDefinition(
+            makeSingleDeviceTopology(), "/references/exact-qwen4exp");
+        const auto cases = expandModelParityDefinition(definition);
+        ASSERT_EQ(cases.size(), 2u);
+        std::set<ImmutableRowStoragePreference> modes;
+        for (const auto &cell : cases)
+        {
+            ASSERT_TRUE(cell.ngram_table_policy.has_value());
+            modes.insert(cell.ngram_table_policy->storage);
+            OrchestrationConfig config;
+            cell.applyRuntimePolicy(config);
+            EXPECT_EQ(config.ngram_table_policy, *cell.ngram_table_policy);
+            EXPECT_EQ(parseE2EArguments(cell).ngram_table_policy, *cell.ngram_table_policy)
+                << "Runtime export must preserve the independent native storage cell";
+            EXPECT_NE(cell.testName().find(cell.ngram_table_policy->storage == ImmutableRowStoragePreference::RAM
+                ? "NgramRAM" : "NgramMmap"), std::string::npos);
+        }
+        EXPECT_EQ(modes.size(), 2u);
+        definition.features.ngram_storage.clear();
+        const auto ordinary = expandModelParityDefinition(definition);
+        ASSERT_EQ(ordinary.size(), 1u);
+        EXPECT_FALSE(ordinary.front().ngram_table_policy.has_value());
+        definition.features.ngram_storage = {ImmutableRowTablePolicy{}, ImmutableRowTablePolicy{}};
+        EXPECT_THROW(expandModelParityDefinition(definition), std::invalid_argument);
+    }
+
+    /** @test Benchmark projection preserves native storage/window policy and ordinary model absence. */
+    TEST(ModelParityDefinition, BenchmarkNgramStorageProjectionIsLossless)
+    {
+        auto definition = makeDefinition(makeSingleDeviceTopology());
+        definition.e2e_certifiable = {{}};
+        const std::array storagePolicies{
+            ImmutableRowTablePolicy{.storage = ImmutableRowStoragePreference::Automatic, .window_bytes = 65536, .window_count = 2},
+            ImmutableRowTablePolicy{.storage = ImmutableRowStoragePreference::VRAM, .window_bytes = 65536, .window_count = 3},
+            ImmutableRowTablePolicy{.storage = ImmutableRowStoragePreference::RAM, .window_bytes = 131072, .window_count = 7},
+            ImmutableRowTablePolicy{.storage = ImmutableRowStoragePreference::MemoryMapped, .window_bytes = 262144, .window_count = 11},
+        };
+        std::vector<std::vector<std::string>> projections;
+        for (const auto &policy : storagePolicies)
+        {
+            // Certification selects exactly one cell. Exercise each storage
+            // policy independently rather than making that selection ambiguous.
+            definition.features.ngram_storage = {policy};
+            const auto cells = expandModelParityDefinition(definition);
+            ASSERT_EQ(cells.size(), 1u);
+            const auto &cell = cells.front();
+            ASSERT_TRUE(cell.e2e_certification);
+            ASSERT_TRUE(cell.ngram_table_policy);
+            auto args = modelParityBenchmarkArguments(cell);
+            projections.push_back(args);
+            EXPECT_EQ(std::count(args.begin(), args.end(), "--ngram-storage"), 1);
+            EXPECT_EQ(std::count(args.begin(), args.end(), "--ngram-mmap-window-bytes"), 1);
+            EXPECT_EQ(std::count(args.begin(), args.end(), "--ngram-mmap-window-count"), 1);
+            args.insert(args.begin(), "llaminar2");
+            std::vector<char *> argv;
+            for (auto &arg : args) argv.push_back(arg.data());
+            const auto actual = OrchestrationConfigParser{}.parseArgs(
+                static_cast<int>(argv.size()), argv.data());
+            EXPECT_EQ(actual.ngram_table_policy, *cell.ngram_table_policy);
+            EXPECT_EQ(actual.ngram_table_policy, parseE2EArguments(cell).ngram_table_policy);
+            EXPECT_FALSE(actual.mtp.enabled);
+        }
+        EXPECT_NE(projections[0], projections[1]);
+        EXPECT_NE(projections[2], projections[3]);
+        EXPECT_EQ((std::set<std::vector<std::string>>(projections.begin(),projections.end())).size(),4u);
+        definition.features.ngram_storage.clear();
+        const auto ordinary = expandModelParityDefinition(definition);
+        ASSERT_EQ(ordinary.size(), 1u);
+        const auto args = modelParityBenchmarkArguments(ordinary.front());
+        for (const auto *flag : {"--ngram-storage", "--ngram-mmap-window-bytes", "--ngram-mmap-window-count"})
+            EXPECT_EQ(std::count(args.begin(), args.end(), flag), 0);
+    }
+
+    /** @test Requested modes export totally while original RAM/mmap identities stay byte-exact. */
+    TEST(ModelParityDefinition, RequestedNgramModesKeepDistinctStableIdentities)
+    {
+        auto definition = makeDefinition(makeSingleDeviceTopology());
+        definition.features.ngram_storage = {
+            {.storage = ImmutableRowStoragePreference::Automatic},
+            {.storage = ImmutableRowStoragePreference::VRAM},
+            {.storage = ImmutableRowStoragePreference::RAM},
+            {.storage = ImmutableRowStoragePreference::MemoryMapped}};
+        const auto cells = expandModelParityDefinition(definition);
+        ASSERT_EQ(cells.size(), 4u);
+        std::set<std::string> names;
+        for (const auto &cell : cells)
+        {
+            ASSERT_TRUE(cell.ngram_table_policy);
+            names.insert(cell.testName());
+            EXPECT_EQ(parseE2EArguments(cell).ngram_table_policy, *cell.ngram_table_policy);
+            EXPECT_NE(cell.testName().find(ngramStorageTestName(cell.ngram_table_policy->storage)), std::string::npos);
+        }
+        EXPECT_EQ(names.size(), 4u);
+        EXPECT_EQ(ngramStorageTestName(ImmutableRowStoragePreference::RAM), "NgramRAM_");
+        EXPECT_EQ(ngramStorageTestName(ImmutableRowStoragePreference::MemoryMapped), "NgramMmap_");
+        EXPECT_THROW(ngramStorageTestName(static_cast<ImmutableRowStoragePreference>(255)), std::invalid_argument);
+    }
+
 } // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity {
+/** @test New adaptive request identities retain exact ceilings/policy, without relabeling approved whole-tier cells. */
+TEST(ModelParityDefinition, HostAdaptiveRamSsdArgumentsAndIdentitiesAreLossless)
+{
+    auto definition=makeDefinition(makeSingleDeviceTopology());
+    ImmutableRowTablePolicy zero{ImmutableRowStoragePreference::HostAdaptiveRAMSSD,131072,7};
+    auto bounded=zero;bounded.host_adaptive={17,65536,{.aging_accesses=97,.protected_numerator=2,.protected_denominator=5}};
+    auto bytes=bounded;++bytes.host_adaptive.cache_physical_byte_limit;
+    auto rows=bounded;++rows.host_adaptive.maximum_cache_rows;
+    auto policy=bounded;++policy.host_adaptive.policy.aging_accesses;
+    definition.features.ngram_storage={zero,bounded,bytes,rows,policy};
+    const auto cells=expandModelParityDefinition(definition);ASSERT_EQ(cells.size(),5u);
+    std::set<std::string> names;
+    for(const auto &cell:cells)
+    {
+        ASSERT_TRUE(cell.ngram_table_policy);EXPECT_TRUE(cell.ngram_table_policy->isHostAdaptive());
+        names.insert(cell.testName());EXPECT_EQ(parseE2EArguments(cell).ngram_table_policy,*cell.ngram_table_policy);
+        EXPECT_NE(cell.testName().find("NgramHostAdaptiveRAMSSD_"),std::string::npos);
+        auto single=definition;single.features.ngram_storage={*cell.ngram_table_policy};single.e2e_certifiable={{}};
+        const auto certified=expandModelParityDefinition(single);ASSERT_EQ(certified.size(),1u);
+        auto args=modelParityBenchmarkArguments(certified.front());
+        for(const auto *flag:{"--ngram-cache-max-rows","--ngram-cache-bytes","--ngram-cache-aging-accesses",
+            "--ngram-cache-protected-numerator","--ngram-cache-protected-denominator"})
+            EXPECT_EQ(std::count(args.begin(),args.end(),flag),1);
+        args.insert(args.begin(),"llaminar2");std::vector<char *> argv;
+        for(auto &arg:args)argv.push_back(arg.data());
+        EXPECT_EQ(OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()),argv.data()).ngram_table_policy,
+            *cell.ngram_table_policy);
+    }
+    EXPECT_EQ(names.size(),5u);
+    definition.features.ngram_storage={bounded,bounded};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    EXPECT_EQ(ngramStorageTestName(ImmutableRowTablePolicy{ImmutableRowStoragePreference::Automatic}),"NgramAuto_");
+    EXPECT_EQ(ngramStorageTestName(ImmutableRowTablePolicy{ImmutableRowStoragePreference::VRAM}),"NgramVRAM_");
+    EXPECT_EQ(ngramStorageTestName(ImmutableRowTablePolicy{ImmutableRowStoragePreference::RAM}),"NgramRAM_");
+    EXPECT_EQ(ngramStorageTestName(ImmutableRowTablePolicy{ImmutableRowStoragePreference::MemoryMapped}),"NgramMmap_");
+}
+} // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity {
+namespace {
+/** @return Existing whole-tier requests and two distinct explicit adaptive profiles, with no new test mode enum. */
+std::vector<ImmutableRowTablePolicy> e2eNgramProfiles()
+{
+    ImmutableRowTablePolicy zero{ImmutableRowStoragePreference::HostAdaptiveRAMSSD,131072,7};
+    auto bounded=zero;
+    bounded.host_adaptive={64,1048576,{.aging_accesses=97,.protected_numerator=2,.protected_denominator=5}};
+    return {{ImmutableRowStoragePreference::Automatic},{ImmutableRowStoragePreference::VRAM},
+        {ImmutableRowStoragePreference::RAM},{ImmutableRowStoragePreference::MemoryMapped},zero,bounded};
+}
+/** @return Parse the actual canonical discovery/export argv, without executing a server or resolving capacity. */
+OrchestrationConfig parseE2ENgramArguments(std::vector<std::string> args)
+{
+    args.insert(args.begin(),"llaminar2");std::vector<char *> argv;
+    for(auto &argument:args)argv.push_back(argument.data());
+    return OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()),argv.data());
+}
+}
+/** @test Exact storage tags change only eligibility; all canonical discovery/HTTP/benchmark projections retain the request. */
+TEST(ModelParityDefinition, E2ENgramSelectionPreservesInventoryAndExportRoundTrips)
+{
+    auto definition=makeDefinition(makeSingleDeviceTopology());
+    definition.features.ngram_storage=e2eNgramProfiles();
+    const auto original=expandModelParityDefinition(definition);
+    ASSERT_EQ(original.size(),6u);
+    for(const auto &policy:definition.features.ngram_storage)
+        definition.e2e_certifiable.push_back({.ngram_table_policy=policy});
+    const auto selected=expandModelParityDefinition(definition);
+    ASSERT_EQ(selected.size(),original.size());std::set<std::string> names;
+    for(std::size_t i=0;i<selected.size();++i)
+    {
+        const auto &cell=selected[i];ASSERT_TRUE(cell.ngram_table_policy);
+        ASSERT_TRUE(cell.e2e_certification);EXPECT_FALSE(original[i].e2e_certification);
+        EXPECT_EQ(cell.testName(),original[i].testName());EXPECT_TRUE(names.insert(cell.testName()).second);
+        EXPECT_EQ(cell.ngram_table_policy,original[i].ngram_table_policy);
+        EXPECT_EQ(parseE2EArguments(cell).ngram_table_policy,*cell.ngram_table_policy);
+        std::ostringstream output;PrintTo(cell,&output);
+        const auto record=nlohmann::json::parse(output.str());
+        ASSERT_FALSE(record.at("e2e").is_null());ASSERT_FALSE(record.at("benchmark").is_null());
+        EXPECT_EQ(record.at("id"),cell.testName());
+        for(const auto &args:{record.at("runtime").at("server_args").get<std::vector<std::string>>(),
+            record.at("e2e").at("server_args").get<std::vector<std::string>>(),
+            record.at("benchmark").at("args").get<std::vector<std::string>>()})
+            EXPECT_EQ(parseE2ENgramArguments(args).ngram_table_policy,*cell.ngram_table_policy);
+    }
+    EXPECT_EQ(names.size(),6u);
+}
+/** @test A selector resolves one exact profile while every unselected mathematical cell is retained. */
+TEST(ModelParityDefinition, E2ENgramSelectionTagsOnlyExactTypedProfile)
+{
+    for(const auto &policy:e2eNgramProfiles())
+    {
+        auto definition=makeDefinition(makeSingleDeviceTopology());
+        definition.features.ngram_storage=e2eNgramProfiles();
+        definition.e2e_certifiable={{.ngram_table_policy=policy}};
+        const auto cells=expandModelParityDefinition(definition);ASSERT_EQ(cells.size(),6u);
+        std::size_t selected=0;
+        for(const auto &cell:cells)
+        {
+            ASSERT_TRUE(cell.ngram_table_policy);
+            EXPECT_EQ(cell.e2e_certification.has_value(),*cell.ngram_table_policy==policy);
+            if(cell.e2e_certification)++selected;
+        }
+        EXPECT_EQ(selected,1u);
+    }
+}
+/** @test Missing, ambiguous and overlapping storage tags fail instead of choosing a default or erasing adaptive identity. */
+TEST(ModelParityDefinition, E2ENgramSelectionRejectsMissingAmbiguousAndOverlappingProfiles)
+{
+    auto definition=makeDefinition(makeSingleDeviceTopology());
+    definition.features.ngram_storage=e2eNgramProfiles();
+    ASSERT_EQ(expandModelParityDefinition(definition).size(),6u);
+    definition.e2e_certifiable={{}};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    const auto policy=e2eNgramProfiles().back();
+    definition.features.ngram_storage={policy};
+    definition.e2e_certifiable={{.ngram_table_policy=policy},{.ngram_table_policy=policy}};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    definition.e2e_certifiable={{},{.ngram_table_policy=policy}};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    definition.e2e_certifiable={{.ngram_table_policy=policy},{}};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    definition.features.ngram_storage.clear();
+    definition.e2e_certifiable={{.ngram_table_policy=policy}};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    definition.features.ngram_storage={{ImmutableRowStoragePreference::RAM}};
+    definition.e2e_certifiable={{.ngram_table_policy=ImmutableRowTablePolicy{ImmutableRowStoragePreference::MemoryMapped}}};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+}
+/** @test Every original production request field participates even if mode or eventual admitted slots could coincide. */
+TEST(ModelParityDefinition, E2ENgramSelectionRejectsWindowCeilingAndReplacementDrift)
+{
+    const auto exact=e2eNgramProfiles().back();
+    std::vector<ImmutableRowTablePolicy> foreign;
+    auto changed=exact;changed.window_bytes*=2;foreign.push_back(changed);
+    changed=exact;++changed.window_count;foreign.push_back(changed);
+    changed=exact;++changed.host_adaptive.maximum_cache_rows;foreign.push_back(changed);
+    changed=exact;++changed.host_adaptive.cache_physical_byte_limit;foreign.push_back(changed);
+    changed=exact;++changed.host_adaptive.policy.aging_accesses;foreign.push_back(changed);
+    changed=exact;--changed.host_adaptive.policy.protected_numerator;foreign.push_back(changed);
+    changed=exact;++changed.host_adaptive.policy.protected_denominator;foreign.push_back(changed);
+    auto definition=makeDefinition(makeSingleDeviceTopology());definition.features.ngram_storage={exact};
+    for(const auto &policy:foreign)
+    {
+        EXPECT_NO_THROW(policy.validate());
+        definition.e2e_certifiable={{.ngram_table_policy=policy}};
+        EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    }
+    auto invalid=exact;invalid.storage=static_cast<ImmutableRowStoragePreference>(255);
+    definition.e2e_certifiable={{.ngram_table_policy=invalid}};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    invalid=exact;invalid.window_count=0;definition.e2e_certifiable={{.ngram_table_policy=invalid}};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    invalid=exact;invalid.storage=ImmutableRowStoragePreference::MemoryMapped;
+    definition.e2e_certifiable={{.ngram_table_policy=invalid}};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+}
+/** @test Legacy omission remains exact-one only, and current QFN definitions acquire no HTTP/benchmark eligibility. */
+TEST(ModelParityDefinition, E2ENgramSelectionPreservesLegacyAndUnqualifiedQFNInventories)
+{
+    auto legacy=makeDefinition(makeSingleDeviceTopology());
+    const auto ordinary=expandModelParityDefinition(legacy);ASSERT_EQ(ordinary.size(),1u);
+    legacy.e2e_certifiable={{}};const auto tagged=expandModelParityDefinition(legacy);
+    ASSERT_EQ(tagged.size(),1u);EXPECT_EQ(tagged.front().testName(),ordinary.front().testName());
+    EXPECT_TRUE(tagged.front().e2e_certification);EXPECT_FALSE(tagged.front().ngram_table_policy);
+    for(const auto &policy:e2eNgramProfiles())
+    {
+        legacy.features.ngram_storage={policy};
+        const auto one=expandModelParityDefinition(legacy);ASSERT_EQ(one.size(),1u);
+        EXPECT_TRUE(one.front().e2e_certification);EXPECT_EQ(one.front().ngram_table_policy,policy);
+    }
+    const auto qfn=qwen4exp::qwen4ExpMainParityDefinition(makeSingleDeviceTopology(),"/references/exact-qwen4exp");
+    EXPECT_TRUE(qfn.e2e_certifiable.empty());const auto cells=expandModelParityDefinition(qfn);
+    ASSERT_EQ(cells.size(),2u);
+    for(const auto &cell:cells)
+    {
+        EXPECT_FALSE(cell.e2e_certification);ASSERT_TRUE(cell.ngram_table_policy);
+        EXPECT_TRUE(cell.ngram_table_policy->storage==ImmutableRowStoragePreference::RAM ||
+            cell.ngram_table_policy->storage==ImmutableRowStoragePreference::MemoryMapped);
+        std::ostringstream output;PrintTo(cell,&output);const auto record=nlohmann::json::parse(output.str());
+        EXPECT_TRUE(record.at("e2e").is_null());EXPECT_TRUE(record.at("benchmark").is_null());
+    }
+}
+} // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity {
+/** @test Request/export identity distinguishes explicit sharding without adding any model certificate. */
+TEST(ModelParityDefinition, FixedHeadNgramDistributionHasDistinctLosslessExportIdentity)
+{
+    ImmutableRowTablePolicy ordinary{ImmutableRowStoragePreference::VRAM};auto sharded=ordinary;
+    sharded.distribution=ImmutableRowTableDistribution::FixedHeadSharded;
+    EXPECT_EQ(ngramStorageTestName(ordinary),"NgramVRAM_");
+    EXPECT_NE(ngramStorageTestName(ordinary),ngramStorageTestName(sharded));
+    ModelParityCase cell;cell.ngram_table_policy=sharded;
+    EXPECT_EQ(parseE2ENgramArguments(modelParityNgramStorageArguments(cell)).ngram_table_policy,sharded);
+    cell.ngram_table_policy=ordinary;
+    const auto args=modelParityNgramStorageArguments(cell);
+    EXPECT_EQ(std::find(args.begin(),args.end(),"--ngram-distribution"),args.end());
+    EXPECT_EQ(parseE2ENgramArguments(args).ngram_table_policy,ordinary);
+}
+}

@@ -7,6 +7,8 @@
  * catalogued NativeVNNI source codebook plus FP16, BF16, and FP32, and delegates
  * final allocator rounding to the allocator-owned `AlignedVector` and GPU
  * weight-pool contracts instead of copying those policies into callers.
+ * Immutable source-native pools and migration-reusable slots select their exact
+ * physical representation explicitly; existing movable callers retain the union.
  */
 
 #pragma once
@@ -14,6 +16,7 @@
 #include "ExpertWeightFormat.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #include "loaders/GPUVramPreflight.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "tensors/AlignedVector.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
@@ -245,14 +248,26 @@ namespace llaminar2
      * @param N Output-row count for the prepared GEMM weight.
      * @param K Reduction dimension for the prepared GEMM weight.
      * @param format Exact quantized codebook or floating precision provenance.
-     * @return Byte-exact CPU live/shadow and GPU live/shadow geometry.
+     * @param layout Actual GPU pool representation; movable slots remain the default.
+     * @return Byte-exact geometry. GPU shadow retains the migration staging contract.
+     * @throws std::invalid_argument If the layout or source geometry is invalid.
      */
     [[nodiscard]] inline ExpertPreparedProjectionMemoryGeometry
     resolveExpertPreparedProjectionMemoryGeometry(
         int N,
         int K,
-        const ExpertWeightFormat &format)
+        const ExpertWeightFormat &format,
+        GPUPreparedWeightPoolLayout layout =
+            GPUPreparedWeightPoolLayout::MigrationReusable)
     {
+        switch (layout)
+        {
+        case GPUPreparedWeightPoolLayout::SourceNative:
+        case GPUPreparedWeightPoolLayout::MigrationReusable:
+            break;
+        default:
+            throw std::invalid_argument("Unknown GPU prepared weight pool layout");
+        }
         using namespace expert_prepared_memory_detail;
         ExpertPreparedProjectionMemoryGeometry result;
         result.cpu_bytes = cpuProjectionBytes(N, K, format);
@@ -281,7 +296,7 @@ namespace llaminar2
             throw std::invalid_argument(
                 "GPU expert projection source codebook is not catalogued");
         }
-        const auto live = reusableDeviceVnniAllocationFormat(*source);
+        const auto live = gpuPreparedWeightPoolAllocation(*source, layout);
         result.gpu_live_bytes = gpuSeparatedProjectionBytes(
             N,
             K,

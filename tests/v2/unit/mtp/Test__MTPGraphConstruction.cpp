@@ -4678,6 +4678,12 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarFromRegistryWithoutRawEx
 TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespace)
 {
     DenseMTPGraphFixture fixture;
+    // The final scope-reset probe deliberately rebuilds source64 as ordinary
+    // main work. Admit that synthetic global interval before constructing the
+    // builder; the tiny test still allocates only its existing per-layer rows.
+    fixture.config.total_n_layers = 65;
+    fixture.config.n_layers = 65;
+    fixture.config.layer_types.resize(65, "full_attention");
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
@@ -4769,6 +4775,8 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     ASSERT_NE(main_dispatch_stage, nullptr);
     EXPECT_EQ(main_dispatch_stage->params().key.key_namespace, MoEOverlayCollectiveNamespace::Main);
     EXPECT_EQ(main_dispatch_stage->params().key.mtp_depth, -1);
+    EXPECT_THROW((void)graph_builder.buildFFNGraph(main_layer, main_buffers, 65, 1, 1,
+        DeviceId::cpu(), nullptr), std::invalid_argument);
 }
 
 TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)

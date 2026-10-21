@@ -705,6 +705,12 @@ namespace llaminar2
             size_t weight_cols() const { return K_; }
             bool weights_converted() const override;
             bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
+            /** @copydoc ITensorGemm::q8ResidualCorrectionWorkspaceRequirements */
+            WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const override;
+            /** @copydoc ITensorGemm::multiply_q8_residual_corrected */
+            void multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,
+                DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace) override;
+
             bool exportNativeVNNISourceIdentity(
                 NativeVnniSourceIdentity &out) const override;
 

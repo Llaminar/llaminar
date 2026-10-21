@@ -36,11 +36,12 @@ namespace llaminar2
     /**
      * @brief Inspect a compiled specialization on the current ROCm device.
      * @param variant Exact transaction whose resources are requested.
+     * @param experts Exact admitted expert count selecting the 256/512-lane launch.
      * @return Loaded kernel resources, or no value for an invalid variant/HIP
      *         query failure. Callers must report failure, not substitute values.
      * @pre The caller owns an initialized ROCm worker context and is outside
      *      graph capture. No launch, allocation, or synchronization occurs.
      */
     [[nodiscard]] std::optional<ROCmRuntimeGroupResources>
-    queryROCmRuntimeGroupResources(ROCmRuntimeGroupVariant variant);
+    queryROCmRuntimeGroupResources(ROCmRuntimeGroupVariant variant, int experts);
 }

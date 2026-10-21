@@ -10,10 +10,14 @@
  */
 
 #pragma once
+
+#include "../../../execution/moe/DeviceMoERuntimeABI.h"
+#include "CPUQ8ResidualCorrectionWorkspace.h"
 #include "CPUProjectionWorkspaceContract.h"
 
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNIGemv.h"
+#include "CPUQ8ResidualCorrection.h"
 #include "CPUPackedWeights.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/TensorClasses.h"
@@ -158,6 +162,26 @@ namespace llaminar2::cpu::native_vnni
         {
             requirements.merge(cpuProjectionFP32WorkspaceRequirements(
                 kCPUProjectionProduct, m, n > 0 ? n : packed_.N));
+        }
+
+        /** @copydoc ITensorGemm::q8ResidualCorrectionWorkspaceRequirements */
+        WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const override {
+            cpu::native_vnni::validateCPUQ8ResidualSource(packed_,m,n,k);
+            if(activation_rotation_)throw std::invalid_argument("Two-term Q8 cannot silently change a rotated source contract");
+            return cpuQ8ResidualCorrectionWorkspaceRequirements(m,n,k);
+        }
+        /** @copydoc ITensorGemm::multiply_q8_residual_corrected */
+        void multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,DeviceRowRange rows,
+            int n,int k,DeviceWorkspaceManager*workspace) override {
+            cpu::native_vnni::validateCPUQ8ResidualSource(packed_,rows.physicalRows(),n,k);
+            if(activation_rotation_)throw std::invalid_argument("Two-term Q8 requires its unrotated prepared source");
+            if(!input||!output||input->native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
+                !input->isHostValid()||!output->isHostValid())
+                throw std::invalid_argument("Two-term CPU Q8 requires prepared host-owned FP32 tensors");
+            validateQ8ResidualTensorCapacities(rows.physicalRows(),n,k,input->numel(),output->numel());
+            auto primary=CPUInvocationWorkspace::require<Q8_1Block>(workspace,kCPUProjectionQ8,cpuProjectionQ8Blocks(rows.physicalRows(),k));
+            auto residual=CPUInvocationWorkspace::require<Q8_1Block>(workspace,kCPUProjectionResidualQ8,cpuProjectionQ8Blocks(rows.physicalRows(),k));
+            cpuQ8ResidualCorrectedProjection(packed_,input->data(),output->mutable_data(),rows,primary,residual);
         }
 
         // -------------------------------------------------------------------
@@ -507,8 +531,10 @@ namespace llaminar2::cpu::native_vnni
          * @brief Grouped MTP verifier SwiGLU + down projection.
          *
          * This follows the same SwiGLU math as the ordinary CPU down path, but
-         * sends the resulting runtime-M activation rows through
-         * gemm_native_vnni_preq_decode_equivalent_rows().  That helper shares
+         * M=1 is the valid no-accepted-draft verifier extent, including predictor
+         * bootstrap. It remains on this same prepared primitive. This path
+         * sends M1 through the prepared decode GEMV and M>=2 through
+         * gemm_native_vnni_preq_decode_equivalent_rows(). The grouped helper shares
          * Q8_1 activation quantization across rows and parallelizes the work,
          * while each row keeps the same K-tile reduction order as M=1 decode.
          */
@@ -521,7 +547,7 @@ namespace llaminar2::cpu::native_vnni
             DeviceWorkspaceManager *workspace = nullptr) override
         {
             (void)workspace;
-            if (!valid_ || !gate || !up || !output || m <= 1 || n <= 0 || k <= 0)
+            if (!valid_ || !gate || !up || !output || m < 1 || n <= 0 || k <= 0)
             {
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU rejected: valid="
                           << valid_ << " gate=" << (gate != nullptr)
@@ -613,13 +639,16 @@ namespace llaminar2::cpu::native_vnni
 
             perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                       : PerfStatsCollector::Clock::time_point{};
-            gemm_native_vnni_preq_decode_equivalent_rows(
-                packed_,
-                shared_q8.data(),
-                output_fp32,
-                partialWorkspace(workspace, m),
-                m,
-                n);
+            // One verifier row belongs to the existing decode schedule, not
+            // the M>=2 grouped policy table. Consume the already-published Q8
+            // bank once; no tensor API reentry or activation requantization.
+            if (m == 1)
+                gemv_native_vnni_preq(packed_, shared_q8.data(), output_fp32,
+                    partialWorkspace(workspace, m));
+            else
+                gemm_native_vnni_preq_decode_equivalent_rows(
+                    packed_, shared_q8.data(), output_fp32,
+                    partialWorkspace(workspace, m), m, n);
             recordVerifierTiming(
                 "cpu_native_vnni_verifier_swiglu_down_gemv",
                 perf_start,
@@ -661,7 +690,7 @@ namespace llaminar2::cpu::native_vnni
         {
             (void)mpi_ctx;
             (void)workspace;
-            constexpr size_t kMaxFusedProjections = 16u;
+            constexpr size_t kMaxFusedProjections = NativeVNNIFusedRowsPlan::capacity;
             if (!valid_ || !input || m <= 0 || k <= 0 ||
                 k != packed_.K || projections.empty() ||
                 projections.size() > kMaxFusedProjections)
@@ -779,8 +808,12 @@ namespace llaminar2::cpu::native_vnni
          * @brief Group MTP verifier rows while preserving M=1 decode GEMV math.
          *
          * This is the CPU implementation of ITensorGemm's Phase 9.8 verifier
-         * contract.  It quantizes the M verifier activation rows once, then
-         * runs every projection through gemm_native_vnni_preq_decode_equivalent_rows().
+         * contract, including M=1 with no accepted draft. Zero physical rows
+         * remain invalid; compact CPU predictor admission owns live-row checks.
+         * It quantizes the M verifier activation rows once, then
+         * uses the prepared decode GEMV for one projection at M1; grouped
+         * rows use gemm_native_vnni_preq_decode_equivalent_rows(), while fused
+         * projection bundles use their existing positive-M descriptor scheduler.
          * That helper parallelizes across rows and N/K tasks, but each row uses
          * the same chunk kernels and reduction order as serial decode.  The
          * result is grouped/concurrent execution without the 2-row GEMM
@@ -796,8 +829,8 @@ namespace llaminar2::cpu::native_vnni
             (void)mpi_ctx;
             (void)workspace;
 
-            constexpr size_t kMaxGroupedProjections = 16u;
-            if (!valid_ || !input || m <= 1 || k <= 0 ||
+            constexpr size_t kMaxGroupedProjections = NativeVNNIFusedRowsPlan::capacity;
+            if (!valid_ || !input || m < 1 || k <= 0 || k != packed_.K ||
                 projections.empty() ||
                 projections.size() > kMaxGroupedProjections)
             {
@@ -809,19 +842,27 @@ namespace llaminar2::cpu::native_vnni
             }
 
             const float *input_data = input->data();
-            if (!input_data)
+            if (!input_data || input->numel() < static_cast<size_t>(m) * k)
             {
-                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected: input has no host FP32 data");
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected: input has no complete host FP32 rows");
                 return false;
             }
 
             std::array<CPUNativeVNNIGemmKernel *, kMaxGroupedProjections>
                 vnni_kernels = {};
+            std::array<float *, kMaxGroupedProjections> outputs = {};
+            std::array<const float *, kMaxGroupedProjections> biases = {};
+            // Validate every descriptor before quantization or projection writes,
+            // matching the ordinary fused contract. Compute consumes packed.N/K,
+            // so the advertised dimensions cannot substitute smaller capacities.
             for (size_t i = 0; i < projections.size(); ++i)
             {
                 const auto &proj = projections[i];
                 auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
-                if (!vnni || !vnni->valid_ || !proj.output || proj.n <= 0)
+                if (!vnni || !vnni->valid_ || !proj.output || proj.n <= 0 ||
+                    vnni->packed_.K != k || vnni->packed_.N != proj.n ||
+                    proj.output->numel() < static_cast<size_t>(m) * proj.n ||
+                    (proj.bias && proj.bias->numel() < static_cast<size_t>(proj.n)))
                 {
                     LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected at projection "
                               << i << ": native_vnni=" << (vnni != nullptr)
@@ -844,6 +885,14 @@ namespace llaminar2::cpu::native_vnni
                     return false;
                 }
                 vnni_kernels[i] = vnni;
+            }
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                const auto &proj = projections[i];
+                outputs[i] = proj.output->mutable_data();
+                biases[i] = proj.bias ? proj.bias->data() : nullptr;
+                if (!outputs[i] || (proj.bias && !biases[i]))
+                    return false;
             }
 
             const bool perf_enabled =
@@ -886,14 +935,12 @@ namespace llaminar2::cpu::native_vnni
                 for (size_t i = 0; i < projections.size(); ++i)
                 {
                     const auto &proj = projections[i];
-                    float *out_data = proj.output->mutable_data();
-                    if (!out_data)
-                        return false;
+                    float *out_data = outputs[i];
 
                     fused_descs[i] = {
                         &vnni_kernels[i]->packed_,
                         out_data,
-                        proj.bias ? proj.bias->data() : nullptr,
+                        biases[i],
                         proj.n,
                         proj.n};
                 }
@@ -949,19 +996,20 @@ namespace llaminar2::cpu::native_vnni
             {
                 auto *vnni = vnni_kernels[i];
                 const auto &proj = projections[i];
-                float *out_data = proj.output->mutable_data();
-                if (!out_data)
-                    return false;
+                float *out_data = outputs[i];
 
                 perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                           : PerfStatsCollector::Clock::time_point{};
-                gemm_native_vnni_preq_decode_equivalent_rows(
-                    vnni->packed_,
-                    shared_q8.data(),
-                    out_data,
-                    vnni->partialWorkspace(workspace, m),
-                    m,
-                    proj.n);
+                // The single-descriptor M1 transaction uses its actual
+                // prepared decode scheduler. Multi-row transactions retain
+                // the grouped scheduler and its unchanged M>=2 contract.
+                if (m == 1)
+                    gemv_native_vnni_preq(vnni->packed_, shared_q8.data(), out_data,
+                        vnni->partialWorkspace(workspace, m));
+                else
+                    gemm_native_vnni_preq_decode_equivalent_rows(
+                        vnni->packed_, shared_q8.data(), out_data,
+                        vnni->partialWorkspace(workspace, m), m, proj.n);
                 recordVerifierTiming(
                     "cpu_native_vnni_verifier_projection_per_gemv",
                     perf_start,
@@ -972,10 +1020,7 @@ namespace llaminar2::cpu::native_vnni
 
                 if (proj.bias)
                 {
-                    const float *bias_data = proj.bias->data();
-                    if (!bias_data)
-                        return false;
-                    apply_bias_epilogue(out_data, bias_data, m, proj.n, proj.n);
+                    apply_bias_epilogue(out_data, biases[i], m, proj.n, proj.n);
                 }
             }
 
@@ -1023,8 +1068,9 @@ namespace llaminar2::cpu::native_vnni
             ProjectionRowsPurpose purpose = ProjectionRowsPurpose::Decode;
         };
 
-        /** Maximum gate/up descriptors for one 256-expert MoE layer. */
-        static constexpr int kMaxBatchedPrequantizedProjections = 512;
+        /** Maximum gate/up descriptors for routed experts plus one shared expert. */
+        static constexpr int kMaxBatchedPrequantizedProjections =
+            NativeVNNIFusedRowsPlan::capacity;
 
         /**
          * @brief Execute unequal-M pre-quantized projections in one CPU team.
@@ -1332,7 +1378,7 @@ namespace llaminar2::cpu::native_vnni
             int k,
             std::span<float> partial_storage)
         {
-            constexpr size_t kMaxRouterQ8Projections = 16u;
+            constexpr size_t kMaxRouterQ8Projections = NativeVNNIFusedRowsPlan::capacity;
             if (!valid_ || !input_q8 || m < 1 || k <= 0 ||
                 projections.empty() ||
                 projections.size() > kMaxRouterQ8Projections)

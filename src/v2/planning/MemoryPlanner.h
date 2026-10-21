@@ -19,12 +19,15 @@
 #include "backends/PeerAccessCoverage.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "backends/DeviceId.h"
+#include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include "config/CollectiveBackendType.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/mtp/MTPGraphOwnerPlan.h"
 #include "execution/mtp/OrdinaryGenerationGraphPlan.h"
 #include "loaders/PreparedWeightAdmission.h"
+#include "planning/ImmutableRowTablePlacementPlanner.h"
+#include "loaders/GPUVramPreflight.h"
 
 #include <optional>
 #include <span>
@@ -205,6 +208,20 @@ struct DevicePlanConfig
      */
     std::optional<PhysicalMemoryResource> associated_host_memory;
 
+    /** Requested execution policy on compiled PLE consumers. Absence is valid only for
+     * lower-level incremental estimates, never a production final table request. */
+    std::optional<ImmutableRowTablePolicy> ngram_execution_policy;
+    ImmutableRowTableHostPlacement ngram_host_placement = ImmutableRowTableHostPlacement::taskPolicy(); ///< Compiled before quotas, not inferred from CPU ordinal.
+    /** Sealed final tier shared across actual PLE participants. Absent in the
+     * higher-priority base, which already includes mandatory lookup execution. */
+    std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+    /** Existing live table lease attested by ModelContext against the same PMA.
+     * This is an admission observation, never a parallel allocation ledger. */
+    std::size_t retained_immutable_table_bytes = 0u;
+    std::size_t retained_immutable_source_table_bytes = 0u; ///< Actual mixed CPU source/cache lease; independent of GPU optional capacity.
+    std::size_t retained_immutable_source_lookup_staging_bytes = 0u; ///< Actual subordinate source/grants+mapped channel leases.
+    std::size_t retained_immutable_lookup_staging_bytes = 0u; ///< Actual provider request-scratch lease, excluding runner channels.
+
     /**
      * @brief Exact transient weight-load allocations for this GPU.
      *
@@ -225,6 +242,9 @@ struct DevicePlanConfig
             return device_bytes != 0u || host_bytes != 0u;
         }
     } weight_load_staging;
+    /** Exact original loader tuple that authored the staging bytes above.
+     * Absent for retained preparation and CPU resources; never derived from table extent. */
+    std::optional<GPUWeightLoadMemoryGeometry> ordinary_weight_load_geometry;
 
     /**
      * CUDA SMs, ROCm CUs, or configured physical-core CPU workers used by the
@@ -239,9 +259,20 @@ struct DevicePlanConfig
      */
     bool runtime_device_policy_available = false;
 
+    /// Setup-frozen arithmetic that changes named HC-up activation scratch only.
+    QuantizedActivationOperandPrecision qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
+    QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.
+    QuantizedActivationOperandPrecision qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen original-main GDN QKV correction; independent of Z, alpha/beta and output projection.
+    QuantizedActivationOperandPrecision qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+
     // TP configuration for this device
     int shard_index = 0;
     int total_shards = 1;
+    /** Actual rank-declared topology provenance; None cannot authorize fixed-head serving. */
+    ImmutableRowTableTPTopology ngram_tp_topology = ImmutableRowTableTPTopology::None;
 
     /** Frozen physical expert layout, shared by the activation BOM and graph schema. */
     RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
@@ -467,9 +498,102 @@ struct ResidentGraphMemoryPlan
     bool fits() const { return resident_graph_rows > 0 && memory_plan.fits(); }
 };
 
+/** @brief Original canonical loader geometry for one exact PLE GPU consumer. */
+struct ImmutableRowTableUploadBinding
+{
+    PhysicalMemoryAllocatorIdentity consumer;
+    GPUWeightLoadMemoryGeometry ordinary;
+};
+
 class MemoryPlanner
 {
 public:
+    /**
+     * @brief Project original source and every actual PLE consumer after topology is fixed.
+     * @param profile Original model metadata.
+     * @param device_groups Exact retained ownership groups, possibly sharing physical consumers.
+     * @param host Canonical selected rank-local CPU allocator, independent of NUMA affinity.
+     * @param host_placement Explicit RAM locality; task-policy default makes no exact-node claim.
+     * @return Checked source/consumer input with duplicate graph-family identities coalesced.
+     * @throws std::invalid_argument For absent geometry or inconsistent physical observations.
+     */
+    static ImmutableRowTablePlacementInput immutableRowTablePlacementInput(
+        const ModelMemoryProfile &profile, std::span<const std::vector<DevicePlanConfig>> device_groups,
+        PhysicalMemoryResource host,
+        ImmutableRowTableHostPlacement host_placement = ImmutableRowTableHostPlacement::taskPolicy());
+    /**
+     * @brief Project a rank's source consumers, returning absence for unrelated PP/expert stages.
+     * @param profile Exact source metadata, including optional native table geometry.
+     * @param device_groups Actual fixed retained ownership groups.
+     * @param host Canonical rank-local CPU allocator.
+     * @param host_placement Explicit RAM locality; task-policy default makes no exact-node claim.
+     * @return Checked input only if this rank actually executes PLE.
+     * @throws std::invalid_argument For malformed source/observations on a real consumer.
+     */
+    static std::optional<ImmutableRowTablePlacementInput> immutableRowTablePlacementInputIfConsumed(
+        const ModelMemoryProfile &profile, std::span<const std::vector<DevicePlanConfig>> device_groups,
+        PhysicalMemoryResource host,
+        ImmutableRowTableHostPlacement host_placement = ImmutableRowTableHostPlacement::taskPolicy());
+
+    /**
+     * @brief Extract each actual PLE GPU's already-frozen ordinary-loader tuple.
+     * @param profile Exact source metadata identifying the PLE block.
+     * @param device_groups Selected immutable per-device ownership inputs.
+     * @return Unique source-owned bindings; missing original tuples stay absent.
+     * @throws std::invalid_argument For conflicting tuples on the same physical consumer.
+     */
+    static std::vector<ImmutableRowTableUploadBinding> immutableRowTableUploadBindings(
+        const ModelMemoryProfile &profile,std::span<const std::vector<DevicePlanConfig>> device_groups);
+    /**
+     * @brief Project exact mode costs after higher-priority row and expert decisions are frozen.
+     * @param profile Original source metadata.
+     * @param device_groups Exact retained continuation instances; expert-only devices own no PLE lane.
+     * @param ordinary_upload Original per-consumer canonical loader geometry; a missing GPU binding makes fresh VRAM ineligible.
+     * @return Incremental tier-dependent arena/channel/executable/upload BOMs; no table payload yet.
+     * @throws std::invalid_argument For incomplete source, host or participant geometry.
+     * @throws std::overflow_error For unrepresentable exact capacity arithmetic.
+     */
+    static ImmutableRowTableModeContributions immutableRowTableModeContributions(
+        const ModelMemoryProfile &profile,
+        std::span<const std::vector<DevicePlanConfig>> device_groups,
+        std::span<const ImmutableRowTableUploadBinding> ordinary_upload);
+    /**
+     * @brief Bind final table admission to the actual consumers' frozen host allocator.
+     * @param profile Original model source metadata identifying the PLE block.
+     * @param requested Lossless user storage preference.
+     * @param device_groups Fixed continuation inputs with existing host resources.
+     * @param ordinary_upload Frozen original loader geometry for actual GPU consumers.
+     * @param host_placement Compiled rank RAM locality, separate from the frozen host allocator.
+     * @return Absence without a PLE consumer, otherwise its complete final request.
+     * @throws std::invalid_argument For absent, foreign or conflicting host ownership.
+     *
+     * CPU affinity is not an allocator ordinal: an unbound process may own the
+     * whole host. CPU consumers name their allocator directly; GPU consumers
+     * name the same host owner already used for their setup and prefix bytes.
+     */
+    static std::optional<ImmutableRowTableAdmissionRequest> immutableRowTableAdmissionRequest(
+        const ModelMemoryProfile &profile, const ImmutableRowTablePolicy &requested,
+        std::span<const std::vector<DevicePlanConfig>> device_groups,
+        std::span<const ImmutableRowTableUploadBinding> ordinary_upload,
+        ImmutableRowTableHostPlacement host_placement);
+    /**
+     * @brief Reauthenticate a remote setup provision using this receiver's canonical source metadata.
+     * @param profile Existing authenticated model metadata; never reconstructed from wire claims.
+     * @param requested Declared rank policy retained in the startup request.
+     * @param input Authenticated sender resource/extent/locality observations.
+     * @param consumers Exact checked temporal consumer graph geometry from that sender.
+     * @param execution Sender-authored execution envelope, independently recomputed here.
+     * @param required_base Sender's complete fixed BOM, still checked against the joint frozen base.
+     * @return Sealed source-authenticated provision or a fatal malformed-input error.
+     * @throws std::invalid_argument For foreign source, invalid geometry or changed execution BOM.
+     */
+    static std::shared_ptr<const ImmutableRowTableExecutionProvision> restoreImmutableRowTableExecutionProvision(
+        const ModelMemoryProfile &profile,const ImmutableRowTablePolicy &requested,
+        const ImmutableRowTablePlacementInput &input,std::vector<ImmutableRowTableExecutionConsumer> consumers,
+        PhysicalMemoryPlan execution,PhysicalMemoryPlan required_base);
+
+
+
     /**
      * @brief Assemble fixed allocations for one ownership group.
      * @param profile Complete model metadata without loaded tensor payloads.

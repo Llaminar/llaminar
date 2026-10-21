@@ -10,6 +10,7 @@
  *   5. Params has only the allowed MoE runtime-table hook, not runner/peer fields.
  *   6. CPU replay and expert replacement retain the setup-owned workspace;
  *      prepared CPU engines receive scratch through invocation, never rebinding.
+ *   7. Model-global PP layer identities select only the exact compact retained bank row.
  */
 
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
@@ -1800,6 +1801,116 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     input.residency_epoch = 2;
     EXPECT_TRUE(stage.execute(&ctx));
     EXPECT_EQ(output.residency_epoch, 2u);
+}
+
+/** @test Real CPU packets address model-global layers within compact PP residency banks. */
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     CPUPipelineGlobalLayerExecutesExactRetainedExpertBank)
+{
+    constexpr int width = 8, experts = 2, rows = 2;
+    for (const int first : {0, 1, 2, 24, 40})
+    for (const int layer_count : {1, 2})
+    {
+        SCOPED_TRACE(::testing::Message() << first << '/' << layer_count);
+        auto residency = std::make_shared<MoEOverlayParticipantResidency>(
+            MoEOverlayParticipantResidency::Config{
+                .participant_id = 3, .device = DeviceId::cpu(),
+                .num_layers = layer_count, .num_experts = experts,
+                .first_model_layer = first});
+        MoEOverlayParticipantResidencyBank bank;
+        bank.epoch = 1; bank.participant_id = 3; bank.device = DeviceId::cpu();
+        bank.first_model_layer = first;
+        bank.layers.resize(layer_count);
+        for (int local = 0; local < layer_count; ++local)
+        {
+            bank.layers[local].resident_mask.assign(experts, false);
+            bank.layers[local].experts.resize(experts);
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                const int identity = local * experts + expert;
+                bank.layers[local].setResidentExpert(expert, {
+                    std::make_shared<CanonicalRouteTestGemm>(identity, false),
+                    std::make_shared<CanonicalRouteTestGemm>(identity, false),
+                    std::make_shared<CanonicalRouteTestGemm>(identity, true)});
+            }
+        }
+        std::string error;
+        ASSERT_EQ(prepareAndInstall(*residency, bank, &error),
+            MoEOverlayParticipantBankInstallStatus::Installed) << error;
+        MoEOverlayCollectiveWorkspace packets;
+        packets.ensureCapacity(rows, rows, width, 1, DeviceId::cpu());
+        auto input = packets.localExpertInput(first, 0);
+        auto output = packets.localExpertOutput(first, 0);
+        input.residency_epoch = 1;
+        input.live_row_count = input.live_entry_count = rows;
+        for (int row = 0; row < rows; ++row)
+        {
+            input.row_ids_host[row] = row;
+            input.entry_offsets_host[row] = row;
+            input.expert_ids_host[row] = row;
+            input.route_weights_host[row] = 1.0F;
+            std::fill_n(input.hidden_rows_fp32 + row * width, width, 1.0F);
+        }
+        input.entry_offsets_host[rows] = rows;
+        DeviceWorkspaceManager workspace(DeviceId::cpu(), 4096);
+        llaminar2::testing::MockDeviceContext context(DeviceId::cpu(), ComputeBackendType::CPU);
+        for (int local = 0; local < layer_count; ++local)
+        {
+            input.key.layer_idx = first + local;
+            MoELocalExpertStage::Params params;
+            params.device_id = DeviceId::cpu();
+            params.input_rows = &input; params.output_rows = &output;
+            params.graph_row_capacity = rows;
+            params.num_experts = experts; params.top_k = 1;
+            params.d_model = width; params.expert_intermediate = 16;
+            params.layer_idx = first + local; params.runtime_participant_index = 3;
+            params.expert_mask.assign(experts, true);
+            params.overlay_participant_residency = residency;
+            for (const auto &source : bank.layers[local].experts)
+            {
+                params.prepared_gate_gemm.push_back(source.gate().get());
+                params.prepared_up_gemm.push_back(source.up().get());
+                params.prepared_down_gemm.push_back(source.down().get());
+            }
+            MoELocalExpertStage stage(params);
+            stage.bindWorkspace(&workspace);
+            auto unbind = [](MoELocalExpertStage *value) { value->unbindWorkspace(); };
+            std::unique_ptr<MoELocalExpertStage, decltype(unbind)> binding(&stage, unbind);
+            for (int replay = 0; replay < 2; ++replay)
+            {
+                ASSERT_TRUE(stage.execute(&context));
+                ASSERT_EQ(output.live_row_count, rows);
+                EXPECT_EQ(output.residency_epoch, 1u);
+                for (int row = 0; row < rows; ++row)
+                    for (int col = 0; col < width; ++col)
+                        EXPECT_FLOAT_EQ(output.output_rows_fp32[row * width + col],
+                            float((local * experts + row + 1) * 16 + col));
+            }
+            for (const int foreign : {first - 1, first + layer_count})
+            {
+                auto invalid = params;
+                invalid.layer_idx = foreign;
+                input.key.layer_idx = foreign; // Valid packet/stage agreement, foreign residency scope.
+                EXPECT_NO_THROW(([&] {
+                    MoELocalExpertStage rejected(invalid);
+                    rejected.bindWorkspace(&workspace);
+                    std::unique_ptr<MoELocalExpertStage, decltype(unbind)> rejected_binding(&rejected, unbind);
+                    EXPECT_FALSE(rejected.execute(&context));
+                }()));
+                input.key.layer_idx = params.layer_idx;
+            }
+            auto invalid = params;
+            invalid.runtime_participant_index++;
+            MoELocalExpertStage rejected_participant(invalid);
+            rejected_participant.bindWorkspace(&workspace);
+            std::unique_ptr<MoELocalExpertStage, decltype(unbind)> rejected_participant_binding(
+                &rejected_participant, unbind);
+            EXPECT_FALSE(rejected_participant.execute(&context));
+            input.residency_epoch = 0;
+            EXPECT_FALSE(stage.execute(&context));
+            input.residency_epoch = 1;
+        }
+    }
 }
 
 TEST(Test__MoELocalExpertStage_PreparedWeights,

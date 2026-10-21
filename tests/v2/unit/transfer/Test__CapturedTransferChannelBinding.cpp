@@ -509,7 +509,7 @@ namespace
     TEST_F(CapturedTransferChannelBindingTest, PipelineGraphDomainsEncloseEveryForwardRole)
     {
         using Edges = PipelineForwardGraphEdges;
-        enum class Role { Prefill, Ordinary, Condition, Verifier2, Verifier16 };
+        enum class Role { Prefill, Ordinary, AdmittedOrdinary, Condition, Verifier2, Verifier16 };
         MPIContext mpi(0, 1);
         TensorFactory factory(mpi);
         for (const bool reverse : {false, true})
@@ -538,11 +538,11 @@ namespace
                     const auto device = members[member].toLocalDeviceId();
                     BufferArena arena({.factory = &factory});
                     ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 16, 32, "FP32", DeviceId::cpu()));
-                    for (const auto id : {BufferId::MTP_LOGICAL_SEQUENCE_STATE, BufferId::MTP_VERIFIER_INPUT_TOKENS,
+                    for (const auto id : {BufferId::REQUEST_TOKEN_IDS, BufferId::MTP_LOGICAL_SEQUENCE_STATE, BufferId::MTP_VERIFIER_INPUT_TOKENS,
                              BufferId::MTP_VERIFIER_POSITION_IDS, BufferId::MTP_VERIFIER_REQUEST_LENGTHS})
                         ASSERT_TRUE(arena.registerBuffer(id, 1, 32, "INT32", DeviceId::cpu()));
                     ASSERT_TRUE(arena.allocate());
-                    for (const auto id : {BufferId::HIDDEN_STATE, BufferId::MTP_LOGICAL_SEQUENCE_STATE,
+                    for (const auto id : {BufferId::HIDDEN_STATE, BufferId::REQUEST_TOKEN_IDS, BufferId::MTP_LOGICAL_SEQUENCE_STATE,
                              BufferId::MTP_VERIFIER_INPUT_TOKENS, BufferId::MTP_VERIFIER_POSITION_IDS,
                              BufferId::MTP_VERIFIER_REQUEST_LENGTHS})
                     {
@@ -561,7 +561,7 @@ namespace
                         .metadata_in = domain ? nullptr : metadata,
                         .metadata_out = domain ? metadata : nullptr};
                     Edges edges(device, port, arena, 32, domain ? std::nullopt : std::optional(follower), transfer);
-                    for (const auto role : {Role::Prefill, Role::Ordinary, Role::Condition, Role::Verifier2, Role::Verifier16})
+                    for (const auto role : {Role::Prefill, Role::Ordinary, Role::AdmittedOrdinary, Role::Condition, Role::Verifier2, Role::Verifier16})
                     {
                         SCOPED_TRACE(::testing::Message() << "reverse=" << reverse << " width=" << width
                             << " domain=" << domain << " member=" << member << " role=" << int(role));
@@ -578,7 +578,9 @@ namespace
                         input.position_ids_device = verifier ? arena.getSharedTensor(BufferId::MTP_VERIFIER_POSITION_IDS)->gpu_data_ptr() : logical + 1;
                         input.sequence_lengths_device = verifier ? static_cast<const int32_t *>(
                             arena.getSharedTensor(BufferId::MTP_VERIFIER_REQUEST_LENGTHS)->gpu_data_ptr()) : logical + 2;
-                        if (role == Role::Ordinary)
+                        if (role == Role::AdmittedOrdinary)
+                            input.token_ids_device = arena.getSharedTensor(BufferId::REQUEST_TOKEN_IDS)->gpu_data_ptr();
+                        if (role == Role::Ordinary || role == Role::AdmittedOrdinary)
                             input.device_decode_position = DeviceDecodePositionBinding{resolve(device), logical + 2, logical + 1};
                         if (role == Role::Prefill) input.device_prefill_chunk.emplace();
                         EXPECT_TRUE(edges.encloses(input));
@@ -603,7 +605,7 @@ namespace
                         {
                             EXPECT_EQ(graph.getRootNodes(), std::vector<std::string>{"pipeline_mtp_rows"});
                             EXPECT_EQ(graph.getNode("pipeline_mtp_rows")->stage->estimatedMemoryBytes(),
-                                sizeof(int32_t) * (role == Role::Ordinary ? 1 : 2 * input.seq_len + 1));
+                                sizeof(int32_t) * (role == Role::Ordinary || role == Role::AdmittedOrdinary ? 1 : 2 * input.seq_len + 1));
                         }
                         // Exact row binding is checked before any graph mutation.
                         if (role == Role::Condition)
@@ -622,6 +624,103 @@ namespace
                         invalid.participant = 0; // Previously escaped validation because this member sends nothing.
                         EXPECT_THROW((Edges(device, invalid, arena, 32, follower, transfer)), std::invalid_argument);
                     }
+                }
+            }
+        }
+    }
+
+    /** @test Native request admission is a NextToken-only owner, independent of mailbox addresses or vendor order. */
+    TEST_F(CapturedTransferChannelBindingTest, PipelineGraphDomainsAdmittedDecodeUsesCanonicalTokenOwner)
+    {
+        using Edges=PipelineForwardGraphEdges;
+        MPIContext mpi(0,1);TensorFactory factory(mpi);
+        for(bool reverse:{false,true})for(int width:{1,2,4,8}) {
+            const auto head=reverse?DeviceId::rocm(1):DeviceId::cuda(1);
+            const auto tail=reverse?DeviceId::cuda(1):DeviceId::rocm(1);
+            constexpr std::size_t capacity=16*32*sizeof(float);
+            auto authority=admission(head,tail,capacity,0,2);
+            auto activation=transfer.createCapturedTransferChannel(*authority,DeviceId::cpu(),head,
+                producer_stream,tail,consumer_stream,capacity);
+            auto metadata=transfer.createCapturedTransferChannel(*authority,DeviceId::cpu(),tail,
+                consumer_stream,head,producer_stream,capacity);
+            for(int domain=0;domain<2;++domain) {
+                llaminar2::test::MockLocalTPContext context;
+                std::vector<GlobalDeviceAddress> members;
+                for(int member=0;member<width;++member)members.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                    DeviceId{(domain?tail:head).type,(member+1)%8}));
+                context.setDevices(members);context.setBackend(members.front().toLocalDeviceId().is_cuda()
+                    ?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL);
+                for(int member=0;member<width;++member) {
+                    SCOPED_TRACE(::testing::Message()<<"reverse="<<reverse<<" width="<<width<<" domain="<<domain<<" member="<<member);
+                    const auto device=members[member].toLocalDeviceId();
+                    BufferArena arena({.factory=&factory});
+                    ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE,16,32,"FP32",DeviceId::cpu()));
+                    constexpr std::array integers{BufferId::REQUEST_TOKEN_IDS,BufferId::REQUEST_POSITION_IDS,
+                        BufferId::MTP_LOGICAL_SEQUENCE_STATE,BufferId::MTP_VERIFIER_INPUT_TOKENS,
+                        BufferId::MTP_VERIFIER_POSITION_IDS,BufferId::MTP_VERIFIER_REQUEST_LENGTHS};
+                    for(auto id:integers)ASSERT_TRUE(arena.registerBuffer(id,1,32,"INT32",DeviceId::cpu()));
+                    ASSERT_TRUE(arena.allocate());
+                    for(auto id:integers) {
+                        auto tensor=arena.getSharedTensor(id);tensor->setBackendForTesting(resolve(device));
+                        TransferEngine::prepareDeviceInput(tensor.get(),device,producer_stream);
+                    }
+                    auto hidden=arena.getSharedTensor(BufferId::HIDDEN_STATE);hidden->setBackendForTesting(resolve(device));
+                    TransferEngine::prepareDeviceInput(hidden.get(),device,producer_stream);
+                    const auto words=[&](BufferId id){return static_cast<int32_t *>(arena.getSharedTensor(id)->gpu_data_ptr());};
+                    auto *logical=words(BufferId::MTP_LOGICAL_SEQUENCE_STATE);
+                    Edges::FollowerState follower{.backend=resolve(device),.checkpoint={
+                        .cache=reinterpret_cast<IKVCache *>(logical),.sequence_index=0,
+                        .checkpoint_device=logical+8,.checkpoint_bytes=2*sizeof(int32_t)}};
+                    Edges::CapturedDomain port{.stage_index=std::size_t(domain),.stage_count=2,
+                        .context=width>1?&context:nullptr,.participant=member,
+                        .activation_in=domain?activation:nullptr,.activation_out=domain?nullptr:activation,
+                        .metadata_in=domain?nullptr:metadata,.metadata_out=domain?metadata:nullptr};
+                    Edges edges(device,port,arena,32,domain?std::nullopt:std::optional(follower),transfer);
+                    ForwardInput input;input.device=device;input.seq_len=1;
+                    input.execution_role=ForwardExecutionRole::MainInference;input.execution_phase=ForwardExecutionPhase::Decode;
+                    input.external_hidden_state=domain?hidden.get():nullptr;
+                    input.kv_cache=domain?nullptr:follower.checkpoint.cache;
+                    input.token_ids_device=words(BufferId::REQUEST_TOKEN_IDS);
+                    input.position_ids_device=words(BufferId::REQUEST_POSITION_IDS);
+                    input.sequence_lengths_device=logical+2;
+                    input.device_decode_position=DeviceDecodePositionBinding{resolve(device),logical+2,
+                        words(BufferId::REQUEST_POSITION_IDS)};
+                    const auto makeGraph=[&] {
+                        auto graph=std::make_unique<ComputeGraph>();
+                        graph->addNode("model",std::make_unique<llaminar2::testing::MockComputeStage>(),device);
+                        return graph;
+                    };
+                    const auto proveOwner=[&](const ForwardInput &binding,BufferId expected) {
+                        auto graph=makeGraph();ASSERT_NO_THROW(edges.append(*graph,binding));
+                        auto *node=graph->getNode("pipeline_mtp_rows");ASSERT_NE(node,nullptr);
+                        const auto contract=node->stage->bufferContract();
+                        const auto &banks=domain?contract.inputs:contract.outputs;
+                        ASSERT_EQ(banks.size(),1u);EXPECT_EQ(banks.front().id,expected);
+                        EXPECT_EQ(node->stage->estimatedMemoryBytes(),sizeof(int32_t));
+                    };
+                    ASSERT_NO_FATAL_FAILURE(proveOwner(input,BufferId::REQUEST_TOKEN_IDS));
+                    auto mailbox=input;mailbox.token_ids_device=logical+4;
+                    ASSERT_NO_FATAL_FAILURE(proveOwner(mailbox,BufferId::MTP_LOGICAL_SEQUENCE_STATE));
+                    auto verifier=input;verifier.execution_role=ForwardExecutionRole::GroupedMTPVerifier;verifier.seq_len=2;
+                    verifier.device_decode_position.reset();
+                    verifier.token_ids_device=words(BufferId::MTP_VERIFIER_INPUT_TOKENS);
+                    verifier.position_ids_device=words(BufferId::MTP_VERIFIER_POSITION_IDS);
+                    verifier.sequence_lengths_device=words(BufferId::MTP_VERIFIER_REQUEST_LENGTHS);
+                    auto complete=makeGraph();ASSERT_NO_THROW(edges.append(*complete,verifier));
+                    const auto reject=[&](ForwardInput invalid) {
+                        auto graph=makeGraph();auto &backend=device.is_cuda()?cuda:rocm;backend.calls.clear();
+                        EXPECT_THROW(edges.append(*graph,invalid),std::exception);
+                        EXPECT_EQ(graph->getRootNodes(),std::vector<std::string>{"model"});
+                        EXPECT_EQ(graph->getLeafNodes(),std::vector<std::string>{"model"});
+                        EXPECT_EQ(graph->getNode("pipeline_mtp_rows"),nullptr);
+                        EXPECT_TRUE(backend.calls.empty());
+                    };
+                    auto invalid=input;invalid.token_ids_device=words(BufferId::REQUEST_TOKEN_IDS)+1;reject(invalid);
+                    invalid=input;invalid.token_ids_device=words(BufferId::REQUEST_POSITION_IDS);reject(invalid);
+                    invalid=input;invalid.execution_role=ForwardExecutionRole::MTPCondition;
+                    invalid.device_decode_position.reset();invalid.position_ids_device=logical+1;reject(invalid);
+                    invalid=verifier;invalid.token_ids_device=words(BufferId::REQUEST_TOKEN_IDS);reject(invalid);
+                    invalid=verifier;invalid.token_ids_device=words(BufferId::MTP_VERIFIER_INPUT_TOKENS)+1;reject(invalid);
                 }
             }
         }

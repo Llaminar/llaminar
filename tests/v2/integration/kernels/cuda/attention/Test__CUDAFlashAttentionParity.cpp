@@ -37,6 +37,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../ReplicatedGQADirectGuardProof.h"
 
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
@@ -9936,4 +9937,25 @@ TEST_F(Test__CUDAFlashAttentionParity, SkipWithoutCUDA)
     GTEST_SKIP() << "CUDA not available";
 }
 
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Direct FP32 admission retains exact global GQA mapping, not local divisibility. */
+TEST_F(Test__CUDAFlashAttentionParity, Qwen4ExpTP8DirectFP32ReplicatedHeadMapping)
+{
+    SKIP_IF_NO_CUDA();
+    llaminar2::test::proveReplicatedGQADirectGuard<llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32>>(gpu_device_);
+}
+/** @test Actual captured attention stage retains odd local Q3 over the original full two-KV bank. */
+TEST_F(Test__CUDAFlashAttentionParity, Qwen4ExpTP8CapturedReplicatedHeadMapping)
+{
+    SKIP_IF_NO_CUDA();
+    for(const int head_start:{0,3,6,9,12,15,18,21})
+        for(const int rows:{1,3})
+        {
+            runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+                rows,5,3,2,256,"QFN TP8 Q3/fullKV2 original global mapping",ActivationPrecision::FP16,head_start,12);
+            if(::testing::Test::HasFatalFailure())return;
+        }
+}
 #endif

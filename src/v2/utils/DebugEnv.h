@@ -15,6 +15,7 @@
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "config/GDNProjectionArithmeticPolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
+#include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "collective/AllreducePrecisionPolicy.h"
 
@@ -382,11 +383,45 @@ namespace llaminar2
          * with FP32 accumulation/output. Decode and verifier use one fixed
          * reduction tree; ordinary GPU prefill uses floating GEMM.
          * The default FP16MoEAlphaBeta applies half operands only to original floating
-         * qwen35moe alpha/beta matrices; dense GDN stays native. Explicit FP16AlphaBeta
+         * qwen35moe and qwen4exp alpha/beta matrices; dense GDN stays native. Explicit FP16AlphaBeta
          * selects alpha/beta for both dense and MoE models. Experts, routers and full-attention keep their own policy.
          */
         GDNProjectionArithmetic gdn_projection_arithmetic = kDefaultGDNProjectionArithmetic;
-        MoERouterArithmetic moe_router_arithmetic = MoERouterArithmetic::Native; ///< Setup-only LLAMINAR_MOE_ROUTER_ARITHMETIC=native|fp16|native_hadamard32; rotation applies only to existing Q8 router paths.
+        /**
+         * @brief Setup-only LLAMINAR_QFN_HC_UP_ACTIVATION=single_q8|two_term_q8.
+         *
+         * Applies only to Flash Next HC-up projections. The graph copies this
+         * policy before workspace preparation; execution never rereads it.
+         * SingleQ8 remains the production default during numerical evaluation.
+         */
+        QuantizedActivationOperandPrecision qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /**
+         * @brief Setup-only LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION=single_q8|two_term_q8.
+         *
+         * Selects only original Flash Next GDN output projections. Setup freezes
+         * this value into graph and admission configuration; kernels never read
+         * the environment. HC-up, alpha/beta, routers and other models retain
+         * their independent policies. SingleQ8 remains the default.
+         */
+        QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /**
+         * @brief Setup-only LLAMINAR_QFN_FA_OUTPUT_ACTIVATION=single_q8|two_term_q8.
+         *
+         * Explicit correction requires the original complete Q8_0 main FA output
+         * and existing prepared/query owners. Predictor, HC and GDN keep their
+         * independent arithmetic; SingleQ8 remains the serving default.
+         */
+        QuantizedActivationOperandPrecision qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        /**
+         * @brief Setup-only LLAMINAR_QFN_GDN_QKV_ACTIVATION=single_q8|two_term_q8.
+         *
+         * Selects only full original native main-GDN mixed-QKV sources. Z,
+         * alpha/beta and the other QFN projection selectors stay independent.
+         * Graph, workspace and prefix identities retain this parsed value;
+         * kernels never read the environment. SingleQ8 remains the default.
+         */
+        QuantizedActivationOperandPrecision qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
+        MoERouterArithmetic moe_router_arithmetic = MoERouterArithmetic::ModelDefault; ///< Omitted selection resolves from the registered model schema; explicit native|fp16|native_hadamard32 remains authoritative.
 
         // Q8_1 GEMM compensation strategy
         bool use_sa_compensation = false; ///< Use sA-based compensation (vs sum_qs-based, experimental)
@@ -443,9 +478,22 @@ namespace llaminar2
             const char *gdn_arithmetic = std::getenv("LLAMINAR_GDN_PROJECTION_ARITHMETIC");
             gdn_projection_arithmetic = gdn_arithmetic ? parseGDNProjectionArithmetic(gdn_arithmetic) :
                 kDefaultGDNProjectionArithmetic;
+            const char *qfn_hc_up = std::getenv("LLAMINAR_QFN_HC_UP_ACTIVATION");
+            qfn_hc_up_activation = qfn_hc_up ? parseQuantizedActivationOperandPrecision(qfn_hc_up) :
+                QuantizedActivationOperandPrecision::SingleQ8;
+            const char *qfn_gdn_output = std::getenv("LLAMINAR_QFN_GDN_OUTPUT_ACTIVATION");
+            qfn_gdn_output_activation = qfn_gdn_output ? parseQuantizedActivationOperandPrecision(qfn_gdn_output) :
+                QuantizedActivationOperandPrecision::SingleQ8;
+            // Setup parses once; graph/planner records carry the frozen policy.
+            const char *qfn_fa_output = std::getenv("LLAMINAR_QFN_FA_OUTPUT_ACTIVATION");
+            qfn_fa_output_activation = qfn_fa_output ? parseQuantizedActivationOperandPrecision(qfn_fa_output) :
+                QuantizedActivationOperandPrecision::SingleQ8;
+            const char *qfn_gdn_qkv = std::getenv("LLAMINAR_QFN_GDN_QKV_ACTIVATION");
+            qfn_gdn_qkv_activation = qfn_gdn_qkv ? parseQuantizedActivationOperandPrecision(qfn_gdn_qkv) :
+                QuantizedActivationOperandPrecision::SingleQ8;
             const char *router_arithmetic = std::getenv("LLAMINAR_MOE_ROUTER_ARITHMETIC");
-            moe_router_arithmetic = parseMoERouterArithmetic(
-                router_arithmetic ? router_arithmetic : "native");
+            moe_router_arithmetic = router_arithmetic ? parseMoERouterArithmetic(router_arithmetic) :
+                MoERouterArithmetic::ModelDefault;
             const char *sa_comp_env = std::getenv("LLAMINAR_USE_SA_COMPENSATION");
             if (sa_comp_env)
             {
@@ -2824,7 +2872,7 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_MOE_ROUTER_Q8=0` - Disable cached Q8 router gate weights for ROCm MoE decode routing (default: on)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE=1` - Enable K-partitioned FP32 router logits for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPARTS=<2|4|8|16>` - K partitions for FP32 router logits decode routing (default: 8)
-     * - `LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK=0` - Disable shared-memory ROCm MoE decode softmax/top-k runtime kernel for <=256 experts (default: on)
+     * - `LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK=0` - Disable shared-memory ROCm MoE decode softmax/top-k runtime kernel for <=512 experts (default: on)
      * - `LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN=0` - Disable router Q8 hidden/scales reuse for grouped gate/up decode when the hidden row pointer matches (default: on)
      * - `LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_M=<4|8|12|16>` - Force expert-row tile for grouped gate/up prefill training (`-1` = generated policy)
      * - `LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_N=<64|128|256>` - Force output-column tile for grouped gate/up prefill training (`-1` = generated policy)
@@ -2899,7 +2947,7 @@ namespace llaminar2
         bool moe_router_q8 = true;                 ///< Enable cached Q8 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_Q8)
         bool moe_router_kpart_decode = false;      ///< Enable K-partitioned FP32 router logits for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         int moe_router_kparts = 8;                 ///< K partitions for FP32 router logits decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPARTS)
-        bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=256 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
+        bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=512 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
         bool moe_reuse_router_q8_hidden = true;    ///< Reuse router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN)
         int moe_prefill_gateup_tile_m = -1;        ///< Grouped prefill gate/up expert-row policy override (-1=generated; 4/8/12/16 fixed, 20=device-adaptive)
         int moe_prefill_gateup_tile_n = -1;        ///< Grouped prefill gate/up output-column tile override (-1=generated policy; 64/128/256 valid)

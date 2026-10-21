@@ -96,6 +96,16 @@ namespace llaminar2
         }
     }
 
+    /** @brief Bind immutable constant-memory tables before any graph capture. */
+    const float *cuda_tq_native_centroids(int bits)
+    {
+        void *pointer = nullptr;
+        const auto status = bits == 4 ? cudaGetSymbolAddress(&pointer,d_TQ4_CENTROIDS) :
+                            bits == 8 ? cudaGetSymbolAddress(&pointer,d_TQ8_CENTROIDS) : cudaErrorInvalidValue;
+        if (status != cudaSuccess) throw std::invalid_argument("CUDA native TQ codebook resolution failed");
+        return static_cast<const float *>(pointer);
+    }
+
     bool cuda_tq_upload_codebooks(cudaStream_t stream)
     {
         if (!stream)

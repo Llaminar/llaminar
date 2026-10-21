@@ -25,6 +25,7 @@
 #include <set>
 #include <algorithm>
 #include <filesystem>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -543,8 +544,12 @@ namespace llaminar2
     std::vector<std::string> MPIBootstrap::buildMPIRunCommand(
         int argc, char *argv[],
         const MPILaunchConfig &config,
-        const CPUTopology &topology)
+        const CPUTopology &topology,
+        MPIBootstrapArgumentPolicy arguments)
     {
+        if (arguments != MPIBootstrapArgumentPolicy::FilterLaunchArguments &&
+            arguments != MPIBootstrapArgumentPolicy::PreserveOriginalArguments)
+            throw std::invalid_argument("Unknown MPI bootstrap argument policy");
         std::vector<std::string> cmd;
 
         cmd.push_back("mpirun");
@@ -647,10 +652,19 @@ namespace llaminar2
         // argv[0] is the program path
         cmd.push_back(argv[0]);
 
-        // Copy all original arguments, filtering out MPI bootstrap-specific ones
+        // Copy original arguments according to the application parser ownership.
         for (int i = 1; i < argc; ++i)
         {
             std::string arg = argv[i];
+
+            // An opaque diagnostic wrapper validates its complete original CLI
+            // again in the child. Preserve even flags after its -- separator;
+            // rank membership was already resolved in the MPI command prefix.
+            if (arguments == MPIBootstrapArgumentPolicy::PreserveOriginalArguments)
+            {
+                cmd.push_back(argv[i]);
+                continue;
+            }
 
             // Skip bootstrap-specific arguments (they're already processed)
             if (arg == "--mpi-bootstrap" ||
@@ -679,7 +693,8 @@ namespace llaminar2
 
     int MPIBootstrap::selfLaunchMPI(int argc, char *argv[],
                                     const MPILaunchConfig &config,
-                                    const CPUTopology &topology)
+                                    const CPUTopology &topology,
+                                    MPIBootstrapArgumentPolicy arguments)
     {
         // Configure OpenMP environment before exec (inherited by child processes)
         if (config.hostfile.empty())
@@ -687,7 +702,7 @@ namespace llaminar2
         configureLauncherEnvironment();
 
         // Build command
-        auto cmd = buildMPIRunCommand(argc, argv, config, topology);
+        auto cmd = buildMPIRunCommand(argc, argv, config, topology, arguments);
 
         // Convert to C-style array for execvp
         std::vector<char *> c_argv;

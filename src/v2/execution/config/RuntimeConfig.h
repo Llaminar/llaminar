@@ -14,6 +14,7 @@
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
+#include "../../loaders/ImmutableRowTablePolicy.h"
 #include "RoutedExpertPolicy.h"
 #include "MTPDepthDefaults.h"
 #include "MTPDepthPolicyTypes.h"
@@ -27,6 +28,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -36,6 +38,8 @@
 
 namespace llaminar2
 {
+    class ResolvedImmutableRowTablePlacement;
+
 
     /**
      * @brief Fused attention execution backend
@@ -2195,6 +2199,13 @@ namespace llaminar2
         /// Cross-request prefix-state cache configuration.
         PrefixCacheRuntimeConfig prefix_cache;
 
+        /// Explicit native PLE table storage; file capacity is not prepared-weight memory.
+        ImmutableRowTablePolicy ngram_table_policy;
+        /** Canonical setup-selected concrete tier and exact physical consumers.
+         * Absence is permitted before final PMA selection or for models without PLE.
+         * Runtime graph/materialization must never infer concrete storage from Auto. */
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+
         /// Multi-token prediction speculative decode configuration.
         MTPRuntimeConfig mtp;
 
@@ -2217,7 +2228,8 @@ namespace llaminar2
             MoERebalanceRuntimeConfig moe_rebalance = {},
             PrefixCacheRuntimeConfig prefix_cache = {},
             MTPRuntimeConfig mtp = {},
-            std::string tp_allreduce_precision_override = {})
+            std::string tp_allreduce_precision_override = {},
+            ImmutableRowTablePolicy ngram_table_policy = {})
         {
             RuntimeConfig rc;
             rc.max_seq_len = max_seq_len;
@@ -2231,6 +2243,8 @@ namespace llaminar2
             rc.moe_routed_prefill = moe_routed_prefill;
             rc.moe_rebalance = moe_rebalance;
             rc.prefix_cache = prefix_cache;
+            ngram_table_policy.validate();
+            rc.ngram_table_policy = ngram_table_policy;
             rc.mtp = mtp;
             return rc;
         }

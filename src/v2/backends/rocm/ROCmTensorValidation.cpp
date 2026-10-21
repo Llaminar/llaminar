@@ -35,24 +35,47 @@ namespace llaminar2
         unsigned int inf_count;
         unsigned int zero_count;
         unsigned int total_checked;
+        unsigned int invalid_extent;
         float sample_min;
         float sample_max;
     };
 
-    /** Initialize one persistent validation record on its execution stream. */
-    __global__ void initializeValidationResultROCm(DeviceValidationResult *result)
+    static_assert(sizeof(DeviceValidationResult) <= 64,
+                  "Validation publishes one compact diagnostic record");
+
+    /**
+     * @brief Initialize the existing transaction and acquire its original frontier.
+     * @param result Persistent per-device diagnostic result, exclusively borrowed.
+     * @param extent Checked static geometry and stream-ordered native count words.
+     *
+     * Invalid native metadata suppresses payload access and is published as an
+     * error, distinct from valid-empty. This replaces the old initializer rather
+     * than adding a count kernel or a separate host observation boundary.
+     */
+    __global__ void initializeValidationResultROCm(DeviceValidationResult *result,
+                                                TensorValidationExtent extent)
     {
         if (blockIdx.x == 0 && threadIdx.x == 0)
         {
-            result->has_nan = 0;
-            result->has_inf = 0;
+            *result = {};
             result->appears_zero = 1;
-            result->nan_count = 0;
-            result->inf_count = 0;
-            result->zero_count = 0;
-            result->total_checked = 0;
             result->sample_min = std::numeric_limits<float>::max();
             result->sample_max = std::numeric_limits<float>::lowest();
+            auto geometry = extent.geometry;
+            std::int32_t prior = 0, live = 0;
+            if (geometry.kind == SnapshotContiguousRowKind::StatePrefixRows)
+            {
+                prior = extent.frontier[0];
+                live = extent.frontier[1];
+            }
+            else if (geometry.kind == SnapshotContiguousRowKind::TokenRows && extent.frontier)
+                live = extent.frontier[0];
+            else
+                geometry.kind = SnapshotContiguousRowKind::Physical;
+            const auto observed = resolveSnapshotContiguousRows(geometry, prior, live);
+            result->invalid_extent = observed.valid ? 0U : 1U;
+            result->total_checked = observed.valid
+                ? static_cast<unsigned int>(observed.rows * extent.columns) : 0U;
         }
     }
 
@@ -99,6 +122,9 @@ namespace llaminar2
         size_t num_elements,
         DeviceValidationResult *__restrict__ result)
     {
+        // Initialization on this stream has already authenticated the frontier.
+        num_elements = result->total_checked;
+
         // Shared memory for block-level reduction
         __shared__ unsigned int s_nan_count;
         __shared__ unsigned int s_inf_count;
@@ -211,6 +237,9 @@ namespace llaminar2
         size_t num_elements,
         DeviceValidationResult *__restrict__ result)
     {
+        // Initialization on this stream has already authenticated the frontier.
+        num_elements = result->total_checked;
+
         __shared__ unsigned int s_nan_count;
         __shared__ unsigned int s_inf_count;
         __shared__ unsigned int s_zero_count;
@@ -294,6 +323,9 @@ namespace llaminar2
         size_t num_elements,
         DeviceValidationResult *__restrict__ result)
     {
+        // Initialization on this stream has already authenticated the frontier.
+        num_elements = result->total_checked;
+
         __shared__ unsigned int s_nan_count;
         __shared__ unsigned int s_inf_count;
         __shared__ unsigned int s_zero_count;
@@ -417,23 +449,35 @@ namespace llaminar2
                 (void)hipFree(d_result_);
         }
 
+        /** @copydoc ITensorValidator::validate */
         [[nodiscard]] TensorValidationResult validate(
             const void *device_ptr,
             size_t num_elements,
             TensorValidationDataType data_type,
             ExplicitGPUStream producer_stream) override
         {
+            return validateObserved(device_ptr,
+                {{SnapshotContiguousRowKind::Physical, num_elements}, 1, nullptr},
+                data_type, producer_stream);
+        }
+
+        /** @copydoc ITensorValidator::validateObserved */
+        [[nodiscard]] TensorValidationResult validateObserved(
+            const void *device_ptr,
+            TensorValidationExtent extent,
+            TensorValidationDataType data_type,
+            ExplicitGPUStream producer_stream) override
+        {
             if (!device_ptr)
                 throw std::invalid_argument("ROCmTensorValidator requires a non-null device pointer");
-            if (num_elements == 0)
-                throw std::invalid_argument("ROCmTensorValidator requires a positive element count");
+            const auto num_elements = checkedTensorValidationElementCapacity(extent, data_type);
 
             std::lock_guard<std::mutex> invocation_lock(invocation_mutex_);
             requireSuccess(hipSetDevice(device_id_), "hipSetDevice before validation");
             auto stream = reinterpret_cast<hipStream_t>(producer_stream.get());
             const int block_size = 256;
             const int max_blocks = 1024;
-            int num_blocks = std::min(max_blocks, (int)((num_elements + block_size - 1) / block_size));
+            int num_blocks = static_cast<int>(std::min(static_cast<size_t>(max_blocks), (num_elements + block_size - 1) / block_size));
 
             hipLaunchKernelGGL(
                 initializeValidationResultROCm,
@@ -441,7 +485,8 @@ namespace llaminar2
                 dim3(1),
                 0,
                 stream,
-                d_result_);
+                d_result_,
+                extent);
             requireSuccess(hipGetLastError(), "initialize validation result launch");
 
             switch (data_type)
@@ -501,12 +546,12 @@ namespace llaminar2
             result.has_nan = (h_result_->has_nan != 0);
             result.has_inf = (h_result_->has_inf != 0);
             result.appears_zero = (h_result_->appears_zero != 0);
-            result.valid = !result.has_nan && !result.has_inf;
+            result.invalid_extent = (h_result_->invalid_extent != 0);
+            result.valid = !result.invalid_extent && !result.has_nan && !result.has_inf;
             result.nan_count = h_result_->nan_count;
             result.inf_count = h_result_->inf_count;
             result.zero_count = h_result_->zero_count;
-            result.total_checked = static_cast<uint32_t>(
-                std::min(num_elements, static_cast<size_t>(UINT32_MAX)));
+            result.total_checked = h_result_->total_checked;
             result.sample_min = h_result_->sample_min;
             result.sample_max = h_result_->sample_max;
             return result;

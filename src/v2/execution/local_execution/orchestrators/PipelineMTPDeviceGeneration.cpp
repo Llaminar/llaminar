@@ -203,6 +203,7 @@ bool PipelineDeviceGeneration::composeSpeculativeParticipants()
         if (hosted)
         {
             if (tail) return true; // Its existing branch table owns every depth.
+            (void)stage.retainedStorageTerminalFragments();
             std::vector<GPUOrderedTimelineStep> steps;
             for (const auto &fragment : loop.source_fragments)
                 steps.push_back({.name = fragment.name, .capture = fragment.capture});
@@ -210,7 +211,8 @@ bool PipelineDeviceGeneration::composeSpeculativeParticipants()
             if (!loop.capture->buildOrderedTimelineTransaction(steps) || !loop.capture->instantiate())
                 return false;
             PerfStatsCollector::addCounter("generation", "pipeline_mtp_follower_graph_materializations", 1.0,
-                "graph_setup", stage.state_.device_id.toString());
+                "graph_setup", stage.state_.device_id.toString(),
+                {{"execution", deviceGenerationExecutionPolicyName(execution_policy_)}});
             return true;
         }
 
@@ -274,7 +276,7 @@ bool PipelineDeviceGeneration::composeSpeculativeParticipants()
         const DeviceControlledLoopEntryFragment entry[] = {{"pipeline continuation arrival", command.get()}};
         auto body = loop.source_fragments;
         body.push_back({"pipeline next or terminal command", command.get()});
-        const DeviceControlledLoopProgram program{.entry = entry, .iteration = body};
+        const DeviceControlledLoopProgram program{.entry = entry, .iteration = body,.terminal=stage.retainedStorageTerminalFragments()};
         if (tail)
         {
             std::string error;
@@ -295,6 +297,12 @@ bool PipelineDeviceGeneration::composeSpeculativeParticipants()
                 .healthy_index = kDeviceGenerationControlOk, .complete_index = kDeviceGenerationControlRequestComplete};
             if (!loop.capture->buildDeviceControlledWhileLoop(program, predicate) || !loop.capture->instantiate())
                 return false;
+            // Observe only the successful complete follower parent. Preparing
+            // source fragments is not native graph materialization; reused
+            // parents and the tail's separate controller are not counted here.
+            PerfStatsCollector::addCounter("generation", "pipeline_mtp_follower_graph_materializations", 1.0,
+                "graph_setup", stage.state_.device_id.toString(),
+                {{"execution", deviceGenerationExecutionPolicyName(execution_policy_)}});
         }
         return true;
     });
@@ -338,7 +346,7 @@ bool PipelineDeviceGeneration::launchHostedSpeculativeTransactions()
         if (ticket.complete)
         {
             for (size_t index = 0; index < terminalIndex(); ++index)
-                if (!stages_[index]->publishDeviceGenerationStateReady(
+                if (!stages_[index]->submitRetainedStorageTerminal()||!stages_[index]->publishDeviceGenerationStateReady(
                         stages_[index]->mtp_device_generation_loop_graph_.stream.get(), 1,
                         DeviceGenerationStatePublicationKind::Terminal)) return false;
             return true;

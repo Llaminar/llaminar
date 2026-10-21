@@ -39,6 +39,13 @@
 
 namespace llaminar2
 {
+    /** @brief Immutable diagnostic ownership of an expert stage's canonical route bank. */
+    enum class MoECanonicalRouteDiagnosticPublication : std::uint8_t
+    {
+        CompleteBank, ///< Existing canonical producer surface for ordinary/native compute.
+        ContinuationLocalBank, ///< Heterogeneous continuation routes before remote ingress/join.
+    };
+
 
     // Forward declarations
     class ITensorGemm;
@@ -520,6 +527,10 @@ namespace llaminar2
              */
             TensorBase *canonical_route_contributions = nullptr;
 
+            /** Frozen producer identity; never infer completeness from shape, M, or current masks. */
+            MoECanonicalRouteDiagnosticPublication canonical_route_diagnostic_publication =
+                MoECanonicalRouteDiagnosticPublication::CompleteBank;
+
             /** Arithmetic represented by each canonical route slot. */
             MoECanonicalRouteArithmeticPolicy canonical_route_arithmetic =
                 MoECanonicalRouteArithmeticPolicy::Unspecified;
@@ -917,6 +928,49 @@ namespace llaminar2
         {
             return params_.moe_runtime_table;
         }
+        /**
+         * @brief Read-only witness of one graph-frozen native expert source.
+         *
+         * Construction regressions compare these const engine identities with
+         * the admitted registry and retained RCU bank. This value grants no
+         * parameter mutation, ownership publication or executable capability.
+         */
+        struct NativePreparedExpertObservation
+        {
+            MoEExpertWeightResolutionPolicy resolution;
+            int participant_count;
+            const int32_t *live_rows;
+            bool has_raw_parents;
+            bool explicit_owner_metadata;
+            const ITensorGemm *gate;
+            const ITensorGemm *up;
+            const ITensorGemm *down;
+        };
+
+        /**
+         * @brief Observe immutable source/count bindings for one logical expert.
+         * @param expert Zero-based logical expert in the complete prepared table.
+         * @return Const source identities and graph-frozen native metadata.
+         * @throws std::out_of_range For an absent or incomplete prepared row.
+         */
+        [[nodiscard]] NativePreparedExpertObservation
+        nativePreparedExpertObservationForTesting(int expert) const
+        {
+            if (expert < 0 || expert >= params_.num_experts ||
+                static_cast<std::size_t>(expert) >= params_.prepared_gate_gemm.size() ||
+                static_cast<std::size_t>(expert) >= params_.prepared_up_gemm.size() ||
+                static_cast<std::size_t>(expert) >= params_.prepared_down_gemm.size())
+                throw std::out_of_range("Native prepared-expert observation has no complete row");
+            return {.resolution = params_.expert_weight_resolution_policy,
+                .participant_count = params_.participant_count,
+                .live_rows = params_.active_row_count_device,
+                .has_raw_parents = params_.gate_exps || params_.up_exps || params_.down_exps,
+                .explicit_owner_metadata = params_.runtime_decode_has_explicit_owner_metadata,
+                .gate = params_.prepared_gate_gemm[expert],
+                .up = params_.prepared_up_gemm[expert],
+                .down = params_.prepared_down_gemm[expert]};
+        }
+
         bool hasPrefillLLEPTPContextForTesting() const { return params_.prefill_llep_tp_ctx != nullptr; }
         bool usesGraphPhasedCurrentBatchLLEPForTesting() const
         {

@@ -518,20 +518,22 @@ namespace llaminar2::test
      * This mirrors the floating-point branch in WeightManager's GPU pipeline:
      * the weight is copied into a WeightVRAMPool slot without repacking, then a
      * CUDA/ROCm floating-point GEMM kernel is bound to that persistent device
-     * pointer and registered in a PreparedWeightStore. Keep the returned object
-     * alive while using the borrowed kernel pointer.
+     * pointer and registered in the caller-owned PreparedWeightStore. The
+     * lifetime vector retains the test-only loader/pool allocation boundary.
      * @param weights Host source owning the immutable floating words.
      * @param device Physical GPU owning the prepared pool and engine.
      * @param canonical_name Unique source identity within the test model.
-     * @param model_id Prepared-store lifetime identity.
+     * @param store Sole caller-owned store retaining all bundle engines.
+     * @param orchestrator_lifetimes Caller-retained owners of uploaded native bytes.
      * @param operand_precision Immutable activation rounding for the engine and binding.
-     * @return Owner retaining the loader, pool and prepared engine.
+     * @return Exact registered reference, valid while the store and loaders live.
      */
-    inline GpuPreparedGemm makeGpuPreparedFloatingPointGemm(
+    inline PreparedWeightRef registerGpuPreparedFloatingPointGemmInStore(
         TensorBase *weights,
         DeviceId device,
-        const std::string &canonical_name = "test.gpu_prepared_fp_gemm.weight",
-        ModelContextId model_id = ModelContextId{9900},
+        const std::string &canonical_name,
+        PreparedWeightStore &store,
+        std::vector<std::shared_ptr<LoadOrchestrator>> &orchestrator_lifetimes,
         FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native)
     {
         namespace kf = llaminar::v2::kernels;
@@ -592,19 +594,47 @@ namespace llaminar2::test
         handle->variant = static_cast<int>(weights->native_type());
         handle->prepared_weights = std::move(prepared_weights);
 
-        out.store = std::make_unique<PreparedWeightStore>(model_id);
-        out.binding = makePreparedWeightTestBinding(weights, device, canonical_name, model_id);
+        out.binding = makePreparedWeightTestBinding(weights, device, canonical_name, store.modelId());
         out.binding.floating_operand_precision = operand_precision;
-        out.ref = out.store->registerPreparedGemmHandle(
+        out.ref = store.registerPreparedGemmHandle(
             out.binding,
             preparedKindForDevice(device),
             device,
             std::move(handle));
 
-        out.kernel = out.store->gemmKernel(out.ref);
+        out.kernel = store.gemmKernel(out.ref);
         if (!out.kernel)
             throw std::runtime_error("makeGpuPreparedFloatingPointGemm: gemmKernel returned null after registration");
 
+        orchestrator_lifetimes.push_back(std::move(out.orchestrator));
+        return out.ref;
+    }
+
+    /**
+     * @brief Own one floating GPU engine using the shared RAW_FP preparation path.
+     * @param weights Original immutable floating source tensor.
+     * @param device Exact physical GPU participant.
+     * @param canonical_name Original source name in this test model.
+     * @param model_id Prepared-store lifetime identity.
+     * @param operand_precision Immutable engine activation-rounding policy.
+     * @return Owner retaining the same loader, pool and store as before extraction.
+     */
+    inline GpuPreparedGemm makeGpuPreparedFloatingPointGemm(
+        TensorBase *weights,
+        DeviceId device,
+        const std::string &canonical_name = "test.gpu_prepared_fp_gemm.weight",
+        ModelContextId model_id = ModelContextId{9900},
+        FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native)
+    {
+        GpuPreparedGemm out;
+        out.store = std::make_unique<PreparedWeightStore>(model_id);
+        std::vector<std::shared_ptr<LoadOrchestrator>> lifetimes;
+        out.ref = registerGpuPreparedFloatingPointGemmInStore(
+            weights, device, canonical_name, *out.store, lifetimes, operand_precision);
+        out.orchestrator = std::move(lifetimes.at(0));
+        out.binding = *out.store->binding(out.ref);
+        out.binding.prepared.reset(); // Preserve the original factory's caller-side binding metadata.
+        out.kernel = out.store->gemmKernel(out.ref);
         return out;
     }
 

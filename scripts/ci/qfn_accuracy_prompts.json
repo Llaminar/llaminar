@@ -1,0 +1,97 @@
+{
+  "schema": "llaminar.qfn-accuracy-prompts.v1",
+  "decode_steps": 6,
+  "cases": [
+    {
+      "name": "original-nine",
+      "group": "short",
+      "prompt": "The quick brown fox jumps over the lazy dog",
+      "expected_prompt_ids": [
+        760,
+        3841,
+        13477,
+        37550,
+        33075,
+        888,
+        279,
+        15217,
+        5388
+      ]
+    },
+    {
+      "name": "prose-cause",
+      "group": "short",
+      "prompt": "The glass slipped from the table and shattered because"
+    },
+    {
+      "name": "prose-science",
+      "group": "short",
+      "prompt": "A seed needs sunlight and water. After a week, the first"
+    },
+    {
+      "name": "prose-dialogue",
+      "group": "short",
+      "prompt": "Mira asked, \"Where is the library?\" Jonas answered, \""
+    },
+    {
+      "name": "python-sum",
+      "group": "short",
+      "prompt": "def sum_even(values):\n    return sum(x for x in values if"
+    },
+    {
+      "name": "python-dataclass",
+      "group": "short",
+      "prompt": "from dataclasses import dataclass\n\n@dataclass\nclass Point:\n    x: float\n    y:"
+    },
+    {
+      "name": "python-guard",
+      "group": "short",
+      "prompt": "def safe_divide(a, b):\n    if b == 0:\n        raise ValueError("
+    },
+    {
+      "name": "json-value",
+      "group": "short",
+      "prompt": "{\"city\":\"Lisbon\",\"forecast\":{\"temperature_c\":18,\"condition\":"
+    },
+    {
+      "name": "json-tool",
+      "group": "short",
+      "prompt": "{\"tool\":\"calendar.search\",\"arguments\":{\"date\":\"2026-10-20\",\"query\":"
+    },
+    {
+      "name": "json-array",
+      "group": "short",
+      "prompt": "{\"items\":[{\"id\":1,\"ready\":true},{\"id\":2,\"ready\":false}],\"count\":"
+    },
+    {
+      "name": "german",
+      "group": "short",
+      "prompt": "Der Zug fährt um acht Uhr ab. Bitte bringen Sie"
+    },
+    {
+      "name": "chinese",
+      "group": "short",
+      "prompt": "请用一句话解释为什么夜晚能看到星星："
+    },
+    {
+      "name": "arabic",
+      "group": "short",
+      "prompt": "في الصباح فتحت النافذة ورأيت"
+    },
+    {
+      "name": "unicode-accent",
+      "group": "short",
+      "prompt": "Compare the strings \"café\" and \"café\". Their Unicode forms are"
+    },
+    {
+      "name": "unicode-emoji",
+      "group": "short",
+      "prompt": "The status symbols are ✅ ready, ⏳ waiting, and ❌ failed. Current status:"
+    },
+    {
+      "name": "unicode-math",
+      "group": "short",
+      "prompt": "For α = 2 and β = 3, the expression α² + β² equals"
+    }
+  ]
+}

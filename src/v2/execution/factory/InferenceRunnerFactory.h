@@ -138,6 +138,9 @@ namespace llaminar2
 
         /// Prefix-state cache feature gates and storage limits.
         PrefixCacheRuntimeConfig prefix_cache;
+        ImmutableRowTablePolicy ngram_table_policy; ///< One rank-owned native PLE table policy.
+        std::shared_ptr<const ResolvedImmutableRowTablePlacement> ngram_table_placement;
+        std::shared_ptr<const class Qwen4ExpReplicatedPLECohort> ngram_replicated_ple_cohort; ///< Borrowed actual Rank source/cohort declaration. ///< Exact PMA-selected rank placement.
 
         /// Multi-token prediction feature gates and verification mode.
         MTPRuntimeConfig mtp;
@@ -335,6 +338,8 @@ namespace llaminar2
             config.moe_routed_prefill = runtime.moe_routed_prefill;
             config.moe_rebalance = runtime.moe_rebalance;
             config.prefix_cache = runtime.prefix_cache;
+            config.ngram_table_policy = runtime.ngram_table_policy;
+            config.ngram_table_placement = runtime.ngram_table_placement;
             config.mtp = runtime.mtp;
             return config;
         }

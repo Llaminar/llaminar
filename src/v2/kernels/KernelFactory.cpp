@@ -14,6 +14,8 @@
  */
 
 #include "KernelFactory.h"
+#include "qwen4exp/Qwen4ExpKernels.h"
+#include "qwen4exp/QwenSparseAttention.h"
 #include "../transfer/TransferEngine.h"
 #include <cstring>
 #include "../backends/BackendManager.h"
@@ -1804,6 +1806,42 @@ namespace llaminar
                 default:
                     throwUnsupportedKernel(dev_type, "ShortConvolution", "FP32");
                 }
+            }
+
+            std::unique_ptr<llaminar2::qwen4exp::IQwen4ExpKernels>
+            KernelFactory::createQwen4Exp(::llaminar2::DeviceId device)
+            {
+                if (!device.is_valid())
+                    throw std::invalid_argument("Qwen4Exp kernels require a valid participant device");
+                if (device.is_cpu())
+                    return ::llaminar2::qwen4exp::createCPUQwen4ExpKernels();
+#ifdef HAVE_CUDA
+                if (device.is_cuda())
+                    return ::llaminar2::qwen4exp::createCUDAQwen4ExpKernels();
+#endif
+#ifdef HAVE_ROCM
+                if (device.is_rocm())
+                    return ::llaminar2::qwen4exp::createROCmQwen4ExpKernels();
+#endif
+                throw std::invalid_argument("Qwen4Exp kernels are not compiled for " + device.toString());
+            }
+
+            std::unique_ptr<llaminar2::qwen4exp::IQwenSparseAttentionKernels>
+            KernelFactory::createQwenSparseAttention(::llaminar2::DeviceId device)
+            {
+                if (!device.is_valid())
+                    throw std::invalid_argument("Qwen sparse attention requires a valid participant device");
+                if (device.is_cpu())
+                    return ::llaminar2::qwen4exp::createCPUQwenSparseAttentionKernels();
+#ifdef HAVE_CUDA
+                if (device.is_cuda())
+                    return ::llaminar2::qwen4exp::createCUDAQwenSparseAttentionKernels();
+#endif
+#ifdef HAVE_ROCM
+                if (device.is_rocm())
+                    return ::llaminar2::qwen4exp::createROCmQwenSparseAttentionKernels();
+#endif
+                throw std::invalid_argument("Qwen sparse attention is not compiled for " + device.toString());
             }
 
             std::unique_ptr<llaminar2::ITensorGatedDeltaNet> KernelFactory::createGatedDeltaNet(

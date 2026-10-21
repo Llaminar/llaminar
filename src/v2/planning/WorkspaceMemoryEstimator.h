@@ -14,6 +14,7 @@
 #include "execution/config/RuntimeConfig.h"
 #include "planning/ModelMemoryProfile.h"
 #include "kernels/attention/AttentionExecutionPolicy.h"
+#include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include <cstddef>
 #include <optional>
 
@@ -72,6 +73,12 @@ struct WorkspaceMemoryGeometry
      * Zero means no MTP graph family is materialized on this participant.
      */
     int mtp_target_query_rows = 0;
+    /**
+     * Exact admitted dense/cache layout of an authenticated QFN predictor.
+     * Null preserves existing non-QFN pricing; QFN MTP requires this value
+     * before any BOM contribution. Source presence never implies replication.
+     */
+    std::optional<MTPShiftedKVHeadLayout> mtp_dense_layout;
     /** Terminal projection ownership retained by the MTP graph family. */
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
@@ -93,6 +100,14 @@ struct WorkspaceMemoryGeometry
     TensorType attention_kv_format = TensorType::FP32; ///< Actual native attention operands.
     attention::AttentionVisibilityPolicy attention_visibility =
         attention::AttentionVisibilityPolicy::General; ///< Model schema's immutable visibility.
+    /// Frozen QFN HC-up arithmetic, shared with exact stage workspace declarations.
+    QuantizedActivationOperandPrecision qfn_hc_up_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
+    QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.
+    QuantizedActivationOperandPrecision qfn_fa_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
+    /// Frozen original-main GDN QKV correction; independent of Z, alpha/beta and output projection.
+    QuantizedActivationOperandPrecision qfn_gdn_qkv_activation = QuantizedActivationOperandPrecision::SingleQ8;
 };
 
 class WorkspaceMemoryEstimator

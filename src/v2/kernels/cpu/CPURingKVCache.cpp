@@ -265,6 +265,48 @@ namespace llaminar2
         }
     }
 
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    qwen4exp::QwenSparseKV CPURingKVCache<KPrecision, VPrecision>::acquireSparseAttentionNativeView(
+        int layer, int sequence, const attention::AttentionDeviceParams *rows,
+        attention::AttentionKeyCachePolicy policy, void *stream)
+    {
+        if (layer < 0 || layer >= n_layers_ || sequence < 0 || sequence >= batch_size_ ||
+            head_dim_ != 256 || local_n_kv_heads_ < 1 || local_n_kv_heads_ > 2 || rows || stream || policy.transformsOnRead())
+            throw std::invalid_argument("CPU selected KV view requires post-RoPE native D256 storage and host ring authority");
+        const auto &entry = entries_[layer][sequence];
+        const auto bank = [&]<ActivationPrecision Precision>(const auto &tensor) {
+            qwen4exp::QwenSparseNativeBank result;
+            result.data = tensor->raw_data();
+            result.codec = tensor->native_type();
+            const auto head_bytes = detail::CPUKVCacheTensor<Precision>::head_bytes(tensor.get(),kv_dim_,head_dim_);
+            result.layout = layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR ?
+                qwen4exp::QwenSparseNativeLayout::HeadMajor : qwen4exp::QwenSparseNativeLayout::TokenMajor;
+            result.token_stride_bytes = layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR ? head_bytes : local_n_kv_heads_ * head_bytes;
+            result.head_stride_bytes = layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR ? max_seq_len_ * head_bytes : head_bytes;
+            if constexpr (Precision == ActivationPrecision::AQ8)
+            {
+                result.data = tensor->blocks();
+                result.anchor = tensor->anchor().data();
+            }
+            if constexpr (Precision == ActivationPrecision::Q16_1)
+                result.q16_block_size = static_cast<int>(q16_block_size_elements(tensor->q16_block_size()));
+            if constexpr (Precision == ActivationPrecision::TQ4 || Precision == ActivationPrecision::TQ8)
+            {
+                if (entry.value_head_contexts.size() != static_cast<std::size_t>(local_n_kv_heads_) ||
+                    tensor->turboquant_context() != entry.V->turboquant_context())
+                    throw std::invalid_argument("CPU selected TQ view requires construction-bound canonical per-head contexts");
+                result.centroids = Precision == ActivationPrecision::TQ4 ? TQ4_CENTROIDS.data() : TQ8_CENTROIDS.data();
+                for (int head = 0; head < local_n_kv_heads_; ++head)
+                    result.rotations[head] = entry.value_head_contexts[head]->rotation().matrix.data();
+            }
+            return result;
+        };
+        return {.keys=bank.template operator()<KPrecision>(entry.K),
+                .values=bank.template operator()<VPrecision>(entry.V),
+                .addressing=qwen4exp::QwenSparseKVAddressing::FixedLogicalView,
+                .logical_view={entry.head,max_seq_len_}, .key_policy=policy};
+    }
+
     // =========================================================================
     // Token Counting and KV Retrieval
     // =========================================================================
@@ -413,6 +455,7 @@ namespace llaminar2
             }
         }
         wrap_warned_ = false;
+        if(auto *aux=auxiliaryState())aux->reset({0,2147483647,0,batch_size_},context.execution_stream);
         return true;
     }
 
@@ -434,6 +477,7 @@ namespace llaminar2
         }
         entries_[layer][seq_idx].head = 0;
         entries_[layer][seq_idx].size = 0;
+        if(auto *aux=auxiliaryState())aux->reset({modelLayerForAttentionStorage(layer),1,seq_idx,1},context.execution_stream);
         return true;
     }
 
@@ -455,6 +499,7 @@ namespace llaminar2
             entries_[layer][seq_idx].head = 0;
             entries_[layer][seq_idx].size = 0;
         }
+        if(auto *aux=auxiliaryState())aux->reset({0,2147483647,seq_idx,1},context.execution_stream);
         return true;
     }
 
@@ -476,6 +521,7 @@ namespace llaminar2
             entries_[layer][seq_idx].head = 0;
             entries_[layer][seq_idx].size = 0;
         }
+        if(auto *aux=auxiliaryState())aux->reset({modelLayerForAttentionStorage(layer),1,0,batch_size_},context.execution_stream);
         return true;
     }
 

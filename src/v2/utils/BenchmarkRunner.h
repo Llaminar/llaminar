@@ -20,6 +20,7 @@
 
 #include "Tokenizer.h"
 #include "Sampler.h"
+#include "PerfStatsCollector.h"
 #include "../execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "../config/OrchestrationConfig.h"
 #include <cstddef>
@@ -189,12 +190,30 @@ namespace llaminar2
     };
 
     /**
+     * @brief Result-owned passive arithmetic observations at the pre-measurement boundary.
+     *
+     * Retained graph recording can emit host metadata only during setup/warmup.
+     * Copying those exact records before the measured reset preserves the
+     * observed route and prepared operands without retaining warmup work in the
+     * measured counters. Counts describe host recording/submission observations;
+     * they are neither native graph replay counts nor token counts. Missing
+     * records do not prove that an arithmetic path was absent.
+     */
+    struct BenchmarkSetupArithmeticObservation
+    {
+        bool observed_before_measurement = false; ///< False when the run never reached the measurement boundary.
+        bool collection_enabled = false; ///< Collector policy at that boundary; this snapshot never enables it.
+        std::vector<PerfStatRecord> records; ///< Independent copies of exact tagged arithmetic families, not collector aliases.
+    };
+
+    /**
      * @brief Results from a benchmark run
      */
     struct BenchmarkResult
     {
         int measurement_iterations = 3; ///< Number of measured benchmark iterations averaged.
         int warmup_iterations = 1;      ///< Number of pre-measurement warmup iterations.
+        BenchmarkSetupArithmeticObservation setup_warmup_arithmetic; ///< Independent setup/warmup evidence, unaffected by collector resets.
 
         // Exact benchmark input identity (the prompt text itself is deliberately omitted).
         BenchmarkPromptSource prompt_source = BenchmarkPromptSource::BuiltIn;

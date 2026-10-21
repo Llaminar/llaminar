@@ -363,9 +363,12 @@ def begin(state: Path) -> None:
 def inspect_journal(directory: Path, evidence: dict) -> None:
     """Stream and authenticate every retained record before admitting evidence.
 
-    The journal proves its exact boot/window, all record ordinals, both ends and
-    the terminal cursor. GPU findings are recomputed from the retained records;
-    neither a stale summary nor truncating a log can produce a clean receipt.
+    The journal proves its exact boot/window, all publication ordinals, both
+    ends and the terminal cursor. Kernel event timestamps are observations, not
+    publication sequence numbers: concurrent records can publish with decreasing
+    timestamps. Keep their original order and authenticate it through the cursor.
+    GPU findings are recomputed from every retained record; neither a stale
+    summary nor truncating a log can produce a clean receipt.
     """
     name = evidence.get('journal')
     if not isinstance(name, str) or Path(name).name != name or name in ('', '.', '..'):
@@ -396,8 +399,6 @@ def inspect_journal(directory: Path, evidence: dict) -> None:
                 if type(row.get('ordinal')) is not int or row['ordinal'] != count:
                     raise ValueError("Missing or reordered driver journal records")
                 record = KernelRecord.parse(row)
-                if record.time < cursor[-1].time:
-                    raise ValueError("Driver journal timestamps moved backwards")
                 cursor = (cursor + [record])[-8:]
                 if driver_diagnostic(record):
                     finding_count += 1
