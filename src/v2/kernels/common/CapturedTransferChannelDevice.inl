@@ -187,6 +187,8 @@ __device__ __forceinline__ void capturedTransferPublish(CapturedTransferChannelD
  * @param binding Acquired private cursor and complete message identity.
  * @param destination Stable mapped or device destination.
  * @param source Stable device or mapped source.
+ * @param copy_block Block index within this original message, independent of batch grid Y.
+ * @param copy_blocks Positive block count for this original cursor and publication.
  *
  * A CTA barrier orders every writer before its block's release/acquire RMW.
  * The RMW modification order chains all blocks to the last one, which performs
@@ -202,19 +204,20 @@ __device__ __forceinline__ void capturedTransferPublish(CapturedTransferChannelD
  */
 template<bool VectorAligned>
 __device__ __forceinline__ void capturedTransferCopyAndPublish(
-    CapturedTransferChannelDeviceBinding binding, void *destination, const void *source)
+    CapturedTransferChannelDeviceBinding binding, void *destination, const void *source,
+    unsigned copy_block, unsigned copy_blocks)
 {
     const auto bytes = binding.cursor->acquired_message.bytes;
-    if (binding.cursor->phase != CapturedTransferPhase::Acquired || bytes > binding.message.bytes ||
+    if (binding.cursor->phase != CapturedTransferPhase::Acquired || bytes > binding.message.bytes || !copy_blocks || copy_block >= copy_blocks ||
         binding.cursor->acquired_message.key != binding.message.key)
     {
         if (threadIdx.x == 0) capturedTransferFail(binding, CapturedTransferStatus::MessageMismatch);
         return;
     }
     if constexpr (VectorAligned)
-        mappedHostCopyVectorBody(static_cast<uint4 *>(destination), static_cast<const uint4 *>(source), bytes);
+        mappedHostCopyVectorBody(static_cast<uint4 *>(destination), static_cast<const uint4 *>(source), bytes, copy_block, copy_blocks);
     else
-        mappedHostCopyByteBody(static_cast<std::uint8_t *>(destination), static_cast<const std::uint8_t *>(source), bytes);
+        mappedHostCopyByteBody(static_cast<std::uint8_t *>(destination), static_cast<const std::uint8_t *>(source), bytes, copy_block, copy_blocks);
     __syncthreads();
     if (threadIdx.x == 0)
     {
@@ -222,11 +225,11 @@ __device__ __forceinline__ void capturedTransferCopyAndPublish(
         // acquire/release tickets both identify the last *completed* copy
         // block and acquire all previous blocks' payload accesses. The final
         // peer-visible release belongs to that one publisher, not each lane.
-        const auto completed = gridDim.x == 1 ? 0u
+        const auto completed = copy_blocks == 1 ? 0u
             : capturedTransferJoinBlock(&binding.cursor->completed_payload_blocks);
-        if (completed >= gridDim.x)
+        if (completed >= copy_blocks)
             capturedTransferFail(binding, CapturedTransferStatus::InvalidPhase);
-        else if (completed + 1u == gridDim.x)
+        else if (completed + 1u == copy_blocks)
             capturedTransferPublish(binding);
     }
 }
@@ -247,7 +250,7 @@ template<bool VectorAligned>
 __global__ __launch_bounds__(256) void capturedTransferCopyPublishKernel(
     CapturedTransferChannelDeviceBinding binding, void *destination, const void *source)
 {
-    capturedTransferCopyAndPublish<VectorAligned>(binding, destination, source);
+    capturedTransferCopyAndPublish<VectorAligned>(binding, destination, source, blockIdx.x, gridDim.x);
 }
 
 /** @brief Complete bounded message in one cooperative block, without a host boundary.
@@ -261,5 +264,41 @@ __global__ __launch_bounds__(256) void capturedTransferFusedKernel(
 {
     if (threadIdx.x == 0) capturedTransferAcquire(binding);
     __syncthreads();
-    capturedTransferCopyAndPublish<VectorAligned>(binding, destination, source);
+    capturedTransferCopyAndPublish<VectorAligned>(binding, destination, source, blockIdx.x, gridDim.x);
+}
+
+/**
+ * @brief Complete one independent small endpoint per CTA, preserving its original cursor.
+ * @param batch Validated by-value packet; each CTA publishes only its own message.
+ */
+__global__ __launch_bounds__(256) void capturedTransferBatchFusedKernel(CapturedTransferChannelBatch batch)
+{
+    const auto &entry = batch.entries[blockIdx.y];
+    if (threadIdx.x == 0) capturedTransferAcquire(entry.binding);
+    __syncthreads();
+    if (entry.vector_aligned)
+        capturedTransferCopyAndPublish<true>(entry.binding, entry.destination, entry.source, 0, 1);
+    else
+        capturedTransferCopyAndPublish<false>(entry.binding, entry.destination, entry.source, 0, 1);
+}
+
+/** @brief Acquire every independent large endpoint before the same-stream payload grid.
+ * @param batch Original per-endpoint identities; there is no batch cursor. */
+__global__ void capturedTransferBatchAcquireKernel(CapturedTransferChannelBatch batch)
+{
+    if (threadIdx.x == 0) capturedTransferAcquire(batch.entries[blockIdx.y].binding);
+}
+
+/**
+ * @brief Copy large messages with local block coordinates and one original publisher each.
+ * @param batch Original endpoint aliases plus immutable backend copy geometry.
+ */
+__global__ __launch_bounds__(256) void capturedTransferBatchCopyPublishKernel(CapturedTransferChannelBatch batch)
+{
+    const auto &entry = batch.entries[blockIdx.y];
+    if (blockIdx.x >= entry.copy_blocks) return;
+    if (entry.vector_aligned)
+        capturedTransferCopyAndPublish<true>(entry.binding, entry.destination, entry.source, blockIdx.x, entry.copy_blocks);
+    else
+        capturedTransferCopyAndPublish<false>(entry.binding, entry.destination, entry.source, blockIdx.x, entry.copy_blocks);
 }

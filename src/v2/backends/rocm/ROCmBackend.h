@@ -955,6 +955,10 @@ namespace llaminar2
         bool prepareMappedHostCopyKernels(int device_id) override;
         /** @copydoc IBackend::prepareCapturedTransferChannelKernels */
         bool prepareCapturedTransferChannelKernels(int device_id, int timeout_ms, std::uint64_t *timeout_ticks) override;
+        /** @copydoc IBackend::enqueueCapturedTransferChannelBatch */
+        bool enqueueCapturedTransferChannelBatch(const CapturedTransferChannelBatch &batch,
+            int device_id, void *stream) override;
+
         /** @copydoc IBackend::enqueueCapturedTransferChannel */
         bool enqueueCapturedTransferChannel(const CapturedTransferChannelDeviceBinding &binding,
             void *destination, const void *source, int device_id, void *stream) override;

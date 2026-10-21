@@ -9,6 +9,7 @@
  * rank-owner isolation and fatal metadata/filesystem failure status.
  */
 #include "integration/parity/FrozenParityHistoryReplay.h"
+#include "integration/parity/ParityTestBase.h"
 #include "integration/parity/ParityArtifactDirectory.h"
 #include "integration/parity/qwen4exp/Qwen4ExpProductionParityCases.h"
 #include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveParityCases.h"
@@ -79,6 +80,53 @@ json descriptor(const MetadataOwner &owner)
             {"prompt", "synthetic metadata only"}, {"prompt_ids", {1, 2}}, {"continuation_ids", {3, 4, 5}},
             {"decode_rows", 2}, {"reference_directory", directory.string()}, {"reference_scope", "full_stages"}};
 }
+
+/**
+ * @brief Exercise the real pre-runner setup state without calling fixture SetUp.
+ *
+ * The tiny history and existing declared snapshot keys are metadata only. No
+ * model, backend, source payload, runner or PMA certificate is constructed.
+ */
+class SnapshotAdmissionGeometryProbe final : public ParityTestBase
+{
+public:
+    /** @brief Restore every original environment value after assertion unwind. */
+    ~SnapshotAdmissionGeometryProbe() override
+    {
+        restoreParityEnvOverrides();
+    }
+    /** @brief This probe is manually scoped and never registered as a model fixture. */
+    void TestBody() override {}
+    /** @return A diagnostic label only, without a device initialization. */
+    std::string getBackendName() override { return "MetadataOnlyAdmissionGeometry"; }
+    /**
+     * @brief Install original source-owned keys and an explicit inactive serving ladder.
+     * @param rows Authored real prompt row count.
+     * @param replay Optional already-validated frozen history.
+     */
+    void configure(int rows, std::optional<FrozenParityHistoryReplay> replay = std::nullopt)
+    {
+        config_.token_ids.assign(static_cast<std::size_t>(rows), 1);
+        config_.graph_snapshot_policy = qwen4exp::qwen4ExpProductionDefinition(
+            qwen4exp::Qwen4ExpParityTopology::CPU).graph_snapshot_policy;
+        frozen_history_replay_ = std::move(replay);
+        setScopedParityEnvOverride("LLAMINAR_PRODUCTION_PARITY", "0");
+        setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "64");
+        setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1");
+        setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,128,256,512");
+    }
+    /** @brief Expose the production pre-admission transaction, not a mirrored resolver. */
+    using ParityTestBase::beginProductionParitySnapshotAdmission;
+    using ParityTestBase::configureExactProductionParityPrefillGraphBucket;
+    /** @return Effective diagnostic capacity from the same current startup inventory. */
+    int retainedRows() const
+    {
+        return paritySnapshotServingGraphRows(static_cast<int>(config_.token_ids.size()),
+            4096, debugEnv().execution.prefill_graph_bucket_sizes, true, MTPRuntimeConfig{});
+    }
+    /** @return Existing source-owned complete checkpoint policy, unchanged by geometry setup. */
+    const ParityGraphSnapshotPolicy &snapshotPolicy() const { return config_.graph_snapshot_policy; }
+};
 
 /** @brief Parse a metadata request; no source or reference owner is granted. */
 FrozenParityHistoryReplay checked(const json &value)
@@ -516,4 +564,43 @@ TEST(FrozenParityHistoryReplay, ArtifactReadyPublicationRejectsValidationCloseAn
     EXPECT_FALSE(reset_failure.error.empty());
     EXPECT_EQ(publications, 0);
 }
+
+
+/** @test Standalone admission activates its production lifetime before exact-history setup. */
+TEST(FrozenParityHistoryReplay, StandaloneSnapshotAdmissionUsesExactHistoryBeforeRunnerSetup)
+{
+    SnapshotAdmissionGeometryProbe probe;
+    probe.configure(9);
+    const auto keys = probe.snapshotPolicy().required_prefill_snapshot_keys;
+    ASSERT_FALSE(keys.empty());
+    // This is the original failing call order: inactive SetUp leaves the
+    // serving maximum in place even though the oracle has only nine rows.
+    ASSERT_NO_FATAL_FAILURE(probe.configureExactProductionParityPrefillGraphBucket());
+    EXPECT_EQ(probe.retainedRows(), 512);
+    ASSERT_NO_FATAL_FAILURE(probe.beginProductionParitySnapshotAdmission());
+    EXPECT_EQ(probe.retainedRows(), 9);
+    EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes, std::vector<int>{9});
+    EXPECT_EQ(probe.snapshotPolicy().required_prefill_snapshot_keys, keys);
+}
+
+/** @test An explicit production-serving diagnosis retains M512 instead of exact-live buckets. */
+TEST(FrozenParityHistoryReplay, StandaloneSnapshotAdmissionPreservesFrozenServingGeometry)
+{
+    MetadataOwner owner;
+    auto value = descriptor(owner);
+    auto config = OrchestrationConfig::defaults();
+    config.prefill_max_bucket_size = 512;
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+    const auto replay = checked(value);
+    const auto serving = replay.servingPrefillCapture();
+    SnapshotAdmissionGeometryProbe probe;
+    probe.configure(2, replay);
+    const auto keys = probe.snapshotPolicy().required_prefill_snapshot_keys;
+    ASSERT_NO_FATAL_FAILURE(probe.beginProductionParitySnapshotAdmission());
+    EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes, serving.bucket_rows);
+    EXPECT_EQ(debugEnv().execution.prefill_graph_min_seq, serving.minimum_rows);
+    EXPECT_EQ(probe.retainedRows(), 512);
+    EXPECT_EQ(probe.snapshotPolicy().required_prefill_snapshot_keys, keys);
+}
+
 } // namespace llaminar2::test::parity

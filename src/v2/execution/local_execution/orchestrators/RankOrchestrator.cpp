@@ -881,6 +881,23 @@ namespace llaminar2
         wireLocalTPMoERuntimeHistogramSyncs();
     }
 
+    std::unique_ptr<TPWorkerPool> RankOrchestrator::makeParticipantWorkerPool(
+        const std::vector<std::unique_ptr<IInferenceRunner>> &participants) const
+    {
+        std::vector<DeviceId> members;
+        members.reserve(participants.size());
+        for (const auto &runner : participants)
+        {
+            if (!runner) throw std::logic_error("Cannot place an absent TP participant worker");
+            members.push_back(runner->primaryDeviceId());
+        }
+        const auto scope = &participants == &device_runners_ &&
+                mode_ == ParallelismMode::TP && pp_stage_runners_.empty() &&
+                !config_.hasPP() && !config_.nested_pp_stage_config
+            ? TPWorkerHostScope::FlatRank : TPWorkerHostScope::PipelineOrComposed;
+        return std::make_unique<TPWorkerPool>(members.size(), tpWorkerHostPlacement(members, scope));
+    }
+
     RankOrchestrator::~RankOrchestrator()
     {
         // Complete parents borrow the stages' events, streams, arenas and native
@@ -2828,7 +2845,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback(
@@ -3150,7 +3167,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -3572,7 +3589,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -4234,7 +4251,7 @@ namespace llaminar2
             // lifetime of the orchestrator, eliminating per-step thread overhead.
             if (!tp_worker_pool_)
             {
-                tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+                tp_worker_pool_ = makeParticipantWorkerPool(device_runners_);
 
                 // Wire abort callback: when one worker fails (exception or false return),
                 // abort the collective backend to unblock any workers stuck in NCCL/RCCL
@@ -5272,7 +5289,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -5535,7 +5552,7 @@ namespace llaminar2
 
         if (!tp_worker_pool_)
         {
-            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_ = makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -5689,7 +5706,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -5854,7 +5871,7 @@ namespace llaminar2
 
         if (!tp_worker_pool_)
         {
-            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_ = makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -6044,7 +6061,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -6170,7 +6187,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -6299,7 +6316,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -6485,7 +6502,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             tp_worker_pool_->setFailureCallback([this]()
                                                 {
                 LOG_WARN("[TPWorkerPool] resident request-batch condition advance failed; aborting collective backend");
@@ -6738,7 +6755,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             tp_worker_pool_->setFailureCallback([this, operation]()
                                                 {
                 LOG_WARN("[TPWorkerPool] " << operation
@@ -6965,7 +6982,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             tp_worker_pool_->setFailureCallback([this, operation]()
                                                 {
                 LOG_WARN("[TPWorkerPool] " << operation
@@ -7363,7 +7380,7 @@ namespace llaminar2
 
         if (!tp_worker_pool_)
         {
-            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_ = makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -7549,7 +7566,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -7662,7 +7679,7 @@ namespace llaminar2
             if (!tp_worker_pool_)
             {
                 tp_worker_pool_ =
-                    std::make_unique<TPWorkerPool>(device_runners_.size());
+                    makeParticipantWorkerPool(device_runners_);
                 if (tp_ctx_)
                 {
                     tp_worker_pool_->setFailureCallback([this]()
@@ -7795,7 +7812,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -7918,7 +7935,7 @@ namespace llaminar2
 
         if (!tp_worker_pool_)
         {
-            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_ = makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -8128,7 +8145,7 @@ namespace llaminar2
 
         if (!tp_worker_pool_)
         {
-            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_ = makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -8345,7 +8362,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -10676,7 +10693,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -11877,7 +11894,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -12654,7 +12671,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(participants.size());
+                makeParticipantWorkerPool(participants);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback(
@@ -14392,7 +14409,7 @@ namespace llaminar2
 
         if (!tp_worker_pool_)
         {
-            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_ = makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -14764,7 +14781,7 @@ namespace llaminar2
 
         if (!tp_worker_pool_)
         {
-            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            tp_worker_pool_ = makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this]()
@@ -15703,7 +15720,7 @@ namespace llaminar2
         if (!tp_worker_pool_)
         {
             tp_worker_pool_ =
-                std::make_unique<TPWorkerPool>(device_runners_.size());
+                makeParticipantWorkerPool(device_runners_);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback([this, operation]()
@@ -16195,7 +16212,7 @@ namespace llaminar2
             if (!tp_worker_pool_)
             {
                 tp_worker_pool_ =
-                    std::make_unique<TPWorkerPool>(device_runners_.size());
+                    makeParticipantWorkerPool(device_runners_);
                 if (tp_ctx_)
                 {
                     tp_worker_pool_->setFailureCallback(
@@ -16580,7 +16597,7 @@ namespace llaminar2
          */
         if (!tp_worker_pool_)
         {
-            tp_worker_pool_ = std::make_unique<TPWorkerPool>(participants.size());
+            tp_worker_pool_ = makeParticipantWorkerPool(participants);
             if (tp_ctx_)
             {
                 tp_worker_pool_->setFailureCallback(

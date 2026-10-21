@@ -5,7 +5,8 @@
  *
  * Optional source-format selection uses the canonical verifier catalog; omitted
  * selection retains the original Q8_0 invocation. Native source blocks are read
- * exactly and never re-encoded. CPU timing is a separately labeled component
+ * exactly and never re-encoded. Q8_1 uses its original typed raw-byte
+ * factory; Q8_K retains full original superblocks. CPU timing is a separately labeled component
  * arm. This diagnostic reuses production packers, prepared-store ownership,
  * GEMMStage, named workspace requirements and outer native timing events. It
  * does not implement arithmetic, a dispatch override, a profiler mode or a
@@ -48,6 +49,7 @@
 #include "utils/MPIContext.h"
 #include "utils/PreparedWeightTestHarness.h"
 #include "utils/QuantizedVerifierFormats.h"
+#include "utils/OriginalQ8ResidualProjectionSource.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -752,8 +754,8 @@ void measure(const MeasureOptions &o) {
         auto raw = load<std::uint8_t>(o.weights.c_str(), sourceBytes, true);
         MPIContext sourceMPI(0, 1, MPI_COMM_NULL);
         TensorFactory sourceFactory(sourceMPI);
-        auto weight = sourceFactory.createQuantized(
-            format.tensor_type, {std::size_t(o.n), std::size_t(o.k)}, raw);
+        auto weight = test::q8_all_formats::originalProjectionSource(
+            sourceFactory, format.tensor_type, {std::size_t(o.n), std::size_t(o.k)}, raw);
         require(weight && weight->size_bytes() == sourceBytes &&
                     std::memcmp(weight->raw_data(), raw.data(), sourceBytes) ==
                         0,

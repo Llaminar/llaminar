@@ -16,6 +16,11 @@
  * Generation-qualified state prevents that completion from being reset or
  * mistaken for a neighboring operation.
  *
+ * An explicit independent-GPU-control intent constructs children on the actual
+ * admitted OpenMP partition, then restores the caller's exact place. CPU/mixed/
+ * composed compute workers retain inherited placement. No replay-time affinity
+ * call, CPU-team change or new worker budget is introduced.
+ *
  * Workers intentionally do not select a CUDA or HIP device themselves. Device
  * graph runners submit work through streams that already belong to the correct
  * device context; the rank's dispatched callable also installs the profiler
@@ -30,6 +35,10 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <span>
+#include "backends/DeviceId.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -38,6 +47,40 @@
 
 namespace llaminar2
 {
+    /** @brief Separate independent GPU control from inherited CPU/composed compute placement. */
+    enum class TPWorkerHostPlacement
+    {
+        InheritedCompute,
+        IndependentGPUControl,
+    };
+
+    /** @brief Only a flat rank is eligible for independent homogeneous-GPU control. */
+    enum class TPWorkerHostScope { FlatRank, PipelineOrComposed };
+
+    /**
+     * @brief Resolve worker intent from original actual members, not row counts or GPU quantity.
+     * @param members Exact child-runner device identities in their original order.
+     * @param scope Original flat versus composed rank ownership.
+     * @return IndependentGPUControl only for a nonempty homogeneous GPU flat rank.
+     * @throws std::invalid_argument For an invalid endpoint or unknown scope.
+     * CPU, mixed and pipeline compute owners retain their established placement.
+     */
+    [[nodiscard]] inline TPWorkerHostPlacement tpWorkerHostPlacement(
+        std::span<const DeviceId> members, TPWorkerHostScope scope)
+    {
+        if (members.empty()) throw std::invalid_argument("Worker placement requires actual participants");
+        for (const auto device : members)
+            if (!device.is_gpu() && !device.is_cpu())
+                throw std::invalid_argument("Worker placement received an invalid participant");
+        if (scope == TPWorkerHostScope::PipelineOrComposed)
+            return TPWorkerHostPlacement::InheritedCompute;
+        if (scope != TPWorkerHostScope::FlatRank)
+            throw std::invalid_argument("Worker placement requires explicit original rank scope");
+        for (const auto device : members)
+            if (!device.is_gpu() || device.type != members.front().type)
+                return TPWorkerHostPlacement::InheritedCompute;
+        return TPWorkerHostPlacement::IndependentGPUControl;
+    }
 
     /**
      * @brief Fan one rank-local operation out to persistent participant workers.
@@ -66,7 +109,15 @@ namespace llaminar2
             size_t worker_index = 0;
         };
 
-        explicit TPWorkerPool(size_t num_workers)
+        /**
+         * @brief Construct persistent participant workers with an explicit immutable host role.
+         * @param num_workers Original participant count, not the CPU/OpenMP team budget.
+         * @param placement GPU-control role widens only child eligibility to the actual
+         *        OpenMP partition; inherited compute preserves the original caller placement.
+         * @throws std::exception Before dispatch for invalid geometry/role or unavailable placement.
+         */
+        explicit TPWorkerPool(size_t num_workers,
+            TPWorkerHostPlacement placement = TPWorkerHostPlacement::InheritedCompute)
             : num_workers_(num_workers),
               results_(num_workers)
         {
@@ -75,6 +126,14 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "TPWorkerPool requires at least one participant worker");
             }
+            std::optional<ScopedOpenMPPartitionAffinity> control_affinity;
+            if (placement == TPWorkerHostPlacement::IndependentGPUControl)
+                control_affinity.emplace();
+            else if (placement != TPWorkerHostPlacement::InheritedCompute)
+                throw std::invalid_argument("TP workers require an explicit host placement intent");
+            // Only construction occurs in this scope. Every participant and
+            // failure-callback child inherits the same admitted partition;
+            // the caller's exact OpenMP place is restored before dispatch.
             workers_.reserve(num_workers);
             for (size_t i = 0; i < num_workers; ++i)
             {

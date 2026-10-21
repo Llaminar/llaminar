@@ -13,6 +13,7 @@
  */
 
 #include "NvidiaDeviceContext.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 #include <sstream>
@@ -93,7 +94,13 @@ namespace llaminar2
 
         try
         {
-            worker_thread_ = std::thread(&NvidiaDeviceContext::workerLoop, this);
+            {
+                // The dedicated GPU-control child needs the admitted rank
+                // partition, not its creator's first OpenMP place. Restore
+                // the creator before waiting or executing any caller work.
+                const ScopedOpenMPPartitionAffinity control_affinity;
+                worker_thread_ = std::thread(&NvidiaDeviceContext::workerLoop, this);
+            }
 
             // Wait for worker to signal it's ready (or failed)
             std::unique_lock<std::mutex> lock(queue_mutex_);

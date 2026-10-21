@@ -13,6 +13,7 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "GDNLinkedLiveStateGeometry.h"
+#include "GDNLiveStateWorkspaceContract.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
 #include <string>
@@ -35,17 +36,17 @@ namespace llaminar2
     {
     public:
         static constexpr const char *WS_LOCAL_CONV_STATE =
-            "gdn_live_state_local_conv";
+            gdn_live_state_workspace::LocalConv;
         static constexpr const char *WS_GATHERED_CONV_STATE =
-            "gdn_live_state_gathered_conv";
+            gdn_live_state_workspace::GatheredConv;
         static constexpr const char *WS_FULL_CONV_STATE =
-            "gdn_live_state_full_conv";
+            gdn_live_state_workspace::FullConv;
         static constexpr const char *WS_LOCAL_RECURRENCE_STATE =
-            "gdn_live_state_local_recurrence";
+            gdn_live_state_workspace::LocalRecurrence;
         static constexpr const char *WS_GATHERED_RECURRENCE_STATE =
-            "gdn_live_state_gathered_recurrence";
+            gdn_live_state_workspace::GatheredRecurrence;
         static constexpr const char *WS_FULL_RECURRENCE_STATE =
-            "gdn_live_state_full_recurrence";
+            gdn_live_state_workspace::FullRecurrence;
 
         /** @brief Complete construction contract for one graph-local handoff. */
         struct Params

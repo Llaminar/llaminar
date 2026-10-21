@@ -390,50 +390,8 @@ namespace llaminar2
         if (!params_.tp_ctx)
             return requirements;
 
-        const auto append_state_buffers = [&requirements](
-                                              const std::string &local,
-                                              const std::string &gathered,
-                                              const std::string &full,
-                                              const GDNLinkedLiveStateShape &shape)
-        {
-            requirements.buffers.push_back(
-                {local,
-                 static_cast<size_t>(shape.local_state_floats) * sizeof(float),
-                 256,
-                 true});
-            requirements.buffers.push_back(
-                {gathered,
-                 static_cast<size_t>(shape.full_state_floats) * sizeof(float),
-                 256,
-                 true});
-            requirements.buffers.push_back(
-                {full,
-                 static_cast<size_t>(shape.full_state_floats) * sizeof(float),
-                 256,
-                 true});
-        };
-
-        if (const auto conv = params_.geometry.resolve(
-                GDNLinkedLiveStateKind::ConvHistory,
-                params_.tp_ctx->degree()))
-        {
-            append_state_buffers(
-                localConvBufferName(),
-                gatheredConvBufferName(),
-                fullConvBufferName(),
-                *conv);
-        }
-        if (const auto recurrence = params_.geometry.resolve(
-                GDNLinkedLiveStateKind::Recurrence,
-                params_.tp_ctx->degree()))
-        {
-            append_state_buffers(
-                localRecurrenceBufferName(),
-                gatheredRecurrenceBufferName(),
-                fullRecurrenceBufferName(),
-                *recurrence);
-        }
-        return requirements;
+        return gdn_live_state_workspace::requirements(params_.layer_idx,
+            {.degree = params_.tp_ctx->degree(), .state = params_.geometry});
     }
 
     void GDNLiveStateAllGatherStage::bindWorkspace(

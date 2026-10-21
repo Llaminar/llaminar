@@ -2186,6 +2186,28 @@ size_t WorkspaceMemoryEstimator::estimate(
         moe_bytes,
         "MoE graph-family requirements");
 
+    size_t gdn_handoff_bytes = 0u;
+    if (geometry.gdn_live_state_handoff)
+    {
+        const int last_gdn_layer = geometry.last_layer >= 0
+            ? geometry.last_layer : profile.mainLayerCount() - 1;
+        WorkspaceRequirements handoff;
+        std::set<int> layers;
+        for (const auto &tensor : profile.tensors)
+            if (tensor.name.ends_with(".ssm_out.weight") &&
+                tensor.layer_index >= geometry.first_layer &&
+                tensor.layer_index <= last_gdn_layer &&
+                tensor.layer_index < profile.mainLayerCount())
+                layers.insert(tensor.layer_index);
+        for (const int layer : layers)
+            handoff.merge(gdn_live_state_workspace::requirements(layer, *geometry.gdn_live_state_handoff));
+        // Original stage names are disjoint from ordinary GEMM/attention and
+        // the separate recurrent_live_state owner. Each prefill graph contains
+        // all these layer-local consumers; retain their exact named union once.
+        gdn_handoff_bytes = handoff.total_bytes_with_alignment();
+        bytes = checkedAdd(bytes, gdn_handoff_bytes, "GDN phase handoff workspace");
+    }
+
     const size_t attention_bytes =
         exactAttentionWorkspaceBytes(profile, geometry);
     bytes = checkedAdd(
@@ -2289,6 +2311,8 @@ size_t WorkspaceMemoryEstimator::estimate(
         mtp_geometry.resident_graph_rows =
             std::max(1, geometry.mtp_target_query_rows);
         mtp_geometry.mtp_target_query_rows = 0;
+        // The shared main-prefill handoff was already priced above.
+        mtp_geometry.gdn_live_state_handoff.reset();
         compact_family_bytes = estimate(profile, mtp_geometry);
         persistent_hybrid_snapshot_bytes =
             exactHybridVerifierStateWorkspaceBytes(profile, geometry);
@@ -2333,6 +2357,7 @@ size_t WorkspaceMemoryEstimator::estimate(
             " rocm_quantized_gemm_bytes=" +
             std::to_string(rocm_quantized_gemm_bytes) +
             " moe_bytes=" + std::to_string(moe_bytes) +
+            " gdn_handoff_bytes=" + std::to_string(gdn_handoff_bytes) +
             " attention_bytes=" + std::to_string(attention_bytes) +
             " kv_conversion_bytes=" +
             std::to_string(kv_conversion_bytes) +

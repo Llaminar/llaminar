@@ -23,8 +23,36 @@ static void proveSharedFullRowsOverlap(DeviceId device, ProjectionExchangeProof 
     for (int rows = 1; rows <= 16; ++rows) config.rows.push_back(rows);
     config.exchange = exchange;
     config.output = ProjectionOutputProof::SharedFullRowsOverlap;
+    config.service_phase = MoEOverlayServicePhaseHint::Decode;
     runProjectionPipelineFixture(device, 2, config);
 }
+
+/** @brief Same rows/source/owners under each semantic phase, including retained empty/shrinking replays. */
+static void proveCountedPhaseScheduling(DeviceId device, int participants)
+{
+    for (const auto phase : {MoEOverlayServicePhaseHint::Prefill, MoEOverlayServicePhaseHint::Decode,
+            MoEOverlayServicePhaseHint::GroupedVerifier})
+    {
+        ProjectionPipelineFixtureConfig config;
+        config.rows = {1, 16};
+        config.format = "Q8_0";
+        config.exchange = ProjectionExchangeProof::DeviceCounted;
+        config.service_phase = phase;
+        runProjectionPipelineFixture(device, participants, config);
+        ASSERT_FALSE(::testing::Test::HasFailure());
+    }
+}
+
+#ifdef HAVE_CUDA
+/** @brief Actual counted allgather captures individual prefill/verifier and batched decode at equal M. */
+TEST(MoEProjectionPhaseScheduling, CUDA2) { proveCountedPhaseScheduling(DeviceId::cuda(0), 2); }
+#endif
+#ifdef HAVE_ROCM
+/** @brief Symmetric HIP phase policy at equal source geometry. */
+TEST(MoEProjectionPhaseScheduling, ROCm2) { proveCountedPhaseScheduling(DeviceId::rocm(0), 2); }
+/** @brief P4 distinguishes three original endpoints from one by-value argument packet. */
+TEST(MoEProjectionPhaseScheduling, ROCm4) { proveCountedPhaseScheduling(DeviceId::rocm(0), 4); }
+#endif
 
 #ifdef HAVE_CUDA
 /** @brief CUDA's native packet collective precedes the overlapped full-row shared sum. */

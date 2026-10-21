@@ -31,6 +31,7 @@ namespace llaminar2
 {
     class TransferEngine;
     struct CapturedTransferChannelDeviceBinding;
+    struct CapturedTransferChannelBatch;
     struct MappedTransferProgressClaim;
     struct MappedTransferProgressCommand;
     struct MappedTransferProgressCompletion;
@@ -4206,6 +4207,24 @@ namespace llaminar2
             void *destination, const void *source, int device_id, void *stream)
         {
             (void)binding; (void)destination; (void)source; (void)device_id; (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Lower independent original endpoints in bounded same-role native packets.
+         * @param batch Immutable retained aliases; backend fills only copy launch geometry.
+         * @param device_id Exact GPU of every original cursor.
+         * @param stream Exact non-null acquired or ordinary stream.
+         * @return True only after every selected native launch is accepted.
+         *
+         * This changes launch scheduling, never ownership, useful wire bytes,
+         * timeout, count authority or retirement. There is no shared batch state.
+         * Unsupported backends fail before submission; no alternate path is tried.
+         */
+        virtual bool enqueueCapturedTransferChannelBatch(
+            const CapturedTransferChannelBatch &batch, int device_id, void *stream)
+        {
+            (void)batch; (void)device_id; (void)stream;
             return false;
         }
 

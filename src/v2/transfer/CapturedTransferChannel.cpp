@@ -8,6 +8,10 @@
  * byte copy and release. No live device epoch is read or reset by this host code.
  */
 #include "CapturedTransferChannel.h"
+#include "CapturedTransferChannelBatch.h"
+#include "CapturedTransferKernelPlan.h"
+#include "utils/PerfStatsCollector.h"
+#include <algorithm>
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/device/WorkspaceBufferLease.h"
@@ -289,11 +293,48 @@ namespace llaminar2
         enqueueCapturedTransferImpl(binding, stream, nullptr);
     }
 
+    void TransferEngine::enqueueCapturedExchange(
+        std::span<const CapturedTransferBinding> producers,
+        std::span<const CapturedTransferBinding> consumers,
+        CapturedTransferEndpointScheduling scheduling, void *stream) const
+    {
+        (void)capturedTransferEndpointSchedulingName(scheduling);
+        validateCapturedTransferBatch(producers, stream, nullptr);
+        validateCapturedTransferBatch(consumers, stream, nullptr);
+        if (producers.front().native_.role != CapturedTransferEndpoint::Producer ||
+            consumers.front().native_.role != CapturedTransferEndpoint::Consumer ||
+            producers.front().device_ != consumers.front().device_)
+            throw std::invalid_argument("Captured exchange requires ordered same-device send/receive phases");
+        enqueueCapturedExchangeImpl(producers, consumers, scheduling, stream, nullptr);
+    }
+
+    void TransferEngine::enqueueCapturedExchangeImpl(
+        std::span<const CapturedTransferBinding> producers,
+        std::span<const CapturedTransferBinding> consumers,
+        CapturedTransferEndpointScheduling scheduling, void *stream,
+        const AcquiredDeviceTransferInput *fork) const
+    {
+        if (scheduling == CapturedTransferEndpointScheduling::Individual)
+        {
+            for (const auto &binding : producers) enqueueCapturedTransferImpl(binding, stream, fork);
+            for (const auto &binding : consumers) enqueueCapturedTransferImpl(binding, stream, fork);
+        }
+        else
+        {
+            // Scheduling was checked before either phase was recorded. Preserve
+            // the same send-before-receive ordering and native failure contract.
+            enqueueCapturedTransferBatchImpl(producers, stream, fork);
+            enqueueCapturedTransferBatchImpl(consumers, stream, fork);
+        }
+    }
+
     void TransferEngine::enqueueForkedCapturedExchange(
         std::span<const CapturedTransferBinding> producers,
         std::span<const CapturedTransferBinding> consumers,
-        const AcquiredDeviceTransferInput &input, ITensor *output) const
+        const AcquiredDeviceTransferInput &input, ITensor *output,
+        CapturedTransferEndpointScheduling scheduling) const
     {
+        (void)capturedTransferEndpointSchedulingName(scheduling);
         auto *destination = dynamic_cast<TensorBase *>(output);
         if (!input.valid() || producers.empty() || consumers.empty() || !destination ||
             destination->transferStorageOwner() != destination || input.sourceOwner() == destination)
@@ -320,14 +361,16 @@ namespace llaminar2
         };
         validate(producers, CapturedTransferEndpoint::Producer, input.sourceOwner());
         validate(consumers, CapturedTransferEndpoint::Consumer, destination);
-        for (const auto &binding : producers)
-            enqueueCapturedTransferImpl(binding, input.consumerStream(), &input);
-        for (const auto &binding : consumers)
-            enqueueCapturedTransferImpl(binding, input.consumerStream(), &input);
+        // Resolve both phases before the first native operation. A malformed
+        // receive cannot leave an otherwise valid producer batch in flight.
+        validateCapturedTransferBatch(producers, input.consumerStream(), &input);
+        validateCapturedTransferBatch(consumers, input.consumerStream(), &input);
+        enqueueCapturedExchangeImpl(producers, consumers, scheduling, input.consumerStream(), &input);
     }
 
-    void TransferEngine::enqueueCapturedTransferImpl(const CapturedTransferBinding &binding,
-        void *stream, const AcquiredDeviceTransferInput *fork) const
+    CapturedTransferChannelBatchEntry TransferEngine::resolveCapturedTransferEndpoint(
+        const CapturedTransferBinding &binding, void *stream,
+        const AcquiredDeviceTransferInput *fork) const
     {
         if (!stream || !binding.channel_ || !binding.native_.valid())
             throw std::invalid_argument("Captured transfer submission needs a frozen binding and explicit stream");
@@ -388,10 +431,112 @@ namespace llaminar2
         const bool outbound = binding.native_.role == CapturedTransferEndpoint::Producer;
         void *destination = outbound ? mapped_bytes : binding.device_bytes_;
         const void *source = outbound ? binding.device_bytes_ : mapped_bytes;
-        if (!backend->enqueueCapturedTransferChannel(binding.native_, destination, source, binding.device_.ordinal, stream))
+        return {.binding = binding.native_, .destination = destination, .source = source};
+    }
+
+    void TransferEngine::enqueueCapturedTransferImpl(const CapturedTransferBinding &binding,
+        void *stream, const AcquiredDeviceTransferInput *fork) const
+    {
+        const auto entry = resolveCapturedTransferEndpoint(binding, stream, fork);
+        auto *const backend = resolveBackend(binding.device_);
+        if (!backend->enqueueCapturedTransferChannel(entry.binding, entry.destination, entry.source,
+                binding.device_.ordinal, stream))
             throw std::runtime_error("Captured transfer submission failed");
-        // Forked outputs are not globally ready on this auxiliary stream. The
-        // paired join owns their one publication after its exact event wait.
-        if (tensor && !outbound && !fork) publishDeviceWrite(tensor, binding.device_, stream);
+        if (const auto *storage = std::get_if<std::shared_ptr<TensorBase>>(&binding.storage_))
+            if (binding.native_.role == CapturedTransferEndpoint::Consumer && !fork)
+                publishDeviceWrite(storage->get(), binding.device_, stream);
+    }
+
+    void TransferEngine::enqueueCapturedTransferBatch(
+        std::span<const CapturedTransferBinding> bindings, void *stream) const
+    {
+        enqueueCapturedTransferBatchImpl(bindings, stream, nullptr);
+    }
+
+    void TransferEngine::validateCapturedTransferBatch(
+        std::span<const CapturedTransferBinding> bindings, void *stream,
+        const AcquiredDeviceTransferInput *fork) const
+    {
+        if (bindings.empty() || !stream)
+            throw std::invalid_argument("Captured endpoint batch requires nonempty original bindings and exact stream");
+        const auto device = bindings.front().device_;
+        const auto role = bindings.front().native_.role;
+        // Full validation precedes submission, including across packet boundaries.
+        // A receive bank cannot use a zero current count to disguise aliasing.
+        for (size_t i = 0; i < bindings.size(); ++i)
+        {
+            const auto &binding = bindings[i];
+            if (binding.device_ != device || binding.native_.role != role)
+                throw std::invalid_argument("Captured endpoint batch mixes physical devices or endpoint roles");
+            const auto current = resolveCapturedTransferEndpoint(binding, stream, fork);
+            const auto begin = reinterpret_cast<std::uintptr_t>(current.destination);
+            for (size_t j = 0; j < i; ++j)
+            {
+                const auto &prior = bindings[j];
+                if (binding.native_.cursor == prior.native_.cursor || binding.native_.control == prior.native_.control)
+                    throw std::invalid_argument("Captured endpoint batch duplicates an original channel");
+                if (role == CapturedTransferEndpoint::Consumer)
+                {
+                    const auto previous = reinterpret_cast<std::uintptr_t>(prior.device_bytes_);
+                    if (begin <= previous ? previous - begin < binding.native_.message.bytes
+                        : begin - previous < prior.native_.message.bytes)
+                        throw std::invalid_argument("Captured endpoint batch has overlapping receive capacities");
+                    // Publication counts are mutable outputs, unlike shared
+                    // producer count inputs. Authenticate their complete byte
+                    // ranges against every other endpoint before any enqueue.
+                    const auto count = reinterpret_cast<std::uintptr_t>(binding.native_.device_extent);
+                    const auto previous_count = reinterpret_cast<std::uintptr_t>(prior.native_.device_extent);
+                    const auto overlaps = [](std::uintptr_t first, size_t first_bytes,
+                                             std::uintptr_t second, size_t second_bytes) {
+                        return first <= second ? second - first < first_bytes : first - second < second_bytes;
+                    };
+                    constexpr size_t count_bytes = sizeof(std::uint64_t);
+                    if ((count && previous_count && overlaps(count, count_bytes, previous_count, count_bytes)) ||
+                        (count && overlaps(count, count_bytes, previous, prior.native_.message.bytes)) ||
+                        (previous_count && overlaps(previous_count, count_bytes, begin, binding.native_.message.bytes)))
+                        throw std::invalid_argument("Captured endpoint batch count publication overlaps another count or payload capacity");
+                }
+            }
+        }
+    }
+
+    void TransferEngine::enqueueCapturedTransferBatchImpl(
+        std::span<const CapturedTransferBinding> bindings, void *stream,
+        const AcquiredDeviceTransferInput *fork) const
+    {
+        validateCapturedTransferBatch(bindings, stream, fork);
+        const auto device = bindings.front().device_;
+        const auto role = bindings.front().native_.role;
+        auto *const backend = resolveBackend(device);
+        for (size_t begin = 0; begin < bindings.size(); begin += CapturedTransferChannelBatch::kCapacity)
+        {
+            CapturedTransferChannelBatch packet;
+            packet.count = static_cast<unsigned>(std::min(bindings.size() - begin,
+                size_t{CapturedTransferChannelBatch::kCapacity}));
+            bool single = true;
+            for (unsigned i = 0; i < packet.count; ++i)
+            {
+                packet.entries[i] = resolveCapturedTransferEndpoint(bindings[begin + i], stream, fork);
+                single = single && capturedTransferKernelPlan(packet.entries[i].binding.message.bytes) ==
+                    CapturedTransferKernelPlan::SingleBlock;
+            }
+            if (!backend->enqueueCapturedTransferChannelBatch(packet, device.ordinal, stream))
+                throw std::runtime_error("Captured endpoint batch native submission failed; partial submission cannot be retried");
+            // The native graph owns argument copies. Original retained bindings
+            // still own all aliases/cursors; no new lifetime or PMA charge exists.
+            for (unsigned i = 0; i < packet.count; ++i)
+            {
+                const auto &binding = bindings[begin + i];
+                if (const auto *storage = std::get_if<std::shared_ptr<TensorBase>>(&binding.storage_))
+                    if (role == CapturedTransferEndpoint::Consumer && !fork)
+                        publishDeviceWrite(storage->get(), device, stream);
+            }
+            if (PerfStatsCollector::isDomainEnabled("transfer"))
+                PerfStatsCollector::addCounter("transfer", "captured_endpoint_batch_submissions", 1.0,
+                    {}, device.toString(), {{"endpoints", std::to_string(packet.count)},
+                        {"role", role == CapturedTransferEndpoint::Producer ? "producer" : "consumer"},
+                        {"lowering", single ? "fused" : "acquire_copy_publish"},
+                        {"accounting", "host_submission_or_graph_template"}});
+        }
     }
 }

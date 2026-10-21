@@ -11,6 +11,7 @@
 #pragma once
 
 #include "MappedTransferProgressABI.h"
+#include "CapturedTransferEndpointScheduling.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +41,7 @@ namespace llaminar2
 
     class CapturedTransferChannel;
     class CapturedTransferBinding;
+    struct CapturedTransferChannelBatchEntry;
     class WorkspaceBufferLease;
     struct CapturedTransferMessage;
     enum class CapturedTransferEndpoint : std::uint32_t;
@@ -1569,11 +1571,42 @@ namespace llaminar2
         void enqueueCapturedTransfer(const CapturedTransferBinding &binding, void *stream) const;
 
         /**
+         * @brief Record a same-role set of independent endpoints in bounded native packets.
+         * @param bindings Frozen distinct original endpoints on one physical GPU.
+         * @param stream Exact non-null execution/capture stream.
+         * @throws std::exception Before submission for malformed/overlapping bindings;
+         *         native submission failure is fatal to the enclosing transaction.
+         *
+         * Empty live messages still run their own acquire/publication protocol.
+         * Only launch grouping changes; no host count read or new state is created.
+         * Each consumer retains ordinary same-stream publication after acceptance.
+         */
+        void enqueueCapturedTransferBatch(std::span<const CapturedTransferBinding> bindings,
+            void *stream) const;
+
+        /**
+         * @brief Submit a complete captured exchange using frozen endpoint scheduling.
+         * @param producers Complete same-device producer set, before all receives.
+         * @param consumers Complete same-device consumer set on the same device.
+         * @param scheduling Explicit immutable launch grouping, never inferred from counts.
+         * @param stream Exact non-null capture/execution stream.
+         * @throws std::exception If either complete phase is invalid before any enqueue.
+         *
+         * Both policies validate all original endpoints, aliases and publications
+         * first. Individual retains original endpoint order; Batched groups only
+         * independent same-role endpoints. No native failure is retried.
+         */
+        void enqueueCapturedExchange(std::span<const CapturedTransferBinding> producers,
+            std::span<const CapturedTransferBinding> consumers,
+            CapturedTransferEndpointScheduling scheduling, void *stream) const;
+
+        /**
          * @brief Enqueue a complete forked exchange without premature output publication.
          * @param producers Retained sends, all reading the acquired canonical owner.
          * @param consumers Retained receives, all writing the disjoint destination owner.
          * @param input Exact producer/event proof acquired by the auxiliary stream.
          * @param output Canonical receive owner prepared on that same device.
+         * @param scheduling Explicit graph-bound policy; both phases validate before either is submitted.
          * @throws std::exception For empty/inconsistent endpoints, stale storage or submission failure.
          *
          * Only the paired collective fork/join owner calls this boundary. Sends
@@ -1585,7 +1618,8 @@ namespace llaminar2
         void enqueueForkedCapturedExchange(
             std::span<const CapturedTransferBinding> producers,
             std::span<const CapturedTransferBinding> consumers,
-            const AcquiredDeviceTransferInput &input, ITensor *output) const;
+            const AcquiredDeviceTransferInput &input, ITensor *output,
+            CapturedTransferEndpointScheduling scheduling) const;
 
         /**
          * @brief Allocate one native mapped slab and partition exclusive slots.
@@ -2622,6 +2656,51 @@ namespace llaminar2
          */
         void enqueueCapturedTransferImpl(const CapturedTransferBinding &binding,
             void *stream, const AcquiredDeviceTransferInput *fork) const;
+
+        /**
+         * @brief Validate one original endpoint and derive immutable aliases without submitting.
+         * @param binding Retained exact endpoint and source/count owners.
+         * @param stream Exact execution stream.
+         * @param fork Original complete-exchange proof, or null for ordinary ownership checks.
+         * @return Native by-value entry; its backend fills only copy-grid geometry.
+         */
+        [[nodiscard]] CapturedTransferChannelBatchEntry resolveCapturedTransferEndpoint(
+            const CapturedTransferBinding &binding, void *stream,
+            const AcquiredDeviceTransferInput *fork) const;
+
+        /**
+         * @brief Reject malformed complete endpoint sets without native submission.
+         * @param bindings Original same-role endpoints; rejects duplicates across packets.
+         * @param stream Exact execution stream.
+         * @param fork Validated original input fork or null for ordinary ownership.
+         */
+        void validateCapturedTransferBatch(std::span<const CapturedTransferBinding> bindings,
+            void *stream, const AcquiredDeviceTransferInput *fork) const;
+
+        /**
+         * @brief Validate all independent same-role endpoints before any batch is enqueued.
+         * @param bindings Original retained bindings; arbitrary positive cohort size.
+         * @param stream Exact execution stream.
+         * @param fork Complete acquired-input proof or null for ordinary publication.
+         *
+         * The packet is stack/native-argument storage, not device progress state.
+         * Distinct receive capacities must not overlap, even when current counts are zero.
+         */
+        void enqueueCapturedTransferBatchImpl(std::span<const CapturedTransferBinding> bindings,
+            void *stream, const AcquiredDeviceTransferInput *fork) const;
+
+        /**
+         * @brief Submit already authenticated complete phases with exact publication semantics.
+         * @param producers Original validated producer set.
+         * @param consumers Original validated consumer set.
+         * @param scheduling Checked immutable launch grouping.
+         * @param stream Exact validated stream.
+         * @param fork Paired fork proof, or null for ordinary publication.
+         */
+        void enqueueCapturedExchangeImpl(std::span<const CapturedTransferBinding> producers,
+            std::span<const CapturedTransferBinding> consumers,
+            CapturedTransferEndpointScheduling scheduling, void *stream,
+            const AcquiredDeviceTransferInput *fork) const;
 
         /**
          * @brief Derive one stable child view without another native mapping.

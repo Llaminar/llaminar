@@ -8,6 +8,8 @@
  */
 #include "transfer/CapturedTransferChannel.h"
 #include "transfer/CapturedTransferKernelPlan.h"
+#include "transfer/CapturedTransferChannelBatch.h"
+#include "execution/moe/MoECountedTransferPolicy.h"
 #include "execution/local_execution/orchestrators/PipelineActivationExchange.h"
 #include "execution/local_execution/orchestrators/PipelineMetadataExchange.h"
 #include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
@@ -85,6 +87,22 @@ namespace
                     binding.cursor->completed_epoch + 1, producer ? control.producer : control.consumer).ready());
             return true;
         }
+        /** @brief Observe packet boundaries while reusing the original pure per-message protocol spy. */
+        bool enqueueCapturedTransferChannelBatch(const CapturedTransferChannelBatch &packet,
+            int device, void *stream) override
+        {
+            EXPECT_TRUE(packet.valid());
+            batch_sizes.push_back(packet.count);
+            if (fail_boundary) return false;
+            for (unsigned i = 0; i < packet.count; ++i)
+            {
+                const auto &entry = packet.entries[i];
+                if (!enqueueCapturedTransferChannel(entry.binding, entry.destination, entry.source, device, stream)) return false;
+            }
+            return true;
+        }
+        std::vector<unsigned> batch_sizes;
+
         /** @brief Copy exact bytes, retaining sentinels outside the requested message. */
         bool copyDeviceVisibleRegionByKernelOnStream(void *dst, const void *src, size_t bytes, int, void *stream) override
         { calls.push_back({"copy", stream, bytes}); std::memcpy(dst, src, bytes); return true; }
@@ -316,6 +334,187 @@ namespace
                     ASSERT_EQ(actual[i], i >= 11 && i < 11 + bytes ? bytes % 251 : 0xa5);
             }
             EXPECT_EQ(cuda.setup_queries + rocm.setup_queries, queries);
+        }
+    }
+
+    TEST_F(CapturedTransferChannelBindingTest, BatchesRetainExactOriginalOwnersAndRejectBeforeAnySubmission)
+    {
+        constexpr size_t lanes = CapturedTransferChannelBatch::kCapacity + 1;
+        constexpr size_t capacity = 257;
+        auto authority = admission(DeviceId::cuda(0), DeviceId::rocm(0), capacity, 0, lanes);
+        auto source = transfer.allocateDeviceTransferBuffer(capacity, DeviceId::cuda(0));
+        auto destination = transfer.allocateDeviceTransferBuffer(lanes * capacity, DeviceId::rocm(0));
+        std::memset(source->mutableDeviceData(), 0x37, capacity);
+        std::memset(destination->mutableDeviceData(), 0xa5, lanes * capacity);
+        std::vector<CapturedTransferBinding> sends, receives;
+        std::vector<std::weak_ptr<CapturedTransferChannel>> owners;
+        for (size_t i = 0; i < lanes; ++i)
+        {
+            auto channel = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(),
+                DeviceId::cuda(0), producer_stream, DeviceId::rocm(0), consumer_stream, capacity);
+            owners.push_back(channel);
+            sends.push_back(transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Producer,
+                {71 + i, capacity}, source));
+            receives.push_back(transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Consumer,
+                {71 + i, capacity}, destination, i * capacity));
+        }
+        const auto attempts = cuda.complete_operations + rocm.complete_operations;
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch({}, producer_stream), std::invalid_argument);
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(sends, nullptr), std::invalid_argument);
+        auto malformed = sends;
+        malformed.back() = malformed.front(); // Duplicate in a later native packet.
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(malformed, producer_stream), std::invalid_argument);
+        malformed = sends;
+        malformed.back() = receives.back();
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(malformed, producer_stream), std::invalid_argument);
+        auto overlap = receives;
+        // A different original channel writing the same receive range is not independent.
+        auto extra = transfer.bindCapturedTransfer(owners.back().lock(), CapturedTransferEndpoint::Consumer,
+            {71 + lanes - 1, capacity}, destination, 0);
+        overlap.back() = extra;
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(overlap, consumer_stream), std::invalid_argument);
+        EXPECT_EQ(cuda.complete_operations + rocm.complete_operations, attempts);
+        const int observations = cuda.setup_queries + rocm.setup_queries;
+        transfer.enqueueCapturedTransferBatch(sends, producer_stream);
+        transfer.enqueueCapturedTransferBatch(receives, consumer_stream);
+        EXPECT_EQ(cuda.batch_sizes, (std::vector<unsigned>{CapturedTransferChannelBatch::kCapacity, 1}));
+        EXPECT_EQ(rocm.batch_sizes, (std::vector<unsigned>{CapturedTransferChannelBatch::kCapacity, 1}));
+        EXPECT_EQ(cuda.setup_queries + rocm.setup_queries, observations);
+        const auto *bytes = static_cast<const unsigned char *>(destination->deviceData());
+        for (size_t i = 0; i < lanes * capacity; ++i) EXPECT_EQ(bytes[i], 0x37);
+        for (const auto &owner : owners) EXPECT_FALSE(owner.expired());
+        cuda.fail_boundary = true;
+        const auto accepted = cuda.complete_operations;
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(sends, producer_stream), std::runtime_error);
+        EXPECT_EQ(cuda.complete_operations, accepted); // No individual-endpoint retry.
+        sends.clear(); receives.clear(); malformed.clear(); overlap.clear();
+        // extra is intentionally still a real original binding, so its owner remains.
+        EXPECT_FALSE(owners.back().expired());
+        for (size_t i = 0; i + 1 < lanes; ++i) EXPECT_TRUE(owners[i].expired());
+        EXPECT_EQ(cuda.getSyncCount() + rocm.getSyncCount(), 0u);
+        EXPECT_EQ(cuda.getStreamSyncCount() + rocm.getStreamSyncCount(), 0u);
+    }
+
+    TEST_F(CapturedTransferChannelBindingTest, BatchConsumerCountsRejectAllCrossEndpointAliasesBeforeEnqueue)
+    {
+        constexpr size_t lanes = CapturedTransferChannelBatch::kCapacity + 1;
+        constexpr size_t capacity = 257;
+        auto authority = admission(DeviceId::cuda(0), DeviceId::rocm(0), capacity, 0, lanes);
+        auto source = transfer.allocateDeviceTransferBuffer(capacity, DeviceId::cuda(0));
+        auto destination = transfer.allocateDeviceTransferBuffer(lanes * capacity, DeviceId::rocm(0));
+        auto producer_count = transfer.allocateDeviceTransferBuffer(sizeof(std::uint64_t), DeviceId::cuda(0));
+        auto consumer_counts = transfer.allocateDeviceTransferBuffer(lanes * sizeof(std::uint64_t), DeviceId::rocm(0));
+        *static_cast<std::uint64_t *>(producer_count->mutableDeviceData()) = 2;
+        std::memset(source->mutableDeviceData(), 0x39, capacity);
+        std::memset(destination->mutableDeviceData(), 0xa5, lanes * capacity);
+        std::memset(consumer_counts->mutableDeviceData(), 0x7f, lanes * sizeof(std::uint64_t));
+        std::vector<CapturedTransferBinding> sends, receives, counted_receives;
+        for (size_t i = 0; i < lanes; ++i)
+        {
+            auto channel = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(),
+                DeviceId::cuda(0), producer_stream, DeviceId::rocm(0), consumer_stream, capacity);
+            sends.push_back(transfer.bindDeviceCountedTransfer(transfer.bindCapturedTransfer(channel,
+                CapturedTransferEndpoint::Producer, {81 + i, capacity}, source), producer_count));
+            receives.push_back(transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Consumer,
+                {81 + i, capacity}, destination, i * capacity));
+            counted_receives.push_back(transfer.bindDeviceCountedTransfer(receives.back(), consumer_counts,
+                i * sizeof(std::uint64_t)));
+        }
+        const auto attempts = cuda.complete_operations + rocm.complete_operations;
+        auto malformed = counted_receives;
+        // Distinct original channels and disjoint payloads, but duplicate
+        // mutable counts across the first/second native packet boundary.
+        malformed.back() = transfer.bindDeviceCountedTransfer(receives.back(), consumer_counts, 0);
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(malformed, consumer_stream), std::invalid_argument);
+        malformed = counted_receives;
+        // Both original per-binding own-payload checks pass. Only complete
+        // cohort validation can see a count inside another payload capacity.
+        constexpr size_t in_second_payload = (capacity + 7) / 8 * 8;
+        malformed.front() = transfer.bindDeviceCountedTransfer(receives.front(), destination, in_second_payload);
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(malformed, consumer_stream), std::invalid_argument);
+        malformed = counted_receives;
+        malformed.back() = transfer.bindDeviceCountedTransfer(receives.back(), destination, 8);
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(malformed, consumer_stream), std::invalid_argument);
+        EXPECT_EQ(cuda.complete_operations + rocm.complete_operations, attempts);
+        // Shared producer counts are intentionally read-only; do not reject
+        // multicast from one original authority. Separate consumer scalars
+        // remain outputs and each must adopt the exact published size.
+        transfer.enqueueCapturedTransferBatch(sends, producer_stream);
+        transfer.enqueueCapturedTransferBatch(counted_receives, consumer_stream);
+        for (size_t i = 0; i < lanes; ++i)
+        {
+            EXPECT_EQ(*static_cast<const std::uint64_t *>(consumer_counts->deviceData(i * sizeof(std::uint64_t))), 2u);
+            const auto *bytes = static_cast<const unsigned char *>(destination->deviceData(i * capacity));
+            for (size_t byte = 0; byte < capacity; ++byte) EXPECT_EQ(bytes[byte], byte < 2 ? 0x39 : 0xa5);
+        }
+    }
+
+    /** @brief Resolve the original graph role, not an inferred captured row bucket. */
+    TEST(CapturedTransferScheduling, ExplicitMoEPhaseAndMessageIdentity)
+    {
+        using Phase = MoEOverlayServicePhaseHint;
+        using Scheduling = CapturedTransferEndpointScheduling;
+        EXPECT_EQ(moeCountedTransferScheduling(Phase::Prefill), Scheduling::Individual);
+        EXPECT_EQ(moeCountedTransferScheduling(Phase::Decode), Scheduling::Batched);
+        EXPECT_EQ(moeCountedTransferScheduling(Phase::GroupedVerifier), Scheduling::Individual);
+        EXPECT_THROW(moeCountedTransferScheduling(Phase::Auto), std::invalid_argument);
+        EXPECT_THROW(moeCountedTransferScheduling(static_cast<Phase>(99)), std::invalid_argument);
+        EXPECT_THROW(capturedTransferEndpointSchedulingName(static_cast<Scheduling>(0)), std::invalid_argument);
+        EXPECT_THROW(capturedTransferEndpointSchedulingKey(0, Scheduling::Individual), std::invalid_argument);
+        EXPECT_NE(capturedTransferEndpointSchedulingKey(31, Scheduling::Individual),
+            capturedTransferEndpointSchedulingKey(31, Scheduling::Batched));
+        EXPECT_EQ(capturedTransferEndpointSchedulingKey(31, Scheduling::Batched),
+            capturedTransferEndpointSchedulingKey(31, Scheduling::Batched));
+    }
+
+    /** @brief A bad receive must reject before any send under either explicit policy. */
+    TEST_F(CapturedTransferChannelBindingTest, ScheduledExchangePrevalidatesBothPhases)
+    {
+        using Scheduling = CapturedTransferEndpointScheduling;
+        constexpr size_t capacity = 257;
+        for (const auto scheduling : {Scheduling::Individual, Scheduling::Batched})
+        {
+            auto authority = admission(DeviceId::cuda(0), DeviceId::rocm(0), capacity, 0, 2);
+            auto forward = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(),
+                DeviceId::cuda(0), producer_stream, DeviceId::rocm(0), consumer_stream, capacity);
+            auto backward = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(),
+                DeviceId::rocm(0), consumer_stream, DeviceId::cuda(0), producer_stream, capacity);
+            auto local = transfer.allocateDeviceTransferBuffer(capacity, DeviceId::cuda(0));
+            auto remote = transfer.allocateDeviceTransferBuffer(capacity, DeviceId::rocm(0));
+            auto output = transfer.allocateDeviceTransferBuffer(capacity, DeviceId::cuda(0));
+            std::memset(local->mutableDeviceData(), 0x32, capacity);
+            std::memset(remote->mutableDeviceData(), 0x64, capacity);
+            std::memset(output->mutableDeviceData(), 0xa5, capacity);
+            const std::array sends{transfer.bindCapturedTransfer(forward,
+                CapturedTransferEndpoint::Producer, {31, capacity}, local)};
+            const std::array receives{transfer.bindCapturedTransfer(backward,
+                CapturedTransferEndpoint::Consumer, {41, capacity}, output)};
+            const std::array peer_sends{transfer.bindCapturedTransfer(backward,
+                CapturedTransferEndpoint::Producer, {41, capacity}, remote)};
+            const auto before_calls = cuda.complete_operations + rocm.complete_operations;
+            const std::array wrong_role{sends.front()};
+            EXPECT_THROW(transfer.enqueueCapturedExchange(sends, wrong_role, scheduling, producer_stream),
+                std::invalid_argument);
+            auto duplicate = std::vector{receives.front(), receives.front()};
+            EXPECT_THROW(transfer.enqueueCapturedExchange(sends, duplicate, scheduling, producer_stream),
+                std::invalid_argument);
+            EXPECT_THROW(transfer.enqueueCapturedExchange(sends, receives,
+                static_cast<Scheduling>(0), producer_stream), std::invalid_argument);
+            EXPECT_EQ(cuda.complete_operations + rocm.complete_operations, before_calls);
+            // Prime only the remote original publication, then observe the
+            // production same-device send/receive transaction with real spies.
+            transfer.enqueueCapturedTransfer(peer_sends.front(), consumer_stream);
+            cuda.batch_sizes.clear();
+            const auto first_binding = cuda.native_bindings.size();
+            transfer.enqueueCapturedExchange(sends, receives, scheduling, producer_stream);
+            ASSERT_EQ(cuda.native_bindings.size(), first_binding + 2);
+            EXPECT_EQ(cuda.native_bindings[first_binding].role, CapturedTransferEndpoint::Producer);
+            EXPECT_EQ(cuda.native_bindings[first_binding + 1].role, CapturedTransferEndpoint::Consumer);
+            EXPECT_EQ(cuda.batch_sizes.size(), scheduling == Scheduling::Batched ? 2u : 0u);
+            const auto *bytes = static_cast<const unsigned char *>(output->deviceData());
+            for (size_t byte = 0; byte < capacity; ++byte) ASSERT_EQ(bytes[byte], 0x64);
+            EXPECT_EQ(cuda.getSyncCount() + rocm.getSyncCount(), 0u);
+            EXPECT_EQ(cuda.getStreamSyncCount() + rocm.getStreamSyncCount(), 0u);
         }
     }
 

@@ -44,6 +44,124 @@ namespace llaminar2::test
         }
     } // namespace
 
+    namespace
+    {
+        /** @return Actual native mask, independent of the production scope. */
+        cpu_set_t observedWorkerMask()
+        {
+            cpu_set_t result;
+            CPU_ZERO(&result);
+            if (sched_getaffinity(0, sizeof(result), &result) != 0)
+                throw std::runtime_error("Cannot observe worker affinity");
+            return result;
+        }
+
+        /** @return Initial rank's admitted places, independently enumerated for this test. */
+        cpu_set_t expectedWorkerPartition()
+        {
+            if (omp_get_proc_bind() == omp_proc_bind_false) return observedWorkerMask();
+            cpu_set_t result;
+            CPU_ZERO(&result);
+            // Registered bound tests start at the initial host level, where
+            // all runtime places form the original participant partition.
+            for (int place = 0; place < omp_get_num_places(); ++place)
+            {
+                std::vector<int> cpus(static_cast<size_t>(omp_get_place_num_procs(place)));
+                omp_get_place_proc_ids(place, cpus.data());
+                for (const int cpu : cpus) CPU_SET(cpu, &result);
+            }
+            return result;
+        }
+    }
+
+    TEST(TPWorkerAffinity, IntentUsesActualDevicesAndPreservesComputeScopes)
+    {
+        using Intent = TPWorkerHostPlacement;
+        using Scope = TPWorkerHostScope;
+        const std::array cuda{DeviceId::cuda(0), DeviceId::cuda(1)};
+        const std::array rocm{DeviceId::rocm(0), DeviceId::rocm(3)};
+        const std::array cpu{DeviceId::cpu(), DeviceId::cpu()};
+        const std::array mixed{DeviceId::rocm(0), DeviceId::cpu()};
+        const std::array vendors{DeviceId::rocm(0), DeviceId::cuda(0)};
+        EXPECT_EQ(tpWorkerHostPlacement(cuda, Scope::FlatRank), Intent::IndependentGPUControl);
+        EXPECT_EQ(tpWorkerHostPlacement(rocm, Scope::FlatRank), Intent::IndependentGPUControl);
+        EXPECT_EQ(tpWorkerHostPlacement(cpu, Scope::FlatRank), Intent::InheritedCompute);
+        EXPECT_EQ(tpWorkerHostPlacement(mixed, Scope::FlatRank), Intent::InheritedCompute);
+        EXPECT_EQ(tpWorkerHostPlacement(vendors, Scope::FlatRank), Intent::InheritedCompute);
+        EXPECT_EQ(tpWorkerHostPlacement(rocm, Scope::PipelineOrComposed), Intent::InheritedCompute);
+        EXPECT_THROW(tpWorkerHostPlacement(cuda, static_cast<Scope>(99)), std::invalid_argument);
+        EXPECT_THROW(tpWorkerHostPlacement({}, Scope::FlatRank), std::invalid_argument);
+        const std::array invalid{DeviceId::invalid()};
+        EXPECT_THROW(tpWorkerHostPlacement(invalid, Scope::FlatRank), std::invalid_argument);
+    }
+
+    TEST(TPWorkerAffinity, ActualParticipantsAndAbortWorkerRetainPartitionWhileParentRestores)
+    {
+        const auto parent = observedWorkerMask();
+        const auto partition = expectedWorkerPartition();
+        const int team = omp_get_max_threads();
+        // Callback observation owners outlive the pool's actual worker join,
+        // including an early assertion return before callback completion.
+        std::promise<cpu_set_t> abort_worker;
+        auto observed_abort = abort_worker.get_future();
+        TPWorkerPool pool(2, TPWorkerHostPlacement::IndependentGPUControl);
+        const auto after_construction = observedWorkerMask();
+        EXPECT_TRUE(CPU_EQUAL(&parent, &after_construction));
+        for (int generation = 0; generation < 3; ++generation)
+        {
+            pool.dispatch([&](size_t) {
+                const auto actual = observedWorkerMask();
+                return CPU_EQUAL(&actual, &partition);
+            });
+            expectSuccessfulGeneration(pool.collectAll(2000));
+        }
+        pool.setFailureCallback([&] { abort_worker.set_value(observedWorkerMask()); });
+        pool.dispatch([](size_t index) { return index != 0; });
+        const auto failed = pool.collectAll(2000);
+        ASSERT_EQ(failed.size(), 2u);
+        EXPECT_TRUE(failed[0].completed);
+        EXPECT_FALSE(failed[0].success);
+        ASSERT_EQ(observed_abort.wait_for(2s), std::future_status::ready);
+        const auto callback_mask = observed_abort.get();
+        EXPECT_TRUE(CPU_EQUAL(&callback_mask, &partition));
+        const auto after = observedWorkerMask();
+        EXPECT_TRUE(CPU_EQUAL(&parent, &after));
+        EXPECT_EQ(omp_get_max_threads(), team);
+    }
+
+    TEST(TPWorkerAffinity, InheritedComputeAndScopeUnwindPreserveExactCallerMask)
+    {
+        const auto parent = observedWorkerMask();
+        TPWorkerPool pool(2, TPWorkerHostPlacement::InheritedCompute);
+        pool.dispatch([&](size_t) {
+            const auto actual = observedWorkerMask();
+            return CPU_EQUAL(&actual, &parent);
+        });
+        expectSuccessfulGeneration(pool.collectAll(2000));
+        EXPECT_THROW(([] {
+            const ScopedOpenMPPartitionAffinity scope;
+            throw std::runtime_error("controlled construction unwind");
+        }()), std::runtime_error);
+        const auto after = observedWorkerMask();
+        EXPECT_TRUE(CPU_EQUAL(&parent, &after));
+        EXPECT_THROW(TPWorkerPool(2, static_cast<TPWorkerHostPlacement>(99)), std::invalid_argument);
+    }
+
+    TEST(TPWorkerAffinity, ScopeRejectsActiveComputeBeforeChangingItsPlace)
+    {
+        bool rejected = false, preserved = false;
+#pragma omp parallel num_threads(1)
+        {
+            const auto original = observedWorkerMask();
+            try { const ScopedOpenMPPartitionAffinity scope; }
+            catch (const std::runtime_error &) { rejected = true; }
+            const auto after = observedWorkerMask();
+            preserved = CPU_EQUAL(&original, &after);
+        }
+        EXPECT_TRUE(rejected);
+        EXPECT_TRUE(preserved);
+    }
+
     /**
      * @brief A terminal worker completion wakes every observer of its generation.
      *

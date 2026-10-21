@@ -8,6 +8,7 @@
  * - NvidiaDeviceContext (if CUDA available)
  * - AMDDeviceContext (if ROCm available)
  * - Ordering receipts cover retained compute after DMA on reused stream lanes
+ * - Actual backend-owned workers inherit admitted OpenMP places and restore their creator
  * - Admission prices every retained verifier width before request execution
  *
  * **Thread Safety Model**:
@@ -33,10 +34,14 @@
 
 #if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 #include <hip/hip_runtime.h>
+#include "backends/rocm/AMDDeviceContext.h"
 #elif defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
 #include <cuda_runtime_api.h>
+#include "backends/cuda/NvidiaDeviceContext.h"
 #endif
 
+#include <omp.h>
+#include <sched.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1843,3 +1848,102 @@ TEST(Test__GPUDeviceContext_Stress, StreamEventChurn)
             ctx->destroyStream(stream); });
     }
 }
+
+namespace
+{
+/** @return Calling thread's actual Linux eligibility, without a device probe. */
+cpu_set_t backendAffinityMask()
+{
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) != 0)
+        throw std::runtime_error("Cannot read backend worker affinity");
+    return mask;
+}
+
+/**
+ * @brief Independently enumerate initial-host OpenMP places for the expected child mask.
+ * @param parent Exact original mask preserved when binding is disabled.
+ * @return Current admitted partition; no guessed socket, CPU ordinal or worker budget.
+ */
+cpu_set_t backendExpectedPartition(const cpu_set_t &parent)
+{
+    if (omp_get_proc_bind() == omp_proc_bind_false) return parent;
+    const int count = omp_get_partition_num_places();
+    if (count <= 0) throw std::runtime_error("Bound backend fixture has no partition places");
+    std::vector<int> places(static_cast<size_t>(count));
+    omp_get_partition_place_nums(places.data());
+    cpu_set_t result;
+    CPU_ZERO(&result);
+    for (int place : places)
+    {
+        const int width = omp_get_place_num_procs(place);
+        if (width <= 0) throw std::runtime_error("Empty backend fixture place");
+        std::vector<int> cpus(static_cast<size_t>(width));
+        omp_get_place_proc_ids(place, cpus.data());
+        for (int cpu : cpus)
+        {
+            if (cpu < 0 || cpu >= CPU_SETSIZE) throw std::runtime_error("Backend fixture CPU exceeds affinity mask");
+            CPU_SET(cpu, &result);
+        }
+    }
+    return result;
+}
+
+/**
+ * @brief Prove placement on the actual newly constructed native backend owner.
+ * @param construct Concrete native constructor, never a pool hit or synthetic worker.
+ *
+ * Normal submitAndWait dispatch identifies the owned child and observes its mask.
+ * No kernel, event, GPU synchronization or all-thread mask inference is used.
+ * Context destruction retires its ordinary owned thread before final parent checks.
+ */
+template<class Factory>
+void expectBackendWorkerAffinity(Factory construct)
+{
+    ASSERT_EQ(omp_get_level(), 0);
+    const auto parent = backendAffinityMask();
+    const auto expected = backendExpectedPartition(parent);
+    const auto parent_id = std::this_thread::get_id();
+    const int team = omp_get_max_threads();
+    auto context = construct();
+    ASSERT_NE(context, nullptr);
+    ASSERT_TRUE(context->isInitialized());
+    const auto restored = backendAffinityMask();
+    EXPECT_TRUE(CPU_EQUAL(&parent, &restored));
+    std::thread::id owner;
+    for (int task = 0; task < 3; ++task)
+    {
+        cpu_set_t observed;
+        std::thread::id current;
+        context->submitAndWait([&] {
+            current = std::this_thread::get_id();
+            observed = backendAffinityMask();
+        });
+        EXPECT_NE(current, parent_id);
+        if (task == 0) owner = current;
+        EXPECT_EQ(current, owner);
+        EXPECT_TRUE(CPU_EQUAL(&expected, &observed)) << "owned task=" << task;
+    }
+    context.reset();
+    const auto retired = backendAffinityMask();
+    EXPECT_TRUE(CPU_EQUAL(&parent, &retired));
+    EXPECT_EQ(omp_get_max_threads(), team);
+}
+} // namespace
+
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+/** @test Real CUDA context construction preserves its parent and places its own task worker. */
+TEST(Test__NvidiaDeviceContext, OwnedWorkerInheritsPartitionAndRestoresParent)
+{
+    SKIP_IF_NO_CUDA();
+    expectBackendWorkerAffinity([] { return std::make_unique<NvidiaDeviceContext>(0); });
+}
+#elif defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+/** @test Real ROCm context construction preserves its parent and places its own task worker. */
+TEST(Test__AMDDeviceContext, OwnedWorkerInheritsPartitionAndRestoresParent)
+{
+    SKIP_IF_NO_ROCM();
+    expectBackendWorkerAffinity([] { return std::make_unique<AMDDeviceContext>(0); });
+}
+#endif

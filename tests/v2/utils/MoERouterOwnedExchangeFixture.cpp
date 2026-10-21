@@ -222,7 +222,8 @@ void proveMoERouterOwnedExchange(DeviceId first, int participants, int capacity,
             r.hidden_scales = static_cast<float *>(p.allocate(input_count / 32 * 4)->gpu_data_ptr());
             p.packet = p.allocate(stride + 64);
             p.peers = p.allocate(stride * (participants - 1) + 64);
-            p.exchange = fabric->bind(member, {0x726f75746572524full, stride}, p.packet, p.peers);
+            p.exchange = fabric->bind(member, {0x726f75746572524full, stride},
+                CapturedTransferEndpointScheduling::Individual, p.packet, p.peers);
             r.selected = static_cast<MoERouterSelectedRoute *>(p.packet->gpu_data_ptr());
             r.selected_bytes = p.exchange.extent(member);
             p.publication = {{r.partition, capacity, top_k}, r.live_rows, r.selected,
@@ -306,7 +307,7 @@ void proveMoERouterOwnedExchange(DeviceId first, int participants, int capacity,
                             node.static_shared_memory_bytes + node.dynamic_shared_memory_bytes,
                             node.local_memory_bytes_per_thread, node.max_active_blocks_per_sm);
                 }
-                if (kind == 1) counted_channel_test::verifyCapturedChannelGraph(*graph, stride, 2 * (participants - 1) * copies);
+                if (kind == 1) counted_channel_test::verifyCapturedChannelGraph(*graph, stride, (participants - 1) * 2 * copies);
                 require(graph->instantiate(), "Router graph instantiate");
             }
             if (timing)

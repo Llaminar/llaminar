@@ -40,6 +40,9 @@
 #include "backends/DeviceId.h"
 
 #include <memory>
+#include <set>
+#include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
+#include "../../mocks/MockLocalTPContext.h"
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -3733,4 +3736,162 @@ TEST(Test__MemoryPlanner, ForwardOnlyBOMFollowsOriginalNativePipelineProjection)
             EXPECT_EQ(*cfg.local_pipeline_backend, type == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
         }
     }
+}
+
+/**
+ * @test Original source geometry and actual stage declarations own handoff bytes.
+ *
+ * Sparse parser-native source metadata is never loaded as model weights. The
+ * existing stage query supplies the descriptors; only collective membership is
+ * mocked. Global layer subranges, scalar families, non-native contexts and
+ * already-full primary state preserve their actual stage-selection boundaries.
+ */
+TEST(Test__MemoryPlanner, ReplicatedDecodeIncludesActualGDNHandoffWorkspace)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto &profile = source.metadata().memoryProfile();
+    const GDNLinkedLiveStateGeometry geometry{
+        .global_key_heads = profile.gdn_group_count,
+        .global_value_heads = profile.gdn_time_step_rank,
+        .key_width = profile.gdn_state_size,
+        .value_width = profile.gdn_state_size,
+        .conv_history_length = profile.gdn_conv_kernel_size - 1};
+    for (const DeviceId first : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int degree : {2, 4, 8})
+    {
+        const auto backend = first.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        std::vector<GlobalDeviceAddress> addresses;
+        std::vector<DeviceId> devices;
+        for (int rank = 0; rank < degree; ++rank)
+        {
+            devices.emplace_back(first.type, rank);
+            addresses.push_back(first.is_cuda() ? GlobalDeviceAddress::cuda(rank) : GlobalDeviceAddress::rocm(rank));
+        }
+        test::MockLocalTPContext collective;
+        collective.setDevices(addresses);
+        collective.setBackend(backend);
+        const auto assignment = TensorParallelConfig::proportionalSplit(devices,
+            std::vector<float>(static_cast<size_t>(degree), 1.f), profile.n_heads,
+            profile.n_kv_heads, profile.d_ff, profile.vocab_size);
+        for (const auto [first_layer, last_layer] : {std::pair{0, 47}, std::pair{12, 27}})
+        {
+            WorkspaceRequirements actual_stages;
+            std::set<int> layers;
+            for (const auto &tensor : profile.tensors)
+                if (tensor.name.ends_with(".ssm_out.weight") &&
+                    tensor.layer_index >= first_layer && tensor.layer_index <= last_layer)
+                    layers.insert(tensor.layer_index);
+            ASSERT_EQ(layers.size(), first_layer == 0 ? 36u : 12u);
+            for (const int layer : layers)
+            {
+                GDNLiveStateAllGatherStage::Params params;
+                params.device_id = first;
+                params.tp_ctx = &collective;
+                params.layer_idx = layer;
+                params.tp_device_idx = 0;
+                params.geometry = geometry;
+                GDNLiveStateAllGatherStage stage(params);
+                const auto one = stage.getWorkspaceRequirements(9);
+                ASSERT_EQ(one.buffers.size(), 6u);
+                for (const auto &descriptor : one.buffers)
+                {
+                    EXPECT_TRUE(descriptor.name.ends_with("_layer" + std::to_string(layer)));
+                    EXPECT_EQ(descriptor.alignment, 256u);
+                    EXPECT_TRUE(descriptor.required);
+                    EXPECT_EQ(descriptor.regime, WorkspaceExecutionRegime::Any);
+                    EXPECT_EQ(descriptor.content_lifetime, WorkspaceContentLifetime::ParticipantExecution);
+                }
+                actual_stages.merge(one);
+            }
+            EXPECT_EQ(actual_stages.buffers.size(), layers.size() * 6u);
+            const auto handoff_bytes = actual_stages.total_bytes_with_alignment();
+            if (degree == 4 && first_layer == 0)
+            {
+                EXPECT_EQ(handoff_bytes, 264757248u);
+            }
+            for (const auto [batch, rows] : {std::pair{1, 1}, std::pair{1, 9},
+                                           std::pair{1, 512}, std::pair{2, 1}})
+            {
+                auto cfg = overlayDeviceConfig(first);
+                cfg.world_rank = -1;
+                cfg.device_total_bytes = cfg.device_free_bytes = 1ull << 40;
+                cfg.total_shards = degree;
+                cfg.local_tp_backend = backend;
+                cfg.bindTensorParallelAssignment(assignment.forRank(0));
+                cfg.first_layer = first_layer;
+                cfg.last_layer = last_layer;
+                cfg.max_seq_len = 4096;
+                cfg.activation_seq_len = rows;
+                cfg.batch_size = batch;
+                cfg.weight_residency = DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+                    profile.expert_count, std::vector<int>(static_cast<size_t>(profile.n_layers), 0));
+                cfg.ngram_execution_policy = ImmutableRowTablePolicy{ImmutableRowStoragePreference::RAM, 65536, 1024};
+                cfg.ngram_host_placement = ImmutableRowTableHostPlacement::fromObservedNUMANode(0);
+                cfg.associated_host_memory = PhysicalMemoryResource{
+                    .world_rank = -1, .device = DeviceId::cpu(),
+                    .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
+                const auto find = [&](const MemoryPlan &plan) -> const DeviceMemoryPlan * {
+                    for (const auto &device : plan.devices)
+                        if (device.device() == first) return &device;
+                    return nullptr;
+                };
+                const auto primary = MemoryPlanner::plan(profile, {cfg});
+                cfg.additional_weight_sets = {AdditionalPersistentWeightSet::ReplicatedDenseDecode};
+                const auto phase_split = MemoryPlanner::plan(profile, {cfg});
+                const auto *before = find(primary);
+                const auto *after = find(phase_split);
+                ASSERT_NE(before, nullptr);
+                ASSERT_NE(after, nullptr);
+                if (batch * rows > 1)
+                {
+                    EXPECT_GE(after->workspace_bytes(), before->workspace_bytes() + handoff_bytes)
+                        << "participant=" << first.toString() << " batch=" << batch << " rows=" << rows << " degree=" << degree;
+                }
+                auto without_native = cfg;
+                without_native.local_tp_backend.reset();
+                const auto nonlocal = MemoryPlanner::plan(profile, {without_native});
+                const auto *without = find(nonlocal);
+                ASSERT_NE(without, nullptr);
+                EXPECT_EQ(after->workspace_bytes() - without->workspace_bytes(), batch * rows > 1 ? handoff_bytes : 0u);
+
+                if (first_layer == 0)
+                {
+                    auto implicit_end = cfg;
+                    implicit_end.last_layer = -1;
+                    const auto default_scope = MemoryPlanner::plan(profile, {implicit_end});
+                    ASSERT_NE(find(default_scope), nullptr);
+                    EXPECT_EQ(find(default_scope)->workspace_bytes(), after->workspace_bytes());
+                }
+
+                // The same declared maximum layout is not a linked-local
+                // producer when its original primary assignment is already full.
+                auto full = assignment.forRank(0);
+                full.head_start = 0; full.head_count = profile.n_heads;
+                full.kv_head_start = 0; full.kv_head_count = profile.n_kv_heads;
+                full.d_ff_start = 0; full.d_ff_count = profile.d_ff;
+                full.vocab_start = 0; full.vocab_count = profile.vocab_size;
+                auto full_primary = cfg;
+                full_primary.bindTensorParallelAssignment(full);
+                const auto full_native = MemoryPlanner::plan(profile, {full_primary});
+                full_primary.local_tp_backend.reset();
+                const auto full_nonlocal = MemoryPlanner::plan(profile, {full_primary});
+                ASSERT_NE(find(full_native), nullptr);
+                ASSERT_NE(find(full_nonlocal), nullptr);
+                EXPECT_EQ(find(full_native)->workspace_bytes(), find(full_nonlocal)->workspace_bytes());
+            }
+        }
+    }
+
+    // A scalar CPU primary cannot request a TP replica sidecar. Preserve this
+    // original admission guard instead of fabricating native CPU membership.
+    auto cpu = overlayDeviceConfig(DeviceId::cpu());
+    cpu.world_rank = -1;
+    cpu.device_total_bytes = cpu.device_free_bytes = 1ull << 40;
+    cpu.total_shards = 1;
+    cpu.first_layer = 0;
+    cpu.last_layer = profile.mainLayerCount() - 1;
+    cpu.activation_seq_len = 9;
+    cpu.additional_weight_sets = {AdditionalPersistentWeightSet::ReplicatedDenseDecode};
+    EXPECT_THROW((void)MemoryPlanner::plan(profile, {cpu}), std::invalid_argument);
 }

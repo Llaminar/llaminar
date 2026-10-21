@@ -3579,6 +3579,15 @@ namespace llaminar2::test::parity
             setenv(name, value.c_str(), 1);
         }
 
+    protected:
+        /**
+         * @brief Restore this fixture's environment and refresh its parsed controls.
+         *
+         * Full fixtures call this from TearDown after native retirement. A
+         * metadata-only derived probe uses the same cleanup without entering
+         * the model lifecycle or touching backend caches. Repeated cleanup is
+         * harmless because the saved values are consumed exactly once.
+         */
         void restoreParityEnvOverrides()
         {
             for (auto it = parity_env_overrides_.rbegin();
@@ -3594,7 +3603,6 @@ namespace llaminar2::test::parity
             mutableDebugEnv().reload();
         }
 
-    protected:
         class ParityProfileScope
         {
         public:
@@ -6898,6 +6906,23 @@ namespace llaminar2::test::parity
         virtual ParityRunnerEvidenceLifetime productionParityRunnerEvidenceLifetime() const
         {
             return ParityRunnerEvidenceLifetime::FreshRunner;
+        }
+
+        /**
+         * @brief Freeze standalone snapshot admission at its explicit history geometry.
+         *
+         * Fixture SetUp precedes the GTest body, so an isolated SnapshotAdmission
+         * has not yet entered the production evidence lifetime when SetUp first
+         * resolves graph buckets. Activate that lifetime before reusing the exact
+         * production bucket resolver, then initialize the runner. Explicit frozen
+         * replay still selects its original serving ladder, including M512.
+         * No checkpoint, allocation owner or numerical policy is changed here.
+         * @note Callers must propagate a fatal geometry assertion before setup.
+         */
+        void beginProductionParitySnapshotAdmission()
+        {
+            beginProductionParityEvidence();
+            configureExactProductionParityPrefillGraphBucket();
         }
 
         /** @brief Reset cell work while respecting authenticated runner ownership. */

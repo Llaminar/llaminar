@@ -17,6 +17,7 @@
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include <cstddef>
 #include <optional>
+#include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
 
 namespace llaminar2
 {
@@ -55,6 +56,14 @@ struct WorkspaceMemoryGeometry
     int first_layer = 0; ///< First model layer owned by this participant.
     int last_layer = -1; ///< Last model layer owned by this participant.
     int total_shards = 1; ///< Tensor-parallel degree for local dimensions.
+    /**
+     * Original native LocalTP prefill-to-replicated-decode handoff. Presence
+     * comes from the continuation's explicit phase policy, local collective and
+     * linked primary assignment; full maximum workspace widths never infer it.
+     * Its named per-layer banks coexist with ordinary scratch and are separate
+     * from kernel-owned live recurrent state. CPU/non-native/no-prefill is absent.
+     */
+    std::optional<gdn_live_state_workspace::Geometry> gdn_live_state_handoff;
     bool apportioned_routed_experts = false; ///< Experts are whole-owner slices, not TP slices.
     /**
      * @brief Whether backend dispatch may be queried on this local device.

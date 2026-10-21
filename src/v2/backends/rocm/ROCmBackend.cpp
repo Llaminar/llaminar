@@ -25,6 +25,7 @@
 #include "../../transfer/MappedTransferProgressABI.h"
 #include "../../transfer/CapturedTransferChannelProtocol.h"
 #include "../../transfer/CapturedTransferKernelPlan.h"
+#include "../../transfer/CapturedTransferChannelBatch.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/rocm/ops/ROCmRowSelectKernels.h"
 #include <hip/hip_runtime.h>
@@ -5981,6 +5982,9 @@ namespace llaminar2
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferCopyPublishKernel<false>)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferFusedKernel<true>)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferFusedKernel<false>)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchFusedKernel)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchAcquireKernel)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferBatchCopyPublishKernel)) != hipSuccess ||
             hipDeviceGetAttribute(&clock_khz, hipDeviceAttributeWallClockRate, device_id) != hipSuccess || clock_khz <= 0)
             return false;
         // wall_clock64 uses this fixed-rate clock. Shader clockRate is a
@@ -6019,6 +6023,37 @@ namespace llaminar2
         else
             hipLaunchKernelGGL(capturedTransferCopyPublishKernel<false>, dim3(mappedHostCopyBlocks(binding.message.bytes)),
                 dim3(kMappedHostCopyThreads), 0, native, binding, destination, source);
+        return hipGetLastError() == hipSuccess;
+    }
+
+    bool ROCmBackend::enqueueCapturedTransferChannelBatch(
+        const CapturedTransferChannelBatch &original, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "ROCmBackend::enqueueCapturedTransferChannelBatch");
+        if (!original.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
+        auto batch = original;
+        unsigned maximum_blocks = 1;
+        bool single = true;
+        for (unsigned i = 0; i < batch.count; ++i)
+        {
+            auto &entry = batch.entries[i];
+            entry.vector_aligned = reinterpret_cast<std::uintptr_t>(entry.destination) % alignof(uint4) == 0 &&
+                reinterpret_cast<std::uintptr_t>(entry.source) % alignof(uint4) == 0;
+            const auto bytes = entry.binding.message.bytes;
+            entry.copy_blocks = entry.vector_aligned
+                ? mappedHostCopyBlocks(bytes / sizeof(uint4) + (bytes % sizeof(uint4) != 0))
+                : mappedHostCopyBlocks(bytes);
+            if (entry.copy_blocks > maximum_blocks) maximum_blocks = entry.copy_blocks;
+            single = single && capturedTransferKernelPlan(bytes) == CapturedTransferKernelPlan::SingleBlock;
+        }
+        if (single)
+            hipLaunchKernelGGL(capturedTransferBatchFusedKernel, dim3(1, batch.count), dim3(kMappedHostCopyThreads), 0, native, batch);
+        else
+        {
+            hipLaunchKernelGGL(capturedTransferBatchAcquireKernel, dim3(1, batch.count), dim3(64), 0, native, batch);
+            if (hipGetLastError() != hipSuccess) return false;
+            hipLaunchKernelGGL(capturedTransferBatchCopyPublishKernel, dim3(maximum_blocks, batch.count), dim3(kMappedHostCopyThreads), 0, native, batch);
+        }
         return hipGetLastError() == hipSuccess;
     }
 

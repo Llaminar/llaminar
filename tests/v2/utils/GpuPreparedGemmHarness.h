@@ -26,6 +26,10 @@
  * (which owns the kernel handle). Keep the struct alive for as long as the
  * returned `kernel` pointer is used.
  *
+ * Batch setup retains independent prepared stores/handles while sharing one
+ * device-local production pool/staging lifecycle across immutable source jobs.
+ * No source bytes, quantization or timed execution is replaced.
+ *
  * Thread-safety: not thread-safe. Intended for single-threaded test setup.
  */
 
@@ -39,6 +43,11 @@
 
 #include "PreparedWeightTestHarness.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <limits>
+#include <vector>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -509,6 +518,106 @@ namespace llaminar2::test
             throw std::runtime_error("makeGpuPreparedGemm: gemmKernel returned null after registration");
 
         return out;
+    }
+
+    /**
+     * @brief Prepare immutable quantized test matrices through one production load batch.
+     * @param weights Original host tensors/views, retained unchanged by the caller.
+     * @param device Exact GPU owning every independent resulting prepared handle.
+     * @param canonical_prefix Unique names within this device-local pool.
+     * @param model_id Existing prepared-store lifetime identity.
+     * @return One ordinary prepared owner per input, in the same order.
+     * @throws std::runtime_error For unsupported source/device, geometry or loading failure.
+     *
+     * All jobs use the same intrinsic format/asymmetry rules as makeGpuPreparedGemm.
+     * Plan once, allocate one pool plus the existing three pinned staging slots,
+     * upload/repack once through LoadOrchestrator, then bind every original source
+     * through KernelFactory. Each returned store/kernel is independent and retains
+     * the shared pool. A thrown setup unwinds stores before the last pool owner.
+     * This fixture-only batching removes repeated cold infrastructure, not work.
+     */
+    inline std::vector<GpuPreparedGemm> makeGpuPreparedGemmBatch(
+        const std::vector<TensorBase *> &weights, DeviceId device,
+        const std::string &canonical_prefix = "test.gpu_prepared_batch",
+        ModelContextId model_id = ModelContextId{9900})
+    {
+        namespace kf = llaminar::v2::kernels;
+        if (weights.empty() || canonical_prefix.empty() || (!device.is_cuda() && !device.is_rocm()))
+            throw std::runtime_error("makeGpuPreparedGemmBatch: nonempty quantized GPU sources required");
+        auto *backend = getBackendFor(device);
+        if (!backend) throw std::runtime_error("makeGpuPreparedGemmBatch: exact backend unavailable");
+        auto owner = std::make_shared<LoadOrchestrator>(backend, kTestOnlyUnadmittedGPUAllocation);
+        owner->addDevice(device.ordinal);
+        std::vector<WeightJob> jobs;
+        jobs.reserve(weights.size());
+        size_t maximum_raw_bytes = 0;
+        const auto started = std::chrono::steady_clock::now();
+        for (size_t index = 0; index < weights.size(); ++index)
+        {
+            auto *source = weights[index];
+            const auto *unpackable = dynamic_cast<IINT8Unpackable *>(source);
+            const auto *format = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!source || !format || source->shape().size() != 2 || !source->raw_data() ||
+                source->rows() == 0 || source->cols() == 0 ||
+                source->rows() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+                source->cols() > static_cast<size_t>(std::numeric_limits<int>::max()))
+                throw std::runtime_error("makeGpuPreparedGemmBatch: invalid original native source");
+            const size_t raw_bytes = quantizedRawBytesForGpuPreparedTest(*source);
+            const auto repack = codebookIdToRepackFormat(format->codebook_id, format->is_superblock);
+            if (!raw_bytes || !repack)
+                throw std::runtime_error("makeGpuPreparedGemmBatch: unsupported original source layout");
+            WeightJob job;
+            job.name = canonical_prefix + "." + std::to_string(index);
+            job.host_raw_data = source->raw_data(); job.raw_bytes = raw_bytes;
+            job.format = *repack; job.N = static_cast<int>(source->rows()); job.K = static_cast<int>(source->cols());
+            job.is_asymmetric = canonicalDeviceVnniFormat(*format).is_asymmetric;
+            owner->planWeight(device.ordinal, job.name, job.N, job.K, format->payload_bytes,
+                job.is_asymmetric, format->has_emins, raw_bytes);
+            maximum_raw_bytes = std::max(maximum_raw_bytes, raw_bytes);
+            jobs.push_back(std::move(job));
+        }
+        std::fprintf(stderr, "PROJECTION_SETUP,phase=batch_allocate,device=%s,matrices=%zu,staging_slots=3,maximum_raw_bytes=%zu\n",
+            device.toString().c_str(), weights.size(), maximum_raw_bytes);
+        std::fflush(stderr);
+        owner->allocate(maximum_raw_bytes, 3);
+        for (const auto &job : jobs) owner->addWeightJob(device.ordinal, job);
+        size_t last_report = 0;
+        owner->load([&](size_t staged, size_t total) {
+            // Callback observes completed HOST staging copies, not GPU completion.
+            // Bounded quarter-progress records stay outside every capture/timing.
+            if (staged == total || staged - std::min(staged, last_report) >= std::max(size_t{1}, total / 4))
+            {
+                last_report = staged;
+                std::fprintf(stderr, "PROJECTION_SETUP,phase=batch_host_staging,device=%s,staged_bytes=%zu,total_bytes=%zu,elapsed_seconds=%.3f\n",
+                    device.toString().c_str(), staged, total,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+                std::fflush(stderr);
+            }
+        });
+        std::vector<GpuPreparedGemm> result(weights.size());
+        for (size_t index = 0; index < weights.size(); ++index)
+        {
+            auto &out = result[index]; auto *source = weights[index];
+            out.orchestrator = owner;
+            auto kernel = kf::KernelFactory::createGemmFromGPUWeightPool(*source, device, owner, jobs[index].name);
+            const auto kind = device.is_cuda() ? kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
+                                              : kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
+            auto prepared = std::make_shared<kf::KernelFactory::PreparedGemmWeights>();
+            prepared->kind = kind; prepared->owned_kernel = std::shared_ptr<ITensorGemm>(std::move(kernel));
+            prepared->kernel = prepared->owned_kernel.get();
+            auto handle = std::make_shared<kf::KernelFactory::PreparedGemmHandle>();
+            handle->tensor = source; handle->device_id = device; handle->kind = kind;
+            handle->variant = static_cast<int>(source->native_type()); handle->prepared_weights = std::move(prepared);
+            out.store = std::make_unique<PreparedWeightStore>(model_id);
+            out.binding = makePreparedWeightTestBinding(source, device, jobs[index].name, model_id);
+            out.ref = out.store->registerPreparedGemmHandle(out.binding, preparedKindForDevice(device), device, std::move(handle));
+            out.kernel = out.store->gemmKernel(out.ref);
+            if (!out.kernel) throw std::runtime_error("makeGpuPreparedGemmBatch: original prepared handle unresolved");
+        }
+        std::fprintf(stderr, "PROJECTION_SETUP,phase=batch_prepared,device=%s,matrices=%zu,elapsed_seconds=%.3f\n",
+            device.toString().c_str(), weights.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+        std::fflush(stderr);
+        return result;
     }
 
     /**

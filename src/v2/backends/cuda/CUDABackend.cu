@@ -23,6 +23,7 @@
 #include "../../transfer/MappedTransferProgressABI.h"
 #include "../../transfer/CapturedTransferChannelProtocol.h"
 #include "../../transfer/CapturedTransferKernelPlan.h"
+#include "../../transfer/CapturedTransferChannelBatch.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDARowSelectKernels.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
@@ -5905,7 +5906,10 @@ namespace llaminar2
             cudaFuncGetAttributes(&attributes, capturedTransferCopyPublishKernel<true>) != cudaSuccess ||
             cudaFuncGetAttributes(&attributes, capturedTransferCopyPublishKernel<false>) != cudaSuccess ||
             cudaFuncGetAttributes(&attributes, capturedTransferFusedKernel<true>) != cudaSuccess ||
-            cudaFuncGetAttributes(&attributes, capturedTransferFusedKernel<false>) != cudaSuccess)
+            cudaFuncGetAttributes(&attributes, capturedTransferFusedKernel<false>) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferBatchFusedKernel) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferBatchAcquireKernel) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferBatchCopyPublishKernel) != cudaSuccess)
             return false;
         // The graph wait uses %globaltimer nanoseconds, not a DVFS-dependent
         // SM cycle count or a queried maximum shader frequency.
@@ -5943,6 +5947,37 @@ namespace llaminar2
         else
             capturedTransferCopyPublishKernel<false><<<mappedHostCopyBlocks(binding.message.bytes),
                 kMappedHostCopyThreads, 0, native>>>(binding, destination, source);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    bool CUDABackend::enqueueCapturedTransferChannelBatch(
+        const CapturedTransferChannelBatch &original, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "CUDABackend::enqueueCapturedTransferChannelBatch");
+        if (!original.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
+        auto batch = original;
+        unsigned maximum_blocks = 1;
+        bool single = true;
+        for (unsigned i = 0; i < batch.count; ++i)
+        {
+            auto &entry = batch.entries[i];
+            entry.vector_aligned = reinterpret_cast<std::uintptr_t>(entry.destination) % alignof(uint4) == 0 &&
+                reinterpret_cast<std::uintptr_t>(entry.source) % alignof(uint4) == 0;
+            const auto bytes = entry.binding.message.bytes;
+            entry.copy_blocks = entry.vector_aligned
+                ? mappedHostCopyBlocks(bytes / sizeof(uint4) + (bytes % sizeof(uint4) != 0))
+                : mappedHostCopyBlocks(bytes);
+            if (entry.copy_blocks > maximum_blocks) maximum_blocks = entry.copy_blocks;
+            single = single && capturedTransferKernelPlan(bytes) == CapturedTransferKernelPlan::SingleBlock;
+        }
+        if (single)
+            capturedTransferBatchFusedKernel<<<dim3(1, batch.count), kMappedHostCopyThreads, 0, native>>>(batch);
+        else
+        {
+            capturedTransferBatchAcquireKernel<<<dim3(1, batch.count), 32, 0, native>>>(batch);
+            if (cudaGetLastError() != cudaSuccess) return false;
+            capturedTransferBatchCopyPublishKernel<<<dim3(maximum_blocks, batch.count), kMappedHostCopyThreads, 0, native>>>(batch);
+        }
         return cudaGetLastError() == cudaSuccess;
     }
 

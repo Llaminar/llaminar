@@ -46,11 +46,14 @@ namespace llaminar2
          * @param source Ordered domain participant.
          * @throws std::out_of_range For a foreign participant. */
         [[nodiscard]] std::uint64_t *extent(std::size_t source) const;
+        /** @return Immutable capture/message scheduling, never a replay-time selection. */
+        [[nodiscard]] CapturedTransferEndpointScheduling scheduling() const noexcept { return scheduling_; }
 
     private:
         friend class DeviceCountedAllGather;
         std::shared_ptr<class DeviceCountedAllGather> owner_;
         std::size_t participant_ = 0;
+        CapturedTransferEndpointScheduling scheduling_ = CapturedTransferEndpointScheduling::Individual; ///< Set only by bind().
         std::vector<CapturedTransferBinding> sends_, receives_;
         ITensor *received_ = nullptr; ///< Borrowed canonical owner retained by receives_.
     };
@@ -89,6 +92,7 @@ namespace llaminar2
         /** @brief Bind existing participant-local arena banks to one semantic message.
          * @param participant Exact communicator coordinate, not physical ordinal.
          * @param message Frozen semantic identity and maximum payload for this graph.
+         * @param scheduling Mandatory launch policy, incorporated into the channel message key.
          * @param local Producer bank; its existing bits are transmitted unchanged.
          * @param received Peer-major bank, excluding this participant's local packet.
          * @throws std::invalid_argument For foreign/aliased or insufficient storage.
@@ -97,7 +101,8 @@ namespace llaminar2
          * The physical stride is message.bytes; acquired counts restrict reads.
          */
         [[nodiscard]] DeviceCountedAllGatherBinding bind(std::size_t participant,
-            CapturedTransferMessage message, std::shared_ptr<ITensor> local, std::shared_ptr<ITensor> received);
+            CapturedTransferMessage message, CapturedTransferEndpointScheduling scheduling,
+            std::shared_ptr<ITensor> local, std::shared_ptr<ITensor> received);
         /** @return Immutable ordered GPU membership. */
         [[nodiscard]] const std::vector<DeviceId> &devices() const noexcept { return devices_; }
         /** @return Admitted per-message capacity, never the next replay's length. */

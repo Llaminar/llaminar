@@ -20488,6 +20488,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 LABELS "V2;Performance;ROCm;MoE;RCCL;GraphCapture;ByteExact"
                 MPI_PROCS 1 TIMEOUT 120 NO_MODELS)
         endforeach()
+        foreach(projection_source IN ITEMS SyntheticQ8_0 SyntheticQ4_K_Q5_1
+                SyntheticQ4_1_Q5_1 SyntheticIQ2S_IQ4NL)
+            add_v2_test(V2_Perf_MoEProjectionPipeline_A1_${projection_source}
+                COMMAND $<TARGET_FILE:v2_perf_moe_projection_pipeline>
+                    --gtest_filter=MoEProjectionPipelineA1Perf.${projection_source}
+                LABELS "V2;Performance;ROCm;MoE;RCCL;GraphCapture;ByteExact;LiveExtent;SyntheticA1Geometry"
+                MPI_PROCS 1 TIMEOUT 120 NO_MODELS)
+        endforeach()
         add_v2_test(V2_Integration_MoEProjectionPipeline_ROCm4
             COMMAND $<TARGET_FILE:v2_integration_moe_projection_pipeline>
                 --gtest_filter=MoEProjectionPipeline.ROCm4
@@ -24349,6 +24357,12 @@ add_v2_test(V2_Integration_PhaseSplitDenseMemoryAdmission
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_ReplicatedGDNLiveStateWorkspaceAdmission
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.ReplicatedDecodeIncludesActualGDNHandoffWorkspace
+    LABELS "V2;Integration;ProductionTestPreflight;Planning;CUDA;ROCm;DeviceFree;Qwen4Exp;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 add_v2_test(V2_Integration_RecurrentOnlyPipelineMemoryAdmission
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=Test__MemoryPlanner.RecurrentOnlyPipelineFollowerOwnsSequenceMetadata
@@ -25150,6 +25164,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ExpertOverlayRetirementProgress
     V2_Integration_ExpertOverlayRetirementProgress_MPI
     V2_Integration_PhaseSplitDenseMemoryAdmission
+    V2_Integration_ReplicatedGDNLiveStateWorkspaceAdmission
     V2_Integration_PhaseSplitDenseGDNResolverGeometry
     V2_Integration_PhaseSplitAttentionSnapshotGeometry
     V2_Integration_PhaseSplitEmbeddingSnapshotGeometry
@@ -30192,6 +30207,17 @@ if(NOT V2_PERF_TESTS_ONLY)
     if(TEST V2_Integration_TwoTermAllFormatsSourceMetadataAndTinyCPU)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TwoTermAllFormatsSourceMetadataAndTinyCPU)
     endif()
+    # Regression owns the saved original-source construction seam used by perf.
+    # Q8_1 requires its existing typed raw-byte factory; all21 keep exact blocks.
+    add_v2_test(V2_Integration_TwoTermSavedOriginalSourceFactory
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=Q8ResidualAllFormats.SavedOriginalSourceFactoryPreservesEveryFormat
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;AllFormats;TwoTermQ8;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    if(TEST V2_Integration_TwoTermSavedOriginalSourceFactory)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TwoTermSavedOriginalSourceFactory)
+    endif()
     foreach(V2_TT_ISA IN ITEMS Default AVX2)
         set(V2_TT_CPU_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_DYNAMIC=false")
         if(V2_TT_ISA STREQUAL "AVX2")
@@ -30276,6 +30302,164 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_qwen4exp_device_primitives)
         endif()
     endforeach()
 endif()
+
+# Captured batches retain each endpoint's live count, publication and ownership.
+# Register the alias checks and every available backend order explicitly.
+if(NOT V2_PERF_TESTS_ONLY)
+    if(TARGET v2_test_captured_transfer_channel_binding)
+        add_v2_test(V2_Integration_CapturedEndpointBatchBinding
+            COMMAND $<TARGET_FILE:v2_test_captured_transfer_channel_binding>
+                --gtest_filter=CapturedTransferChannelBindingTest.BatchesRetainExactOriginalOwnersAndRejectBeforeAnySubmission:CapturedTransferChannelBindingTest.BatchConsumerCountsRejectAllCrossEndpointAliasesBeforeEnqueue
+            LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+        if(TEST V2_Integration_CapturedEndpointBatchBinding)
+            set_property(TEST V2_Integration_CapturedEndpointBatchBinding APPEND PROPERTY ENVIRONMENT
+                "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedEndpointBatchBinding)
+        endif()
+    endif()
+    if(TARGET v2_integration_captured_transfer_channel)
+        foreach(_batch_pair CUDA_CUDA ROCm_ROCm CUDA_ROCm ROCm_CUDA)
+            if((_batch_pair STREQUAL "CUDA_CUDA" AND HAVE_CUDA) OR
+               (_batch_pair STREQUAL "ROCm_ROCm" AND HAVE_ROCM) OR
+               (HAVE_CUDA AND HAVE_ROCM))
+                string(REPLACE "_" ";" _batch_backends "${_batch_pair}")
+                list(REMOVE_DUPLICATES _batch_backends)
+                add_v2_test(V2_Integration_CapturedEndpointBatch_${_batch_pair}
+                    COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
+                        --gtest_filter=DeviceCountedTransferChannel.${_batch_pair}_BatchedEndpoints
+                    LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_batch_backends};Regression"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+                if(TEST V2_Integration_CapturedEndpointBatch_${_batch_pair})
+                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedEndpointBatch_${_batch_pair})
+                endif()
+            endif()
+        endforeach()
+    endif()
+endif()
+
+# Insert before the canonical V2_PRODUCTION_TEST_PREFLIGHT_TESTS finalizer.
+# Existing targets own all source files; no new backend executable or model.
+if(NOT V2_PERF_TESTS_ONLY)
+    if(TARGET v2_test_captured_transfer_channel_binding)
+        add_v2_test(V2_Integration_CapturedTransferPhaseScheduling
+            COMMAND $<TARGET_FILE:v2_test_captured_transfer_channel_binding>
+                --gtest_filter=CapturedTransferScheduling.*:CapturedTransferChannelBindingTest.ScheduledExchangePrevalidatesBothPhases
+            LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+        if(TEST V2_Integration_CapturedTransferPhaseScheduling)
+            set_property(TEST V2_Integration_CapturedTransferPhaseScheduling APPEND PROPERTY ENVIRONMENT
+                "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedTransferPhaseScheduling)
+        endif()
+    endif()
+    if(TARGET v2_integration_moe_projection_pipeline)
+        foreach(_phase_backend CUDA2 ROCm2 ROCm4)
+            if((_phase_backend STREQUAL "CUDA2" AND HAVE_CUDA) OR
+               (NOT _phase_backend STREQUAL "CUDA2" AND HAVE_ROCM))
+                if(_phase_backend STREQUAL "CUDA2")
+                    set(_phase_backend_label CUDA)
+                else()
+                    set(_phase_backend_label ROCm)
+                endif()
+                add_v2_test(V2_Integration_MoEProjectionPhaseScheduling_${_phase_backend}
+                    COMMAND $<TARGET_FILE:v2_integration_moe_projection_pipeline>
+                        --gtest_filter=MoEProjectionPhaseScheduling.${_phase_backend}
+                    LABELS "V2;Integration;ProductionTestPreflight;LocalTP;MoE;GraphCapture;ByteExact;${_phase_backend_label};Regression"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+                if(TEST V2_Integration_MoEProjectionPhaseScheduling_${_phase_backend})
+                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionPhaseScheduling_${_phase_backend})
+                endif()
+            endif()
+        endforeach()
+    endif()
+endif()
+# Existing V2_Integration_MoERouterOwnedExchange_{CUDA2,ROCm2,ROCm4} aliases
+# retain the updated ordinary-prefill individual graph proof; rerun all three.
+
+# The explicit policy comparison shares the original QFN source and parser;
+# admission and model accuracy remain separate native parity obligations.
+if(TARGET v2_test_model_parity_definition)
+    target_sources(v2_test_model_parity_definition PRIVATE
+        unit/parity/Test__Qwen4ExpROCm4OverlayPolicyParity.cpp)
+    add_v2_test(V2_Integration_Qwen4ExpROCm4OverlayPolicy
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpROCm4OverlayPolicy.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Ownership;Parity;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    if(TEST V2_Integration_Qwen4ExpROCm4OverlayPolicy)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpROCm4OverlayPolicy)
+    endif()
+endif()
+
+# Standalone snapshot setup selects exact or frozen history geometry before
+# runner admission. The host-only probe exercises the actual fixture API.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpSnapshotAdmissionGeometry
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=FrozenParityHistoryReplay.StandaloneSnapshotAdmission*
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Qwen4Exp;Parity;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    if(TEST V2_Integration_Qwen4ExpSnapshotAdmissionGeometry)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpSnapshotAdmissionGeometry)
+    endif()
+endif()
+
+# Existing native context targets; construction/tasks only, no model or kernel.
+foreach(_aff_backend CUDA ROCm)
+    if(_aff_backend STREQUAL "CUDA")
+        set(_aff_target v2_test_gpu_device_context_cuda)
+        set(_aff_suite Test__NvidiaDeviceContext)
+    else()
+        set(_aff_target v2_test_gpu_device_context_rocm)
+        set(_aff_suite Test__AMDDeviceContext)
+    endif()
+    if(TARGET ${_aff_target} AND NOT V2_PERF_TESTS_ONLY)
+        foreach(_aff_binding close false)
+            if(_aff_binding STREQUAL "close")
+                set(_aff_label Bound)
+            else()
+                set(_aff_label Unbound)
+            endif()
+            add_v2_test(V2_Integration_BackendOwnedWorkerAffinity_${_aff_backend}_${_aff_label}
+                COMMAND ${CMAKE_COMMAND} -E env
+                    OMP_PROC_BIND=${_aff_binding} OMP_PLACES=cores OMP_NUM_THREADS=2 OMP_DYNAMIC=false
+                    $<TARGET_FILE:${_aff_target}>
+                    --gtest_filter=${_aff_suite}.OwnedWorkerInheritsPartitionAndRestoresParent
+                LABELS "V2;Integration;ProductionTestPreflight;${_aff_backend};Backends;Threading;Lifecycle;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+            if(TEST V2_Integration_BackendOwnedWorkerAffinity_${_aff_backend}_${_aff_label})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                    V2_Integration_BackendOwnedWorkerAffinity_${_aff_backend}_${_aff_label})
+            endif()
+        endforeach()
+    endif()
+endforeach()
+
+# Insert before the canonical preflight target/label finalizer. Existing Unit
+# target owns these device-free actual-worker tests; no GPU/mock backend init.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_unit_tp_worker_pool)
+    foreach(_control_affinity close false)
+        if(_control_affinity STREQUAL "close")
+            set(_control_affinity_name Bound)
+        else()
+            set(_control_affinity_name Unbound)
+        endif()
+        add_v2_test(V2_Integration_GPUControlWorkerAffinity${_control_affinity_name}
+            COMMAND ${CMAKE_COMMAND} -E env
+                OMP_PROC_BIND=${_control_affinity} OMP_PLACES=cores OMP_NUM_THREADS=2
+                $<TARGET_FILE:v2_unit_tp_worker_pool> --gtest_filter=TPWorkerAffinity.*
+            LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Threading;LocalTP;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+        if(TEST V2_Integration_GPUControlWorkerAffinity${_control_affinity_name})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GPUControlWorkerAffinity${_control_affinity_name})
+        endif()
+    endforeach()
+endif()
+# Retain/rerun existing HTTPServiceThreadAffinity{,Unbound}; its semantic alias
+# now uses the same shared RAII implementation rather than a second algorithm.
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})

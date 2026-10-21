@@ -25,6 +25,7 @@
 #include "planning/ActivationMemoryEstimator.h"
 #include "planning/CollectiveMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "kernels/HybridGDNStateGeometry.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
@@ -1620,6 +1621,36 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     "continuation local-expert compact tensors");
             }
 
+            // Only the actual phase-split native LocalTP prefill owns linked
+            // state handoff stages. Preserve its original primary assignment;
+            // the full maximum-width workspace descriptor is a different role.
+            std::optional<gdn_live_state_workspace::Geometry> gdn_handoff;
+            if (cfg.device.is_gpu() && replicated_dense_decode && cfg.batch_size > 0 &&
+                checkedMultiply(static_cast<size_t>(cfg.batch_size),
+                    static_cast<size_t>(activation_seq), "GDN handoff flattened rows") > 1u &&
+                cfg.total_shards > 1 && cfg.local_tp_backend &&
+                (*cfg.local_tp_backend == CollectiveBackendType::NCCL ||
+                 *cfg.local_tp_backend == CollectiveBackendType::RCCL) &&
+                profile.gdn_state_size > 0 && profile.gdn_conv_kernel_size > 1)
+            {
+                const auto primary = HybridGDNStateGeometry::resolve(profile.n_heads,
+                    local_query_head_start, local_query_heads, profile.gdn_group_count,
+                    profile.gdn_time_step_rank, profile.gdn_state_size,
+                    profile.gdn_inner_size, profile.gdn_conv_kernel_size);
+                const gdn_live_state_workspace::Geometry candidate{
+                    .degree = cfg.total_shards,
+                    .state = {.global_key_heads = primary.full_key_heads,
+                        .global_value_heads = primary.full_value_heads,
+                        .key_width = primary.d_k, .value_width = primary.d_v,
+                        .conv_history_length = profile.gdn_conv_kernel_size - 1}};
+                const auto conv = candidate.state.resolve(GDNLinkedLiveStateKind::ConvHistory, candidate.degree);
+                const auto recurrence = candidate.state.resolve(GDNLinkedLiveStateKind::Recurrence, candidate.degree);
+                if (conv && recurrence &&
+                    primary.local_conv_state_floats == conv->local_state_floats &&
+                    primary.local_recurrence_state_floats == recurrence->local_state_floats &&
+                    primary.local_recurrence_state_floats != primary.full_recurrence_state_floats)
+                    gdn_handoff = candidate;
+            }
             // Workspace estimation
             workspace_bytes = WorkspaceMemoryEstimator::estimate(
                 profile,
@@ -1667,6 +1698,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     .first_layer = cfg.first_layer,
                     .last_layer = last_layer,
                     .total_shards = cfg.total_shards,
+                    .gdn_live_state_handoff = gdn_handoff,
                     .apportioned_routed_experts =
                         cfg.weight_residency.selectsRoutedExperts(),
                     .runtime_device_policy_available =

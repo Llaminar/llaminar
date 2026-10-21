@@ -73,8 +73,10 @@ std::shared_ptr<DeviceCountedAllGather> DeviceCountedAllGather::create(
 }
 
 DeviceCountedAllGatherBinding DeviceCountedAllGather::bind(std::size_t participant,
-    CapturedTransferMessage message, std::shared_ptr<ITensor> local, std::shared_ptr<ITensor> received)
+    CapturedTransferMessage message, CapturedTransferEndpointScheduling scheduling,
+    std::shared_ptr<ITensor> local, std::shared_ptr<ITensor> received)
 {
+    message.key = capturedTransferEndpointSchedulingKey(message.key, scheduling);
     if (isGraphCaptureActive() || participant >= devices_.size() || !message.fits(capacity_) ||
         !local || !received || local.get() == received.get() || local->size_bytes() < message.bytes ||
         received->size_bytes() < multiply(devices_.size() - 1, message.bytes))
@@ -94,6 +96,7 @@ DeviceCountedAllGatherBinding DeviceCountedAllGather::bind(std::size_t participa
     DeviceCountedAllGatherBinding binding;
     binding.owner_ = shared_from_this();
     binding.participant_ = participant;
+    binding.scheduling_ = scheduling;
     binding.received_ = received.get();
     auto &transfer = TransferEngine::instance();
     for (std::size_t peer = 0; peer < devices_.size(); ++peer)
@@ -115,8 +118,7 @@ void DeviceCountedAllGatherBinding::enqueue(void *stream) const
     if (!owner_ || !stream || sends_.empty() || sends_.size() != receives_.size())
         throw std::invalid_argument("Counted allgather requires a complete binding and non-null stream");
     auto &transfer = TransferEngine::instance();
-    for (const auto &send : sends_) transfer.enqueueCapturedTransfer(send, stream);
-    for (const auto &receive : receives_) transfer.enqueueCapturedTransfer(receive, stream);
+    transfer.enqueueCapturedExchange(sends_, receives_, scheduling_, stream);
 }
 
 void DeviceCountedAllGatherBinding::enqueueAcquiredInput(const AcquiredDeviceTransferInput &input) const
@@ -124,7 +126,7 @@ void DeviceCountedAllGatherBinding::enqueueAcquiredInput(const AcquiredDeviceTra
     if (!owner_ || sends_.empty() || sends_.size() != receives_.size() ||
         !input.valid() || input.device() != owner_->devices_[participant_])
         throw std::invalid_argument("Counted allgather requires its exact participant's acquired fork");
-    TransferEngine::instance().enqueueForkedCapturedExchange(sends_, receives_, input, received_);
+    TransferEngine::instance().enqueueForkedCapturedExchange(sends_, receives_, input, received_, scheduling_);
 }
 
 std::uint64_t *DeviceCountedAllGatherBinding::extent(std::size_t source) const

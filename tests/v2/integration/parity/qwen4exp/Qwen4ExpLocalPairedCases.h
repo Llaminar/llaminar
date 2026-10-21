@@ -13,6 +13,7 @@
 #include "Qwen4ExpFixedHeadParityCases.h"
 #include "Qwen4ExpGPUAdaptiveParityCases.h"
 #include "Qwen4ExpFullROCmTP4ParityCases.h"
+#include "Qwen4ExpROCm4OverlayPolicyParityCases.h"
 #include <nlohmann/json.hpp>
 #include <map>
 #include <set>
@@ -33,7 +34,8 @@ inline QFNCaseFamilies qfnOriginalCaseFamilies()
             {"Qwen4ExpHostAdaptiveRAMSSD", qwen4ExpHostAdaptiveProductionCases()},
             {"Qwen4ExpFixedHeadTP", qwen4ExpFixedHeadProductionCases()},
             {"Qwen4ExpGPUAdaptive", qwen4ExpGPUAdaptiveProductionCases()},
-            {"Qwen4ExpFullROCmTP4", qwen4ExpFullROCmTP4ProductionCases()}};
+            {"Qwen4ExpFullROCmTP4", qwen4ExpFullROCmTP4ProductionCases()},
+            {"Qwen4ExpROCm4OverlayPolicy", qwen4ExpROCm4OverlayPolicyProductionCases()}};
 }
 
 /** @brief Reject malformed local metadata before a case can enter registration. */

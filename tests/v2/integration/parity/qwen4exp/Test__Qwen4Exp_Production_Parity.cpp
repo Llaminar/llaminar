@@ -51,7 +51,7 @@ TEST_P(Qwen4ExpMainParityTest, ProductionParity) { runQwen4ExpProductionParityCa
  */
 TEST_P(Qwen4ExpMainParityTest, SnapshotAdmission)
 {
-    beginProductionParityEvidence();
+    ASSERT_NO_FATAL_FAILURE(beginProductionParitySnapshotAdmission());
     ASSERT_TRUE(setupProductionParityPipeline())
         << "Flash Next production admission/materialization failed";
     ASSERT_TRUE(hasOrchestrationRunner());
@@ -185,6 +185,12 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpGPUAdaptive, Qwen4ExpMainParityTest,
 // remain mandatory. RAM PLE is independent host storage, not CPU expert offload.
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpFullROCmTP4, Qwen4ExpMainParityTest,
     ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpFullROCmTP4", qwen4ExpFullROCmTP4ProductionCases())),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
+
+// Three exact controls preserve the original full-stage/partial-prefix/path
+// fixture and optional paired-document attachment. Original A1 remains separate.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpROCm4OverlayPolicy, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpROCm4OverlayPolicy", qwen4ExpROCm4OverlayPolicyProductionCases())),
     [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
 
 /**

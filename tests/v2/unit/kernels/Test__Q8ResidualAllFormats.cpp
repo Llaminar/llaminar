@@ -6,11 +6,14 @@
  * Original Q8_0 fixtures and their accuracy threshold are untouched. This small
  * three-row/five-column sweep exercises real native factor, minimum and IQ
  * paths. Larger geometries and thread/ISA sweeps are explicit integration
- * cases.
+ * cases. Saved-source reconstruction also covers every original native block
+ * layout, including Q8_1 sums and Q8_K FP32-scale superblocks.
  */
 #include "../../utils/Q8ResidualAllFormatCPUHarness.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
+#include "../../utils/OriginalQ8ResidualProjectionSource.h"
 #include <climits>
+#include <cstring>
 using namespace llaminar2;
 /** @test The canonical inventory, not a second hand-maintained list, feeds
  * every actual CPU stage. */
@@ -151,4 +154,27 @@ TEST(Q8ResidualAllFormats, OriginalBlock32ActualPreparedStage) {
     test::q8_all_formats::proveCPU(format, 3, 5, 32, 1);
     ASSERT_FALSE(::testing::Test::HasFailure());
   }
+}
+
+/** @test The exact performance source-construction seam preserves every native byte. */
+TEST(Q8ResidualAllFormats, SavedOriginalSourceFactoryPreservesEveryFormat)
+{
+    MPIContext mpi(0,1,MPI_COMM_NULL);
+    TensorFactory factory(mpi);
+    for(const auto &format:test::quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        const std::vector<std::size_t> shape{5,256};
+        const auto original=format.create(shape,731);
+        ASSERT_TRUE(original);
+        const auto *first=static_cast<const std::uint8_t *>(original->raw_data());
+        ASSERT_NE(first,nullptr);
+        const std::vector<std::uint8_t> raw(first,first+original->size_bytes());
+        const auto restored=test::q8_all_formats::originalProjectionSource(factory,format.tensor_type,shape,raw);
+        ASSERT_TRUE(restored);
+        EXPECT_EQ(restored->native_type(),original->native_type());
+        EXPECT_EQ(restored->shape(),original->shape());
+        ASSERT_EQ(restored->size_bytes(),raw.size());
+        EXPECT_EQ(std::memcmp(restored->raw_data(),raw.data(),raw.size()),0);
+    }
 }

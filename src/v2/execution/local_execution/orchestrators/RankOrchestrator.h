@@ -1696,6 +1696,15 @@ namespace llaminar2
     private:
         /** @return The sole TP publication root; PP stages retain independent namespaces. */
         const IInferenceRunner *moeOptimizationOwner() const;
+        /**
+         * @brief Construct the sole participant pool using its original execution ownership.
+         * @param participants Original selected child-owner vector, including PP stages.
+         * @return GPU-control partition placement for flat homogeneous GPU ranks;
+         *         CPU/mixed/nested pipeline compute retains inherited placement.
+         * @throws std::exception For missing child identities or failed cold construction.
+         */
+        [[nodiscard]] std::unique_ptr<TPWorkerPool> makeParticipantWorkerPool(
+            const std::vector<std::unique_ptr<IInferenceRunner>> &participants) const;
         // =====================================================================
         // Private Constructor (for createForTest)
         // =====================================================================
