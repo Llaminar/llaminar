@@ -401,9 +401,264 @@ segment and 256 threads, with zero spills, private storage or LDS. The separate
 acquire and copy/publish kernels likewise retain zero spills/private storage.
 
 There is still no production TP attachment. Accepted A1 remains L74 at
-**785.397 prefill / 33.882 decode tok/s**. The next bounded component prototype
-will retain the original producers and fold directly from acquired peer payloads,
-preserving ascending-rank FP32 arithmetic and acknowledging each peer only after
-all readers finish. Its possible saving is one launch plus the local peer-bank
-write/read traffic, not fewer interconnect bytes. It must beat both existing
-controls before the larger ownership/sideband integration is justified.
+**785.397 prefill / 33.882 decode tok/s**. Candidate 78 below tests the proposed
+direct peer-payload fold while preserving ascending-rank arithmetic and original
+acknowledgment ordering. Its possible saving was one launch plus local peer-bank
+write/read traffic, with unchanged interconnect bytes.
+
+
+## Direct consumer/fold candidate 78: exact, slower, retired
+
+The bounded prototype kept the original producers and consumed acquired mapped
+peer payloads directly into the original ascending-rank FP32 sum. Acknowledgments
+followed all readers. Its captured component used two nodes per transaction,
+removing one launch and the intermediate peer-bank write/read traffic. For P4,
+that removes 61,440 local GPU bytes per endpoint, while the twelve directed
+10,240-byte messages remain unchanged. This prototype was never attached to
+production TP stages or their sidebands.
+
+All [32 focused registrations](../../../../parity-results/qwen-flash-next/consumer-fold78-focused-gates-corrected/result.json)
+passed with no skips and clean driver/retirement checks. The new component
+checks covered CUDA2 and ROCm3/4 with permuted participants, tails through
+16 KiB, changed input generations, large/small replay, exact local/output alias,
+97 retained transactions, untouched poisoned peer banks and complete captured
+node inventories. Issuance/ownership and failed-submission checks were included.
+The first local CTest filter used unsupported noncapturing-group syntax; that
+setup failure occurred before native execution and remains recorded separately.
+
+The [Release build](../../../../parity-results/qwen-flash-next/consumer-fold78-release-build/result.json)
+passed for CUDA SM80/86/89/90 and gfx906 with the spill guards enabled. Each
+comparison below uses H2560, five warmups and all 31 alternating measured pairs,
+rotating the first host rank. Values are the maximum original per-rank native
+event interval, amortized over 97 retained transactions.
+
+| Backend | Paired control | Control median µs | Direct median µs | Control range | Direct range | Direct wins |
+|---|---|---:|---:|---:|---:|---:|
+| ROCm P4 | Previous mapped copy + fold | 42.149 | 47.017 | 41.036–43.144 | 45.885–48.536 | 0/31 |
+| ROCm P4 | Native gather + original fold | 43.187 | 46.573 | 42.096–44.541 | 45.179–49.735 | 0/31 |
+| CUDA P2 | Previous mapped copy + fold | 19.112 | 24.129 | 18.939–19.296 | 23.346–24.401 | 0/31 |
+| CUDA P2 | Native gather + original fold | 14.950 | 22.829 | 14.544–15.340 | 22.563–23.447 | 0/31 |
+
+Both [ROCm](../../../../parity-results/qwen-flash-next/consumer-fold78-rocm-timing/analysis.json)
+and [CUDA](../../../../parity-results/qwen-flash-next/consumer-fold78-cuda-timing/analysis.json)
+pass every original byte, source/runtime, driver and retirement check. Direct
+consumption is **7.84% slower than native on ROCm and 52.70% slower on CUDA**;
+it also loses against the previous mapped implementation. Separate one-transaction
+observations and every raw pair remain in those reports. No model speed or new
+model accuracy result is inferred from this synthetic component.
+
+Fresh final-object inspection reports 50 CUDA registers, a 32-byte diagnostic
+stack and zero compiler-local bytes on all four targets. Every local store
+terminates in a relocation-proven `vprintf` call and trap; there are no local
+loads. SM90's 1,024-byte compiler shared allocation remains explicit. The gfx906
+leaf has 65 VGPRs, 78 SGPRs, a 552-byte argument segment, alignment 8, block size
+256, and zero spills/private storage/LDS. These are static resource facts, not
+achieved occupancy or memory-throughput measurements. The initial artifact
+parser assumed REL relocations; its corrected version also handles SM90 RELA.
+
+CUDA memory-checker qualification is **not green**. The
+[first diagnostic](../../../../parity-results/qwen-flash-next/consumer-fold78-cuda-memcheck/result.json)
+timed out at the existing 120-second test limit. It reported NCCL's explicit
+unsupported-kernel attribute probes, which the pinned dependency drains during
+initialization. A [targeted diagnostic](../../../../parity-results/qwen-flash-next/consumer-fold78-cuda-memcheck-targeted/result.json)
+then instrumented the transfer-batch and direct-consumer kernels, excluding API
+probe reports. Native gather completed, but the existing mapped consumer hit
+its original 30-second peer deadline at epoch zero before the new direct path
+ran. The trap produced NVIDIA Xid43 and a host driver fault. Neither diagnostic
+passes; further sanitizer attachments stopped. The later ordinary CUDA timing
+process retired normally with a fresh clean driver window. No larger timeout,
+production protocol change or numerical tolerance change was introduced.
+
+The losing prototype and its test-only registrations have been removed from
+the working source. Its complete patch, source identities and tested Release
+build products are retained at `/tmp/qfn-consumer-fold78-rejected-snapshot`;
+resource evidence is under `/tmp/qfn-consumer-fold78-release-{cuda,hip}-resource-audit`.
+Accepted A1 remains **L74 785.397 / 33.882 tok/s**. Candidate 79 below tests the
+existing native RCCL tuner interface for small per-rank LL messages while
+preserving the larger-message choices.
+
+## Size-aware native tuner 79: paired decode gain, production integration pending
+
+The isolated v4 plugin selects the lowest original eligible LL cost for positive
+AllGather messages of at most 16 KiB **per rank**. RCCL supplies a rank-expanded
+byte count: the P4 H2560 case is 40,960 callback bytes and 10,240 bytes per rank.
+Ignored costs and the native channel output remain unchanged. Missing eligible
+LL costs, malformed tables and unsupported communicator contracts fail before
+changing the table. Larger and other collective cost tables remain byte-identical.
+This does not change the installed RCCL, its source, or production defaults.
+
+The private package at `/tmp/qfn-size-aware-ll-tuner79-next` binds the original
+v4 ABI and behavioral source inputs. Its host-only Release build and all three
+CPU tests pass, covering cost-table decisions, concurrent actual-plugin context
+lifetimes and strict retired-receipt validation. These are experimental checks,
+not new production-preflight registrations. The plugin observes a bounded set of
+native planning/capture calls; its logs do not count retained graph executions.
+
+The [boundary control/plugin/control comparison](../../../../parity-results/qwen-flash-next/tuner79-boundary-analysis.json)
+passes actual mapped-library/export checks, all byte oracles, original graph
+memory bounds, normal retirement and clean driver windows. Each process retains
+56 complete captured templates on the same four physical participants. All 24
+target native templates use LL; the 16,388-byte control retains the exact original
+SIMPLE kernel, grid and block. Mapped-channel templates remain identical. The
+automatic controls load no external tuner or network plugin. Two earlier local
+capture-log analyses failed because merged stdout/stderr interleaved JSON; those
+raw native outcomes remain retained. Separating the streams produced complete
+saved records without changing native execution or suppressing diagnostics.
+
+The [Release timing controls](../../../../parity-results/qwen-flash-next/tuner79-timing-analysis.json)
+retain H2560, five warmups and every one of 31 alternating path pairs, with
+rotating first-rank submission and original 1/97 transaction counts. The following
+are maximum-rank native-event intervals amortized over 97 transactions, not model
+latencies or sums of independent kernel times.
+
+| Observation | Native gather + fold median µs | Unchanged mapped control median µs |
+|---|---:|---:|
+| Automatic before | 45.493 | 43.258 |
+| Size-aware LL | 41.407 | 42.035 |
+| Automatic after | 44.760 | 42.435 |
+
+The native component improves against both bracketing controls; the mapped
+control also varies, so the complete model comparison supplies the relevant gain.
+Both model arms use the unchanged L74 runtime, RAM ngrams, original six arithmetic
+selectors, 512 fresh prompt tokens, 256 emitted tokens, one warmup and three
+measured requests per process on the original 28 physical NUMA1 cores. Actual
+plugin mapping and retired planning receipts are required separately from the
+native benchmark's output and lifecycle checks.
+
+All four [A/B/B/A model arms](../../../../parity-results/qwen-flash-next/tuner79-model-abba-comparison-loader-metadata-v2.json)
+pass their original benchmark, source/runtime, resource, driver and retirement
+checks. The independent terminal proof also confirms actual original RCCL
+mapping, absent external tuners in both automatic controls, and the exact plugin
+with all four normally retired communicator contexts in both candidate arms.
+Every one of the twelve measured 256-token sequences is identical.
+
+| Policy | Prefill median [min, max] tok/s | Decode median [min, max] tok/s |
+|---|---:|---:|
+| Automatic, six samples | 785.103 [783.061, 786.170] | 33.947 [33.862, 34.043] |
+| Size-aware LL, six samples | 785.609 [784.228, 786.455] | 34.697 [34.645, 34.793] |
+
+The measured change is **+0.064% prefill / +2.209% decode**, with separated decode
+ranges. This avoids the earlier broad-LL prefill loss. The plugin's bounded cold
+planning observations remain explicit instrumentation; this is a diagnostic
+policy comparison, not a new canonical uninstrumented baseline or a full-logit
+accuracy certificate. Castagna's 42.959 decode target remains ahead.
+
+The first automatic arm's terminal library audit rejected `/etc/ld.so.cache`
+as non-ELF because the passive collector includes that loader metadata. Its
+original native result passed. A separately sealed validator now classifies
+only that exact path as metadata, preserving both stat checks and rejecting
+other unexpected non-ELF mappings. Four device-free controls pass. The original
+failure remains intact, and a distinct corrected proof revalidates the saved
+run without repeating inference. All four comparison arms explicitly consume
+that corrected proof format.
+
+Production integration is still pending. The proposed native dependency policy
+keeps the original collectives and no-plugin selection/postpass machinery; it
+does not install the experimental plugin. Its eligibility must agree across
+every rank and preserve explicit user selectors. A proposed rank-local transport
+check was rejected in review because mixed SHM/P2P connections could make ranks
+choose different protocols. The implementation must use the original native
+clique's fully published connection metadata and prove its ordering and lifetime.
+Then the native candidate needs focused regressions, captured selection and
+byte checks, the frozen full-logit accuracy slice and matched Release timing.
+Accepted A1 remains L74 until those gates complete.
+
+
+## Native small-AllGather policy 80: accepted focused checkpoint
+
+The native implementation retains the original RCCL selector and postpasses.
+After the outermost blocking `ncclCommInitAll` completes successfully, one
+control thread validates the entire original clique before publishing the
+communicator-local preference. Eligibility requires four gfx906 participants
+on one host/process, default CTA policy, no explicit algorithm/protocol selector
+or external tuner, four channels, and completed direct SHM ring endpoints on
+every owner. Mixed, incomplete, lazy, proxy/CE and other-architecture arrangements
+retain their existing native policy. No extra connection, barrier, collective,
+host count readback or hot-path allocation is added. The preference changes only
+eligible positive AllGather messages up to 16 KiB per rank; channel selection and
+native postpasses remain intact.
+
+The isolated [native build receipt](../../../../parity-results/qwen-flash-next/native-small-allgather80-release-build/result.json)
+and dependency receipt at `/tmp/qfn-native-small-allgather80-v3-build-r1/dependency-build-receipt.json`
+bind the new dependency to the original compile configuration. The complete
+gfx906 dependency rebuild took 771.37 seconds. All 132 original compile commands
+retain identical normalized flags; the sole additional command builds the new
+host policy. Production Release and Integration products select the explicit
+new DSO. Paired controls preserve untouched old products; both arms use the same
+isolated HIP kernel-argument repair, with no external tuning plugin.
+
+Validation completed so far:
+
+- All three [supporting host tests](../../../../parity-results/qwen-flash-next/native-small-allgather80-host-test-r4/result.json)
+  pass, including exhaustive policy equivalence with candidate79 and complete
+  clique publication/exclusion cases.
+- The [source/compiler/DSO-bound native proof](../../../../parity-results/qwen-flash-next/native-small-allgather80-proof-build-r3/result.json)
+  runs 29 scope and 17 selection cases against the actual native implementations.
+  The original enqueue negative fails exactly the nine intended selection/error
+  assertions, while excluded cases and native postpasses remain equal. Explicit
+  policy and proof-packaging registrations belong to production preflight.
+- [Complete Unit](../../../../parity-results/qwen-flash-next/native-small-allgather80-unit/result.json)
+  passes **759/759**; all [17 focused registrations](../../../../parity-results/qwen-flash-next/native-small-allgather80-focused/result.json)
+  pass, including storage, capture, generation retirement and twenty-clique
+  lifecycle loops. Driver windows and native retirement are clean.
+- The [real captured boundary comparison](../../../../parity-results/qwen-flash-next/native-small-allgather80-boundary-analysis.json)
+  retains all 56 templates per arm and every exact byte oracle. All 24 small
+  native captures match candidate79's complete kernel/resource/geometry records.
+  Larger-message SIMPLE and mapped-channel captures remain unchanged. Native
+  live bank stride and mapped storage stride are distinct; both communicate
+  exactly the live payload extent.
+- [Frozen full-logit accuracy](../../../../parity-results/qwen-flash-next/native-small-allgather80-release-accuracy/report.json)
+  passes every required group. All **185 rows in 26 files are byte-identical to
+  L74**, including reset and diagnostic rows. This is the original accuracy
+  workload and scoring policy, with unchanged arithmetic.
+
+The source-bound host proof tests the actual selection and publication helper;
+it does not claim to initialize a real communicator. The separate native
+captured comparison above proves actual publication and LL execution on this
+host. A portable permanent captured-policy assertion would additionally need
+an independent transport-eligibility observation; the existing public storage
+receipt does not expose the complete guard. Do not infer eligibility from the
+flag or LL result being tested, or require LL on every generic ROCm4 cell.
+
+The [matched Release component timings](../../../../parity-results/qwen-flash-next/native-small-allgather80-timing-analysis.json)
+retain all 31 pairs per process. At 97 transactions, native gather/fold medians
+are **42.169 / 41.961 / 44.086 µs** for control/candidate/control; unchanged
+mapped medians are **41.270 / 42.456 / 42.722 µs**. These ranges reinforce the
+need for the full model comparison instead of attributing all component
+movement to the policy. The final uninstrumented model comparison below decides
+acceptance; complete production preflight remains pending.
+
+The [complete native-policy A/B/B/A](../../../../parity-results/qwen-flash-next/native-small-allgather80-model-abba-comparison.json)
+passes all four original benchmark, archive/source, resource, driver and normal
+retirement gates. All twelve measured 256-token sequences match. Both arms use
+real archived Release binaries with their actual selected RCCL dependency and
+the same isolated repaired HIP runtime; neither loads a tuning plugin.
+
+| Native policy | Prefill median [min, max] tok/s | Decode median [min, max] tok/s |
+|---|---:|---:|
+| Original automatic, six samples | 785.911 [785.104, 786.302] | 33.939 [33.886, 34.115] |
+| Small-AllGather LL, six samples | 785.303 [783.835, 785.682] | 34.700 [34.663, 34.746] |
+
+The matched change is **−0.077% prefill / +2.240% decode**, with separated
+decode ranges. Together with the frozen byte-identical accuracy slice and
+focused regressions, this qualifies **L80 as the new accepted A1 tuning
+checkpoint**. Castagna's 42.959 decode tok/s remains the target.
+
+The workload is unchanged: four MI50s, `TensorParallel` dense computation plus
+`GateUpOwnedDownColumns` routed experts, all experts on GPU, RAM ngrams,
+512 prompt tokens / 256 output tokens / M512 / context4096, FP32 activation
+storage and FP16 KV, MTP and prefix cache off, greedy seed42, 28 physical NUMA1
+workers and ordinary MPI bootstrap. Each process runs one warmup and three
+measured requests; decode throughput counts the 255 steps after prefill. All
+six established precision selectors remain unchanged (HC-up TwoTermQ8,
+FP16 router and MoE alpha/beta, other selected projections SingleQ8).
+PerfStats is disabled for this throughput comparison. No full-preflight or
+other-topology qualification is inferred from these focused results.
+
+Earlier supporting test builds exposed incomplete header/ABI linkage and
+CMake option grouping; their failed logs are retained. The canonical native
+proof also exposed lost RDC mode and loss of the C++ compiler driver name
+through symlink resolution. The corrected proof preserves and authenticates
+the original RDC flags and invokes CMake's declared C++ entrypoint. Stale and
+interrupted proof publication now has explicit device-free regressions. None
+of these fixture corrections changes the native policy or model arithmetic.

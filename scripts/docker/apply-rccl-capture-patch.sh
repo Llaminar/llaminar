@@ -5,7 +5,7 @@ set -euo pipefail
 
 rccl_source_dir="$(realpath -- "${1:?RCCL source directory is required}")"
 rccl_patch_root="$(realpath -- "$(dirname "${BASH_SOURCE[0]}")/patches")"
-for rccl_patch_name in rccl-hip-capture-event-wait.patch rccl-device-live-rows.patch rccl-native-host-storage.patch rccl-communicator-protocol-defaults.patch rccl-collective-selector-taxonomy.patch; do
+for rccl_patch_name in rccl-hip-capture-event-wait.patch rccl-device-live-rows.patch rccl-native-host-storage.patch rccl-communicator-protocol-defaults.patch rccl-collective-selector-taxonomy.patch rccl-small-allgather-ll-policy.patch; do
     rccl_patch_file="${rccl_patch_root}/${rccl_patch_name}"
     if git -C "${rccl_source_dir}" apply --reverse --check "${rccl_patch_file}" 2>/dev/null; then
         continue

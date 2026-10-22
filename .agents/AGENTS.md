@@ -482,6 +482,18 @@ the actual parser against every tunable collective and the original faulty
 table. Its builder-only probe captures diagnostics locally without querying HIP;
 installed preflight verifies the source/DSO-bound evidence without a GPU or SDK.
 
+RCCL's small-AllGather LL preference is a native, communicator-local policy.
+It is published only after a complete blocking `ncclCommInitAll` proves the
+four-gfx906, single-process direct-SHM transport configuration. It applies to
+at most 16 KiB of live data per rank; explicit selectors and external tuners
+retain their native semantics. Channel geometry and other native postpasses
+remain owned by RCCL. `V2_Integration_RCCLSmallAllGatherPolicy` verifies the
+actual selector and complete-clique publication helper, including the original
+enqueue negative control. Its builder-owned proof is source/compiler/DSO bound;
+it does not replace real captured-collective, model-parity or performance tests.
+`V2_Integration_RCCLSmallAllGatherProofPackaging` rejects incomplete or stale
+proofs. A failed rebuild must retire any prior successful proof before it runs.
+
 RCCL bootstrap proves host/process identity before selecting transport storage.
 Container launchers pair IPC storage with PID identity: private IPC is the
 ordinary policy; explicit host/peer IPC must also join the matching PID namespace.

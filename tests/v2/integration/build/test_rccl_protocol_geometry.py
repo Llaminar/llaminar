@@ -19,8 +19,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[4]
 PATCH = "scripts/docker/patches/rccl-communicator-protocol-defaults.patch"
+SMALL_ALLGATHER_PATCH = "scripts/docker/patches/rccl-small-allgather-ll-policy.patch"
 INPUTS = (PATCH, "tests/v2/integration/build/rccl_protocol_geometry_probe.cpp",
-          "tests/v2/integration/build/test_rccl_protocol_geometry.py")
+          "tests/v2/integration/build/test_rccl_protocol_geometry.py", SMALL_ALLGATHER_PATCH)
 MODES = ("forward", "reverse", "concurrent")
 CHECKS = {"forward": 1080, "reverse": 1080, "concurrent": 1728000}
 
@@ -34,6 +35,20 @@ def digest(path):
 def source_identity():
     """Return the complete small regression/policy identity present in runners."""
     return {name: digest(ROOT / name) for name in INPUTS}
+
+
+def verify_receipt(receipt):
+    """Require the exact canonical repair suffix in builder and installed proof.
+
+    Protocol defaults precede the small-AllGather preference in the native
+    patch chain. Accepting an arbitrary suffix would admit an unknown policy;
+    requiring protocol to be the final patch rejects the current native build.
+    Both repairs are source-bound even though this probe tests protocol geometry.
+    """
+    suffix = ("-protocol-" + digest(ROOT / PATCH)
+              + "-smallag-" + digest(ROOT / SMALL_ALLGATHER_PATCH))
+    if not isinstance(receipt, str) or not receipt.endswith(suffix):
+        raise RuntimeError("RCCL build receipt does not contain the current canonical repair suffix")
 
 
 def native_compile_inputs(build):
@@ -73,6 +88,7 @@ def verify_report(report, library):
             or not report.get("native_source_sha256")
             or not report.get("native_arch_source_sha256")):
         raise RuntimeError("RCCL protocol proof identity does not match this source/runtime")
+    verify_receipt(report.get("rccl_receipt"))
     observations = report.get("observations", [])
     if [(row.get("variant"), row.get("mode")) for row in observations] != [
             (variant, mode) for variant in ("native", "original") for mode in MODES]:
@@ -98,8 +114,7 @@ def compile_report(args):
     if digest(native_library) != digest(args.library):
         raise RuntimeError("Selected RCCL DSO is not the native build supplying the tested consumers")
     receipt = (args.rccl_build / ".llaminar-rccl-commit").read_text().strip()
-    if not receipt.endswith("-protocol-" + digest(ROOT / PATCH)):
-        raise RuntimeError("RCCL build receipt does not contain the current protocol repair")
+    verify_receipt(receipt)
     report = dict(schema=1, sources=source_identity(), library_sha256=digest(args.library),
                   compiler_version=subprocess.check_output([args.compiler, "--version"], text=True),
                   native_source_sha256=digest(source), native_arch_source_sha256=digest(arch_source),

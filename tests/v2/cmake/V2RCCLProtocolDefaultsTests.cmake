@@ -23,6 +23,7 @@ if(HAVE_ROCM AND HAVE_RCCL AND NOT V2_PERF_TESTS_ONLY)
         DEPENDS "${V2_RCCL_PROTOCOL_SCRIPT}"
             integration/build/rccl_protocol_geometry_probe.cpp
             "${REPO_ROOT}/scripts/docker/patches/rccl-communicator-protocol-defaults.patch"
+            "${REPO_ROOT}/scripts/docker/patches/rccl-small-allgather-ll-policy.patch"
             "${RCCL_PROTOCOL_BUILD_DIR}/compile_commands.json"
             "${RCCL_PROTOCOL_BUILD_DIR}/.llaminar-rccl-commit"
             "${RCCL_PROTOCOL_BUILD_DIR}/hipify/src/rccl_wrap.cc"

@@ -165,6 +165,8 @@ COPY scripts/docker/patches/rccl-communicator-protocol-defaults.patch \
      /tmp/install-scripts/patches/rccl-communicator-protocol-defaults.patch
 COPY scripts/docker/patches/rccl-collective-selector-taxonomy.patch \
      /tmp/install-scripts/patches/rccl-collective-selector-taxonomy.patch
+COPY scripts/docker/patches/rccl-small-allgather-ll-policy.patch \
+     /tmp/install-scripts/patches/rccl-small-allgather-ll-policy.patch
 # ccache hashes the compiler and full command line, so one 50 GB shared cache
 # is correct across both ISA lanes. It lives in the persistent named BuildKit
 # worker hosted by the one host Docker daemon; locked sharing keeps independent
@@ -235,7 +237,8 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         rccl_storage_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-native-host-storage.patch | cut -d ' ' -f 1)"; \
         rccl_protocol_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-communicator-protocol-defaults.patch | cut -d ' ' -f 1)"; \
         rccl_selector_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-collective-selector-taxonomy.patch | cut -d ' ' -f 1)"; \
-        printf '%s\n' "${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}-selector-${rccl_selector_patch_sha}-protocol-${rccl_protocol_patch_sha}" \
+        rccl_small_allgather_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-small-allgather-ll-policy.patch | cut -d ' ' -f 1)"; \
+        printf '%s\n' "${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}-selector-${rccl_selector_patch_sha}-protocol-${rccl_protocol_patch_sha}-smallag-${rccl_small_allgather_patch_sha}" \
             > /src/external/rccl/build/.llaminar-rccl-commit; \
         echo "==> [rccl] done; elapsed_seconds=$(( $(date +%s) - rccl_started_epoch )); library: $(readlink -f /src/external/rccl/build/librccl.so.1.0)"; \
     elif [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \

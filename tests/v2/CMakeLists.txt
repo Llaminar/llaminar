@@ -4166,6 +4166,18 @@ set_tests_properties(V2_Integration_ROCmBLASKernelPackaging PROPERTIES
     TIMEOUT 30)
 include(cmake/V2RCCLProtocolDefaultsTests.cmake)
 include(cmake/V2RCCLSelectorTests.cmake)
+include(cmake/V2RCCLSmallAllGatherTests.cmake)
+add_test(NAME V2_Unit_RCCLSmallAllGatherProof
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rccl_small_allgather_policy.py)
+set_tests_properties(V2_Unit_RCCLSmallAllGatherProof PROPERTIES
+    LABELS "V2;Unit;RCCL;DeviceFree;Regression" TIMEOUT 30)
+add_test(NAME V2_Integration_RCCLSmallAllGatherProofPackaging
+    COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rccl_small_allgather_policy.py)
+set_tests_properties(V2_Integration_RCCLSmallAllGatherProofPackaging PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;RCCL;DeviceFree;Regression" TIMEOUT 30)
+
 add_test(NAME V2_Unit_RCCLSelectorProof
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rccl_selector_taxonomy.py)

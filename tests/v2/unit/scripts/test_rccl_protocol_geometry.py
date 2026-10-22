@@ -33,6 +33,8 @@ class RCCLProtocolProofTests(unittest.TestCase):
         self.library.write_bytes(b"protocol-proof-library-identity")
         self.report = dict(
             schema=1, sources=PROOF.source_identity(), library_sha256=PROOF.digest(self.library),
+            rccl_receipt=("fixture-protocol-" + PROOF.digest(ROOT / PROOF.PATCH)
+                          + "-smallag-" + PROOF.digest(ROOT / PROOF.SMALL_ALLGATHER_PATCH)),
             compiler_version="fixture-compiler", native_source_sha256="source",
             native_arch_source_sha256="architecture-source", observations=[
                 dict(variant=variant, mode=mode, returncode=0 if variant == "native" else 1,
@@ -43,6 +45,28 @@ class RCCLProtocolProofTests(unittest.TestCase):
     def test_complete_bound_report_passes(self):
         """All modes, both polarities and the exact runtime identity are required."""
         PROOF.verify_report(self.report, self.library)
+
+    def test_only_exact_current_repair_suffix_is_accepted(self):
+        """A known later repair is required; stale or arbitrary suffixes are rejected."""
+        current = self.report["rccl_receipt"]
+        old = "fixture-protocol-" + PROOF.digest(ROOT / PROOF.PATCH)
+        for receipt in (None, False, [], "", old, old + "-smallag-" + "0" * 64,
+                        current + "-unknown-policy", current[:-1],
+                        current.replace("-protocol-", "-other-")):
+            with self.subTest(receipt=receipt):
+                changed = copy.deepcopy(self.report)
+                changed["rccl_receipt"] = receipt
+                with self.assertRaisesRegex(RuntimeError, "canonical repair suffix"):
+                    PROOF.verify_report(changed, self.library)
+
+    def test_receipt_suffix_dependencies_are_rebuilt_and_packaged(self):
+        """A policy edit invalidates both the build proof and its installed verifier."""
+        self.assertIn(PROOF.SMALL_ALLGATHER_PATCH, PROOF.INPUTS)
+        registration = (ROOT / "tests/v2/cmake/V2RCCLProtocolDefaultsTests.cmake").read_text()
+        self.assertIn(PROOF.SMALL_ALLGATHER_PATCH, registration)
+        for path, suffix in (("Dockerfile", "-smallag-${rccl_small_allgather_patch_sha}"),
+                             ("src/v2/CMakeLists.txt", "-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")):
+            self.assertIn(suffix, (ROOT / path).read_text())
 
     def test_changed_runtime_fails(self):
         """Replacing the selected DSO invalidates earlier proof immediately."""
