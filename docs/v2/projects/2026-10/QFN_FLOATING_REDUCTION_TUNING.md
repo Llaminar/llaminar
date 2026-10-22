@@ -1,6 +1,12 @@
 # QFN floating projection reduction tuning
 
-Updated: 2026-10-22. Candidate96 preserves the original floating arithmetic
+Updated: 2026-10-22. **L97 source-format specialization is qualified at
+814.368 prefill / 36.727 decode tok/s.** Its matched L96 control measures
+796.421 / 36.812: **+2.254% prefill / −0.229% decode**, with overlapping decode
+ranges. All 185 logit rows and twelve generated sequences remain byte-identical;
+776 Unit tests and six focused registrations pass. Full preflight is pending.
+
+Candidate96 preserves the original floating arithmetic
 while reducing block barriers from nine to three. The focused native gates,
 complete Unit suite and frozen A1 accuracy panel pass. Four clean matched
 Release arms qualify **L96: 796.370 prefill / 36.750 decode tok/s**, versus
@@ -176,3 +182,127 @@ The first Release target/registration attempts failed before native execution;
 their logs remain retained. The corrected target is available in Release and
 the existing executable-CMake regression covers its native-language metadata.
 Complete production preflight remains pending.
+
+## Native source-format specialization: candidate97
+
+The next candidate specializes the existing FP32-activation/native-16-bit-weight
+projection on its validated FP16 or BF16 source encoding. The host selects the
+encoding at the existing launch boundary, removing the dtype branch from every
+K iteration. Conversion, FP32 FMA order, stride-256 lane ownership, the accepted
+three-barrier reduction, live-row masks, explicit stream and launch geometry
+remain unchanged. This introduces no shape threshold, requantization or new
+allocation.
+
+All six final focused registrations pass in `x16-97-final-native-r1`. The
+historical native oracle now also covers raw FP16/BF16 signed subnormals,
+minimum normals and signaling/quiet NaNs. K1 witnesses scale tiny weights into
+nonzero normal FP32 products, preventing matching zeros from concealing loss.
+Paired NaN payloads exercise the original 0/128, 64/192 and 0/64 edges in both
+operand orders and all sign combinations, for all three floating formats and
+plain/fused families. These remain part of the explicit historical-tree
+production-preflight registration. Complete Unit passes **776/776**, zero skips,
+in `x16-97-unit-r1`. The unchanged Release accuracy panel passes in
+`x16-97-release-accuracy-r1`: all **185 final-logit rows / 26 files** are
+byte-identical to L96, including reset checks. Required KL and top-1/top-5
+metrics therefore remain those reported above.
+
+### Unprofiled component measurements
+
+These captured native-event medians compare production96 with production97,
+using synthetic inputs and twelve alternating pairs with an independent native
+oracle in each process. K is 2560 throughout. They measure components rather
+than whole-model throughput.
+
+| Source | M | N | Control, µs | Candidate, µs | Speedup |
+|---|---:|---:|---:|---:|---:|
+| FP16 | 1 | 128 | 7.050660 | 5.243765 | 1.345× |
+| BF16 | 1 | 128 | 6.823150 | 5.053450 | 1.350× |
+| FP16 | 1 | 512 | 46.893050 | 46.916700 | 0.999× |
+| BF16 | 1 | 512 | 46.850200 | 46.901100 | 0.999× |
+| FP16 | 9 | 512 | 72.401000 | 47.221700 | 1.533× |
+| BF16 | 9 | 512 | 75.178150 | 42.872950 | 1.754× |
+| FP16 | 512 | 512 | 3584.785000 | 2760.580000 | 1.299× |
+| BF16 | 512 | 512 | 3523.500000 | 2650.825000 | 1.329× |
+
+The wide single-row query is effectively unchanged. The narrower key and
+larger-M components improve. M512 controls use the retained96 archive core;
+their declared loader closure was checked before execution. Evidence is in
+`x16-97-component-comparison-r1.json` and
+`x16-97-bulk-component-comparison-r1.json` under the local QFN result root.
+
+### Isolated profiling
+
+Six separate format/shape traces each authenticate 3,072 selected dispatches:
+twelve replays of 256 captured kernels, with exact geometry. Twenty-two
+additional counter processes each select one metric on the 1,025th matching
+dispatch. Profiled durations are excluded from the timing table.
+
+Both specializations retain 1 KiB LDS, three barriers, zero spills and zero
+private storage on gfx906. FP16 compiler usage falls from 15 to 14 VGPRs;
+BF16 falls from 15 to 10. Both use 28 SGPRs. Rounded hardware allocations are
+16/32 and 12/32 VGPR/SGPR respectively. The M9 traces report L2 hit rates of
+88.988% for FP16 and 87.843% for BF16, with zero measured LDS bank conflicts.
+These observations do not establish attained CU occupancy or a general
+bandwidth explanation. Exact records and ISA are in
+`x16-97-profile-summary-r1.json` and `x16-97-candidate-isa-r1`.
+
+The wide M1 query remains open. Its observed fetch is close to its 2,560 KiB
+native weight footprint, versus 640 KiB for N128; removing repeated activation
+loads cannot be claimed to eliminate that measured weight traffic. The indexer
+has four heads independent of the participant's ordinary attention heads, and
+scoring consumes all four. Sharding therefore requires an explicit live-query
+collective and original-head normalization/observation contracts. That larger
+graph change is separate from this local specialization. Recorded-input GDN
+scaling remains the next measurement slice.
+
+### Matched Release qualification: L97
+
+Four clean A/B/B/A arms compare the immutable accepted L96 archive with the
+new specialization archive. The complete model, prompt, precision selectors,
+placement, native dependency closure and generation settings are identical to
+the workload documented above. Each process has one warmup and three measured
+requests, without a profiler or PerfStats instrumentation. All twelve natural
+256-token sequences match exactly. Source/runtime identities, observed native
+libraries, driver windows and normal retirement pass in every arm.
+
+| Phase | L96 control median | L97 median | Change | Control range | Candidate range |
+|---|---:|---:|---:|---:|---:|
+| Prefill, tok/s | 796.421 | 814.368 | +2.254% | 796.171–797.193 | 813.664–815.496 |
+| Decode, tok/s | 36.812 | 36.727 | −0.229% | 36.729–36.904 | 36.685–36.765 |
+
+Both candidate process medians improve prefill. Decode is slightly lower with
+overlapping ranges; this checkpoint claims a prefill gain, not a decode gain.
+Its complete evidence is `x16-97-model-{a1,b1,b2,a2}` and
+`x16-97-model-comparison.json`. The original L96 archive retains its actual
+precommit source receipt; it has not been relabeled as the current source.
+The latest complete production-preflight checkpoint remains G60.
+
+## Deferred one-barrier experiment
+
+An independent candidate moved both original cross-wave edges into the first
+wave after one LDS publication. Its initial gate failed all 144 paired-NaN
+cases. The finite addition tree was unchanged, but LLVM reversed the native
+operand order of three additions, changing which NaN payload survived. ISA
+inspection identified the original high-before-low ordering and the candidate's
+low-before-high ordering.
+
+Three explicit native adds restored the original operand order without a NaN
+scan, extra arithmetic or additional buffers. All six focused gates then
+passed. Release ISA and three isolated traces confirmed one barrier, unchanged
+register/LDS allocations and zero spills/private storage. This demonstrates why
+native byte tests are necessary even when source parenthesization is preserved.
+
+The nine-case comparison measured approximately 2.8–2.9% improvement for narrow
+single-row keys, 4.1–5.2% for nine-row queries and 2.8–4.0% for fused projections;
+wide single-row queries remained neutral. HC initially measured 10.205 µs for
+the control and 10.549 µs for the candidate, but a fresh candidate process
+measured 10.065 µs. Historical-oracle medians in those processes were 10.539,
+10.454 and 10.384 µs respectively. The repeat prevents a conclusive HC
+regression claim and exposes interprocess variability.
+
+This optional change is deferred because its smaller gains and mixed timing
+evidence do not yet justify the operand-order specialization. It is absent from
+selected candidate97. Its paired-NaN regressions remain. Retained evidence:
+`floating97b-candidate-native-r1` (initial failure), `floating97c-native-r1`
+(corrected bytes), `floating97c-component-comparison-r1.json`,
+`floating97c-hc-confirm-r1` and `floating97c-profile-summary-r1.json`.

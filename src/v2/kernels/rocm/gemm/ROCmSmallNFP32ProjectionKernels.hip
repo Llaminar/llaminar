@@ -220,7 +220,11 @@ namespace
      * Original FP32 activation storage retains its 256 physical lane mapping.
      * Actual half A/B uses the compact kernel below with the same logical tree.
      * Inactive rows return before dereferencing either operand or output.
+     * Native source encoding is immutable launch policy; specializing it removes
+     * a uniform dtype branch from every K iteration without changing conversion.
+     * @tparam WeightDtype Validated original FP16 or BF16 source encoding.
      */
+    template<SmallProjectionWeightDtype WeightDtype>
     __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
         void fp32x16_batched_projection_kernel(
             const float *const *__restrict__ d_A_array,
@@ -229,9 +233,10 @@ namespace
             int M,
             int N,
             int K,
-            int weight_dtype,
             llaminar2::FloatingProjectionRows row_range)
     {
+        static_assert(WeightDtype == SMALL_PROJECTION_WEIGHT_FP16 ||
+                      WeightDtype == SMALL_PROJECTION_WEIGHT_BF16);
         const int n = static_cast<int>(blockIdx.x);
         const int m = static_cast<int>(blockIdx.y);
         const int batch = static_cast<int>(blockIdx.z);
@@ -249,10 +254,11 @@ namespace
         {
             const uint16_t weight_bits =
                 B[static_cast<size_t>(n) * static_cast<size_t>(K) + static_cast<size_t>(k)];
-            const float weight =
-                (weight_dtype == SMALL_PROJECTION_WEIGHT_BF16)
-                    ? bf16_bits_to_float(weight_bits)
-                    : fp16_bits_to_float(weight_bits);
+            float weight;
+            if constexpr (WeightDtype == SMALL_PROJECTION_WEIGHT_BF16)
+                weight = bf16_bits_to_float(weight_bits);
+            else
+                weight = fp16_bits_to_float(weight_bits);
             const size_t activation_index =
                 static_cast<size_t>(m) * static_cast<size_t>(K) + static_cast<size_t>(k);
             // Preserve the original FP32 products, strided lane ownership
@@ -665,20 +671,41 @@ extern "C" bool rocmFp32x16_batched_projection(
 
     dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
     dim3 block(SMALL_N_FP32_BLOCK);
-    hipLaunchKernelGGL(
-        fp32x16_batched_projection_kernel,
-        grid,
-        block,
-        0,
-        hip_stream,
-        d_A_array,
-        d_B_array,
-        d_C_array,
-        M,
-        N,
-        K,
-        weight_dtype,
-        rows);
+    // Admission above authenticates the original native encoding once. Each
+    // retained graph records its exact specialization; live rows remain device
+    // owned and never participate in this immutable source-format selection.
+    if (weight_dtype == SMALL_PROJECTION_WEIGHT_BF16)
+    {
+        hipLaunchKernelGGL(
+            (fp32x16_batched_projection_kernel<SMALL_PROJECTION_WEIGHT_BF16>),
+            grid,
+            block,
+            0,
+            hip_stream,
+            d_A_array,
+            d_B_array,
+            d_C_array,
+            M,
+            N,
+            K,
+            rows);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            (fp32x16_batched_projection_kernel<SMALL_PROJECTION_WEIGHT_FP16>),
+            grid,
+            block,
+            0,
+            hip_stream,
+            d_A_array,
+            d_B_array,
+            d_C_array,
+            M,
+            N,
+            K,
+            rows);
+    }
 
     return complete_kernel_launch(hip_stream, "rocmFp32x16_batched_projection");
 }

@@ -12,6 +12,8 @@
 #include "kernels/common/FloatingProjectionRows.h"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
+#include <span>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -259,8 +261,18 @@ struct Events {
 template<class T> void upload(T* target,const std::vector<T>& source,hipStream_t stream){
     checked(hipMemcpyAsync(target,source.data(),source.size()*sizeof(T),hipMemcpyHostToDevice,stream));
 }
+/** @brief One authored original native weight word; storage width follows source type. */
+struct NativeSourceWord {
+    size_t index; ///< Original flat source coordinate, never a byte offset.
+    uint32_t bits; ///< Exact FP32 word or zero-extended FP16/BF16 word.
+};
+/** @brief Borrow a small immutable authored source list only during synchronous setup. */
+struct NativeSourceOverrides {
+    std::span<const NativeSourceWord> words{}; ///< No owner retained by captured execution.
+};
 /** @brief Exercise original production symbols against literal historical native arithmetic. */
-inline void runCase(int type,bool fused,int m,int n,int k,int pattern,bool timing=false){
+inline void runCase(int type,bool fused,int m,int n,int k,int pattern,bool timing=false,int rawWord=-1,
+    NativeSourceOverrides overrides={}){
     const size_t elements=size_t(m)*k,weights=size_t(n)*k,outputs=size_t(m)*n;
     Allocation<float> input(elements),up(elements),weight(weights),actual(outputs),expected(outputs);
     Allocation<uint16_t> narrow(weights);Allocation<int32_t> count(1);
@@ -288,6 +300,24 @@ inline void runCase(int type,bool fused,int m,int n,int k,int pattern,bool timin
     for(size_t i=0;i<weights;++i){
         if(type==1)bits[i]=__half_as_ushort(__float2half(w[i]));
         else {uint32_t word;std::memcpy(&word,&w[i],4);bits[i]=uint16_t(word>>16);}
+    }
+    // Author one native source word directly. Other columns retain finite,
+    // rounding-sensitive data, and each special word gets its own replay case:
+    // NaNs can never hide finite/subnormal checks in another invocation.
+    if(rawWord>=0){
+        if(type==0)throw std::invalid_argument("Raw16 source case requires FP16 or BF16");
+        bits[0]=static_cast<uint16_t>(rawWord);
+        // K1 witnesses keep tiny source values observable: power-of-two scaling
+        // maps even the minimum BF16 subnormal into a normal FP32 product.
+        if(k==1)std::fill(a.begin(),a.end(),0x1p24f);
+    }
+    // Consume borrowed authored words synchronously into fixture-owned host
+    // banks before any DMA. Neither span nor caller storage enters graph identity.
+    for(const auto& source:overrides.words){
+        if(source.index>=weights || (type!=0 && source.bits>0xffffu))
+            throw std::invalid_argument("Native source override exceeds original word geometry");
+        if(type==0)std::memcpy(&w[source.index],&source.bits,sizeof(source.bits));
+        else bits[source.index]=static_cast<uint16_t>(source.bits);
     }
     // Every borrowed async host source precedes stream owners, including
     // loop-reused poison, count and pointer publications. Exception teardown
@@ -350,7 +380,10 @@ inline void runCase(int type,bool fused,int m,int n,int k,int pattern,bool timin
         checked(hipMemcpyAsync(got.data(),actual.p,outputs*4,hipMemcpyDeviceToHost,candidate.stream));
         checked(hipMemcpyAsync(gold.data(),expected.p,outputs*4,hipMemcpyDeviceToHost,oracle.stream));
         checked(hipStreamSynchronize(candidate.stream));checked(hipStreamSynchronize(oracle.stream));
-        ASSERT_EQ(std::memcmp(got.data(),gold.data(),outputs*4),0)<<"type="<<type<<" fused="<<fused<<" M/N/K="<<m<<'/'<<n<<'/'<<k<<" pattern="<<pattern<<" replay="<<iteration;
+        ASSERT_EQ(std::memcmp(got.data(),gold.data(),outputs*4),0)<<"type="<<type<<" fused="<<fused<<" M/N/K="<<m<<'/'<<n<<'/'<<k<<" pattern="<<pattern<<" raw16="<<rawWord<<" replay="<<iteration;
+        // Tiny-source witnesses must remain observable in the native oracle;
+        // matching zero outputs would not prove preservation of their bits.
+        if(rawWord>=0 && k==1 && live>0)ASSERT_NE(got[0],0.0f);
         for(size_t i=size_t(live)*n;i<outputs;++i)ASSERT_EQ(std::memcmp(&got[i],&dirty[i],4),0);
     }
     if(timing){
@@ -398,6 +431,40 @@ TEST(ROCmFloatingReduction,HistoricalTreeCapturedByteExact){
             runCase(type,fused,m,shape.first,shape.second,0);
     for(bool fused:{false,true})for(int type:{0,1,2})for(int pattern=1;pattern<=6;++pattern)
         runCase(type,fused,3,4,257,pattern);
+    // Two distinct quiet payloads exercise the original cross-wave operands.
+    // Exact old-native comparison is required; payload canonicalization on a
+    // backend is permitted and must not be reported as a sensitivity witness.
+    for(bool fused:{false,true})for(int type:{0,1,2}){
+        const uint32_t first=type==0?0x7fc12345u:type==1?0x7e11u:0x7fc1u;
+        const uint32_t second=type==0?0x7fc54321u:type==1?0x7e22u:0x7fe2u;
+        const uint32_t sign=type==0?0x80000000u:0x8000u;
+        for(auto edge:{std::pair{0,128},std::pair{64,192},std::pair{0,64}})
+            for(unsigned signs=0;signs<4;++signs)for(bool reverse:{false,true}){
+                const uint32_t left=(reverse?second:first)|((signs&1u)?sign:0u);
+                const uint32_t right=(reverse?first:second)|((signs&2u)?sign:0u);
+                const std::array<NativeSourceWord,2> words{{
+                    {static_cast<size_t>(edge.first),left},{static_cast<size_t>(edge.second),right}}};
+                SCOPED_TRACE(::testing::Message()<<"native pair type="<<type<<" fused="<<fused
+                    <<" edge="<<edge.first<<'/'<<edge.second<<" signs="<<signs<<" reverse="<<reverse);
+                runCase(type,fused,1,1,256,0,false,-1,NativeSourceOverrides{words});
+            }
+    }
+    // Independent native16-bit finite/zero/subnormal/infinity and NaN words.
+    // Signaling/quiet payloads are not routed through a host float conversion.
+    for(bool fused:{false,true})for(int type:{1,2}){
+        const std::vector<uint16_t> words=type==1 ?
+            std::vector<uint16_t>{0x0000,0x8000,0x0001,0x8001,0x03ff,0x83ff,
+                0x0400,0x8400,0x3c01,0xbc01,0x7bff,0xfbff,0x7c00,0xfc00,
+                0x7c01,0xfc01,0x7d55,0xfd55,0x7e00,0xfe00,0x7fff,0xffff} :
+            std::vector<uint16_t>{0x0000,0x8000,0x0001,0x8001,0x007f,0x807f,
+                0x0080,0x8080,0x3f81,0xbf81,0x7f7f,0xff7f,0x7f80,0xff80,
+                0x7f81,0xff81,0x7fa5,0xffa5,0x7fc0,0xffc0,0x7fff,0xffff};
+        for(uint16_t word:words)runCase(type,fused,3,4,257,0,false,word);
+        // Ordinary K1 has no later lane-local product or unrelated nonzero
+        // reduction partial to round away subnormal/min-normal source evidence.
+        if(!fused)for(size_t word=2;word<8;++word)
+            runCase(type,false,3,4,1,0,false,words[word]);
+    }
 }
 /** @brief Opt-in exact-shape paired native-event timings; excluded from functional gate. */
 TEST(ROCmFloatingReduction,DISABLED_ExactShapePairedEvents){

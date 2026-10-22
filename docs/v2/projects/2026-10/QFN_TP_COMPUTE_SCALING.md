@@ -2,10 +2,11 @@
 
 Updated: 2026-10-22. The recorded vocabulary-projection local-shape and concurrent
 TP1/TP2/TP4 measurements are green. Other kernel families remain in progress.
-The accepted A1 checkpoint is L96, 796.370 prefill / 36.750 decode tok/s
-on four MI50s, including the [profiled fixed-tree reduction](QFN_FLOATING_REDUCTION_TUNING.md).
+The accepted A1 checkpoint is L97, 814.368 prefill / 36.727 decode tok/s
+on four MI50s, including [profiled native-format specialization](QFN_FLOATING_REDUCTION_TUNING.md#native-source-format-specialization-candidate97).
 See the [dashboard](QFN_TUNING_DASHBOARD.md) for its exact settings and matched
-comparison with Automatic94.
+comparison with L96. Prefill improves 2.254%; decode is 0.229% lower with
+overlapping ranges. Recorded-input GDN scaling is the next measurement slice.
 
 The user selected **preserve recorded inputs and expert routes**. The diagnostic
 will measure the original production compute without executing communication
