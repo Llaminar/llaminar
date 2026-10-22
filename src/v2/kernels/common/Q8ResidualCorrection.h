@@ -186,4 +186,22 @@ void cudaQ8ResidualCorrectedProjection(const GPUQ8ResidualCorrectionArgs&args,vo
  * @param stream Exact ordered native HIP stream; null/default is rejected.
  */
 void rocmQ8ResidualCorrectedProjection(const GPUQ8ResidualCorrectionArgs&args,void*stream);
+/**
+ * @brief Explicit CUDA original-column diagnostic oracle, independent of production dispatch.
+ * @param args PhysicalM1 native signed-Q8 source, row authority and original admitted banks.
+ * @param stream Exact non-default native stream owning publication and reference projection.
+ * @throws std::invalid_argument Before publication for any unsupported source or geometry.
+ * @throws std::runtime_error When native submission fails.
+ * @return No value; submits the original publisher and ordered column projection.
+ */
+void cudaQ8ResidualOriginalColumnReference(const GPUQ8ResidualCorrectionArgs &args, void *stream);
+/**
+ * @brief Explicit HIP original-column diagnostic oracle, independent of production dispatch.
+ * @param args PhysicalM1 native signed-Q8 source, row authority and original admitted banks.
+ * @param stream Exact non-default native stream owning publication and reference projection.
+ * @throws std::invalid_argument Before publication for any unsupported source or geometry.
+ * @throws std::runtime_error When native submission fails.
+ * @return No value; submits the original publisher and ordered column projection.
+ */
+void rocmQ8ResidualOriginalColumnReference(const GPUQ8ResidualCorrectionArgs &args, void *stream);
 }

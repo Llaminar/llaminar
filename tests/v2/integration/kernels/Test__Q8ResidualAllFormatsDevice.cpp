@@ -9,6 +9,7 @@
  * setup/terminal boundaries only.
  */
 #include "utils/GpuPreparedGemmHarness.h"
+#include "utils/PerfStatsCollector.h"
 #include "moe/NativeVNNIExpertTransferParityTest.h"
 #include "../../utils/Q8ResidualAllFormatOracle.h"
 #include "backends/ExplicitGPUStream.h"
@@ -19,7 +20,10 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "kernels/common/Q8ResidualGroupedGeometry.h"
+#include "kernels/common/Q8ResidualShortKGeometry.h"
 #include "transfer/TransferEngine.h"
+#include <cstdlib>
+#include <string>
 #include <future>
 #include <gtest/gtest.h>
 #include <iostream>
@@ -287,13 +291,102 @@ test::GpuPreparedGemm preparePromotedAsymmetric(TensorBase *source, DeviceId dev
           "Promoted prepared-store source identity changed");
   return out;
 }
+/** @brief Scope only the existing collector policy; restore original optional environment values. */
+class ProjectionSubmissionObservation final {
+    std::optional<std::string> json_, filter_;
+    /**
+     * @param name One of the two collector environment keys owned by this scope.
+     * @return Exact prior value, distinguishing an empty value from absence.
+     */
+    static std::optional<std::string> prior(const char *name) {
+        const char *value = std::getenv(name);
+        return value ? std::optional<std::string>{value} : std::nullopt;
+    }
+    /**
+     * @brief Restore exactly the saved value or original absence; failed restoration is fatal.
+     * @param name Collector environment key being retired.
+     * @param value Original value, or absence to restore with unsetenv.
+     */
+    static void restore(const char *name, const std::optional<std::string> &value) {
+        const int result = value ? setenv(name,value->c_str(),1) : unsetenv(name);
+        if (result != 0) std::terminate();
+    }
+public:
+    /** @brief Select accepted host submissions without enabling timers or another domain. */
+    ProjectionSubmissionObservation()
+        : json_(prior("LLAMINAR_PERF_STATS_JSON")),
+          filter_(prior("LLAMINAR_PERF_STATS_FILTER")) {
+        if (setenv("LLAMINAR_PERF_STATS_JSON","1",1) != 0 ||
+            setenv("LLAMINAR_PERF_STATS_FILTER","kernel.q8_residual_ordered_short_k_submissions",1) != 0) {
+            restore("LLAMINAR_PERF_STATS_FILTER",filter_);
+            restore("LLAMINAR_PERF_STATS_JSON",json_);
+            throw std::runtime_error("Cannot select projection submission observation environment");
+        }
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+        PerfStatsCollector::reset();
+    }
+    /** @brief Retire fixture evidence, restore exact environment absence/values and reload it. */
+    ~ProjectionSubmissionObservation() {
+        PerfStatsCollector::reset();
+        restore("LLAMINAR_PERF_STATS_FILTER",filter_);
+        restore("LLAMINAR_PERF_STATS_JSON",json_);
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+    }
+    ProjectionSubmissionObservation(const ProjectionSubmissionObservation&) = delete;
+    ProjectionSubmissionObservation& operator=(const ProjectionSubmissionObservation&) = delete;
+};
+/** @return Exact accepted-submission records, excluding dotted neighboring families. */
+std::vector<PerfStatRecord> projectionSubmissions() {
+    auto records = PerfStatsCollector::snapshot({"kernel.q8_residual_ordered_short_k_submissions"});
+    records.erase(std::remove_if(records.begin(),records.end(),[](const auto &record) {
+        return record.domain != "kernel" || record.name != "q8_residual_ordered_short_k_submissions";
+    }),records.end());
+    return records;
+}
 /** @brief Explicit test setup choice; inference arithmetic is unchanged. */
 enum class SourcePreparation { NativeGpu, PromotedCpuAsymmetric };
-/** @brief One actual original-format stage/capture with cold declaration and
- * retained live-prefix replays. */
+/** @brief Serial oracle choice only; every tested production capture uses the actual GEMMStage. */
+enum class SerialProjectionReference { Production, OriginalColumn };
+/**
+ * @brief Submit the independent original-column diagnostic without production dispatch.
+ * @param device Actual source/bank owner backend.
+ * @param args Original prepared source, live authority and independent output/scratch.
+ * @param stream Exact capture stream retaining those owners.
+ * @return No value; native submissions are accepted or a typed exception is raised.
+ */
+void submitOriginalColumnReference(DeviceId device, const GPUQ8ResidualCorrectionArgs &args,
+                                   void *stream)
+{
+#ifdef HAVE_CUDA
+    if (device.is_cuda()) {
+        cudaQ8ResidualOriginalColumnReference(args, stream);
+        return;
+    }
+#endif
+#ifdef HAVE_ROCM
+    if (device.is_rocm()) {
+        rocmQ8ResidualOriginalColumnReference(args, stream);
+        return;
+    }
+#endif
+    throw std::invalid_argument("Diagnostic projection backend is not compiled");
+}
+/**
+ * @brief Prove actual prepared-stage capture, source math and retained live-prefix replay.
+ * @param device Actual participant and original prepared-source owner.
+ * @param format Canonical original quantized source fixture.
+ * @param m Physical rows, independent of later live counts.
+ * @param n Output width, including final-column tails.
+ * @param k Complete native K32 reduction width.
+ * @param tile Whether authored equal input rows label a larger geometry workload.
+ * @param concurrentCold Whether cold IQ preparation queries run concurrently.
+ * @param sourcePreparation Original native or actual promoted source path.
+ * @param reference Independent original-column or ordinary serial reference.
+ */
 void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
            int m, int n, int k, bool tile, bool concurrentCold = false,
-           SourcePreparation sourcePreparation = SourcePreparation::NativeGpu) {
+           SourcePreparation sourcePreparation = SourcePreparation::NativeGpu,
+           SerialProjectionReference reference = SerialProjectionReference::Production) {
   const bool promotedAsymmetric = sourcePreparation == SourcePreparation::PromotedCpuAsymmetric;
   SCOPED_TRACE(format.label);
   SCOPED_TRACE(::testing::Message() << device.toString() << " M=" << m << " N="
@@ -432,12 +525,78 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
               backend->deviceToDevice(out, in, bytes, device.ordinal, s.stream),
               "Independent native row copy failed");
         };
+        if (reference == SerialProjectionReference::OriginalColumn) {
+          PerfStatsCollector::reset();
+          const GPUQ8ResidualCorrectionArgs referenceArgs{
+              .weights = desc, .rows = DeviceRowRange::fullyActive(1),
+              .quantizer = device.is_cuda()
+                  ? Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal
+                  : Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal,
+              .input = static_cast<const float *>(rowInput.gpu_data_ptr()),
+              .output = static_cast<float *>(rowOutput.gpu_data_ptr()),
+              .primary = static_cast<signed char *>(correction.value->getBuffer(kGPUProjectionPrimaryQ8)),
+              .residual = static_cast<signed char *>(correction.value->getBuffer(kGPUProjectionResidualQ8)),
+              .primaryScales = static_cast<float *>(correction.value->getBuffer(kGPUProjectionPrimaryQ8Scales)),
+              .residualScales = static_cast<float *>(correction.value->getBuffer(kGPUProjectionResidualQ8Scales))};
+          auto rejected = referenceArgs;
+          rejected.input = nullptr;
+#ifdef HAVE_CUDA
+          if (device.is_cuda()) EXPECT_THROW(cudaQ8ResidualCorrectedProjection(rejected,s.stream),std::invalid_argument);
+#endif
+#ifdef HAVE_ROCM
+          if (device.is_rocm()) EXPECT_THROW(rocmQ8ResidualCorrectedProjection(rejected,s.stream),std::invalid_argument);
+#endif
+          EXPECT_TRUE(projectionSubmissions().empty()) << "Rejected production calls must not issue receipts";
+          s.graph = worker.createGraphCapture(s.stream);
+          require(bool(s.graph), "Original-column reference capture unavailable");
+          {
+            ScopedBackendGraphCapture capture(worker, *s.graph, "Independent original-column reference");
+            require(capture.begin(), "Original-column reference capture failed");
+            auto unsupported = referenceArgs;
+            unsupported.rows = DeviceRowRange::fullyActive(2);
+            EXPECT_THROW(submitOriginalColumnReference(device, unsupported, s.stream), std::invalid_argument);
+            unsupported = referenceArgs;
+            unsupported.weights.codebook_id = 20;
+            EXPECT_THROW(submitOriginalColumnReference(device, unsupported, s.stream), std::invalid_argument);
+            submitOriginalColumnReference(device, referenceArgs, s.stream);
+            capture.finish();
+          }
+          require(s.graph->instantiate(), "Original-column reference instantiate failed");
+          std::vector<GPUGraphKernelNodeInfo> referenceNodes;
+          std::string referenceError;
+          require(s.graph->inspectKernelNodes(referenceNodes, &referenceError),
+                  "Original-column reference inspection failed");
+          ASSERT_EQ(referenceNodes.size(), 2u);
+          unsigned referenceProjects = 0, referencePublishers = 0;
+          for (const auto &node : referenceNodes) {
+            ASSERT_EQ(node.name.find("projectShortK"), std::string::npos);
+            EXPECT_TRUE(node.name_resolved);
+            if (node.name.find("publish") != std::string::npos) {
+              ++referencePublishers;
+              EXPECT_EQ(node.block_x, 256u);
+              EXPECT_EQ(node.grid_x, (std::uint64_t(k / 32) + 7) / 8);
+            }
+            if (node.name.find("project") != std::string::npos) {
+              ++referenceProjects;
+              EXPECT_TRUE(node.name.find("project<1>") != std::string::npos ||
+                          node.name.find("projectILi1EE") != std::string::npos);
+              EXPECT_EQ(node.block_x, 128u);
+              EXPECT_EQ(node.grid_x, (std::uint64_t(n) + 127) / 128);
+              EXPECT_EQ(node.grid_y, 1u); EXPECT_EQ(node.grid_z, 1u);
+            }
+          }
+          EXPECT_EQ(referenceProjects, 1u);
+          EXPECT_EQ(referencePublishers, 1u);
+        }
         for (int r = 0; r < uniqueRows; ++r) {
           copy(rowInput.gpu_data_ptr(),
                static_cast<const float *>(input.gpu_data_ptr()) +
                    std::size_t(r) * k,
                std::size_t(k) * sizeof(float));
-          kernel->multiply_q8_residual_corrected(&rowInput, &rowOutput,
+          if (reference == SerialProjectionReference::OriginalColumn)
+            require(s.graph->launch(), "Independent original-column replay failed");
+          else
+            kernel->multiply_q8_residual_corrected(&rowInput, &rowOutput,
                                                  DeviceRowRange::fullyActive(1),
                                                  n, k, correction.value.get());
           copy(serial + std::size_t(r) * n, rowOutput.gpu_data_ptr(),
@@ -465,6 +624,12 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
             s.download(serial0, std::size_t(uniqueRows) * k);
         const auto serialResidual =
             s.download(serial1, std::size_t(uniqueRows) * k);
+        // Reference replay is complete before its captured graph retires; all
+        // original source/bank owners remain retained for actual stage capture.
+        if (reference == SerialProjectionReference::OriginalColumn) {
+          s.retire();
+          EXPECT_TRUE(projectionSubmissions().empty()) << "Independent oracle must not issue production receipts";
+        }
         for (int r = 0; r < m; ++r) {
           const auto frozen = r % uniqueRows;
           ASSERT_EQ(std::memcmp(ordinaryPrimary.data() + std::size_t(r) * k,
@@ -541,6 +706,13 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
         EXPECT_EQ(s.download(static_cast<const float *>(output.gpu_data_ptr()),
                              dirtyOutput.size()),
                   dirtyOutput);
+        if (reference == SerialProjectionReference::OriginalColumn) {
+          PerfStatsCollector::reset();
+          // Zero is device-owned input data, not a host-submission suppression
+          // condition. Capture accepts once; retained live/empty replays do not
+          // revisit the factory or add host receipts.
+          s.upload(count,std::vector<int32_t>{0});
+        }
         s.graph = worker.createGraphCapture(s.stream);
         require(bool(s.graph), "Native graph capture unavailable");
         {
@@ -561,6 +733,11 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
             device.is_cuda() ? Q8ResidualGroupedBackend::CUDA
                              : Q8ResidualGroupedBackend::ROCm,
             m, n, desc.codebook_id);
+        const auto shortGeometry = q8ResidualShortKGeometry(
+            device.is_cuda() ? Q8ResidualGroupedBackend::CUDA : Q8ResidualGroupedBackend::ROCm,
+            m, n, k, desc.codebook_id);
+        const auto threads = shortGeometry ? shortGeometry->threads : geometry.threads;
+        const auto blocks = shortGeometry ? shortGeometry->blocks : geometry.blocks;
         unsigned publishers = 0, projects = 0;
         for (const auto &node : nodes) {
           EXPECT_EQ(node.local_memory_bytes_per_thread, 0u);
@@ -575,12 +752,40 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
           }
           if (node.name.find("project") != std::string::npos) {
             ++projects;
-            EXPECT_EQ(node.block_x, static_cast<unsigned>(geometry.threads));
-            EXPECT_EQ(node.grid_x, geometry.blocks);
+            EXPECT_EQ(node.block_x, static_cast<unsigned>(threads));
+            EXPECT_EQ(node.grid_x, blocks);
+            EXPECT_EQ(node.name.find("projectShortK") != std::string::npos, bool(shortGeometry));
+            if (shortGeometry) {
+              EXPECT_NE(node.name.find("projectShortK"), std::string::npos);
+              EXPECT_EQ(node.dynamic_shared_memory_bytes, 0u);
+              EXPECT_EQ(node.static_shared_memory_bytes, shortGeometry->shared_bytes);
+            }
           }
         }
         EXPECT_EQ(publishers, 1u);
         EXPECT_EQ(projects, 1u);
+        std::vector<PerfStatRecord> capturedSubmissions;
+        if (reference == SerialProjectionReference::OriginalColumn) {
+          capturedSubmissions = projectionSubmissions();
+          ASSERT_EQ(capturedSubmissions.size(),shortGeometry?1u:0u);
+          if (shortGeometry) {
+            const auto &record = capturedSubmissions.front();
+            EXPECT_EQ(record.kind,PerfStatRecord::Kind::Counter);
+            EXPECT_EQ(record.phase,"submission"); EXPECT_TRUE(record.device.empty());
+            EXPECT_EQ(record.count,1u); EXPECT_EQ(record.value,1.0);
+            EXPECT_EQ(record.tags.at("backend"),device.is_cuda()?"cuda":"rocm");
+            EXPECT_EQ(record.tags.at("observation"),"host_execute_or_capture");
+            EXPECT_EQ(record.tags.at("kernel_family"),"ordered_short_k");
+            EXPECT_EQ(record.tags.at("physical_rows"),std::to_string(m));
+            EXPECT_EQ(record.tags.at("n"),std::to_string(n)); EXPECT_EQ(record.tags.at("k"),std::to_string(k));
+            EXPECT_EQ(record.tags.at("execution_codebook"),std::to_string(desc.codebook_id));
+            for(const auto &node:nodes) if(node.name.find("project")!=std::string::npos) {
+              EXPECT_EQ(record.tags.at("launch_blocks"),std::to_string(node.grid_x));
+              EXPECT_EQ(record.tags.at("launch_threads"),std::to_string(node.block_x));
+              EXPECT_EQ(record.tags.at("static_shared_bytes"),std::to_string(node.static_shared_memory_bytes));
+            }
+          }
+        }
         const auto signature = stage.graphCaptureVariantSignature(),
                    used = correction.value->used(),
                    ownerCount = s.owners->size();
@@ -648,6 +853,15 @@ void prove(DeviceId device, const test::QuantizedVerifierFormatCase &format,
             ASSERT_EQ(x[i], -8765.f);
             ASSERT_EQ(y[i], -8765.f);
           }
+          if (reference == SerialProjectionReference::OriginalColumn) {
+            const auto records = projectionSubmissions();
+            ASSERT_EQ(records.size(),capturedSubmissions.size());
+            if (shortGeometry) {
+              EXPECT_EQ(records.front().count,capturedSubmissions.front().count);
+              EXPECT_EQ(records.front().value,capturedSubmissions.front().value);
+              EXPECT_EQ(records.front().tags,capturedSubmissions.front().tags);
+            }
+          }
           EXPECT_EQ(stage.graphCaptureVariantSignature(), signature);
           EXPECT_EQ(correction.value->used(), used);
           EXPECT_EQ(s.owners->size(), ownerCount);
@@ -684,8 +898,38 @@ void block32(DeviceId device) {
     ASSERT_FALSE(::testing::Test::HasFailure());
   }
 }
+/** @brief Every actual K-group specialization plus wide-N and final-column tails.
+ * The independent original-column launcher computes each distinct serial row;
+ * every tested capture is the actual GEMMStage with original prepared owners.
+ * Matching grouped geometry must retain serial bytes across live/empty/reset.
+ */
+void shortK(DeviceId device) {
+  ProjectionSubmissionObservation observation;
+  const auto &q8 = test::quantizedVerifierFormat("Q8_0");
+  for (int k = 64; k <= 512; k += 32) {
+    prove(device, q8, 1, 4*k+1, k, false, false,
+          SourcePreparation::NativeGpu, SerialProjectionReference::OriginalColumn);
+    ASSERT_FALSE(::testing::Test::HasFailure());
+  }
+  for (int n : {1279, 1280, 1311, 1312, 1313, 1343, 1344, 1345, 10240}) {
+    prove(device, q8, 1, n, 320, false, false,
+          SourcePreparation::NativeGpu, SerialProjectionReference::OriginalColumn);
+    ASSERT_FALSE(::testing::Test::HasFailure());
+  }
+  for (int m : {2, 3, 15, 32, 64, 65, 512}) {
+    prove(device, q8, m, 1281, 320, false, false,
+          SourcePreparation::NativeGpu, SerialProjectionReference::OriginalColumn);
+    ASSERT_FALSE(::testing::Test::HasFailure());
+  }
+  for (const char *name : {"Q8_1", "Q8_K"}) {
+    prove(device, test::quantizedVerifierFormat(name), 1, 2049, 512, false, false,
+          SourcePreparation::NativeGpu, SerialProjectionReference::OriginalColumn);
+    ASSERT_FALSE(::testing::Test::HasFailure());
+  }
+}
 } // namespace
 #ifdef HAVE_CUDA
+TEST(Q8ResidualAllFormatsDevice, CUDAOrderedShortK) { shortK(DeviceId::cuda(0)); }
 TEST(Q8ResidualAllFormatsDevice, CUDA) { sweep(DeviceId::cuda(0), false); }
 TEST(Q8ResidualAllFormatsDevice, CUDALargeTiled) {
   sweep(DeviceId::cuda(0), true);
@@ -713,6 +957,7 @@ TEST(Q8ResidualAllFormatsDevice, CUDAConcurrentColdIQ) {
 }
 #endif
 #ifdef HAVE_ROCM
+TEST(Q8ResidualAllFormatsDevice, ROCmOrderedShortK) { shortK(DeviceId::rocm(0)); }
 TEST(Q8ResidualAllFormatsDevice, ROCm) { sweep(DeviceId::rocm(0), false); }
 TEST(Q8ResidualAllFormatsDevice, ROCmLargeTiled) {
   sweep(DeviceId::rocm(0), true);

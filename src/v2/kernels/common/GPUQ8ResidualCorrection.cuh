@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 #define Q8R_STREAM cudaStream_t
 #define Q8R_FACTORY cudaQ8ResidualCorrectedProjection
+#define Q8R_COLUMN_REFERENCE cudaQ8ResidualOriginalColumnReference
 #define Q8R_NAMESPACE cuda_q8_residual
 #define Q8R_ERROR cudaGetLastError
 #define Q8R_SUCCESS cudaSuccess
@@ -25,6 +26,7 @@
 #include "kernels/rocm/ops/ROCmSwiGLUDecodeEquivalentMath.h"
 #define Q8R_STREAM hipStream_t
 #define Q8R_FACTORY rocmQ8ResidualCorrectedProjection
+#define Q8R_COLUMN_REFERENCE rocmQ8ResidualOriginalColumnReference
 #define Q8R_NAMESPACE rocm_q8_residual
 #define Q8R_ERROR hipGetLastError
 #define Q8R_SUCCESS hipSuccess
@@ -32,9 +34,11 @@
 #define Q8R_SHFL(x,o) __shfl_xor(x,o,32)
 #endif
 #include "Q8ResidualCorrection.h"
+#include "utils/PerfStatsCollector.h"
 #include "DeviceFP32NumericalContract.h"
 #include "DeviceNativeVNNIContributionContract.h"
 #include "Q8ResidualGroupedGeometry.h"
+#include "Q8ResidualShortKGeometry.h"
 #include "GPUQ8ResidualNative.h"
 #include "GPUQ8ResidualNativeDevice.cuh"
 #if defined(Q8_RESIDUAL_CUDA)
@@ -141,6 +145,58 @@ template<int Rows>__global__ __launch_bounds__(128,2) void project(GPUQ8Residual
 #pragma unroll
  for(int r=0;r<Rows;++r)if(rowBase+r<static_cast<unsigned>(live))
   a.output[(rowBase+r)*a.weights.n+column]=device_fp32_contract::add(primary[r],residual[r]);
+}
+/**
+ * @brief Compute independent K32 contributions, then retain the original ordered fold.
+ * @tparam Groups Actual K32 group count; no inactive reduction capacity is admitted.
+ * @param a Original native source, publication banks and M1 device-row authority.
+ *
+ * Each K32 group contributes 32 adjacent columns: one CUDA warp, or half a
+ * gfx906 wave. Every contributor writes both FP32 terms into distinct LDS cells.
+ * The group0 output owners fold group0..Groups-1 with the exact scalar add
+ * contract, and add the two complete terms once.
+ * The static storage and single workgroup barrier introduce no global workspace
+ * or extra publication. Even zero-live or final-tile lanes reach the same barrier.
+ */
+template<int Groups>
+__global__ __launch_bounds__(Groups*kQ8ResidualShortKColumns,1) void projectShortK(GPUQ8ResidualCorrectionArgs a) {
+ static_assert(Groups>=2&&Groups<=16);
+ constexpr unsigned Columns=kQ8ResidualShortKColumns;
+ __shared__ float primary[Groups][Columns],residual[Groups][Columns];
+ const unsigned group=threadIdx.x/Columns,localColumn=threadIdx.x%Columns;
+ const auto column=static_cast<std::uint64_t>(blockIdx.x)*Columns+localColumn;
+ const int live=a.rows.activeRows();
+ float p=0.f,q=0.f;
+ if(live>0&&column<static_cast<unsigned>(a.weights.n)) {
+  const auto linear=static_cast<std::uint64_t>(group)*a.weights.n+column;
+  const auto*payload=reinterpret_cast<const int4*>(a.weights.payload+linear*32);
+  const int4 low=payload[0],high=payload[1];
+  const int weights[8]{low.x,low.y,low.z,low.w,high.x,high.y,high.z,high.w};
+  const auto bits=static_cast<const unsigned short*>(a.weights.scales)[linear];
+  const float weightScale=__half2float(__ushort_as_half(bits));
+  const auto*p0=reinterpret_cast<const int*>(a.primary+group*32);
+  const auto*p1=reinterpret_cast<const int*>(a.residual+group*32);
+  int dot0=0,dot1=0;
+#pragma unroll
+  for(int word=0;word<8;++word) {
+   dot0=dot4(p0[word],weights[word],dot0);
+   dot1=dot4(p1[word],weights[word],dot1);
+  }
+  p=device_native_vnni_contract::singleScaleBlock(dot0,weightScale,a.primaryScales[group]);
+  q=device_native_vnni_contract::singleScaleBlock(dot1,weightScale,a.residualScales[group]);
+ }
+ primary[group][localColumn]=p;
+ residual[group][localColumn]=q;
+ __syncthreads();
+ if(group==0&&live>0&&column<static_cast<unsigned>(a.weights.n)) {
+  float sum0=0.f,sum1=0.f;
+#pragma unroll
+  for(int block=0;block<Groups;++block) {
+   sum0=device_fp32_contract::add(sum0,primary[block][localColumn]);
+   sum1=device_fp32_contract::add(sum1,residual[block][localColumn]);
+  }
+  a.output[column]=device_fp32_contract::add(sum0,sum1);
+ }
 }
 /**
  * @brief Native small-row paired dots sharing one compact block across real rows.
@@ -260,8 +316,42 @@ inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, N
     validateQ8ResidualStorage(writes, reads);
     return native;
 }
+/**
+ * @brief Launch the exact specialization selected from validated immutable geometry.
+ * @param a Original prepared source, live authority and published activation banks.
+ * @param geometry Already validated production geometry, with groups2..16.
+ * @param stream Exact non-default CUDA/HIP stream used by the publisher.
+ * @throws std::logic_error If an internal validated group lacks a specialization.
+ * @note The caller validates all metadata before publication; this helper never
+ * reads live state, publishes banks, allocates storage or selects another family.
+ */
+inline void launchOrderedShortK(const GPUQ8ResidualCorrectionArgs &a,
+                               const Q8ResidualShortKGeometry &geometry, Q8R_STREAM stream)
+{
+#define Q8R_SHORT_K_CASE(G) case G: projectShortK<G><<<static_cast<unsigned>(geometry.blocks),geometry.threads,0,stream>>>(a); break
+    switch (geometry.groups) {
+        Q8R_SHORT_K_CASE(2); Q8R_SHORT_K_CASE(3); Q8R_SHORT_K_CASE(4); Q8R_SHORT_K_CASE(5);
+        Q8R_SHORT_K_CASE(6); Q8R_SHORT_K_CASE(7); Q8R_SHORT_K_CASE(8); Q8R_SHORT_K_CASE(9);
+        Q8R_SHORT_K_CASE(10); Q8R_SHORT_K_CASE(11); Q8R_SHORT_K_CASE(12); Q8R_SHORT_K_CASE(13);
+        Q8R_SHORT_K_CASE(14); Q8R_SHORT_K_CASE(15); Q8R_SHORT_K_CASE(16);
+        default: throw std::logic_error("Validated ordered short-K group has no native specialization");
+    }
+#undef Q8R_SHORT_K_CASE
 }
-/** @brief Submit complete paired-Q8 arithmetic; no setup, allocation or host live-state observation. */
+
+}
+/**
+ * @brief Submit complete paired-Q8 arithmetic with passive host-submission evidence.
+ * @param a Original source/banks, immutable physical shape and device-owned live extent.
+ * @param stream Exact non-default native stream retaining all captured owners.
+ * @param tables Already cold-declared immutable IQ tables when the source needs them.
+ * @throws std::invalid_argument Before publication for invalid source, storage or geometry.
+ * @throws std::runtime_error After a native submission error; failed calls are never counted.
+ * @note The optional PerfStats record counts accepted host calls, including capture
+ * and zero-live calls, not device executions or tokens. Only ordered short-K
+ * submissions issue this record, using the same immutable launch/storage geometry.
+ * Disabled collection does not construct tags or inspect device state.
+ */
 void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream, NativeEmbeddingIQTables tables)
 {
     const auto native = Q8R_NAMESPACE::validate(a, stream, tables);
@@ -273,11 +363,22 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream, NativeEmbed
     const auto geometry =
         q8ResidualGroupedGeometry(Q8ResidualGroupedBackend::ROCm, a.rows.physicalRows(), a.weights.n, a.weights.codebook_id);
 #endif
-    const auto grid = geometry.blocks;
+    const auto shortGeometry = q8ResidualShortKGeometry(
+#if defined(Q8_RESIDUAL_CUDA)
+        Q8ResidualGroupedBackend::CUDA,
+#else
+        Q8ResidualGroupedBackend::ROCm,
+#endif
+        a.rows.physicalRows(), a.weights.n, a.weights.k, a.weights.codebook_id);
+    if (shortGeometry && a.weights.blocks_per_row != static_cast<unsigned>(shortGeometry->groups))
+        throw std::invalid_argument("Ordered short-K source groups differ from retained geometry");
+    const auto grid = shortGeometry ? shortGeometry->blocks : geometry.blocks;
     if ((tasks + 7) / 8 > INT_MAX || grid > INT_MAX)
         throw std::invalid_argument("Two-term GPU Q8 retained launch grid exceeds native capacity");
     Q8R_NAMESPACE::publish<<<static_cast<unsigned>((tasks + 7) / 8), 256, 0, native>>>(a);
-    visitQ8ResidualNativeCodebook(a.weights.codebook_id, [&]<std::uint8_t C>() {
+    if (shortGeometry)
+        Q8R_NAMESPACE::launchOrderedShortK(a, *shortGeometry, native);
+    else visitQ8ResidualNativeCodebook(a.weights.codebook_id, [&]<std::uint8_t C>() {
         if constexpr (C == 19)
         {
             if (geometry.strategy == Q8ResidualGroupedStrategy::CooperativeMatrix)
@@ -303,6 +404,50 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream, NativeEmbed
     const auto error = Q8R_ERROR();
     if (error != Q8R_SUCCESS)
         throw std::runtime_error(std::string("Two-term Q8 native launch failed: ") + Q8R_ERROR_TEXT(error));
+    // This is accepted host submission/capture evidence only. Retained native
+    // replay does not revisit this factory or increment this counter. No live
+    // count, device ordinal or compiler resource query is performed here.
+    if (shortGeometry && PerfStatsCollector::isDomainEnabled("kernel"))
+    {
+#if defined(Q8_RESIDUAL_CUDA)
+        constexpr const char *backend = "cuda";
+#else
+        constexpr const char *backend = "rocm";
+#endif
+        PerfStatsCollector::addCounter("kernel", "q8_residual_ordered_short_k_submissions", 1.0,
+            "submission", {}, {{"backend", backend}, {"observation", "host_execute_or_capture"},
+            {"kernel_family", "ordered_short_k"},
+            {"physical_rows", std::to_string(a.rows.physicalRows())},
+            {"n", std::to_string(a.weights.n)}, {"k", std::to_string(a.weights.k)},
+            {"execution_codebook", std::to_string(a.weights.codebook_id)},
+            {"launch_blocks", std::to_string(shortGeometry->blocks)},
+            {"launch_threads", std::to_string(shortGeometry->threads)},
+            {"static_shared_bytes", std::to_string(shortGeometry->shared_bytes)}});
+    }
+}
+/**
+ * @brief Submit the immutable original-column M1 arithmetic as a diagnostic reference.
+ * @param a Original signed-Q8 prepared source, physicalM1 row authority and admitted banks.
+ * @param stream Exact native stream retaining the source, scratch and output owners.
+ * @throws std::invalid_argument Before publication for non-M1 or non-signed-Q8 sources.
+ * @throws std::runtime_error When either original native launch fails admission.
+ * @note This named oracle never consults production geometry selection. It is
+ * not a public arithmetic policy, automatic alternative or inference fallback.
+ */
+void Q8R_COLUMN_REFERENCE(const GPUQ8ResidualCorrectionArgs &a, void *stream)
+{
+    if (a.rows.physicalRows() != 1 || a.weights.codebook_id != 19)
+        throw std::invalid_argument("Original-column reference requires physicalM1 and native signed-Q8");
+    const auto native = Q8R_NAMESPACE::validate(a, stream, {});
+    const auto tasks = static_cast<std::uint64_t>(a.weights.blocks_per_row);
+    const auto blocks = (static_cast<std::uint64_t>(a.weights.n) + 127) / 128;
+    if ((tasks + 7) / 8 > INT_MAX || blocks > INT_MAX)
+        throw std::invalid_argument("Original-column reference grid exceeds native capacity");
+    Q8R_NAMESPACE::publish<<<static_cast<unsigned>((tasks + 7) / 8), 256, 0, native>>>(a);
+    Q8R_NAMESPACE::project<1><<<static_cast<unsigned>(blocks), 128, 0, native>>>(a);
+    const auto error = Q8R_ERROR();
+    if (error != Q8R_SUCCESS)
+        throw std::runtime_error(std::string("Original-column reference launch failed: ") + Q8R_ERROR_TEXT(error));
 }
 /** @brief Preserve the original table-free external ABI through the same launcher. */
 void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream)
@@ -312,6 +457,7 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream)
 }
 #undef Q8R_STREAM
 #undef Q8R_FACTORY
+#undef Q8R_COLUMN_REFERENCE
 #undef Q8R_NAMESPACE
 #undef Q8R_ERROR
 #undef Q8R_SUCCESS

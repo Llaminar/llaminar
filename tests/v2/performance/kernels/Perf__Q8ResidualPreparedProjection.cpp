@@ -35,6 +35,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/common/Q8ResidualGroupedGeometry.h"
+#include "kernels/common/Q8ResidualShortKGeometry.h"
 #ifdef HAVE_CUDA
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #endif
@@ -276,9 +277,14 @@ std::vector<T> load(const char *path, std::size_t byteBound, bool exact) {
   require(bool(file), "Native slice read failed");
   return x;
 }
+/** @brief Named diagnostic comparison; never a production selector or arithmetic policy. */
+enum class ProjectionComparison { SingleVsTwoTerm, OriginalVsShortK };
+/** @brief Component launch selection bound to one retained graph instance. */
+enum class ProjectionKernel { Production, OriginalColumnReference };
 /** @brief One explicitly authored source, row authority and timing workload. */
 struct MeasureOptions {
   DeviceId device;
+  ProjectionComparison comparison = ProjectionComparison::SingleVsTwoTerm;
   int m = 0, n = 0, k = 0, live = -1, iterations = 0, batches = 0, warmup = 0;
   bool verifier = false, serial = false, tile = false, grouped = false;
   std::string weights, input, sourceName, exportDirectory,
@@ -320,6 +326,10 @@ MeasureOptions options(int argc, char **argv) {
       require(v == "vector" || v == "grouped",
               "Invalid compiled implementation expectation");
       o.grouped = v == "grouped";
+    } else if (key == "--comparison") {
+      require(v == "single_vs_two_term" || v == "original_vs_short_k", "Invalid comparison");
+      o.comparison = v == "original_vs_short_k" ? ProjectionComparison::OriginalVsShortK
+                                                 : ProjectionComparison::SingleVsTwoTerm;
     } else if (key == "--input-mode") {
       require(v == "exact" || v == "tile", "Invalid input mode");
       o.tile = v == "tile";
@@ -344,7 +354,7 @@ MeasureOptions options(int argc, char **argv) {
       throw std::invalid_argument("Unknown measurement option");
   }
   require(seen.size() == 14 + seen.count("--export-output") +
-                             seen.count("--source-format"),
+                             seen.count("--source-format") + seen.count("--comparison"),
           "All14 legacy measurement options required; export/source-format are "
           "optional");
   const auto &format = test::quantizedVerifierFormat(o.sourceFormat);
@@ -370,6 +380,11 @@ MeasureOptions options(int argc, char **argv) {
               o.batches <= 20 && o.batches % 2 == 0 && o.warmup > 0 &&
               o.warmup <= 64,
           "Bounded balanced timing repetitions required");
+  if (o.comparison == ProjectionComparison::OriginalVsShortK) {
+    require(o.m == 1 && !o.grouped && o.k >= 64 && o.k <= 512 && o.n >= 4*o.k,
+            "Short-K comparison requires M1/K64..512/N>=4K/vector");
+    require(o.exportDirectory.empty(), "Short-K comparison uses exact pair byte checks, not SingleQ8 export labels");
+  }
   if (!o.exportDirectory.empty()) {
     const std::filesystem::path directory(o.exportDirectory);
     const auto parent = directory.has_parent_path()
@@ -387,6 +402,8 @@ struct Projection {
   Storage &storage;
   const MeasureOptions &options;
   QuantizedActivationOperandPrecision precision;
+  const ProjectionKernel selectedKernel;
+  const DeviceRowRange rows;
   std::size_t signature = 0, used = 0;
   const void *outputPointer = nullptr;
   std::vector<const void *> banks;
@@ -400,8 +417,10 @@ struct Projection {
              TensorBase *weight, PreparedWeightStore &store,
              const WeightBinding &binding,
              QuantizedActivationOperandPrecision precision,
-             const int32_t *count)
-      : storage(s), options(o), precision(precision),
+             const int32_t *count,
+             ProjectionKernel selectedKernel = ProjectionKernel::Production)
+      : storage(s), options(o), precision(precision), selectedKernel(selectedKernel),
+        rows(count ? DeviceRowRange::deviceCounted(o.m,count) : DeviceRowRange::fullyActive(o.m)),
         output(std::make_shared<FP32Tensor>(
             std::vector<std::size_t>{std::size_t(o.m), std::size_t(o.n)},
             DeviceId::cpu())) {
@@ -477,12 +496,50 @@ struct Projection {
     if (stage)
       stage->unbindWorkspace();
   }
+  /**
+   * @brief Submit the actual stage or one explicit diagnostic role on unchanged bindings.
+   * @param context Original participant context, used only by actual stage execution.
+   * @return True after the selected actual stage or independent reference accepts its native submissions.
+   * @throws std::invalid_argument For a diagnostic role/backend that is not available.
+   * @note The original-column role never consults the normal production selector.
+   */
+  bool submit(IDeviceContext *context) {
+    if (selectedKernel == ProjectionKernel::Production) return stage->execute(context);
+    require(precision == QuantizedActivationOperandPrecision::TwoTermQ8, "Original-column reference requires TwoTerm");
+    const auto &p = stage->getParams();
+    auto *engine = p.prepared_store->gemmKernel(*p.prepared_ref);
+    DeviceNativeVNNIMatrixDesc source{};
+    require(engine && engine->exportNativeVNNIMatrixDesc(source), "Short-K lost original prepared source");
+    const GPUQ8ResidualCorrectionArgs args{
+        .weights=source, .rows=rows,
+        .quantizer=storage.device.is_cuda() ? Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal
+                                          : Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal,
+        .input=static_cast<const float *>(p.A->gpu_data_ptr()),
+        .output=static_cast<float *>(output->gpu_data_ptr()),
+        .primary=static_cast<signed char *>(workspace->value->getBuffer(kGPUProjectionPrimaryQ8)),
+        .residual=static_cast<signed char *>(workspace->value->getBuffer(kGPUProjectionResidualQ8)),
+        .primaryScales=static_cast<float *>(workspace->value->getBuffer(kGPUProjectionPrimaryQ8Scales)),
+        .residualScales=static_cast<float *>(workspace->value->getBuffer(kGPUProjectionResidualQ8Scales))};
+#ifdef HAVE_CUDA
+    if (storage.device.is_cuda()) {
+      cudaQ8ResidualOriginalColumnReference(args, storage.stream);
+      return true;
+    }
+#endif
+#ifdef HAVE_ROCM
+    if (storage.device.is_rocm()) {
+      rocmQ8ResidualOriginalColumnReference(args, storage.stream);
+      return true;
+    }
+#endif
+    throw std::invalid_argument("Short-K requested backend is not compiled");
+  }
   /** @brief Capture the exact native stage after optional setup warmup outside
    * capture. */
   void capture(IWorkerGPUContext &worker, IDeviceContext *context,
                bool prepare) {
     if (prepare) {
-      require(stage->execute(context), "Prepared projection warmup failed");
+      require(submit(context), "Prepared projection warmup failed");
       require(storage.backend->synchronizeStream(storage.stream,
                                                  storage.device.ordinal),
               "Setup projection observation failed");
@@ -493,7 +550,7 @@ struct Projection {
       ScopedBackendGraphCapture capture(
           worker, *graph, "prepared original Q8 projection measurement");
       require(capture.begin(), "Projection capture failed");
-      require(stage->execute(context), "Projection stage capture failed");
+      require(submit(context), "Projection stage capture failed");
       capture.finish();
     }
     require(graph->instantiate(), "Projection graph instantiation failed");
@@ -509,10 +566,14 @@ struct Projection {
           *stage->getParams().prepared_ref);
       require(engine && engine->exportNativeVNNIMatrixDesc(source),
               "Projection lost its original source descriptor");
-      const auto geometry = q8ResidualGroupedGeometry(
-          storage.device.is_cuda() ? Q8ResidualGroupedBackend::CUDA
-                                   : Q8ResidualGroupedBackend::ROCm,
-          options.m, options.n, source.codebook_id);
+      // The oracle's geometry must remain independent when production dispatch evolves.
+      const auto geometry = selectedKernel == ProjectionKernel::OriginalColumnReference
+          ? Q8ResidualGroupedGeometry{Q8ResidualGroupedStrategy::RowVector, 1, 128, 128,
+              (static_cast<std::uint64_t>(options.n) + 127) / 128}
+          : q8ResidualGroupedGeometry(
+              storage.device.is_cuda() ? Q8ResidualGroupedBackend::CUDA
+                                       : Q8ResidualGroupedBackend::ROCm,
+              options.m, options.n, source.codebook_id);
       const bool expectedGroup =
           geometry.strategy == Q8ResidualGroupedStrategy::CooperativeMatrix;
       require(!expectedGroup || options.grouped,
@@ -521,7 +582,12 @@ struct Projection {
       bool group = false, projection = false, publication = false;
       const auto publisherGrid =
           (std::size_t(options.m) * (options.k / 32) + 7) / 8;
-      const auto projectionGrid = geometry.blocks;
+      const auto shortGeometry = q8ResidualShortKGeometry(
+          storage.device.is_cuda() ? Q8ResidualGroupedBackend::CUDA : Q8ResidualGroupedBackend::ROCm,
+          options.m, options.n, options.k, source.codebook_id);
+      const bool orderedShortK = selectedKernel == ProjectionKernel::Production && bool(shortGeometry);
+      const auto projectionGrid = orderedShortK ? shortGeometry->blocks : geometry.blocks;
+      const auto projectionThreads = orderedShortK ? shortGeometry->threads : geometry.threads;
       for (const auto &node : nodes) {
         require(node.grid_y == 1 && node.grid_z == 1 && node.block_y == 1 &&
                     node.block_z == 1,
@@ -533,9 +599,21 @@ struct Projection {
         }
         if (node.name.find("project") != std::string::npos) {
           projection = true;
-          group = node.block_x == 256;
+          group = !orderedShortK && selectedKernel == ProjectionKernel::Production && node.block_x == 256;
+          if (orderedShortK) {
+            require(node.name.find("projectShortK") != std::string::npos &&
+                        node.dynamic_shared_memory_bytes == 0 &&
+                        node.static_shared_memory_bytes == shortGeometry->shared_bytes,
+                    "Short-K actual kernel/storage identity differs");
+          }
+          if (selectedKernel == ProjectionKernel::OriginalColumnReference) {
+            require(node.name.find("projectShortK") == std::string::npos &&
+                        (node.name.find("project<1>") != std::string::npos ||
+                         node.name.find("projectILi1EE") != std::string::npos),
+                    "Independent original-column graph selected another kernel");
+          }
           require(node.grid_x == projectionGrid &&
-                      node.block_x == static_cast<unsigned>(geometry.threads),
+                      node.block_x == static_cast<unsigned>(projectionThreads),
                   "Unexpected TwoTerm projection launch");
         }
       }
@@ -637,6 +715,75 @@ float elapsed(Projection &p, void *start, void *stop, int iterations) {
   require(s.backend->eventElapsedTimeMs(start, stop, s.device.ordinal, &ms),
           "Completed outer timing unavailable");
   return ms * 1000.f / iterations;
+}
+/**
+ * @brief Pair the independent original-column oracle with actual production stage execution.
+ *
+ * Both objects retain their own original four-bank workspace and captured graph.
+ * Every observed output and published bank is byte-equal before/after timing;
+ * raw AB/BA event intervals include all submissions and retain every result.
+ */
+void measureShortK(Storage &storage,const MeasureOptions &o,IWorkerGPUContext &worker,
+                   IDeviceContext *context,FP32Tensor *input,TensorBase *weight,
+                   PreparedWeightStore &store,const WeightBinding &binding,const int32_t *count,
+                   void *start,void *stop,const DeviceNativeVNNIMatrixDesc &sourceBefore,
+                   const std::vector<std::uint8_t> &raw) {
+  require(bool(q8ResidualShortKGeometry(o.device.is_cuda() ? Q8ResidualGroupedBackend::CUDA
+                                                         : Q8ResidualGroupedBackend::ROCm,
+                                        o.m,o.n,o.k,sourceBefore.codebook_id)),
+          "Exact source is not eligible for short-K comparison");
+  Projection original(storage,o,input,weight,store,binding,QuantizedActivationOperandPrecision::TwoTermQ8,count,
+                      ProjectionKernel::OriginalColumnReference);
+  Projection candidate(storage,o,input,weight,store,binding,QuantizedActivationOperandPrecision::TwoTermQ8,count,
+                       ProjectionKernel::Production);
+  std::cout << "SHORT_K_ROLE role=original kernel=independent_original_column_reference\n";
+  original.capture(worker,context,true);
+  std::cout << "SHORT_K_ROLE role=candidate kernel=production_ordered_short_k\n";
+  candidate.capture(worker,context,true);
+  original.dirtyOutput(); candidate.dirtyOutput();
+  for(int i=0;i<o.warmup;++i) {
+    require(original.graph->launch(),"Original TwoTerm warm replay failed");
+    require(candidate.graph->launch(),"Short-K warm replay failed");
+  }
+  const auto expected=original.observe();
+  const auto ownerCount=storage.owners->size(); const auto *inputPointer=input->gpu_data_ptr();
+  const auto compare=[&] {
+    const auto oldOutput=original.observe(),newOutput=candidate.observe();
+    require(oldOutput.size()==expected.size() && oldOutput.size()==newOutput.size() &&
+            (oldOutput.empty()||(std::memcmp(oldOutput.data(),expected.data(),oldOutput.size()*sizeof(float))==0 &&
+                                std::memcmp(oldOutput.data(),newOutput.data(),oldOutput.size()*sizeof(float))==0)),
+            "Short-K candidate differs from exact original TwoTerm bytes");
+    for(std::size_t i=0;i<original.banks.size();++i) {
+      const auto values = std::size_t(o.live)*o.k;
+      const auto bytes = i%2 ? values/32*sizeof(float) : values;
+      const auto a=storage.download(static_cast<const std::uint8_t *>(original.banks[i]),std::size_t(bytes));
+      const auto b=storage.download(static_cast<const std::uint8_t *>(candidate.banks[i]),std::size_t(bytes));
+      require(a==b,"Short-K published activation bank/scales differ");
+    }
+    DeviceNativeVNNIMatrixDesc after{};
+    auto *engine=store.gemmKernel(*binding.prepared);
+    require(engine && engine->exportNativeVNNIMatrixDesc(after) &&
+            std::memcmp(&after,&sourceBefore,sizeof(after))==0 &&
+            std::memcmp(weight->raw_data(),raw.data(),raw.size())==0 &&
+            storage.owners->size()==ownerCount && input->gpu_data_ptr()==inputPointer,
+            "Short-K retained source/allocation identity changed");
+  };
+  compare();
+  for(int batch=0;batch<o.batches;++batch) {
+    float a,b;
+    if(batch%2==0) {a=elapsed(original,start,stop,o.iterations);b=elapsed(candidate,start,stop,o.iterations);}
+    else {b=elapsed(candidate,start,stop,o.iterations);a=elapsed(original,start,stop,o.iterations);}
+    compare();
+    std::cout << "CAPTURED_SHORT_K_TIMING backend=" << o.device.toString()
+              << " M=" << o.m << " N=" << o.n << " K=" << o.k << " live=" << o.live
+              << " source=" << o.sourceName << " source_format=" << o.sourceFormat
+              << " execution_codebook=" << unsigned(sourceBefore.codebook_id)
+              << " weights=" << o.weights << " input=" << o.input
+              << " batch=" << batch << " order=" << (batch%2 ? "BA" : "AB")
+              << " graph_submissions=" << o.iterations
+              << " original_two_term_us=" << a << " short_k_two_term_us=" << b << " ratio=" << b/a
+              << " scope=outer_complete_native_transaction includes_submission_gaps=1 timed_host_observations=0\n";
+  }
 }
 /**
  * @brief Export already-joined live FP32 observations after all timing
@@ -797,6 +944,11 @@ void measure(const MeasureOptions &o) {
             o.serial ? nullptr : storage.input(std::vector<int32_t>{o.live});
         auto *start = events.add();
         auto *stop = events.add();
+        if(o.comparison == ProjectionComparison::OriginalVsShortK) {
+          measureShortK(storage,o,worker,context.get(),input.get(),weight.get(),store,binding,count,
+                        start,stop,sourceBefore,raw);
+          return;
+        }
         single = std::make_unique<Projection>(
             storage, o, input.get(), weight.get(), store, binding,
             QuantizedActivationOperandPrecision::SingleQ8, count);

@@ -30518,6 +30518,43 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_qwen4exp_device_primitives)
     endforeach()
 endif()
 
+# Insert before the canonical final inventory closure; do not append after it.
+# Focused actual production dispatch, independent serial oracle and host-submission evidence.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_Q8ResidualShortKGeometry
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=Q8ResidualShortKGeometry.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;TwoTermQ8;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
+    if(TEST V2_Integration_Q8ResidualShortKGeometry)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Q8ResidualShortKGeometry)
+    endif()
+    foreach(V2_SHORT_K_BACKEND IN ITEMS CUDA ROCm)
+        if((V2_SHORT_K_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (V2_SHORT_K_BACKEND STREQUAL "ROCm" AND HAVE_ROCM))
+            if(V2_SHORT_K_BACKEND STREQUAL "CUDA")
+                set(V2_SHORT_K_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+            else()
+                set(V2_SHORT_K_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+            endif()
+            set(V2_SHORT_K_ALIAS V2_Integration_${V2_SHORT_K_BACKEND}_TwoTermOrderedShortK)
+            add_v2_test(${V2_SHORT_K_ALIAS}
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=Q8ResidualAllFormatsDevice.${V2_SHORT_K_BACKEND}OrderedShortK
+                LABELS "V2;Integration;ProductionTestPreflight;${V2_SHORT_K_BACKEND};TwoTermQ8;Capture;ByteExact;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120
+                ENVIRONMENT ${V2_SHORT_K_ENV})
+            if(TEST ${V2_SHORT_K_ALIAS})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_SHORT_K_ALIAS})
+            endif()
+        endif()
+    endforeach()
+endif()
+
+# The existing v2_perf_q8_residual_prepared_projection target consumes the
+# optional --comparison original_vs_short_k mode. No new timing framework,
+# model-file-dependent preflight test or production runtime switch is added.
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR
