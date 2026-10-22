@@ -334,3 +334,76 @@ Focused registration is explicit: `V2_Integration_HIPGraphArgumentGeometry`,
 `V2_Integration_CapturedFixedRankGather_CUDA2` / `_ROCm4` belong to
 `ProductionTestPreflight`. Unit geometry and opt-in performance aliases are
 separate; timing does not substitute for those correctness entries.
+
+## Batch-only 16 KiB candidate 77: small ROCm component gain
+
+The batched transfer selector now keeps each endpoint in one acquire/copy/publish
+CTA through 16 KiB, or 64 bytes per thread. Individual non-batched transfers retain
+their separate 8 KiB boundary. The original kernel bodies, channel protocol and
+exact live-copy extents are unchanged. A packet fuses only when every endpoint
+fits; a larger entry selects the existing parallel implementation for the whole
+packet. Device-counted capacity selects geometry, while the acquired live extent
+still owns actual communication.
+
+All [24 focused checks](../../../../parity-results/qwen-flash-next/captured-batch77-focused-gates/result.json)
+pass, including the four backend directions, partial packets, boundary/tail and
+large/small replay cases, and actual successful host-submission counters with
+failed-enqueue controls. Eight new explicit preflight entries cover the batch
+boundary, fixed-rank components and counter observation. These are focused results,
+not complete production preflight qualification.
+
+The complete [Unit suite](../../../../parity-results/qwen-flash-next/captured-batch77-complete-unit/result.json)
+passes **757/757**, with no skips. The frozen [A1 Release accuracy slice](../../../../parity-results/qwen-flash-next/captured-batch77-release-accuracy/report.json)
+also passes, including exact reset replay, source/runtime identities, driver
+windows and ordinary retirement. All **26 files / 185 logit rows** remain
+[byte-identical to accepted L74](../../../../parity-results/qwen-flash-next/captured-batch77-release-accuracy/shortk74-logit-byte-comparison.json).
+The isolated canonical HIP argument-metadata repair is selected explicitly;
+the installed SDK remains unchanged.
+
+The matched Release component retains the original H2560 geometry, exactly
+10,240 logical bytes per directed peer edge, five warmups and 31 paired measured
+samples per path/count. Path order alternates and the first host rank rotates.
+Actual captured templates contain two fused transfer nodes and one ordered-fold
+node per transaction. All original native exactness, runtime/source identity,
+driver-window and retirement checks pass.
+
+| Backend / observation | Transactions | Native median µs/transaction | Channel median µs/transaction | Native range | Channel range | Channel wins / pairs |
+|---|---:|---:|---:|---:|---:|---:|
+| ROCm P4, first | 1 | 271.199 | 250.239 | 250.719–311.998 | 222.879–273.919 | 29/31 |
+| ROCm P4, first | 97 | 43.744 | 42.200 | 42.990–45.809 | 40.965–45.171 | 31/31 |
+| ROCm P4, confirmation | 1 | 198.080 | 176.159 | 155.040–237.119 | 137.600–213.279 | 27/31 |
+| ROCm P4, confirmation | 97 | 44.366 | 42.553 | 43.437–45.438 | 41.488–43.261 | 31/31 |
+| CUDA P2 | 1 | 41.184 | 41.248 | 37.600–47.488 | 38.816–47.904 | 14/31 |
+| CUDA P2 | 97 | 14.730 | 18.401 | 14.425–14.890 | 18.281–18.546 | 0/31 |
+
+The [first ROCm run](../../../../parity-results/qwen-flash-next/captured-batch77-rocm-timing/analysis.json)
+and [confirmation](../../../../parity-results/qwen-flash-next/captured-batch77-rocm-confirmation/analysis.json)
+give **3.53% / 4.09% lower latency** than their paired native controls at 97
+transactions. The [CUDA run](../../../../parity-results/qwen-flash-next/captured-batch77-cuda-timing/analysis.json)
+is still **24.93% slower** than native. Count-1 observations remain particularly
+sensitive to host-arrival timing. Cross-run changes from candidate 76 are not a
+matched threshold-only speedup, and none of these component medians measures a
+whole-model improvement. The ROCm advantage corresponds to only about 0.15–0.18
+ms across 97 synthetic transactions if fully exposed.
+
+The first private CUDA analysis rejected the driver's 32-byte local-memory
+attribute as scratch traffic. That classification was too broad: all four
+compiled targets (SM80/86/89/90) report a 32-byte stack and zero compiler-local
+bytes for these batch kernels, with no local loads. Every local store leads
+directly to a diagnostic call and trap. SM86 ELF relocations identify every
+such call as `vprintf`. The corrected analysis retains the raw driver values
+and attaches this exact compiled-code evidence; the native run already passed.
+No compiler spill guard, failure diagnostic or production arithmetic changed.
+The fused CUDA kernel uses 54 registers and a 256-thread block; this static
+evidence does not claim achieved occupancy or a profiler-measured bandwidth.
+The fresh gfx906 fused kernel uses 51 VGPRs, 80 SGPRs, a 576-byte argument
+segment and 256 threads, with zero spills, private storage or LDS. The separate
+acquire and copy/publish kernels likewise retain zero spills/private storage.
+
+There is still no production TP attachment. Accepted A1 remains L74 at
+**785.397 prefill / 33.882 decode tok/s**. The next bounded component prototype
+will retain the original producers and fold directly from acquired peer payloads,
+preserving ascending-rank FP32 arithmetic and acknowledging each peer only after
+all readers finish. Its possible saving is one launch plus the local peer-bank
+write/read traffic, not fewer interconnect bytes. It must beat both existing
+controls before the larger ownership/sideband integration is justified.

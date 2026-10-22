@@ -30634,6 +30634,69 @@ if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
     endif()
 endif()
 
+# Insert before the canonical ProductionTestPreflight finalizer. This candidate
+# does not alter old aliases or add a new executable/lifecycle implementation.
+if(NOT V2_PERF_TESTS_ONLY)
+    if(TARGET v2_test_captured_transfer_channel_binding)
+        add_v2_test(V2_Integration_CapturedBatch16KiBContract
+            COMMAND $<TARGET_FILE:v2_test_captured_transfer_channel_binding>
+                --gtest_filter=CapturedTransferKernelPlan.CompleteDispatchUsesCaptureCapacityAndKeepsCursorBOM:CapturedTransferKernelPlan.Batch16KiBBoundariesRetainIndividual8KiBAndCursorBOM
+            LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Memory;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+        if(TEST V2_Integration_CapturedBatch16KiBContract)
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedBatch16KiBContract)
+        endif()
+    endif()
+    if(TARGET v2_integration_captured_transfer_channel)
+        foreach(_batch77_pair CUDA_CUDA ROCm_ROCm CUDA_ROCm ROCm_CUDA)
+            if((_batch77_pair STREQUAL "CUDA_CUDA" AND HAVE_CUDA) OR
+               (_batch77_pair STREQUAL "ROCm_ROCm" AND HAVE_ROCM) OR (HAVE_CUDA AND HAVE_ROCM))
+                string(REPLACE "_" ";" _batch77_labels "${_batch77_pair}")
+                list(REMOVE_DUPLICATES _batch77_labels)
+                add_v2_test(V2_Integration_CapturedBatch16KiBBoundaries_${_batch77_pair}
+                    COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
+                        --gtest_filter=DeviceCountedTransferChannel.${_batch77_pair}_Batch16KiBBoundaries
+                    LABELS "V2;Integration;ProductionTestPreflight;GPU;${_batch77_labels};Transfer;Memory;GraphCapture;Regression"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+                if(TEST V2_Integration_CapturedBatch16KiBBoundaries_${_batch77_pair})
+                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedBatch16KiBBoundaries_${_batch77_pair})
+                endif()
+            endif()
+        endforeach()
+        foreach(_batch77_fixed CUDA2 ROCm4)
+            if((_batch77_fixed STREQUAL "CUDA2" AND HAVE_CUDA) OR (_batch77_fixed STREQUAL "ROCm4" AND HAVE_ROCM))
+                if(_batch77_fixed STREQUAL "CUDA2")
+                    set(_batch77_backend CUDA)
+                else()
+                    set(_batch77_backend ROCm)
+                endif()
+                add_v2_test(V2_Integration_CapturedFixedRankBatch16KiB_${_batch77_fixed}
+                    COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
+                        --gtest_filter=CapturedFixedRankGatherBatch16KiBBoundaries.${_batch77_fixed}
+                    LABELS "V2;Integration;ProductionTestPreflight;GPU;${_batch77_backend};Transfer;Collective;Memory;ByteExact;Regression"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+                if(TEST V2_Integration_CapturedFixedRankBatch16KiB_${_batch77_fixed})
+                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedFixedRankBatch16KiB_${_batch77_fixed})
+                endif()
+            endif()
+        endforeach()
+    endif()
+endif()
+
+# Insert before the canonical preflight finalizer; existing device-free target only.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_captured_transfer_channel_binding)
+    add_v2_test(V2_Integration_CapturedBatch16KiBSubmissionObservation
+        COMMAND $<TARGET_FILE:v2_test_captured_transfer_channel_binding>
+            --gtest_filter=CapturedTransferChannelBindingTest.Batch16KiBSubmissionCountersDescribeAcceptedPacketsOnly
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Observability;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    if(TEST V2_Integration_CapturedBatch16KiBSubmissionObservation)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedBatch16KiBSubmissionObservation)
+    endif()
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR

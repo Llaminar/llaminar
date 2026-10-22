@@ -70,7 +70,7 @@ namespace llaminar2::counted_channel_test
         std::string error;
         if (!graph.inspectKernelNodes(kernels, &error))
             throw std::runtime_error("Captured batch inspection failed: " + error);
-        const bool single = capturedTransferKernelPlan(maximum_bytes) == CapturedTransferKernelPlan::SingleBlock;
+        const bool single = capturedTransferBatchKernelPlan(maximum_bytes) == CapturedTransferKernelPlan::SingleBlock;
         size_t fused = 0, acquire = 0, copy = 0, total = 0, endpoint_ctas = 0;
         for (const auto &kernel : kernels)
         {

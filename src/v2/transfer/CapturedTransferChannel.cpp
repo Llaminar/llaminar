@@ -517,7 +517,7 @@ namespace llaminar2
             for (unsigned i = 0; i < packet.count; ++i)
             {
                 packet.entries[i] = resolveCapturedTransferEndpoint(bindings[begin + i], stream, fork);
-                single = single && capturedTransferKernelPlan(packet.entries[i].binding.message.bytes) ==
+                single = single && capturedTransferBatchKernelPlan(packet.entries[i].binding.message.bytes) ==
                     CapturedTransferKernelPlan::SingleBlock;
             }
             if (!backend->enqueueCapturedTransferChannelBatch(packet, device.ordinal, stream))

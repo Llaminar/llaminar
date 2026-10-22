@@ -5968,7 +5968,7 @@ namespace llaminar2
                 ? mappedHostCopyBlocks(bytes / sizeof(uint4) + (bytes % sizeof(uint4) != 0))
                 : mappedHostCopyBlocks(bytes);
             if (entry.copy_blocks > maximum_blocks) maximum_blocks = entry.copy_blocks;
-            single = single && capturedTransferKernelPlan(bytes) == CapturedTransferKernelPlan::SingleBlock;
+            single = single && capturedTransferBatchKernelPlan(bytes) == CapturedTransferKernelPlan::SingleBlock;
         }
         if (single)
             capturedTransferBatchFusedKernel<<<dim3(1, batch.count), kMappedHostCopyThreads, 0, native>>>(batch);

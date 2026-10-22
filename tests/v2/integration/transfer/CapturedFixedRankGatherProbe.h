@@ -35,6 +35,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <span>
 #include <thread>
 #include <utility>
 #include <stdexcept>
@@ -201,11 +202,12 @@ namespace llaminar2::fixed_rank_component_test
         if (family.path == Path::Mapped)
             counted_channel_test::verifyCapturedChannelBatchGraph(*family.graph,
                 family.elements * sizeof(float), degree - 1, 2 * family.transactions);
-        std::size_t folds = 0, native = 0;
+        std::size_t folds = 0, native = 0, transfers = 0;
         std::map<std::string, Json> inventory;
         for (const auto &kernel : kernels)
         {
             require(kernel.valid() && kernel.name_resolved, "Fixed-rank native kernel identity is incomplete");
+            if (kernel.name.find("capturedTransfer") != std::string::npos) ++transfers;
             if (kernel.name.find("rankOrdered") != std::string::npos)
             {
                 const char *expected = family.path == Path::Mapped
@@ -226,7 +228,13 @@ namespace llaminar2::fixed_rank_component_test
             const auto key = kernel.name + ":" + std::to_string(kernel.grid_x) + ":" + std::to_string(kernel.grid_y);
             auto &item = inventory[key];
             if (item.is_null()) item = {{"name", kernel.name}, {"grid", {kernel.grid_x, kernel.grid_y, kernel.grid_z}},
-                {"block", {kernel.block_x, kernel.block_y, kernel.block_z}}, {"count", 0}};
+                {"block", {kernel.block_x, kernel.block_y, kernel.block_z}}, {"count", 0},
+                {"registers_per_thread", kernel.registers_per_thread},
+                {"static_shared_memory_bytes", kernel.static_shared_memory_bytes},
+                {"dynamic_shared_memory_bytes", kernel.dynamic_shared_memory_bytes},
+                {"local_memory_bytes_per_thread", kernel.local_memory_bytes_per_thread},
+                {"max_threads_per_block", kernel.max_threads_per_block},
+                {"theoretical_max_active_blocks_per_sm", kernel.max_active_blocks_per_sm}};
             item["count"] = item["count"].get<std::size_t>() + 1;
         }
         require(folds == static_cast<std::size_t>(family.transactions) &&
@@ -235,13 +243,28 @@ namespace llaminar2::fixed_rank_component_test
         emit({{"kind", "capture"}, {"device", p.device.toString()},
             {"path", family.path == Path::Mapped ? "mapped_fixed_local_fold" : "native_fixed_original_fold"},
             {"elements", family.elements}, {"transactions", family.transactions},
-            {"in_place", family.in_place}, {"kernels", inventory}});
+            {"in_place", family.in_place}, {"kernels", inventory},
+            {"transfer_nodes", transfers},
+            {"transfer_nodes_per_transaction", transfers / static_cast<std::size_t>(family.transactions)},
+            {"transfer_lowering", family.path == Path::Native ? "native_fixed" :
+                capturedTransferBatchKernelPlan(family.elements * sizeof(float)) == CapturedTransferKernelPlan::SingleBlock
+                    ? "batched_fused" : "batched_acquire_copy_publish"},
+            {"observation", "actual_complete_captured_template_not_replay_counter"}});
     }
+
+    /** @brief Immutable test-authored graph geometry, without a live count or runtime mode. */
+    struct ProbeShape final
+    {
+        std::size_t elements; ///< Positive whole FP32 message extent.
+        int transactions; ///< Original captured repetitions, not host graph launches.
+        bool in_place; ///< Exact local/output alias; only one transaction is admitted.
+    };
 
     /**
      * @brief Run one explicit homogeneous communicator, preserving original rank order.
      * @param devices Exact ordered physical membership; permutations are intentional.
      * @param timing Whether to run 31 paired samples for exact H2560 counts 1/97.
+     * @param selected_shapes Optional bounded functional-only boundary family; timing stays fixed.
      *
      * Both paths use the same original frame pointers and immutable FP32 input
      * bytes. Functional families include retained large->small->large extents,
@@ -249,7 +272,8 @@ namespace llaminar2::fixed_rank_component_test
      * transactions consume the same immutable partials in both paths. This
      * isolates gather+fold component cost, not a complete model layer schedule.
      */
-    inline void probe(const std::vector<DeviceId> &devices, bool timing)
+    inline void probe(const std::vector<DeviceId> &devices, bool timing,
+        std::span<const ProbeShape> selected_shapes = {})
     {
         constexpr std::size_t guard = 16;
         const std::size_t maximum = timing ? 2560 : 8193;
@@ -274,7 +298,19 @@ namespace llaminar2::fixed_rank_component_test
         const std::size_t frame_bytes = frame_elements * sizeof(float);
         const auto channel_geometry = CapturedTransferChannel::memoryFor(maximum * sizeof(float));
         const auto mapped_bytes = TransferEngine::mappedHostRegionAllocationBytes(frame_bytes);
-        const int family_count = timing ? 4 : 6;
+        std::vector<ProbeShape> shapes;
+        if (timing)
+        {
+            require(selected_shapes.empty(), "Timing retains only exact original H2560 shapes");
+            shapes = {{2560, 1, false}, {2560, 97, false}};
+        }
+        else if (selected_shapes.empty()) shapes = {{maximum, 1, false}, {257, 1, true}, {2560, 1, false}};
+        else shapes.assign(selected_shapes.begin(), selected_shapes.end());
+        require(!shapes.empty() && shapes.size() <= 8, "Functional boundary family must be nonempty and bounded");
+        for (const auto shape : shapes)
+            require(shape.elements > 0 && shape.elements <= maximum && shape.transactions > 0 &&
+                (!shape.in_place || shape.transactions == 1), "Invalid original fixed-rank functional geometry");
+        const int family_count = static_cast<int>(2 * shapes.size());
         PhysicalMemoryPlanBuilder builder;
         builder.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
             degree * (degree - 1) * channel_geometry.mapped_host_bytes + 2 * degree * mapped_bytes);
@@ -335,9 +371,6 @@ namespace llaminar2::fixed_rank_component_test
                         channels.push_back(transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(),
                             devices[source], participants[source]->stream, devices[target], participants[target]->stream,
                             maximum * sizeof(float)));
-            struct Shape { std::size_t elements; int transactions; bool in_place; };
-            const std::vector<Shape> shapes = timing ? std::vector<Shape>{{2560, 1, false}, {2560, 97, false}}
-                : std::vector<Shape>{{maximum, 1, false}, {257, 1, true}, {2560, 1, false}};
             for (std::size_t shape = 0; shape < shapes.size(); ++shape)
                 for (const auto path : {Path::Native, Path::Mapped})
                     for (int index = 0; index < degree; ++index)

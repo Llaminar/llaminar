@@ -484,6 +484,28 @@ namespace
              {1, CapturedTransferKernelPlan::SingleBlock, 1}});
     }
 
+    /**
+     * @brief Actual frozen-capacity boundaries with zero/skew/full/shrinking replays.
+     * @param first Original producer/result GPU.
+     * @param second Original receiver/echo GPU; backend order remains explicit.
+     *
+     * Three endpoints fill one argument packet; four also prove a final partial
+     * packet. Existing offset1/16 inputs exercise byte/vector copy paths, and
+     * the GPU-owned sequence crosses full->empty->small without recapture.
+     */
+    void verifyBatch16KiBBoundaries(DeviceId first, DeviceId second)
+    {
+        for (const size_t capacity : {size_t{8191}, size_t{8192}, size_t{8193}, size_t{10240},
+                size_t{16383}, size_t{16384}, size_t{16385}})
+            verifyCountedBatchRoundTrip(first, second, capacity == 16384 ? 4 : 3, capacity);
+        // A single >16KiB entry selects parallel for its whole original packet;
+        // the final independent endpoint is fused. No live count selects this.
+        verifyCountedBatchRoundTrip(first, second,
+            {8193, 10240, 16385, 16384},
+            {{3, CapturedTransferKernelPlan::ParallelCopy, 32},
+             {1, CapturedTransferKernelPlan::SingleBlock, 1}});
+    }
+
     /** @brief Cross the exact dispatch boundary without changing the protocol oracle. */
     void verifyFusedBoundaries(DeviceId first, DeviceId second)
     {
@@ -496,17 +518,21 @@ namespace
 #ifdef HAVE_CUDA
 TEST(DeviceCountedTransferChannel, CUDA_CUDA) { verifyCountedRoundTrip(DeviceId::cuda(0), DeviceId::cuda(1)); }
 TEST(DeviceCountedTransferChannel, CUDA_CUDA_BatchedEndpoints) { verifyCountedBatches(DeviceId::cuda(0), DeviceId::cuda(1)); }
+TEST(DeviceCountedTransferChannel, CUDA_CUDA_Batch16KiBBoundaries) { verifyBatch16KiBBoundaries(DeviceId::cuda(0), DeviceId::cuda(1)); }
 TEST(DeviceCountedTransferChannel, CUDA_CUDA_FusedBoundaries) { verifyFusedBoundaries(DeviceId::cuda(0), DeviceId::cuda(1)); }
 #endif
 #ifdef HAVE_ROCM
 TEST(DeviceCountedTransferChannel, ROCm_ROCm) { verifyCountedRoundTrip(DeviceId::rocm(0), DeviceId::rocm(1)); }
 TEST(DeviceCountedTransferChannel, ROCm_ROCm_BatchedEndpoints) { verifyCountedBatches(DeviceId::rocm(0), DeviceId::rocm(1)); }
+TEST(DeviceCountedTransferChannel, ROCm_ROCm_Batch16KiBBoundaries) { verifyBatch16KiBBoundaries(DeviceId::rocm(0), DeviceId::rocm(1)); }
 TEST(DeviceCountedTransferChannel, ROCm_ROCm_FusedBoundaries) { verifyFusedBoundaries(DeviceId::rocm(0), DeviceId::rocm(1)); }
 #endif
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 TEST(DeviceCountedTransferChannel, CUDA_ROCm_BatchedEndpoints) { verifyCountedBatches(DeviceId::cuda(0), DeviceId::rocm(0)); }
+TEST(DeviceCountedTransferChannel, CUDA_ROCm_Batch16KiBBoundaries) { verifyBatch16KiBBoundaries(DeviceId::cuda(0), DeviceId::rocm(0)); }
 TEST(DeviceCountedTransferChannel, CUDA_ROCm) { verifyCountedRoundTrip(DeviceId::cuda(0), DeviceId::rocm(0)); }
 TEST(DeviceCountedTransferChannel, ROCm_CUDA_BatchedEndpoints) { verifyCountedBatches(DeviceId::rocm(0), DeviceId::cuda(0)); }
+TEST(DeviceCountedTransferChannel, ROCm_CUDA_Batch16KiBBoundaries) { verifyBatch16KiBBoundaries(DeviceId::rocm(0), DeviceId::cuda(0)); }
 TEST(DeviceCountedTransferChannel, ROCm_CUDA) { verifyCountedRoundTrip(DeviceId::rocm(0), DeviceId::cuda(0)); }
 TEST(DeviceCountedTransferChannel, CUDA_ROCm_FusedBoundaries) { verifyFusedBoundaries(DeviceId::cuda(0), DeviceId::rocm(0)); }
 TEST(DeviceCountedTransferChannel, ROCm_CUDA_FusedBoundaries) { verifyFusedBoundaries(DeviceId::rocm(0), DeviceId::cuda(0)); }

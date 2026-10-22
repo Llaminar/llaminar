@@ -19,6 +19,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
+#include "utils/PerfStatsCollector.h"
 #include "../../mocks/MockBackend.h"
 #include "../../mocks/MockComputeStage.h"
 #include "../../mocks/MockLocalTPContext.h"
@@ -26,6 +27,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <optional>
 #include <limits>
 #include <set>
 #include <string>
@@ -395,6 +398,113 @@ namespace
         EXPECT_EQ(cuda.getStreamSyncCount() + rocm.getStreamSyncCount(), 0u);
     }
 
+    /** @brief Collect only accepted batch host submissions and restore exact prior policy. */
+    class BatchSubmissionObservation final
+    {
+        std::optional<std::string> json_, filter_;
+        /** @return Exact prior value, distinguishing absence from an empty string. */
+        static std::optional<std::string> prior(const char *name)
+        {
+            const char *value = std::getenv(name);
+            return value ? std::optional<std::string>{value} : std::nullopt;
+        }
+        /** @brief Restore one owned environment key; a restoration failure is fatal. */
+        static void restore(const char *name, const std::optional<std::string> &value)
+        {
+            if ((value ? setenv(name, value->c_str(), 1) : unsetenv(name)) != 0) std::terminate();
+        }
+    public:
+        /** @brief Enable this exact existing counter family without enabling timers or probes. */
+        BatchSubmissionObservation()
+            : json_(prior("LLAMINAR_PERF_STATS_JSON")), filter_(prior("LLAMINAR_PERF_STATS_FILTER"))
+        {
+            if (setenv("LLAMINAR_PERF_STATS_JSON", "1", 1) != 0 ||
+                setenv("LLAMINAR_PERF_STATS_FILTER", "transfer.captured_endpoint_batch_submissions", 1) != 0)
+            {
+                restore("LLAMINAR_PERF_STATS_FILTER", filter_);
+                restore("LLAMINAR_PERF_STATS_JSON", json_);
+                throw std::runtime_error("Cannot select batch submission observation");
+            }
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+            PerfStatsCollector::reset();
+        }
+        /** @brief Retire fixture evidence and restore the original collector policy exactly. */
+        ~BatchSubmissionObservation()
+        {
+            PerfStatsCollector::reset();
+            restore("LLAMINAR_PERF_STATS_FILTER", filter_);
+            restore("LLAMINAR_PERF_STATS_JSON", json_);
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+        }
+        BatchSubmissionObservation(const BatchSubmissionObservation &) = delete;
+        BatchSubmissionObservation &operator=(const BatchSubmissionObservation &) = delete;
+    };
+
+    TEST_F(CapturedTransferChannelBindingTest, Batch16KiBSubmissionCountersDescribeAcceptedPacketsOnly)
+    {
+        BatchSubmissionObservation observation;
+        constexpr size_t lanes = CapturedTransferChannelBatch::kCapacity + 1;
+        for (const bool reverse : {false, true})
+        for (const size_t capacity : {8193u, 10240u, 16384u, 16385u})
+        {
+            SCOPED_TRACE(::testing::Message() << "reverse=" << reverse << " capacity=" << capacity);
+            PerfStatsCollector::reset();
+            const auto producer = reverse ? DeviceId::rocm(2) : DeviceId::cuda(1);
+            const auto consumer = reverse ? DeviceId::cuda(1) : DeviceId::rocm(2);
+            auto authority = admission(producer, consumer, capacity, 0, lanes);
+            auto source = transfer.allocateDeviceTransferBuffer(capacity, producer);
+            auto destination = transfer.allocateDeviceTransferBuffer(lanes * capacity, consumer);
+            std::memset(source->mutableDeviceData(), 0x37, capacity);
+            std::memset(destination->mutableDeviceData(), 0xa5, lanes * capacity);
+            std::vector<CapturedTransferBinding> sends, receives;
+            for (size_t i = 0; i < lanes; ++i)
+            {
+                auto channel = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(),
+                    producer, producer_stream, consumer, consumer_stream, capacity);
+                sends.push_back(transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Producer,
+                    {71 + i, capacity}, source));
+                receives.push_back(transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Consumer,
+                    {71 + i, capacity}, destination, i * capacity));
+            }
+            EXPECT_THROW(transfer.enqueueCapturedTransferBatch(sends, nullptr), std::invalid_argument);
+            EXPECT_TRUE(PerfStatsCollector::snapshot({"transfer.captured_endpoint_batch_submissions"}).empty());
+            // Two public host submissions per role merge into each packet's existing key.
+            for (int repetition = 0; repetition < 2; ++repetition)
+            {
+                transfer.enqueueCapturedTransferBatch(sends, producer_stream);
+                transfer.enqueueCapturedTransferBatch(receives, consumer_stream);
+            }
+            auto *producer_backend = producer.is_cuda() ? &cuda : &rocm;
+            producer_backend->fail_boundary = true;
+            EXPECT_THROW(transfer.enqueueCapturedTransferBatch(sends, producer_stream), std::runtime_error);
+            producer_backend->fail_boundary = false;
+            const auto records = PerfStatsCollector::snapshot({"transfer.captured_endpoint_batch_submissions"});
+            ASSERT_EQ(records.size(), 4u); // Producer/consumer times full/partial packet.
+            std::set<std::pair<std::string, std::string>> keys;
+            for (const auto &record : records)
+            {
+                EXPECT_EQ(record.kind, PerfStatRecord::Kind::Counter);
+                EXPECT_EQ(record.domain, "transfer");
+                EXPECT_EQ(record.name, "captured_endpoint_batch_submissions");
+                EXPECT_TRUE(record.phase.empty());
+                EXPECT_EQ(record.count, 2u);
+                EXPECT_EQ(record.value, 2.0); // Failed enqueue must not increment accepted observations.
+                ASSERT_TRUE(record.tags.contains("role"));
+                ASSERT_TRUE(record.tags.contains("endpoints"));
+                const auto &role = record.tags.at("role");
+                const auto &endpoints = record.tags.at("endpoints");
+                EXPECT_TRUE(role == "producer" || role == "consumer");
+                EXPECT_TRUE(endpoints == "3" || endpoints == "1");
+                EXPECT_TRUE(keys.emplace(role, endpoints).second);
+                EXPECT_EQ(record.device, (role == "producer" ? producer : consumer).toString());
+                const PerfStatsCollector::Tags expected{{"role", role}, {"endpoints", endpoints},
+                    {"lowering", capacity <= 16384 ? "fused" : "acquire_copy_publish"},
+                    {"accounting", "host_submission_or_graph_template"}};
+                EXPECT_EQ(record.tags, expected);
+            }
+        }
+    }
+
     TEST_F(CapturedTransferChannelBindingTest, BatchConsumerCountsRejectAllCrossEndpointAliasesBeforeEnqueue)
     {
         constexpr size_t lanes = CapturedTransferChannelBatch::kCapacity + 1;
@@ -527,6 +637,23 @@ namespace
             EXPECT_EQ(capturedTransferKernelPlan(bytes), CapturedTransferKernelPlan::ParallelCopy);
         EXPECT_EQ(sizeof(CapturedTransferCursor), 32u);
         EXPECT_EQ(CapturedTransferChannel::memoryFor(1024).cursor_bytes_per_device, 32u);
+    }
+
+    /** @test Batch capacity owns dispatch at both boundaries; individual controls stay unchanged. */
+    TEST(CapturedTransferKernelPlan, Batch16KiBBoundariesRetainIndividual8KiBAndCursorBOM)
+    {
+        EXPECT_THROW((void)capturedTransferBatchKernelPlan(0), std::invalid_argument);
+        for (const auto bytes : {std::uint64_t{1}, std::uint64_t{8191}, std::uint64_t{8192},
+                std::uint64_t{8193}, std::uint64_t{10240}, std::uint64_t{16383}, std::uint64_t{16384}})
+            EXPECT_EQ(capturedTransferBatchKernelPlan(bytes), CapturedTransferKernelPlan::SingleBlock);
+        for (const auto bytes : {std::uint64_t{16385}, std::numeric_limits<std::uint64_t>::max()})
+            EXPECT_EQ(capturedTransferBatchKernelPlan(bytes), CapturedTransferKernelPlan::ParallelCopy);
+        EXPECT_EQ(capturedTransferKernelPlan(8192), CapturedTransferKernelPlan::SingleBlock);
+        EXPECT_EQ(capturedTransferKernelPlan(8193), CapturedTransferKernelPlan::ParallelCopy);
+        EXPECT_EQ(capturedTransferKernelPlan(10240), CapturedTransferKernelPlan::ParallelCopy);
+        EXPECT_EQ(capturedTransferKernelPlan(16384), CapturedTransferKernelPlan::ParallelCopy);
+        EXPECT_EQ(sizeof(CapturedTransferCursor), 32u);
+        EXPECT_EQ(CapturedTransferChannel::memoryFor(16384).cursor_bytes_per_device, 32u);
     }
 
     TEST_F(CapturedTransferChannelBindingTest, PartialSetupRetiresEventsBuffersRegistrationsAndClaims)

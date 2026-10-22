@@ -40,4 +40,33 @@ namespace llaminar2
         return maximum_bytes <= kCapturedTransferSingleBlockBytes
             ? CapturedTransferKernelPlan::SingleBlock : CapturedTransferKernelPlan::ParallelCopy;
     }
+
+    /**
+     * @brief Bound each batched endpoint to 64 bytes per thread in its own CTA.
+     *
+     * An independent endpoint has its own acquire/barrier/publication, even
+     * when several endpoints share a native argument packet. Individual launch
+     * geometry retains its separate 32-byte-per-thread bound. Both selectors
+     * consume only capture-frozen maximum extents, never a live host count.
+     */
+    inline constexpr std::uint64_t kCapturedTransferBatchSingleBlockBytes = 16 * 1024;
+
+    /**
+     * @brief Choose the complete implementation for one endpoint of a batch.
+     * @param maximum_bytes Positive fixed bytes or immutable counted capacity.
+     * @return Fused one-CTA acquire/copy/publish, or parallel acquire then copy.
+     * @throws std::invalid_argument For zero admitted capacity.
+     *
+     * Every entry of a packet must select SingleBlock to fuse that packet.
+     * One larger capacity selects the parallel implementation for the whole
+     * packet, including empty replays; native failure never changes selection.
+     */
+    [[nodiscard]] constexpr CapturedTransferKernelPlan capturedTransferBatchKernelPlan(
+        std::uint64_t maximum_bytes)
+    {
+        if (maximum_bytes == 0)
+            throw std::invalid_argument("Captured transfer batch requires a positive admitted extent");
+        return maximum_bytes <= kCapturedTransferBatchSingleBlockBytes
+            ? CapturedTransferKernelPlan::SingleBlock : CapturedTransferKernelPlan::ParallelCopy;
+    }
 }
