@@ -13,6 +13,7 @@
  * it cannot manufacture another pipeline or lazily discover TP domains.
  */
 
+#include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "DeviceGraphOrchestrator.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../backends/GPUDeviceContextPool.h"
@@ -16591,6 +16592,10 @@ namespace llaminar2
             graph_builder_->initializeCacheAuxiliaryState(*state_.kv_cache,
                 device.is_gpu() ? explicitGPUStreamForOperation("cache_auxiliary_setup_publication") : nullptr);
             logKVCacheBom("main", device, state_.kv_cache.get(), batch_size);
+            if (query_main_heads && !use_replicated_attention_state_cache && physical_memory_authority_ &&
+                PerfStatsCollector::isDomainEnabled("gpu_graph_inventory"))
+                query_kv_geometry::recordCache(config, device, *state_.kv_cache,
+                    *physical_memory_authority_);
         }
 
         // Pipeline followers still retain main-model verification and rollback.

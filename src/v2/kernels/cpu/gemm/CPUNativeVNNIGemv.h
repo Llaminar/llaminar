@@ -766,6 +766,18 @@ namespace llaminar2::cpu::native_vnni
         }
     }
 
+    namespace detail
+    {
+        /** @brief Authenticated leaf extent permitting policy N above physical N. */
+        struct OriginalOutputSlicePolicy { int physical_n = 0; int policy_n = 0; };
+        /** @return Caller-thread metadata used only inside an authenticated leaf scope. */
+        inline OriginalOutputSlicePolicy &originalOutputSlicePolicy()
+        {
+            static thread_local OriginalOutputSlicePolicy policy;
+            return policy;
+        }
+    }
+
     /** @brief Read the immutable public view of the caller-thread scope. */
     inline int cpuNativeVNNISerialOutputPartitionN()
     {
@@ -813,7 +825,9 @@ namespace llaminar2::cpu::native_vnni
             cpuNativeVNNISerialOutputPartitionN();
         if (serial_partition_n == 0)
             return actual_n;
-        if (serial_partition_n > actual_n)
+        const auto original = detail::originalOutputSlicePolicy();
+        if (serial_partition_n > actual_n &&
+            (original.physical_n != actual_n || original.policy_n != serial_partition_n))
         {
             throw std::logic_error(
                 "CPU NativeVNNI serial output partition exceeds physical output width");
@@ -6379,6 +6393,7 @@ namespace llaminar2::cpu::native_vnni
         VerifierRowsPolicy verifier_schedule = VerifierRowsPolicy::Auto;
         /** Scheduling intent; changing it never changes the numerical K tree. */
         ProjectionRowsPurpose purpose = ProjectionRowsPurpose::Decode;
+        int policy_n = 0; ///< Explicit authenticated leaf width; zero retains existing ambient policy.
     };
 
     /** @brief One projection's unchanged serial arithmetic and fused task geometry. */
@@ -6494,7 +6509,7 @@ namespace llaminar2::cpu::native_vnni
             const auto &d = descs[p];
             const int projection_rows = d.rows > 0 ? d.rows : M;
             if (!d.packed || d.packed->N <= 0 || d.packed->K <= 0 ||
-                d.packed->blocks_per_row != K_blocks || d.rows < 0)
+                d.packed->blocks_per_row != K_blocks || d.rows < 0 || d.policy_n < 0)
                 throw std::invalid_argument("CPU fused plan requires complete, common-K matrix geometry");
             if ((projection_rows > 1 && d.decode_schedule != DecodeSchedulePolicy::Auto) ||
                 (projection_rows == 1 && d.verifier_schedule != VerifierRowsPolicy::Auto))
@@ -6502,8 +6517,8 @@ namespace llaminar2::cpu::native_vnni
             if (d.purpose != ProjectionRowsPurpose::Decode &&
                 d.purpose != ProjectionRowsPurpose::Prefill)
                 throw std::invalid_argument("CPU fused projection has an unknown scheduling purpose");
-            const int policy_n =
-                cpuNativeVNNISerialEquivalentPolicyN(d.packed->N);
+            const int policy_n = d.policy_n > 0 ? d.policy_n
+                : cpuNativeVNNISerialEquivalentPolicyN(d.packed->N);
             const NativeVNNITileConfig cfg =
                 serialTileConfigForPackedMatrix(
                     *d.packed,
@@ -9168,6 +9183,7 @@ namespace llaminar2::cpu::native_vnni
         float *output;                            // output vector [N]
         const float *bias;                        // optional bias [N], nullptr if none
         int N;                                    // number of output rows
+        int policy_n = 0; ///< Projection-local original width; never an output stride.
     };
 
     /**
@@ -9230,6 +9246,7 @@ namespace llaminar2::cpu::native_vnni
                 .ldc = d.N,
                 .input = nullptr,
                 .decode_schedule = schedule_override,
+                .policy_n = d.policy_n,
             };
         }
 

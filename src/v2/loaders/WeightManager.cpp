@@ -18,6 +18,8 @@
  * lifecycle owns reclamation of shared model bytes. Static original F shards
  * enter this same pool/staging pipeline only through complete declared frozen
  * participant sources; they never publish whole-expert or overlay aliases.
+ * Each sharding operation retains an immutable TP assignment while parallel
+ * participant construction may atomically republish the shared manager owner.
  *
  * @author David Sanftenberg
  */
@@ -1348,6 +1350,7 @@ namespace llaminar2
 
     std::shared_ptr<TensorBase> WeightManager::getShardedWeight(const std::string &name, DeviceId device)
     {
+        const auto tp_config = tensorParallelConfig();
         // For SHARDED strategy:
         // 1. Determine sharding mode based on weight name
         // 2. Load full tensor in native format (quantized)
@@ -1445,12 +1448,12 @@ namespace llaminar2
             // Calculate row range for this rank
             // Use proportional slicing if TensorParallelConfig is set, otherwise equal split
             size_t row_start, row_count;
-            if (tp_config_)
+            if (tp_config)
             {
                 // Row-parallel actually splits ROWS (for Wo, which has shape [d_model, n_heads*head_dim])
                 // But the input dimension to match is from the column-parallel output
                 // For Wo: we split rows based on head assignment since input comes from Q output
-                auto [start, count] = calculateProportionalRowSlice(name, total_rows);
+                auto [start, count] = calculateProportionalRowSlice(name, total_rows, *tp_config);
                 row_start = start;
                 row_count = count;
             }
@@ -1476,7 +1479,7 @@ namespace llaminar2
                                               << " [" << total_rows << ", " << cols
                                               << "] -> loaded ONLY rows [" << row_start << ", " << row_end
                                               << ") = " << row_count << " rows"
-                                              << (tp_config_ ? " (proportional)" : " (equal)"));
+                                              << (tp_config ? " (proportional)" : " (equal)"));
 
             // Wrap in TensorSlice with metadata (inner_is_presliced=true)
             // The inner tensor already contains only the slice data
@@ -1553,10 +1556,10 @@ namespace llaminar2
 
                 // Calculate slice range - use proportional if config set
                 size_t start, slice_elements;
-                if (tp_config_)
+                if (tp_config)
                 {
                     // Use column slice calculation (1D bias treated as single-row 2D)
-                    auto [s, count] = calculateProportionalColumnSlice(name, total_elements);
+                    auto [s, count] = calculateProportionalColumnSlice(name, total_elements, *tp_config);
                     start = s;
                     slice_elements = count;
                 }
@@ -1594,7 +1597,7 @@ namespace llaminar2
                                                   << " [" << total_elements
                                                   << "] -> sliced elements [" << start << ", " << end
                                                   << ") = " << slice_elements << " elements"
-                                                  << (tp_config_ ? " (proportional)" : " (equal)"));
+                                                  << (tp_config ? " (proportional)" : " (equal)"));
 
                 // For 1D tensors, use row-parallel metadata with cols=1
                 auto meta = SliceMetadata::forRowParallel(
@@ -1887,9 +1890,9 @@ namespace llaminar2
             // Calculate this rank's ROW range (splitting output dimension)
             // Use proportional slicing if TensorParallelConfig is set, otherwise equal split
             size_t row_start, row_count;
-            if (tp_config_)
+            if (tp_config)
             {
-                auto [start, count] = calculateProportionalColumnSlice(name, total_rows);
+                auto [start, count] = calculateProportionalColumnSlice(name, total_rows, *tp_config);
                 row_start = start;
                 row_count = count;
             }
@@ -1915,7 +1918,7 @@ namespace llaminar2
                                               << " [" << total_rows << ", " << cols
                                               << "] -> loaded ONLY rows [" << row_start << ", " << row_end
                                               << ") = " << row_count << " rows"
-                                              << (tp_config_ ? " (proportional)" : " (equal)"));
+                                              << (tp_config ? " (proportional)" : " (equal)"));
 
             // Wrap in TensorSlice with metadata (inner_is_presliced=true)
             // Note: forColumnParallel stores original dimensions for allgather reconstruction
@@ -1974,9 +1977,9 @@ namespace llaminar2
             // Calculate this rank's COLUMN range (splitting input dimension)
             // Use proportional slicing if TensorParallelConfig is set, otherwise equal split
             size_t col_start, col_count;
-            if (tp_config_)
+            if (tp_config)
             {
-                auto [start, count] = calculateProportionalRowSlice(name, total_cols);
+                auto [start, count] = calculateProportionalRowSlice(name, total_cols, *tp_config);
                 col_start = start;
                 col_count = count;
             }
@@ -2002,7 +2005,7 @@ namespace llaminar2
                                               << " [" << rows << ", " << total_cols
                                               << "] -> loaded ONLY cols [" << col_start << ", " << col_end
                                               << ") = " << col_count << " cols"
-                                              << (tp_config_ ? " (proportional)" : " (equal)"));
+                                              << (tp_config ? " (proportional)" : " (equal)"));
 
             // Wrap in TensorSlice with row-parallel metadata
             // (input-parallel is mathematically like row-parallel but with column slicing)
@@ -2292,6 +2295,7 @@ namespace llaminar2
 
     FrozenModelWeightSet WeightManager::materialize(const WeightPlan &plan)
     {
+        const auto tp_config = tensorParallelConfig();
         ModelWeightSetBuilder builder(plan.strategy());
 
         for (const auto &requirement : plan.requirements())
@@ -2369,11 +2373,11 @@ namespace llaminar2
                 if (!tensor && load_name == "output.weight" && requirement.canonical_name == "output.weight")
                     tensor = getReplicatedWeight("token_embd.weight", lookup_device);
             }
-            else if (tp_config_ && requirement.tp_domain >= 0 && requirement.tp_rank_or_device_index >= 0)
+            else if (tp_config && requirement.tp_domain >= 0 && requirement.tp_rank_or_device_index >= 0)
             {
                 try
                 {
-                    const auto &assignment = tp_config_->forRank(requirement.tp_rank_or_device_index);
+                    const auto &assignment = tp_config->forRank(requirement.tp_rank_or_device_index);
                     tensor = getShardedWeightForAssignment(
                         load_name,
                         lookup_device,
@@ -2923,9 +2927,10 @@ namespace llaminar2
     }
 
     std::pair<size_t, size_t> WeightManager::calculateProportionalColumnSlice(
-        const std::string &name, size_t total_rows) const
+        const std::string &name, size_t total_rows, const TensorParallelConfig &assignment_config) const
     {
-        if (!tp_config_ || !mpi_ctx_)
+        const auto *tp_config = &assignment_config;
+        if (!mpi_ctx_)
         {
             // Fallback to equal split
             int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
@@ -2937,7 +2942,7 @@ namespace llaminar2
         }
 
         int rank = mpi_ctx_->rank();
-        const auto &assignment = tp_config_->forRank(rank);
+        const auto &assignment = tp_config->forRank(rank);
         WeightCategory category = categorizeWeight(name);
 
         switch (category)
@@ -2954,8 +2959,8 @@ namespace llaminar2
 
             // CRITICAL: K/V weights use totalKVHeads(), not totalHeads()!
             const int total_heads_for_weight = is_kv_weight
-                                                   ? tp_config_->totalKVHeads()
-                                                   : tp_config_->totalHeads();
+                                                   ? tp_config->totalKVHeads()
+                                                   : tp_config->totalHeads();
             if (total_heads_for_weight <= 0)
             {
                 throw std::runtime_error("[WeightManager] Invalid total_heads/total_kv_heads in TensorParallelConfig");
@@ -3023,7 +3028,7 @@ namespace llaminar2
                 WeightDimensionType dim_type = sharding_config_.getDimensionType(name);
                 if (dim_type == WeightDimensionType::ProportionalHeads)
                 {
-                    const int total_heads = tp_config_->totalHeads();
+                    const int total_heads = tp_config->totalHeads();
                     if (total_heads > 0)
                     {
                         size_t start = total_rows * static_cast<size_t>(assignment.head_start) / static_cast<size_t>(total_heads);
@@ -3037,7 +3042,7 @@ namespace llaminar2
                 }
                 else if (dim_type == WeightDimensionType::Heads)
                 {
-                    const int total_heads = tp_config_->totalHeads();
+                    const int total_heads = tp_config->totalHeads();
                     if (total_heads > 0)
                     {
                         const size_t head_dim = total_rows / static_cast<size_t>(total_heads);
@@ -3052,7 +3057,7 @@ namespace llaminar2
                 }
                 else if (dim_type == WeightDimensionType::KVHeads)
                 {
-                    const int total_kv_heads = tp_config_->totalKVHeads();
+                    const int total_kv_heads = tp_config->totalKVHeads();
                     if (total_kv_heads > 0)
                     {
                         const size_t head_dim = total_rows / static_cast<size_t>(total_kv_heads);
@@ -3072,9 +3077,10 @@ namespace llaminar2
     }
 
     std::pair<size_t, size_t> WeightManager::calculateProportionalRowSlice(
-        const std::string &name, size_t total_cols) const
+        const std::string &name, size_t total_cols, const TensorParallelConfig &assignment_config) const
     {
-        if (!tp_config_ || !mpi_ctx_)
+        const auto *tp_config = &assignment_config;
+        if (!mpi_ctx_)
         {
             // Fallback to equal split
             int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
@@ -3086,7 +3092,7 @@ namespace llaminar2
         }
 
         int rank = mpi_ctx_->rank();
-        const auto &assignment = tp_config_->forRank(rank);
+        const auto &assignment = tp_config->forRank(rank);
         WeightCategory category = categorizeWeight(name);
 
         switch (category)
@@ -3096,7 +3102,7 @@ namespace llaminar2
             // Row-parallel: input dimension matches column-parallel Q output
             // Weight shape: [d_model, n_heads * head_dim]
             // Each rank needs columns [head_start * head_dim, (head_start + head_count) * head_dim)
-            int total_heads = tp_config_->totalHeads();
+            int total_heads = tp_config->totalHeads();
             if (total_heads <= 0)
             {
                 throw std::runtime_error("[WeightManager] Invalid total_heads in TensorParallelConfig");
@@ -3130,7 +3136,7 @@ namespace llaminar2
                 WeightDimensionType dim_type = sharding_config_.getDimensionType(name);
                 if (dim_type == WeightDimensionType::ProportionalHeads)
                 {
-                    const int total_heads = tp_config_->totalHeads();
+                    const int total_heads = tp_config->totalHeads();
                     if (total_heads > 0)
                     {
                         size_t start = total_cols * static_cast<size_t>(assignment.head_start) / static_cast<size_t>(total_heads);
@@ -3144,7 +3150,7 @@ namespace llaminar2
                 }
                 else if (dim_type == WeightDimensionType::Heads)
                 {
-                    const int total_heads = tp_config_->totalHeads();
+                    const int total_heads = tp_config->totalHeads();
                     if (total_heads > 0)
                     {
                         const size_t head_dim = total_cols / static_cast<size_t>(total_heads);
@@ -3162,7 +3168,7 @@ namespace llaminar2
                 }
                 else if (dim_type == WeightDimensionType::KVHeads)
                 {
-                    const int total_kv_heads = tp_config_->totalKVHeads();
+                    const int total_kv_heads = tp_config->totalKVHeads();
                     if (total_kv_heads > 0)
                     {
                         const size_t head_dim = total_cols / static_cast<size_t>(total_kv_heads);
@@ -3298,6 +3304,7 @@ namespace llaminar2
         DeviceId device,
         int layer_idx)
     {
+        const auto tp_config = tensorParallelConfig();
         if (inferWeightRole(name) == WeightRole::ImmutableRowTable)
             throw std::invalid_argument("[WeightManager] " + name +
                 " requires its typed ImmutableRowTable store owner; ordinary weight materialization is forbidden");
@@ -3317,19 +3324,19 @@ namespace llaminar2
         // =======================================================================
         // LOCAL TP support: Check TensorParallelConfig FIRST for device-specific slicing
         // =======================================================================
-        // When tp_config_ is set, each device gets a DIFFERENT slice of the weights
+        // When tp_config is set, each device gets a DIFFERENT slice of the weights
         // based on its DeviceShardingAssignment. This applies regardless of the
         // distribution strategy (SHARDED, REPLICATED, or LAYER_PARTITIONED).
         //
         // For hybrid PP+TP mode:
         // - The PP stage context uses LAYER_PARTITIONED strategy for layer filtering
         // - But the nested MDO still needs TP column-parallel slicing within those layers
-        // - So we check tp_config_ alone, not strategy_
-        if (tp_config_)
+        // - So we check tp_config alone, not strategy_
+        if (tp_config)
         {
             try
             {
-                const auto assignment = tp_config_->forDevice(device);
+                const auto assignment = tp_config->forDevice(device);
                 lock.unlock();
                 return getShardedWeightForAssignment(name, device, assignment, layer_idx);
             }
@@ -7881,7 +7888,8 @@ namespace llaminar2
     GDNHeadAssignment WeightManager::gdnHeadAssignmentFor(
         const DeviceShardingAssignment &assignment) const
     {
-        if (!tp_config_)
+        const auto tp_config = tensorParallelConfig();
+        if (!tp_config)
             throw std::runtime_error("[WeightManager] GDN linked sharding requires TensorParallelConfig");
         if (!has_gdn_dimensions_ || gdn_n_k_heads_ <= 0 ||
             gdn_n_v_heads_ <= 0 || gdn_d_state_ <= 0)
@@ -7894,7 +7902,7 @@ namespace llaminar2
             gdn_n_v_heads_,
             assignment.head_start,
             assignment.head_count,
-            tp_config_->totalHeads());
+            tp_config->totalHeads());
     }
 
     GDNHeadAssignment WeightManager::gdnHeadAssignmentForEqualRank(
@@ -8275,6 +8283,7 @@ namespace llaminar2
         size_t &out_start,
         size_t &out_count) const
     {
+        const auto tp_config = tensorParallelConfig();
         if (!has_sharding_config_)
         {
             throw std::runtime_error("[WeightManager] No sharding config set - cannot compute slice boundaries");
@@ -8286,7 +8295,7 @@ namespace llaminar2
         {
         case WeightDimensionType::Heads:
         {
-            const int total_heads = tp_config_->totalHeads();
+            const int total_heads = tp_config->totalHeads();
             if (total_heads <= 0)
             {
                 throw std::runtime_error("[WeightManager] Invalid total_heads in TensorParallelConfig");
@@ -8302,7 +8311,7 @@ namespace llaminar2
 
         case WeightDimensionType::KVHeads:
         {
-            const int total_kv_heads = tp_config_->totalKVHeads();
+            const int total_kv_heads = tp_config->totalKVHeads();
             if (total_kv_heads <= 0)
             {
                 throw std::runtime_error("[WeightManager] Invalid total_kv_heads in TensorParallelConfig");
@@ -8336,7 +8345,7 @@ namespace llaminar2
 
         case WeightDimensionType::ProportionalHeads:
         {
-            const int total_heads = tp_config_->totalHeads();
+            const int total_heads = tp_config->totalHeads();
             if (total_heads <= 0)
             {
                 throw std::runtime_error("[WeightManager] Invalid total_heads for ProportionalHeads slicing");
@@ -8364,16 +8373,17 @@ namespace llaminar2
         const DeviceShardingAssignment &assignment,
         const std::vector<size_t> &dimensions)
     {
+        const auto tp_config = tensorParallelConfig();
         // 1D bias tensor - slice along single dimension
         size_t total_size = dimensions[0];
-        if (tp_config_ && tp_config_->worldSize() > 1 &&
+        if (tp_config && tp_config->worldSize() > 1 &&
             gdnValueElementsPerHead(name, total_size) > 0)
         {
             const GDNHeadAssignment head_assignment =
                 gdnHeadAssignmentFor(assignment);
             return loadGDNValueRows(
                 name, device, head_assignment, assignment.local_rank,
-                tp_config_->worldSize(), dimensions);
+                tp_config->worldSize(), dimensions);
         }
 
         size_t slice_start = 0;
@@ -8408,7 +8418,7 @@ namespace llaminar2
                     slice_count * sizeof(float));
 
         LOG_TRACE("[WeightManager] Device " << device.to_string()
-                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " (rank " << assignment.local_rank << "/" << tp_config->worldSize() << ")"
                                             << " column-parallel 1D " << name
                                             << " [" << total_size << "]"
                                             << " -> [" << slice_start << ", " << (slice_start + slice_count) << ")"
@@ -8420,7 +8430,7 @@ namespace llaminar2
                 total_size,
                 1,
                 assignment.local_rank,
-                tp_config_->worldSize(),
+                tp_config->worldSize(),
                 true));
 
         WeightSliceSpec bias_slice;
@@ -8442,6 +8452,7 @@ namespace llaminar2
         const DeviceShardingAssignment &assignment,
         const std::vector<size_t> &dimensions)
     {
+        const auto tp_config = tensorParallelConfig();
         size_t total_rows = dimensions[0];
         size_t cols = dimensions[1];
 
@@ -8455,7 +8466,7 @@ namespace llaminar2
                    static_cast<size_t>(gdn_n_v_heads_)) *
                       static_cast<size_t>(gdn_d_state_)
                 : 0;
-        if (tp_config_ && tp_config_->worldSize() > 1)
+        if (tp_config && tp_config->worldSize() > 1)
         {
             if (dimension == WeightDimensionType::FusedQKVHeads &&
                 total_rows == expected_gdn_fused_rows)
@@ -8464,7 +8475,7 @@ namespace llaminar2
                     gdnHeadAssignmentFor(assignment);
                 return loadGDNFusedQKVColumnParallel(
                     name, device, head_assignment, assignment.local_rank,
-                    tp_config_->worldSize(), dimensions);
+                    tp_config->worldSize(), dimensions);
             }
             if (gdnValueElementsPerHead(name, total_rows) > 0)
             {
@@ -8472,7 +8483,7 @@ namespace llaminar2
                     gdnHeadAssignmentFor(assignment);
                 return loadGDNValueRows(
                     name, device, head_assignment, assignment.local_rank,
-                    tp_config_->worldSize(), dimensions);
+                    tp_config->worldSize(), dimensions);
             }
         }
 
@@ -8504,7 +8515,7 @@ namespace llaminar2
 
         // Wrap in TensorSlice with metadata
         auto meta = SliceMetadata::forColumnParallel(
-            total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
+            total_rows, cols, assignment.local_rank, tp_config->worldSize(),
             true /* inner_is_presliced */);
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
@@ -8520,7 +8531,7 @@ namespace llaminar2
         registerDerivedMetadata(name, result, WeightDerivationKind::RowSlice, column_slice, device);
 
         LOG_TRACE("[WeightManager] Device " << device.to_string()
-                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " (rank " << assignment.local_rank << "/" << tp_config->worldSize() << ")"
                                             << " column-parallel " << name
                                             << " [" << total_rows << ", " << cols << "]"
                                             << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
@@ -8535,12 +8546,13 @@ namespace llaminar2
         const DeviceShardingAssignment &assignment,
         const std::vector<size_t> &dimensions)
     {
+        const auto tp_config = tensorParallelConfig();
         const size_t total_rows = dimensions[0];
         const size_t cols = dimensions[1];
-        if (!tp_config_)
+        if (!tp_config)
             throw std::runtime_error(
                 "[WeightManager] FusedQKV assignment loading requires TensorParallelConfig");
-        const int world_size = tp_config_->worldSize();
+        const int world_size = tp_config->worldSize();
         const int rank = assignment.local_rank;
 
         const ModelDimensions model_dimensions{
@@ -8552,7 +8564,7 @@ namespace llaminar2
             .gdn_d_state = gdn_d_state_,
         };
         WeightSlicer slicer(
-            model_dimensions, sharding_config_, tp_config_);
+            model_dimensions, sharding_config_, tp_config);
         auto slice = slicer.computeFusedQKVSliceForAssignment(
             name, total_rows, assignment);
         if (!slice)
@@ -8601,7 +8613,7 @@ namespace llaminar2
         // Wrap in TensorSlice with column-parallel metadata so downstream TP
         // logic (allreduce detection, etc.) works correctly
         auto meta = SliceMetadata::forColumnParallel(
-            total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
+            total_rows, cols, assignment.local_rank, tp_config->worldSize(),
             true /* inner_is_presliced */);
 
         auto result = std::make_shared<TensorSlice>(
@@ -8636,6 +8648,7 @@ namespace llaminar2
         const DeviceShardingAssignment &assignment,
         const std::vector<size_t> &dimensions)
     {
+        const auto tp_config = tensorParallelConfig();
         size_t total_rows = dimensions[0];
         size_t cols = dimensions[1];
         size_t row_start = 0;
@@ -8656,7 +8669,7 @@ namespace llaminar2
         }
 
         auto meta = SliceMetadata::forRowParallel(
-            total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
+            total_rows, cols, assignment.local_rank, tp_config->worldSize(),
             true /* inner_is_presliced */);
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
@@ -8672,7 +8685,7 @@ namespace llaminar2
         registerDerivedMetadata(name, result, WeightDerivationKind::RowSlice, row_slice, device);
 
         LOG_TRACE("[WeightManager] Device " << device.to_string()
-                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " (rank " << assignment.local_rank << "/" << tp_config->worldSize() << ")"
                                             << " row-parallel " << name
                                             << " [" << total_rows << ", " << cols << "]"
                                             << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
@@ -8687,17 +8700,18 @@ namespace llaminar2
         const DeviceShardingAssignment &assignment,
         const std::vector<size_t> &dimensions)
     {
+        const auto tp_config = tensorParallelConfig();
         size_t rows = dimensions[0];
         size_t total_cols = dimensions[1];
 
-        if (tp_config_ && tp_config_->worldSize() > 1 &&
+        if (tp_config && tp_config->worldSize() > 1 &&
             gdnValueElementsPerHead(name, total_cols) > 0)
         {
             const GDNHeadAssignment head_assignment =
                 gdnHeadAssignmentFor(assignment);
             return loadGDNValueColumns(
                 name, device, head_assignment, assignment.local_rank,
-                tp_config_->worldSize(), dimensions);
+                tp_config->worldSize(), dimensions);
         }
 
         // Use config-based dimension type to determine column slicing
@@ -8734,7 +8748,7 @@ namespace llaminar2
 
         // Input-parallel uses row-parallel metadata (mathematically similar but with column slicing)
         auto meta = SliceMetadata::forRowParallel(
-            rows, total_cols, assignment.local_rank, tp_config_->worldSize(),
+            rows, total_cols, assignment.local_rank, tp_config->worldSize(),
             true /* inner_is_presliced */);
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
@@ -8750,7 +8764,7 @@ namespace llaminar2
         registerDerivedMetadata(name, result, WeightDerivationKind::ColumnSlice, input_slice, device);
 
         LOG_TRACE("[WeightManager] Device " << device.to_string()
-                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " (rank " << assignment.local_rank << "/" << tp_config->worldSize() << ")"
                                             << " input-parallel " << name
                                             << " [" << rows << ", " << total_cols << "]"
                                             << " -> cols [" << col_start << ", " << (col_start + col_count) << ")"
@@ -8769,6 +8783,7 @@ namespace llaminar2
         const DeviceShardingAssignment &assignment,
         int layer_idx)
     {
+        const auto tp_config = tensorParallelConfig();
         // Get sharding mode for this weight before consulting the per-device
         // cache. Older/preload paths may have populated the cache with a plain
         // device clone; for TP-sharded weights graph builders must see the
@@ -8778,7 +8793,7 @@ namespace llaminar2
         std::optional<std::vector<int>> expected_expert_ids;
         if (mode == ShardingMode::EXPERT_ID_APPORTIONED)
         {
-            if (!tp_config_)
+            if (!tp_config)
             {
                 throw std::runtime_error(
                     "[WeightManager] Local routed-expert apportionment requires a tensor-parallel configuration for " +
@@ -8787,7 +8802,7 @@ namespace llaminar2
             expected_expert_ids = expectedRoutedExpertIds(
                 name,
                 assignment.local_rank,
-                tp_config_->worldSize(),
+                tp_config->worldSize(),
                 layer_idx);
         }
 
@@ -8825,8 +8840,8 @@ namespace llaminar2
                     const bool slice_matches_assignment =
                         slice &&
                         slice->metadata().rank == assignment.local_rank &&
-                        tp_config_ &&
-                        slice->metadata().world_size == tp_config_->worldSize();
+                        tp_config &&
+                        slice->metadata().world_size == tp_config->worldSize();
                     const bool cache_matches_mode =
                         (mode == ShardingMode::REPLICATE) ||
                         (mode == ShardingMode::ROW_PARALLEL &&
@@ -8847,7 +8862,7 @@ namespace llaminar2
                         std::to_string(static_cast<int>(mode)) +
                         " requested_rank=" + std::to_string(assignment.local_rank) +
                         " requested_world_size=" +
-                        std::to_string(tp_config_ ? tp_config_->worldSize() : 0) +
+                        std::to_string(tp_config ? tp_config->worldSize() : 0) +
                         " cached_rank=" +
                         std::to_string(slice ? slice->metadata().rank : -1) +
                         " cached_world_size=" +
@@ -8968,7 +8983,7 @@ namespace llaminar2
                     }
 
                     auto meta = SliceMetadata::forColumnParallel(
-                        total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
+                        total_rows, cols, assignment.local_rank, tp_config->worldSize(),
                         true /* inner_is_presliced */);
                     result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
 
@@ -9062,7 +9077,7 @@ namespace llaminar2
             }
             const auto &dims = *dims_opt;
             const size_t ne2 = dims[2]; // num_experts
-            const int local_ws = tp_config_->worldSize();
+            const int local_ws = tp_config->worldSize();
             const int resolved_layer_idx =
                 layer_idx >= 0 ? layer_idx : inferWeightLayer(name);
             if (resolved_layer_idx < 0)

@@ -406,6 +406,9 @@ namespace llaminar2
                 int K,
                 int *kb,
                 int *target_waves_per_cu);
+            /** @brief Query exact original source arithmetic without physical-codebook inference. */
+            bool rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+                uint8_t policy_codebook_id, int N, int K, int *kb, int *target_waves_per_cu);
             bool rocmGemv_native_vnni_query_generated_config(
                 uint8_t codebook_id,
                 int M,
@@ -1361,6 +1364,18 @@ namespace llaminar2
             }
             return std::make_unique<ScopedNativeVNNISerialPartition>(
                 serial_partition_columns);
+        }
+
+        std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
+        ROCmQuantisedGemmKernel::beginOriginalOutputSliceScope(const OriginalOutputSlice &slice)
+        {
+            slice.require(this, static_cast<int>(N_), static_cast<int>(K_));
+            if (slice.device() != DeviceId::rocm(rocm_device_id_))
+                throw std::invalid_argument("Original output slice belongs to a foreign ROCm endpoint");
+            if (!impl_ || !(impl_->has_native_vnni && impl_->d_weights_native_vnni && impl_->d_weights_native_scales) ||
+                !impl_->native_source_identity.present)
+                throw std::invalid_argument("Original output slice requires ready source-authenticated native quantized weights");
+            return std::make_unique<ScopedNativeVNNISerialPartition>(slice.policyColumns());
         }
 
         bool ROCmQuantisedGemmKernel::weights_converted() const
@@ -3428,6 +3443,12 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+            for (const auto &projection : projections)
+            {
+                projection.requireOriginalOutputSlice(k);
+                auto original_scope = projection.beginOriginalOutputSliceScope();
+            }
+
             auto execution_stream =
                 static_cast<hipStream_t>(requireGPUStream());
             const DeviceId target_device = DeviceId::rocm(rocm_device_id_);
@@ -3739,6 +3760,7 @@ namespace llaminar2
                 for (size_t i = 0; i < projections.size(); ++i)
                 {
                     const auto &proj = projections[i];
+                    auto original_scope = proj.beginOriginalOutputSliceScope();
                     if (!proj.kernel || !proj.output)
                     {
                         concurrent_eligible = false;
@@ -3777,6 +3799,7 @@ namespace llaminar2
                     for (int pi = 0; pi < num_proj; ++pi)
                     {
                         const auto &proj = projections[pi];
+                        auto original_scope = proj.beginOriginalOutputSliceScope();
                         auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
                         const int n = proj.n;
 
@@ -3966,6 +3989,7 @@ namespace llaminar2
                 for (size_t i = 0; i < projections.size(); ++i)
                 {
                     const auto &proj = projections[i];
+                    auto original_scope = proj.beginOriginalOutputSliceScope();
                     if (!proj.kernel || !proj.output)
                     {
                         decode_concurrent_eligible = false;
@@ -4060,6 +4084,7 @@ namespace llaminar2
                     for (int pi = 0; pi < num_proj; ++pi)
                     {
                         const auto &proj = projections[pi];
+                        auto original_scope = proj.beginOriginalOutputSliceScope();
                         auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
                         const int n = proj.n;
 
@@ -4271,6 +4296,7 @@ namespace llaminar2
                 for (size_t i = 0; i < projections.size(); ++i)
                 {
                     const auto &proj = projections[i];
+                    auto original_scope = proj.beginOriginalOutputSliceScope();
                     auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
                     auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
                     if (!rocm_kernel || !rocm_kernel->impl_ || !rocm_kernel->impl_->has_native_vnni)
@@ -4558,6 +4584,7 @@ namespace llaminar2
                         bool generated_grouping_available = true;
                         for (size_t i = 0; i < projections.size(); ++i)
                         {
+                            auto original_scope = projections[i].beginOriginalOutputSliceScope();
                             int policy_kb = -1;
                             int policy_target_waves = -1;
                             /*
@@ -4581,12 +4608,13 @@ namespace llaminar2
                              * of that shared compatibility bit and preserve the
                              * serial reduction geometry by construction.
                              */
-                            if (!rocmGemv_native_vnni_query_serial_m1_config(
-                                    codebooks[i],
-                                    Ns[i],
-                                    k,
-                                    &policy_kb,
-                                    &policy_target_waves))
+                            const bool policy_ready = projections[i].original_output_slice
+                                ? rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+                                    canonicalDeviceVnniCodebookId(projections[i].original_output_slice->sourceIdentity().codebook_id),
+                                    Ns[i], k, &policy_kb, &policy_target_waves)
+                                : rocmGemv_native_vnni_query_serial_m1_config(
+                                    codebooks[i], Ns[i], k, &policy_kb, &policy_target_waves);
+                            if (!policy_ready)
                             {
                                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection "
                                           << i
@@ -4738,6 +4766,7 @@ namespace llaminar2
             for (size_t i = 0; i < projections.size() && all_success; ++i)
             {
                 const auto &proj = projections[i];
+                auto original_scope = proj.beginOriginalOutputSliceScope();
                 if (!proj.kernel || !proj.output)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " has null kernel or output");

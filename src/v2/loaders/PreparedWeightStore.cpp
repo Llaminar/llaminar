@@ -565,6 +565,51 @@ namespace llaminar2
         return false;
     }
 
+    OriginalOutputSlice PreparedWeightStore::originalOutputSlice(
+        const PreparedWeightRef &ref, const TensorBase &source) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = entries_.find(keyFor(ref));
+        if (found == entries_.end() || !samePreparedRef(found->second.ref, ref))
+            throw std::invalid_argument("Original output slice requires an exact prepared reference");
+        const auto &entry = found->second;
+        const auto &binding = entry.binding;
+        const auto *handle = entry.activeHandle();
+        const auto *kernel = handle && handle->prepared_weights
+            ? handle->prepared_weights->kernel : nullptr;
+        const auto &slice = binding.slice;
+        constexpr auto limit = static_cast<std::size_t>(std::numeric_limits<int>::max());
+        if (!binding.immutable || binding.tensor != &source || !kernel ||
+            !binding.tensor_owner || binding.tensor_owner.get() != &source ||
+            !handle->prepared_weights->owned_kernel ||
+            handle->prepared_weights->owned_kernel.get() != kernel ||
+            handle->tensor != &source || handle->device_id != ref.device ||
+            source.shape().size() != 2 || kernel->get_n() <= 0 || kernel->get_k() <= 0 ||
+            slice.source_rows == 0 || slice.source_rows > limit ||
+            slice.source_cols == 0 || slice.source_cols > limit ||
+            slice.row_count == 0 || slice.row_count > slice.source_rows ||
+            slice.row_start > slice.source_rows - slice.row_count ||
+            slice.col_start != 0 || slice.col_count != slice.source_cols ||
+            slice.expert_start != 0 || slice.expert_count != 0 || !slice.expert_ids.empty() ||
+            slice.row_count != static_cast<std::size_t>(kernel->get_n()) ||
+            slice.source_cols != static_cast<std::size_t>(kernel->get_k()) ||
+            source.rows() != slice.row_count || source.cols() != slice.source_cols)
+            throw std::invalid_argument("Original output slice requires a frozen original matrix row interval with complete K");
+        const auto *native_source = IINT8Unpackable::fromTensor(&source);
+        const auto *format = native_source ? native_source->vnniFormatInfo() : nullptr;
+        NativeVnniSourceIdentity prepared_source;
+        if (!format || !kernel->exportNativeVNNISourceIdentity(prepared_source) ||
+            !prepared_source.present || prepared_source.codebook_id != format->codebook_id ||
+            prepared_source.is_superblock != format->is_superblock)
+            throw std::invalid_argument("Original output slice requires matching original native quantized source/prepared format; floating ordinary arithmetic is unsupported");
+        // Canonical Factory-to-store publication is the source/payload affinity
+        // boundary. Freeze actual owners, not mutable handle/weights wrappers:
+        // replacing an index later cannot destroy or substitute this binding.
+        return OriginalOutputSlice(handle->prepared_weights->owned_kernel, binding.tensor_owner,
+            ref.binding_id, ref.model_id.value, ref.kind, ref.device, static_cast<int>(slice.source_rows), static_cast<int>(slice.row_start),
+            kernel->get_n(), kernel->get_k(), prepared_source);
+    }
+
     ITensorGemm *PreparedWeightStore::gemmKernel(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);

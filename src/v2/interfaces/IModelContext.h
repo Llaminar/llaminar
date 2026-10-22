@@ -9,6 +9,9 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * A passive borrowed original GGUF directory can authenticate source-derived
+ * declarations without opening the mutable loader or materializing weights.
  */
 
 #pragma once
@@ -105,6 +108,15 @@ namespace llaminar2
          * @return Shared pointer to loader interface
          */
         virtual std::shared_ptr<IModelLoader> loader() = 0;
+
+        /**
+         * @brief Borrow the already-owned complete original GGUF directory without materialization.
+         * @return Context-owned immutable directory, or null only when source metadata is absent.
+         * @note The borrow lasts no longer than this context. This accessor
+         *       performs no load, tensor preparation, allocation or backend query.
+         */
+        virtual const GGUFModel *ggufDirectory() const noexcept { return nullptr; }
+
 
         /**
          * @brief Get the weight manager interface

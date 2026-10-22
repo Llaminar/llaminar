@@ -7,6 +7,10 @@
  * input ownership, and transaction terminal nodes; orchestration remains in
  * the runner/executor layers.  Diagnostic metadata identifies existing graph
  * values only and must not introduce alternate arithmetic or lifecycle paths.
+ *
+ * Query-local QFN K/V matrices bind original-output arithmetic from immutable
+ * prepared source slices. Q arithmetic and separately retained families remain
+ * independent; unsupported source ownership fails before graph publication.
  */
 
 #include "Qwen35Graph.h"
@@ -1858,6 +1862,12 @@ namespace llaminar2
         const Qwen4ExpPredictorResidualBinding *predictor)
     {
         const int layer_idx = identity.source().sourceLayer();
+        const bool declared_query=config_.tp_source_declaration &&
+            config_.tp_source_declaration->coverage()==KVHeadCoveragePolicy::QueryInterval;
+        const bool bound_query=config_.tp_config &&
+            config_.tp_config->kvHeadCoveragePolicy()==KVHeadCoveragePolicy::QueryInterval;
+        if(declared_query!=bound_query)
+            throw std::invalid_argument("QFN query-local KV graph declaration and physical assignment disagree");
         if (seq_len <= 0 || batch_size <= 0 || batch_size > std::numeric_limits<int>::max() / seq_len)
             throw std::invalid_argument("FA graph requires positive representable query geometry");
         if ((identity.source().sourcePolicy() == GraphLayerSourcePolicy::Qwen4ExpSharedPredictor) != (predictor != nullptr))
@@ -1935,6 +1945,29 @@ namespace llaminar2
             LOG_TRACE("[Qwen35Graph FA] Layer " << layer_idx << " QKV dims: q_n=" << q_n
                                                 << " k_n=" << k_n << " v_n=" << v_n);
 
+            // The immutable prepared binding, not local width or degree,
+            // authenticates original K/V output arithmetic independently of Q.
+            std::optional<OriginalOutputSlice> original_k,original_v;
+            if(config_.tp_config && config_.tp_config->kvHeadCoveragePolicy()==KVHeadCoveragePolicy::QueryInterval)
+            {
+                if(!config_.tp_source_declaration || !config_.flash_next || predictor ||
+                    retainsMTPGraphCapacity(config_.mtp) || !device.is_gpu() ||
+                    layer_idx<0 || layer_idx>=int(config_.flash_next->mainLayers()) ||
+                    config_.flash_next->mixers().at(std::size_t(layer_idx))!=Qwen4ExpMixer::SparseAttention ||
+                    !prepared_weight_store_)
+                    throw std::invalid_argument("query-local KV projection lacks its ordinary native main source declaration");
+                const auto &assignment=config_.tp_config->forRank(config_.local_rank);
+                const auto kr=preparedRefForGraphWeight(wk_binding,device),vr=preparedRefForGraphWeight(wv_binding,device);
+                if(!kr || !vr)throw std::invalid_argument("query-local KV projection lacks its published prepared sources");
+                original_k=prepared_weight_store_->originalOutputSlice(*kr,*layer.wk);
+                original_v=prepared_weight_store_->originalOutputSlice(*vr,*layer.wv);
+                for(const auto *slice:{&*original_k,&*original_v})
+                    if(slice->device()!=device || slice->policyColumns()!=config_.n_kv_heads*config_.head_dim ||
+                        slice->firstColumn()!=assignment.kv_head_start*config_.head_dim ||
+                        slice->physicalColumns()!=assignment.kv_head_count*config_.head_dim ||
+                        slice->reductionColumns()!=k)
+                        throw std::invalid_argument("query-local KV arithmetic source differs from canonical original assignment");
+            }
             // Q GEMM writes to fa_q_raw (oversized: n_heads * head_dim * 2)
             graph.addNode(prefix + "qkv_proj",
                           ComputeStageFactory::createFusedQKVGEMM({
@@ -1965,6 +1998,8 @@ namespace llaminar2
                               .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
                               .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
                               .prepared_store = prepared_weight_store_,
+                              .original_output_slice_k = original_k,
+                              .original_output_slice_v = original_v,
                           }),
                           device);
             graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");

@@ -99,6 +99,7 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
+#include <limits>
 #include <memory>
 #include <cstdint>
 #include <stdexcept>
@@ -425,6 +426,10 @@ namespace llaminar2
                 int actual_output_columns,
                 int serial_partition_columns) override;
 
+            /** @brief Bind a store-authenticated original output interval to this native leaf. */
+            std::unique_ptr<OutputPartitionEquivalenceScope>
+            beginOriginalOutputSliceScope(const OriginalOutputSlice &slice) override;
+
             bool canReleaseSourceWeightTensor() const override
             {
                 return packed_ != nullptr ||
@@ -706,6 +711,28 @@ namespace llaminar2
             int rocm_device_id() const { return rocm_device_id_; }
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
+            /**
+             * @brief Publish the existing physical output extent through the GEMM interface.
+             * @return Actual prepared N, without preparing weights or querying the device.
+             * @throws std::overflow_error If the extent cannot be represented by the launch API.
+             */
+            int get_n() const override
+            {
+                if (N_ > static_cast<size_t>(std::numeric_limits<int>::max()))
+                    throw std::overflow_error("Prepared GEMM output extent exceeds the launch API");
+                return static_cast<int>(N_);
+            }
+            /**
+             * @brief Publish the existing physical reduction extent through the GEMM interface.
+             * @return Actual prepared K, without preparing weights or querying the device.
+             * @throws std::overflow_error If the extent cannot be represented by the launch API.
+             */
+            int get_k() const override
+            {
+                if (K_ > static_cast<size_t>(std::numeric_limits<int>::max()))
+                    throw std::overflow_error("Prepared GEMM reduction extent exceeds the launch API");
+                return static_cast<int>(K_);
+            }
             bool weights_converted() const override;
             bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
             /** @copydoc ITensorGemm::inspectPreparedNativeVNNIMatrixDesc */

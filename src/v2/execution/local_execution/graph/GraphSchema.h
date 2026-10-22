@@ -19,9 +19,13 @@
  *   GraphSchema schema = Qwen2Schema::create(model_config);
  *   ResolvedGraphSpec resolved = resolver.resolve(schema, runtime_config);
  *   ComputeGraph graph = builder.build(resolved);
+ *
+ * Main KV coverage is a typed schema declaration; physical source eligibility
+ * and the complete original consumer grain are authenticated before assignment.
  */
 
 #pragma once
+#include "config/KVHeadCoverage.h"
 
 #include "../../../backends/DeviceId.h"
 #include "../../StageShardingMode.h"
@@ -414,6 +418,9 @@ namespace llaminar2
      */
     struct WeightShardingConfig
     {
+        /** Main attention consumer coverage; retained full-model families resolve separately. */
+        KVHeadCoveragePolicy main_kv_head_coverage = KVHeadCoveragePolicy::Legacy;
+
         /// Patterns evaluated in order (first match wins)
         std::vector<WeightShardingPattern> patterns;
 

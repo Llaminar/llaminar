@@ -117,12 +117,18 @@ namespace llaminar2
             std::optional<PreparedWeightRef> prepared_ref_k;
             std::optional<PreparedWeightRef> prepared_ref_v;
             PreparedWeightStore *prepared_store = nullptr;
+            // Optional cold facts minted by that same store; never a bundle-wide override.
+            std::optional<OriginalOutputSlice> original_output_slice_q;
+            std::optional<OriginalOutputSlice> original_output_slice_k;
+            std::optional<OriginalOutputSlice> original_output_slice_v;
         };
 
         explicit FusedQKVGEMMStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
+        /** @return Complete immutable source-interval launch identity for this stage. */
+        uint64_t graphCaptureVariantSignature() const override;
         ComputeStageType type() const override
         {
             return includesQuery()

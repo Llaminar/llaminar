@@ -1714,6 +1714,18 @@ namespace llaminar2
                 serial_partition_columns);
         }
 
+        std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
+        CUDAQuantisedGemmKernel::beginOriginalOutputSliceScope(const OriginalOutputSlice &slice)
+        {
+            slice.require(this, static_cast<int>(N_), static_cast<int>(K_));
+            if (slice.device() != DeviceId::cuda(cuda_device_id_))
+                throw std::invalid_argument("Original output slice belongs to a foreign CUDA endpoint");
+            if (!impl_ || !(impl_->d_weights_native_vnni && impl_->d_weights_native_scales) ||
+                !impl_->native_source_identity.present)
+                throw std::invalid_argument("Original output slice requires ready source-authenticated native quantized weights");
+            return std::make_unique<ScopedNativeVNNISerialPartition>(slice.policyColumns());
+        }
+
         // =====================================================================
         // Weight conversion: Any quantized format → INT8 + scales
         // =====================================================================
@@ -2404,6 +2416,12 @@ namespace llaminar2
             const IMPIContext * /*mpi_ctx*/,
             DeviceWorkspaceManager *workspace)
         {
+            for (const auto &projection : projections)
+            {
+                projection.requireOriginalOutputSlice(k);
+                auto original_scope = projection.beginOriginalOutputSliceScope();
+            }
+
             // Use passed workspace if provided, otherwise fall back to bound workspace
             DeviceWorkspaceManager *effective_ws = workspace ? workspace : workspace_;
             if (effective_ws != workspace_)
@@ -2540,6 +2558,7 @@ namespace llaminar2
                     const float *bias = nullptr;
                     int n = 0;
                     const char *name = nullptr;
+                    const TensorProjectionDesc *projection = nullptr; ///< Borrowed immutable member through this call.
                 };
 
                 std::vector<SmallMProjectionBinding> bindings;
@@ -2548,6 +2567,7 @@ namespace llaminar2
                 for (size_t i = 0; i < projections.size(); ++i)
                 {
                     const auto &proj = projections[i];
+                    auto original_scope = proj.beginOriginalOutputSliceScope();
                     if (!proj.kernel || !proj.output)
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
@@ -2629,7 +2649,7 @@ namespace llaminar2
                         d_output,
                         d_bias,
                         proj.n,
-                        proj.name});
+                        proj.name, &proj});
                 }
 
                 /*
@@ -2728,6 +2748,7 @@ namespace llaminar2
                     for (size_t pi = 0; pi < bindings.size(); ++pi)
                     {
                         auto &binding = bindings[pi];
+                        auto original_scope = binding.projection->beginOriginalOutputSliceScope();
                         auto &plan = projection_plans[pi];
                         plan.stream_index =
                             static_cast<int>(pi) % active_streams;
@@ -2857,6 +2878,7 @@ namespace llaminar2
                 auto launch_projection = [&](int pi, void *projection_stream)
                 {
                     const auto &binding = bindings[static_cast<size_t>(pi)];
+                    auto original_scope = binding.projection->beginOriginalOutputSliceScope();
                     void *saved_stream = binding.kernel->getGPUStream();
                     binding.kernel->setGPUStream(projection_stream);
                     const bool projection_ok = binding.kernel->multiply_quantized_small_m_gemv(
@@ -3160,6 +3182,7 @@ namespace llaminar2
                 for (int pi = 0; pi < num_proj; ++pi)
                 {
                     const auto &proj = projections[pi];
+                    auto original_scope = proj.beginOriginalOutputSliceScope();
                     auto *cuda_kernel = dynamic_cast<CUDAQuantisedGemmKernel *>(proj.kernel);
                     if (!cuda_kernel || !proj.output)
                     {
@@ -3368,6 +3391,7 @@ namespace llaminar2
             for (size_t i = 0; i < projections.size() && all_success; ++i)
             {
                 const auto &proj = projections[i];
+                auto original_scope = proj.beginOriginalOutputSliceScope();
                 if (!proj.kernel || !proj.output)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " has null kernel or output");

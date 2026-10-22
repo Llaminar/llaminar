@@ -9,8 +9,12 @@
  * independent integer split reconstructed from the shard count. Ordinary and
  * ExpertOverlay pipelines share the same physical transfer-leader projection;
  * replicated weight views do not become extra channel owners.
+ *
+ * Source-qualified query KV intervals come from the same canonical assignment
+ * used for weights and graphs; PMA alone accounts their actual physical bytes.
  */
 #include "planning/RankMemoryPlanInputs.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "utils/DebugEnv.h"
 #include "planning/ActivationBufferSizing.h"
 #include "backends/DeviceAddressAdapter.h"
@@ -290,7 +294,7 @@ namespace llaminar2
          * model dimensions because GQA KV replication and remainder shards
          * make that reconstruction lossy.
          */
-        const auto bindRankLocalTPAssignment = [&profile](
+        const auto bindRankLocalTPAssignment = [&profile,&request](
             DevicePlanConfig &cfg,
             const std::vector<GlobalDeviceAddress> &participants,
             const std::vector<float> &configured_weights)
@@ -306,14 +310,15 @@ namespace llaminar2
             std::vector<float> weights = configured_weights;
             if (weights.empty())
                 weights.assign(devices.size(), 1.0f);
-            const auto assignment =
-                TensorParallelConfig::proportionalSplit(
-                    devices,
-                    weights,
-                    profile.n_heads,
-                    profile.n_kv_heads,
-                    profile.d_ff,
-                    profile.vocab_size);
+            const bool complete_main=request.plan.usesLocalTP() && !request.plan.usesLocalPP() &&
+                !request.plan.usesGlobalTP() && !request.plan.prev_rank && !request.plan.next_rank &&
+                request.plan.first_layer==0 && (request.plan.last_layer<0 || request.plan.last_layer==profile.mainLayerCount()-1);
+            std::optional<TensorParallelAssignmentDeclaration> source;
+            if(profile.architecture=="qwen4exp")source=resolveProfileTPDeclaration(profile,
+                complete_main?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
+                request.plan.runtime.mtp,DenseParallelPolicy::TensorParallel,devices);
+            const auto assignment=source?source->partition(devices,weights,profile.d_ff,profile.vocab_size):
+                TensorParallelConfig::proportionalSplit(devices,weights,profile.n_heads,profile.n_kv_heads,profile.d_ff,profile.vocab_size);
             cfg.bindTensorParallelAssignment(
                 assignment.forRank(cfg.shard_index));
         };

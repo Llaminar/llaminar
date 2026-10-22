@@ -11,6 +11,7 @@
 #pragma once
 #include "kernels/FloatingActivationOperandPrecision.h"
 #include "kernels/common/Q8ResidualCorrection.h"
+#include "kernels/common/OriginalOutputSlice.h"
 
 #include "../backends/ExplicitGPUStream.h"
 #include "../utils/MPIContext.h"
@@ -32,6 +33,7 @@
 #include <span>
 #include <stdexcept>
 #include <vector>
+#include <utility>
 
 namespace llaminar2
 {
@@ -937,6 +939,23 @@ namespace llaminar2
         // =====================================================================
 
         /**
+         * @brief Bind an authenticated original source interval to this leaf only.
+         * @param slice Store-minted source/engine/physical-N/K identity.
+         * @return Recording scope restored before any sibling projection.
+         * @throws std::logic_error When this backend lacks exact source-slice arithmetic.
+         *
+         * This distinct typed operation intentionally does not relax the existing
+         * two-int mirrored-output API. Floating ordinary BLAS has no authenticated
+         * original-N algorithm contract and must reject rather than switch trees.
+         */
+        virtual std::unique_ptr<OutputPartitionEquivalenceScope>
+        beginOriginalOutputSliceScope(const OriginalOutputSlice &slice)
+        {
+            slice.require(this, get_n(), get_k());
+            throw std::logic_error("Original output slice requires a supported native quantized engine");
+        }
+
+        /**
          * @brief Descriptor for tensor-aware fused multi-projection GEMM
          *
          * Unlike FusedProjectionDesc which uses raw pointers, this uses TensorBase
@@ -950,11 +969,31 @@ namespace llaminar2
             int n;                  ///< Output dimension (columns)
             const TensorBase *bias; ///< Optional bias tensor [n] (nullptr = no bias)
             const char *name;       ///< Name for debug logging
+            std::optional<OriginalOutputSlice> original_output_slice; ///< Store-authenticated source arithmetic, leaf-local.
+
+            /** @brief Authenticate every declared source fact before shared quantization/enqueue. */
+            void requireOriginalOutputSlice(int reduction) const
+            {
+                if (!original_output_slice) return;
+                if (!kernel || n != kernel->get_n() || reduction != kernel->get_k())
+                    throw std::invalid_argument("Original output slice has inconsistent projection N/K");
+                original_output_slice->require(kernel, n, reduction);
+            }
+
+            /** @return This leaf's arithmetic scope, or no scope for an unchanged sibling. */
+            std::unique_ptr<OutputPartitionEquivalenceScope> beginOriginalOutputSliceScope() const
+            {
+                if (!original_output_slice) return nullptr;
+                requireOriginalOutputSlice(kernel ? kernel->get_k() : 0);
+                return kernel->beginOriginalOutputSliceScope(*original_output_slice);
+            }
 
             TensorProjectionDesc(ITensorGemm *k, TensorBase *out, int n_dim,
                                  const TensorBase *b = nullptr,
-                                 const char *nm = nullptr)
-                : kernel(k), output(out), n(n_dim), bias(b), name(nm) {}
+                                 const char *nm = nullptr,
+                                 std::optional<OriginalOutputSlice> slice = std::nullopt)
+                : kernel(k), output(out), n(n_dim), bias(b), name(nm),
+                  original_output_slice(std::move(slice)) {}
         };
 
         /**

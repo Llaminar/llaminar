@@ -9,6 +9,9 @@
  * one source/PMA generation; graph families borrow Ready owners without reload.
  *
  * @author David Sanftenberg
+ *
+ * Original-source metadata inspection borrows the already-owned loader directory;
+ * it neither initializes weights nor changes prepared ownership or coherence.
  */
 
 #pragma once
@@ -174,6 +177,9 @@ namespace llaminar2
          * @brief Get ModelLoader interface for tensor loading
          */
         std::shared_ptr<IModelLoader> loader() override { return loader_interface_; }
+        /** @return Original complete loader-owned metadata; never loads or converts a tensor. */
+        const GGUFModel *ggufDirectory() const noexcept override { return loader_.ggufDirectory(); }
+
 
         /** @brief Return the single admitted rank-owned native row service, if present. */
         std::shared_ptr<HostImmutableRowProvider> hostImmutableRowProvider() const override;

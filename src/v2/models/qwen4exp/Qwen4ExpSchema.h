@@ -6,6 +6,9 @@
  * Qwen MoE schema. Branch mixers, lexical projections and the sparse indexer
  * are explicitly replicated within each TP domain. Exact device/PP arena
  * declarations are supplied by Qwen4ExpBufferLayout after metadata admission.
+ *
+ * Main sparse KV consumer intent is source-qualified before assignment; branch,
+ * lexical and indexer replication policies remain separate declarations.
  */
 #pragma once
 #include "../qwen35moe/Qwen35MoESchema.h"
@@ -35,6 +38,7 @@ public:
     WeightShardingConfig getWeightShardingConfig() const override
     {
         auto config=Qwen35MoESchemaFactory::getWeightShardingConfig();
+        config.main_kv_head_coverage=KVHeadCoveragePolicy::QueryInterval;
         for(const char *prefix:{"hc_","ple_","indexer."})
             config.patterns.insert(config.patterns.begin(),{prefix,WeightShardingMode::Replicate,
                 WeightDimensionType::None,"Flash Next branch, lexical and indexer operands are replicated per participant"});

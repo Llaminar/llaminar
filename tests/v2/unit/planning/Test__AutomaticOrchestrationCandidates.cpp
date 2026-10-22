@@ -6,9 +6,16 @@
  * ordinal. Proposals are checked through the real model-aware rank compiler and
  * reusable config codec. These tests establish placement semantics only; no
  * synthetic memory number or observed core count is treated as cost evidence.
+ *
+ * Original QFN declarations and actual nonordinal endpoint fixtures cover every
+ * supported head degree without loading model tensors or initializing GPUs.
  */
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "planning/PlanningModelMetadata.h"
+#include "planning/TensorParallelSourceDeclaration.h"
+#include "planning/MoEOverlayMemoryPlanInputs.h"
+#include "planning/MoEOverlayPlanningInputs.h"
+#include "../../utils/CPUExecutionTestGeometry.h"
 #include "planning/ResolvedRankOrchestration.h"
 #include "app/RuntimeInitPhase.h"
 #include "config/OrchestrationConfigDocument.h"
@@ -16,6 +23,7 @@
 #include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "utils/NUMATopology.h"
 #include "../../utils/PlanningGGUFFixture.h"
+#include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <map>
@@ -919,4 +927,74 @@ TEST(AutomaticOrchestrationCandidates, InvalidIntentOrObservationFailsBeforePubl
     cards(inventory, 0, DeviceType::CUDA, 1);
     inventory.ranks[0].gpus[0].uuid.clear();
     EXPECT_THROW(candidates(request({DeviceType::CUDA}, {OrchestrationStrategy::SingleDevice}), inventory), std::invalid_argument);
+}
+
+/** @test Automatic candidates retain exact query coverage; independent expert-column constraints remain explicit. */
+TEST(AutomaticOrchestrationCandidates, QueryConsumerSourceUsesCanonicalAssignmentsAndPreservesExpertLimits)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource source(file.path());
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(int degree=2;degree<=8;++degree)
+    {
+        auto inventory=hosts(1);cards(inventory,0,backend,degree);
+        auto &observed=inventory.ranks.front();
+        observed.cpu.memory_bytes=observed.cpu.free_memory_bytes=observed.cpu_memory_bytes=256ull<<30;
+        observed.cpu_execution=test::kSyntheticCPUExecutionGeometry;
+        for(auto &gpu:observed.gpus)gpu.memory_bytes=gpu.free_memory_bytes=256ull<<30;
+        // A complete authored no-peer matrix is real typed input; absence is not treated as no peer access.
+        if(backend==DeviceType::CUDA){observed.p2p_cuda_count=degree;observed.p2p_cuda.assign(degree*degree,false);}
+        else {observed.p2p_rocm_count=degree;observed.p2p_rocm.assign(degree*degree,false);}
+        auto config=request({backend},{OrchestrationStrategy::TensorParallel});
+        config.mtp.enabled=false;config.mtp.graph_capacity_draft_tokens=0;
+        config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        config.ngram_table_policy.storage=ImmutableRowStoragePreference::RAM;
+        config.automatic_planning.device_counts={{backend,degree}};
+        std::size_t proposed=0;
+        visitAutomaticOrchestrationCandidates(config,source.metadata(),inventory,[&](const auto &proposal)
+        {
+            ASSERT_TRUE(proposal.config.moe_routed_expert_plan);
+            const auto &placement=*proposal.config.moe_routed_expert_plan;
+            if(placement.continuation_domain_spec.effectiveDensePolicy()!=DenseParallelPolicy::TensorParallel)return;
+            ++proposed;
+            ASSERT_EQ(placement.domains.size(),1u);
+            const auto domain=placement.domains.front().toExecutionDomainDefinition();
+            ASSERT_EQ(domain.participants.size(),degree);
+            EXPECT_EQ(domain.resolveRoutedComputePolicy(placement.routed_tiers.size()),RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+            std::vector<DeviceId> members;for(const auto &endpoint:domain.participants)members.push_back(endpoint.toLocalDeviceId());
+            const auto declaration=resolveProfileTPDeclaration(source.metadata().memoryProfile(),
+                TensorParallelMainPlacement::FullMainRankLocal,config.mtp,
+                placement.continuation_domain_spec.effectiveDensePolicy(),members);
+            ASSERT_EQ(declaration.coverage(),KVHeadCoveragePolicy::QueryInterval);
+            const auto actual=declaration.partition(members,{},source.metadata().memoryProfile().d_ff,
+                source.metadata().memoryProfile().vocab_size);
+            ExecutionPlanBuilder builder;
+            const auto compiled=ResolvedRankOrchestration::resolve(proposal.config,source.metadata(),
+                proposal.membership.inventory(),builder,0);
+            const auto &plan=compiled.rankPlan();
+            // Real overlay admission input, not the ordinary-rank BOM or duplicated capacity arithmetic.
+            ASSERT_TRUE(compiled.overlayExecution());
+            const auto &installed=*compiled.config().moe_routed_expert_plan;
+            const auto policy=resolveMoEOverlayCapacityAdmissionPolicy(installed,compiled.config(),1,48,512);
+            const MoEOverlayInferenceGraphFamilyIdentity family{.graph_family_generation=1,.main_layer_count=48,
+                .mtp_source_layers={},.max_graph_rows=32,.max_decode_rows=1,.max_request_count=1,.max_mtp_draft_depth=0};
+            const std::vector<int> buckets{1,8,32};
+            const auto input=buildMoEOverlayMemoryPlanInputs({.model=source.metadata().memoryProfile(),.rank_plan=plan,
+                .config=compiled.config(),.inventory=proposal.membership.inventory(),.execution=*compiled.overlayExecution(),
+                .capacity_policy=policy,.retained_mtp=plan.runtime.mtp,.graph_family=family,
+                .prefill={.bucket_rows=buckets,.minimum_sequence_rows=1,.maximum_cached_buckets=16},
+                .gpu_weight_load={.maximum_source_bytes=4096}},32);
+            const auto fixed=MoEOverlayLocalCapacityPlanner::plan(input.local_capacity);
+            const auto &bom=fixed.device_inputs;
+            // An overlay may append expert-only physical owners; locate each exact continuation device.
+            for(const auto &expected:actual.assignments())
+            {
+                const auto found=std::find_if(bom.begin(),bom.end(),[&](const auto &entry)
+                    {return entry.device==expected.device && entry.tensor_parallel_assignment.has_value();});
+                ASSERT_NE(found,bom.end());const auto &local=*found->tensor_parallel_assignment;
+                EXPECT_EQ(local.head_start,expected.head_start);EXPECT_EQ(local.head_count,expected.head_count);
+                EXPECT_EQ(local.kv_head_start,expected.kv_head_start);EXPECT_EQ(local.kv_head_count,expected.kv_head_count);
+            }
+        });
+        const bool expert_columns_fit=MoEProjectionArenaGeometry::hasIntegralOutputPartition(2560,degree);
+        EXPECT_EQ(proposed>0,expert_columns_fit)<<"Head coverage is valid1..8; owned expert columns impose a separate source constraint";
+    }
 }

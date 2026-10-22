@@ -49,6 +49,7 @@
 #include <limits>
 #include <vector>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -521,11 +522,25 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief Optional actual source ownership/coordinates for batch publications.
+     *
+     * Tests that mint an OriginalOutputSlice must use the real source/view owner
+     * and its original row coordinates at the same canonical publication boundary.
+     * Empty options preserve every existing batch helper's preparation behavior.
+     */
+    struct GpuPreparedGemmSourceBinding
+    {
+        std::shared_ptr<TensorBase> owner; ///< Exact matrix/view passed to preparation.
+        WeightSliceSpec original_interval; ///< Original source rows, physical interval and complete K.
+    };
+
+    /**
      * @brief Prepare immutable quantized test matrices through one production load batch.
      * @param weights Original host tensors/views, retained unchanged by the caller.
      * @param device Exact GPU owning every independent resulting prepared handle.
      * @param canonical_prefix Unique names within this device-local pool.
      * @param model_id Existing prepared-store lifetime identity.
+     * @param source_bindings Optional exact source owners/original row coordinates; empty preserves defaults.
      * @return One ordinary prepared owner per input, in the same order.
      * @throws std::runtime_error For unsupported source/device, geometry or loading failure.
      *
@@ -539,11 +554,17 @@ namespace llaminar2::test
     inline std::vector<GpuPreparedGemm> makeGpuPreparedGemmBatch(
         const std::vector<TensorBase *> &weights, DeviceId device,
         const std::string &canonical_prefix = "test.gpu_prepared_batch",
-        ModelContextId model_id = ModelContextId{9900})
+        ModelContextId model_id = ModelContextId{9900},
+        std::span<const GpuPreparedGemmSourceBinding> source_bindings = {})
     {
         namespace kf = llaminar::v2::kernels;
         if (weights.empty() || canonical_prefix.empty() || (!device.is_cuda() && !device.is_rocm()))
             throw std::runtime_error("makeGpuPreparedGemmBatch: nonempty quantized GPU sources required");
+        if (!source_bindings.empty() && source_bindings.size() != weights.size())
+            throw std::invalid_argument("makeGpuPreparedGemmBatch: source binding count differs from actual matrices");
+        for (size_t index = 0; index < source_bindings.size(); ++index)
+            if (!source_bindings[index].owner || source_bindings[index].owner.get() != weights[index])
+                throw std::invalid_argument("makeGpuPreparedGemmBatch: exact source owner is required");
         auto *backend = getBackendFor(device);
         if (!backend) throw std::runtime_error("makeGpuPreparedGemmBatch: exact backend unavailable");
         auto owner = std::make_shared<LoadOrchestrator>(backend, kTestOnlyUnadmittedGPUAllocation);
@@ -610,6 +631,11 @@ namespace llaminar2::test
             handle->variant = static_cast<int>(source->native_type()); handle->prepared_weights = std::move(prepared);
             out.store = std::make_unique<PreparedWeightStore>(model_id);
             out.binding = makePreparedWeightTestBinding(source, device, jobs[index].name, model_id);
+            if (!source_bindings.empty())
+            {
+                out.binding.tensor_owner = source_bindings[index].owner;
+                out.binding.slice = source_bindings[index].original_interval;
+            }
             out.ref = out.store->registerPreparedGemmHandle(out.binding, preparedKindForDevice(device), device, std::move(handle));
             out.kernel = out.store->gemmKernel(out.ref);
             if (!out.kernel) throw std::runtime_error("makeGpuPreparedGemmBatch: original prepared handle unresolved");

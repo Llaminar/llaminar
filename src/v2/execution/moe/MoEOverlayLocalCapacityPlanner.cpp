@@ -9,11 +9,16 @@
  * MoEOverlayCapacityResolver. Pipeline groups share one fixed-owner assembly:
  * process archive backing is counted once and parent transfer endpoints remain
  * explicit even after each child has its own expert topology.
+ *
+ * Ordinary single-domain native QFN TP shares original consumer declarations
+ * with weight construction; separately retained dense/overlay families keep
+ * their explicit full-bank demand and never recover from a selected-mode error.
  */
 
 #include "MoEOverlayLocalCapacityPlanner.h"
 #include "utils/DebugEnv.h"
 #include "planning/RankMemoryPlanInputs.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "MoEOverlayCPUServiceMeasurement.h"
 #include "MoEOverlayNoPeerResidency.h"
 #include "collective/LocalTPCollectiveInventory.h"
@@ -751,7 +756,7 @@ namespace llaminar2
              * TensorParallelConfig rather than reimplementing remainder or GQA
              * replication rules in the capacity planner.
              */
-            const auto bindRankLocalTPAssignment = [&profile](
+            const auto bindRankLocalTPAssignment = [&profile,&rank_plan,&overlay_plan](
                 DevicePlanConfig &config,
                 const std::vector<GlobalDeviceAddress> &participants,
                 const std::vector<float> &configured_weights)
@@ -767,14 +772,16 @@ namespace llaminar2
                 if (weights.empty())
                     weights.assign(devices.size(), 1.0f);
 
-                const auto assignments =
-                    TensorParallelConfig::proportionalSplit(
-                        devices,
-                        weights,
-                        profile.n_heads,
-                        profile.n_kv_heads,
-                        profile.d_ff,
-                        profile.vocab_size);
+                const bool complete_main=overlay_plan.domains.size()==1 &&
+                    rank_plan.usesLocalTP() && !rank_plan.usesLocalPP() &&
+                    !rank_plan.usesGlobalTP() && !rank_plan.prev_rank && !rank_plan.next_rank &&
+                    rank_plan.first_layer==0 && (rank_plan.last_layer<0 || rank_plan.last_layer==profile.mainLayerCount()-1);
+                std::optional<TensorParallelAssignmentDeclaration> source;
+                if(profile.architecture=="qwen4exp")source=resolveProfileTPDeclaration(profile,
+                    complete_main?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
+                    rank_plan.runtime.mtp,overlay_plan.continuation_domain_spec.effectiveDensePolicy(),devices);
+                const auto assignments=source?source->partition(devices,weights,profile.d_ff,profile.vocab_size):
+                    TensorParallelConfig::proportionalSplit(devices,weights,profile.n_heads,profile.n_kv_heads,profile.d_ff,profile.vocab_size);
                 config.bindTensorParallelAssignment(
                     assignments.forRank(config.shard_index));
             };

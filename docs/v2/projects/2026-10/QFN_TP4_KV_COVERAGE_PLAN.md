@@ -1,6 +1,6 @@
 # QFN consumer-minimal KV coverage, one through eight participants
 
-Updated: 2026-10-22. This source-derived design extends the [TP4 ownership audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md). Typed geometry and subset-replica snapshots are implemented behind an explicit declaration; production callers do not yet select it. The geometry and captured-scaling foundation is checkpointed at 11873a1a8; the rejected correction 88 experiment does not change this plan. Consumer-minimal KV work proceeds alongside the recorded per-kernel scaling measurements. Production promotion requires the complete arithmetic, cache-origin and planner/consumer closure below.
+Updated: 2026-10-22. This source-derived design extends the [TP4 ownership audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md). The implementation propagates the same original-source declaration through automatic planning, admission, weights and graphs. Focused planning, captured projection, full Unit, frozen model accuracy, prefix restoration and matched Release throughput pass; complete current-source production preflight remains pending. The geometry and captured-scaling foundation is checkpointed at 11873a1a8, and original cache/snapshot consumers at 0552f5a34. The rejected correction 88 experiment does not change this plan.
 
 **Conclusion:** retain the existing `TensorParallelConfig` assignment as the sole geometry authority and extend it to *consumer-proven overlapping KV intervals*. Q24/KV2/TP4 needs `[0,1),[0,1),[1,2),[1,2)` for Q intervals `[0,6),[6,12),[12,18),[18,24)`. Original source slicing and native sparse attention already support these origins. There is no existing general overlap-policy switch that makes this complete: cache origin reconstruction, partial-replica snapshots, and original-N arithmetic binding are genuine closure gaps. The minimum coherent candidate therefore crosses those existing owners; it is not a two-line splitter change.
 
@@ -125,8 +125,9 @@ Only after those gates: canonical 185-row panel/exact accepted-source logits, th
 The explicit coverage declaration, original-consumer query granularity and
 subset-replica snapshot assembler are implemented. Every degree 1–8 is covered,
 with MQA/GQA/MHA geometry, uneven/reordered membership, exact minimum head
-coverage, invalid source intervals and GDN boundary checks. Production callers
-still use their existing policies while the remaining consumers are wired.
+coverage, invalid source intervals and GDN boundary checks. This foundation
+initially left production selection unchanged; the propagation follow-up below
+now selects the qualified source family in the working candidate.
 
 Focused geometry/ownership and CPU compact-cache tests passed in
 `kv-coverage94-focused-r1`. CUDA and ROCm compact-cache tests passed in
@@ -158,15 +159,94 @@ without changing runtime code. The two new consumer regressions are explicitly
 registered in `ProductionTestPreflight`; complete current-source preflight is
 still pending.
 
-Automatic planning is a required consumer of this change. Its candidate filter,
-PMA/weight-plan binding, validator and graph construction must consume the same
-original declaration and canonical assignments. The existing cost model already
-prices work from those assignments; it must charge every necessary KV replica.
-No separate savings formula or second layout table is needed. The remaining
-source work is original K/V projection arithmetic binding and this coherent
-planner-to-execution propagation, followed by native model accuracy and matched
-Release performance qualification. Review of the arithmetic candidate found
-that a borrowed prepared-engine pointer could outlive its store entry. Its
-successor must retain the exact existing kernel and source owners in the
-immutable slice fact, so replacement cannot rebind or invalidate a captured
-publication. It must not copy weights or create another allocation ledger.
+Automatic candidate generation, the validator, PMA inputs, weight slicing and
+graph construction now consume the shared original declaration and canonical
+assignment. The three explicit preflight aliases pass in
+`query-kv95-propagation-focused-r1`, covering source/profile agreement,
+physical-device identity, actual automatic candidates and admission inputs.
+Head-layout checks cover logical degrees 1–8; the independent expert-column
+restriction remains explicit. Complete Unit passes **773/773**, zero skips, in
+`query-kv95-unit-r1` (117.67 seconds including the wrapper). The existing cost
+model prices the actual assignments; no independent KV saving is subtracted.
+
+Original K/V arithmetic facts now retain the exact prepared kernel and source
+owners, so store replacement cannot invalidate or rebind an already prepared
+stage. The native fixture exposed missing GPU `get_n/get_k` overrides; both
+backends now expose the checked immutable prepared dimensions. The all-format
+captured slice gate passes on CUDA and ROCm in `original-slice95-native-r5`:
+21 source formats, ordinary/grouped M1/3/17, twenty changed/poisoned histories,
+exact full-versus-slice bytes, unchanged Q, guard extents and physical-width
+workspace declarations. Seven neighboring GEMM regressions pass in
+`original-slice95-native-neighbors-r1`. Initial fixture failures also corrected
+its capture dependency declaration and per-bundle workspace merge; they did
+not require a runtime allocator or synchronization change.
+
+Ordinary M512 and passive geometry evidence now pass together in
+`query-kv95-evidence-bulk-focused-r1`: **9/9**, zero skips, clean driver and
+retirement. Both GPU backends retain the original small-row histories and add
+three M512 histories across all 21 source formats. The 84 captured bulk graphs
+prove three native prefill producers each, exact full-versus-slice bytes and
+physical-width workspace. All 252 observed producers report zero local-memory
+bytes. Passive PerfStats metadata joins original prepared source intervals,
+selected admission inputs and constructed cache geometry; it deliberately does
+not claim per-instance leaf replay or replace native workspace tests.
+
+The first Release model attempt, `query-kv95-release-accuracy-r1`, failed during
+parallel participant setup, before inference. The driver window was clean. It
+exposed a real TP assignment lifetime race: a factory borrowed the shared
+WeightManager's raw configuration pointer while another participant replaced
+its owner. Both factory readers now retain immutable shared snapshots, and all
+WeightManager TP readers use atomically published owners. WeightSlicer also
+retains a const owner. This fixes equal-assignment parallel setup without
+serializing builders; it does not promise arbitrary topology reconfiguration
+during nested weight materialization.
+
+The explicit `WeightManagerTensorParallelSnapshotOwnership` preflight alias
+and its existing Unit owner pass **2/2** in `query-kv95-ownership-focused-r1`.
+The regression forces replacement through both APIs, checks final-owner
+retirement, and validates 8,448 observations across four readers. Complete
+current-source Unit passes **774/774**, zero skips, in
+`query-kv95-ownership-unit-r1` (117.26 seconds including the wrapper).
+The corrected Release build passes in `query-kv95-release-build-r2`. Its fresh
+canonical required-group panel passes in `query-kv95-release-accuracy-r2`, with
+all **26 files / 185 retained logit rows byte-identical** to accepted Four90,
+including reset replay. The same observation validates selected admission,
+all 24 original K/V source roles and compact cache geometry on all four GPUs.
+Parent replay is observed; this cold metadata does not claim per-leaf replay
+counts or native workspace measurements.
+
+The exact registered TP4 parity cell also passes in `query-kv95-prefix-r1`
+(91.07 seconds including staging/retirement), preserving all eight canonical
+CSV artifacts, full and partial prefix restoration, a clean driver window and
+normal native retirement.
+
+### Matched Release throughput (L95)
+
+The accepted ABBA cohort is `query-kv95-model-a1`,
+`query-kv95-model-b1-repeat1`, `query-kv95-model-b2`, and
+`query-kv95-model-a2`; `query-kv95-model-comparison.json` retains every sample
+and validates all twelve natural 256-token sequences as identical. The six
+samples per role have medians **786.251 / 36.746 tok/s** for the historical
+Four90 control and **791.519 / 36.759 tok/s** for QueryInterval KV95
+(prefill/decode): **+0.670% prefill / +0.034% decode**. Decode ranges overlap;
+this is effectively unchanged decode, not a demonstrated decode speedup.
+
+Both roles use explicit Four-worker owner execution and vocabulary sharding,
+the same HIP76/RCCL80 runtime, four MI50s, 28 physical NUMA1 host workers,
+RAM ngrams, context4096/M512, prompt512/output256, seed42 greedy/top-k1/top-p1,
+MTP off with zero reserved capacity, one warmup and three measured repetitions
+per arm. The frozen six arithmetic selectors are unchanged. This compares
+different source/layout revisions, not different compile modes of one source.
+Exact loaded-library equality and the complete cold dependency inventory are
+checked separately; no model or cache payload checksums are introduced.
+
+The first `query-kv95-model-b1` remains rejected: its native process completed
+normally and its tokens matched, but the driver window contained an AMD
+`amdgpu_amdkfd_restore_userptr_worker` workqueue CPU-hog warning during teardown.
+The original failure and `attempt-disposition.json` are retained. Its exact
+repeat passed without changing source, runtime, settings or driver policy;
+the rejected timings are excluded and explicitly disclosed here. All four
+accepted arms have clean driver windows and normal retirement. These are
+descriptive paired results, not a statistical confidence claim. Complete
+current-source preflight remains pending, and Automatic Four qualification is
+a separate next slice.

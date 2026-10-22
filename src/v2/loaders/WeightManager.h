@@ -10,6 +10,9 @@
  * For SHARDED strategy, weights are partitioned based on model-specific
  * sharding configuration defined in the model's schema (e.g., Qwen2Schema).
  * This keeps WeightManager generic and model-agnostic.
+ * Parallel participant setup retains immutable TP assignment snapshots. Atomic
+ * publication prevents a reconfiguration from invalidating another builder's
+ * weight-slicing declaration, without serializing participant construction.
  *
  * @see GraphSchema.h for WeightShardingConfig structure
  * @see models/qwen/Qwen2Schema.h for Qwen2-specific sharding patterns
@@ -41,6 +44,7 @@
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -445,7 +449,7 @@ namespace llaminar2
             // Tensor parallel config
             if (config.hasTensorParallelConfig())
             {
-                tp_config_ = config.tp_config;
+                tp_config_.store(config.tp_config, std::memory_order_release);
             }
 
             if (!config.routed_expert_assignment.valid())
@@ -678,18 +682,27 @@ namespace llaminar2
          * heterogeneous tensor parallelism where devices get proportional work.
          *
          * @param config Tensor parallelism configuration with device assignments
+         * Existing readers retain their immutable assignment until their operation
+         * completes; cache invalidation uses the same cache lock as weight lookup.
          */
         void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config)
         {
-            tp_config_ = std::move(config);
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            tp_config_.store(std::move(config), std::memory_order_release);
             cache_.clear(); // Invalidate cache since slices may change
         }
 
         /**
-         * @brief Get tensor parallelism configuration
-         * @return Pointer to config, or nullptr if not set
+         * @brief Retain the immutable tensor parallelism assignment for one operation.
+         * @return Owning snapshot, or an empty owner when no assignment is installed.
+         * Publication may replace the manager's owner during parallel graph setup.
+         * Callers retain this value through every use; a borrowed raw pointer would
+         * dangle when another participant republishes its validated configuration.
          */
-        const TensorParallelConfig *tensorParallelConfig() const { return tp_config_.get(); }
+        std::shared_ptr<const TensorParallelConfig> tensorParallelConfig() const
+        {
+            return tp_config_.load(std::memory_order_acquire);
+        }
 
         /**
          * @brief Check if a weight is sharded (only valid for SHARDED strategy)
@@ -1096,7 +1109,7 @@ namespace llaminar2
         IModelLoader &loader_;                                                      ///< Model loader (GGUF, mock, etc.)
         std::shared_ptr<IMPIContext> mpi_ctx_;                                      ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
-        std::shared_ptr<TensorParallelConfig> tp_config_;                           ///< Tensor parallelism configuration (optional)
+        std::atomic<std::shared_ptr<const TensorParallelConfig>> tp_config_;       ///< Published immutable TP assignment; readers retain one owner per operation.
         WeightDistributionStrategy strategy_;                                       ///< Distribution strategy
         WeightPrecision weight_precision_;                                          ///< How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_;        ///< Weight cache
@@ -1346,10 +1359,11 @@ namespace llaminar2
          *
          * @param name Weight tensor name (to determine weight type)
          * @param total_rows Total number of rows in the weight
+         * @param assignment_config The caller's retained immutable assignment for this entire load.
          * @return {start_row, num_rows} pair for this rank's slice
          */
         std::pair<size_t, size_t> calculateProportionalColumnSlice(
-            const std::string &name, size_t total_rows) const;
+            const std::string &name, size_t total_rows, const TensorParallelConfig &assignment_config) const;
 
         /**
          * @brief Calculate proportional row slice for this rank
@@ -1359,10 +1373,11 @@ namespace llaminar2
          *
          * @param name Weight tensor name (to determine weight type)
          * @param total_cols Total number of columns in the weight
+         * @param assignment_config The caller's retained immutable assignment for this entire load.
          * @return {start_col, num_cols} pair for this rank's slice
          */
         std::pair<size_t, size_t> calculateProportionalRowSlice(
-            const std::string &name, size_t total_cols) const;
+            const std::string &name, size_t total_cols, const TensorParallelConfig &assignment_config) const;
 
     public:
         // =========================================================================

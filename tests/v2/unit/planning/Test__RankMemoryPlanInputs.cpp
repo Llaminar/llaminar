@@ -5,9 +5,13 @@
  * Sweep backend and TP degree while retaining the exact graph, shifted MTP KV,
  * mirrored weights, prefix and fresh-load owners. No model loading or driver
  * calls occur; these are policy/geometry proofs before physical admission.
+ *
+ * Original QFN declarations and actual nonordinal endpoint fixtures cover every
+ * supported head degree without loading model tensors or initializing GPUs.
  */
 #include "planning/RankMemoryPlanInputs.h"
 #include "planning/PlanningModelMetadata.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "kernels/attention/AttentionHeadMapping.h"
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
@@ -653,6 +657,45 @@ TEST(RankMemoryPlanInputs, FixedHeadDistributionUsesActualDeclarationOrderAndRej
             case 8:bad.plan.runtime.ngram_table_policy.storage=ImmutableRowStoragePreference::Automatic;break;
             }
             EXPECT_THROW((void)buildRankMemoryPlanInputs(bad.request()),std::invalid_argument)<<failure;
+        }
+    }
+}
+
+/** @test PMA consumes the same original-source assignment as graph/weight construction, not KV/P arithmetic. */
+TEST(RankMemoryPlanInputs, QueryConsumerSourceMatchesCanonicalAssignmentEveryDegree)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource original(file.path());
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(int degree=1;degree<=8;++degree)
+    {
+        Fixture f(backend,degree);f.model=original.metadata().memoryProfile();f.plan.last_layer=47;
+        f.plan.runtime.mtp.enabled=false;f.plan.runtime.mtp.graph_capacity_draft_tokens=0;
+        f.plan.runtime.ngram_table_policy.storage=ImmutableRowStoragePreference::RAM;
+        // This is the actual declared discovery order; ordinal and logical rank deliberately differ.
+        std::vector<DeviceId> members;
+        for(int rank=0;rank<degree;++rank)
+        {
+            const int ordinal=21-rank*2;members.emplace_back(backend,ordinal);
+            f.inventory.gpus[rank].local_device_id=ordinal;
+            const auto address=GlobalDeviceAddress::fromLocalDeviceId(members.back(),"node",0);
+            if(degree>1)f.plan.local_tp_devices[rank]=address;
+            if(!rank)f.plan.primary_device=address;
+        }
+        const auto declared=resolveProfileTPDeclaration(f.model,TensorParallelMainPlacement::FullMainRankLocal,
+            f.plan.runtime.mtp,DenseParallelPolicy::TensorParallel,members);
+        const auto assignment=declared.partition(members,{},f.model.d_ff,f.model.vocab_size);
+        const auto configs=buildRankMemoryPlanInputs(f.request());ASSERT_EQ(configs.size(),degree);
+        for(int rank=0;rank<degree;++rank)
+        {
+            const auto &cfg=configs[rank];EXPECT_EQ(cfg.device,members[rank]);
+            if(degree==1){EXPECT_FALSE(cfg.tensor_parallel_assignment);continue;}
+            ASSERT_TRUE(cfg.tensor_parallel_assignment);const auto &actual=*cfg.tensor_parallel_assignment;
+            const auto &expected=assignment.forRank(rank);
+            EXPECT_EQ(actual.device,expected.device);EXPECT_EQ(actual.local_rank,rank);
+            EXPECT_EQ(actual.head_start,expected.head_start);EXPECT_EQ(actual.head_count,expected.head_count);
+            EXPECT_EQ(actual.kv_head_start,expected.kv_head_start);EXPECT_EQ(actual.kv_head_count,expected.kv_head_count);
+            EXPECT_EQ(actual.d_ff_start,expected.d_ff_start);EXPECT_EQ(actual.d_ff_count,expected.d_ff_count);
+            EXPECT_EQ(actual.vocab_start,expected.vocab_start);EXPECT_EQ(actual.vocab_count,expected.vocab_count);
+            EXPECT_EQ(cfg.local_kv_heads,expected.kv_head_count);
         }
     }
 }

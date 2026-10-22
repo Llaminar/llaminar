@@ -42,6 +42,7 @@
 
 #include "../../../utils/CUDATestUtils.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/OriginalOutputSliceNativeFixture.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -2794,3 +2795,11 @@ int main(int argc, char **argv)
     MPI_Finalize();
     return result;
 }
+
+#ifdef HAVE_CUDA
+/** @test All original native sources preserve Q and exact source-slice bytes in captured ordinary/grouped QKV. */
+TEST_F(Test__CUDAGemmBatchInvariance, CapturedOriginalOutputSliceAllNativeFormats)
+{
+    ASSERT_NO_THROW(original_output_slice_native::prove(gpu_device_));
+}
+#endif

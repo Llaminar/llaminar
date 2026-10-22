@@ -24,6 +24,9 @@
  * Resident condition forwards retire the preceding host result before fan-out.
  * Only an explicitly enabled diagnostic observation republishes current logits;
  * pending input publication and device-only sampling do not gather host rows.
+ *
+ * Ordinary native QFN local TP derives one immutable assignment from the original
+ * directory before weight slicing; physical device order remains context-owned.
  */
 
 #include "RankOrchestrator.h"
@@ -55,6 +58,7 @@
 #include "../../moe/MoEProjectionArenaGeometry.h"
 #include "../../../planning/ActivationBufferSizing.h"
 #include "../../../planning/ModelMemoryProfile.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "../../../collective/ILocalPPContext.h"
 #include "../../../config/TensorParallelConfig.h"
 #include "../../config/KVHeadConsumerGeometry.h"
@@ -1311,9 +1315,26 @@ namespace llaminar2
                 std::shared_ptr<TensorParallelConfig> tp_config;
                 if (dense_tp_enabled)
                 {
-                    tp_config = std::make_shared<TensorParallelConfig>(
-                        TensorParallelConfig::fromLocalTPContext(
-                            *tp_ctx_, n_heads, n_kv_heads, d_ff, vocab_size));
+                    if(model_ctx_->architecture()=="qwen4exp")
+                    {
+                        const auto *directory=model_ctx_->ggufDirectory();
+                        if(!directory)throw std::invalid_argument("QFN TP weight assignment lacks original source directory");
+                        const Qwen4ExpConfig original(*directory);
+                        std::vector<DeviceId> members;
+                        for(const auto &address:tp_ctx_->devices())members.push_back(address.toLocalDeviceId());
+                        const auto dense=config_.moe_routed_expert_plan
+                            ?config_.moe_routed_expert_plan->continuation_domain_spec.effectiveDensePolicy():DenseParallelPolicy::TensorParallel;
+                        const auto source=resolveQfnTPDeclaration(*directory,
+                            mode_==ParallelismMode::TP && config_.pp_stages.empty() &&
+                                (!config_.moe_routed_expert_plan || config_.moe_routed_expert_plan->domains.size()==1)
+                                ?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
+                            config_.mtp,dense,members);
+                        tp_config=std::make_shared<TensorParallelConfig>(source.partition(members,tp_ctx_->weights(),d_ff,vocab_size));
+                    }
+                    else
+                        tp_config = std::make_shared<TensorParallelConfig>(
+                            TensorParallelConfig::fromLocalTPContext(
+                                *tp_ctx_, n_heads, n_kv_heads, d_ff, vocab_size));
                 }
 
                 // Build unified WeightManagerConfig

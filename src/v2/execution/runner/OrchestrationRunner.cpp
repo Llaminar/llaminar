@@ -32,8 +32,13 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * Physical TP validation borrows the already-resolved LocalTP endpoint order;
+ * early structural validation never manufactures physical participant IDs.
  */
 
+#include "execution/diagnostics/QueryKVGeometryObservation.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "planning/ImmutableRowTableAdmissionWire.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "loaders/ImmutableRowTable.h"
@@ -18227,6 +18232,28 @@ namespace llaminar2
                     throw std::logic_error(
                         "ExpertOverlay capacity resolution returned no topology-wide physical-memory authority");
                 }
+                // Publish only the selected successful admission's actual inputs,
+                // never speculative candidate BOMs or reconstructed intervals.
+                if (profile.architecture == "qwen4exp" &&
+                    PerfStatsCollector::isDomainEnabled("gpu_graph_inventory"))
+                {
+                    std::vector<DeviceId> members;
+                    for (const auto &address : plan_.local_tp_devices)
+                        members.push_back(address.toLocalDeviceId());
+                    if (!members.empty())
+                    {
+                        const auto source = resolveProfileTPDeclaration(profile,
+                            config_.moe_routed_expert_plan->domains.size() == 1 &&
+                                plan_.usesLocalTP() && !plan_.usesLocalPP() && !plan_.usesGlobalTP() &&
+                                !plan_.prev_rank && !plan_.next_rank && plan_.first_layer == 0 &&
+                                (plan_.last_layer < 0 || plan_.last_layer == profile.mainLayerCount() - 1)
+                                ? TensorParallelMainPlacement::FullMainRankLocal : TensorParallelMainPlacement::OtherDeclared,
+                            plan_.runtime.mtp, config_.moe_routed_expert_plan->continuation_domain_spec.effectiveDensePolicy(), members);
+                        if (source.coverage() == KVHeadCoveragePolicy::QueryInterval)
+                            query_kv_geometry::recordInstalledAssignments(profile,
+                                selected_local_capacity->device_inputs, *physical_memory_admission_);
+                    }
+                }
                 LOG_DEBUG(
                     "[MoEOverlayCapacity] Selected rank-local fixed BOM at "
                     << selected_local_capacity->resident_graph_rows
@@ -21067,7 +21094,11 @@ namespace llaminar2
         }
 
         // Run validation
-        auto result = TPPPValidator::validate(config_, *model_ctx_);
+        if(plan_.usesLocalTP() && !plan_.usesLocalPP() && !local_tp_ctx_)
+            return setError("TP validation lacks the already-resolved LocalTP context");
+        const auto membership=local_tp_ctx_
+            ?TPPPAssignmentMembership::resolved(local_tp_ctx_->devices()):TPPPAssignmentMembership::structural();
+        auto result = TPPPValidator::validate(config_, *model_ctx_,membership);
 
         // Log warnings (but don't fail)
         for (const auto &warning : result.warnings)

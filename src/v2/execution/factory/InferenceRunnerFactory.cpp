@@ -9,9 +9,14 @@
  * plan as the graph. Generic primary-weight preparation never owns those banks.
  * @author David Sanftenberg
  * @date December 2025
+ *
+ * QFN graph construction revalidates original-source TP intent against retained
+ * weight slicing. Cold initial declaration is explicit; absent prepared authority
+ * cannot silently change query-local KV coverage into another execution family.
  */
 
 #include "InferenceRunnerFactory.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "backends/HostMemoryCapacity.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "loaders/ResidentImmutableRowTable.h"
@@ -1671,6 +1676,14 @@ namespace llaminar2
                 ? WeightShardingMode::Replicate
                 : WeightShardingMode::ExpertIdApportioned;
 
+        if(graph_config.tp_source_declaration && graph_config.tp_source_declaration->coverage()==KVHeadCoveragePolicy::QueryInterval)
+        {
+            if(!include_tp_config || !graph_config.tp_config)
+                throw std::invalid_argument("declared query TP graph lost its physical weight assignment");
+            std::vector<DeviceId> members;
+            for(const auto &assignment:graph_config.tp_config->assignments())members.push_back(assignment.device);
+            graph_config.tp_source_declaration->validate(*graph_config.tp_config,members);
+        }
         WeightManagerConfig wm_config;
         wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
         if (architecture == "qwen35moe" || architecture == "qwen4exp")
@@ -2490,12 +2503,14 @@ namespace llaminar2
      * @param graph_config    Config to modify with TP dimensions
      * @param global_tp_ctx   The pre-created global TP context
      * @param device_idx      This rank's index within the TP domain
+     * @param retained_assignment Existing weight slicing; QueryInterval cannot enter this unbound-global family.
      * @return true if assignment succeeded, false on invalid input
      */
     static bool applyGlobalTPContextAssignment(
         GraphConfig &graph_config,
         IGlobalTPContext *global_tp_ctx,
-        int device_idx)
+        int device_idx,
+        const TensorParallelConfig *retained_assignment)
     {
         const int degree = global_tp_ctx->degree();
         if (device_idx < 0 || device_idx >= degree)
@@ -2505,6 +2520,13 @@ namespace llaminar2
             return false;
         }
 
+        // This unchanged GlobalTP family has no complete local endpoint vector.
+        // QueryInterval is only admitted by the exact local-owner construction.
+        // Never reinterpret its CPU placeholders as actual GPU membership.
+        if((retained_assignment && retained_assignment->kvHeadCoveragePolicy()==KVHeadCoveragePolicy::QueryInterval) ||
+            (graph_config.tp_source_declaration &&
+             graph_config.tp_source_declaration->coverage()==KVHeadCoveragePolicy::QueryInterval))
+            throw std::invalid_argument("QueryInterval cannot be rebound through GlobalTP placeholder membership");
         // Equal split: build a TensorParallelConfig based on domain degree
         std::vector<DeviceId> dummy_devices(degree, DeviceId::cpu());
         auto tp_config = TensorParallelConfig::equalSplit(
@@ -2549,6 +2571,9 @@ namespace llaminar2
     // Helper: Apply LOCAL TP assignment to graph config
     // =========================================================================
 
+    /** @brief Existing cold owner either reuses prepared slicing or declares it before first materialization. */
+    enum class TPAssignmentConstruction { RetainedWeightOwner, InitialDeclarationBeforeMaterialization };
+
     /**
      * @brief Apply LOCAL TP head/FFN/vocab assignment based on device weights
      *
@@ -2559,12 +2584,20 @@ namespace llaminar2
      * @param graph_config Config to modify with TP dimensions
      * @param local_tp_ctx LOCAL TP context with device list and weights
      * @param device_idx Index of this device within the TP group
+     * @param retained_assignment Original weight-construction authority, required after materialization.
+     * @param construction Explicit existing cold publication role; no missing binding selects another policy.
+     * @param declared_placement Original complete local authority or an explicitly retained multi-domain family.
+     * @param original_directory Passive original format authority; required for declared QFN source selection.
      * @return true if assignment succeeded, false on invalid input
      */
     static bool applyLocalTPAssignment(
         GraphConfig &graph_config,
         ILocalTPContext *local_tp_ctx,
-        int device_idx)
+        int device_idx,
+        const TensorParallelConfig *retained_assignment,
+        TPAssignmentConstruction construction,
+        TensorParallelMainPlacement declared_placement,
+        const GGUFModel *original_directory)
     {
         const int tp_degree = local_tp_ctx->degree();
 
@@ -2578,12 +2611,41 @@ namespace llaminar2
         // Use TensorParallelConfig for consistent head/FFN/vocab distribution.
         // This ensures the graph config matches the weight slicing exactly
         // (both use distributeProportionally instead of independent std::round).
-        auto tp_config = TensorParallelConfig::fromLocalTPContext(
-            *local_tp_ctx,
-            graph_config.n_heads,
-            graph_config.n_kv_heads,
-            graph_config.d_ff,
-            graph_config.vocab_size);
+        auto tp_config = [&]
+        {
+            if(!graph_config.flash_next)
+                return TensorParallelConfig::fromLocalTPContext(*local_tp_ctx,graph_config.n_heads,
+                    graph_config.n_kv_heads,graph_config.d_ff,graph_config.vocab_size);
+            if(!original_directory)throw std::invalid_argument("QFN TP graph lacks original source-format directory");
+            std::vector<DeviceId> members;
+            for(const auto &address:local_tp_ctx->devices())members.push_back(address.toLocalDeviceId());
+            const bool complete_main=declared_placement==TensorParallelMainPlacement::FullMainRankLocal &&
+                graph_config.pp_layer_offset==0 &&
+                graph_config.n_layers==int(graph_config.flash_next->mainLayers());
+            const auto dense=graph_config.dense_tp_decode_replicated?DenseParallelPolicy::PrefillTensorParallelDecodeReplicated:
+                graph_config.dense_tp_decode_mirrored_embedding?DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding:
+                graph_config.dense_tp_enabled?DenseParallelPolicy::TensorParallel:DenseParallelPolicy::Replicated;
+            auto source=resolveQfnTPDeclaration(*original_directory,
+                complete_main?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
+                graph_config.mtp,dense,members);
+            auto expected=source.partition(members,local_tp_ctx->weights(),graph_config.d_ff,graph_config.vocab_size);
+            if(source.coverage()==KVHeadCoveragePolicy::QueryInterval && !retained_assignment &&
+                construction!=TPAssignmentConstruction::InitialDeclarationBeforeMaterialization)
+                throw std::invalid_argument("declared QFN query TP graph lacks its prepared weight assignment");
+            if(retained_assignment)
+            {
+                source.validate(*retained_assignment,members);
+                for(int rank=0;rank<expected.worldSize();++rank)
+                {
+                    const auto &a=expected.forRank(rank),&b=retained_assignment->forRank(rank);
+                    if(std::tie(a.head_start,a.head_count,a.kv_head_start,a.kv_head_count,a.d_ff_start,a.d_ff_count,a.vocab_start,a.vocab_count,a.work_fraction)!=
+                       std::tie(b.head_start,b.head_count,b.kv_head_start,b.kv_head_count,b.d_ff_start,b.d_ff_count,b.vocab_start,b.vocab_count,b.work_fraction))
+                        throw std::invalid_argument("QFN graph and prepared weight assignments differ");
+                }
+            }
+            graph_config.tp_source_declaration=std::move(source);
+            return retained_assignment?*retained_assignment:std::move(expected);
+        }();
 
         const auto &assignment = tp_config.forRank(device_idx);
 
@@ -2675,6 +2737,8 @@ namespace llaminar2
         const TensorParallelConfig *tp_config,
         int current_rank)
     {
+        if(tp_config->kvHeadCoveragePolicy()==KVHeadCoveragePolicy::QueryInterval)
+            throw std::invalid_argument("QueryInterval requires an authenticated rank-local GPU participant context");
         const DeviceShardingAssignment &assignment = tp_config->forRank(current_rank);
 
         // Store config and rank in graph_config for downstream use
@@ -2802,7 +2866,9 @@ namespace llaminar2
         int tp_device_idx,
         const TensorParallelConfig *tp_config,
         const std::shared_ptr<IMPIContext> &mpi_ctx,
-        bool weights_sharded)
+        bool weights_sharded,
+        TensorParallelMainPlacement declared_placement,
+        const GGUFModel *original_directory)
     {
         // LOCAL TP activation: also activate if tp_config is set on WeightManager,
         // which indicates MDO configured it for TP weight slicing within a PP stage
@@ -2815,7 +2881,7 @@ namespace llaminar2
 
         if (local_tp_ctx && local_tp_ctx->degree() > 1 && (weights_sharded || local_tp_weights_configured))
         {
-            return applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx);
+            return applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx, tp_config,TPAssignmentConstruction::RetainedWeightOwner,declared_placement,original_directory);
         }
 
         if (tp_config && weights_sharded)
@@ -3169,17 +3235,23 @@ namespace llaminar2
         const int tp_device_idx = config.tp_device_index;
 
         // Check if TensorParallelConfig is available from WeightManager (for GLOBAL TP)
-        const TensorParallelConfig *tp_config = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
+        // Another participant may republish the same logical assignment while
+        // this builder validates it. Keep its physical owner through construction.
+        const auto tp_config_owner = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
+        const TensorParallelConfig *tp_config = tp_config_owner.get();
 
         if (injected_global_tp_ctx && injected_global_tp_ctx->degree() > 1)
         {
-            if (!applyGlobalTPContextAssignment(graph_config, injected_global_tp_ctx, tp_device_idx))
+            if (!applyGlobalTPContextAssignment(graph_config, injected_global_tp_ctx, tp_device_idx,tp_config))
             {
                 return nullptr;
             }
         }
         else if (!applyTPAssignment(graph_config, local_tp_ctx, tp_device_idx,
-                                    tp_config, mpi_ctx, weights_sharded))
+                                    tp_config, mpi_ctx, weights_sharded,
+                                    !config.moe_routed_expert_plan || config.moe_routed_expert_plan->domains.size()==1
+                                        ?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
+                                    model_ctx->ggufDirectory()))
         {
             return nullptr;
         }
@@ -4224,6 +4296,9 @@ namespace llaminar2
                                                        : nullptr;
         const int tp_device_idx = config.tp_device_index;
 
+        const auto prepared_owner=std::dynamic_pointer_cast<ModelContext>(model_ctx);
+        const auto prepared_assignment=prepared_owner && prepared_owner->concreteWeightManager()
+            ?prepared_owner->concreteWeightManager()->tensorParallelConfig():nullptr;
         if (local_tp_ctx && local_tp_ctx->degree() > 1 && !graph_config.dense_tp_enabled)
         {
             if (!bindLocalTPContextWithoutDenseSharding(graph_config, local_tp_ctx, tp_device_idx))
@@ -4233,7 +4308,11 @@ namespace llaminar2
         }
         else if (local_tp_ctx && local_tp_ctx->degree() > 1)
         {
-            if (!applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx))
+            if (!applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx,prepared_assignment.get(),
+                    TPAssignmentConstruction::InitialDeclarationBeforeMaterialization,
+                    !config.moe_routed_expert_plan || config.moe_routed_expert_plan->domains.size()==1
+                        ?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
+                    model_ctx->ggufDirectory()))
             {
                 return nullptr;
             }
@@ -4242,7 +4321,7 @@ namespace llaminar2
         {
             // Injected global TP context (from DomainCommunicatorRegistry or test)
             // — apply equal-split assignment without auto-creating a world context.
-            if (!applyGlobalTPContextAssignment(graph_config, injected_global_tp_ctx, tp_device_idx))
+            if (!applyGlobalTPContextAssignment(graph_config, injected_global_tp_ctx, tp_device_idx,prepared_assignment.get()))
             {
                 return nullptr;
             }

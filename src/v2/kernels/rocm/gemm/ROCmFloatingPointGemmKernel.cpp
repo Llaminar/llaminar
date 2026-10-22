@@ -746,6 +746,10 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+                for (const auto &projection : projections)
+                    if (projection.original_output_slice)
+                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
             if (!input || projections.empty())
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Null input or empty projections");
@@ -1045,6 +1049,10 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+                for (const auto &projection : projections)
+                    if (projection.original_output_slice)
+                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
             for (const auto &projection : projections)
                 if (projection.kernel && projection.kernel->floatingActivationOperandPrecision() != operand_precision_)
                     throw std::invalid_argument("Floating verifier group mixes activation operand policies");

@@ -3396,6 +3396,10 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr) override
             {
                 for (const auto &projection : projections)
+                    if (projection.original_output_slice)
+                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
+                for (const auto &projection : projections)
                 {
                     const auto *engine = dynamic_cast<const FloatingPointGemmKernel *>(projection.kernel);
                     if (!engine || engine->operand_precision_ != operand_precision_)
@@ -3658,6 +3662,10 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override
             {
+                for (const auto &projection : projections)
+                    if (projection.original_output_slice)
+                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
                 for (const auto &projection : projections)
                 {
                     const auto *engine = dynamic_cast<const FloatingPointGemmKernel *>(projection.kernel);

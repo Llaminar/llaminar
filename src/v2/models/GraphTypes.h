@@ -15,6 +15,9 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * A source-derived TP declaration accompanies the exact retained assignment.
+ * It names original consumer identity, never a second assignment or byte ledger.
  */
 
 #pragma once
@@ -31,6 +34,7 @@
 #include "../backends/DeviceId.h"
 #include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
+#include "../config/TensorParallelAssignmentDeclaration.h"
 #include "../config/TPDomain.h"
 #include "../collective/ITPContext.h"
 #include "../loaders/WeightPlan.h"
@@ -562,6 +566,8 @@ namespace llaminar2
         /// When set, overrides equal-split head/KV/FFN computation.
         /// Use for heterogeneous GPU setups (e.g., NVIDIA 73% + AMD 27%).
         std::shared_ptr<TensorParallelConfig> tp_config = nullptr;
+        /** Original source/retained-family intent; QueryInterval must match the actual bound assignment. */
+        std::optional<TensorParallelAssignmentDeclaration> tp_source_declaration;
 
         /// Local rank index (used with tp_config to look up assignment)
         int local_rank = 0;

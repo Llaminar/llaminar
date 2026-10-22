@@ -7,10 +7,15 @@
  * IDs and GPU ordinals never undergo rank arithmetic. The model compiler, not
  * this enumerator, decides whether each proposed graph can execute. Memory and
  * performance admission remain separate and cannot short-circuit on first fit.
+ *
+ * QFN source-format and complete original GDN consumer declarations constrain
+ * canonical head assignments before candidate publication. Expert output-column
+ * integrality remains an independent topology requirement.
  */
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "config/GDNHeadAssignment.h"
 #include "config/TensorParallelConfig.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/RankHardwareOwnership.h"
@@ -279,7 +284,9 @@ namespace llaminar2
          *         interval, or when the model has no GDN layers.
          * @throws std::invalid_argument for incomplete or invalid GDN geometry.
          */
-        bool preservesGDNHeadOwnership(const ModelMemoryProfile &profile, const Pool &pool)
+        bool preservesGDNHeadOwnership(const ModelMemoryProfile &profile, const Pool &pool,
+            const MTPRuntimeConfig &mtp,DenseParallelPolicy dense=DenseParallelPolicy::TensorParallel,
+            bool single_domain=true)
         {
             if (pool.size() <= 1 ||
                 (profile.gdn_group_count == 0 && profile.gdn_time_step_rank == 0))
@@ -292,9 +299,20 @@ namespace llaminar2
                     "Automatic planning requires both GDN key and value head counts");
             }
 
-            const auto sharding = TensorParallelConfig::equalSplit(
-                static_cast<int>(pool.size()), profile.n_heads, profile.n_kv_heads,
-                profile.d_ff, profile.vocab_size);
+            const auto sharding = [&]
+            {
+                if(!profile.flash_next)
+                    return TensorParallelConfig::equalSplit(static_cast<int>(pool.size()),profile.n_heads,
+                        profile.n_kv_heads,profile.d_ff,profile.vocab_size);
+                std::vector<DeviceId> devices;
+                for(const auto &endpoint:pool)devices.push_back(endpoint.address.toLocalDeviceId());
+                const bool local=std::all_of(pool.begin(),pool.end(),[&](const Endpoint &endpoint)
+                    {return endpoint.rank==pool.front().rank;});
+                const auto source=resolveProfileTPDeclaration(profile,
+                    local && single_domain?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
+                    mtp,dense,devices);
+                return source.partition(devices,{},profile.d_ff,profile.vocab_size);
+            }();
             return std::all_of(sharding.assignments().begin(), sharding.assignments().end(),
                 [&](const DeviceShardingAssignment &assignment) {
                     return GDNHeadAssignment::hasIntegralKeyHeadBoundaries(
@@ -493,7 +511,8 @@ namespace llaminar2
             }
             const auto default_policy = default_config.moe_routed_expert_plan
                 ->continuation_domain_spec.effectiveDensePolicy();
-            publish({strategy, membership, std::move(default_config)});
+            if(preservesGDNHeadOwnership(model.memoryProfile(),domains.front(),request.mtp,default_policy,domains.size()==1))
+                publish({strategy, membership, std::move(default_config)});
             if (default_policy == DenseParallelPolicy::PrefillTensorParallelDecodeReplicated)
             {
                 // Full decode replicas are faster only when their complete
@@ -502,7 +521,8 @@ namespace llaminar2
                 // expert residency; neither policy is a hidden runtime fallback.
                 auto tp_config = overlayConfig(request, domains, membership,
                     DenseParallelPolicy::TensorParallel);
-                publish({strategy, std::move(membership), std::move(tp_config)});
+                if(preservesGDNHeadOwnership(model.memoryProfile(),domains.front(),request.mtp,DenseParallelPolicy::TensorParallel,domains.size()==1))
+                    publish({strategy, std::move(membership), std::move(tp_config)});
             }
         };
         const auto pools = endpointPools(inventory, *policy);
@@ -511,7 +531,7 @@ namespace llaminar2
             const auto strategy = pool.size() == 1 ? OrchestrationStrategy::SingleDevice : OrchestrationStrategy::TensorParallel;
             if (!permitsPools(*policy, strategy, {pool})) continue;
             if (strategy == OrchestrationStrategy::TensorParallel &&
-                !preservesGDNHeadOwnership(model.memoryProfile(), pool)) continue;
+                !preservesGDNHeadOwnership(model.memoryProfile(), pool,request.mtp)) continue;
             auto membership = membershipFor({pool}, inventory);
             auto config = explicitRequest(request);
             if (pool.size() == 1)
@@ -632,7 +652,7 @@ namespace llaminar2
                 }
                 if (!overlays ||
                     first.front().address.device_type == DeviceType::CPU) continue;
-                if (!preservesGDNHeadOwnership(model.memoryProfile(), first)) continue;
+                if (!preservesGDNHeadOwnership(model.memoryProfile(), first,request.mtp)) continue;
                 emitOverlay(domains);
             }
         if (!overlays) return;
@@ -653,7 +673,7 @@ namespace llaminar2
                 if (selected.empty())
                 {
                     if (next.front().address.isCPU() ||
-                        !preservesGDNHeadOwnership(model.memoryProfile(), next))
+                        !preservesGDNHeadOwnership(model.memoryProfile(), next,request.mtp))
                         continue;
                 }
                 else if (std::any_of(selected.begin(), selected.end(),

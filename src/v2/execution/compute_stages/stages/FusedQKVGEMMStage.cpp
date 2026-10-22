@@ -8,6 +8,7 @@
  * fused projection route.
  */
 
+#include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "FusedQKVGEMMStage.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
@@ -19,6 +20,7 @@
 #include "../../../loaders/PreparedWeightStore.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -32,6 +34,28 @@ namespace llaminar2
     FusedQKVGEMMStage::FusedQKVGEMMStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    uint64_t FusedQKVGEMMStage::graphCaptureVariantSignature() const
+    {
+        uint64_t signature = 1469598103934665603ULL;
+        bool declared = false;
+        const auto append = [&](const auto &slice)
+        {
+            const auto mix = [&](uint64_t word) { signature = (signature ^ word) * 1099511628211ULL; };
+            mix(slice.has_value());
+            if (!slice) return;
+            declared = true;
+            mix(slice->recordingIdentity());
+            mix(slice->modelId()); mix(slice->bindingId());
+            mix(slice->policyColumns()); mix(slice->firstColumn());
+            mix(slice->physicalColumns()); mix(slice->reductionColumns());
+            mix(slice->sourceIdentity().codebook_id); mix(slice->sourceIdentity().is_superblock);
+        };
+        append(params_.original_output_slice_q);
+        append(params_.original_output_slice_k);
+        append(params_.original_output_slice_v);
+        return declared ? signature : 0;
     }
 
     bool FusedQKVGEMMStage::includesQuery() const noexcept
@@ -61,20 +85,20 @@ namespace llaminar2
                 dynamic_cast<TensorBase *>(params_.output_q),
                 params_.n_q,
                 params_.bias_q,
-                "Q");
+                "Q", params_.original_output_slice_q);
         }
         cached_projections_.emplace_back(
             cached_gemm_k_,
             dynamic_cast<TensorBase *>(params_.output_k),
             params_.n_k,
             params_.bias_k,
-            "K");
+            "K", params_.original_output_slice_k);
         cached_projections_.emplace_back(
             cached_gemm_v_,
             dynamic_cast<TensorBase *>(params_.output_v),
             params_.n_v,
             params_.bias_v,
-            "V");
+            "V", params_.original_output_slice_v);
     }
 
     void FusedQKVGEMMStage::clearCachedGemmStreams()
@@ -166,11 +190,25 @@ namespace llaminar2
             }
             return false;
         }
-        const bool has_q = !includesQuery() ||
-                           params_.prepared_store->contains(
-                               params_.prepared_ref_q.value());
-        const bool has_k = params_.prepared_store->contains(params_.prepared_ref_k.value());
-        const bool has_v = params_.prepared_store->contains(params_.prepared_ref_v.value());
+        // A resolved opted leaf owns its exact publication independently of
+        // the index. Revalidation must not substitute a newer entry or reject
+        // a retained graph merely because that index has been retired. Cold
+        // stages and unopted members retain the existing live-store frontier.
+        const auto available = [&](const std::optional<PreparedWeightRef> &ref,
+                                   const std::optional<OriginalOutputSlice> &fact,
+                                   const ITensorGemm *kernel)
+        {
+            if (cache_resolved_individual_ && fact)
+                return kernel && kernel == fact->retainedEngine() &&
+                    ref->binding_id == fact->bindingId() && ref->model_id.value == fact->modelId() &&
+                    ref->kind == fact->preparedKind() && ref->device == fact->device() &&
+                    kernel->get_n() == fact->physicalColumns() && kernel->get_k() == fact->reductionColumns();
+            return params_.prepared_store->contains(*ref);
+        };
+        const bool has_q = !includesQuery() || available(
+            params_.prepared_ref_q, params_.original_output_slice_q, cached_gemm_q_);
+        const bool has_k = available(params_.prepared_ref_k, params_.original_output_slice_k, cached_gemm_k_);
+        const bool has_v = available(params_.prepared_ref_v, params_.original_output_slice_v, cached_gemm_v_);
         if (!has_q || !has_k || !has_v)
         {
             if (error)
@@ -193,6 +231,30 @@ namespace llaminar2
             return (!includesQuery() || cached_gemm_q_) &&
                    cached_gemm_k_ && cached_gemm_v_;
 
+        // Authenticate cold facts through the actual store before a missing
+        // handle can be mistaken for an ordinary legacy preparation miss.
+        const std::array facts{params_.original_output_slice_q, params_.original_output_slice_k, params_.original_output_slice_v};
+        const std::array refs{params_.prepared_ref_q, params_.prepared_ref_k, params_.prepared_ref_v};
+        const std::array sources{params_.wq, params_.wk, params_.wv};
+        std::array<std::optional<WeightBinding>,3> observation_bindings;
+        if (!includesQuery() && facts[0])
+            throw std::invalid_argument("K/V-only projection cannot declare a query original slice");
+        for (size_t member = includesQuery() ? 0 : 1; member < facts.size(); ++member)
+        {
+            if (!facts[member]) continue;
+            const auto *tensor = dynamic_cast<const TensorBase *>(sources[member]);
+            if (!params_.prepared_store || !refs[member] || !tensor ||
+                facts[member]->device() != params_.device_id ||
+                params_.prepared_store->originalOutputSlice(*refs[member], *tensor) != *facts[member])
+                throw std::invalid_argument("Fused QKV original slice differs from actual prepared source binding");
+            if (PerfStatsCollector::isDomainEnabled("gpu_graph_inventory"))
+            {
+                observation_bindings[member]=params_.prepared_store->binding(*refs[member]);
+                if (!observation_bindings[member] || observation_bindings[member]->tensor != tensor)
+                    throw std::invalid_argument("Original slice observation lost its actual source publication");
+            }
+        }
+
         if (!params_.prepared_store ||
             (includesQuery() && !params_.prepared_ref_q.has_value()) ||
             !params_.prepared_ref_k.has_value() ||
@@ -204,12 +266,19 @@ namespace llaminar2
             return false;
         }
 
-        cached_gemm_q_ = includesQuery()
-                             ? params_.prepared_store->gemmKernel(
-                                   params_.prepared_ref_q.value())
-                             : nullptr;
-        cached_gemm_k_ = params_.prepared_store->gemmKernel(params_.prepared_ref_k.value());
-        cached_gemm_v_ = params_.prepared_store->gemmKernel(params_.prepared_ref_v.value());
+        // Cold authentication above compares the current publication. Resolve
+        // opted leaves from that exact retained object, never from a second
+        // index lookup that could observe a replacement between those steps.
+        // Cached stages keep those owners through Params and descriptors; fresh
+        // stages with a historical fact still fail the current-entry check.
+        const auto resolve = [&](size_t member) -> ITensorGemm *
+        {
+            return facts[member] ? facts[member]->retainedEngine()
+                                 : params_.prepared_store->gemmKernel(*refs[member]);
+        };
+        cached_gemm_q_ = includesQuery() ? resolve(0) : nullptr;
+        cached_gemm_k_ = resolve(1);
+        cached_gemm_v_ = resolve(2);
 
         if ((includesQuery() && !cached_gemm_q_) ||
             !cached_gemm_k_ || !cached_gemm_v_)
@@ -222,6 +291,20 @@ namespace llaminar2
         }
 
         rebuildProjectionDescriptors();
+        for (const auto &projection : cached_projections_)
+        {
+            projection.requireOriginalOutputSlice(params_.k);
+            auto scope = projection.beginOriginalOutputSliceScope();
+        }
+        // Setup evidence projects only actual authenticated retained facts.
+        // It is not a replay counter and never inspects weight payloads.
+        if (PerfStatsCollector::isDomainEnabled("gpu_graph_inventory"))
+            for (size_t member = includesQuery() ? 0 : 1; member < facts.size(); ++member)
+                if (facts[member])
+                    query_kv_geometry::recordProjection(*facts[member],
+                        *observation_bindings[member],
+                        static_cast<query_kv_geometry::ProjectionRole>(member),
+                        graphCaptureVariantSignature(), params_.prepared_store->physicalMemoryAuthority().get());
         cache_resolved_individual_ = true;
         return true;
     }
@@ -276,7 +359,7 @@ namespace llaminar2
         if (params_.projection_set == AttentionProjectionSet::KeyValueOnly &&
             (params_.wq || params_.output_q || params_.bias_q ||
              params_.n_q != 0 || params_.prepared_ref_q.has_value() ||
-             params_.output_q_buffer_id.has_value()))
+             params_.output_q_buffer_id.has_value() || params_.original_output_slice_q.has_value()))
         {
             LOG_ERROR("[FusedQKVGEMMStage] K/V-only policy must not carry query weights, output, dimensions, bias, prepared refs, or buffer ownership");
             return false;
@@ -611,27 +694,14 @@ namespace llaminar2
         const int workspace_k = (k > 0) ? k : params_.k;
 
         WorkspaceRequirements combined;
-        if (includesQuery())
+        for (const auto &projection : cached_projections_)
         {
-            if (auto *consumer_q =
-                    dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
-            {
-                combined.merge(consumer_q->getWorkspaceRequirements(
-                    workspace_m,
-                    params_.n_q > 0 ? params_.n_q : n,
-                    workspace_k));
-            }
+            projection.requireOriginalOutputSlice(workspace_k);
+            auto scope = projection.beginOriginalOutputSliceScope();
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(projection.kernel))
+                combined.merge(consumer->getWorkspaceRequirements(workspace_m,
+                    projection.n > 0 ? projection.n : n, workspace_k));
         }
-        if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_k_))
-            combined.merge(consumer_k->getWorkspaceRequirements(
-                workspace_m,
-                params_.n_k > 0 ? params_.n_k : n,
-                workspace_k));
-        if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_v_))
-            combined.merge(consumer_v->getWorkspaceRequirements(
-                workspace_m,
-                params_.n_v > 0 ? params_.n_v : n,
-                workspace_k));
 
         std::vector<int> fused_columns;
         fused_columns.reserve(projectionCount());

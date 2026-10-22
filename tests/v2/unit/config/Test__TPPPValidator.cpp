@@ -6,10 +6,14 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * Original QFN declarations and actual nonordinal endpoint fixtures cover every
+ * supported head degree without loading model tensors or initializing GPUs.
  */
 
 #include <gtest/gtest.h>
 #include "config/TPPPValidator.h"
+#include "../models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include <unordered_set>
 #include <algorithm>
 
@@ -467,4 +471,53 @@ namespace llaminar2::test
         EXPECT_TRUE(suggests_valid) << "Expected error to suggest valid TP degrees (1, 2)";
     }
 
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+/** @brief Passive original directory owner; materialization calls are observable and forbidden here. */
+class OriginalQfnValidationContext final : public MockModelContext
+{
+public:
+    GGUFModel original=qwen4MetadataFixture(false);
+    bool present=true;
+    mutable int materialization_calls=0;
+    OriginalQfnValidationContext()
+    {
+        for(int layer=3;layer<48;layer+=4)for(const char *role:{"attn_k.weight","attn_v.weight"})
+            original.tensors.push_back({.name="blk."+std::to_string(layer)+"."+role,.dimensions={512,2560},.type=GGUFTensorType::Q8_0});
+        n_heads_=24;n_kv_heads_=2;n_layers_=48;vocab_size_=248320;ffn_hidden_=640;embedding_dim_=2560;
+    }
+    const std::string &architecture()const override {static const std::string value="qwen4exp";return value;}
+    const GGUFModel *ggufDirectory()const noexcept override {return present?&original:nullptr;}
+    std::shared_ptr<IModelLoader> loader()override {++materialization_calls;return nullptr;}
+    std::shared_ptr<TensorBase> getWeightForDevice(const std::string &,DeviceId)override
+        {++materialization_calls;return nullptr;}
+};
+/** @test Structural validation has original source authority but does not fabricate physical participants. */
+TEST_F(Test__TPPPValidator, QueryConsumerSourceStructuralAndResolvedContractsAreDistinct)
+{
+    OriginalQfnValidationContext source;
+    auto config=OrchestrationConfig::defaults();config.tp_scope=TPScope::RANK_LOCAL;
+    config.mtp.enabled=false;config.mtp.graph_capacity_draft_tokens=0;
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(int degree=2;degree<=8;++degree)
+    {
+        config.tp_degree=degree;
+        EXPECT_TRUE(TPPPValidator::validate(config,source).valid);
+        std::vector<GlobalDeviceAddress> devices;
+        for(int rank=0;rank<degree;++rank)devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+            DeviceId(backend,19-rank*2),"authored-node",0));
+        auto result=TPPPValidator::validate(config,source,TPPPAssignmentMembership::resolved(devices));
+        EXPECT_TRUE(result.valid)<<result.toString();
+        devices.back()=devices.front();
+        EXPECT_FALSE(TPPPValidator::validate(config,source,TPPPAssignmentMembership::resolved(devices)).valid);
+        devices.pop_back();
+        EXPECT_FALSE(TPPPValidator::validate(config,source,TPPPAssignmentMembership::resolved(devices)).valid);
+    }
+    config.tp_degree=9;EXPECT_FALSE(TPPPValidator::validate(config,source).valid);
+    config.tp_degree=4;source.present=false;
+    EXPECT_FALSE(TPPPValidator::validate(config,source).valid);
+    EXPECT_EQ(source.materialization_calls,0);
+    EXPECT_THROW(TPPPAssignmentMembership::resolved({}),std::invalid_argument);
+}
 } // namespace llaminar2::test

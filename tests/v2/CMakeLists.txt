@@ -12448,12 +12448,21 @@ add_v2_test(V2_Unit_TensorParallelConfig_LocalTP
 # Part of Phase 1: LOCAL TP Weight Sharding Infrastructure
 add_executable(v2_test_weight_manager_localtp_slicing unit/loaders/Test__WeightManager_LocalTPSlicing.cpp)
 target_link_libraries(v2_test_weight_manager_localtp_slicing llaminar2_core GTest::gtest GTest::gtest_main)
-target_include_directories(v2_test_weight_manager_localtp_slicing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+target_include_directories(v2_test_weight_manager_localtp_slicing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/utils ${CMAKE_CURRENT_SOURCE_DIR})
 add_v2_test(V2_Unit_WeightManager_LocalTPSlicing
     COMMAND $<TARGET_FILE:v2_test_weight_manager_localtp_slicing>
     LABELS "V2;Unit;Loaders;WeightManager;LocalTP;Slicing;WeightSharding"
     MPI_PROCS 1
 )
+
+# The actual manager must retain immutable TP declaration owners during parallel setup.
+add_v2_test(V2_Integration_WeightManagerTensorParallelSnapshotOwnership
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_localtp_slicing>
+        --gtest_filter=Test__WeightManager_LocalTPSlicing.TensorParallelSnapshot*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Loaders;LocalTP;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_WeightManagerTensorParallelSnapshotOwnership)
 
 # Test: PipelineParallelConfig (layer range assignment for pipeline parallelism)
 # Tests equal splits, custom splits, topology methods, validation
@@ -31473,6 +31482,88 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_tensor_parallel_config AND TARGET v
         V2_Integration_QueryKVRankSnapshotConsumers)
 endif()
 
+# Append in the existing non-performance Unit registration region.
+# No accelerators/models; CPU functional proof plus exact backend source closure.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_executable(v2_test_original_output_slice unit/loaders/Test__OriginalOutputSlice.cpp)
+    target_link_libraries(v2_test_original_output_slice PRIVATE
+        llaminar2_core GTest::gtest_main OpenMP::OpenMP_CXX)
+    add_v2_test(V2_Unit_OriginalOutputSlice
+        COMMAND $<TARGET_FILE:v2_test_original_output_slice>
+        LABELS "V2;Unit;CPU;DeviceFree;PreparedWeights;NativeVNNI;TensorParallel;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_v2_test(V2_Integration_OriginalOutputSliceContract
+        COMMAND $<TARGET_FILE:v2_test_original_output_slice> --gtest_filter=OriginalOutputSlice.*
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;PreparedWeights;NativeVNNI;TensorParallel;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OriginalOutputSliceContract)
+    add_v2_test(V2_Unit_OriginalOutputSliceSource
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_original_output_slice_source.py
+        LABELS "V2;Unit;CPU;DeviceFree;SourcePolicy;NativeVNNI;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_OriginalOutputSliceSource
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_original_output_slice_source.py
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;SourcePolicy;NativeVNNI;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OriginalOutputSliceSource)
+endif()
+
+# Append after the existing backend GEMM integration target declarations.
+# Canonical production-prepared native source slices; no models or new launcher.
+if(TARGET v2_integration_cuda_gemm_batch_invariance OR TARGET v2_integration_rocm_quantised_gemm_small_m)
+    add_library(v2_original_output_slice_native_fixture STATIC utils/OriginalOutputSliceNativeFixture.cpp)
+    target_link_libraries(v2_original_output_slice_native_fixture PRIVATE llaminar2_core GTest::gtest)
+endif()
+if(TARGET v2_integration_cuda_gemm_batch_invariance)
+    target_link_libraries(v2_integration_cuda_gemm_batch_invariance v2_original_output_slice_native_fixture)
+    add_v2_test(V2_Integration_CUDA_OriginalOutputSliceCapturedAllFormats
+        COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
+            --gtest_filter=Test__CUDAGemmBatchInvariance.CapturedOriginalOutputSliceAllNativeFormats --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeVNNI;PreparedWeights;TensorParallel;QKV;GraphCapture;ByteExact;AllFormats;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_OriginalOutputSliceCapturedAllFormats)
+endif()
+if(TARGET v2_integration_rocm_quantised_gemm_small_m)
+    target_link_libraries(v2_integration_rocm_quantised_gemm_small_m v2_original_output_slice_native_fixture)
+    add_v2_test(V2_Integration_ROCm_OriginalOutputSliceCapturedAllFormats
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+            --gtest_filter=Test__ROCmQuantisedGemmSmallM.CapturedOriginalOutputSliceAllNativeFormats --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;PreparedWeights;TensorParallel;QKV;GraphCapture;ByteExact;AllFormats;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_OriginalOutputSliceCapturedAllFormats)
+endif()
+
+# Insert before the canonical ProductionTestPreflight finalizer and Unit target inventory.
+# Existing owners retain their Unit names; these are explicit focused preflight aliases.
+if(NOT V2_PERF_TESTS_ONLY)
+    target_sources(v2_test_tppp_validator PRIVATE
+        unit/config/Test__TensorParallelAssignmentDeclaration.cpp)
+    add_v2_test(V2_Integration_QueryKVOriginalSourceDeclaration
+        COMMAND $<TARGET_FILE:v2_test_tppp_validator>
+            --gtest_filter=TensorParallelAssignmentDeclaration.*:Test__TPPPValidator.QueryConsumerSourceStructuralAndResolvedContractsAreDistinct
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Config;Attention;Sharding;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_v2_test(V2_Integration_QueryKVPMAAssignment
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=RankMemoryPlanInputs.QueryConsumerSourceMatchesCanonicalAssignmentEveryDegree
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PhysicalMemoryAuthority;Attention;Sharding;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_v2_test(V2_Integration_QueryKVAutomaticAssignment
+        COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+            --gtest_filter=AutomaticOrchestrationCandidates.QueryConsumerSourceUsesCanonicalAssignmentsAndPreservesExpertLimits
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;ExpertOverlay;Attention;Sharding;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_QueryKVOriginalSourceDeclaration
+        V2_Integration_QueryKVPMAAssignment
+        V2_Integration_QueryKVAutomaticAssignment)
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR
@@ -31581,6 +31672,30 @@ if(HAVE_ROCM)
 endif()
 # Retain canonical add_v2_test startup/resource/driver policy. These are explicit
 # accelerator integrations, never Unit or default production preload hooks.
+endif()
+
+# Insert before the canonical Unit inventory and ProductionTestPreflight finalizer.
+if(NOT V2_PERF_TESTS_ONLY)
+    target_sources(v2_test_tensor_parallel_config PRIVATE unit/config/Test__QueryKVGeometryObservation.cpp)
+    add_v2_test(V2_Integration_QueryKVGeometryColdObservation
+        COMMAND $<TARGET_FILE:v2_test_tensor_parallel_config> --gtest_filter=QueryKVGeometryObservation.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Attention;Planning;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_v2_test(V2_Integration_QueryKVGeometryPreparedStage
+        COMMAND $<TARGET_FILE:v2_test_original_output_slice> --gtest_filter=OriginalOutputSlice.ColdStageGeometryEvidenceUsesActualOwnedFacts
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PreparedWeights;Attention;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_v2_test(V2_Unit_QueryKVGeometryArtifact
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_query_kv_geometry_evidence.py
+        LABELS "V2;Unit;DeviceFree;Attention;Artifact;Regression" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_QueryKVGeometryArtifact
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_query_kv_geometry_evidence.py
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Attention;Artifact;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QueryKVGeometryColdObservation
+        V2_Integration_QueryKVGeometryPreparedStage V2_Integration_QueryKVGeometryArtifact)
 endif()
 
 # The label, not the list above, is the installed gate's inventory authority.

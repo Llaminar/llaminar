@@ -19,6 +19,7 @@
 
 #include "ExpertSlabTypes.h"
 #include "WeightPlan.h"
+#include "kernels/common/OriginalOutputSlice.h"
 #include "../kernels/KernelFactory.h"
 #include "../kernels/common/PreparedEmbeddingWeights.h"
 
@@ -262,6 +263,24 @@ namespace llaminar2
 
         bool contains(const PreparedWeightRef &ref) const;
         std::optional<WeightBinding> binding(const PreparedWeightRef &ref) const;
+
+        /**
+         * @brief Authenticate one original output interval from the actual frozen binding.
+         * @param ref Exact published prepared engine/device/model identity.
+         * @param source Actual graph source tensor, including an already materialized TP view.
+         * @return Immutable interval retaining the exact published source and engine owners.
+         * @throws std::invalid_argument For foreign, unowned, mutable, missing, K-sliced or expert bindings.
+         *
+         * Source coordinates come only from WeightBinding::slice. A presliced
+         * inner tensor remains valid: its original coordinates stay in that
+         * existing binding rather than being reconstructed from local shape.
+         * Canonical Factory-to-store publication remains the payload-affinity
+         * trust boundary; matching format metadata is not a payload comparison.
+         * A fact keeps its exact owned kernel and tensor owner alive across index
+         * replacement/clear. A fresh stage still authenticates the current entry.
+         */
+        [[nodiscard]] OriginalOutputSlice originalOutputSlice(
+            const PreparedWeightRef &ref, const TensorBase &source) const;
         size_t size() const;
 
         /**

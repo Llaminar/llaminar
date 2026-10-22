@@ -36,6 +36,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/OriginalOutputSliceNativeFixture.h"
 #include "../../../utils/NativeVNNIEquivalenceInventory.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/ScopedGPUStream.h"
@@ -8890,3 +8891,12 @@ TEST(Test__ROCmQuantisedGemmSmallM, GDNHalfPackedProjectionFixedTreeCaptured)
     }
 #endif
 }
+
+#ifdef HAVE_ROCM
+/** @test All original native sources retain per-leaf policy and physical extents in captured ordinary/grouped QKV. */
+TEST(Test__ROCmQuantisedGemmSmallM, CapturedOriginalOutputSliceAllNativeFormats)
+{
+    if (!hasROCmDevice()) GTEST_SKIP() << "No ROCm device available";
+    ASSERT_NO_THROW(original_output_slice_native::prove(DeviceId::rocm(0)));
+}
+#endif

@@ -41,6 +41,7 @@
 #include "tensors/TensorKernels.h"
 #include "tensors/BlockStructures.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include <limits>
 #include <memory>
 #include <cstdint>
 #include <string>
@@ -206,6 +207,10 @@ namespace llaminar2
             beginOutputPartitionEquivalenceScope(
                 int actual_output_columns,
                 int serial_partition_columns) override;
+
+            /** @brief Bind a store-authenticated original output interval to this native leaf. */
+            std::unique_ptr<OutputPartitionEquivalenceScope>
+            beginOriginalOutputSliceScope(const OriginalOutputSlice &slice) override;
 
             /**
              * @brief Tensor-based GEMM with type introspection (PRIMARY ENTRY POINT)
@@ -413,6 +418,28 @@ namespace llaminar2
 
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
+            /**
+             * @brief Publish the existing physical output extent through the GEMM interface.
+             * @return Actual prepared N, without preparing weights or querying the device.
+             * @throws std::overflow_error If the extent cannot be represented by the launch API.
+             */
+            int get_n() const override
+            {
+                if (N_ > static_cast<size_t>(std::numeric_limits<int>::max()))
+                    throw std::overflow_error("Prepared GEMM output extent exceeds the launch API");
+                return static_cast<int>(N_);
+            }
+            /**
+             * @brief Publish the existing physical reduction extent through the GEMM interface.
+             * @return Actual prepared K, without preparing weights or querying the device.
+             * @throws std::overflow_error If the extent cannot be represented by the launch API.
+             */
+            int get_k() const override
+            {
+                if (K_ > static_cast<size_t>(std::numeric_limits<int>::max()))
+                    throw std::overflow_error("Prepared GEMM reduction extent exceeds the launch API");
+                return static_cast<int>(K_);
+            }
             bool weights_converted() const override;
 
             /// @brief Export native-VNNI device pointers for grouped MoE CUDA prefill.

@@ -697,6 +697,10 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+                for (const auto &projection : projections)
+                    if (projection.original_output_slice)
+                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
             // Validate immutable operand identity before seed-based dispatch:
             // a Native seed must not silently admit a half-A consumer either.
             for (const auto &projection : projections)
@@ -1084,6 +1088,10 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
+                for (const auto &projection : projections)
+                    if (projection.original_output_slice)
+                        throw std::invalid_argument("Floating fused original-output-slice arithmetic is not implemented; ordinary BLAS must not be replaced by verifier arithmetic");
+
             // Validate immutable operand identity before seed-based dispatch:
             // a Native seed must not silently admit a half-A consumer either.
             for (const auto &projection : projections)

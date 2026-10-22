@@ -67,6 +67,32 @@ namespace llaminar2::cpu::native_vnni
         int previous_ = 0; ///< Scope value restored at transaction completion.
     };
 
+    /** @brief Bind one authenticated source interval; sibling projections never enter this scope. */
+    class CPUNativeVNNIOriginalOutputSliceScope final
+        : public ITensorGemm::OutputPartitionEquivalenceScope
+    {
+    public:
+        /** @brief Preserve both enclosing APIs while recording this leaf's original arithmetic. */
+        explicit CPUNativeVNNIOriginalOutputSliceScope(const OriginalOutputSlice &slice)
+            : previous_(detail::originalOutputSlicePolicy()),
+              previous_serial_(cpuNativeVNNISerialOutputPartitionN())
+        {
+            detail::originalOutputSlicePolicy() = {slice.physicalColumns(), slice.policyColumns()};
+            setCPUNativeVNNISerialOutputPartitionN(slice.policyColumns());
+        }
+        /** @brief Restore even after a failed launch or nested legacy scope. */
+        ~CPUNativeVNNIOriginalOutputSliceScope() override
+        {
+            setCPUNativeVNNISerialOutputPartitionN(previous_serial_);
+            detail::originalOutputSlicePolicy() = previous_;
+        }
+        CPUNativeVNNIOriginalOutputSliceScope(const CPUNativeVNNIOriginalOutputSliceScope &) = delete;
+        CPUNativeVNNIOriginalOutputSliceScope &operator=(const CPUNativeVNNIOriginalOutputSliceScope &) = delete;
+    private:
+        detail::OriginalOutputSlicePolicy previous_; ///< Immutable predecessor geometry.
+        int previous_serial_; ///< Existing two-int predecessor policy.
+    };
+
     /** @brief Prepared quantized weights with participant-owned invocation scratch. */
     class CPUNativeVNNIGemmKernel : public ITensorGemm, public CPUInvocationWorkspaceConsumer
     {
@@ -243,6 +269,16 @@ namespace llaminar2::cpu::native_vnni
             return std::make_unique<
                 CPUNativeVNNIOutputPartitionEquivalenceScope>(
                 serial_partition_columns);
+        }
+
+        /** @brief Bind store-authenticated original N without changing packed bytes or physical extents. */
+        std::unique_ptr<OutputPartitionEquivalenceScope>
+        beginOriginalOutputSliceScope(const OriginalOutputSlice &slice) override
+        {
+            slice.require(this, packed_.N, packed_.K);
+            if (slice.device() != DeviceId::cpu())
+                throw std::invalid_argument("Original output slice belongs to a foreign CPU endpoint");
+            return std::make_unique<CPUNativeVNNIOriginalOutputSliceScope>(slice);
         }
 
         /**
@@ -690,6 +726,9 @@ namespace llaminar2::cpu::native_vnni
         {
             (void)mpi_ctx;
             (void)workspace;
+            for (const auto &projection : projections)
+                projection.requireOriginalOutputSlice(k);
+
             constexpr size_t kMaxFusedProjections = NativeVNNIFusedRowsPlan::capacity;
             if (!valid_ || !input || m <= 0 || k <= 0 ||
                 k != packed_.K || projections.empty() ||
@@ -759,6 +798,8 @@ namespace llaminar2::cpu::native_vnni
                         .output = outputs[i],
                         .bias = biases[i],
                         .N = projections[i].n,
+                        .policy_n = projections[i].original_output_slice
+                            ? projections[i].original_output_slice->policyColumns() : 0,
                     };
                 }
                 gemv_native_vnni_fused_preq(
@@ -771,6 +812,7 @@ namespace llaminar2::cpu::native_vnni
 
             for (size_t i = 0; i < projections.size(); ++i)
             {
+                auto original_scope = projections[i].beginOriginalOutputSliceScope();
                 gemm_native_vnni_preq(
                     vnni_kernels[i]->packed_,
                     shared_q8.data(),
@@ -828,6 +870,9 @@ namespace llaminar2::cpu::native_vnni
         {
             (void)mpi_ctx;
             (void)workspace;
+
+            for (const auto &projection : projections)
+                projection.requireOriginalOutputSlice(k);
 
             constexpr size_t kMaxGroupedProjections = NativeVNNIFusedRowsPlan::capacity;
             if (!valid_ || !input || m < 1 || k <= 0 || k != packed_.K ||
@@ -943,6 +988,8 @@ namespace llaminar2::cpu::native_vnni
                         biases[i],
                         proj.n,
                         proj.n};
+                    fused_descs[i].policy_n = proj.original_output_slice
+                        ? proj.original_output_slice->policyColumns() : 0;
                 }
 
                 perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
@@ -996,6 +1043,7 @@ namespace llaminar2::cpu::native_vnni
             {
                 auto *vnni = vnni_kernels[i];
                 const auto &proj = projections[i];
+                auto original_scope = proj.beginOriginalOutputSliceScope();
                 float *out_data = outputs[i];
 
                 perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
@@ -1378,6 +1426,9 @@ namespace llaminar2::cpu::native_vnni
             int k,
             std::span<float> partial_storage)
         {
+            for (const auto &projection : projections)
+                projection.requireOriginalOutputSlice(k);
+
             constexpr size_t kMaxRouterQ8Projections = NativeVNNIFusedRowsPlan::capacity;
             if (!valid_ || !input_q8 || m < 1 || k <= 0 ||
                 projections.empty() ||
@@ -1431,6 +1482,8 @@ namespace llaminar2::cpu::native_vnni
                 {
                     const auto &projection = projections[i];
                     auto &descriptor = descriptors[i];
+                    descriptor.policy_n = projection.original_output_slice
+                        ? projection.original_output_slice->policyColumns() : 0;
                     descriptor.packed = &vnni_kernels[i]->packed_;
                     descriptor.output = projection.output->mutable_data();
                     descriptor.bias = projection.bias ? projection.bias->data() : nullptr;
@@ -1461,6 +1514,8 @@ namespace llaminar2::cpu::native_vnni
                         bias,
                         projection.n,
                         projection.n};
+                    descriptors[i].policy_n = projection.original_output_slice
+                        ? projection.original_output_slice->policyColumns() : 0;
                 }
 
                 if (!gemm_native_vnni_fused_verifier_rows_preq(

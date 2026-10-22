@@ -3,7 +3,9 @@
  * @brief Model-aware validation for Tensor Parallelism and Pipeline Parallelism configurations
  *
  * Validates that TP/PP configurations are compatible with the loaded model's architecture.
- * This validation runs AFTER model loading but BEFORE weight sharding begins.
+ * Structural calls authenticate original consumer geometry without inventing
+ * participants. The runner's post-plan call borrows its resolved LocalTP order
+ * to authenticate exactly the assignment retained by weight and PMA owners.
  *
  * Validation Categories:
  * 1. Rank-local TP - validate the exact uneven/GQA-aware sharding assignment
@@ -20,6 +22,8 @@
 
 #include "OrchestrationConfig.h"
 #include "TensorParallelConfig.h"
+#include "planning/TensorParallelSourceDeclaration.h"
+#include <span>
 #include "../interfaces/IModelContext.h"
 #include <vector>
 #include <string>
@@ -82,6 +86,35 @@ namespace llaminar2
     };
 
     /**
+     * @brief Typed structural-versus-resolved assignment validation boundary.
+     *
+     * Structural validation never claims a physical assignment. Production
+     * passes its already-created LocalTP membership after plan/context setup.
+     */
+    class TPPPAssignmentMembership final
+    {
+    public:
+        /** @return Source/grain-only validation, with no physical endpoint assertion. */
+        static TPPPAssignmentMembership structural() {return {};}
+        /**
+         * @brief Borrow exact already-resolved rank-local membership for this call.
+         * @param devices Original context/domain order; no IDs are synthesized.
+         * @return Checked nonempty membership value, retaining no independent inventory.
+         */
+        static TPPPAssignmentMembership resolved(std::span<const GlobalDeviceAddress> devices)
+        {
+            if(devices.empty())throw std::invalid_argument("physical TP validation lacks resolved endpoints");
+            TPPPAssignmentMembership result;result.devices_=devices;return result;
+        }
+        /** @return Whether this call authenticates an actual physical assignment. */
+        bool isPhysical() const noexcept {return !devices_.empty();}
+        /** @return Original borrowed endpoint order, valid through the validator call. */
+        std::span<const GlobalDeviceAddress> devices() const noexcept {return devices_;}
+    private:
+        std::span<const GlobalDeviceAddress> devices_;
+    };
+
+    /**
      * @brief Validator for TP/PP configurations against model architecture
      *
      * Performs comprehensive validation that the requested parallelism configuration
@@ -102,11 +135,13 @@ namespace llaminar2
          *
          * @param config Orchestration configuration
          * @param model Model context with architecture parameters
+         * @param membership Structural source-only contract or existing resolved LocalTP endpoint authority.
          * @return Validation result with errors and warnings
          */
         static TPPPValidationResult validate(
             const OrchestrationConfig &config,
-            const IModelContext &model)
+            const IModelContext &model,
+            TPPPAssignmentMembership membership=TPPPAssignmentMembership::structural())
         {
             TPPPValidationResult result;
 
@@ -130,7 +165,7 @@ namespace llaminar2
             {
                 if (config.tp_scope == TPScope::RANK_LOCAL)
                 {
-                    validateRankLocalTPAssignment(config, model, result);
+                    validateRankLocalTPAssignment(config, model, result,membership);
                 }
                 else
                 {
@@ -184,10 +219,39 @@ namespace llaminar2
         static void validateRankLocalTPAssignment(
             const OrchestrationConfig &config,
             const IModelContext &model,
-            TPPPValidationResult &result)
+            TPPPValidationResult &result,
+            TPPPAssignmentMembership membership=TPPPAssignmentMembership::structural())
         {
             try
             {
+                if(model.architecture()=="qwen4exp")
+                {
+                    const auto *directory=model.ggufDirectory();
+                    if(!directory)throw std::invalid_argument("QFN TP validation lacks original source directory");
+                    const Qwen4ExpConfig original(*directory);
+                    const auto grain=QueryHeadPartitionDeclaration::fromOriginalConsumers(
+                        original.sparseAttention().query_heads,originalQfnTPConsumers(original));
+                    if(config.tp_degree<1 || config.tp_degree>grain.originalQueryHeads()/grain.granularity())
+                        throw std::invalid_argument("TP degree exceeds original complete query-consumer groups");
+                    if(!membership.isPhysical())return; // explicitly structural: no physical split/proof
+                    if(membership.devices().size()!=std::size_t(config.tp_degree))
+                        throw std::invalid_argument("physical TP validation membership differs from declared degree");
+                    std::vector<DeviceId> devices;
+                    for(const auto &address:membership.devices())devices.push_back(address.toLocalDeviceId());
+                    const auto dense=config.moe_routed_expert_plan
+                        ?config.moe_routed_expert_plan->continuation_domain_spec.effectiveDensePolicy():DenseParallelPolicy::TensorParallel;
+                    const auto source=resolveQfnTPDeclaration(*directory,
+                        config.pp_degree==1 && (!config.moe_routed_expert_plan || config.moe_routed_expert_plan->domains.size()==1)
+                            ?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
+                        config.mtp,dense,devices);
+                    const auto assignment=source.partition(devices,config.tp_weights,model.feedForwardLength(),model.vocabSize());
+                    source.validate(assignment,devices);
+                    for(const auto &local:assignment.assignments())for(const auto &gdn:originalQfnTPConsumers(original))
+                        if(!GDNHeadAssignment::hasIntegralKeyHeadBoundaries(gdn.key_heads,gdn.value_heads,
+                            local.head_start,local.head_count,original.sparseAttention().query_heads))
+                            throw std::invalid_argument("actual TP assignment cuts an original retained GDN consumer");
+                    return;
+                }
                 TensorParallelConfig assignment;
                 if (config.tp_weights.empty())
                 {
@@ -607,7 +671,8 @@ namespace llaminar2
                     local.tp_scope = TPScope::RANK_LOCAL;
                     local.tp_degree = domain_tp_degree;
                     local.tp_weights = domain.weights;
-                    validateRankLocalTPAssignment(local, model, result);
+                    local.tp_devices = domain.devices;
+                    validateRankLocalTPAssignment(local, model, result,TPPPAssignmentMembership::resolved(domain.devices));
                     continue;
                 }
 
