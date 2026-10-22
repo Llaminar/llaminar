@@ -1,5 +1,13 @@
 # QFN tuning dashboard
 
+The [route-owned MoE follow-up](QFN_ROUTE_OWNED_MOE_TUNING.md) records the fresh
+accepted-runtime profile, exact-operation dispatch repair, **766/766 Unit** and
+**21/21 focused checks**, with all **185 final-logit rows byte-identical** to L74
+and accepted84 sharded. TN64 is fastest in all twelve batch32 source/owner cells;
+no larger tile is promoted. Accepted throughput and full-preflight status are
+unchanged. The next investigation targets work inside the dominant gate/up leaf
+and remaining redundant TP4 computation.
+
 Updated: 2026-10-22; **L84 is the accepted explicit vocabulary-sharded A1 throughput checkpoint: 786.235 prefill / 35.056 decode tok/s**. The [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) measures matched mirrored **785.752 / 34.627**, giving **+0.061% / +1.237%**, with all twelve generated sequences equal. Follow-up85 completes typed ordinary projected-row admission and exact native ABI regressions: **763/763 Unit**, **19/19 device-free** and **12/12 native** registrations pass. Final-source Release accuracy retains **all 185 logit rows byte-identically** to L74 and accepted84 sharded. Auto selection is unchanged; use the explicit policy recorded below. Complete production preflight remains pending. NativeVNNI81/82 retain their prepared-weight identity repair, QFN coverage and balanced timing harness, with the original kernel geometry installed. Unused local KV-head and short-context indexer-query work remain separate opportunities.
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.

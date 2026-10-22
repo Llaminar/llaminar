@@ -32,7 +32,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../gemm/CUDADeviceWorkspace.h"
 #include "../gemm/CUDAMoEGroupedPrefillKernels.h"
-#include "../gemm/CUDAMoEProductionPrefillOverlayGenerated.inc"
+#include "../gemm/CUDAMoEProductionPrefillPolicy.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -585,6 +585,7 @@ namespace
      * it is never replaced after selection.
      */
     CUDAMoEProductionPrefillPolicy selectCUDAMoEProductionPrefillPolicy(
+        llaminar2::MoEPrefillMeasuredOperation operation,
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
         int seq_len,
@@ -605,6 +606,7 @@ namespace
         {
             const auto grouped_imma =
                 llaminar2::cuda::moe::selectGroupedImmaLaunchPolicy(
+                    operation,
                     singleCUDAMoECodebook(gateup_codebook_mask),
                     singleCUDAMoECodebook(down_codebook_mask),
                     seq_len,
@@ -661,8 +663,9 @@ namespace
         {
             policy.source = "generic";
             int exact_tile_n = 0;
-            if (llaminar2::cuda::generated::
-                    selectCUDAMoEProductionPrefillOverlay(
+            if (llaminar2::cuda::
+                    selectCUDAMoEProductionPrefillOverlayForOperation(
+                        operation,
                         static_cast<uint8_t>(gateup_codebook),
                         static_cast<uint8_t>(down_codebook),
                         hidden_size,
@@ -1198,6 +1201,7 @@ extern "C"
         }
         const CUDAMoEProductionPrefillPolicy policy =
             selectCUDAMoEProductionPrefillPolicy(
+                llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
                 uint32_t{1} << gateup_codebook_id,
                 uint32_t{1} << down_codebook_id,
                 m,
@@ -2569,6 +2573,7 @@ namespace llaminar2
 
     void CUDAMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
+        grouped_prefill_grouping_.invalidate();
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
         staging_capacity_ = 0;
@@ -3205,6 +3210,7 @@ namespace llaminar2
 
     void CUDAMoEKernel::resetDynamicState()
     {
+        grouped_prefill_grouping_.invalidate();
         /*
          * This hook is reached only on hard kernel-dynamic reset boundaries.
          * Replay-preserving request reset deliberately avoids
@@ -3358,6 +3364,7 @@ namespace llaminar2
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
         group_active_expert_slots_ = 0;
+        grouped_prefill_grouping_.invalidate();
         group_expert_mask_cap_ = 0;
         group_expert_mask_hash_ = 0;
         group_expert_mask_num_experts_ = 0;
@@ -6726,6 +6733,7 @@ namespace llaminar2
                                                   int *d_expert_offsets, int *d_expert_counts,
                                                   int *d_grouped_token_indices, float *d_grouped_weights)
     {
+        grouped_prefill_grouping_.invalidate();
         const int total_slots = seq_len * top_k;
         void *stream = requireStream("CUDAMoEKernel::groupTokensByExpertDevice");
         // One graph node resets every publication, including padded/remote
@@ -6770,6 +6778,7 @@ namespace llaminar2
         bool filter_to_local_runtime_experts,
         bool retain_routes_for_deferred_commit)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!runtime_layer || !routing_indices || !routing_weights)
         {
             LOG_ERROR("[CUDAMoEKernel::groupPrefillRoutes] null runtime or routing tensor");
@@ -6840,6 +6849,7 @@ namespace llaminar2
         int top_k,
         bool retain_routes_for_deferred_commit)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!runtime_layer ||
             current_tokens < 0 || max_tokens <= 0 ||
             current_tokens > max_tokens || num_experts <= 0 || top_k <= 0)
@@ -6881,6 +6891,7 @@ namespace llaminar2
         MoEGroupedPlanDemand demand,
         DeviceMoEProjectionSet expected_projections)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer || !routing_indices || !routing_weights ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
@@ -6983,6 +6994,7 @@ namespace llaminar2
         MoEGroupedPlanDemand demand,
         DeviceMoEProjectionSet expected_projections)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
@@ -8387,6 +8399,7 @@ namespace llaminar2
     bool CUDAMoEKernel::prepareExpertGroupsAsync(ITensor *routing_indices, ITensor *routing_weights,
                                                  int seq_len, int num_experts, int top_k)
     {
+        auto grouping_publication = grouped_prefill_grouping_.beginAllRoutes();
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
         void *stream = requireStream("CUDAMoEKernel::prepareExpertGroupsAsync");
@@ -8438,6 +8451,7 @@ namespace llaminar2
                  {"top_k", std::to_string(top_k)},
                  {"num_experts", std::to_string(num_experts)},
                  {"total_slots", std::to_string(total_slots)}});
+            std::move(grouping_publication).publish();
             return true;
         }
 
@@ -8463,6 +8477,7 @@ namespace llaminar2
              {"top_k", std::to_string(top_k)},
              {"num_experts", std::to_string(num_experts)},
              {"total_slots", std::to_string(total_slots)}});
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -8473,6 +8488,7 @@ namespace llaminar2
         int num_experts,
         int top_k)
     {
+        auto grouping_publication = grouped_prefill_grouping_.beginSelectedRoutes();
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
         void *stream = requireStream(
@@ -8546,6 +8562,7 @@ namespace llaminar2
              {"num_experts", std::to_string(num_experts)},
              {"mask_active_experts", std::to_string(group_expert_mask_active_experts_)},
              {"expert_grid_slots", std::to_string(group_active_expert_slots_)}});
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -8670,6 +8687,7 @@ namespace llaminar2
 
     bool CUDAMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows)
     {
+        grouped_prefill_grouping_.invalidate();
         const int seq_len = rows.physicalRows();
         if (seq_len <= 0)
             return false;
@@ -8989,6 +9007,10 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             active_expert_slots > 0 && !use_grouped_imma;
         CUDAMoEProductionPrefillPolicy prefill_policy =
             selectCUDAMoEProductionPrefillPolicy(
+                execution.measuredOperation(
+                    canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                                  : MoEPrefillOutputLayout::TokenRows,
+                    grouped_prefill_grouping_.scope()),
                 gateup_table.codebook_mask,
                 down_table.codebook_mask,
                 seq_len,
@@ -9285,6 +9307,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        grouped_prefill_grouping_.invalidate();
         if (!device_runtime_layer)
             return false;
         // Mutable placement never owns immutable column slices. Binding a
@@ -9479,6 +9502,10 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             active_expert_slots > 0 && !use_grouped_imma;
         CUDAMoEProductionPrefillPolicy prefill_policy =
             selectCUDAMoEProductionPrefillPolicy(
+                execution.measuredOperation(
+                    canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                                  : MoEPrefillOutputLayout::TokenRows,
+                    MoEPrefillRouteScope::SelectedRoutes),
                 gateup_table.codebook_mask,
                 down_table.codebook_mask,
                 seq_len,

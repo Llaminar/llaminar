@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Regression tests for the shared NativeVNNI shape/split manifest."""
+"""Regression tests for the shared NativeVNNI shape/split manifest.
+
+Production trainers and device-free diagnostic parsers share the CMake-owned
+catalog bindings. Injected test documents do not authorize a private catalog
+path or change the release inventory used by a compiled consumer.
+"""
 
 from __future__ import annotations
 
@@ -867,22 +872,30 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
                 target,
             )
 
-        # The production MoE prefill harness consumes the same release-model
-        # catalog plus its centralized real-GGUF codebook-pattern manifest. It
-        # is intentionally not a generic shape-manifest trainer.
+        # The MoE trainer and its device-free diagnostic parser consume the
+        # centralized release/codebook declarations rather than the generic
+        # shape inventory. Fixtures inject documents without replacing those
+        # compile-time bindings with a private or dummy catalog path.
         catalog_only_targets = {
             target
             for target, body in definition_blocks.items()
             if "LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH" in body
         } - shared_targets
-        self.assertSetEqual(
-            catalog_only_targets,
-            {"v2_perf_moe_verifier_prefill"},
-        )
-        self.assertIn(
-            "LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST_PATH",
-            definition_blocks["v2_perf_moe_verifier_prefill"],
-        )
+        expected_catalog_only_targets = {
+            "v2_perf_moe_verifier_prefill",
+            "v2_unit_moe_projection_diagnostic",
+        }
+        self.assertSetEqual(catalog_only_targets, expected_catalog_only_targets)
+        for target in expected_catalog_only_targets:
+            with self.subTest(target=target):
+                self.assertIn(
+                    'LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST}"',
+                    definition_blocks[target],
+                )
+                self.assertIn(
+                    'LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}"',
+                    definition_blocks[target],
+                )
 
 
 if __name__ == "__main__":

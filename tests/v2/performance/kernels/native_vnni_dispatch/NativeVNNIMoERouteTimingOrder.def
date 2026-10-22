@@ -1,0 +1,13 @@
+/**
+ * @file NativeVNNIMoERouteTimingOrder.def
+ * @brief Six chronological permutations for three real M1 gate/up geometries.
+ *
+ * Every contender occupies each position twice; each directed pair occurs
+ * three times. This distinct contest never borrows the five-way dense aliases.
+ */
+LLAMINAR_MOE_ROUTE_TIMING_ORDER(0,1,2)
+LLAMINAR_MOE_ROUTE_TIMING_ORDER(1,2,0)
+LLAMINAR_MOE_ROUTE_TIMING_ORDER(2,0,1)
+LLAMINAR_MOE_ROUTE_TIMING_ORDER(2,1,0)
+LLAMINAR_MOE_ROUTE_TIMING_ORDER(1,0,2)
+LLAMINAR_MOE_ROUTE_TIMING_ORDER(0,2,1)

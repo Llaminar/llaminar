@@ -345,6 +345,7 @@ TEST(Test__DeterministicMode, CudaMoEGroupedImmaPolicyIsMTotal)
         for (const int rows : exact_rows)
         {
             const auto policy = selectGroupedImmaLaunchPolicy(
+                llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
                 regime.gate_up_codebook,
                 regime.down_codebook,
                 rows,
@@ -372,6 +373,7 @@ TEST(Test__DeterministicMode, CudaMoEGroupedImmaPolicyIsMTotal)
     for (const int rows : {1, 17, 769, 4096, 1 << 20})
     {
         const auto generic = selectGroupedImmaLaunchPolicy(
+            llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
             /*gateup_codebook=*/-1,
             /*down_codebook=*/-1,
             rows,

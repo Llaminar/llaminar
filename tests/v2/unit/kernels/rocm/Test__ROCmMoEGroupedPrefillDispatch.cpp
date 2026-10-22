@@ -196,6 +196,7 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch,
         .expert_count = 256,
         .top_k = 1,
         .rows = 16,
+        .operation = llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
     };
     for (const int rows : {16, 32})
     {
@@ -310,7 +311,8 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, LiveAdmissionPreservesExactKeysAndReje
     ROCmMoEGroupedPrefillRouteKey key{
         .gateup_codebook = 19, .down_codebook = 19,
         .hidden_size = 3072, .expert_width = 1024,
-        .expert_count = 256, .top_k = 1, .rows = 64};
+        .expert_count = 256, .top_k = 1, .rows = 64,
+        .operation = llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes};
     const ROCmMoEGroupedRouteAdmission admission(key, &storage, &storage);
     EXPECT_EQ(admission.maximumSlotsFor(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned), 32);
     EXPECT_EQ(admission.maximumSlotsFor(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled), 64);

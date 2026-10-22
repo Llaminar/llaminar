@@ -22,6 +22,7 @@
 
 #include "../../common/DeviceNativeVNNIMatrixDesc.h"
 #include "../../common/MoEGroupedSourceRows.h"
+#include "../../common/MoEPrefillProjectionExecution.h"
 
 #include <algorithm>
 #include <array>
@@ -152,6 +153,8 @@ namespace llaminar2::cuda::moe
      * captured bucket. Positive unseen M values remain total by extending the
      * adjacent measured regime rather than requiring an exact bucket lookup.
      *
+     * @param operation Actual phase/publication/grouping qualification; only
+     *        complete full-width token-row all-route measurements are installed.
      * @param gateup_codebook Sole gate/up execution codebook, or a negative
      *        value when a mixed descriptor table has no single codebook.
      * @param down_codebook Sole down execution codebook, or a negative value
@@ -166,6 +169,7 @@ namespace llaminar2::cuda::moe
      */
     [[nodiscard]] inline constexpr GroupedImmaLaunchPolicy
     selectGroupedImmaLaunchPolicy(
+        MoEPrefillMeasuredOperation operation,
         int gateup_codebook,
         int down_codebook,
         int seq_len,
@@ -178,7 +182,8 @@ namespace llaminar2::cuda::moe
         const bool qwen_35b_geometry =
             hidden_size == 2048 && expert_width == 512 &&
             expert_count == 256 && top_k == 8;
-        if (!qwen_35b_geometry)
+        if (operation != MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes ||
+            !qwen_35b_geometry)
             return policy;
 
         for (const auto &regime : kQwen35BGroupedImmaCodebookRegimes)

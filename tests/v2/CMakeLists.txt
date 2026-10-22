@@ -9179,7 +9179,11 @@ add_executable(v2_perf_moe_verifier_prefill
     performance/kernels/moe/Perf__ROCmMoEVerifierPrefill.cpp
     performance/kernels/moe/Perf__CUDAMoERouterSoftmaxTopK.cpp
     performance/kernels/moe/Perf__ROCmMoERouterSoftmaxTopK.cpp
+    performance/kernels/moe/Test__MoETrainerBootstrap.cpp
+    integration/mpi_gtest_main.cpp
 )
+# Host OpenMP selection owns the runtime ABI even with HIP verification sources.
+set_property(TARGET v2_perf_moe_verifier_prefill PROPERTY LINKER_LANGUAGE CXX)
 if(HAVE_ROCM)
     set_source_files_properties(
         performance/kernels/native_vnni_dispatch/ROCmTrainerVerification.hip
@@ -9197,7 +9201,8 @@ endif()
 target_link_libraries(v2_perf_moe_verifier_prefill
     llaminar2_core
     GTest::gtest
-    GTest::gtest_main
+    MPI::MPI_CXX
+    OpenMP::OpenMP_CXX
 )
 target_include_directories(v2_perf_moe_verifier_prefill PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
@@ -30941,6 +30946,121 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_memory_planner)
             MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     endif()
 endif()
+
+# Complete-operation measurements cannot qualify split or selected-route work.
+# This pure C++ target exercises the same typed policy and setup publication
+# objects as both GPU backends, without loading either runtime.
+add_executable(v2_test_moe_prefill_measured_operation
+    unit/kernels/Test__MoEPrefillMeasuredOperation.cpp)
+target_compile_features(v2_test_moe_prefill_measured_operation PRIVATE cxx_std_20)
+target_include_directories(v2_test_moe_prefill_measured_operation PRIVATE
+    ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_test_moe_prefill_measured_operation PRIVATE GTest::gtest_main)
+add_v2_test(V2_Unit_MoEPrefillMeasuredOperation
+    COMMAND $<TARGET_FILE:v2_test_moe_prefill_measured_operation>
+    LABELS "V2;Unit;MoE;NativeVNNI;Dispatch;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_MoEPrefillMeasuredOperation
+    COMMAND $<TARGET_FILE:v2_test_moe_prefill_measured_operation>
+            --gtest_filter=MoEPrefillMeasuredOperation.*
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Dispatch;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MoEPrefillMeasuredOperation)
+
+# Preserve the source-format identity in the same captured verifier cases that
+# independently compare every output byte with serial execution.
+if(TARGET v2_integration_cuda_moe_kernel)
+    add_v2_test(V2_Integration_CUDA_MoEVerifierSourceIdentity
+        COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture:Test__CUDAMoEKernel.SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;IQ4_XS;SourceIdentity;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CUDA_MoEVerifierSourceIdentity)
+endif()
+
+# Explicit serial-K column geometries retain their own native resource and
+# captured-byte admission proofs before they may enter a tuning measurement.
+add_executable(v2_test_rocm_moe_route_owned_geometry
+    unit/kernels/rocm/Test__ROCmMoERouteOwnedGeometry.cpp)
+target_compile_features(v2_test_rocm_moe_route_owned_geometry PRIVATE cxx_std_20)
+target_include_directories(v2_test_rocm_moe_route_owned_geometry PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_test_rocm_moe_route_owned_geometry PRIVATE GTest::gtest_main)
+add_v2_test(V2_Unit_ROCmMoERouteOwnedGeometry
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
+    LABELS "V2;Unit;ProductionTestPreflight;MoE;NativeVNNI;Geometry;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
+    target_sources(v2_integration_moe_live_rows PRIVATE
+        integration/backends/Test__ROCmMoERouteOwnedGeometry.cpp)
+    target_link_libraries(v2_integration_moe_live_rows PRIVATE hip::host)
+    add_v2_test(V2_Integration_ROCmMoERouteOwnedGeometryAdmission
+        COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+            --gtest_filter=ROCmMoERouteOwnedGeometryNative.*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+endif()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Unit_ROCmMoERouteOwnedGeometry)
+if(TEST V2_Integration_ROCmMoERouteOwnedGeometryAdmission)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoERouteOwnedGeometryAdmission)
+endif()
+
+# Descriptor-derived component measurements must retain their operation and
+# source identities without masquerading as installed complete-operation rows.
+add_executable(v2_unit_moe_projection_diagnostic
+    unit/kernels/Test__MoEProjectionDiagnostic.cpp)
+target_compile_features(v2_unit_moe_projection_diagnostic PRIVATE cxx_std_20)
+target_include_directories(v2_unit_moe_projection_diagnostic PRIVATE
+    ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_compile_definitions(v2_unit_moe_projection_diagnostic PRIVATE
+    LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_MOE_GGUF_PATTERN_MANIFEST}"
+    LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
+target_link_libraries(v2_unit_moe_projection_diagnostic PRIVATE GTest::gtest_main)
+add_v2_test(V2_Unit_MoEProjectionDiagnostic
+    COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
+    LABELS "V2;Unit;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+add_v2_test(V2_Integration_MoEProjectionDiagnostic
+    COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionDiagnostic)
+
+# Both the native trainer and its device-free parser bind the same catalogs.
+add_test(NAME V2_Integration_NativeVNNICatalogBindings
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_shape_manifest.py
+        NativeVNNIShapeManifestTest.test_all_backend_trainers_share_one_overlay_inventory)
+set_tests_properties(V2_Integration_NativeVNNICatalogBindings PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;Trainer;BuildSystem;DeviceFree;Regression"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeVNNICatalogBindings)
+
+# Exercise the real mixed-language trainer entrypoint and loader without a
+# model or accelerator. Its physical-core inventory requires initialized MPI.
+add_v2_test(V2_Integration_MoETrainerBootstrap
+    COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+        --gtest_filter=MoETrainerBootstrap.CanonicalInventoryStartsAfterMPIInitialization
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;MPI;MoE;Trainer;Bootstrap;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_test(NAME V2_Integration_MoETrainerOpenMPRuntimeBinding
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_openmp_runtime_binding.py
+        --binary $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+        --expected-soname ${LLAMINAR_OPENMP_RUNTIME_SONAME}
+        --wrong-runtime-fixture $<TARGET_FILE:v2_integration_openmp_shadow_runtime>)
+set_tests_properties(V2_Integration_MoETrainerOpenMPRuntimeBinding PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;Trainer;BuildSystem;DeviceFree;Regression"
+    TIMEOUT 60)
+set_property(GLOBAL PROPERTY
+    V2_TEST_BUILD_TARGETS_V2_Integration_MoETrainerOpenMPRuntimeBinding
+    "v2_perf_moe_verifier_prefill;v2_integration_openmp_shadow_runtime")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MoETrainerBootstrap
+    V2_Integration_MoETrainerOpenMPRuntimeBinding)
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})

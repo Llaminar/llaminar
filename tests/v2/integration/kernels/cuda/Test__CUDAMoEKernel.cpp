@@ -22,6 +22,7 @@
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
+#include "tensors/NativeVnniFormatInfo.h"
 #include "tensors/Tensors.h"
 
 #include "backends/BackendManager.h"
@@ -22739,6 +22740,11 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecode512ExpertsCapturedUpperHalfDescriptors)
     proveRuntimeDecodeGraphReplayCompleteDescriptors<512>();
 }
 
+/**
+ * @test Captured verifier boundaries retain IQ4_XS source identity and serial bytes.
+ * IQ4_XS carries its original scale factors in its dedicated execution format;
+ * the IQ4_NL decoder identity cannot certify those prepared descriptors.
+ */
 TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture)
 {
 #ifndef HAVE_CUDA
@@ -22806,7 +22812,9 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
     {
         gate_descs.push_back(add_prepared_desc(intermediate, d_model, 4100 + expert, "gate", 13));
         up_descs.push_back(add_prepared_desc(intermediate, d_model, 4200 + expert, "up", 13));
-        down_descs.push_back(add_prepared_desc(d_model, intermediate, 4300 + expert, "down", 4));
+        down_descs.push_back(add_prepared_desc(
+            d_model, intermediate, 4300 + expert, "down",
+            llaminar2::kNativeVnniIQ4XSSourceScaleCodebook));
     }
 
     const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
@@ -23578,6 +23586,11 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
 #endif
 }
 
+/**
+ * @test Shared-expert captured verifier rows preserve IQ4_XS source factors.
+ * Descriptor identity and serial byte equivalence are independent assertions;
+ * both must hold across every declared verifier row boundary.
+ */
 TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture)
 {
 #ifndef HAVE_CUDA
@@ -23640,7 +23653,8 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
     std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> up_descs = {
         add_prepared_desc(intermediate, d_model, 5200, "up", 13)};
     std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> down_descs = {
-        add_prepared_desc(d_model, intermediate, 5300, "down", 4)};
+        add_prepared_desc(d_model, intermediate, 5300, "down",
+                          llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)};
 
     const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
         gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);

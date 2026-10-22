@@ -8,7 +8,7 @@
  * Route-owned projections minimize directory and publication overhead for
  * sparse verifier buckets. Expert-tiled projections amortize weight decode
  * when many rows reuse an expert. The crossover depends on the complete MoE
- * topology, not M alone, so measured production exceptions are represented as
+ * operation and topology, not M alone, so measured production exceptions are represented as
  * exact immutable keys while the conservative generic policy remains total.
  * Capture retains all reachable families; the ordered device group plan
  * admits exactly one on replay. The arithmetic is also host-callable so unit
@@ -16,6 +16,8 @@
  */
 
 #pragma once
+
+#include "../../common/MoEPrefillProjectionExecution.h"
 
 #include <array>
 #include <cstdint>
@@ -47,6 +49,8 @@ namespace llaminar2::rocm
         std::int32_t expert_count = 0;
         std::int32_t top_k = 0;
         std::int32_t rows = 0;
+        MoEPrefillMeasuredOperation operation = MoEPrefillMeasuredOperation::Unmeasured;
+            ///< Exact exceptions require the measured complete/publication/scope identity.
 
         /** @return true only when every capture-identity field is equal. */
         [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr bool operator==(
@@ -57,7 +61,7 @@ namespace llaminar2::rocm
                    hidden_size == other.hidden_size &&
                    expert_width == other.expert_width &&
                    expert_count == other.expert_count &&
-                   top_k == other.top_k && rows == other.rows;
+                   top_k == other.top_k && rows == other.rows && operation == other.operation;
         }
     };
 
@@ -103,6 +107,7 @@ namespace llaminar2::rocm
                     .expert_count = 256,
                     .top_k = 1,
                     .rows = 16,
+                    .operation = MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
                 },
                 .strategy = ROCmMoEGroupedPrefillRouteStrategy::RouteOwned,
             },
@@ -115,6 +120,7 @@ namespace llaminar2::rocm
                     .expert_count = 256,
                     .top_k = 1,
                     .rows = 32,
+                    .operation = MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
                 },
                 .strategy = ROCmMoEGroupedPrefillRouteStrategy::RouteOwned,
             },

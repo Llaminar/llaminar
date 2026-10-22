@@ -293,7 +293,10 @@ namespace llaminar2::test
                     uint32_t{1} << formats_.down.device_execution_codebook_id,
                     nativeVnniCodebookMaskBit(canonicalDeviceVnniCodebookId(formats_.gate_up.source_codebook_id)),
                     nativeVnniCodebookMaskBit(canonicalDeviceVnniCodebookId(formats_.down.source_codebook_id)),
-                    device.ordinal, execution_stream, execution))
+                    device.ordinal, execution_stream, execution,
+                    // Diagnostic resets may alternate all-route/owner coverage
+                    // after capture; this fixture never certifies an exact corpus row.
+                    MoEPrefillRouteScope::Unspecified))
                 throw std::runtime_error("production grouped projection launch failed: gate/up=" +
                     std::string(formats_.gate_up.label) + ", down=" + formats_.down.label +
                     ", rows=" + std::to_string(rows));

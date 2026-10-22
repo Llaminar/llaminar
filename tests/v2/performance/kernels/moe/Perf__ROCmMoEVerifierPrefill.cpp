@@ -35,6 +35,8 @@
 #include "../native_vnni_dispatch/NativeVNNIMoEPrefillManifest.h"
 #include "../native_vnni_dispatch/NativeVNNIMoERoutingProfiles.h"
 #include "../native_vnni_dispatch/NativeVNNIProfilerControl.h"
+#include "../native_vnni_dispatch/NativeVNNIMoEProjectionDiagnostic.h"
+#include "../native_vnni_dispatch/NativeVNNIGeometryTimingOrder.h"
 
 #ifdef HAVE_ROCM
 #include "backends/rocm/HIPGraphCapture.h"
@@ -43,6 +45,14 @@
 #include <rocprofiler-sdk-roctx/roctx.h>
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "../native_vnni_dispatch/GPUTrainerVerification.h"
+#include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
+#include "execution/moe/MoEProjectionRuntimeBinding.h"
+#include "execution/moe/MoEOverlayFixedDownProjectionBank.h"
+#include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
+#include "loaders/ExpertGemmRegistry.h"
+#include "backends/HardwareInventory.h"
+#include "utils/MPIContext.h"
+#include <omp.h>
 
 extern "C" bool rocmMoE_grouped_prefill_query_tile_config(
     uint8_t codebook_id,
@@ -87,6 +97,8 @@ extern "C" bool rocmMoE_grouped_prefill_query_kernel_resources(
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <cstring>
+#include <exception>
 
 /**
  * @file Perf__ROCmMoEVerifierPrefill.cpp
@@ -1031,10 +1043,10 @@ namespace
             : graph_(stream, device_ordinal),
               transaction_(graph_, std::move(operation))
         {
-            if (!stream || !transaction_.begin())
+            if (!stream || graph_.hasExecutable() || graph_.nodeCount() != 0 || !transaction_.begin())
             {
                 throw std::runtime_error(
-                    "ScopedHipPerfGraph failed to begin HIP graph capture");
+                    "ScopedHipPerfGraph requires a fresh empty HIP capture owner");
             }
         }
 
@@ -1052,6 +1064,12 @@ namespace
         bool launch()
         {
             return graph_.launch();
+        }
+
+        /** @brief Inspect the real retained native nodes after capture, outside timing. */
+        bool inspectKernelNodes(std::vector<llaminar2::GPUGraphKernelNodeInfo> &nodes, std::string *error) const
+        {
+            return graph_.inspectKernelNodes(nodes, error);
         }
 
     private:
@@ -3133,6 +3151,8 @@ namespace
         llaminar2::IWorkspaceConsumer *consumer_ = nullptr;
     };
 
+    #include "NativeVNNIROCmMoEProjectionDiagnostic.inc"
+
     /**
      * @brief Train one real routed-MoE source tuple at one prefill bucket.
      *
@@ -4463,6 +4483,13 @@ TEST(Perf__MoEVerifierPrefill, ROCm_ProductionGGUFMixtureCandidatePairTrainer)
 #ifndef HAVE_ROCM
     GTEST_SKIP() << "ROCm support not compiled";
 #else
+    if (const char *request = std::getenv("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP_OPERATION_REQUEST"); request && *request)
+    {
+        if (envInt("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP", 0) != 1)
+            throw std::invalid_argument("explicit MoE operation diagnostics require the canonical sweep enable");
+        route87::run(llaminar2::test::native_vnni_dispatch::loadMoEProjectionDiagnostic(request));
+        return;
+    }
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
     if (envInt("LLAMINAR_ROCM_MOE_PRODUCTION_SWEEP", 0) == 0)

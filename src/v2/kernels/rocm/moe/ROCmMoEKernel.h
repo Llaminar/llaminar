@@ -1592,6 +1592,8 @@ namespace llaminar2
         float *d_group_weights_ = nullptr;     ///< [total_slots] grouped routing weights
         int *d_group_active_expert_ids_ = nullptr; ///< [min(total_slots,num_experts)] compact active expert ids
         int group_active_expert_slots_ = 0;    ///< Fixed active-expert launch slots from the last small grouping pass
+        MoEPrefillGroupingProvenance grouped_prefill_grouping_;
+            ///< Instance-owned static producer origin; no host copy of live route counts.
         int group_slots_cap_ = 0;              ///< capacity for total_slots buffers
         int group_experts_cap_ = 0;            ///< capacity for num_experts buffers
 

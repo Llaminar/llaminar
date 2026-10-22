@@ -30,6 +30,7 @@
  * change these pointers, dimensions or policy after graph recording.
  *
  * @param execution Validated phase and immutable source/output geometry.
+ * @param route_scope Capture-time grouping origin, not a live route count.
  * @return True if the declared transaction was enqueued on the non-null stream.
  */
 extern "C"
@@ -67,7 +68,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     uint32_t down_policy_codebook_mask,
     int device_id,
     void *stream,
-    const llaminar2::MoEPrefillProjectionExecution &execution);
+    const llaminar2::MoEPrefillProjectionExecution &execution,
+    llaminar2::MoEPrefillRouteScope route_scope);
 
 /**
  * @brief Fold already-weighted route outputs in the original router order.
@@ -89,3 +91,27 @@ bool rocmMoE_reduce_canonical_route_contributions(
     int d_model,
     int device_id,
     void *stream);
+
+/**
+ * @brief Query the actual qualified pair policy without any device operation.
+ * @param operation Actual phase/publication/grouping qualification.
+ * @param gateup_codebook_id Existing uniform gate/up execution family.
+ * @param down_codebook_id Existing uniform down execution family.
+ * @param m Captured token rows.
+ * @param hidden_size Original hidden width; generic and arithmetic keys stay full.
+ * @param expert_width Complete intermediate width.
+ * @param expert_count Logical expert descriptor count.
+ * @param top_k Routes per token.
+ * @param gateup_tile_m Receives selected gate/up row tile.
+ * @param gateup_tile_n Receives selected gate/up column tile.
+ * @param down_tile_m Receives selected down row tile.
+ * @param down_tile_n Receives selected down column tile.
+ * @param exact_overlay Receives one only for an eligible measured exact row.
+ * @return Whether the unchanged selected generic/exact geometry is compiled.
+ */
+extern "C" bool rocmMoE_grouped_prefill_query_production_pair_config_for_operation(
+    llaminar2::MoEPrefillMeasuredOperation operation,
+    uint8_t gateup_codebook_id, uint8_t down_codebook_id,
+    int m, int hidden_size, int expert_width, int expert_count, int top_k,
+    int *gateup_tile_m, int *gateup_tile_n, int *down_tile_m, int *down_tile_n,
+    int *exact_overlay);

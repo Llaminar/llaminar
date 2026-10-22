@@ -1,8 +1,8 @@
 /**
  * @file NativeVNNIGeometryTimingOrder.h
- * @brief Typed balanced sampling order for the five fixed-arithmetic geometries.
+ * @brief Typed balanced sampling orders for dense and routed MoE diagnostics.
  *
- * The immutable shared .def inventory owns actual measurement permutations.
+ * The immutable shared .def inventories own actual measurement permutations.
  * Retained graphs are submitted serially in this order; no host timing order
  * is substituted for a different native candidate or a repeated graph body.
  */
@@ -55,4 +55,20 @@ static_assert(geometryTimingOrdersValid(), "diagnostic order inventory must be b
 {
     return kGeometryTimingOrders[round % kGeometryTimingOrders.size()];
 }
+/** @brief Three actual M1 gate/up widths; the five dense modes remain unchanged. */
+inline constexpr std::array<std::array<std::size_t, 3>, 6> kMoERouteGeometryTimingOrders{{
+#define LLAMINAR_MOE_ROUTE_TIMING_ORDER(a,b,c) {{a,b,c}},
+#include "NativeVNNIMoERouteTimingOrder.def"
+#undef LLAMINAR_MOE_ROUTE_TIMING_ORDER
+}};
+/**
+ * @brief Read one complete three-way rotation/reversal round.
+ * @param round Zero-based chronological round; sorting latency never changes it.
+ * @return Each actual gate/up contender once, balanced over six rounds.
+ */
+[[nodiscard]] constexpr const auto &moeRouteGeometryTimingOrder(std::size_t round) noexcept
+{
+    return kMoERouteGeometryTimingOrders[round % kMoERouteGeometryTimingOrders.size()];
+}
+
 }

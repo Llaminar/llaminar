@@ -28,6 +28,7 @@
 #include "../gemm/HipBLASGemmKernel.h"
 #include "../gemm/ROCmWeightPacker.h"
 #include "../gemm/ROCmMoEGroupedPrefillKernels.h"
+#include "../gemm/ROCmMoERouteOwnedTuning.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -1519,7 +1520,8 @@ namespace
         int hidden_size,
         int expert_width,
         int expert_count,
-        int top_k)
+        int top_k,
+        llaminar2::MoEPrefillMeasuredOperation operation)
     {
         if (seq_len <= 8)
             return {{"1", "64"}, {"1", "64"}, "direct"};
@@ -1540,7 +1542,8 @@ namespace
         int down_tile_m = 0;
         int down_tile_n = 0;
         int exact_overlay = 0;
-        if (!rocmMoE_grouped_prefill_query_production_pair_config(
+        if (!rocmMoE_grouped_prefill_query_production_pair_config_for_operation(
+                operation,
                 static_cast<uint8_t>(gateup_codebook),
                 static_cast<uint8_t>(down_codebook),
                 seq_len,
@@ -2239,6 +2242,7 @@ namespace llaminar2
 
     void ROCmMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
+        grouped_prefill_grouping_.invalidate();
         d_write_heads_ = nullptr;
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
@@ -2895,6 +2899,7 @@ namespace llaminar2
 
     void ROCmMoEKernel::resetDynamicState()
     {
+        grouped_prefill_grouping_.invalidate();
         if (!setMoEDevice(device_ordinal_, "resetDynamicState"))
             return;
 
@@ -3855,6 +3860,7 @@ namespace llaminar2
         int *d_grouped_token_indices,
         float *d_grouped_weights)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
@@ -9761,6 +9767,7 @@ namespace llaminar2
         bool filter_to_local_runtime_experts,
         bool retain_routes_for_deferred_commit)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (!runtime_layer || !routing_indices || !routing_weights)
@@ -9812,6 +9819,7 @@ namespace llaminar2
         int top_k,
         bool retain_routes_for_deferred_commit)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(
             ROCmKernelType::MOE_ROUTE,
             static_cast<hipStream_t>(getStream()));
@@ -9856,6 +9864,7 @@ namespace llaminar2
         MoEGroupedPlanDemand demand,
         DeviceMoEProjectionSet expected_projections)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(
             ROCmKernelType::MOE_ROUTE,
             static_cast<hipStream_t>(getStream()));
@@ -9975,6 +9984,7 @@ namespace llaminar2
         MoEGroupedPlanDemand demand,
         DeviceMoEProjectionSet expected_projections)
     {
+        grouped_prefill_grouping_.invalidate();
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer ||
@@ -10449,6 +10459,7 @@ namespace llaminar2
         ITensor *routing_indices, ITensor *routing_weights,
         int seq_len, int num_experts, int top_k)
     {
+        auto grouping_publication = grouped_prefill_grouping_.beginAllRoutes();
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
 
@@ -10605,6 +10616,7 @@ namespace llaminar2
                         {"top_k", std::to_string(top_k)}});
             }
 
+            std::move(grouping_publication).publish();
             return true;
         }
 
@@ -10661,6 +10673,7 @@ namespace llaminar2
         // NO D2H copy, NO hipStreamSynchronize — data stays on device
         // for consumption by executeGroupedPrefillPipeline()
 
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -10671,6 +10684,7 @@ namespace llaminar2
         int num_experts,
         int top_k)
     {
+        auto grouping_publication = grouped_prefill_grouping_.beginSelectedRoutes();
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
 
@@ -10838,6 +10852,7 @@ namespace llaminar2
              {"num_experts", std::to_string(num_experts)},
              {"mask_active_experts", std::to_string(group_expert_mask_active_experts_)},
              {"expert_grid_slots", std::to_string(group_active_expert_slots_)}});
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -10968,6 +10983,7 @@ namespace llaminar2
 
     bool ROCmMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows)
     {
+        grouped_prefill_grouping_.invalidate();
         const int seq_len = rows.physicalRows();
         if (seq_len <= 0)
             return false;
@@ -11331,6 +11347,7 @@ namespace llaminar2
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        rocm::validateMoERouteOwnedGateUpScopeBinding(device_ordinal_, gpu_stream_, seq_len, execution);
 if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             num_experts <= 0 || top_k <= 0 ||
             seq_len > std::numeric_limits<int>::max() / top_k ||
@@ -11357,6 +11374,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask);
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
 
@@ -11577,7 +11595,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     down_table.policy_codebook_mask,
                     device_ordinal_,
                     producer_stream,
-                    execution);
+                    execution,
+                    grouped_prefill_grouping_.scope());
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11615,7 +11634,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     d_model,
                     intermediate,
                     num_experts,
-                    top_k);
+                    top_k,
+                    execution.measuredOperation(
+                        canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                                      : MoEPrefillOutputLayout::TokenRows,
+                        grouped_prefill_grouping_.scope()));
             const std::string common_row_tile =
                 policy.gateup.tile_m == policy.down.tile_m
                     ? policy.gateup.tile_m
@@ -11678,6 +11701,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        rocm::validateMoERouteOwnedGateUpScopeBinding(device_ordinal_, gpu_stream_, seq_len, execution);
+        grouped_prefill_grouping_.invalidate();
         if (!device_runtime_layer)
             return false;
         // Mutable placement never owns immutable column slices. Binding a
@@ -11730,6 +11755,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask);
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -11957,7 +11983,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     down_table.policy_codebook_mask,
                     device_ordinal_,
                     producer_stream,
-                    execution);
+                    execution,
+                    MoEPrefillRouteScope::SelectedRoutes);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11994,7 +12021,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     d_model,
                     intermediate,
                     num_experts,
-                    top_k);
+                    top_k,
+                    execution.measuredOperation(
+                        canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
+                                                      : MoEPrefillOutputLayout::TokenRows,
+                        MoEPrefillRouteScope::SelectedRoutes));
             const std::string common_row_tile =
                 policy.gateup.tile_m == policy.down.tile_m
                     ? policy.gateup.tile_m

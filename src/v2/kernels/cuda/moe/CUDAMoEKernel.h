@@ -1467,6 +1467,8 @@ namespace llaminar2
         uint8_t *d_group_expert_mask_ = nullptr;
         std::shared_ptr<PersistentWorkspaceSlotLease> group_expert_mask_workspace_lease_;
         int group_active_expert_slots_ = 0;
+        MoEPrefillGroupingProvenance grouped_prefill_grouping_;
+            ///< Instance-owned static producer origin; no host copy of live route counts.
         int group_slots_cap_ = 0;
         int group_experts_cap_ = 0;
         bool group_buffers_workspace_bound_ = false;
