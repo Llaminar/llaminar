@@ -6,7 +6,9 @@ The accepted A1 checkpoint is L97, 814.368 prefill / 36.727 decode tok/s
 on four MI50s, including [profiled native-format specialization](QFN_FLOATING_REDUCTION_TUNING.md#native-source-format-specialization-candidate97).
 See the [dashboard](QFN_TUNING_DASHBOARD.md) for its exact settings and matched
 comparison with L96. Prefill improves 2.254%; decode is 0.229% lower with
-overlapping ranges. Recorded-input GDN scaling is the next measurement slice.
+overlapping ranges. [Recorded-input GDN decode scaling](#recorded-gdn-projection-measurements)
+now measures only 1.388–1.392× at TP2 and 1.733–1.749× at TP4. Both targets
+remain missed; the original output bytes pass at every decode participant.
 
 The user selected **preserve recorded inputs and expert routes**. The diagnostic
 will measure the original production compute without executing communication
@@ -106,8 +108,9 @@ The isolation extension must retain both fused subgroups. GDNHeadAssignment
 owns the original packed Q/K/V and modulo-linked value-head spans, including
 Z/alpha/beta; equal contiguous row slicing would test different ownership.
 Every degree must match the saved original output bytes before timing. Actual
-TP1/TP2/TP4 GDN measurements remain pending; the completed head measurements
-do not establish scaling for this bundle.
+TP1/TP2/TP4 GDN decode measurements are reported below. The nine-row TP2
+prefill comparison remains unqualified because its selected floating reduction
+differs from the original TP4 observation; head results do not qualify GDN.
 
 For each supported cohort, cover decode and production prefill shapes plus
 partial buckets. Extend reusable kernel improvements across applicable physical
@@ -116,6 +119,100 @@ contracts; a backend-specific implementation or unavailable device count is
 explicitly pending until exercised.
 
 ## Gates and current evidence
+
+### Recorded GDN projection measurements
+
+Slice98 adds the complete original `GDNProjectionStage` to the existing recorded
+projection executable. It retains production source slicing, prepared engines,
+both fused subgroups, exact streams, captured compute and separate captured
+restoration. Shared head/GDN runtime code owns cohort admission, complete rounds
+and retirement. It is a diagnostic, with no production arithmetic change.
+
+The rebuilt Unit suite passes **776/776**, zero skips, and all **17** focused
+registrations pass. Native CUDA and ROCm fixtures compare independent complete
+captures at M1/M9 and every local TP1/2/4 participant, including twenty dirty
+input/output/workspace histories. Initial failures exposed diagnostic setup
+defects: immutable Q8 descriptors legitimately omit reusable-slot capacity,
+and the cold stage must call its canonical launch preparation before capture.
+Metadata regressions retain semantic boolean fields and empty local inventories.
+The existing real-input TP4 vocabulary-head cohort also passes after the shared
+runtime refactor. Evidence: `recorded-gdn98-focused-r1`, `recorded-gdn98-unit-r1`,
+`recorded-gdn98-release-build-r1` and `recorded-head98-compat-r1`.
+
+Every decode cohort below passes all four original output byte oracles, original
+input restoration, twenty dirty histories and twenty composed-parent histories
+on every participant. Each has eight warmups and 31 measured complete rounds;
+the reported value is the median of each round's slowest participant. Drivers
+and owned native retirement are clean. K=2560; original QKV/Z widths are
+10240/6144, and alpha/beta widths are 48 each. Native Q8 sources and the selected
+half-RNE control policy remain unchanged.
+
+| Recorded input | TP1 µs | TP2 µs | TP4 µs | TP1/TP2 | TP1/TP4 | Targets |
+|---|---:|---:|---:|---:|---:|---|
+| Decode 0, M1 | 89.285 | 64.161 | 51.041 | 1.392× | 1.749× | Both missed |
+| Decode 1, M1 | 89.280 | 64.320 | 51.520 | 1.388× | 1.733× | Both missed |
+
+The [raw cohorts and scaling report](../../../../parity-results/qwen-flash-next/recorded-gdn98-scaling-r1/index.json)
+retain all participants and samples; the existing reporter produces the
+[scaling chart](../../../../parity-results/qwen-flash-next/recorded-gdn98-scaling-r1/scaling.svg).
+These are complete projection-bundle compute intervals, excluding restoration
+and communication. They are not whole-layer, recurrent-state, token-throughput
+or pure per-kernel measurements. Native graph scheduling gaps may be included.
+
+The actual decode graph contains seven kernels: one Q8 quantizer, separate
+QKV/Z producer and ordered-reducer pairs, one half conversion and the combined
+short-half alpha/beta projection. Q8 producers use TN128/CPT1 and sixteen K
+partitions at all measured degrees. On TP4 their grids are 20×16 and 12×16;
+the half group uses 24 blocks of 128 threads. All inspected leaves report zero
+local-memory bytes.
+
+The subsequent [isolated profile report](../../../../parity-results/qwen-flash-next/recorded-gdn98-profile-summary-r1/report.json)
+retains fifteen separate exact-symbol/shape trace launches and 22 singleton
+counter observations. Each native run preserves the original decode0 byte
+oracles and passes driver/retirement checks. These are **instrumented local
+shape** measurements on one MI50, not the concurrent TP cohort timings above.
+Each timing keeps all 31 samples after twenty proof replays and eight warmups.
+Same-symbol QKV/Z kernels are separated by their actual launch geometry; each
+counter is joined to one warmed native dispatch. The initial rejected trace
+receipt remains excluded: HIP's function name and HSA's `.kd` descriptor now
+have an explicit mapping authenticated by the loaded code-object metadata.
+
+| Selected kernel | TP1 shape µs | TP2 shape µs | TP4 shape µs | T1/T2 | T1/T4 |
+|---|---:|---:|---:|---:|---:|
+| QKV producer | 36.16 | 19.20 | 10.08 | 1.883× | 3.587× |
+| QKV ordered reducer | 6.56 | 5.28 | 4.16 | 1.242× | 1.577× |
+| Z producer | 22.88 | 12.32 | 7.36 | 1.857× | 3.109× |
+| Z ordered reducer | 6.08 | 4.32 | 4.16 | 1.407× | 1.462× |
+| Combined half alpha/beta | 7.52 | 7.52 | 7.52 | 1.000× | 1.000× |
+
+The producer inner loop scales much better than the complete bundle. The
+reducers and tiny floating controls therefore merit attention before changing
+Q8 arithmetic. The half group launches 48 wavefronts at TP4, with 16 allocated
+VGPRs, 48 SGPRs, 1 KiB LDS and zero scratch. QKV producer/reducer launch 640/40
+wavefronts, use 20/24 allocated VGPRs and no LDS or scratch. Active-vector-lane
+utilization is 99.79%/99.12%/100% for half/producer/reducer; all three report
+zero LDS-bank-conflict stalls. Those counters do not measure achieved occupancy.
+Fetched memory falls with partition size: QKV 27321.875→6803.188 KiB and its
+reducer 640.063→160.063 KiB; half controls 485.500→125.750 KiB. Cached output
+stores can report zero video-memory write traffic within a dispatch, so that
+counter is not an output-store count. Do not sum leaf medians into a model
+critical path or use profiled times as canonical throughput.
+
+The next bounded candidates preserve the original producer/reduction order:
+combine existing per-projection reducer launches using distinct admitted
+partial slots, and evaluate a wave-local half reduction without LDS barriers.
+Neither candidate is installed or has a performance claim at this checkpoint.
+
+The original **nine-row prefill** passes at TP1 and TP4, measuring 470.241 and
+426.560 µs. TP2 fails the original-output byte gate at alpha row0/column0:
+actual word3194733219 versus original3194733206. Its native library selection
+uses MT64×64×8/GLVW2 with GSU7, while TP1 and the original TP4 select
+MT64×64×4/GLVW1 with GSU7. The source slices and QKV/Z outputs pass; this
+comparison does not establish a model-level accuracy failure. Keep TP2 red and
+exclude its timing until original floating-arithmetic identity is addressed.
+Applying the existing fixed-column scope would substitute a different half
+reduction and is not an identity repair. No tolerance has been relaxed, and
+these nine rows must not be relabeled as the production M512 prefill workload.
 
 The existing scaling reporter now accepts the two independent targets and
 optional complete actual-TP participant rounds. Its 18 device-free tests pass,

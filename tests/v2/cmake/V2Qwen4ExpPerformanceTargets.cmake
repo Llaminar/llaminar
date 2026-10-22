@@ -26,7 +26,8 @@ endif()
 # The same component supports CPU-only builds; CPU selection performs no GPU setup.
 add_executable(v2_perf_q8_residual_prepared_projection
     "${_qfn_test_sources}/performance/kernels/Perf__Q8ResidualPreparedProjection.cpp"
-    "${_qfn_test_sources}/performance/kernels/recorded/RecordedHeadProjection.cpp")
+    "${_qfn_test_sources}/performance/kernels/recorded/RecordedHeadProjection.cpp"
+    "${_qfn_test_sources}/performance/kernels/recorded/RecordedGDNProjection.cpp")
 target_include_directories(v2_perf_q8_residual_prepared_projection PRIVATE "${_qfn_test_sources}")
 target_link_libraries(v2_perf_q8_residual_prepared_projection PRIVATE llaminar2_core GTest::gtest)
 if(HAVE_CUDA OR HAVE_ROCM)

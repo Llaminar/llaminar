@@ -7,6 +7,10 @@
  * engine checks belong to the concrete adapter's backend integration proof.
  */
 #include "execution/diagnostics/PreparedGemmIsolationAdapter.h"
+#include "execution/diagnostics/PreparedGDNIsolationAdapter.h"
+#include "../../performance/kernels/recorded/RecordedGDNSourceGeometry.h"
+#include "loaders/WeightSlicer.h"
+#include "models/qwen35/Qwen35Schema.h"
 #include <gtest/gtest.h>
 
 namespace
@@ -124,4 +128,101 @@ TEST(CapturedComputeIsolation, OutputPartitionPolicyIsExplicitAndBounded)
     for(int width:{-1,65,256})
         EXPECT_THROW((void)CapturedComputeIsolationContract(DeviceId::rocm(0),shape(),provenance(),ComputeStageType::GEMM,
             stage(),bindings(),IsolationOutputPartitionPolicy{.serial_columns=width}),std::invalid_argument);
+}
+
+/** @brief Complete ordinary GDN supports no borrowed counts, corrected QKV or hidden verifier policy. */
+TEST(CapturedComputeIsolation, GDNBundleFormRejectsUnimplementedRowArithmetic)
+{
+    GDNProjectionStage::Params p;p.m=1;p.k=2560;p.n_qkv=2560;p.n_z=1536;p.n_a=12;p.n_b=12;
+    EXPECT_TRUE(staticGDNIsolationFormSupported(p));
+    p.mpi_ctx=reinterpret_cast<const IMPIContext *>(0x10000);EXPECT_FALSE(staticGDNIsolationFormSupported(p));p.mpi_ctx=nullptr;
+    p.qkv_operand_precision=QuantizedActivationOperandPrecision::TwoTermQ8;
+    EXPECT_FALSE(staticGDNIsolationFormSupported(p));p.qkv_operand_precision=QuantizedActivationOperandPrecision::SingleQ8;
+    p.qkv_row_range=DeviceRowRange::fullyActive(1);EXPECT_FALSE(staticGDNIsolationFormSupported(p));p.qkv_row_range.reset();
+    p.verifier_row_range=DeviceRowRange::fullyActive(1);EXPECT_FALSE(staticGDNIsolationFormSupported(p));p.verifier_row_range.reset();
+    p.force_decode_equivalent_verifier_prefill=true;EXPECT_FALSE(staticGDNIsolationFormSupported(p));p.force_decode_equivalent_verifier_prefill=false;
+    p.n_b=0;EXPECT_FALSE(staticGDNIsolationFormSupported(p));p.n_b=12;
+    p.k=2559;EXPECT_FALSE(staticGDNIsolationFormSupported(p));
+}
+/** @brief A complete bundle's only activation read and all four independent writes must be owned. */
+TEST(CapturedComputeIsolation, GDNBundleClosureRejectsMissingSiblingAndResetAliases)
+{
+    auto contract=StageBufferContract::build().addInput(BufferId::NORMALIZED)
+        .addOutput(BufferId::GDN_QKV).addOutput(BufferId::GDN_Z).addOutput(BufferId::GDN_ALPHA).addOutput(BufferId::GDN_BETA);
+    std::vector<IsolationBuffer> spans={{BufferId::NORMALIZED,0x10000,0x20000,10240,owner(),owner()},
+        {BufferId::GDN_QKV,0x30000,0,10240,owner(),{}},{BufferId::GDN_Z,0x40000,0,6144,owner(),{}},
+        {BufferId::GDN_ALPHA,0x50000,0,48,owner(),{}},{BufferId::GDN_BETA,0x60000,0,48,owner(),{}}};
+    EXPECT_NO_THROW(validateIsolationBufferClosure(contract,spans));
+    auto bad=spans;bad.pop_back();EXPECT_THROW(validateIsolationBufferClosure(contract,bad),std::invalid_argument);
+    bad=spans;bad[4].address=bad[3].address;EXPECT_THROW(validateIsolationBufferClosure(contract,bad),std::invalid_argument);
+    bad=spans;bad[4].address=bad[0].baseline;EXPECT_THROW(validateIsolationBufferClosure(contract,bad),std::invalid_argument);
+    bad=spans;bad[0].baseline_owner.reset();EXPECT_THROW(validateIsolationBufferClosure(contract,bad),std::invalid_argument);
+}
+
+/** @brief TP1 must retain actual ordinary source axes so the production slicer recognizes asymmetric GDN QKV. */
+TEST(CapturedComputeIsolation, GDNBundleOriginalDimensionsRetainTP1PackedSource)
+{
+    using namespace llaminar2::test::recorded_gdn;
+    const Qwen4ExpSparseAttentionGeometry attention{.query_heads=24,.kv_heads=2,.head_dimension=256};
+    const Qwen4ExpDeltaNetGeometry gdn{.key_heads=16,.value_heads=48,.head_dimension=128,.value_width=6144,.convolution_kernel=4};
+    const auto dimensions=originalSourceDimensions(attention,gdn);
+    EXPECT_EQ(dimensions.n_heads,24);EXPECT_EQ(dimensions.n_kv_heads,2);EXPECT_EQ(dimensions.head_dim,256);
+    for(int degree:{1,2,4})
+    {
+        const auto assignments=originalSourceAssignments(dimensions,degree);
+        auto tp=std::make_shared<TensorParallelConfig>(assignments);
+        WeightSlicer slicer(dimensions,Qwen35SchemaFactory{}.getWeightShardingConfig(),tp);
+        for(int rank=0;rank<degree;++rank)
+        {
+            const auto slice=slicer.computeFusedQKVSliceForAssignment("blk.0.attn_qkv.weight",10240,assignments[rank]);
+            ASSERT_TRUE(slice.has_value());EXPECT_TRUE(slice->modulo_linked_gdn);
+            EXPECT_EQ(slice->q_total,2048u);EXPECT_EQ(slice->k_total,2048u);EXPECT_EQ(slice->v_total,6144u);
+            const auto expected=GDNHeadAssignment::forEqualRank(16,48,rank,degree);
+            const auto key=expected.keyElementSpan(128);EXPECT_EQ(slice->q.start,std::size_t(key.start));EXPECT_EQ(slice->q.count,std::size_t(key.count));
+            const auto values=expected.valueElementSpans(128);ASSERT_EQ(slice->v.size(),values.size());
+            for(std::size_t i=0;i<values.size();++i){EXPECT_EQ(slice->v[i].start,std::size_t(values[i].start));EXPECT_EQ(slice->v[i].count,std::size_t(values[i].count));}
+        }
+    }
+    auto incomplete=attention;incomplete.head_dimension=0;
+    EXPECT_THROW(originalSourceDimensions(incomplete,gdn),std::invalid_argument);
+    incomplete=attention;incomplete.query_heads=0;EXPECT_THROW(originalSourceDimensions(incomplete,gdn),std::invalid_argument);
+    auto missing=dimensions;missing.n_heads=0;EXPECT_THROW(originalSourceAssignments(missing,1),std::invalid_argument);
+}
+
+/** @brief Immutable pool descriptors use implicit capacity, unlike reusable slots. */
+TEST(CapturedComputeIsolation,GDNBundleQ8AllocationRetainsImmutablePoolContract)
+{
+    DeviceNativeVNNIMatrixDesc native{};
+    native.payload=reinterpret_cast<const std::uint8_t *>(0x10000);
+    native.scales=reinterpret_cast<const void *>(0x20000);
+    native.n=640;native.k=640;native.blocks_per_row=20;
+    native.codebook_id=19;native.source_codebook_id=19;native.source_identity_present=1;
+    EXPECT_NO_THROW(validateGDNIsolationQ8Allocation(native));
+    native.allocation_payload_bytes_per_block=32;
+    EXPECT_NO_THROW(validateGDNIsolationQ8Allocation(native));
+    for(const auto capacity:{16,64})
+    {
+        auto bad=native;bad.allocation_payload_bytes_per_block=capacity;
+        EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
+    }
+    for(const bool explicit_capacity:{false,true})
+    {
+        auto original=native;original.allocation_payload_bytes_per_block=explicit_capacity?32:0;
+        auto bad=original;bad.allocation_has_mins=1;
+        EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
+        bad=original;bad.allocation_has_emins=1;
+        EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
+        bad=original;bad.mins=reinterpret_cast<const void *>(0x30000);
+        EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
+        bad=original;bad.emins=reinterpret_cast<const void *>(0x40000);
+        EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
+    }
+    auto bad=native;bad.blocks_per_row=19;
+    EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
+    bad=native;bad.source_identity_present=0;
+    EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
+    bad=native;bad.source_is_superblock=1;
+    EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
+    bad=native;bad.codebook_id=23;
+    EXPECT_THROW(validateGDNIsolationQ8Allocation(bad),std::invalid_argument);
 }

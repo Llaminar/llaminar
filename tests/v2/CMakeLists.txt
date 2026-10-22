@@ -31299,6 +31299,12 @@ if(NOT V2_PERF_TESTS_ONLY)
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GraphCapture;ComputeIsolation;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedComputeIsolationContract)
+    add_v2_test(V2_Integration_RecordedGDNIsolationContract
+        COMMAND $<TARGET_FILE:v2_unit_captured_compute_isolation>
+            --gtest_filter=CapturedComputeIsolation.GDNBundle*
+        LABELS "V2;Integration;ProductionTestPreflight;GraphCapture;ComputeIsolation;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecordedGDNIsolationContract)
     if((HAVE_CUDA OR HAVE_ROCM) AND NOT V2_PERF_TESTS_ONLY)
         target_sources(v2_test_qwen4exp_device_primitives PRIVATE
             integration/execution/graph/Test__CapturedComputeIsolation.cpp)
@@ -31318,6 +31324,14 @@ if(NOT V2_PERF_TESTS_ONLY)
                     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
                 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
                     V2_Integration_CapturedComputeIsolation_${ISOLATION_BACKEND})
+                add_v2_test(V2_Integration_CapturedGDNIsolation_${ISOLATION_BACKEND}
+                    COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                        --gtest_filter=CapturedGDNIsolationNative.${ISOLATION_BACKEND}
+                    LABELS "V2;Integration;ProductionTestPreflight;${ISOLATION_BACKEND};GraphCapture;ComputeIsolation;GDN;ByteExact;Regression"
+                    ENVIRONMENT ${ISOLATION_ENV}
+                    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                    V2_Integration_CapturedGDNIsolation_${ISOLATION_BACKEND})
             endif()
         endforeach()
     endif()
@@ -31357,7 +31371,8 @@ endif()
 # Header-only request contract opens no real model or accelerator.
 if(NOT V2_PERF_TESTS_ONLY)
     add_executable(v2_unit_recorded_head_request
-        unit/performance/Test__RecordedHeadRequest.cpp)
+        unit/performance/Test__RecordedHeadRequest.cpp
+        unit/performance/Test__RecordedGDNRequest.cpp)
     target_compile_features(v2_unit_recorded_head_request PRIVATE cxx_std_20)
     target_include_directories(v2_unit_recorded_head_request PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor")
@@ -31367,6 +31382,18 @@ if(NOT V2_PERF_TESTS_ONLY)
         COMMAND $<TARGET_FILE:v2_unit_recorded_head_request>
         LABELS "V2;Unit;Performance;NativeVNNI;DeviceFree"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_RecordedGDNInputContract
+        COMMAND $<TARGET_FILE:v2_unit_recorded_head_request>
+            --gtest_filter=RecordedGDNRequest.*
+        LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;Snapshot;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecordedGDNInputContract)
+    add_v2_test(V2_Integration_RecordedGDNMetadataContract
+        COMMAND $<TARGET_FILE:v2_unit_recorded_head_request>
+            --gtest_filter=RecordedGDNRequest.NativePreparedMetadataUsesSemanticBoolean
+        LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecordedGDNMetadataContract)
     add_v2_test(V2_Integration_RecordedHeadInputContract
         COMMAND $<TARGET_FILE:v2_unit_recorded_head_request>
         LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;Snapshot;DeviceFree;Regression"

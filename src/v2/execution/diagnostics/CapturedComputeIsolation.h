@@ -69,6 +69,57 @@ struct IsolationBuffer
     std::shared_ptr<const void> owner, baseline_owner;
 };
 /**
+ * @brief Validate exact arena read/write and immutable baseline separation for any concrete adapter.
+ * @param stage Real production contract; adapters must separately authenticate supported stage forms.
+ * @param bindings Complete resident owners for that contract.
+ * @return Owned reset spans for every actual input/inout.
+ * @throws std::invalid_argument For missing bindings, incomplete baselines or aliases.
+ */
+inline std::vector<IsolationBuffer> validateIsolationBufferClosure(const StageBufferContract &stage,
+    const std::vector<IsolationBuffer> &bindings)
+{
+    std::vector<IsolationBuffer> resets;
+    std::set<BufferId> wanted, reads;
+    for(const auto &binding:stage.inputs) { wanted.insert(binding.id); reads.insert(binding.id); }
+    for(const auto &binding:stage.inouts) { wanted.insert(binding.id); reads.insert(binding.id); }
+    for(const auto &binding:stage.outputs) wanted.insert(binding.id);
+    if(wanted.empty() || reads.empty() || wanted.contains(BufferId::_COUNT) || bindings.size()!=wanted.size())
+        throw std::invalid_argument("Isolated compute requires complete nonempty production buffer closure");
+    std::set<BufferId> seen;
+    for(const auto &binding:bindings)
+    {
+        if(!wanted.contains(binding.id) || !seen.insert(binding.id).second || !binding.owner ||
+            !binding.address || !binding.bytes || binding.bytes>std::numeric_limits<std::uintptr_t>::max()-binding.address)
+            throw std::invalid_argument("Isolated compute has missing, duplicate or overflowing resident storage");
+        if(reads.contains(binding.id))
+        {
+            if(!binding.baseline || !binding.baseline_owner ||
+                binding.bytes>std::numeric_limits<std::uintptr_t>::max()-binding.baseline)
+                throw std::invalid_argument("Every isolated read/inout requires an owned pre-execution reset baseline");
+            resets.push_back(binding);
+        }
+        else if(binding.baseline || binding.baseline_owner)
+            throw std::invalid_argument("Write-only isolation output cannot invent an input baseline");
+    }
+    const auto overlap=[](std::uintptr_t a,std::size_t an,std::uintptr_t b,std::size_t bn)
+    { return a<b+bn && b<a+an; };
+    for(std::size_t i=0;i<bindings.size();++i)
+    {
+        const auto &a=bindings[i];
+        for(std::size_t j=0;j<bindings.size();++j)
+        {
+            const auto &b=bindings[j];
+            if((i!=j && overlap(a.address,a.bytes,b.address,b.bytes)) ||
+                (a.baseline && overlap(a.baseline,a.bytes,b.address,b.bytes)))
+                throw std::invalid_argument("Isolation reset/compute banks must have disjoint exact storage");
+        }
+        for(const auto &b:resets)
+            if(a.baseline && a.id!=b.id && overlap(a.baseline,a.bytes,b.baseline,b.bytes))
+                throw std::invalid_argument("Independent isolation input baselines may not alias");
+    }
+    return resets;
+}
+/**
  * @brief Frozen read closure derived from the actual production StageBufferContract.
  *
  * Inputs and inouts require a baseline. Write-only outputs need no reset for
@@ -106,44 +157,7 @@ public:
             provenance_.observation.empty() || provenance_.producer_stage.empty() ||
             !provenance_.generation || !provenance_.owner)
             throw std::invalid_argument("Isolated compute requires exact GPU/source topology and retained input provenance");
-        std::set<BufferId> wanted, reads;
-        for(const auto &binding:stage.inputs) { wanted.insert(binding.id); reads.insert(binding.id); }
-        for(const auto &binding:stage.inouts) { wanted.insert(binding.id); reads.insert(binding.id); }
-        for(const auto &binding:stage.outputs) wanted.insert(binding.id);
-        if(wanted.empty() || reads.empty() || wanted.contains(BufferId::_COUNT) || bindings_.size()!=wanted.size())
-            throw std::invalid_argument("Isolated compute requires complete nonempty production buffer closure");
-        std::set<BufferId> seen;
-        for(const auto &binding:bindings_)
-        {
-            if(!wanted.contains(binding.id) || !seen.insert(binding.id).second || !binding.owner ||
-                !binding.address || !binding.bytes || binding.bytes>std::numeric_limits<std::uintptr_t>::max()-binding.address)
-                throw std::invalid_argument("Isolated compute has missing, duplicate or overflowing resident storage");
-            if(reads.contains(binding.id))
-            {
-                if(!binding.baseline || !binding.baseline_owner ||
-                    binding.bytes>std::numeric_limits<std::uintptr_t>::max()-binding.baseline)
-                    throw std::invalid_argument("Every isolated read/inout requires an owned pre-execution reset baseline");
-                resets_.push_back(binding);
-            }
-            else if(binding.baseline || binding.baseline_owner)
-                throw std::invalid_argument("Write-only isolation output cannot invent an input baseline");
-        }
-        const auto overlap=[](std::uintptr_t a,std::size_t an,std::uintptr_t b,std::size_t bn)
-        { return a<b+bn && b<a+an; };
-        for(std::size_t i=0;i<bindings_.size();++i)
-        {
-            const auto &a=bindings_[i];
-            for(std::size_t j=0;j<bindings_.size();++j)
-            {
-                const auto &b=bindings_[j];
-                if((i!=j && overlap(a.address,a.bytes,b.address,b.bytes)) ||
-                    (a.baseline && overlap(a.baseline,a.bytes,b.address,b.bytes)))
-                    throw std::invalid_argument("Isolation reset/compute banks must have disjoint exact storage");
-            }
-            for(const auto &b:resets_)
-                if(a.baseline && a.id!=b.id && overlap(a.baseline,a.bytes,b.baseline,b.bytes))
-                    throw std::invalid_argument("Independent isolation input baselines may not alias");
-        }
+        resets_=validateIsolationBufferClosure(stage,bindings_);
     }
     /** @return Actual participant owning all captured spans. */
     [[nodiscard]] DeviceId device() const noexcept {return device_;}

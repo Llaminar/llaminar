@@ -20,12 +20,15 @@
  * claim. Setup/terminal observations remain outside every timed region.
  * An explicit --recorded-head-request branch consumes qualified native FINAL_NORM
  * and original GGUF slices with captured LMHeadStage bytes before compute-only timing.
+ * The --recorded-gdn-request branch captures the complete original four-projection
+ * stage on its qualified normalized input and byte-checks every packed sibling.
  * Existing raw-slice modes retain their original semantics.
  * Optional raw output export retains only the already-observed live prefix,
  * after all timed/verification work completes; no extra native readback,
  * launch, precision policy, source conversion or model execution is introduced.
  */
 #include "recorded/RecordedHeadRequest.h"
+#include "recorded/RecordedGDNRequest.h"
 #include "cpu/CPUQ8ResidualPreparedMeasurement.h"
 #include "cpu/Q8ResidualFixtureExport.h"
 #include <gtest/gtest.h>
@@ -1034,6 +1037,8 @@ void measure(const MeasureOptions &o) {
  * initialization precedes parsing. */
 int main(int argc, char **argv) {
   try {
+    if (llaminar2::test::recorded_gdn::requested(argc, argv))
+      return llaminar2::test::recorded_gdn::run(argc, argv);
     if (llaminar2::test::recorded_head::requested(argc, argv))
       return llaminar2::test::recorded_head::run(argc, argv);
     if (llaminar2::test::q8_all_formats::q8ResidualFixtureExportRequested(argc, argv))

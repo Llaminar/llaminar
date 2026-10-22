@@ -7,7 +7,17 @@ All 185 logit rows and twelve generated sequences match exactly; 776 Unit
 tests and six focused registrations pass. Isolated traces and ISA confirm
 lower register use and zero spills. See the
 [component measurements and matched comparison](QFN_FLOATING_REDUCTION_TUNING.md#native-source-format-specialization-candidate97).
-Full production preflight remains pending. Recorded-input GDN scaling is next.
+Full production preflight remains pending. [Recorded GDN decode scaling](QFN_TP_COMPUTE_SCALING.md#recorded-gdn-projection-measurements)
+now measures **1.388–1.392× TP2 / 1.733–1.749× TP4**, below both targets,
+with every original output byte preserved. All 776 Unit and 17 focused checks
+pass. The nine-row TP2 prefill comparison remains unqualified because its
+library-selected floating reduction differs from the saved TP4 observation.
+Exact-kernel profiles now show **1.883×/3.587×** local-shape scaling for the
+QKV producer, versus **1.242×/1.577×** for its reducer; alpha/beta remains
+7.52 µs at all three degrees. These instrumented diagnostics identify fixed
+reduction/control costs without replacing the concurrent cohort measurements.
+All inspected kernels have zero scratch. Reducer grouping and a wave-local
+half reduction are the next candidates; no GDN tuning default has changed.
 
 **L96 floating reductions are qualified** at **796.370 prefill / 36.750 decode
 tok/s** on A1. The matched Automatic94 control measures **791.395 / 36.654**:
