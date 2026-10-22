@@ -15,6 +15,11 @@
  * Raw resident IQ descriptors publish their runtime-generation-owned lookup
  * tables during construction, before a retained graph can consume them.
  *
+ * Diagnostic native-Q8 serial geometry scopes admit only a real prepared M1
+ * native19 producer; an unrelated format, grouped operation or epilogue cannot
+ * silently consume an experiment's requested geometry. Production without a
+ * diagnostic scope retains its existing producer and arithmetic selection.
+ *
  * @see ROCmQuantisedGemmWorkspaceContract.h
  * @see ROCmDenseProductionPrefillOverlay.h
  */
@@ -25,6 +30,7 @@
 #include "ROCmDenseProductionPrefillOverlay.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "ROCmQuantisedGemmWorkspaceContract.h"
+#include "ROCmNativeVNNISerialGeometry.h"
 #include "transfer/TransferEngine.h"
 #include "../ROCmKernelBase.h"
 #include "ROCmWeightPacker.h"     // packWeightsToROCm, packNativeVNNI
@@ -2459,6 +2465,19 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
         {
+            if (llaminar2::rocm::currentNativeQ8SerialGeometry())
+            {
+                // A geometry experiment must reach the actual native-Q8 M1
+                // producer. Reject other prepared families/operations before
+                // they can enqueue a byte-equal but unmeasured substitute.
+                llaminar2::rocm::clearNativeQ8SerialLaunch();
+                llaminar2::rocm::validateNativeQ8SerialScopeBinding(rocm_device_id_, gpu_stream_);
+                if (m != 1 || n <= 0 || k <= 0 || alpha != 1.0f ||
+                    beta != 0.0f || bias || !impl_ || !impl_->has_native_vnni ||
+                    impl_->native_vnni_codebook_id != 19 ||
+                    !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
+                    throw std::logic_error("native-Q8 serial geometry scope requires the prepared native19 M1 alpha1/beta0 projection");
+            }
             auto execution_stream =
                 static_cast<hipStream_t>(requireGPUStream());
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(

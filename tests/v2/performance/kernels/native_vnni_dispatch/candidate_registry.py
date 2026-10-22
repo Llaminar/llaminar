@@ -421,6 +421,30 @@ def rocm_native_vnni_decode_registry() -> CandidateRegistry:
 
 
 @lru_cache(maxsize=1)
+def rocm_native_q8_serial_geometry_diagnostic_registry() -> CandidateRegistry:
+    """Five real fixed-arithmetic M1 geometries; excluded from installed policy.
+
+    This separate generation retains the original KB-only registry and digest.
+    TN128/CPT1 is the unscoped production control, not a sixth timing alias.
+    Every geometry inherits the exact original K32 partition/fold contract.
+    """
+    return CandidateRegistry(tuple(_candidate(
+        backend=Backend.ROCM,
+        surface="rocm_native_q8_serial_geometry_diagnostic_v1",
+        candidate_id=f"rocm.nvnni.decode.native_q8_geometry.tn{tn}.cpt{cpt}",
+        aliases=(),
+        family="rocm_native_q8_serial_geometry_diagnostic_v1",
+        config={"tile_n": tn, "columns_per_thread": cpt,
+                "block_threads": tn // cpt, "split_policy": "unchanged_serial_m1"},
+        arithmetic="native-Q8 original serial-M1 K32 partitions and ascending FP32 fold-v1",
+        schedule=f"hip-native-q8-serial-tn{tn}-cpt{cpt}-v1",
+        contracts=(SemanticContract.FAST,),
+        resources=("native_vnni_prepared_weights", "ordered_kpart_partials"),
+        workspace="ROCmNativeVNNIKPartWorkspace-v1",
+    ) for tn, cpt in ((64, 1), (128, 1), (256, 1), (128, 2), (256, 2))))
+
+
+@lru_cache(maxsize=1)
 def rocm_native_vnni_decode_formula_registry() -> CandidateRegistry:
     """Return total generic ROCm policies backed by concrete KB evidence.
 

@@ -6,7 +6,9 @@ closure without entering main, initializing an accelerator, or loading a model.
 The expected SONAME comes from FindOpenMP's selected library at configuration;
 absolute compiler paths and untrusted same-filename aliases are not authority.
 The shadow control uses a harmless DSO and a temporary alias to reproduce the
-SDK's libgomp-to-libomp mistake without modifying any installed library.
+SDK's libgomp-to-libomp mistake without modifying any installed library. The
+closure must also contain no second GNU, LLVM or Intel OpenMP runtime: a genuine
+selected runtime cannot certify a binary that simultaneously loads another ABI.
 """
 from __future__ import annotations
 
@@ -24,7 +26,20 @@ class RuntimeBindingError(RuntimeError):
 
 
 def parse_loader_runtime(trace: str, expected_soname: str) -> Path:
-    """Resolve the required ABI from loader output, rejecting missing bindings."""
+    """Resolve exactly the selected ABI, rejecting missing or mixed bindings."""
+    openmp_name = re.compile(r"lib(?:gomp|omp|iomp5)\.so(?:\.\d+)*")
+    for line in trace.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if not fields:
+            continue
+        # A direct absolute dependency has no `=>` in loader output. Inspect
+        # its basename too, so neither it nor an unresolved second runtime can
+        # hide beside a correctly resolved selected SONAME.
+        label = Path(fields[0]).name
+        if openmp_name.fullmatch(label) and label != expected_soname:
+            raise RuntimeBindingError(
+                f"Unexpected OpenMP runtime binding: selected {expected_soname}, "
+                f"also requested {label}")
     pattern = re.compile(r"^\s*(\S+)\s+=>\s+(.+?)\s+\(0x[0-9a-fA-F]+\)\s*$")
     matches = []
     for line in trace.splitlines():
@@ -99,6 +114,20 @@ class OpenMPRuntimeBindingTests(unittest.TestCase):
         trace = "libc.so.6 => /lib/libc.so.6 (0x1)\nlibgomp.so.1 => /lib/libgomp.so.1 (0x2)"
         self.assertEqual(parse_loader_runtime(trace, "libgomp.so.1"),
                          Path("/lib/libgomp.so.1"))
+
+    def test_simultaneous_native_and_distinct_openmp_bindings_fail(self):
+        """A correct GNU/LLVM runtime cannot conceal a second runtime ABI."""
+        for expected, selected, extra in (
+            ("libgomp.so.1", "/lib/libgomp.so.1", "libomp.so => /sdk/libomp.so (0x3)"),
+            ("libomp.so", "/lib/libomp.so", "libgomp.so.1 => /lib/libgomp.so.1 (0x3)"),
+            ("libgomp.so.1", "/lib/libgomp.so.1", "libiomp5.so => /sdk/libiomp5.so (0x3)"),
+            ("libgomp.so.1", "/lib/libgomp.so.1", "/sdk/libomp.so (0x3)"),
+            ("libgomp.so.1", "/lib/libgomp.so.1", "libomp.so => not found"),
+        ):
+            trace = f"{expected} => {selected} (0x2)\n{extra}"
+            with self.subTest(extra=extra), self.assertRaisesRegex(
+                    RuntimeBindingError, "Unexpected OpenMP runtime binding"):
+                parse_loader_runtime(trace, expected)
 
     def test_missing_relative_and_duplicate_bindings_fail(self):
         """Incomplete closure and ambiguous identities fail instead of guessing."""

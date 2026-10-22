@@ -22,7 +22,9 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from .evidence import raw_corpus_id, verify_aggregate_timing
-from ..candidate_registry import rocm_native_vnni_decode_registry
+from ..candidate_registry import (
+    rocm_native_vnni_decode_registry, rocm_native_q8_serial_geometry_diagnostic_registry,
+)
 from ..corpus import ObservationCorpus
 from ..format_registry import format_spec
 from ..profiles import (
@@ -140,6 +142,10 @@ def _read_rocm_decode_timing_rows(
         ):
             raise ValueError(f"{location}: wrong timing sidecar surface")
         _execution_mode(raw["execution_mode"])
+        generation = raw.get("evidence_generation", "").strip()
+        geometry_id = raw["candidate_id"].strip().lower().startswith("rocm.nvnni.decode.native_q8_geometry.")
+        if generation not in ("", ROCM_Q8_GEOMETRY_GENERATION) or geometry_id != (generation == ROCM_Q8_GEOMETRY_GENERATION):
+            raise ValueError(f"{location}: timing generation/candidate identity mismatch")
         if int(raw["timed_replays"]) != 1:
             raise ValueError(f"{location}: decode timing rows require one replay")
         key = _timing_key(raw)
@@ -472,10 +478,109 @@ def _trial_set_hash(raw: Mapping[str, str]) -> str:
     )
 
 
+ROCM_Q8_GEOMETRY_GENERATION = "rocm-native-q8-fixed-arithmetic-geometry-v1"
+
+
+def _geometry_launch_evidence(raw: Mapping[str, str], candidate) -> dict:
+    """Authenticate loaded functions, captured geometry and unchanged arithmetic.
+
+    The trainer retains actual HIP kernel-node parameters separately from the
+    runtime's construction receipt. Neither requested knobs nor an asserted
+    match boolean can substitute for those observations.
+    """
+    evidence = json.loads(raw["physical_launch_evidence"])
+    if not isinstance(evidence, dict) or evidence.get("generation") != ROCM_Q8_GEOMETRY_GENERATION:
+        raise ValueError("missing fixed-arithmetic geometry generation")
+    if evidence.get("prepared_family") != "NativeVNNI_K32_CB19":
+        raise ValueError("geometry trial requires original native-Q8 preparation")
+    baseline, launch = evidence["baseline"], evidence["launch"]
+    n, k = int(raw["n"]), int(raw["k"])
+    arithmetic = ("physical_n", "arithmetic_policy_n", "k", "execution_codebook",
+                  "arithmetic_policy_codebook", "k_partitions", "blocks_per_partition",
+                  "nonempty_partitions", "partial_elements", "device_ordinal", "stream")
+    if any(type(value[name]) is not int for value in (baseline, launch) for name in arithmetic):
+        raise ValueError("geometry receipt requires exact integer arithmetic/owner identities")
+    if any(launch[name] != baseline[name] for name in arithmetic):
+        raise ValueError("geometry changed the original serial arithmetic/owner contract")
+    if launch["physical_n"] != n or launch["arithmetic_policy_n"] != n or launch["k"] != k:
+        raise ValueError("geometry receipt does not match the physical projection")
+    if launch["execution_codebook"] != 19 or launch["arithmetic_policy_codebook"] != 19:
+        raise ValueError("geometry receipt changed source/execution identity")
+    if (type(launch["stream"]) is not int or launch["stream"] in (0, 1, 2)
+            or type(launch["device_ordinal"]) is not int or launch["device_ordinal"] < 0):
+        raise ValueError("geometry receipt has no explicit stream/device")
+    kb = launch["k_partitions"]
+    if type(kb) is not int or not 1 <= kb <= k // 32 or k % 32:
+        raise ValueError("geometry receipt has invalid original partition count")
+    blocks = k // 32
+    # This generation binds the original shared C++ contract:
+    # MoEProjectionNumericalContract::orderedKPartitionsForWidth. The trainer
+    # calls that actual helper; no Python callable counterpart exists. Receipt
+    # agreement alone cannot authenticate two jointly altered partition trees.
+    if kb != min(16, blocks):
+        raise ValueError("geometry changed the canonical original serial K-partition tree")
+    b_per = (blocks + kb - 1) // kb
+    if (launch["blocks_per_partition"] != b_per
+            or launch["nonempty_partitions"] != (blocks + b_per - 1) // b_per
+            or launch["partial_elements"] != (kb * n if kb > 1 else 0)):
+        raise ValueError("geometry receipt changed K32 planes or live partial extent")
+    if int(raw["kb"]) != kb or int(raw["serial_m1_kb"]) != kb:
+        raise ValueError("geometry row mislabeled the observed KB")
+
+    def validate_one(value: dict, tile: int, cpt: int) -> None:
+        grid = (n + tile - 1) // tile
+        threads = tile // cpt
+        if (type(value["tile_n"]) is not int or type(value["columns_per_thread"]) is not int
+                or value["tile_n"] != tile or value["columns_per_thread"] != cpt):
+            raise ValueError("observed geometry disagrees with the concrete registry entry")
+        for role in ("producer", "reducer"):
+            kernel = value[role]
+            if role == "reducer" and kb == 1:
+                if kernel is not None:
+                    raise ValueError("KB1 must not enqueue a reducer")
+                continue
+            if not isinstance(kernel, dict) or type(kernel["function"]) is not int or kernel["function"] <= 0:
+                raise ValueError("geometry receipt lacks a loaded function")
+            if not isinstance(kernel["specialization"], str) or not kernel["specialization"].strip():
+                raise ValueError("geometry receipt lacks specialization attribution")
+            expected_grid = [grid, kb if role == "producer" else 1, 1]
+            if (any(not isinstance(kernel[name], list) or len(kernel[name]) != 3
+                    or any(type(axis) is not int or axis <= 0 for axis in kernel[name])
+                    for name in ("grid", "block"))
+                    or kernel["grid"] != expected_grid or kernel["block"] != [threads, 1, 1]):
+                raise ValueError("geometry receipt has incorrect physical grid/block")
+            resources = value["resources"][role]
+            if (any(type(resources[name]) is not int for name in ("function", "block_threads",
+                    "local_memory_bytes_per_thread", "registers_per_thread", "max_threads_per_block",
+                    "max_active_blocks_per_sm", "static_shared_memory_bytes"))
+                    or resources["function"] != kernel["function"]
+                    or resources["specialization"] != kernel["specialization"]
+                    or resources["block_threads"] != threads
+                    or resources["local_memory_bytes_per_thread"] != 0
+                    or resources["registers_per_thread"] <= 0
+                    or resources["max_threads_per_block"] < threads
+                    or resources["max_active_blocks_per_sm"] <= 0
+                    or resources["static_shared_memory_bytes"] < 0):
+                raise ValueError("geometry resources do not admit the exact captured symbol")
+            matches = [node for node in value["captured_kernels"]
+                       if node["function"] == kernel["function"]]
+            if len(matches) != 1 or matches[0]["grid"] != kernel["grid"] or matches[0]["block"] != kernel["block"]:
+                raise ValueError("captured native node disagrees with construction receipt")
+    validate_one(baseline, 128, 1)
+    validate_one(launch, int(candidate.config_json["tile_n"]),
+                 int(candidate.config_json["columns_per_thread"]))
+    if candidate.config_json["tile_n"] == 128 and candidate.config_json["columns_per_thread"] == 1:
+        for role in ("producer", "reducer"):
+            if launch[role] != baseline[role]:
+                raise ValueError("production control is not the identical physical launch")
+    return evidence
+
+
 def adapt_rocm_decode_row(
     raw: Mapping[str, str],
     context: ROCmDecodeAdapterContext,
     timing_samples: tuple[float, ...] | None = None,
+    *, diagnostic_geometry: bool = False,
 ) -> NativeVNNIObservation:
     """Convert one strong ROCm decode row into the common schema."""
 
@@ -489,7 +594,18 @@ def adapt_rocm_decode_row(
     k = int(raw["k"])
     contract = _semantic_contract(m)
     execution_mode = _execution_mode(raw["execution_mode"])
-    registry = rocm_native_vnni_decode_registry()
+    generation = raw.get("evidence_generation", "").strip()
+    geometry = generation == ROCM_Q8_GEOMETRY_GENERATION
+    if generation and not geometry:
+        raise ValueError("unknown ROCm decode evidence generation")
+    if geometry and (not diagnostic_geometry or context.profile.installable
+                     or m != 1 or execution_mode != ExecutionMode.GRAPH_CAPTURED
+                     or raw["source_format"].strip().upper() != "Q8_0"):
+        raise ValueError("native-Q8 geometry evidence requires explicit diagnostic captured M1 mode")
+    if diagnostic_geometry and not geometry:
+        raise ValueError("diagnostic geometry cannot reinterpret old KB-only evidence")
+    registry = (rocm_native_q8_serial_geometry_diagnostic_registry() if geometry
+                else rocm_native_vnni_decode_registry())
     candidate = registry.resolve(raw["candidate_id"])
     if not candidate.supports_contract(contract):
         raise ValueError(
@@ -510,7 +626,12 @@ def adapt_rocm_decode_row(
     serial_waves = int(raw["serial_m1_target_waves"])
     if min(observed_kb, observed_waves, serial_kb, serial_waves) <= 0:
         raise ValueError("ROCm decode route configuration must be positive")
-    if contract == SemanticContract.FAST:
+    if geometry and timing_samples is None:
+        raise ValueError("diagnostic geometry requires every raw timing sample")
+    physical = _geometry_launch_evidence(raw, candidate) if geometry else {}
+    if geometry:
+        config_matches = observed_kb == serial_kb and observed_waves == serial_waves
+    elif contract == SemanticContract.FAST:
         config_matches = observed_kb == int(candidate.config_json["kb"])
     else:
         config_matches = observed_kb == serial_kb and observed_waves == serial_waves
@@ -547,6 +668,8 @@ def adapt_rocm_decode_row(
     numerical_correctness = _parse_bool(
         "numerical_correctness", raw["numerical_correctness"]
     )
+    if geometry and (mismatch_count != 0 or repeat_mismatches != 0):
+        raise ValueError("fixed-arithmetic geometry must be byte identical to original M1")
     expected_pass = (
         route_counter_ok
         and repeat_mismatches == 0
@@ -598,8 +721,8 @@ def adapt_rocm_decode_row(
         driver_runtime=context.driver_runtime,
         threading_or_stream_mode=context.threading_or_stream_mode,
         semantic_contract=contract,
-        operation_kind="NativeVNNIDecodeProjection",
-        bundle_signature="single-native-vnni-projection:fp32-output:v2",
+        operation_kind=("NativeQ8SerialGeometryDiagnostic" if geometry else "NativeVNNIDecodeProjection"),
+        bundle_signature=(ROCM_Q8_GEOMETRY_GENERATION if geometry else "single-native-vnni-projection:fp32-output:v2"),
         projection_n_vector=projection_vector,
         source_format=source_format,
         source_codebook_id=format_entry.source_codebook_id,
@@ -624,14 +747,15 @@ def adapt_rocm_decode_row(
         config_json=candidate.config_json,
         supported=config_matches,
         graph_capture_ok=candidate.graph_capture_supported,
-        generic_eligible=True,
+        generic_eligible=not geometry,
         arithmetic_fingerprint=candidate.arithmetic_fingerprint,
         serial_m1_policy_id=ROCM_DECODE_SERIAL_POLICY_ID,
         serial_m1_policy_hash=context.serial_m1_policy_hash,
         candidate_policy_hash=candidate.candidate_policy_hash(),
         ordered_reduction=candidate.ordered_reduction,
         uses_atomic_reduction=candidate.uses_atomic_reduction,
-        trial_set_hash=_trial_set_hash(raw),
+        trial_set_hash=(_sha256({"generation": ROCM_Q8_GEOMETRY_GENERATION,
+            "original_trial": _trial_set_hash(raw)}) if geometry else _trial_set_hash(raw)),
         numerical_correctness=numerical_correctness,
         bitwise_equal=mismatch_count == 0,
         repeat_equal=repeat_mismatches == 0,
@@ -661,6 +785,7 @@ def adapt_rocm_decode_row(
         route_counter_ok=route_counter_ok and serial_route_ok,
         workspace_ok=True,
         explicit_stream_ok=True,
+        physical_launch_evidence=physical,
     )
     observation.validate()
     return observation
@@ -671,6 +796,7 @@ def adapt_rocm_decode_csv(
     context: ROCmDecodeAdapterContext,
     *,
     timing_sidecars: Iterable[Path] = (),
+    diagnostic_geometry: bool = False,
 ) -> ObservationCorpus:
     """Read strong decode shards and return one validated common corpus."""
 
@@ -690,7 +816,8 @@ def adapt_rocm_decode_csv(
             for row_number, raw in enumerate(reader, start=2):
                 try:
                     samples = timing_index.pop(_timing_key(raw), None)
-                    observations.append(adapt_rocm_decode_row(raw, context, samples))
+                    observations.append(adapt_rocm_decode_row(raw, context, samples,
+                        diagnostic_geometry=diagnostic_geometry))
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ValueError(f"{path}:{row_number}: {exc}") from exc
     if not observations:

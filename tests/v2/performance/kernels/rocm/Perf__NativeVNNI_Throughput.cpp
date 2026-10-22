@@ -30,6 +30,11 @@
  *   2. Native-VNNI kernel dispatch (or INT8 scatter GEMV for reference)
  *   3. Scale application (FP32 output)
  *
+ * A separate fixed-arithmetic native-Q8 geometry diagnostic reuses the public
+ * multiply/capture lifecycle and common evidence adapter. Its explicit v1
+ * generation retains all five real TN/CPT variants and raw samples, while the
+ * untouched production M1 launch owns the full-byte oracle. It installs no policy.
+ *
  * @note Requires ROCm device. Tests skip if no GPU is available.
  * @note Run with build_v2_release for representative timing.
  */
@@ -50,6 +55,7 @@
 #include <functional>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -67,6 +73,7 @@
 #include <omp.h>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
@@ -82,6 +89,7 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include "kernels/rocm/gemm/ROCmNativeVNNISerialGeometry.h"
 #include <rocprofiler-sdk-roctx/roctx.h>
 #include "GpuVerification.h"
 extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
@@ -897,6 +905,32 @@ namespace
             graph_ = nullptr;
             outputs_.clear();
             device_.reset();
+        }
+
+        /** @return Actual flat kernel parameters from this retained native graph. */
+        std::vector<hipKernelNodeParams> kernelNodes() const
+        {
+            size_t count = 0;
+            if (!graph_ || hipGraphGetNodes(graph_, nullptr, &count) != hipSuccess)
+                throw std::runtime_error("cannot inspect captured decode nodes");
+            std::vector<hipGraphNode_t> nodes(count);
+            if (hipGraphGetNodes(graph_, nodes.data(), &count) != hipSuccess)
+                throw std::runtime_error("cannot read captured decode nodes");
+            std::vector<hipKernelNodeParams> kernels;
+            for (const auto node : nodes)
+            {
+                hipGraphNodeType type;
+                if (hipGraphNodeGetType(node, &type) != hipSuccess)
+                    throw std::runtime_error("cannot classify captured decode node");
+                if (type == hipGraphNodeTypeGraph)
+                    throw std::runtime_error("diagnostic projection unexpectedly owns a child graph");
+                if (type != hipGraphNodeTypeKernel) continue;
+                hipKernelNodeParams params{};
+                if (hipGraphKernelNodeGetParams(node, &params) != hipSuccess)
+                    throw std::runtime_error("cannot inspect captured decode kernel");
+                kernels.push_back(params);
+            }
+            return kernels;
         }
 
         CapturedDecodeLaunch(const CapturedDecodeLaunch &) = delete;
@@ -2346,6 +2380,343 @@ namespace
         return result;
     }
 #endif
+
+#ifdef HAVE_ROCM
+    /** @brief Fail at a test boundary without changing the native launch policy. */
+    static void requireGeometryTrial(bool condition, const char *reason)
+    {
+        if (!condition) throw std::runtime_error(reason);
+    }
+
+    /** @return CSV field escaping shared aggregate/sidecar identities and JSON. */
+    static std::string geometryCsvField(const std::string &value)
+    {
+        std::string result = "\"";
+        for (const char c : value) { if (c == '"') result += '"'; result += c; }
+        return result + '"';
+    }
+
+    /** @brief Serialize actual loaded-function resources, never requested heuristics. */
+    static void writeGeometryResources(std::ostream &out, const NativeQ8SerialKernelResources &r)
+    {
+        out << "{\"function\":" << reinterpret_cast<std::uintptr_t>(r.function)
+            << ",\"specialization\":" << std::quoted(r.specialization ? r.specialization : "")
+            << ",\"block_threads\":" << r.block_threads
+            << ",\"registers_per_thread\":" << r.registers_per_thread
+            << ",\"local_memory_bytes_per_thread\":" << r.local_memory_bytes_per_thread
+            << ",\"static_shared_memory_bytes\":" << r.static_shared_memory_bytes
+            << ",\"max_threads_per_block\":" << r.max_threads_per_block
+            << ",\"max_active_blocks_per_sm\":" << r.max_active_blocks_per_sm << '}';
+    }
+
+    /** @brief Validate capture topology against the actual native construction receipt. */
+    static void validateGeometryCapture(const NativeQ8SerialLaunch &r,
+        const NativeQ8SerialGeometryAdmission &admission,
+        const std::vector<hipKernelNodeParams> &nodes)
+    {
+        const auto spec = nativeQ8SerialGeometrySpec(r.geometry);
+        requireGeometryTrial(r.geometry == admission.geometry() && r.device_ordinal == admission.deviceOrdinal(),
+            "geometry receipt lost its resource owner");
+        const auto validate = [&](const NativeQ8SerialKernelLaunch &launch,
+                                  const NativeQ8SerialKernelResources &resources, bool reducer)
+        {
+            requireGeometryTrial(launch.function && launch.function == resources.function &&
+                launch.specialization && resources.specialization &&
+                std::string(launch.specialization) == resources.specialization,
+                "geometry capture used a different compiled symbol");
+            const int grid_n = 1 + (r.physical_n - 1) / spec.tile_columns;
+            requireGeometryTrial(launch.grid_x == grid_n && launch.grid_y == (reducer ? 1 : r.k_partitions) &&
+                launch.grid_z == 1 && launch.block_x == spec.block_threads && launch.block_y == 1 && launch.block_z == 1,
+                "geometry receipt has an unexpected grid/block");
+            size_t matches = 0;
+            for (const auto &node : nodes)
+                if (reinterpret_cast<const void *>(node.func) == launch.function)
+                {
+                    ++matches;
+                    requireGeometryTrial(node.gridDim.x == static_cast<unsigned>(launch.grid_x) &&
+                        node.gridDim.y == static_cast<unsigned>(launch.grid_y) && node.gridDim.z == 1 &&
+                        node.blockDim.x == static_cast<unsigned>(launch.block_x) &&
+                        node.blockDim.y == 1 && node.blockDim.z == 1 && node.sharedMemBytes == 0,
+                        "actual captured grid/block differs from native receipt");
+                }
+            requireGeometryTrial(matches == 1, "captured native function is missing or duplicated");
+        };
+        validate(r.producer, admission.producerResources(), false);
+        if (r.k_partitions > 1) validate(r.reducer, admission.reducerResources(), true);
+        else requireGeometryTrial(!r.reducer.function, "direct M1 unexpectedly enqueued a reducer");
+    }
+
+    /** @return Complete immutable receipt plus independently inspected graph kernel parameters. */
+    static std::string geometryLaunchJson(const NativeQ8SerialLaunch &r,
+        const NativeQ8SerialGeometryAdmission &admission,
+        const std::vector<hipKernelNodeParams> &nodes)
+    {
+        const auto spec = nativeQ8SerialGeometrySpec(r.geometry);
+        std::ostringstream out;
+        out << "{\"tile_n\":" << spec.tile_columns << ",\"columns_per_thread\":" << spec.columns_per_thread
+            << ",\"physical_n\":" << r.physical_n << ",\"arithmetic_policy_n\":" << r.arithmetic_policy_n
+            << ",\"k\":" << r.k << ",\"device_ordinal\":" << r.device_ordinal
+            << ",\"execution_codebook\":" << static_cast<unsigned>(r.execution_codebook)
+            << ",\"arithmetic_policy_codebook\":" << static_cast<unsigned>(r.arithmetic_policy_codebook)
+            << ",\"k_partitions\":" << r.k_partitions << ",\"blocks_per_partition\":" << r.blocks_per_partition
+            << ",\"nonempty_partitions\":" << r.nonempty_partitions << ",\"partial_elements\":" << r.partial_elements
+            << ",\"stream\":" << reinterpret_cast<std::uintptr_t>(r.stream);
+        const auto kernel = [&](const char *role, const NativeQ8SerialKernelLaunch &launch)
+        {
+            out << ",\"" << role << "\":";
+            if (!launch.function) { out << "null"; return; }
+            out << "{\"function\":" << reinterpret_cast<std::uintptr_t>(launch.function)
+                << ",\"specialization\":" << std::quoted(launch.specialization)
+                << ",\"grid\":[" << launch.grid_x << ',' << launch.grid_y << ',' << launch.grid_z
+                << "],\"block\":[" << launch.block_x << ',' << launch.block_y << ',' << launch.block_z << "]}";
+        };
+        kernel("producer", r.producer); kernel("reducer", r.reducer);
+        out << ",\"resources\":{\"producer\":";
+        writeGeometryResources(out, admission.producerResources());
+        out << ",\"reducer\":"; writeGeometryResources(out, admission.reducerResources());
+        out << "},\"captured_kernels\":[";
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            if (i) out << ',';
+            const auto &p = nodes[i];
+            out << "{\"function\":" << reinterpret_cast<std::uintptr_t>(p.func)
+                << ",\"grid\":[" << p.gridDim.x << ',' << p.gridDim.y << ',' << p.gridDim.z
+                << "],\"block\":[" << p.blockDim.x << ',' << p.blockDim.y << ',' << p.blockDim.z << "]}";
+        }
+        out << "]}";
+        return out.str();
+    }
+
+    /** @brief Own the original production kernel/stream binding through all local graphs. */
+    struct GeometryTrainerBinding
+    {
+        ROCmQuantisedGemmKernel &kernel;
+        hipStream_t stream;
+        ~GeometryTrainerBinding()
+        {
+            // Diagnostic retirement joins before tensor/workspace owners die,
+            // including exceptions after capture or a submitted replay.
+            if (stream && hipStreamSynchronize(stream) != hipSuccess)
+                ADD_FAILURE() << "native-Q8 diagnostic retirement boundary failed";
+            kernel.unbindWorkspace();
+            kernel.clearGPUStreamBinding();
+            if (stream) (void)hipStreamDestroy(stream);
+        }
+    };
+
+    /** @brief One complete diagnostic row; no policy installation or fitting authority. */
+    struct NativeQ8GeometryTrial
+    {
+        NativeQ8SerialLaunch launch;
+        std::string receipt_json;
+        std::vector<float> output;
+        std::vector<double> samples;
+        llaminar2::test::trainer::TimingEvidence timing;
+        llaminar2::test::trainer::FP32Evidence comparison;
+        int target_waves = 0;
+    };
+
+    /**
+     * @brief Capture the real public M1 projection, prove its bytes, then time replay.
+     * @param baseline Null only for the untouched, unscoped production control.
+     * @param admission Resource proof obtained before any graph/timing work.
+     * @return Actual physical launch, complete output certificate and every event sample.
+     */
+    static NativeQ8GeometryTrial runNativeQ8GeometryTrial(ROCmQuantisedGemmKernel &kernel,
+        TensorBase *input, TensorBase *output, hipStream_t stream, int device,
+        int n, int k, const NativeQ8SerialGeometryAdmission &admission,
+        const NativeQ8GeometryTrial *baseline, int warmups, int samples)
+    {
+        requireGeometryTrial(!currentNativeQ8SerialGeometry(), "diagnostic trial must start outside a geometry scope");
+        std::unique_ptr<ScopedNativeQ8SerialGeometry> scope;
+        if (baseline) scope = std::make_unique<ScopedNativeQ8SerialGeometry>(admission);
+        else requireGeometryTrial(!currentNativeQ8SerialGeometry(), "production oracle must be unscoped");
+        const auto call = [&] { return kernel.multiply_tensor(input, output, 1, n, k); };
+        requireGeometryTrial(call() && hipStreamSynchronize(stream) == hipSuccess, "geometry primer failed");
+        TransferEngine::requireDeviceInput(input, DeviceId::rocm(device), stream);
+        PerfStatsCollector::reset();
+        clearNativeQ8SerialLaunch();
+        CapturedDecodeLaunch graph;
+        requireGeometryTrial(graph.capture(stream, DeviceId::rocm(device), {input}, {output}, call),
+            "geometry public M1 capture failed");
+        const auto receipt = lastNativeQ8SerialLaunch();
+        requireGeometryTrial(receipt.has_value(), "geometry capture emitted no native receipt");
+        NativeQ8GeometryTrial result;
+        result.launch = *receipt;
+        requireGeometryTrial(result.launch.k_partitions ==
+            MoEProjectionNumericalContract::orderedKPartitionsForWidth(k),
+            "geometry changed the canonical production K-partition tree");
+        // Captured functions remain bound after the construction override dies.
+        scope.reset();
+        requireGeometryTrial(!currentNativeQ8SerialGeometry(), "geometry scope leaked into replay");
+        const auto nodes = graph.kernelNodes();
+        validateGeometryCapture(result.launch, admission, nodes);
+        requireGeometryTrial(result.launch.physical_n == n && result.launch.arithmetic_policy_n == n &&
+            result.launch.k == k && result.launch.execution_codebook == 19 && result.launch.arithmetic_policy_codebook == 19 &&
+            result.launch.stream == stream, "geometry capture changed source/arithmetic identity");
+        if (baseline)
+        {
+            const auto &a = result.launch; const auto &b = baseline->launch;
+            requireGeometryTrial(a.physical_n == b.physical_n && a.arithmetic_policy_n == b.arithmetic_policy_n &&
+                a.k == b.k && a.k_partitions == b.k_partitions && a.blocks_per_partition == b.blocks_per_partition &&
+                a.nonempty_partitions == b.nonempty_partitions && a.partial_elements == b.partial_elements &&
+                a.device_ordinal == b.device_ordinal && a.stream == b.stream,
+                "geometry changed the original partition/publication contract");
+        }
+        int kb = 0; std::string path; uint64_t count = 0;
+        requireGeometryTrial(findObservedDecodeRoute(1, n, k, 19, kb, result.target_waves, path, &count) &&
+            count > 0 && kb == result.launch.k_partitions,
+            "geometry public route counter disagrees with actual launch");
+        result.receipt_json = geometryLaunchJson(result.launch, admission, nodes);
+        requireGeometryTrial(graph.launch(stream) && copyTrainerOutputToHost(output, n, stream, result.output),
+            "geometry initial replay failed");
+        // Poison the entire physical output between retained replays. A stale
+        // prefix or missing tail write must fail the independent full-byte oracle.
+        for (int repeat = 0; repeat < 2; ++repeat)
+        {
+            requireGeometryTrial(hipMemsetAsync(output->gpu_data_ptr(), 0xa5, static_cast<size_t>(n) * sizeof(float), stream) == hipSuccess &&
+                graph.launch(stream), "geometry poisoned replay failed");
+            std::vector<float> replay;
+            requireGeometryTrial(copyTrainerOutputToHost(output, n, stream, replay), "geometry replay download failed");
+            requireGeometryTrial(llaminar2::test::trainer::nativeByteMismatchCount(replay, result.output) == 0,
+                "geometry retained replay is not byte stable");
+        }
+        const auto &oracle = baseline ? baseline->output : result.output;
+        result.comparison = llaminar2::test::trainer::compareFP32(result.output, oracle, n);
+        requireGeometryTrial(result.comparison.mismatch_count == 0 && result.comparison.nonfinite_count == 0,
+            "geometry differs from untouched production M1 bytes");
+        if (samples == 0) return result; // Functional scoped-control proof, no timing alias.
+        for (int i = 0; i < warmups; ++i)
+            requireGeometryTrial(graph.launch(stream), "geometry warmup failed");
+        requireGeometryTrial(hipStreamSynchronize(stream) == hipSuccess, "geometry warmup boundary failed");
+        hipEvent_t start = nullptr, stop = nullptr;
+        requireGeometryTrial(hipEventCreate(&start) == hipSuccess, "geometry start event failed");
+        struct Events { hipEvent_t a, b; ~Events() { if (a) (void)hipEventDestroy(a); if (b) (void)hipEventDestroy(b); } } events{start, nullptr};
+        requireGeometryTrial(hipEventCreate(&stop) == hipSuccess, "geometry stop event failed"); events.b = stop;
+        for (int sample = 0; sample < samples; ++sample)
+        {
+            requireGeometryTrial(hipEventRecord(start, stream) == hipSuccess && graph.launch(stream) &&
+                hipEventRecord(stop, stream) == hipSuccess && hipEventSynchronize(stop) == hipSuccess,
+                "geometry timed replay failed");
+            float ms = 0;
+            requireGeometryTrial(hipEventElapsedTime(&ms, start, stop) == hipSuccess, "geometry timing read failed");
+            result.samples.push_back(static_cast<double>(ms) * 1000.0);
+        }
+        std::sort(result.samples.begin(), result.samples.end());
+        result.timing = llaminar2::test::trainer::summarizeSortedTimingSamples(result.samples);
+        return result;
+    }
+#endif
+
+    /** @brief Bounded captured native-Q8 geometry tournament; diagnostic generation only. */
+    TEST_F(NativeVNNIPerfTest, NativeQ8SerialGeometryDiagnostic)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_device_) GTEST_SKIP() << "No ROCm device available";
+        const auto filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_DECODE_SHAPES");
+        ASSERT_FALSE(filters.empty()) << "select explicit shared-manifest shapes for the diagnostic tournament";
+        ASSERT_TRUE(getEnvString("LLAMINAR_ROCM_NVNNI_DECODE_VARIANTS").empty())
+            << "geometry has five physical candidates; KB/TW aliases are not geometry candidates";
+        ASSERT_TRUE(native_vnni_dispatch::profilerRequestId().empty());
+        ASSERT_TRUE(native_vnni_dispatch::profilerEnvironment(native_vnni_dispatch::kProfilerBatchPathEnvironment).empty());
+        const auto requested_m = trim(getEnvString("LLAMINAR_ROCM_NVNNI_DECODE_M"));
+        const auto requested_mode = toLower(trim(getEnvString("LLAMINAR_ROCM_NVNNI_DECODE_EXECUTION_MODES")));
+        ASSERT_TRUE(requested_m.empty() || requested_m == "1");
+        ASSERT_TRUE(requested_mode.empty() || requested_mode == "graph_captured");
+        const auto formats = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS");
+        ASSERT_TRUE(formats.empty() || formats == std::set<std::string>{"q8_0"});
+        const std::string csv_path = getEnvString("LLAMINAR_ROCM_NVNNI_DECODE_CSV");
+        const std::string timing_path = getEnvString("LLAMINAR_ROCM_NVNNI_DECODE_TIMING_CSV");
+        ASSERT_FALSE(csv_path.empty()); ASSERT_FALSE(timing_path.empty()); ASSERT_NE(csv_path, timing_path);
+        const int warmups = getEnvInt("LLAMINAR_ROCM_NVNNI_DECODE_WARMUPS").value_or(5);
+        const int samples = getEnvInt("LLAMINAR_ROCM_NVNNI_DECODE_SAMPLES").value_or(31);
+        ASSERT_GE(warmups, 0); ASSERT_GT(samples, 0);
+        std::vector<const GEMVShape *> shapes;
+        for (const auto &shape : SHAPES) if (shouldRunName(filters, shape.name)) shapes.push_back(&shape);
+        ASSERT_EQ(shapes.size(), filters.size()) << "shape filter must name exact original shared-manifest entries";
+        ASSERT_GE(getEnvInt("LLAMINAR_ROCM_NVNNI_DECODE_MAX_CASES").value_or(static_cast<int>(shapes.size())),
+                  static_cast<int>(shapes.size())) << "diagnostic must not silently truncate selected shapes";
+        ScopedTrainerEnvironment stats("LLAMINAR_PERF_STATS_JSON", "1");
+        std::unique_ptr<std::FILE, decltype(&std::fclose)> csv(std::fopen(csv_path.c_str(), "w"), &std::fclose);
+        std::unique_ptr<std::FILE, decltype(&std::fclose)> timing(std::fopen(timing_path.c_str(), "w"), &std::fclose);
+        ASSERT_TRUE(csv); ASSERT_TRUE(timing);
+        std::fputs("backend,phase,source_format,source_codebook,execution_codebook,shape,execution_mode,m,n,k,candidate_id,kb,target_waves,weight_bytes,warmup_count,sample_count,min_us,median_us,p95_us,mad_us,cv,effective_bandwidth_gbs,bit_mismatches,first_bit_mismatch,repeat_byte_mismatches,max_abs,relative_l2,cosine,symmetric_kld,grouped_output_digest,serial_output_digest,timing_sample_digest,route_counter_ok,observed_candidate_id,observed_path,serial_m1_kb,serial_m1_target_waves,serial_route_counter_ok,numerical_correctness,correctness_pass,is_winner,evidence_generation,physical_launch_evidence\n", csv.get());
+        std::fputs("backend,phase,source_format,source_codebook,execution_codebook,shape,execution_mode,m,n,k,candidate_id,kb,target_waves,sample_index,timed_replays,latency_us,latency_us_hex,evidence_generation\n", timing.get());
+        constexpr const char *generation = "rocm-native-q8-fixed-arithmetic-geometry-v1";
+        for (const auto *shape : shapes)
+        {
+            SCOPED_TRACE(shape->name);
+            auto source = TestTensorFactory::createQ8_0Random({static_cast<size_t>(shape->N), static_cast<size_t>(shape->K)});
+            ROCmPackedWeights packed;
+            ASSERT_TRUE(packWeightsToROCm(source.get(), packed));
+            ASSERT_TRUE(ensureNativeVNNIPayloadForDecodeTrainer(source.get(), packed, shape->N, shape->K, "Q8_0"));
+            ASSERT_TRUE(packed.native_source_identity.present);
+            ASSERT_EQ(packed.native_source_identity.codebook_id, 19);
+            ASSERT_EQ(packed.native_vnni_codebook_id, 19);
+            ASSERT_FALSE(packed.native_vnni_payload.empty());
+            ROCmQuantisedGemmKernel kernel(&packed, 0);
+            std::unique_ptr<DeviceWorkspaceManager> workspace;
+            auto input = TestTensorFactory::createFP32Random({1, static_cast<size_t>(shape->K)});
+            auto output = TestTensorFactory::createFP32({1, static_cast<size_t>(shape->N)});
+            hipStream_t stream = nullptr;
+            ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+            GeometryTrainerBinding binding{kernel, stream};
+            kernel.setGPUStream(stream);
+            const auto reqs = kernel.getWorkspaceRequirements(1, shape->N, shape->K);
+            workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), reqs.total_bytes_with_alignment());
+            ASSERT_TRUE(workspace->allocate(reqs)); kernel.bindWorkspace(workspace.get());
+            ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream));
+            ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+            // Query all five exact pairs before timing any contender. Admission
+            // fails on incomplete/private-memory allocation rather than skipping.
+            std::vector<NativeQ8SerialGeometryAdmission> admissions;
+            for (const auto geometry : kNativeQ8SerialGeometries)
+                admissions.push_back(admitNativeQ8SerialGeometry(geometry, 0));
+            const auto control_it = std::find_if(admissions.begin(), admissions.end(), [](const auto &a)
+                { return a.geometry() == NativeQ8SerialGeometry::TN128CPT1; });
+            ASSERT_NE(control_it, admissions.end());
+            auto baseline = runNativeQ8GeometryTrial(kernel, input.get(), output.get(), stream, 0,
+                shape->N, shape->K, *control_it, nullptr, warmups, samples);
+            const auto scoped_control = runNativeQ8GeometryTrial(kernel, input.get(), output.get(), stream, 0,
+                shape->N, shape->K, *control_it, &baseline, 0, 0);
+            ASSERT_EQ(scoped_control.launch.producer.function, baseline.launch.producer.function);
+            ASSERT_EQ(scoped_control.launch.reducer.function, baseline.launch.reducer.function);
+            std::vector<NativeQ8GeometryTrial> rows;
+            rows.push_back(baseline);
+            for (const auto &admission : admissions)
+                if (admission.geometry() != NativeQ8SerialGeometry::TN128CPT1)
+                    rows.push_back(runNativeQ8GeometryTrial(kernel, input.get(), output.get(), stream, 0,
+                        shape->N, shape->K, admission, &baseline, warmups, samples));
+            ASSERT_EQ(rows.size(), 5u);
+            for (const auto &r : rows)
+            {
+                const auto spec = nativeQ8SerialGeometrySpec(r.launch.geometry);
+                const std::string id = "rocm.nvnni.decode.native_q8_geometry.tn" + std::to_string(spec.tile_columns) +
+                    ".cpt" + std::to_string(spec.columns_per_thread);
+                const auto &t = r.timing; const auto &c = r.comparison;
+                const auto evidence = geometryCsvField(std::string("{\"generation\":\"") + generation +
+                    "\",\"prepared_family\":\"NativeVNNI_K32_CB19\",\"baseline\":" + baseline.receipt_json +
+                    ",\"launch\":" + r.receipt_json + '}');
+                const double bytes = nativePackedWeightBytes(packed);
+                const double gbps = bytes / (t.median * 1.0e-6) / 1.0e9;
+                std::fprintf(csv.get(), "rocm,decode,Q8_0,19,19,%s,graph_captured,1,%d,%d,%s,%d,%d,%.0f,%d,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,0,%.9g,%.9g,%.9g,%.9g,%s,%s,%s,1,%s,%s,%d,%d,1,1,1,0,%s,%s\n",
+                    shape->name.c_str(), shape->N, shape->K, id.c_str(), r.launch.k_partitions, r.target_waves,
+                    bytes, warmups, samples, t.min, t.median, t.p95, t.mad, t.cv, gbps,
+                    c.mismatch_count, c.first_mismatch_index, c.max_abs, c.relative_l2, c.cosine, c.symmetric_kld,
+                    c.actual_digest.c_str(), baseline.comparison.actual_digest.c_str(), t.digest.c_str(), id.c_str(),
+                    r.launch.k_partitions > 1 ? "split_reduce" : "direct", baseline.launch.k_partitions,
+                    baseline.target_waves, generation, evidence.c_str());
+                for (size_t index = 0; index < r.samples.size(); ++index)
+                    std::fprintf(timing.get(), "rocm,decode,Q8_0,19,19,%s,graph_captured,1,%d,%d,%s,%d,%d,%zu,1,%.9f,%a,%s\n",
+                        shape->name.c_str(), shape->N, shape->K, id.c_str(), r.launch.k_partitions, r.target_waves,
+                        index, r.samples[index], r.samples[index], generation);
+            }
+            ASSERT_EQ(std::fflush(csv.get()), 0); ASSERT_EQ(std::fflush(timing.get()), 0);
+        }
+#endif
+    }
 
     // =============================================================================
     // Test: Single-shape sweep across all 18 formats (quick CI check)

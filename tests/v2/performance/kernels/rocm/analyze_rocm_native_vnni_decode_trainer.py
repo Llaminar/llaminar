@@ -41,6 +41,7 @@ from native_vnni_dispatch.candidate_registry import (  # noqa: E402
     candidate_registry_digest,
     rocm_native_vnni_decode_formula_registry,
     rocm_native_vnni_decode_registry,
+    rocm_native_q8_serial_geometry_diagnostic_registry,
 )
 from native_vnni_dispatch.certification import CertificationReport  # noqa: E402
 from native_vnni_dispatch.compiler import (  # noqa: E402
@@ -1166,6 +1167,8 @@ def main() -> int:
     parser.add_argument("--freeze-generic", action="store_true")
     parser.add_argument("--certify-generic", action="store_true")
     parser.add_argument("--adapt-only", action="store_true")
+    parser.add_argument("--diagnostic-geometry", action="store_true",
+        help="Adapt only new native-Q8 geometry generation to common observations; never emit policy")
     parser.add_argument("--frozen-policy-json", type=Path)
     parser.add_argument("--policy-json", type=Path)
     parser.add_argument("--development-profiler-requests", type=Path)
@@ -1340,6 +1343,52 @@ def main() -> int:
             "production ROCm policy emission requires development freeze and "
             "separate sealed certification"
         )
+
+    if args.diagnostic_geometry:
+        if (args.adapt_only or args.freeze_generic or args.certify_generic
+                or certified_replay or separate_certification
+                or MeasurementProfile(args.profile).installable
+                or args.base_include or args.certified_policy_include or args.certified_policy_json
+                or args.policy_json or args.frozen_policy_json
+                or args.development_profiler_requests or args.development_profiler_evidence):
+            parser.error("diagnostic geometry cannot emit/install/fit/certify a policy")
+        timing = tuple(args.timing_sidecar)
+        if not timing:
+            parser.error("diagnostic geometry requires every raw timing sample")
+        context = _context_from_args(args, inputs, timing)
+        corpus = adapt_rocm_decode_csv(inputs, context, timing_sidecars=timing,
+                                      diagnostic_geometry=True)
+        expected = {entry.candidate_id for entry in
+                    rocm_native_q8_serial_geometry_diagnostic_registry().entries}
+        manifest = load_shape_manifest(args.shape_manifest)
+        declared = {(shape.name, shape.n, shape.k) for shape in manifest.shapes}
+        groups = {}
+        for row in corpus:
+            if (row.shape_name, row.aggregate_n, row.k) not in declared:
+                raise ValueError("geometry diagnostic names an undeclared physical shape")
+            key = (row.shape_name, row.aggregate_n, row.k, row.source_format)
+            candidates = groups.setdefault(key, set())
+            if row.candidate_id in candidates:
+                raise ValueError("duplicate physical geometry candidate in diagnostic contest")
+            candidates.add(row.candidate_id)
+        if any(candidates != expected for candidates in groups.values()):
+            raise ValueError("diagnostic contest must retain all five physical geometries")
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        write_observation_csv(args.output, corpus)
+        if args.common_observations and args.common_observations != args.output:
+            args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+            write_observation_csv(args.common_observations, corpus)
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            with args.summary.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(("shape", "n", "k", "candidate_id", "median_us",
+                                 "sample_count", "byte_equal", "installable"))
+                for row in corpus:
+                    writer.writerow((row.shape_name, row.aggregate_n, row.k,
+                        row.candidate_id, row.median_us, row.sample_count, row.bitwise_equal, False))
+        print(f"adapted {len(corpus)} diagnostic geometry observations; no policy emitted")
+        return 0
 
     manifest = load_shape_manifest(args.shape_manifest)
     measurement_plan = load_gpu_measurement_plan(

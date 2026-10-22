@@ -5143,6 +5143,25 @@ set_tests_properties(V2_Unit_ROCmNativeVNNIDecodeAdapter PROPERTIES
     TIMEOUT 30
 )
 
+# The new fixed-arithmetic geometry generation uses the common device-free
+# adapter. These explicit preflight cases reject old KB aliases, forged native
+# capture/resource receipts, compacted empty planes and installable promotion.
+add_test(NAME V2_Integration_ROCmNativeQ8GeometryEvidence
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_vnni_decode_adapter.py
+            ROCmNativeVNNIDecodeAdapterTest.test_fixed_arithmetic_geometry_uses_five_distinct_common_candidates
+            ROCmNativeVNNIDecodeAdapterTest.test_geometry_requires_explicit_generation_raw_samples_and_diagnostic_mode
+            ROCmNativeVNNIDecodeAdapterTest.test_geometry_rejects_requested_only_or_changed_physical_evidence
+            ROCmNativeVNNIDecodeAdapterTest.test_geometry_rejects_installable_context_and_timing_generation_aliases
+            ROCmNativeVNNIDecodeAdapterTest.test_geometry_rejects_coordinated_baseline_and_candidate_tree_mutation
+            ROCmNativeVNNIDecodeAdapterTest.test_geometry_common_observation_roundtrip_preserves_actual_launch_receipts
+)
+set_tests_properties(V2_Integration_ROCmNativeQ8GeometryEvidence PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;ROCm;Decode;Evidence;DeviceFree;Regression"
+    TIMEOUT 30
+)
+
+
 add_test(NAME V2_Unit_ROCmNativeVNNIDecodeTrainer
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_vnni_decode_trainer.py
@@ -18415,6 +18434,12 @@ if(HAVE_ROCM)
         performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp
         performance/kernels/rocm/GpuVerification.hip
     )
+    # The host C++ compiler and OpenMP::OpenMP_CXX own this executable's
+    # OpenMP ABI. GpuVerification.hip remains HIP-compiled (with the same
+    # embedded device kernels and spill guard), but must not select the HIP
+    # driver for the final host link: its implicit SDK RPATH/libomp would
+    # override the selected runtime and the caller's repaired HIP binding.
+    set_target_properties(v2_perf_native_vnni_throughput PROPERTIES LINKER_LANGUAGE CXX)
     target_link_libraries(v2_perf_native_vnni_throughput
         llaminar2_core
         GTest::gtest
@@ -18428,13 +18453,27 @@ if(HAVE_ROCM)
     target_compile_definitions(v2_perf_native_vnni_throughput PRIVATE
         LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
         LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
-    target_compile_options(v2_perf_native_vnni_throughput PRIVATE -fopenmp)
-    target_link_options(v2_perf_native_vnni_throughput PRIVATE -fopenmp)
     add_v2_test(V2_Perf_NativeVNNI_Throughput
         COMMAND $<TARGET_FILE:v2_perf_native_vnni_throughput>
+                --gtest_filter=-NativeVNNIPerfTest.NativeQ8SerialGeometryDiagnostic
         LABELS "V2;Performance;ROCm;GEMV;Decode;NativeVNNI;Codebook;Quantized;gfx906;Benchmark;Bandwidth;Trainer"
         MPI_PROCS 1
     )
+    # Trace the actual mixed C++/HIP trainer with the same native-loader and
+    # same-filename shadow controls as the application. This runs no benchmark,
+    # model, accelerator initialization or compiler in the installed runner.
+    add_test(NAME V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_openmp_runtime_binding.py
+                --binary $<TARGET_FILE:v2_perf_native_vnni_throughput>
+                --expected-soname ${LLAMINAR_OPENMP_RUNTIME_SONAME}
+                --wrong-runtime-fixture $<TARGET_FILE:v2_integration_openmp_shadow_runtime>)
+    set_tests_properties(V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;Trainer;BuildSystem;DeviceFree;Regression"
+        TIMEOUT 60)
+    set_property(GLOBAL PROPERTY
+        V2_TEST_BUILD_TARGETS_V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding
+        "v2_perf_native_vnni_throughput;v2_integration_openmp_shadow_runtime")
     message(STATUS "V2 Tests: Added Native-VNNI decode throughput/trainer benchmark (all GPU codebooks, multi-GPU)")
 
     # Performance Test: Native-VNNI GEMM (Q4_0 + IQ4_NL, M>1 prefill)
@@ -25235,6 +25274,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixArchiveIdempotentPublication
     V2_Integration_NativeVocabularyPrefixAdmission
     V2_Integration_ROCmDensePrefillOverlayAdmission
+    V2_Integration_ROCmNativeQ8GeometryEvidence
     V2_Integration_MTPDefaultSamplingPolicy
     ${V2_FP32_SUBNORMAL_PREFLIGHT_TESTS}
     V2_Integration_MTPDefaultSamplingLifecycle
@@ -25401,6 +25441,11 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoEOverlayTicketRoutingWork
     V2_Integration_PrefixRestoreGDNMovementEpochContract
 )
+if(TEST V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding)
+endif()
+
 if(HAVE_CUDA OR HAVE_ROCM)
     # The mapped transfer epoch fixture is intentionally device-backed and is
     # not registered by a CPU-only configuration.
@@ -30741,6 +30786,24 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_captured_transfer_channel_binding)
     if(TEST V2_Integration_CapturedBatch16KiBSubmissionObservation)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedBatch16KiBSubmissionObservation)
     endif()
+endif()
+
+# Insert before the final V2_PRODUCTION_TEST_PREFLIGHT_TESTS labeling pass and
+# before V2_CONFIGURED_TESTS / gate target inventory is finalized. This is an
+# Integration-only correctness/resource regression; Release owns the separate
+# diagnostic timing tournament being prepared by the trainer agent.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_integration_rocm_native_vnni_gemv)
+    target_sources(v2_integration_rocm_native_vnni_gemv PRIVATE
+        integration/kernels/rocm/Test__NativeQ8SerialGeometry.cpp)
+    target_include_directories(v2_integration_rocm_native_vnni_gemv PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    add_v2_test(V2_Integration_ROCmNativeQ8SerialGeometry
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
+            --gtest_filter=NativeQ8SerialGeometry.CapturedTailsAndEmptyPartitionsAreByteExact
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;Q8_0;SerialM1;GraphCapture;CompilerResources;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmNativeQ8SerialGeometry)
 endif()
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)

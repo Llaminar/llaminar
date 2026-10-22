@@ -283,6 +283,9 @@ class NativeVNNIObservation:
     # smaller live prefix. This is an evidence surface, never a host-visible
     # runtime dispatch feature. None preserves legacy fully-active evidence.
     active_rows: int | None = None
+    # Optional source-bound loaded-function/capture evidence. Omitted for older
+    # observations, preserving their canonical digests and runtime identities.
+    physical_launch_evidence: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
         """Reject malformed, ambiguous, or runtime-inexpressible observations."""
@@ -373,6 +376,8 @@ class NativeVNNIObservation:
             raise ValueError("first_mismatch_index is required for a byte mismatch")
         if self.warmup_count < 0 or self.sample_count <= 0:
             raise ValueError("timing counts are invalid")
+        if not isinstance(self.physical_launch_evidence, dict):
+            raise ValueError("physical_launch_evidence must be a JSON object")
         if not isinstance(self.adaptive_timing_evidence, dict):
             raise ValueError("adaptive_timing_evidence must be a JSON object")
         if any(not str(name).strip() for name in self.adaptive_timing_evidence):
@@ -407,6 +412,8 @@ class NativeVNNIObservation:
             result.pop("adaptive_timing_evidence")
         if self.active_rows is None:
             result.pop("active_rows")
+        if not self.physical_launch_evidence:
+            result.pop("physical_launch_evidence")
         return result
 
     def digest(self) -> str:
@@ -460,6 +467,7 @@ class NativeVNNIObservation:
             "launch_n_block_chunks",
             "adaptive_timing_evidence",
             "active_rows",
+            "physical_launch_evidence",
         }
         missing = [
             name
@@ -589,6 +597,8 @@ class NativeVNNIObservation:
                 raw.get("launch_n_block_chunks") or 0
             ),
             adaptive_timing_evidence=adaptive_timing_evidence,
+            physical_launch_evidence=({} if raw.get("physical_launch_evidence") in (None, "")
+                else _parse_json("physical_launch_evidence", raw["physical_launch_evidence"], dict)),
             active_rows=(None if raw.get("active_rows") in (None, "")
                          else int(raw["active_rows"])),
         )

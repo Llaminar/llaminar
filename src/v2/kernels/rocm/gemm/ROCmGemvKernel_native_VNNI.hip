@@ -35,6 +35,12 @@
  * before capture. Neither inactive capacity nor an optional bias may extend
  * decoder live ranges into register spills.
  *
+ * Native-Q8 serial diagnostic geometry scopes alter only independent column
+ * ownership, require exact pre-capture symbol resources and preserve every
+ * source-policy K partition. Ordinary inference retains the existing
+ * TN128/CPT1 launch. Thread-local receipts observe construction topology;
+ * they never mirror live device state or count captured graph replays.
+ *
  * Split from ROCmGemvKernel.hip.
  *
  * @see ROCmGemvKernel_INT8_VNNI.hip for INT8 VNNI kernels
@@ -68,6 +74,10 @@
 #include "kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "ROCmNativeVNNISerialGeometry.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include <exception>
+#include <utility>
 #include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 
 #include <atomic>
@@ -88,6 +98,69 @@ static std::atomic<int> g_native_vnni_target_waves_override{-1};
  */
 static thread_local int g_native_vnni_decode_equivalent_m1_config = 0;
 static thread_local int g_native_vnni_serial_partition_n = 0;
+
+namespace
+{
+/** One lowering thread owns its diagnostic scope; no process-global geometry switch. */
+thread_local const llaminar2::rocm::ScopedNativeQ8SerialGeometry *g_native_q8_serial_scope = nullptr;
+/** Immutable topology observation, not device execution state or a replay counter. */
+thread_local std::optional<llaminar2::rocm::NativeQ8SerialLaunch> g_native_q8_serial_launch;
+}
+
+void llaminar2::rocm::validateNativeQ8SerialScopeBinding(int device_ordinal, void *stream)
+{
+    if (!g_native_q8_serial_scope) return;
+    if (device_ordinal != g_native_q8_serial_scope->admission().deviceOrdinal() ||
+        !stream || stream == static_cast<void *>(hipStreamLegacy) ||
+        stream == static_cast<void *>(hipStreamPerThread))
+    {
+        g_native_q8_serial_launch.reset();
+        throw std::logic_error("native-Q8 serial geometry requires its admitted device and exact nondefault stream");
+    }
+}
+
+void llaminar2::rocm::clearNativeQ8SerialLaunch() noexcept
+{
+    g_native_q8_serial_launch.reset();
+}
+
+std::optional<llaminar2::rocm::NativeQ8SerialLaunch>
+llaminar2::rocm::lastNativeQ8SerialLaunch() noexcept
+{
+    return g_native_q8_serial_launch;
+}
+
+std::optional<llaminar2::rocm::NativeQ8SerialGeometry>
+llaminar2::rocm::currentNativeQ8SerialGeometry() noexcept
+{
+    return g_native_q8_serial_scope
+        ? std::optional{g_native_q8_serial_scope->admission().geometry()} : std::nullopt;
+}
+
+llaminar2::rocm::ScopedNativeQ8SerialGeometry::ScopedNativeQ8SerialGeometry(
+    const NativeQ8SerialGeometryAdmission &admission)
+    : admission_(admission), previous_(g_native_q8_serial_scope)
+{
+    if (llaminar2::isGraphCaptureActive())
+        throw std::logic_error("native-Q8 serial geometry must be scoped before capture");
+    const auto &env = llaminar2::debugEnv().rocm;
+    if (g_native_vnni_kb_override.load(std::memory_order_relaxed) > 0 ||
+        g_native_vnni_target_waves_override.load(std::memory_order_relaxed) > 0 ||
+        env.nvnni_gemv_kb > 0 || env.nvnni_gemv_target_waves > 0 ||
+        env.nvnni_disable_generated)
+        throw std::logic_error("native-Q8 serial geometry requires unchanged generated arithmetic, without KB/TW overrides");
+    (void)nativeQ8SerialGeometrySpec(admission_.geometry());
+    g_native_q8_serial_scope = this;
+}
+
+llaminar2::rocm::ScopedNativeQ8SerialGeometry::~ScopedNativeQ8SerialGeometry() noexcept
+{
+    // A scope belongs to one construction thread and must retire in LIFO order.
+    if (g_native_q8_serial_scope != this)
+        std::terminate();
+    g_native_q8_serial_scope = previous_;
+}
+
 
 struct NativeVNNIDecodeGeneratedRuntimeConfig
 {
@@ -238,28 +311,30 @@ static void recordNativeVNNISmallMLaunch(
         return;
 
     const char* path = (kb <= 1) ? "direct" : "split_reduce";
+    llaminar2::PerfStatsCollector::Tags tags{
+        {"m", std::to_string(m)}, {"n", std::to_string(n)},
+        {"k", std::to_string(k)}, {"codebook", std::to_string(codebook)},
+        {"arithmetic_policy_codebook", std::to_string(arithmetic_policy_codebook >= 0
+            ? arithmetic_policy_codebook : static_cast<int>(codebook))},
+        {"grid_n", std::to_string(grid_n)}, {"kb", std::to_string(kb)},
+        {"path", path}, {"target_waves_per_cu", std::to_string(target_waves_per_cu)},
+        {"batched", batched ? "true" : "false"},
+        {"projections", std::to_string(projections)}};
+    if (m == 1 && codebook == 19 && !batched && g_native_q8_serial_launch)
+    {
+        const auto &launch = *g_native_q8_serial_launch;
+        const auto spec = llaminar2::rocm::nativeQ8SerialGeometrySpec(launch.geometry);
+        tags.emplace("serial_tile_n", std::to_string(spec.tile_columns));
+        tags.emplace("serial_cpt", std::to_string(spec.columns_per_thread));
+        tags.emplace("serial_block_threads", std::to_string(launch.producer.block_x));
+        tags.emplace("serial_arithmetic_policy_n", std::to_string(launch.arithmetic_policy_n));
+        tags.emplace("serial_blocks_per_partition", std::to_string(launch.blocks_per_partition));
+        tags.emplace("serial_nonempty_partitions", std::to_string(launch.nonempty_partitions));
+        tags.emplace("serial_producer", launch.producer.specialization);
+        tags.emplace("serial_reducer", launch.reducer.function ? launch.reducer.specialization : "absent");
+    }
     llaminar2::PerfStatsCollector::addCounter(
-        "kernel",
-        "rocm_native_vnni_small_m_launch",
-        1.0,
-        "gemm",
-        {},
-        llaminar2::PerfStatsCollector::Tags{
-            {"m", std::to_string(m)},
-            {"n", std::to_string(n)},
-            {"k", std::to_string(k)},
-            {"codebook", std::to_string(codebook)},
-            {"arithmetic_policy_codebook",
-             std::to_string(
-                 arithmetic_policy_codebook >= 0
-                     ? arithmetic_policy_codebook
-                     : static_cast<int>(codebook))},
-            {"grid_n", std::to_string(grid_n)},
-            {"kb", std::to_string(kb)},
-            {"path", path},
-            {"target_waves_per_cu", std::to_string(target_waves_per_cu)},
-            {"batched", batched ? "true" : "false"},
-            {"projections", std::to_string(projections)}});
+        "kernel", "rocm_native_vnni_small_m_launch", 1.0, "gemm", {}, std::move(tags));
 }
 
 extern "C" bool rocmQuantGemm_biasAdd(
@@ -4233,6 +4308,192 @@ __global__ void gemv_native_vnni_reduce_kernel_t(
     }
 }
 
+
+namespace
+{
+/** @brief Exact loaded producer/reducer pair for one existing template geometry. */
+struct NativeQ8SerialSymbols
+{
+    const void *producer;
+    const void *reducer;
+    const char *producer_name;
+    const char *reducer_name;
+};
+
+/**
+ * @brief Resolve the same symbols the launch builder will enqueue.
+ * @tparam TN Output columns per workgroup.
+ * @tparam CPT Independent output columns per lane.
+ * @return Loaded HIP symbols and stable readable specialization spellings.
+ */
+template <int TN, int CPT>
+NativeQ8SerialSymbols nativeQ8SerialSymbols()
+{
+#define NQ8_SYMBOL_NAMES(N, C) \
+    "gemv_native_vnni_kernel_t<" #N "," #C ",NVNNI_Q8_0>", \
+    "gemv_native_vnni_reduce_kernel_t<" #N "," #C ">"
+    const char *producer_name = nullptr;
+    const char *reducer_name = nullptr;
+#define NQ8_NAME_CASE(N, C) \
+    if constexpr (TN == N && CPT == C) { \
+        const char *names[] = {NQ8_SYMBOL_NAMES(N, C)}; \
+        producer_name = names[0]; reducer_name = names[1]; }
+    NQ8_NAME_CASE(64, 1)
+    NQ8_NAME_CASE(128, 1)
+    NQ8_NAME_CASE(256, 1)
+    NQ8_NAME_CASE(128, 2)
+    NQ8_NAME_CASE(256, 2)
+#undef NQ8_NAME_CASE
+#undef NQ8_SYMBOL_NAMES
+    static_assert((TN == 64 && CPT == 1) || (TN == 128 && (CPT == 1 || CPT == 2)) ||
+                  (TN == 256 && (CPT == 1 || CPT == 2)));
+    return {reinterpret_cast<const void *>(gemv_native_vnni_kernel_t<TN, CPT, NVNNI_Q8_0>),
+            reinterpret_cast<const void *>(gemv_native_vnni_reduce_kernel_t<TN, CPT>),
+            producer_name, reducer_name};
+}
+
+/**
+ * @brief Select one exact compiled pair; unknown enum values fail before HIP calls.
+ * @param geometry Typed requested geometry.
+ * @return The function pair shared with the actual launch dispatch.
+ */
+NativeQ8SerialSymbols nativeQ8SerialSymbols(llaminar2::rocm::NativeQ8SerialGeometry geometry)
+{
+    using G = llaminar2::rocm::NativeQ8SerialGeometry;
+    switch (geometry)
+    {
+    case G::TN64CPT1: return nativeQ8SerialSymbols<64, 1>();
+    case G::TN128CPT1: return nativeQ8SerialSymbols<128, 1>();
+    case G::TN256CPT1: return nativeQ8SerialSymbols<256, 1>();
+    case G::TN128CPT2: return nativeQ8SerialSymbols<128, 2>();
+    case G::TN256CPT2: return nativeQ8SerialSymbols<256, 2>();
+    }
+    throw std::invalid_argument("unknown ROCm native-Q8 serial geometry");
+}
+
+/**
+ * @brief Authenticate a loaded specialization at its exact block width.
+ * @param function Exact symbol selected by nativeQ8SerialSymbols().
+ * @param name Static readable template spelling; function remains authority.
+ * @param threads Physical workgroup width, not a target-wave heuristic.
+ * @return Complete compiler and occupancy evidence with zero private memory.
+ * @throws std::runtime_error on incomplete, nonresident or spilling resources.
+ */
+llaminar2::rocm::NativeQ8SerialKernelResources inspectNativeQ8SerialSymbol(
+    const void *function, const char *name, int threads)
+{
+    hipFuncAttributes attributes{};
+    int active_blocks = 0;
+    if (!function || !name || threads <= 0 ||
+        hipFuncGetAttributes(&attributes, function) != hipSuccess ||
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active_blocks, function, threads, 0) != hipSuccess ||
+        attributes.numRegs <= 0 || attributes.maxThreadsPerBlock < threads ||
+        active_blocks <= 0 || attributes.localSizeBytes != 0)
+        throw std::runtime_error(std::string("native-Q8 serial resource admission failed: ") + (name ? name : "missing symbol"));
+    return {.function = function, .specialization = name, .block_threads = threads,
+            .registers_per_thread = attributes.numRegs,
+            .local_memory_bytes_per_thread = attributes.localSizeBytes,
+            .static_shared_memory_bytes = attributes.sharedSizeBytes,
+            .max_threads_per_block = attributes.maxThreadsPerBlock,
+            .max_active_blocks_per_sm = active_blocks};
+}
+
+/**
+ * @brief Enqueue the existing serial producer and ordered reducer at one geometry.
+ * @tparam TN Independent output columns owned by one workgroup.
+ * @tparam CPT Independent output chains per thread, one or two.
+ * @tparam FMT Existing compiled decoder; new geometries instantiate Q8 only.
+ * @param A Existing quantized activation bytes.
+ * @param payload Existing prepared native weight payload.
+ * @param scales Existing prepared primary scale metadata.
+ * @param mins Existing prepared optional asymmetric metadata.
+ * @param emins Existing prepared optional extended metadata.
+ * @param output Live FP32 output vector.
+ * @param partials Existing persistent [KB][N] partial workspace.
+ * @param scale_a Existing per-row activation scale, when used.
+ * @param block_scales Existing per-block activation scales, when used.
+ * @param N Physical descriptor/output width.
+ * @param K Complete unchanged reduction width.
+ * @param kb Resolved production arithmetic partition count.
+ * @param arithmetic_policy Source codebook owning the arithmetic tree.
+ * @param device Exact HIP device.
+ * @param stream Exact non-null producer stream.
+ * @param geometry Actual selected geometry for the launch receipt.
+ * @note No resource queries, allocations, transfers or waits occur here.
+ */
+template <int TN, int CPT, NativeVNNIFormat FMT>
+void launchNativeVNNISerialGeometry(
+    const int8_t *A, const uint8_t *payload, const uint16_t *scales,
+    const uint16_t *mins, const uint32_t *emins, float *output, float *partials,
+    const float *scale_a, const float *block_scales, int N, int K, int kb,
+    uint8_t arithmetic_policy, int device, void *stream,
+    llaminar2::rocm::NativeQ8SerialGeometry geometry)
+{
+    static_assert(CPT == 1 || CPT == 2);
+    static_assert(TN % CPT == 0);
+    const int grid_n = 1 + (N - 1) / TN;
+    const dim3 block(TN / CPT, 1, 1);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT>),
+        dim3(grid_n, kb, 1), block, 0, static_cast<hipStream_t>(stream),
+        A, payload, scales, mins, emins, output, partials, scale_a, block_scales, N, K, kb);
+    if (g_native_q8_serial_scope && hipPeekAtLastError() != hipSuccess)
+    {
+        g_native_q8_serial_launch.reset();
+        throw std::runtime_error("native-VNNI serial producer submission failed");
+    }
+    if (kb > 1)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<TN, CPT>),
+            dim3(grid_n, 1, 1), block, 0, static_cast<hipStream_t>(stream),
+            partials, output, N, kb);
+    if (g_native_q8_serial_scope && hipPeekAtLastError() != hipSuccess)
+    {
+        g_native_q8_serial_launch.reset();
+        throw std::runtime_error("native-VNNI serial ordered-reducer submission failed");
+    }
+    if constexpr (FMT == NVNNI_Q8_0)
+    {
+        const auto symbols = nativeQ8SerialSymbols<TN, CPT>();
+        const int b_per = 1 + (K / 32 - 1) / kb;
+        const int nonempty = 1 + (K / 32 - 1) / b_per;
+        const auto launch = [&](const void *function, const char *name, int grid_y)
+        {
+            return llaminar2::rocm::NativeQ8SerialKernelLaunch{
+                function, name, grid_n, grid_y, 1, TN / CPT, 1, 1};
+        };
+        // Publish topology only. Replays never update this host observation.
+        g_native_q8_serial_launch = llaminar2::rocm::NativeQ8SerialLaunch{
+            .geometry = geometry, .physical_n = N,
+            .arithmetic_policy_n = g_native_vnni_serial_partition_n > 0
+                ? g_native_vnni_serial_partition_n : N,
+            .k = K, .device_ordinal = device, .execution_codebook = 19,
+            .arithmetic_policy_codebook = arithmetic_policy, .k_partitions = kb,
+            .blocks_per_partition = b_per, .nonempty_partitions = nonempty,
+            .partial_elements = kb > 1 ? std::size_t(kb) * N : 0u,
+            .stream = stream,
+            .producer = launch(symbols.producer, symbols.producer_name, kb),
+            .reducer = kb > 1 ? launch(symbols.reducer, symbols.reducer_name, 1)
+                : llaminar2::rocm::NativeQ8SerialKernelLaunch{}};
+    }
+}
+} // namespace
+
+llaminar2::rocm::NativeQ8SerialGeometryAdmission
+llaminar2::rocm::admitNativeQ8SerialGeometry(NativeQ8SerialGeometry geometry, int device_ordinal)
+{
+    const auto spec = nativeQ8SerialGeometrySpec(geometry);
+    const auto symbols = nativeQ8SerialSymbols(geometry);
+    if (device_ordinal < 0)
+        throw std::invalid_argument("native-Q8 serial resource admission needs an exact device");
+    if (llaminar2::isGraphCaptureActive())
+        throw std::logic_error("native-Q8 serial resources must be inspected before capture");
+    if (llaminar2::HipDeviceGuard::setDevice(device_ordinal) != 0)
+        throw std::runtime_error("native-Q8 serial resource admission could not select device");
+    return {geometry, device_ordinal,
+        inspectNativeQ8SerialSymbol(symbols.producer, symbols.producer_name, spec.block_threads),
+        inspectNativeQ8SerialSymbol(symbols.reducer, symbols.reducer_name, spec.block_threads)};
+}
+
 /**
  * @brief Publishes one runtime verifier row from ordered split-K partials.
  *
@@ -7342,6 +7603,19 @@ bool rocmGemv_native_vnni_fp32_with_policy(
     int device_id, void* stream,
     const float* d_scale_A_blockwise)
 {
+    llaminar2::rocm::clearNativeQ8SerialLaunch();
+    if (g_native_q8_serial_scope)
+    {
+        llaminar2::rocm::validateNativeQ8SerialScopeBinding(device_id, stream);
+        const auto &env = llaminar2::debugEnv().rocm;
+        if (codebook_id != NVNNI_Q8_0 ||
+            !llaminar2::MoEProjectionNumericalContract::ownsOrderedKPartitionTree(
+                arithmetic_policy_codebook_id) || N <= 0 || K <= 0 ||
+            g_native_vnni_kb_override.load(std::memory_order_relaxed) > 0 ||
+            g_native_vnni_target_waves_override.load(std::memory_order_relaxed) > 0 ||
+            env.nvnni_gemv_kb > 0 || env.nvnni_gemv_target_waves > 0)
+            throw std::logic_error("native-Q8 serial geometry scope requires exact device/native19/stream and unchanged production arithmetic");
+    }
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
     if ((K % 32) != 0)
@@ -7588,9 +7862,13 @@ bool rocmGemv_native_vnni_fp32_with_policy(
         // =====================================================================
         constexpr int TN = 128;
         constexpr int CPT = 1;
-        constexpr int THREADS = TN / CPT;  // 128 threads = 2 wavefronts
 
-        const int grid_n = (N + TN - 1) / TN;
+        const auto serial_geometry = g_native_q8_serial_scope
+            ? g_native_q8_serial_scope->admission().geometry()
+            : llaminar2::rocm::NativeQ8SerialGeometry::TN128CPT1;
+        const auto serial_spec = llaminar2::rocm::nativeQ8SerialGeometrySpec(serial_geometry);
+        const int physical_tile_n = codebook_id == NVNNI_Q8_0 ? serial_spec.tile_columns : TN;
+        const int grid_n = 1 + (N - 1) / physical_tile_n;
 
         constexpr int DEFAULT_TARGET_WAVES_PER_CU = 24;
 
@@ -7631,6 +7909,10 @@ bool rocmGemv_native_vnni_fp32_with_policy(
             if (kb > blocks_per_row) kb = blocks_per_row;
         }
 
+        if (g_native_q8_serial_scope && kb !=
+            llaminar2::MoEProjectionNumericalContract::orderedKPartitionsForWidth(K))
+            throw std::logic_error("native-Q8 serial geometry cannot change the production K-partition tree");
+
         if (kb > 1 && !d_partial_fp32)
         {
             fprintf(stderr, "[rocmGemv_native_vnni_fp32] kb=%d>1 but no partial buffer (N=%d K=%d)\n", kb, N, K);
@@ -7643,38 +7925,11 @@ bool rocmGemv_native_vnni_fp32_with_policy(
          * requested overrides, also proves clamping and shape constraints did
          * not silently select a different production launch.
          */
-        recordNativeVNNISmallMLaunch(
-            1,
-            N,
-            K,
-            static_cast<unsigned>(codebook_id),
-            grid_n,
-            kb,
-            TARGET_WAVES_PER_CU,
-            false,
-            1,
-            static_cast<int>(arithmetic_policy_codebook_id));
-
-        dim3 block(THREADS, 1, 1);
-
-        #define LAUNCH_NATIVE_VNNI(FMT_TAG)                                                  \
-            if (kb <= 1) {                                                                    \
-                hipLaunchKernelGGL(                                                           \
-                    HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT_TAG>),            \
-                    dim3(grid_n, 1), block, 0, static_cast<hipStream_t>(stream),             \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,              \
-                    d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, 1);      \
-            } else {                                                                          \
-                hipLaunchKernelGGL(                                                           \
-                    HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT_TAG>),            \
-                    dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),            \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,              \
-                    d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb);     \
-                hipLaunchKernelGGL(                                                           \
-                    HIP_KERNEL_NAME(gemv_native_vnni_reduce_kernel_t<TN, CPT>),              \
-                    dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),                \
-                    d_partial_fp32, d_C_fp32, N, kb);                                        \
-            }
+        #define LAUNCH_NATIVE_VNNI(FMT_TAG) \
+            launchNativeVNNISerialGeometry<TN, CPT, FMT_TAG>( \
+                d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, \
+                d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb, \
+                arithmetic_policy_codebook_id, device_id, stream, serial_geometry)
 
         switch (static_cast<NativeVNNIFormat>(codebook_id))
         {
@@ -7695,7 +7950,26 @@ bool rocmGemv_native_vnni_fp32_with_policy(
         case NVNNI_IQ2_XXS:  LAUNCH_NATIVE_VNNI(NVNNI_IQ2_XXS);  break;
         case NVNNI_IQ1_S:    LAUNCH_NATIVE_VNNI(NVNNI_IQ1_S);    break;
         case NVNNI_IQ1_M:    LAUNCH_NATIVE_VNNI(NVNNI_IQ1_M);    break;
-        case NVNNI_Q8_0:     LAUNCH_NATIVE_VNNI(NVNNI_Q8_0);     break;
+        case NVNNI_Q8_0:
+        {
+            using G = llaminar2::rocm::NativeQ8SerialGeometry;
+#define LAUNCH_NATIVE_Q8_GEOMETRY(TILE, COLUMNS) \
+            launchNativeVNNISerialGeometry<TILE, COLUMNS, NVNNI_Q8_0>( \
+                d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, \
+                d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb, \
+                arithmetic_policy_codebook_id, device_id, stream, serial_geometry)
+            switch (serial_geometry)
+            {
+            case G::TN64CPT1: LAUNCH_NATIVE_Q8_GEOMETRY(64, 1); break;
+            case G::TN128CPT1: LAUNCH_NATIVE_Q8_GEOMETRY(128, 1); break;
+            case G::TN256CPT1: LAUNCH_NATIVE_Q8_GEOMETRY(256, 1); break;
+            case G::TN128CPT2: LAUNCH_NATIVE_Q8_GEOMETRY(128, 2); break;
+            case G::TN256CPT2: LAUNCH_NATIVE_Q8_GEOMETRY(256, 2); break;
+            default: throw std::invalid_argument("unknown ROCm native-Q8 serial geometry");
+            }
+#undef LAUNCH_NATIVE_Q8_GEOMETRY
+            break;
+        }
         case NVNNI_EXPANDED_INT8_MIN:
             LAUNCH_NATIVE_VNNI(NVNNI_EXPANDED_INT8_MIN);
             break;
@@ -7705,12 +7979,25 @@ bool rocmGemv_native_vnni_fp32_with_policy(
             return false;
         }
 
+        recordNativeVNNISmallMLaunch(
+            1,
+            N,
+            K,
+            static_cast<unsigned>(codebook_id),
+            grid_n,
+            kb,
+            TARGET_WAVES_PER_CU,
+            false,
+            1,
+            static_cast<int>(arithmetic_policy_codebook_id));
+
         #undef LAUNCH_NATIVE_VNNI
     }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
+        llaminar2::rocm::clearNativeQ8SerialLaunch();
         fprintf(stderr, "[rocmGemv_native_vnni_fp32] Kernel launch failed: %s (N=%d K=%d codebook=%u)\n",
                 hipGetErrorString(err), N, K, static_cast<unsigned>(codebook_id));
         return false;

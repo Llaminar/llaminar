@@ -22,6 +22,7 @@ OPTIONAL_OBSERVATION_COLUMNS = frozenset({
     "launch_n_block_chunks",
     "adaptive_timing_evidence",
     "active_rows",
+    "physical_launch_evidence",
 })
 
 
@@ -68,6 +69,10 @@ def _observation_csv_row(
             row["adaptive_timing_evidence"],
             sort_keys=True,
             separators=(",", ":"),
+        )
+    if "physical_launch_evidence" in row:
+        row["physical_launch_evidence"] = json.dumps(
+            row["physical_launch_evidence"], sort_keys=True, separators=(",", ":")
         )
     return row
 

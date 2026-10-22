@@ -1,6 +1,6 @@
 # QFN tuning dashboard
 
-Updated: 2026-10-22; L80 remains the measured throughput checkpoint. NativeVNNI81 adds QFN shape coverage and repairs prepared-weight dispatch identity, with 760/760 Unit registrations and byte-identical Release accuracy. Captured native-Q8 decode geometry tuning is next.
+Updated: 2026-10-22; L80 remains the measured throughput checkpoint. NativeVNNI81 adds QFN shape coverage and repairs prepared-weight dispatch identity, with 760/760 Unit registrations and byte-identical Release accuracy. NativeVNNI82's first captured geometry sweep is byte exact and shows shape-dependent component gains; paired timing and model qualification remain pending.
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.
 
@@ -78,12 +78,85 @@ production preflight.
 An exact-table refresh alone cannot improve the current ROCm native-Q8 M1 path:
 its numerical contract fixes K partitions, and its launcher fixes TN128/CPT1.
 The existing target-waves value is overwritten when the resolved partition
-count is applied. Next experiment82 will expose independent output-column
-geometry while preserving each column's arithmetic, the exact partition
+count is applied. Experiment82 now exposes five independent output-column
+geometries while preserving each column's arithmetic, the exact partition
 boundaries and every ordered partial addition. The existing baseline remains
-installed until real captured timing, compiler resources, byte equivalence and
-the model comparison establish a winner. CUDA and CPU have different effective
-dispatch surfaces and need their own measured evidence.
+installed until repeated captured timing, compiler resources, byte equivalence
+and the model comparison establish a winner. CUDA and CPU have different
+effective dispatch surfaces and need their own measured evidence.
+
+The first [qualified Release sweep](../../../../parity-results/qwen-flash-next/nativevnni82-release-tournament-loader-fixed/result.json)
+passes **50/50 candidate cells and all 5,050 timing samples**, with no output or
+retained-replay byte mismatches. It uses the real prepared native-Q8 public
+projection, including activation quantization, captured at M1 on gfx906; each
+candidate has 31 warmups and 101 samples. These synthetic component weights
+are not the model accuracy panel. The ordinary unscoped TN128/CPT1 launch is
+the single timed control. The [common analyzer summary](../../../../parity-results/qwen-flash-next/nativevnni82-release-tournament-loader-fixed/summary.csv)
+is explicitly diagnostic and cannot emit or install a policy.
+
+| Physical N × K | Default median µs | Lowest median µs | Geometry at lowest median | Latency reduction |
+|---|---:|---:|---|---:|
+| 160 × 2560 | 27.04 | 24.48 | TN256/CPT1 | 9.47% |
+| 320 × 10240 | 35.84 | 31.36 | TN256/CPT1 | 12.50% |
+| 512 × 2560 | 27.68 | 24.96 | TN256/CPT1 | 9.83% |
+| 1536 × 2560 | 30.72 | 26.72 | TN256/CPT1 | 13.02% |
+| 2560 × 160 | 23.52 | 22.40 | TN128/CPT2 | 4.76% |
+| 2560 × 1536 | 30.88 | 26.88 | TN256/CPT1 | 12.95% |
+| 2560 × 2560 | 34.88 | 30.08 | TN256/CPT1 | 13.76% |
+| 3072 × 2560 | 37.44 | 32.16 | TN64/CPT1 | 14.10% |
+| 10240 × 2560 | 60.48 | 57.76 | TN256/CPT1 | 4.50% |
+| 248320 × 2560 | 994.88 | 994.88 | Default TN128/CPT1 | 0.00% |
+
+This first pass uses fixed candidate order and one graph replay per event sample.
+Retain every result, including slower candidates. Counterbalanced paired timing
+and a separately labeled capture-batch measurement will test ordering and
+submission overhead before selecting entries. No component percentage is a
+whole-model throughput claim. The head favors the existing default, so a global
+geometry change is not supported by these observations.
+
+The [exact compiled gfx906 functions](../../../../parity-results/qwen-flash-next/nativevnni82-isa/resources.json)
+have zero spills, private storage and LDS. Producers use 18 VGPRs; reducers use
+23 for CPT1 and 27 for CPT2. Actual loaded-function queries agree and prove
+resident blocks at each launch width; these are resource limits, not measured
+occupancy. Captured kernel-node functions and grids match the recorded launches.
+The [initial 13 focused checks](../../../../parity-results/qwen-flash-next/nativevnni82-focused/result.json)
+pass, including tail widths, empty partition planes, poisoned replays and
+invalid scoped bindings.
+
+The [first timing attempt](../../../../parity-results/qwen-flash-next/nativevnni82-release-tournament/result.json)
+was rejected: the benchmark's HIP host link embedded an overriding SDK RPATH
+and loaded LLVM OpenMP alongside the compiler-selected GNU runtime. Its 40
+partial rows remain rejected evidence. A [device-free original-code control](../../../../parity-results/qwen-flash-next/nativevnni82-loader-negative/result.json)
+reproduces the wrong OpenMP binding. The target now uses the C++ host linker
+and `OpenMP::OpenMP_CXX`; HIP source compilation and the spill guard remain
+enabled. The actual benchmark and application loader controls, mixed-runtime
+negative cases, geometry bytes and evidence validation all pass in the
+[five-check follow-up](../../../../parity-results/qwen-flash-next/nativevnni82-openmp-focused/result.json).
+The successful sweep authenticates its complete loader closure before device
+launch, observes the intended core/HIP/GNU runtime, and retires normally with
+an unchanged source/runtime snapshot and clean driver window. Its exact build
+receipt is [nativevnni82-openmp-release-build](../../../../parity-results/qwen-flash-next/nativevnni82-openmp-release-build/result.json).
+
+The [complete Unit suite](../../../../parity-results/qwen-flash-next/nativevnni82-unit/result.json)
+passes **760/760**, zero skips, in **116.28 seconds**. The
+[surrounding native run](../../../../parity-results/qwen-flash-next/nativevnni82-surrounding/result.json)
+passes all four selected registrations plus their fixture in **19.19 seconds**:
+complete GEMV format coverage, grouped prepared-source byte equivalence, the
+Qwen GDN output shard, and actual serial-route telemetry. Driver windows and
+native retirement are clean.
+
+The [unchanged-default Release accuracy panel](../../../../parity-results/qwen-flash-next/nativevnni82-release-accuracy/runtime-observation.json)
+passes in **100.87 seconds**. All **26 files / 185 final-logit rows** remain
+[byte-identical to L74](../../../../parity-results/qwen-flash-next/nativevnni82-release-accuracy/shortk74-logit-byte-comparison.json),
+including reset and diagnostic rows. This qualifies the infrastructure with the
+existing production geometry; it does not qualify an installed faster policy.
+The new [actual construction-route observations](../../../../parity-results/qwen-flash-next/nativevnni82-release-accuracy/native-q8-physical-route-observation.json)
+show seven ordinary serial shapes and the vocabulary head on TN128/CPT1/KB16.
+The head has physical N248320 but arithmetic-policy N62080, which the component
+head's equal-N key does not represent. Neither 160×2560 nor 2560×160 appears in
+this serial producer's model observations, so their isolated timings cannot yet
+be attributed to A1. Physical shape, arithmetic-policy shape and fused/batched
+operation identity must remain distinct in any measured dispatch update.
 
 The [actual GGUF descriptor inventory](../../../../parity-results/qwen-flash-next/nativevnni81-source-descriptors.json)
 was collected through the canonical bounded header parser, without scanning or
