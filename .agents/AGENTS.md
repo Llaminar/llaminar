@@ -475,6 +475,13 @@ preflight needs neither the vendor source nor an accelerator. An external local
 RCCL build must export its compile database and be supplied through
 `RCCL_PROTOCOL_BUILD_DIR` alongside the exact `RCCL_LIBRARY` selection.
 
+RCCL per-collective protocol and algorithm selectors use native enum indices.
+Their name table must derive from the canonical enum-to-name function rather
+than a separately ordered list. `V2_Integration_RCCLCollectiveSelectors` proves
+the actual parser against every tunable collective and the original faulty
+table. Its builder-only probe captures diagnostics locally without querying HIP;
+installed preflight verifies the source/DSO-bound evidence without a GPU or SDK.
+
 RCCL bootstrap proves host/process identity before selecting transport storage.
 Container launchers pair IPC storage with PID identity: private IPC is the
 ordinary policy; explicit host/peer IPC must also join the matching PID namespace.

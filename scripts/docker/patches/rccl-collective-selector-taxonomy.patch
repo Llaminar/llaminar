@@ -1,0 +1,25 @@
+--- a/src/init.cc
++++ b/src/init.cc
+@@ -78,7 +78,21 @@
+ 
+ using namespace rccl;
+ 
+-const char* ncclFuncStr[NCCL_NUM_FUNCTIONS+2] = { "AllGather", "AllReduce", "AllToAllPivot", "Broadcast", "Reduce", "ReduceScatter", "SendRecv"};
++/** @brief Preserve the native C-array ABI while deriving enum names from its sole switch. */
++const char* ncclFuncStr[NCCL_NUM_FUNCTIONS+2] = {};
++namespace {
++/** @brief Publish the complete original table before dlopen returns to communicator callers.
++ * ncclFuncToString is a pure enum switch and has no dependency on this table or
++ * communicator state. No parser, GPU initialization or hot-path mutation occurs. */
++struct ncclFunctionNamesInitializer {
++  /** @brief Fill each existing ABI slot using its actual enum index, never a positional alias. */
++  ncclFunctionNamesInitializer() {
++    for (int index = 0; index < NCCL_NUM_FUNCTIONS+2; ++index)
++      ncclFuncStr[index] = ncclFuncToString(static_cast<ncclFunc_t>(index));
++  }
++};
++const ncclFunctionNamesInitializer ncclFunctionNamesReady;
++}
+ const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree", "PAT" };
+ const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple" };
+ const char* ncclDevRedOpStr[ncclNumDevRedOps] = { "Sum", "Prod", "MinMax", "PreMulSum", "SumPostDiv" };

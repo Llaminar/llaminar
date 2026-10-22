@@ -983,7 +983,8 @@ if(HAVE_ROCM)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-device-live-rows.patch" RCCL_ROWS_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-native-host-storage.patch" RCCL_HOST_STORAGE_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-communicator-protocol-defaults.patch" RCCL_PROTOCOL_PATCH_HASH)
-    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}")
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-collective-selector-taxonomy.patch" RCCL_SELECTOR_PATCH_HASH)
+    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}")
     
     # Check if RCCL build is up-to-date
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")

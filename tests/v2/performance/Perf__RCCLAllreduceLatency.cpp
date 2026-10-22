@@ -18,8 +18,13 @@
  *   3. On-stream vs dedicated-stream allreduce
  *   4. Multi-allreduce pipelining (ncclGroupStart/End batching)
  *   5. Comparison to llaminar's actual allreduce path
+ *   6. Captured P4/H2560/M1 all-gather plus canonical ascending-rank FP32 sum
  *
- * **Target hardware**: AMD MI50 (gfx906) × 2-3, PCIe gen3
+ * **Target hardware**: AMD MI50 (gfx906), explicit two/four-device controls.
+ * An isolated, single-test dependency experiment may select an absolute DSO
+ * with LLAMINAR_RCCL_PERF_LIBRARY. It must be the process's first RCCL load;
+ * ordinary tests retain the exact CMake-selected library. Selection never
+ * substitutes a different library after an error or mutates a live runtime.
  *
  * @author GitHub Copilot
  * @date February 2026
@@ -40,6 +45,7 @@
 #include <numeric>
 #include <algorithm>
 #include <barrier>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -56,6 +62,7 @@
 // We use the dynamic loader consistent with the rest of the codebase
 #include "collective/backends/RCCLDynamicLoader.h"
 #include "kernels/common/ColumnShardAssemblyKernels.h"
+#include "kernels/common/TPRankOrderedReductionKernels.h"
 namespace rccl = llaminar2::rccl_dynamic;
 
 #define HIP_CHECK(call)                                                               \
@@ -194,6 +201,7 @@ namespace
         static constexpr size_t MAX_BUFFER_BYTES = 64 * 1024 * 1024;
         static constexpr size_t MAX_BUFFER_FLOATS = MAX_BUFFER_BYTES / sizeof(float);
 
+        /** @brief Admit native resources and select one immutable dependency per process. */
         void SetUp() override
         {
             // Detect available ROCm devices
@@ -225,8 +233,15 @@ namespace
             // Print current NCCL environment for reference
             printCurrentNCCLEnv();
 
-            // Load RCCL
-            if (!rccl::isLoaded())
+            // A dependency candidate owns a fresh, filtered test process. Refuse
+            // to mistake an already loaded DSO for the explicitly requested one.
+            if (const char *diagnostic_library = std::getenv("LLAMINAR_RCCL_PERF_LIBRARY"))
+            {
+                ASSERT_EQ(diagnostic_library[0], '/') << "Diagnostic RCCL DSO requires an absolute path";
+                ASSERT_FALSE(rccl::isLoaded()) << "Diagnostic RCCL DSO requires a fresh single-test process";
+                ASSERT_TRUE(rccl::load(diagnostic_library)) << rccl::getLastError();
+            }
+            else if (!rccl::isLoaded())
             {
                 ASSERT_TRUE(rccl::load()) << "Failed to load RCCL: " << rccl::getLastError();
             }
@@ -2171,6 +2186,141 @@ namespace
                 message.name, num_devices_, message.send_bytes, receive_bytes,
                 kLayers, kSamples, timing.median_us, timing.p5_us, timing.p95_us);
         }
+    }
+
+    /**
+     * @brief Time A1's exact P4/H2560/M1 byte gather and ascending-rank FP32 fold.
+     *
+     * Immutable inputs and distinct fold outputs prevent recurrent accumulation.
+     * Each retained graph contains 97 complete transactions; native events cover
+     * device execution, not a host enqueue loop. This synthetic control has no
+     * model, optional sidebands or claim of whole-model critical-path latency.
+     * Protocol selection remains the original RCCL planner and process environment.
+     */
+    TEST_F(Perf__RCCLAllreduceLatency, A1CanonicalRankOrderP4H2560M1)
+    {
+        if (!initialized_) GTEST_SKIP();
+        if (num_devices_ != 4) GTEST_SKIP() << "Exact A1 selector requires LLAMINAR_RCCL_PERF_DEVICE_COUNT=4";
+        constexpr int width = 2560, transactions = 97, warmups = 5, samples = 31;
+        constexpr size_t bytes = width * sizeof(float);
+        /** @brief Retire captured native work before fixture streams and communicators. */
+        struct Lane
+        {
+            int device = -1;
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t executable = nullptr;
+            /** @brief Destroy each handle under its original device after completed samples. */
+            ~Lane()
+            {
+                if (device < 0) return;
+                (void)hipSetDevice(device);
+                if (executable) (void)hipGraphExecDestroy(executable);
+                if (graph) (void)hipGraphDestroy(graph);
+            }
+        };
+        std::vector<Lane> lanes(4);
+        std::array<std::vector<float>, 4> inputs;
+        std::vector<float> expected(width, 0.0f);
+        for (int rank = 0; rank < 4; ++rank)
+        {
+            lanes[rank].device = rank;
+            inputs[rank].resize(width);
+            for (int col = 0; col < width; ++col)
+            {
+                // Cancellation distinguishes ascending rank from common alternate trees.
+                const float values[]{16777216.0f, 1.0f, -16777216.0f, float(1 + col % 7)};
+                inputs[rank][col] = values[rank];
+                volatile float rounded = expected[col] + values[rank];
+                expected[col] = rounded;
+            }
+            ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(devices_[rank].d_buffer, inputs[rank].data(), bytes,
+                hipMemcpyHostToDevice, devices_[rank].stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(devices_[rank].stream), hipSuccess);
+        }
+        std::array<hipError_t, 4> status{};
+        std::array<rccl::ncclResult_t, 4> collective{};
+        std::array<bool, 4> fold{};
+        std::barrier entered(4), recorded(4);
+        std::vector<std::thread> builders;
+        for (int rank = 0; rank < 4; ++rank)
+            builders.emplace_back([&, rank] {
+                auto &d = devices_[rank];
+                status[rank] = hipSetDevice(rank);
+                if (status[rank] == hipSuccess)
+                    status[rank] = hipStreamBeginCapture(d.stream, hipStreamCaptureModeRelaxed);
+                const bool capturing = status[rank] == hipSuccess;
+                entered.arrive_and_wait();
+                collective[rank] = rccl::ncclSuccess;
+                fold[rank] = true;
+                const llaminar2::NativeCollectiveRows rows(
+                    llaminar2::DeviceRowRange::fullyActive(1), width);
+                if (capturing)
+                    for (int n = 0; n < transactions; ++n)
+                    {
+                        collective[rank] = rccl::nativeRows(llaminar2::NativeRowCollective::AllGather,
+                            d.d_buffer, d.d_buffer + width, rows, rccl::ncclFloat, rccl::ncclSum,
+                            nullptr, comms_[rank], d.stream);
+                        if (collective[rank] != rccl::ncclSuccess) break;
+                        fold[rank] = llaminar2::launchROCmTPRankOrderedSumFP32(
+                            d.d_buffer + width, d.d_buffer + 5 * width, size_t(width), 4, rank, d.stream);
+                        if (!fold[rank]) break;
+                    }
+                recorded.arrive_and_wait();
+                if (capturing) status[rank] = hipStreamEndCapture(d.stream, &lanes[rank].graph);
+                if (status[rank] == hipSuccess && collective[rank] == rccl::ncclSuccess && fold[rank])
+                    status[rank] = hipGraphInstantiate(&lanes[rank].executable, lanes[rank].graph, nullptr, nullptr, 0);
+            });
+        for (auto &thread : builders) thread.join();
+        for (int rank = 0; rank < 4; ++rank)
+        {
+            ASSERT_EQ(status[rank], hipSuccess);
+            ASSERT_EQ(collective[rank], rccl::ncclSuccess);
+            ASSERT_TRUE(fold[rank]); ASSERT_NE(lanes[rank].executable, nullptr);
+        }
+        std::vector<double> slowest;
+        for (int sample = -warmups; sample < samples; ++sample)
+        {
+            for (int rank = 0; rank < 4; ++rank)
+            {
+                auto &d = devices_[rank];
+                ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+                ASSERT_EQ(hipEventRecord(d.start_event, d.stream), hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(lanes[rank].executable, d.stream), hipSuccess);
+                ASSERT_EQ(hipEventRecord(d.stop_event, d.stream), hipSuccess);
+            }
+            double maximum = 0;
+            for (int rank = 0; rank < 4; ++rank)
+            {
+                auto &d = devices_[rank];
+                ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+                ASSERT_EQ(hipEventSynchronize(d.stop_event), hipSuccess);
+                float ms = 0;
+                ASSERT_EQ(hipEventElapsedTime(&ms, d.start_event, d.stop_event), hipSuccess);
+                ASSERT_TRUE(std::isfinite(ms)); ASSERT_GT(ms, 0);
+                const double us = double(ms) * 1000 / transactions;
+                maximum = std::max(maximum, us);
+                if (sample >= 0)
+                    std::printf("A1_CANONICAL_SAMPLE,rank=%d,sample=%d,transactions=%d,us=%.9f,send_bytes=%zu,protocol_requested=%s\n",
+                        rank, sample, transactions, us, bytes, std::getenv("NCCL_PROTO") ? std::getenv("NCCL_PROTO") : "auto");
+            }
+            if (sample >= 0) slowest.push_back(maximum);
+        }
+        for (int rank = 0; rank < 4; ++rank)
+        {
+            ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+            std::vector<float> result(width), original(width), banks(4 * width);
+            ASSERT_EQ(hipMemcpy(result.data(), devices_[rank].d_buffer + 5 * width, bytes, hipMemcpyDeviceToHost), hipSuccess);
+            ASSERT_EQ(hipMemcpy(original.data(), devices_[rank].d_buffer, bytes, hipMemcpyDeviceToHost), hipSuccess);
+            ASSERT_EQ(hipMemcpy(banks.data(), devices_[rank].d_buffer + width, 4 * bytes, hipMemcpyDeviceToHost), hipSuccess);
+            ASSERT_EQ(std::memcmp(result.data(), expected.data(), bytes), 0) << "rank=" << rank;
+            ASSERT_EQ(std::memcmp(original.data(), inputs[rank].data(), bytes), 0);
+            for (int source = 0; source < 4; ++source)
+                ASSERT_EQ(std::memcmp(banks.data() + source * width, inputs[source].data(), bytes), 0);
+        }
+        const auto summary = computeStats(slowest, bytes, "A1 canonical synthetic no-sidebands");
+        std::printf("A1_CANONICAL_SUMMARY,participants=4,H=2560,M=1,transactions=%d,samples=%d,median_us=%.9f,p5_us=%.9f,p95_us=%.9f,exact=1,scope=synthetic_no_sidebands\n",
+            transactions, samples, summary.median_us, summary.p5_us, summary.p95_us);
     }
 
     // ============================================================================

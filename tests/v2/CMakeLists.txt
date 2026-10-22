@@ -4165,6 +4165,18 @@ set_tests_properties(V2_Integration_ROCmBLASKernelPackaging PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;ROCm;BLAS;Regression"
     TIMEOUT 30)
 include(cmake/V2RCCLProtocolDefaultsTests.cmake)
+include(cmake/V2RCCLSelectorTests.cmake)
+add_test(NAME V2_Unit_RCCLSelectorProof
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rccl_selector_taxonomy.py)
+set_tests_properties(V2_Unit_RCCLSelectorProof PROPERTIES
+    LABELS "V2;Unit;RCCL;DeviceFree;Regression" TIMEOUT 30)
+add_test(NAME V2_Integration_RCCLSelectorProofPackaging
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rccl_selector_taxonomy.py)
+set_tests_properties(V2_Integration_RCCLSelectorProofPackaging PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;RCCL;DeviceFree;Regression" TIMEOUT 30)
+
 add_test(NAME V2_Unit_RCCLProtocolProof
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rccl_protocol_geometry.py)
@@ -19418,6 +19430,19 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         TIMEOUT 600
     )
+    # Exact synthetic A1 fixed-row canonical transaction; protocol arms are separate processes.
+    add_v2_test(V2_Perf_RCCLCanonicalRankOrder_ROCm4_A1
+        COMMAND $<TARGET_FILE:v2_perf_rccl_allreduce_latency>
+            --gtest_filter=Perf__RCCLAllreduceLatency.A1CanonicalRankOrderP4H2560M1
+        LABELS "V2;Performance;ROCm;RCCL;GraphCapture;SyntheticA1Geometry;CanonicalRankOrder"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_RCCL_PERF_DEVICE_COUNT=4")
+    add_v2_test(V2_Perf_RCCLCanonicalRankOrder_ROCm4_A1_LL
+        COMMAND $<TARGET_FILE:v2_perf_rccl_allreduce_latency>
+            --gtest_filter=Perf__RCCLAllreduceLatency.A1CanonicalRankOrderP4H2560M1
+        LABELS "V2;Performance;ROCm;RCCL;GraphCapture;SyntheticA1Geometry;CanonicalRankOrder"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_RCCL_PERF_DEVICE_COUNT=4;NCCL_PROTO=AllGather:LL")
     message(STATUS "V2 Tests: Added RCCL AllReduce Latency performance benchmarks")
 endif()
 
