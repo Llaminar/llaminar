@@ -355,6 +355,10 @@ namespace llaminar2
 
         void enableSnapshotCapture(const std::string &output_dir = "") override;
         void setSnapshotCaptureFilter(const std::vector<std::string> &keys) override;
+        /** @brief Freeze authored ordinary output demand before plan compilation.
+         * @param capacity Positive diagnostic demand or selected-final-row policy.
+         * @return False after plan compilation/admission/runner creation. */
+        bool setOrdinaryTerminalProjectionCapacity(OrdinaryTerminalProjectionCapacity capacity) override;
         bool setSnapshotMemoryCapacity(
             GraphSnapshotMemoryCapacity capacity) override;
         bool prepareInactiveSnapshotCapture(
@@ -1383,6 +1387,8 @@ namespace llaminar2
         /** Requested routed-weight identity captured before model-aware freezing. */
         std::string requested_routed_weight_authority_identity_;
         RankExecutionPlan plan_;
+        /** Setup-only declaration consumed by the pure rank compiler before child projection. */
+        OrdinaryTerminalProjectionCapacity ordinary_terminal_projection_setup_;
         bool plan_built_{false};
         ClusterInventory cluster_inventory_;
         /** Root-published metadata retained for placement and canonical BOM construction. */

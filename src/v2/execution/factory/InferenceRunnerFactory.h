@@ -109,6 +109,8 @@ namespace llaminar2
     {
         int max_seq_len = 4096;
         int activation_seq_len = 0;
+        /** Authored ordinary output demand, frozen before factory materialization. */
+        OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
         int batch_size = 1;
 
         // Explicit graph path selection (only graph path is supported)
@@ -323,6 +325,7 @@ namespace llaminar2
             InferenceRunnerConfig config;
             config.max_seq_len = runtime.max_seq_len;
             config.activation_seq_len = runtime.resident_graph_rows;
+            config.ordinary_terminal_projection = runtime.ordinary_terminal_projection;
             config.batch_size = runtime.batch_size;
             config.activation_precision = runtime.activation_precision;
             config.kv_cache_precision = runtime.kv_cache_precision;

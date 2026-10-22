@@ -1674,6 +1674,7 @@ namespace llaminar2
                                                  runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
                                                  runner_config.activation_seq_len = config_.resident_graph_rows;
                                                  runner_config.batch_size = config_.batch_size;
+                                                 runner_config.ordinary_terminal_projection = config_.ordinary_terminal_projection;
                                                  runner_config.activation_precision = config_.activation_precision;
                                                  runner_config.fused_attention_backend = config_.fused_attention_backend;
                                                  runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
@@ -2031,6 +2032,7 @@ namespace llaminar2
             runner_config.max_seq_len = static_cast<int>(child_config.max_seq_len);
             runner_config.activation_seq_len = child_config.resident_graph_rows;
             runner_config.batch_size = child_config.batch_size;
+            runner_config.ordinary_terminal_projection = child_config.ordinary_terminal_projection;
             runner_config.activation_precision = child_config.activation_precision;
             runner_config.fused_attention_backend = child_config.fused_attention_backend;
             runner_config.kv_cache_scale_k = child_config.kv_cache_scale_k;

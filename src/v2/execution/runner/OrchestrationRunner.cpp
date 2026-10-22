@@ -17123,7 +17123,8 @@ namespace llaminar2
         {
             const int rank = mpi_ctx_->rank();
             const auto resolved = ResolvedRankOrchestration::resolve(
-                config_, *planning_model_metadata_, cluster_inventory_, *plan_builder_, rank);
+                config_, *planning_model_metadata_, cluster_inventory_, *plan_builder_, rank,
+                ordinary_terminal_projection_setup_);
             if (!resolved.pipelineStages().empty())
             {
                 // Movement storage is not the authority locus. Singleton
@@ -24222,6 +24223,17 @@ namespace llaminar2
         {
             runner_->setSnapshotCaptureFilter(keys);
         }
+    }
+
+    bool OrchestrationRunner::setOrdinaryTerminalProjectionCapacity(
+        OrdinaryTerminalProjectionCapacity capacity)
+    {
+        // A precompiled plan is already immutable; its caller supplies demand
+        // through RuntimeConfig before construction, never by editing children.
+        if (plan_built_ || initialization_lifecycle_.admissionComplete() || runner_)
+            return setError("Ordinary terminal projection capacity must be declared before plan compilation and model admission");
+        ordinary_terminal_projection_setup_ = capacity;
+        return true;
     }
 
     bool OrchestrationRunner::setSnapshotMemoryCapacity(

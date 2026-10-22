@@ -533,11 +533,11 @@ TEST(RankMemoryPlanInputs, CapturedPipelineChannelsFollowDomainsNotDeviceOrdinal
     }
 }
 
-/** @test Native publication follows retained graph capacity and the actual local communicator. */
+/** @test Native terminal publication follows actual ownership/communicator, independently of MTP capacity. */
 TEST(RankMemoryPlanInputs, NativeVocabularyPublicationFollowsResolvedOwnership)
 {
     for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
-    for (const int degree : {1, 2, 4})
+    for (const int degree : {1, 2, 4, 8})
     for (const bool enabled : {false, true})
     for (const int retained : {0, 15})
     for (const auto head : {MTPTerminalHeadPolicy::MirroredFullVocabulary,
@@ -549,7 +549,7 @@ TEST(RankMemoryPlanInputs, NativeVocabularyPublicationFollowsResolvedOwnership)
         mtp.graph_capacity_draft_tokens = retained;
         mtp.terminal_head_policy = head;
         const bool native = backend != DeviceType::CPU && degree > 1 &&
-            retainsMTPGraphCapacity(mtp) && head == MTPTerminalHeadPolicy::VocabularySharded;
+            head == MTPTerminalHeadPolicy::VocabularySharded;
         for (const auto &cfg : buildRankMemoryPlanInputs(fixture.request()))
             EXPECT_EQ(cfg.terminalLogitsCollective(cfg.last_layer < 0 || cfg.last_layer >= fixture.model.n_layers - fixture.model.mtp_layer_count - 1), native
                 ? MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather

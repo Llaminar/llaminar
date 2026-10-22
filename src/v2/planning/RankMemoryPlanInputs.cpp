@@ -194,6 +194,7 @@ namespace llaminar2
             cfg.last_layer = ngram.isFixedHeadSharded()?profile.mainLayerCount()-1:request.plan.last_layer;
             cfg.owns_embedding = request.plan.has_embedding;
             cfg.batch_size = request.plan.runtime.batch_size;
+            cfg.ordinary_terminal_projection = request.plan.runtime.ordinary_terminal_projection;
             cfg.generation_request_capacity =
                 std::max(1, request.plan.runtime.mtp.max_request_batch);
             cfg.max_seq_len = request.plan.runtime.max_seq_len;

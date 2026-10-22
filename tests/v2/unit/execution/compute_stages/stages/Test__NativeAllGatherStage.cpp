@@ -334,7 +334,8 @@ TEST_F(NativeAllGatherContract, VocabularyPublicationRetainsShardedProjectionOwn
     config.tp_ctx = &tp;
     config.lm_head_column_parallel = true;
     config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
-    EXPECT_FALSE(config.mtpPublishesNativeGatheredVocabulary());
+    EXPECT_FALSE(retainsMTPGraphCapacity(config.mtp));
+    EXPECT_TRUE(config.mtpPublishesNativeGatheredVocabulary());
     config.mtp.graph_capacity_draft_tokens = 4;
     EXPECT_TRUE(config.mtpParticipantLogitsAreVocabularySharded());
     EXPECT_FALSE(config.mtpUsesMirroredTerminalHeadBinding());
@@ -690,3 +691,100 @@ TEST_F(NativeAllGatherContract, ReceiptForkRejectsMissingForeignOrUnpublishedCon
     EXPECT_TRUE(exact.includesSource(control.owner())); // Native execution remains integration-only.
 }
 } // namespace
+
+/** @test Ordinary native vocabulary publication depends on domain/layout, never MTP capacity. */
+TEST_F(NativeAllGatherContract, OrdinaryVocabularyExcludesCPUAncillaryAndGlobalDomains)
+{
+    /** @brief A global metadata scope must never advertise a native rank-local edge. */
+    class GlobalScope final : public test::MockLocalTPContext
+    {
+    public:
+        /** @return Explicit global scope; no transport executes in this fixture. */
+        TPScope scope() const override { return TPScope::GLOBAL; }
+    };
+    GraphConfig config;
+    config.default_device = params.device_id;
+    config.tp_ctx = &tp;
+    config.lm_head_column_parallel = true;
+    config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = 0;
+    config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+    EXPECT_FALSE(retainsMTPGraphCapacity(config.mtp));
+    EXPECT_TRUE(config.hasNativeLocalVocabularyGather());
+    EXPECT_TRUE(config.mtpPublishesNativeGatheredVocabulary());
+    auto changed = config;
+    changed.default_device = DeviceId::cpu();
+    EXPECT_FALSE(changed.hasNativeLocalVocabularyGather());
+    changed = config; changed.tp_ctx = nullptr;
+    EXPECT_FALSE(changed.hasNativeLocalVocabularyGather());
+    test::MockLocalTPContext singleton;
+    singleton.setDevices({GlobalDeviceAddress::rocm(0)});
+    singleton.setBackend(CollectiveBackendType::RCCL);
+    changed = config; changed.tp_ctx = &singleton;
+    EXPECT_FALSE(changed.hasNativeLocalVocabularyGather());
+    GlobalScope global;
+    global.setDevices(tp.devices());
+    global.setBackend(CollectiveBackendType::RCCL);
+    changed = config; changed.tp_ctx = &global;
+    EXPECT_FALSE(changed.hasNativeLocalVocabularyGather());
+    changed = config; changed.lm_head_column_parallel = false;
+    EXPECT_FALSE(changed.mtpPublishesNativeGatheredVocabulary());
+    changed = config; changed.mtp.terminal_head_policy = MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    EXPECT_FALSE(changed.mtpPublishesNativeGatheredVocabulary());
+
+    NativeVocabularyAllGatherStage::Params declaration;
+    declaration.device_id = params.device_id;
+    declaration.tp_ctx = &tp;
+    declaration.local_logits = &input;
+    declaration.full_logits = &output;
+    declaration.rows = DeviceRowRange::fullyActive(1);
+    declaration.local_vocabulary = 16;
+    declaration.vocabulary = 32;
+    declaration.participant = 0;
+    declaration.stage_name = "lm_head_allgather";
+    NativeVocabularyAllGatherStage stage(declaration);
+    EXPECT_TRUE(stage.getWorkspaceRequirements(1).buffers.empty());
+    EXPECT_EQ(stage.bufferContract().inputs.front().id, BufferId::LOGITS_LOCAL);
+    EXPECT_EQ(stage.bufferContract().outputs.front().id, BufferId::LOGITS);
+}
+
+/** @test Explicit ordinary storage preview keeps the executable's one-row live extent. */
+TEST_F(NativeAllGatherContract, OrdinaryProjectedCapacityKeepsFrozenOperationRows)
+{
+    GraphConfig config;
+    config.default_device = params.device_id;
+    config.tp_ctx = &tp;
+    config.lm_head_column_parallel = true;
+    config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = 0;
+    config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+    config.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(16);
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest());
+    auto excluded = config;
+    excluded.default_device = DeviceId::cpu();
+    EXPECT_FALSE(excluded.requiresEagerWorkspaceFamilyManifest());
+    excluded = config;
+    excluded.lm_head_column_parallel = false;
+    EXPECT_FALSE(excluded.requiresEagerWorkspaceFamilyManifest());
+    excluded = config;
+    excluded.tp_ctx = nullptr;
+    EXPECT_FALSE(excluded.requiresEagerWorkspaceFamilyManifest());
+    NativeVocabularyAllGatherStage::Params declaration;
+    declaration.device_id = params.device_id;
+    declaration.tp_ctx = &tp;
+    declaration.local_logits = &input;
+    declaration.full_logits = &output;
+    declaration.rows = DeviceRowRange::fullyActive(1);
+    declaration.local_vocabulary = 16;
+    declaration.vocabulary = 32;
+    declaration.participant = 0;
+    declaration.stage_name = "lm_head_allgather";
+    NativeVocabularyAllGatherStage stage(declaration);
+    const auto rows = config.ordinary_terminal_projection.resolveForSequence(1, 512);
+    const auto preview = stage.getWorkspaceRequirements(rows);
+    ASSERT_EQ(preview.buffers.size(), 1u);
+    EXPECT_EQ(preview.buffers.front().size_bytes, 16u * 32u * sizeof(float));
+    EXPECT_EQ(stage.params().rows.physicalRows(), 1);
+    EXPECT_FALSE(stage.params().rows.countOwner());
+    EXPECT_TRUE(stage.getWorkspaceRequirements(1).buffers.empty());
+}

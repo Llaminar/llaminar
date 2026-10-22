@@ -1003,6 +1003,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             cfg.mtp_enabled, owns_terminal_main_layer);
         const auto terminal_logits_collective =
             cfg.terminalLogitsCollective(owns_terminal_main_layer);
+        if (owns_terminal_main_layer && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
+            (void)cfg.ordinary_terminal_projection.resolveForSequence(cfg.batch_size, activation_seq);
         if (cfg.device.is_gpu() && cfg.graph_snapshot_memory.effective_kv &&
             cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
         {
@@ -1659,6 +1661,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     .device_compute_units = cfg.device_compute_units,
                     .cpu_execution = cfg.cpu_execution,
                     .batch_size = cfg.batch_size,
+                    .ordinary_terminal_projection = cfg.ordinary_terminal_projection,
                     .resident_graph_rows = activation_seq,
                     .max_context_rows = max_seq,
                     .owns_embedding = cfg.owns_embedding,

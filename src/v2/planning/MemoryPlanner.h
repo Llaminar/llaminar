@@ -369,8 +369,11 @@ struct DevicePlanConfig
     MTPShiftedKVHeadLayout mtp_shifted_kv_head_layout =
         MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
 
-    /** Flattened target-verifier rows retained by the MTP graph family. */
+    /** Flattened retained target rows; ordinary arena schemas retain their positive placeholder, while workspace propagation supplies zero. */
     int mtp_target_query_rows = 2;
+
+    /** Exact ordinary diagnostic output demand within the selected activation envelope. */
+    OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
 
     /** Retained random-seed request rows, independent of current MTP enablement. */
     int generation_request_capacity = 1;
@@ -387,14 +390,17 @@ struct DevicePlanConfig
      * The physical projection layout never implies the archived output width.
      * Deriving this fact from the same immutable local transport declaration
      * avoids a second policy field that ordinary and overlay BOM builders could
-     * leave inconsistent. Retained MTP capacity is independent of enablement.
+     * leave inconsistent. Ordinary terminal projection owns this publication
+     * even when no MTP family is retained; predictor capacity is unrelated.
+     * The resolver's historical sidecar_produces_logits field also names the
+     * ordinary terminal projection here; it does not authorize a predictor.
      */
     [[nodiscard]] MTPTerminalLogitsCollective terminalLogitsCollective(
         bool owns_terminal_main_layer) const noexcept
     {
         return resolveMTPTerminalLogitsCollective({
             .layout = mtp_terminal_logits_layout,
-            .sidecar_produces_logits = mtp_enabled && owns_terminal_main_layer &&
+            .sidecar_produces_logits = owns_terminal_main_layer &&
                 execution_role == DeviceExecutionMemoryRole::ContinuationGraph,
             .spans_multiple_global_ranks = false,
             .native_local_gpu_tp = device.is_gpu() && total_shards > 1 &&

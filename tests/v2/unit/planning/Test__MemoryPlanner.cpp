@@ -22,6 +22,7 @@
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "models/qwen35/Qwen35Schema.h"
 #include "collective/DeviceCountedAllGather.h"
+#include "collective/VocabularyGatherWorkspaceContract.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "planning/MemoryPlan.h"
@@ -3894,4 +3895,108 @@ TEST(Test__MemoryPlanner, ReplicatedDecodeIncludesActualGDNHandoffWorkspace)
     cpu.activation_seq_len = 9;
     cpu.additional_weight_sets = {AdditionalPersistentWeightSet::ReplicatedDenseDecode};
     EXPECT_THROW((void)MemoryPlanner::plan(profile, {cpu}), std::invalid_argument);
+}
+
+/**
+ * @test Ordinary native terminal publication owns full logits without an MTP family.
+ *
+ * Keep the planner's historical target-row default deliberately untouched:
+ * workspace propagation must mask it to zero while mtp_enabled is false. An
+ * ordinary singleton gather needs no transpose scratch, predictor weights or
+ * recurrent checkpoints. The no-native comparison differs only in publication.
+ */
+TEST(Test__MemoryPlanner, OrdinaryNativeVocabularyHasNoRetainedMTPOrSingletonScratch)
+{
+    const auto profile = createTestProfile();
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int degree : {2, 4, 8})
+    {
+        SCOPED_TRACE(DeviceId(backend, 0).toString() + "/" + std::to_string(degree));
+        DevicePlanConfig cfg;
+        cfg.device = DeviceId(backend, 0);
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ULL << 30;
+        cfg.device_compute_units = 60;
+        cfg.total_shards = degree;
+        cfg.first_layer = 0;
+        cfg.last_layer = profile.n_layers - 1;
+        cfg.batch_size = 1;
+        cfg.max_seq_len = cfg.activation_seq_len = 64;
+        cfg.mtp_enabled = false;
+        cfg.mtp_terminal_logits_layout = MTPTerminalLogitsLayout::VocabularyShardPerParticipant;
+        cfg.local_tp_backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        ASSERT_EQ(cfg.terminalLogitsCollective(true), MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather);
+        EXPECT_EQ(cfg.terminalLogitsCollective(false), MTPTerminalLogitsCollective::None);
+        MTPRuntimeConfig no_mtp;
+        no_mtp.enabled = false;
+        no_mtp.graph_capacity_draft_tokens = 0;
+        no_mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+        EXPECT_FALSE(retainsMTPGraphCapacity(no_mtp));
+        cfg.additional_weight_sets = resolveAdditionalPersistentWeightSets(
+            DenseParallelPolicy::TensorParallel, degree, no_mtp);
+        EXPECT_TRUE(cfg.additional_weight_sets.empty());
+        const auto native = MemoryPlanner::plan(profile, {cfg});
+        cfg.local_tp_backend.reset(); // Explicit global/non-local shard owns no native publication.
+        EXPECT_EQ(cfg.terminalLogitsCollective(true), MTPTerminalLogitsCollective::None);
+        const auto without_native = MemoryPlanner::plan(profile, {cfg});
+        ASSERT_EQ(native.devices.size(), 1u);
+        ASSERT_EQ(without_native.devices.size(), 1u);
+        EXPECT_EQ(native.devices.front().workspace_bytes(), without_native.devices.front().workspace_bytes());
+        EXPECT_EQ(native.devices.front().additional_weight_bytes(), 0u);
+        EXPECT_EQ(native.devices.front().checkpoint_state_bytes(), 0u);
+    }
+}
+
+/** @test Ordinary native scratch follows declared output rows, never prompt/MTP placeholders. */
+TEST(Test__MemoryPlanner, OrdinaryProjectedRowsPriceExactNativeBank)
+{
+    const auto profile = createTestProfile();
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int degree : {2, 4, 8})
+    {
+        DevicePlanConfig cfg;
+        cfg.device = DeviceId(backend, 0);
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ULL << 30;
+        cfg.device_compute_units = 60;
+        cfg.total_shards = degree;
+        cfg.last_layer = profile.n_layers - 1;
+        cfg.max_seq_len = 4096;
+        cfg.activation_seq_len = 512;
+        cfg.batch_size = 1;
+        cfg.mtp_enabled = false; // Keep the inactive target-row placeholder unchanged.
+        cfg.mtp_terminal_logits_layout = MTPTerminalLogitsLayout::VocabularyShardPerParticipant;
+        cfg.local_tp_backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        const auto singleton = MemoryPlanner::plan(profile, {cfg});
+        for (const int rows : {2, 16, 512})
+        {
+            cfg.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(rows);
+            const auto diagnostic = MemoryPlanner::plan(profile, {cfg});
+            const auto bank = VocabularyGatherWorkspaceContract::requirements(rows, profile.vocab_size);
+            EXPECT_EQ(diagnostic.devices.front().workspace_bytes() - singleton.devices.front().workspace_bytes(),
+                      bank.total_bytes_with_alignment());
+            EXPECT_EQ(diagnostic.devices.front().additional_weight_bytes(), 0u);
+            EXPECT_EQ(diagnostic.devices.front().checkpoint_state_bytes(), 0u);
+        }
+        cfg.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(513);
+        EXPECT_THROW(MemoryPlanner::plan(profile, {cfg}), std::invalid_argument);
+        cfg.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(16);
+        cfg.local_tp_backend.reset(); // Global/non-native ownership contributes no transpose bank.
+        const auto global = MemoryPlanner::plan(profile, {cfg});
+        cfg.ordinary_terminal_projection = {};
+        const auto global_single = MemoryPlanner::plan(profile, {cfg});
+        EXPECT_EQ(global.devices.front().workspace_bytes(), global_single.devices.front().workspace_bytes());
+        cfg.local_tp_backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        cfg.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
+        EXPECT_EQ(cfg.terminalLogitsCollective(true), MTPTerminalLogitsCollective::None);
+    }
+    DevicePlanConfig cpu;
+    cpu.device = DeviceId::cpu();
+    cpu.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    cpu.device_compute_units = 8;
+    cpu.device_total_bytes = cpu.device_free_bytes = 64ULL << 30;
+    cpu.max_seq_len = cpu.activation_seq_len = 512;
+    const auto singleton = MemoryPlanner::plan(profile, {cpu});
+    cpu.ordinary_terminal_projection = OrdinaryTerminalProjectionCapacity::projectedRows(16);
+    const auto diagnostic = MemoryPlanner::plan(profile, {cpu});
+    EXPECT_EQ(cpu.terminalLogitsCollective(true), MTPTerminalLogitsCollective::None);
+    EXPECT_EQ(diagnostic.devices.front().workspace_bytes(), singleton.devices.front().workspace_bytes());
 }

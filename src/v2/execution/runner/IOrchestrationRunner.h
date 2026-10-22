@@ -992,6 +992,22 @@ namespace llaminar2
         }
 
         /**
+         * @brief Declare ordinary terminal output rows before plan compilation.
+         * @param capacity Immutable maximum actual output demand, not prompt capacity.
+         * @return True only while setup can still publish one complete admitted plan.
+         *
+         * Precompiled plans carry this value in RuntimeConfig before construction.
+         * Later all-position/row-indexed selection remains a separate runtime
+         * operation within this frozen demand; it cannot enlarge admission.
+         * This API does not enable projection execution or reserve MTP capacity.
+         */
+        virtual bool setOrdinaryTerminalProjectionCapacity(OrdinaryTerminalProjectionCapacity capacity)
+        {
+            (void)capacity;
+            return false;
+        }
+
+        /**
          * @brief Declare graph-resident diagnostic storage before initialize().
          *
          * The caller that selects checkpoint topology supplies a complete

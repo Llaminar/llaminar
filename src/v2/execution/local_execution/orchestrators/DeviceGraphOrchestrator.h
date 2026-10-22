@@ -4677,6 +4677,22 @@ namespace llaminar2
             size_t columns) const;
 
         /**
+         * @brief Reject an unadmitted native publication before narrowing or owner binding.
+         * @param rows Actual physical projected rows, including compact padding.
+         * @throws std::invalid_argument For absent/oversized native publication geometry.
+         */
+        void requireNativeTerminalPublicationCapacity(std::size_t rows) const;
+
+        /**
+         * @brief Check already selected ordinary/all-position demand before admission.
+         * @param requests Immutable input request count.
+         * @param sequence_rows Immutable physical input rows per request.
+         * @throws std::invalid_argument For invalid/unadmitted projected rows.
+         * @throws std::overflow_error For an unrepresentable flattened input.
+         */
+        void requireActiveNativeTerminalPublicationCapacity(int requests, int sequence_rows) const;
+
+        /**
          * @brief Bind the sole all-position logits surface for a graph role.
          *
          * GPU MTP condition and grouped-verifier graphs must reuse the

@@ -16,6 +16,7 @@
 #include "../../utils/Logger.h"
 #include "../../loaders/ImmutableRowTablePolicy.h"
 #include "RoutedExpertPolicy.h"
+#include "OrdinaryTerminalProjectionCapacity.h"
 #include "MTPDepthDefaults.h"
 #include "MTPDepthPolicyTypes.h"
 #include "../mtp/MTPConditionForwardPurpose.h"
@@ -2150,6 +2151,9 @@ namespace llaminar2
          * context capacity; longer prompts execute as ordered graph chunks.
          */
         int resident_graph_rows = 0;
+
+        /** Authored ordinary output-row demand, frozen before model admission. */
+        OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
 
         /**
          * @brief ExpertOverlay prefill authority, when one is required.

@@ -30836,6 +30836,112 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_integration_rocm_native_vnni_gemv)
         V2_Integration_ROCmNativeQ8SerialGeometry)
 endif()
 
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_mtp_graph_construction)
+    # Complete Unit includes these cases; preflight also registers the focused defects.
+    add_v2_test(V2_Integration_OrdinaryNativeVocabularyGraphOwnership
+        COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+            --gtest_filter=Test__MTPGraphConstruction.OrdinaryNativeVocabularyPublishesFullLogitsWithoutMTPCapacity
+        LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;LocalTP;Vocabulary;GraphCapture;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_OrdinaryNativeVocabularyDomain
+        COMMAND $<TARGET_FILE:v2_test_native_allgather_stage>
+            --gtest_filter=NativeAllGatherContract.OrdinaryVocabularyExcludesCPUAncillaryAndGlobalDomains
+        LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;LocalTP;Vocabulary;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_OrdinaryNativeVocabularyMemory
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=Test__MemoryPlanner.OrdinaryNativeVocabularyHasNoRetainedMTPOrSingletonScratch:RankMemoryPlanInputs.NativeVocabularyPublicationFollowsResolvedOwnership
+        LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;PhysicalMemoryAuthority;LocalTP;Vocabulary;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    foreach(_ordinary_vocab_backend CUDA ROCm)
+        if((_ordinary_vocab_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (_ordinary_vocab_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            add_v2_test(V2_Integration_OrdinaryNativeVocabulary_${_ordinary_vocab_backend}2
+                COMMAND $<TARGET_FILE:v2_integration_native_vocabulary_allgather>
+                    --gtest_filter=NativeVocabularyAllGather.OrdinaryNoMTP${_ordinary_vocab_backend}
+                LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;LocalTP;Vocabulary;GraphCapture;ByteExact;LiveExtent;${_ordinary_vocab_backend};Devices2;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        endif()
+    endforeach()
+    if(HAVE_ROCM)
+        add_v2_test(V2_Integration_OrdinaryNativeVocabulary_ROCm4
+            COMMAND $<TARGET_FILE:v2_integration_native_vocabulary_allgather>
+                --gtest_filter=NativeVocabularyAllGather.OrdinaryNoMTPROCm4
+            LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;LocalTP;Vocabulary;GraphCapture;ByteExact;LiveExtent;ROCm;Devices4;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    endif()
+
+endif()
+
+if(NOT V2_PERF_TESTS_ONLY)
+    # Device-free actual-loader ABI witnesses; separate DSOs keep NCCL/RCCL isolated.
+    foreach(native_rows_backend IN ITEMS NCCL RCCL)
+        if((native_rows_backend STREQUAL "NCCL" AND HAVE_CUDA) OR
+           (native_rows_backend STREQUAL "RCCL" AND HAVE_ROCM))
+            string(TOLOWER "${native_rows_backend}" native_rows_suffix)
+            set(native_rows_fixture "v2_unit_${native_rows_suffix}_rows_abi_dependency")
+            set(native_rows_test "v2_unit_${native_rows_suffix}_rows_abi")
+            add_library(${native_rows_fixture} SHARED
+                unit/collective/backends/NativeRowsABIDependency.cpp)
+            target_include_directories(${native_rows_fixture} PRIVATE ${CMAKE_SOURCE_DIR})
+            target_compile_features(${native_rows_fixture} PRIVATE cxx_std_20)
+            target_compile_definitions(${native_rows_fixture} PRIVATE
+                "LLAMINAR_NATIVE_ROWS_ABI_${native_rows_backend}=1")
+            add_executable(${native_rows_test}
+                unit/collective/backends/Test__NativeRowsABI.cpp)
+            target_compile_definitions(${native_rows_test} PRIVATE
+                "LLAMINAR_NATIVE_ROWS_ABI_${native_rows_backend}=1")
+            target_link_libraries(${native_rows_test} PRIVATE
+                llaminar2_core ${native_rows_fixture} GTest::gtest_main)
+            add_v2_test(V2_Unit_${native_rows_backend}FixedRowsABI
+                COMMAND $<TARGET_FILE:${native_rows_test}>
+                LABELS "V2;Unit;Collective;CPU;Dependency;${native_rows_backend};Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10)
+            add_v2_test(V2_Integration_${native_rows_backend}FixedRowsABI
+                COMMAND $<TARGET_FILE:${native_rows_test}>
+                LABELS "V2;Integration;ProductionTestPreflight;Collective;CPU;Dependency;${native_rows_backend};Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10)
+        endif()
+    endforeach()
+endif()
+
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_memory_planner)
+    target_sources(v2_test_memory_planner PRIVATE
+        unit/planning/Test__OrdinaryTerminalProjectionCapacity.cpp)
+    add_v2_test(V2_Integration_OrdinaryTerminalProjectionDeclaration
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=OrdinaryTerminalProjectionCapacity.*:Test__MemoryPlanner.OrdinaryProjectedRowsPriceExactNativeBank
+        LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;PhysicalMemoryAuthority;Vocabulary;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_OrdinaryTerminalProjectionPipeline
+        COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+            --gtest_filter=ResolvedRankOrchestration.OrdinaryProjectionDemandPrecedesPipelineProjection:ResolvedRankOrchestration.OrdinaryProjectionSurvivesImplicitMoERecompile
+        LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;Planning;Vocabulary;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_OrdinaryTerminalProjectionWorkspace
+        COMMAND $<TARGET_FILE:v2_test_native_allgather_stage>
+            --gtest_filter=NativeAllGatherContract.OrdinaryProjectedCapacityKeepsFrozenOperationRows
+        LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;Workspace;Vocabulary;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    foreach(_ordinary_projection_backend CUDA ROCm)
+        if((_ordinary_projection_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (_ordinary_projection_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            add_v2_test(V2_Integration_OrdinaryTerminalProjection_${_ordinary_projection_backend}2
+                COMMAND $<TARGET_FILE:v2_integration_native_vocabulary_allgather>
+                    --gtest_filter=NativeVocabularyAllGather.OrdinaryProjectedNoMTP${_ordinary_projection_backend}
+                LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;PhysicalMemoryAuthority;Vocabulary;GraphCapture;ByteExact;LiveExtent;${_ordinary_projection_backend};Devices2;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        endif()
+    endforeach()
+    if(HAVE_ROCM)
+        add_v2_test(V2_Integration_OrdinaryTerminalProjection_ROCm4
+            COMMAND $<TARGET_FILE:v2_integration_native_vocabulary_allgather>
+                --gtest_filter=NativeVocabularyAllGather.OrdinaryProjectedNoMTPROCm4
+            LABELS "V2;Integration;ProductionTestPreflight;OrdinaryGeneration;PhysicalMemoryAuthority;Vocabulary;GraphCapture;ByteExact;LiveExtent;ROCm;Devices4;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    endif()
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR

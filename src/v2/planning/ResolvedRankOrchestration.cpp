@@ -220,7 +220,8 @@ namespace llaminar2
 
     ResolvedRankOrchestration ResolvedRankOrchestration::resolve(
         const OrchestrationConfig &requested, const PlanningModelMetadata &model,
-        const ClusterInventory &inventory, IExecutionPlanBuilder &builder, int rank)
+        const ClusterInventory &inventory, IExecutionPlanBuilder &builder, int rank,
+        OrdinaryTerminalProjectionCapacity terminal_projection)
     {
         if (inventory.world_size <= 0 || inventory.ranks.size() != static_cast<size_t>(inventory.world_size) ||
             rank < 0 || rank >= inventory.world_size)
@@ -237,6 +238,8 @@ namespace llaminar2
         bindOverlay(config, inventory, MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains);
         requireValid(builder.validateConfig(config, geometry, inventory), "Configuration validation failed");
         auto rank_plan = builder.buildPlanForRank(config, geometry, inventory, rank);
+        // Install authored output demand before immutable child rank projections.
+        rank_plan.runtime.ordinary_terminal_projection = terminal_projection;
         if (model.memoryProfile().expert_count > 0 && rank_plan.usesLocalPP())
         {
             if (rank_plan.usesGlobalTP() || rank_plan.usesPipelineParallel() || config.moe_routed_expert_plan)
@@ -310,6 +313,7 @@ namespace llaminar2
             bindOverlay(config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP);
             requireValid(builder.validateConfig(config, geometry, inventory), "Implicit ExpertOverlay validation failed");
             rank_plan = builder.buildPlanForRank(config, geometry, inventory, rank);
+            rank_plan.runtime.ordinary_terminal_projection = terminal_projection;
         }
         else if (config.routed_expert_compute_policy == RoutedExpertComputePolicy::Automatic)
         {

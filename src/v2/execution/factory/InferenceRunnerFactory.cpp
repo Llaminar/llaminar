@@ -318,23 +318,15 @@ namespace llaminar2
                                           : resolveActivationBufferSeqLen(
                                                 config.max_seq_len,
                                                 device);
-            if (sequence_rows <= 0)
+            try
             {
-                error = "graph activation capacity must be positive";
+                return OrdinaryTerminalProjectionCapacity::checkedFlattenedRows(config.batch_size, sequence_rows);
+            }
+            catch (const std::exception &failure)
+            {
+                error = failure.what();
                 return std::nullopt;
             }
-            if (config.batch_size <= 0)
-            {
-                error = "graph batch capacity must be positive";
-                return std::nullopt;
-            }
-            if (sequence_rows >
-                std::numeric_limits<int>::max() / config.batch_size)
-            {
-                error = "flattened graph activation capacity overflows int";
-                return std::nullopt;
-            }
-            return sequence_rows * config.batch_size;
         }
 
         void installTPExecutorCancellation(
@@ -3050,6 +3042,9 @@ namespace llaminar2
             return nullptr;
         }
         graph_config.max_activation_rows = *graph_row_capacity;
+        graph_config.ordinary_terminal_projection = config.ordinary_terminal_projection;
+        (void)graph_config.ordinary_terminal_projection.resolve(
+            config.batch_size, *graph_row_capacity);
         graph_config.max_request_count = std::max(1, config.batch_size);
         graph_config.executor_config.cancellation_requested = config.cancellation_requested;
         graph_config.executor_config.stage_failure_callback = config.stage_failure_callback;
@@ -4178,6 +4173,9 @@ namespace llaminar2
             return nullptr;
         }
         graph_config.max_activation_rows = *graph_row_capacity;
+        graph_config.ordinary_terminal_projection = config.ordinary_terminal_projection;
+        (void)graph_config.ordinary_terminal_projection.resolve(
+            config.batch_size, *graph_row_capacity);
         graph_config.max_request_count = std::max(1, config.batch_size);
         graph_config.activation_precision = config.activation_precision;
         graph_config.fused_attention_backend = config.fused_attention_backend;

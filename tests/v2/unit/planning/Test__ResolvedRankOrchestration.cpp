@@ -633,3 +633,29 @@ TEST_P(MoEPipelineMultiDeviceTopology, MiddleStagesAndMTPPolicySurviveCompilatio
 
 INSTANTIATE_TEST_SUITE_P(DeviceCounts, MoEPipelineMultiDeviceTopology, ::testing::Values(4, 8),
     [](const auto &info) { return "Devices" + std::to_string(info.param); });
+
+/** @test Authored output demand reaches immutable child plans before any admission. */
+TEST(ResolvedRankOrchestration, OrdinaryProjectionDemandPrecedesPipelineProjection)
+{
+    const auto demand = OrdinaryTerminalProjectionCapacity::projectedRows(16);
+    ExecutionPlanBuilder builder;
+    const auto result = ResolvedRankOrchestration::resolve(
+        pipeline(true), metadata(true), hybridInventory(), builder, 0, demand);
+    EXPECT_EQ(result.rankPlan().runtime.ordinary_terminal_projection, demand);
+    ASSERT_EQ(result.pipelineStages().size(), 2u);
+    for (const auto &stage : result.pipelineStages())
+        EXPECT_EQ(stage.rankPlan().runtime.ordinary_terminal_projection, demand);
+}
+
+/** @test Implicit MoE synthesis cannot erase authored demand during canonical recompilation. */
+TEST(ResolvedRankOrchestration, OrdinaryProjectionSurvivesImplicitMoERecompile)
+{
+    OrchestrationConfig config;
+    config.tp_devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+    ExecutionPlanBuilder builder;
+    const auto demand = OrdinaryTerminalProjectionCapacity::projectedRows(16);
+    const auto result = ResolvedRankOrchestration::resolve(config, metadata(true),
+        inventory(1, {card(DeviceType::ROCm, 0, 7), card(DeviceType::ROCm, 1, 7)}), builder, 0, demand);
+    EXPECT_EQ(result.overlayOrigin(), MoEExpertOverlayAuthorityPlanDisposition::SynthesizedLocalTP);
+    EXPECT_EQ(result.rankPlan().runtime.ordinary_terminal_projection, demand);
+}

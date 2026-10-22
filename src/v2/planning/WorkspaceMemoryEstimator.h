@@ -40,6 +40,8 @@ struct WorkspaceMemoryGeometry
     int device_compute_units = 0;
     CPUExecutionGeometry cpu_execution; ///< Exact participant cache/ISA observation for CPU admission.
     int batch_size = 1; ///< Maximum simultaneously admitted requests.
+    /** Maximum authored ordinary output demand; independent of retained MTP. */
+    OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
     int resident_graph_rows = 1; ///< Largest token-row capture bucket.
     int max_context_rows = 1; ///< Stable KV-cache capacity in token rows.
     bool owns_embedding = false; ///< Participant publishes token-ID state.

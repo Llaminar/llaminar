@@ -1,11 +1,12 @@
 # QFN TP4 computation ownership audit
 
-Reviewed 2026-10-22 against source `77e17645b`, the retained L69 per-device
-trace, and NativeVNNI82's current construction observations. A1 uses one MPI
+Initial audit reviewed 2026-10-22 against source `77e17645b`, the retained L69
+per-device trace, and NativeVNNI82's construction observations. A1 uses one MPI
 rank with four MI50 participants, dense `TensorParallel`, routed
 `GateUpOwnedDownColumns`, RAM ngrams, 48 main layers and MTP disabled. Its
-accepted unprofiled result remains **L80 785.303 prefill / 34.700 decode tok/s**.
-This audit changes neither placement nor accuracy policy.
+initial accepted unprofiled baseline was **L80 785.303 prefill / 34.700 decode
+tok/s**. The measured follow-up below advances the explicit vocabulary-sharded
+configuration to **L84 786.235 / 35.056 tok/s**, with unchanged accuracy.
 
 The transformer is not replicated wholesale. Several explicit replicas do
 repeat substantial work, and two narrower opportunities avoid computation
@@ -23,7 +24,7 @@ whose result the current consumer does not need.
 | Hyperconnections | 97 full branch reads and 96 injections | Explicit replicated computation and branch state. |
 | PLE/ngram frontend | Full key/value projections and per-participant lookup responses | Explicit replicated compute; four response channels do not mean four physical RAM tables. |
 | Sparse indexer | Full BF16 query/key projections, pool history and selection | Replicated indexer; its subsequent attention consumes distinct query heads. |
-| Terminal vocabulary head | 248320×2560 on each GPU | Full projection repeated four times. Arithmetic-policy N62080 does not shard physical work. |
+| Terminal vocabulary head, mirrored control | 248320×2560 on each GPU | Full projection repeated four times. Arithmetic-policy N62080 does not shard physical work. The qualified explicit sharded follow-up below uses physical N62080. |
 | Router/norms/activation quantization | Router and some full-row operations repeat; head-local norms are sharded | Inspect actual inputs and consumers. Repeated kernel names or replicated norm weights alone do not establish duplicate work. |
 
 The declarations and bindings are in
@@ -83,10 +84,10 @@ weights and an explicit native logits gather. Auto currently mirrors QFN;
 the measured automatic sharding exception is a different dense TP2/MTP family.
 An explicit comparison must not change Auto before it is qualified.
 
-The audit found a concrete ordinary-mode gap: native local vocabulary
+The original audit found a concrete ordinary-mode gap: native local vocabulary
 publication in [GraphTypes.h](../../../../src/v2/models/GraphTypes.h) and its
 terminal publication fact in
-[MemoryPlanner.h](../../../../src/v2/planning/MemoryPlanner.h) depend on retained
+[MemoryPlanner.h](../../../../src/v2/planning/MemoryPlanner.h) depended on retained
 MTP capacity. With MTP disabled and zero capacity, the complete ordinary
 sampler correctly rejects incomplete sharded logits. Removing that rejection
 would hide the defect.
@@ -104,7 +105,100 @@ the accepted small-AllGather threshold. Benchmark the complete projection,
 gather and sampling transaction, followed by the unchanged 512-prompt/256-output
 Release workload. Require exact output bytes, live communication extents,
 zero-capacity admission, reset/prefix lifecycle and the canonical 185-row model
-accuracy slice. No QFN TP4 sharded-head performance claim is established yet.
+accuracy slice.
+
+### Experiment84: measured ordinary M1 head sharding
+
+The two publication predicates now admit an explicit native local sharded
+head independently of retained MTP capacity. The focused old-source regression
+fails in all three ownership/admission cases; the repaired source passes
+**11/11 device-free** and **9/9 native** registrations, including CUDA TP2,
+ROCm TP2 and the actual 248320-column ROCm TP4 vocabulary. Existing counted,
+serial-family and fixed-serial native cases remain green. Ordinary M1 retains
+no transpose bank, predictor or verifier count. These are focused results,
+not a complete production-preflight certificate.
+
+Both explicit policies pass the unchanged canonical QFN accuracy panel.
+The [sharded byte comparison](../../../../parity-results/qwen-flash-next/vocabulary84-release-accuracy-sharded/logit-byte-comparison.json)
+retains **all 26 files / 185 final-logit rows byte-identically** to both L74
+and the newly measured mirrored control. This includes prefill, decode and
+reset rows, each with one projected terminal row. Construction receipts show
+physical N62080 instead of N248320, with the same arithmetic-policy N62080,
+K2560 and native-Q8 kernel geometry. Those receipts are not replay counters.
+
+The [complete A/B/B/A comparison](../../../../parity-results/qwen-flash-next/vocabulary84-model-abba-comparison.json)
+uses one archived Release binary, HIP76 and RCCL80. Each arm has one warmup
+and three measured 512-prompt/256-output iterations; all twelve generated
+sequences match. Dense/routed placement, 28 physical NUMA1 workers, RAM ngrams,
+C4096/M512, precision, seed, disabled prefix cache and MTP-off/capacity0 are
+identical. Only the explicit terminal-head policy changes. PerfStats timing
+instrumentation is disabled, and all four arms retire normally with clean
+driver windows and unchanged runtime/source identities.
+
+| Explicit terminal policy | Prefill median tok/s | Decode median tok/s | Decode sample range tok/s |
+|---|---:|---:|---:|
+| Mirrored full vocabulary | 785.752 | 34.627 | 34.514–34.656 |
+| Vocabulary sharded | 786.235 | 35.056 | 34.970–35.158 |
+
+The combined six-sample medians give **+0.061% prefill / +1.237% decode**.
+This removes roughly 0.35 milliseconds per decoded token in this workload;
+it does not close the remaining gap to Castagna's 42.959 tok/s. Five-second
+passive resource samples also show lower per-card VRAM peaks, by approximately
+0.5–0.65 GiB in the first three arms. These are sampled whole-process/device
+observations, not a measurement of the projection's individual allocation.
+
+### Follow-up85: ordinary projected-row admission and traffic regressions
+
+`OrdinaryTerminalProjectionCapacity` now carries setup-time output demand
+through the existing rank, participant and graph configuration. Selected-final
+execution retains one row per request; an explicit larger declaration is
+bounded by the existing flattened activation capacity. Admission prices the
+same `VocabularyGatherWorkspaceContract` used by the native stage. Its exact
+bank is published before capture, and later output selection cannot enlarge
+it. Retained MTP rows join that capacity only when an MTP family actually
+exists; inactive placeholders do not authorize storage or execution.
+
+The [19 device-free registrations](../../../../parity-results/qwen-flash-next/ordinary-vocabulary84-capacity-devicefree/result.json)
+pass declaration/overflow, pipeline propagation, implicit MoE recompilation,
+ownership and workspace checks. Planning coverage includes two, four and
+eight participants. The [12 native registrations](../../../../parity-results/qwen-flash-next/ordinary-vocabulary84-capacity-native-r2/result.json)
+pass on CUDA TP2 and ROCm TP2/TP4, including 20 poisoned large/partial/empty/small
+replays, exact admitted ordinary banks, stable workspace identity and the
+existing MTP serial/counting families. The rebuilt
+[complete Unit suite](../../../../parity-results/qwen-flash-next/ordinary-vocabulary84-unit/result.json)
+passes **763/763**, with no failures or skips, in **116.43 seconds**.
+
+The device-free ABI tests call the real NCCL/RCCL loader wrappers against an
+explicit recording dependency. Fixed M1 forwards exactly **62080 FP32 elements
+/ 248320 bytes**, preserving its original stream and buffer identities. It
+rejects a passive counter rather than fabricating a traffic receipt. A counted
+positive control proves that the distinct extension is actually observed.
+Native captured fixtures independently prove output and untouched tails.
+
+The first TP4 counted-fixture run exposed a test expectation inherited from
+two participants. Native receipts count primitive sends, including necessary
+ring forwarding: aggregate payload is `P * (P - 1) * live_rows * local_columns
+* sizeof(float)`. The old assertion omitted `P - 1`; outputs and tails were
+already correct. The corrected assertion passes without a runtime change or
+tolerance. Original failed build/test receipts remain retained.
+
+The [final-source Release build](../../../../parity-results/qwen-flash-next/vocabulary85-capacity-release-build/result.json)
+passes in **215.09 seconds**. Its [canonical M1 panel](../../../../parity-results/qwen-flash-next/vocabulary85-capacity-release-accuracy-sharded/runtime-observation.json)
+passes in **100.64 seconds**, with all required numerical groups, reset,
+driver, source/runtime identity and normal retirement checks green. All
+**26 files / 185 rows** remain [byte-identical](../../../../parity-results/qwen-flash-next/vocabulary85-capacity-release-accuracy-sharded/logit-byte-comparison.json)
+to both L74 and accepted84 sharded. The archived source is parent
+`27b6006f5ec630ac46b74a98e5555019dc654ddb` plus scoped source delta
+`8e258dd5e55238d4df610c6212d4e70332f8699d9450ef28e151588e1e0bc792`.
+This follow-up validates the completed capacity implementation; throughput
+numbers remain the actual four-arm Release84 measurements above.
+
+All discovered contracts have explicit `ProductionTestPreflight` registrations.
+The model evidence establishes M1 correctness within the retained panel:
+native multi-row fixture coverage does not claim complete all-position model
+qualification or qualify the existing dynamic ordinary-logits allocation
+owner. Auto policy is unchanged. Complete production preflight remains a
+separate qualification.
 
 ## Consumer-minimal KV ownership
 

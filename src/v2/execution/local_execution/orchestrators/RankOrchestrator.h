@@ -256,6 +256,9 @@ namespace llaminar2
              */
             int resident_graph_rows = 0;
 
+            /** Authored ordinary terminal output demand, shared by every participant. */
+            OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
+
             /// Batch size for inference
             int batch_size = 1;
 

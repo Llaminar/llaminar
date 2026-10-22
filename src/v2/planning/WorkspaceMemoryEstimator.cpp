@@ -2284,14 +2284,15 @@ size_t WorkspaceMemoryEstimator::estimate(
         }
     }
 
-    // Terminal graphs project one row per request, or the retained compact
-    // verifier width. Prompt/KV capacity is never this transpose geometry.
+    // Terminal storage follows authored ordinary output demand and the existing
+    // retained verifier union. Resident rows bound demand; they never imply it.
     // This named scratch is disjoint from the projection's live output bank.
     if (geometry.mtp_terminal_logits_collective ==
         MTPTerminalLogitsCollective::NativeLocalVocabularyAllGather)
     {
         bytes = checkedAdd(bytes, VocabularyGatherWorkspaceContract::requirements(
-            std::max({1, geometry.batch_size, geometry.mtp_target_query_rows}), profile.vocab_size)
+            std::max(geometry.ordinary_terminal_projection.resolveForSequence(
+                geometry.batch_size, geometry.resident_graph_rows), geometry.mtp_target_query_rows), profile.vocab_size)
                 .total_bytes_with_alignment(), "native terminal vocabulary transpose");
     }
 

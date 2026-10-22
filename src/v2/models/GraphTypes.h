@@ -254,15 +254,17 @@ namespace llaminar2
 
         /**
          * @brief Classify an explicit native local vocabulary publication edge.
-         * @return True for a retained MTP graph family in one native local GPU TP domain.
+         * @return True for one admitted native local GPU TP domain, independent of MTP capacity.
          *
          * Projection ownership remains sharded. This predicate describes the
          * complete graph-boundary publication after its explicit collective,
-         * allowing samplers to consume the admitted full output bank.
+         * allowing ordinary and MTP samplers to consume the admitted full output
+         * bank. A fixed ordinary row uses the same explicit publication stage
+         * without a predictor, verifier count or retained MTP workspace.
          */
         [[nodiscard]] bool hasNativeLocalVocabularyGather() const noexcept
         {
-            return retainsMTPGraphCapacity(mtp) && default_device.is_gpu() && tp_ctx && tp_ctx->isLocal() && tp_ctx->degree() > 1 &&
+            return default_device.is_gpu() && tp_ctx && tp_ctx->isLocal() && tp_ctx->degree() > 1 &&
                 (tp_ctx->backend() == CollectiveBackendType::NCCL || tp_ctx->backend() == CollectiveBackendType::RCCL);
         }
 
@@ -359,6 +361,9 @@ namespace llaminar2
         /// Runtime-only decode verifier mode: compute LM-head logits for every
         /// input row instead of the selected final row.
         bool compute_all_position_logits = false;
+
+        /** Immutable setup demand; runtime output selection cannot enlarge this envelope. */
+        OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
 
         /**
          * @brief Runtime-only grouped MTP verifier graph policy.

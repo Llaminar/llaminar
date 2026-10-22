@@ -610,6 +610,7 @@ namespace llaminar2
                     role == DeviceExecutionMemoryRole::ContinuationGraph &&
                     rank_plan.has_embedding;
                 config.batch_size = rank_plan.runtime.batch_size;
+                config.ordinary_terminal_projection = rank_plan.runtime.ordinary_terminal_projection;
                 config.max_seq_len = rank_plan.runtime.max_seq_len;
                 config.activation_seq_len =
                     input.resident_graph_rows > 0 &&

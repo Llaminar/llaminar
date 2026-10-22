@@ -8162,3 +8162,63 @@ TEST(Test__MTPGraphConstruction, SerialProjectionDoesNotBorrowVerifierSequenceCo
         }
     }
 }
+
+/**
+ * @test Ordinary no-capacity native publication is the full sampling surface.
+ *
+ * CPU-backed arenas are metadata fixtures; no graph executes or initializes a
+ * GPU. Native context identities describe ownership only. The actual DGO public
+ * local-logits classifier must consume the completed-publication fact even with
+ * MTP disabled and zero reserved capacity; the old predicate advertises a shard.
+ */
+TEST(Test__MTPGraphConstruction, OrdinaryNativeVocabularyPublishesFullLogitsWithoutMTPCapacity)
+{
+    /** @brief Keep allocation ownership CPU-only while testing native graph metadata. */
+    class MetadataArenaGraph final : public QwenStandardGraph
+    {
+    public:
+        using QwenStandardGraph::QwenStandardGraph;
+        /**
+         * @brief Resolve the real schema into a CPU-backed metadata fixture.
+         * @param rows Frozen schema row extent; no graph will execute.
+         * @return Original schema geometry with explicit CPU allocation authority.
+         */
+        GraphResolverConfig getResolverConfig(int rows) const override
+        {
+            auto result = QwenStandardGraph::getResolverConfig(rows);
+            result.default_device = DeviceId::cpu();
+            return result;
+        }
+    };
+    DeviceManager::instance().initialize(-1, false);
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int degree : {2, 4, 8})
+    {
+        TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+        MockLocalTPContext tp;
+        std::vector<GlobalDeviceAddress> devices;
+        for (int ordinal = degree - 1; ordinal >= 0; --ordinal)
+            devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId(backend, ordinal)));
+        tp.setDevices(devices);
+        tp.setBackend(backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        tp.setRawAllgatherGraphCaptureSupported(true);
+        fixture.config.default_device = devices.front().toLocalDeviceId();
+        fixture.config.tp_ctx = &tp;
+        fixture.config.lm_head_column_parallel = true;
+        fixture.config.vocab_local = fixture.config.vocab_size / degree;
+        fixture.config.mtp.enabled = false;
+        fixture.config.mtp.graph_capacity_draft_tokens = 0;
+        fixture.config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+        EXPECT_FALSE(retainsMTPGraphCapacity(fixture.config.mtp));
+        ASSERT_TRUE(fixture.config.hasNativeLocalVocabularyGather());
+        ASSERT_TRUE(fixture.config.mtpPublishesNativeGatheredVocabulary());
+        auto builder = std::make_shared<MetadataArenaGraph>(fixture.config, fixture.mpi);
+        builder->setWeights(fixture.modelWeights());
+        DeviceGraphOrchestrator orchestrator(builder, fixture.mpi);
+        ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+        ASSERT_NE(orchestrator.inferenceState().logits_local, nullptr);
+        EXPECT_FALSE(orchestrator.hasLogitsLocal());
+        EXPECT_FALSE(orchestrator.getLogitsLocalInfo());
+        EXPECT_FALSE(orchestrator.consumeLogitsLocalInfoForSampling());
+    }
+}

@@ -72,6 +72,7 @@
 #include "../../prefix_cache/PrefixArchiveCheckpointReadiness.h"
 #include "../../prefix_cache/PrefixArchivePublicationScope.h"
 #include "../../prefix_cache/PrefixAuxiliaryStateIO.h"
+#include "execution/compute_stages/stages/NativeVocabularyAllGatherStage.h"
 #include "../../prefix_cache/ResidualRowGeometry.h"
 #include "../engine/ForwardGraphEntryOrdering.h"
 #include "../engine/PrefillBucketUtils.h"
@@ -8338,6 +8339,41 @@ namespace llaminar2
         return it->second;
     }
 
+    void DeviceGraphOrchestrator::requireNativeTerminalPublicationCapacity(std::size_t rows) const
+    {
+        if (!state_.device_id.is_gpu() || !graph_builder_ ||
+            !graph_builder_->config().hasNativeLocalVocabularyGather() ||
+            (pp_stage_config_ && !pp_stage_config_->has_lm_head))
+            return;
+        if (rows == 0 || rows > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("Native terminal publication rows exceed the graph ABI");
+        if (!allPositionVerifierGraphWritesLocalLogits(static_cast<int>(rows)))
+            return;
+        const auto &config = graph_builder_->config();
+        // MainInference can also be a retained-MTP parity verifier; roles and
+        // enabled flags cannot replace its true retained row-capacity union.
+        config.ordinary_terminal_projection.requirePublication(
+            static_cast<int>(rows), state_.batch_size, config.max_activation_rows,
+            retainsMTPGraphCapacity(config.mtp) ? resolveMTPRetainedTargetQueryRows(config.mtp) : 0);
+    }
+
+    void DeviceGraphOrchestrator::requireActiveNativeTerminalPublicationCapacity(
+        int requests, int sequence_rows) const
+    {
+        if ((!compute_all_position_logits_ && !live_mtp_request_batch_condition_) ||
+            !state_.device_id.is_gpu() || !graph_builder_ ||
+            !graph_builder_->config().hasNativeLocalVocabularyGather() ||
+            !allPositionVerifierGraphWritesLocalLogits(1) ||
+            (pp_stage_config_ && !pp_stage_config_->has_lm_head))
+            return;
+        const int input_rows = OrdinaryTerminalProjectionCapacity::checkedFlattenedRows(requests, sequence_rows);
+        const int projected_rows = compute_all_position_logits_ && compute_row_indexed_all_position_logits_
+            ? row_indexed_all_position_logits_row_count_ : input_rows;
+        if (projected_rows <= 0 || projected_rows > input_rows)
+            throw std::invalid_argument("Native terminal projected rows exceed the actual input population");
+        requireNativeTerminalPublicationCapacity(static_cast<std::size_t>(projected_rows));
+    }
+
     bool DeviceGraphOrchestrator::bindAllPositionLogitsOutputs(
         ForwardExecutionRole execution_role,
         size_t rows,
@@ -8361,6 +8397,7 @@ namespace llaminar2
             logits_local_output = nullptr;
             return true;
         }
+        requireNativeTerminalPublicationCapacity(rows);
         const int rows_key = static_cast<int>(rows);
         const bool typed_gpu_mtp_logits =
             state_.device_id.is_gpu() &&
@@ -15305,6 +15342,35 @@ namespace llaminar2
         }
 
         std::vector<WorkspaceConsumerRequest> extras;
+        if (state_.device_id.is_gpu() && config.ordinary_terminal_projection.hasExplicitRows() &&
+            config.hasNativeLocalVocabularyGather())
+        {
+            const int ordinary_rows = config.ordinary_terminal_projection.resolve(
+                state_.batch_size, config.max_activation_rows);
+            // Preview the existing native terminal stage's exact named bank.
+            // The graph keeps its frozen live rows; this request only publishes
+            // admitted family storage before any captured pointer can escape.
+            std::vector<NativeVocabularyAllGatherStage *> declared;
+            const auto preview = [&](const ComputeGraph &participant)
+            {
+                for (const auto &name : participant.getExecutionOrder())
+                {
+                    const auto *node = participant.getNode(name);
+                    auto *vocabulary = node && node->stage && node->device == state_.device_id
+                        ? dynamic_cast<NativeVocabularyAllGatherStage *>(node->stage.get()) : nullptr;
+                    if (vocabulary && vocabulary->params().rows.capacity() < ordinary_rows &&
+                        std::find(declared.begin(), declared.end(), vocabulary) == declared.end())
+                    {
+                        declared.push_back(vocabulary);
+                        extras.push_back({vocabulary, state_.device_id, ordinary_rows, 0, 0,
+                                          WorkspaceConsumerShapePolicy::FixedDeclaredShape});
+                    }
+                }
+            };
+            preview(graph);
+            for (const auto &participant : exact_serial_participants)
+                if (participant.graph) preview(*participant.graph);
+        }
         if (state_.kv_cache)
         {
             auto *kv_consumer = dynamic_cast<IWorkspaceConsumer *>(state_.kv_cache.get());
@@ -18369,6 +18435,9 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Resident request-batched decode requires device-owned position and sequence-length rows");
             return std::nullopt;
         }
+
+        // Reject already selected ordinary output demand before token admission/event edges.
+        requireActiveNativeTerminalPublicationCapacity(batch_size, seq_len);
 
         /*
          * Normalize the immutable row geometry at the API boundary. Ordinary
@@ -54880,6 +54949,8 @@ namespace llaminar2
                       << " request_capacity=" << request_sequence_lengths_capacity_);
             return false;
         }
+        // Chunked ordinary diagnostic callers share the same pre-enqueue guard.
+        requireActiveNativeTerminalPublicationCapacity(request_count, padded_seq_len);
         IBackend *backend=getBackendFor(state_.device_id);
         std::optional<RequestInputPositionAdmission> position_admission;
         try {

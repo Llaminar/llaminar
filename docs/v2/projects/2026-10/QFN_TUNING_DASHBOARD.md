@@ -1,6 +1,6 @@
 # QFN tuning dashboard
 
-Updated: 2026-10-22; L80 remains the measured throughput checkpoint. NativeVNNI81 adds QFN shape coverage and repairs prepared-weight dispatch identity, with byte-identical Release accuracy. NativeVNNI82's balanced paired timings do not reproduce the first fixed-order gains; the current kernel geometry remains installed. The paired harness passes 761/761 Unit registrations. The [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md) confirms mirrored head work and identifies unused local KV-head and short-context indexer-query work; none is promoted yet.
+Updated: 2026-10-22; **L84 is the accepted explicit vocabulary-sharded A1 throughput checkpoint: 786.235 prefill / 35.056 decode tok/s**. The [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) measures matched mirrored **785.752 / 34.627**, giving **+0.061% / +1.237%**, with all twelve generated sequences equal. Follow-up85 completes typed ordinary projected-row admission and exact native ABI regressions: **763/763 Unit**, **19/19 device-free** and **12/12 native** registrations pass. Final-source Release accuracy retains **all 185 logit rows byte-identically** to L74 and accepted84 sharded. Auto selection is unchanged; use the explicit policy recorded below. Complete production preflight remains pending. NativeVNNI81/82 retain their prepared-weight identity repair, QFN coverage and balanced timing harness, with the original kernel geometry installed. Unused local KV-head and short-context indexer-query work remain separate opportunities.
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.
 
@@ -229,11 +229,11 @@ its actual prepared route must be represented explicitly in coverage.
 
 ## A. Implemented and admitted — baseline and tune first
 
-`G60` names the last complete qualification checkpoint. `L62` names the original uninstrumented Llaminar Release measurements. `L80†` adds the native small-AllGather preference to the ordered short-K L74 checkpoint, with complete Unit, focused dependency/capture checks, Release accuracy and matched timing passed; complete production preflight remains pending. `L69†` remains the lookup-worker placement correctness fix with effectively unchanged paired throughput. `L66†` remains the earlier measured GPU-control affinity improvement. `L64†` remains the earlier transfer-scheduling checkpoint. A4 passes both phase comparisons on the declared short workload; A3's reference variance remains open. Historical `R58†` values remain in the evidence discussion and do not populate current measured rows.
+`G60` names the last complete qualification checkpoint. `L62` names the original uninstrumented Llaminar Release measurements. `L84†` measures explicit ordinary `VocabularySharded` output on top of L80; follow-up85 validates the final capacity implementation with complete Unit, focused native checks and byte-identical Release accuracy. L84 timing and final-source85 accuracy are separate retained observations, and neither replaces G60. `L80†` adds the native small-AllGather preference to the ordered short-K L74 checkpoint, with complete Unit, focused dependency/capture checks, Release accuracy and matched timing passed; complete production preflight remains pending. `L69†` remains the lookup-worker placement correctness fix with effectively unchanged paired throughput. `L66†` remains the earlier measured GPU-control affinity improvement. `L64†` remains the earlier transfer-scheduling checkpoint. A4 passes both phase comparisons on the declared short workload; A3's reference variance remains open. Historical `R58†` values remain in the evidence discussion and do not populate current measured rows.
 
 | ID | Topology / actual work placement | Ngrams | Reference engine | Accuracy | Llaminar prefill | Reference prefill | Strata prefill | Llaminar decode | Reference decode | Strata decode | Next action |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts | RAM | Castagna | [🟢 GREEN G60][a1]; L80† Release accuracy green | 785.303 L80† | 467.821 F62§ | — | 34.700 L80† | 42.959 F62§ | — | Native small-AllGather preference gives +2.240% paired decode, −0.077% prefill, 185 byte-identical logit rows and all 12 equal output sequences. Next: QFN NativeVNNI exact-overlay and physical-layout coverage. Full preflight remains pending. |
+| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head | RAM | Castagna | 🟢 L84†/85 Release required groups; latest complete topology gate [G60][a1] | 786.235 L84† | 467.821 F62§ | — | 35.056 L84† | 42.959 F62§ | — | Head sharding gives +1.237% paired decode, +0.061% prefill, 185 byte-identical logit rows and all 12 equal output sequences. Auto is unchanged. Continue auditing replicated work and native dispatch; full preflight remains pending. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |
@@ -245,7 +245,7 @@ Use the exact policy names in subsequent four-GPU records. The dense-compute pol
 
 | ID | Dense-compute policy | Expert policy | QFN accuracy | Llaminar prefill | Castagna prefill | Llaminar decode | Castagna decode | Status |
 |---|---|---|---|---:|---:|---:|---:|---|
-| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L80† Release required groups | 785.303 | 467.821 | 34.700 | 42.959 | Current admitted pair; native small-AllGather improves paired decode 2.240% with byte-identical logits. |
+| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L84†/85 Release required groups | 786.235 | 467.821 | 35.056 | 42.959 | Current admitted pair with explicit `VocabularySharded` terminal head; +1.237% paired decode with byte-identical logits. Auto remains mirrored. |
 | A1.1 | `TensorParallel` | `Apportioned` | 🟢 L64† Release required groups | 561.867 | 467.821 | 30.515 | 42.959 | Accuracy, corrected SnapshotAdmission and timing passed; slower than current A1 in both phases. |
 | A1.2 | `PrefillTensorParallelDecodeReplicated` | `GateUpOwnedDownColumns` | 🔴 L65† Release short decode row KL | — | 467.821 | — | 42.959 | Admission and native execution passed; one forced decode row KL 1.119 exceeds the unchanged 1.0 ceiling. Diagnose before promotion. Timing pending. |
 | A1.3 | `PrefillTensorParallelDecodeReplicated` | `Apportioned` | 🟢 L65† Release required groups | 382.757 | 467.821 | 30.761 | 42.959 | Retained **Ornith** arrangement; admission, accuracy and timing passed, but both phases are slower than the current A1 control and Castagna. |
@@ -456,6 +456,7 @@ Keep experimental candidates separate until their own comparisons pass.
 | L64 | Individual prefill and grouped-verifier transfers; batched decode endpoints | 780.089 / 29.532 | 779.529 / 31.128 | −0.072% / +5.406% | [Four clean arms, twelve equal output sequences](../../../../parity-results/qwen-flash-next/a1-phase64-abba-comparison.json) |
 | L66 | Construct independent GPU-control workers on the admitted OpenMP partition | 779.091 / 31.662 | **784.382 / 33.376** | **+0.679% / +5.413%** | [Four clean arms, twelve equal output sequences](../../../../parity-results/qwen-flash-next/affinity66-abba-comparison.json) |
 | L74 | Parallel short-K contributions with the original ordered TwoTerm fold | 784.699 / 33.283 | **785.397 / 33.882** | **+0.089% / +1.797%** | [Four clean arms, twelve equal output sequences](../../../../parity-results/qwen-flash-next/shortk74-abba-comparison.json); [settings, accuracy and resources](QFN_ORDERED_SHORT_K_PROJECTION_TUNING.md) |
+| L84 | Explicit ordinary vocabulary sharding with MTP disabled and zero retained capacity | 785.752 / 34.627 | **786.235 / 35.056** | **+0.061% / +1.237%** | [Four clean arms, twelve equal output sequences](../../../../parity-results/qwen-flash-next/vocabulary84-model-abba-comparison.json); [settings, final-source85 accuracy and regressions](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) |
 
 Each percentage uses its own interleaved A/B/B/A comparison. Do not multiply
 percentages or compare unmatched process lifecycles to claim a cumulative gain.
@@ -481,6 +482,16 @@ The L64/L66/L74 benchmark contract is:
 | Sampling / maintenance | `--temperature 0 --top-k 1 --top-p 1 --seed 42`; `--no-mtp --mtp-depth-policy fixed --moe-residency-maintenance off` |
 | Host budget | Outer `taskset -c 28-55`, `--threads 28`; NUMA1 physical cores. The canonical MPI bootstrap installs GPU-local `OMP_PLACES=cores`, `OMP_PROC_BIND=close`; actual worker masks are retained. No strict memory-bind claim |
 | Timing | `LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1`, `LLAMINAR_BENCHMARK_ITERATIONS=3`; native phase timing, no profiler or PerfStats instrumentation in the timed run |
+
+L84 retains the same workload, arithmetic and worker settings. It uses the
+accepted HIP76/RCCL80 dependency closure and adds explicit
+`--mtp-graph-capacity-draft-tokens 0` to both arms. The sole comparison variable
+is `--mtp-terminal-head-policy mirrored-full-vocabulary` versus
+`--mtp-terminal-head-policy vocabulary-sharded`, with `--no-mtp` retained.
+The latter is the current A1 tuning configuration; it does not change Auto.
+The final-source85 run repeats the canonical 185-row accuracy panel after the
+capacity/ABI follow-up; the throughput table retains the actual Release84
+archive observations rather than attributing a new timing run to source85.
 
 The six arithmetic selectors were explicitly frozen for both arms:
 

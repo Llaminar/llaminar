@@ -1604,7 +1604,9 @@ namespace llaminar2
             moe.routed_expert_plan &&
             moe.routed_expert_plan->usesExpertOverlayAuthority();
         return retainsMTPGraphCapacity(mtp) || phase_split_dense_graphs ||
-               tiered_overlay_graphs;
+               tiered_overlay_graphs || (ordinary_terminal_projection.hasExplicitRows() &&
+                   lm_head_column_parallel && mtp.terminal_head_policy == MTPTerminalHeadPolicy::VocabularySharded &&
+                   hasNativeLocalVocabularyGather());
     }
 
     bool GraphConfig::hasUnifiedPP() const

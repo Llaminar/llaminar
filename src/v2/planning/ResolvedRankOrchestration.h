@@ -81,6 +81,7 @@ namespace llaminar2
          * @param inventory Exact immutable inventory for this rank namespace.
          * @param builder Canonical rank/shard compiler, also injectable by tests.
          * @param rank Rank in that inventory; negative or absent ranks are errors.
+         * @param terminal_projection Ordinary diagnostic output demand, frozen before child projection.
          * @return Validated topology with no resources materialized.
          * @throws std::invalid_argument for invalid topology, inventory or policy.
          * @throws std::logic_error for an unimplemented explicit execution form.
@@ -90,7 +91,8 @@ namespace llaminar2
             const PlanningModelMetadata &model,
             const ClusterInventory &inventory,
             IExecutionPlanBuilder &builder,
-            int rank);
+            int rank,
+            OrdinaryTerminalProjectionCapacity terminal_projection = {});
 
         /** @return Configuration after hardware/authority/MTP normalization. */
         [[nodiscard]] const OrchestrationConfig &config() const noexcept { return config_; }
