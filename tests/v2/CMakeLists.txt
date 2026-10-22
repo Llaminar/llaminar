@@ -26489,6 +26489,16 @@ if(HAVE_ROCM)
         HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
 endif()
 
+# Independent historical native oracle for fixed-tree floating reduction changes.
+if(TARGET v2_integration_rocm_floating_request_projection)
+    add_v2_test(V2_Integration_ROCmFloatingReductionHistoricalTree
+        COMMAND $<TARGET_FILE:v2_integration_rocm_floating_request_projection>
+            --gtest_filter=ROCmFloatingReduction.HistoricalTreeCapturedByteExact --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;FP32;FP16;BF16;Capture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFloatingReductionHistoricalTree)
+endif()
+
 # Device-free aliases: NO_MODELS, MPI_PROCS1; append each alias to the explicit
 # V2_PRODUCTION_TEST_PREFLIGHT_TESTS inventory as well as these registrations.
 add_v2_test(V2_Integration_QwenSparseCandidateCopyCounterAdmission
@@ -31759,6 +31769,16 @@ endif()
 
 # Timing targets must also exist when Release excludes functional preflight.
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/V2Qwen4ExpPerformanceTargets.cmake)
+
+# Use the same native oracle in Release without enabling functional preflight.
+if(HAVE_ROCM)
+    add_v2_test(V2_Perf_ROCmFloatingReductionExactShape
+        COMMAND $<TARGET_FILE:v2_perf_rocm_floating_reduction>
+            --gtest_also_run_disabled_tests
+            --gtest_filter=ROCmFloatingReduction.DISABLED_ExactShapePairedEvents
+        LABELS "V2;Performance;ROCm;FloatingReduction;NativeEvents"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+endif()
 
 # Matched fixed-message component timings remain available in Release builds.
 if(HAVE_CUDA OR HAVE_ROCM)

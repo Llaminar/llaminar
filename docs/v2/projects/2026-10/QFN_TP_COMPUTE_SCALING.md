@@ -2,8 +2,10 @@
 
 Updated: 2026-10-22. The recorded vocabulary-projection local-shape and concurrent
 TP1/TP2/TP4 measurements are green. Other kernel families remain in progress.
-The accepted A1 checkpoint is L90, 785.806 prefill / 36.780 decode tok/s on
-four MI50s. See the [dashboard](QFN_TUNING_DASHBOARD.md) for its exact settings.
+The accepted A1 checkpoint is L96, 796.370 prefill / 36.750 decode tok/s
+on four MI50s, including the [profiled fixed-tree reduction](QFN_FLOATING_REDUCTION_TUNING.md).
+See the [dashboard](QFN_TUNING_DASHBOARD.md) for its exact settings and matched
+comparison with Automatic94.
 
 The user selected **preserve recorded inputs and expert routes**. The diagnostic
 will measure the original production compute without executing communication
@@ -88,6 +90,23 @@ existing component fixtures, without adding another serving orchestrator:
 | Attention and GDN | Head assignment, original position/context, KV/recurrent state and exact reset; no synthetic shorter history |
 | Norms, activation preparation and layout | Actual live tensor extents and aliases; replicated versus sharded consumers |
 | Ngrams, indexer and other service-dependent stages | Explicit input/service boundary; reject isolation until its complete state contract exists |
+
+The next recorded boundary is the complete layer-zero GDN projection bundle.
+The fresh `recorded-gdn96-native-input-r1` canonical TP4 observation passes all
+eight CSV checks, prefix restoration and driver/retirement checks. It exports
+the actual normalized input and QKV/Z/alpha/beta outputs for nine prefill rows
+and two individual decode steps. Those nine rows are not an M512 performance
+workload. The original QKV/Z sources are Q8_0; alpha/beta arrive as FP32 and
+retain the selected prepared FP16 policy. Native submission/capture records
+identify a QKV+Z subgroup (local N=2560+1536, K=2560) and an alpha+beta subgroup
+(N=12+12). Their counts are not device replay counts.
+
+The isolation extension must retain both fused subgroups. GDNHeadAssignment
+owns the original packed Q/K/V and modulo-linked value-head spans, including
+Z/alpha/beta; equal contiguous row slicing would test different ownership.
+Every degree must match the saved original output bytes before timing. Actual
+TP1/TP2/TP4 GDN measurements remain pending; the completed head measurements
+do not establish scaling for this bundle.
 
 For each supported cohort, cover decode and production prefill shapes plus
 partial buckets. Extend reusable kernel improvements across applicable physical

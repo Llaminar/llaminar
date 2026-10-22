@@ -11,6 +11,18 @@ add_executable(v2_perf_qwen_sparse_selection EXCLUDE_FROM_ALL
     "${_qfn_test_sources}/performance/kernels/cpu/attention/Perf__QwenSparseSelection.cpp")
 target_link_libraries(v2_perf_qwen_sparse_selection PRIVATE llaminar2_core GTest::gtest_main)
 
+if(HAVE_ROCM)
+    set_source_files_properties(
+        "${_qfn_test_sources}/performance/kernels/rocm/Perf__FloatingReduction.hip"
+        PROPERTIES LANGUAGE HIP)
+    add_executable(v2_perf_rocm_floating_reduction EXCLUDE_FROM_ALL
+        "${_qfn_test_sources}/performance/kernels/rocm/Perf__FloatingReduction.hip")
+    target_link_libraries(v2_perf_rocm_floating_reduction PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main hip::host)
+    set_target_properties(v2_perf_rocm_floating_reduction PROPERTIES
+        HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+endif()
+
 # The same component supports CPU-only builds; CPU selection performs no GPU setup.
 add_executable(v2_perf_q8_residual_prepared_projection
     "${_qfn_test_sources}/performance/kernels/Perf__Q8ResidualPreparedProjection.cpp"

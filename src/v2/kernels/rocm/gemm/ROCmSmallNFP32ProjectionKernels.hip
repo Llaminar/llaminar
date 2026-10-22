@@ -128,6 +128,40 @@ namespace
         return false;
     }
 
+    /**
+     * @brief Preserve the original 256-part tree with a native wave64 tail.
+     * @param value Original stride-256 lane accumulator, including zero K tails.
+     * @param scratch Exclusive 256-float CTA storage, populated by every lane.
+     * @return Original reduced result in lane zero; other lanes are not consumed.
+     * @pre Exactly 256 threads enter collectively; no participant returns early.
+     *
+     * LDS retains edges128/64 and their producer barriers. All64 lanes of
+     * the first wave then execute every shuffle; only original owning lanes
+     * perform additions. No multiply or rounded partial is reassociated.
+     */
+    __device__ __forceinline__ float reduceFloating256(float value, float *scratch)
+    {
+        const unsigned lane = threadIdx.x;
+        scratch[lane] = value;
+        __syncthreads();
+        for (unsigned stride = 128; stride >= 64; stride >>= 1)
+        {
+            if (lane < stride) scratch[lane] += scratch[lane + stride];
+            __syncthreads();
+        }
+        if (lane < 64)
+        {
+            value = scratch[lane];
+#pragma unroll
+            for (unsigned stride = 32; stride; stride >>= 1)
+            {
+                const float partner = __shfl_down(value, stride, 64);
+                if (lane < stride) value += partner;
+            }
+        }
+        return value;
+    }
+
     __global__ void fp32_stage_batched_projection_pointers_kernel(
         const Fp32BatchedProjectionPointers ptrs,
         const float **__restrict__ d_A_array,
@@ -174,18 +208,10 @@ namespace
         }
 
         __shared__ float scratch[SMALL_N_FP32_BLOCK];
-        scratch[threadIdx.x] = sum;
-        __syncthreads();
-
-        for (int stride = SMALL_N_FP32_BLOCK / 2; stride > 0; stride >>= 1)
-        {
-            if (threadIdx.x < stride)
-                scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-            __syncthreads();
-        }
+        const float reduced = reduceFloating256(sum, scratch);
 
         if (threadIdx.x == 0)
-            C[static_cast<size_t>(m) * N + n] = scratch[0];
+            C[static_cast<size_t>(m) * N + n] = reduced;
     }
 
     /**
@@ -236,18 +262,10 @@ namespace
         }
 
         __shared__ float scratch[SMALL_N_FP32_BLOCK];
-        scratch[threadIdx.x] = sum;
-        __syncthreads();
-
-        for (int stride = SMALL_N_FP32_BLOCK / 2; stride > 0; stride >>= 1)
-        {
-            if (threadIdx.x < stride)
-                scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-            __syncthreads();
-        }
+        const float reduced = reduceFloating256(sum, scratch);
 
         if (threadIdx.x == 0)
-            C[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = scratch[0];
+            C[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = reduced;
     }
 
     /**
@@ -451,18 +469,10 @@ namespace
         }
 
         __shared__ float scratch[SMALL_N_FP32_BLOCK];
-        scratch[threadIdx.x] = sum;
-        __syncthreads();
-
-        for (int stride = SMALL_N_FP32_BLOCK / 2; stride > 0; stride >>= 1)
-        {
-            if (threadIdx.x < stride)
-                scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-            __syncthreads();
-        }
+        const float reduced = reduceFloating256(sum, scratch);
 
         if (threadIdx.x == 0)
-            output[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = scratch[0];
+            output[static_cast<size_t>(m) * static_cast<size_t>(N) + static_cast<size_t>(n)] = reduced;
     }
 } // namespace
 

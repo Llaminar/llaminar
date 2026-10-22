@@ -130,7 +130,8 @@ endforeach()
                     if cuda:
                         expected.append("v2_perf_cuda_qwen_sparse_selection")
                     if rocm:
-                        expected.append("v2_perf_rocm_qwen_sparse_selection")
+                        expected += ["v2_perf_rocm_qwen_sparse_selection",
+                                     "v2_perf_rocm_floating_reduction"]
                     extra = f"""
 enable_testing()
 set(HAVE_CUDA {"ON" if cuda else "OFF"})
@@ -138,8 +139,26 @@ set(HAVE_ROCM {"ON" if rocm else "OFF"})
 add_library(llaminar2_core INTERFACE)
 add_library(GTest::gtest INTERFACE IMPORTED)
 add_library(GTest::gtest_main INTERFACE IMPORTED)
+add_library(hip::host INTERFACE IMPORTED)
 include("{QFN_PERFORMANCE.as_posix()}")
 include("{QFN_PERFORMANCE.as_posix()}")
+if(HAVE_ROCM)
+    get_target_property(native_sources v2_perf_rocm_floating_reduction SOURCES)
+    get_target_property(native_standard v2_perf_rocm_floating_reduction HIP_STANDARD)
+    if(NOT native_standard EQUAL 20)
+        message(FATAL_ERROR "Floating reduction lost its native HIP language contract")
+    endif()
+    foreach(source IN LISTS native_sources)
+        get_source_file_property(language "${{source}}" LANGUAGE)
+        if(NOT language STREQUAL "HIP")
+            message(FATAL_ERROR "Floating reduction source is not native HIP")
+        endif()
+        # This metadata-only fixture has no HIP compiler. After authenticating
+        # the production declaration, omit compilation from the generated stub.
+        set_source_files_properties("${{source}}" PROPERTIES HEADER_FILE_ONLY TRUE)
+    endforeach()
+    set_target_properties(v2_perf_rocm_floating_reduction PROPERTIES LINKER_LANGUAGE CXX)
+endif()
 get_property(all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 list(FILTER all_targets INCLUDE REGEX "^v2_perf_")
 list(REMOVE_ITEM all_targets v2_perf_contract)
