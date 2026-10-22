@@ -15,9 +15,11 @@ and **3.847–3.865× TP4**, meeting both targets across three recorded rows wit
 every participant byte-checked. These are projection-compute timings with
 restore/communication excluded; other kernel families remain pending. Removing
 unused KV heads is a parallel priority across every participant count 1–8.
-The aligned geometry and compact CPU/CUDA/ROCm consumer tests pass, together
-with **771/771 Unit**. Production planner/cache/arithmetic propagation remains
-in progress. The current equal-width expert down-projection policy independently
+The aligned geometry and compact CPU/CUDA/ROCm consumer tests pass. The cache
+origin and retained-snapshot follow-up passes **19/19** focused registrations
+and **771/771 Unit**; it retains every participant's original KV interval and
+checks original layer/device ownership. Production planner and projection
+arithmetic propagation remains in progress. The current equal-width expert down-projection policy independently
 excludes full-model degrees 3/6/7 for H2560; head-layout coverage alone does not
 advertise those complete topologies.
 

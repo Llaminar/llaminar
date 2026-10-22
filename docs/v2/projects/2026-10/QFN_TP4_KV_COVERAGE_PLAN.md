@@ -1,6 +1,6 @@
 # QFN consumer-minimal KV coverage, one through eight participants
 
-Updated: 2026-10-22. This source-derived design extends the [TP4 ownership audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md). Typed geometry and subset-replica snapshots are implemented behind an explicit declaration; production callers do not yet select it. The accepted source checkpoint is 382492209; the rejected correction 88 experiment does not change this plan. Consumer-minimal KV work proceeds alongside the recorded per-kernel scaling measurements. Production promotion requires the complete arithmetic, cache-origin and planner/consumer closure below.
+Updated: 2026-10-22. This source-derived design extends the [TP4 ownership audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md). Typed geometry and subset-replica snapshots are implemented behind an explicit declaration; production callers do not yet select it. The geometry and captured-scaling foundation is checkpointed at 11873a1a8; the rejected correction 88 experiment does not change this plan. Consumer-minimal KV work proceeds alongside the recorded per-kernel scaling measurements. Production promotion requires the complete arithmetic, cache-origin and planner/consumer closure below.
 
 **Conclusion:** retain the existing `TensorParallelConfig` assignment as the sole geometry authority and extend it to *consumer-proven overlapping KV intervals*. Q24/KV2/TP4 needs `[0,1),[0,1),[1,2),[1,2)` for Q intervals `[0,6),[6,12),[12,18),[18,24)`. Original source slicing and native sparse attention already support these origins. There is no existing general overlap-policy switch that makes this complete: cache origin reconstruction, partial-replica snapshots, and original-N arithmetic binding are genuine closure gaps. The minimum coherent candidate therefore crosses those existing owners; it is not a two-line splitter change.
 
@@ -139,16 +139,34 @@ the existing GPU reducer deliberately zeros those counters. The corrected test
 asserts that established contract and changes no kernel. These are same-device
 consumer tests, not eight-physical-device model runs.
 
-The complete current-source Unit suite passed **771/771** in
-`kv-coverage94-unit-r1`. The new focused regressions are explicitly registered
-in `ProductionTestPreflight`; the complete preflight has not been rerun for this
-foundation slice.
+The cache/snapshot consumer follow-up now takes original KV origins and counts
+from the retained assignment for both main and shifted caches. Explicit
+full-model demands remain separate. Rank snapshots derive original-head groups
+from each actual producer, verify all replicas, and reject foreign devices,
+missing producers, mismatched widths and stale source layers. Absolute PP layer
+ownership and historical prefill/condition scopes are checked before selecting
+per-layer geometry; a complete-value publication still supersedes partials.
+Prefix identity continues to use the actual cache geometry.
+
+The focused consumer and neighboring TP/rank gate passes **19/19** in
+`kv-cache95-focused-r1`; complete current-source Unit passes **771/771** in
+`kv-cache95-unit-r1` (116.07 seconds). Both have clean driver and retirement
+evidence. These device-free tests exercise real cache-geometry inputs and Rank
+snapshot assembly, not native model admission. The initial build found two
+GTest trace macros on one line; splitting them fixes the test compilation,
+without changing runtime code. The two new consumer regressions are explicitly
+registered in `ProductionTestPreflight`; complete current-source preflight is
+still pending.
 
 Automatic planning is a required consumer of this change. Its candidate filter,
 PMA/weight-plan binding, validator and graph construction must consume the same
 original declaration and canonical assignments. The existing cost model already
 prices work from those assignments; it must charge every necessary KV replica.
 No separate savings formula or second layout table is needed. The remaining
-source work is original K/V projection arithmetic binding, actual cache/snapshot
-origins, and this coherent planner-to-execution propagation, followed by native
-model accuracy and matched Release performance qualification.
+source work is original K/V projection arithmetic binding and this coherent
+planner-to-execution propagation, followed by native model accuracy and matched
+Release performance qualification. Review of the arithmetic candidate found
+that a borrowed prepared-engine pointer could outlive its store entry. Its
+successor must retain the exact existing kernel and source owners in the
+immutable slice fact, so replacement cannot rebind or invalidate a captured
+publication. It must not copy weights or create another allocation ledger.

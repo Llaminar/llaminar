@@ -20,6 +20,7 @@
 #include "../../../collective/CollectiveTimeoutPolicy.h"
 #include "../../../collective/ILocalTPContext.h" // createLocalTPContext()
 #include "../../../config/TensorParallelConfig.h"
+#include "../../config/KVHeadConsumerGeometry.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../kernels/HybridKVCacheConfig.h"
 #include "../../../kernels/IHybridKVCache.h"
@@ -8076,6 +8077,10 @@ namespace llaminar2
                 config.n_kv_heads,
                 primary_local_kv_heads);
 
+        const auto query_sidecar_heads = resolveQueryIntervalCacheHeads(config, device,
+            sidecar_head_layout == MTPShiftedKVHeadLayout::FullModelPerParticipant
+                ? KVHeadConsumerDemand::FullModel : KVHeadConsumerDemand::AssignedQueryInterval);
+
         // Qwen3.5/Qwen3.6 support is currently D=1. Additional depths need
         // distinct sidecar weights before they can have independent caches.
         constexpr int kSupportedMTPDepth = 1;
@@ -8091,7 +8096,7 @@ namespace llaminar2
             kv_config.batch_size = batch_size;
             kv_config.max_seq_len = max_seq_len;
             kv_config.n_kv_heads = config.n_kv_heads;
-            kv_config.local_n_kv_heads = sidecar_local_kv_heads;
+            kv_config.local_n_kv_heads = query_sidecar_heads ? query_sidecar_heads->count : sidecar_local_kv_heads;
             kv_config.head_dim = config.head_dim;
             kv_config.layout_mode = kv_layout_mode;
             kv_config.mpi_ctx = local_mpi_ctx.get();
@@ -8099,7 +8104,9 @@ namespace llaminar2
             kv_config.physical_memory_authority =
                 physical_memory_authority_;
 
-            if (sidecar_head_layout ==
+            if (query_sidecar_heads)
+                kv_config.kv_head_start = query_sidecar_heads->first;
+            else if (sidecar_head_layout ==
                     MTPShiftedKVHeadLayout::PrimaryTensorParallelShard &&
                 use_sharded_cache &&
                 (has_tp || is_global_tp))
@@ -16441,6 +16448,12 @@ namespace llaminar2
                       "disabling TP KV sharding for this graph");
         }
 
+        const auto query_main_heads = resolveQueryIntervalCacheHeads(config, device,
+            use_replicated_attention_state_cache ? KVHeadConsumerDemand::FullModel
+                                                : KVHeadConsumerDemand::AssignedQueryInterval);
+        if (query_main_heads && n_kv_heads != config.n_kv_heads)
+            throw std::invalid_argument("main cache original KV geometry differs from its query assignment");
+
         // One participant owns one main cache, including a PP layer shard.
         {
             llaminar::v2::kernels::KVCacheConfig kv_config;
@@ -16525,7 +16538,13 @@ namespace llaminar2
             kv_config.mpi_ctx = local_mpi_ctx.get();
             kv_config.turboquant_ctx = config.turboquant_ctx;
 
-            if (use_sharded_cache && (has_tp || is_global_tp))
+            if (query_main_heads)
+            {
+                // Original query coverage, never participant*localCount, owns subset replica origins.
+                kv_config.local_n_kv_heads = query_main_heads->count;
+                kv_config.kv_head_start = query_main_heads->first;
+            }
+            else if (use_sharded_cache && (has_tp || is_global_tp))
             {
                 kv_config.local_n_kv_heads = config.local_n_kv_heads;
 

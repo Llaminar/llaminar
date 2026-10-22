@@ -31454,6 +31454,25 @@ foreach(QSA_COMPACT_BACKEND IN ITEMS CUDA ROCm)
     endif()
 endforeach()
 
+# Append before the canonical ProductionTestPreflight finalizer; existing targets own all source files.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_tensor_parallel_config AND TARGET v2_test_multi_device_orchestrator)
+    add_v2_test(V2_Integration_QueryKVCachedConsumerGeometry
+        COMMAND $<TARGET_FILE:v2_test_tensor_parallel_config>
+            --gtest_filter=KVHeadCoverage.CacheConsumer*:KVHeadCoverage.SnapshotProducerGeometryRejectsMixedMembershipAndWidths:KVHeadCoverage.SnapshotOriginalLayerDeclarationRejectsDefaultSubstitution
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Attention;KVCache;PrefixCache;Sharding;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_v2_test(V2_Integration_QueryKVRankSnapshotConsumers
+        COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
+            --gtest_filter=Test__RankOrchestrator.TPSnapshot_QueryKV*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Attention;Snapshot;Sharding;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_QueryKVCachedConsumerGeometry
+        V2_Integration_QueryKVRankSnapshotConsumers)
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR

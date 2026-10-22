@@ -57,6 +57,7 @@
 #include "../../../planning/ModelMemoryProfile.h"
 #include "../../../collective/ILocalPPContext.h"
 #include "../../../config/TensorParallelConfig.h"
+#include "../../config/KVHeadConsumerGeometry.h"
 #include "../../../interfaces/IModelContext.h"
 #include "../../../loaders/ModelContext.h"
 #include "../../../loaders/PreparedWeightStore.h"
@@ -18458,6 +18459,10 @@ namespace llaminar2
         // TP Mode (non-PP): Collect from device_runners_
         // =========================================================================
 
+        // A typed subset consumer cannot use the legacy KV<TP full-replica override.
+        // Keep actual producer geometry alongside retained publications; no live cache is queried.
+        const bool kv_snapshot = isKVHeadSnapshotStage(extractStageType(std::string(kvHeadSnapshotProducerKey(key))));
+        std::vector<KVHeadSnapshotProducer> kv_producers;
         // Acquire each immutable publication once. A root finalizer can share
         // a semantic key with pre-finalization partials left on other devices.
         // Complete values supersede those partials; when several finalizers
@@ -18507,6 +18512,37 @@ namespace llaminar2
 
         const bool retained_prefill_chunk =
             prefillChunkSnapshotSemanticStageOffset(key) != std::string_view::npos;
+        if (kv_snapshot && !has_complete_publication)
+        {
+            // CompleteValue supersedes partial source metadata above. Only an
+            // actual subset assembly needs original absolute-layer ownership.
+            for (const auto &runner : device_runners_)
+            {
+                const auto *owner = dynamic_cast<const DeviceGraphOrchestrator *>(runner.get());
+                const auto *builder = owner ? owner->graphBuilder() : nullptr;
+                const auto *cfg = builder ? &builder->config() : nullptr;
+                const auto geometry = cfg && hasQueryIntervalKVDeclaration(*cfg)
+                    ? resolveQueryKVSnapshotLayerGeometry(*cfg, key) : KVHeadSnapshotLayerGeometry{};
+                kv_producers.push_back({cfg, runner ? runner->primaryDeviceId() : DeviceId::cpu(), 0,
+                    geometry.columns_per_head, geometry.original_kv_heads});
+            }
+            for (size_t i = 0; i < publications.size(); ++i)
+                kv_producers[i].row_columns = publications[i] ? publications[i].cols : 0;
+            const bool mtp_depth = isMTPDepthQualifiedSnapshot(key);
+            const auto demand = (mtp_depth && replicatedMTPSidecarSnapshotsActive()) ||
+                (!mtp_depth && !retained_prefill_chunk && phaseSplitReplicatedDecodeSnapshotsActive())
+                ? KVHeadConsumerDemand::FullModel : KVHeadConsumerDemand::AssignedQueryInterval;
+            const auto groups = resolveQueryIntervalKVSnapshotGroups(kv_producers, demand);
+            if (groups)
+            {
+                for (const auto &publication : publications)
+                    if (!publication || publication.publication != SnapshotPublication::SchemaPartition)
+                        throw std::invalid_argument("query KV snapshot has missing or conflicting publication ownership");
+                result.mode = SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+                result.column_groups = *groups;
+            }
+        }
+
         if (retained_prefill_chunk &&
             extractStageType(key) == "LM_HEAD" &&
             result.mode == SnapshotShardingMode::GATHERED)
@@ -18607,6 +18643,12 @@ namespace llaminar2
                 dev_type = config_.devices[i].device_type;
             }
             dev_data.device_id = GlobalDeviceId::gpu(0, static_cast<int>(i), dev_type);
+            if (kv_snapshot && !result.column_groups.empty())
+            {
+                const auto actual = kv_producers[i].device;
+                dev_data.device_id = actual.is_cpu() ? GlobalDeviceId::cpu(0)
+                    : GlobalDeviceId::gpu(0, actual.ordinal, actual.type);
+            }
             dev_data.device_index = static_cast<int>(i);
             dev_data.data.assign(snap.data, snap.data + snap.size);
             dev_data.row_ownership = snap.row_ownership;
@@ -18648,7 +18690,7 @@ namespace llaminar2
             }
         }
         else if (result.mode == SnapshotShardingMode::PACKED_COLUMN_PARALLEL &&
-                 !result.device_data.empty())
+                 !result.device_data.empty() && result.column_groups.empty())
         {
             /*
              * Qwen GDN participants publish dependency-closed local rows.
@@ -18706,6 +18748,12 @@ namespace llaminar2
             }
         }
 
+        if (kv_snapshot && !result.column_groups.empty())
+        {
+            size_t total = 0;
+            for (const auto &group : result.column_groups) total += group.global_cols;
+            for (auto &producer : result.device_data) producer.global_total_cols = total;
+        }
         return result;
     }
 

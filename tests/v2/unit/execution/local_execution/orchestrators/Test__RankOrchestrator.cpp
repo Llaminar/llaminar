@@ -14,6 +14,8 @@
  * publications independently of a model schema's default partial-sum layout.
  * Main host output capacity is checked independently of context length; the
  * all-position verifier owns a separate, explicitly requested output surface.
+ * Explicit query-KV regressions use real passive DGO graph configuration and
+ * retained mock publications to verify original-head subset assembly for1..8.
  * Resident-condition regressions also prove that diagnostic host logits belong
  * to the completed forward, while device-only execution performs no gather.
  */
@@ -23,6 +25,9 @@
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "models/qwen/QwenStandardGraph.h"
+#include "execution/config/KVHeadConsumerGeometry.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/mtp/MTPSpecStateContract.h"
@@ -11999,4 +12004,181 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_RetainedPrefillHeadNeverUsesCurrentGat
             EXPECT_THROW(rank->getTPSnapshot(key), std::runtime_error);
         }
     }
+}
+
+namespace
+{
+/** @brief Host-only DGO fixture retaining the actual graph configuration used by production snapshot dispatch. */
+class QueryKVSnapshotOwner final : public DeviceGraphOrchestrator
+{
+public:
+    /**
+     * @brief Retain producer geometry without initialization, weights, backend access or cache allocation.
+     * @param config Actual graph metadata used by Rank snapshot geometry dispatch.
+     * @param member Original physical participant identity.
+     */
+    QueryKVSnapshotOwner(const GraphConfig &config, DeviceId member)
+        : DeviceGraphOrchestrator(std::make_shared<QwenStandardGraph>(config)), member_(member) {}
+    /** @return Original participant identity independently of any GPU execution state. */
+    DeviceId primaryDeviceId() const override { return member_; }
+    /**
+     * @brief Read the retained host fixture publication without observing execution state.
+     * @param key Original semantic transaction key.
+     * @return Exact immutable publication, or an absent result.
+     */
+    SnapshotInfo getSnapshotWithShape(const std::string &key) const override
+    {
+        const auto it = values.find(key);
+        if (it == values.end()) return {};
+        return {.data = it->second.data(), .size = it->second.size(), .rows = 3,
+            .cols = it->second.size() / 3, .publication = publication};
+    }
+    std::unordered_map<std::string, std::vector<float>> values;
+    SnapshotPublication publication = SnapshotPublication::SchemaPartition;
+private:
+    DeviceId member_;
+};
+/** @brief Retained source owner and original participant handles used by adversarial snapshot regressions. */
+struct QueryKVSnapshotRank
+{
+    std::unique_ptr<RankOrchestrator> rank;
+    std::vector<QueryKVSnapshotOwner *> owners;
+};
+/**
+ * @brief Construct the real rank consumer with nonordinal members and original producer head intervals.
+ * @param degree Canonical participant count1..8.
+ * @param first_layer Absolute first owned PP layer; default0 is the original full test model.
+ * @param local_layers Actual number of owned layers.
+ * @param total_layers Original global source layer count.
+ * @return Real orchestration owner plus borrowed host-only producer handles.
+ */
+QueryKVSnapshotRank makeQueryKVSnapshotRank(int degree, int first_layer = 0, int local_layers = 4, int total_layers = 4)
+{
+    RankOrchestrator::Config rank_config;
+    std::vector<DeviceId> members;
+    for (int rank = 0; rank < degree; ++rank)
+    {
+        members.push_back(DeviceId::rocm(degree - 1 - rank));
+        rank_config.devices.push_back(GlobalDeviceAddress::rocm(degree - 1 - rank));
+        rank_config.weights.push_back(1.f / degree);
+    }
+    rank_config.mtp.enabled = true; rank_config.mtp.draft_tokens = 1;
+    rank_config.mtp.sidecar_dense_policy = MTPSidecarDensePolicy::ReplicatedPerParticipant;
+    auto tp = std::make_shared<TensorParallelConfig>(TensorParallelConfig::equalSplit(degree, 24, 2, 10240, 248320,
+        members, KVHeadCoveragePolicy::QueryInterval,
+        QueryHeadPartitionDeclaration::fromOriginalConsumers(24, {{16, 48}})));
+    QueryKVSnapshotRank result;
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    for (int participant = 0; participant < degree; ++participant)
+    {
+        const auto &a = tp->forRank(participant);
+        GraphConfig config; config.tp_config = tp; config.local_rank = participant; config.tp_device_idx = participant;
+        config.n_heads = 24; config.n_kv_heads = 2; config.head_dim = 2;
+        config.n_layers = local_layers; config.total_n_layers = total_layers; config.pp_layer_offset = first_layer;
+        config.layer_head_dim = std::vector<int>(static_cast<size_t>(total_layers), 2);
+        if (first_layer > 0) config.layer_head_dim[static_cast<size_t>(first_layer - 1)] = 4; // Wrong local rebasing must fail.
+
+        config.head_start = a.head_start; config.local_n_heads = a.head_count; config.local_n_kv_heads = a.kv_head_count;
+        auto owner = std::make_unique<QueryKVSnapshotOwner>(config, members[participant]);
+        for (const auto stage : {"K_PROJECTION", "V_PROJECTION", "K_NORM", "K_ROPE", "KV_APPEND_SOURCE_K", "KV_APPEND_SOURCE_V",
+                                "KV_CACHE_K", "KV_CACHE_V", "ATTENTION_EFFECTIVE_K", "ATTENTION_EFFECTIVE_V", "ATTENTION_EFFECTIVE_K_ROW0"})
+        {
+            std::vector<float> data;
+            for (int row = 0; row < 3; ++row) for (int head = a.kv_head_start; head < a.kvHeadEnd(); ++head)
+            { data.push_back(float(100 * row + 10 * head + 1)); data.push_back(float(100 * row + 10 * head + 2)); }
+            const auto key = "layer3_" + std::string(stage);
+            owner->values[key] = data;
+            owner->values["PREFILL_CHUNK_0_" + key] = data;
+            owner->values["MTP_SCALAR_CONDITION_" + key] = data;
+        }
+        owner->values["MTP0_K_PROJECTION"] = {1,2,11,12,101,102,111,112,201,202,211,212};
+        result.owners.push_back(owner.get()); runners.push_back(std::move(owner));
+    }
+    auto model = llaminar2::test::MockModelContext::createMinimal();
+    model->setArchitecture("qwen35moe"); model->setHeadCountKV(2);
+    MockLocalTPContext::Config context; context.devices = rank_config.devices; context.weights = rank_config.weights;
+    result.rank = RankOrchestrator::createForTest(model, std::move(runners), std::make_unique<MockLocalTPContext>(context), rank_config);
+    return result;
+}
+}
+/** @test Real rank assembly checks each subset replica and reconstructs original full heads for every count1..8. */
+TEST_F(Test__RankOrchestrator, TPSnapshot_QueryKVUsesActualProducerIntervalsEveryDegree)
+{
+    const std::vector<float> expected = {1,2,11,12,101,102,111,112,201,202,211,212};
+    for (int degree = 1; degree <= 8; ++degree)
+    {
+        SCOPED_TRACE(degree);
+        auto fixture = makeQueryKVSnapshotRank(degree);
+        for (const auto stage : {"K_PROJECTION", "V_PROJECTION", "K_NORM", "K_ROPE", "KV_APPEND_SOURCE_K", "KV_APPEND_SOURCE_V",
+                                "KV_CACHE_K", "KV_CACHE_V", "ATTENTION_EFFECTIVE_K", "ATTENTION_EFFECTIVE_V", "ATTENTION_EFFECTIVE_K_ROW0"})
+        for (const auto prefix : {"", "PREFILL_CHUNK_0_", "MTP_SCALAR_CONDITION_"})
+        {
+            const auto key = std::string(prefix) + "layer3_" + stage;
+            SCOPED_TRACE(key);
+            auto value = fixture.rank->getTPSnapshot(key);
+            EXPECT_EQ(value.mode, SnapshotShardingMode::PACKED_COLUMN_PARALLEL);
+            ASSERT_EQ(value.column_groups.size(), 2u);
+            for (int participant = 0; participant < degree; ++participant)
+            {
+                EXPECT_EQ(value.device_data[participant].device_index, participant);
+                EXPECT_EQ(value.device_data[participant].device_id.local_device_id, degree - 1 - participant);
+            }
+            ASSERT_TRUE(value.computeCombined());
+            EXPECT_EQ(value.combined_data, expected);
+        }
+        auto full = fixture.rank->getTPSnapshot("MTP0_K_PROJECTION");
+        ASSERT_TRUE(full.computeCombined()); EXPECT_EQ(full.combined_data, expected);
+        for (const auto &group : full.column_groups) EXPECT_EQ(group.mode, degree > 1
+            ? SnapshotColumnGroupMode::REPLICATED : SnapshotColumnGroupMode::SUBSET_REPLICATED);
+    }
+}
+/** @test Missing/malformed retained producers never shrink, concatenate, or bypass replica agreement. */
+TEST_F(Test__RankOrchestrator, TPSnapshot_QueryKVRejectsMissingConflictingAndDivergentPublications)
+{
+    auto fixture = makeQueryKVSnapshotRank(4);
+    const auto original = fixture.owners[3]->values["layer3_K_PROJECTION"];
+    fixture.owners[3]->values["layer3_K_PROJECTION"][0] += 1.f;
+    auto diverged = fixture.rank->getTPSnapshot("layer3_K_PROJECTION");
+    EXPECT_FALSE(diverged.computeCombined()); // Both original head1 replicas must agree.
+    fixture.owners[3]->values["layer3_K_PROJECTION"] = original;
+    fixture.owners[3]->values.erase("layer3_K_PROJECTION");
+    EXPECT_THROW(fixture.rank->getTPSnapshot("layer3_K_PROJECTION"), std::invalid_argument);
+    fixture.owners[3]->values["layer3_K_PROJECTION"] = original;
+    fixture.owners[3]->publication = SnapshotPublication::ColumnPartition;
+    EXPECT_THROW(fixture.rank->getTPSnapshot("layer3_K_PROJECTION"), std::runtime_error);
+    fixture.owners[3]->publication = SnapshotPublication::CompleteValue;
+    fixture.owners[3]->values["layer3_K_PROJECTION"] = {1,2,11,12,101,102,111,112,201,202,211,212};
+    auto complete = fixture.rank->getTPSnapshot("layer3_K_PROJECTION");
+    EXPECT_EQ(complete.mode, SnapshotShardingMode::REPLICATED);
+    ASSERT_TRUE(complete.computeCombined()); EXPECT_EQ(complete.combined_data, fixture.owners[3]->values["layer3_K_PROJECTION"]);
+}
+
+/** @test Original absolute PP bounds and historical source names are checked before any default geometry lookup. */
+TEST_F(Test__RankOrchestrator, TPSnapshot_QueryKVRejectsForeignLayersAndKeepsAbsolutePPSource)
+{
+    auto fixture = makeQueryKVSnapshotRank(4, 4, 4, 12);
+    for (auto *owner : fixture.owners)
+    {
+        const auto data = owner->values.at("layer3_K_PROJECTION");
+        for (const auto key : {"layer7_K_PROJECTION", "PREFILL_CHUNK_2_layer7_K_PROJECTION",
+            "MTP_SCALAR_CONDITION_layer7_K_PROJECTION", "layer3_K_PROJECTION", "layer8_K_PROJECTION",
+            "layer12_K_PROJECTION", "layer2147483648_K_PROJECTION", "K_PROJECTION"})
+            owner->values[key] = data;
+    }
+    const std::vector<float> expected = {1,2,11,12,101,102,111,112,201,202,211,212};
+    for (const auto key : {"layer7_K_PROJECTION", "PREFILL_CHUNK_2_layer7_K_PROJECTION", "MTP_SCALAR_CONDITION_layer7_K_PROJECTION"})
+    {
+        auto value = fixture.rank->getTPSnapshot(key);
+        ASSERT_TRUE(value.computeCombined()); EXPECT_EQ(value.combined_data, expected);
+    }
+    for (const auto key : {"layer3_K_PROJECTION", "layer8_K_PROJECTION", "layer12_K_PROJECTION",
+                           "layer2147483648_K_PROJECTION", "K_PROJECTION"})
+        EXPECT_THROW(fixture.rank->getTPSnapshot(key), std::invalid_argument);
+    // A finalizer publishes the complete immutable value; obsolete/missing
+    // partial source layers must not be looked up before this authority wins.
+    fixture.owners[3]->publication = SnapshotPublication::CompleteValue;
+    fixture.owners[3]->values["layer999_K_PROJECTION"] = expected;
+    auto complete = fixture.rank->getTPSnapshot("layer999_K_PROJECTION");
+    EXPECT_EQ(complete.mode, SnapshotShardingMode::REPLICATED);
+    ASSERT_TRUE(complete.computeCombined()); EXPECT_EQ(complete.combined_data, expected);
 }

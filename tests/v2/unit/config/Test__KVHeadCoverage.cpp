@@ -3,12 +3,17 @@
  * @brief Device-free original-source KV coverage and subset-replica assembly proofs.
  *
  * These tests exercise opt-in typed geometry and diagnostic byte ownership only.
- * No schema/planner/cache/kernel consumer is switched to the candidate policy.
+ * No schema or planner opts in; explicit cache/snapshot consumers are exercised
+ * through actual checked geometry without device initialization or allocations.
  */
 #include <gtest/gtest.h>
 #include "config/TensorParallelConfig.h"
 #include "config/GDNHeadAssignment.h"
 #include "execution/debug/KVHeadSnapshotColumnGroups.h"
+#include "execution/config/KVHeadConsumerGeometry.h"
+#include "execution/prefix_cache/PrefixPayloadLayout.h"
+#include "planning/KVCacheMemoryEstimator.h"
+#include "../../mocks/MockLocalTPContext.h"
 #include <bit>
 #include <cstdint>
 #include <limits>
@@ -403,5 +408,162 @@ TEST(KVHeadCoverage, ConsumerDeclarationRejectsForeignCutsAndPreservesNonGDNDefa
         QueryHeadPartitionDeclaration::fromOriginalConsumers(30, {})), std::invalid_argument);
     aligned[0].local_rank = 3;
     EXPECT_THROW(TensorParallelConfig(aligned, source), std::invalid_argument);
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+namespace
+{
+/**
+ * @brief Build actual participant metadata carrying canonical membership and original source bounds.
+ * @param tp Original authenticated assignment owner.
+ * @param participant Canonical participant index, independently of hardware ordinal.
+ * @return Matching graph declaration without device work.
+ */
+GraphConfig cacheConsumerConfig(const std::shared_ptr<TensorParallelConfig> &tp, int participant)
+{
+    const auto &a = tp->forRank(participant);
+    GraphConfig c;
+    c.tp_config = tp; c.local_rank = participant; c.tp_device_idx = participant;
+    c.n_heads = tp->totalHeads(); c.n_kv_heads = tp->totalKVHeads();
+    c.head_start = a.head_start; c.local_n_heads = a.head_count; c.local_n_kv_heads = a.kv_head_count;
+    c.head_dim = 256;
+    return c;
+}
+}
+/** @test Main/shifted source intervals, actual admission bytes and immutable prefix identity derive from original assignment. */
+TEST(KVHeadCoverage, CacheConsumersUseOriginalOriginsAndDeclaredFamily)
+{
+    for (int degree = 1; degree <= 8; ++degree)
+    {
+        std::vector<DeviceId> members;
+        for (int rank = 0; rank < degree; ++rank) members.push_back(DeviceId::rocm(degree - 1 - rank));
+        auto tp = std::make_shared<TensorParallelConfig>(TensorParallelConfig::equalSplit(degree, 24, 2, 10240, 248320,
+            members, KVHeadCoveragePolicy::QueryInterval,
+            QueryHeadPartitionDeclaration::fromOriginalConsumers(24, {{16, 48}})));
+        for (int rank = 0; rank < degree; ++rank)
+        {
+            SCOPED_TRACE(degree);
+            SCOPED_TRACE(rank);
+            const auto c = cacheConsumerConfig(tp, rank);
+            const auto &a = tp->forRank(rank);
+            const auto main = resolveQueryIntervalCacheHeads(c, members[rank], KVHeadConsumerDemand::AssignedQueryInterval);
+            const auto shifted = resolveQueryIntervalCacheHeads(c, members[rank], KVHeadConsumerDemand::AssignedQueryInterval);
+            const auto full = resolveQueryIntervalCacheHeads(c, members[rank], KVHeadConsumerDemand::FullModel);
+            ASSERT_TRUE(main); ASSERT_TRUE(shifted); ASSERT_TRUE(full);
+            EXPECT_EQ(*main, (KVHeadInterval{a.kv_head_start, a.kv_head_count}));
+            EXPECT_EQ(*shifted, *main); EXPECT_EQ(*full, (KVHeadInterval{0, 2}));
+            const auto payload = KVCacheMemoryEstimator::logicalPayload(KVCacheFamily::AttentionOnly,
+                7, main->count, c.head_dim, "fp32", members[rank]);
+            EXPECT_EQ(payload.k_bytes, size_t(7 * a.kv_head_count * 256 * sizeof(float)));
+            EXPECT_EQ(payload.v_bytes, payload.k_bytes);
+            const auto capacity = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
+                1, 1, 128, main->count, c.head_dim, "fp32", members[rank]);
+            const auto full_capacity = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
+                1, 1, 128, full->count, c.head_dim, "fp32", members[rank]);
+            EXPECT_LE(capacity, full_capacity);
+            if (a.kv_head_count < 2) EXPECT_LT(capacity, full_capacity);
+            else EXPECT_EQ(capacity, full_capacity);
+            // Prefix identity includes actual original origin even for equal-size subset replicas.
+            PrefixPayloadLayout first;
+            first.local_kv_heads = main->count; first.kv_head_start = main->first; first.head_dim = c.head_dim;
+            auto foreign = first; foreign.kv_head_start = main->first == 0 ? 1 : 0;
+            EXPECT_FALSE(first.compatiblePayloadShape(foreign));
+            EXPECT_FALSE(first == foreign);
+        }
+    }
+    const auto tp = std::make_shared<TensorParallelConfig>(covered(4));
+    auto c = cacheConsumerConfig(tp, 3);
+    EXPECT_EQ(resolveQueryIntervalCacheHeads(c, tp->forRank(3).device,
+        KVHeadConsumerDemand::AssignedQueryInterval)->first, 1); // participant*count would incorrectly give3.
+    const auto legacy = std::make_shared<TensorParallelConfig>(TensorParallelConfig::equalSplit(4, 24, 2, 10240, 248320));
+    c = cacheConsumerConfig(legacy, 3);
+    EXPECT_FALSE(resolveQueryIntervalCacheHeads(c, legacy->forRank(3).device, KVHeadConsumerDemand::AssignedQueryInterval));
+}
+/** @test Source/config/membership mismatches fail rather than synthesize a cache origin or default full bank. */
+TEST(KVHeadCoverage, CacheConsumerRejectsForeignSourceDeviceAndShape)
+{
+    const auto tp = std::make_shared<TensorParallelConfig>(covered(4));
+    const auto original = cacheConsumerConfig(tp, 2);
+    const auto device = tp->forRank(2).device;
+    for (int field = 0; field < 7; ++field)
+    {
+        auto c = original;
+        switch (field) {
+        case 0: ++c.n_heads; break; case 1: ++c.n_kv_heads; break; case 2: ++c.head_start; break;
+        case 3: ++c.local_n_heads; break; case 4: ++c.local_n_kv_heads; break; case 5: c.local_rank = 7; break; case 6: c.tp_device_idx = 0; break; }
+        EXPECT_THROW(resolveQueryIntervalCacheHeads(c, device, KVHeadConsumerDemand::AssignedQueryInterval), std::invalid_argument);
+        EXPECT_THROW(resolveQueryIntervalCacheHeads(c, device, KVHeadConsumerDemand::FullModel), std::invalid_argument);
+    }
+    std::vector<GlobalDeviceAddress> membership;
+    for (const auto &a : tp->assignments()) membership.push_back(GlobalDeviceAddress::cuda(a.device.ordinal));
+    MockLocalTPContext context; context.setDevices(membership);
+    auto bound = original; bound.tp_ctx = &context;
+    EXPECT_NO_THROW(resolveQueryIntervalCacheHeads(bound, device, KVHeadConsumerDemand::AssignedQueryInterval));
+    std::swap(membership[0], membership[1]);
+    MockLocalTPContext foreign_context; foreign_context.setDevices(membership); bound.tp_ctx = &foreign_context;
+    EXPECT_THROW(resolveQueryIntervalCacheHeads(bound, device, KVHeadConsumerDemand::AssignedQueryInterval), std::invalid_argument);
+    EXPECT_THROW(resolveQueryIntervalCacheHeads(original, DeviceId::rocm(9), KVHeadConsumerDemand::AssignedQueryInterval), std::invalid_argument);
+    EXPECT_THROW(resolveQueryIntervalCacheHeads(original, device, static_cast<KVHeadConsumerDemand>(99)), std::invalid_argument);
+}
+/** @test Every actual reported producer width and complete membership must authenticate before subset assembly. */
+TEST(KVHeadCoverage, SnapshotProducerGeometryRejectsMixedMembershipAndWidths)
+{
+    auto tp = std::make_shared<TensorParallelConfig>(covered(4));
+    std::vector<GraphConfig> configs;
+    for (int rank = 0; rank < 4; ++rank) configs.push_back(cacheConsumerConfig(tp, rank));
+    std::vector<KVHeadSnapshotProducer> producers;
+    for (int rank = 0; rank < 4; ++rank)
+        producers.push_back({&configs[rank], tp->forRank(rank).device, 256, 256, 2});
+    const auto original = producers;
+    ASSERT_TRUE(resolveQueryIntervalKVSnapshotGroups(producers, KVHeadConsumerDemand::AssignedQueryInterval));
+    producers[2].row_columns = 512;
+    EXPECT_THROW(resolveQueryIntervalKVSnapshotGroups(producers, KVHeadConsumerDemand::AssignedQueryInterval), std::invalid_argument);
+    producers = original; producers[2].config = nullptr;
+    EXPECT_THROW(resolveQueryIntervalKVSnapshotGroups(producers, KVHeadConsumerDemand::AssignedQueryInterval), std::invalid_argument);
+    producers = original; producers[1].device = DeviceId::rocm(9);
+    EXPECT_THROW(resolveQueryIntervalKVSnapshotGroups(producers, KVHeadConsumerDemand::AssignedQueryInterval), std::invalid_argument);
+    producers = original; producers[1].original_kv_heads = 3;
+    EXPECT_THROW(resolveQueryIntervalKVSnapshotGroups(producers, KVHeadConsumerDemand::AssignedQueryInterval), std::invalid_argument);
+    producers = original; producers[1].columns_per_head = 128;
+    EXPECT_THROW(resolveQueryIntervalKVSnapshotGroups(producers, KVHeadConsumerDemand::AssignedQueryInterval), std::invalid_argument);
+    auto assignments = tp->assignments();
+    std::swap(assignments[0].device, assignments[1].device);
+    auto foreign = configs[1]; foreign.tp_config = std::make_shared<TensorParallelConfig>(assignments, KVHeadCoverageDeclaration{24, 2});
+    producers = original; producers[1].config = &foreign; producers[1].device = assignments[1].device;
+    EXPECT_THROW(resolveQueryIntervalKVSnapshotGroups(producers, KVHeadConsumerDemand::AssignedQueryInterval), std::invalid_argument);
+    producers = original;
+    for (auto &p : producers) p.row_columns = 512;
+    const auto full = resolveQueryIntervalKVSnapshotGroups(producers, KVHeadConsumerDemand::FullModel);
+    ASSERT_TRUE(full); ASSERT_EQ(full->size(), 2u);
+    for (const auto &group : *full) EXPECT_EQ(group.mode, SnapshotColumnGroupMode::REPLICATED);
+    for (const auto stage : {"K_PROJECTION", "KV_CACHE_V", "ATTENTION_EFFECTIVE_K_ROW3"}) EXPECT_TRUE(isKVHeadSnapshotStage(stage));
+    for (const auto stage : {"Q_PROJECTION", "GDN_RECURRENCE", "KV_CACHE_V_ROWbad"}) EXPECT_FALSE(isKVHeadSnapshotStage(stage));
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+/** @test Missing global declarations and partial per-layer vectors cannot mint a valid snapshot source by default lookup. */
+TEST(KVHeadCoverage, SnapshotOriginalLayerDeclarationRejectsDefaultSubstitution)
+{
+    auto c = cacheConsumerConfig(std::make_shared<TensorParallelConfig>(covered(4)), 1);
+    c.total_n_layers = 12; c.n_layers = 4; c.pp_layer_offset = 4;
+    c.layer_head_dim = std::vector<int>(12, 256); c.layer_n_kv_heads = std::vector<int>(12, 2);
+    c.layer_head_dim[3] = 128;
+    const auto actual = resolveQueryKVSnapshotLayerGeometry(c, "PREFILL_CHUNK_3_layer7_K_PROJECTION");
+    EXPECT_EQ(actual.columns_per_head, 256); EXPECT_EQ(actual.original_kv_heads, 2);
+    auto bad = c; bad.total_n_layers = 0;
+    EXPECT_THROW(resolveQueryKVSnapshotLayerGeometry(bad, "layer7_K_PROJECTION"), std::invalid_argument);
+    bad = c; bad.layer_head_dim.resize(8); // Contains layer7 but does not authenticate the complete original source.
+    EXPECT_THROW(resolveQueryKVSnapshotLayerGeometry(bad, "layer7_K_PROJECTION"), std::invalid_argument);
+    bad = c; bad.layer_n_kv_heads.resize(4);
+    EXPECT_THROW(resolveQueryKVSnapshotLayerGeometry(bad, "layer7_K_PROJECTION"), std::invalid_argument);
+    bad = c; bad.layer_n_heads = std::vector<int>(12, 24); bad.layer_n_heads[7] = 12;
+    EXPECT_THROW(resolveQueryKVSnapshotLayerGeometry(bad, "layer7_K_PROJECTION"), std::invalid_argument);
+    for (const auto key : {"layer3_K_PROJECTION", "layer8_K_PROJECTION", "layer12_K_PROJECTION", "K_PROJECTION"})
+        EXPECT_THROW(resolveQueryKVSnapshotLayerGeometry(c, key), std::invalid_argument);
+    EXPECT_EQ(resolveQueryKVSnapshotLayerGeometry(c, "MTP0_K_PROJECTION").columns_per_head, 256);
 }
 } // namespace llaminar2::test
