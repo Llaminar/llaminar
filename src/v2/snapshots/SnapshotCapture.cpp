@@ -719,7 +719,8 @@ namespace llaminar2
             return;
         }
 
-        // Handle lm_head_allgather — overwrites partial LM_HEAD with full vocab
+        // The completed gather owns the full vocabulary, including when the
+        // scoped-capture wrapper retains this publication for an older chunk.
         if (name == "lm_head_allgather")
         {
             if (!dump.outputs.empty() && dump.outputs[0].data)
@@ -728,7 +729,8 @@ namespace llaminar2
                 auto data = extractFp32FromOutput(out);
                 LOG_DEBUG("[Snapshot] lm_head_allgather handler: storing as LM_HEAD (overwriting partial), count=" << data.size());
                 if (!data.empty())
-                    storeSnapshot("LM_HEAD", std::move(data), out.rows, out.cols);
+                    storeSnapshot("LM_HEAD", std::move(data), out.rows, out.cols,
+                                  SnapshotPublication::CompleteValue);
             }
             return;
         }

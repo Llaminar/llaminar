@@ -6,6 +6,8 @@
  * QSA_EVENT, and the three production launch bindings. All allocation, copies,
  * and result synchronization are explicit fixture boundaries outside capture.
  * The core attention observations prove the loops decoded selected rows only.
+ * Compact consumer fixtures retain original head bytes/codec metadata and prove
+ * logical degrees1..8 on one device, without implying eight physical devices.
  */
 #pragma once
 #include "kernels/qwen4exp/QwenSparseAttention.h"
@@ -16,6 +18,8 @@
 #include "QwenSparseRotaryReference.h"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
+#include <memory>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -624,6 +628,189 @@ TEST(QSA_SUITE, ParticipantLocalThreeQueriesReplicatedTwoKVHeadsMatchFullHeadByt
                 EXPECT_EQ(std::memcmp(local.data()+row*width,full.data()+row*6144+start*256,width*sizeof(float)),0)
                     <<"participant="<<participant<<" row="<<row;
             for(std::size_t i=f.rows*width;i<local.size();++i)EXPECT_EQ(local[i],poison[i]);
+        }
+    }
+}
+
+/**
+ * @brief Test-only exact native-bank upload with retirement before every backing unwind.
+ *
+ * Logical bytes and metadata come only from the original serialized fixture or
+ * its canonical compact slice. No codec conversion, full-bank expansion or
+ * physical-device count is inferred from these single-device fixtures.
+ */
+struct ConsumerNativeUpload final
+{
+    QSA_STREAM stream;
+    QwenSparseNativeBank descriptor;
+    Buffer<unsigned char> bytes;
+    std::unique_ptr<Buffer<float>> rotation,centroids,anchor;
+    FixtureCopyRetirement retirement{&stream};
+    /**
+     * @brief Upload the exact original bank, retaining source bytes through completion.
+     * @param source Original independently packed native fixture.
+     * @param execution_stream Exact fixture stream; no upload occurs in capture.
+     */
+    ConsumerNativeUpload(const test::NativeCodecFixture &source,QSA_STREAM execution_stream)
+        :ConsumerNativeUpload(source.storage,source.rotation,source.centroids,source.anchor,source.bank(),execution_stream){}
+    /**
+     * @brief Upload a consumer's exact compact native bytes and local codec metadata.
+     * @param source Canonically assigned compact slice, retained through retirement.
+     * @param execution_stream Exact same-device fixture stream.
+     */
+    ConsumerNativeUpload(const test::ConsumerLocalCodecFixture &source,QSA_STREAM execution_stream)
+        :ConsumerNativeUpload(source.storage,source.rotation,source.source.centroids,source.anchor,source.bank(),execution_stream){}
+    /** @return Native device view with exact source/compact token and head strides. */
+    QwenSparseNativeBank bank() const {return descriptor;}
+private:
+    /**
+     * @brief Materialize only the exact persistent bank/table extents outside capture.
+     * @param storage Original serialized native bytes, never requantized.
+     * @param rotations Matching original-head rotations for rotated codecs only.
+     * @param codes Original immutable TQ codebook, unchanged between full/local banks.
+     * @param anchors Corresponding original AQ8 request anchors, if applicable.
+     * @param native Complete host descriptor supplying codec/block/stride identity.
+     * @param execution_stream Original fixture stream retained by its owner.
+     */
+    ConsumerNativeUpload(const std::vector<unsigned char> &storage,const std::vector<float> &rotations,
+        const std::vector<float> &codes,const std::vector<float> &anchors,QwenSparseNativeBank native,QSA_STREAM execution_stream)
+        :stream(execution_stream),descriptor(native),bytes(storage.size())
+    {
+        if(detail::isRotated(native))
+        {rotation=std::make_unique<Buffer<float>>(rotations.size());centroids=std::make_unique<Buffer<float>>(codes.size());}
+        if(native.codec==TensorType::AQ8)anchor=std::make_unique<Buffer<float>>(anchors.size());
+        bytes.upload(storage.data(),stream);descriptor.data=bytes.data;
+        descriptor.rotations[0]=nullptr;descriptor.rotations[1]=nullptr;descriptor.centroids=nullptr;descriptor.anchor=nullptr;
+        if(rotation)
+        {
+            rotation->upload(rotations.data(),stream);centroids->upload(codes.data(),stream);
+            descriptor.rotations[0]=rotation->data;
+            if(rotations.size()>65536)descriptor.rotations[1]=rotation->data+65536;
+            descriptor.centroids=centroids->data;
+        }
+        if(anchor){anchor->upload(anchors.data(),stream);descriptor.anchor=anchor->data;}
+    }
+};
+/** @brief Retire every native node before any local operand/metadata buffer unwinds. */
+struct ConsumerSparseGraphRetirement final
+{
+    Fixture &fixture;
+    /** @brief Join the original stream, then destroy its exact current retained graph. */
+    ~ConsumerSparseGraphRetirement()
+    {
+        if(QSA_RT(StreamSynchronize)(fixture.stream)!=QSA_RT(Success))std::terminate();
+        if(fixture.executable)
+        {if(QSA_RT(GraphExecDestroy)(fixture.executable)!=QSA_RT(Success))std::terminate();fixture.executable=nullptr;}
+        if(fixture.graph)
+        {if(QSA_RT(GraphDestroy)(fixture.graph)!=QSA_RT(Success))std::terminate();fixture.graph=nullptr;}
+    }
+};
+/**
+ * @brief Capture the original production selected-attention operation without changing its arithmetic.
+ * @param f Same-device fixture whose original replay/selection remain device-owned inputs.
+ * @note The indexer is not part of this consumer-local KV mapping certificate.
+ */
+void captureConsumerSparseAttention(Fixture &f)
+{
+    check(QSA_RT(StreamBeginCapture)(f.stream,QSA_RT(StreamCaptureModeThreadLocal)));
+    try{QSA_ATTENTION(f.attention,f.stream);}
+    catch(...)
+    {
+        QSA_GRAPH abandoned=nullptr;(void)QSA_RT(StreamEndCapture)(f.stream,&abandoned);
+        if(abandoned)(void)QSA_RT(GraphDestroy)(abandoned);throw;
+    }
+    check(QSA_RT(StreamEndCapture)(f.stream,&f.graph));
+    std::size_t count=0;check(QSA_RT(GraphGetNodes)(f.graph,nullptr,&count));
+    EXPECT_EQ(count,detail::isRotated(f.attention.kv.keys)?3u:2u);
+    check(QSA_RT(GraphInstantiate)(&f.executable,f.graph,nullptr,nullptr,0));
+}
+
+/** @test Every logical degree1..8 consumes only compact native heads with exact full-head replay bytes. */
+TEST(QSA_SUITE, CompactConsumerKVEveryDegreeMatchesFullOriginalBytes)
+{
+    constexpr int rows=3,tokens=8,dimension=256,full_width=24*dimension;
+    const auto grain=QueryHeadPartitionDeclaration::fromOriginalConsumers(24,{{16,48}});
+    for(const auto codec:{TensorType::FP32,TensorType::FP16,TensorType::BF16,TensorType::Q8_1,
+            TensorType::Q16_1,TensorType::AQ8,TensorType::TQ4,TensorType::TQ8})
+    for(int block:{32,64,128})
+    {
+        if(block!=32 && codec!=TensorType::Q16_1)continue;
+        SCOPED_TRACE(::testing::Message()<<"codec="<<int(codec)<<" block="<<block);
+        Fixture f(rows,5,tokens,QwenSparseScalar::FP32);
+        test::NativeCodecFixture source_keys(codec,tokens,block,false),source_values(codec==TensorType::AQ8?TensorType::FP32:codec,tokens,block,false);
+        ConsumerNativeUpload full_keys(source_keys,f.stream),full_values(source_values,f.stream);
+        std::vector<std::int32_t> selected(rows*QwenSparseSelected,-99),counts{3,4,5};
+        for(int row=0;row<rows;++row)for(int i=0;i<counts[row];++i)selected[row*QwenSparseSelected+i]=i;
+        ConsumerSparseGraphRetirement full_retirement{f};
+        f.selected.upload(selected.data(),f.stream);f.count.upload(counts.data(),f.stream);
+        f.attention.kv={.keys=full_keys.bank(),.values=full_values.bank(),.addressing=QwenSparseKVAddressing::FixedLogicalView,
+            .logical_view={.logical_row_origin=6,.physical_row_capacity=tokens}};
+        check(QSA_RT(StreamSynchronize)(f.stream));captureConsumerSparseAttention(f);f.launch();
+        const auto full=f.output.download(f.stream);
+        check(QSA_RT(GraphExecDestroy)(f.executable));f.executable=nullptr;
+        check(QSA_RT(GraphDestroy)(f.graph));f.graph=nullptr;
+        for(int degree=1;degree<=8;++degree)
+        {
+            const auto config=TensorParallelConfig::equalSplit(degree,24,2,10240,248320,
+                std::nullopt,KVHeadCoveragePolicy::QueryInterval,grain);
+            for(int rank=0;rank<degree;++rank)
+            {
+                const auto &a=config.forRank(rank);const int width=a.head_count*dimension;
+                SCOPED_TRACE(::testing::Message()<<"degree="<<degree<<" rank="<<rank);
+                test::ConsumerLocalCodecFixture compact_keys(source_keys,config,rank),compact_values(source_values,config,rank);
+                ConsumerNativeUpload keys(compact_keys,f.stream),values(compact_values,f.stream);
+                ASSERT_EQ(keys.bytes.size,std::size_t(tokens*a.kv_head_count)*source_keys.head_bytes);
+                ASSERT_EQ(values.bytes.size,std::size_t(tokens*a.kv_head_count)*source_values.head_bytes);
+                ASSERT_EQ(keys.bank().token_stride_bytes,std::size_t(a.kv_head_count)*source_keys.head_bytes);
+                ASSERT_EQ(values.bank().token_stride_bytes,std::size_t(a.kv_head_count)*source_values.head_bytes);
+                std::vector<float> query(rows*width),gate(query.size()),poison(query.size()+16,-923.25f),expected=poison;
+                for(int row=0;row<rows;++row)
+                {
+                    std::copy_n(f.host_core_query.data()+row*full_width+a.head_start*dimension,width,query.data()+row*width);
+                    std::copy_n(f.host_gate.data()+row*full_width+a.head_start*dimension,width,gate.data()+row*width);
+                }
+                Buffer<float> local_query(query.size()),local_gate(gate.size()),output(poison.size());
+                Buffer<QwenSparseAttentionPartial> partials(std::size_t(rows*a.head_count)*QwenSparsePartitions);
+                Buffer<QwenSparseAttentionObservation> observations(rows*a.head_count);
+                std::vector<QwenSparseAttentionObservation> initial(observations.size);
+                std::memset(initial.data(),0xa5,initial.size()*sizeof(initial[0]));
+                ConsumerSparseGraphRetirement retirement{f};
+                local_query.upload(query.data(),f.stream);local_gate.upload(gate.data(),f.stream);output.upload(poison.data(),f.stream);
+                observations.upload(initial.data(),f.stream);
+                f.attention.query=local_query.data;f.attention.gate=local_gate.data;f.attention.output=output.data;
+                f.attention.query_heads=a.head_count;f.attention.query_head_start=a.head_start;
+                f.attention.kv_heads=a.kv_head_count;f.attention.kv_head_start=a.kv_head_start;
+                f.attention.kv.keys=keys.bank();f.attention.kv.values=values.bank();
+                f.attention.gpu_partials=partials.data;f.attention.observations=observations.data;
+                check(QSA_RT(StreamSynchronize)(f.stream));captureConsumerSparseAttention(f);
+                for(int history=0;history<20;++history)
+                {
+                    const int live=std::array{1,3,1,0,2}[std::size_t(history)%5];f.replay.live_rows=live;
+                    for(int row=0;row<rows;++row)counts[row]=row<live?row+3:-987;
+                    f.state.upload(&f.replay,f.stream);f.count.upload(counts.data(),f.stream);
+                    for(int row=0;row<live;++row)std::copy_n(full.data()+row*full_width+a.head_start*dimension,width,expected.data()+row*width);
+                    f.launch();const auto actual=output.download(f.stream);const auto traffic=observations.download(f.stream);
+                    EXPECT_EQ(std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float)),0)<<"history="<<history;
+                    // The native reducer publishes zero reads for inactive
+                    // diagnostic rows, while preserving their output payload.
+                    // Keep that established GPU observation contract; struct
+                    // padding is not a published counter field.
+                    for(int row=live;row<rows;++row)for(int head=0;head<a.head_count;++head)
+                    {
+                        const auto &value=traffic[row*a.head_count+head];
+                        EXPECT_EQ(value.key_elements,0u);
+                        EXPECT_EQ(value.value_elements,0u);
+                        EXPECT_EQ(value.selected_tokens,0u);
+                    }
+                    for(int row=0;row<live;++row)for(int head=0;head<a.head_count;++head)
+                    {
+                        const auto &value=traffic[row*a.head_count+head];
+                        EXPECT_EQ(value.key_elements,std::uint64_t(counts[row])*dimension);
+                        EXPECT_EQ(value.value_elements,std::uint64_t(counts[row])*dimension);
+                        EXPECT_EQ(value.selected_tokens,counts[row]);
+                    }
+                }
+            }
         }
     }
 }

@@ -8,6 +8,8 @@
  * Design:
  * - DeviceShardingAssignment: Per-device assignment of heads, FFN slices, vocab
  * - TensorParallelConfig: Container with factory methods for common patterns
+ * Explicit QueryInterval coverage retains original source bounds and permits
+ * only the overlaps justified by actual Q consumers. Defaults remain legacy.
  *
  * Usage:
  *   // Equal split across 2 GPUs
@@ -23,6 +25,8 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "KVHeadCoverage.h"
+#include "QueryHeadPartitionDeclaration.h"
 #include <vector>
 #include <optional>
 #include <stdexcept>
@@ -125,6 +129,24 @@ namespace llaminar2
 
         TensorParallelConfig() = default;
         explicit TensorParallelConfig(std::vector<DeviceShardingAssignment> assignments);
+        /**
+         * @brief Authenticate authored consumer-minimal intervals against original source bounds.
+         * @param assignments Actual participant intervals; order is retained for device ownership.
+         * @param source Original global Q/KV declaration; a union maximum cannot supply it.
+         * @param query_partition Optional original consumer alignment, authenticated before totals.
+         * @throws std::invalid_argument For missing coverage, unjustified overlap or invalid geometry.
+         */
+        TensorParallelConfig(std::vector<DeviceShardingAssignment> assignments,
+                             KVHeadCoverageDeclaration source,
+                             std::optional<QueryHeadPartitionDeclaration> query_partition = std::nullopt);
+        /**
+         * @brief Authenticate an aligned query declaration while preserving legacy KV ownership.
+         * @param assignments Canonical participant-indexed original intervals.
+         * @param query_partition Complete immutable original consumer declaration.
+         * @throws std::invalid_argument For cuts, holes, empty owners or stale participant identity.
+         */
+        TensorParallelConfig(std::vector<DeviceShardingAssignment> assignments,
+                             QueryHeadPartitionDeclaration query_partition);
 
         // =========================================================================
         // Accessors
@@ -135,6 +157,18 @@ namespace llaminar2
         const DeviceShardingAssignment &forRank(int rank) const;
         int worldSize() const { return static_cast<int>(assignments_.size()); }
         bool isProportional() const { return is_proportional_; }
+        /** @return Explicit consumer policy; old construction always remains Legacy. */
+        KVHeadCoveragePolicy kvHeadCoveragePolicy() const noexcept
+        { return kv_coverage_ ? KVHeadCoveragePolicy::QueryInterval : KVHeadCoveragePolicy::Legacy; }
+        /** @return Immutable original bounds only when explicitly authenticated. */
+        const std::optional<KVHeadCoverageDeclaration> &kvHeadCoverageDeclaration() const noexcept
+        { return kv_coverage_; }
+
+        /** @return Original consumer declaration, when explicitly supplied at canonical construction. */
+        const std::optional<QueryHeadPartitionDeclaration> &queryHeadPartitionDeclaration() const noexcept
+        { return query_partition_; }
+        /** @return Existing non-GDN default1 or authenticated consumer-derived step. */
+        int queryHeadGranularity() const noexcept { return query_partition_ ? query_partition_->granularity() : 1; }
 
         // =========================================================================
         // Totals (for validation)
@@ -168,6 +202,8 @@ namespace llaminar2
          * @param d_ff FFN intermediate dimension
          * @param vocab_size Vocabulary size
          * @param devices Optional device IDs (defaults to cuda(0), cuda(1), ...)
+         * @param kv_coverage Explicit consumer coverage opt-in; existing full-bank/disjoint defaults remain unchanged.
+         * @param query_partition Original retained consumer declaration; absent retains query alignment1.
          * @return TensorParallelConfig with equal splits
          */
         static TensorParallelConfig equalSplit(
@@ -176,7 +212,9 @@ namespace llaminar2
             int n_kv_heads,
             int d_ff,
             int vocab_size,
-            std::optional<std::vector<DeviceId>> devices = std::nullopt);
+            std::optional<std::vector<DeviceId>> devices = std::nullopt,
+            KVHeadCoveragePolicy kv_coverage = KVHeadCoveragePolicy::Legacy,
+            std::optional<QueryHeadPartitionDeclaration> query_partition = std::nullopt);
 
         /**
          * @brief Create proportional splits based on work fractions
@@ -192,6 +230,8 @@ namespace llaminar2
          *
          * @param devices Devices to distribute work across
          * @param work_fractions Relative work fraction per device (normalized)
+         * @param kv_coverage Explicit consumer coverage opt-in; existing full-bank/disjoint defaults remain unchanged.
+         * @param query_partition Original retained consumer declaration; absent retains query alignment1.
          * @param n_heads Total number of Q attention heads
          * @param n_kv_heads Total number of KV heads (for GQA)
          * @param d_ff FFN intermediate dimension
@@ -207,7 +247,9 @@ namespace llaminar2
             int n_heads,
             int n_kv_heads,
             int d_ff,
-            int vocab_size);
+            int vocab_size,
+            KVHeadCoveragePolicy kv_coverage = KVHeadCoveragePolicy::Legacy,
+            std::optional<QueryHeadPartitionDeclaration> query_partition = std::nullopt);
 
         /**
          * @brief Create single-device configuration (no parallelism)
@@ -233,6 +275,8 @@ namespace llaminar2
          * for use by WeightManager during weight loading.
          *
          * @param local_tp_ctx LOCAL TP context with devices and weights
+         * @param kv_coverage Explicit consumer coverage opt-in; existing full-bank/disjoint defaults remain unchanged.
+         * @param query_partition Original retained consumer declaration; absent retains query alignment1.
          * @param n_heads Total Q attention heads
          * @param n_kv_heads Total KV heads (for GQA)
          * @param d_ff FFN intermediate dimension
@@ -244,7 +288,9 @@ namespace llaminar2
             int n_heads,
             int n_kv_heads,
             int d_ff,
-            int vocab_size);
+            int vocab_size,
+            KVHeadCoveragePolicy kv_coverage = KVHeadCoveragePolicy::Legacy,
+            std::optional<QueryHeadPartitionDeclaration> query_partition = std::nullopt);
 
         /**
          * @brief String representation for logging
@@ -258,8 +304,15 @@ namespace llaminar2
         int total_d_ff_ = 0;
         int total_vocab_ = 0;
         bool is_proportional_ = false;
+        std::optional<KVHeadCoverageDeclaration> kv_coverage_; ///< Original bounds; never inferred from replicas.
+        std::optional<QueryHeadPartitionDeclaration> query_partition_; ///< Complete original consumer alignment, not another assignment.
 
+        /** @brief Count logical original heads once; physical copies remain per-assignment BOM inputs. */
         void computeTotals();
+        /** @return Precise source/coverage failure for explicit QueryInterval assignments, or empty. */
+        std::string kvCoverageError() const;
+        /** @return Source-bound query alignment/membership/extent failure, or empty. */
+        std::string queryPartitionError() const;
 
         /**
          * @brief Round value to alignment boundary (round down)

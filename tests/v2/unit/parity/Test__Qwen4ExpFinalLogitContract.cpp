@@ -316,4 +316,57 @@ TEST(Qwen4ExpFinalLogits, TPAndLegacyControlsDoNotAcquireNumericalWaivers)
     FinalLogitProbe::finalizeDecodeSummaryNumerics(decoded, cfg, true);
     EXPECT_FALSE(decoded.overall_passed);
 }
+
+/** @test Both partial publication authorities retain low raw cosine but honor the declared decode KL. */
+TEST(Qwen4ExpFinalLogits, PartialPrefixUsesDeclaredFinalLogitPolicyAndRetainsLegacyCosine)
+{
+    const std::array reference{1.f,2.f,3.f,4.f};
+    const std::array shifted{-99.1f,-98.f,-97.f,-96.f}; // Small probability drift; raw cosine remains red.
+    const auto cfg=config();
+    const auto graph=comparePrefixPartialLogits(shifted,reference,4,cfg.final_logit_mean_kl,.99f);
+    std::vector<float> terminal;terminal.insert(terminal.end(),shifted.begin(),shifted.end());
+    terminal.insert(terminal.end(),shifted.begin(),shifted.end());
+    const auto publication=comparePrefixPartialLogits(terminal,reference,4,cfg.final_logit_mean_kl,.99f);
+    ASSERT_TRUE(graph.evidence_valid);EXPECT_TRUE(graph.passed);EXPECT_LT(graph.minimum_cosine,.99f);
+    EXPECT_TRUE(publication.passed);EXPECT_EQ(publication.rows,2u);
+    EXPECT_FLOAT_EQ(publication.maximum_kl,graph.maximum_kl);
+    EXPECT_FALSE(comparePrefixPartialLogits(shifted,reference,4,std::nullopt,.99f).passed);
+    EXPECT_TRUE(comparePrefixPartialLogits(reference,reference,4,std::nullopt,.99f).passed);
+}
+
+/** @test Every complete participant row must meet the strict decode budget, never a mean over copies. */
+TEST(Qwen4ExpFinalLogits, PartialPrefixRejectsOneBadRowAndStrictKLBoundary)
+{
+    const std::array reference{1.f,2.f,3.f,4.f};
+    const std::array bad{4.f,3.f,2.f,1.f};
+    auto cfg=config();
+    std::vector<float> rows(reference.begin(),reference.end());rows.insert(rows.end(),bad.begin(),bad.end());
+    EXPECT_FALSE(comparePrefixPartialLogits(rows,reference,4,cfg.final_logit_mean_kl,.99f).passed);
+    std::swap_ranges(rows.begin(),rows.begin()+4,rows.begin()+4);
+    EXPECT_FALSE(comparePrefixPartialLogits(rows,reference,4,cfg.final_logit_mean_kl,.99f).passed);
+    const float exact=computeKLDivergence(bad.data(),reference.data(),4,4);
+    ASSERT_GT(exact,0.f);cfg.final_logit_mean_kl->decode_maximum=exact;
+    EXPECT_FALSE(comparePrefixPartialLogits(bad,reference,4,cfg.final_logit_mean_kl,-1.f).passed);
+    cfg.final_logit_mean_kl->decode_maximum=std::nextafter(exact,std::numeric_limits<float>::infinity());
+    EXPECT_TRUE(comparePrefixPartialLogits(bad,reference,4,cfg.final_logit_mean_kl,-1.f).passed);
+}
+
+/** @test Invalid geometry and any nonfinite source row reject both actual publication variants. */
+TEST(Qwen4ExpFinalLogits, PartialPrefixRejectsMissingPartialAndNonfiniteRows)
+{
+    const std::array reference{1.f,2.f,3.f,4.f};const auto cfg=config();
+    EXPECT_FALSE(comparePrefixPartialLogits({},reference,4,cfg.final_logit_mean_kl,.99f).evidence_valid);
+    EXPECT_FALSE(comparePrefixPartialLogits(reference,reference,0,cfg.final_logit_mean_kl,.99f).evidence_valid);
+    EXPECT_FALSE(comparePrefixPartialLogits(std::span(reference).first(3),reference,4,cfg.final_logit_mean_kl,.99f).evidence_valid);
+    EXPECT_FALSE(comparePrefixPartialLogits(reference,std::span(reference).first(3),4,cfg.final_logit_mean_kl,.99f).evidence_valid);
+    for(float invalid:{std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()})
+    {
+        std::vector<float> rows(reference.begin(),reference.end());rows.insert(rows.end(),reference.begin(),reference.end());
+        rows[0]=invalid;
+        EXPECT_FALSE(comparePrefixPartialLogits(rows,reference,4,cfg.final_logit_mean_kl,.99f).evidence_valid);
+        rows[0]=1.f;rows.back()=invalid;
+        EXPECT_FALSE(comparePrefixPartialLogits(rows,reference,4,cfg.final_logit_mean_kl,.99f).passed);
+    }
+}
+
 } // namespace llaminar2::test::parity

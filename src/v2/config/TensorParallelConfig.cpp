@@ -5,6 +5,8 @@
  * Replicated KV retains the full original bank and global GQA mapping; local
  * query intervals stay integral without an artificial KV-count alignment.
  * Model-specific GDN key-head boundary validation remains a separate guard.
+ * Opt-in query coverage authenticates exact original intervals and their union;
+ * logical totals count each original head once, never each physical replica.
  */
 
 #include "TensorParallelConfig.h"
@@ -13,6 +15,9 @@
 #include <numeric>
 #include <sstream>
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <utility>
 
 namespace llaminar2
 {
@@ -56,6 +61,38 @@ namespace llaminar2
         }
     }
 
+    TensorParallelConfig::TensorParallelConfig(
+        std::vector<DeviceShardingAssignment> assignments, KVHeadCoverageDeclaration source,
+        std::optional<QueryHeadPartitionDeclaration> query_partition)
+        : assignments_(std::move(assignments)), kv_coverage_(source), query_partition_(std::move(query_partition))
+    {
+        // Validate every endpoint and sum before legacy int arithmetic can run.
+        const auto query_error = queryPartitionError();
+        if (!query_error.empty()) throw std::invalid_argument(query_error);
+        const auto coverage_error = kvCoverageError();
+        if (!coverage_error.empty()) throw std::invalid_argument(coverage_error);
+        computeTotals();
+        const auto error = validationError();
+        if (!error.empty()) throw std::invalid_argument(error);
+        if (assignments_.size() > 1)
+            is_proportional_ = std::any_of(assignments_.begin() + 1, assignments_.end(),
+                [&](const auto &a) { return std::abs(a.work_fraction - assignments_[0].work_fraction) > 0.01f; });
+    }
+
+    TensorParallelConfig::TensorParallelConfig(
+        std::vector<DeviceShardingAssignment> assignments, QueryHeadPartitionDeclaration query_partition)
+        : assignments_(std::move(assignments)), query_partition_(std::move(query_partition))
+    {
+        const auto query_error = queryPartitionError();
+        if (!query_error.empty()) throw std::invalid_argument(query_error);
+        computeTotals();
+        const auto error = validationError();
+        if (!error.empty()) throw std::invalid_argument(error);
+        if (assignments_.size() > 1)
+            is_proportional_ = std::any_of(assignments_.begin() + 1, assignments_.end(),
+                [&](const auto &a) { return std::abs(a.work_fraction - assignments_[0].work_fraction) > 0.01f; });
+    }
+
     // =========================================================================
     // TensorParallelConfig - Accessors
     // =========================================================================
@@ -90,6 +127,97 @@ namespace llaminar2
     // TensorParallelConfig - Validation
     // =========================================================================
 
+    std::string TensorParallelConfig::queryPartitionError() const
+    {
+        if (!query_partition_) return {};
+        if (assignments_.empty() || assignments_.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+            return "Query consumer partition has no representable participants";
+        const int total = query_partition_->originalQueryHeads();
+        const int grain = query_partition_->granularity();
+        if (kv_coverage_ && kv_coverage_->query_heads != total)
+            return "Query and KV declarations name different original head spaces";
+        std::int64_t query_sum = 0, ffn_sum = 0, vocab_sum = 0, kv_sum = 0;
+        bool kv_full_replicas = true;
+        for (size_t rank = 0; rank < assignments_.size(); ++rank)
+        {
+            const auto &a = assignments_[rank];
+            if (a.local_rank != static_cast<int>(rank) || a.head_start < 0 || a.head_count <= 0 ||
+                a.head_start >= total || a.head_count > total - a.head_start ||
+                a.head_start % grain || a.head_count % grain)
+                return "Query assignment cuts an original consumer head or has stale participant identity";
+            for (const auto &[first, count] : {std::pair{a.d_ff_start, a.d_ff_count},
+                    std::pair{a.vocab_start, a.vocab_count}, std::pair{a.kv_head_start, a.kv_head_count}})
+                if (first < 0 || count <= 0 || count > std::numeric_limits<int>::max() - first)
+                    return "Aligned query assignment has empty or unrepresentable physical intervals";
+            query_sum += a.head_count; ffn_sum += a.d_ff_count; vocab_sum += a.vocab_count; kv_sum += a.kv_head_count;
+            kv_full_replicas &= a.kv_head_start == 0 && a.kv_head_count == assignments_.front().kv_head_count;
+            if (query_sum > total || ffn_sum > std::numeric_limits<int>::max() || vocab_sum > std::numeric_limits<int>::max())
+                return "Aligned query assignment totals exceed original or representable bounds";
+        }
+        if (query_sum != total) return "Aligned query assignment misses original query heads";
+        if (!kv_coverage_)
+        {
+            const std::int64_t logical_kv = kv_full_replicas ? assignments_.front().kv_head_count : kv_sum;
+            if (logical_kv > std::numeric_limits<int>::max())
+                return "Aligned query assignment logical KV total overflows";
+            for (const auto &a : assignments_)
+            {
+                KVHeadInterval needed;
+                try { needed = resolveQueryKVHeadCoverage({total, static_cast<int>(logical_kv)}, a.head_start, a.head_count); }
+                catch (const std::invalid_argument &error) { return error.what(); }
+                // Keeping legacy KV means keeping its exact full-bank/disjoint
+                // intervals. A new query grain cannot quietly borrow missing
+                // heads or reinterpret those old intervals as subset replicas.
+                if (a.kv_head_start > needed.first || a.kvHeadEnd() < needed.end())
+                    return "Legacy KV interval cannot serve the aligned original query consumer";
+            }
+        }
+        return {};
+    }
+
+    std::string TensorParallelConfig::kvCoverageError() const
+    {
+        if (!kv_coverage_) return {};
+        const auto source = *kv_coverage_;
+        try { validateKVHeadCoverageDeclaration(source); }
+        catch (const std::invalid_argument &error) { return error.what(); }
+        if (assignments_.empty() || assignments_.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+            return "KV query coverage has no representable participant membership";
+        std::vector<KVHeadInterval> intervals;
+        std::int64_t query_sum = 0, ffn_sum = 0, vocab_sum = 0;
+        for (size_t rank = 0; rank < assignments_.size(); ++rank)
+        {
+            const auto &a = assignments_[rank];
+            if (a.local_rank != static_cast<int>(rank))
+                return "KV-covered assignment local rank differs from canonical participant order";
+            KVHeadInterval expected;
+            try { expected = resolveQueryKVHeadCoverage(source, a.head_start, a.head_count); }
+            catch (const std::invalid_argument &error) { return error.what(); }
+            if (a.kv_head_start != expected.first || a.kv_head_count != expected.count)
+                return "KV interval does not equal its original query consumer coverage";
+            for (const auto &[first, count] : {std::pair{a.d_ff_start, a.d_ff_count},
+                                              std::pair{a.vocab_start, a.vocab_count}})
+                if (first < 0 || count <= 0 || count > std::numeric_limits<int>::max() - first)
+                    return "KV-covered assignment has invalid FFN/vocabulary interval";
+            query_sum += a.head_count; ffn_sum += a.d_ff_count; vocab_sum += a.vocab_count;
+            if (query_sum > source.query_heads || ffn_sum > std::numeric_limits<int>::max() ||
+                vocab_sum > std::numeric_limits<int>::max())
+                return "KV-covered assignment totals exceed original or representable bounds";
+            intervals.push_back(expected);
+        }
+        if (query_sum != source.query_heads) return "KV query assignment does not cover original global Q heads";
+        std::sort(intervals.begin(), intervals.end(),
+                  [](const auto &a, const auto &b) { return a.first < b.first; });
+        int end = 0;
+        for (const auto &interval : intervals)
+        {
+            if (interval.first > end) return "KV query coverage has an unowned original head";
+            end = std::max(end, interval.end());
+        }
+        if (end != source.kv_heads) return "KV query coverage does not cover the complete original KV bank";
+        return {};
+    }
+
     void TensorParallelConfig::computeTotals()
     {
         total_heads_ = 0;
@@ -100,9 +228,25 @@ namespace llaminar2
         for (const auto &a : assignments_)
         {
             total_heads_ += a.head_count;
-            total_kv_heads_ += a.kv_head_count;
+            if (!kv_coverage_ && !query_partition_) total_kv_heads_ += a.kv_head_count;
             total_d_ff_ += a.d_ff_count;
             total_vocab_ += a.vocab_count;
+        }
+
+        if (kv_coverage_)
+        {
+            total_kv_heads_ = kv_coverage_->kv_heads;
+            return;
+        }
+
+        if (query_partition_)
+        {
+            std::int64_t count = 0;
+            for (const auto &a : assignments_) count += a.kv_head_count;
+            // A representable disjoint total was checked before this call.
+            // Full replicas can exceed int in physical sum; the original
+            // reduction below supplies their one logical original count.
+            total_kv_heads_ = count <= std::numeric_limits<int>::max() ? static_cast<int>(count) : 0;
         }
 
         // GQA replication fix: when KV heads are replicated across all devices
@@ -134,6 +278,8 @@ namespace llaminar2
 
     std::string TensorParallelConfig::validationError() const
     {
+        if (const auto error = queryPartitionError(); !error.empty()) return error;
+        if (const auto error = kvCoverageError(); !error.empty()) return error;
         if (assignments_.empty())
         {
             return "No device assignments";
@@ -199,7 +345,7 @@ namespace llaminar2
                 }
 
                 // Check KV head overlap (skip when GQA-replicated — all devices have same KV range)
-                if (!kv_replicated && a.kv_head_start < b.kvHeadEnd() && b.kv_head_start < a.kvHeadEnd())
+                if (!kv_coverage_ && !kv_replicated && a.kv_head_start < b.kvHeadEnd() && b.kv_head_start < a.kvHeadEnd())
                 {
                     return "Overlapping KV head ranges between rank " +
                            std::to_string(i) + " and " + std::to_string(j);
@@ -266,7 +412,9 @@ namespace llaminar2
         int n_kv_heads,
         int d_ff,
         int vocab_size,
-        std::optional<std::vector<DeviceId>> devices)
+        std::optional<std::vector<DeviceId>> devices,
+        KVHeadCoveragePolicy kv_coverage,
+        std::optional<QueryHeadPartitionDeclaration> query_partition)
     {
         if (world_size <= 0)
         {
@@ -304,7 +452,7 @@ namespace llaminar2
         }
 
         // Use proportionalSplit with equal fractions
-        auto config = proportionalSplit(device_list, fractions, n_heads, n_kv_heads, d_ff, vocab_size);
+        auto config = proportionalSplit(device_list, fractions, n_heads, n_kv_heads, d_ff, vocab_size, kv_coverage, std::move(query_partition));
 
         // Mark as non-proportional (equal split)
         config.is_proportional_ = false;
@@ -318,7 +466,9 @@ namespace llaminar2
         int n_heads,
         int n_kv_heads,
         int d_ff,
-        int vocab_size)
+        int vocab_size,
+        KVHeadCoveragePolicy kv_coverage,
+        std::optional<QueryHeadPartitionDeclaration> query_partition)
     {
         if (devices.size() != work_fractions.size())
         {
@@ -333,10 +483,19 @@ namespace llaminar2
             throw std::invalid_argument("All dimension parameters must be positive");
         }
 
+        if (kv_coverage != KVHeadCoveragePolicy::Legacy && kv_coverage != KVHeadCoveragePolicy::QueryInterval)
+            throw std::invalid_argument("Unknown KV head coverage policy");
+        if (kv_coverage == KVHeadCoveragePolicy::QueryInterval)
+            validateKVHeadCoverageDeclaration({n_heads, n_kv_heads});
+
+        if (query_partition && (query_partition->originalQueryHeads() != n_heads ||
+            static_cast<size_t>(n_heads / query_partition->granularity()) < devices.size()))
+            throw std::invalid_argument("Query consumer source differs or has too few complete groups for participants");
+
         // Validate work fractions
         for (float f : work_fractions)
         {
-            if (f < 0.0f)
+            if (f < 0.0f || ((kv_coverage == KVHeadCoveragePolicy::QueryInterval || query_partition.has_value()) && !std::isfinite(f)))
             {
                 throw std::invalid_argument("Work fractions must be non-negative");
             }
@@ -344,7 +503,7 @@ namespace llaminar2
 
         // Normalize work fractions to sum to 1.0
         float sum = std::accumulate(work_fractions.begin(), work_fractions.end(), 0.0f);
-        if (sum <= 0.0f)
+        if (sum <= 0.0f || ((kv_coverage == KVHeadCoveragePolicy::QueryInterval || query_partition.has_value()) && !std::isfinite(sum)))
         {
             throw std::invalid_argument("Sum of work fractions must be positive");
         }
@@ -383,7 +542,8 @@ namespace llaminar2
         // offset. Local Q widths therefore need no KV-count alignment: imposing
         // it turns QFN TP8's exact three-head intervals into nonintegral GDN
         // partitions. GDN admission still independently rejects cut key heads.
-        std::vector<int> head_counts = distributeProportionally(n_heads, normalized, 1);
+        std::vector<int> head_counts = distributeProportionally(n_heads, normalized,
+            query_partition ? query_partition->granularity() : 1);
         std::vector<int> d_ff_counts = distributeProportionally(d_ff, normalized, 32); // 32-aligned
         std::vector<int> vocab_counts = distributeProportionally(vocab_size, normalized, 1);
 
@@ -408,6 +568,12 @@ namespace llaminar2
             // When KV is replicated, all devices start at 0 and have all heads
             a.kv_head_start = kv_replicated ? 0 : kv_offset;
             a.kv_head_count = kv_head_counts[i];
+            if (kv_coverage == KVHeadCoveragePolicy::QueryInterval)
+            {
+                const auto interval = resolveQueryKVHeadCoverage({n_heads, n_kv_heads}, a.head_start, a.head_count);
+                a.kv_head_start = interval.first;
+                a.kv_head_count = interval.count;
+            }
             if (!kv_replicated)
                 kv_offset += kv_head_counts[i];
 
@@ -422,7 +588,10 @@ namespace llaminar2
             assignments.push_back(a);
         }
 
-        TensorParallelConfig config(std::move(assignments));
+        TensorParallelConfig config = kv_coverage == KVHeadCoveragePolicy::QueryInterval
+            ? TensorParallelConfig(std::move(assignments), KVHeadCoverageDeclaration{n_heads, n_kv_heads}, std::move(query_partition))
+            : query_partition ? TensorParallelConfig(std::move(assignments), std::move(*query_partition))
+                              : TensorParallelConfig(std::move(assignments));
         config.is_proportional_ = true;
         return config;
     }
@@ -455,7 +624,9 @@ namespace llaminar2
         int n_heads,
         int n_kv_heads,
         int d_ff,
-        int vocab_size)
+        int vocab_size,
+        KVHeadCoveragePolicy kv_coverage,
+        std::optional<QueryHeadPartitionDeclaration> query_partition)
     {
         const auto &devices = local_tp_ctx.devices();
         const auto &weights = local_tp_ctx.weights();
@@ -503,7 +674,7 @@ namespace llaminar2
         }
 
         // Delegate to proportionalSplit which handles the distribution logic
-        return proportionalSplit(device_ids, work_fractions, n_heads, n_kv_heads, d_ff, vocab_size);
+        return proportionalSplit(device_ids, work_fractions, n_heads, n_kv_heads, d_ff, vocab_size, kv_coverage, std::move(query_partition));
     }
 
     // =========================================================================

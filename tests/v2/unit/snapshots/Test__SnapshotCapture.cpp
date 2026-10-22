@@ -1989,3 +1989,35 @@ TEST(Test__SnapshotCapture_Capture, CanonicalRouteProducersKeepLocalTicketAndCom
     capture.captureStage(expert,local_dump);capture.captureStage(ingress,ticket_dump);
     EXPECT_EQ(capture.get("layer7_MOE_ROUTE_CONTRIBUTIONS")->data,complete);
 }
+
+/**
+ * @brief Completed vocabulary gathers keep full ownership through retained scopes.
+ *
+ * A later unscoped decode publication must not mutate the retained prefill
+ * payload or turn its complete value back into a schema-local vocabulary shard.
+ */
+TEST_F(Test__SnapshotCapture_Routing, LMHeadAllgatherRetainsCompleteScopedPublication)
+{
+    for (const std::string scope : {"", "prefill_chunk_3::"})
+    {
+        capture.captureStage(scope + "lm_head", makeSingleOutputDump("logits", data_a.data(), 1, 4));
+        const std::string key = scope.empty() ? "LM_HEAD" : "PREFILL_CHUNK_3_LM_HEAD";
+        auto partial = capture.getShared(key);
+        ASSERT_NE(partial, nullptr);
+        EXPECT_EQ(partial->publication, SnapshotPublication::SchemaPartition);
+        capture.captureStage(scope + "lm_head_allgather", makeSingleOutputDump("logits", data_b.data(), 1, 8));
+        auto complete = capture.getShared(key);
+        ASSERT_NE(complete, nullptr);
+        EXPECT_EQ(complete->publication, SnapshotPublication::CompleteValue);
+        EXPECT_EQ(complete->rows, 1u);
+        EXPECT_EQ(complete->cols, 8u);
+        EXPECT_EQ(complete->data, std::vector<float>(data_b.begin(), data_b.begin() + 8));
+        EXPECT_EQ(partial->cols, 4u);
+        EXPECT_EQ(partial->publication, SnapshotPublication::SchemaPartition);
+        capture.captureStage("lm_head", makeSingleOutputDump("logits", data_a.data(), 1, 4));
+        EXPECT_EQ(complete->publication, SnapshotPublication::CompleteValue);
+        EXPECT_EQ(complete->data, std::vector<float>(data_b.begin(), data_b.begin() + 8));
+        if (!scope.empty())
+            EXPECT_EQ(capture.getShared(key), complete);
+    }
+}

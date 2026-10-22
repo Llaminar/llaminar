@@ -11,6 +11,7 @@
  * - Parallel forward pass execution across devices via TPWorkerPool (TP) / std::async (PP)
  * - AllGather for combining partial logits from column-parallel LM head
  * - Unified snapshot/profiling API across all device runners
+ * Retained prefill heads never borrow the current transaction's logits buffer.
  * Diagnostic assembly obeys each immutable producer publication, including
  * complete values and explicit output-column partitions, instead of assuming
  * that a semantic checkpoint always retains its schema's historical layout.
@@ -18117,10 +18118,13 @@ namespace llaminar2
             }
         }
         const bool condition_snapshot = !condition_scope.empty();
+        const size_t chunk_stage = prefillChunkSnapshotSemanticStageOffset(key);
+        const bool prefill_chunk_snapshot = chunk_stage != std::string_view::npos;
         const std::string_view semantic_key_view =
             condition_snapshot
                 ? std::string_view(key).substr(condition_scope.size())
-                : std::string_view(key);
+                : prefill_chunk_snapshot ? std::string_view(key).substr(chunk_stage)
+                                         : std::string_view(key);
         const std::string semantic_key(semantic_key_view);
         const bool mtp_model_snapshot =
             isMTPDepthQualifiedSnapshot(semantic_key);
@@ -18159,7 +18163,7 @@ namespace llaminar2
         // Only the ordinary main embedding uses this placement rule. MTP
         // depths and condition scopes retain their own vocabulary authority;
         // generic layer-qualified names are not global embedding checkpoints.
-        if (!condition_snapshot && !mtp_model_snapshot &&
+        if (!condition_snapshot && !mtp_model_snapshot && !prefill_chunk_snapshot &&
             semantic_key == "EMBEDDING" &&
             mode == SnapshotShardingMode::ROW_PARALLEL &&
             phaseSplitReplicatedDecodeEmbeddingSnapshotsActive())
@@ -18174,7 +18178,11 @@ namespace llaminar2
          * for plain TP. During replicated decode, summing per-device snapshots
          * doubles the captured tensor and produces false parity failures.
          */
-        if (mode == SnapshotShardingMode::ROW_PARALLEL &&
+        // A retained prefill chunk predates the current main transaction.
+        // Later replicated decode must not reinterpret its original TP values.
+        // Explicit immutable producer publications still override schema layout
+        // in getTPSnapshot, including complete heads and token-row partitions.
+        if (!prefill_chunk_snapshot && mode == SnapshotShardingMode::ROW_PARALLEL &&
             phaseSplitReplicatedDecodeSnapshotsActive() &&
             isPhaseSplitReplicatedDecodeSnapshotKey(semantic_key))
         {
@@ -18187,7 +18195,7 @@ namespace llaminar2
         // The typed phase and declared placement establish replication; the
         // one-row restriction excludes grouped verifier transactions. Their
         // depth/condition scopes keep the existing independent MTP contracts.
-        if (!condition_snapshot && !mtp_model_snapshot &&
+        if (!condition_snapshot && !mtp_model_snapshot && !prefill_chunk_snapshot &&
             current_padded_seq_len_ == 1 &&
             (mode == SnapshotShardingMode::COLUMN_PARALLEL ||
              mode == SnapshotShardingMode::PACKED_COLUMN_PARALLEL) &&
@@ -18497,8 +18505,31 @@ namespace llaminar2
             result.mode = SnapshotShardingMode::COLUMN_PARALLEL;
         }
 
-        // Special case: GATHERED stages (e.g., LM_HEAD) with combined logits already gathered
-        if (result.mode == SnapshotShardingMode::GATHERED &&
+        const bool retained_prefill_chunk =
+            prefillChunkSnapshotSemanticStageOffset(key) != std::string_view::npos;
+        if (retained_prefill_chunk &&
+            extractStageType(key) == "LM_HEAD" &&
+            result.mode == SnapshotShardingMode::GATHERED)
+        {
+            // A retained chunk belongs to its producing transaction. The current
+            // logits gatherer can already contain a later decode, and GATHERED
+            // assembly alone would incorrectly accept the first local shard.
+            // Explicit complete/column/row publications were resolved above.
+            // Only declared mirrored heads establish full values without an
+            // explicit publication; verify all replicas through normal assembly.
+            if (!mtpTerminalHeadIsMirrored(config_.mtp.terminal_head_policy))
+                throw std::runtime_error("Snapshot '" + key +
+                    "' lacks retained terminal-head publication ownership");
+            if (!std::all_of(publications.begin(), publications.end(),
+                    [](const SnapshotInfo &snap) { return static_cast<bool>(snap); }))
+                throw std::runtime_error("Snapshot '" + key +
+                    "' has missing retained mirrored terminal-head publications");
+            result.mode = SnapshotShardingMode::REPLICATED;
+        }
+
+        // The live gatherer is valid only for an unretained current transaction.
+        if (!retained_prefill_chunk &&
+            result.mode == SnapshotShardingMode::GATHERED &&
             device_runners_.size() > 1 && logits_gatherer_ && logits_gatherer_->isAllocated() && tp_ctx_)
         {
             bool has_column_parallel_lm_head = false;

@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstddef>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -110,6 +111,24 @@ namespace llaminar2
                 return false;
             }
             return scaled_end > scaled_start;
+        }
+
+        /**
+         * @brief Derive the smallest exact common-partition step for original GDN heads.
+         * @param global_key_heads Original positive query/key head count.
+         * @param global_value_heads Original positive integral repeats of key heads.
+         * @param partition_total Original common query partition width.
+         * @return Minimal step whose boundaries are integral for both original head axes.
+         * @throws std::invalid_argument For the same malformed source geometry as fromPartition().
+         */
+        static int partitionGranularity(int global_key_heads, int global_value_heads, int partition_total)
+        {
+            // Reuse the canonical source/linkage validation. At the complete
+            // original interval no boundary may be rounded or inferred.
+            (void)hasIntegralKeyHeadBoundaries(global_key_heads, global_value_heads,
+                                               0, partition_total, partition_total);
+            return std::lcm(partition_total / std::gcd(partition_total, global_key_heads),
+                            partition_total / std::gcd(partition_total, global_value_heads));
         }
 
         /**

@@ -608,7 +608,8 @@ so a speed gain can simply reflect invalid work. Prepare valid imported data
 outside timing and retain every necessary local producer/consumer dependency.
 Normal communication-enabled inference remains the correctness and end-to-end
 check. A topology-bound neutral model result alone does not disprove a local
-gain; separately report absolute latency, per-doubling ratios, real-route
+gain; separately report absolute latency, cumulative TP1-relative and descriptive
+2→4 ratios, real-route
 sensitivity and any suffix regression. A faster candidate may have a worse
 scaling ratio if it improves the single-device operation more.
 
@@ -636,24 +637,44 @@ KV position and length, not an unrelated full-bucket attention call.
 
 Normalize raw records to the backend-neutral schema consumed by
 `tests/v2/performance/kernels/plot_kernel_shard_scaling.py`:
-`operation,workload,degree,sample,latency_us,disposition,calls`. The optional
+`operation,workload,degree,sample,latency_us,disposition,calls,scope,rank`. The optional
 positive `calls` is the number of occurrences in the measured workload, not a
 universal model constant. `disposition` is `partitioned`, `replicated` or
-`collective`; only partitioned work has an ideal halving expectation. Keep
-backend, model/shape, binary and precision provenance alongside the input CSV.
+`collective`; only partitioned work has an ideal work-division expectation.
+Missing `scope` retains `local_shape`, which measures independent local shapes,
+not actual TP throughput. Do not fill a participant `rank` for local shapes.
+For actual simultaneous participant samples use `scope=actual_tp` and
+`rank=0..degree-1`, one sample per rank in every paired round at TP1, TP2 and TP4.
+The reporter requires identical round sets and complete unique rank sets, takes
+the slowest rank per round, then the median of those complete round latencies.
+This does not manufacture synchronized clocks or a complete-operation boundary:
+the collector must bind the declared operation's start/stop semantics, rank
+membership and round pairing. Per-kernel rows remain per-kernel evidence,
+including replicated and collective operations; do not relabel them full model.
+Keep source format, prepared ABI, precision, model/physical shape, binary,
+backend/device membership, stream/capture timing scope and collector provenance
+alongside the CSV. This parser neither measures nor authenticates them and
+never invents a TP1 baseline from a larger topology.
 
 ```bash
 python3 tests/v2/performance/kernels/plot_kernel_shard_scaling.py \
   --samples /path/to/normalized-captured-samples.csv \
   --output-prefix /path/to/results/scaling \
-  --threshold 1.9 --rank-degree 2
+  --tp2-target 1.85 --tp4-target 3.6 --rank-degree 2
 python3 tests/v2/unit/scripts/test_kernel_shard_scaling.py
 ```
 
-The report rejects incomplete degree sets, repeated sample identities and
-mixed ownership semantics. It uses medians and checks each doubling separately.
-Its priority score is `calls * max(0, T_after - T_before/2)`. This is local-time
-excess, **not additive achievable model savings**. Do not rank a complete
+The report rejects incomplete degree/rank/paired-round sets, duplicate
+identities, nonfinite/nonpositive latencies and mixed scope/ownership semantics.
+Its inclusive targets are INDEPENDENT cumulative speedups `T1/T2 >= 1.85` and
+`T1/T4 >= 3.6`; `T2/T4` remains descriptive only. The old `--threshold` option
+is retired, not reinterpreted. Absolute TP1/2/4 latency and all raw/reduced
+samples remain in the report. Local replicated/collective rows are explicitly
+`not_applicable`, never green; actual TP rows retain their measured ownership
+semantics and target misses, even when replicated or collective. A target pass
+certifies neither correctness nor economics outside that declared measured scope.
+Its partitioned priority score is `calls * max(0, T_degree - T1/degree)`.
+This is a diagnostic time excess, **not additive achievable model savings**. Do not rank a complete
 pipeline alongside its constituent kernels, count alternative whole-expert and
 column-owned down modes together, or mix a GEMM producer-only interval with a
 quantize/GEMM/reducer pipeline. Preserve main and suffix curves even if a

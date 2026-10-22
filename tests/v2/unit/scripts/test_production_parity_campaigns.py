@@ -798,8 +798,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
         """The cached seed epoch is distinct from the old serial oracle epoch."""
         header = campaigns.REQUIRED_CSV_HEADERS["prefix_restore.csv"]
         columns = next(campaigns.csv.reader([header]))
-        self.assertEqual(columns[-9], "cached_prefix_moe_movement_epoch")
-        self.assertEqual(columns[-8:], [
+        seed = columns.index("cached_prefix_moe_movement_epoch")
+        self.assertEqual(columns[seed + 1:seed + 9], [
             "shifted_mtp_kv_numerically_compared", "shifted_mtp_kv_exact_prefix_segments",
             "shifted_mtp_kv_numerical_suffix_payloads", "shifted_mtp_kv_numerical_elements",
             "shifted_mtp_kv_minimum_cosine", "shifted_mtp_kv_maximum_relative_l2",
@@ -808,6 +808,38 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertIn("oracle_moe_movement_epoch", columns)
         self.assertIn("observed_moe_movement_epoch", columns)
         self.assertEqual(columns.count("cached_prefix_moe_movement_epoch"), 1)
+
+    def test_prefix_restore_schema_preserves_explicit_partial_logit_policy(self) -> None:
+        """Require the native writer's policy evidence without changing raw cosine fields."""
+        cell = self.typed_stage_cell()
+        suffix = ["partial_checkpoint_policy", "partial_checkpoint_rows",
+                  "partial_checkpoint_maximum_kl", "partial_checkpoint_kl_limit"]
+        columns = next(campaigns.csv.reader([campaigns.REQUIRED_CSV_HEADERS["prefix_restore.csv"]]))
+        self.assertEqual(columns[-4:], suffix)
+        self.assertIn("checkpoint_cosine", columns)
+        for mutation in ("complete", "missing_policy", "duplicate", "reorder"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                directory = root / campaigns._gtest_artifact_directory_name(cell.gtest_cases[0])
+                self.write_canonical_artifacts(directory)
+                emitted = list(columns)
+                if mutation == "missing_policy":
+                    emitted = emitted[:-4]
+                elif mutation == "duplicate":
+                    emitted[-1] = emitted[-2]
+                elif mutation == "reorder":
+                    emitted[-1], emitted[-2] = emitted[-2], emitted[-1]
+                path = directory / "prefix_restore.csv"
+                with path.open("w", newline="") as stream:
+                    writer = campaigns.csv.writer(stream)
+                    writer.writerow(emitted)
+                    writer.writerow(["value"] * len(emitted))
+                _, _, errors = campaigns.validate_campaign_artifacts(
+                    cell, campaigns.time.time_ns(), revision_results_root=root)
+                if mutation == "complete":
+                    self.assertEqual(errors, ())
+                else:
+                    self.assertTrue(any("prefix_restore.csv header" in error for error in errors))
 
     @mock.patch.object(campaigns.subprocess, "run")
     def test_complete_unit_inventory_is_discovered_from_ctest(

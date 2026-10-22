@@ -17,6 +17,8 @@ from check_gpu_blocking_sync_policy import (  # noqa: E402
     ALLOWANCES,
     Allowance,
     scan_file,
+    function_intervals,
+    strip_comments_and_literals,
     validate,
 )
 
@@ -334,6 +336,34 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
             source_path = root / "src" / "v2" / "example.cpp"
             self.assertEqual(scan_file(root, source_path), [])
             self.assertEqual(validate(root, ()), [])
+
+    def test_captured_compute_isolation_requires_async_exact_stream_copies(self) -> None:
+        """Restore/cold snapshots retain bytes; synchronous D2D cannot hide in capture."""
+        root = pathlib.Path(__file__).resolve().parents[4]
+        relative = "src/v2/execution/diagnostics/PreparedGemmIsolationAdapter.h"
+        source_path = root / relative
+        source = strip_comments_and_literals(source_path.read_text(encoding="utf-8"))
+        intervals = function_intervals(source)
+        self.assertFalse(any(entry.path == relative for entry in ALLOWANCES))
+        self.assertEqual(scan_file(root, source_path), [])
+        for caller in ("recordRestore", "freeze"):
+            bodies = [source[first + 1:last] for first, last, name in intervals if name == caller]
+            self.assertEqual(len(bodies), 1, caller)
+            compact = "".join(bodies[0].split())
+            self.assertEqual(compact.count("backend.deviceCopyAsync("), 1, caller)
+            self.assertIn("copy.bytes,device_.ordinal,stream)", compact)
+            self.assertLess(compact.index("requireReady(stream,"), compact.index("backend.deviceCopyAsync("))
+            temporary, fixture_root = self.make_repo(
+                f"void {caller}(IBackend &backend, void *stream) {{"
+                "backend.deviceToDevice(dst, src, bytes, ordinal, stream); }"
+            )
+            with temporary:
+                failures = validate(fixture_root, ())
+                self.assertEqual(len(failures), 1)
+                self.assertIn("unapproved backend_sync_copy", failures[0])
+                self.assertIn(caller, failures[0])
+        ready, = [source[first + 1:last] for first, last, name in intervals if name == "requireReady"]
+        self.assertIn("word<=2", "".join(ready.split()))
 
     def test_removed_wait_leaves_stale_allowance_and_fails(self) -> None:
         temporary, root = self.make_repo(

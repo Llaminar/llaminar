@@ -1,5 +1,26 @@
 # QFN tuning dashboard
 
+The [same-Four vocabulary comparison](QFN_TP_COMPUTE_SCALING.md#default-policy-qualification)
+confirms sharding at **785.553 prefill / 36.629 decode tok/s**, versus mirrored
+**784.992 / 36.179**: **+1.243% decode**, with effectively unchanged prefill,
+185 byte-identical logit rows and twelve identical generated sequences. The
+planner now defaults the qualified ordinary QFN Q8_0 MI50/RCCL TP4 family to
+sharding. Its regression fails against the old resolver and passes after the
+change; all **771 Unit** registrations pass. Current-source native parity and
+prefix restore pass, with ten exported head/input records byte-identical to
+the earlier mirrored run. This repeats the head-policy comparison on the Four archive;
+it is not an additional gain to multiply into L90's already-sharded score.
+The recorded head-projection concurrent cohort is green: **1.973–1.978× TP2**
+and **3.847–3.865× TP4**, meeting both targets across three recorded rows with
+every participant byte-checked. These are projection-compute timings with
+restore/communication excluded; other kernel families remain pending. Removing
+unused KV heads is a parallel priority across every participant count 1–8.
+The aligned geometry and compact CPU/CUDA/ROCm consumer tests pass, together
+with **771/771 Unit**. Production planner/cache/arithmetic propagation remains
+in progress. The current equal-width expert down-projection policy independently
+excludes full-model degrees 3/6/7 for H2560; head-layout coverage alone does not
+advertise those complete topologies.
+
 The [route-owned MoE follow-up](QFN_ROUTE_OWNED_MOE_TUNING.md) now qualifies
 **L90: 785.806 prefill / 36.780 decode tok/s**, a **5.142% paired decode gain**
 with unchanged prefill. All twelve generated sequences match. Both same-source
@@ -15,11 +36,14 @@ bytes and lower component latency at the tested N640/K2560 geometry. All eightee
 compiled leaves have zero spills/private memory. Four workers remain an explicit
 compiled selection; the ordinary build default is `serial` pending economy
 coverage beyond the qualified model/geometry. Complete preflight remains G60.
-The next candidate varies worker count without changing original partitions or
-arithmetic. The
+The two/eight-worker contest is complete: neither gives a consistent gain over
+Four, and its source is retired with evidence preserved. The next
+[compute-scaling diagnostic](QFN_TP_COMPUTE_SCALING.md) preserves recorded inputs
+and routes while measuring TP1/TP2/TP4 against cumulative targets of 1.85×/3.6×.
+The
 [KV coverage plan](QFN_TP4_KV_COVERAGE_PLAN.md) records the separate duplication work.
 
-Updated: 2026-10-22; **L90 is the current explicitly configured A1 throughput checkpoint**. Its same-source Serial control measures **785.821 prefill / 34.982 decode tok/s**. L84 remains the preceding vocabulary-sharded checkpoint at **786.235 / 35.056**; the [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) retains its matched comparison and final-source85 regressions. Neither Auto terminal ownership nor the ordinary compiled partition policy changes. Use the exact settings recorded below. Complete production preflight remains pending. Unused local KV-head and short-context indexer-query work remain separate opportunities.
+Updated: 2026-10-22; **L90 is the current explicitly configured A1 throughput checkpoint**. Its same-source Serial control measures **785.821 prefill / 34.982 decode tok/s**. L84 remains the preceding vocabulary-sharded checkpoint at **786.235 / 35.056**; the [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) retains its matched comparison and final-source85 regressions. Automatic terminal ownership now shards the qualified ordinary MI50 TP4 family; the ordinary compiled partition policy remains Serial pending its bounded default implementation. Use the exact settings recorded below. Complete production preflight remains pending. Unused local KV-head and short-context indexer-query work remain separate opportunities.
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.
 

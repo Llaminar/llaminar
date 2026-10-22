@@ -7,6 +7,8 @@
  * ordinals across ranks, request reuse, parser round trips, and the sealed
  * device policy. No model, GPU context, or performance timing is involved.
  * CPU ownership is an explicit observed NUMA fact, not a rank-ordinal inference.
+ * Ordinary QFN vocabulary defaults are constrained independently of MTP to the
+ * exact authenticated architecture, native source and full local MI50 TP4 domain.
  */
 #include <gtest/gtest.h>
 
@@ -18,6 +20,7 @@
 #include "planning/MemoryPlanner.h"
 
 #include <limits>
+#include <utility>
 
 using namespace llaminar2;
 
@@ -182,6 +185,245 @@ TEST(MTPHardwareDefaults, DenseQwenGPUHeadDefaultsRequireMeasuredNativeLocalFami
         for (const auto &plan : builder.buildAllPlans(config, model, cluster))
             EXPECT_EQ(plan.runtime.mtp.terminal_head_policy, MTPTerminalHeadPolicy::MirroredFullVocabulary);
     }
+}
+
+namespace
+{
+    /** @brief Authenticated published QFN planning geometry, without any model payload. */
+    ModelConfig ordinaryQFN()
+    {
+        return {.name = "qwen4exp", .n_layers = 48, .n_heads = 24, .n_kv_heads = 2,
+            .hidden_size = 2560, .intermediate_size = 640, .vocab_size = 248320, .head_dim = 256,
+            .terminal_head_source = {.codebook_id = native_vnni_formats::Q8_0.codebook_id,
+                .is_superblock = false, .present = true}};
+    }
+
+    /**
+     * @brief Build one observed MI50 clique with exact local TP addresses.
+     * @param count Synthetic physical participants, including unmeasured negative degrees.
+     * @return Authored Auto configuration and matching inventory; no backend is created.
+     */
+    std::pair<OrchestrationConfig, ClusterInventory> ordinaryQFNLocalTP(int count = 4)
+    {
+        OrchestrationConfig config;
+        std::vector<DeviceInfo> devices;
+        for (int ordinal = 0; ordinal < count; ++ordinal)
+        {
+            devices.push_back(card(DeviceType::ROCm, ordinal));
+            config.tp_devices.push_back(address(DeviceType::ROCm, ordinal));
+        }
+        return {config, inventory({devices})};
+    }
+
+    /**
+     * @brief Assert runtime agreement without mutating authored Auto intent.
+     * @param config Caller-owned startup configuration.
+     * @param model Authenticated or deliberately unmeasured synthetic geometry.
+     * @param cluster Synthetic gathered physical inventory.
+     * @param expected Exact resolved physical policy for every returned rank.
+     */
+    void expectOrdinaryQFNPolicy(const OrchestrationConfig &config, const ModelConfig &model,
+        const ClusterInventory &cluster, MTPTerminalHeadPolicy expected)
+    {
+        const auto result = ExecutionPlanBuilder{}.buildAllPlans(config, model, cluster);
+        ASSERT_FALSE(result.empty());
+        for (const auto &plan : result)
+        {
+            EXPECT_EQ(plan.runtime.mtp.terminal_head_policy, expected);
+            if (expected == MTPTerminalHeadPolicy::VocabularySharded)
+                EXPECT_EQ(plan.local_tp_backend, CollectiveBackendType::RCCL);
+        }
+        EXPECT_EQ(config.mtp.terminal_head_policy, MTPTerminalHeadPolicy::Automatic);
+    }
+}
+
+/** @test The measured ordinary default follows both actual simple and named-domain ownership. */
+TEST(MTPHardwareDefaults, QFNOrdinaryHeadDefaultsSelectEqualLocalTP4)
+{
+    const auto model = ordinaryQFN();
+    auto [config, cluster] = ordinaryQFNLocalTP();
+    for (const bool named : {false, true})
+        for (const bool explicit_weights : {false, true})
+        {
+            auto selected = config;
+            if (named)
+            {
+                selected.domain_definitions = {domain("terminal", selected.tp_devices, {0, 0, 0, 0})};
+                selected.tp_devices.clear();
+                if (explicit_weights) selected.domain_definitions.front().weights = {.25f, .25f, .25f, .25f};
+            }
+            else if (explicit_weights) selected.tp_weights = {.25f, .25f, .25f, .25f};
+            expectOrdinaryQFNPolicy(selected, model, cluster, MTPTerminalHeadPolicy::VocabularySharded);
+            if (named) selected.domain_definitions.front().backend = CollectiveBackendType::RCCL;
+            else selected.default_backend = CollectiveBackendType::RCCL;
+            expectOrdinaryQFNPolicy(selected, model, cluster, MTPTerminalHeadPolicy::VocabularySharded);
+            if (named)
+            {
+                selected.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+                selected.moe_routed_expert_plan->enabled = true;
+                selected.moe_routed_expert_plan->continuation_domain = "terminal";
+                selected.moe_routed_expert_plan->continuation_domain_spec.domain = "terminal";
+                selected.moe_routed_expert_plan->continuation_domain_spec.setDensePolicy(DenseParallelPolicy::TensorParallel);
+                expectOrdinaryQFNPolicy(selected, model, cluster, MTPTerminalHeadPolicy::VocabularySharded);
+            }
+        }
+}
+
+/** @test A similar architecture or decoder is not provenance for the measured QFN head. */
+TEST(MTPHardwareDefaults, QFNOrdinaryHeadDefaultsRejectOtherGeometryAndSource)
+{
+    const auto [config, cluster] = ordinaryQFNLocalTP();
+    const auto expected = MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    for (const auto member : {&ModelConfig::n_layers, &ModelConfig::n_heads,
+             &ModelConfig::n_kv_heads, &ModelConfig::hidden_size, &ModelConfig::intermediate_size,
+             &ModelConfig::vocab_size, &ModelConfig::head_dim})
+    {
+        auto model = ordinaryQFN();
+        ++(model.*member);
+        expectOrdinaryQFNPolicy(config, model, cluster, expected);
+    }
+    auto model = ordinaryQFN();
+    model.name = "qwen35moe";
+    expectOrdinaryQFNPolicy(config, model, cluster, expected);
+    model = ordinaryQFN();
+    model.terminal_head_source.present = false;
+    expectOrdinaryQFNPolicy(config, model, cluster, expected);
+    model = ordinaryQFN();
+    model.terminal_head_source.is_superblock = true;
+    expectOrdinaryQFNPolicy(config, model, cluster, expected);
+    model = ordinaryQFN();
+    model.terminal_head_source.codebook_id = native_vnni_formats::Q6_K.codebook_id;
+    expectOrdinaryQFNPolicy(config, model, cluster, expected);
+}
+
+/** @test Batch demand and true retained capacity stay outside the ordinary M1 default. */
+TEST(MTPHardwareDefaults, QFNOrdinaryHeadDefaultsRejectBatchAndRetainedMTP)
+{
+    const auto model = ordinaryQFN();
+    const auto [original, cluster] = ordinaryQFNLocalTP();
+    auto config = original;
+    config.batch_size = 2;
+    expectOrdinaryQFNPolicy(config, model, cluster, MTPTerminalHeadPolicy::MirroredFullVocabulary);
+    config = original;
+    config.mtp.enabled = true;
+    expectOrdinaryQFNPolicy(config, model, cluster, MTPTerminalHeadPolicy::MirroredFullVocabulary);
+    config = original;
+    config.mtp.graph_capacity_draft_tokens = 1;
+    expectOrdinaryQFNPolicy(config, model, cluster, MTPTerminalHeadPolicy::MirroredFullVocabulary);
+    // Inactive schema/default draft depth is not retained graph capacity.
+    config = original;
+    config.mtp.draft_tokens = 15;
+    expectOrdinaryQFNPolicy(config, model, cluster, MTPTerminalHeadPolicy::VocabularySharded);
+}
+
+/** @test Real hardware, full-model stage and equal shares bound the measured clique. */
+TEST(MTPHardwareDefaults, QFNOrdinaryHeadDefaultsRejectOtherTopologyAndOwnership)
+{
+    const auto model = ordinaryQFN();
+    const auto expected = MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    for (const int count : {1, 2, 3, 8})
+    {
+        const auto [config, cluster] = ordinaryQFNLocalTP(count);
+        expectOrdinaryQFNPolicy(config, model, cluster, expected);
+    }
+    const auto [original, observed] = ordinaryQFNLocalTP();
+    auto cluster = observed;
+    cluster.ranks.front().gpus.back().compute_units = 64;
+    expectOrdinaryQFNPolicy(original, model, cluster, expected);
+    cluster = observed;
+    cluster.ranks.front().gpus.back().name = "AMD Instinct MI100";
+    expectOrdinaryQFNPolicy(original, model, cluster, expected);
+    for (const bool named : {false, true})
+    {
+        auto config = original;
+        if (named)
+        {
+            config.domain_definitions = {domain("terminal", config.tp_devices, {0, 0, 0, 0})};
+            config.tp_devices.clear();
+            config.domain_definitions.front().weights = {.1f, .2f, .3f, .4f};
+        }
+        else config.tp_weights = {.1f, .2f, .3f, .4f};
+        expectOrdinaryQFNPolicy(config, model, observed, expected);
+    }
+    for (const auto backend : {CollectiveBackendType::MPI, CollectiveBackendType::HOST})
+        for (const bool named : {false, true})
+        {
+            auto config = original;
+            if (named)
+            {
+                config.domain_definitions = {domain("terminal", config.tp_devices, {0, 0, 0, 0})};
+                config.domain_definitions.front().backend = backend;
+                config.tp_devices.clear();
+            }
+            else config.default_backend = backend;
+            expectOrdinaryQFNPolicy(config, model, observed, expected);
+        }
+    auto config = original;
+    config.domain_definitions = {domain("terminal", config.tp_devices, {0, 0, 0, 0})};
+    config.tp_devices.clear();
+    config.pp_stage_definitions = {{0, "terminal", 0, 23}, {1, "terminal", 24, 47}};
+    expectOrdinaryQFNPolicy(config, model, observed, expected);
+    config.pp_stage_definitions = {{0, "terminal", 24, 47}};
+    expectOrdinaryQFNPolicy(config, model, observed, expected);
+    config.pp_stage_definitions.clear();
+    config.domain_definitions.front().devices.back() = config.domain_definitions.front().devices.front();
+    expectOrdinaryQFNPolicy(config, model, observed, expected);
+    config.domain_definitions = {domain("terminal",
+        {address(DeviceType::ROCm, 0), address(DeviceType::ROCm, 0),
+         address(DeviceType::ROCm, 0), address(DeviceType::ROCm, 0)}, {0, 1, 2, 3})};
+    expectOrdinaryQFNPolicy(config, model,
+        inventory({{card(DeviceType::ROCm, 0)}, {card(DeviceType::ROCm, 0)},
+                   {card(DeviceType::ROCm, 0)}, {card(DeviceType::ROCm, 0)}}), expected);
+    for (const bool disabled_tp : {false, true})
+    {
+        config = original;
+        config.disable_gpu_tp = disabled_tp;
+        config.heterogeneous_mode = !disabled_tp;
+        expectOrdinaryQFNPolicy(config, model, observed, expected);
+    }
+    for (const auto policy : {DenseParallelPolicy::Replicated,
+             DenseParallelPolicy::PrefillTensorParallelDecodeReplicated,
+             DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding})
+    {
+        config = original;
+        config.domain_definitions = {domain("terminal", config.tp_devices, {0, 0, 0, 0})};
+        config.tp_devices.clear();
+        config.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+        config.moe_routed_expert_plan->enabled = true;
+        config.moe_routed_expert_plan->continuation_domain = "terminal";
+        config.moe_routed_expert_plan->continuation_domain_spec.domain = "terminal";
+        config.moe_routed_expert_plan->continuation_domain_spec.setDensePolicy(policy);
+        expectOrdinaryQFNPolicy(config, model, observed, expected);
+    }
+    for (const bool mixed : {false, true})
+    {
+        config = original;
+        cluster = observed;
+        for (int ordinal = mixed ? 3 : 0; ordinal < 4; ++ordinal)
+        {
+            config.tp_devices[ordinal] = address(DeviceType::CUDA, ordinal);
+            cluster.ranks.front().gpus[ordinal] = card(DeviceType::CUDA, ordinal);
+        }
+        expectOrdinaryQFNPolicy(config, model, cluster, expected);
+    }
+}
+
+/** @test An explicit physical policy remains authoritative even outside the Auto evidence cell. */
+TEST(MTPHardwareDefaults, QFNOrdinaryHeadDefaultsPreserveExplicitOverrides)
+{
+    auto [config, cluster] = ordinaryQFNLocalTP();
+    for (const auto policy : {MTPTerminalHeadPolicy::VocabularySharded,
+             MTPTerminalHeadPolicy::MirroredFullVocabulary})
+        for (const bool measured : {true, false})
+        {
+            auto model = ordinaryQFN();
+            config.batch_size = measured ? 1 : 2;
+            if (!measured) model.name = "other";
+            config.mtp.terminal_head_policy = policy;
+            const auto result = ExecutionPlanBuilder{}.buildAllPlans(config, model, cluster);
+            for (const auto &plan : result) EXPECT_EQ(plan.runtime.mtp.terminal_head_policy, policy);
+            EXPECT_EQ(config.mtp.terminal_head_policy, policy);
+        }
 }
 
 TEST(MTPHardwareDefaults, ExplicitSingleDeviceIgnoresUnselectedCards)

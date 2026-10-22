@@ -330,7 +330,10 @@ Head placement is automatic too: CPU tensor-parallel execution splits the
 vocabulary projection across participants. Dense Qwen3.8 27B with a Q6_K head
 and dynamic MTP also uses vocabulary shards on a local pair of RTX 3090 or
 MI50 cards with the measured two- or fifteen-draft graph envelope and a
-replicated sidecar. Other CUDA and ROCm configurations keep a mirrored head.
+replicated sidecar. Qwen Flash Next's native Q8_0 head also uses vocabulary
+shards on four local MI50s with RCCL, equal full-model tensor-parallel shares,
+batch size one, and MTP disabled with no reserved draft capacity. Other CUDA
+and ROCm configurations keep a mirrored head.
 For experiments, `--mtp-terminal-head-policy vocabulary-sharded` or
 `--mtp-terminal-head-policy mirrored-full-vocabulary` overrides that choice.
 

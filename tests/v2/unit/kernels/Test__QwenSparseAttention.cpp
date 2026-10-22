@@ -6,12 +6,15 @@
  * tail length, the 2048-token threshold, nonzero RoPE origins, and acceptance
  * across a complete-block boundary. Grouped results are compared byte-for-byte
  * with serial transactions, including the native selected-index attention path.
+ * Canonical consumer-local compact KV slices additionally cover every logical
+ * degree1..8; these are CPU operation tests, not multi-device model certification.
  */
 #include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseMath.h"
 #include "../../integration/kernels/qwen4exp/QwenSparseNativeCodecFixture.h"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -314,6 +317,101 @@ TEST(QwenSparseAttention, ReplicatedKVOddQueryIntervalsMatchFullOriginalHeads)
             std::fill(actual.begin(), actual.end(), -91.0f);
             EXPECT_THROW(cpuQwenSparseAttention(local), std::invalid_argument);
             EXPECT_TRUE(std::all_of(actual.begin(), actual.end(), [](float v) { return v == -91.0f; }));
+        }
+    }
+}
+
+/** @test Compact bank fixture accepts only authenticated original-consumer assignment authority. */
+TEST(QwenSparseAttention, CompactConsumerKVRejectsUndeclaredOrForeignGeometry)
+{
+    test::NativeCodecFixture source(TensorType::FP16,1,32,false);
+    const auto legacy=TensorParallelConfig::equalSplit(4,24,2,10240,248320);
+    EXPECT_THROW((test::ConsumerLocalCodecFixture(source,legacy,0)),std::invalid_argument);
+    const auto undeclared=TensorParallelConfig::equalSplit(4,24,2,10240,248320,std::nullopt,KVHeadCoveragePolicy::QueryInterval);
+    EXPECT_THROW((test::ConsumerLocalCodecFixture(source,undeclared,0)),std::invalid_argument);
+    const auto grain=QueryHeadPartitionDeclaration::fromOriginalConsumers(24,{{16,48}});
+    const auto actual=TensorParallelConfig::equalSplit(4,24,2,10240,248320,std::nullopt,KVHeadCoveragePolicy::QueryInterval,grain);
+    EXPECT_THROW((test::ConsumerLocalCodecFixture(source,actual,-1)),std::out_of_range);
+    EXPECT_THROW((test::ConsumerLocalCodecFixture(source,actual,4)),std::out_of_range);
+}
+
+/** @test Canonical consumer-local native KV bytes match full original heads for every degree1..8. */
+TEST(QwenSparseAttention, CompactConsumerKVEveryDegreeMatchesFullOriginalBytes)
+{
+    ThreadPolicy thread_policy;omp_set_num_threads(3);
+    constexpr int rows=3,tokens=8,dimension=256,full_width=24*dimension;
+    QwenSparseReplay replay{5,rows,17};
+    std::vector<float> query(rows*full_width),gate(query.size()),full(query.size());
+    for(std::size_t i=0;i<query.size();++i)
+    {query[i]=float(int(i%113)-56)/64.f;gate[i]=float(int(i%23)-11)/16.f;}
+    std::vector<std::int32_t> selected(rows*QwenSparseSelected,-99),counts{3,4,5};
+    for(int row=0;row<rows;++row)for(int i=0;i<counts[row];++i)selected[row*QwenSparseSelected+i]=i;
+    const auto grain=QueryHeadPartitionDeclaration::fromOriginalConsumers(24,{{16,48}});
+    for(const auto codec:{TensorType::FP32,TensorType::FP16,TensorType::BF16,TensorType::Q8_1,
+            TensorType::Q16_1,TensorType::AQ8,TensorType::TQ4,TensorType::TQ8})
+    for(int block:{32,64,128})
+    {
+        if(block!=32 && codec!=TensorType::Q16_1)continue;
+        SCOPED_TRACE(::testing::Message()<<"codec="<<int(codec)<<" block="<<block);
+        test::NativeCodecFixture keys(codec,tokens,block,false),values(codec==TensorType::AQ8?TensorType::FP32:codec,tokens,block,false);
+        QwenSparseAttention original{.replay=&replay,.query=query.data(),
+            .kv={.keys=keys.bank(),.values=values.bank(),.addressing=QwenSparseKVAddressing::FixedLogicalView,
+                 .logical_view={.logical_row_origin=6,.physical_row_capacity=tokens}},
+            .selected=selected.data(),.selected_count=counts.data(),.gate=gate.data(),.output=full.data(),
+            .row_capacity=rows,.token_capacity=tokens};
+        replay.live_rows=rows;for(int row=0;row<rows;++row)counts[row]=row+3;cpuQwenSparseAttention(original);
+        for(int degree=1;degree<=8;++degree)
+        {
+            const auto config=TensorParallelConfig::equalSplit(degree,24,2,10240,248320,
+                std::nullopt,KVHeadCoveragePolicy::QueryInterval,grain);
+            for(int rank=0;rank<degree;++rank)
+            {
+                const auto &a=config.forRank(rank);const int width=a.head_count*dimension;
+                SCOPED_TRACE(::testing::Message()<<"degree="<<degree<<" rank="<<rank);
+                test::ConsumerLocalCodecFixture local_keys(keys,config,rank),local_values(values,config,rank);
+                ASSERT_EQ(local_keys.storage.size(),std::size_t(tokens*a.kv_head_count)*keys.head_bytes);
+                ASSERT_EQ(local_values.storage.size(),std::size_t(tokens*a.kv_head_count)*values.head_bytes);
+                ASSERT_EQ(local_keys.bank().token_stride_bytes,std::size_t(a.kv_head_count)*keys.head_bytes);
+                ASSERT_EQ(local_values.bank().token_stride_bytes,std::size_t(a.kv_head_count)*values.head_bytes);
+                for(int token=0;token<tokens;++token)
+                {
+                    EXPECT_EQ(std::memcmp(local_keys.storage.data()+std::size_t(token*a.kv_head_count)*keys.head_bytes,
+                        keys.storage.data()+std::size_t(token*2+a.kv_head_start)*keys.head_bytes,std::size_t(a.kv_head_count)*keys.head_bytes),0);
+                    EXPECT_EQ(std::memcmp(local_values.storage.data()+std::size_t(token*a.kv_head_count)*values.head_bytes,
+                        values.storage.data()+std::size_t(token*2+a.kv_head_start)*values.head_bytes,std::size_t(a.kv_head_count)*values.head_bytes),0);
+                }
+                std::vector<float> local_query(rows*width),local_gate(local_query.size()),actual(local_query.size()+16,-923.25f),expected=actual;
+                for(int row=0;row<rows;++row)
+                {
+                    std::copy_n(query.data()+row*full_width+a.head_start*dimension,width,local_query.data()+row*width);
+                    std::copy_n(gate.data()+row*full_width+a.head_start*dimension,width,local_gate.data()+row*width);
+                }
+                std::vector<QwenSparseAttentionObservation> observations(rows*a.head_count);
+                std::memset(observations.data(),0xa5,observations.size()*sizeof(observations[0]));
+                auto local=original;local.query=local_query.data();local.gate=local_gate.data();local.output=actual.data();
+                local.kv.keys=local_keys.bank();local.kv.values=local_values.bank();local.observations=observations.data();
+                local.query_heads=a.head_count;local.query_head_start=a.head_start;
+                local.kv_heads=a.kv_head_count;local.kv_head_start=a.kv_head_start;
+                for(int history=0;history<20;++history)
+                {
+                    const int live=std::array{1,3,1,0,2}[std::size_t(history)%5];replay.live_rows=live;
+                    for(int row=0;row<rows;++row)counts[row]=row<live?row+3:-987;
+                    const auto before=std::vector<unsigned char>(reinterpret_cast<const unsigned char*>(observations.data()),
+                        reinterpret_cast<const unsigned char*>(observations.data()+observations.size()));
+                    for(int row=0;row<live;++row)std::copy_n(full.data()+row*full_width+a.head_start*dimension,width,expected.data()+row*width);
+                    ASSERT_NO_THROW(cpuQwenSparseAttention(local));
+                    EXPECT_EQ(std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float)),0)<<"history="<<history;
+                    const auto inactive=std::size_t(live*a.head_count)*sizeof(observations[0]);
+                    EXPECT_EQ(std::memcmp(reinterpret_cast<const unsigned char*>(observations.data())+inactive,before.data()+inactive,before.size()-inactive),0);
+                    for(int row=0;row<live;++row)for(int head=0;head<a.head_count;++head)
+                    {
+                        const auto &traffic=observations[row*a.head_count+head];
+                        EXPECT_EQ(traffic.key_elements,std::uint64_t(counts[row])*dimension);
+                        EXPECT_EQ(traffic.value_elements,std::uint64_t(counts[row])*dimension);
+                        EXPECT_EQ(traffic.selected_tokens,counts[row]);
+                    }
+                }
+            }
         }
     }
 }

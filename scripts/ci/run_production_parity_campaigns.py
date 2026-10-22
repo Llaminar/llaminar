@@ -211,7 +211,9 @@ REQUIRED_CSV_HEADERS = {
         "shifted_mtp_kv_numerically_compared,shifted_mtp_kv_exact_prefix_segments,"
         "shifted_mtp_kv_numerical_suffix_payloads,shifted_mtp_kv_numerical_elements,"
         "shifted_mtp_kv_minimum_cosine,shifted_mtp_kv_maximum_relative_l2,"
-        "shifted_mtp_kv_maximum_abs,shifted_mtp_kv_numerically_passed"
+        "shifted_mtp_kv_maximum_abs,shifted_mtp_kv_numerically_passed,"
+        "partial_checkpoint_policy,partial_checkpoint_rows,"
+        "partial_checkpoint_maximum_kl,partial_checkpoint_kl_limit"
     ),
     "production_path.csv": (
         "backend,device,execution_path,execution_topology,graph_contract,"

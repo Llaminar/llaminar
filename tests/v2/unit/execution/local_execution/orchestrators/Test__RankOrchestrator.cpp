@@ -10721,6 +10721,30 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitAttentionUsesTypedMainPhase)
             else
                 ASSERT_TRUE(rank->forwardPrefill(tokens, static_cast<int>(rows)));
             verify("layer0_", rows, replicas);
+            // Retained prefill values keep their original sharding even when
+            // the most recent transaction switched to replicated decode.
+            publish("PREFILL_CHUNK_0_layer0_", 3, false);
+            verify("PREFILL_CHUNK_0_layer0_", 3, false);
+            for (const std::string stage : {"EMBEDDING", "layer0_ATTENTION_OUTPUT", "layer0_GDN_OUTPUT"})
+            {
+                const std::string key = "PREFILL_CHUNK_0_" + stage;
+                for (auto *participant : participants)
+                    participant->set_mock_snapshot(key, 1, 8,
+                        std::vector<float>(8, 4.0f / degree));
+                auto snapshot = rank->getTPSnapshot(key);
+                EXPECT_EQ(snapshot.mode, SnapshotShardingMode::ROW_PARALLEL);
+                ASSERT_TRUE(snapshot.computeCombined());
+                EXPECT_EQ(snapshot.combined_data, std::vector<float>(8, 4.0f));
+            }
+            // An explicit complete producer remains authoritative after the
+            // scope is resolved; the schema's gathered head is not a shard.
+            for (auto *participant : participants)
+                participant->set_mock_snapshot("PREFILL_CHUNK_0_LM_HEAD", 1, 8,
+                    std::vector<float>(8, 7.0f), SnapshotPublication::CompleteValue);
+            auto head = rank->getTPSnapshot("PREFILL_CHUNK_0_LM_HEAD");
+            EXPECT_EQ(head.mode, SnapshotShardingMode::REPLICATED);
+            ASSERT_TRUE(head.computeCombined());
+            EXPECT_EQ(head.combined_data, std::vector<float>(8, 7.0f));
         }
         // A grouped TensorParallel MTP depth retains packed/column assembly.
         publish("MTP0_", 3, false);
@@ -11559,6 +11583,39 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_MTPQualifiersPreserveSchemaLayout)
         SnapshotShardingMode::REPLICATED);
 }
 
+/** @brief Numbered chunk scopes preserve stage layout and reject malformed keys. */
+TEST_F(Test__RankOrchestrator, TPSnapshot_PrefillChunkScopePreservesSchemaLayout)
+{
+    const StageShardingConfig sharding = {
+        {"FINAL_NORM", SnapshotShardingMode::REPLICATED},
+        {"LM_HEAD", SnapshotShardingMode::GATHERED},
+        {"GDN_OUTPUT", SnapshotShardingMode::ROW_PARALLEL},
+        {"QKV_PROJECTION", SnapshotShardingMode::PACKED_COLUMN_PARALLEL},
+    };
+    for (const std::string chunk : {"0", "12", "184467440737095516160"})
+    {
+        const std::string prefix = "PREFILL_CHUNK_" + chunk + "_";
+        for (const auto &[stage, mode] : sharding)
+        {
+            EXPECT_EQ(getStageShardingMode(prefix + stage, sharding), mode);
+            EXPECT_EQ(getStageShardingMode(prefix + "layer17_" + stage, sharding), mode);
+            EXPECT_EQ(getStageShardingMode(prefix + "LAYER17_" + stage, sharding), mode);
+        }
+        EXPECT_EQ(getStageShardingMode(prefix + "UNKNOWN_STAGE", sharding),
+                  SnapshotShardingMode::UNKNOWN);
+    }
+    for (const std::string malformed : {
+             "PREFILL_CHUNK_FINAL_NORM", "PREFILL_CHUNK__FINAL_NORM",
+             "PREFILL_CHUNK_-1_FINAL_NORM", "PREFILL_CHUNK_1x_FINAL_NORM",
+             "PREFILL_CHUNK_1", "PREFILL_CHUNK_1_",
+             "prefix_PREFILL_CHUNK_1_FINAL_NORM", "prefill_chunk_1_FINAL_NORM"})
+    {
+        EXPECT_EQ(prefillChunkSnapshotSemanticStageOffset(malformed), std::string_view::npos);
+        EXPECT_EQ(extractStageType(malformed), malformed);
+        EXPECT_EQ(getStageShardingMode(malformed, sharding), SnapshotShardingMode::UNKNOWN);
+    }
+}
+
 /**
  * @brief Capture spelling must not change a layer checkpoint's TP contract.
  */
@@ -11855,5 +11912,91 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitEmbeddingUsesTypedMainNamesp
         ASSERT_TRUE(rank->forwardPrefill(&token, 1));
         publish("EMBEDDING", true, SnapshotPublication::CompleteValue);
         verify("EMBEDDING", true);
+    }
+}
+
+/**
+ * @brief Retained heads use historical ownership and never current decode logits.
+ *
+ * Mock children own real CPU FP32 local tensors; production forward fills the
+ * rank's ordinary gatherer with deliberately different values. No device API
+ * or model weights are needed to reproduce the temporal ownership defect.
+ */
+TEST_F(Test__RankOrchestrator, TPSnapshot_RetainedPrefillHeadNeverUsesCurrentGatherer)
+{
+    for (const int degree : {2, 4})
+    for (const SnapshotPublication publication : {
+             SnapshotPublication::CompleteValue,
+             SnapshotPublication::ColumnPartition,
+             SnapshotPublication::SchemaPartition})
+    for (const auto policy : {MTPTerminalHeadPolicy::VocabularySharded,
+                              MTPTerminalHeadPolicy::MirroredFullVocabulary})
+    {
+        SCOPED_TRACE(::testing::Message() << "TP" << degree << "/publication="
+            << static_cast<int>(publication) << "/policy=" << static_cast<int>(policy));
+        MockDeviceGraphOrchestrator::Config child_config;
+        child_config.vocab_size = 4;
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
+        std::vector<MockDeviceGraphOrchestrator *> children;
+        const std::vector<float> historical{101.0f, 102.0f, 103.0f, 104.0f};
+        const std::string key = "PREFILL_CHUNK_3_LM_HEAD";
+        for (int participant = 0; participant < degree; ++participant)
+        {
+            auto child = std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+            child->set_primary_device_id(DeviceId::cuda(participant));
+            child->set_mock_logits_local(4 / degree, std::vector<float>(4 / degree, 1.0f));
+            const size_t columns = publication == SnapshotPublication::ColumnPartition
+                ? 4 / degree : 4;
+            const size_t offset = publication == SnapshotPublication::ColumnPartition
+                ? participant * columns : 0;
+            child->set_mock_snapshot(key, 1, columns,
+                std::vector<float>(historical.begin() + offset,
+                                   historical.begin() + offset + columns), publication);
+            children.push_back(child.get());
+            runners.push_back(std::move(child));
+        }
+        auto model = llaminar2::test::MockModelContextBuilder()
+            .usePreset(llaminar2::test::ModelPreset::MINIMAL).setVocabSize(4).build();
+        model->setArchitecture("qwen35moe");
+        auto config = makeRankConfigForRunnerCount(degree);
+        config.mtp.terminal_head_policy = policy;
+        auto rank = RankOrchestrator::createForTest(std::move(model), std::move(runners),
+            makeTPContextForRunnerCount(degree), config);
+        rank->setSkipLogitsGatherDecode(false);
+        const int32_t token = 17;
+        for (const float current : {7.0f, 19.0f})
+        {
+            for (auto *child : children)
+                child->set_mock_logits_local(4 / degree, std::vector<float>(4 / degree, current));
+            ASSERT_TRUE(rank->forward(&token, 1));
+            // Preserve the existing unscoped API: it exposes the CURRENT gather.
+            auto live = rank->getTPSnapshot("LM_HEAD");
+            ASSERT_TRUE(live.computeCombined());
+            EXPECT_EQ(live.combined_data, std::vector<float>(4, current));
+            if (publication == SnapshotPublication::SchemaPartition &&
+                policy == MTPTerminalHeadPolicy::VocabularySharded)
+            {
+                EXPECT_THROW(rank->getTPSnapshot(key), std::runtime_error);
+                continue;
+            }
+            auto retained = rank->getTPSnapshot(key);
+            EXPECT_EQ(retained.mode, publication == SnapshotPublication::ColumnPartition
+                ? SnapshotShardingMode::COLUMN_PARALLEL : SnapshotShardingMode::REPLICATED);
+            EXPECT_EQ(retained.device_data.size(), static_cast<size_t>(degree));
+            ASSERT_TRUE(retained.computeCombined());
+            EXPECT_EQ(retained.combined_rows, 1u);
+            EXPECT_EQ(retained.combined_cols, 4u);
+            EXPECT_EQ(retained.combined_data, historical);
+        }
+        if (publication == SnapshotPublication::SchemaPartition &&
+            policy == MTPTerminalHeadPolicy::MirroredFullVocabulary)
+        {
+            // Declared replication never licenses omission or disagreement.
+            children.back()->set_mock_snapshot(key, 1, 4, std::vector<float>(4, -9.0f));
+            auto disagreement = rank->getTPSnapshot(key);
+            EXPECT_FALSE(disagreement.computeCombined());
+            children.back()->set_mock_snapshot(key, 0, 0, {});
+            EXPECT_THROW(rank->getTPSnapshot(key), std::runtime_error);
+        }
     }
 }

@@ -927,6 +927,20 @@ namespace llaminar2::test::parity
         }
     };
 
+    /** @brief Numerical policy applied only to the one-row partial-prefix continuation proof. */
+    enum class PrefixPartialCheckpointPolicy : uint8_t { NotApplicable, LegacyCosine, FinalLogitMeanKL };
+    /** @return Stable CSV spelling, independent of the retained raw cosine diagnostic. */
+    inline const char *prefixPartialCheckpointPolicyName(PrefixPartialCheckpointPolicy policy)
+    {
+        switch(policy)
+        {
+        case PrefixPartialCheckpointPolicy::NotApplicable: return "not_applicable";
+        case PrefixPartialCheckpointPolicy::LegacyCosine: return "legacy_cosine";
+        case PrefixPartialCheckpointPolicy::FinalLogitMeanKL: return "final_logit_mean_kl_decode";
+        }
+        throw std::logic_error("Unknown partial-prefix checkpoint numerical policy");
+    }
+
     /**
      * @brief Machine-readable proof for one mandatory prefix lifecycle phase.
      *
@@ -1008,6 +1022,10 @@ namespace llaminar2::test::parity
         bool checkpoint_compared = false;
         float checkpoint_cosine = 0.0f;
         bool checkpoint_passed = false;
+        PrefixPartialCheckpointPolicy partial_checkpoint_policy = PrefixPartialCheckpointPolicy::NotApplicable;
+        uint64_t partial_checkpoint_rows = 0; ///< Every actual full-vocabulary publication must pass separately.
+        float partial_checkpoint_maximum_kl = 0.0f; ///< Worst per-row KL, never an across-participant mean.
+        float partial_checkpoint_kl_limit = 0.0f; ///< Decode budget, populated only for the explicit KL policy.
         bool passed = false;
     };
 
@@ -1441,7 +1459,9 @@ namespace llaminar2::test::parity
                    "shifted_mtp_kv_numerically_compared,shifted_mtp_kv_exact_prefix_segments,"
                    "shifted_mtp_kv_numerical_suffix_payloads,shifted_mtp_kv_numerical_elements,"
                    "shifted_mtp_kv_minimum_cosine,shifted_mtp_kv_maximum_relative_l2,"
-                   "shifted_mtp_kv_maximum_abs,shifted_mtp_kv_numerically_passed\n";
+                   "shifted_mtp_kv_maximum_abs,shifted_mtp_kv_numerically_passed,"
+                   "partial_checkpoint_policy,partial_checkpoint_rows,"
+                   "partial_checkpoint_maximum_kl,partial_checkpoint_kl_limit\n";
             for (const auto &row : evidence)
             {
                 out << csvEscape(backend) << ','
@@ -1540,7 +1560,12 @@ namespace llaminar2::test::parity
                     << shifted.numerical_suffix_payloads << ','
                     << shifted.elements << ',' << shifted.minimum_cosine << ','
                     << shifted.maximum_relative_l2 << ',' << shifted.maximum_abs << ','
-                    << boolText(shifted.passed) << '\n';
+                    << boolText(shifted.passed) << ','
+                    << prefixPartialCheckpointPolicyName(row.partial_checkpoint_policy) << ','
+                    << row.partial_checkpoint_rows << ',' << row.partial_checkpoint_maximum_kl << ',';
+                if(row.partial_checkpoint_policy==PrefixPartialCheckpointPolicy::FinalLogitMeanKL)
+                    out << row.partial_checkpoint_kl_limit;
+                out << '\n';
             }
             return out.good();
         }
@@ -2817,6 +2842,54 @@ namespace llaminar2::test::parity
         }
 
         return static_cast<float>(total_kl / seq_len);
+    }
+
+    /** @brief Complete finite/geometry witness and worst-row diagnostics for a prefix suffix projection. */
+    struct PrefixPartialLogitComparison
+    {
+        bool evidence_valid = false, passed = false;
+        uint64_t rows = 0;
+        float minimum_cosine = 1.0f, maximum_relative_l2 = 0.0f, maximum_abs = 0.0f, maximum_kl = 0.0f;
+    };
+
+    /**
+     * @brief Apply the ordinary decode final-logit contract to every published partial-prefix row.
+     * @param actual Actual graph snapshot or terminal publication, retaining all TP copies.
+     * @param expected Original decode-step reference; only its final complete vocabulary row is the target.
+     * @param vocabulary Authenticated model vocabulary, never allocation capacity.
+     * @param final_policy Optional explicit ordinary policy; absence retains the original cosine gate.
+     * @param cosine_threshold Original legacy threshold, also used for raw diagnostic comparisons.
+     * @return Finite exact-row evidence, all-row acceptance and unmodified raw cosine/error diagnostics.
+     * @note Partial restore consumes one authenticated decode token, so the decode KL budget applies.
+     *       This does not relax exact prefix/state equivalence or average good and bad participants.
+     */
+    inline PrefixPartialLogitComparison comparePrefixPartialLogits(std::span<const float> actual,
+        std::span<const float> expected, size_t vocabulary,
+        const std::optional<FinalLogitMeanKLContract> &final_policy, float cosine_threshold)
+    {
+        PrefixPartialLogitComparison result;
+        if(!vocabulary || actual.empty() || actual.size()%vocabulary || expected.empty() ||
+            expected.size()%vocabulary || !std::isfinite(cosine_threshold) ||
+            !finiteParityOperands(actual)) return result;
+        const auto reference=expected.last(vocabulary);
+        if(!finiteParityOperands(reference)) return result;
+        result.evidence_valid=true;result.passed=true;result.rows=actual.size()/vocabulary;
+        for(size_t offset=0;offset<actual.size();offset+=vocabulary)
+        {
+            const auto raw=compareParityTensorData(actual.data()+offset,reference.data(),vocabulary,
+                "PREFIX_PARTIAL_LM_HEAD",cosine_threshold);
+            const float kl=computeKLDivergence(actual.data()+offset,reference.data(),vocabulary,vocabulary);
+            result.evidence_valid=result.evidence_valid && raw.evidence_valid &&
+                (!final_policy || (std::isfinite(kl) && kl>=0.0f));
+            result.passed=result.passed && raw.evidence_valid &&
+                (final_policy ? final_policy->accepts(kl,false) : raw.passed);
+            result.minimum_cosine=std::min(result.minimum_cosine,raw.cosine_similarity);
+            result.maximum_relative_l2=std::max(result.maximum_relative_l2,raw.rel_l2_norm);
+            result.maximum_abs=std::max(result.maximum_abs,raw.max_abs_diff);
+            result.maximum_kl=std::max(result.maximum_kl,kl);
+        }
+        result.passed=result.passed && result.evidence_valid;
+        return result;
     }
 
     /**
@@ -7577,6 +7650,8 @@ namespace llaminar2::test::parity
                 float cosine = 0.0f;
                 float rel_l2 = 0.0f;
                 float max_abs = 0.0f;
+                float maximum_kl = 0.0f;
+                uint64_t rows = 0;
             };
             static_assert(std::is_trivially_copyable_v<PartialCheckpointProof>);
 
@@ -7589,102 +7664,42 @@ namespace llaminar2::test::parity
                     "LM_HEAD") != local_snapshot_keys.end()
                     ? 1
                     : 0;
+            // Both actual publication authorities consume the same declared final-logit policy.
+            const auto compare_checkpoint = [&](const float *actual, size_t elements)
+            {
+                const auto reference = loadPyTorchSnapshot("decode_step0_LM_HEAD");
+                const auto result = comparePrefixPartialLogits(
+                    actual ? std::span<const float>{actual,elements} : std::span<const float>{}, reference,
+                    static_cast<size_t>(getActiveVocabSize()), config_.final_logit_mean_kl,
+                    config_.decode_cosine_threshold);
+                EXPECT_TRUE(result.evidence_valid)
+                    << "Partial prefix LM-head authority published invalid geometry or nonfinite operands";
+                local_checkpoint.compared = result.evidence_valid ? 1 : 0;
+                local_checkpoint.passed = result.passed ? 1 : 0;
+                local_checkpoint.cosine = result.minimum_cosine;
+                local_checkpoint.rel_l2 = result.maximum_relative_l2;
+                local_checkpoint.max_abs = result.maximum_abs;
+                local_checkpoint.maximum_kl = result.maximum_kl;
+                local_checkpoint.rows = result.rows;
+            };
             if (local_checkpoint.advertised != 0)
             {
-                local_checkpoint.authority =
-                    PartialCheckpointProof::Authority::GraphSnapshot;
-                size_t live_logits_size = 0;
-                const float *live_logits =
-                    activeSnapshot("LM_HEAD", live_logits_size);
-                std::vector<float> reference_logits =
-                    loadPyTorchSnapshot("decode_step0_LM_HEAD");
-                const bool valid_geometry =
-                    live_logits != nullptr &&
-                    live_logits_size > 0u &&
-                    !reference_logits.empty() &&
-                    reference_logits.size() >= live_logits_size &&
-                    reference_logits.size() % live_logits_size == 0u;
-                EXPECT_TRUE(valid_geometry)
-                    << "Partial prefix LM-head owner published an invalid checkpoint geometry";
-                if (valid_geometry)
-                {
-                    const float *reference_tail =
-                        reference_logits.data() +
-                        (reference_logits.size() - live_logits_size);
-                    const StageComparisonResult logits =
-                        compareParityTensorData(
-                            live_logits,
-                            reference_tail,
-                            live_logits_size,
-                            "PREFIX_PARTIAL_LM_HEAD",
-                            config_.decode_cosine_threshold);
-                    local_checkpoint.compared = 1;
-                    local_checkpoint.passed = logits.passed ? 1 : 0;
-                    local_checkpoint.cosine = logits.cosine_similarity;
-                    local_checkpoint.rel_l2 = logits.rel_l2_norm;
-                    local_checkpoint.max_abs = logits.max_abs_diff;
-                }
+                local_checkpoint.authority = PartialCheckpointProof::Authority::GraphSnapshot;
+                size_t elements = 0;
+                const float *actual = activeSnapshot("LM_HEAD", elements);
+                compare_checkpoint(actual,elements);
             }
             else if (!restored.terminal_logits_values.empty())
             {
-                /* Restored-prefix suffix execution is a scalar captured decode
-                 * bridge. Its production output authority is the terminal
-                 * logits publication, not the ordinary prefill snapshot bank.
-                 * A TP aggregate may contain one identical full-vocabulary row
-                 * per participant; compare every published row so a corrupt
-                 * participant cannot hide behind the continuation owner. */
-                local_checkpoint.authority = PartialCheckpointProof::Authority::
-                    TerminalLogitsPublication;
+                // Scalar captured decode-bridge publication may retain one full row per TP participant.
+                // Compare every row; a good continuation owner cannot hide a corrupt peer.
+                local_checkpoint.authority = PartialCheckpointProof::Authority::TerminalLogitsPublication;
                 local_checkpoint.advertised = 1;
-                std::vector<float> reference_logits =
-                    loadPyTorchSnapshot("decode_step0_LM_HEAD");
-                const size_t vocab_size =
-                    static_cast<size_t>(getActiveVocabSize());
-                const bool valid_geometry =
-                    vocab_size > 0u &&
-                    !reference_logits.empty() &&
-                    reference_logits.size() >= vocab_size &&
-                    reference_logits.size() % vocab_size == 0u &&
-                    restored.terminal_logits_values.size() % vocab_size == 0u &&
-                    restored.terminal_logits_bytes ==
-                        restored.terminal_logits_values.size() * sizeof(float);
-                EXPECT_TRUE(valid_geometry)
-                    << "Partial prefix terminal-logits authority published an invalid checkpoint geometry";
-                if (valid_geometry)
-                {
-                    const float *const reference_tail =
-                        reference_logits.data() +
-                        (reference_logits.size() - vocab_size);
-                    local_checkpoint.compared = 1;
-                    local_checkpoint.passed = 1;
-                    local_checkpoint.cosine = 1.0f;
-                    const size_t published_rows =
-                        restored.terminal_logits_values.size() / vocab_size;
-                    for (size_t row = 0u; row < published_rows; ++row)
-                    {
-                        const StageComparisonResult logits =
-                            compareParityTensorData(
-                                restored.terminal_logits_values.data() +
-                                    row * vocab_size,
-                                reference_tail,
-                                vocab_size,
-                                "PREFIX_PARTIAL_TERMINAL_LOGITS",
-                                config_.decode_cosine_threshold);
-                        local_checkpoint.passed =
-                            (local_checkpoint.passed != 0 && logits.passed)
-                                ? 1
-                                : 0;
-                        local_checkpoint.cosine = std::min(
-                            local_checkpoint.cosine,
-                            logits.cosine_similarity);
-                        local_checkpoint.rel_l2 = std::max(
-                            local_checkpoint.rel_l2,
-                            logits.rel_l2_norm);
-                        local_checkpoint.max_abs = std::max(
-                            local_checkpoint.max_abs,
-                            logits.max_abs_diff);
-                    }
-                }
+                const bool published_geometry = restored.terminal_logits_bytes ==
+                    restored.terminal_logits_values.size()*sizeof(float);
+                EXPECT_TRUE(published_geometry) << "Partial prefix terminal-logits byte extent disagrees";
+                if(published_geometry)
+                    compare_checkpoint(restored.terminal_logits_values.data(),restored.terminal_logits_values.size());
             }
 
             std::vector<PartialCheckpointProof> checkpoint_proofs{
@@ -7716,7 +7731,9 @@ namespace llaminar2::test::parity
             float checkpoint_cosine = 1.0f;
             float checkpoint_rel_l2 = 0.0f;
             float checkpoint_max_abs = 0.0f;
-            bool checkpoint_passed = compared_checkpoints > 0;
+            float checkpoint_maximum_kl = 0.0f;
+            uint64_t checkpoint_rows = 0;
+            bool checkpoint_passed = compared_checkpoints > 0 && compared_checkpoints == advertised_checkpoints;
             for (const auto &proof : checkpoint_proofs)
             {
                 if (proof.compared == 0)
@@ -7727,6 +7744,8 @@ namespace llaminar2::test::parity
                     std::max(checkpoint_rel_l2, proof.rel_l2);
                 checkpoint_max_abs =
                     std::max(checkpoint_max_abs, proof.max_abs);
+                checkpoint_maximum_kl = std::max(checkpoint_maximum_kl,proof.maximum_kl);
+                checkpoint_rows += proof.rows;
                 checkpoint_passed =
                     checkpoint_passed && proof.passed != 0;
             }
@@ -7778,6 +7797,11 @@ namespace llaminar2::test::parity
                 .checkpoint_compared = true,
                 .checkpoint_cosine = checkpoint_cosine,
                 .checkpoint_passed = checkpoint_passed,
+                .partial_checkpoint_policy = config_.final_logit_mean_kl
+                    ? PrefixPartialCheckpointPolicy::FinalLogitMeanKL : PrefixPartialCheckpointPolicy::LegacyCosine,
+                .partial_checkpoint_rows = checkpoint_rows,
+                .partial_checkpoint_maximum_kl = checkpoint_maximum_kl,
+                .partial_checkpoint_kl_limit = config_.final_logit_mean_kl ? config_.final_logit_mean_kl->decode_maximum : 0.0f,
                 .passed = lifecycle_passed &&
                           static_cast<bool>(state_match) &&
                           checkpoint_passed,
@@ -7786,7 +7810,11 @@ namespace llaminar2::test::parity
                 << "Partial prefix LM_HEAD cosine="
                 << checkpoint_cosine
                 << " rel_l2=" << checkpoint_rel_l2
-                << " max_abs=" << checkpoint_max_abs;
+                << " max_abs=" << checkpoint_max_abs
+                << " maximum_row_kl=" << checkpoint_maximum_kl
+                << " rows=" << checkpoint_rows
+                << " policy=" << prefixPartialCheckpointPolicyName(config_.final_logit_mean_kl
+                    ? PrefixPartialCheckpointPolicy::FinalLogitMeanKL : PrefixPartialCheckpointPolicy::LegacyCosine);
         }
 
         /**

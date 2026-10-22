@@ -570,3 +570,80 @@ does not promote Four workers for every eligible geometry, certify per-instance
 graph identity, or refresh the complete production-preflight gate. The next
 component contest varies worker count while preserving the original source
 partitions, all-format decoders and ordered arithmetic.
+
+### Two/four/eight-worker component contest: candidate91
+
+The retired diagnostic measured two, four and eight whole-partition workers using
+the same source-owned partitions, range arithmetic and ascending final fold.
+The original automatic/Four native entrypoints and Four logical identity remain
+unchanged. A shared force-inline body serves separate two/eight entrypoints;
+their blocks have 128/512 threads, while Four retains 256. The source-partition
+LDS bank is independent of worker count, including IQ2_S's disjoint immutable
+codebook prefix. No model build mode or installed default is added.
+
+The [Integration build](../../../../parity-results/qwen-flash-next/moe-worker91-integration-build-r1/result.json)
+passes with the spill guard in **292.83 seconds**. The
+[focused gate](../../../../parity-results/qwen-flash-next/moe-worker91-native-focused-r1/result.json)
+passes **23/23 registrations**, no skips, in **228.40 seconds**. It includes
+all-format captured Two/Eight histories, real CPU-promoted23, original
+automatic/Four controls, IQ2 capacity branches, both GPU projection suites and
+actual two/four-device immutable model bindings. Driver windows and retirement
+are clean. The [Release trainer build](../../../../parity-results/qwen-flash-next/moe-worker91-release-build-r1/result.json)
+also passes with the spill guard in **233.54 seconds**. This source refactor does
+not inherit the archived L90 throughput result automatically.
+
+All three [component comparisons](../../../../parity-results/qwen-flash-next/moe-worker91-component-disposition-r2/report.json)
+pass: twenty changing/poisoned histories, exact bytes and live extents, complete
+native function/resource/capture joins, 31 warmups and 101 balanced-order rounds
+at 32 operations each. Each case retains all four summary rows and 404 raw
+intervals, including the unchanged down-projection control. All cases have eight
+live owner routes, N640/K2560 and sixteen original source partitions.
+
+| Original source / resident preparation | Two workers µs | Four workers µs | Eight workers µs | Eight latency change vs Four |
+|---|---:|---:|---:|---:|
+| Q4_K, compact GPU | 55.765 | 54.360 | 53.650 | −1.31% |
+| Q5_K, compact GPU | 83.741 | 68.571 | 68.615 | +0.07% |
+| Q5_K, genuine CPU-promoted23 | 80.971 | 76.201 | 78.976 | +3.64% |
+
+Four remains the accepted worker count. Eight's small Q4_K component gain does
+not establish a model gain and does not outweigh the promoted-format regression.
+Two is slower in all three cases. The native resource records retain zero
+private memory and the same 4096-byte dynamic partial bank for each worker count.
+For Q4_K the native occupancy query admits 16/8/4 blocks per SM at 128/256/512
+threads respectively; this is resident capacity, not measured achieved occupancy.
+The first private analyzer incorrectly required one CTest case instead of the
+registered model fixture plus performance test. Its failed report remains
+retained; the corrected analyzer requires those two exact successful names and
+the one selected GTest. No native timing was rerun for that reporting fix.
+
+The final [Release ISA audit](../../../../parity-results/qwen-flash-next/moe-worker91-release-isa-r2/observation.json)
+checks 73 selected symbols with zero spills/private storage. Native resource
+observations cover the three measured physical decoders; they do not prove
+achieved occupancy or an all-format performance gain. An initial private
+`objcopy` helper accidentally rewrote its input object. Its identity guard
+rejected the audit; the corrected helper uses a distinct output, and the object
+was rebuilt before the successful audit. No production spill policy changed.
+
+Candidate91's seven source files and additive registrations are now
+[retired](../../../../parity-results/qwen-flash-next/moe-worker91-source-retirement-r1/result.json),
+with their exact patch and all experiment results preserved. Each restored file
+equals accepted commit `33c920f71`; Four remains the qualified explicit build.
+
+### Accepted Four-worker profile and next scaling diagnostic
+
+The [matched L90 native profile](../../../../parity-results/qwen-flash-next/moe-model90-four-rocm-profile-r1/result.json)
+passes trajectory, runtime identity, driver and normal-retirement checks.
+[Attribution](../../../../parity-results/qwen-flash-next/moe-model90-four-profile-analysis-r1/REPORT.md)
+joins all four devices' measured 255 model-forward transactions to their actual
+graphs. No measured kernel names are unclassified. Native-Q8 projection and its
+reduction, floating projections, MoE down and repeated norms/routing remain
+substantial compute cohorts. The profile is heavily instrumented: its roughly
+125 ms forward envelope and collective waits are not unprofiled throughput or
+removable communication cost. The accepted benchmark remains 36.780 tok/s.
+
+The next diagnostic preserves recorded inputs and expert routes while excluding
+communication from isolated captured compute. Independent targets are
+**TP1/TP2 ≥1.85** and **TP1/TP4 ≥3.6**. The
+[scaling plan](QFN_TP_COMPUTE_SCALING.md) records ownership, numerical and timing
+requirements; local shard-shape timings must remain distinct from actual
+multi-device measurements.
