@@ -2323,6 +2323,231 @@ namespace
             transactions, samples, summary.median_us, summary.p5_us, summary.p95_us);
     }
 
+    /** @brief Separate diagnostic work classes without changing native collective arithmetic. */
+    enum class A1CanonicalAttributionMode { Complete, GatherOnly, FoldOnly };
+
+    /**
+     * @brief Attribute fixed-row gather/fold cost and host-launch arrival bias.
+     *
+     * Each setup-selected graph uses the existing four immutable input banks,
+     * original exact streams, communicators and rank-order fold. Modes/counts
+     * are diagnostic graph identities, never production dispatch alternatives.
+     * Native-event intervals include each participant's own host enqueue gap;
+     * host launch timestamps are not a device-clock or arrival-time calibration.
+     */
+    TEST_F(Perf__RCCLAllreduceLatency, A1CanonicalRankOrderAttributionP4H2560M1)
+    {
+        if (!initialized_) GTEST_SKIP();
+        if (num_devices_ != 4) GTEST_SKIP() << "Exact A1 attribution requires LLAMINAR_RCCL_PERF_DEVICE_COUNT=4";
+        constexpr int width = 2560, ranks = 4, warmups = 5, samples = 31;
+        constexpr size_t bytes = width * sizeof(float), guard_floats = 16;
+        // Preserve the original offsets: input, four gathered rank banks, sum.
+        constexpr size_t frame_floats = 6 * width + guard_floats;
+        constexpr size_t frame_bytes = frame_floats * sizeof(float);
+        static_assert(frame_bytes < MAX_BUFFER_BYTES);
+        constexpr float poison = -12345.0f;
+        const llaminar2::NativeCollectiveRows rows(
+            llaminar2::DeviceRowRange::fullyActive(1), width);
+        ASSERT_EQ(rows.bankElements(), size_t(width));
+        ASSERT_EQ(rows.rows().capacity(), 1);
+        ASSERT_EQ(rows.rows().countOwner(), nullptr);
+        ASSERT_EQ(rows.payloadReceipt(), nullptr);
+        std::array<std::vector<float>, ranks> inputs;
+        std::vector<float> banks(ranks * width), expected(width, 0.0f);
+        for (int rank = 0; rank < ranks; ++rank)
+        {
+            ASSERT_EQ(devices_[rank].ordinal, rank);
+            ASSERT_NE(devices_[rank].stream, nullptr);
+            ASSERT_NE(comms_[rank], nullptr);
+            inputs[rank].resize(width);
+            for (int col = 0; col < width; ++col)
+            {
+                const float values[]{16777216.0f, 1.0f, -16777216.0f, float(1 + col % 7)};
+                inputs[rank][col] = values[rank];
+                banks[rank * width + col] = values[rank];
+                // Force one FP32 rounding at each original ascending-rank add.
+                volatile float rounded = expected[col] + values[rank];
+                expected[col] = rounded;
+            }
+        }
+        /** @brief Retain native graphs until all successful sampled work has completed. */
+        struct Lane
+        {
+            int device = -1;
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t executable = nullptr;
+            /** @brief Destroy original graph handles before fixture stream/communicator retirement. */
+            ~Lane()
+            {
+                if (device < 0) return;
+                (void)hipSetDevice(device);
+                if (executable) (void)hipGraphExecDestroy(executable);
+                if (graph) (void)hipGraphDestroy(graph);
+            }
+        };
+        for (int transactions : {1, 97})
+            for (const auto mode : {A1CanonicalAttributionMode::Complete,
+                                   A1CanonicalAttributionMode::GatherOnly,
+                                   A1CanonicalAttributionMode::FoldOnly})
+            {
+                const bool gather = mode != A1CanonicalAttributionMode::FoldOnly;
+                const bool fold = mode != A1CanonicalAttributionMode::GatherOnly;
+                const char *name = mode == A1CanonicalAttributionMode::Complete ? "complete" :
+                    mode == A1CanonicalAttributionMode::GatherOnly ? "gather_only" : "fold_only";
+                SCOPED_TRACE(::testing::Message() << name << " transactions=" << transactions);
+                std::vector<Lane> lanes(ranks);
+                std::array<std::vector<float>, ranks> initial, terminal;
+                for (int rank = 0; rank < ranks; ++rank)
+                {
+                    lanes[rank].device = rank;
+                    initial[rank].assign(frame_floats, poison);
+                    std::copy(inputs[rank].begin(), inputs[rank].end(), initial[rank].begin());
+                    if (!gather)
+                        std::copy(banks.begin(), banks.end(), initial[rank].begin() + width);
+                    terminal[rank] = initial[rank];
+                    std::copy(banks.begin(), banks.end(), terminal[rank].begin() + width);
+                    if (fold)
+                        std::copy(expected.begin(), expected.end(), terminal[rank].begin() + 5 * width);
+                }
+                std::array<hipError_t, ranks> status{};
+                std::array<rccl::ncclResult_t, ranks> collective{};
+                std::array<bool, ranks> folded{};
+                std::barrier entered(ranks), recorded(ranks);
+                std::vector<std::thread> builders;
+                for (int rank = 0; rank < ranks; ++rank)
+                    builders.emplace_back([&, rank] {
+                        auto &d = devices_[rank];
+                        status[rank] = hipSetDevice(rank);
+                        if (status[rank] == hipSuccess)
+                            status[rank] = hipStreamBeginCapture(d.stream, hipStreamCaptureModeRelaxed);
+                        const bool capturing = status[rank] == hipSuccess;
+                        entered.arrive_and_wait();
+                        const bool admitted = std::all_of(status.begin(), status.end(),
+                            [](hipError_t value) { return value == hipSuccess; });
+                        collective[rank] = rccl::ncclSuccess;
+                        folded[rank] = true;
+                        if (admitted)
+                            for (int transaction = 0; transaction < transactions; ++transaction)
+                            {
+                                if (gather)
+                                    collective[rank] = rccl::nativeRows(llaminar2::NativeRowCollective::AllGather,
+                                        d.d_buffer, d.d_buffer + width, rows, rccl::ncclFloat, rccl::ncclSum,
+                                        nullptr, comms_[rank], d.stream);
+                                if (collective[rank] != rccl::ncclSuccess) break;
+                                if (fold)
+                                    folded[rank] = llaminar2::launchROCmTPRankOrderedSumFP32(
+                                        d.d_buffer + width, d.d_buffer + 5 * width,
+                                        size_t(width), ranks, rank, d.stream);
+                                if (!folded[rank]) break;
+                            }
+                        recorded.arrive_and_wait();
+                        if (capturing) status[rank] = hipStreamEndCapture(d.stream, &lanes[rank].graph);
+                        if (admitted && status[rank] == hipSuccess &&
+                            collective[rank] == rccl::ncclSuccess && folded[rank])
+                            status[rank] = hipGraphInstantiate(&lanes[rank].executable, lanes[rank].graph, nullptr, nullptr, 0);
+                    });
+                for (auto &thread : builders) thread.join();
+                for (int rank = 0; rank < ranks; ++rank)
+                {
+                    ASSERT_EQ(status[rank], hipSuccess);
+                    ASSERT_EQ(collective[rank], rccl::ncclSuccess);
+                    ASSERT_TRUE(folded[rank]); ASSERT_NE(lanes[rank].executable, nullptr);
+                    ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+                    size_t node_count = 0;
+                    ASSERT_EQ(hipGraphGetNodes(lanes[rank].graph,nullptr,&node_count),hipSuccess);
+                    std::vector<hipGraphNode_t> nodes(node_count);
+                    ASSERT_EQ(hipGraphGetNodes(lanes[rank].graph,nodes.data(),&node_count),hipSuccess);
+                    size_t kernels = 0;
+                    for (const auto node : nodes) {
+                        hipGraphNodeType type{};
+                        ASSERT_EQ(hipGraphNodeGetType(node,&type),hipSuccess);
+                        ASSERT_NE(type,hipGraphNodeTypeGraph) << "Attribution requires directly inspectable retained kernels";
+                        if (type == hipGraphNodeTypeKernel) ++kernels;
+                    }
+                    ASSERT_EQ(kernels,size_t(transactions)*(size_t(gather)+size_t(fold)));
+                    std::printf("A1_CANONICAL_ATTRIBUTION_GRAPH,mode=%s,rank=%d,transactions=%d,"
+                        "nodes=%zu,kernels=%zu,rows=1,elements_per_row=2560,receipt=unavailable_fixed_native_api\n",
+                        name,rank,transactions,node_count,kernels);
+                }
+                std::vector<double> slowest;
+                for (int sample = -warmups; sample < samples; ++sample)
+                {
+                    // Poison/reset outside event intervals, finish every setup
+                    // copy before any rank starts its measured graph. No count
+                    // or mutable model state is surfaced by this component.
+                    for (int rank = 0; rank < ranks; ++rank)
+                    {
+                        ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+                        ASSERT_EQ(hipMemcpyAsync(devices_[rank].d_buffer, initial[rank].data(), frame_bytes,
+                            hipMemcpyHostToDevice, devices_[rank].stream), hipSuccess);
+                    }
+                    for (int rank = 0; rank < ranks; ++rank)
+                    {
+                        ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+                        ASSERT_EQ(hipStreamSynchronize(devices_[rank].stream), hipSuccess);
+                    }
+                    const int rotation = (sample < 0 ? sample + warmups : sample) % ranks;
+                    std::array<long long, ranks> host_start_ns{}, host_end_ns{};
+                    for (int position = 0; position < ranks; ++position)
+                    {
+                        const int rank = (rotation + position) % ranks;
+                        auto &d = devices_[rank];
+                        ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+                        ASSERT_EQ(hipEventRecord(d.start_event, d.stream), hipSuccess);
+                        host_start_ns[rank] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        ASSERT_EQ(hipGraphLaunch(lanes[rank].executable, d.stream), hipSuccess);
+                        host_end_ns[rank] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        ASSERT_EQ(hipEventRecord(d.stop_event, d.stream), hipSuccess);
+                    }
+                    double maximum = 0;
+                    std::array<double, ranks> total_us{};
+                    // Join all four measured intervals before any diagnostic
+                    // D2H copy can perturb a still-running peer's event span.
+                    for (int rank = 0; rank < ranks; ++rank)
+                    {
+                        auto &d = devices_[rank];
+                        ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+                        ASSERT_EQ(hipEventSynchronize(d.stop_event), hipSuccess);
+                        float ms = 0;
+                        ASSERT_EQ(hipEventElapsedTime(&ms, d.start_event, d.stop_event), hipSuccess);
+                        ASSERT_TRUE(std::isfinite(ms)); ASSERT_GT(ms, 0);
+                        total_us[rank] = double(ms) * 1000;
+                        maximum = std::max(maximum, total_us[rank] / transactions);
+                    }
+                    for (int rank = 0; rank < ranks; ++rank)
+                    {
+                        auto &d = devices_[rank];
+                        ASSERT_EQ(hipSetDevice(rank), hipSuccess);
+                        std::vector<float> actual(frame_floats);
+                        ASSERT_EQ(hipMemcpy(actual.data(), d.d_buffer, frame_bytes, hipMemcpyDeviceToHost), hipSuccess);
+                        ASSERT_EQ(std::memcmp(actual.data(), terminal[rank].data(), frame_bytes), 0)
+                            << "source/rank-bank/output/guard mismatch rank=" << rank;
+                        std::printf("A1_CANONICAL_ATTRIBUTION_SAMPLE,mode=%s,rank=%d,sample=%d,warmup=%d,transactions=%d,"
+                            "rotation=%d,launch_position=%d,total_us=%.9f,us=%.9f,host_launch_start_ns=%lld,"
+                            "host_launch_end_ns=%lld,logical_send_bytes=%zu,logical_receive_bytes=%zu,"
+                            "native_link_byte_receipt=unavailable,protocol_requested=%s,exact=1\n",
+                            name, rank, sample, sample < 0 ? 1 : 0, transactions, rotation,
+                            (rank - rotation + ranks) % ranks, total_us[rank], total_us[rank] / transactions,
+                            host_start_ns[rank], host_end_ns[rank], gather ? bytes : size_t(0),
+                            gather ? ranks * bytes : size_t(0),
+                            std::getenv("NCCL_PROTO") ? std::getenv("NCCL_PROTO") : "auto");
+                    }
+                    std::fflush(stdout);
+                    if (sample >= 0) slowest.push_back(maximum);
+                }
+                ASSERT_EQ(slowest.size(),size_t(samples));
+                const auto summary = computeStats(slowest, gather ? bytes : 0,
+                    std::string("A1 attribution ") + name);
+                std::printf("A1_CANONICAL_ATTRIBUTION_SUMMARY,mode=%s,participants=4,H=2560,M=1,transactions=%d,"
+                    "samples=%d,median_us=%.9f,p5_us=%.9f,p95_us=%.9f,exact=1,"
+                    "scope=synthetic_no_sidebands_arrival_inclusive,production_change=0\n",
+                    name, transactions, samples, summary.median_us, summary.p5_us, summary.p95_us);
+                std::fflush(stdout);
+            }
+    }
+
     // ============================================================================
     // TEST 10: Prefill fused vs sequential
     // (Should we fuse all 56 allreduces into one larger allreduce?)

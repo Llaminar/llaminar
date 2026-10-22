@@ -1,8 +1,9 @@
 # QFN TP4 collective attribution and selector repair
 
-Updated: 2026-10-22. Accepted inference source: `545192c8` (L69); documentation
-checkpoint `24ac6ab0`. This investigation does not change the dashboard's
-accepted **785.182 prefill / 33.238 decode tok/s** observation.
+Updated: 2026-10-22. The historical trace below uses L69; selector repair is
+checkpoint `7bfca677d`. The later independent short-K checkpoint `e0d2e73b3`
+(L74) now owns the accepted **785.397 prefill / 33.882 decode tok/s** observation.
+The new component attribution below does not replace that model measurement.
 
 ## Fresh accepted-runtime trace
 
@@ -156,3 +157,84 @@ prefill/decode mean KL remains **0.033535869 / 0.032070057**, top-1 agreement
 The loaded native process mapped the isolated repaired DSO. This is the frozen
 local numerical slice; complete current-source production preflight and new
 model throughput qualification remain pending.
+
+
+## Gather, fold and arrival attribution after L74
+
+The additive `A1CanonicalRankOrderAttributionP4H2560M1` performance fixture
+preserves the original complete control and adds separate gather-only and
+fold-only graphs at both one and 97 transactions. Each mode has five warmups
+and 31 measured samples, rotating the first submitted rank. Every replay checks
+the original input, all four source-indexed banks, independent ascending-FP32
+sum and suffix guards. All four stop events complete before any diagnostic
+readback. Graph inspection verifies the exact kernel counts. The ordinary
+120-second fixture budget and 30-second collective timeout remain unchanged.
+
+The [three unprofiled processes](../../../../parity-results/qwen-flash-next/collective75-protocol-comparison.json)
+run automatic selection, `AllGather:LL`, then automatic selection again on the
+same repaired RCCL DSO and Release binary. Each passes 24 graph records, 864
+rank sample records and six summaries; driver, native retirement and runtime
+closure checks are clean. The two performance aliases retain explicit protocol
+selection, rather than changing production defaults.
+
+| Protocol request / order | Transactions per captured graph | Complete median µs/transaction | Gather-only median µs/transaction | Fold-only median µs/transaction |
+|---|---:|---:|---:|---:|
+| Automatic, opening | 1 | 95.520 | 88.960 | 14.400 |
+| AllGather:LL | 1 | 79.360 | 72.000 | 14.400 |
+| Automatic, closing | 1 | 96.000 | 87.360 | 14.240 |
+| Automatic, opening | 97 | 45.615 | 41.367 | 2.293 |
+| AllGather:LL | 97 | 42.553 | 38.936 | 2.291 |
+| Automatic, closing | 97 | 44.691 | 40.627 | 2.293 |
+
+These are slowest-participant event intervals. At 97 transactions, opening-auto
+complete medians by launch position are 45.615, 43.830, 42.134 and 40.435 µs;
+gather-only positions are 41.367, 40.393, 39.406 and 38.423 µs. Rotating the
+physical first rank changes the complete median only from 45.501 to 45.667 µs,
+and gather-only from 41.360 to 41.499 µs. Thus launch-arrival skew is visible,
+without evidence here for one uniquely slow GPU. The one-transaction controls
+have much more startup/arrival overhead per transaction.
+
+Gather-only clearly dominates isolated fold-only cost. Complete minus gather
+is not a pure fold measurement: removing the fold changes dependencies,
+submission duration and cache behavior. These measurements cannot be subtracted
+from model wall time. The LL request gives a modest component improvement; a
+whole-model observation is still needed before considering any policy change.
+The earlier separate kernel traces authenticate this repaired selector, while
+these unprofiled records themselves prove the requested protocol only.
+
+Every gather still passes exactly 2,560 FP32 elements: **10,240 send bytes per
+rank / 40,960 receive bytes per transaction**. The backing allocation is 64 MiB
+and is never used as a communication extent. The fixed-native API provides no
+physical-link byte receipt; the test records that limitation instead of
+switching to the distinct device-counted implementation for instrumentation.
+
+The next private component candidate uses existing TransferEngine captured
+channels to gather only the three required peer banks. Its proposed local-aware
+fold would consume the original local contribution at its explicit communicator
+rank and preserve ascending-rank FP32 additions, avoiding a redundant self-copy.
+No production transport, arithmetic or runtime selection has changed. Ownership,
+exactness, measured economy and symmetric backend coverage must pass before
+that candidate can be considered for production.
+
+
+## Whole-model LL pilot: decode gain, prefill regression
+
+The [single LL model pilot](../../../../parity-results/qwen-flash-next/collective75-ll-model-pilot-comparison.json)
+uses the unchanged archived L74 Release runtime and all original A1 settings.
+Only `NCCL_PROTO=AllGather:LL` changes. One warmup and three measured requests
+pass with clean drivers, exact runtime/source metadata, bounded resources and
+normal retirement. All three pilot output sequences equal the six retained
+L74 automatic-protocol sequences, each containing 256 tokens.
+
+| Selection | Prefill median tok/s | Decode median tok/s | Prefill sample range | Decode sample range |
+|---|---:|---:|---:|---:|
+| Retained L74 automatic, six samples | 785.397376 | 33.881558 | 784.584272–786.028355 | 33.853745–33.926483 |
+| LL pilot, three samples | 702.850344 | 34.852762 | 702.579134–703.020254 | 34.778360–34.863189 |
+
+The descriptive change is **−10.510% prefill / +2.866% decode**. This is one
+pilot against earlier controls, not a new paired accepted win or a full accuracy
+gate. It establishes an unfavorable prefill trade-off for the broad protocol
+request. Automatic selection remains the production baseline. Further tuning
+targets small decode messages explicitly while retaining an economical policy
+for large prefill messages. No environment selector or global native protocol
+default was installed.

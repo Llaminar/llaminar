@@ -19443,6 +19443,21 @@ if(HAVE_ROCM)
         LABELS "V2;Performance;ROCm;RCCL;GraphCapture;SyntheticA1Geometry;CanonicalRankOrder"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120
         ENVIRONMENT "LLAMINAR_RCCL_PERF_DEVICE_COUNT=4;NCCL_PROTO=AllGather:LL")
+    # Attribution-only performance alias beside the existing exact A1 performance
+    # registrations, inside their original HAVE_ROCM performance-target scope.
+    # This is not ProductionTestPreflight and advertises no production capability.
+    add_v2_test(V2_Perf_RCCLCanonicalRankOrderAttribution_ROCm4_A1
+        COMMAND $<TARGET_FILE:v2_perf_rccl_allreduce_latency>
+            --gtest_filter=Perf__RCCLAllreduceLatency.A1CanonicalRankOrderAttributionP4H2560M1
+        LABELS "V2;Performance;ROCm;RCCL;GraphCapture;SyntheticA1Geometry;CanonicalRankOrder;Attribution"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_RCCL_PERF_DEVICE_COUNT=4")
+    add_v2_test(V2_Perf_RCCLCanonicalRankOrderAttribution_ROCm4_A1_LL
+        COMMAND $<TARGET_FILE:v2_perf_rccl_allreduce_latency>
+            --gtest_filter=Perf__RCCLAllreduceLatency.A1CanonicalRankOrderAttributionP4H2560M1
+        LABELS "V2;Performance;ROCm;RCCL;GraphCapture;SyntheticA1Geometry;CanonicalRankOrder;Attribution"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_RCCL_PERF_DEVICE_COUNT=4;NCCL_PROTO=AllGather:LL")
     message(STATUS "V2 Tests: Added RCCL AllReduce Latency performance benchmarks")
 endif()
 
