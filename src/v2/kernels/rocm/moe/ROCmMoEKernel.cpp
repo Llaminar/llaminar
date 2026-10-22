@@ -56,13 +56,17 @@
 
 namespace llaminar2::rocm
 {
-/** @copydoc compiledMoERouteOwnedModelPartitionExecution */
-MoERouteOwnedGateUpPartitionExecution compiledMoERouteOwnedModelPartitionExecution() noexcept
+/** @copydoc compiledMoERouteOwnedModelPartitionPolicy */
+MoERouteOwnedModelPartitionPolicy compiledMoERouteOwnedModelPartitionPolicy() noexcept
 {
-#if LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES
-    return MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes;
+#if LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES == 1
+    return MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes;
+#elif LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES == 0
+    return MoERouteOwnedModelPartitionPolicy::Serial;
+#elif LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES == 2
+    return MoERouteOwnedModelPartitionPolicy::Automatic;
 #else
-    return MoERouteOwnedGateUpPartitionExecution::Serial;
+#error "invalid source-bound ROCm owner partition policy"
 #endif
 }
 }

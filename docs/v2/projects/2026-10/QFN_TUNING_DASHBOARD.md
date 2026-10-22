@@ -1,5 +1,13 @@
 # QFN tuning dashboard
 
+**Automatic Four-worker selection is qualified** for the measured ordinary
+MI50 TP4 owner gate/up domain. Fresh default A94 measures **791.635 prefill /
+36.645 decode tok/s**, effectively matching explicit Four at **791.084 /
+36.668**. All **776 Unit** registrations, the focused native gates and the
+185-row accuracy panel pass; all twelve benchmark sequences match. See the
+[scope, settings and evidence](QFN_ROUTE_OWNED_MOE_TUNING.md#automatic-four-worker-policy-qualification).
+Additional domains require their own measurements before default selection.
+
 The [same-Four vocabulary comparison](QFN_TP_COMPUTE_SCALING.md#default-policy-qualification)
 confirms sharding at **785.553 prefill / 36.629 decode tok/s**, versus mirrored
 **784.992 / 36.179**: **+1.243% decode**, with effectively unchanged prefill,
@@ -51,9 +59,9 @@ templates/resources on all four devices, with per-instance identity explicitly
 unavailable in the aggregate exporter. The source-format comparison and genuine
 CPU-promoted23 fixture cover all eighteen physical worker decoders with exact
 bytes and lower component latency at the tested N640/K2560 geometry. All eighteen
-compiled leaves have zero spills/private memory. Four workers remain an explicit
-compiled selection; the ordinary build default is `serial` pending economy
-coverage beyond the qualified model/geometry. Complete preflight remains G60.
+compiled leaves have zero spills/private memory. The new Automatic policy
+selects Four for the qualified MI50 TP4 operation and keeps established policies
+elsewhere; explicit Serial/Four remain available. Complete preflight remains G60.
 The two/eight-worker contest is complete: neither gives a consistent gain over
 Four, and its source is retired with evidence preserved. The next
 [compute-scaling diagnostic](QFN_TP_COMPUTE_SCALING.md) preserves recorded inputs
@@ -61,7 +69,7 @@ and routes while measuring TP1/TP2/TP4 against cumulative targets of 1.85×/3.6�
 The
 [KV coverage plan](QFN_TP4_KV_COVERAGE_PLAN.md) records the separate duplication work.
 
-Updated: 2026-10-22; **L95 is the current explicitly configured A1 throughput checkpoint**. Its historical explicit-Four control measures **786.251 prefill / 36.746 decode tok/s**. L90 independently measured the Four-worker gain against same-source Serial at **785.821 / 34.982 tok/s**. L84 remains the preceding vocabulary-sharded checkpoint at **786.235 / 35.056**; the [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) retains its matched comparison and final-source85 regressions. Automatic terminal ownership now shards the qualified ordinary MI50 TP4 family; the ordinary compiled partition policy remains Serial pending its bounded default implementation. Use the exact settings recorded below. Complete production preflight remains pending. Local KV-head duplication is removed in the qualified ordinary TP domain; short-context indexer-query work remains a separate opportunity.
+Updated: 2026-10-22; **A94 Automatic is the current A1 throughput checkpoint** at **791.635 / 36.645 tok/s**. L95 is the preceding compact-KV checkpoint. Its historical explicit-Four control measures **786.251 prefill / 36.746 decode tok/s**. L90 independently measured the Four-worker gain against same-source Serial at **785.821 / 34.982 tok/s**. L84 remains the preceding vocabulary-sharded checkpoint at **786.235 / 35.056**; the [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) retains its matched comparison and final-source85 regressions. Automatic terminal ownership now shards the qualified ordinary MI50 TP4 family; the compiled partition policy now defaults to Automatic, selecting Four only within the measured domain. Use the exact settings recorded below. Complete production preflight remains pending. Local KV-head duplication is removed in the qualified ordinary TP domain; short-context indexer-query work remains a separate opportunity.
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.
 
@@ -290,11 +298,11 @@ its actual prepared route must be represented explicitly in coverage.
 
 ## A. Implemented and admitted — baseline and tune first
 
-`G60` names the last complete qualification checkpoint. `L95†` adds query-covered K/V storage and projections with original arithmetic, 774 Unit registrations, all-format native slice tests, exact 185-row accuracy, canonical prefix restoration and matched throughput. See the [KV qualification record](QFN_TP4_KV_COVERAGE_PLAN.md#matched-release-throughput-l95), including the rejected driver-warning attempt. `L90†` measures the explicit compiled Four-worker owner gate/up policy against same-source Serial, with 769 Unit checks, 18/20 focused checks, unchanged 185-row accuracy, native family inventory and four clean timing arms. Ordinary builds remain Serial until wider economy is qualified. `L62` names the original uninstrumented Llaminar Release measurements. `L84†` measures explicit ordinary `VocabularySharded` output on top of L80; follow-up85 validates the final capacity implementation with complete Unit, focused native checks and byte-identical Release accuracy. L84 timing and final-source85 accuracy are separate retained observations, and neither replaces G60. `L80†` adds the native small-AllGather preference to the ordered short-K L74 checkpoint, with complete Unit, focused dependency/capture checks, Release accuracy and matched timing passed; complete production preflight remains pending. `L69†` remains the lookup-worker placement correctness fix with effectively unchanged paired throughput. `L66†` remains the earlier measured GPU-control affinity improvement. `L64†` remains the earlier transfer-scheduling checkpoint. A4 passes both phase comparisons on the declared short workload; A3's reference variance remains open. Historical `R58†` values remain in the evidence discussion and do not populate current measured rows.
+`G60` names the last complete qualification checkpoint. `A94†` qualifies Automatic selection of the L90 Four winner on top of L95, with 776 Unit registrations, twenty focused CTest registrations (including two native default cases), exact 185-row accuracy and matched ABBA. Its timing is effectively unchanged versus explicit Four. `L95†` adds query-covered K/V storage and projections with original arithmetic, 774 Unit registrations, all-format native slice tests, exact 185-row accuracy, canonical prefix restoration and matched throughput. See the [KV qualification record](QFN_TP4_KV_COVERAGE_PLAN.md#matched-release-throughput-l95), including the rejected driver-warning attempt. `L90†` measures the explicit compiled Four-worker owner gate/up policy against same-source Serial, with 769 Unit checks, 18/20 focused checks, unchanged 185-row accuracy, native family inventory and four clean timing arms. That historical experiment used an explicit build choice; A94 now qualifies the bounded Automatic default. `L62` names the original uninstrumented Llaminar Release measurements. `L84†` measures explicit ordinary `VocabularySharded` output on top of L80; follow-up85 validates the final capacity implementation with complete Unit, focused native checks and byte-identical Release accuracy. L84 timing and final-source85 accuracy are separate retained observations, and neither replaces G60. `L80†` adds the native small-AllGather preference to the ordered short-K L74 checkpoint, with complete Unit, focused dependency/capture checks, Release accuracy and matched timing passed; complete production preflight remains pending. `L69†` remains the lookup-worker placement correctness fix with effectively unchanged paired throughput. `L66†` remains the earlier measured GPU-control affinity improvement. `L64†` remains the earlier transfer-scheduling checkpoint. A4 passes both phase comparisons on the declared short workload; A3's reference variance remains open. Historical `R58†` values remain in the evidence discussion and do not populate current measured rows.
 
 | ID | Topology / actual work placement | Ngrams | Reference engine | Accuracy | Llaminar prefill | Reference prefill | Strata prefill | Llaminar decode | Reference decode | Strata decode | Next action |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
-| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and compiled Four-worker owner gate/up | RAM | Castagna | 🟢 L95† Release required groups and prefix restore; latest complete topology gate [G60][a1] | 791.519 L95† | 467.821 F62§ | — | 36.759 L95† | 42.959 F62§ | — | Compact K/V gives +0.670% paired prefill with effectively unchanged decode, 185 byte-identical logit rows and all 12 equal sequences. Explicit Four build; automatic default qualification is next. Full preflight remains pending. |
+| A1 | 4×ROCm: TP4, `TensorParallel` + `GateUpOwnedDownColumns`, all GPU experts; explicit `VocabularySharded` terminal head and Automatic-resolved Four-worker owner gate/up | RAM | Castagna | 🟢 A94† Release required groups; L95 prefix restore; latest complete topology gate [G60][a1] | 791.635 A94† | 467.821 F62§ | — | 36.645 A94† | 42.959 F62§ | — | Four is the qualified default for the measured domain. Automatic retains explicit-Four performance and exact logits/tokens. Compact K/V is included. Full preflight remains pending. |
 | A2 | 1×ROCm + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | Castagna | [🟢 GREEN G60][a2] | 156.707 L62 | 159.177 F61-30 | 45.270 S62≈ | 15.164 L62 | 11.600 F61-30 | 24.024 S62≈ | Prefill remains 1.6% below Castagna; decode remains below Strata's 24.024. Both reference policies stay explicit. |
 | A3 | 1×CUDA + 1×CPU: expert overlay, 8 GPU / 504 CPU experts per layer | Adaptive VRAM/RAM/SSD, zero-cache control | llama.cpp | [🟢 GREEN G60][a3] | 180.920 L62 | 129.020 U62⚠ | 74.301 S62≈ | 18.231 L62 | 13.059 U62⚠ | 31.253 S62≈ | Ahead of recorded upstream samples; below Strata's 31.253 decode. Resolve upstream variance and tune against the faster applicable reference. |
 | A4 | CPU only: one NUMA participant, 28 physical-core workers | SSD mmap | Castagna | [🟢 GREEN G60][a4] | 98.466 L62 | 48.408 F61-30 | n/a | 5.797 L62 | 4.611 F61-30 | n/a | Both phases ahead of Castagna: 2.03× prefill, 1.26× decode. Complete other applicable baselines before closing the broader row. |
@@ -306,7 +314,7 @@ Use the exact policy names in subsequent four-GPU records. The dense-compute pol
 
 | ID | Dense-compute policy | Expert policy | QFN accuracy | Llaminar prefill | Castagna prefill | Llaminar decode | Castagna decode | Status |
 |---|---|---|---|---:|---:|---:|---:|---|
-| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 L95† Release required groups and prefix restore | 791.519 | 467.821 | 36.759 | 42.959 | Explicit `VocabularySharded` terminal head and compiled Four-worker owner gate/up with compact K/V; byte-identical logits. Automatic Four qualification remains next. |
+| A1 | `TensorParallel` | `GateUpOwnedDownColumns` | 🟢 A94† Release required groups; L95 prefix restore | 791.635 | 467.821 | 36.645 | 42.959 | Explicit `VocabularySharded` head, Automatic-resolved Four-worker owner gate/up and compact K/V; 185 identical logit rows and all twelve matching sequences. |
 | A1.1 | `TensorParallel` | `Apportioned` | 🟢 L64† Release required groups | 561.867 | 467.821 | 30.515 | 42.959 | Accuracy, corrected SnapshotAdmission and timing passed; slower than current A1 in both phases. |
 | A1.2 | `PrefillTensorParallelDecodeReplicated` | `GateUpOwnedDownColumns` | 🔴 L65† Release short decode row KL | — | 467.821 | — | 42.959 | Admission and native execution passed; one forced decode row KL 1.119 exceeds the unchanged 1.0 ceiling. Diagnose before promotion. Timing pending. |
 | A1.3 | `PrefillTensorParallelDecodeReplicated` | `Apportioned` | 🟢 L65† Release required groups | 382.757 | 467.821 | 30.761 | 42.959 | Retained **Ornith** arrangement; admission, accuracy and timing passed, but both phases are slower than the current A1 control and Castagna. |
@@ -520,6 +528,7 @@ Keep experimental candidates separate until their own comparisons pass.
 | L84 | Explicit ordinary vocabulary sharding with MTP disabled and zero retained capacity | 785.752 / 34.627 | **786.235 / 35.056** | **+0.061% / +1.237%** | [Four clean arms, twelve equal output sequences](../../../../parity-results/qwen-flash-next/vocabulary84-model-abba-comparison.json); [settings, final-source85 accuracy and regressions](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md#experiment84-measured-ordinary-m1-head-sharding) |
 | L90 | Explicit compiled Four-worker execution of original owner gate/up K partitions | 785.821 / 34.982 | **785.806 / 36.780** | **−0.002% / +5.142%** | [Four clean arms, twelve equal sequences](../../../../parity-results/qwen-flash-next/moe-model90-release-abba-comparison-r1); [all-format resources, accuracy and settings](QFN_ROUTE_OWNED_MOE_TUNING.md#matched-release-model-throughput-l90) |
 | L95 | Query-covered K/V storage and original-output-slice projections | 786.251 / 36.746 | **791.519 / 36.759** | **+0.670% / +0.034%** | [Four accepted arms, twelve equal sequences](../../../../parity-results/qwen-flash-next/query-kv95-model-comparison.json); [settings, numerical proof and rejected attempt](QFN_TP4_KV_COVERAGE_PLAN.md#matched-release-throughput-l95). Decode is effectively unchanged. |
+| A94 | Automatic selects the qualified Four-worker program on top of L95 | 791.084 / 36.668 | **791.635 / 36.645** | **+0.070% / −0.064%** | [Four clean arms, twelve equal sequences](../../../../parity-results/qwen-flash-next/four-automatic94-model-comparison.json); [default scope and qualification](QFN_ROUTE_OWNED_MOE_TUNING.md#automatic-four-worker-policy-qualification). Performance is effectively unchanged. |
 
 Each percentage uses its own interleaved A/B/B/A comparison. Do not multiply
 percentages or compare unmatched process lifecycles to claim a cumulative gain.
@@ -563,8 +572,9 @@ Separate Release archives from the same source retain their original native
 metadata/dependency receipts. The option affects only the owning MoE C++
 translation unit; it is not a serving environment variable. Complete Unit and
 focused device checks pass, and all 185 retained logits remain byte-identical.
-The explicit build is qualified for the measured QFN workload; ordinary builds
-remain Serial until broader geometry and topology economy is established.
+The explicit build qualified the measured QFN workload. A94 subsequently
+installs Automatic selection for that bounded operation/domain, retaining
+explicit modes and established policies elsewhere.
 
 L95 retains the L90 Four candidate configuration and dependencies on both sides.
 It compares the retained Four90 source/runtime with current QueryInterval KV95;

@@ -31564,6 +31564,38 @@ if(NOT V2_PERF_TESTS_ONLY)
         V2_Integration_QueryKVAutomaticAssignment)
 endif()
 
+# Focused automatic owner-policy contracts; add_v2_test owns build-mode filtering.
+# Append after current route-owned model-policy targets/registrations exist.
+add_v2_test(V2_Unit_ROCmMoEAutomaticOwnerPolicy
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
+        --gtest_filter=ROCmMoERouteOwnedGeometry.AutomaticOwnerPolicy*
+    LABELS "V2;Unit;DeviceFree;MoE;NativeVNNI;Policy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ROCmMoEAutomaticOwnerPolicyContract
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
+        --gtest_filter=ROCmMoERouteOwnedGeometry.AutomaticOwnerPolicy*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;NativeVNNI;Policy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEAutomaticOwnerPolicyContract)
+if(HAVE_ROCM AND TARGET v2_integration_moe_projection_pipeline AND NOT V2_PERF_TESTS_ONLY
+        AND LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS STREQUAL "automatic")
+    add_v2_test(V2_Integration_ROCmMoEAutomaticOwnerDefault
+        COMMAND $<TARGET_FILE:v2_integration_moe_projection_pipeline>
+            --gtest_filter=MoEModelPartitionBinding.AutomaticMeasured*ROCm4
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MI50;LocalTP4;MoE;NativeVNNI;GraphCapture;LocalTP;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEAutomaticOwnerDefault)
+endif()
+
+# Reuse the existing executable-CMake regression owner; do not configure the full project.
+add_v2_test(V2_Unit_ROCmMoEAutomaticOwnerConfiguration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_optional_gpu_preflight_registration.py ROCmOwnerPartitionConfiguration
+    LABELS "V2;Unit;DeviceFree;Build;MoE;Policy;Regression" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ROCmMoEAutomaticOwnerConfiguration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_optional_gpu_preflight_registration.py ROCmOwnerPartitionConfiguration
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Build;MoE;Policy;Regression" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEAutomaticOwnerConfiguration)
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR

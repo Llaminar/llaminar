@@ -1,12 +1,13 @@
 # QFN route-owned MoE tuning
 
-Updated: 2026-10-22. The explicit Four-worker A1 Release checkpoint is now
-**785.806 prefill / 36.780 decode tok/s**, versus same-source Serial
-**785.821 / 34.982**: **−0.002% prefill / +5.142% decode**. All twelve measured
-output sequences match and all 185 retained accuracy rows are byte-identical.
-Castagna Veloce's matched decode reference remains **42.959 tok/s**. The compiled
-option remains explicit; the ordinary build default is still `serial` while
-economy outside the qualified QFN geometry remains unmeasured.
+Updated: 2026-10-22. Automatic now selects Four-worker execution for the
+[qualified MI50 TP4 owner operation](#automatic-four-worker-policy-qualification).
+The fresh default measures **791.635 prefill / 36.645 decode tok/s**, versus
+explicit Four at **791.084 / 36.668**: effectively unchanged performance, with
+all twelve token sequences and all 185 logit rows identical. The independent
+L90 comparison established the **+5.142% decode** gain over Serial. Castagna
+Veloce's matched decode reference remains **42.959 tok/s**. Additional domains
+require their own accuracy/economy qualification; explicit choices remain available.
 
 ## Actual production path
 
@@ -440,7 +441,7 @@ first graph identity is computed. Passive descriptor inspection does no upload
 or conversion; CUDA and ROCm expose equivalent inspection contracts. A declared
 worker mode rejects missing or mismatched bindings before execution. The
 source-local CMake setting selects `serial` or `four_worker_planes` in the owning
-ROCm MoE translation unit; the default remains `serial`. It adds no serving
+ROCm MoE translation unit; the default at this historical checkpoint remained `serial`. It adds no serving
 environment override or mutable model-global policy.
 
 Enabling that compiled option selects every eligible ROCm native runtime-table
@@ -647,3 +648,86 @@ communication from isolated captured compute. Independent targets are
 [scaling plan](QFN_TP_COMPUTE_SCALING.md) records ownership, numerical and timing
 requirements; local shard-shape timings must remain distinct from actual
 multi-device measurements.
+
+### Automatic Four-worker policy qualification
+
+Following the accepted L90 worker comparison and the L95 compact-KV checkpoint
+`550ca0d2e`, fresh configurations now select the source-owned `automatic`
+partition policy. Explicit `serial` and `four_worker_planes` remain first-class
+choices, and an existing CMake cache keeps its authored setting. There is no
+new serving flag or environment override. Automatic uses compiled intent 2;
+observed Serial/Four execution remains a separate fact.
+
+The initial automatic winner is deliberately limited to the measured ordinary
+owner gate/up operation: M1, N640, K2560, 512 experts/top-10, Decode phase,
+no live-query range, equal same-host TP4 shares with RCCL, and four startup
+observations identifying MI50/gfx906/60 CUs. Actual prepared original gate/up
+sources must be homogeneous Q4_K or Q5_K superblocks. The existing sixteen
+source K partitions, immutable resource admission and native worker bodies are
+unchanged. Selection uses the canonical startup inventory and prepared sources
+before graph identity; it adds no native probe, hot transfer or second ledger.
+Other domains keep their established automatic kernel policy. Once Four is
+selected, a missing or invalid capability fails; no runtime retry is introduced.
+Additional topology or geometry defaults require their own accuracy and
+performance evidence.
+
+The initial Integration build exposed a fixture link dependency on the
+out-of-line device-address factories. Plain synthetic address aggregates keep
+the existing Unit target runtime-free and preserve the factories' values;
+production code was unaffected. The corrected build passes in
+`four-automatic94-integration-build-r2`. Source review also verifies the final
+registration placement and the actual fresh-cache/explicit-mode CMake tests.
+
+`four-automatic94-native-default-r1` passes both original Q4_K and Q5_K cases
+through the complete four-device production projection fixture, preserving its
+twenty ownership/empty/partial histories, serial byte oracle, live communication
+extents, reset and retirement checks. Original GTest properties record compiled
+Automatic2, qualified MI50 hardware and resolved Four for both source families.
+Actual submission records check all four devices, grid10×10×2, block256 and
+4096-byte dynamic LDS. These counters prove host execution/capture submissions;
+they are not per-instance replay or active-decoder counts. Unmeasured hardware
+is an explicit Serial-negative observation, never positive Four qualification.
+
+The surrounding `four-automatic94-focused-r1` gate passes **19/19** with zero
+skips, including both GPU projection paths, original-source inspection,
+two/four-device binding, all-format workers, IQ2 capacity, the actual selector
+and CMake default/override behavior. The default gate takes 38.96 seconds and
+the surrounding gate 114.09 seconds, with clean driver windows and normal
+retirement. Complete current-source Unit passes **776/776**, zero skips, in
+`four-automatic94-unit-r1` (116.44 seconds including its wrapper).
+
+The Release build passes in `four-automatic94-release-build-r1` (222.46
+seconds, spill guards retained). The unchanged canonical required-group panel
+passes in `four-automatic94-release-accuracy-r1` (102.19 seconds): all **26
+files / 185 logit rows are byte-identical** to accepted explicit-Four L95,
+including reset replay. The original compiler/cache observation proves
+Automatic2, separately from actual model submission metadata proving resolved
+Four on all four devices. The twelve observed records cover original execution
+families 5/7 and reachable 23 with the expected native functions and launch
+geometry; reachable-family capture does not establish active decoder work.
+The same observation retains the compact-KV admission/source/cache proof.
+
+The complete matched ABBA is green in `four-automatic94-model-a1/b1/b2/a2`
+and `four-automatic94-model-comparison.json`. All four arms retire normally
+with clean driver windows, no resource errors and unchanged source/native
+dependencies; no attempt was rejected or repeated in this cohort. All twelve
+natural 256-token sequences match. Six samples per role give:
+
+| Authored policy | Prefill median tok/s | Decode median tok/s | Prefill range | Decode range |
+|---|---:|---:|---:|---:|
+| Explicit Four, accepted L95 archive | 791.084 | 36.668 | 790.218–791.564 | 36.559–36.746 |
+| Automatic, resolved Four | 791.635 | 36.645 | 790.835–792.638 | 36.572–36.686 |
+
+The descriptive changes are **+0.070% prefill / −0.064% decode**, with
+overlapping ranges: effectively unchanged performance. This qualifies automatic
+selection of the existing winner, not a new kernel speedup or statistical
+confidence claim. The historical L90 +5.142% decode gain remains separate.
+
+Both roles retain [L95 settings](QFN_TP4_KV_COVERAGE_PLAN.md#matched-release-throughput-l95):
+four MI50s, the same HIP76/RCCL80 closure, original GGUF, RAM ngrams,
+TP plus GateUpOwnedDownColumns, explicit vocabulary sharding, context4096/M512,
+prompt512/output256, 28 physical NUMA1 workers, greedy seed42, MTP off/zero
+capacity, one warmup/three measured requests and the same six arithmetic
+selectors. Compilation proves authored mode independently from the actual
+model Four records. Complete current-source production preflight remains
+pending; this focused default qualification does not replace it.

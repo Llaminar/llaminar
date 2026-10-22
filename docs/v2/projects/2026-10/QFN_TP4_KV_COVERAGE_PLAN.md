@@ -248,5 +248,6 @@ repeat passed without changing source, runtime, settings or driver policy;
 the rejected timings are excluded and explicitly disclosed here. All four
 accepted arms have clean driver windows and normal retirement. These are
 descriptive paired results, not a statistical confidence claim. Complete
-current-source preflight remains pending, and Automatic Four qualification is
-a separate next slice.
+current-source preflight remains pending. The subsequent
+[Automatic Four slice](QFN_ROUTE_OWNED_MOE_TUNING.md#automatic-four-worker-policy-qualification)
+now passes its own model accuracy and matched-throughput qualification.

@@ -6,11 +6,16 @@
  * runtime ABI headers never collide. This TU adds no native runtime include.
  * The unchanged production fixture owns all numerical/lifetime/extent checks;
  * its host submission counters prove recording, never executed-token counts.
+ * Bounded Automatic has Q4_K/Q5_K exact-geometry four-device witnesses, with
+ * independent startup-hardware expectations; legacy smaller
+ * fixtures remain negative defaults and explicit Four controls.
  */
 #include "utils/MoEProjectionPipelineFixture.h"
 #include "utils/PerfStatsCollector.h"
 #include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
+#include "backends/HardwareInventory.h"
 #include <gtest/gtest.h>
+#include <array>
 #include <cstdlib>
 #include <optional>
 #include <set>
@@ -56,24 +61,54 @@ public:
 /**
  * @brief Run the unchanged complete graph lowerer and assert its source-bound compiled policy.
  * @param participants Explicit physical communicator size; no device ordinal assumptions enter kernel policy.
+ * @param measured_geometry Require compiled Automatic and select the measured operation tuple.
+ * @param measured_format Actual original source family for a measured witness; Q4_K or Q5_K.
  *
  * The existing fixture owns every lifecycle and byte/extent oracle. These checks
  * add actual accepted host capture metadata only. The per-table native tests
  * separately prove symbols and replay-stable capture counters. No profiler or
  * synthetic timing is part of this regression.
  */
-void proveModelOwnerBinding(int participants)
+void proveModelOwnerBinding(int participants, bool measured_geometry = false, const char *measured_format = "Q4_K")
 {
+    const auto policy = rocm::compiledMoERouteOwnedModelPartitionPolicy();
+    if (measured_geometry)
+        ASSERT_EQ(policy, rocm::MoERouteOwnedModelPartitionPolicy::Automatic)
+            << "The Automatic-specific witness cannot certify an explicitly forced mode";
     OwnerCounters observation;
     ProjectionPipelineFixtureConfig config;
-    config.rows={1,2};
+    config.rows = measured_geometry ? std::vector<int>{1} : std::vector<int>{1,2};
     config.geometry.intermediate=512;
-    if (participants==4) config.format="Q4_K";
+    if (measured_geometry) config.geometry = {512, 2560, 640, 10};
+    if (participants==4) config.format=measured_geometry ? measured_format : "Q4_K";
     config.exchange=ProjectionExchangeProof::DeviceCounted;
     config.service_phase=MoEOverlayServicePhaseHint::Decode;
     runProjectionPipelineFixture(DeviceId::rocm(0), participants, config);
     ASSERT_FALSE(::testing::Test::HasFailure());
-    const bool selected=rocm::compiledMoERouteOwnedModelPartitionExecution()==rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes;
+    const auto *startup = DeviceManager::instance().hardware();
+    ASSERT_NE(startup, nullptr) << "the fixture must retain canonical startup publication";
+    // Independent test expectation from original native startup facts, not the
+    // production selector under test. Unqualified hardware is a negative case.
+    bool measured_hardware = participants == 4;
+    for (int ordinal = 0; ordinal < participants; ++ordinal)
+    {
+        int matches = 0;
+        for (const auto &entry : startup->rocm_devices)
+            if (entry.type == ComputeBackendType::GPU_ROCM && entry.device_id == ordinal)
+            {
+                ++matches;
+                measured_hardware = measured_hardware && entry.compute_capability == 906 &&
+                    entry.compute_units == 60 && entry.name.find("MI50") != std::string::npos;
+            }
+        measured_hardware = measured_hardware && matches == 1;
+    }
+    const bool selected = policy == rocm::MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes ||
+        (policy == rocm::MoERouteOwnedModelPartitionPolicy::Automatic && measured_geometry && measured_hardware);
+    ::testing::Test::RecordProperty("automatic_hardware_qualified", measured_geometry && measured_hardware ? "true" : "false");
+    if (measured_geometry)
+        ::testing::Test::RecordProperty("measured_source_codebook", config.format == "Q5_K" ? "7" : "5");
+    ::testing::Test::RecordProperty("compiled_owner_partition_policy", std::to_string(static_cast<int>(policy)));
+    ::testing::Test::RecordProperty("resolved_owner_partition_execution", selected ? "four_worker_planes" : "serial");
     const auto records=PerfStatsCollector::snapshot({"kernel.rocm_moe_owner_m1_partition_submissions"});
     if(!selected) { EXPECT_TRUE(records.empty()); return; }
     ASSERT_FALSE(records.empty());
@@ -86,11 +121,19 @@ void proveModelOwnerBinding(int participants)
         EXPECT_EQ(record.tags.at("observation"),"host_execute_or_capture");
         EXPECT_EQ(record.tags.at("partition_execution"),"four_worker_planes");
         EXPECT_EQ(record.tags.at("worker_planes"),"4"); EXPECT_EQ(record.tags.at("block_threads"),"256");
-        EXPECT_EQ(record.tags.at("n"),"512"); EXPECT_EQ(record.tags.at("k"),"256");
-        EXPECT_EQ(record.tags.at("grid_x"),"8"); EXPECT_EQ(record.tags.at("grid_z"),"2");
+        EXPECT_EQ(record.tags.at("n"),std::to_string(config.geometry.intermediate));
+        EXPECT_EQ(record.tags.at("k"),std::to_string(config.geometry.width));
+        EXPECT_EQ(record.tags.at("grid_x"),std::to_string((config.geometry.intermediate + 63) / 64));
+        EXPECT_EQ(record.tags.at("grid_y"),std::to_string(config.geometry.top_k));
+        EXPECT_EQ(record.tags.at("grid_z"),"2");
+        EXPECT_NE(record.tags.at("native_function"),"0");
+        if (measured_geometry) EXPECT_EQ(record.tags.at("dynamic_shared_bytes"),"4096");
         devices.insert(record.device);
     }
-    EXPECT_EQ(devices.size(),static_cast<std::size_t>(participants));
+    std::set<std::string> expected_devices;
+    for (int ordinal = 0; ordinal < participants; ++ordinal)
+        expected_devices.insert(DeviceId::rocm(ordinal).toString());
+    EXPECT_EQ(devices,expected_devices);
 }
 #endif
 } // namespace
@@ -99,5 +142,9 @@ void proveModelOwnerBinding(int participants)
 TEST(MoEModelPartitionBinding, ROCm2) { proveModelOwnerBinding(2); }
 /** @brief Four real ranks exercise source-indexed ownership beyond a paired-rank special case. */
 TEST(MoEModelPartitionBinding, ROCm4) { proveModelOwnerBinding(4); }
+/** @brief Exact admitted owner geometry drives real default selection and all twenty replay histories. */
+TEST(MoEModelPartitionBinding, AutomaticMeasuredROCm4) { proveModelOwnerBinding(4, true, "Q4_K"); }
+/** @brief The second measured original source family exercises actual prepared Automatic lowering. */
+TEST(MoEModelPartitionBinding, AutomaticMeasuredQ5KROCm4) { proveModelOwnerBinding(4, true, "Q5_K"); }
 #endif
 } // namespace llaminar2::test

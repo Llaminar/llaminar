@@ -11,6 +11,8 @@
  * full-K down dot and ordered top-k fold used by serial decode.
  * Diagnostics borrow each down stage's existing per-route column bank at its
  * producer boundary; they never add a full-route bank or another collective.
+ * Bounded Automatic owner execution reads the existing startup observation at
+ * declaration and resolves the actual mode before graph identity or admission.
  */
 #include "MoEProjectionPipeline.h"
 #include "MoEOverlayPinnedRouteEvidenceViews.h"
@@ -33,6 +35,7 @@
 #include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
 #endif
 #include "kernels/KernelFactory.h"
+#include "backends/HardwareInventory.h"
 #include "kernels/common/ColumnShardAssemblyKernels.h"
 #include "kernels/common/SharedExpertColumnGateKernels.h"
 #include "models/GraphTypes.h"
@@ -128,50 +131,76 @@ namespace
                 else return DeviceMoEWeightFormat::NativeVNNI;
             }, fixed_table);
 #ifdef HAVE_ROCM
-            if (device().is_rocm() && params.rows == 1 && family == DeviceMoEWeightFormat::NativeVNNI &&
-                rocm::compiledMoERouteOwnedModelPartitionExecution() == rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes)
+            if (device().is_rocm() && params.rows == 1 && family == DeviceMoEWeightFormat::NativeVNNI)
             {
-                NativeVnniExecutionFormatEnvelope envelope;
-                for (const auto &payload : params.initial_gate_up)
+                const auto model_policy = rocm::compiledMoERouteOwnedModelPartitionPolicy();
+                const rocm::MoERouteOwnedModelOperation operation{
+                    .shape = {.output_columns = geometry.intermediate_columns, .reduction_columns = geometry.model_columns},
+                    .rows = params.rows, .experts = geometry.experts, .top_k = params.top_k,
+                    .phase = params.service_phase, .has_live_rows = params.live_rows.has_value()};
+                // Borrow existing startup metadata only for this declaration.
+                // Never initialize/discover hardware here or retain its pointers.
+                const auto *startup = DeviceManager::instance().hardware();
+                const auto startup_devices = startup ? std::span<const ComputeDevice>{startup->rocm_devices}
+                                                     : std::span<const ComputeDevice>{};
+                const bool inspect_sources = model_policy == rocm::MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes ||
+                    (model_policy == rocm::MoERouteOwnedModelPartitionPolicy::Automatic &&
+                        rocm::moeRouteOwnedModelMeasuredDomain(operation, params.tp->devices(), params.tp->weights(),
+                            params.tp->backend(), startup_devices));
+                if (inspect_sources)
                 {
-                    if (payload.empty()) continue;
-                    DeviceNativeVNNIMatrixDesc gate{}, up{};
-                    if (!payload.readyFor(DeviceMoEProjectionSet::GateUp) ||
-                        !payload.gate()->inspectPreparedNativeVNNIMatrixDesc(gate) ||
-                        !payload.up()->inspectPreparedNativeVNNIMatrixDesc(up) ||
-                        gate.n != geometry.intermediate_columns || up.n != geometry.intermediate_columns ||
-                        gate.k != geometry.model_columns || up.k != geometry.model_columns ||
-                        !areNativeVnniGateUpCodebooksCompatible(gate.codebook_id, up.codebook_id))
-                        throw std::logic_error("Projection launch intent requires already-prepared original native gate/up metadata");
-                    for (const auto *desc : {&gate, &up})
-                        if (!addNativeVnniExecutionFormat(envelope, desc->codebook_id,
-                                NativeVnniSourceIdentity{desc->source_codebook_id, desc->source_is_superblock != 0,
-                                    desc->source_identity_present != 0}, true))
-                            throw std::invalid_argument("Projection owner launch intent has an invalid original source envelope");
+                    NativeVnniExecutionFormatEnvelope envelope;
+                    std::vector<NativeVnniSourceIdentity> sources;
+                    for (const auto &payload : params.initial_gate_up)
+                    {
+                        if (payload.empty()) continue;
+                        DeviceNativeVNNIMatrixDesc gate{}, up{};
+                        if (!payload.readyFor(DeviceMoEProjectionSet::GateUp) ||
+                            !payload.gate()->inspectPreparedNativeVNNIMatrixDesc(gate) ||
+                            !payload.up()->inspectPreparedNativeVNNIMatrixDesc(up) ||
+                            gate.n != geometry.intermediate_columns || up.n != geometry.intermediate_columns ||
+                            gate.k != geometry.model_columns || up.k != geometry.model_columns ||
+                            !areNativeVnniGateUpCodebooksCompatible(gate.codebook_id, up.codebook_id))
+                            throw std::logic_error("Projection launch intent requires already-prepared original native gate/up metadata");
+                        for (const auto *desc : {&gate, &up})
+                        {
+                            const NativeVnniSourceIdentity source{desc->source_codebook_id, desc->source_is_superblock != 0,
+                                desc->source_identity_present != 0};
+                            if (!addNativeVnniExecutionFormat(envelope, desc->codebook_id, source, true))
+                                throw std::invalid_argument("Projection owner launch intent has an invalid original source envelope");
+                            sources.push_back(source);
+                        }
+                    }
+                    const auto execution = rocm::selectMoERouteOwnedModelPartitionExecution(model_policy, operation,
+                        params.tp->devices(), params.tp->weights(), params.tp->backend(), startup_devices, sources);
+                    if (execution == rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes)
+                    {
+                        owner_plan.emplace(rocm::planMoERouteOwnedGateUp(rocm::MoERouteOwnedGateUpGeometry::TN64,
+                            envelope, device().rocm_ordinal(), execution, operation.shape));
+                        if (model_policy == rocm::MoERouteOwnedModelPartitionPolicy::Automatic && owner_plan->maximumKPartitions() != 16)
+                            throw std::logic_error("Automatic owner source partitions changed beyond their qualified program");
+                        declaration_signature = owner_plan->identity();
+                        // The immutable launch mode/shape/source-policy intent exists
+                        // before the first cache hash. Descriptor payload pointers are
+                        // runtime table contents, not additional embedded graph operands.
+                        // Original prepare/export/upload and workspace leases remain their
+                        // sole authority; materialization must validate this same intent.
+                        const auto mix = [&](std::uint64_t word) { declaration_signature = (declaration_signature ^ word) * kFNV1a64Prime; };
+                        mix(params.rows); mix(params.top_k);
+                        mix(static_cast<std::uint64_t>(params.demand)); mix(static_cast<std::uint64_t>(params.service_phase));
+                        mix(reinterpret_cast<std::uintptr_t>(params.tp));
+                        mix(reinterpret_cast<std::uintptr_t>(params.counted_exchange.get()));
+                        mix(reinterpret_cast<std::uintptr_t>(params.runtime));
+                        mix(reinterpret_cast<std::uintptr_t>(params.kernel_owner.get()));
+                        mix(reinterpret_cast<std::uintptr_t>(params.fixed_down.get()));
+                        mix(fnv1a64(params.prefix.data(), params.prefix.size()));
+                        for (const auto &tensor : {params.hidden, params.routing_indices, params.routing_weights,
+                                params.local_packet, params.gathered_packets, params.local_route_columns,
+                                params.local_columns, params.gathered_columns, params.output})
+                        { mix(reinterpret_cast<std::uintptr_t>(tensor.tensor)); mix(static_cast<std::uint64_t>(tensor.id)); }
+                        if (!declaration_signature) declaration_signature = 1;
+                    }
                 }
-                owner_plan.emplace(rocm::planMoERouteOwnedGateUp(rocm::MoERouteOwnedGateUpGeometry::TN64,
-                    envelope, device().rocm_ordinal(), rocm::compiledMoERouteOwnedModelPartitionExecution(),
-                    {.output_columns = geometry.intermediate_columns, .reduction_columns = geometry.model_columns}));
-                declaration_signature = owner_plan->identity();
-                // The immutable launch mode/shape/source-policy intent exists
-                // before the first cache hash. Descriptor payload pointers are
-                // runtime table contents, not additional embedded graph operands.
-                // Original prepare/export/upload and workspace leases remain their
-                // sole authority; materialization must validate this same intent.
-                const auto mix = [&](std::uint64_t word) { declaration_signature = (declaration_signature ^ word) * kFNV1a64Prime; };
-                mix(params.rows); mix(params.top_k);
-                mix(static_cast<std::uint64_t>(params.demand)); mix(static_cast<std::uint64_t>(params.service_phase));
-                mix(reinterpret_cast<std::uintptr_t>(params.tp));
-                mix(reinterpret_cast<std::uintptr_t>(params.counted_exchange.get()));
-                mix(reinterpret_cast<std::uintptr_t>(params.runtime));
-                mix(reinterpret_cast<std::uintptr_t>(params.kernel_owner.get()));
-                mix(reinterpret_cast<std::uintptr_t>(params.fixed_down.get()));
-                mix(fnv1a64(params.prefix.data(), params.prefix.size()));
-                for (const auto &tensor : {params.hidden, params.routing_indices, params.routing_weights,
-                        params.local_packet, params.gathered_packets, params.local_route_columns,
-                        params.local_columns, params.gathered_columns, params.output})
-                { mix(reinterpret_cast<std::uintptr_t>(tensor.tensor)); mix(static_cast<std::uint64_t>(tensor.id)); }
-                if (!declaration_signature) declaration_signature = 1;
             }
 #endif
             layout = {deviceMoEWeightFormatIsFloating(family) ? MoEGroupedIntermediateEncoding::FP32

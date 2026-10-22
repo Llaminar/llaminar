@@ -5,10 +5,13 @@
  * Native symbol inspection belongs to the explicit ROCm integration test.
  * These tests instantiate no backend, initialize no device and cannot forge a
  * resource admission merely to exercise a scoped selector on a CPU.
+ * The actual model selector consumes synthetic immutable startup observations
+ * here; native binding and its recorded physical leaves remain integration proofs.
  */
 #include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
 #include <gtest/gtest.h>
 #include <set>
+#include <limits>
 #include <type_traits>
 
 using namespace llaminar2::rocm;
@@ -222,4 +225,157 @@ TEST(ROCmMoERouteOwnedGeometry, ImmutableOwnerPlanRejectsContradictoryAxes)
     auto oversize = partitions; oversize[5]=9;
     reject(MoERouteOwnedGateUpGeometry::TN64, envelope, 0, P::FourWorkerPlanes, shape, oversize);
     EXPECT_NE(moeRouteOwnedGateUpPlanIdentity(MoERouteOwnedGateUpGeometry::TN64, envelope, 0, P::Serial, {}, {}), 0u);
+}
+
+namespace
+{
+/** @brief Device-free authored facts; no entry is a backend, live owner map or capability. */
+struct AutomaticOwnerFacts
+{
+    llaminar2::rocm::MoERouteOwnedModelOperation operation{
+        .shape = {.output_columns = 640, .reduction_columns = 2560},
+        .rows = 1, .experts = 512, .top_k = 10,
+        .phase = llaminar2::MoEOverlayServicePhaseHint::Decode};
+    std::vector<llaminar2::GlobalDeviceAddress> participants;
+    std::vector<float> weights;
+    std::vector<llaminar2::ComputeDevice> devices;
+    std::vector<llaminar2::NativeVnniSourceIdentity> sources{{5, true, true}, {5, true, true}};
+
+    /** @brief Publish plain synthetic MI50 addresses and startup facts without linking runtime discovery. */
+    AutomaticOwnerFacts()
+    {
+        for (int ordinal = 0; ordinal < 4; ++ordinal)
+        {
+            participants.push_back(llaminar2::GlobalDeviceAddress{
+                .device_type = llaminar2::DeviceType::ROCm, .device_ordinal = ordinal});
+            llaminar2::ComputeDevice device{};
+            device.type = llaminar2::ComputeBackendType::GPU_ROCM; device.device_id = ordinal;
+            device.name = "AMD Instinct MI60 / MI50 (gfx906)";
+            device.compute_capability = 906; device.compute_units = 60;
+            devices.push_back(device);
+        }
+    }
+    /**
+     * @brief Invoke the exact production selector, not a test copy of eligibility.
+     * @param policy Explicit or Automatic authored build policy.
+     * @param backend Actual resolved local collective family in this synthetic observation.
+     * @return Resolved physical execution; still no native resource capability.
+     */
+    MoERouteOwnedGateUpPartitionExecution select(
+        MoERouteOwnedModelPartitionPolicy policy = MoERouteOwnedModelPartitionPolicy::Automatic,
+        llaminar2::CollectiveBackendType backend = llaminar2::CollectiveBackendType::RCCL) const
+    {
+        return selectMoERouteOwnedModelPartitionExecution(policy, operation, participants, weights, backend, devices, sources);
+    }
+};
+}
+
+/** @test Original source flags and exact startup/domain facts qualify the bounded default. */
+TEST(ROCmMoERouteOwnedGeometry, AutomaticOwnerPolicySelectsMeasuredSourceAndDomain)
+{
+    using E = MoERouteOwnedGateUpPartitionExecution;
+    for (const std::uint8_t source : std::array<std::uint8_t, 2>{5, 7})
+        for (const bool weights : {false, true})
+        {
+            AutomaticOwnerFacts facts;
+            facts.sources = {{source, true, true}, {source, true, true}};
+            if (weights) facts.weights = {.25f, .25f, .25f, .25f};
+            EXPECT_EQ(facts.select(), E::FourWorkerPlanes);
+            std::reverse(facts.participants.begin(), facts.participants.end());
+            EXPECT_EQ(facts.select(), E::FourWorkerPlanes) << "native membership, not ordinal order, is authoritative";
+        }
+    static_assert(static_cast<int>(E::Serial) == 0 && static_cast<int>(E::FourWorkerPlanes) == 1);
+    static_assert(static_cast<int>(MoERouteOwnedModelPartitionPolicy::Serial) == 0 &&
+        static_cast<int>(MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes) == 1);
+}
+
+/** @test A single different physical/semantic/source axis keeps the defined original default. */
+TEST(ROCmMoERouteOwnedGeometry, AutomaticOwnerPolicyRejectsUnmeasuredAxes)
+{
+    using E = MoERouteOwnedGateUpPartitionExecution;
+    const auto reject = [](const AutomaticOwnerFacts &facts) { EXPECT_EQ(facts.select(), E::Serial); };
+    auto facts = AutomaticOwnerFacts{}; facts.operation.rows = 2; reject(facts);
+    facts = {}; facts.operation.shape.output_columns = 96; reject(facts);
+    facts = {}; facts.operation.shape.reduction_columns = 640; reject(facts);
+    facts = {}; facts.operation.experts = 32; reject(facts);
+    facts = {}; facts.operation.top_k = 16; reject(facts);
+    facts = {}; facts.operation.has_live_rows = true; reject(facts);
+    for (const auto phase : {llaminar2::MoEOverlayServicePhaseHint::Auto,
+             llaminar2::MoEOverlayServicePhaseHint::Prefill, llaminar2::MoEOverlayServicePhaseHint::GroupedVerifier})
+    { facts = {}; facts.operation.phase = phase; reject(facts); }
+    facts = {}; facts.participants.pop_back(); reject(facts);
+    facts = {}; facts.participants.back() = facts.participants.front(); reject(facts);
+    facts = {}; facts.participants.back().hostname = "another-host"; reject(facts);
+    facts = {}; facts.weights = {.1f, .2f, .3f, .4f}; reject(facts);
+    facts = {}; facts.weights = {-1.f, -1.f, -1.f, -1.f}; reject(facts);
+    facts = {}; EXPECT_EQ(facts.select(MoERouteOwnedModelPartitionPolicy::Automatic,
+        llaminar2::CollectiveBackendType::HOST), E::Serial);
+    facts = {}; facts.devices.back().type = llaminar2::ComputeBackendType::GPU_CUDA; reject(facts);
+    facts = {}; facts.devices.back().compute_capability = 908; reject(facts);
+    facts = {}; facts.devices.back().compute_units = 64; reject(facts);
+    facts = {}; facts.devices.back().name = "unmeasured gfx906 card"; reject(facts);
+    facts = {}; facts.devices.clear(); reject(facts);
+    facts = {}; facts.devices.push_back(facts.devices.front()); reject(facts);
+    facts = {}; facts.sources.clear(); reject(facts);
+    facts = {}; facts.sources.back().present = false; reject(facts);
+    facts = {}; facts.sources.back().is_superblock = false; reject(facts);
+    facts = {}; facts.sources.back().codebook_id = 7; reject(facts);
+    facts = {}; facts.sources = {{19, false, true}, {19, false, true}}; reject(facts);
+}
+
+/** @test Complete unmeasured degree/backend membership cannot enter the measured TP4 default. */
+TEST(ROCmMoERouteOwnedGeometry, AutomaticOwnerPolicyRejectsUnmeasuredParticipantFamilies)
+{
+    using E = MoERouteOwnedGateUpPartitionExecution;
+    for (const int degree : {1, 2, 8})
+    {
+        AutomaticOwnerFacts facts;
+        const auto prototype = facts.devices.front();
+        facts.participants.clear(); facts.devices.clear();
+        for (int ordinal = 0; ordinal < degree; ++ordinal)
+        {
+            facts.participants.push_back(llaminar2::GlobalDeviceAddress{
+                .device_type = llaminar2::DeviceType::ROCm, .device_ordinal = ordinal});
+            auto device = prototype; device.device_id = ordinal;
+            facts.devices.push_back(device);
+        }
+        EXPECT_EQ(facts.select(), E::Serial) << "degree=" << degree;
+    }
+    for (const bool cpu : {false, true})
+    {
+        AutomaticOwnerFacts facts;
+        for (int rank = 0; rank < 4; ++rank)
+            facts.participants[rank] = cpu ? llaminar2::GlobalDeviceAddress{.numa_node = rank, .device_type = llaminar2::DeviceType::CPU}
+                                          : llaminar2::GlobalDeviceAddress{.device_type = llaminar2::DeviceType::CUDA, .device_ordinal = rank};
+        EXPECT_EQ(facts.select(), E::Serial) << (cpu ? "CPU" : "CUDA");
+        facts = {};
+        facts.participants[2] = cpu ? llaminar2::GlobalDeviceAddress{.numa_node = 2, .device_type = llaminar2::DeviceType::CPU}
+                                   : llaminar2::GlobalDeviceAddress{.device_type = llaminar2::DeviceType::CUDA, .device_ordinal = 2};
+        EXPECT_EQ(facts.select(), E::Serial) << (cpu ? "mixed CPU/ROCm" : "mixed CUDA/ROCm");
+    }
+    for (const auto weights : {std::vector<float>{.25f, .25f},
+             std::vector<float>{std::numeric_limits<float>::quiet_NaN(), .25f, .25f, .25f},
+             std::vector<float>{.25f, .25f, .25f, std::numeric_limits<float>::infinity()}})
+    {
+        AutomaticOwnerFacts facts; facts.weights = weights;
+        EXPECT_EQ(facts.select(), E::Serial);
+    }
+    for (const auto shape : {MoERouteOwnedProjectionShape{639,2560}, {641,2560},
+                             {640,2559}, {640,2561}, {0,2560}, {640,0}})
+    {
+        AutomaticOwnerFacts facts; facts.operation.shape = shape;
+        EXPECT_EQ(facts.select(), E::Serial);
+    }
+}
+
+/** @test Explicit original/Four remain first-class; corrupt intent is never silently normalized. */
+TEST(ROCmMoERouteOwnedGeometry, AutomaticOwnerPolicyPreservesExplicitModes)
+{
+    AutomaticOwnerFacts facts;
+    EXPECT_EQ(facts.select(MoERouteOwnedModelPartitionPolicy::Serial), MoERouteOwnedGateUpPartitionExecution::Serial);
+    facts.operation = {};
+    facts.devices.clear(); facts.sources.clear(); facts.participants.clear();
+    EXPECT_EQ(facts.select(MoERouteOwnedModelPartitionPolicy::Serial), MoERouteOwnedGateUpPartitionExecution::Serial);
+    EXPECT_EQ(facts.select(MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes), MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes);
+    EXPECT_THROW((void)facts.select(static_cast<MoERouteOwnedModelPartitionPolicy>(255)), std::invalid_argument);
 }

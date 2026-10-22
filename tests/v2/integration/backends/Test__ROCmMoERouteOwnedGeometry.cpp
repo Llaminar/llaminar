@@ -571,8 +571,8 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
                 const auto intent_before_resources = plan.identity();
                 const auto capability = admitMoERouteOwnedGateUpGeometry(plan);
                 ASSERT_EQ(plan.identity(), intent_before_resources);
-                const bool selected = compiledMoERouteOwnedModelPartitionExecution() ==
-                    MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes;
+                const bool selected = compiledMoERouteOwnedModelPartitionPolicy() ==
+                    MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes;
                 const auto expected_intent = selected ? plan.identity() : 0u;
                 EXPECT_THROW((void)kernel->prepareOwnerGateUpCaptureBinding(gate_table, rows,
                     plan.identity() ^ 1u), std::logic_error);

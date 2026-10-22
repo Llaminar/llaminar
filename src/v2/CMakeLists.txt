@@ -106,16 +106,16 @@ option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 option(LLAMINAR_BUILD_TESTS "Configure and build Llaminar V2 tests" ON)
 
-# Explicit source-bound model experiment only. No serving option, environment
-# selector or installed policy is created; ordinary builds remain serial.
-set(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS "serial" CACHE STRING
-    "Experimental physical-M1 owner gate/up partition execution: serial|four_worker_planes")
-set_property(CACHE LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS PROPERTY STRINGS serial four_worker_planes)
-if(NOT LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS MATCHES "^(serial|four_worker_planes)$")
-    message(FATAL_ERROR "Invalid LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS; use serial or four_worker_planes")
+# Source-bound model policy: Automatic selects only the measured native owner
+# operation. Explicit Serial/Four remain first-class; no serving/env override.
+set(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS "automatic" CACHE STRING
+    "Physical-M1 owner gate/up policy: automatic|serial|four_worker_planes")
+set_property(CACHE LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS PROPERTY STRINGS automatic serial four_worker_planes)
+if(NOT LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS MATCHES "^(automatic|serial|four_worker_planes)$")
+    message(FATAL_ERROR "Invalid LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS; use automatic, serial or four_worker_planes")
 endif()
 if(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS STREQUAL "four_worker_planes" AND NOT HAVE_ROCM)
-    message(FATAL_ERROR "Experimental owner partition planes require the ROCm backend")
+    message(FATAL_ERROR "Explicit owner partition planes require the ROCm backend")
 endif()
 
 set(LLAMINAR_SHARED_CORE_DEFAULT OFF)
@@ -2317,11 +2317,14 @@ if(HAVE_ROCM)
     if(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS STREQUAL "four_worker_planes")
         set_property(SOURCE kernels/rocm/moe/ROCmMoEKernel.cpp APPEND PROPERTY
             COMPILE_DEFINITIONS LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES=1)
-    else()
+    elseif(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS STREQUAL "serial")
         set_property(SOURCE kernels/rocm/moe/ROCmMoEKernel.cpp APPEND PROPERTY
             COMPILE_DEFINITIONS LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES=0)
+    else()
+        set_property(SOURCE kernels/rocm/moe/ROCmMoEKernel.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES=2)
     endif()
-    message(STATUS "V2: Compiled ROCm M1 owner partition experiment: ${LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS}")
+    message(STATUS "V2: Compiled ROCm M1 owner partition policy: ${LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS}")
 
     if(LLAMINAR_SHARED_CORE)
         target_include_directories(llaminar2_core PUBLIC

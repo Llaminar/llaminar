@@ -7,12 +7,13 @@
  * column ownership or execution of independent original K partitions; decoding,
  * source-owned partition boundaries, per-partition contribution arithmetic,
  * SwiGLU preparation and ordered down publication remain production code.
- * The default binary retains ordinary Q6_K/IQ2_S subgroup policies. A separately
- * configured source-bound experiment may attach an immutable capability to an
+ * Automatic model policy selects the measured MI50 native owner operation;
+ * explicit Serial retains ordinary Q6_K/IQ2_S subgroup policies. Selection may
+ * attach an immutable capability to an
  * original runtime descriptor table; it uses the same launcher without TLS model
  * policy. Logical plan identity exists before graph hashing, while cold resource
- * admission remains separate. There is no serving environment switch, installed
- * winner, allocation authority or replay probe.
+ * admission remains separate. There is no serving environment switch,
+ * independent allocation authority or replay probe.
  * Launch receipts authenticate host enqueue/capture, not hardware execution,
  * replay counts, complete graph-cache identity or whole-operation provenance.
  */
@@ -21,6 +22,13 @@
 #include "../../common/MoEPrefillProjectionExecution.h"
 #include "../../common/NativeVNNIGroupedDecodePolicy.h"
 #include "../../../tensors/NativeVnniFormatInfo.h"
+#include "../../../backends/ComputeBackend.h"
+#include "../../../config/CollectiveBackendType.h"
+#include "../../../execution/moe/DeviceMoEOverlayServiceTelemetry.h"
+#include <algorithm>
+#include <cmath>
+#include <span>
+#include <string_view>
 #include <bit>
 #include <array>
 #include <cstddef>
@@ -341,12 +349,114 @@ private:
     int maximum_;
 };
 
+/** @brief Authored compiled intent, separate from the unchanged physical execution enum. */
+enum class MoERouteOwnedModelPartitionPolicy : std::uint8_t
+{
+    Serial = 0, ///< Original unbound automatic kernels, including Q6/IQ2 K_LANES policies.
+    FourWorkerPlanes = 1, ///< Explicit existing resource-admitted owner M1 execution.
+    Automatic = 2 ///< Bounded measured operation; every other domain retains Serial.
+};
+
+/** @brief Immutable operation axes borrowed from the actual projection declaration. */
+struct MoERouteOwnedModelOperation
+{
+    MoERouteOwnedProjectionShape shape; ///< Physical gate/up N/K from original ownership.
+    int rows = 0; ///< Physical rows, not a live count or allocation capacity.
+    int experts = 0; ///< Original source inventory from fixed-down ownership.
+    int top_k = 0; ///< Original router width.
+    MoEOverlayServicePhaseHint phase = MoEOverlayServicePhaseHint::Auto; ///< Existing graph semantic phase.
+    bool has_live_rows = false; ///< Retained query-range inputs exclude the initial ordinary domain.
+};
+
 /**
- * @brief Report this source-bound binary's explicit experimental owner policy without querying HIP/env.
- * @return Serial by default; a separately configured experimental binary may request FourWorkerPlanes.
- * @note No serving config/default promotion or mutable process-wide selector is introduced.
+ * @brief Recognize only measured MI50/gfx906 from the existing startup observation.
+ * @param device Canonical DeviceManager entry; compute_capability is native gfx906->906 on ROCm.
+ * @return Whether exact architecture, CU count and reported card identity match.
+ * @note No native query, inventory publication or capacity accounting occurs here.
  */
-[[nodiscard]] MoERouteOwnedGateUpPartitionExecution compiledMoERouteOwnedModelPartitionExecution() noexcept;
+[[nodiscard]] inline bool moeRouteOwnedModelMeasuredDevice(const ComputeDevice &device) noexcept
+{
+    return device.type == ComputeBackendType::GPU_ROCM && device.compute_capability == 906 &&
+        device.compute_units == 60 && device.name.find("MI50") != std::string::npos;
+}
+
+/**
+ * @brief Classify the measured operation/domain before touching prepared source metadata.
+ * @param operation Actual stage axes and semantic query policy.
+ * @param participants Exact local-TP membership, never inferred from ordinal ordering.
+ * @param weights Actual proportional shares; empty is the existing equal policy.
+ * @param backend Resolved native collective backend.
+ * @param inventory Borrowed canonical startup devices; never retained across reinitialization.
+ * @return Whether the bounded ordinary domain matches without live routing/count inspection.
+ */
+[[nodiscard]] inline bool moeRouteOwnedModelMeasuredDomain(const MoERouteOwnedModelOperation &operation,
+    std::span<const GlobalDeviceAddress> participants, std::span<const float> weights,
+    CollectiveBackendType backend, std::span<const ComputeDevice> inventory) noexcept
+{
+    if (operation.rows != 1 || operation.shape.output_columns != 640 || operation.shape.reduction_columns != 2560 ||
+        operation.experts != 512 || operation.top_k != 10 || operation.has_live_rows ||
+        operation.phase != MoEOverlayServicePhaseHint::Decode || participants.size() != 4 ||
+        backend != CollectiveBackendType::RCCL) return false;
+    if (!weights.empty() && (weights.size() != 4 || !std::isfinite(weights.front()) || weights.front() <= 0 ||
+        !std::all_of(weights.begin(), weights.end(), [&](float value) { return value == weights.front(); }))) return false;
+    for (std::size_t index = 0; index < participants.size(); ++index)
+    {
+        const auto &address = participants[index];
+        if (address.device_type != DeviceType::ROCm || address.hostname != participants.front().hostname ||
+            std::any_of(participants.begin(), participants.begin() + index,
+                [&](const auto &prior) { return prior.device_ordinal == address.device_ordinal; })) return false;
+        const ComputeDevice *observed = nullptr;
+        for (const auto &device : inventory)
+            if (device.type == ComputeBackendType::GPU_ROCM && device.device_id == address.device_ordinal)
+            {
+                if (observed) return false;
+                observed = &device;
+            }
+        if (!observed || !moeRouteOwnedModelMeasuredDevice(*observed)) return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Resolve compiled intent from the actual operation and original prepared source identities.
+ * @param policy Authored source-bound intent; explicit choices remain authoritative.
+ * @param operation Actual stage axes; this pure result is not a resource capability.
+ * @param participants Original local communicator membership.
+ * @param weights Original local vocabulary-independent TP shares.
+ * @param backend Resolved collective transport.
+ * @param inventory Existing immutable startup observation.
+ * @param sources Inspected original gate/up identities, including superblock provenance.
+ * @return Four only for an explicit request or the complete measured Automatic tuple.
+ * @throws std::invalid_argument For an unknown authored policy.
+ * @note Serial means original production automatic kernels, never forced diagnostic Serial/K1.
+ */
+[[nodiscard]] inline MoERouteOwnedGateUpPartitionExecution selectMoERouteOwnedModelPartitionExecution(
+    MoERouteOwnedModelPartitionPolicy policy, const MoERouteOwnedModelOperation &operation,
+    std::span<const GlobalDeviceAddress> participants, std::span<const float> weights,
+    CollectiveBackendType backend, std::span<const ComputeDevice> inventory,
+    std::span<const NativeVnniSourceIdentity> sources)
+{
+    using Execution = MoERouteOwnedGateUpPartitionExecution;
+    if (policy == MoERouteOwnedModelPartitionPolicy::Serial) return Execution::Serial;
+    if (policy == MoERouteOwnedModelPartitionPolicy::FourWorkerPlanes) return Execution::FourWorkerPlanes;
+    if (policy != MoERouteOwnedModelPartitionPolicy::Automatic)
+        throw std::invalid_argument("unknown compiled ROCm owner partition policy");
+    if (!moeRouteOwnedModelMeasuredDomain(operation, participants, weights, backend, inventory) || sources.empty())
+        return Execution::Serial;
+    const auto family = sources.front().codebook_id;
+    if (family != native_vnni_formats::Q4_K.codebook_id && family != native_vnni_formats::Q5_K.codebook_id)
+        return Execution::Serial;
+    for (const auto &source : sources)
+        if (!source.present || !source.is_superblock || source.codebook_id != family) return Execution::Serial;
+    return Execution::FourWorkerPlanes;
+}
+
+/**
+ * @brief Read source-bound intent without querying HIP, environment or device state.
+ * @return The CMake-authored Automatic, explicit Serial or explicit Four policy.
+ * @note Only the existing ROCm MoE bridge consumes the compile definition.
+ */
+[[nodiscard]] MoERouteOwnedModelPartitionPolicy compiledMoERouteOwnedModelPartitionPolicy() noexcept;
 
 class MoERouteOwnedGateUpAdmission;
 /**
