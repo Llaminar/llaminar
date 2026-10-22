@@ -82,6 +82,41 @@ namespace llaminar2
                 output[element] = sum;
             }
         }
+
+        /**
+         * @brief Replace only the original local-rank load, preserving every add.
+         * @param local Original immutable local partial, optionally the output.
+         * @param peers Source-indexed peer banks; own slot is never read.
+         * @param output Exact fixed-width destination, disjoint from peer banks.
+         * @param elements Exact fixed-message scalar extent.
+         * @param bank_stride Admitted peer-slot stride, not transmitted capacity.
+         * @param rank_count Original ordered physical membership size.
+         * @param local_rank Original communicator position, never a device ordinal.
+         *
+         * Each thread reads its own local column before writing that column, so
+         * exact local/output alias is safe after every local send completed.
+         * There is no restrict promise between local and output. FP32 addition
+         * order and round-to-nearest semantics match the original full-bank fold.
+         */
+        __global__ void rankOrderedLocalSumFP32Kernel(
+            const float *local, const float *__restrict__ peers, float *output,
+            std::size_t elements, std::size_t bank_stride,
+            int rank_count, int local_rank)
+        {
+            const std::size_t first = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+            const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+            for (std::size_t element = first; element < elements; element += stride)
+            {
+                float sum = local_rank == 0 ? local[element] : peers[element];
+                for (int rank = 1; rank < rank_count; ++rank)
+                {
+                    const float contribution = rank == local_rank ? local[element]
+                        : peers[static_cast<std::size_t>(rank) * bank_stride + element];
+                    sum = __fadd_rn(sum, contribution);
+                }
+                output[element] = sum;
+            }
+        }
     } // namespace
 
     /**
@@ -149,6 +184,27 @@ namespace llaminar2
         const unsigned int blocks = static_cast<unsigned int>(blocks_needed > 65535u ? 65535u : blocks_needed);
         hipLaunchKernelGGL(rankOrderedLiveSumFP32Kernel, dim3(blocks), dim3(kThreadsPerBlock), 0,
             static_cast<hipStream_t>(stream), rank_banks, output, rows.rows(), rows.elementsPerRow(), rank_count);
+        return hipPeekAtLastError() == hipSuccess;
+    }
+
+    /**
+     * @brief Submit only a previously validated immutable local-aware operand set.
+     * @param launch Complete fixed-message geometry with explicit communicator rank.
+     * @param device_index Actual ROCm ordinal owning all borrowed pointers.
+     * @param stream Exact non-null ordered graph/execution stream.
+     * @return Whether device selection and native enqueue succeeded, without retry.
+     */
+    bool launchROCmTPRankOrderedLocalSumFP32(
+        const TPRankOrderedLocalSumFP32 &launch, int device_index, void *stream)
+    {
+        if (!tpRankOrderedLocalLaunchValid(device_index, stream)) return false;
+        if (hipSetDevice(device_index) != hipSuccess) return false;
+        const std::size_t needed = 1 + (launch.elements() - 1) / kThreadsPerBlock;
+        const unsigned int blocks = static_cast<unsigned int>(needed > 65535u ? 65535u : needed);
+        hipLaunchKernelGGL(rankOrderedLocalSumFP32Kernel, dim3(blocks), dim3(kThreadsPerBlock), 0,
+            static_cast<hipStream_t>(stream), launch.local().data, launch.peerBanks(),
+            launch.output(), launch.elements(), launch.bankStride(), launch.rankCount(),
+            launch.local().participant_index);
         return hipPeekAtLastError() == hipSuccess;
     }
 } // namespace llaminar2

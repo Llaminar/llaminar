@@ -30570,6 +30570,70 @@ endif()
 # optional --comparison original_vs_short_k mode. No new timing framework,
 # model-file-dependent preflight test or production runtime switch is added.
 
+# Original fixed-message channel owners and exact local-aware rank arithmetic.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_executable(v2_unit_tp_rank_ordered_local_sum
+        unit/kernels/Test__TPRankOrderedLocalSum.cpp)
+    target_include_directories(v2_unit_tp_rank_ordered_local_sum PRIVATE ${PROJECT_SOURCE_DIR})
+    target_compile_features(v2_unit_tp_rank_ordered_local_sum PRIVATE cxx_std_20)
+    target_link_libraries(v2_unit_tp_rank_ordered_local_sum PRIVATE GTest::gtest_main)
+    add_v2_test(V2_Unit_TPRankOrderedLocalSum
+        COMMAND $<TARGET_FILE:v2_unit_tp_rank_ordered_local_sum>
+        LABELS "V2;Unit;Collective;Transfer;Memory;DeviceFree"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_TPRankOrderedLocalSumContract
+        COMMAND $<TARGET_FILE:v2_unit_tp_rank_ordered_local_sum>
+        LABELS "V2;Integration;ProductionTestPreflight;Collective;Transfer;Memory;DeviceFree;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    if(TEST V2_Integration_TPRankOrderedLocalSumContract)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TPRankOrderedLocalSumContract)
+    endif()
+    if(TARGET v2_integration_captured_transfer_channel)
+        target_sources(v2_integration_captured_transfer_channel PRIVATE
+            integration/transfer/Test__CapturedFixedRankGather.cpp)
+        foreach(_fixed_pair CUDA2 ROCm4)
+            if((_fixed_pair STREQUAL "CUDA2" AND HAVE_CUDA) OR (_fixed_pair STREQUAL "ROCm4" AND HAVE_ROCM))
+                if(_fixed_pair STREQUAL "CUDA2")
+                    set(_fixed_backend CUDA)
+                else()
+                    set(_fixed_backend ROCm)
+                endif()
+                add_v2_test(V2_Integration_CapturedFixedRankGather_${_fixed_pair}
+                    COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
+                        --gtest_filter=CapturedFixedRankGather.${_fixed_pair}
+                    LABELS "V2;Integration;ProductionTestPreflight;${_fixed_backend};GPU;Transfer;Collective;ByteExact;Memory;Regression"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+                if(TEST V2_Integration_CapturedFixedRankGather_${_fixed_pair})
+                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedFixedRankGather_${_fixed_pair})
+                endif()
+            endif()
+        endforeach()
+    endif()
+endif()
+
+# Native argument metadata must size original, cloned and child graph pools.
+if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
+    set_source_files_properties(integration/backends/rocm/HIPGraphArgumentGeometryKernel.hip PROPERTIES LANGUAGE HIP)
+    add_executable(v2_integration_hip_graph_argument_geometry
+        integration/backends/rocm/Test__HIPGraphArgumentGeometry.cpp
+        integration/backends/rocm/HIPGraphArgumentGeometryKernel.hip
+        integration/mpi_gtest_main.cpp)
+    target_compile_features(v2_integration_hip_graph_argument_geometry PRIVATE cxx_std_20)
+    v2_test_device_scope(v2_integration_hip_graph_argument_geometry FullInventory)
+    target_link_libraries(v2_integration_hip_graph_argument_geometry PRIVATE llaminar2_core GTest::gtest)
+    add_v2_test(V2_Integration_HIPGraphArgumentGeometry
+        COMMAND $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>
+            --gtest_filter=HIPGraphArgumentGeometry.OriginalCloneUpdateChildFamily
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;HIP;GraphCapture;Memory;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+    if(TEST V2_Integration_HIPGraphArgumentGeometry)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPGraphArgumentGeometry)
+    endif()
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR
@@ -30709,6 +30773,28 @@ endif()
 
 # Timing targets must also exist when Release excludes functional preflight.
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/V2Qwen4ExpPerformanceTargets.cmake)
+
+# Matched fixed-message component timings remain available in Release builds.
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_perf_captured_fixed_rank_gather
+        performance/transfer/Perf__CapturedFixedRankGather.cpp integration/mpi_gtest_main.cpp)
+    v2_test_device_scope(v2_perf_captured_fixed_rank_gather FullInventory)
+    target_link_libraries(v2_perf_captured_fixed_rank_gather PRIVATE llaminar2_core GTest::gtest)
+    foreach(_fixed_pair CUDA2 ROCm4)
+        if((_fixed_pair STREQUAL "CUDA2" AND HAVE_CUDA) OR (_fixed_pair STREQUAL "ROCm4" AND HAVE_ROCM))
+            if(_fixed_pair STREQUAL "CUDA2")
+                set(_fixed_backend CUDA)
+            else()
+                set(_fixed_backend ROCm)
+            endif()
+            add_v2_test(V2_Perf_CapturedFixedRankGather_${_fixed_pair}
+                COMMAND $<TARGET_FILE:v2_perf_captured_fixed_rank_gather>
+                    --gtest_filter=CapturedFixedRankGatherEconomy.${_fixed_pair}
+                LABELS "V2;Performance;${_fixed_backend};Transfer;Collective;GraphCapture;SyntheticA1Geometry"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        endif()
+    endforeach()
+endif()
 
 # CTest's unrestricted parallel level is expressed in logical CPUs, whereas
 # unit-test worker budgets above are deliberately expressed in physical cores.

@@ -14,6 +14,8 @@
 # enabled; finite compute graphs retain the upstream single-queue optimization.
 # Retained events authenticate a live producer generation under the native
 # stream registry before inspecting capture state, including after retirement.
+# Final node-device argument metadata sizes retained graph pools, so large
+# by-value arguments do not roll over pools sized from stale constructor caches.
 #
 # Both development and release builders call this after installing ROCm's
 # compiler/SDK. The release image copies the resulting standard-SONAME DSO
@@ -35,6 +37,7 @@ hip_patches=(
     "${hip_script_dir}/patches/rocm-hip-sdma-event-publication.patch"
     "${hip_script_dir}/patches/rocm-hip-graph-progress-safe-collapse.patch"
     "${hip_script_dir}/patches/rocm-hip-event-producer-lifetime.patch"
+    "${hip_script_dir}/patches/rocm-hip-graph-kernarg-metadata.patch"
 )
 hip_library="${hip_prefix}/lib/libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}"
 # ROCm's package uses a zero Git stamp. Preserve its filename as an alias, not

@@ -4020,6 +4020,7 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("patches/rocm-hip-sdma-event-publication.patch", toolchain)
         self.assertIn("patches/rocm-hip-graph-progress-safe-collapse.patch", toolchain)
         self.assertIn("patches/rocm-hip-event-producer-lifetime.patch", toolchain)
+        self.assertIn("patches/rocm-hip-graph-kernarg-metadata.patch", toolchain)
         # Those four backports are part of the pinned upstream monorepo now.
         # Applying them again would make the upgrade a second orphaned repair.
         for old_patch in ("node-identity", "queue-placement", "packet-publication", "entry-ordering"):
@@ -4092,6 +4093,7 @@ class InfrastructureTests(unittest.TestCase):
                 ROOT / "scripts/docker/patches/rocm-hip-sdma-event-publication.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-event-producer-lifetime.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch",
             )
             parts = [pins[key] for key in ("LLAMINAR_ROCM_VERSION", "LLAMINAR_ROCM_DEB_VERSION",
                      "LLAMINAR_ROCM_SYSTEMS_REVISION", "LLAMINAR_HIP_LIBRARY_VERSION")]

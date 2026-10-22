@@ -238,3 +238,99 @@ request. Automatic selection remains the production baseline. Further tuning
 targets small decode messages explicitly while retaining an economical policy
 for large prefill messages. No environment selector or global native protocol
 default was installed.
+
+## Fixed-message channel component 76: exact, slower, not promoted
+
+The component compares the original native fixed-row AllGather plus full-bank
+ascending-rank FP32 fold with existing TransferEngine fixed-message channels
+plus a local-aware fold. The latter reads the original local contribution at its
+communicator position and gathers only the other participants' banks; it does
+not alter the order or rounding of additions. Permuted membership distinguishes
+communicator position from device ordinal. Functional checks cover independent
+native full-bank output bits, signed zeros/nonfinites, cancellation, in-place
+output, tails, poisoned own slots and retained large/small/large replay. This
+remains a separately named component, with no production transport attachment.
+
+The [CUDA P2 results](../../../../parity-results/qwen-flash-next/fixed-rank76-cuda-timing/analysis.json)
+and [ROCm P4 results on the isolated repaired HIP runtime](../../../../parity-results/qwen-flash-next/fixed-rank76-rocm-repaired-runtime-timing/analysis.json)
+retain five warmups and 31 paired measured samples per path/count, alternating
+path order and rotating first host rank. Timing uses identical packed H2560
+bank stride, aligned original source/bank/output offsets and separate immutable
+input/output. Per-participant event intervals include waits and host-arrival
+skew. They are not pure link latency or a model speedup prediction.
+
+| Backend / participants | Transactions | Native median µs/transaction | Channel median µs/transaction | Native range | Channel range |
+|---|---:|---:|---:|---:|---:|
+| CUDA / 2 | 1 | 49.792 | 51.872 | 46.240–66.720 | 49.312–67.712 |
+| CUDA / 2 | 97 | 15.101 | 18.994 | 14.812–15.327 | 18.793–19.906 |
+| ROCm / 4 | 1 | 170.560 | 164.800 | 127.199–201.279 | 122.400–204.800 |
+| ROCm / 4 | 97 | 41.519 | 45.209 | 41.122–43.771 | 44.282–46.431 |
+
+At 97 transactions the channel component is **25.8% slower on CUDA / 8.89%
+slower on ROCm**. The count-1 spread and different arrival sensitivity do not
+override that result. Both processes pass exactness, normal native retirement,
+unchanged source/runtime metadata and clean driver windows. The fixed messages
+are exactly 10,240 logical bytes per directed peer edge; physical-link receipts
+are unavailable. CUDA P2 is not an A1 TP4 topology result. Native communicator
+storage remains owned by its original context and is not falsely included in
+the small fixture's PMA BOM. No production integration or whole-model channel
+benchmark is warranted by this component outcome. Accepted A1 remains L74:
+**785.397 prefill / 33.882 decode tok/s**, with automatic native protocol.
+
+## HIP argument-geometry defect exposed by long retained families
+
+The initial long ROCm component exceeded its unchanged general graph-family
+admission. The cause was native HIP setup metadata: original kernel-node
+construction/cloning could leave `alignedKernArgSize` at its default 256 bytes before
+parent binding. Graph sizing summed those defaults while packet capture used
+the actual kernel/device argument width, forcing repeated pool rollovers. This
+was not evidence that the model needed a larger reserve. The
+[scoped vendor patch](../../../../scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch)
+resolves actual original node/device metadata before recursive sizing, retains
+original device identity across cloning, and propagates metadata/overflow
+errors. It changes neither arithmetic, public ABI nor PMA budgets.
+
+The focused `HIPGraphArgumentGeometry.OriginalCloneUpdateChildFamily` proof
+uses 97 nodes with a declared 4096-byte trivial argument packet, four retained
+original/clone/updated-clone/child variants, and three unchanged replays per
+variant. Host argument storage is overwritten after native construction;
+original copied arguments, exact outputs and suffix guards must survive.
+Terminal events, final original device and zero PMA claims after retirement are
+checked. The compiled gfx906 code object reports a 4096-byte argument segment with
+8-byte compiler alignment; the runtime applies 128-byte alignment. Its kernel
+uses 6 VGPRs and 11 SGPRs with no spills, private storage or shared memory.
+The fixture consumes the declared packet directly, without a private copy.
+
+The [meaningful original-runtime negative](../../../../parity-results/qwen-flash-next/hip-kernarg76-original-native-negative/native.log)
+records **6 MiB per variant / 24 MiB total** against the existing **8 MiB** family
+budget, then fails that exact admission check with native exit 1. The failed
+receipt remains failed, with no kill/survivors, unchanged source/runtime and a
+clean driver window. The
+[isolated repaired-runtime positive](../../../../parity-results/qwen-flash-next/hip-kernarg76-repaired-native-positive/native.log)
+records **2 MiB per variant / 8 MiB total**, passes the same budget and all
+four-variant/three-replay exact-output checks, and retires with native exit 0 cleanly.
+Total-device-memory identity is unchanged throughout both setup observations.
+The earlier `hip-kernarg76-original-negative` attempt only lacked a built
+executable after compilation failed; it is preserved as setup failure and is
+**not** a numerical or runtime-budget negative.
+
+The isolated dependency's source/patch receipt is retained at
+`/tmp/qfn-hip-kernarg76-runtime/share/llaminar/hip-graph-runtime.txt`; selected DSO
+and loader facts are attached to the original negative, repaired positive and
+ROCm component receipts. These do not imply the installed runtime has been
+promoted or that complete preflight/model qualification passed. The surrounding [24 model-free graph/lifetime/packaging tests](../../../../parity-results/qwen-flash-next/hip-kernarg76-related-gates/result.json)
+passed with no skips, normal retirement and a clean driver window. The complete
+[Unit inventory](../../../../parity-results/qwen-flash-next/hip-kernarg76-complete-unit/result.json)
+also passed **757/757**. The frozen [A1 Release accuracy slice](../../../../parity-results/qwen-flash-next/hip-kernarg76-release-accuracy/report.json)
+is green with exact reset replay, normal native retirement and a clean driver
+window. All **26 files / 185 logit rows** are byte-identical to accepted L74,
+including required and diagnostic rows. The observer/core are unchanged copies
+of the real Release files; passive loader receipts prove the isolated repaired
+HIP DSO was selected. No model throughput improvement is claimed by this runtime
+repair. All-model and full production preflight qualification remain pending.
+
+Focused registration is explicit: `V2_Integration_HIPGraphArgumentGeometry`,
+`V2_Integration_TPRankOrderedLocalSumContract`, and
+`V2_Integration_CapturedFixedRankGather_CUDA2` / `_ROCm4` belong to
+`ProductionTestPreflight`. Unit geometry and opt-in performance aliases are
+separate; timing does not substitute for those correctness entries.

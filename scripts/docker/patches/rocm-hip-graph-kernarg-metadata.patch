@@ -1,0 +1,255 @@
+From: Llaminar HIP graph kernel-argument ownership repair
+Subject: [PATCH] Resolve final node-device argument geometry before graph pool sizing
+
+Original construction and cloning copy kernel parameters before parent binding,
+leaving the cached argument width at its default256. Packet capture consumes the
+actual postLoad compiler/runtime width and alignment, so the underestimated pool
+rolls over into additional allocations. Resolve each original kernel/device at
+setup before recursive sizing, preserve its device across cloning, and propagate
+metadata/overflow errors. Keep graph reserves, execution and public ABI unchanged.
+
+Apply after the existing ordered HIP runtime patches at projects/clr.
+Pinned upstream: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9.
+Exact development baseline: selected hip-event-lease-source; see package manifest.
+
+diff --git a/hipamd/src/hip_graph_internal.hpp b/hipamd/src/hip_graph_internal.hpp
+--- a/hipamd/src/hip_graph_internal.hpp
++++ b/hipamd/src/hip_graph_internal.hpp
+@@ -5,9 +5,20 @@
+  */
+ 
+ #pragma once
++/**
++ * @file hip_graph_internal.hpp
++ * @brief Native HIP graph owners and capture-time argument storage contracts.
++ *
++ * Kernel argument metadata is resolved against each retained node's original
++ * device before graph argument pools are sized. Construction and cloning may
++ * run before a parent graph is bound, so default cached widths cannot authorize
++ * allocation. No graph launch, transport or application memory policy lives in
++ * this metadata repair.
++ */
+ #include <algorithm>
+ #include <atomic>
+ #include <queue>
++#include <limits>
+ #include <stack>
+ #include <iostream>
+ #include <unordered_map>
+@@ -1145,7 +1156,12 @@
+   }
+   GraphKernelArgManager* GetKernelArgManager() { return kernArgManager_; }
+   hipError_t CaptureAndFormPacketsForGraph();
+-  void GetKernelArgSizeForGraph(std::unordered_map<int, size_t>& kernArgSizeForGraph);
++  /**
++   * @brief Resolve final node-device metadata and bound all captured arguments.
++   * @param kernArgSizeForGraph Existing per-device total shared with child graphs.
++   * @return hipSuccess or an explicit device/metadata/overflow error before allocation.
++   */
++  hipError_t GetKernelArgSizeForGraph(std::unordered_map<int, size_t>& kernArgSizeForGraph);
+ 
+   //! out_signal_set, when non-null, marks the top-level launch path: signals
+   //! are taken from the per-graph pool and returned via this out-parameter so
+@@ -1427,6 +1443,10 @@
+  protected:
+   // Copy Constructor. This is protected to prevent accidental copies causing unexpected behaviors.
+   GraphKernelNode(const GraphKernelNode& rhs) : GraphNode(rhs) {
++    // GraphNode's generic copy starts from the calling thread's device. Kernel
++    // parameters and their compiler metadata belong to the original node, even
++    // when a graph/child is cloned from a different current-device context.
++    dev_id_ = rhs.dev_id_;
+     kernelParams_ = rhs.kernelParams_;
+     kernelEvents_ = rhs.kernelEvents_;
+     coopKernel_ = rhs.coopKernel_;
+@@ -1577,6 +1597,61 @@
+     return func;
+   }
+ 
++  /**
++   * @brief Resolve compiler argument geometry using the final original node device.
++   * @param params Exact original or newly validated kernel parameters.
++   * @return hipSuccess, hipErrorInvalidDevice, or hipErrorInvalidDeviceFunction.
++   *
++   * Parent binding is intentionally irrelevant: constructors and clones copy
++   * parameters before Graph::AddNode/clone attaches their parent. Resolve the
++   * actual device kernel instead of copying those nodes' default cache values.
++   * All fields publish together only after complete validation. A legitimate
++   * zero-byte argument segment remains valid; absent metadata does not.
++   */
++  hipError_t ResolveKernelArgMetadata(const hipKernelNodeParams& params) {
++    if (dev_id_ < 0 || static_cast<size_t>(dev_id_) >= g_devices.size() ||
++        g_devices[dev_id_] == nullptr || g_devices[dev_id_]->devices().empty() ||
++        g_devices[dev_id_]->devices()[0] == nullptr) {
++      ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
++              "[hipGraph] Cannot resolve kernel arguments for invalid node device %d", dev_id_);
++      return hipErrorInvalidDevice;
++    }
++    hipFunction_t func = getFunc(params, dev_id_);
++    if (func == nullptr) {
++      ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
++              "[hipGraph] Missing kernel function for argument sizing on device %d", dev_id_);
++      return hipErrorInvalidDeviceFunction;
++    }
++    const amd::Kernel* kernel = hip::asKernel(func);
++    const auto* device = g_devices[dev_id_]->devices()[0];
++    const device::Kernel* deviceKernel = kernel == nullptr ? nullptr : kernel->getDeviceKernel(*device);
++    if (deviceKernel == nullptr) {
++      ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
++              "[hipGraph] Missing device kernel metadata for argument sizing on device %d", dev_id_);
++      return hipErrorInvalidDeviceFunction;
++    }
++    const size_t bytes = deviceKernel->KernargSegmentByteSize();
++    const size_t alignment = deviceKernel->KernargSegmentAlignment();
++    if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
++        bytes > std::numeric_limits<size_t>::max() - (alignment - 1)) {
++      ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
++              "[hipGraph] Invalid kernel argument geometry: device %d bytes %zu alignment %zu",
++              dev_id_, bytes, alignment);
++      return hipErrorInvalidDeviceFunction;
++    }
++    resolvedFunc_ = func;
++    kernargSegmentByteSize_ = bytes;
++    kernargSegmentAlignment_ = alignment;
++    alignedKernArgSize_ = amd::alignUp(bytes, alignment);
++    return hipSuccess;
++  }
++
++  /**
++   * @brief Refresh the exact retained parameters before aggregate pool sizing.
++   * @return Explicit metadata/device failure without a guessed cache or allocation.
++   */
++  hipError_t RefreshKernelArgMetadata() { return ResolveKernelArgMetadata(kernelParams_); }
++
+   hipError_t copyParams(const hipKernelNodeParams* pNodeParams) {
+     hasHiddenHeap_ = false;
+     hipFunction_t func = getFunc(*pNodeParams, dev_id_);
+@@ -1586,12 +1661,8 @@
+     resolvedFunc_ = func;
+     amd::Kernel* kernel = hip::asKernel(func);
+     if (parentGraph_ != nullptr) {
+-      auto device = g_devices[dev_id_]->devices()[0];
+-      device::Kernel* devKernel = const_cast<device::Kernel*>(kernel->getDeviceKernel(*device));
+-      kernargSegmentByteSize_ = devKernel->KernargSegmentByteSize();
+-      kernargSegmentAlignment_ = devKernel->KernargSegmentAlignment();
+-      alignedKernArgSize_ =
+-          amd::alignUp(devKernel->KernargSegmentByteSize(), devKernel->KernargSegmentAlignment());
++      const hipError_t metadataStatus = ResolveKernelArgMetadata(*pNodeParams);
++      if (metadataStatus != hipSuccess) return metadataStatus;
+     }
+     const amd::KernelSignature& signature = kernel->signature();
+     numParams_ = signature.numParameters();
+@@ -1786,9 +1857,12 @@
+     }
+     if ((kernelParams_.kernelParams && kernelParams_.kernelParams == params->kernelParams) ||
+         (kernelParams_.extra && kernelParams_.extra == params->extra)) {
+-      // params is copied from kernelParams_ and then updated, so just copy it back
++      // A reused argument array can still change function/device geometry.
++      // Validate metadata before publishing rejected parameters into this node.
++      status = ResolveKernelArgMetadata(*params);
++      if (status != hipSuccess) return status;
+       kernelParams_ = *params;
+-      return status;
++      return hipSuccess;
+     }
+     freeParams();
+     status = copyParams(params);
+diff --git a/hipamd/src/hip_graph_internal.cpp b/hipamd/src/hip_graph_internal.cpp
+--- a/hipamd/src/hip_graph_internal.cpp
++++ b/hipamd/src/hip_graph_internal.cpp
+@@ -4,6 +4,15 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++/**
++ * @file hip_graph_internal.cpp
++ * @brief Native graph construction, retained packet ownership and replay.
++ *
++ * Capture-time argument pools are sized from validated final per-device kernel
++ * metadata, including recursively shared child graphs. Invalid or overflowing
++ * metadata fails before allocation instead of growing pools from a stale
++ * default-width estimate. Replay, packet ordering and retirement are unchanged.
++ */
+ #include "hip_graph_internal.hpp"
+ 
+ #define CASE_STRING(X, C)                                                                          \
+@@ -1766,7 +1775,7 @@
+ //! Chunk size to add to kern arg pool
+ constexpr uint32_t kKernArgChunkSize = 128 * Ki;
+ // ================================================================================================
+-void GraphExecSegmented::GetKernelArgSizeForGraph(std::unordered_map<int, size_t>& kernArgSizeForGraph) {
++hipError_t GraphExecSegmented::GetKernelArgSizeForGraph(std::unordered_map<int, size_t>& kernArgSizeForGraph) {
+   // Calculate the kernel argument size required for all graph kernel nodes
+   // when GPU packet capture is enabled
+ 
+@@ -1784,7 +1793,8 @@
+               childGraphExec->SetKernelArgManager(kernArgMgr);
+             }
+           }
+-          childGraphExec->GetKernelArgSizeForGraph(kernArgSizeForGraph);
++          const hipError_t childStatus = childGraphExec->GetKernelArgSizeForGraph(kernArgSizeForGraph);
++          if (childStatus != hipSuccess) return childStatus;
+         }
+         continue;  // Skip processing nodes in this segment
+       }
+@@ -1792,12 +1802,33 @@
+       // Process regular nodes in this segment
+       for (hip::GraphNode* node : segment.nodes) {
+         if (node->GraphCaptureEnabled()) {
+-          // Accumulate the kernel argument size for each device
+-          kernArgSizeForGraph[node->dev_id_] += node->GetKerArgSize();
+-        }
+-      }
+-    }
+-  }
++          // Cloning attaches parents after copying kernel parameters. Cached
++          // defaults therefore cannot size a pool. Resolve each real kernel
++          // against its final original device before consuming its metadata.
++          if (node->GetType() == hipGraphNodeTypeKernel) {
++            const hipError_t metadataStatus =
++                static_cast<GraphKernelNode*>(node)->RefreshKernelArgMetadata();
++            if (metadataStatus != hipSuccess) return metadataStatus;
++          }
++          if (node->dev_id_ < 0 || static_cast<size_t>(node->dev_id_) >= g_devices.size() ||
++              g_devices[node->dev_id_] == nullptr) {
++            ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
++                    "[hipGraph] Invalid captured node device %d during argument sizing", node->dev_id_);
++            return hipErrorInvalidDevice;
++          }
++          size_t& total = kernArgSizeForGraph[node->dev_id_];
++          const size_t bytes = node->GetKerArgSize();
++          if (bytes > std::numeric_limits<size_t>::max() - total) {
++            ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
++                    "[hipGraph] Captured kernel argument total overflows on device %d", node->dev_id_);
++            return hipErrorInvalidValue;
++          }
++          total += bytes;
++        }
++      }
++    }
++  }
++  return hipSuccess;
+ }
+ // ================================================================================================
+ // Enable or disable a graph node's packets in the batch
+@@ -2164,7 +2195,8 @@
+   for (int devId = 0; devId < g_devices.size(); devId++) {
+     kernArgSizeForGraph[devId] = 0;
+   }
+-  GetKernelArgSizeForGraph(kernArgSizeForGraph);
++  status = GetKernelArgSizeForGraph(kernArgSizeForGraph);
++  if (status != hipSuccess) return status;
+ 
+   // Allocate kernel argument pools on respective devices with extra space for updates
+   for (const auto& deviceKernArgPair : kernArgSizeForGraph) {
+@@ -2175,6 +2207,11 @@
+       continue;
+     }
+ 
++    if (kernArgSize > std::numeric_limits<size_t>::max() - kKernArgChunkSize) {
++      ClPrint(amd::LOG_ERROR, amd::LOG_CODE,
++              "[hipGraph] Kernel argument pool size overflows for device %d", deviceId);
++      return hipErrorInvalidValue;
++    }
+     const size_t totalPoolSize = kernArgSize + kKernArgChunkSize;
+     if (!kernArgManager_->AllocGraphKernargPool(totalPoolSize, g_devices[deviceId]->devices()[0])) {
+       ClPrint(amd::LOG_ERROR, amd::LOG_CODE,

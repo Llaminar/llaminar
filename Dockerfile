@@ -114,6 +114,7 @@ COPY scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch \
      scripts/docker/patches/rocm-hip-sdma-event-publication.patch \
      scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch \
      scripts/docker/patches/rocm-hip-event-producer-lifetime.patch \
+     scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch \
      /tmp/install-scripts/patches/
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
