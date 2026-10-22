@@ -34,6 +34,9 @@ from native_vnni_dispatch.adapters.rocm_decode import (  # noqa: E402
     adapt_rocm_decode_csv,
     raw_corpus_id,
 )
+from native_vnni_dispatch.geometry_timing import (  # noqa: E402
+    PAIRED_GEOMETRY_GENERATION, paired_geometry_summary,
+)
 from native_vnni_dispatch.candidate_observation import (  # noqa: E402
     write_observation_csv,
 )
@@ -1379,14 +1382,26 @@ def main() -> int:
             args.common_observations.parent.mkdir(parents=True, exist_ok=True)
             write_observation_csv(args.common_observations, corpus)
         if args.summary:
+            baselines = {(row.shape_name, row.aggregate_n, row.k, row.source_format): row
+                for row in corpus if row.config_json["tile_n"] == 128 and row.config_json["columns_per_thread"] == 1}
+            paired = corpus.observations[0].bundle_signature == PAIRED_GEOMETRY_GENERATION
             args.summary.parent.mkdir(parents=True, exist_ok=True)
             with args.summary.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(("shape", "n", "k", "candidate_id", "median_us",
-                                 "sample_count", "byte_equal", "installable"))
+                                 "sample_count", "byte_equal", "installable") +
+                    (("operations_per_sample", "paired_rounds", "paired_median_speedup",
+                      "paired_geomean_speedup", "median_total_interval_us") if paired else ()))
                 for row in corpus:
+                    extra = ()
+                    if paired:
+                        baseline = baselines[(row.shape_name, row.aggregate_n, row.k, row.source_format)]
+                        comparison = paired_geometry_summary(row.physical_launch_evidence["sampling"],
+                            baseline.physical_launch_evidence["sampling"])
+                        extra = tuple(comparison[name] for name in ("operations_per_sample", "paired_rounds",
+                            "paired_median_speedup", "paired_geomean_speedup", "median_total_interval_us"))
                     writer.writerow((row.shape_name, row.aggregate_n, row.k,
-                        row.candidate_id, row.median_us, row.sample_count, row.bitwise_equal, False))
+                        row.candidate_id, row.median_us, row.sample_count, row.bitwise_equal, False) + extra)
         print(f"adapted {len(corpus)} diagnostic geometry observations; no policy emitted")
         return 0
 

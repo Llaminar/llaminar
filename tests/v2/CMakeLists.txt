@@ -4450,6 +4450,20 @@ add_v2_test(V2_Integration_GroupedDp4aGeometry
     LABELS "V2;Integration;ProductionTestPreflight;GEMM;Geometry;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 
+# The actual diagnostic order authority is independently device-free.
+add_executable(v2_unit_native_vnni_geometry_timing_order
+    unit/kernels/Test__NativeVNNIGeometryTimingOrder.cpp)
+target_compile_features(v2_unit_native_vnni_geometry_timing_order PRIVATE cxx_std_23)
+target_link_libraries(v2_unit_native_vnni_geometry_timing_order PRIVATE GTest::gtest_main)
+add_v2_test(V2_Unit_NativeVNNIGeometryTimingOrder
+    COMMAND $<TARGET_FILE:v2_unit_native_vnni_geometry_timing_order>
+    LABELS "V2;Unit;NativeVNNI;Timing;DeviceFree;Regression"
+    NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_NativeVNNIGeometryTimingOrder
+    COMMAND $<TARGET_FILE:v2_unit_native_vnni_geometry_timing_order>
+    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;Timing;DeviceFree;Regression"
+    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+
 # Immutable launch ownership is device-free even in a CPU-only build.
 add_executable(v2_unit_rocm_dense_prefill_overlay
     unit/kernels/Test__ROCmDensePrefillOverlay.cpp
@@ -5158,6 +5172,22 @@ add_test(NAME V2_Integration_ROCmNativeQ8GeometryEvidence
 )
 set_tests_properties(V2_Integration_ROCmNativeQ8GeometryEvidence PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;ROCm;Decode;Evidence;DeviceFree;Regression"
+    TIMEOUT 30
+)
+
+
+# A fixed-order or host-submit batch must never pass as paired capture evidence.
+add_test(NAME V2_Integration_ROCmNativeQ8PairedTimingEvidence
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_native_vnni_decode_adapter.py
+            ROCmNativeVNNIDecodeAdapterTest.test_shared_geometry_order_balances_positions_and_both_pair_directions
+            ROCmNativeVNNIDecodeAdapterTest.test_paired_geometry_retains_every_round_interval_and_separate_batch_regime
+            ROCmNativeVNNIDecodeAdapterTest.test_paired_geometry_rejects_coordinate_count_and_normalization_forgeries
+            ROCmNativeVNNIDecodeAdapterTest.test_paired_geometry_cannot_mix_one_and_32_operation_surfaces
+            ROCmNativeVNNIDecodeAdapterTest.test_paired_summary_uses_matching_rounds_instead_of_unpaired_medians
+)
+set_tests_properties(V2_Integration_ROCmNativeQ8PairedTimingEvidence PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;ROCm;Decode;Timing;DeviceFree;Regression"
     TIMEOUT 30
 )
 

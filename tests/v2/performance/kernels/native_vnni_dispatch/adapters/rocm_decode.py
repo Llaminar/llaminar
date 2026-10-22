@@ -26,6 +26,9 @@ from ..candidate_registry import (
     rocm_native_vnni_decode_registry, rocm_native_q8_serial_geometry_diagnostic_registry,
 )
 from ..corpus import ObservationCorpus
+from ..geometry_timing import (
+    PAIRED_GEOMETRY_GENERATION, GEOMETRY_ORDER_PROTOCOL, geometry_timing_position,
+)
 from ..format_registry import format_spec
 from ..profiles import (
     MIN_PROMOTION_SAMPLES,
@@ -68,7 +71,9 @@ REQUIRED_TIMING_COLUMNS = frozenset({
     "latency_us", "latency_us_hex",
 })
 
-RawTimingKey = tuple[str, int, int, str, str, int, int, int, str, int, int]
+LegacyRawTimingKey = tuple[str, int, int, str, str, int, int, int, str, int, int]
+PairedRawTimingKey = tuple[str, int, int, str, str, int, int, int, str, int, int, str, int]
+RawTimingKey = LegacyRawTimingKey | PairedRawTimingKey
 
 
 def _sha256(value: object) -> str:
@@ -112,7 +117,7 @@ def _semantic_contract(m: int) -> SemanticContract:
 def _timing_key(raw: Mapping[str, str]) -> RawTimingKey:
     """Project aggregate and sidecar rows onto one exact candidate trial."""
 
-    return (
+    key = (
         raw["source_format"].strip().upper(),
         int(raw["source_codebook"]),
         int(raw["execution_codebook"]),
@@ -125,16 +130,21 @@ def _timing_key(raw: Mapping[str, str]) -> RawTimingKey:
         int(raw["kb"]),
         int(raw["target_waves"]),
     )
+    # Evidence regime belongs to timing identity, never production dispatch.
+    if raw.get("evidence_generation", "").strip() == PAIRED_GEOMETRY_GENERATION:
+        return key + (PAIRED_GEOMETRY_GENERATION, int(raw["operations_per_sample"]))
+    return key
 
 
 def _read_rocm_decode_timing_rows(
     rows: Iterable[Mapping[str, str]],
     *,
     location_prefix: str,
-) -> dict[RawTimingKey, tuple[float, ...]]:
+) -> tuple[dict[RawTimingKey, tuple[float, ...]], dict[RawTimingKey, dict]]:
     """Validate complete trial rows and return their exact sorted samples."""
 
     indexed: dict[RawTimingKey, list[float]] = {}
+    sampling: dict[RawTimingKey, dict] = {}
     for row_number, raw in enumerate(rows, start=1):
         location = f"{location_prefix}+{row_number}"
         if raw["backend"].strip().lower() != "rocm" or (
@@ -144,10 +154,13 @@ def _read_rocm_decode_timing_rows(
         _execution_mode(raw["execution_mode"])
         generation = raw.get("evidence_generation", "").strip()
         geometry_id = raw["candidate_id"].strip().lower().startswith("rocm.nvnni.decode.native_q8_geometry.")
-        if generation not in ("", ROCM_Q8_GEOMETRY_GENERATION) or geometry_id != (generation == ROCM_Q8_GEOMETRY_GENERATION):
+        if generation not in ("", ROCM_Q8_GEOMETRY_GENERATION, PAIRED_GEOMETRY_GENERATION) or geometry_id != bool(generation):
             raise ValueError(f"{location}: timing generation/candidate identity mismatch")
-        if int(raw["timed_replays"]) != 1:
-            raise ValueError(f"{location}: decode timing rows require one replay")
+        operations = int(raw["operations_per_sample"]) if generation == PAIRED_GEOMETRY_GENERATION else 1
+        if generation != PAIRED_GEOMETRY_GENERATION and int(raw.get("operations_per_sample") or 1) != 1:
+            raise ValueError("legacy timing evidence cannot be relabeled as a captured batch")
+        if operations not in (1, 32) or int(raw["timed_replays"]) != operations:
+            raise ValueError(f"{location}: decode timing replay count disagrees with measurement regime")
         key = _timing_key(raw)
         sample_index = int(raw["sample_index"])
         samples = indexed.setdefault(key, [])
@@ -167,6 +180,23 @@ def _read_rocm_decode_timing_rows(
             raise ValueError(
                 f"{location}: readable and exact latency fields disagree"
             )
+        if generation == PAIRED_GEOMETRY_GENERATION:
+            if raw["ordering_protocol"] != GEOMETRY_ORDER_PROTOCOL:
+                raise ValueError("unknown geometry timing order protocol")
+            registry = rocm_native_q8_serial_geometry_diagnostic_registry()
+            candidate = registry.resolve(raw["candidate_id"])
+            candidate_index = registry.entries.index(candidate)
+            round_index, position = int(raw["round_index"]), int(raw["order_position"])
+            if position != geometry_timing_position(round_index, candidate_index):
+                raise ValueError("timing round/position disagrees with shared ordering authority")
+            interval = float.fromhex(raw["interval_us_hex"])
+            if (not math.isfinite(interval) or interval <= 0 or latency_us != interval / operations
+                    or not math.isclose(float(raw["interval_us"]), interval, rel_tol=0, abs_tol=5.1e-7)):
+                raise ValueError("timing total interval/normalization disagrees")
+            proof = sampling.setdefault(key, {"protocol": GEOMETRY_ORDER_PROTOCOL,
+                "operations_per_sample": operations, "rounds": []})
+            proof["rounds"].append({"round_index": round_index, "order_position": position,
+                "latency_us": latency_us, "interval_us": interval})
         samples.append(latency_us)
 
     result = {}
@@ -175,7 +205,12 @@ def _read_rocm_decode_timing_rows(
         if tuple(sorted(values)) != values:
             raise ValueError(f"timing sidecar samples are not trainer-sorted for {key}")
         result[key] = values
-    return result
+        if key in sampling:
+            rounds = sampling[key]["rounds"]
+            rounds.sort(key=lambda row: row["round_index"])
+            if [row["round_index"] for row in rounds] != list(range(len(values))):
+                raise ValueError("paired timing rounds must be complete and unique")
+    return result, sampling
 
 
 def _rocm_timing_header(path: Path) -> tuple[tuple[str, ...], int]:
@@ -276,7 +311,7 @@ def _rocm_timing_byte_ranges(
 
 def _read_rocm_decode_timing_shard(
     task: tuple[str, tuple[str, ...], int, int],
-) -> dict[RawTimingKey, tuple[float, ...]]:
+) -> tuple[dict[RawTimingKey, tuple[float, ...]], dict[RawTimingKey, dict]]:
     """Parse one complete-trial-aligned physical byte range."""
 
     path_text, fieldnames, begin, end = task
@@ -319,6 +354,7 @@ def read_rocm_decode_timing_sidecars(
     paths: Iterable[Path],
     *,
     workers: int | None = None,
+    sampling_evidence: dict[RawTimingKey, dict] | None = None,
 ) -> dict[RawTimingKey, tuple[float, ...]]:
     """Read exact HIP-event samples on complete-trial-aligned workers."""
 
@@ -368,7 +404,9 @@ def read_rocm_decode_timing_sidecars(
             shards = tuple(executor.map(_read_rocm_decode_timing_shard, tasks))
 
     result: dict[RawTimingKey, tuple[float, ...]] = {}
-    for shard in shards:
+    all_sampling = {}
+    for shard, sampling in shards:
+        all_sampling.update(sampling)
         overlap = result.keys() & shard.keys()
         if overlap:
             raise ValueError(
@@ -376,6 +414,8 @@ def read_rocm_decode_timing_sidecars(
                 f"{next(iter(overlap))}"
             )
         result.update(shard)
+    if sampling_evidence is not None:
+        sampling_evidence.update(all_sampling)
     return result
 
 
@@ -489,11 +529,14 @@ def _geometry_launch_evidence(raw: Mapping[str, str], candidate) -> dict:
     match boolean can substitute for those observations.
     """
     evidence = json.loads(raw["physical_launch_evidence"])
-    if not isinstance(evidence, dict) or evidence.get("generation") != ROCM_Q8_GEOMETRY_GENERATION:
+    if not isinstance(evidence, dict) or evidence.get("generation") != raw.get("evidence_generation"):
         raise ValueError("missing fixed-arithmetic geometry generation")
     if evidence.get("prepared_family") != "NativeVNNI_K32_CB19":
         raise ValueError("geometry trial requires original native-Q8 preparation")
     baseline, launch = evidence["baseline"], evidence["launch"]
+    operations = int(raw["operations_per_sample"]) if raw.get("evidence_generation") == PAIRED_GEOMETRY_GENERATION else 1
+    if operations not in (1, 32):
+        raise ValueError("geometry measurement operations must be one or 32")
     n, k = int(raw["n"]), int(raw["k"])
     arithmetic = ("physical_n", "arithmetic_policy_n", "k", "execution_codebook",
                   "arithmetic_policy_codebook", "k_partitions", "blocks_per_partition",
@@ -527,7 +570,10 @@ def _geometry_launch_evidence(raw: Mapping[str, str], candidate) -> dict:
     if int(raw["kb"]) != kb or int(raw["serial_m1_kb"]) != kb:
         raise ValueError("geometry row mislabeled the observed KB")
 
-    def validate_one(value: dict, tile: int, cpt: int) -> None:
+    def validate_one(value: dict, tile: int, cpt: int, count: int) -> None:
+        if raw.get("evidence_generation") == PAIRED_GEOMETRY_GENERATION:
+            if type(value.get("captured_operations")) is not int or value["captured_operations"] != count:
+                raise ValueError("captured projection count differs from measurement regime")
         grid = (n + tile - 1) // tile
         threads = tile // cpt
         if (type(value["tile_n"]) is not int or type(value["columns_per_thread"]) is not int
@@ -564,11 +610,21 @@ def _geometry_launch_evidence(raw: Mapping[str, str], candidate) -> dict:
                 raise ValueError("geometry resources do not admit the exact captured symbol")
             matches = [node for node in value["captured_kernels"]
                        if node["function"] == kernel["function"]]
-            if len(matches) != 1 or matches[0]["grid"] != kernel["grid"] or matches[0]["block"] != kernel["block"]:
+            if len(matches) != count or any(node["grid"] != kernel["grid"] or node["block"] != kernel["block"] for node in matches):
                 raise ValueError("captured native node disagrees with construction receipt")
-    validate_one(baseline, 128, 1)
+    validate_one(baseline, 128, 1, 1)
     validate_one(launch, int(candidate.config_json["tile_n"]),
-                 int(candidate.config_json["columns_per_thread"]))
+                 int(candidate.config_json["columns_per_thread"]), operations)
+    if raw.get("evidence_generation") == PAIRED_GEOMETRY_GENERATION:
+        def quantizers(value):
+            functions = {value[role]["function"] for role in ("producer", "reducer") if value[role] is not None}
+            return [node for node in value["captured_kernels"] if node["function"] not in functions]
+        original, actual = quantizers(baseline), quantizers(launch)
+        if (len(baseline["captured_kernels"]) != (3 if kb > 1 else 2)
+                or len(launch["captured_kernels"]) != operations * (3 if kb > 1 else 2)
+                or len(original) != 1 or len(actual) != operations
+                or any(node != original[0] for node in actual)):
+            raise ValueError("captured batch changed the original activation quantizer/count")
     if candidate.config_json["tile_n"] == 128 and candidate.config_json["columns_per_thread"] == 1:
         for role in ("producer", "reducer"):
             if launch[role] != baseline[role]:
@@ -581,6 +637,7 @@ def adapt_rocm_decode_row(
     context: ROCmDecodeAdapterContext,
     timing_samples: tuple[float, ...] | None = None,
     *, diagnostic_geometry: bool = False,
+    sampling_evidence: dict | None = None,
 ) -> NativeVNNIObservation:
     """Convert one strong ROCm decode row into the common schema."""
 
@@ -595,7 +652,9 @@ def adapt_rocm_decode_row(
     contract = _semantic_contract(m)
     execution_mode = _execution_mode(raw["execution_mode"])
     generation = raw.get("evidence_generation", "").strip()
-    geometry = generation == ROCM_Q8_GEOMETRY_GENERATION
+    geometry = generation in (ROCM_Q8_GEOMETRY_GENERATION, PAIRED_GEOMETRY_GENERATION)
+    if generation != PAIRED_GEOMETRY_GENERATION and int(raw.get("operations_per_sample") or 1) != 1:
+        raise ValueError("legacy decode evidence cannot be relabeled as a captured batch")
     if generation and not geometry:
         raise ValueError("unknown ROCm decode evidence generation")
     if geometry and (not diagnostic_geometry or context.profile.installable
@@ -705,6 +764,12 @@ def adapt_rocm_decode_row(
             f"{observed_path!r}; production permits only direct ownership or "
             "ordered K-partition reduction"
         )
+    if generation == PAIRED_GEOMETRY_GENERATION:
+        if sampling_evidence is None or len(sampling_evidence.get("rounds", ())) != samples:
+            raise ValueError("paired geometry requires every raw round/position/total interval")
+        if sampling_evidence["operations_per_sample"] != int(raw["operations_per_sample"]):
+            raise ValueError("paired geometry aggregate/raw operations disagree")
+        physical["sampling"] = sampling_evidence
     projection_vector = (n,)
     observation = NativeVNNIObservation(
         schema_version=SCHEMA_VERSION,
@@ -722,7 +787,7 @@ def adapt_rocm_decode_row(
         threading_or_stream_mode=context.threading_or_stream_mode,
         semantic_contract=contract,
         operation_kind=("NativeQ8SerialGeometryDiagnostic" if geometry else "NativeVNNIDecodeProjection"),
-        bundle_signature=(ROCM_Q8_GEOMETRY_GENERATION if geometry else "single-native-vnni-projection:fp32-output:v2"),
+        bundle_signature=(generation if geometry else "single-native-vnni-projection:fp32-output:v2"),
         projection_n_vector=projection_vector,
         source_format=source_format,
         source_codebook_id=format_entry.source_codebook_id,
@@ -754,7 +819,7 @@ def adapt_rocm_decode_row(
         candidate_policy_hash=candidate.candidate_policy_hash(),
         ordered_reduction=candidate.ordered_reduction,
         uses_atomic_reduction=candidate.uses_atomic_reduction,
-        trial_set_hash=(_sha256({"generation": ROCM_Q8_GEOMETRY_GENERATION,
+        trial_set_hash=(_sha256({"generation": generation,
             "original_trial": _trial_set_hash(raw)}) if geometry else _trial_set_hash(raw)),
         numerical_correctness=numerical_correctness,
         bitwise_equal=mismatch_count == 0,
@@ -801,7 +866,9 @@ def adapt_rocm_decode_csv(
     """Read strong decode shards and return one validated common corpus."""
 
     context.validate()
-    timing_index = read_rocm_decode_timing_sidecars(timing_sidecars)
+    sampling_index: dict[RawTimingKey, dict] = {}
+    timing_index = read_rocm_decode_timing_sidecars(timing_sidecars, sampling_evidence=sampling_index)
+    regimes = set()
     if context.profile.installable and not timing_index:
         raise ValueError("installable ROCm decode corpus is missing raw timing sidecars")
     observations = []
@@ -815,9 +882,13 @@ def adapt_rocm_decode_csv(
                 )
             for row_number, raw in enumerate(reader, start=2):
                 try:
-                    samples = timing_index.pop(_timing_key(raw), None)
+                    key = _timing_key(raw)
+                    samples = timing_index.pop(key, None)
+                    regimes.add((raw.get("evidence_generation", ""), int(raw.get("operations_per_sample") or 1)))
+                    if len(regimes) > 1:
+                        raise ValueError("mixed timing generations or operations require separate analysis surfaces")
                     observations.append(adapt_rocm_decode_row(raw, context, samples,
-                        diagnostic_geometry=diagnostic_geometry))
+                        diagnostic_geometry=diagnostic_geometry, sampling_evidence=sampling_index.pop(key, None)))
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ValueError(f"{path}:{row_number}: {exc}") from exc
     if not observations:

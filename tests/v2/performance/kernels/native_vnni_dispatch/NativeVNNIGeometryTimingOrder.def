@@ -1,0 +1,20 @@
+/**
+ * @file NativeVNNIGeometryTimingOrder.def
+ * @brief One common inventory of balanced diagnostic measurement permutations.
+ *
+ * C++ capture trainers and the common Python evidence validator consume this
+ * same ordered inventory. Every ten-round cycle exposes each physical
+ * candidate twice at every position and each pair in both orders five times.
+ * This is measurement order only; no runtime dispatch or arithmetic policy.
+ */
+
+LLAMINAR_GEOMETRY_TIMING_ORDER(0, 1, 2, 3, 4)
+LLAMINAR_GEOMETRY_TIMING_ORDER(1, 2, 3, 4, 0)
+LLAMINAR_GEOMETRY_TIMING_ORDER(2, 3, 4, 0, 1)
+LLAMINAR_GEOMETRY_TIMING_ORDER(3, 4, 0, 1, 2)
+LLAMINAR_GEOMETRY_TIMING_ORDER(4, 0, 1, 2, 3)
+LLAMINAR_GEOMETRY_TIMING_ORDER(0, 4, 3, 2, 1)
+LLAMINAR_GEOMETRY_TIMING_ORDER(1, 0, 4, 3, 2)
+LLAMINAR_GEOMETRY_TIMING_ORDER(2, 1, 0, 4, 3)
+LLAMINAR_GEOMETRY_TIMING_ORDER(3, 2, 1, 0, 4)
+LLAMINAR_GEOMETRY_TIMING_ORDER(4, 3, 2, 1, 0)

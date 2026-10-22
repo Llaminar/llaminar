@@ -1,6 +1,6 @@
 # QFN tuning dashboard
 
-Updated: 2026-10-22; L80 remains the measured throughput checkpoint. NativeVNNI81 adds QFN shape coverage and repairs prepared-weight dispatch identity, with 760/760 Unit registrations and byte-identical Release accuracy. NativeVNNI82's first captured geometry sweep is byte exact and shows shape-dependent component gains; paired timing and model qualification remain pending.
+Updated: 2026-10-22; L80 remains the measured throughput checkpoint. NativeVNNI81 adds QFN shape coverage and repairs prepared-weight dispatch identity, with byte-identical Release accuracy. NativeVNNI82's balanced paired timings do not reproduce the first fixed-order gains; the current kernel geometry remains installed. The paired harness passes 761/761 Unit registrations. The [TP4 computation audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md) confirms mirrored head work and identifies unused local KV-head and short-context indexer-query work; none is promoted yet.
 
 Goal: beat **all applicable measured reference engines in both prefill and decode**, while keeping each row's accuracy gate green. For each phase, the target is the fastest applicable measured result across **Castagna Veloce, upstream llama.cpp and Strata**. Keep their pinned revisions, topology differences and arithmetic qualifications explicit, including Strata's approved default-tail7 approximation. Supported but unmeasured comparisons remain pending; an unsupported topology is not an automatic win. Collect the applicable baselines before tuning a row. Runtime configurations remain owned by the typed parity inventory; a planned row does not advertise implemented support.
 
@@ -108,11 +108,72 @@ is explicitly diagnostic and cannot emit or install a policy.
 | 248320 × 2560 | 994.88 | 994.88 | Default TN128/CPT1 | 0.00% |
 
 This first pass uses fixed candidate order and one graph replay per event sample.
-Retain every result, including slower candidates. Counterbalanced paired timing
-and a separately labeled capture-batch measurement will test ordering and
-submission overhead before selecting entries. No component percentage is a
-whole-model throughput claim. The head favors the existing default, so a global
-geometry change is not supported by these observations.
+Retain every result, including slower candidates. The balanced follow-up below
+supersedes these screening values for candidate selection. No component
+percentage is a whole-model throughput claim.
+
+The [paired single-projection run](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-one/result.json)
+and [captured batch32 run](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-batch32/result.json)
+both pass all **50 candidate/shape cases and 5,050 raw samples**. The trainer
+retains all five actual graphs, rotates and reverses their order through a
+shared ten-round schedule, and preserves every original round and position.
+Each complete schedule balances positions and both directions of every pair;
+the final partial round of the 101-sample run remains included. Batch32 is
+one graph containing 32 complete public projections, including quantization,
+submitted once per event sample. Actual graph nodes and construction counters
+prove that multiplicity. The original unscoped one-operation capture remains
+the byte oracle. Both runs retain zero output/replay mismatches, the intended
+native loader closure, clean driver windows and normal retirement.
+
+The common analyzer retains all five candidates in each
+[single-projection summary](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-one/summary.csv)
+and [batch32 summary](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-batch32/summary.csv).
+The table shows the best paired geometric-mean speedup in each separate regime;
+it is a diagnostic comparison, not an installed selection or model result.
+
+| Physical N × K | Single control µs | Best single speedup | Batch32 control µs/op | Best batch32 speedup | Best batch32 geometry |
+|---|---:|---:|---:|---:|---|
+| 160 × 2560 | 24.640 | 1.0024× | 10.125 | 1.0032× | TN64/CPT1 |
+| 320 × 10240 | 31.201 | 1.0000× | 18.320 | 1.0073× | TN64/CPT1 |
+| 512 × 2560 | 25.120 | 1.0090× | 10.515 | 1.0195× | TN64/CPT1 |
+| 1536 × 2560 | 26.720 | 1.0021× | 12.450 | 1.0000× | Default TN128/CPT1 |
+| 2560 × 160 | 21.760 | 1.0014× | 7.330 | 1.0033× | TN64/CPT1 |
+| 2560 × 1536 | 26.880 | 1.0014× | 12.615 | 1.0005× | TN256/CPT1 |
+| 2560 × 2560 | 30.400 | 1.0020× | 18.130 | 1.0130× | TN64/CPT1 |
+| 3072 × 2560 | 32.320 | 1.0079× | 20.630 | 1.0205× | TN64/CPT1 |
+| 10240 × 2560 | 58.561 | 1.0000× | 47.705 | 1.0000× | Default TN128/CPT1 |
+| 248320 × 2560 | 996.963 | 1.0000× | 980.208 | 1.0000× | Default TN128/CPT1 |
+
+The earlier 4.5–14% reductions mostly disappear when candidate ordering is
+balanced. Batch32 reduces submission overhead per operation and changes cache
+reuse; its normalized times are not interchangeable with full-model timings.
+These results do not justify promoting a new geometry. The full head and large
+projection retain the existing winner. Physical-selector groundwork and dynamic
+profiling are parked; neither has been installed. Follow the concrete TP4
+duplication opportunities before spending more qualification work on these
+small component differences.
+
+The [TP4 ownership audit](QFN_TP4_COMPUTE_OWNERSHIP_AUDIT.md) verifies that GDN,
+query heads, shared FFN and routed expert columns are sharded. Explicit HC,
+PLE, indexer, router and terminal-head replicas remain. The first implementation
+candidate is ordinary vocabulary gathering with MTP disabled and zero reserved
+capacity: its existing native publication is incorrectly gated on MTP capacity.
+Keep the current Auto policy while fixing and measuring the explicit sharded
+mode. Consumer-minimal KV ownership and unused short-context indexer query work
+are separate next candidates; their typed ownership and replay tests remain
+required before any speed claim.
+
+The [Release build](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-build-r1/result.json)
+passes, as do the [seven focused checks](../../../../parity-results/qwen-flash-next/nativevnni82-paired-focused/result.json)
+and [complete Unit suite](../../../../parity-results/qwen-flash-next/nativevnni82-paired-unit/result.json):
+**761/761, zero failures or skips, 116.45 seconds**. Focused preflight entries
+cover the actual shared order and malformed pairing/capture evidence, alongside
+the existing native geometry and benchmark loader checks. This change touches
+the test/analysis harness only; it does not replace the retained model accuracy
+receipt or claim a new complete production-preflight run. The first Release
+build attempt also requested a Unit-only target and was rejected before
+compilation; its [failed receipt](../../../../parity-results/qwen-flash-next/nativevnni82-paired-release-build/result.json)
+is preserved, and the corrected build targets the Release trainer alone.
 
 The [exact compiled gfx906 functions](../../../../parity-results/qwen-flash-next/nativevnni82-isa/resources.json)
 have zero spills, private storage and LDS. Producers use 18 VGPRs; reducers use

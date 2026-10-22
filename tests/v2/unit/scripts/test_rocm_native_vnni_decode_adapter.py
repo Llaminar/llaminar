@@ -28,6 +28,10 @@ from tests.v2.performance.kernels.native_vnni_dispatch.adapters.rocm_decode impo
     read_rocm_decode_timing_sidecars,
     ROCM_Q8_GEOMETRY_GENERATION,
 )
+from tests.v2.performance.kernels.native_vnni_dispatch.geometry_timing import (
+    PAIRED_GEOMETRY_GENERATION, GEOMETRY_ORDER_PROTOCOL, geometry_timing_orders,
+    geometry_timing_position, paired_geometry_summary,
+)
 from tests.v2.performance.kernels.native_vnni_dispatch.exact_oracle import (
     candidate_is_eligible,
 )
@@ -139,6 +143,123 @@ class ROCmNativeVNNIDecodeAdapterTest(unittest.TestCase):
         row["physical_launch_evidence"] = json.dumps({"generation": ROCM_Q8_GEOMETRY_GENERATION,
             "prepared_family": "NativeVNNI_K32_CB19", "baseline": baseline, "launch": observed})
         return row, samples
+
+    def paired_geometry_row(self, operations: int = 1, candidate_index: int = 0):
+        """Build paired evidence from registry identity, including true batch counts."""
+        entry = rocm_native_q8_serial_geometry_diagnostic_registry().entries[candidate_index]
+        row, samples = self.geometry_row(entry.config_json["tile_n"], entry.config_json["columns_per_thread"])
+        row.update(evidence_generation=PAIRED_GEOMETRY_GENERATION, operations_per_sample=str(operations))
+        evidence = json.loads(row["physical_launch_evidence"])
+        evidence["generation"] = PAIRED_GEOMETRY_GENERATION
+        for role, count in (("baseline", 1), ("launch", operations)):
+            value = evidence[role]
+            value["captured_operations"] = count
+            value["captured_kernels"].append({"function": 50, "grid": [20, 1, 1], "block": [32, 1, 1]})
+            value["captured_kernels"] *= count
+        row["physical_launch_evidence"] = json.dumps(evidence)
+        base = {name: row[name] for name in ("backend", "phase", "source_format", "source_codebook",
+            "execution_codebook", "shape", "execution_mode", "m", "n", "k", "candidate_id", "kb",
+            "target_waves", "evidence_generation", "operations_per_sample")}
+        timings = [base | {"sample_index": str(index), "timed_replays": str(operations),
+            "latency_us": str(value), "latency_us_hex": value.hex(), "round_index": str(index),
+            "order_position": str(geometry_timing_position(index, candidate_index)),
+            "interval_us": str(value * operations), "interval_us_hex": (value * operations).hex(),
+            "ordering_protocol": GEOMETRY_ORDER_PROTOCOL} for index, value in enumerate(samples)]
+        return row, timings
+
+    def adapt_paired_fixture(self, row, timings):
+        """Exercise the real aggregate/raw parser, not an independently built proof."""
+        with tempfile.TemporaryDirectory() as tmp:
+            aggregate, sidecar = Path(tmp) / "aggregate.csv", Path(tmp) / "timing.csv"
+            for path, values in ((aggregate, [row]), (sidecar, timings)):
+                with path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=tuple(values[0]))
+                    writer.writeheader(); writer.writerows(values)
+            return adapt_rocm_decode_csv((aggregate,), self.context(), timing_sidecars=(sidecar,), diagnostic_geometry=True)
+
+    def test_shared_geometry_order_balances_positions_and_both_pair_directions(self):
+        orders = geometry_timing_orders()
+        for order in orders:
+            self.assertEqual(sorted(order), list(range(5)))
+        for a in range(5):
+            for position in range(5):
+                self.assertEqual(sum(order[position] == a for order in orders), len(orders) // 5)
+            for b in range(a + 1, 5):
+                self.assertEqual(sum(order.index(a) < order.index(b) for order in orders), len(orders) // 2)
+        for round_index in range(3 * len(orders)):
+            for candidate in range(5):
+                self.assertEqual(orders[round_index % len(orders)][geometry_timing_position(round_index, candidate)], candidate)
+
+    def test_paired_geometry_retains_every_round_interval_and_separate_batch_regime(self):
+        for operations in (1, 32):
+            for candidate in range(5):
+                row, timings = self.paired_geometry_row(operations, candidate)
+                # Latency sorting need not preserve chronological round order.
+                timings[0]["round_index"], timings[2]["round_index"] = "2", "0"
+                for raw in timings:
+                    raw["order_position"] = str(geometry_timing_position(int(raw["round_index"]), candidate))
+                corpus = self.adapt_paired_fixture(row, timings)
+                observation = corpus.observations[0]
+                sampling = observation.physical_launch_evidence["sampling"]
+                self.assertEqual([value["round_index"] for value in sampling["rounds"]], [0, 1, 2])
+                self.assertEqual(sampling["operations_per_sample"], operations)
+                self.assertEqual(sum(value["interval_us"] for value in sampling["rounds"]), 34.0 * operations)
+                self.assertFalse(observation.generic_eligible)
+                self.assertEqual(observation.config_json, rocm_native_q8_serial_geometry_diagnostic_registry().entries[candidate].config_json)
+                paired = paired_geometry_summary(sampling, sampling)
+                self.assertEqual(paired["paired_rounds"], len(timings))
+                self.assertEqual(paired["paired_median_speedup"], 1.0)
+
+    def test_paired_geometry_rejects_coordinate_count_and_normalization_forgeries(self):
+        row, timings = self.paired_geometry_row(32)
+        for change in ("position", "duplicate_round", "negative_round", "interval", "replays", "protocol", "missing_round"):
+            broken = copy.deepcopy(timings)
+            if change == "position": broken[0]["order_position"] = str((int(broken[0]["order_position"]) + 1) % 5)
+            elif change == "duplicate_round":
+                broken[1]["round_index"] = broken[0]["round_index"]
+                broken[1]["order_position"] = broken[0]["order_position"]
+            elif change == "negative_round": broken[0]["round_index"] = "-1"
+            elif change == "interval": broken[0]["interval_us_hex"] = (321.0).hex()
+            elif change == "replays": broken[0]["timed_replays"] = "1"
+            elif change == "protocol": broken[0]["ordering_protocol"] = "fixed-candidate-blocks"
+            elif change == "missing_round": broken.pop()
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.adapt_paired_fixture(row, broken)
+        evidence = json.loads(row["physical_launch_evidence"])
+        missing_quantizer = copy.deepcopy(evidence)
+        missing_quantizer["launch"]["captured_kernels"][-1]["function"] += 1
+        with self.assertRaisesRegex(ValueError, "quantizer"):
+            self.adapt_paired_fixture(row | {"physical_launch_evidence": json.dumps(missing_quantizer)}, timings)
+        for role in ("baseline", "launch"):
+            broken = copy.deepcopy(evidence)
+            broken[role]["captured_operations"] = 2
+            with self.subTest(role=role), self.assertRaisesRegex(ValueError, "projection count"):
+                self.adapt_paired_fixture(row | {"physical_launch_evidence": json.dumps(broken)}, timings)
+
+    def test_paired_geometry_cannot_mix_one_and_32_operation_surfaces(self):
+        one, one_samples = self.paired_geometry_row(1)
+        batch, batch_samples = self.paired_geometry_row(32)
+        with tempfile.TemporaryDirectory() as tmp:
+            aggregate, sidecar = Path(tmp) / "aggregate.csv", Path(tmp) / "timing.csv"
+            for path, values in ((aggregate, [one, batch]), (sidecar, one_samples + batch_samples)):
+                with path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=tuple(values[0]))
+                    writer.writeheader(); writer.writerows(values)
+            with self.assertRaisesRegex(ValueError, "separate analysis surfaces"):
+                adapt_rocm_decode_csv((aggregate,), self.context(), timing_sidecars=(sidecar,), diagnostic_geometry=True)
+
+    def test_paired_summary_uses_matching_rounds_instead_of_unpaired_medians(self):
+        candidate = {"protocol": GEOMETRY_ORDER_PROTOCOL, "operations_per_sample": 1,
+            "rounds": [{"round_index": i, "latency_us": x, "interval_us": x} for i, x in enumerate((1., 50., 100.))]}
+        baseline = copy.deepcopy(candidate)
+        for record, value in zip(baseline["rounds"], (2., 100., 1.)):
+            record.update(latency_us=value, interval_us=value)
+        result = paired_geometry_summary(candidate, baseline)
+        self.assertEqual(result["paired_rounds"], 3)
+        self.assertAlmostEqual(result["paired_median_speedup"], 2.)
+        self.assertNotEqual(result["paired_median_speedup"], 2. / 50.)
+        baseline["rounds"].pop()
+        with self.assertRaises(ValueError): paired_geometry_summary(candidate, baseline)
 
     def test_fixed_arithmetic_geometry_uses_five_distinct_common_candidates(self) -> None:
         registry = rocm_native_q8_serial_geometry_diagnostic_registry()
