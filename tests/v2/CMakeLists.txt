@@ -31028,6 +31028,32 @@ add_v2_test(V2_Integration_MoEProjectionDiagnostic
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionDiagnostic)
 
+# Merge after the existing v2_unit_moe_projection_diagnostic target; retain its
+# original Unit and Integration aliases, which run all parser regressions.
+add_v2_test(V2_Integration_MoEProjectionPartitionContest
+    COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
+        --gtest_filter=MoEProjectionDiagnostic.PartitionContestPreservesExplicitIdentityAndDefault:MoEProjectionDiagnostic.RejectsUnknownPartitionContest:MoEProjectionDiagnostic.PartitionContestUsesBalancedTwoWayProjection
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionPartitionContest)
+
+# Authenticate actual automatic dispatch separately from scoped diagnostic controls.
+add_v2_test(V2_Integration_MoEProjectionAutomaticContest
+    COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
+        --gtest_filter=MoEProjectionDiagnostic.AutomaticContestPreservesOldContestsAndSourceIdentity:MoEProjectionDiagnostic.SyntheticFixturesPreserveEveryCanonicalSourceAlias:MoEProjectionDiagnostic.SyntheticFixturesRejectMixedAuthorityAndLossyBounds:MoEProjectionDiagnostic.AutomaticContestRejectsMultirowAndOversizedRouteCapacity
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionAutomaticContest)
+
+# Genuine CPU promotion retains original source authority through descriptor publication.
+add_v2_test(V2_Integration_MoEProjectionPromoted23Fixture
+    COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
+        --gtest_filter=MoEProjectionDiagnostic.Promoted23RepresentationPreservesDefaultAndOriginalSource:MoEProjectionDiagnostic.Promoted23SourcesUseCanonicalMigrationContract:MoEProjectionDiagnostic.Promoted23RejectsUnknownAndMixedPreparationAuthority:MoEProjectionDiagnostic.Promoted23KeepsBoundedSyntheticOperation
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeVNNI;Trainer;DeviceFree;Regression"
+    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionPromoted23Fixture)
+
+
 # Both the native trainer and its device-free parser bind the same catalogs.
 add_test(NAME V2_Integration_NativeVNNICatalogBindings
     COMMAND ${Python3_EXECUTABLE}
@@ -31061,6 +31087,106 @@ set_property(GLOBAL PROPERTY
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoETrainerBootstrap
     V2_Integration_MoETrainerOpenMPRuntimeBinding)
+
+# Original-partition execution retains exact arithmetic across native layouts.
+add_v2_test(V2_Unit_ROCmMoERouteOwnedParallelPartitions
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
+        --gtest_filter=ROCmMoERouteOwnedGeometry.ParallelSourcePartitionContract
+    LABELS "V2;Unit;ProductionTestPreflight;MoE;NativeVNNI;Geometry;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Unit_ROCmMoERouteOwnedParallelPartitions)
+if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_ROCmMoERouteOwnedParallelPartitions
+        COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+            --gtest_filter=ROCmMoERouteOwnedGeometryNative.*ParallelSourcePartition*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmMoERouteOwnedParallelPartitions)
+endif()
+
+# All quant decoders share the range program; IQ2_S owns a disjoint grid prefix.
+add_v2_test(V2_Unit_ROCmMoERouteOwnedAllFormatPartitions
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
+        --gtest_filter=ROCmMoERouteOwnedGeometry.ParallelSourcePartitionContract:ROCmMoERouteOwnedGeometry.AllFormatSharedLayoutHasDisjointGridAndPartials
+    LABELS "V2;Unit;ProductionTestPreflight;MoE;NativeVNNI;Geometry;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Unit_ROCmMoERouteOwnedAllFormatPartitions)
+if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_ROCmMoERouteOwnedAllFormatPartitions
+        COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+            --gtest_filter=ROCmMoERouteOwnedGeometryNative.CapturedParallelSourcePartitionsMatchSerialBytes:ROCmMoERouteOwnedGeometryNative.CapturedParallelSourcePartitionsPromotedQ5KMatchSerialBytes
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmMoERouteOwnedAllFormatPartitions)
+    add_v2_test(V2_Integration_ROCmMoERouteOwnedIQ2AutomaticCapacity
+        COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+            --gtest_filter=ROCmMoERouteOwnedGeometryNative.CapturedIQ2AutomaticCapacityBranchesMatchParallelBytes
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmMoERouteOwnedIQ2AutomaticCapacity)
+endif()
+
+# Model-bound owner execution and passive prepared metadata retain explicit regression gates.
+add_v2_test(V2_Unit_ROCmMoEImmutableOwnerPlan
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_route_owned_geometry>
+        --gtest_filter=ROCmMoERouteOwnedGeometry.ImmutableOwnerPlan*
+    LABELS "V2;Unit;ProductionTestPreflight;MoE;NativeVNNI;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Unit_ROCmMoEImmutableOwnerPlan)
+
+if(TARGET v2_integration_moe_projection_pipeline AND NOT V2_PERF_TESTS_ONLY)
+    if(HAVE_CUDA)
+        target_sources(v2_integration_moe_projection_pipeline PRIVATE
+            integration/backends/Test__PreparedNativeVNNIInspectionCUDA.cpp)
+    endif()
+    if(HAVE_ROCM)
+        target_sources(v2_integration_moe_projection_pipeline PRIVATE
+            integration/backends/Test__PreparedNativeVNNIInspectionROCm.cpp
+            integration/backends/Test__PreparedNativeVNNIInspection.cpp)
+    endif()
+    if(HAVE_CUDA)
+        target_link_libraries(v2_integration_moe_projection_pipeline PRIVATE CUDA::cudart)
+    endif()
+    if(HAVE_ROCM)
+        target_link_libraries(v2_integration_moe_projection_pipeline PRIVATE hip::host)
+    endif()
+    foreach(inspection_backend CUDA ROCm)
+        if((inspection_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (inspection_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            add_v2_test(V2_Integration_PreparedNativeVNNIInspection_${inspection_backend}
+                COMMAND $<TARGET_FILE:v2_integration_moe_projection_pipeline>
+                    --gtest_filter=PreparedNativeVNNIInspection.${inspection_backend}
+                LABELS "V2;Integration;ProductionTestPreflight;${inspection_backend};NativeVNNI;GraphCapture;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_PreparedNativeVNNIInspection_${inspection_backend})
+        endif()
+    endforeach()
+    if(HAVE_ROCM)
+        foreach(owner_participants 2 4)
+            add_v2_test(V2_Integration_MoEImmutableOwnerBinding_ROCm${owner_participants}
+                COMMAND $<TARGET_FILE:v2_integration_moe_projection_pipeline>
+                    --gtest_filter=MoEModelPartitionBinding.ROCm${owner_participants}
+                LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;LocalTP;ByteExact;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_MoEImmutableOwnerBinding_ROCm${owner_participants})
+        endforeach()
+    endif()
+endif()
+if(HAVE_ROCM AND TARGET v2_integration_moe_live_rows AND NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_ROCmMoEModelOwnerBinding
+        COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+            --gtest_filter=ROCmMoERouteOwnedGeometryNative.CapturedModelOwnerBinding*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeVNNI;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEModelOwnerBinding)
+endif()
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})

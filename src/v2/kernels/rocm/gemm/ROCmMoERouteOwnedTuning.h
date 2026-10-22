@@ -1,19 +1,25 @@
 /**
  * @file ROCmMoERouteOwnedTuning.h
- * @brief Explicit diagnostic geometry of the existing serial-K MoE producer.
+ * @brief Immutable native geometry of the existing source-ordered MoE producer.
  *
  * These capabilities inspect the actual loaded HIP specialization before graph
  * construction. A thread-local lexical scope changes only independent output
- * column ownership; decoding, serial K partitions, contribution arithmetic,
+ * column ownership or execution of independent original K partitions; decoding,
+ * source-owned partition boundaries, per-partition contribution arithmetic,
  * SwiGLU preparation and ordered down publication remain production code.
- * Ordinary dispatch, including Q6_K/IQ2_S subgroup policies, is unchanged.
- * There is no environment switch, installed winner, allocation or replay probe.
+ * The default binary retains ordinary Q6_K/IQ2_S subgroup policies. A separately
+ * configured source-bound experiment may attach an immutable capability to an
+ * original runtime descriptor table; it uses the same launcher without TLS model
+ * policy. Logical plan identity exists before graph hashing, while cold resource
+ * admission remains separate. There is no serving environment switch, installed
+ * winner, allocation authority or replay probe.
  * Launch receipts authenticate host enqueue/capture, not hardware execution,
  * replay counts, complete graph-cache identity or whole-operation provenance.
  */
 #pragma once
 
 #include "../../common/MoEPrefillProjectionExecution.h"
+#include "../../common/NativeVNNIGroupedDecodePolicy.h"
 #include "../../../tensors/NativeVnniFormatInfo.h"
 #include <bit>
 #include <array>
@@ -26,7 +32,96 @@ namespace llaminar2::rocm
 {
 /** @brief Exactly the existing template's three independent-column widths. */
 enum class MoERouteOwnedGateUpGeometry : std::uint8_t { TN64, TN128, TN256 };
-/** @brief Every candidate has one serial-K lane per output column. */
+/** @brief Execution of the unchanged source-owned partition program, independent of column geometry. */
+enum class MoERouteOwnedGateUpPartitionExecution : std::uint8_t
+{
+    Serial, ///< Existing lane-local partition computation and ascending fold.
+    FourWorkerPlanes ///< Four full TN64 planes compute independent original partitions.
+};
+/**
+ * @brief Named immutable axes for one diagnostic owner gate/up projection.
+ *
+ * Default{} preserves historical unbound Serial admission. Bound admissions
+ * require both positive axes and K32 alignment. This is not a model or policy
+ * inference: output_columns is physical gate/up F and reduction_columns is H.
+ */
+struct MoERouteOwnedProjectionShape
+{
+    int output_columns = 0; ///< Actual gate/up N; never a down slice/full-H policy key.
+    int reduction_columns = 0; ///< Actual gate/up K in original K32 blocks.
+};
+
+/** @brief Fixed diagnostic worker geometry; never a replacement partition policy. */
+inline constexpr int kMoERouteOwnedGateUpPartitionWorkers = 4;
+/** @brief Each worker wave retains the original coalesced64-column footprint. */
+inline constexpr int kMoERouteOwnedGateUpPartitionColumns = 64;
+
+/**
+ * @brief Identify every compiled physical NativeVNNI decoder for original-partition workers.
+ * @param codebook Actual physical decoder, not the source arithmetic policy.
+ * @return Whether this explicit partition-worker candidate is implemented for the decoder.
+ * @note The cold symbol selector resolves the actual compiled decoder; ordinary serial coverage is unchanged.
+ */
+[[nodiscard]] constexpr bool moeRouteOwnedGateUpPartitionCodebook(std::uint8_t codebook) noexcept
+{
+    for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        if (canonicalDeviceVnniFormat(*source.metadata).codebook_id == codebook ||
+            migrationStableDeviceVnniFormat(*source.metadata).codebook_id == codebook)
+            return true;
+    return false;
+}
+
+/**
+ * @brief Size the exact partition-major partial bank from an authenticated source-policy maximum.
+ * @param maximum_partitions Maximum original count resolved across all required source policies.
+ * @return One FP32 partial for each original partition and each64-column lane.
+ * @throws std::invalid_argument For a count outside the original captured-policy ABI.
+ * @note This allocates no memory; the original launch owns dynamic LDS. Capacity is not a new KB policy.
+ */
+[[nodiscard]] constexpr std::size_t moeRouteOwnedGateUpPartitionSharedBytes(int maximum_partitions)
+{
+    if (maximum_partitions <= 0 || maximum_partitions > NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+        throw std::invalid_argument("route-owned partition bank requires an original resolved count");
+    return static_cast<std::size_t>(maximum_partitions) * kMoERouteOwnedGateUpPartitionColumns * sizeof(float);
+}
+
+/** @brief Immutable IQ2_S codebook prefix shared by query, launch and device layout. */
+[[nodiscard]] constexpr std::size_t moeRouteOwnedGateUpCodebookSharedBytes(std::uint8_t codebook) noexcept
+{
+    return codebook == 13 ? 1024u * sizeof(std::uint64_t) : 0u;
+}
+
+/** @brief Exact disjoint K1 LDS regions; activation staging of ordinary K_LANES>1 is separate. */
+struct MoERouteOwnedGateUpK1SharedLayout
+{
+    std::size_t codebook_bytes; ///< Immutable grid prefix; zero except IQ2_S.
+    std::size_t partial_offset; ///< First byte after the immutable grid.
+    std::size_t partial_bytes; ///< Original source-partition bank; zero for Serial.
+    std::size_t total_bytes; ///< Exact launch-owned dynamic LDS.
+};
+
+/**
+ * @brief Resolve disjoint immutable-grid and original-partition banks for one actual decoder.
+ * @param codebook Normalized physical launch decoder; original policy remains separate.
+ * @param execution Serial K1 or four full worker planes.
+ * @param maximum_partitions Original complete-envelope maximum; required only for four planes.
+ * @return Exact K1 layout used by resource admission, launch and evidence validation.
+ * @throws std::invalid_argument For unknown decoder/mode or invalid parallel partition count.
+ */
+[[nodiscard]] constexpr MoERouteOwnedGateUpK1SharedLayout moeRouteOwnedGateUpK1SharedLayout(
+    std::uint8_t codebook, MoERouteOwnedGateUpPartitionExecution execution, int maximum_partitions = 0)
+{
+    if (!moeRouteOwnedGateUpPartitionCodebook(codebook) ||
+        (execution != MoERouteOwnedGateUpPartitionExecution::Serial &&
+         execution != MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes))
+        throw std::invalid_argument("route-owned K1 LDS requires a known decoder and partition mode");
+    const auto grid = moeRouteOwnedGateUpCodebookSharedBytes(codebook);
+    const auto partial = execution == MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes
+        ? moeRouteOwnedGateUpPartitionSharedBytes(maximum_partitions) : 0u;
+    return {grid, grid, partial, grid + partial};
+}
+
+/** @brief Closed output-column widths; partition worker count is a separate explicit axis. */
 inline constexpr std::array kMoERouteOwnedGateUpGeometries{
     MoERouteOwnedGateUpGeometry::TN64, MoERouteOwnedGateUpGeometry::TN128,
     MoERouteOwnedGateUpGeometry::TN256};
@@ -34,7 +129,7 @@ inline constexpr std::array kMoERouteOwnedGateUpGeometries{
 /**
  * @brief Resolve a reviewed column width without a device operation.
  * @param geometry Closed diagnostic geometry, never an occupancy request.
- * @return Exact output tile and workgroup width; K_LANES is always one.
+ * @return Exact output tile width; native thread count additionally depends on partition execution.
  * @throws std::invalid_argument For unknown values, without substitution.
  */
 [[nodiscard]] constexpr int moeRouteOwnedGateUpColumns(MoERouteOwnedGateUpGeometry geometry)
@@ -94,19 +189,191 @@ struct MoERouteOwnedKernelResources
         !(envelope.policy_codebook_mask & ~known_policy);
 }
 
+/**
+ * @brief Validate explicit partition execution and immutable N/K axes without a backend query.
+ * @param execution Original lane-local computation or the bounded four-plane component candidate.
+ * @param envelope Exact original physical/source-policy descriptor-table envelope.
+ * @param shape Actual named gate/up N/K; both zero axes preserve only original serial compatibility.
+ * @return Whether shape and all normalized decoders support this explicit execution mode.
+ */
+[[nodiscard]] constexpr bool moeRouteOwnedGateUpPartitionExecutionValid(
+    MoERouteOwnedGateUpPartitionExecution execution, const NativeVnniExecutionFormatEnvelope &envelope,
+    MoERouteOwnedProjectionShape shape) noexcept
+{
+    const int reduction_width = shape.reduction_columns;
+    const int output_width = shape.output_columns;
+    if (!moeRouteOwnedGateUpEnvelopeValid(envelope) || reduction_width < 0 || output_width < 0 ||
+        ((reduction_width == 0) != (output_width == 0)) ||
+        (reduction_width > 0 && reduction_width % 32 != 0)) return false;
+    if (execution == MoERouteOwnedGateUpPartitionExecution::Serial) return true;
+    if (execution != MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes || reduction_width == 0) return false;
+    const auto mask = moeRouteOwnedGateUpLaunchCodebookMask(envelope.execution_codebook_mask);
+    for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
+        if ((mask & nativeVnniCodebookMaskBit(codebook)) && !moeRouteOwnedGateUpPartitionCodebook(codebook)) return false;
+    return true;
+}
+
+/**
+ * @brief Validate an existing resolver output and obtain its exact complete-envelope maximum.
+ * @param envelope Original source-policy membership that owns each resolved entry.
+ * @param partitions Existing resolver output, never caller-supplied capability authority.
+ * @param reduction_width Actual K32 width against which every entry was resolved.
+ * @return Maximum required count, or zero for missing/foreign/out-of-range entries.
+ * @note Nonowned entries must remain zero; no physical-decoder-to-source inference is made.
+ */
+[[nodiscard]] constexpr int moeRouteOwnedGateUpMaximumKPartitions(
+    const NativeVnniExecutionFormatEnvelope &envelope, const std::array<std::uint8_t, 32> &partitions,
+    int reduction_width) noexcept
+{
+    if (!moeRouteOwnedGateUpEnvelopeValid(envelope) || reduction_width <= 0 || reduction_width % 32 != 0) return 0;
+    int maximum = 0;
+    for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
+    {
+        const int count = partitions[codebook];
+        if (envelope.policy_codebook_mask & nativeVnniCodebookMaskBit(codebook))
+        {
+            if (count <= 0 || count > reduction_width / 32 || count > NativeVNNIGroupedDecodePolicy::maximum_k_partitions) return 0;
+            if (count > maximum) maximum = count;
+        }
+        else if (count != 0) return 0;
+    }
+    return maximum;
+}
+
+/**
+ * @brief Hash complete logical launch intent without querying native resources or live tensors.
+ * @param geometry Exact independent-column geometry.
+ * @param envelope Complete original source/execution membership.
+ * @param device Exact declaration device.
+ * @param execution Serial diagnostic geometry or four original-partition workers.
+ * @param shape Named physical gate/up N/K, never inferred from a model name.
+ * @param partitions Original source-policy resolver output; zero only for unbound Serial compatibility.
+ * @return Stable nonzero binary-local logical identity; native resources must still be admitted.
+ * @throws std::invalid_argument For incomplete or contradictory intent.
+ * @note This identity confers no allocation, resource capability, hardware execution or graph ownership.
+ */
+[[nodiscard]] constexpr std::uint64_t moeRouteOwnedGateUpPlanIdentity(
+    MoERouteOwnedGateUpGeometry geometry, const NativeVnniExecutionFormatEnvelope &envelope, int device,
+    MoERouteOwnedGateUpPartitionExecution execution, MoERouteOwnedProjectionShape shape,
+    const std::array<std::uint8_t, 32> &partitions)
+{
+    const auto columns = moeRouteOwnedGateUpColumns(geometry);
+    if (device < 0 || !moeRouteOwnedGateUpPartitionExecutionValid(execution, envelope, shape) ||
+        (execution == MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes && geometry != MoERouteOwnedGateUpGeometry::TN64))
+        throw std::invalid_argument("route-owned logical intent requires exact supported axes");
+    const int maximum = shape.reduction_columns > 0
+        ? moeRouteOwnedGateUpMaximumKPartitions(envelope, partitions, shape.reduction_columns) : 0;
+    if (shape.reduction_columns > 0 && maximum <= 0)
+        throw std::invalid_argument("route-owned logical intent has an incomplete source-policy array");
+    if (shape.reduction_columns == 0)
+        for (auto count : partitions) if (count) throw std::invalid_argument("unbound Serial intent cannot invent source partitions");
+    std::uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&](std::uint64_t value) constexpr { hash = (hash ^ value) * 1099511628211ull; };
+    mix(0x4d4f45524f555445ull); mix(1); mix(static_cast<std::uint64_t>(geometry));
+    mix(static_cast<std::uint64_t>(execution)); mix(device); mix(shape.output_columns); mix(shape.reduction_columns);
+    mix(envelope.execution_codebook_mask); mix(envelope.policy_codebook_mask); mix(columns); mix(maximum);
+    mix(execution == MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes ? kMoERouteOwnedGateUpPartitionWorkers : 1);
+    for (auto count : partitions) mix(count);
+    return hash ? hash : 1;
+}
+
+class MoERouteOwnedGateUpPlan;
+/**
+ * @brief Resolve immutable original source-policy launch intent without selecting a HIP device.
+ * @param geometry Exact independent-column geometry.
+ * @param envelope Canonical complete table envelope, including reachable migration leaves.
+ * @param device Exact owning declaration device.
+ * @param execution Explicit partition execution, independent of original KB policy.
+ * @param shape Actual gate/up axes; default{} is historical Serial compatibility only.
+ * @return Readonly logical plan from the SAME production source-policy resolver.
+ * @throws std::invalid_argument For malformed/unsupported geometry or source policy.
+ * @throws std::logic_error During capture or with conflicting explicit numerical/tile controls.
+ * @note Performs only host metadata work; never native resource queries or allocation.
+ */
+[[nodiscard]] MoERouteOwnedGateUpPlan planMoERouteOwnedGateUp(
+    MoERouteOwnedGateUpGeometry geometry, const NativeVnniExecutionFormatEnvelope &envelope, int device,
+    MoERouteOwnedGateUpPartitionExecution execution, MoERouteOwnedProjectionShape shape);
+
+/** @brief Immutable logical plan, distinct from a native resource capability. */
+class MoERouteOwnedGateUpPlan final
+{
+public:
+    /** @return Exact independent-column width. */
+    [[nodiscard]] MoERouteOwnedGateUpGeometry geometry() const noexcept { return geometry_; }
+    /** @return Complete original masks; never a live descriptor/placement shadow. */
+    [[nodiscard]] const NativeVnniExecutionFormatEnvelope &executionEnvelope() const noexcept { return envelope_; }
+    /** @return Exact owner selected by graph declaration. */
+    [[nodiscard]] int deviceOrdinal() const noexcept { return device_; }
+    /** @return Explicit partition execution of the unchanged numerical program. */
+    [[nodiscard]] MoERouteOwnedGateUpPartitionExecution partitionExecution() const noexcept { return execution_; }
+    /** @return Named physical axes. */
+    [[nodiscard]] const MoERouteOwnedProjectionShape &shape() const noexcept { return shape_; }
+    /** @return Exact source-policy-indexed original resolver output. */
+    [[nodiscard]] const std::array<std::uint8_t, 32> &arithmeticPartitions() const noexcept { return partitions_; }
+    /** @return Exact maximum required source partition count. */
+    [[nodiscard]] int maximumKPartitions() const noexcept { return maximum_; }
+    /** @return Pure immutable intent identity, stable before and after resource admission. */
+    [[nodiscard]] std::uint64_t identity() const { return moeRouteOwnedGateUpPlanIdentity(geometry_, envelope_, device_, execution_, shape_, partitions_); }
+private:
+    friend MoERouteOwnedGateUpPlan planMoERouteOwnedGateUp(MoERouteOwnedGateUpGeometry,
+        const NativeVnniExecutionFormatEnvelope &, int, MoERouteOwnedGateUpPartitionExecution, MoERouteOwnedProjectionShape);
+    /**
+     * @brief Publish the complete canonical resolver result; native admission remains separate.
+     * @param geometry Exact independent-column width.
+     * @param envelope Original complete execution and source-policy membership.
+     * @param device Exact declaration owner, without native device selection.
+     * @param execution Immutable partition worker mode.
+     * @param shape Named actual physical projection N/K.
+     * @param partitions Original source-policy resolver result for those exact axes.
+     * @param maximum Validated maximum over original source-policy members.
+     */
+    MoERouteOwnedGateUpPlan(MoERouteOwnedGateUpGeometry geometry, NativeVnniExecutionFormatEnvelope envelope,
+        int device, MoERouteOwnedGateUpPartitionExecution execution, MoERouteOwnedProjectionShape shape,
+        std::array<std::uint8_t, 32> partitions, int maximum)
+        : geometry_(geometry), envelope_(envelope), device_(device), execution_(execution), shape_(shape),
+          partitions_(partitions), maximum_(maximum) {}
+    MoERouteOwnedGateUpGeometry geometry_;
+    NativeVnniExecutionFormatEnvelope envelope_;
+    int device_;
+    MoERouteOwnedGateUpPartitionExecution execution_;
+    MoERouteOwnedProjectionShape shape_;
+    std::array<std::uint8_t, 32> partitions_;
+    int maximum_;
+};
+
+/**
+ * @brief Report this source-bound binary's explicit experimental owner policy without querying HIP/env.
+ * @return Serial by default; a separately configured experimental binary may request FourWorkerPlanes.
+ * @note No serving config/default promotion or mutable process-wide selector is introduced.
+ */
+[[nodiscard]] MoERouteOwnedGateUpPartitionExecution compiledMoERouteOwnedModelPartitionExecution() noexcept;
+
 class MoERouteOwnedGateUpAdmission;
 /**
+ * @brief Materialize exactly one previously resolved logical plan before capture.
+ * @param plan Original immutable intent; no source-policy re-resolution or new geometry choice.
+ * @return Complete native capability after every required actual leaf succeeds.
+ * @throws std::logic_error During native capture or with conflicting controls.
+ * @throws std::runtime_error For incomplete/nonresident/private native resources.
+ */
+[[nodiscard]] MoERouteOwnedGateUpAdmission admitMoERouteOwnedGateUpGeometry(const MoERouteOwnedGateUpPlan &plan);
+
+/**
  * @brief Seal every actual leaf in one original descriptor-table format envelope.
- * @param geometry Common independent-column width, with K_LANES1 for every family.
+ * @param geometry Common independent-column width; four-plane execution admits TN64 only.
  * @param envelope Exact immutable setup envelope produced by addNativeVnniExecutionFormat.
  * @param device_ordinal Actual owner used for all cold inspections.
+ * @param partition_execution Original serial execution or explicit four full worker planes.
+ * @param shape Named physical gate/up N/K for original policy resolution and resource identity; default{} preserves serial compatibility.
  * @return Immutable complete envelope/resource capability; no partial admission.
  * @throws std::invalid_argument For empty/unsupported envelope or invalid geometry/device.
  * @throws std::logic_error During capture.
  * @throws std::runtime_error When any exact native leaf is nonresident or uses private storage.
  */
 [[nodiscard]] MoERouteOwnedGateUpAdmission admitMoERouteOwnedGateUpGeometry(
-    MoERouteOwnedGateUpGeometry geometry, const NativeVnniExecutionFormatEnvelope &envelope, int device_ordinal);
+    MoERouteOwnedGateUpGeometry geometry, const NativeVnniExecutionFormatEnvelope &envelope, int device_ordinal,
+    MoERouteOwnedGateUpPartitionExecution partition_execution = MoERouteOwnedGateUpPartitionExecution::Serial,
+    MoERouteOwnedProjectionShape shape = {});
 
 /**
  * @brief Seal actual symbol/resources before capture; never launch a kernel.
@@ -128,6 +395,18 @@ class MoERouteOwnedGateUpAdmission final
 public:
     /** @return Exact diagnostic TN. */
     [[nodiscard]] MoERouteOwnedGateUpGeometry geometry() const noexcept { return geometry_; }
+    /** @return Explicit partition work sharing; the original partition arithmetic is unchanged. */
+    [[nodiscard]] MoERouteOwnedGateUpPartitionExecution partitionExecution() const noexcept { return partition_execution_; }
+    /** @return Exact admitted K; zero is original unbound serial compatibility only. */
+    [[nodiscard]] int reductionWidth() const noexcept { return shape_.reduction_columns; }
+    /** @return Exact admitted gate/up N; zero is original unbound serial compatibility only. */
+    [[nodiscard]] int outputWidth() const noexcept { return shape_.output_columns; }
+    /** @return Both original physical projection axes without an ambiguous positional pair. */
+    [[nodiscard]] const MoERouteOwnedProjectionShape &shape() const noexcept { return shape_; }
+    /** @return Actual original source-policy resolver output; zero only for unbound serial compatibility. */
+    [[nodiscard]] const std::array<std::uint8_t, 32> &arithmeticPartitions() const noexcept { return arithmetic_partitions_; }
+    /** @return Exact maximum over required original source policies; never a new split-K choice. */
+    [[nodiscard]] int maximumKPartitions() const noexcept { return maximum_k_partitions_; }
     /** @return Exact original execution and source-policy masks, before family normalization. */
     [[nodiscard]] const NativeVnniExecutionFormatEnvelope &executionEnvelope() const noexcept { return envelope_; }
     /** @return Original decoder families after the production IQ4 normalization. */
@@ -164,23 +443,34 @@ public:
      */
     [[nodiscard]] const MoERouteOwnedKernelResources &resources() const { return leafResources(executionCodebook()); }
 private:
-    friend MoERouteOwnedGateUpAdmission admitMoERouteOwnedGateUpGeometry(
-        MoERouteOwnedGateUpGeometry, const NativeVnniExecutionFormatEnvelope &, int);
+    friend MoERouteOwnedGateUpAdmission admitMoERouteOwnedGateUpGeometry(const MoERouteOwnedGateUpPlan &);
     /**
      * @brief Publish one complete cold-inspected capability after every leaf succeeds.
      * @param geometry Common TN; arithmetic and production dispatch order are unchanged.
      * @param envelope Exact original descriptor-table execution/source-policy contract.
      * @param device Owning device of every inspection.
      * @param resources Fixed decoder-indexed observations, populated only for launch families.
+     * @param partition_execution Explicit work sharing, independent of original KB counts.
+     * @param shape Named physical gate/up N/K, or default{} for original serial compatibility.
+     * @param partitions Original source-policy-indexed resolver output for these exact N/K axes.
+     * @param maximum_partitions Validated maximum across required original policies.
      */
     MoERouteOwnedGateUpAdmission(MoERouteOwnedGateUpGeometry geometry,
         NativeVnniExecutionFormatEnvelope envelope, int device,
-        std::array<MoERouteOwnedKernelResources, 32> resources)
-        : geometry_(geometry), envelope_(envelope), device_(device), resources_(resources) {}
+        std::array<MoERouteOwnedKernelResources, 32> resources,
+        MoERouteOwnedGateUpPartitionExecution partition_execution, MoERouteOwnedProjectionShape shape,
+        std::array<std::uint8_t, 32> partitions, int maximum_partitions)
+        : geometry_(geometry), envelope_(envelope), device_(device), resources_(resources),
+          partition_execution_(partition_execution), shape_(shape),
+          arithmetic_partitions_(partitions), maximum_k_partitions_(maximum_partitions) {}
     MoERouteOwnedGateUpGeometry geometry_;
     NativeVnniExecutionFormatEnvelope envelope_;
     int device_;
     std::array<MoERouteOwnedKernelResources, 32> resources_;
+    MoERouteOwnedGateUpPartitionExecution partition_execution_;
+    MoERouteOwnedProjectionShape shape_;
+    std::array<std::uint8_t, 32> arithmetic_partitions_;
+    int maximum_k_partitions_;
 
 };
 
@@ -201,6 +491,8 @@ private:
 struct MoERouteOwnedGateUpLaunch
 {
     MoERouteOwnedGateUpGeometry geometry = MoERouteOwnedGateUpGeometry::TN64;
+    MoERouteOwnedGateUpPartitionExecution partition_execution = MoERouteOwnedGateUpPartitionExecution::Serial;
+    int partition_worker_planes = 1; ///< Actual execution workers, distinct from source arithmetic partitions.
     std::uint8_t execution_codebook = 0;
     int device_ordinal = -1;
     void *stream = nullptr; ///< Exact nondefault construction stream.
@@ -263,19 +555,24 @@ private:
  * @param stream Exact explicit producer stream; null/default sentinels fail.
  * @param rows Must be physical M1; no live count readback or topology inference.
  * @param execution Must execute gate/up; separate down-only control runs outside this scope.
+ * @param shape Actual named gate/up N/K, checked before any public preparation for a shape-bound capability.
+ * @param explicit_admission Graph/table-owned model binding; simultaneous diagnostic scope is rejected.
  * @throws std::logic_error For an incompatible active scope, clearing stale receipt first.
  * @note A new ordinary attempt clears old diagnostic evidence, then returns without policy checks or HIP calls.
  */
 void validateMoERouteOwnedGateUpScopeBinding(int device_ordinal, void *stream,
-    int rows, const MoEPrefillProjectionExecution &execution);
+    int rows, const MoEPrefillProjectionExecution &execution, MoERouteOwnedProjectionShape shape = {},
+    const MoERouteOwnedGateUpAdmission *explicit_admission = nullptr);
 /**
  * @brief Require the exact original physical/source-policy envelope before preparation.
  * @param mask Actual descriptor-table execution mask, not a source-label guess.
  * @param policy_mask Original source-policy mask; zero never authenticates an active scope.
+ * @param explicit_admission Immutable graph/table-owned model capability, without TLS ownership.
  * @throws std::logic_error For a mismatched active scope, clearing stale receipt.
  * @note Pure host validation; inactive ordinary calls return immediately.
  */
-void validateMoERouteOwnedGateUpCodebook(std::uint32_t mask, std::uint32_t policy_mask = 0);
+void validateMoERouteOwnedGateUpCodebook(std::uint32_t mask, std::uint32_t policy_mask = 0,
+    const MoERouteOwnedGateUpAdmission *explicit_admission = nullptr);
 /** @return Calling thread's current explicit override, absent in ordinary dispatch. */
 [[nodiscard]] std::optional<MoERouteOwnedGateUpGeometry> currentMoERouteOwnedGateUpGeometry() noexcept;
 /** @return Complete accepted construction set, or no evidence after failed/incomplete/ordinary attempts. */

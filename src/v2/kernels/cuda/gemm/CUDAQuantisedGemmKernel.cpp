@@ -1,5 +1,8 @@
 /**
  * @file CUDAQuantisedGemmKernel.cpp
+ * @note Const prepared-descriptor inspection observes only existing resident
+ * metadata. Active export retains the original preparation contract and reuses
+ * that projection; declaration must never materialize GPU weights implicitly.
  * @brief ITensorGemm adapter implementation for CUTLASS INT8 quantized GEMM
  *
  * This is the C++ adapter that wraps the CUTLASS INT8 GEMM kernel. It implements
@@ -1599,6 +1602,13 @@ namespace llaminar2
                 return false;
             }
 
+            return inspectPreparedNativeVNNIMatrixDesc(out);
+        }
+
+        /** @copydoc ITensorGemm::inspectPreparedNativeVNNIMatrixDesc */
+        bool CUDAQuantisedGemmKernel::inspectPreparedNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) const
+        {
+            out = {};
             if (!impl_ || !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales ||
                 N_ == 0 || K_ == 0 || impl_->native_blocks_per_row == 0 ||
                 !nativeVNNIPrefillSupportsCodebook(impl_->native_codebook_id))

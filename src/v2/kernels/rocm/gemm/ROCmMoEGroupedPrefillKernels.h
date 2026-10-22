@@ -11,6 +11,7 @@
 #pragma once
 
 #include "../../common/MoEPrefillProjectionExecution.h"
+#include "ROCmMoERouteOwnedTuning.h"
 #include <cstdint>
 
 /**
@@ -31,6 +32,8 @@
  *
  * @param execution Validated phase and immutable source/output geometry.
  * @param route_scope Capture-time grouping origin, not a live route count.
+ * @param explicit_admission Optional immutable graph/table-owned model capability; no TLS policy inheritance.
+ * @param completed_observation Required with an explicit capability; caller-owned host construction receipt, cleared on failure.
  * @return True if the declared transaction was enqueued on the non-null stream.
  */
 extern "C"
@@ -69,7 +72,9 @@ bool rocmMoE_grouped_prefill_pipeline(
     int device_id,
     void *stream,
     const llaminar2::MoEPrefillProjectionExecution &execution,
-    llaminar2::MoEPrefillRouteScope route_scope);
+    llaminar2::MoEPrefillRouteScope route_scope,
+    const llaminar2::rocm::MoERouteOwnedGateUpAdmission *explicit_admission = nullptr,
+    llaminar2::rocm::MoERouteOwnedGateUpLaunchSet *completed_observation = nullptr);
 
 /**
  * @brief Fold already-weighted route outputs in the original router order.

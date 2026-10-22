@@ -3303,6 +3303,53 @@ namespace llaminar2
         }
 
         /**
+         * @brief Materialize an immutable owner gate/up launch intent during existing cold graph preparation.
+         * @param gateup_desc_table_id Original instance-owned descriptor table.
+         * @param physical_rows Frozen physical token-row count, never a live GPU count.
+         * @param expected_intent Pure declaration identity resolved before graph-cache identity.
+         * @return Exactly the validated intent, or zero for the unchanged default/unselected policy.
+         * @throws std::logic_error If an explicit intent is unsupported or cannot be bound before capture.
+         * @note Default backends perform no work and cannot silently accept a nonzero foreign intent.
+         */
+        virtual std::uint64_t prepareOwnerGateUpCaptureBinding(int gateup_desc_table_id, int physical_rows,
+                                                              std::uint64_t expected_intent)
+        {
+            (void)gateup_desc_table_id; (void)physical_rows;
+            if (expected_intent) throw std::logic_error("backend cannot materialize the explicit owner gate/up launch intent");
+            return 0;
+        }
+
+        /**
+         * @brief Inspect already-bound immutable owner capture identity without native calls or preparation.
+         * @param gateup_desc_table_id Original instance-owned descriptor table.
+         * @param physical_rows Frozen physical rows of this graph.
+         * @return Previously prepared identity, or zero for default/unselected policy.
+         * @throws std::logic_error For a stale/incomplete table binding.
+         * @note Unbound component tables return zero. Graphs must validate their
+         *       declaration with requireOwnerGateUpCaptureBinding; this is host
+         *       metadata, never a GPU/replay observation or resource ledger.
+         */
+        [[nodiscard]] virtual std::uint64_t ownerGateUpCaptureBindingSignature(int gateup_desc_table_id,
+                                                                              int physical_rows) const
+        { (void)gateup_desc_table_id; (void)physical_rows; return 0; }
+
+        /**
+         * @brief Require the graph's declared immutable owner policy before publication or execution.
+         * @param gateup_desc_table_id Original prepared table, never a substituted representative.
+         * @param physical_rows Frozen physical graph rows.
+         * @param expected_intent Graph declaration's nonzero explicit intent, or original unbound zero.
+         * @throws std::logic_error For an absent, foreign or stale declared binding.
+         * @note Pure host validation shared by real graph stages and focused no-enqueue regressions.
+         *       Zero is the original component policy, never a replacement for a declared nonzero graph intent.
+         */
+        void requireOwnerGateUpCaptureBinding(int gateup_desc_table_id, int physical_rows,
+                                              std::uint64_t expected_intent) const
+        {
+            if (ownerGateUpCaptureBindingSignature(gateup_desc_table_id, physical_rows) != expected_intent)
+                throw std::logic_error("owner gate/up binding does not match the graph's immutable declared intent");
+        }
+
+        /**
          * @brief Enqueue one typed projection phase using the ordinary pipeline.
          *
          * Complete execution is the same operation used by the convenience

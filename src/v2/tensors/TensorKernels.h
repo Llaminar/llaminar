@@ -841,6 +841,17 @@ namespace llaminar2
         }
 
         /**
+         * @brief Inspect already-prepared native-VNNI device metadata without materializing weights.
+         * @param out Receives the original resident descriptor, cleared on absence.
+         * @return True only when immutable native device bytes already exist.
+         * @note This const observation performs no allocation, device selection, GPU call,
+         *       transfer, synchronization, conversion, publication or mutable caching.
+         *       CPU/floating/unprepared engines return false; callers must not substitute an active export.
+         */
+        [[nodiscard]] virtual bool inspectPreparedNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) const
+        { out = {}; return false; }
+
+        /**
          * @brief Export unambiguous source provenance for prepared VNNI weights.
          *
          * The device descriptor carries the canonical execution codebook. This

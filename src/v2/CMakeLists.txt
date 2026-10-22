@@ -106,6 +106,18 @@ option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 option(LLAMINAR_BUILD_TESTS "Configure and build Llaminar V2 tests" ON)
 
+# Explicit source-bound model experiment only. No serving option, environment
+# selector or installed policy is created; ordinary builds remain serial.
+set(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS "serial" CACHE STRING
+    "Experimental physical-M1 owner gate/up partition execution: serial|four_worker_planes")
+set_property(CACHE LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS PROPERTY STRINGS serial four_worker_planes)
+if(NOT LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS MATCHES "^(serial|four_worker_planes)$")
+    message(FATAL_ERROR "Invalid LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS; use serial or four_worker_planes")
+endif()
+if(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS STREQUAL "four_worker_planes" AND NOT HAVE_ROCM)
+    message(FATAL_ERROR "Experimental owner partition planes require the ROCm backend")
+endif()
+
 set(LLAMINAR_SHARED_CORE_DEFAULT OFF)
 if(HAVE_CUDA OR HAVE_ROCM)
     set(LLAMINAR_SHARED_CORE_DEFAULT ON)
@@ -2300,6 +2312,16 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmEmbeddingKernelT.cpp             # Embedding ITensor implementation
         kernels/rocm/moe/ROCmMoEKernel.cpp                    # MoE kernel (routing, gather, scatter, gate, swiglu)
     )
+    # Only this bridge consumes the compiled choice. Other stages call its
+    # immutable function; flipping modes must not rebuild unrelated core TUs.
+    if(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS STREQUAL "four_worker_planes")
+        set_property(SOURCE kernels/rocm/moe/ROCmMoEKernel.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES=1)
+    else()
+        set_property(SOURCE kernels/rocm/moe/ROCmMoEKernel.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES=0)
+    endif()
+    message(STATUS "V2: Compiled ROCm M1 owner partition experiment: ${LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS}")
 
     if(LLAMINAR_SHARED_CORE)
         target_include_directories(llaminar2_core PUBLIC

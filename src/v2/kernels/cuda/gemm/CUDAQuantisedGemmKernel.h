@@ -1,5 +1,8 @@
 /**
  * @file CUDAQuantisedGemmKernel.h
+ * @note Const prepared-descriptor inspection observes only existing resident
+ * metadata. Active export retains the original preparation contract and reuses
+ * that projection; declaration must never materialize GPU weights implicitly.
  * @brief CUDA quantized GEMM kernel for quantized tensors
  *
  * Implements ITensorGemm using CUDA quantized GEMM backends for any quantized weight tensor.
@@ -414,6 +417,8 @@ namespace llaminar2
 
             /// @brief Export native-VNNI device pointers for grouped MoE CUDA prefill.
             bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
+            /** @copydoc ITensorGemm::inspectPreparedNativeVNNIMatrixDesc */
+            [[nodiscard]] bool inspectPreparedNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) const override;
             /** @copydoc ITensorGemm::q8ResidualCorrectionWorkspaceRequirements */
             WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const override;
             /** @copydoc ITensorGemm::multiply_q8_residual_corrected */

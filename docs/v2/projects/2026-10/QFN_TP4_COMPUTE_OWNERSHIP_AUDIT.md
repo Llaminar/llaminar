@@ -249,8 +249,25 @@ contracts, capture identity, acceptance/reset and crossings at
 roughly 0.73–0.75 milliseconds per GPU is a hypothesis to measure, not an
 accepted saving.
 
+The follow-up source review at `382492209` identifies two requirements before
+such a guard is complete. `prepared_query` is a semantic snapshot/validation
+output, unlike disposable score scratch; the existing
+`IndexerObservedRowsRetainStrictNumericalValidation` regression requires its
+strict validation even at short contexts. A blind early return would break that
+contract. A request crossing the scoring threshold also needs a suffix of rows,
+whereas the current counted floating GEMM contract names a verifier-owned
+prefix. A complete implementation needs typed observation/scoring demand and
+backend row selection. This makes consumer-minimal KV coverage the smaller
+ownership candidate; neither change has a measured performance result yet.
+
 HC/router/PLE sharing would require earlier explicit publication to current
 consumers. Their existing downstream collectives occur too late to carry those
 inputs. There is no demonstrated free sideband optimization here, and spare
 allocation capacity never authorizes extra communication. These larger graph
 changes remain separate from the bounded candidates above.
+
+The [consumer-minimal KV coverage plan](QFN_TP4_KV_COVERAGE_PLAN.md) now records
+the concrete closure: Q-derived overlapping intervals, subset-replica snapshots,
+and per-projection original-N arithmetic binding. Existing cache, weight and PMA
+owners remain authoritative. This is a scoped plan, with no measured speedup or
+new topology admission.

@@ -88,39 +88,59 @@ namespace
 thread_local const llaminar2::rocm::ScopedMoERouteOwnedGateUpGeometry *g_moe_route_scope = nullptr;
 /** Accepted host-enqueue observation only; graph replay never writes this value. */
 thread_local std::optional<llaminar2::rocm::MoERouteOwnedGateUpLaunchSet> g_moe_route_launch;
-/** Stack-owned current attempt; absent outside explicit diagnostic lowering. */
-thread_local llaminar2::rocm::MoERouteOwnedGateUpLaunchSet *g_moe_route_pending = nullptr;
+/**
+ * @brief Resolve one explicit construction authority; model bindings never inherit a diagnostic override.
+ * @param explicit_admission Immutable graph/table-owned capability, or null for ordinary/diagnostic calls.
+ * @return Exactly the supplied model capability or the original lexical diagnostic capability.
+ * @throws std::logic_error If both authorities are present.
+ */
+const llaminar2::rocm::MoERouteOwnedGateUpAdmission *resolveMoERouteOwnedAdmission(
+    const llaminar2::rocm::MoERouteOwnedGateUpAdmission *explicit_admission)
+{
+    if (explicit_admission && g_moe_route_scope)
+        throw std::logic_error("model route-owned capability cannot overlap a diagnostic scope");
+    return explicit_admission ? explicit_admission :
+        (g_moe_route_scope ? &g_moe_route_scope->admission() : nullptr);
+}
 
 /**
- * @brief Retain accepted leaves locally and publish only a complete successful attempt.
+ * @brief Stack-owned complete host-submission observation shared by explicit model and diagnostic lowering.
  *
- * This is bounded host construction evidence, not a live device ledger. Failure
- * or a partial launch never leaves an apparently complete published receipt.
+ * No pending pointer or mutable model policy is thread-local. The raw call owns
+ * this bounded record, each original leaf appends to it, and only complete native
+ * submission success can publish it to that caller. Replay never executes it.
  */
 class MoERouteOwnedSubmissionObservation final
 {
 public:
-    /** @brief Bind one stack-owned attempt after exact public/raw envelope validation. */
-    MoERouteOwnedSubmissionObservation()
-    {
-        if (!g_moe_route_scope || g_moe_route_pending)
-            throw std::logic_error("route-owned observation requires one active nonnested raw attempt");
-        pending_.execution_envelope = g_moe_route_scope->admission().executionEnvelope();
-        g_moe_route_pending = &pending_;
-    }
-    /** @brief Clear failed/partial observations before the stack storage retires. */
-    ~MoERouteOwnedSubmissionObservation()
-    {
-        if (g_moe_route_pending != &pending_) std::terminate();
-        g_moe_route_pending = nullptr;
-        if (!published_) g_moe_route_launch.reset();
-    }
+    /** @brief Start one original raw transaction under its immutable capability. */
+    explicit MoERouteOwnedSubmissionObservation(const llaminar2::rocm::MoERouteOwnedGateUpAdmission &admission)
+        : admission_(admission)
+    { pending_.execution_envelope = admission.executionEnvelope(); }
     MoERouteOwnedSubmissionObservation(const MoERouteOwnedSubmissionObservation &) = delete;
     MoERouteOwnedSubmissionObservation &operator=(const MoERouteOwnedSubmissionObservation &) = delete;
-    /** @brief Commit only after every original normalized family succeeded exactly once. */
-    void publish()
+    /**
+     * @brief Append one accepted leaf locally, rejecting duplicate/foreign/overflow records.
+     * @param leaf Actual successful original host submission with exact native resources.
+     * @throws std::logic_error For incomplete ownership or a repeated/foreign decoder.
+     */
+    void record(const llaminar2::rocm::MoERouteOwnedGateUpLaunch &leaf)
     {
-        const auto &admission = g_moe_route_scope->admission();
+        const auto bit = llaminar2::nativeVnniCodebookMaskBit(leaf.execution_codebook);
+        if (!(admission_.launchCodebookMask() & bit) || pending_.leaf_count >= pending_.leaves.size())
+            throw std::logic_error("route-owned observation has a foreign leaf or exceeds its bounded ABI");
+        for (std::size_t index = 0; index < pending_.leaf_count; ++index)
+            if (pending_.leaves[index].execution_codebook == leaf.execution_codebook)
+                throw std::logic_error("route-owned decoder family was submitted twice");
+        pending_.leaves[pending_.leaf_count++] = leaf;
+    }
+    /**
+     * @brief Return only a complete original normalized family set.
+     * @return Immutable accepted host construction evidence, not hardware/replay work.
+     * @throws std::logic_error For any omitted or repeated admitted family.
+     */
+    const llaminar2::rocm::MoERouteOwnedGateUpLaunchSet &complete() const
+    {
         std::uint32_t actual = 0;
         for (std::size_t index = 0; index < pending_.leaf_count; ++index)
         {
@@ -128,31 +148,14 @@ public:
             if (!bit || (actual & bit)) throw std::logic_error("route-owned observation repeated a decoder family");
             actual |= bit;
         }
-        if (actual != admission.launchCodebookMask() || pending_.leaf_count != admission.leafCount())
+        if (actual != admission_.launchCodebookMask() || pending_.leaf_count != admission_.leafCount())
             throw std::logic_error("route-owned observation omitted an admitted decoder family");
-        g_moe_route_launch = pending_;
-        published_ = true;
+        return pending_;
     }
 private:
+    const llaminar2::rocm::MoERouteOwnedGateUpAdmission &admission_;
     llaminar2::rocm::MoERouteOwnedGateUpLaunchSet pending_{};
-    bool published_ = false;
 };
-
-/** @brief Append one accepted original-loop leaf without publishing a partial transaction. */
-void recordMoERouteOwnedLeaf(const llaminar2::rocm::MoERouteOwnedGateUpLaunch &leaf)
-{
-    if (!g_moe_route_scope || !g_moe_route_pending ||
-        g_moe_route_pending->leaf_count >= g_moe_route_pending->leaves.size())
-        throw std::logic_error("route-owned leaf has no bounded observation owner");
-    const auto &admission = g_moe_route_scope->admission();
-    const auto bit = llaminar2::nativeVnniCodebookMaskBit(leaf.execution_codebook);
-    if (!(admission.launchCodebookMask() & bit))
-        throw std::logic_error("route-owned observation reached a foreign decoder family");
-    for (std::size_t index = 0; index < g_moe_route_pending->leaf_count; ++index)
-        if (g_moe_route_pending->leaves[index].execution_codebook == leaf.execution_codebook)
-            throw std::logic_error("route-owned decoder family was submitted twice");
-    g_moe_route_pending->leaves[g_moe_route_pending->leaf_count++] = leaf;
-}
 
 /** @brief Reject arithmetic/expert-tile mixing without querying HIP or changing policy. */
 void requireMoERouteOwnedUnmodifiedPolicy()
@@ -167,23 +170,31 @@ void requireMoERouteOwnedUnmodifiedPolicy()
 } // namespace
 
 void llaminar2::rocm::validateMoERouteOwnedGateUpScopeBinding(
-    int device, void *stream, int rows, const MoEPrefillProjectionExecution &execution)
+    int device, void *stream, int rows, const MoEPrefillProjectionExecution &execution,
+    MoERouteOwnedProjectionShape shape, const MoERouteOwnedGateUpAdmission *explicit_admission)
 {
-    g_moe_route_launch.reset();
-    if (!g_moe_route_scope) return;
-    if (device != g_moe_route_scope->admission().deviceOrdinal() || rows != 1 ||
+    if (!explicit_admission) g_moe_route_launch.reset();
+    const auto *admission = resolveMoERouteOwnedAdmission(explicit_admission);
+    if (!admission) return;
+    if (device != admission->deviceOrdinal() || rows != 1 ||
         !execution.executesGateUp() || !stream ||
         stream == static_cast<void *>(hipStreamLegacy) ||
         stream == static_cast<void *>(hipStreamPerThread))
         throw std::logic_error("route-owned gate/up geometry requires physical M1 gate/up on its admitted device and exact nondefault stream");
+    const auto &proof = *admission;
+    if (proof.reductionWidth() > 0 &&
+        (shape.reduction_columns != proof.reductionWidth() || shape.output_columns != proof.outputWidth()))
+        throw std::logic_error("route-owned partition execution reached a foreign admitted N/K shape");
     requireMoERouteOwnedUnmodifiedPolicy();
 }
 
-void llaminar2::rocm::validateMoERouteOwnedGateUpCodebook(std::uint32_t mask, std::uint32_t policy_mask)
+void llaminar2::rocm::validateMoERouteOwnedGateUpCodebook(std::uint32_t mask, std::uint32_t policy_mask,
+    const MoERouteOwnedGateUpAdmission *explicit_admission)
 {
-    if (!g_moe_route_scope) return;
-    g_moe_route_launch.reset();
-    const auto &envelope = g_moe_route_scope->admission().executionEnvelope();
+    const auto *admission = resolveMoERouteOwnedAdmission(explicit_admission);
+    if (!admission) return;
+    if (!explicit_admission) g_moe_route_launch.reset();
+    const auto &envelope = admission->executionEnvelope();
     if (mask != envelope.execution_codebook_mask || policy_mask != envelope.policy_codebook_mask)
         throw std::logic_error("route-owned gate/up geometry requires its exact admitted physical/source-policy envelope");
 }
@@ -1902,13 +1913,43 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
  * gate/up scratch is written exactly
  * like the M=1 decode-table path before one grouped SwiGLU quantization pass
  * consumes it.
+ *
+ * Explicit partition-worker diagnostics retain the same source-owned K ranges,
+ * original range helper and ascending RN fold. Four full64-column planes own
+ * disjoint complete partitions and publish one exact partial per bank cell;
+ * inactive N lanes remain through the publication barrier. This is independent
+ * of the existing adjacent K_LANES block-preparation optimization.
+ * @tparam FMT Actual prepared physical decoder, with original source metadata.
+ * @tparam TILE_N Independent output columns owned by this workgroup.
+ * @tparam STAGE_IQ2_S_GRID Existing immutable IQ2_S codebook staging.
+ * @tparam K_LANES Existing adjacent lanes preparing blocks within a partition.
+ * @tparam PARALLEL_SOURCE_PARTITIONS Four full TN64 planes compute original partitions; ordinary false remains unchanged.
+ * @param A_int8 Original quantized activation rows.
+ * @param scales_A_blockwise Original activation-block scales.
+ * @param grouped_token_indices Original compact token/route indices.
+ * @param grouped_indices_are_route_slots Whether an original index includes the top-k offset.
+ * @param gate_descs Original prepared gate descriptors and source identities.
+ * @param up_descs Original prepared up descriptors and source identities.
+ * @param gate_out Owned gate output, one writer per compact row/column.
+ * @param up_out Owned up output, one writer per compact row/column.
+ * @param total_slots Original captured route-slot bound, not a host live count.
+ * @param seq_len Original token-row bound.
+ * @param top_k Original routes per token.
+ * @param input_is_original_rows Whether input is token-owned rather than compact-slot-owned.
+ * @param N Physical gate/up output columns.
+ * @param K Original reduction width in K32 blocks.
+ * @param k_partition_policy Original immutable source-policy resolver output.
+ * @param num_experts Original descriptor-table extent.
+ * @param admission Device-owned live route/owner authority for this retained family.
  */
 template <
     NativeVNNIFormatPrefill FMT,
     int TILE_N = 64,
     bool STAGE_IQ2_S_GRID = false,
-    int K_LANES = 1>
-__global__ __launch_bounds__(TILE_N * K_LANES)
+    int K_LANES = 1,
+    bool PARALLEL_SOURCE_PARTITIONS = false>
+__global__ __launch_bounds__(TILE_N * K_LANES *
+    (PARALLEL_SOURCE_PARTITIONS ? llaminar2::rocm::kMoERouteOwnedGateUpPartitionWorkers : 1))
 void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     const int8_t*  __restrict__ A_int8,              // [total_slots, K]
     const float*   __restrict__ scales_A_blockwise,  // [total_slots, K / 32]
@@ -1944,6 +1985,9 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
             FMT == NVNNI_PF_Q6_K ||
             FMT == NVNNI_PF_IQ2_S,
         "only tuned correction-free dual-scale formats may use subgroup preparation");
+    static_assert(!PARALLEL_SOURCE_PARTITIONS ||
+        (TILE_N == llaminar2::rocm::kMoERouteOwnedGateUpPartitionColumns && K_LANES == 1),
+        "four partition-worker planes require the original TN64/K1 range program");
     static_assert(TILE_N * K_LANES <= 256,
                   "route-owned grouped gate/up exceeds the tuned gfx906 block size");
 
@@ -1957,11 +2001,12 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
      * its dot products, dual-scale commits, corrections, partition boundaries,
      * and ordered partition reduction are unchanged.
      *
-     * Dynamic shared storage is zero bytes for every other codebook, so this
-     * specialization cannot silently tax their occupancy or alter their
-     * established launch geometry.
+     * Ordinary inline execution uses zero dynamic shared bytes for every other
+     * codebook. Explicit four-plane diagnostics instead own an exact source-
+     * partition partial bank; that mode never changes ordinary geometry.
      */
-    constexpr size_t kIQ2SGridBytes = 1024u * sizeof(uint64_t);
+    constexpr size_t kIQ2SGridBytes =
+        llaminar2::rocm::moeRouteOwnedGateUpCodebookSharedBytes(static_cast<std::uint8_t>(FMT));
     constexpr size_t kStagedCodebookBytes =
         STAGE_IQ2_S_GRID ? kIQ2SGridBytes : 0u;
     extern __shared__ uint8_t staged_bytes[];
@@ -1974,7 +2019,9 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
             staged_iq2s_grid[i] = d_pf_iq2s_grid[i];
     }
 
-    const int output_lane = static_cast<int>(threadIdx.x) / K_LANES;
+    const int output_lane = PARALLEL_SOURCE_PARTITIONS
+        ? static_cast<int>(threadIdx.x) % llaminar2::rocm::kMoERouteOwnedGateUpPartitionColumns
+        : static_cast<int>(threadIdx.x) / K_LANES;
     const int n = blockIdx.x * TILE_N + output_lane;
     const int projection_role = static_cast<int>(blockIdx.z);
     if (grouped_slot >= total_slots || projection_role > 1)
@@ -2039,6 +2086,67 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     if constexpr (STAGE_IQ2_S_GRID || K_LANES > 1)
         __syncthreads();
 
+    if constexpr (PARALLEL_SOURCE_PARTITIONS)
+    {
+        // The original descriptor/source policy chooses partitions. Four full
+        // column planes merely compute disjoint complete partitions concurrently.
+        // A uniform failure precedes all bank accesses and barriers.
+        if (k_partitions <= 0 || k_partitions > blocks_per_row ||
+            k_partitions > llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+        {
+            moe_prefill_fail_fast_invalid_grouped_index();
+            return;
+        }
+        constexpr int columns = llaminar2::rocm::kMoERouteOwnedGateUpPartitionColumns;
+        constexpr int workers = llaminar2::rocm::kMoERouteOwnedGateUpPartitionWorkers;
+        // Every aligned wave64, and both wave32s within one column plane,
+        // has one worker. Make that invariant visible before the tail-column
+        // branch so activation addresses can use scalar loads without changing
+        // any lane's partition, partial, or final reduction order.
+        const int worker = __builtin_amdgcn_readfirstlane(
+            static_cast<int>(threadIdx.x) / columns);
+        // Immutable IQ2_S grid readers remain live while other workers publish partials.
+        // The shared layout therefore gives partials a disjoint grid-prefix offset.
+        float* partials = reinterpret_cast<float*>(staged_bytes + kStagedCodebookBytes);
+        const int blocks_per_partition = (blocks_per_row + k_partitions - 1) / k_partitions;
+        if (n < N)
+        {
+#pragma unroll 1
+            for (int partition = worker; partition < k_partitions; partition += workers)
+            {
+                const int begin = partition * blocks_per_partition;
+                const int end = min(begin + blocks_per_partition, blocks_per_row);
+                // Original range helper starts at +0 and commits every original
+                // K32 contribution in order. Empty original partitions are +0.
+                partials[static_cast<size_t>(partition) * columns + output_lane] = begin < end
+                    ? moe_prefill_dot_desc_range<FMT, STAGE_IQ2_S_GRID>(
+                          desc, n, slot_A, slot_scales, N, begin, end, staged_iq2s_grid)
+                    : 0.0f;
+            }
+        }
+        // Tail columns cannot return before this publication edge. Each live
+        // (partition,column) has one writer, and only worker0 consumes it.
+        __syncthreads();
+        if (worker == 0 && n < N)
+        {
+            float value;
+            if (k_partitions == 1)
+                value = partials[output_lane]; // Original KB1 has no extra +0 add.
+            else
+            {
+                float total = 0.0f;
+#pragma unroll 1
+                for (int partition = 0; partition < k_partitions; ++partition)
+                    total = rocm_native_vnni_accumulate_rn(total,
+                        partials[static_cast<size_t>(partition) * columns + output_lane]);
+                value = total;
+            }
+            float* projection_out = projection_role == 0 ? gate_out : up_out;
+            projection_out[static_cast<size_t>(grouped_slot) * N + n] = value;
+        }
+        return;
+    }
+
     if (n >= N)
         return;
 
@@ -2076,13 +2184,6 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     }
 }
 
-/** @brief Exact codebook staging shared by native inspection and the existing launch. */
-template <NativeVNNIFormatPrefill FMT>
-constexpr size_t moeRouteOwnedK1SharedBytes() noexcept
-{
-    return FMT == NVNNI_PF_IQ2_S ? 1024u * sizeof(uint64_t) : 0u;
-}
-
 /**
  * @brief Launch one compile-time route-owned gate/up geometry.
  *
@@ -2094,6 +2195,7 @@ constexpr size_t moeRouteOwnedK1SharedBytes() noexcept
  * @tparam FMT NativeVNNI execution codebook.
  * @tparam TILE_N Output columns owned by one workgroup before K subdivision.
  * @tparam K_LANES Adjacent lanes preparing blocks within one serial partition.
+ * @tparam PARALLEL_SOURCE_PARTITIONS Explicit four-plane computation of unchanged source-owned partitions; false preserves ordinary launches.
  * @param stream Non-null graph-capture stream that owns this launch.
  * @param A_int8 Quantized input rows.
  * @param scales_A_blockwise Per-row activation scales.
@@ -2111,11 +2213,14 @@ constexpr size_t moeRouteOwnedK1SharedBytes() noexcept
  * @param K Projection reduction width.
  * @param k_partition_policy Source-codebook-indexed serial-M1 partition policy.
  * @param num_experts Number of descriptors in each table.
+ * @param admission Original device-owned route/extent authority; no host count is read.
+ * @param launch_proof Optional immutable table-owned or diagnostic native capability; never resolved from model TLS.
  */
 template <
     NativeVNNIFormatPrefill FMT,
     int TILE_N,
-    int K_LANES>
+    int K_LANES,
+    bool PARALLEL_SOURCE_PARTITIONS = false>
 void launch_moe_grouped_gate_up_route_owned_geometry(
     hipStream_t stream,
     const int8_t* A_int8,
@@ -2134,24 +2239,38 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
     int K,
     MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts,
-    ROCmMoEGroupedRouteAdmission admission)
+    ROCmMoEGroupedRouteAdmission admission,
+    const llaminar2::rocm::MoERouteOwnedGateUpAdmission *launch_proof = nullptr)
 {
     constexpr bool kStageIQ2SGrid = FMT == NVNNI_PF_IQ2_S;
     constexpr bool kStageActivation = K_LANES > 1;
-    const size_t lds_bytes =
-        moeRouteOwnedK1SharedBytes<FMT>() +
+    constexpr int partition_workers = PARALLEL_SOURCE_PARTITIONS
+        ? llaminar2::rocm::kMoERouteOwnedGateUpPartitionWorkers : 1;
+    if constexpr (PARALLEL_SOURCE_PARTITIONS)
+        if (!launch_proof)
+            throw std::logic_error("parallel source partitions require an exact native capability");
+    const auto layout = llaminar2::rocm::moeRouteOwnedGateUpK1SharedLayout(
+        static_cast<std::uint8_t>(FMT), PARALLEL_SOURCE_PARTITIONS
+            ? llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes
+            : llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution::Serial,
+        PARALLEL_SOURCE_PARTITIONS ? launch_proof->maximumKPartitions() : 0);
+    const size_t lds_bytes = layout.total_bytes +
         (kStageActivation
              ? static_cast<size_t>(K) +
                    static_cast<size_t>(K / 32) * sizeof(float)
              : 0u);
-    if (g_moe_route_scope)
+    if (launch_proof)
     {
-        const auto &proof = g_moe_route_scope->admission();
+        const auto &proof = *launch_proof;
         const auto &resources = proof.leafResources(static_cast<uint8_t>(FMT));
         const void *actual_function = reinterpret_cast<const void *>(HIP_KERNEL_NAME(
-            moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT, TILE_N, kStageIQ2SGrid, K_LANES>));
-        if (K_LANES != 1 || resources.function != actual_function ||
-            resources.block_threads != TILE_N || resources.dynamic_shared_memory_bytes != lds_bytes)
+            moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT, TILE_N, kStageIQ2SGrid, K_LANES, PARALLEL_SOURCE_PARTITIONS>));
+        if (K_LANES != 1 ||
+            (proof.partitionExecution() == llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes) != PARALLEL_SOURCE_PARTITIONS ||
+            (proof.reductionWidth() > 0 && (proof.reductionWidth() != K || proof.outputWidth() != N ||
+                !std::equal(std::begin(k_partition_policy.by_codebook), std::end(k_partition_policy.by_codebook),
+                    proof.arithmeticPartitions().begin()))) || resources.function != actual_function ||
+            resources.block_threads != TILE_N * partition_workers || resources.dynamic_shared_memory_bytes != lds_bytes)
             throw std::logic_error("route-owned launch changed its inspected exact leaf or staging geometry");
     }
     const int compact_capacity = admission.maximumSlotsFor(
@@ -2159,10 +2278,10 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
     if (compact_capacity <= 0)
         throw std::invalid_argument("MoE route-owned launch has no admitted compact rows");
     const dim3 grid((N + TILE_N - 1) / TILE_N, compact_capacity, 2);
-    const dim3 block(TILE_N * K_LANES);
+    const dim3 block(TILE_N * K_LANES * partition_workers);
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(moe_grouped_gate_up_decode_equivalent_prefill_kernel<
-            FMT, TILE_N, kStageIQ2SGrid, K_LANES>),
+            FMT, TILE_N, kStageIQ2SGrid, K_LANES, PARALLEL_SOURCE_PARTITIONS>),
         grid,
         block,
         lds_bytes,
@@ -2186,7 +2305,28 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
 }
 
 /**
- * @brief Select the measured route-owned geometry once, during graph capture.
+ * @brief Lower explicit immutable native geometry or retain the original automatic policy.
+ * @tparam FMT Original compiled physical decoder; source arithmetic remains descriptor-owned.
+ * @param stream Exact original producer stream.
+ * @param A_int8 Original quantized activation rows.
+ * @param scales_A_blockwise Original K32 scales.
+ * @param grouped_token_indices Original device group-to-token map.
+ * @param grouped_indices_are_route_slots Whether grouped entries name route slots.
+ * @param gate_descs Original device gate table, not a host descriptor mirror.
+ * @param up_descs Original device up table.
+ * @param gate_out Existing persistent gate bank.
+ * @param up_out Existing persistent up bank.
+ * @param total_slots Captured route capacity, not a communication extent.
+ * @param seq_len Actual physical token rows.
+ * @param top_k Original routes per token.
+ * @param input_is_original_rows Original activation row interpretation.
+ * @param N Actual gate/up output columns.
+ * @param K Actual gate/up reduction columns.
+ * @param k_partition_policy Same original source-policy resolver result.
+ * @param num_experts Original descriptor count.
+ * @param admission Original device-owned route admission.
+ * @param launch_proof Explicit table-owned or scoped native capability; null retains original automatic selection.
+ * @param observation Stack-owned accepted-submission evidence, required only with launch_proof.
  *
  * IQ2_S is codebook-stage limited at tiny route counts and K-loop limited once
  * the route grid broadens.  Measurements on gfx906 select four K lanes for at
@@ -2214,44 +2354,60 @@ void launch_moe_grouped_gate_up_route_owned(
     int K,
     MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts,
-    ROCmMoEGroupedRouteAdmission admission)
+    ROCmMoEGroupedRouteAdmission admission,
+    const llaminar2::rocm::MoERouteOwnedGateUpAdmission *launch_proof = nullptr,
+    MoERouteOwnedSubmissionObservation *observation = nullptr)
 {
-    if (g_moe_route_scope)
+    if (launch_proof)
     {
-        const auto &admission_proof = g_moe_route_scope->admission();
+        const auto &admission_proof = *launch_proof;
         if (!(admission_proof.launchCodebookMask() & llaminar2::nativeVnniCodebookMaskBit(static_cast<uint8_t>(FMT))) || seq_len != 1)
             throw std::logic_error("route-owned geometry reached a foreign decoder or physical row count");
         const auto geometry = admission_proof.geometry();
         const int columns = llaminar2::rocm::moeRouteOwnedGateUpColumns(geometry);
-        #define LAUNCH_SCOPED_ROUTE_TN(TN) \
-            launch_moe_grouped_gate_up_route_owned_geometry<FMT, TN, 1>( \
+        #define LAUNCH_ADMITTED_ROUTE_TN(TN, PARALLEL) \
+            launch_moe_grouped_gate_up_route_owned_geometry<FMT, TN, 1, PARALLEL>( \
                 stream, A_int8, scales_A_blockwise, grouped_token_indices, \
                 grouped_indices_are_route_slots, gate_descs, up_descs, gate_out, up_out, \
                 total_slots, seq_len, top_k, input_is_original_rows, N, K, \
-                k_partition_policy, num_experts, admission)
-        switch (geometry)
+                k_partition_policy, num_experts, admission, launch_proof)
+        if (admission_proof.partitionExecution() == llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes)
         {
-        case llaminar2::rocm::MoERouteOwnedGateUpGeometry::TN64: LAUNCH_SCOPED_ROUTE_TN(64); break;
-        case llaminar2::rocm::MoERouteOwnedGateUpGeometry::TN128: LAUNCH_SCOPED_ROUTE_TN(128); break;
-        case llaminar2::rocm::MoERouteOwnedGateUpGeometry::TN256: LAUNCH_SCOPED_ROUTE_TN(256); break;
+            if (geometry != llaminar2::rocm::MoERouteOwnedGateUpGeometry::TN64)
+                throw std::logic_error("parallel source partitions require their admitted TN64 leaf");
+            LAUNCH_ADMITTED_ROUTE_TN(64, true);
         }
-        #undef LAUNCH_SCOPED_ROUTE_TN
+        else
+        {
+            switch (geometry)
+            {
+            case llaminar2::rocm::MoERouteOwnedGateUpGeometry::TN64: LAUNCH_ADMITTED_ROUTE_TN(64, false); break;
+            case llaminar2::rocm::MoERouteOwnedGateUpGeometry::TN128: LAUNCH_ADMITTED_ROUTE_TN(128, false); break;
+            case llaminar2::rocm::MoERouteOwnedGateUpGeometry::TN256: LAUNCH_ADMITTED_ROUTE_TN(256, false); break;
+            }
+        }
+        #undef LAUNCH_ADMITTED_ROUTE_TN
         if (hipGetLastError() != hipSuccess)
         {
-            g_moe_route_launch.reset();
             throw std::runtime_error("route-owned diagnostic producer submission failed");
         }
         const int slots = admission.maximumSlotsFor(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned);
         llaminar2::rocm::MoERouteOwnedGateUpLaunch receipt{
-            .geometry = geometry, .execution_codebook = static_cast<uint8_t>(FMT),
+            .geometry = geometry, .partition_execution = admission_proof.partitionExecution(),
+            .partition_worker_planes = admission_proof.partitionExecution() ==
+                llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes ?
+                    llaminar2::rocm::kMoERouteOwnedGateUpPartitionWorkers : 1,
+            .execution_codebook = static_cast<uint8_t>(FMT),
             .device_ordinal = admission_proof.deviceOrdinal(), .stream = stream,
             .n = N, .k = K, .route_capacity = slots,
             .grid_x = 1 + (N - 1) / columns, .grid_y = slots, .grid_z = 2,
-            .block_x = columns, .block_y = 1, .block_z = 1,
+            .block_x = admission_proof.leafResources(static_cast<uint8_t>(FMT)).block_threads,
+            .block_y = 1, .block_z = 1,
             .resources = admission_proof.leafResources(static_cast<uint8_t>(FMT))};
         std::copy(std::begin(k_partition_policy.by_codebook), std::end(k_partition_policy.by_codebook),
             receipt.arithmetic_partitions.begin());
-        recordMoERouteOwnedLeaf(receipt);
+        if (!observation) throw std::logic_error("route-owned explicit leaf has no stack observation owner");
+        observation->record(receipt);
         return;
     }
     if constexpr (FMT == NVNNI_PF_IQ2_S)
@@ -3452,26 +3608,55 @@ auto selectMoERouteOwnedFormat(uint8_t codebook, Select select)
     }
 }
 
-/** @brief Resolve the same one-lane producer template the scoped launcher enqueues. */
-template <NativeVNNIFormatPrefill FMT, int TN>
-MoERouteLeafSymbol routeGateUpSymbol()
+/**
+ * @brief Resolve the exact shared producer symbol and launch-owned partial-bank size before capture.
+ * @tparam FMT Actual prepared decoder.
+ * @tparam TN Independent-column width; explicit four-plane execution requires64.
+ * @tparam PARALLEL_SOURCE_PARTITIONS Whether four workers compute unchanged original partitions.
+ * @param maximum_partitions Authenticated original source-policy maximum; unused by serial resources.
+ * @return Actual native function, block width and exact dynamic LDS requirement.
+ */
+template <NativeVNNIFormatPrefill FMT, int TN, bool PARALLEL_SOURCE_PARTITIONS = false>
+MoERouteLeafSymbol routeGateUpSymbol(int maximum_partitions)
 {
+    static_assert(!PARALLEL_SOURCE_PARTITIONS ||
+        (TN == llaminar2::rocm::kMoERouteOwnedGateUpPartitionColumns));
     return {reinterpret_cast<const void *>(HIP_KERNEL_NAME(
-        moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT, TN, FMT == NVNNI_PF_IQ2_S, 1>)),
-        __PRETTY_FUNCTION__,
-        TN, moeRouteOwnedK1SharedBytes<FMT>()};
+        moe_grouped_gate_up_decode_equivalent_prefill_kernel<FMT, TN, FMT == NVNNI_PF_IQ2_S, 1, PARALLEL_SOURCE_PARTITIONS>)),
+        __PRETTY_FUNCTION__, TN * (PARALLEL_SOURCE_PARTITIONS ? llaminar2::rocm::kMoERouteOwnedGateUpPartitionWorkers : 1),
+        llaminar2::rocm::moeRouteOwnedGateUpK1SharedLayout(static_cast<std::uint8_t>(FMT),
+            PARALLEL_SOURCE_PARTITIONS
+                ? llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes
+                : llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution::Serial,
+            maximum_partitions).total_bytes};
 }
 
-/** @brief Match a reviewed geometry to an exact compiled producer. */
+/**
+ * @brief Resolve one exact scoped mode without substituting any decoder or geometry.
+ * @tparam FMT Actual physical decoder validated against the bounded candidate domain.
+ * @param geometry Independent output-column geometry.
+ * @param partition_execution Serial source program or explicit four full worker planes.
+ * @param maximum_partitions Existing source-policy maximum, required for exact parallel resources.
+ * @return Exact compiled leaf identity and immutable launch-owned LDS.
+ * @throws std::invalid_argument For an unsupported explicit mode/decoder/geometry.
+ */
 template <NativeVNNIFormatPrefill FMT>
-MoERouteLeafSymbol routeGateUpSymbolForGeometry(llaminar2::rocm::MoERouteOwnedGateUpGeometry geometry)
+MoERouteLeafSymbol routeGateUpSymbolForGeometry(llaminar2::rocm::MoERouteOwnedGateUpGeometry geometry,
+    llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution partition_execution, int maximum_partitions)
 {
     using G = llaminar2::rocm::MoERouteOwnedGateUpGeometry;
+    using P = llaminar2::rocm::MoERouteOwnedGateUpPartitionExecution;
+    if (partition_execution == P::FourWorkerPlanes)
+    {
+        if (geometry != G::TN64) throw std::invalid_argument("parallel source partitions support only TN64");
+        return routeGateUpSymbol<FMT, 64, true>(maximum_partitions);
+    }
+    if (partition_execution != P::Serial) throw std::invalid_argument("unknown route-owned partition execution");
     switch (geometry)
     {
-    case G::TN64: return routeGateUpSymbol<FMT, 64>();
-    case G::TN128: return routeGateUpSymbol<FMT, 128>();
-    case G::TN256: return routeGateUpSymbol<FMT, 256>();
+    case G::TN64: return routeGateUpSymbol<FMT, 64>(maximum_partitions);
+    case G::TN128: return routeGateUpSymbol<FMT, 128>(maximum_partitions);
+    case G::TN256: return routeGateUpSymbol<FMT, 256>(maximum_partitions);
     }
     throw std::invalid_argument("unknown route-owned producer geometry");
 }
@@ -3526,13 +3711,58 @@ llaminar2::rocm::MoERouteOwnedKernelResources inspectMoERouteLeaf(MoERouteLeafSy
 }
 } // namespace
 
-llaminar2::rocm::MoERouteOwnedGateUpAdmission
-llaminar2::rocm::admitMoERouteOwnedGateUpGeometry(
-    MoERouteOwnedGateUpGeometry geometry, const llaminar2::NativeVnniExecutionFormatEnvelope &envelope, int device)
+llaminar2::rocm::MoERouteOwnedGateUpPlan
+llaminar2::rocm::planMoERouteOwnedGateUp(
+    MoERouteOwnedGateUpGeometry geometry, const llaminar2::NativeVnniExecutionFormatEnvelope &envelope, int device,
+    MoERouteOwnedGateUpPartitionExecution partition_execution, MoERouteOwnedProjectionShape shape)
 {
     (void)moeRouteOwnedGateUpColumns(geometry);
-    if (!moeRouteOwnedGateUpEnvelopeValid(envelope))
-        throw std::invalid_argument("route-owned geometry requires a complete known source-policy envelope");
+    if (!moeRouteOwnedGateUpPartitionExecutionValid(partition_execution, envelope, shape) ||
+        (partition_execution == MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes && geometry != MoERouteOwnedGateUpGeometry::TN64))
+        throw std::invalid_argument("route-owned partition execution requires its exact supported envelope, TN and N/K");
+    if (device < 0) throw std::invalid_argument("route-owned logical plan requires an exact device");
+    if (llaminar2::isGraphCaptureActive())
+        throw std::logic_error("route-owned partition policy must be admitted before graph capture");
+    requireMoERouteOwnedUnmodifiedPolicy();
+    std::array<std::uint8_t, 32> partitions{};
+    int maximum_partitions = 0;
+    if (shape.reduction_columns > 0)
+    {
+        MoEPrefillSerialM1KPartitionPolicy resolved{};
+        // Invoke the original resolver with original source-policy bits and the
+        // same physical gate/up N/K as raw production lowering, never physical23.
+        if (!moe_prefill_resolve_serial_m1_k_partitions(envelope.policy_codebook_mask,
+                shape.output_columns, shape.reduction_columns, resolved))
+            throw std::invalid_argument("route-owned admission could not resolve the original source partitions");
+        std::copy(std::begin(resolved.by_codebook), std::end(resolved.by_codebook), partitions.begin());
+        maximum_partitions = moeRouteOwnedGateUpMaximumKPartitions(envelope, partitions, shape.reduction_columns);
+        if (maximum_partitions <= 0)
+            throw std::invalid_argument("route-owned admission received an incomplete original partition policy");
+    }
+    (void)moeRouteOwnedGateUpPlanIdentity(geometry, envelope, device, partition_execution, shape, partitions);
+    return {geometry, envelope, device, partition_execution, shape, partitions, maximum_partitions};
+}
+
+llaminar2::rocm::MoERouteOwnedGateUpAdmission
+llaminar2::rocm::admitMoERouteOwnedGateUpGeometry(
+    MoERouteOwnedGateUpGeometry geometry, const llaminar2::NativeVnniExecutionFormatEnvelope &envelope, int device,
+    MoERouteOwnedGateUpPartitionExecution partition_execution, MoERouteOwnedProjectionShape shape)
+{
+    return admitMoERouteOwnedGateUpGeometry(planMoERouteOwnedGateUp(geometry, envelope, device, partition_execution, shape));
+}
+
+llaminar2::rocm::MoERouteOwnedGateUpAdmission
+llaminar2::rocm::admitMoERouteOwnedGateUpGeometry(const MoERouteOwnedGateUpPlan &plan)
+{
+    const auto geometry = plan.geometry();
+    const auto &envelope = plan.executionEnvelope();
+    const auto device = plan.deviceOrdinal();
+    const auto partition_execution = plan.partitionExecution();
+    const auto shape = plan.shape();
+    const auto &partitions = plan.arithmeticPartitions();
+    const auto maximum_partitions = plan.maximumKPartitions();
+    (void)plan.identity();
+    requireMoERouteOwnedUnmodifiedPolicy();
     const auto launch_mask = moeRouteOwnedGateUpLaunchCodebookMask(envelope.execution_codebook_mask);
     std::array<MoERouteLeafSymbol, 32> symbols{};
     // Resolve every family before the first HIP query: unsupported members
@@ -3540,13 +3770,13 @@ llaminar2::rocm::admitMoERouteOwnedGateUpGeometry(
     for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
         if (launch_mask & llaminar2::nativeVnniCodebookMaskBit(codebook))
             symbols[codebook] = selectMoERouteOwnedFormat(codebook,
-                [=]<NativeVNNIFormatPrefill FMT>() { return routeGateUpSymbolForGeometry<FMT>(geometry); });
+                [=]<NativeVNNIFormatPrefill FMT>() { return routeGateUpSymbolForGeometry<FMT>(geometry, partition_execution, maximum_partitions); });
     requireMoERouteOwnedColdInspection(device);
     std::array<MoERouteOwnedKernelResources, 32> resources{};
     for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
         if (launch_mask & llaminar2::nativeVnniCodebookMaskBit(codebook))
             resources[codebook] = inspectMoERouteLeaf(symbols[codebook]);
-    return {geometry, envelope, device, resources};
+    return {geometry, envelope, device, resources, partition_execution, shape, partitions, maximum_partitions};
 }
 
 llaminar2::rocm::MoERouteOwnedGateUpAdmission
@@ -3902,14 +4132,20 @@ bool rocmMoE_grouped_prefill_pipeline(
     int device_id,
     void* stream,
     const llaminar2::MoEPrefillProjectionExecution& execution,
-    llaminar2::MoEPrefillRouteScope route_scope)
+    llaminar2::MoEPrefillRouteScope route_scope,
+    const llaminar2::rocm::MoERouteOwnedGateUpAdmission *explicit_admission,
+    llaminar2::rocm::MoERouteOwnedGateUpLaunchSet *completed_observation)
 {
+    if (completed_observation) *completed_observation = {};
+    if ((explicit_admission != nullptr) != (completed_observation != nullptr))
+        throw std::logic_error("model route-owned lowering requires one capability and one caller-owned observation");
+    const auto *launch_proof = resolveMoERouteOwnedAdmission(explicit_admission);
     llaminar2::rocm::validateMoERouteOwnedGateUpScopeBinding(device_id, stream,
         top_k > 0 && total_slots > 0 && total_slots % top_k == 0 ? total_slots / top_k : -1,
-        execution);
-    llaminar2::rocm::validateMoERouteOwnedGateUpCodebook(gateup_codebook_mask, gateup_policy_codebook_mask);
-    std::optional<MoERouteOwnedSubmissionObservation> diagnostic_observation;
-    if (g_moe_route_scope) diagnostic_observation.emplace();
+        execution, {.output_columns = intermediate, .reduction_columns = d_model}, explicit_admission);
+    llaminar2::rocm::validateMoERouteOwnedGateUpCodebook(gateup_codebook_mask, gateup_policy_codebook_mask, explicit_admission);
+    std::optional<MoERouteOwnedSubmissionObservation> submission_observation;
+    if (launch_proof) submission_observation.emplace(*launch_proof);
     const bool executes_gateup = execution.executesGateUp();
     const bool executes_down = execution.executesDown();
     const int down_columns = execution.columnCount();
@@ -3971,7 +4207,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         admission.maySelect(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned);
     const bool use_expert_row_tiles =
         admission.maySelect(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled);
-    if (g_moe_route_scope && (!use_route_owned || use_expert_row_tiles))
+    if (launch_proof && (!use_route_owned || use_expert_row_tiles))
         throw std::logic_error("route-owned diagnostic requires only its actual M1 route-owned family");
     const MoEPrefillPairConfig pair_config =
         use_expert_row_tiles && has_uniform_codebook_pair
@@ -4008,6 +4244,15 @@ bool rocmMoE_grouped_prefill_pipeline(
             down_k_partition_policy))
     {
         return false;
+    }
+
+    if (launch_proof && launch_proof->reductionWidth() > 0)
+    {
+        const auto &proof = *launch_proof;
+        if (proof.outputWidth() != intermediate || proof.reductionWidth() != d_model ||
+            !std::equal(std::begin(gateup_k_partition_policy.by_codebook), std::end(gateup_k_partition_policy.by_codebook),
+                proof.arithmeticPartitions().begin()))
+            throw std::logic_error("route-owned raw preparation changed its sealed original N/K partition policy");
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_id);
@@ -4208,7 +4453,8 @@ bool rocmMoE_grouped_prefill_pipeline(
                     d_group_token_indices, grouped_indices_are_route_slots, gate_descs, up_descs, \
                     d_scratch_gate, d_scratch_up, total_slots, seq_len, top_k, \
                     1, intermediate, d_model, \
-                    gateup_k_partition_policy, num_experts, admission); \
+                    gateup_k_partition_policy, num_experts, admission, launch_proof, \
+                    submission_observation ? &*submission_observation : nullptr); \
             } while (0)
         #define LAUNCH_GATEUP_ADAPTIVE(FMT, TN) \
             do { \
@@ -4616,7 +4862,12 @@ bool rocmMoE_grouped_prefill_pipeline(
         return false;
     }
 
-    if (diagnostic_observation) diagnostic_observation->publish();
+    if (submission_observation)
+    {
+        const auto &completed = submission_observation->complete();
+        if (completed_observation) *completed_observation = completed;
+        else g_moe_route_launch = completed; // Explicit diagnostic compatibility only.
+    }
     return true;
 }
 

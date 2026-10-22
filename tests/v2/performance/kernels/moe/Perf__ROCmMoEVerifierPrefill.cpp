@@ -12,6 +12,8 @@
  * must not be mistaken for additional expert computation in that comparison.
  * Benchmark geometry admission is shared with CUDA and rejects malformed
  * explicit selectors instead of silently substituting or dropping shapes.
+ * Explicit promoted-source diagnostics share the established transfer helper
+ * and real prepared-engine publication, retaining compact sources as oracle.
  */
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
@@ -31,6 +33,10 @@
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/NativeVNNITrainerEvidence.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#ifdef HAVE_ROCM
+#include "../../../integration/kernels/moe/NativeVNNIExpertTransferParityTest.h"
+#include "execution/moe/MoEOverlayParticipantMigration.h"
+#endif
 #include "../../../utils/TestTensorFactory.h"
 #include "../native_vnni_dispatch/NativeVNNIMoEPrefillManifest.h"
 #include "../native_vnni_dispatch/NativeVNNIMoERoutingProfiles.h"

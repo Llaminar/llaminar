@@ -1,5 +1,8 @@
 /**
  * @file ROCmQuantisedGemmKernel.cpp
+ * @note Const prepared-descriptor inspection observes only existing resident
+ * metadata. Active export retains the original preparation contract and reuses
+ * that projection; declaration must never materialize GPU weights implicitly.
  * @brief Device-resident prepared quantized GEMM and captured launch admission.
  *
  * Prepared weight handles and arena-owned activation/scratch surfaces survive
@@ -1488,6 +1491,13 @@ namespace llaminar2
             out = {};
             ensureWeightsConverted();
 
+            return inspectPreparedNativeVNNIMatrixDesc(out);
+        }
+
+        /** @copydoc ITensorGemm::inspectPreparedNativeVNNIMatrixDesc */
+        bool ROCmQuantisedGemmKernel::inspectPreparedNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) const
+        {
+            out = {};
             if (!impl_ || !impl_->has_native_vnni ||
                 !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
             {

@@ -29,6 +29,9 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
+#endif
 #include "kernels/KernelFactory.h"
 #include "kernels/common/ColumnShardAssemblyKernels.h"
 #include "kernels/common/SharedExpertColumnGateKernels.h"
@@ -124,6 +127,53 @@ namespace
                     return table.format;
                 else return DeviceMoEWeightFormat::NativeVNNI;
             }, fixed_table);
+#ifdef HAVE_ROCM
+            if (device().is_rocm() && params.rows == 1 && family == DeviceMoEWeightFormat::NativeVNNI &&
+                rocm::compiledMoERouteOwnedModelPartitionExecution() == rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes)
+            {
+                NativeVnniExecutionFormatEnvelope envelope;
+                for (const auto &payload : params.initial_gate_up)
+                {
+                    if (payload.empty()) continue;
+                    DeviceNativeVNNIMatrixDesc gate{}, up{};
+                    if (!payload.readyFor(DeviceMoEProjectionSet::GateUp) ||
+                        !payload.gate()->inspectPreparedNativeVNNIMatrixDesc(gate) ||
+                        !payload.up()->inspectPreparedNativeVNNIMatrixDesc(up) ||
+                        gate.n != geometry.intermediate_columns || up.n != geometry.intermediate_columns ||
+                        gate.k != geometry.model_columns || up.k != geometry.model_columns ||
+                        !areNativeVnniGateUpCodebooksCompatible(gate.codebook_id, up.codebook_id))
+                        throw std::logic_error("Projection launch intent requires already-prepared original native gate/up metadata");
+                    for (const auto *desc : {&gate, &up})
+                        if (!addNativeVnniExecutionFormat(envelope, desc->codebook_id,
+                                NativeVnniSourceIdentity{desc->source_codebook_id, desc->source_is_superblock != 0,
+                                    desc->source_identity_present != 0}, true))
+                            throw std::invalid_argument("Projection owner launch intent has an invalid original source envelope");
+                }
+                owner_plan.emplace(rocm::planMoERouteOwnedGateUp(rocm::MoERouteOwnedGateUpGeometry::TN64,
+                    envelope, device().rocm_ordinal(), rocm::compiledMoERouteOwnedModelPartitionExecution(),
+                    {.output_columns = geometry.intermediate_columns, .reduction_columns = geometry.model_columns}));
+                declaration_signature = owner_plan->identity();
+                // The immutable launch mode/shape/source-policy intent exists
+                // before the first cache hash. Descriptor payload pointers are
+                // runtime table contents, not additional embedded graph operands.
+                // Original prepare/export/upload and workspace leases remain their
+                // sole authority; materialization must validate this same intent.
+                const auto mix = [&](std::uint64_t word) { declaration_signature = (declaration_signature ^ word) * kFNV1a64Prime; };
+                mix(params.rows); mix(params.top_k);
+                mix(static_cast<std::uint64_t>(params.demand)); mix(static_cast<std::uint64_t>(params.service_phase));
+                mix(reinterpret_cast<std::uintptr_t>(params.tp));
+                mix(reinterpret_cast<std::uintptr_t>(params.counted_exchange.get()));
+                mix(reinterpret_cast<std::uintptr_t>(params.runtime));
+                mix(reinterpret_cast<std::uintptr_t>(params.kernel_owner.get()));
+                mix(reinterpret_cast<std::uintptr_t>(params.fixed_down.get()));
+                mix(fnv1a64(params.prefix.data(), params.prefix.size()));
+                for (const auto &tensor : {params.hidden, params.routing_indices, params.routing_weights,
+                        params.local_packet, params.gathered_packets, params.local_route_columns,
+                        params.local_columns, params.gathered_columns, params.output})
+                { mix(reinterpret_cast<std::uintptr_t>(tensor.tensor)); mix(static_cast<std::uint64_t>(tensor.id)); }
+                if (!declaration_signature) declaration_signature = 1;
+            }
+#endif
             layout = {deviceMoEWeightFormatIsFloating(family) ? MoEGroupedIntermediateEncoding::FP32
                         : MoEGroupedIntermediateEncoding::BlockQ8FP32Scales,
                 static_cast<std::uint32_t>(geometry.intermediate_columns),
@@ -192,6 +242,9 @@ namespace
                     throw std::logic_error("Projection graph workspace identity changed after preparation");
                 if (prepared->stream != stream)
                     throw std::logic_error("Projection graph descriptor publication belongs to another capture stream");
+                if (!params.kernel_owner->kernel)
+                    throw std::logic_error("Projection graph lost its prepared kernel owner");
+                params.kernel_owner->kernel->requireOwnerGateUpCaptureBinding(prepared->gate, params.rows, prepared->owner_intent);
                 return;
             }
             auto &kernel = params.kernel_owner->kernel;
@@ -247,9 +300,18 @@ namespace
                     {fnv1a64(identity.data(), identity.size()), layout.compactCapacityBytes()}, scheduling,
                     retain(params.local_packet.tensor), retain(params.gathered_packets.tensor));
             }
-            // Publication is atomic on the host setup path. Execute sees either
-            // the complete immutable metadata identity or a hard failure.
-            prepared = Prepared{workspace, workspace->id(), stream, gate_table, down_table};
+            std::uint64_t expected_intent = 0;
+#ifdef HAVE_ROCM
+            if (owner_plan) expected_intent = owner_plan->identity();
+#endif
+            const auto materialized_intent = kernel->prepareOwnerGateUpCaptureBinding(gate_table, params.rows, expected_intent);
+            if (materialized_intent != expected_intent)
+                throw std::logic_error("Projection graph materialized a different owner launch intent");
+            kernel->requireOwnerGateUpCaptureBinding(gate_table, params.rows, expected_intent);
+            // Publication is atomic on the host setup path. It does not alter
+            // declaration_signature: graph identity was complete before this
+            // exact resource materialization, including during the first hash.
+            prepared = Prepared{workspace, workspace->id(), stream, gate_table, down_table, expected_intent};
         }
 
         /**
@@ -276,6 +338,7 @@ namespace
             if (prepared->stream != stream)
                 throw std::logic_error("Projection graph execution changed its prepared metadata stream");
             auto &kernel = *params.kernel_owner->kernel;
+            kernel.requireOwnerGateUpCaptureBinding(prepared->gate, params.rows, prepared->owner_intent);
             kernel.setGPUStream(stream);
             const auto &ownership = params.fixed_down->ownership();
             const auto geometry = ownership.geometry();
@@ -359,8 +422,13 @@ namespace
             void *stream;
             int gate;
             int down;
+            std::uint64_t owner_intent;
         };
         const MoEProjectionPipelineParams params;
+#ifdef HAVE_ROCM
+        std::optional<rocm::MoERouteOwnedGateUpPlan> owner_plan; ///< Pure immutable intent, not resource/allocation authority.
+#endif
+        std::uint64_t declaration_signature = 0; ///< Frozen before any cache-identity query; zero retains default policy.
         MoEGroupedIntermediateLayout layout;
         DeviceMoEWeightFormat family;
         MoEOverlayFixedDownProjectionBank::DescriptorTable fixed_table;
@@ -405,6 +473,16 @@ namespace
         ComputeStageType type() const override { return ComputeStageType::MOE_PROJECTION_PHASE; }
         /** @return The frozen model/layer/phase identity. */
         std::string name() const override { return name_; }
+        /**
+         * @return Pure predeclared owner launch variant; native preparation only validates/materializes it.
+         * @note Arena/stream/workspace ownership retains its existing independent checks. No getter probes HIP or lazily changes identity.
+         */
+        std::uint64_t graphCaptureVariantSignature() const override
+        {
+            if (!binding_->declaration_signature) return 0;
+            const auto value = (binding_->declaration_signature ^ static_cast<std::uint64_t>(phase_)) * kFNV1a64Prime;
+            return value ? value : 1;
+        }
         /** @return Only the exact compiled GPU backend is supported. */
         bool supportsBackend(ComputeBackendType backend) const override
         {

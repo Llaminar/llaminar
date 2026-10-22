@@ -54,6 +54,19 @@
 #include <string>
 #include <utility>
 
+namespace llaminar2::rocm
+{
+/** @copydoc compiledMoERouteOwnedModelPartitionExecution */
+MoERouteOwnedGateUpPartitionExecution compiledMoERouteOwnedModelPartitionExecution() noexcept
+{
+#if LLAMINAR_ROCM_MOE_M1_OWNER_PARTITION_PLANES
+    return MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes;
+#else
+    return MoERouteOwnedGateUpPartitionExecution::Serial;
+#endif
+}
+}
+
 namespace
 {
     constexpr size_t kGroupedDecodeGateLogitsSharedCapBytes = 48 * 1024;
@@ -7045,6 +7058,106 @@ namespace llaminar2
         return static_cast<int>(grouped_down_desc_tables_.size() - 1);
     }
 
+    /** @copydoc IMoEKernel::prepareOwnerGateUpCaptureBinding */
+    std::uint64_t ROCmMoEKernel::prepareOwnerGateUpCaptureBinding(int table_id, int rows,
+                                                                    std::uint64_t expected_intent)
+    {
+        if (isGraphCaptureActive()) throw std::logic_error("owner gate/up capability must be bound before native capture");
+        if (table_id < 0 || table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) || rows <= 0)
+            throw std::invalid_argument("owner gate/up preparation requires its original table and physical rows");
+        auto &table = grouped_gateup_desc_tables_[table_id];
+        if (!table.valid || !table.deviceReady()) throw std::logic_error("owner gate/up table is not prepared");
+        const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeVNNI &&
+            table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!selected)
+        {
+            if (expected_intent) throw std::logic_error("owner gate/up intent names an unsupported physical operation");
+            return 0;
+        }
+        if (!expected_intent)
+        {
+            if (table.owner_m1_admission || table.owner_m1_intent)
+                throw std::logic_error("retained owner capability cannot be replaced by an unbound component policy");
+            return 0; // Original explicitly unbound component policy; model declarations validate their own nonzero intent.
+        }
+        const auto plan = rocm::planMoERouteOwnedGateUp(rocm::MoERouteOwnedGateUpGeometry::TN64,
+            {table.codebook_mask, table.policy_codebook_mask}, device_ordinal_,
+            rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes,
+            {.output_columns = table.intermediate, .reduction_columns = table.d_model});
+        if (plan.identity() != expected_intent)
+            throw std::logic_error("owner gate/up table does not match its predeclared immutable intent");
+        if (table.owner_m1_admission)
+        {
+            if (table.owner_m1_intent != expected_intent)
+                throw std::logic_error("owner gate/up capability cannot change behind a retained graph");
+            return table.owner_m1_intent;
+        }
+        auto admission = rocm::admitMoERouteOwnedGateUpGeometry(plan);
+        // Publish only the complete native capability. The original table and
+        // graph retirement own this host metadata; no memory reserve is added.
+        table.owner_m1_admission = std::move(admission);
+        table.owner_m1_intent = expected_intent;
+        return expected_intent;
+    }
+
+    /** @copydoc IMoEKernel::ownerGateUpCaptureBindingSignature */
+    std::uint64_t ROCmMoEKernel::ownerGateUpCaptureBindingSignature(int table_id, int rows) const
+    {
+        if (table_id < 0 || table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) || rows <= 0)
+            throw std::logic_error("owner gate/up capture binding lost its descriptor table");
+        const auto &table = grouped_gateup_desc_tables_[table_id];
+        if (!table.valid || !table.deviceReady()) throw std::logic_error("owner gate/up capture binding lost its prepared storage");
+        const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeVNNI &&
+            table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!selected) return 0;
+        if (table.owner_m1_admission.has_value() != (table.owner_m1_intent != 0))
+            throw std::logic_error("owner gate/up table lost its complete immutable capability");
+        return table.owner_m1_intent;
+    }
+
+    /** @copydoc ROCmMoEKernel::ownerGateUpAdmissionForCall */
+    const rocm::MoERouteOwnedGateUpAdmission *ROCmMoEKernel::ownerGateUpAdmissionForCall(
+        int table_id, int rows, const MoEPrefillProjectionExecution &execution,
+        rocm::MoERouteOwnedProjectionShape shape) const
+    {
+        if (!execution.executesGateUp() || execution.executesDown() || rows != 1 ||
+            table_id < 0 || table_id >= static_cast<int>(grouped_gateup_desc_tables_.size())) return nullptr;
+        const auto &table = grouped_gateup_desc_tables_[table_id];
+        if (table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+            table.descriptor_source != MoEDecodeDescriptorSource::RuntimePlacementTable) return nullptr;
+        if (!table.owner_m1_admission && !table.owner_m1_intent)
+            return nullptr; // Existing unbound component path, not a declared graph policy.
+        if (!table.owner_m1_admission || !table.owner_m1_intent)
+            throw std::logic_error("owner gate/up table lost its complete immutable capability");
+        if (rocm::currentMoERouteOwnedGateUpGeometry())
+            throw std::logic_error("prepared model owner capability cannot be overridden by a diagnostic scope");
+        // A bound operation cannot silently execute under a different shape.
+        if (shape.output_columns != table.intermediate || shape.reduction_columns != table.d_model)
+            throw std::logic_error("owner M1 gate/up requires its exact cold model capability");
+        return &*table.owner_m1_admission;
+    }
+
+    /** @copydoc ROCmMoEKernel::recordOwnerGateUpCaptureSubmissions */
+    void ROCmMoEKernel::recordOwnerGateUpCaptureSubmissions(
+        const rocm::MoERouteOwnedGateUpLaunchSet &completed, std::uint64_t intent) const
+    {
+        if (!PerfStatsCollector::isDomainEnabled("kernel")) return;
+        for (std::size_t index = 0; index < completed.leaf_count; ++index)
+        {
+            const auto &leaf = completed.leaves[index];
+            PerfStatsCollector::addCounter("kernel", "rocm_moe_owner_m1_partition_submissions", 1.0,
+                "submission", DeviceId::rocm(device_ordinal_).toString(),
+                {{"observation", "host_execute_or_capture"}, {"partition_execution", "four_worker_planes"},
+                 {"intent", std::to_string(intent)}, {"execution_codebook", std::to_string(leaf.execution_codebook)},
+                 {"n", std::to_string(leaf.n)}, {"k", std::to_string(leaf.k)},
+                 {"worker_planes", std::to_string(leaf.partition_worker_planes)},
+                 {"grid_x", std::to_string(leaf.grid_x)}, {"grid_y", std::to_string(leaf.grid_y)}, {"grid_z", std::to_string(leaf.grid_z)},
+                 {"block_threads", std::to_string(leaf.block_x)},
+                 {"dynamic_shared_bytes", std::to_string(leaf.resources.dynamic_shared_memory_bytes)},
+                 {"native_function", std::to_string(reinterpret_cast<std::uintptr_t>(leaf.resources.function))}});
+        }
+    }
+
     int ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables(
         const DeviceNativeVNNIMatrixDesc *gate_descs,
         const DeviceNativeVNNIMatrixDesc *up_descs,
@@ -11347,8 +11460,12 @@ namespace llaminar2
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
-        rocm::validateMoERouteOwnedGateUpScopeBinding(device_ordinal_, gpu_stream_, seq_len, execution);
-if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
+        const auto *owner_admission = ownerGateUpAdmissionForCall(gateup_desc_table_id, seq_len, execution,
+            {.output_columns = intermediate, .reduction_columns = d_model});
+        rocm::MoERouteOwnedGateUpLaunchSet owner_completed{};
+        rocm::validateMoERouteOwnedGateUpScopeBinding(device_ordinal_, gpu_stream_, seq_len, execution,
+            {.output_columns = intermediate, .reduction_columns = d_model}, owner_admission);
+        if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             num_experts <= 0 || top_k <= 0 ||
             seq_len > std::numeric_limits<int>::max() / top_k ||
             execution.modelColumns() != d_model)
@@ -11374,7 +11491,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
-        rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask);
+        rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask, owner_admission);
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
 
@@ -11596,7 +11713,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     device_ordinal_,
                     producer_stream,
                     execution,
-                    grouped_prefill_grouping_.scope());
+                    grouped_prefill_grouping_.scope(), owner_admission,
+                    owner_admission ? &owner_completed : nullptr);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11609,6 +11727,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillProjection] pipeline failed for layer");
             return false;
         }
+
+        if (owner_admission)
+            recordOwnerGateUpCaptureSubmissions(owner_completed, gateup_table.owner_m1_intent);
 
         if (reuse_router_q8_hidden)
         {
@@ -11701,7 +11822,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
-        rocm::validateMoERouteOwnedGateUpScopeBinding(device_ordinal_, gpu_stream_, seq_len, execution);
+        const auto *owner_admission = ownerGateUpAdmissionForCall(gateup_desc_table_id, seq_len, execution,
+            {.output_columns = intermediate, .reduction_columns = d_model});
+        rocm::MoERouteOwnedGateUpLaunchSet owner_completed{};
+        rocm::validateMoERouteOwnedGateUpScopeBinding(device_ordinal_, gpu_stream_, seq_len, execution,
+            {.output_columns = intermediate, .reduction_columns = d_model}, owner_admission);
         grouped_prefill_grouping_.invalidate();
         if (!device_runtime_layer)
             return false;
@@ -11712,7 +11837,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             LOG_ERROR("Sliced MoE down execution requires the immutable fixed-down descriptor table");
             return false;
         }
-if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
+        if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             num_experts <= 0 || top_k <= 0 ||
             seq_len > std::numeric_limits<int>::max() / top_k ||
             execution.modelColumns() != d_model)
@@ -11755,7 +11880,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
-        rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask);
+        rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask, owner_admission);
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -11984,7 +12109,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
                     device_ordinal_,
                     producer_stream,
                     execution,
-                    MoEPrefillRouteScope::SelectedRoutes);
+                    MoEPrefillRouteScope::SelectedRoutes, owner_admission,
+                    owner_admission ? &owner_completed : nullptr);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11996,6 +12122,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] grouped ROCm pipeline failed");
             return false;
         }
+
+        if (owner_admission)
+            recordOwnerGateUpCaptureSubmissions(owner_completed, gateup_table.owner_m1_intent);
 
         if (reuse_router_q8_hidden)
         {

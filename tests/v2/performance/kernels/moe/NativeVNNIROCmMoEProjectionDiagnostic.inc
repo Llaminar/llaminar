@@ -7,8 +7,17 @@
  * Prepared ownership follows MoEProjectionPipeline: sparse initial gate/up
  * payloads in the ordinary runtime and every original-source fixed down slice.
  * Extra full-H oracle engines cover only the actually routed source experts.
+ * An explicit promoted23 fixture publishes genuine completed CPU transfer
+ * storage through the production borrowed-storage GEMM and prepared-arrival API;
+ * the original compact engines remain the independent numerical oracle.
  * Runtime-mutable format reachability is certified from prepared/setup metadata;
  * each actual normalized physical leaf retains its own resources and receipt.
+ * Explicit scoped-inline and true automatic controls reuse this transaction.
+ * The automatic control authenticates actual captured adjacent-K_LANES geometry;
+ * it is never relabeled as the scoped Serial/K1 control. Synthetic source
+ * fixtures retain canonical original aliases without model/corpus provenance.
+ * An explicit fixed-TN64 source-partition execution contest reuses this exact transaction;
+ * the original three-width inline contest remains the default declaration.
  * No expert descriptor aliases, replacement arithmetic, transport, scheduler,
  * installed policy or complete-operation performance provenance is introduced.
  */
@@ -17,6 +26,104 @@ namespace route87
 using namespace llaminar2;
 using Diagnostic = test::native_vnni_dispatch::MoEProjectionDiagnostic;
 using Json = nlohmann::json;
+
+/**
+ * @param spec Explicit immutable prepared-representation declaration.
+ * @return Whether local resident gate/up must be genuine expanded-asymmetric CPU arrivals.
+ * @throws std::invalid_argument For an unknown enum; no prepared representation substitution.
+ */
+inline bool promoted23Fixture(const Diagnostic &spec)
+{
+    using namespace test::native_vnni_dispatch;
+    (void)moeProjectionPreparedRepresentationName(spec.prepared_representation);
+    return spec.prepared_representation == MoEProjectionPreparedRepresentation::CpuPreparedPromoted23;
+}
+
+/**
+ * @brief Name work sharing independently of source partitions and adjacent K_LANES.
+ * @param execution Closed cold-admitted partition execution.
+ * @return Stable evidence spelling; unknown values fail before capture.
+ * @throws std::invalid_argument For an unknown execution enum.
+ */
+inline const char *partitionExecutionName(rocm::MoERouteOwnedGateUpPartitionExecution execution)
+{
+    switch (execution)
+    {
+    case rocm::MoERouteOwnedGateUpPartitionExecution::Serial: return "serial";
+    case rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes: return "four-worker-planes";
+    }
+    throw std::invalid_argument("unknown route-owned source partition execution");
+}
+
+/**
+ * @param execution Closed physical worker assignment, never a replacement KB count.
+ * @return Actual worker planes; K_LANES remains one within each original partition.
+ * @throws std::invalid_argument For an unknown execution enum.
+ */
+inline int partitionWorkerPlanes(rocm::MoERouteOwnedGateUpPartitionExecution execution)
+{
+    (void)partitionExecutionName(execution);
+    return execution == rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes ?
+        rocm::kMoERouteOwnedGateUpPartitionWorkers : 1;
+}
+
+/**
+ * @param spec Authored source/operation request with a closed contest enum.
+ * @return Whether the request times actual unscoped production against four worker planes.
+ * @throws std::invalid_argument For an unknown contest enum.
+ */
+inline bool automaticContest(const Diagnostic &spec)
+{
+    (void)test::native_vnni_dispatch::moeProjectionContestName(spec.contest);
+    return spec.contest == test::native_vnni_dispatch::MoEProjectionContest::AutomaticVsParallelPartitions64;
+}
+
+/**
+ * @param spec Authored source/operation request with a closed contest enum.
+ * @return Whether this is the existing scoped-K1 two-way source-partition contest.
+ * @throws std::invalid_argument For an unknown contest enum.
+ */
+inline bool partitionContest(const Diagnostic &spec)
+{
+    (void)test::native_vnni_dispatch::moeProjectionContestName(spec.contest);
+    return spec.contest == test::native_vnni_dispatch::MoEProjectionContest::Inline64VsParallelPartitions64;
+}
+
+/**
+ * @param spec Original typed diagnostic request, never an implicit environment mode.
+ * @return Evidence generation; old three-width requests retain their original schema.
+ * @throws std::invalid_argument For an unknown contest enum.
+ */
+inline const char *evidenceGeneration(const Diagnostic &spec)
+{
+    if (promoted23Fixture(spec)) return "rocm-moe-owner-compact-promoted23-automatic-partition-diagnostic-v1";
+    if (automaticContest(spec)) return "rocm-moe-owner-compact-automatic-partition-diagnostic-v1";
+    return partitionContest(spec) ? "rocm-moe-owner-compact-source-partition-diagnostic-v1"
+                                 : "rocm-moe-owner-compact-diagnostic-v2";
+}
+
+/**
+ * @brief Name a real execution without aliasing new workers to old TN evidence.
+ * @param spec Original request including exact gate/up output N and reduction K.
+ * @param geometry Independent-column geometry, orthogonal to worker planes.
+ * @param execution Explicit physical execution of the original partition program.
+ * @return Old geometry ID or a mode/worker/N/K-qualified diagnostic ID.
+ * @throws std::invalid_argument For an unknown geometry/execution/contest enum.
+ */
+inline std::string ownerCandidateId(const Diagnostic &spec, rocm::MoERouteOwnedGateUpGeometry geometry,
+    rocm::MoERouteOwnedGateUpPartitionExecution execution)
+{
+    const auto base = "rocm.moe.route_owned.gate_up.tn" +
+        std::to_string(rocm::moeRouteOwnedGateUpColumns(geometry)) + ".k1";
+    const auto *name = partitionExecutionName(execution);
+    const std::string prepared_suffix = promoted23Fixture(spec) ? ".prepared.cpu-prepared-promoted23" : "";
+    if (automaticContest(spec) && execution == rocm::MoERouteOwnedGateUpPartitionExecution::Serial)
+        return "rocm.moe.route_owned.gate_up.automatic-production.n" + std::to_string(spec.source.routed_expert_width) +
+            ".k" + std::to_string(spec.source.hidden_size) + prepared_suffix;
+    return (partitionContest(spec) || automaticContest(spec)) ? base + ".source-partitions-" + name + ".workers" +
+        std::to_string(partitionWorkerPlanes(execution)) + ".n" + std::to_string(spec.source.routed_expert_width) +
+        ".k" + std::to_string(spec.source.hidden_size) + prepared_suffix : base + prepared_suffix;
+}
 
 /** @brief Fail one diagnostic cell without dropping a candidate or timing row. */
 inline void require(bool ok, const char *message)
@@ -81,6 +188,100 @@ struct PreparedOwner final
     std::vector<DeviceNativeVNNIMatrixDesc> oracle_gate, oracle_up, oracle_down;
     std::map<int, int> oracle_ids;
     Json inventory = Json::array();
+
+    /** @brief Immutable promotion bytes/metadata retained by the real engine; never owns that engine. */
+    struct PromotedProjectionStorage final
+    {
+        cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
+        std::optional<test::native_vnni_transfer_parity_detail::PromotedCPUProjection> gpu;
+    };
+    std::vector<std::shared_ptr<PromotedProjectionStorage>> promoted_storage;
+    Json promotion_inventory = Json::array();
+
+    /**
+     * @brief Prepare one distinct original projection through the real CPU transfer and GPU engine path.
+     * @param spec Original source/owner declaration; no authored physical23 source alias.
+     * @param expert Actual original logical expert, preserved in the transfer manifest.
+     * @param projection Actual gate/up role; fixed down never enters this movable family.
+     * @param source Original immutable tensor already retained for the independent compact oracle.
+     * @param original Authenticated compact GPU descriptor of that same original projection.
+     * @return Actual production borrowed-storage GEMM retaining the genuine completed arrival owner.
+     * @throws std::runtime_error For CPU packing, transfer, source/capacity authentication or export failure.
+     * @note Everything is cold setup. The existing lane supplies staging/stream capacity and completion;
+     *       no bytes, events, descriptor tables or weights are repaired during capture or timing.
+     */
+    std::shared_ptr<ITensorGemm> promoteOriginalProjection(const Diagnostic &spec, int expert,
+        ExpertTierWeightProjection projection, const std::shared_ptr<TensorBase> &source,
+        const DeviceNativeVNNIMatrixDesc &original)
+    {
+        using namespace test::native_vnni_transfer_parity_detail;
+        require(promoted23Fixture(spec) && source && original.valid() && original.source_identity_present &&
+            original.n == spec.source.routed_expert_width && original.k == spec.source.hidden_size &&
+            expert >= 0 && expert < spec.source.expert_count &&
+            (projection == ExpertTierWeightProjection::Gate || projection == ExpertTierWeightProjection::Up),
+            "promoted23 requires a complete original local gate/up source");
+        auto storage = std::make_shared<PromotedProjectionStorage>();
+        require(cpu::native_vnni::packWeightsCPUNativeVNNI(source.get(), storage->cpu) &&
+            storage->cpu.usesExpandedInt8() && storage->cpu.is_asymmetric &&
+            storage->cpu.codebook_id == original.source_codebook_id &&
+            storage->cpu.is_superblock == bool(original.source_is_superblock) &&
+            storage->cpu.N == original.n && storage->cpu.N_padded == original.n && storage->cpu.K == original.k,
+            "original source did not produce the declared genuine expanded asymmetric CPU bytes");
+        auto *backend = getBackendFor(device);
+        require(backend != nullptr, "promoted23 backend is absent");
+        const auto lane_identity = std::uint64_t{930000} + std::uint64_t(expert) * 2u +
+            static_cast<std::uint64_t>(projection);
+        const auto probe = makeCpuToGpuExpertTierWeightStreamManifest(storage->cpu, 1, 0, expert, projection, 1);
+        const CPUProjectionPromotionOptions options{.identity = {.residency_epoch = 1,
+            .layer_idx = 0, .expert_id = expert},
+            .maximum_units_per_chunk = std::min<std::uint32_t>(64, probe.deviceLayout().unit_count)};
+        storage->gpu.emplace(promoteCPUProjection(backend, device, storage->cpu, projection, lane_identity, options));
+        const auto &arrived = *storage->gpu;
+        const auto &d = arrived.descriptor;
+        require(arrived.payload && arrived.scales && arrived.mins && d.valid() &&
+            d.payload == arrived.payload->as<std::uint8_t>() && d.scales == arrived.scales->get() &&
+            d.mins == arrived.mins->get() && d.emins == (arrived.emins ? arrived.emins->get() : nullptr) &&
+            d.codebook_id == kNativeVnniExpandedInt8MinCodebook && d.mins &&
+            d.n == original.n && d.k == original.k && d.blocks_per_row == std::uint32_t(original.k / 32) &&
+            d.source_identity_present && d.source_codebook_id == original.source_codebook_id &&
+            d.source_is_superblock == original.source_is_superblock &&
+            arrived.manifest.residency_epoch == options.identity.residency_epoch &&
+            arrived.manifest.layer_idx == options.identity.layer_idx && arrived.manifest.expert_id == expert &&
+            arrived.manifest.projection == projection && arrived.manifest.N == d.n && arrived.manifest.K == d.k &&
+            arrived.manifest.gpu_codebook_id == d.codebook_id &&
+            arrived.manifest.gpu_source_codebook_id == d.source_codebook_id &&
+            arrived.manifest.gpu_source_is_superblock == d.source_is_superblock &&
+            arrived.manifest.maximum_units_per_chunk == options.maximum_units_per_chunk,
+            "completed promoted23 storage/manifest contradicts its exact original source");
+        auto engine = std::make_shared<rocm::ROCmQuantisedGemmKernel>(d.n, d.k, device.ordinal,
+            arrived.payload->as<std::uint8_t>(), arrived.scales->get(), arrived.mins->get(),
+            arrived.emins ? arrived.emins->get() : nullptr, d.codebook_id, d.blocks_per_row, storage,
+            NativeVnniSourceIdentity{.codebook_id = d.source_codebook_id,
+                .is_superblock = d.source_is_superblock != 0, .present = true},
+            NativeVnniReusableDeviceAllocationFormat{.payload_bytes_per_block = d.allocation_payload_bytes_per_block,
+                .has_mins = d.allocation_has_mins != 0, .has_emins = d.allocation_has_emins != 0});
+        DeviceNativeVNNIMatrixDesc exported{};
+        require(engine->exportNativeVNNIMatrixDesc(exported) && exported.valid() &&
+            exported.payload == d.payload && exported.scales == d.scales && exported.mins == d.mins && exported.emins == d.emins &&
+            exported.n == d.n && exported.k == d.k && exported.blocks_per_row == d.blocks_per_row &&
+            exported.codebook_id == d.codebook_id && exported.source_identity_present == d.source_identity_present &&
+            exported.source_codebook_id == d.source_codebook_id && exported.source_is_superblock == d.source_is_superblock &&
+            exported.allocation_payload_bytes_per_block == d.allocation_payload_bytes_per_block &&
+            exported.allocation_has_mins == d.allocation_has_mins && exported.allocation_has_emins == d.allocation_has_emins,
+            "production borrowed-storage engine did not retain the actual promoted descriptor");
+        promotion_inventory.push_back({{"expert", expert}, {"projection", static_cast<int>(projection)},
+            {"lane_identity", lane_identity}, {"epoch", arrived.manifest.residency_epoch},
+            {"layer", arrived.manifest.layer_idx}, {"maximum_units_per_chunk", arrived.manifest.maximum_units_per_chunk},
+            {"source_codebook", storage->cpu.codebook_id}, {"source_is_superblock", storage->cpu.is_superblock},
+            {"cpu_expanded_asymmetric", true}, {"actual_descriptor", descriptorIdentity(exported)},
+            {"allocation_format", {{"payload_bytes_per_block", d.allocation_payload_bytes_per_block},
+                {"has_mins", bool(d.allocation_has_mins)}, {"has_emins", bool(d.allocation_has_emins)}}},
+            {"transfers_completed", arrived.stats.transfers_completed}, {"chunks_submitted", arrived.stats.chunks_submitted},
+            {"bytes_submitted", arrived.stats.bytes_submitted}, {"blocking_synchronizations", arrived.stats.blocking_synchronizations},
+            {"inference_stream_waits", arrived.stats.inference_stream_waits}});
+        promoted_storage.push_back(storage);
+        return engine;
+    }
 
     /**
      * @brief Prepare exactly one participant and the independent serial oracle.
@@ -178,6 +379,28 @@ struct PreparedOwner final
                 local_gate_up[expert] = MoEOverlayPreparedExpertPayload::gateUp(handle(indices[expert][0]), handle(indices[expert][1]));
                 entry["gate"] = descriptorIdentity(descriptor(indices[expert][0], gate_format, source.routed_expert_width, source.hidden_size));
                 entry["up"] = descriptorIdentity(descriptor(indices[expert][1], gate_format, source.routed_expert_width, source.hidden_size));
+                if (promoted23Fixture(spec))
+                {
+                    const auto original_gate = descriptor(indices[expert][0], gate_format, source.routed_expert_width, source.hidden_size);
+                    const auto original_up = descriptor(indices[expert][1], gate_format, source.routed_expert_width, source.hidden_size);
+                    auto gate = promoteOriginalProjection(spec, expert, ExpertTierWeightProjection::Gate, originals[expert].gate, original_gate);
+                    auto up = promoteOriginalProjection(spec, expert, ExpertTierWeightProjection::Up, originals[expert].up, original_up);
+                    MoEOverlayPreparedExpertArrival arrival(DeviceMoEProjectionSet::GateUp);
+                    std::string error;
+                    if (!arrival.publish(ExpertTierWeightProjection::Gate, gate, &error) ||
+                        !arrival.publish(ExpertTierWeightProjection::Up, up, &error) ||
+                        !arrival.completePayload(local_gate_up[expert], &error))
+                        throw std::runtime_error("completed promoted gate/up arrival publication failed: " + error);
+                    DeviceMoEExpertDescriptor actual{};
+                    require(exportDeviceMoEPreparedPayload(local_gate_up[expert], actual) &&
+                        actual.gate.codebook_id == kNativeVnniExpandedInt8MinCodebook &&
+                        actual.up.codebook_id == kNativeVnniExpandedInt8MinCodebook,
+                        "promoted gate/up payload did not export its actual resident23 engines");
+                    entry["original_compact_gate_oracle"] = entry["gate"];
+                    entry["original_compact_up_oracle"] = entry["up"];
+                    entry["gate"] = descriptorIdentity(actual.gate); entry["up"] = descriptorIdentity(actual.up);
+                    entry["prepared_representation"] = "cpu-prepared-promoted23";
+                }
             }
             inventory.push_back(std::move(entry));
         }
@@ -526,17 +749,111 @@ inline Json nodes(const std::vector<GPUGraphKernelNodeInfo> &inventory)
 }
 
 /**
+ * @brief Authenticate the actual unscoped production M1 producer inventory.
+ * @param state Original owner, source geometry and complete immutable runtime envelope.
+ * @param arithmetic_reference Exact cold Serial/K1 capability used only for its canonical source program.
+ * @param inventory Read-only native nodes from this fresh, already-instantiated automatic capture.
+ * @return Actual physical leaf metadata. No scoped launch receipt is invented for ordinary execution.
+ * @throws std::runtime_error If names, decoder coverage, resources or multiplicity are incomplete.
+ * @note Legal M1 has at most16 slots: Q6_K/IQ2_S really use adjacent K_LANES4;
+ *       every other ordinary decoder uses K_LANES1. Four worker planes are a separate axis.
+ */
+inline Json automaticPhysical(const State &state, const rocm::MoERouteOwnedGateUpAdmission &arithmetic_reference,
+    const std::vector<GPUGraphKernelNodeInfo> &inventory)
+{
+    require(arithmetic_reference.outputWidth() == state.spec.source.routed_expert_width &&
+        arithmetic_reference.reductionWidth() == state.spec.source.hidden_size &&
+        state.spec.rows == 1 && state.spec.top_k > 0 && state.spec.top_k <= 16,
+        "automatic comparison requires exact shape and the legal public M1 route capacity");
+    for (const auto &node : inventory)
+        require(node.name_resolved, "automatic native capture has an unresolved symbol; no inferred decoder identity");
+    const auto mask = arithmetic_reference.launchCodebookMask();
+    Json leaves = Json::array(), codebooks = Json::array(), arithmetic = Json::array();
+    int minimum_lanes = 4, maximum_lanes = 1;
+    for (std::uint8_t cb = 0; cb < 32; ++cb)
+    {
+        if (!(mask & nativeVnniCodebookMaskBit(cb))) continue;
+        const int lanes = cb == 8 || cb == 13 ? 4 : 1;
+        minimum_lanes = std::min(minimum_lanes, lanes); maximum_lanes = std::max(maximum_lanes, lanes);
+        const std::string identity = "IL23NativeVNNIFormatPrefill" + std::to_string(cb) +
+            "ELi64ELb" + (cb == 13 ? "1" : "0") + "ELi" + std::to_string(lanes) + "ELb0EE";
+        int matches = 0; const GPUGraphKernelNodeInfo *first = nullptr;
+        const std::size_t lds = rocm::moeRouteOwnedGateUpCodebookSharedBytes(cb) +
+            (lanes > 1 ? std::size_t(state.spec.source.hidden_size) +
+                std::size_t(state.spec.source.hidden_size / 32) * sizeof(float) : 0u);
+        for (const auto &node : inventory)
+        {
+            if (node.name.find("moe_grouped_gate_up_decode_equivalent_prefill_kernel") == std::string::npos ||
+                node.name.find(identity) == std::string::npos) continue;
+            require(node.name_resolved && node.valid() && node.grid_x == unsigned((state.spec.source.routed_expert_width + 63) / 64) &&
+                node.grid_y == unsigned(state.spec.source.experts_per_token) && node.grid_z == 2 &&
+                node.block_x == unsigned(64 * lanes) && node.block_y == 1 && node.block_z == 1 &&
+                node.dynamic_shared_memory_bytes == lds && node.local_memory_bytes_per_thread == 0,
+                "automatic M1 native symbol/grid/K_LANES/LDS/resource contract is incomplete");
+            if (first)
+                require(node.function_identity == first->function_identity && node.registers_per_thread == first->registers_per_thread &&
+                    node.static_shared_memory_bytes == first->static_shared_memory_bytes &&
+                    node.max_threads_per_block == first->max_threads_per_block &&
+                    node.max_active_blocks_per_sm == first->max_active_blocks_per_sm,
+                    "automatic repeated producer changed its native resource identity");
+            else first = &node;
+            ++matches;
+        }
+        require(first && matches == state.spec.operations_per_sample,
+            "automatic graph omitted or aliased a normalized physical producer");
+        const auto &serial_resource = arithmetic_reference.leafResources(cb);
+        require(lanes == 1 ? first->function_identity == reinterpret_cast<std::uintptr_t>(serial_resource.function) :
+                first->function_identity != reinterpret_cast<std::uintptr_t>(serial_resource.function),
+            "automatic physical function disagrees with original K_LANES selection");
+        if (lanes == 1)
+            require(first->registers_per_thread == serial_resource.registers_per_thread &&
+                first->static_shared_memory_bytes == serial_resource.static_shared_memory_bytes &&
+                first->max_threads_per_block == serial_resource.max_threads_per_block &&
+                first->max_active_blocks_per_sm == serial_resource.max_active_blocks_per_sm,
+                "automatic K_LANES1 resources disagree with the identical cold-inspected function");
+        codebooks.push_back(cb);
+        arithmetic.push_back({{"execution_codebook", cb}, {"arithmetic_partitions", arithmetic_reference.arithmeticPartitions()}});
+        leaves.push_back({{"execution_codebook", cb}, {"tn", 64}, {"k_lanes", lanes}, {"partition_worker_planes", 1},
+            {"source_program_authority", "exact-canonical-cold-resolver-not-a-scoped-launch-observation"},
+            {"source_arithmetic_partitions", arithmetic_reference.arithmeticPartitions()},
+            {"n", state.spec.source.routed_expert_width}, {"k", state.spec.source.hidden_size},
+            {"route_capacity", state.spec.source.experts_per_token}, {"captured_instances", matches},
+            {"resources", {{"function", first->function_identity}, {"name", first->name},
+                {"registers", first->registers_per_thread}, {"local_bytes", first->local_memory_bytes_per_thread},
+                {"static_shared_bytes", first->static_shared_memory_bytes}, {"dynamic_shared_bytes", lds},
+                {"max_threads_per_block", first->max_threads_per_block}, {"active_blocks_per_sm", first->max_active_blocks_per_sm}}},
+            {"grid", {first->grid_x, first->grid_y, first->grid_z}}, {"block", {first->block_x, first->block_y, first->block_z}}});
+    }
+    std::size_t producers = 0;
+    for (const auto &node : inventory)
+        if (node.name.find("moe_grouped_gate_up_decode_equivalent_prefill_kernel") != std::string::npos) ++producers;
+    require(leaves.size() == arithmetic_reference.leafCount() && producers == leaves.size() * state.spec.operations_per_sample,
+        "automatic graph contains an unexpected or unresolved producer leaf");
+    return {{"gate_tn", 64}, {"k_lanes", minimum_lanes == maximum_lanes ? minimum_lanes : 0},
+        {"k_lanes_min", minimum_lanes}, {"k_lanes_max", maximum_lanes}, {"partition_execution", "automatic-production"},
+        {"partition_worker_planes", 1}, {"actual_output_n", state.spec.source.routed_expert_width},
+        {"actual_reduction_k", state.spec.source.hidden_size}, {"maximum_source_partitions", arithmetic_reference.maximumKPartitions()},
+        {"reachable_execution_mask", state.gateup_envelope.execution_codebook_mask},
+        {"source_policy_mask", state.gateup_envelope.policy_codebook_mask}, {"normalized_launch_mask", mask},
+        {"ordered_leaf_codebooks", codebooks}, {"leaf_order_authority", "ascending-codebook-canonicalized-inventory-not-submission-order"},
+        {"arithmetic_identity", arithmetic}, {"leaf_count_per_operation", leaves.size()}, {"actual_automatic_leaves", leaves},
+        {"scoped_launch_receipt", false}};
+}
+
+/**
  * @brief Capture one real owner transaction under an admitted lexical geometry.
  * @param state Shared immutable preparation and exact construction stream.
  * @param admission Every normalized leaf in the exact runtime envelope, inspected before capture.
- * @param scoped False only for the untouched functional control, never a timed fourth alias.
+ * @param scoped True for a cold-admitted lexical override; false retains ordinary production dispatch.
+ * @param timed_automatic Explicit new contest control; its native inventory must authenticate ordinary execution.
  * @return Retained original graph and exact receipt/node identities.
  */
-inline Trial captureOwner(State &state, const rocm::MoERouteOwnedGateUpAdmission &admission, bool scoped = true)
+inline Trial captureOwner(State &state, const rocm::MoERouteOwnedGateUpAdmission &admission, bool scoped = true, bool timed_automatic = false)
 {
     const int columns = rocm::moeRouteOwnedGateUpColumns(admission.geometry());
     Trial result;
-    result.candidate = scoped ? "rocm.moe.route_owned.gate_up.tn" + std::to_string(columns) + ".k1"
+    require(!timed_automatic || (!scoped && automaticContest(state.spec)), "invalid automatic capture authority");
+    result.candidate = scoped || timed_automatic ? ownerCandidateId(state.spec, admission.geometry(), admission.partitionExecution())
                               : "rocm.moe.route_owned.gate_up.untouched-functional-control";
     result.boundary = "owner-gate-up-pack-m1";
     std::unique_ptr<rocm::ScopedMoERouteOwnedGateUpGeometry> selected;
@@ -581,16 +898,36 @@ inline Trial captureOwner(State &state, const rocm::MoERouteOwnedGateUpAdmission
                     "route87 actual leaf is duplicated or outside normalized admission");
                 observed_mask |= bit;
                 const auto &admitted = admission.leafResources(leaf.execution_codebook);
-                require(leaf.geometry == admission.geometry() &&
+                require(leaf.geometry == admission.geometry() && leaf.partition_execution == admission.partitionExecution() &&
                     leaf.device_ordinal == state.prepared.device.ordinal && leaf.stream == state.stream &&
                     leaf.n == state.spec.source.routed_expert_width && leaf.k == state.spec.source.hidden_size &&
-                    leaf.route_capacity == state.spec.source.experts_per_token && leaf.block_x == columns &&
+                    leaf.route_capacity == state.spec.source.experts_per_token &&
+                    leaf.partition_worker_planes == partitionWorkerPlanes(admission.partitionExecution()) &&
+                    leaf.block_x == admitted.block_threads &&
+                    admitted.block_threads == columns * leaf.partition_worker_planes &&
                     leaf.block_y == 1 && leaf.block_z == 1 && resources(leaf.resources) == resources(admitted),
                     "route87 effective leaf differs from admitted resources/source identity");
+                const int maximum_partitions = rocm::moeRouteOwnedGateUpMaximumKPartitions(
+                    envelope, leaf.arithmetic_partitions, leaf.k);
+                require(maximum_partitions > 0 &&
+                    ((admission.outputWidth() == 0 && admission.reductionWidth() == 0) ||
+                        (admission.outputWidth() == leaf.n && admission.reductionWidth() == leaf.k &&
+                         admission.arithmeticPartitions() == leaf.arithmetic_partitions &&
+                         admission.maximumKPartitions() == maximum_partitions)),
+                    "route89 actual source partitions differ from exact named-shape admission");
+                require(leaf.partition_execution != rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes ||
+                    (columns == rocm::kMoERouteOwnedGateUpPartitionColumns &&
+                     admission.outputWidth() == leaf.n && admission.reductionWidth() == leaf.k &&
+                     leaf.resources.dynamic_shared_memory_bytes ==
+                        rocm::moeRouteOwnedGateUpK1SharedLayout(leaf.execution_codebook,
+                            leaf.partition_execution, maximum_partitions).total_bytes),
+                    "route89 actual worker geometry/LDS differs from original source-partition admission");
                 order.push_back(leaf.execution_codebook);
                 trees.push_back({{"execution_codebook", leaf.execution_codebook},
                     {"arithmetic_partitions", leaf.arithmetic_partitions}});
                 leaves.push_back({{"execution_codebook", leaf.execution_codebook},
+                    {"partition_execution", partitionExecutionName(leaf.partition_execution)},
+                    {"partition_worker_planes", leaf.partition_worker_planes}, {"maximum_source_partitions", maximum_partitions},
                     {"n", leaf.n}, {"k", leaf.k}, {"route_capacity", leaf.route_capacity},
                     {"stream", reinterpret_cast<std::uintptr_t>(leaf.stream)},
                     {"grid", {leaf.grid_x, leaf.grid_y, leaf.grid_z}},
@@ -628,10 +965,21 @@ inline Trial captureOwner(State &state, const rocm::MoERouteOwnedGateUpAdmission
                 "route87 captured operation changed source arithmetic or launch order");
             operations.push_back({{"operation", operation}, {"leaf_count", set.leaf_count}, {"leaves", leaves}});
         }
-        result.physical = {{"gate_tn", columns}, {"reachable_execution_mask", envelope.execution_codebook_mask},
+        result.physical = {{"gate_tn", columns}, {"partition_execution", partitionExecutionName(admission.partitionExecution())},
+            {"partition_worker_planes", partitionWorkerPlanes(admission.partitionExecution())},
+            {"admitted_output_width", admission.outputWidth()}, {"admitted_reduction_width", admission.reductionWidth()},
+            {"actual_output_n", state.spec.source.routed_expert_width}, {"actual_reduction_k", state.spec.source.hidden_size},
+            {"maximum_source_partitions", rocm::moeRouteOwnedGateUpMaximumKPartitions(
+                envelope, receipts.front().leaves.front().arithmetic_partitions, state.spec.source.hidden_size)},
+            {"reachable_execution_mask", envelope.execution_codebook_mask},
             {"source_policy_mask", envelope.policy_codebook_mask}, {"normalized_launch_mask", admission.launchCodebookMask()},
             {"leaf_count_per_operation", admission.leafCount()}, {"ordered_leaf_codebooks", ordered_codebooks},
             {"arithmetic_identity", arithmetic}, {"recorded_operations", operations}};
+    }
+    if (timed_automatic)
+    {
+        require(!rocm::lastMoERouteOwnedGateUpLaunchSet(), "automatic control unexpectedly used a scoped producer");
+        result.physical = automaticPhysical(state, admission, inventory);
     }
     result.physical["captured_kernels"] = nodes(inventory);
     result.graph = std::move(graph);
@@ -727,28 +1075,72 @@ inline void proveOwner(State &state, Trial &trial, const std::vector<float> &ids
     proveDownOutput(state);
 }
 
+/**
+ * @brief Append explicit physical execution fields only to the new contest schema.
+ * @param sink Existing fresh raw/aggregate destination, never inside a timed interval.
+ * @param spec Authored contest; default three-width CSV remains byte-compatible.
+ * @param trial Accepted physical capture; fixed down has no gate execution identity.
+ * @note Worker planes and maximum source partitions are independent of K_LANES.
+ */
+inline void writePartitionColumns(std::FILE *sink, const Diagnostic &spec, const Trial &trial)
+{
+    if (partitionContest(spec) || automaticContest(spec))
+    {
+        const bool gate_up = trial.boundary == "owner-gate-up-pack-m1";
+        std::fprintf(sink, ",%s,%d,%d,%d,%d",
+            gate_up ? trial.physical.at("partition_execution").get<std::string>().c_str() : "not-applicable",
+            gate_up ? trial.physical.at("partition_worker_planes").get<int>() : 0,
+            gate_up ? trial.physical.at("actual_output_n").get<int>() : 0,
+            gate_up ? trial.physical.at("actual_reduction_k").get<int>() : 0,
+            gate_up ? trial.physical.at("maximum_source_partitions").get<int>() : 0);
+    }
+    if (automaticContest(spec))
+    {
+        const bool gate_up = trial.boundary == "owner-gate-up-pack-m1";
+        std::fprintf(sink, ",%d,%d,%s", gate_up ? trial.physical.value("k_lanes_min", 1) : 0,
+            gate_up ? trial.physical.value("k_lanes_max", 1) : 0,
+            gate_up && trial.physical.value("scoped_launch_receipt", true) ? "scoped-candidate" :
+                gate_up ? "actual-unscoped-production" : "fixed-down-control");
+    }
+    require(std::fputc('\n', sink) != EOF, "route89 physical CSV publication failed");
+}
+
 /** @brief Preserve completed paid samples on success or a later cohort failure. */
 inline void writeRawEvidence(std::FILE *raw, const Diagnostic &spec, const Trial &trial)
 {
     const bool gate_up = trial.boundary == "owner-gate-up-pack-m1";
     for (const auto &sample : trial.raw)
-        std::fprintf(raw, "rocm,%s,%s,%s,%d,%d,%d,%.9f,%a,%.9f,%a,%d,%s,rocm-moe-owner-compact-diagnostic-v2\n",
+    {
+        std::fprintf(raw, "rocm,%s,%s,%s,%d,%d,%d,%.9f,%a,%.9f,%a,%d,%s,%s",
             trial.boundary.c_str(), spec.evidenceId().c_str(), trial.candidate.c_str(), sample.round, sample.position,
-            spec.operations_per_sample, sample.interval_us, sample.interval_us, sample.latency_us, sample.latency_us, 1, gate_up ? "balanced-rotation-paired-v1" : "singleton-fixed-control-v1");
+            spec.operations_per_sample, sample.interval_us, sample.interval_us, sample.latency_us, sample.latency_us, 1, gate_up ? "balanced-rotation-paired-v1" : "singleton-fixed-control-v1", evidenceGeneration(spec));
+        writePartitionColumns(raw, spec, trial);
+    }
     require(std::fflush(raw) == 0, "route87 raw evidence flush failed");
 }
 
-/** @brief Time all three gate/up contenders once per balanced chronological round. */
-inline void timeOwners(State &state, std::FILE *raw)
+/**
+ * @brief Time every admitted gate/up contender once per balanced chronological round.
+ * @param state Existing independently retained graphs, with untouched control first.
+ * @param raw Fresh raw evidence sink, including completed samples on later failure.
+ * @param contenders Exactly two partition executions or the original three geometries.
+ * @note The two-way contest projects the existing six-round order onto indices
+ *       0/1. Each physical mode then occupies each position three times, and each
+ *       pair direction occurs three times. No duplicate or idle third graph is timed.
+ */
+inline void timeOwners(State &state, std::FILE *raw, std::size_t contenders)
 {
     using test::native_vnni_dispatch::moeRouteGeometryTimingOrder;
+    require((contenders == 2 || contenders == 3) && state.trials.size() == contenders + 1,
+        "route89 timing inventory differs from admitted physical contest");
     for (int round = 0; round < state.spec.warmups; ++round)
         for (auto index : moeRouteGeometryTimingOrder(round))
-            require(state.trials[1 + index].graph->launch(), "route87 owner warmup replay failed");
+            if (index < contenders)
+                require(state.trials[1 + index].graph->launch(), "route87 owner warmup replay failed");
     require(hipStreamSynchronize(state.stream) == hipSuccess, "route87 owner warmup did not complete");
     MoEPrefillEventTimer timer(state.stream);
     const auto publish_raw = [&] {
-        for (std::size_t index = 1; index <= 3; ++index)
+        for (std::size_t index = 1; index <= contenders; ++index)
             writeRawEvidence(raw, state.spec, state.trials[index]);
     };
     try
@@ -756,13 +1148,15 @@ inline void timeOwners(State &state, std::FILE *raw)
         for (int round = 0; round < state.spec.samples; ++round)
         {
             const auto &order = moeRouteGeometryTimingOrder(round);
-            for (std::size_t position = 0; position < order.size(); ++position)
+            int position = 0;
+            for (auto index : order)
             {
-                auto &trial = state.trials[1 + order[position]];
+                if (index >= contenders) continue;
+                auto &trial = state.trials[1 + index];
                 const double interval = timer.sample(1, [&] { return trial.graph->launch(); }) * 1000.;
                 require(std::isfinite(interval) && interval > 0, "route87 event interval must be finite and positive");
                 const double latency = interval / state.spec.operations_per_sample;
-                trial.raw.push_back({round, static_cast<int>(position), interval, latency}); trial.samples.push_back(latency);
+                trial.raw.push_back({round, position++, interval, latency}); trial.samples.push_back(latency);
             }
         }
     }
@@ -782,7 +1176,7 @@ inline void writeEvidence(std::FILE *aggregate, const Diagnostic &spec, const Tr
     const bool gate_up = trial.boundary == "owner-gate-up-pack-m1";
     const auto down = spec.ownership().projection(WeightRole::MoEExpertDown);
     std::fprintf(aggregate,
-        "rocm,%s,%s,%s,%s,%s,%s,1,%d,%d,%d,%d,%d,%zu,%d,%d,%d,%s,%s,%s,%d,1,64,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%s,1,1,0,0,rocm-moe-owner-compact-diagnostic-v2\n",
+        "rocm,%s,%s,%s,%s,%s,%s,1,%d,%d,%d,%d,%d,%zu,%d,%d,%d,%s,%s,%s,%d,%d,64,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%s,1,1,0,0,%s",
         trial.boundary.c_str(), spec.evidenceId().c_str(),
         std::string(test::native_vnni_dispatch::moeRoutingProfileName(spec.route_profile)).c_str(),
         spec.source.routed.gate.c_str(), spec.source.routed.up.c_str(), spec.source.routed.down.c_str(),
@@ -790,8 +1184,9 @@ inline void writeEvidence(std::FILE *aggregate, const Diagnostic &spec, const Tr
         spec.participant, spec.device_ordinals.size(), down.first_row, down.rows, spec.source.hidden_size,
         gate_up ? "SelectedRoutes" : "AllRoutes", gate_up ? "IntermediateRows" : "OriginalRouteRowsThenTokenRows",
         trial.candidate.c_str(), gate_up ? trial.physical.at("gate_tn").get<int>() : 0,
-        spec.operations_per_sample, summary.min, summary.median, summary.p95, summary.mad, summary.cv,
-        trial.samples.size(), summary.digest.c_str());
+        gate_up ? trial.physical.value("k_lanes", 1) : 1, spec.operations_per_sample, summary.min, summary.median, summary.p95, summary.mad, summary.cv,
+        trial.samples.size(), summary.digest.c_str(), evidenceGeneration(spec));
+    writePartitionColumns(aggregate, spec, trial);
     require(std::fflush(aggregate) == 0, "route87 aggregate evidence flush failed");
 }
 
@@ -816,9 +1211,23 @@ inline void run(const Diagnostic &spec)
     const std::string bundle_path = std::string(aggregate_path) + ".operation.json";
     File bundle(std::fopen(bundle_path.c_str(), "wx"), std::fclose);
     require(bool(bundle), "route87 operation bundle destination must be fresh");
-    std::fputs("backend,phase,case_id,route_profile,source_gate,source_up,source_down,m,model_hidden,expert_width,logical_expert_count,top_k,participant,degree,first_column,physical_down_n,arithmetic_policy_down_n,route_scope,publication,candidate_id,gate_tn,k_lanes,down_tn,operations_per_sample,min_us,median_us,p95_us,mad_us,cv,samples,sample_digest,serial_byte_equal,compact_extent_equal,installed_policy_eligible,winner_installable,evidence_generation\n", aggregate.get());
-    std::fputs("backend,phase,case_id,candidate_id,round_index,order_position,complete_operations_per_sample,interval_us,interval_us_hex,latency_us,latency_us_hex,graph_submissions,ordering_protocol,evidence_generation\n", raw.get());
-    Json evidence{{"schema", "native-vnni-moe-projection-diagnostic-evidence-v2"}, {"complete", false}, {"passed", false},
+    const bool automatic_contest = automaticContest(spec);
+    const bool partition_contest = partitionContest(spec) || automatic_contest;
+    const std::size_t contenders = partition_contest ? 2 : 3;
+    constexpr const char *partition_columns =
+        ",gate_partition_execution,gate_partition_worker_planes,gate_n,gate_k,maximum_gate_source_partitions";
+    std::fputs("backend,phase,case_id,route_profile,source_gate,source_up,source_down,m,model_hidden,expert_width,logical_expert_count,top_k,participant,degree,first_column,physical_down_n,arithmetic_policy_down_n,route_scope,publication,candidate_id,gate_tn,k_lanes,down_tn,operations_per_sample,min_us,median_us,p95_us,mad_us,cv,samples,sample_digest,serial_byte_equal,compact_extent_equal,installed_policy_eligible,winner_installable,evidence_generation", aggregate.get());
+    if (partition_contest) std::fputs(partition_columns, aggregate.get());
+    if (automatic_contest) std::fputs(",gate_k_lanes_min,gate_k_lanes_max,gate_physical_control", aggregate.get());
+    std::fputc('\n', aggregate.get());
+    std::fputs("backend,phase,case_id,candidate_id,round_index,order_position,complete_operations_per_sample,interval_us,interval_us_hex,latency_us,latency_us_hex,graph_submissions,ordering_protocol,evidence_generation", raw.get());
+    if (partition_contest) std::fputs(partition_columns, raw.get());
+    if (automatic_contest) std::fputs(",gate_k_lanes_min,gate_k_lanes_max,gate_physical_control", raw.get());
+    std::fputc('\n', raw.get());
+    Json evidence{{"schema", promoted23Fixture(spec) ? "native-vnni-moe-projection-promoted23-evidence-v1" : automatic_contest ? "native-vnni-moe-projection-automatic-partition-evidence-v1" : partition_contest ? "native-vnni-moe-projection-source-partition-evidence-v1" :
+            "native-vnni-moe-projection-diagnostic-evidence-v2"},
+        {"contest", test::native_vnni_dispatch::moeProjectionContestName(spec.contest)},
+        {"evidence_generation", evidenceGeneration(spec)}, {"owner_contender_count", contenders}, {"complete", false}, {"passed", false},
         {"installable", false}, {"case_id", spec.evidenceId()}, {"descriptor_document", spec.descriptor_document},
         {"descriptor_evidence", spec.descriptor_evidence}, {"weight_authority", "synthetic-independent-seeds-51800-51900-52000"},
         {"owner_map", "ordinal"}, {"native_membership", spec.device_ordinals}, {"participant", spec.participant},
@@ -827,6 +1236,14 @@ inline void run(const Diagnostic &spec)
         {"timing_protocol", {{"owner_contest", "balanced-rotation-paired-v1"}, {"fixed_down_control", "singleton-fixed-control-v1"}}}, {"scope", "transport-free-components-not-full-TP4-economy"},
         {"router_q8_reuse", false}, {"capture_input_quantization", "existing-production-path"},
         {"candidate_dispositions", Json::array()}};
+    if (automatic_contest || spec.source_kind == test::native_vnni_dispatch::MoEProjectionSourceKind::SyntheticSourceFixture)
+    {
+        evidence["source_provenance"] = spec.source_kind == test::native_vnni_dispatch::MoEProjectionSourceKind::SyntheticSourceFixture ?
+            "synthetic-source-fixture" : "retained-descriptors-synthetic-seeded";
+        evidence["format_coverage_authority"] = "prepared-resident-physical-codebooks-with-positive-timed-owner-live-routes";
+        evidence["reachable_only_leaf_is_active_coverage"] = false;
+        evidence["cpu_promoted_codebook23_timing_included"] = false;
+    }
     const auto finish = [&] {
         const auto text = evidence.dump(2);
         require(std::fprintf(bundle.get(), "%s\n", text.c_str()) >= 0 && std::fflush(bundle.get()) == 0,
@@ -844,16 +1261,34 @@ inline void run(const Diagnostic &spec)
             spec.source.experts_per_token, spec.source.expert_count);
         const auto base_weights = makeRoutingWeights(1, spec.source.experts_per_token);
         const auto base_hidden = makeHiddenValues(1, spec.source.hidden_size);
-        State state(spec, base_ids); state.prepare(); state.trials.reserve(5);
+        State state(spec, base_ids); state.prepare(); state.trials.reserve(contenders + 2);
         evidence["gateup_setup_identity"] = state.gateup_setup_identity;
+        if (promoted23Fixture(spec))
+        {
+            evidence["prepared_representation"] = "cpu-prepared-promoted23";
+            evidence["completed_promotion_inventory"] = state.prepared.promotion_inventory;
+            require(!state.prepared.promoted_storage.empty() &&
+                state.prepared.promotion_inventory.size() == state.prepared.promoted_storage.size() &&
+                state.gateup_setup_identity.at("prepared_execution_mask").get<std::uint32_t>() ==
+                    nativeVnniCodebookMaskBit(kNativeVnniExpandedInt8MinCodebook),
+                "promoted23 timing requires actual resident23 prepared gate/up engines");
+        }
         std::vector<rocm::MoERouteOwnedGateUpAdmission> admissions;
         bool resource_rejection = false;
-        for (auto geometry : rocm::kMoERouteOwnedGateUpGeometries)
+        for (std::size_t candidate = 0; candidate < contenders; ++candidate)
         {
-            const auto id = "rocm.moe.route_owned.gate_up.tn" + std::to_string(rocm::moeRouteOwnedGateUpColumns(geometry)) + ".k1";
+            const auto geometry = partition_contest ? rocm::MoERouteOwnedGateUpGeometry::TN64 :
+                rocm::kMoERouteOwnedGateUpGeometries[candidate];
+            const auto partition_execution = partition_contest && candidate == 1 ?
+                rocm::MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes :
+                rocm::MoERouteOwnedGateUpPartitionExecution::Serial;
+            const auto id = ownerCandidateId(spec, geometry, partition_execution);
             try
             {
-                admissions.push_back(rocm::admitMoERouteOwnedGateUpGeometry(geometry, state.gateup_envelope, device));
+                admissions.push_back(rocm::admitMoERouteOwnedGateUpGeometry(geometry, state.gateup_envelope, device,
+                    partition_execution, partition_contest ? rocm::MoERouteOwnedProjectionShape{
+                        .output_columns = spec.source.routed_expert_width, .reduction_columns = spec.source.hidden_size} :
+                        rocm::MoERouteOwnedProjectionShape{}));
                 const auto &admitted = admissions.back();
                 Json leaves = Json::array();
                 for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
@@ -861,7 +1296,13 @@ inline void run(const Diagnostic &spec)
                         leaves.push_back({{"execution_codebook", codebook},
                             {"resources", resources(admitted.leafResources(codebook))}});
                 require(leaves.size() == admitted.leafCount(), "route87 admission leaf inventory is incomplete");
-                evidence["candidate_dispositions"].push_back({{"candidate", id}, {"status", "resource-admitted"},
+                evidence["candidate_dispositions"].push_back({{"candidate", id}, {"status", automatic_contest && candidate == 0 ?
+                    "canonical-source-program-reference-only-automatic-native-validation-pending" : "resource-admitted"},
+                    {"partition_execution", partitionExecutionName(admitted.partitionExecution())},
+                    {"partition_worker_planes", partitionWorkerPlanes(admitted.partitionExecution())},
+                    {"admitted_shape", {{"output_columns", admitted.outputWidth()}, {"reduction_columns", admitted.reductionWidth()}}},
+                    {"source_arithmetic_partitions", admitted.arithmeticPartitions()},
+                    {"maximum_source_partitions", admitted.maximumKPartitions()},
                     {"reachable_execution_mask", admitted.executionEnvelope().execution_codebook_mask},
                     {"source_policy_mask", admitted.executionEnvelope().policy_codebook_mask},
                     {"normalized_launch_mask", admitted.launchCodebookMask()}, {"leaves", leaves}});
@@ -872,7 +1313,23 @@ inline void run(const Diagnostic &spec)
                 evidence["candidate_dispositions"].push_back({{"candidate", id}, {"status", "resource-rejected"}, {"error", error.what()}});
             }
         }
-        require(!resource_rejection && admissions.size() == 3, "route87 complete three-geometry resource admission failed");
+        require(!resource_rejection && admissions.size() == contenders,
+            "route89 complete authored-contest resource admission failed");
+        if (partition_contest)
+        {
+            require(admissions.front().outputWidth() == spec.source.routed_expert_width &&
+                admissions.back().outputWidth() == spec.source.routed_expert_width &&
+                admissions.front().reductionWidth() == spec.source.hidden_size &&
+                admissions.back().reductionWidth() == spec.source.hidden_size &&
+                admissions.front().arithmeticPartitions() == admissions.back().arithmeticPartitions() &&
+                admissions.front().maximumKPartitions() > 0 &&
+                admissions.front().maximumKPartitions() == admissions.back().maximumKPartitions(),
+                "route89 pair admission changed named shape or source-owned partition program");
+            for (std::uint8_t codebook = 0; codebook < 32; ++codebook)
+                if (admissions.front().launchCodebookMask() & nativeVnniCodebookMaskBit(codebook))
+                    require(admissions.front().leafResources(codebook).function != admissions.back().leafResources(codebook).function,
+                        "route89 worker contender aliases the serial physical leaf");
+        }
         const auto fixed_down_resources = rocm::inspectMoERouteOwnedDown64(
             down_format.device_execution_codebook_id, MoEPrefillOutputLayout::OriginalRouteRows, device);
         evidence["fixed_down64_resources"] = resources(fixed_down_resources);
@@ -889,17 +1346,47 @@ inline void run(const Diagnostic &spec)
         evidence["peer_setup"] = "untimed-public-gateUp-fixed-packets-no-transport-not-an-independent-oracle";
         prepareReference(state, base_hidden, base_ids, base_weights);
         state.trials.push_back(captureOwner(state, admissions.front(), false)); // Untimed untouched physical control.
-        for (const auto &admission : admissions) state.trials.push_back(captureOwner(state, admission));
+        for (std::size_t index = 0; index < admissions.size(); ++index)
+            state.trials.push_back(captureOwner(state, admissions[index], !(automatic_contest && index == 0), automatic_contest && index == 0));
         evidence["untouched_control"] = state.trials.front().physical;
+        if (automatic_contest)
+        {
+            auto &disposition = evidence["candidate_dispositions"].at(0);
+            disposition["status"] = "actual-automatic-native-capture-validated";
+            disposition["resource_authority"] = "leaves-are-cold-SerialK1-source-program-reference-only";
+            disposition["actual_automatic_physical"] = state.trials[1].physical;
+        }
         evidence["owner_contest_operations"] = Json::array();
-        for (std::size_t index = 1; index <= 3; ++index)
+        for (std::size_t index = 1; index <= contenders; ++index)
             evidence["owner_contest_operations"].push_back({{"candidate", state.trials[index].candidate},
                 {"physical", state.trials[index].physical}, {"installed_policy_eligible", false}});
-        const auto partitions = state.trials[1].physical.at("arithmetic_identity");
-        for (std::size_t contender = 1; contender <= 3; ++contender)
-            require(state.trials[contender].physical.at("arithmetic_identity") == partitions &&
-                state.trials[contender].physical.at("ordered_leaf_codebooks") == state.trials[1].physical.at("ordered_leaf_codebooks"),
-                "route87 TN candidate changed original serial-M1 arithmetic partitions");
+        if (automatic_contest)
+        {
+            // Native graph enumeration is not submission order. Compare the
+            // exact keyed source program without inventing automatic launch receipts.
+            const auto &worker = state.trials[2].physical;
+            require(state.trials[1].physical.at("normalized_launch_mask") == worker.at("normalized_launch_mask") &&
+                worker.at("recorded_operations").at(0).at("leaves").size() == admissions.back().leafCount(),
+                "automatic/worker physical decoder inventories differ");
+            for (const auto &leaf : worker.at("recorded_operations").at(0).at("leaves"))
+            {
+                require(leaf.at("arithmetic_partitions") == Json(admissions.front().arithmeticPartitions()),
+                    "automatic/worker original source program differs");
+                for (const auto &control : state.trials[1].physical.at("actual_automatic_leaves"))
+                    if (control.at("execution_codebook") == leaf.at("execution_codebook"))
+                        require(control.at("resources").at("function") != leaf.at("resources").at("function"),
+                            "automatic/worker contenders alias a physical function");
+            }
+            evidence["automatic_control_authority"] = "actual-native-graph-symbol-resources-no-scoped-receipt";
+        }
+        else
+        {
+            const auto partitions = state.trials[1].physical.at("arithmetic_identity");
+            for (std::size_t contender = 1; contender <= contenders; ++contender)
+                require(state.trials[contender].physical.at("arithmetic_identity") == partitions &&
+                    state.trials[contender].physical.at("ordered_leaf_codebooks") == state.trials[1].physical.at("ordered_leaf_codebooks"),
+                    "route89 physical contender changed original serial-M1 arithmetic partitions");
+        }
         for (int replay = 0; replay < 20; ++replay)
         {
             auto hidden = base_hidden;
@@ -923,8 +1410,11 @@ inline void run(const Diagnostic &spec)
         evidence["timed_device_compact_bytes"] = timed_bytes;
         evidence["timed_owner_live_routes"] = timed_bytes / record_bytes;
         evidence["timed_owner_has_work"] = timed_bytes > 0;
-        timeOwners(state, raw.get());
-        for (std::size_t index = 1; index <= 3; ++index)
+        if (promoted23Fixture(spec))
+            require(timed_bytes > 0, "promoted23 timing has no active owner routes; reachable-only leaves are not coverage");
+        timeOwners(state, raw.get(), contenders);
+        if (promoted23Fixture(spec)) evidence["cpu_promoted_codebook23_timing_included"] = true;
+        for (std::size_t index = 1; index <= contenders; ++index)
             writeEvidence(aggregate.get(), spec, state.trials[index]);
         // Owner captures mutate grouping/scratch. Restore all routes and import
         // before capturing the separate isolated fixed-down control, then run

@@ -25,6 +25,9 @@
  * Immutable router weights live for the entire workspace, just as they do in
  * a model instance. Changing expert inputs or formats must not manufacture a
  * new model router and exhaust the graph family's retained publications.
+ * Explicit promotion diagnostics retain actual logical stream identity and
+ * use the existing layout's admitted chunk capacity; legacy calls keep their
+ * original zero-index identity and one-unit staging contract.
  */
 
 #pragma once
@@ -577,8 +580,41 @@ namespace llaminar2::test
             std::unique_ptr<DeviceAllocation> mins;
             std::unique_ptr<DeviceAllocation> emins;
             DeviceNativeVNNIMatrixDesc descriptor{};
+            ExpertTierWeightStreamManifest manifest{}; ///< Exact immutable authority used by the completed transfer.
             ExpertTierWeightTransferLaneStats stats{};
         };
+
+        /** @brief Authored logical stream identity, separate from a diagnostic lane's unique name. */
+        struct CPUProjectionPromotionIdentity
+        {
+            std::uint64_t residency_epoch = 0; ///< Actual immutable destination publication epoch.
+            int layer_idx = -1; ///< Logical source/destination layer, never an inferred model label.
+            int expert_id = -1; ///< Actual distinct original expert represented by these bytes.
+        };
+
+        /** @brief Existing stream capacity authority; no additional allocator or reserve. */
+        struct CPUProjectionPromotionOptions
+        {
+            CPUProjectionPromotionIdentity identity; ///< Complete manifest authority, validated before allocation.
+            std::uint32_t maximum_units_per_chunk = 1; ///< Exact persistent staging extent in existing stream units.
+        };
+
+        /**
+         * @brief Promote genuine CPU execution bytes using an explicitly bound manifest.
+         * @param backend Exact destination backend.
+         * @param device Destination physical GPU.
+         * @param cpu_weights Retained original CPU packed bytes.
+         * @param projection Actual gate/up/down role.
+         * @param identity Unique diagnostic transfer/lane identity, distinct from residency epoch.
+         * @param options Exact logical source and existing unit/chunk capacity authority.
+         * @return Genuine promoted storage, descriptor and completion statistics.
+         * @throws std::invalid_argument For invalid stream identity/capacity before allocation.
+         */
+        PromotedCPUProjection promoteCPUProjection(
+            IBackend *backend, DeviceId device,
+            const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+            ExpertTierWeightProjection projection, uint64_t identity,
+            CPUProjectionPromotionOptions options);
 
         /**
          * @brief Stream final CPU execution bytes into their exact GPU form.
@@ -1391,19 +1427,43 @@ namespace llaminar2::test
             ExpertTierWeightProjection projection,
             uint64_t identity)
         {
-            if (!backend || !device.is_gpu())
+            // Existing native tests retain their original manifest, one-unit
+            // staging and lane name exactly; only explicit callers author more.
+            return promoteCPUProjection(backend, device, cpu_weights, projection, identity,
+                CPUProjectionPromotionOptions{.identity = {.residency_epoch = identity,
+                    .layer_idx = 0, .expert_id = 0}, .maximum_units_per_chunk = 1});
+        }
+
+        /**
+         * @brief Complete the existing transfer lane before publishing any prepared alias.
+         * @param backend Exact destination backend.
+         * @param device Destination physical GPU.
+         * @param cpu_weights Real original CPU execution bytes retained through completion.
+         * @param projection Actual projection role.
+         * @param identity Unique lane name; manifest identity is separately explicit.
+         * @param options Existing logical identity and admitted maximum units per chunk.
+         * @return Final storage and the exact lane's completed statistics.
+         * @throws std::runtime_error For materialization, transfer, timing or publication failure.
+         */
+        inline PromotedCPUProjection promoteCPUProjection(
+            IBackend *backend, DeviceId device,
+            const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+            ExpertTierWeightProjection projection, uint64_t identity,
+            CPUProjectionPromotionOptions options)
+        {
+            if (!backend || !device.is_gpu() || identity == 0)
             {
                 throw std::invalid_argument(
-                    "Grouped promotion parity requires a GPU destination");
+                    "Grouped promotion requires a GPU destination and nonzero transfer identity");
             }
 
             const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
                 cpu_weights,
-                identity,
-                /*layer_id=*/0,
-                /*expert_id=*/0,
+                options.identity.residency_epoch,
+                options.identity.layer_idx,
+                options.identity.expert_id,
                 projection,
-                /*maximum_units_per_chunk=*/1);
+                options.maximum_units_per_chunk);
             const auto layout = manifest.deviceLayout();
             if (!layout.valid())
             {
@@ -1415,6 +1475,7 @@ namespace llaminar2::test
                 static_cast<size_t>(layout.N) *
                 static_cast<size_t>(layout.blocks_per_row);
             PromotedCPUProjection result;
+            result.manifest = manifest;
             result.payload = std::make_unique<DeviceAllocation>(
                 backend,
                 device.ordinal,
@@ -1463,7 +1524,7 @@ namespace llaminar2::test
                 .device = device,
                 .staging = TransferEngine::instance()
                                .allocatePersistentTransferStagingSlices(
-                                   layout.chunkBytes(1),
+                                   layout.chunkBytes(layout.maximum_units_per_chunk),
                                    1u,
                                    device)
                                .front(),

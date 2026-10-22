@@ -23,6 +23,7 @@
 #include "../../IMoEKernel.h"
 #include "../../common/DeviceResidentRouterGateCache.h"
 #include "../ROCmKernelBase.h"
+#include "../gemm/ROCmMoERouteOwnedTuning.h"
 #include "../../../tensors/TensorType.h"
 #include "../../../execution/moe/MoERuntimePointerWorkspaceOwners.h"
 
@@ -30,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -1032,6 +1034,11 @@ namespace llaminar2
             const std::int32_t *route_participants, ITensor *packet,
             std::size_t packet_byte_offset, const std::uint64_t *packet_bytes, int participant) override;
 
+        /** @copydoc IMoEKernel::prepareOwnerGateUpCaptureBinding */
+        std::uint64_t prepareOwnerGateUpCaptureBinding(int table, int rows, std::uint64_t expected_intent) override;
+        /** @copydoc IMoEKernel::ownerGateUpCaptureBindingSignature */
+        [[nodiscard]] std::uint64_t ownerGateUpCaptureBindingSignature(int table, int rows) const override;
+
         /** @copydoc IMoEKernel::executeGroupedPrefillProjection */
         bool executeGroupedPrefillProjection(
             ITensor *hidden, ITensor *output,
@@ -1417,6 +1424,10 @@ namespace llaminar2
             std::size_t workspace_slot = 0;
             bool valid = false;
 
+            std::optional<rocm::MoERouteOwnedGateUpAdmission> owner_m1_admission;
+                ///< Cold graph-local capability; no device state or separate allocation ownership.
+            std::uint64_t owner_m1_intent = 0; ///< Exact immutable declaration signature; zero retains ordinary dispatch.
+
             /** @return Whether both selected descriptor tables are resident. */
             [[nodiscard]] bool deviceReady() const noexcept
             {
@@ -1427,6 +1438,26 @@ namespace llaminar2
                                  device_floating_up_descs != nullptr;
             }
         };
+
+        /**
+         * @brief Borrow the already-prepared owner-only M1 capability before any public GPU work.
+         * @param table Original table handle; no representative/foreign table is substituted.
+         * @param rows Physical row count for this invocation.
+         * @param execution Actual projection phase; complete/down operations retain their own policy.
+         * @param shape Actual named gate/up axes checked against frozen table/capability identity.
+         * @return Explicit immutable capability for the declared model operation, otherwise null.
+         * @throws std::logic_error For a missing/stale/mismatched required model binding.
+         */
+        [[nodiscard]] const rocm::MoERouteOwnedGateUpAdmission *ownerGateUpAdmissionForCall(
+            int table, int rows, const MoEPrefillProjectionExecution &execution,
+            rocm::MoERouteOwnedProjectionShape shape) const;
+        /**
+         * @brief Publish accepted model host-submission evidence after the complete raw call succeeds.
+         * @param completed Caller-owned completed launch set, never a live device/replay ledger.
+         * @param intent Exact immutable table intent included in model capture identity.
+         */
+        void recordOwnerGateUpCaptureSubmissions(const rocm::MoERouteOwnedGateUpLaunchSet &completed,
+                                               std::uint64_t intent) const;
 
         /**
          * @brief Publish or adopt one exact down-descriptor table.
