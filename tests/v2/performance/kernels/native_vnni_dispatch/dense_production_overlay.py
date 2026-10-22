@@ -1,8 +1,8 @@
 """Generate dense GPU prefill exact overlays from authenticated sweep cells.
 
 Every source format is measured independently, while production dispatch sees
-the prepared execution codebook. This generator therefore pools source aliases
-only after validating each cell and chooses the candidate with the lowest
+the prepared execution codebook and physical operand family. This generator
+pools source aliases only after validating each cell and chooses the candidate with the lowest
 geometric-mean normalized regret across those aliases. The selected candidate
 must resolve to one concrete physical launch tuple for the whole runtime key;
 an AUTO label is never emitted into production policy.
@@ -24,6 +24,7 @@ import os
 import re
 import statistics
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -44,14 +45,27 @@ from .production_dense_prefill_sweep import (
 )
 
 
+class DensePreparedWeightFamily(IntEnum):
+    """Physical prepared operand ABI, independent of source/execution codebook."""
+
+    NATIVE_VNNI = 0
+    INT8_BLOCKWISE = 1
+
+
 @dataclass(frozen=True, order=True)
 class DenseOverlayKey:
-    """One runtime-visible exact dense prefill dispatch key."""
+    """One runtime-visible exact key, including the prepared operand ABI."""
 
     execution_codebook: int
     m: int
     n: int
     k: int
+    prepared_family: DensePreparedWeightFamily = DensePreparedWeightFamily.NATIVE_VNNI
+
+    def __post_init__(self) -> None:
+        """Reject untyped family identities before grouping or retention."""
+        if not isinstance(self.prepared_family, DensePreparedWeightFamily):
+            raise ValueError("dense overlay key requires a typed prepared family")
 
 
 @dataclass(frozen=True)
@@ -69,11 +83,42 @@ class DenseOverlayEntry:
     geometric_mean_speedup_vs_auto: float
 
 
+def _canonical_sweep_prepared_family(cell: DensePrefillCell) -> DensePreparedWeightFamily:
+    """Name the existing trainer's actual preparation contract, not a runtime rule.
+
+    The canonical ROCm trainer expands Q8 into INT8 VNNI; its authenticated
+    aggregate parser requires that physical producer. Other cells retain their
+    native preparation. A native-Q8 trainer would need a separately typed plan;
+    this repair neither invents that mode nor installs native-Q8 measurements.
+    """
+    if cell.backend == "rocm" and cell.source_format.runtime_codebook("rocm") == 19:
+        return DensePreparedWeightFamily.INT8_BLOCKWISE
+    return DensePreparedWeightFamily.NATIVE_VNNI
+
+
+def _validate_prepared_identity(entry: DenseOverlayEntry) -> None:
+    """Reject mismatched physical producer/key pairs before any publication."""
+    family = entry.key.prepared_family
+    if entry.backend == "cuda":
+        if family != DensePreparedWeightFamily.NATIVE_VNNI:
+            raise ValueError("CUDA overlay does not own expanded INT8 preparation")
+        return
+    if entry.backend != "rocm":
+        raise ValueError("unsupported dense overlay backend")
+    if len(entry.launch) != 6 or entry.launch[5] not in range(4):
+        raise ValueError("ROCm dense overlay requires an exact producer identity")
+    int8 = entry.launch[5] in (2, 3)
+    if int8 != (family == DensePreparedWeightFamily.INT8_BLOCKWISE):
+        raise ValueError("ROCm measured producer disagrees with prepared family")
+    if int8 and entry.key.execution_codebook != 19:
+        raise ValueError("expanded INT8 producer requires its Q8 execution decoder")
+
+
 def _expected_overlay_inventory(
     cells: Sequence[DensePrefillCell],
     backend: str,
 ) -> dict[DenseOverlayKey, tuple[tuple[str, ...], tuple[str, ...]]]:
-    """Collapse source cells into the exact runtime-visible key inventory."""
+    """Collapse current typed trainer cells into the complete runtime key."""
 
     grouped: dict[DenseOverlayKey, tuple[set[str], set[str]]] = {}
     for cell in cells:
@@ -86,6 +131,7 @@ def _expected_overlay_inventory(
             m=cell.m,
             n=cell.shape.n,
             k=cell.shape.k,
+            prepared_family=_canonical_sweep_prepared_family(cell),
         )
         source_formats, shape_names = grouped.setdefault(
             key, (set(), set())
@@ -122,6 +168,7 @@ def validate_dense_overlay_totality(
             )
         if entry.key in observed:
             raise ValueError(f"duplicate dense overlay key: {entry.key}")
+        _validate_prepared_identity(entry)
         observed[entry.key] = entry
 
     missing = sorted(set(expected) - set(observed))
@@ -278,6 +325,7 @@ def collect_dense_overlay_entries(
             m=cell.m,
             n=cell.shape.n,
             k=cell.shape.k,
+            prepared_family=_canonical_sweep_prepared_family(cell),
         )
         grouped.setdefault(key, []).append((cell, aggregate, timing))
 
@@ -386,6 +434,8 @@ def _generated_doxygen(encoded: str, backend: str) -> str:
               " * producers. The caller retains its complete generic policy for other\n"
               " * geometry. Entries never change reduction order, allocate workspace\n"
               " * or hold live execution state; graph construction seals their launch.\n */\n")
+    if backend == "rocm":
+        header = header.replace("codebook/M/N/K keys", "codebook/M/N/K/prepared-family keys")
     comparison = ("    /**\n     * @brief Compare one immutable physical launch key.\n"
                   "     * @param entry Stored codebook and geometry.\n"
                   "     * @param codebook Requested physical execution decoder.\n"
@@ -400,6 +450,10 @@ def _generated_doxygen(encoded: str, backend: str) -> str:
               "     * @param k Contraction width.\n"
               "     * @param config Destination written only for a matching key.\n"
               "     * @return Whether the immutable table owns the requested geometry.\n     */\n")
+    if backend == "rocm":
+        family_doc = "     * @param family Physical prepared operand ABI.\n"
+        comparison = comparison.replace("     * @return", family_doc + "     * @return")
+        lookup = lookup.replace("     * @param config", family_doc + "     * @param config")
     encoded = encoded.replace(f"    inline int compare{vendor}DensePrefillOverlayKey(",
         comparison + f"    inline int compare{vendor}DensePrefillOverlayKey(")
     encoded = encoded.replace(f"    inline bool select{vendor}DensePrefillOverlay(",
@@ -529,10 +583,15 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
     if any(len(entry.launch) != 6 or entry.launch[5] not in range(len(producers))
            for entry in entries):
         raise ValueError("ROCm dense overlay requires an exact producer identity")
+    for entry in entries:
+        _validate_prepared_identity(entry)
+    families = {DensePreparedWeightFamily.NATIVE_VNNI: "NativeVNNI",
+                DensePreparedWeightFamily.INT8_BLOCKWISE: "Int8Blockwise"}
     rows = [
         "        {"
         f"{entry.key.execution_codebook}, {entry.key.m}, {entry.key.n}, "
-        f"{entry.key.k}, {{{entry.launch[0]}, {entry.launch[1]}, "
+        f"{entry.key.k}, DensePrefillWeightFamily::{families[entry.key.prepared_family]}, "
+        f"{{{entry.launch[0]}, {entry.launch[1]}, "
         f"{entry.launch[2]}, {entry.launch[3]}, "
         f"{str(bool(entry.launch[4])).lower()}, VNNIPrefillProducer::{producers[entry.launch[5]]}}}"
         "},"
@@ -545,6 +604,7 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "#include <cstddef>",
         "#include <cstdint>",
         '#include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"',
+        '#include "kernels/rocm/gemm/ROCmDensePrefillPreparedWeightFamily.h"',
         "",
         "namespace llaminar2::rocm::generated",
         "{",
@@ -564,6 +624,7 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "        int m;",
         "        int n;",
         "        int k;",
+        "        DensePrefillWeightFamily family;",
         "        ROCmDensePrefillOverlayConfig config;",
         "    };",
         "",
@@ -574,7 +635,7 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "",
         "    inline int compareROCmDensePrefillOverlayKey(",
         "        const ROCmDensePrefillOverlayEntry &entry,",
-        "        uint8_t codebook, int m, int n, int k)",
+        "        uint8_t codebook, int m, int n, int k, DensePrefillWeightFamily family)",
         "    {",
         "        if (entry.codebook != codebook)",
         "            return entry.codebook < codebook ? -1 : 1;",
@@ -584,11 +645,13 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "            return entry.n < n ? -1 : 1;",
         "        if (entry.k != k)",
         "            return entry.k < k ? -1 : 1;",
+        "        if (entry.family != family)",
+        "            return entry.family < family ? -1 : 1;",
         "        return 0;",
         "    }",
         "",
         "    inline bool selectROCmDensePrefillOverlay(",
-        "        uint8_t codebook, int m, int n, int k,",
+        "        uint8_t codebook, int m, int n, int k, DensePrefillWeightFamily family,",
         "        ROCmDensePrefillOverlayConfig &config)",
         "    {",
         "        size_t first = 0;",
@@ -599,7 +662,7 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "            const size_t middle = first + (last - first) / 2;",
         "            const auto &entry = kROCmDensePrefillOverlayEntries[middle];",
         "            const int comparison = compareROCmDensePrefillOverlayKey(",
-        "                entry, codebook, m, n, k);",
+        "                entry, codebook, m, n, k, family);",
         "            if (comparison < 0)",
         "                first = middle + 1;",
         "            else",
@@ -612,7 +675,7 @@ def _render_rocm(entries: Sequence[DenseOverlayEntry]) -> str:
         "            return false;",
         "        const auto &entry = kROCmDensePrefillOverlayEntries[first];",
         "        if (compareROCmDensePrefillOverlayKey(",
-        "                entry, codebook, m, n, k) != 0)",
+        "                entry, codebook, m, n, k, family) != 0)",
         "            return false;",
         "        config = entry.config;",
         "        return true;",
@@ -632,6 +695,10 @@ def render_dense_overlay(entries: Sequence[DenseOverlayEntry]) -> str:
         raise ValueError("cannot render mixed-backend overlay entries")
     if tuple(sorted(entries, key=lambda entry: entry.key)) != tuple(entries):
         raise ValueError("dense prefill overlay entries must be sorted")
+    if len({entry.key for entry in entries}) != len(entries):
+        raise ValueError("duplicate dense overlay key")
+    for entry in entries:
+        _validate_prepared_identity(entry)
     return _render_cuda(entries) if backend == "cuda" else _render_rocm(entries)
 
 
@@ -670,15 +737,27 @@ def _split_generated_overlay(
         if backend == "cuda" else r"\d+, \d+, \d+, \d+, (?:true|false), "
         r"VNNIPrefillProducer::(?:NativeCooperative|NativeStreaming|Int8BlockwiseV3|Int8BlockwiseV7)"
     )
+    family_pattern = (r", DensePrefillWeightFamily::(NativeVNNI|Int8Blockwise)"
+                      if backend == "rocm" else "")
     row_pattern = re.compile(
-        r"        \{(\d+), (\d+), (\d+), (\d+), \{" + config + r"\}\},\n"
+        r"        \{(\d+), (\d+), (\d+), (\d+)" + family_pattern
+        + r", \{" + config + r"\}\},\n"
     )
     rows: dict[DenseOverlayKey, str] = {}
     for line in body.splitlines(keepends=True):
         match = row_pattern.fullmatch(line)
         if not match:
             raise ValueError("retained dense overlay has a noncanonical row")
-        key = DenseOverlayKey(*(int(value) for value in match.groups()))
+        family = (DensePreparedWeightFamily.INT8_BLOCKWISE
+                  if backend == "rocm" and match.group(5) == "Int8Blockwise"
+                  else DensePreparedWeightFamily.NATIVE_VNNI)
+        key = DenseOverlayKey(*(int(value) for value in match.groups()[:4]), family)
+        if backend == "rocm":
+            int8 = "VNNIPrefillProducer::Int8Blockwise" in line
+            if int8 != (family == DensePreparedWeightFamily.INT8_BLOCKWISE):
+                raise ValueError("retained producer disagrees with prepared family")
+            if int8 and key.execution_codebook != 19:
+                raise ValueError("retained expanded INT8 decoder mismatch")
         if not 0 <= key.execution_codebook <= 255 or any(
             not 0 < value <= 2147483647 for value in (key.m, key.n, key.k)
         ):
@@ -710,7 +789,10 @@ def retain_dense_overlay_base(
     encoded = prefix + "".join(combined[key] for key in sorted(combined)) + suffix
     digest = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
     return encoded, {
-        "schema": "dense-prefill-additive-exact-overlay-v1",
+        "schema": ("dense-prefill-additive-exact-overlay-v2" if backend == "rocm"
+                   else "dense-prefill-additive-exact-overlay-v1"),
+        "key_schema": ("codebook-m-n-k-prepared-family" if backend == "rocm"
+                       else "codebook-m-n-k"),
         "backend": backend,
         "base_sha256": digest(base),
         "measured_delta_sha256": digest(delta),
@@ -782,7 +864,7 @@ def write_overlay_summary(
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = output.with_name(output.name + ".inprogress")
     columns = (
-        "backend", "execution_codebook", "source_formats", "shape_names",
+        "backend", "execution_codebook", "prepared_family", "source_formats", "shape_names",
         "m", "n", "k", "candidate_id", "launch",
         "geometric_mean_regret", "maximum_alias_regret",
         "geometric_mean_speedup_vs_auto",
@@ -794,6 +876,7 @@ def write_overlay_summary(
             writer.writerow({
                 "backend": entry.backend,
                 "execution_codebook": entry.key.execution_codebook,
+                "prepared_family": entry.key.prepared_family.name.lower(),
                 "source_formats": "/".join(entry.source_formats),
                 "shape_names": "/".join(entry.shape_names),
                 "m": entry.key.m,

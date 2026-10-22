@@ -34,6 +34,7 @@ if str(KERNEL_TOOLS) not in os.sys.path:
 from native_vnni_dispatch.format_registry import FORMAT_SPECS  # noqa: E402
 from native_vnni_dispatch.dense_production_overlay import (  # noqa: E402
     DenseOverlayEntry,
+    DensePreparedWeightFamily,
     DenseOverlayKey,
     collect_dense_overlay_entries,
     render_dense_overlay,
@@ -1413,13 +1414,91 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             (17, 1, "NativeStreaming", (256, 8, 3, 0, 0)),
         ):
             with self.subTest(family=family):
-                entry = DenseOverlayEntry("rocm", DenseOverlayKey(codebook, 512, 4096, 2048),
+                entry = DenseOverlayEntry("rocm", DenseOverlayKey(codebook, 512, 4096, 2048,
+                    DensePreparedWeightFamily.INT8_BLOCKWISE if producer in (2, 3)
+                    else DensePreparedWeightFamily.NATIVE_VNNI),
                     (), (), "Auto", (*launch, producer), 0.0, 0.0, 1.0)
                 rendered = render_dense_overlay((entry,))
                 self.assertIn(f"VNNIPrefillProducer::{family}", rendered)
                 self.assertEqual(retain_dense_overlay_base(rendered, (entry,))[0], rendered)
                 with self.assertRaisesRegex(ValueError, "producer identity"):
                     render_dense_overlay((replace(entry, launch=launch),))
+
+    def test_rocm_same_geometry_retention_separates_prepared_families(self) -> None:
+        """One family's refresh cannot erase or consume the other's exact row."""
+        native = DenseOverlayEntry(
+            "rocm", DenseOverlayKey(19, 64, 512, 5120), (), (),
+            "native_fixture", (64, 16, 1, 4, 0, 0), 0.0, 0.0, 1.0)
+        expanded = replace(native, key=replace(native.key,
+            prepared_family=DensePreparedWeightFamily.INT8_BLOCKWISE),
+            candidate_id="int8_fixture", launch=(64, 16, 1, 4, 0, 2))
+        base = render_dense_overlay((native, expanded))
+        self.assertIn("5120, DensePrefillWeightFamily::NativeVNNI", base)
+        self.assertIn("5120, DensePrefillWeightFamily::Int8Blockwise", base)
+        changed = replace(native, launch=(128, 32, 1, 2, 0, 0))
+        output, receipt = retain_dense_overlay_base(base, (changed,))
+        int8_row = next(row for row in base.splitlines()
+                        if row.startswith("        {19,") and "Int8Blockwise," in row)
+        self.assertIn(int8_row, output)
+        self.assertEqual(receipt["replaced_keys"], 1)
+        self.assertEqual(receipt["retained_keys"], 1)
+        self.assertEqual(receipt["output_keys"], 2)
+        self.assertEqual(receipt["key_schema"], "codebook-m-n-k-prepared-family")
+        self.assertEqual(retain_dense_overlay_base(output, (changed,))[0], output)
+        for malformed in (replace(native, launch=expanded.launch),
+                          replace(expanded, launch=native.launch)):
+            with self.assertRaisesRegex(ValueError, "prepared family"):
+                render_dense_overlay((malformed,))
+        with self.assertRaisesRegex(ValueError, "typed prepared family"):
+            replace(native.key, prepared_family=255)
+        with self.assertRaisesRegex(ValueError, "duplicate dense overlay key"):
+            render_dense_overlay((native, native))
+        with self.assertRaisesRegex(ValueError, "retained producer"):
+            retain_dense_overlay_base(base.replace(
+                "VNNIPrefillProducer::NativeCooperative", "VNNIPrefillProducer::Int8BlockwiseV3"),
+                (changed,))
+        # The old untyped program is not an admissible additive base. Migration
+        # must bind its original producer values explicitly before retention.
+        with self.assertRaisesRegex(ValueError, "selector ABI mismatch"):
+            retain_dense_overlay_base(base.replace(
+                "        DensePrefillWeightFamily family;\n", ""), (changed,))
+
+    def test_installed_rocm_family_key_abi_is_retained_without_reinterpretation(self) -> None:
+        """The installed program must match the generator's complete typed ABI."""
+        path = REPO_ROOT / "src/v2/kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayGenerated.inc"
+        base = path.read_text(encoding="utf-8")
+        expanded = DenseOverlayEntry("rocm", DenseOverlayKey(19, 64, 512, 5120,
+            DensePreparedWeightFamily.INT8_BLOCKWISE), (), (), "installed_identity",
+            (64, 16, 1, 4, 0, 2), 0.0, 0.0, 1.0)
+        output, receipt = retain_dense_overlay_base(base, (expanded,))
+        self.assertEqual(output, base)
+        self.assertEqual(receipt["replaced_keys"], 1)
+        # Adding an uninstalled native row is a metadata fixture only. The base
+        # INT8 row keeps exactly its original bytes and producer contract.
+        native = replace(expanded, key=replace(expanded.key,
+            prepared_family=DensePreparedWeightFamily.NATIVE_VNNI),
+            launch=(64, 16, 1, 4, 0, 0))
+        output, receipt = retain_dense_overlay_base(base, (native,))
+        self.assertEqual(receipt["replaced_keys"], 0)
+        self.assertEqual(receipt["output_keys"], receipt["base_keys"] + 1)
+        for row in base.splitlines():
+            if row.startswith("        {"):
+                self.assertIn(row + "\n", output)
+
+    def test_rocm_totality_requires_canonical_prepared_family(self) -> None:
+        """A same-geometry native row cannot certify the current INT8 trainer."""
+        cell = next(cell for cell in production_dense_prefill_cells("rocm")
+                    if cell.source_format.runtime_codebook("rocm") == 19)
+        native = DenseOverlayEntry("rocm", DenseOverlayKey(19, cell.m,
+            cell.shape.n, cell.shape.k), (cell.source_format.label,),
+            (cell.shape.name,), "native_fixture", (64, 16, 1, 0, 0, 0),
+            0.0, 0.0, 1.0)
+        with self.assertRaisesRegex(ValueError, "not total"):
+            validate_dense_overlay_totality((native,), (cell,), "rocm")
+        expanded = replace(native, key=replace(native.key,
+            prepared_family=DensePreparedWeightFamily.INT8_BLOCKWISE),
+            launch=(64, 16, 1, 0, 0, 2))
+        validate_dense_overlay_totality((expanded,), (cell,), "rocm")
 
     def test_overlay_rejects_aliases_with_conflicting_physical_auto_launches(self) -> None:
         cells = production_dense_prefill_cells("cuda")

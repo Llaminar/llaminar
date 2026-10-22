@@ -79,7 +79,7 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         """Every spent prefill witness leaves a disjoint fresh holdout pool."""
 
         manifest = load_shape_manifest()
-        self.assertEqual(len(manifest.shapes), 606)
+        self.assertEqual(len(manifest.shapes), 628)
         fast_sealed = [
             shape
             for shape in manifest.shapes
@@ -706,7 +706,7 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         production = [
             shape for shape in manifest.shapes if shape.role == ShapeRole.PRODUCTION
         ]
-        self.assertEqual(len(production), 98)
+        self.assertEqual(len(production), 120)
         self.assertTrue(all(shape.exact_overlay for shape in production))
         tp_local = {
             shape.name: (shape.n, shape.k)
@@ -737,6 +737,59 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         for degree, dimensions in expected_by_degree.items():
             with self.subTest(tp_degree=degree):
                 self.assertTrue(dimensions.issubset(exact_dimensions))
+
+    def test_qfn_native_geometry_obligations_reuse_existing_exact_keys(self) -> None:
+        """Own physical P1/TP2/TP4 dimensions without installing a runtime policy."""
+        manifest = load_shape_manifest()
+        production = {(s.n, s.k): s for s in manifest.shapes
+                      if s.role == ShapeRole.PRODUCTION}
+        required = {
+            (4, 10240),
+            (160, 2560),
+            (256, 2560),
+            (320, 2560),
+            (320, 10240),
+            (512, 2560),
+            (640, 640),
+            (640, 2560),
+            (1280, 640),
+            (1536, 2560),
+            (2560, 160),
+            (2560, 320),
+            (2560, 640),
+            (2560, 1536),
+            (2560, 2560),
+            (2560, 3072),
+            (2560, 5120),
+            (2560, 6144),
+            (3072, 2560),
+            (5120, 2560),
+            (6144, 2560),
+            (10240, 2560),
+            (12288, 2560),
+            (248320, 2560),
+        }
+        self.assertTrue(required.issubset(production))
+        self.assertEqual(len(production), len([s for s in manifest.shapes
+                         if s.role == ShapeRole.PRODUCTION]))
+        self.assertEqual(production[(248320, 2560)].model_family,
+                         "qwen35-qwen36-release-geometries")
+        self.assertEqual(production[(2560, 5120)].model_family,
+                         "qwen35-qwen36-release-geometries")
+        for shape in manifest.shapes:
+            if shape.model_family == "qwen4exp":
+                self.assertTrue(shape.exact_overlay)
+                self.assertEqual(shape.fast_partition, ShapePartition.DEVELOPMENT)
+                self.assertEqual(shape.verifier_partition, ShapePartition.DEVELOPMENT)
+                self.assertIsNone(shape.prefill_partition)
+                self.assertEqual(shape.k % 32, 0)
+        qfn = {(s.n, s.k) for s in manifest.shapes if s.model_family == "qwen4exp"}
+        # Current HC-up TwoTerm and floating-only alpha/beta/indexer do
+        # not become mislabeled SingleQ8 obligations. KV512 is independently
+        # applicable even though a floating indexer also uses that geometry.
+        self.assertIn((4, 10240), qfn)  # Supported predictor HC injection uses Q8_0.
+        self.assertFalse(qfn & {(10240, 320), (48, 2560),
+                                (24, 2560), (12, 2560), (128, 2560)})
 
     def test_manifest_digest_is_stable_and_content_addressed(self) -> None:
         """Generated policy provenance must bind the complete reviewed split."""
@@ -795,6 +848,7 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         }
         expected_shared_targets = {
             "v2_perf_cpu_native_vnni_gemv",
+            "v2_test_native_vnni_shape_manifest_projection",
             "v2_perf_cuda_native_vnni_decode_trainer",
             "v2_perf_cuda_native_vnni_gemm",
             "v2_perf_native_vnni_sweep",

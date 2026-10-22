@@ -151,6 +151,8 @@ def _largest_release_owner_by_dimensions() -> dict[tuple[int, int], float]:
 def _shape_owner_size_billions(shape: NativeVNNIShape) -> float:
     """Return the largest model size that owns one exact-overlay geometry."""
 
+    if shape.model_family == "qwen4exp":
+        raise ValueError(f"{shape.name}: explicit CPU evidence tier has no asserted model parameter total")
     fixed_size = _FIXED_MODEL_FAMILY_SIZE_BILLIONS.get(shape.model_family)
     if fixed_size is not None:
         return fixed_size
@@ -179,6 +181,11 @@ def _cpu_prefill_m_values_for_shape(
 ) -> tuple[int, ...]:
     """Select the reviewed exact-overlay M inventory for one model owner."""
 
+    # This is an offline evidence budget, not an asserted checkpoint total.
+    # The published 512-expert/48-layer main architecture alone is already in
+    # the large-model tier. No runtime dispatch branches on this family name.
+    if shape.model_family == "qwen4exp":
+        return CPU_14B_PLUS_PREFILL_M_BUCKETS
     owner_size = _shape_owner_size_billions(shape)
     if owner_size >= CPU_LARGE_MODEL_THRESHOLD_BILLIONS:
         return CPU_14B_PLUS_PREFILL_M_BUCKETS

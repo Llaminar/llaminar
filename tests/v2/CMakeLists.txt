@@ -5102,6 +5102,9 @@ add_test(NAME V2_Integration_NativeVNNIDensePrefillEvidenceIdentity
             ProductionDensePrefillSweepTest.test_rocm_streaming_observation_rejects_invented_or_forced_launch
             ProductionDensePrefillSweepTest.test_rocm_q8_aliases_authenticate_their_int8_producers
             ProductionDensePrefillSweepTest.test_rocm_producer_identity_rejects_cross_family_and_stale_evidence
+            ProductionDensePrefillSweepTest.test_rocm_same_geometry_retention_separates_prepared_families
+            ProductionDensePrefillSweepTest.test_installed_rocm_family_key_abi_is_retained_without_reinterpretation
+            ProductionDensePrefillSweepTest.test_rocm_totality_requires_canonical_prepared_family
             ProductionDensePrefillSweepTest.test_rocm_winner_uses_raw_ticks_and_native_tie_order
             ProductionDensePrefillSweepTest.test_both_backends_authenticate_aggregate_against_every_sample
             ProductionDensePrefillSweepTest.test_both_backends_reject_direct_or_partial_captured_timing
@@ -10298,6 +10301,29 @@ add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemmSweep
 # must never grow private model/shape lists.
 set(LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST
     "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_vnni_dispatch/manifests/native_vnni_decode_shapes_v5.json")
+
+# Device-free parity of the same C++ and Python resolved trainer inventory.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_executable(v2_test_native_vnni_shape_manifest_projection
+        unit/native_vnni_dispatch/NativeVNNIShapeManifestProjection.cpp)
+    target_include_directories(v2_test_native_vnni_shape_manifest_projection PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+    target_compile_definitions(v2_test_native_vnni_shape_manifest_projection PRIVATE
+        LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST_PATH="${LLAMINAR_NATIVE_VNNI_SHAPE_MANIFEST}"
+        LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG_PATH="${LLAMINAR_NATIVE_VNNI_QWEN_RELEASE_CATALOG}")
+    foreach(V2_MANIFEST_SUITE IN ITEMS Unit Integration)
+        add_v2_test(V2_${V2_MANIFEST_SUITE}_NativeVNNIShapeManifestCppParity
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_manifest_cpp_parity.py
+                --binary $<TARGET_FILE:v2_test_native_vnni_shape_manifest_projection>
+            LABELS "V2;${V2_MANIFEST_SUITE};NativeVNNI;CPU;DeviceFree;Dispatch;Catalog;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    endforeach()
+    if(TEST V2_Integration_NativeVNNIShapeManifestCppParity)
+        set_property(TEST V2_Integration_NativeVNNIShapeManifestCppParity APPEND PROPERTY LABELS ProductionTestPreflight)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeVNNIShapeManifestCppParity)
+    endif()
+endif()
 
 add_executable(v2_perf_cuda_native_vnni_decode_trainer
     performance/kernels/cuda/gemm/Perf__CUDANativeVNNIDecodeTrainer.cpp)
@@ -18179,6 +18205,14 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;GEMM;NativeVNNI;Quantized;gfx906;Accuracy"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_ROCm_NativeQ8PreparedFamily
+        COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemm>
+            --gtest_filter=NativeVNNIGEMMTest.NativeQ8PreparedFamilyDoesNotConsumeInt8ExactRow
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;NativeVNNI;PreparedWeights;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    if(TEST V2_Integration_ROCm_NativeQ8PreparedFamily)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_NativeQ8PreparedFamily)
+    endif()
     add_v2_test(V2_Integration_ROCm_NativeVNNI_PrefillHeuristic
         COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemm>
                 --gtest_filter=AllDispatchPaths/NativeVNNIGEMMTest.MatchesFP32Reference/*M32*

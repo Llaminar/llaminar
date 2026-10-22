@@ -6207,6 +6207,248 @@
       "aspect_bucket": "very_wide",
       "fast_partition": "development",
       "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_160x2560",
+      "n": 160,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_256x2560",
+      "n": 256,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_320x2560",
+      "n": 320,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_320x10240",
+      "n": 320,
+      "k": 10240,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_512x2560",
+      "n": 512,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_640x640",
+      "n": 640,
+      "k": 640,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_640x2560",
+      "n": 640,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_1280x640",
+      "n": 1280,
+      "k": 640,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "wide",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_1536x2560",
+      "n": 1536,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_2560x160",
+      "n": 2560,
+      "k": 160,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "very_wide",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_2560x320",
+      "n": 2560,
+      "k": 320,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "wide",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_2560x640",
+      "n": 2560,
+      "k": 640,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "wide",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_2560x1536",
+      "n": 2560,
+      "k": 1536,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_2560x2560",
+      "n": 2560,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_2560x3072",
+      "n": 2560,
+      "k": 3072,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_2560x6144",
+      "n": 2560,
+      "k": 6144,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_3072x2560",
+      "n": 3072,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_5120x2560",
+      "n": 5120,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "wide",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_6144x2560",
+      "n": 6144,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "wide",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_10240x2560",
+      "n": 10240,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "wide",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_12288x2560",
+      "n": 12288,
+      "k": 2560,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "wide",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen4Exp_4x10240",
+      "n": 4,
+      "k": 10240,
+      "model_family": "qwen4exp",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
     }
   ]
 }

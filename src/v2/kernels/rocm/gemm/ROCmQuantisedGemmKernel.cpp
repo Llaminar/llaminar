@@ -2004,7 +2004,7 @@ namespace llaminar2
                         bw_env.blockwise_v7_unroll >= 0;
                     const auto exact = !has_manual_override && !blockwise_override
                         ? selectDensePrefillExactConfig(
-                            19, m, n, k, DensePrefillWeightFamily::Int8)
+                            19, m, n, k, DensePrefillWeightFamily::Int8Blockwise)
                         : std::nullopt;
                     const bool use_v3 = exact
                         ? exact->producer == VNNIPrefillProducer::Int8BlockwiseV3

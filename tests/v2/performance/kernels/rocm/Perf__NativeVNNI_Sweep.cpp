@@ -1505,8 +1505,12 @@ namespace
                 auto weights = format.create(n, k);
                 const auto codebook = canonicalDeviceVnniCodebookId(
                     requireNativeVnniInfo(weights.get(), "installed overlay source weights").codebook_id);
+                // This canonical fixture uses the ordinary packer: Q8 is
+                // expanded INT8, while low-bit formats retain native payloads.
+                // Native-Q8 is a separate physical contract covered by the
+                // focused prepared-family regression, not a measured row here.
                 const auto family = codebook == 19
-                    ? DensePrefillWeightFamily::Int8 : DensePrefillWeightFamily::NativeLowBit;
+                    ? DensePrefillWeightFamily::Int8Blockwise : DensePrefillWeightFamily::NativeVNNI;
                 for (const int m : row_buckets)
                 {
                     SCOPED_TRACE(::testing::Message() << "M=" << m << " N=" << n << " K=" << k);

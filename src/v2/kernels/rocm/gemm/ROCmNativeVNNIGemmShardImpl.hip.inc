@@ -3063,7 +3063,7 @@ static bool launch_native_vnni_gemm(
     // measured producer that cannot launch is an error, never a second choice.
     if (const auto exact = llaminar2::rocm::selectDensePrefillExactConfig(
             FMT == NVNNI_GEMM_IQ4_XS_SOURCE ? uint8_t{4} : static_cast<uint8_t>(FMT), M, N, K,
-            llaminar2::rocm::DensePrefillWeightFamily::NativeLowBit))
+            llaminar2::rocm::DensePrefillWeightFamily::NativeVNNI))
     {
         switch (exact->producer)
         {

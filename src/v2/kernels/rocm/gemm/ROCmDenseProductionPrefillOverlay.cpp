@@ -20,7 +20,7 @@ namespace
 thread_local bool exact_enabled = true;
 /** @return Stable lexicographic identity used by generation and lookup. */
 constexpr auto key(const generated::ROCmDensePrefillOverlayEntry &entry) noexcept
-{ return std::tuple(entry.codebook, entry.m, entry.n, entry.k); }
+{ return std::tuple(entry.codebook, entry.m, entry.n, entry.k, entry.family); }
 /** @return Whether the canonical source catalog owns this execution decoder. */
 constexpr bool sourceOwned(std::uint8_t codebook) noexcept
 {
@@ -33,14 +33,16 @@ constexpr bool admitted(const generated::ROCmDensePrefillOverlayEntry &entry) no
 {
     const auto &launch = entry.config;
     if (!sourceOwned(entry.codebook) ||
+        !densePrefillWeightFamilyValid(entry.family) ||
         entry.m <= 0 || entry.n <= 0 || entry.k <= 0 || entry.k % 32 != 0 ||
         launch.m_tile <= 0 || launch.n_tile <= 0 ||
         (launch.unroll != 0 && launch.unroll != 1 && launch.unroll != 2 && launch.unroll != 4)) return false;
     if (launch.full_tiles && (entry.m % launch.m_tile || entry.n % launch.n_tile || entry.k % 64)) return false;
+    if (!densePrefillProducerMatchesFamily(entry.family, launch.producer)) return false;
     switch (launch.producer)
     {
     case VNNIPrefillProducer::NativeCooperative:
-        return entry.codebook != 19 && (launch.n_tile == 64 || launch.n_tile == 128) &&
+        return (launch.n_tile == 64 || launch.n_tile == 128) &&
             (launch.m_tile == 16 || launch.m_tile == 32 || (launch.n_tile == 64 && launch.m_tile == 64 && !launch.full_tiles)) &&
             (launch.min_blocks == 1 || launch.min_blocks == 2) &&
             (!launch.full_tiles || entry.codebook == 8) &&
@@ -78,18 +80,16 @@ void setDensePrefillExactOverlayEnabled(bool enabled) noexcept { exact_enabled =
 std::optional<DensePrefillExactConfig> selectDensePrefillExactConfig(
     std::uint8_t codebook, int m, int n, int k, DensePrefillWeightFamily family)
 {
-    if (family != DensePrefillWeightFamily::NativeLowBit && family != DensePrefillWeightFamily::Int8)
+    if (!densePrefillWeightFamilyValid(family))
         throw std::invalid_argument("Unknown ROCm dense prefill weight family");
     if (m <= 0 || n <= 0 || k <= 0) throw std::invalid_argument("ROCm dense prefill requires positive geometry");
     if (!exact_enabled) return std::nullopt;
-    const auto requested = std::tuple(codebook, m, n, k);
+    const auto requested = std::tuple(codebook, m, n, k, family);
     const auto &entries = generated::kROCmDensePrefillOverlayEntries;
     const auto found = std::lower_bound(std::begin(entries), std::end(entries), requested,
         [](const auto &entry, const auto &lookup) { return key(entry) < lookup; });
     if (found == std::end(entries) || key(*found) != requested) return std::nullopt;
-    const bool int8 = found->config.producer == VNNIPrefillProducer::Int8BlockwiseV3 ||
-        found->config.producer == VNNIPrefillProducer::Int8BlockwiseV7;
-    if (int8 != (family == DensePrefillWeightFamily::Int8))
+    if (!densePrefillProducerMatchesFamily(family, found->config.producer))
         throw std::logic_error("ROCm measured prefill producer disagrees with prepared weight family");
     return found->config;
 }

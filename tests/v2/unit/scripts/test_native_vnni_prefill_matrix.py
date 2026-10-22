@@ -196,10 +196,26 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
                         for row in measurements
                     ))
 
+    def test_qfn_has_explicit_large_evidence_tier_without_a_total_count(self) -> None:
+        """Budget original large-model evidence without inventing a release size."""
+        cpu = {row.shape.name: row for row in cpu_prefill_measurements()}
+        gpu = {row.shape.name: row for row in gpu_prefill_measurements()}
+        shapes = [s for s in load_shape_manifest().shapes
+                  if s.model_family == "qwen4exp"]
+        self.assertTrue(shapes)
+        for shape in shapes:
+            with self.subTest(shape=shape.name):
+                self.assertEqual(cpu[shape.name].m_values, CPU_14B_PLUS_PREFILL_M_BUCKETS)
+                self.assertEqual(gpu[shape.name].m_values, GPU_PREFILL_M_BUCKETS)
+                with self.assertRaisesRegex(ValueError, "no asserted model parameter total"):
+                    _shape_owner_size_billions(shape)
+
     def test_matrix_has_every_shape_depth_cell(self) -> None:
         matrix = cpu_prefill_measurements()
 
         def expected_m_values(row):
+            if row.shape.model_family == "qwen4exp":
+                return CPU_14B_PLUS_PREFILL_M_BUCKETS
             owner_size = _shape_owner_size_billions(row.shape)
             if owner_size >= CPU_LARGE_MODEL_THRESHOLD_BILLIONS:
                 return CPU_14B_PLUS_PREFILL_M_BUCKETS

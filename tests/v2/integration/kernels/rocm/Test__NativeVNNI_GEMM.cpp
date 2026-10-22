@@ -35,6 +35,10 @@
  * M values: 1, 7, 16, 17, 32, 33, 64 — covering exact tile boundaries,
  * non-tile-aligned M (boundary tiles), and M=1 (GEMV fallback).
  *
+ * The prepared-Q8 producer regression additionally exercises two original
+ * physical layouts at one installed exact key, with captured native replay
+ * checked byte-for-byte against its own public serial-M1 program.
+ *
  * @note Requires ROCm device and build_v2_integration.
  */
 
@@ -47,6 +51,7 @@
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
 #include "backends/rocm/HIPGraphCapture.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -597,6 +602,145 @@ namespace
         ASSERT_TRUE(waitForROCmTestBoundary(stream_));
         qkv_kernel.unbindWorkspace();
         z_kernel.unbindWorkspace();
+#endif
+    }
+
+
+    /**
+     * @test Native signed-Q8 and expanded INT8 retain distinct prepared authority.
+     *
+     * The installed M64/N512/K5120 entry belongs to INT8 V3. Native Q8 bytes
+     * originate from the same tensor's format-owned block packer and enter the
+     * real public prepared-weight constructor. They must capture their existing
+     * native producer, whose complete output equals independent serial M1 rows.
+     * No exact native-Q8 winner or changed source arithmetic is introduced.
+     */
+    TEST_F(NativeVNNIGEMMTest, NativeQ8PreparedFamilyDoesNotConsumeInt8ExactRow)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        ASSERT_TRUE(has_gpu_) << "Explicit ROCm regression requires a physical device";
+        constexpr int M = 64, N = 512, K = 5120;
+        const DeviceId device = DeviceId::rocm(0);
+        auto source = TestTensorFactory::createQ8_0Random({N, K});
+        ASSERT_NE(source, nullptr);
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(source.get());
+        ASSERT_NE(unpackable, nullptr);
+        const auto *format = unpackable->vnniFormatInfo();
+        ASSERT_NE(format, nullptr);
+        ASSERT_EQ(format->codebook_id, 19);
+        ASSERT_EQ(format->payload_bytes, 32);
+        ROCmPackedWeights int8_packed, native_packed;
+        ASSERT_TRUE(packWeightsToROCm(source.get(), int8_packed));
+        ASSERT_TRUE(packWeightsToROCm(source.get(), native_packed));
+        ASSERT_TRUE(int8_packed.native_vnni_payload.empty());
+        ASSERT_TRUE(native_packed.native_vnni_payload.empty());
+        ASSERT_TRUE(native_packed.native_source_identity.present);
+        ASSERT_EQ(native_packed.native_source_identity.codebook_id, 19);
+
+        // This is the original tensor's production-native K32 layout, not a
+        // reinterpretation of the expanded INT8 VNNI buffer or a fake decoder.
+        constexpr int groups = K / 32;
+        const std::size_t blocks = static_cast<std::size_t>(N) * groups;
+        native_packed.native_vnni_payload.resize(blocks * format->payload_bytes);
+        native_packed.native_vnni_scales.resize(blocks);
+        native_packed.native_vnni_codebook_id = format->codebook_id;
+        native_packed.native_vnni_blocks_per_row = groups;
+        VnniPackContext pack{};
+        pack.raw_bytes = static_cast<const std::uint8_t *>(source->raw_data());
+        pack.N = N; pack.K = K; pack.blocks_per_row = groups;
+        pack.payload_bytes = format->payload_bytes;
+        pack.payload_array = native_packed.native_vnni_payload.data();
+        pack.scales_array = native_packed.native_vnni_scales.data();
+        for (int column = 0; column < N; ++column)
+            for (int group = 0; group < groups; ++group)
+                unpackable->packVnniBlock(pack, column, column, group);
+
+        auto input = TestTensorFactory::createFP32Random({M, K});
+        auto native_output = TestTensorFactory::createFP32({M, N});
+        auto int8_output = TestTensorFactory::createFP32({M, N});
+        auto row_output = TestTensorFactory::createFP32({1, N});
+        auto oracle_bank = TestTensorFactory::createFP32({M, N});
+        ASSERT_TRUE(input->ensureOnDevice(device, stream_));
+        for (auto *tensor : {native_output.get(), int8_output.get(), row_output.get(), oracle_bank.get()})
+            ASSERT_TRUE(tensor->allocateOnDevice(device, stream_));
+        ROCmQuantisedGemmKernel native(&native_packed, 0), expanded(&int8_packed, 0);
+        native.setGPUStream(stream_); expanded.setGPUStream(stream_);
+        ASSERT_TRUE(setupWorkspace(native, M, N, K));
+        expanded.bindWorkspace(workspace_.get());
+
+        // Materialize original weights/workspace outside capture. The ordinary
+        // packed owner must continue selecting the already measured INT8 V3 row.
+        clearVNNIPrefillLaunch();
+        ASSERT_TRUE(expanded.multiply_tensor(input.get(), int8_output.get(), M, N, K));
+        ASSERT_TRUE(waitForROCmTestBoundary(stream_));
+        const auto expanded_launch = lastVNNIPrefillLaunch();
+        ASSERT_TRUE(expanded_launch);
+        EXPECT_EQ(expanded_launch->producer, VNNIPrefillProducer::Int8BlockwiseV3);
+        EXPECT_EQ(expanded_launch->execution_codebook, 19);
+        EXPECT_EQ(expanded_launch->n_tile, 64);
+        EXPECT_EQ(expanded_launch->m_tile, 16);
+        EXPECT_EQ(expanded_launch->unroll, 4);
+        EXPECT_FALSE(expanded_launch->full_tiles);
+
+        // Each row uses the public native M1 program with the same prepared
+        // source and exact stream. The bank is an independent test oracle;
+        // serial replay never participates in the production captured path.
+        for (int row = 0; row < M; ++row)
+        {
+            ASSERT_TRUE(native.multiply_tensor(input.get(), row_output.get(), 1, N, K,
+                true, 1.0f, 0.0f, nullptr, nullptr, -1, workspace_.get(), row));
+            ASSERT_EQ(hipMemcpyAsync(static_cast<float *>(oracle_bank->gpu_data_ptr()) + row * N,
+                row_output->gpu_data_ptr(), N * sizeof(float), hipMemcpyDeviceToDevice, stream_), hipSuccess);
+        }
+        ASSERT_TRUE(waitForROCmTestBoundary(stream_));
+        std::vector<float> expected(static_cast<std::size_t>(M) * N), actual(expected.size());
+        ASSERT_EQ(hipMemcpyAsync(expected.data(), oracle_bank->gpu_data_ptr(), expected.size() * sizeof(float),
+            hipMemcpyDeviceToHost, stream_), hipSuccess);
+        ASSERT_TRUE(waitForROCmTestBoundary(stream_));
+
+        HIPGraphCapture capture(stream_, 0);
+        ScopedBackendGraphCapture transaction(capture,
+            "NativeVNNIGEMMTest.NativeQ8PreparedFamilyDoesNotConsumeInt8ExactRow");
+        clearVNNIPrefillLaunch();
+        ASSERT_TRUE(transaction.begin());
+        // Old production throws here: its four-field key finds the foreign V3
+        // entry before checking the native prepared family. The graph scope
+        // still closes on failure; no partially captured graph is submitted.
+        ASSERT_TRUE(native.multiply_tensor(input.get(), native_output.get(), M, N, K));
+        transaction.finish();
+        const auto native_launch = lastVNNIPrefillLaunch();
+        ASSERT_TRUE(native_launch);
+        ASSERT_EQ(native_launch->execution_codebook, 19);
+        ASSERT_EQ(native_launch->producer, VNNIPrefillProducer::NativeCooperative);
+        ASSERT_TRUE(capture.instantiate());
+        std::vector<GPUGraphKernelNodeInfo> kernels;
+        std::string diagnostic;
+        ASSERT_TRUE(capture.inspectKernelNodes(kernels, &diagnostic)) << diagnostic;
+        std::size_t original_producers = 0;
+        for (const auto &kernel : kernels)
+        {
+            ASSERT_TRUE(kernel.valid() && kernel.name_resolved);
+            if (kernel.name.find("native_vnni_gemm_kernel") != std::string::npos)
+            {
+                EXPECT_EQ(kernel.function_identity, reinterpret_cast<std::uintptr_t>(native_launch->function));
+                ++original_producers;
+            }
+            EXPECT_EQ(kernel.name.find("prefill_wide_tile"), std::string::npos);
+        }
+        ASSERT_EQ(original_producers, 1u);
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            ASSERT_EQ(hipMemsetAsync(native_output->gpu_data_ptr(), 0xA5,
+                actual.size() * sizeof(float), stream_), hipSuccess);
+            ASSERT_TRUE(capture.launch());
+            ASSERT_EQ(hipMemcpyAsync(actual.data(), native_output->gpu_data_ptr(), actual.size() * sizeof(float),
+                hipMemcpyDeviceToHost, stream_), hipSuccess);
+            ASSERT_TRUE(waitForROCmTestBoundary(stream_));
+            EXPECT_EQ(firstBitwiseMismatchIndex(actual, expected), expected.size()) << "replay=" << replay;
+        }
+        expanded.unbindWorkspace(); native.unbindWorkspace();
 #endif
     }
 

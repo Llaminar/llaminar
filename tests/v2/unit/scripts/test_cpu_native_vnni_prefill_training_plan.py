@@ -641,6 +641,8 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
         self.assertEqual(set(regime_loads), set(ISA_REGIMES))
 
     def test_process_jobs_form_identical_m_inventory_mpmd_groups(self) -> None:
+        """Pair only equal M inventories without fixing the growing catalog size."""
+
         records = cpu_prefill_source_training_records()
         groups = [
             tuple(group)
@@ -666,9 +668,18 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
                 (32, 128),
             },
         )
+        # The shared shape inventory grows as new model and TP geometries are
+        # admitted. Every geometry must still contribute every source format
+        # and ISA regime to exactly its declared M inventory.
+        expected_group_sizes = Counter(
+            measurement.m_values for measurement in cpu_prefill_measurements()
+        )
         self.assertEqual(
-            sorted(len(group) for group in groups),
-            [441, 1890, 3087],
+            {group[0].m_values: len(group) for group in groups},
+            {
+                m_values: shape_count * len(FORMAT_SPECS) * len(ISA_REGIMES)
+                for m_values, shape_count in expected_group_sizes.items()
+            },
         )
         self.assertEqual(
             sum((len(group) + 1) // 2 for group in groups),
